@@ -170,11 +170,6 @@ void dae2(
         //   task_gemv<gemv_atom, 128, 128, 4, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
         //   }
         //   break;
-        // case OP_GEMV_M64N8_ROPE_128: {
-        //   using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-        //   task_gemv_fused_rope<gemv_atom, 64, 256, 128, 0, 4, false>(inst.args[0], inst.args[1], inst.args[2], smem_base, st_insts, m2c, c2m);
-        //   }
-        //   break;
         case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim: {
           using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
           using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
