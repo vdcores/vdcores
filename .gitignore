@@ -1,0 +1,76 @@
+.hypothesis/
+
+# Compiled object files
+*.o
+*.obj
+
+# Compiled dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled executables
+*.exe
+
+# CUDA object files
+*.cu.o
+*.cu.obj
+
+# CUDA PTX files
+*.ptx
+
+# CUDA C++ dependency files
+*.d
+
+# Build directories
+build/
+bin/
+/.cache/
+
+#vscode
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info
+dist/
+wheelhouse/
+
+# Cython
+/python/mirage/_cython/core.cpp
+
+# Mac OS .DS_Store
+.DS_Store
+
+# Visualizer results
+*.png
+*.dot
+!docs/**/*.png
+
+# Triton transpiler
+demo/mirage_search_checkpoint.json
+demo/*generated*
+benchmark/*generated*
+
+# Rust
+Cargo.lock
+
+# Output files of runtime
+output/
+# Temp file
+task_graph*.json
+test.cu
+kernel*.cu
+
+#runtime
+*.perfetto-trace
+
+test/[!.]*
+report
+ncu_tmp
+
+#nsys
+*.nsys-rep
+*.sqlite
+.claude/
