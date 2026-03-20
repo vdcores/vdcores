@@ -127,3 +127,126 @@ __device__ __forceinline__ void task_gemv(
     c2m.template push<0, true>(thread_id, slot_c);
 }
 
+// This function uses mma instead of wgmma, so it works on sm >= 89
+template<typename T, int M, int N, int K, typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_Type& m2c, C2M_Type& c2m) {
+    using namespace cute;
+
+    static_assert(sizeof(T) == 2, "Only support fp16/u16/bf16 types");
+
+    using Atom = SM80_16x8x16_F16F16F16F16_TN;
+    using AtomTrait = MMA_Traits<Atom>;
+
+    constexpr int MMA_M = shape<0>(typename AtomTrait::Shape_MNK{});
+    constexpr int MMA_N = shape<1>(typename AtomTrait::Shape_MNK{});
+    constexpr int MMA_K = shape<2>(typename AtomTrait::Shape_MNK{});
+    constexpr int numThreads = 32 * (M / MMA_M);
+
+    static_assert(M % MMA_M == 0, "M must be multiple of MMA_M");
+    static_assert(K % MMA_K == 0, "K must be multiple of MMA_K");
+    static_assert(numThreads <= 128, "At least 64 threads are required for queue operations");
+
+    // TODO(zhiyuang): calculate arrival count for each thread
+    const int arrival_count = 128 / numThreads + ((128 % numThreads) < __comptue_tid());
+    // now we just use 
+    __activate_compute_group(numThreads);
+
+    // One warp, so 32 threads
+    int tid = __compute_tid();
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    // 2. Describe SMEM tiles as CuTe tensors
+    // These tensors are dummy descriptions, used for tiling only
+    Tensor t_sB = make_tensor(
+        make_smem_ptr(static_cast<T*>(base)),
+        make_shape(Int<N>{}, Int<K>{}),      // N,K
+        make_stride(Int<1>{}, Int<N>{})       // N Major
+    );
+    Tensor t_sC = make_tensor(
+        make_smem_ptr(static_cast<T*>(base)),
+        make_shape(Int<M>{}, Int<N>{}),      // (M,N)
+        make_stride(Int<N>{}, Int<1>{})      // N Major
+    );
+
+    auto tiled_mma = make_tiled_mma(
+        MMA_Atom<Atom>{},
+        make_layout(make_shape(Int<M / MMA_M>{}, Int<1>{}, Int<1>{})), // atom replication
+        make_tile(Int<M>{}, Int<N>{}, Int<K>{}) // final target MNK
+    );
+    auto thr_mma_qk   = tiled_mma.get_slice(threadIdx.x);
+
+    auto tiled_copy = make_tiled_copy_A(
+        Copy_Atom<SM75_U16x8_LDSM_T, T>{},
+        tiled_mma
+    );
+    auto thr_copy = tiled_copy.get_slice(threadIdx.x);
+
+    //
+    // 4. Partition SMEM per-thread, then make register fragments
+    //
+    // Per-thread views into SMEM tiles
+    
+    // TODO(zhiyuang): tile A or slice A
+    auto frag_B = thr_mma_qk.partition_fragment_B(t_sB);   // (thr, mma_n, mma_k)
+    auto frag_C = thr_mma_qk.partition_fragment_C(t_sC);   // (thr, mma_m, mma_n)
+
+    clear(frag_B);
+    clear(frag_C);                                      // C = 0
+
+    // TODO(zhiyuang): make B nop read
+    // we first assume the address of B is loaded
+    int slot_b = m2c.pop();
+    T* sb = (T *)get_slot_address(base, extract(slot_b));
+    __cprint("loaded B from slot %d at address %p", slot_b, sb);
+
+    for (int i = 0; i < nTiles; i++) {
+        // loop over tiles of matrix, each tile is of size (M x K)
+        int slot_id = m2c.pop();
+        T* sa = (T *)get_slot_address(base, extract(slot_id));
+
+        // load fragB, vectorized as bfloat162
+        if (lane_id < N * 4) { // each thread loads 4 elements (bfloat16x2)
+            uint32_t *ptr_regs = reinterpret_cast<uint32_t*>(frag_B.data());
+            uint32_t *ptr_smem = reinterpret_cast<uint32_t*>(sb + t * MMA_K);
+            ptr_regs[0] = ptr_smem[lane_id];
+            ptr_regs[1] = ptr_smem[lane_id + 4];
+        }
+
+        // load fragA first as a could be just ready
+        Tensor t_sA = make_tensor(
+            make_smem_ptr(sa),
+            make_shape(Int<M>{}, Int<MMA_K>{}),     // (M,K)
+            make_stride(Int<1>{}, Int<M>{}));       // col-major
+
+        auto frag_A = thr_mma_qk.partition_fragment_A(t_sA);
+
+        copy(tiled_copy,
+            thr_copy.partition_S(t_sA),
+            thr_copy.retile_D(frag_A)); 
+
+        // 5. Issue the m16n8k16 MMA atom through cute::gemm
+        gemm(tiled_mma, frag_C, frag_A, frag_B, frag_C);   // C = A*B + C
+
+        sb += K;
+        // free the used segments
+        c2m.push(slot_id);
+    }
+
+    // 6. Write back the C fragments to SMEM
+    int slot_c = m2c.pop();
+    T* sc = (T *)get_slot_address(base, extract(slot_c));
+
+    // frag_C: M * N
+    // This is trying to get (M, 0)
+    // TODO(zhiyuang): is this faster than a stmatrix?
+    const int warp_base = warp_id * MMA_M + lane_id / 4;
+    if (lane_id % 4 < N / 2) { // each thread stores 4 elements (bfloat16x2)
+        uint32_t *vec = frag_C.data();
+        sc[warp_base] = vec[0];
+        sc[warp_base + 8] = vec[2];
+    }
+
+    // TODO(zhiyuang) necessary sync?
+    c2m.push(slot_b);
+}
