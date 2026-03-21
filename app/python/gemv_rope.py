@@ -98,18 +98,16 @@ gemv = SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, HIDDEN),
     tmas=(loadM, loadV, regStoreO)).place(num_sms)
 
-def cord_reduce(sm: int, inst):
-    m = sm % 64 * TileM
-    return inst.cord(0, m)
-
 cached_seq_len = 7
-def cord_table(sm: int, inst):
-    m = sm % 64 * TileM
-    return inst.cord(cached_seq_len, (m % 128) // 64)
-
 rope = SchedRope( ROPE_INTERLEAVE_512,
-   tmas=(loadRope, regLoadO, reduceO),
-   cords=(cord_table, None, cord_reduce)
+   tmas=(
+       ToConvertedCordAdapter(
+           loadRope,
+           lambda sm: (cached_seq_len, ((sm % 64) * TileM % 128) // 64),
+       ),
+       regLoadO,
+       ToSplitMCordAdapter(reduceO, 64, TileM),
+   )
 ).place(num_sms)
 
 dae.s(
