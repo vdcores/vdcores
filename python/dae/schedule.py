@@ -628,12 +628,14 @@ class SchedRMSShared(Schedule):
                  num_token: int,
                  epsilon: float,
                  tmas,
+                 hidden_size: int | None = None,
                  group: bool = True,
                  embedding = None):
         super().__init__()
         self.num_token = num_token
         self.epsilon = epsilon
         self.tmas = tmas
+        self.hidden_size = hidden_size
         self.group = group
         self.embedding = embedding
 
@@ -641,11 +643,21 @@ class SchedRMSShared(Schedule):
         assert self.num_token % self.num_sms == 0, "Number of tokens must be divisible by number of SMs"
         self.workload_per_sm = self.num_token // self.num_sms
 
+    def _resolve_hidden_size(self):
+        if self.hidden_size is not None:
+            return self.hidden_size
+
+        weight = self.tmas[0]
+        if hasattr(weight, "size") and weight.size % 2 == 0:
+            return weight.size // 2
+        raise ValueError("SchedRMSShared requires hidden_size or a byte-sized weight TMA")
+
     def schedule(self, sm):
         if sm < 0:
             return []
 
-        per_token_size = 4096 * 2
+        hidden_size = self._resolve_hidden_size()
+        per_token_size = hidden_size * 2
         start_token_id = sm * self.workload_per_sm
         weight, load, store = self.tmas
 
@@ -659,7 +671,7 @@ class SchedRMSShared(Schedule):
             load.jump()
         
         return [
-            RMS_NORM_F16_K_4096_SMEM(self.workload_per_sm, self.epsilon),
+            select_rms_smem_instruction(hidden_size)(self.workload_per_sm, self.epsilon),
             weight.group(),
             self.embedding,
             load,
@@ -675,18 +687,26 @@ class SchedRMS(Schedule):
     def __init__(self,
                  num_token: int,
                  epsilon: float,
-                 weights_glob: torch.Tensor,
                  input_glob: torch.Tensor,
                  output_glob: torch.Tensor,
+                 weights_glob: torch.Tensor | None = None,
+                 hidden_size: int | None = None,
                  use_glob: bool = False,
                  group: bool = True,
                  embedding = None):
         super().__init__()
         self.num_token = num_token
         self.epsilon = epsilon
-        self.weights_glob = weights_glob
         self.input_glob = input_glob
         self.output_glob = output_glob
+        if weights_glob is None:
+            weights_glob = torch.ones(
+                self.input_glob.shape[-1],
+                dtype=self.input_glob.dtype,
+                device=self.input_glob.device,
+            )
+        self.weights_glob = weights_glob
+        self.hidden_size = hidden_size if hidden_size is not None else input_glob.shape[-1]
         self.use_glob = use_glob
         self.group = group
         self.embedding = embedding
@@ -707,7 +727,7 @@ class SchedRMS(Schedule):
                 weight = RawAddress(self.weights_glob, 26)
                 load = RawAddress(self.input_glob[start_token_id:start_token_id+self.workload_per_sm], 24)
                 store = RawAddress(self.output_glob[start_token_id:start_token_id+self.workload_per_sm], 25)
-                kernel = RMS_NORM_F16_K_4096
+                kernel = select_rms_glob_instruction(self.hidden_size)
             else:
                 loadTensors = self.input_glob[start_token_id:start_token_id+self.workload_per_sm]
                 if len(loadTensors) == 1:
@@ -719,7 +739,7 @@ class SchedRMS(Schedule):
                 weight = TmaLoad1D(self.weights_glob)
                 load = TmaLoad1D(loadTensors)
                 store = TmaStore1D(storeTensors)
-                kernel = RMS_NORM_F16_K_4096_SMEM
+                kernel = select_rms_smem_instruction(self.hidden_size)
                 # TODO(zhiyuang): recheck this when refector on repeat is done.
                 if self.embedding is not None:
                     load.jump()

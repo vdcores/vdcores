@@ -66,8 +66,8 @@ class ToLinearCordAdapter(ToConvertedCordAdapter):
         super().__init__(inner, lambda sm: (sm * delta,))
 
 class ToRopeTableCordAdapter(ToConvertedCordAdapter):
-    def __init__(self, inner, batch_seq_len: int):
-        super().__init__(inner, lambda sm: (sm % 2, batch_seq_len))
+    def __init__(self, inner, batch_seq_len: int, tile_repeats: int = 2):
+        super().__init__(inner, lambda sm: (sm % tile_repeats, batch_seq_len))
 
 class ToSplitMCordAdapter(ToConvertedCordAdapter):
     def __init__(self, inner, num_sms: int, tile_m: int):
@@ -120,17 +120,19 @@ def tma_store_attn_kv(mat: torch.Tensor, TileM: int, TileK: int):
 # for building table
 def tma_load_tbl(mat: torch.Tensor, TileM: int, TileN: int):
     assert mat.element_size() == 2, "Only support float16/bfloat16 output"
-    # assume headdim = 64
+    head_dim = mat.shape[-1]
     MAX_SEQ_LEN = mat.shape[0]
     assert TileM == 64, "TileM must be 64 for rope table"
-    assert mat.shape[-1] == 128, "mat shape should be head_dim"
+    assert head_dim % 64 == 0, "rope table head_dim must be a multiple of 64"
 
     # assign a different ROPE table for each single req in a batch of TileN
     s = mat.element_size()
+    vec_width = head_dim // 2
+    tile_repeats = head_dim // 64
     # repeat for tileN times
-    glob_dims = [64, TileN, 2, MAX_SEQ_LEN]
-    glob_strides = [128 * s, 64 * s, 128 * TileN * s]
-    box_dims = [64, TileN, 1, 1]
+    glob_dims = [vec_width, TileN, tile_repeats, MAX_SEQ_LEN]
+    glob_strides = [head_dim * s, vec_width * s, head_dim * TileN * s]
+    box_dims = [vec_width, TileN, 1, 1]
     rank = len(glob_dims)
     box_strides = [1] * rank
     return rank, runtime.build_tma_desc(

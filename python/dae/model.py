@@ -15,15 +15,17 @@ def get_other_dims(dim: int, i: int):
 def tma_gqa_load_q(mat: torch.Tensor, tileK: int, tileN: int):
     # [HEAD_DIM[0], HEAD_GROUP_SIZE, REP * HEAD_DIM[1] * NUM_KV_HEAD]
     assert mat.element_size() == 2, "Only support float16/bfloat16 output"
-    assert tileK == 128 and tileN == 64, "tile must be 128x64"
+    assert tileN == 64, "tileN must be 64"
     # getting the mat size
     NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM = mat.shape
-    assert HEAD_DIM == 128, "Only support head dim 128 for loading Q in GQA"
+    assert tileK == HEAD_DIM, "tileK must match HEAD_DIM"
+    assert HEAD_DIM % 64 == 0, "HEAD_DIM must be a multiple of 64"
 
     # this will dup for 4 times, due to 0 in strides, do not know how tma engine will handle it
-    glob_dims = [64, 4, 16, 2, NUM_REQ * NUM_KV_HEAD]
-    glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
-    box_dims = [64, 4, 16, 2, 1]
+    rope_tiles = HEAD_DIM // 64
+    glob_dims = [64, HEAD_GROUP_SIZE, 16, rope_tiles, NUM_REQ * NUM_KV_HEAD]
+    glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    box_dims = [64, HEAD_GROUP_SIZE, 16, rope_tiles, 1]
 
     rank = len(glob_dims)
     box_strides = [1] * rank
@@ -40,8 +42,7 @@ def tma_gqa_load_q(mat: torch.Tensor, tileK: int, tileN: int):
 
 def cord_gqa_load_q(mat: torch.Tensor, rank: int):
     assert rank == 5, "Only support 5D TMA load for load Q"
-    # TODO(zhiyuang): hardcode for now
-    NUM_KV_HEAD = 4
+    NUM_KV_HEAD = mat.shape[1]
 
     def cfunc(*cords):
         assert len(cords) == 2, f"cords should be (req, head), but got {cords}"
