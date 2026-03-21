@@ -14,6 +14,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `app/python/`: runnable experiments and schedule prototypes.
 - `app/python/llama3/sched.py`: primary end-to-end decoding demo for `meta-llama/Llama-3.1-8B-Instruct`.
 - `app/python/llama3/reference.py` and `app/python/llama3/llama_attention_reference.py`: local reference helpers worth checking before re-deriving model math.
+- `app/python/gemv_mma_out.py`: dedicated correctness harness for the isolated `N=8` MMA GEMV operator path.
 - `app/python/qwen3/`: Qwen 3 client, layer, utilities, and schedule variants.
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
 - `python/dae/instructions.py`: serialized instruction types, compute operation definitions, memory-side instruction helpers, and TMA instruction wrappers used by `launcher.py`.

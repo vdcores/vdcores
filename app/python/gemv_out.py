@@ -20,7 +20,7 @@ dae = Launcher(num_sms, device=gpu)
 layer = GemvLayer(dae, Atom, "out_proj", (matA, matB, matC))
 
 
-dae.s(layer.schedule())
+dae.s(layer.schedule().place(num_sms))
 
 dae_app(dae)
 

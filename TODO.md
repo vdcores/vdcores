@@ -24,6 +24,8 @@ BugFix:
 - [ ] unify the cord converter
 
 Optmizations
+- [ ] reduce "before allocation" operations
+  - [ ] change the shift to after allocation?
 - [ ] optimize layout for KV; make them stay same in the single batch?
   - [ ] how do paged attention do?
 - [ ] direct bar from raw address (spcifically, argmax)
