@@ -52,6 +52,11 @@ class Gemv_M64N8(ComputeInstruction):
     n_batch = 4
     def __init__(self, kTiles: int, nprefeth = 0, residual: bool = False):
         super().__init__(opcode=opcode.OP_GEMV_M64N8, args=[kTiles, nprefeth])
+class Gemv_M64N8_MMA(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 1
+    def __init__(self, kTiles: int):
+        super().__init__(opcode=opcode.OP_GEMV_M64N8_MMA, args=[kTiles])
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
     n_batch = 4

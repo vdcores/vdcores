@@ -128,12 +128,11 @@ __device__ __forceinline__ void task_gemv(
 }
 
 // This function uses mma instead of wgmma, so it works on sm >= 89
-template<typename T, int M, int N, int K, typename M2C_Type, typename C2M_Type>
+template<int M, int N, int K, typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_Type& m2c, C2M_Type& c2m) {
     using namespace cute;
 
     static_assert(N == 8, "Only support N=8 for now");
-    static_assert(sizeof(T) == 2, "Only support fp16/u16/bf16 types");
 
     using Atom = SM80_16x8x16_F32BF16BF16F32_TN;
     using AtomTrait = MMA_Traits<Atom>;
@@ -147,14 +146,8 @@ __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_
 
     static_assert(M % MMA_M == 0, "M must be multiple of MMA_M");
     static_assert(K % MMA_K == 0, "K must be multiple of MMA_K");
-    static_assert(numThreads <= 128, "At least 64 threads are required for queue operations");
+    static_assert(numThreads == 128, "Only support a 128-thread compute group for now");
 
-    // TODO(zhiyuang): calculate arrival count for each thread
-    const int arrival_count = 128 / numThreads + ((128 % numThreads) < __compute_tid());
-    // now we just use 
-    __activate_compute_group(numThreads);
-
-    // One warp, so 32 threads
     int tid = __compute_tid();
 
     auto tiled_mma = make_tiled_mma(
@@ -162,65 +155,50 @@ __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_
         make_layout(make_shape(Int<M / MMA_M>{}, Int<1>{}, Int<1>{})), // atom replication
         make_tile(Int<M>{}, Int<MMA_N>{}, Int<K>{}) // final target MNK
     );
-    auto thr_mma  = tiled_mma.get_slice(threadIdx.x);
+    auto thr_mma  = tiled_mma.get_slice(tid);
 
-    // auto tiled_copy = make_tiled_copy_A(
-    //     Copy_Atom<SM75_U16x8_LDSM_T, T>{},
-    //     tiled_mma
-    // );
-    // auto thr_copy = tiled_copy.get_slice(threadIdx.x);
-
-    //
-    // 4. Partition SMEM per-thread, then make register fragments
-    //
-    // Per-thread views into SMEM tiles
-    auto layout_sA = Layout<Shape<Int<M>, Int<K>>, Stride<_1, Int<M>>>{};
-    auto layout_sB = Layout<Shape<Int<MMA_N>, Int<K>>,Stride<_1, Int<MMA_N>>>{};
-    auto layout_sC = Layout<Shape<Int<M>, Int<MMA_N>>, Stride<Int<MMA_N>, _1>>{};
+    auto layout_sA = tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<data_t>{},
+        make_shape(Int<M>{}, Int<K>{}));
+    auto layout_sB = tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<data_t>{},
+        make_shape(Int<MMA_N>{}, Int<K>{}));
+    auto layout_sC = tile_to_shape(
+        GMMA::Layout_MN_SW128_Atom<data_t>{},
+        make_shape(Int<M>{}, Int<MMA_N>{}));
 
     auto t_dummyA = make_tensor(make_smem_ptr(static_cast<data_t*>(nullptr)), layout_sA);
     auto t_dummyB = make_tensor(make_smem_ptr(static_cast<data_t*>(nullptr)), layout_sB);
-    auto t_dummyC = make_tensor(make_smem_ptr(static_cast<accum_t*>(nullptr)), layout_sC);
-    
-    // TODO(zhiyuang): tile A or slice A
-    auto frag_A = thr_mma.partition_fragment_A(t_dummyA);
-    auto frag_B = thr_mma.partition_fragment_B(t_dummyB);   // (thr, mma_n, mma_k)
-    auto frag_C = thr_mma.partition_fragment_C(t_dummyC);   // (thr, mma_m, mma_n)
+    auto t_dummyC = make_tensor(make_smem_ptr(static_cast<accum_t*>(nullptr)),
+        Layout<Shape<Int<M>, Int<MMA_N>>, Stride<Int<1>, Int<M>>>());
 
-    clear(frag_C);                                      // C = 0
+    auto frag_A = thr_mma.partition_fragment_A(t_dummyA);
+    auto frag_B = thr_mma.partition_fragment_B(t_dummyB);
+    auto frag_C = thr_mma.partition_fragment_C(t_dummyC);
+
+    clear(frag_C);
 
     for (int i = 0; i < nTiles; i++) {
-        // load fragB, vectorized as bfloat162
-        int slot_b = m2c.pop();
+        int slot_b = m2c.template pop<0>();
         data_t* sb = (data_t *)get_slot_address(base, extract(slot_b));
-        auto t_sB = make_tensor(make_smem_ptr(sb), layout_sB);
-        copy(thr_mma.partition_B(t_sB), frag_B);
+        auto sB = make_tensor(make_smem_ptr(sb), layout_sB);
+        copy(thr_mma.partition_B(sB), frag_B);
 
-        // load fragA first as a could be just ready
-        int slot_a = m2c.pop();
+        int slot_a = m2c.template pop<0>();
         data_t* sa = (data_t *)get_slot_address(base, extract(slot_a));
-        auto t_sA = make_tensor(make_smem_ptr(sa), layout_sA);
-        copy(thr_mma.partition_A(t_sA), frag_A);
+        auto sA = make_tensor(make_smem_ptr(sa), layout_sA);
+        copy(thr_mma.partition_A(sA), frag_A);
 
-        // copy(tiled_copy,
-        //     thr_copy.partition_S(t_sA),
-        //     thr_copy.retile_D(frag_A)); 
+        gemm(tiled_mma, frag_C, frag_A, frag_B, frag_C);
 
-        // 5. Issue the m16n8k16 MMA atom through cute::gemm
-        gemm(tiled_mma, frag_C, frag_A, frag_B, frag_C);   // C = A*B + C
-
-        // TODO(zhiyuang): do we need sync here
-        __sync_compute_group(128);
-        c2m.push(slot_a | slot_b);
+        __sync_compute_group(numThreads);
+        c2m.push(tid, slot_a | slot_b);
     }
 
-    // 6. Write back the C fragments to SMEM
-    int slot_c = m2c.pop();
+    int slot_c = m2c.template pop<0>();
     data_t* sc = (data_t *)get_slot_address(base, extract(slot_c));
     auto t_sC = make_tensor(make_smem_ptr(sc), layout_sC);
 
-    // we can directly store the accumulator fragment to shared memory
     copy(frag_C, thr_mma.partition_C(t_sC));
-
-    c2m.template push<0, true>(slot_c);
+    c2m.template push<0, true>(tid, slot_c);
 }

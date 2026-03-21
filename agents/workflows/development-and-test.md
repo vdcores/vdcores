@@ -64,8 +64,27 @@ Typical Python-only areas include:
 - `make pyext` requires the local CUDA toolkit version to match the CUDA version used by the installed PyTorch build.
 - In this environment, `make pyext` failed because the detected CUDA version was `12.5` while PyTorch was built with CUDA `13.0`.
 - The benchmark command succeeded against the existing environment and extension artifacts.
+- For the isolated `N=8` MMA GEMV path, use `app/python/gemv_mma_out.py` as the dedicated harness instead of modifying `app/python/gemv_out.py`.
+- If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
+
+```bash
+source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh
+conda deactivate
+conda activate
+make pyext
+```
+
+- The MMA GEMV harness defaults to `M=4096`, `K=4096`, and `N=8`, and supports quick smaller checks through `GEMV_M`, `GEMV_K`, and `GEMV_SMS`.
 
 ## Last Verified Result
+
+On 2026-03-21:
+
+- `python -m py_compile app/python/gemv_mma_out.py python/dae/launcher.py`: succeeded
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate && make pyext`: succeeded
+- `GEMV_M=64 GEMV_K=256 GEMV_SMS=1 python app/python/gemv_mma_out.py -l`: succeeded with `0.0%` average diff
+- `python app/python/gemv_mma_out.py -l`: succeeded with `0.0%` average diff
+- `python app/python/gemv_out.py -l`: succeeded
 
 On 2026-03-20:
 
