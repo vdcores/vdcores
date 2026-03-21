@@ -146,6 +146,44 @@ class RMS_NORM_F16_K_128_SMEM(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_128_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
+def select_attention_decode_instruction(head_dim: int):
+    if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
+        return ATTENTION_M64N64K16_F16_F32_64_64_hdim
+    raise NotImplementedError(
+        f"Missing attention decode kernel support for head_dim={head_dim}. "
+        "Add a dedicated opcode/instruction path before launching this model."
+    )
+
+
+def select_rms_glob_instruction(hidden_size: int):
+    if hidden_size == 4096:
+        return RMS_NORM_F16_K_4096
+    raise NotImplementedError(
+        f"Missing global RMS kernel support for hidden_size={hidden_size}. "
+        "Add a dedicated opcode/instruction path before launching this model."
+    )
+
+
+def select_rms_smem_instruction(hidden_size: int):
+    if hidden_size == 4096:
+        return RMS_NORM_F16_K_4096_SMEM
+    if hidden_size == 128:
+        return RMS_NORM_F16_K_128_SMEM
+    raise NotImplementedError(
+        f"Missing shared-memory RMS kernel support for hidden_size={hidden_size}. "
+        "Add a dedicated opcode/instruction path before launching this model."
+    )
+
+
+def ensure_cc0_supported_hidden_size(hidden_size: int):
+    if hidden_size == 4096:
+        return
+    raise NotImplementedError(
+        f"Missing CC0 embedding-stride support for hidden_size={hidden_size}. "
+        "Parameterize the memory op before launching this model."
+    )
+
+
 class ARGMAX_PARTIAL_bf16_1152_50688_132(ComputeInstruction):
     CHUNK_SIZE = 1152
     I_STRIDE = 50688
@@ -661,6 +699,10 @@ __all__ = [
     "RMS_NORM_F16_K_4096",
     "RMS_NORM_F16_K_4096_SMEM",
     "RMS_NORM_F16_K_128_SMEM",
+    "select_attention_decode_instruction",
+    "select_rms_glob_instruction",
+    "select_rms_smem_instruction",
+    "ensure_cc0_supported_hidden_size",
     "ARGMAX_PARTIAL_bf16_1152_50688_132",
     "ARGMAX_REDUCE_bf16_1152_132",
     "ARGMAX_PARTIAL_bf16_1024_65536_128",
