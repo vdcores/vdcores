@@ -37,7 +37,7 @@ Add a separate `N=8` MMA-based GEMV operator path without changing the existing 
 ## Notes
 
 - A direct `make pyext` from the starting shell failed because `nvcc 12.5` rejected the active Conda GCC 14 host compiler.
-- Running `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate && make pyext` succeeded in this environment and rebuilt the extension.
+- Running `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && make pyext` succeeded in this environment and rebuilt the extension.
 - New-kernel verification results:
   - `M=64, N=8, K=256`: `Ave Diff GEMV MMA M64N8: 0.0 %`
   - `M=4096, N=8, K=4096`: `Ave Diff GEMV MMA M64N8: 0.0 %`

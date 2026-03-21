@@ -68,7 +68,7 @@ Typical Python-only areas include:
 - If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
 
 ```bash
-source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate
 conda activate
 make pyext
@@ -81,7 +81,7 @@ make pyext
 On 2026-03-21:
 
 - `python -m py_compile app/python/gemv_mma_out.py python/dae/launcher.py`: succeeded
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate && make pyext`: succeeded
+- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && make pyext`: succeeded
 - `GEMV_M=64 GEMV_K=256 GEMV_SMS=1 python app/python/gemv_mma_out.py -l`: succeeded with `0.0%` average diff
 - `python app/python/gemv_mma_out.py -l`: succeeded with `0.0%` average diff
 - `python app/python/gemv_out.py -l`: succeeded
