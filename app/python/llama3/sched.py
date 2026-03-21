@@ -264,7 +264,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   embed_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
-    embedding=CC0(matTokens[0], token_offset)
+    embedding=CC0(matTokens[0], token_offset, hidden_size=HIDDEN)
   ).bar("output", layerg['bar_pre_attn_rms'])
   # copy the HIDDEN from embedding
   copy_hidden = SchedCopy(
@@ -273,7 +273,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
       StaticCordAdapter(loadEmbed1D),
       ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
     ),
-    before_copy = CC0(matTokens[0], token_offset),
+    before_copy = CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
   )
 
   # TODO(zhiyuang): finish a set of clear functions

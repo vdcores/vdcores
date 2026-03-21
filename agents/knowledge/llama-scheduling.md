@@ -31,4 +31,5 @@
 ## Implemented Low-Level Support
 
 - The runtime now has a dedicated `RMS_NORM_F16_K_2048_SMEM` path for the 1B hidden size.
-- The 1B dry-build path should now report only the remaining `head_dim=64` attention gap and the `CC0` embedding-stride gap.
+- `CC0` now carries the embedding row stride as a shift width, so power-of-two row sizes like `4096` bytes (`2048` bf16) and `8192` bytes (`4096` bf16) use the same fast path.
+- The 1B dry-build path should now report only the remaining `head_dim=64` attention gap.

@@ -183,7 +183,8 @@ def select_rms_smem_instruction(hidden_size: int):
 
 
 def ensure_cc0_supported_hidden_size(hidden_size: int):
-    if hidden_size == 4096:
+    row_bytes = hidden_size * 2
+    if row_bytes > 0 and (row_bytes & (row_bytes - 1)) == 0:
         return
     raise NotImplementedError(
         f"Missing CC0 embedding-stride support for hidden_size={hidden_size}. "
@@ -532,9 +533,13 @@ class IssueBarrier(MemoryInstruction):
 
 
 class CC0(MemoryInstruction):
-    def __init__(self, tokens: torch.Tensor, idx: int):
+    def __init__(self, tokens: torch.Tensor, idx: int, hidden_size: int = 4096, dtype_size: int = 2):
         addr = get_tensor_address(tokens[idx])
-        super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=0, size=0, address=addr)
+        row_bytes = hidden_size * dtype_size
+        if row_bytes <= 0 or (row_bytes & (row_bytes - 1)) != 0:
+            raise ValueError(f"CC0 requires a power-of-two embedding row size in bytes, got {row_bytes}")
+        shift = row_bytes.bit_length() - 1
+        super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
 
 
 class RegStore(MemoryInstruction):
