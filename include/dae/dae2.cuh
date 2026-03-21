@@ -199,6 +199,10 @@ void dae2(
           task_rms_norm_f16_from_smem<4096,__nv_bfloat16>(smem_base, inst.args[0], *reinterpret_cast<__nv_bfloat16*>(inst.args+1), (float*)scratch_space, m2c, c2m);
           }
           break;
+        case OP_RMS_NORM_F16_K_2048_SMEM: {
+          task_rms_norm_f16_from_smem<2048,__nv_bfloat16>(smem_base, inst.args[0], *reinterpret_cast<__nv_bfloat16*>(inst.args+1), (float*)scratch_space, m2c, c2m);
+          }
+          break;
         case OP_RMS_NORM_F16_K_128_SMEM: {
           task_rms_norm_f16_from_smem<128,__nv_bfloat16>(smem_base, inst.args[0], *reinterpret_cast<__nv_bfloat16*>(inst.args[1]), (float*)scratch_space, m2c, c2m);
           }

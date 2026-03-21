@@ -25,6 +25,10 @@
 ## Remaining Low-Level Gaps
 
 - A runnable Llama 3.2 1B launch still needs a dedicated attention decode opcode/instruction path for `head_dim=64`.
-- A runnable Llama 3.2 1B launch still needs a dedicated RMS opcode/instruction path for `hidden_size=2048`.
 - A runnable Llama 3.2 1B launch still needs `CC0` embedding-row stride parameterization because the current memory op is hard-wired to `4096 * 2` bytes.
 - `python app/python/llama32_1b/sched.py --dry-build` is the lightweight validation path before those low-level pieces are added.
+
+## Implemented Low-Level Support
+
+- The runtime now has a dedicated `RMS_NORM_F16_K_2048_SMEM` path for the 1B hidden size.
+- The 1B dry-build path should now report only the remaining `head_dim=64` attention gap and the `CC0` embedding-stride gap.
