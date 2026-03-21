@@ -82,6 +82,12 @@ class Gemv_M192N16(ComputeInstruction):
     def __init__(self, kTiles: int):
         super().__init__(opcode=opcode.OP_GEMV_M192, args=[kTiles])
 
+class Gemv_M64N8_MMA(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 1
+    def __init__(self, kTiles: int):
+        super().__init__(opcode=opcode.OP_GEMV_M64N8_MMA, args=[kTiles])
+
 
 class WGMMA_64x256x64_F16(ComputeInstruction):
     MNK = (64, 64, 256)
@@ -645,6 +651,7 @@ __all__ = [
     "Gemv_M128N8",
     "Gemv_M64N8_ROPE_128",
     "Gemv_M192N16",
+    "Gemv_M64N8_MMA",
     "WGMMA_64x256x64_F16",
     "WGMMA_64x256x64_BF16",
     "ROPE_INTERLEAVE_512",
