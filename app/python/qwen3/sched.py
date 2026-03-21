@@ -219,7 +219,7 @@ storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
 embed_rms = SchedRMSShared(
   num_token=N, epsilon=eps,
   tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
-  embedding=CC0(matTokens, 0)
+  embedding=CC0(matTokens, 0, hidden_size=HIDDEN)
 ).place(rms_sms)
 # copy the HIDDEN from embedding
 copy_hidden = SchedCopy(
@@ -228,7 +228,7 @@ copy_hidden = SchedCopy(
     StaticCordAdapter(loadEmbed1D),
     ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
   ),
-  before_copy = CC0(matTokens, 0),
+  before_copy = CC0(matTokens, 0, hidden_size=HIDDEN),
 ).place(N, base_sm=64)
 
 pre_attn_rms = SchedRMSShared(

@@ -166,12 +166,11 @@ __device__ __forceinline__ void allocwarp_execute(
         // CV here for custom variation
         case op(OP_CC0): {
           // CC0: embedding operator. A single tmaload1D instruction should come right after this one
-          // TODO(zhiyuang): shift this address by register
           int token = *(int *)(inst.address);
           di.loop_counter = 1;
           di.loop_start_pc = pc + 1;
           if (lane_id == 0) {
-            di.gpr[1] = token * 4096 * 2;
+            di.gpr[1] = token << inst.arg;
           }
           break;
         }
