@@ -20,6 +20,7 @@ Use this when an agent is starting work in `vdcores` without prior local context
    - add a dated file in `agents/changes/`
    - capture durable findings in `agents/knowledge/`
    - refine this workflow when repeated steps become clear
+   - when you learn a reusable validation flow, add it to `agents/workflows/` during the same task
 6. Verify with the least expensive meaningful command first.
 7. If CUDA or hardware requirements block verification, document that explicitly in the change log.
 

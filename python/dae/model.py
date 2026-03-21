@@ -409,12 +409,13 @@ class GemvLayerBase(Layer):
         print("theory load speed (no L2):", (matA.nbytes + matB.nbytes * num_sms + matC.nbytes) / 1024 ** 3 / 3700 * 1e6, "us")
 
 
-    def schedule(self, num_gemv_sms=None, **kwargs):
-        if num_gemv_sms is None:
-            num_gemv_sms = self.dae.num_sms
-        return SchedGemv(self.Atom, num_gemv_sms, self.MNK, self.tmas, **kwargs)
-    def schedule_(self, num_gemv_sms=None, **kwargs):
-        return self.schedule(num_gemv_sms=num_gemv_sms, exec=False, **kwargs)
+    def schedule(self, num_gemv_sms=None, base_sm=0, **kwargs):
+        sched = SchedGemv(self.Atom, self.MNK, self.tmas, **kwargs)
+        if num_gemv_sms is not None:
+            sched = sched.place(num_gemv_sms, base_sm=base_sm)
+        return sched
+    def schedule_(self, num_gemv_sms=None, base_sm=0, **kwargs):
+        return self.schedule(num_gemv_sms=num_gemv_sms, base_sm=base_sm, exec=False, **kwargs)
     
     def reference(self):
         matA, matB, _ = self.tensors
@@ -474,15 +475,13 @@ class RMSLayer(Layer):
     
     def schedule(self, num_sms, base_sm=0, **kwargs):
         return SchedRMS(
-            sms=num_sms,
             num_token=self.num_token,
             epsilon=self.epsilon,
             input_glob=self.input,
             output_glob=self.output,
-            base_sm=base_sm,
             use_glob=False,
             **kwargs
-        )
+        ).place(num_sms, base_sm=base_sm)
 
     def reference(self):
         var = self.input.pow(2).mean(dim=-1, keepdim=True)

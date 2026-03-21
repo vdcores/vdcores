@@ -51,6 +51,14 @@ When starting fresh in this repository:
    - add structural notes in `agents/knowledge/` when new project understanding is gained.
 6. Verify with the lightest meaningful check first and record any environment limitations in the change log.
 
+## Development And Test
+
+- Standard workflow is documented in `agents/workflows/development-and-test.md`.
+- If CUDA runtime or kernel code changes, run `make pyext` before the Python app.
+- If only Python code changes, you can skip `make pyext` and run the target application directly.
+- For the Llama3 benchmark path, use `python app/python/llama3/sched.py -b`.
+- Rebuilds require the local CUDA toolkit to match the CUDA version used by the installed PyTorch build.
+
 ## Logging Expectations
 
 - Name change logs with an ISO date prefix when possible, for example `2026-03-20-project-initialization.md`.

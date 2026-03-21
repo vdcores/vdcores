@@ -59,21 +59,21 @@ for i in range(3):
 
 dae.s(
     interleave(
-        SchedGemv(Gemv_M64N16, num_gemv_sms,
+        SchedGemv(Gemv_M64N16,
             MNK=(INTERMIDIATE, N, HIDDEN),
             tmas=(loadGate, loadHidden, reduceGateOut),
-            exec=False).split_M(3),
-        [s.store_bar(up_bar) for up_bar, s in zip(up_bars, SchedGemv(Gemv_M64N16, num_gemv_sms,
+            exec=False).split_M(3).place(num_gemv_sms),
+        [s.bar("store", up_bar) for up_bar, s in zip(up_bars, SchedGemv(Gemv_M64N16,
             MNK=(INTERMIDIATE, N, HIDDEN),
             tmas=(loadUp, loadHidden, reduceInterm),
-            exec=False).split_M(3))]
+            exec=False).split_M(3).place(num_gemv_sms))]
     ),
     sched_silus,
-    [s.load_bar(down_bar) for down_bar, s in zip(down_bars, SchedGemv(Gemv_M64N16, num_gemv_sms,
+    [s.bar("load", down_bar) for down_bar, s in zip(down_bars, SchedGemv(Gemv_M64N16,
               MNK=(HIDDEN, N, INTERMIDIATE),
               tmas=(loadDown, loadInterm, reduceOut),
               prefetch=False)
-              .split_K(3))],
+              .split_K(3).place(num_gemv_sms))],
     # SchedGemv(Gemv_M64N16, num_gemv_sms,
     #           MNK=(HIDDEN, N, INTERMIDIATE),
     #           tmas=(loadDown, loadInterm, reduceOut))

@@ -78,27 +78,27 @@ def silu(sm : int):
     ]
 
 
-downs = SchedGemv(Gemv_M64N8, 128,
+downs = SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, INTERMIDIATE),
-    tmas=(loadDown, loadSilu, reduceOut)).split_K(3)
-downs[0].load_bar(silu_out_bar1)
-downs[1].load_bar(silu_out_bar2)
+    tmas=(loadDown, loadSilu, reduceOut)).place(128).split_K(3)
+downs[0].bar("load", silu_out_bar1)
+downs[1].bar("load", silu_out_bar2)
 
 dae.s(
-    SchedGemv(Gemv_M64N8, 64,
+    SchedGemv(Gemv_M64N8,
         MNK=(4096, N, HIDDEN),
-        tmas=(loadGate, loadHidden, storeGateOut)).store_bar(silu_in_bar),
-    SchedGemv(Gemv_M64N8, 64,
+        tmas=(loadGate, loadHidden, storeGateOut)).place(64).bar("store", silu_in_bar),
+    SchedGemv(Gemv_M64N8,
         MNK=(4096, N, HIDDEN),
         tmas=(loadUp, loadHidden, storeInterm),
-        base_sm=64).store_bar(silu_in_bar),
+        ).place(64, base_sm=64).bar("store", silu_in_bar),
     silu1,
-    SchedGemv(Gemv_M64N8, 128,
+    SchedGemv(Gemv_M64N8,
         MNK=((4096,8192), N, HIDDEN),
-        tmas=(loadGate, loadHidden, regStoreGate)),
-    SchedGemv(Gemv_M64N8, 128,
+        tmas=(loadGate, loadHidden, regStoreGate)).place(128),
+    SchedGemv(Gemv_M64N8,
         MNK=((4096,8192), N, HIDDEN),
-        tmas=(loadUp, loadHidden, regStoreUp)),
+        tmas=(loadUp, loadHidden, regStoreUp)).place(128),
     silu,
     downs,
     TerminateC(),

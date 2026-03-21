@@ -94,9 +94,9 @@ regLoadO = RegLoad(0)
 
 reduceO = TmaTensor(dae, matO).wgmma('reduce', TileN, TileM, Major.MN)
 
-gemv = SchedGemv(Gemv_M64N8, num_sms,
+gemv = SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, HIDDEN),
-    tmas=(loadM, loadV, regStoreO))
+    tmas=(loadM, loadV, regStoreO)).place(num_sms)
 
 def cord_reduce(sm: int, inst):
     m = sm % 64 * TileM
@@ -107,10 +107,10 @@ def cord_table(sm: int, inst):
     m = sm % 64 * TileM
     return inst.cord(cached_seq_len, (m % 128) // 64)
 
-rope = SchedRope( ROPE_INTERLEAVE_512, num_sms,
+rope = SchedRope( ROPE_INTERLEAVE_512,
    tmas=(loadRope, regLoadO, reduceO),
    cords=(cord_table, None, cord_reduce)
-)
+).place(num_sms)
 
 dae.s(
     gemv,

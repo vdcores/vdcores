@@ -28,3 +28,4 @@ This note summarizes the stable structure confirmed during repository initializa
 - The repository currently includes built extension artifacts under `python/dae/`.
 - Full runtime verification may require Hopper-class CUDA hardware.
 - For Python-only edits, start with light checks such as `python -m py_compile`.
+- `app/python/llama3/sched.py` now includes a `--correctness` mode for a single-token, single-decoding-step validation against `app/python/llama3/reference.py`.
