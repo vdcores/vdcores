@@ -182,6 +182,14 @@ void dae2(
           task_attention_fwd_flash3_grouped<128, 64, 64, false, false, kernel_QK, kernel_PV>(inst.args[0], inst.args[1], need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
         }
           break;
+        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64: {
+          using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
+          using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
+          bool need_norm = inst.args[2] & 0x1;
+          bool need_rope = (inst.args[2] >> 1) & 0x1;
+          task_attention_fwd_flash3_grouped<64, 64, 64, false, false, kernel_QK, kernel_PV>(inst.args[0], inst.args[1], need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
+        }
+          break;
         case OP_SILU_MUL_SHARED_BF16_K_4096_INTER: {
           const int num_token = inst.args[0];
           task_silu_smem_1D<6144>(num_token, smem_base, m2c, c2m);

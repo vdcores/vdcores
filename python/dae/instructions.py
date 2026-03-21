@@ -121,6 +121,17 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
         )
 
 
+class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
+    HEAD_DIM = 64
+
+    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+        need_flag = (need_norm << 0) | (need_rope << 1)
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
+            args=[num_kv_block, last_kv_active_token_len, need_flag],
+        )
+
+
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):
         super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_4096_INTER, args=[num_token])
@@ -154,6 +165,8 @@ class RMS_NORM_F16_K_2048_SMEM(ComputeInstruction):
 def select_attention_decode_instruction(head_dim: int):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
+    if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim64.HEAD_DIM:
+        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64
     raise NotImplementedError(
         f"Missing attention decode kernel support for head_dim={head_dim}. "
         "Add a dedicated opcode/instruction path before launching this model."
@@ -706,6 +719,7 @@ __all__ = [
     "WGMMA_64x256x64_BF16",
     "ROPE_INTERLEAVE_512",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim",
+    "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",

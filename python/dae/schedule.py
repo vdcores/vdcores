@@ -261,6 +261,7 @@ class SchedAttentionDecoding(Schedule):
         self.tmas = tmas
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
+        self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
@@ -279,7 +280,7 @@ class SchedAttentionDecoding(Schedule):
 
         # we only handle a single Q token here
         insts = [
-            ATTENTION_M64N64K16_F16_F32_64_64_hdim(num_kv_blocks, seq_len_last_block, need_norm=False, need_rope=False),
+            self.AttentionInst(num_kv_blocks, seq_len_last_block, need_norm=False, need_rope=False),
             tQ.cord(req, head).bar(self._bar("q")).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
@@ -323,6 +324,7 @@ class SchedAttention(Schedule):
         self.need_norm = need_norm
         self.need_rope = need_rope
         self.rope_table = rope_table
+        self.AttentionInst = select_attention_decode_instruction(QKVHdim[2])
 
         self.required_sms = reqs * QKVHdim[1]
 
@@ -354,7 +356,7 @@ class SchedAttention(Schedule):
         insts = []
         for q in range(0, self.active_new_len, QTile):
             insts += [
-                ATTENTION_M64N64K16_F16_F32_64_64_hdim(min(self.active_new_len-q, QTile), hist_len=q+self.cached_seq_len, need_norm=self.need_norm, need_rope=self.need_rope),
+                self.AttentionInst(min(self.active_new_len-q, QTile), hist_len=q+self.cached_seq_len, need_norm=self.need_norm, need_rope=self.need_rope),
                 tQ.cord(req, q * HEAD_GROUP_SIZE, head, 0).bar(self._bar("q")).group(),
                 self.rope_table if self.need_rope else [],
                 # FIXME (zijian): this calculation should separate cached kv and new kv
