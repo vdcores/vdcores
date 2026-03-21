@@ -30,9 +30,9 @@ reduceC = TmaTensor(dae, matC).wgmma("reduce", N, TileM, Major.MN)
     
 dae.i(
     # sm tasks for 
-    SchedGemv(Atom, num_sms, (4096, N, K), (loadA, loadB, reduceC)),
+    SchedGemv(Atom, (4096, N, K), (loadA, loadB, reduceC)).place(num_sms),
 
-    SchedGemv(Atom, num_sms, ((4096, 2048), N, K), (loadA, loadB, reduceC)),
+    SchedGemv(Atom, ((4096, 2048), N, K), (loadA, loadB, reduceC)).place(num_sms),
     # GlobalBarrier(num_sms, reduceC.bar()),
 
     TerminateC(),
@@ -52,4 +52,3 @@ res = matC.t()
 dae_app(dae)
 
 tensor_diff("GEMV M64N16", ref, res)
-

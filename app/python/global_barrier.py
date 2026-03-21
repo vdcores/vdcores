@@ -25,8 +25,8 @@ l1 = GemvLayer(dae, Atom, "proj1", (matW1, matIn, matInterm))
 l2 = GemvLayer(dae, Atom, "proj2", (matW2, matInterm, matOut))
 
 dae.s(
-    l1.schedule().store_bar(bar_id),
-    l2.schedule().load_bar(bar_id)
+    l1.schedule().bar("store", bar_id),
+    l2.schedule().bar("load", bar_id)
     # l1.schedule(),
     # l2.schedule(),
 )

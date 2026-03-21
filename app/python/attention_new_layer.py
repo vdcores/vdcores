@@ -33,7 +33,7 @@ matO = torch.zeros(NUM_REQ, Q_SEQ_LEN, NUM_Q_HEAD * HEAD_DIM, dtype=torch.bfloat
 gqa = GQALayer(dae, "gqa", (matQ, matK, matV, matO))
 
 dae.s(
-    gqa.schedule().o_bar(0)
+    gqa.schedule().bar("o", 0)
 )
 
 dae_app(dae)

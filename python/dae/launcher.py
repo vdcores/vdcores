@@ -588,8 +588,10 @@ class ResourceGroup:
         self.bars = {}
 
         self.built = False
+        self.launcher = None
         self.tma_insts = {}
         self.bar_ids = {}
+        self.bar_instances = {}
 
     def addTma(self, name: str, matList, tmaFn):
         if isinstance(matList, torch.Tensor):
@@ -600,10 +602,51 @@ class ResourceGroup:
         assert name not in self.tmas, f"TMA with name {name} already exists in the group"
         self.tmas[name] = (matList, tmaFn)
 
-    def addBarrier(self, name: str, bar_count):
-        assert isinstance(bar_count, int), "bar must be an value of bar id"
+    def addBarrier(self, name: str, bar_count = None):
+        if bar_count is not None:
+            assert isinstance(bar_count, int), "bar_count must be an int or None"
         assert name not in self.bars, f"Barrier with name {name} already exists in the group"
-        self.bars[name] = bar_count
+        self.bars[name] = {
+            "count": bar_count,
+            "late_bind": bar_count is None,
+        }
+
+    def bindBarrier(self, name: str, bar_count: int):
+        assert isinstance(bar_count, int), "bar_count must be an int"
+        assert name in self.bars, f"Barrier with name {name} does not exist in the group"
+
+        bar_info = self.bars[name]
+        if not bar_info["late_bind"]:
+            raise ValueError(f"Barrier {name} was declared with an eager count and cannot be rebound")
+        if bar_info["count"] is not None:
+            raise ValueError(f"Barrier {name} has already been bound")
+
+        bar_info["count"] = bar_count
+        if self.built:
+            for bar_id in self.bar_instances[name]:
+                self.launcher.set_bar(bar_id, bar_count)
+
+    def bindBarriersFromCounts(self, bar_counts: dict[int, int]):
+        unresolved = []
+        for name, bar_info in self.bars.items():
+            if not bar_info["late_bind"] or bar_info["count"] is not None:
+                continue
+
+            matched_counts = {
+                bar_counts[bar_id]
+                for bar_id in self.bar_instances.get(name, [])
+                if bar_id in bar_counts
+            }
+            if len(matched_counts) == 0:
+                unresolved.append(name)
+                continue
+            if len(matched_counts) != 1:
+                raise ValueError(f"Barrier {name} observed inconsistent release counts: {sorted(matched_counts)}")
+
+            self.bindBarrier(name, matched_counts.pop())
+
+        if unresolved:
+            raise ValueError(f"Could not infer release counts for late-bound barriers in group {self.name}: {unresolved}")
 
     def get_shift(self):
         return len(self.tmas), len(self.bars)
@@ -637,6 +680,7 @@ class ResourceGroup:
     def build(self, launcher):
         if self.built:
             return
+        self.launcher = launcher
 
         for i in range(self.repeat):
             for name, (matList, tmaFn) in self.tmas.items():
@@ -652,8 +696,9 @@ class ResourceGroup:
         # TODO(zhiyuang): include over group by default
         num_bar_repeat = 1 if self.repeat == 1 else self.repeat + 1
         for i in range(num_bar_repeat):
-            for name, bar_count in self.bars.items():
-                bar_id = launcher.new_bar(bar_count)
+            for name, bar_info in self.bars.items():
+                bar_id = launcher.new_bar(bar_info["count"])
+                self.bar_instances.setdefault(name, []).append(bar_id)
                 if i == 0:
                     self.bar_ids[name] = bar_id
         
@@ -684,6 +729,7 @@ class Launcher:
 
         self.num_bars = 0
         self.bar_values = {}
+        self._late_barriers_bound = False
 
         self.bars = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
         self.bars_src = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
@@ -706,13 +752,14 @@ class Launcher:
         for group in self.resource_groups.values():
             group.build(self)
 
-    def new_bar(self, value: int):
+    def new_bar(self, value: int | None):
         bar_id = self.num_bars
         self.bar_values[bar_id] = value
         self.num_bars += 1
         return bar_id
     def set_bar(self, bar_id: int, value: int):
         assert bar_id in self.bar_values, f"bar_id {bar_id} does not exist"
+        assert isinstance(value, int), "bar value must be an int"
         self.bar_values[bar_id] = value
     def new_tma(self, desc: torch.Tensor) -> int:
         self.tmas.append(desc)
@@ -759,6 +806,39 @@ class Launcher:
                 b.add(inst)
         self.need_instruction_build = True
 
+    def collect_barrier_release_counts(self, *insts):
+        counts = {}
+
+        def merge(new_counts):
+            for bar_id, count in new_counts.items():
+                counts[bar_id] = counts.get(bar_id, 0) + count
+
+        def collect(inst):
+            if inst is None:
+                return
+            if isinstance(inst, list):
+                for sub_inst in inst:
+                    collect(sub_inst)
+                return
+            if hasattr(inst, "collect_barrier_release_counts"):
+                merge(inst.collect_barrier_release_counts())
+                return
+
+        for inst in insts:
+            collect(inst)
+
+        return counts
+
+    def bind_late_barrier_counts(self, *insts):
+        if self._late_barriers_bound:
+            return
+
+        bar_counts = self.collect_barrier_release_counts(*insts)
+        for group in self.resource_groups.values():
+            group.bindBarriersFromCounts(bar_counts)
+
+        self._late_barriers_bound = True
+
     def s(self, *schedules):
         self.i(*schedules, TerminateC(), TerminateM())
 
@@ -771,6 +851,10 @@ class Launcher:
 
     def launch(self):
         self.build_instructions()
+
+        unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
+        if unbound_bar_ids:
+            raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
 
         # Load the model using the runtime
         cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)

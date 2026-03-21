@@ -3,8 +3,32 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from collections import defaultdict
 import os
 
+from dae.util import tensor_diff
 
-def reference_pass(model, inputs):
+
+def mean_relative_diff_pct(t1: torch.Tensor, t2: torch.Tensor, ref: torch.Tensor | None = None):
+    if ref is None:
+        ref = t1
+    denom = ref.abs().float().mean().item()
+    if denom == 0:
+        denom = 1.0
+    return (t1 - t2).abs().float().mean().item() / denom * 100.0
+
+
+def check_tensor_threshold(name: str,
+                           expected: torch.Tensor,
+                           actual: torch.Tensor,
+                           threshold_pct: float,
+                           ref: torch.Tensor | None = None):
+    diff = mean_relative_diff_pct(expected, actual, ref=ref)
+    tensor_diff(name, expected, actual, ref=ref)
+    passed = diff <= threshold_pct
+    status = "PASS" if passed else "FAIL"
+    print(f"[correctness] {status} {name}: {diff:.3f}% <= {threshold_pct:.3f}%")
+    return passed, diff
+
+
+def reference_pass(model, inputs, verbose=False):
     # Container for all captured tensors
     # structure: { layer_idx: { "q_proj": tensor, "rms_1": tensor, ... } }
     captured_data = defaultdict(dict)
@@ -66,7 +90,8 @@ def reference_pass(model, inputs):
 
     with torch.no_grad():
         output = model(**inputs, use_cache=False)
-        print(output)
+        if verbose:
+            print(output)
 
     # 3. Cleanup
     for h in hooks:
@@ -123,4 +148,3 @@ if __name__ == '__main__':
     # pkv = output.past_key_values
     # for k, v, _ in pkv:
     #     print(k.shape, v.shape)
-

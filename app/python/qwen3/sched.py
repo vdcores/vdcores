@@ -217,58 +217,53 @@ loadHidden1D = TmaLoad1D(matHidden, bytes=HIDDEN * 2)
 storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
 
 embed_rms = SchedRMSShared(
-  sms=rms_sms, num_token=N, epsilon=eps,
+  num_token=N, epsilon=eps,
   tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
   embedding=CC0(matTokens, 0)
-)
+).place(rms_sms)
 # copy the HIDDEN from embedding
 copy_hidden = SchedCopy(
-  num_sms = N, size = HIDDEN * matHidden.element_size(),
+  size = HIDDEN * matHidden.element_size(),
   tmas = (loadEmbed1D, storeHidden1D),
   cords = (None, sm_cord_1d(HIDDEN * 2)),
   before_copy = CC0(matTokens, 0),
-  base_sm = 64,
-)
+).place(N, base_sm=64)
 
 pre_attn_rms = SchedRMSShared(
-  sms=rms_sms, num_token=N, epsilon=eps,
+  num_token=N, epsilon=eps,
   tmas=(layerg['loadRMSInputW'].cord(0), loadHidden1D, storeRMSHidden1D)
-)
+).place(rms_sms)
 post_attn_rms = SchedRMSShared(
-  sms=rms_sms, num_token=N, epsilon=eps,
+  num_token=N, epsilon=eps,
   tmas=(layerg['loadRMSPostAttnW'].cord(0), loadHidden1D, storeRMSHidden1D)
-)
+).place(rms_sms)
 
 # QKV Projection
 # TODO(zhiyuang): add the ROPE for Q and K
 regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
 regLoadQ = RegLoad(0)
-QProj = SchedGemv(Gemv_M64N8, 128, 
+QProj = SchedGemv(Gemv_M64N8,
   MNK=(QW, N, HIDDEN),
   tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
-  base_sm=0,
-)
-QRope = SchedRope(ROPE_INTERLEAVE_512, 128,
+).place(128)
+QRope = SchedRope(ROPE_INTERLEAVE_512,
   tmas=(defaultg['loadRope'], regLoadQ, layerg['storeQ']),
   cords=(sm_cord_rope(batch_seq_len), None, sm_cord_splitM(128, TileM))
-)
+).place(128)
 regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
 regLoadK = RegLoad(0)
-KProj = SchedGemv(Gemv_M64N8, 64,
+KProj = SchedGemv(Gemv_M64N8,
   MNK=(KW, N, HIDDEN),
   tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
-  base_sm=64,
-)
-KRope = SchedRope(ROPE_INTERLEAVE_512, 64,
+).place(64, base_sm=64)
+KRope = SchedRope(ROPE_INTERLEAVE_512,
   tmas=(defaultg['loadRope'], regLoadK, layerg['storeK']),
   cords=(sm_cord_rope(batch_seq_len), None, sm_cord_splitM(64, TileM)),
-  base_sm=64,
-)
-VProj = SchedGemv(Gemv_M64N8, 64,
+).place(64, base_sm=64)
+VProj = SchedGemv(Gemv_M64N8,
   MNK=(VW, N, HIDDEN),
   tmas=(layerg['loadVW'], layerg['loadRMSLayer'], layerg['storeV']),
-  base_sm=0,
-)
+).place(64)
 
 QWen8BGemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
 Gqa = SchedAttentionDecoding(
@@ -277,60 +272,60 @@ Gqa = SchedAttentionDecoding(
   NUM_KV_HEADS = NUM_KV_HEAD,
   matO = matO_attn_view,
   tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
-)
+).place(N * NUM_KV_HEAD)
 
 # accumulate to matHidden, which auto applies the residual add
-OutProj = SchedGemv(Gemv_M64N8, num_sms,
+OutProj = SchedGemv(Gemv_M64N8,
   MNK=(HIDDEN, N, HIDDEN),
-  tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer']))
+  tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])).place(num_sms)
 
 # Gate Up + SiLU
 regGate, regUp = 0, 1
 regStoreGate = RegStore(regGate, matGateOut[:,0:TileM])
 regStoreUp = RegStore(regUp, matInterm[:,0:TileM])
+mlp_split = 4096
 
 # after all layers, logits projection
 LogitsProj = []
 for i in range(logits_epoch):
   proj = QWen8BGemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-  sched = proj.schedule_(full_sms, group=False).split_M(6)
+  sched = proj.schedule_(group=False).split_M(6).place(full_sms)
   # TODO(zhiyuang): check the "no-prefetch" here
   if i == 0:
-    sched[0].load_bar(layerg.over('bar_pre_attn_rms')).no_prefetch()
+    sched.bar("load", layerg.over('bar_pre_attn_rms'))
+    sched[0].no_prefetch()
   if i == logits_epoch - 1:
-    sched[-1].store_bar(defaultg['bar_logits'])
+    sched.bar("store", defaultg['bar_logits'])
   LogitsProj.append(sched)
 
 # argmax
-Argmax = SchedArgmax(N, 152064, logits_slice, matLogits, matArgmaxVal, matArgmaxIdx, matArgmaxOut)
+Argmax = SchedArgmax(
+  num_token=N,
+  logits_slice=logits_slice,
+  num_slice=logits_epoch,
+  AtomPartial=ARGMAX_PARTIAL_bf16_1152_50688_132,
+  AtomReduce=ARGMAX_REDUCE_bf16_1152_132,
+  matLogits=matLogits,
+  matOutVal=matArgmaxVal,
+  matOutIdx=matArgmaxIdx,
+  matFinalOut=matArgmaxOut,
+).place(full_sms)
 
-def silu1(sm: int):
-  sm -= 128
-  if sm < 0:
-    return []
-  insts = []
-  start_token_id = sm * (N // 4)
-  end_token_id = (sm + 1) * (N // 4)
-  for i in range(start_token_id, end_token_id):
-    insts.extend([
-      SILU_MUL_SHARED_BF16_K_4096_INTER(1),
-      TmaStore1D(matSiLUOut[i,:4096]).bar(layerg['bar_silu_out1']).group(),
-      TmaLoad1D(matGateOut[i,:4096]).bar(layerg['bar_silu_in']).group() if i == start_token_id else TmaLoad1D(matGateOut[i,:4096]),
-      TmaLoad1D(matInterm[i,:4096]),
-    ])
-  return insts
+silu1 = SchedSmemSiLUInterleaved(
+  num_token=N,
+  gate_glob=matGateOut[:, :mlp_split],
+  up_glob=matInterm[:, :mlp_split],
+  out_glob=matSiLUOut[:, :mlp_split],
+).place(4, base_sm=128).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
 
-def silu_fused(sm : int):
-  if sm >= 128:
-    return []
-
-  return [
-    SILU_MUL_SHARED_BF16_K_64_SW128(N),
-
-    layerg['storeSiluLayer'].cord(0, 4096 + sm * TileM).bar(layerg['bar_silu_out2']).group(),
-    RegLoad(regGate), # Load the gate
-    RegLoad(regUp), # load the up
-  ]
+silu_fused = SchedRegSiLUFused(
+  num_token=N,
+  store_tma=layerg['storeSiluLayer'],
+  reg_gate=regGate,
+  reg_up=regUp,
+  base_offset=mlp_split,
+  stride=TileM,
+).place(128).bar("output", layerg['bar_silu_out2'])
 
 # nloop = num_layers
 # default_tmas, default_bars = defaultg.get_shift()
@@ -339,69 +334,72 @@ def silu_fused(sm : int):
 # build first rms with embedding
 dae.i(
   embed_rms
-    .o_bar(layerg['bar_pre_attn_rms']),
+    .bar("output", layerg['bar_pre_attn_rms']),
   copy_hidden
 )
 
 # start a new scheudule to mark the loop target
 dae.s(
   QProj
-    .load_bar(layerg['bar_pre_attn_rms']),
+    .bar("load", layerg['bar_pre_attn_rms']),
   QRope
-    .store_bar(layerg['bar_q_proj']),
+    .bar("store", layerg['bar_q_proj']),
   KProj,
   KRope
-    .store_bar(layerg['bar_qkv_attn']),
+    .bar("store", layerg['bar_qkv_attn']),
   VProj
-    .store_bar(layerg['bar_qkv_attn']),
+    .bar("store", layerg['bar_qkv_attn']),
 
   Gqa
-    .q_bar(layerg['bar_q_proj'])
-    .k_bar(layerg['bar_qkv_attn'])
-    .o_bar(layerg['bar_attn_out']),
+    .bar("q", layerg['bar_q_proj'])
+    .bar("k", layerg['bar_qkv_attn'])
+    .bar("o", layerg['bar_attn_out']),
   OutProj
-    .load_bar(layerg['bar_attn_out'])
-    .store_bar(layerg['bar_out_mlp']),
+    .bar("load", layerg['bar_attn_out'])
+    .bar("store", layerg['bar_out_mlp']),
 
   # # RMS
   post_attn_rms
-    .i_bar(layerg['bar_out_mlp'])
-    .o_bar(layerg['bar_post_attn_rms']),
+    .bar("input", layerg['bar_out_mlp'])
+    .bar("output", layerg['bar_post_attn_rms']),
   
   # # MLP
-  SchedGemv(Gemv_M64N8, 64,
+  SchedGemv(Gemv_M64N8,
     MNK=(4096, N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),)
-    .store_bar(layerg['bar_silu_in'])
-    .load_bar(layerg['bar_post_attn_rms']),
-  SchedGemv(Gemv_M64N8, 64,
+    .place(64)
+    .bar("store", layerg['bar_silu_in'])
+    .bar("load", layerg['bar_post_attn_rms']),
+  SchedGemv(Gemv_M64N8,
     MNK=(4096, N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-    base_sm=64)
-    .store_bar(layerg['bar_silu_in'])
-    .load_bar(layerg['bar_post_attn_rms']),
+    ).place(64, base_sm=64)
+    .bar("store", layerg['bar_silu_in'])
+    .bar("load", layerg['bar_post_attn_rms']),
   silu1,
-  SchedGemv(Gemv_M64N8, 128,
+  SchedGemv(Gemv_M64N8,
     MNK=((4096,8192), N, HIDDEN),
-    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], regStoreGate)),
-  SchedGemv(Gemv_M64N8, 128,
+    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], regStoreGate)).place(128),
+  SchedGemv(Gemv_M64N8,
     MNK=((4096,8192), N, HIDDEN),
-    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], regStoreUp)),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], regStoreUp)).place(128),
   silu_fused,
-  SchedGemv(Gemv_M64N8, 128,
+  SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, 4096),
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer']))
-    .load_bar(layerg['bar_silu_out1']),
-  SchedGemv(Gemv_M64N8, 128,
+    .place(128)
+    .bar("load", layerg['bar_silu_out1']),
+  SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, (4096, 8192)),
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer']))
-    .load_bar(layerg['bar_silu_out2'])
-    .store_bar(layerg['bar_layer']),
+    .place(128)
+    .bar("load", layerg['bar_silu_out2'])
+    .bar("store", layerg['bar_layer']),
 
   # rms for next layer
   pre_attn_rms
-    .i_bar(layerg['bar_layer'])
-    .o_bar(layerg.next('bar_pre_attn_rms')),
+    .bar("input", layerg['bar_layer'])
+    .bar("output", layerg.next('bar_pre_attn_rms')),
 
   # # all 132 SM need loop
   LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
@@ -412,10 +410,10 @@ dae.s(
 
   # argmax
   Argmax
-    .ld_barrier(defaultg['bar_logits'])
-    .val_barrier(defaultg['bar_argmax_val'])
-    .idx_barrier(defaultg['bar_argmax_idx'])
-    .final_barrier(defaultg['bar_argmax_out'])
+    .bar("load", defaultg['bar_logits'])
+    .bar("val", defaultg['bar_argmax_val'])
+    .bar("idx", defaultg['bar_argmax_idx'])
+    .bar("final", defaultg['bar_argmax_out'])
 )
 
 ###################################

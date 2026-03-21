@@ -36,18 +36,18 @@ reduceOut = TmaTensor(dae, matOut).wgmma("reduce", N, TileM, Major.MN)
 
 dae.s(
     interleave(
-        SchedGemv(Gemv_M64N16, num_sms,
+        SchedGemv(Gemv_M64N16,
             MNK=(INTERMIDIATE, N, HIDDEN),
             tmas=(loadGate, loadHidden, reduceGateOut),
-            exec=False).split_M(3),
-        SchedGemv(Gemv_M64N16, num_sms,
+            exec=False).split_M(3).place(num_sms),
+        SchedGemv(Gemv_M64N16,
             MNK=(INTERMIDIATE, N, HIDDEN),
             tmas=(loadUp, loadHidden, reduceInterm),
-            exec=False).split_M(3)
+            exec=False).split_M(3).place(num_sms)
     ),
-    SchedGemv(Gemv_M64N16, 128,
+    SchedGemv(Gemv_M64N16,
               MNK=(HIDDEN, N, INTERMIDIATE),
-              tmas=(loadDown, loadInterm, reduceOut))
+              tmas=(loadDown, loadInterm, reduceOut)).place(128)
               .split_K(3),
 )
 

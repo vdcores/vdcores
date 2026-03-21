@@ -45,7 +45,6 @@ def task_rms_norm_smem(sm: int):
     return insts
 
 rms = SchedRMSShared(
-    sms=num_sms,
     num_token=NUM_TOKEN,
     epsilon=1.0,
     tmas = (
@@ -53,8 +52,7 @@ rms = SchedRMSShared(
         TmaLoad1D(matIn, bytes=HID_DIM * 2),
         TmaStore1D(matOut, bytes=HID_DIM * 2),
     ),
-    base_sm=0
-)
+).place(num_sms)
 
 dae.s(
     # task_rms_norm_smem,

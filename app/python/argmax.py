@@ -37,7 +37,6 @@ val_bar = dae.new_bar(num_sms)
 idx_bar = dae.new_bar(num_sms)
 
 task_argmax = SchedArgmax(
-    num_sms=num_sms,
     num_token=NUM_TOKEN,
     logits_slice=logits_slice,
     num_slice=logits_epoch,
@@ -47,7 +46,7 @@ task_argmax = SchedArgmax(
     matOutVal=matArgOutVal,
     matOutIdx=matArgOutIdx,
     matFinalOut=matArgOut,
-)
+).place(num_sms)
 
 dae.i(
     task_argmax,   
