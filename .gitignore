@@ -74,3 +74,4 @@ ncu_tmp
 *.nsys-rep
 *.sqlite
 .claude/
+.agentlog/

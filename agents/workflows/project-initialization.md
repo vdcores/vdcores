@@ -17,12 +17,13 @@ Use this when an agent is starting work in `vdcores` without prior local context
    - `Makefile` for `runtime.o` and `make pyext`
    - `setup.py` for the `dae.runtime` extension packaging
 5. Create or update agent notes:
-   - add a dated file in `agents/changes/`
+   - add a dated file under `.agentlog/`
    - capture durable findings in `agents/knowledge/`
    - refine this workflow when repeated steps become clear
    - when you learn a reusable validation flow, add it to `agents/workflows/` during the same task
+   - do not leave important changes or durable lessons only in `.agentlog/`; summarize them into tracked `agents/` docs before finishing
 6. Verify with the least expensive meaningful command first.
-7. If CUDA or hardware requirements block verification, document that explicitly in the change log.
+7. If CUDA or hardware requirements block verification, document that explicitly in `.agentlog/`.
 
 ## Current Environment Facts
 

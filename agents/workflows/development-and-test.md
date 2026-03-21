@@ -60,15 +60,7 @@ Typical Python-only areas include:
 
 - `-b` is the short form of `--bench` and defaults to one benchmark iteration.
 - `app/python/llama3/sched.py --help` still performs model loading before printing usage, so prefer using it sparingly on large checkpoints.
-- When a task reveals a stable repo fact or a reusable procedure, update `agents/knowledge/` or `agents/workflows/` in the same task instead of leaving it only in the change log.
+- When a task reveals a stable repo fact or a reusable procedure, update `agents/knowledge/` or `agents/workflows/` in the same task instead of leaving it only in `.agentlog/`.
+- When a task changes the standard workflow or exposes a durable verification lesson, persist the concise takeaway in tracked `agents/` docs before closing the task.
 - `make pyext` requires the local CUDA toolkit version to match the CUDA version used by the installed PyTorch build.
-- In this environment, `make pyext` failed because the detected CUDA version was `12.5` while PyTorch was built with CUDA `13.0`.
-- The benchmark command succeeded against the existing environment and extension artifacts.
-
-## Last Verified Result
-
-On 2026-03-20:
-
-- `make pyext`: failed due to CUDA version mismatch (`12.5` local toolkit vs `13.0` PyTorch)
-- `python app/python/llama3/sched.py -b`: succeeded
-- `python app/python/llama3/sched.py --correctness`: succeeded
+- Put machine-specific verification outcomes and dated run history in `.agentlog/`, then distill only durable conclusions back into `agents/`.
