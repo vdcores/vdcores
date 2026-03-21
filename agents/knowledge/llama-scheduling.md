@@ -32,4 +32,9 @@
 
 - The runtime now has a dedicated `RMS_NORM_F16_K_2048_SMEM` path for the 1B hidden size.
 - `CC0` now carries the embedding row stride as a shift width, so power-of-two row sizes like `4096` bytes (`2048` bf16) and `8192` bytes (`4096` bf16) use the same fast path.
-- The 1B dry-build path should now report only the remaining `head_dim=64` attention gap.
+- The runtime now has a dedicated attention decode opcode/instruction path for `head_dim=64`, and the Python attention schedulers now select the decode instruction from `head_dim`.
+- The 1B dry-build path should now clear all known runtime blockers.
+
+## Current External Blocker
+
+- Full runtime verification of `meta-llama/Llama-3.2-1B-Instruct` still depends on Hugging Face access to the gated checkpoint in the current environment.

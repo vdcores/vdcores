@@ -237,8 +237,8 @@ class GQALayer(Layer):
         self.cached_seq_len = cached_seq_len
         self.need_norm = need_norm
         self.need_rope = need_rope
-        self.Atom = ATTENTION_M64N64K16_F16_F32_64_64_hdim
         self._build_dims()
+        self.Atom = select_attention_decode_instruction(self.QKVHdim[2])
         self._build_tmas()
 
     def _build_dims(self):
