@@ -32,35 +32,57 @@ def bytes2slots(bytes: int) -> int:
     return (bytes + runtime.config.slot_size - 1) // runtime.config.slot_size
 
 #####
-# SM Cord helper functions
+# Cord adapters
 #####
 
-def sm_cord_1d(delta: int):
-    def cordf(sm: int, inst):
-        return inst.cord(sm * delta)
-    return cordf
+class CordAdapter:
+    def __init__(self, inner):
+        self.inner = inner
 
-def sm_cord_splitM(num_sms: int, tileM: int):
-    def cordf(sm: int, inst):
-        m = sm % num_sms * tileM
-        return inst.cord(0, m)
-    return cordf
+    def cord(self, *cords):
+        raise NotImplementedError()
 
-def sm_cord_store_attn_kv(num_sms: int, tileM: int, position: int):
-    def cordf(sm: int, inst):
-        m = sm % num_sms * tileM
-        return inst.cord(m, position, 0)
-    return cordf
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
-def sm_cord_rope(batch_seq_len : int):
-    def cordf(sm: int, inst):
-        return inst.cord(sm % 2, batch_seq_len)
-    return cordf
+class StaticCordAdapter(CordAdapter):
+    def cord(self, *cords):
+        return self.inner
 
-def conv_m2cord_attn_store_v(position: int):
-    def cordf(m, inst):
-        return inst.cord(m, position, 0)
-    return cordf
+def wrap_static(*tmas):
+    return tuple(StaticCordAdapter(tma) for tma in tmas)
+
+class ToConvertedCordAdapter(CordAdapter):
+    def __init__(self, inner, convert):
+        super().__init__(inner)
+        self.convert = convert
+
+    def cord(self, *cords):
+        converted = self.convert(*cords)
+        return self.inner.cord(*converted)
+
+class ToLinearCordAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, delta: int):
+        super().__init__(inner, lambda sm: (sm * delta,))
+
+class ToRopeTableCordAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, batch_seq_len: int):
+        super().__init__(inner, lambda sm: (sm % 2, batch_seq_len))
+
+class ToSplitMCordAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, num_sms: int, tile_m: int):
+        super().__init__(inner, lambda sm: (0, (sm % num_sms) * tile_m))
+
+class ToAttnKVStoreCordAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, num_sms: int, tile_m: int, position: int):
+        super().__init__(
+            inner,
+            lambda sm: ((sm % num_sms) * tile_m, position, 0),
+        )
+
+class ToAttnVStoreCordAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, position: int):
+        super().__init__(inner, lambda _, m: (m, position, 0))
 
 #####
 # TMA Builders
