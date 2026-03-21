@@ -341,41 +341,26 @@ def schedule_single_token(token_offset: int, token_pos: int):
   regStoreUp = RegStore(regUp, matInterm[:,0:TileM])
 
   mlp_split = 6144
-
-  def silu1(sm: int):
-    sm -= 128
-    if sm < 0:
-      return []
-    insts = []
-    start_token_id = sm * (N // 4)
-    end_token_id = (sm + 1) * (N // 4)
-    for i in range(start_token_id, end_token_id):
-      insts.extend([
-        SILU_MUL_SHARED_BF16_K_4096_INTER(1),
-        TmaStore1D(matSiLUOut[i,:mlp_split]).bar(layerg['bar_silu_out1']).group(),
-        TmaLoad1D(matGateOut[i,:mlp_split]).bar(layerg['bar_silu_in']).group() if i == start_token_id else TmaLoad1D(matGateOut[i,:mlp_split]),
-        TmaLoad1D(matInterm[i,:mlp_split]),
-      ])
-    return insts
-
-  def silu_fused(sm : int):
-    if sm >= 128:
-      return []
-
-    return [
-      SILU_MUL_SHARED_BF16_K_64_SW128(N),
-
-      layerg['storeSiluLayer'].cord(0, mlp_split + sm * TileM).bar(layerg['bar_silu_out2']).group(),
-      RegLoad(regGate), # Load the gate
-      RegLoad(regUp), # load the up
-    ]
+  silu1 = SchedSmemSiLUInterleaved(
+    num_token=N,
+    gate_glob=matGateOut[:, :mlp_split],
+    up_glob=matInterm[:, :mlp_split],
+    out_glob=matSiLUOut[:, :mlp_split],
+  ).place(4, base_sm=128).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
+  silu_fused = SchedRegSiLUFused(
+    num_token=N,
+    store_tma=layerg['storeSiluLayer'],
+    reg_gate=regGate,
+    reg_up=regUp,
+    base_offset=mlp_split,
+    stride=TileM,
+  ).place(128).bar("output", layerg['bar_silu_out2'])
 
   # after all layers, logits projection
   LogitsProj = []
   for i in range(logits_epoch):
     proj = QWen8BGemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
     sched = proj.schedule_(group=False).split_M(logits_fold).place(num_sms)
-    # TODO(zhiyuang): check the "no-prefetch" here
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
       sched[0].no_prefetch()
@@ -385,7 +370,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
   # argmax
   Argmax = SchedArgmax(
-    num_sms=128,
     num_token=N,
     logits_slice=logits_slice,
     num_slice=logits_epoch,
@@ -395,7 +379,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     matOutVal=matArgmaxVal,
     matOutIdx=matArgmaxIdx,
     matFinalOut=matTokens[:, token_offset+1],
-  )
+  ).place(128)
 
   sstart, send = systemg.range_bars()
 
@@ -497,10 +481,10 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     # argmax and cleanup
     Argmax
-      .ld_barrier(systemg['bar_logits'])
-      .val_barrier(systemg['bar_argmax_val'])
-      .idx_barrier(systemg['bar_argmax_idx'])
-      .final_barrier(systemg['bar_token_finish']),
+      .bar("load", systemg['bar_logits'])
+      .bar("val", systemg['bar_argmax_val'])
+      .bar("idx", systemg['bar_argmax_idx'])
+      .bar("final", systemg['bar_token_finish']),
 
     restore_bars_low
       .bar("load", layerg.over('bar_pre_attn_rms'))

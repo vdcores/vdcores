@@ -745,6 +745,69 @@ class SchedSiLU(Schedule):
             split_schedule._apply_boundary_bars()
         return split_schedule
 
+class SchedSmemSiLUInterleaved(Schedule):
+    def __init__(self,
+                 num_token: int,
+                 gate_glob: torch.Tensor,
+                 up_glob: torch.Tensor,
+                 out_glob: torch.Tensor):
+        super().__init__()
+        self.num_token = num_token
+        self.gate_glob = gate_glob
+        self.up_glob = up_glob
+        self.out_glob = out_glob
+
+    def _on_place(self):
+        assert self.num_token % self.num_sms == 0, "Number of tokens must be divisible by number of SMs"
+        self.tokens_per_sm = self.num_token // self.num_sms
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+
+        start_token_id = sm * self.tokens_per_sm
+        end_token_id = (sm + 1) * self.tokens_per_sm
+        insts = []
+        for i in range(start_token_id, end_token_id):
+            gate = TmaLoad1D(self.gate_glob[i])
+            if i == start_token_id:
+                gate = gate.bar(self._bar("input")).group()
+
+            insts.extend([
+                SILU_MUL_SHARED_BF16_K_4096_INTER(1),
+                TmaStore1D(self.out_glob[i]).bar(self._bar("output")).group(),
+                gate,
+                TmaLoad1D(self.up_glob[i]),
+            ])
+        return insts
+
+class SchedRegSiLUFused(Schedule):
+    def __init__(self,
+                 num_token: int,
+                 store_tma: TmaTensor,
+                 reg_gate: int,
+                 reg_up: int,
+                 base_offset: int,
+                 stride: int):
+        super().__init__()
+        self.num_token = num_token
+        self.store_tma = store_tma
+        self.reg_gate = reg_gate
+        self.reg_up = reg_up
+        self.base_offset = base_offset
+        self.stride = stride
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+
+        return [
+            SILU_MUL_SHARED_BF16_K_64_SW128(self.num_token),
+            self.store_tma.cord(0, self.base_offset + sm * self.stride).bar(self._bar("output")).group(),
+            RegLoad(self.reg_gate),
+            RegLoad(self.reg_up),
+        ]
+
 class SchedSmemSiLU_K_4096_N_1(Schedule):
     def __init__(self,
                  gate_tma: TmaLoad1D,
@@ -776,7 +839,6 @@ class SchedSmemSiLU_K_4096_N_1(Schedule):
 
 class SchedArgmax(Schedule):
     def __init__(self,
-                 num_sms: int,
                  num_token: int,
                  logits_slice: int,
                  num_slice: int,
@@ -788,7 +850,6 @@ class SchedArgmax(Schedule):
                  matFinalOut: torch.Tensor):
         super().__init__()
         self.num_token = num_token
-        self.num_sms = num_sms
         self.logits_slice = logits_slice
         self.num_slice = num_slice
         self.matLogits = matLogits
@@ -797,14 +858,9 @@ class SchedArgmax(Schedule):
         self.matFinalOut = matFinalOut
         self.AtomPartial = AtomPartial
         self.AtomReduce = AtomReduce
-        self.ld_bar = None
-        self.idx_bar = None
-        self.val_bar = None
-        self.final_bar = None
+    
+    def _on_place(self):
         self.validate()
-
-    def __call__(self, sm: int):
-        return self.schedule(sm)
 
     def validate(self):
         assert len(self.matLogits) == self.num_slice, "Number of logits slices must match vocab size and slice size"
@@ -822,21 +878,8 @@ class SchedArgmax(Schedule):
         assert self.AtomReduce.CHUNK_SIZE == c_per_sm, f"AtomReduce chunk size missmatch, expected {c_per_sm}, got {self.AtomReduce.CHUNK_SIZE}"
         assert self.AtomReduce.SMS == self.num_sms, f"AtomReduce SMS missmatch, expected {self.num_sms}, got {self.AtomReduce.SMS}"
 
-    def ld_barrier(self, bar_id: int):
-        self.ld_bar = bar_id
-        return self
-    def idx_barrier(self, bar_id: int):
-        self.idx_bar = bar_id
-        return self
-    def val_barrier(self, bar_id: int):
-        self.val_bar = bar_id
-        return self
-    def final_barrier(self, bar_id: int):
-        self.final_bar = bar_id
-        return self
-
     def schedule(self, sm):
-        if sm >= self.num_sms:
+        if sm < 0:
             return []
         # decide which slice
         sm_per_slice = self.num_sms // self.num_slice
@@ -846,9 +889,9 @@ class SchedArgmax(Schedule):
         insts = [
             self.AtomPartial(self.num_token),
             # FIXME(zhiyuang): the index 0 for batched mode?
-            RawAddress(self.matLogits[slice_idx][0,slice_ofst], 24).bar(self.ld_bar),
-            RawAddress(self.matOutVal[0,sm], 25).bar(self.val_bar).writeback(),
-            RawAddress(self.matOutIdx[0,sm], 26).bar(self.idx_bar).writeback(),
+            RawAddress(self.matLogits[slice_idx][0,slice_ofst], 24).bar(self._bar("load")),
+            RawAddress(self.matOutVal[0,sm], 25).bar(self._bar("val")).writeback(),
+            RawAddress(self.matOutIdx[0,sm], 26).bar(self._bar("idx")).writeback(),
         ]
         if sm >= self.num_token:
             return insts
@@ -856,9 +899,9 @@ class SchedArgmax(Schedule):
         insts += [
             self.AtomReduce(1),
 
-            RawAddress(self.matOutVal[sm], 27).bar(self.val_bar),
-            RawAddress(self.matOutIdx[sm], 28).bar(self.idx_bar),
-            RawAddress(self.matFinalOut[sm], 29).bar(self.final_bar).writeback(),
+            RawAddress(self.matOutVal[sm], 27).bar(self._bar("val")),
+            RawAddress(self.matOutIdx[sm], 28).bar(self._bar("idx")),
+            RawAddress(self.matFinalOut[sm], 29).bar(self._bar("final")).writeback(),
         ]
         return insts
 

@@ -29,3 +29,5 @@ This note summarizes the stable structure confirmed during repository initializa
 - Full runtime verification may require Hopper-class CUDA hardware.
 - For Python-only edits, start with light checks such as `python -m py_compile`.
 - `app/python/llama3/sched.py` now includes a `--correctness` mode for a single-token, single-decoding-step validation against `app/python/llama3/reference.py`.
+- `python/dae/schedule.py` now treats SM-count placement as a post-construction concern across the main scheduler classes, including `SchedArgmax`.
+- The llama/qwen shared-memory SiLU stages are no longer only inline callables in the app scripts; they now have dedicated schedule classes in `python/dae/schedule.py` for the interleaved phase and the fused register-backed phase.
