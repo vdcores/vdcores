@@ -32,6 +32,28 @@ class Schedule:
     def _bar(self, role: str):
         return self._bars.get(role)
 
+    def _require_placed(self):
+        if self.num_sms is None:
+            raise ValueError(f"{self.__class__.__name__} must be placed before querying barrier release counts")
+
+    def _bar_release_if_present(self, role: str, count: int):
+        if self._bar(role) is None:
+            return 0
+        self._require_placed()
+        return count
+
+    def bar_release_count(self, role: str):
+        return 0
+
+    def collect_barrier_release_counts(self):
+        counts = {}
+        for role, bar_id in self._bars.items():
+            count = self.bar_release_count(role)
+            if count <= 0:
+                continue
+            counts[bar_id] = counts.get(bar_id, 0) + count
+        return counts
+
     def map_sm(self, sm: int):
         # This function decides how to map SM to SM ID. this can create scheudle
         # that is not strictly round-robin, e.g., for hierarchical scheduling,
@@ -146,6 +168,22 @@ class ListSchedule(Schedule):
     def __len__(self):
         return len(self.items)
 
+    def bar_release_count(self, role: str):
+        return sum(
+            item.bar_release_count(role)
+            for item in self.items
+            if isinstance(item, Schedule)
+        )
+
+    def collect_barrier_release_counts(self):
+        counts = {}
+        for item in self.items:
+            if not isinstance(item, Schedule):
+                continue
+            for bar_id, count in item.collect_barrier_release_counts().items():
+                counts[bar_id] = counts.get(bar_id, 0) + count
+        return counts
+
 class SchedCopy(Schedule):
     def __init__(self,
                  tmas, cords = None,
@@ -185,6 +223,11 @@ class SchedCopy(Schedule):
             store.bar(self._bar("store")),
         ]
 
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
 class SchedRope(Schedule):
     def __init__(self, Atom, tmas, cords = None):
         super().__init__()
@@ -211,6 +254,11 @@ class SchedRope(Schedule):
             load,
             store.bar(self._bar("store")).group(),
         ]
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 class SchedAttentionDecoding(Schedule):
     # for decoding, the Qtile len will always be 1
@@ -258,6 +306,11 @@ class SchedAttentionDecoding(Schedule):
             TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group(),
         ]
         return insts
+
+    def bar_release_count(self, role: str):
+        if role != "o":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedAttention(Schedule):
@@ -326,6 +379,13 @@ class SchedAttention(Schedule):
                 tO.cord(req, q * HEAD_GROUP_SIZE, head, 0).port(1).bar(self._bar("o")).group(),
             ]
         return insts
+
+    def bar_release_count(self, role: str):
+        if role != "o":
+            return 0
+        q_tile = self.QKVTile[0]
+        q_iters = (self.active_new_len + q_tile - 1) // q_tile
+        return self._bar_release_if_present(role, self.num_sms * q_iters)
 
 
 class SchedGemv(Schedule):
@@ -492,6 +552,11 @@ class SchedGemv(Schedule):
         self.prefetch = False
         return self
 
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
 class SchedGemvRope(Schedule):
     def __init__(self,
                  MNK: tuple[int, int, int],
@@ -576,6 +641,11 @@ class SchedGemvRope(Schedule):
         ]
         return insts
 
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
 class SchedRMSShared(Schedule):
     def __init__(self,
                  num_token: int,
@@ -618,6 +688,11 @@ class SchedRMSShared(Schedule):
             load,
             store,
         ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 class SchedRMS(Schedule):
     def __init__(self,
@@ -682,8 +757,13 @@ class SchedRMS(Schedule):
                 load,
                 store,
             ]
-                
+        
         return insts
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 class SchedSiLU(Schedule):
     def __init__(self,
@@ -720,6 +800,11 @@ class SchedSiLU(Schedule):
             out_addr,
         ]
         return insts
+
+    def bar_release_count(self, role: str):
+        if role not in ("gate", "up", "out"):
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
     def split(self, div: int, bars: list[tuple[int]]):
         assert self.output_size % div == 0, "Cannot split K dimension evenly"
@@ -781,6 +866,11 @@ class SchedSmemSiLUInterleaved(Schedule):
             ])
         return insts
 
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_token)
+
 class SchedRegSiLUFused(Schedule):
     def __init__(self,
                  num_token: int,
@@ -807,6 +897,11 @@ class SchedRegSiLUFused(Schedule):
             RegLoad(self.reg_gate),
             RegLoad(self.reg_up),
         ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 class SchedSmemSiLU_K_4096_N_1(Schedule):
     def __init__(self,
@@ -904,6 +999,13 @@ class SchedArgmax(Schedule):
             RawAddress(self.matFinalOut[sm], 29).bar(self._bar("final")).writeback(),
         ]
         return insts
+
+    def bar_release_count(self, role: str):
+        if role == "val" or role == "idx":
+            return self._bar_release_if_present(role, self.num_sms)
+        if role == "final":
+            return self._bar_release_if_present(role, min(self.num_token, self.num_sms))
+        return 0
 
 
 def interleave(*schedules):

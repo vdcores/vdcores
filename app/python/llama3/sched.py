@@ -83,23 +83,23 @@ systemg = dae.add_group("system", 1)
 
 defaultg.addBarrier('bar_embedding', N)
 
-systemg.addBarrier('bar_logits', num_sms)
-systemg.addBarrier('bar_argmax_idx', num_sms)
-systemg.addBarrier('bar_argmax_val', num_sms)
-systemg.addBarrier('bar_token_finish', N + 1) # one extra for the restore barrier after argmax
+systemg.addBarrier('bar_logits')
+systemg.addBarrier('bar_argmax_idx')
+systemg.addBarrier('bar_argmax_val')
+systemg.addBarrier('bar_token_finish') # argmax plus restore-barrier copy after placement
 
-layerg.addBarrier('bar_layer', num_sms)
-layerg.addBarrier('bar_out_mlp', num_sms)
-layerg.addBarrier('bar_q_proj', num_sms)
-layerg.addBarrier('bar_qkv_attn', num_sms)
-layerg.addBarrier('bar_attn_out', REQ * 8)
+layerg.addBarrier('bar_layer')
+layerg.addBarrier('bar_out_mlp')
+layerg.addBarrier('bar_q_proj')
+layerg.addBarrier('bar_qkv_attn')
+layerg.addBarrier('bar_attn_out')
 layerg.addBarrier('bar_rms_layer', REQ)
 layerg.addBarrier('bar_rms_mlp', REQ)
-layerg.addBarrier('bar_silu_in', num_sms)
-layerg.addBarrier('bar_silu_out1', N)
-layerg.addBarrier('bar_silu_out2', num_sms)
-layerg.addBarrier('bar_pre_attn_rms', rms_sms)
-layerg.addBarrier('bar_post_attn_rms', rms_sms)
+layerg.addBarrier('bar_silu_in')
+layerg.addBarrier('bar_silu_out1')
+layerg.addBarrier('bar_silu_out2')
+layerg.addBarrier('bar_pre_attn_rms')
+layerg.addBarrier('bar_post_attn_rms')
 
 ###################################
 # Define tensors
@@ -265,33 +265,33 @@ def schedule_single_token(token_offset: int, token_pos: int):
     num_token=N, epsilon=eps,
     tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
     embedding=CC0(matTokens[0], token_offset)
-  ).place(rms_sms)
+  ).bar("output", layerg['bar_pre_attn_rms'])
   # copy the HIDDEN from embedding
   copy_hidden = SchedCopy(
     size = HIDDEN * matHidden.element_size(),
     tmas = (loadEmbed1D, storeHidden1D),
     cords = (None, sm_cord_1d(HIDDEN * 2)),
     before_copy = CC0(matTokens[0], token_offset),
-  ).place(N, base_sm=64)
+  )
 
   # TODO(zhiyuang): finish a set of clear functions
   clear_interm = SchedCopy(
     size = 2048 * matInterm.element_size(),
     tmas = (TmaLoad1D(matZero[:2048]), TmaStore1D(matInterm[0,4096:4096+2048])),
-  ).place(1, base_sm=128)
+  )
   clear_gateout = SchedCopy(
     size = 2048 * matGateOut.element_size(),
     tmas = (TmaLoad1D(matZero[:2048]), TmaStore1D(matGateOut[0, 4096:4096+2048])),
-  ).place(1, base_sm=129)
+  )
 
   pre_attn_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(layerg['loadRMSInputW'].cord(0), loadHidden1D, storeRMSHidden1D)
-  ).place(rms_sms)
+  ).bar("input", layerg['bar_layer']).bar("output", layerg.next('bar_pre_attn_rms'))
   post_attn_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(layerg['loadRMSPostAttnW'].cord(0), loadHidden1D, storeRMSHidden1D)
-  ).place(rms_sms)
+  ).bar("input", layerg['bar_out_mlp']).bar("output", layerg['bar_post_attn_rms'])
 
   # QKV Projection
   # TODO(zhiyuang): add the ROPE for Q and K
@@ -300,26 +300,26 @@ def schedule_single_token(token_offset: int, token_pos: int):
   QProj = SchedGemv(Gemv_M64N8,
     MNK=(QW, N, HIDDEN),
     tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
-  ).place(128)
+  ).bar("load", layerg['bar_pre_attn_rms'])
   QRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(defaultg['loadRope'], regLoadQ, layerg['storeQ']),
     cords=(sm_cord_rope(token_pos), None, sm_cord_splitM(128//2, TileM))
-  ).place(128)
+  ).bar("store", layerg['bar_q_proj'])
   regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
   regLoadK = RegLoad(0)
   KProj = SchedGemv(Gemv_M64N8,
     MNK=(KW, N, HIDDEN),
     tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
-  ).place(64, base_sm=64)
+  )
   KRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(defaultg['loadRope'], regLoadK, layerg['storeK']),
     cords=(sm_cord_rope(token_pos), None, sm_cord_store_attn_kv(64//4, TileM, token_pos)),
-  ).place(64, base_sm=64)
+  ).bar("store", layerg['bar_qkv_attn'])
   VProj = SchedGemv(Gemv_M64N8,
     MNK=(VW, N, HIDDEN),
     tmas=(layerg['loadVW'], layerg['loadRMSLayer'], layerg['storeV']),
     cordconv=(None, None, conv_m2cord_attn_store_v(token_pos)),
-  ).place(64)
+  ).bar("store", layerg['bar_qkv_attn'])
 
   QWen8BGemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
   Gqa = SchedAttentionDecoding(
@@ -328,17 +328,35 @@ def schedule_single_token(token_offset: int, token_pos: int):
     NUM_KV_HEADS = NUM_KV_HEAD,
     matO = matO_attn_view,
     tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
-  ).place(N * NUM_KV_HEAD)
+  ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
 
   # accumulate to matHidden, which auto applies the residual add
   OutProj = SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, HIDDEN),
-    tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])).place(num_sms)
+    tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])
+  ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
 
   # Gate Up + SiLU
   regGate, regUp = 0, 1
   regStoreGate = RegStore(regGate, matGateOut[:,0:TileM])
   regStoreUp = RegStore(regUp, matInterm[:,0:TileM])
+
+  gate_proj_low = SchedGemv(Gemv_M64N8,
+    MNK=(4096, N, HIDDEN),
+    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),
+  ).bar("load", layerg['bar_post_attn_rms'])
+  gate_proj_high = SchedGemv(Gemv_M64N8,
+    MNK=((4096, 2048), N, HIDDEN),
+    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['reduceGateOut']),
+  ).bar("store", layerg['bar_silu_in'])
+  up_proj_low = SchedGemv(Gemv_M64N8,
+    MNK=(4096, N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
+  ).bar("load", layerg['bar_post_attn_rms'])
+  up_proj_high = SchedGemv(Gemv_M64N8,
+    MNK=((4096, 2048), N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['reduceInterm']),
+  ).bar("store", layerg['bar_silu_in'])
 
   mlp_split = 6144
   silu1 = SchedSmemSiLUInterleaved(
@@ -346,7 +364,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
     gate_glob=matGateOut[:, :mlp_split],
     up_glob=matInterm[:, :mlp_split],
     out_glob=matSiLUOut[:, :mlp_split],
-  ).place(4, base_sm=128).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
+  ).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
+  gate_proj_fused = SchedGemv(Gemv_M64N8,
+    MNK=((6144,8192), N, HIDDEN),
+    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], regStoreGate))
+  up_proj_fused = SchedGemv(Gemv_M64N8,
+    MNK=((6144,8192), N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], regStoreUp))
   silu_fused = SchedRegSiLUFused(
     num_token=N,
     store_tma=layerg['storeSiluLayer'],
@@ -354,19 +378,27 @@ def schedule_single_token(token_offset: int, token_pos: int):
     reg_up=regUp,
     base_offset=mlp_split,
     stride=TileM,
-  ).place(128).bar("output", layerg['bar_silu_out2'])
+  ).bar("output", layerg['bar_silu_out2'])
+  down_proj_low = SchedGemv(Gemv_M64N8,
+    MNK=(HIDDEN, N, 6144),
+    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer']))
+  down_proj_high = SchedGemv(Gemv_M64N8,
+    MNK=(HIDDEN, N, (6144, 8192)),
+    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
+  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
+  down_proj_low.bar("load", layerg['bar_silu_out1'])
 
   # after all layers, logits projection
   LogitsProj = []
   for i in range(logits_epoch):
     proj = QWen8BGemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-    sched = proj.schedule_(group=False).split_M(logits_fold).place(num_sms)
+    sched = proj.schedule_(group=False).split_M(logits_fold)
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
       sched[0].no_prefetch()
     if i == logits_epoch - 1:
       sched.bar("store", systemg['bar_logits'])
-    LogitsProj.append(sched)
+    LogitsProj.append(sched.place(num_sms))
 
   # argmax
   Argmax = SchedArgmax(
@@ -379,22 +411,78 @@ def schedule_single_token(token_offset: int, token_pos: int):
     matOutVal=matArgmaxVal,
     matOutIdx=matArgmaxIdx,
     matFinalOut=matTokens[:, token_offset+1],
-  ).place(128)
+  ).bar("load", systemg['bar_logits']).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
 
   sstart, send = systemg.range_bars()
 
   # restore barrier
   restore_bars_low = SchedCopy(
     tmas = (TmaLoad1D(dae.bars_src[:sstart]), TmaStore1D(dae.bars[:sstart]))
-  ).place(1, base_sm=128)
+  ).bar("load", layerg.over('bar_pre_attn_rms')).bar("store", systemg['bar_token_finish'])
   restore_bars_high = SchedCopy(
     tmas = (TmaLoad1D(dae.bars_src[sstart:send]), TmaStore1D(dae.bars[sstart:send]))
-  ).place(1, base_sm=128)
+  )
+
+  embed_rms = embed_rms.place(rms_sms)
+  copy_hidden = copy_hidden.place(N, base_sm=64)
+  clear_interm = clear_interm.place(1, base_sm=128)
+  clear_gateout = clear_gateout.place(1, base_sm=129)
+  pre_attn_rms = pre_attn_rms.place(rms_sms)
+  post_attn_rms = post_attn_rms.place(rms_sms)
+  QProj = QProj.place(128)
+  QRope = QRope.place(128)
+  KProj = KProj.place(64, base_sm=64)
+  KRope = KRope.place(64, base_sm=64)
+  VProj = VProj.place(64)
+  Gqa = Gqa.place(N * NUM_KV_HEAD)
+  OutProj = OutProj.place(num_sms)
+  gate_proj_low = gate_proj_low.place(64)
+  gate_proj_high = gate_proj_high.place(64)
+  up_proj_low = up_proj_low.place(64, base_sm=64)
+  up_proj_high = up_proj_high.place(64, base_sm=64)
+  silu1 = silu1.place(4, base_sm=128)
+  gate_proj_fused = gate_proj_fused.place(128)
+  up_proj_fused = up_proj_fused.place(128)
+  silu_fused = silu_fused.place(128)
+  down_proj_low = down_proj_low.place(128)
+  down_proj_high = down_proj_high.place(128)
+  Argmax = Argmax.place(128)
+  restore_bars_low = restore_bars_low.place(1, base_sm=128)
+  restore_bars_high = restore_bars_high.place(1, base_sm=128)
+
+  dae.bind_late_barrier_counts(
+    embed_rms,
+    copy_hidden,
+    restore_bars_high,
+    clear_interm,
+    clear_gateout,
+    QProj,
+    QRope,
+    KProj,
+    KRope,
+    VProj,
+    Gqa,
+    OutProj,
+    post_attn_rms,
+    gate_proj_low,
+    gate_proj_high,
+    up_proj_low,
+    up_proj_high,
+    silu1,
+    gate_proj_fused,
+    up_proj_fused,
+    silu_fused,
+    down_proj_low,
+    down_proj_high,
+    pre_attn_rms,
+    LogitsProj,
+    Argmax,
+    restore_bars_low,
+  )
 
   # build first rms with embedding
   dae.i(
-    embed_rms
-      .bar("output", layerg['bar_pre_attn_rms']),
+    embed_rms,
     copy_hidden,
     restore_bars_high,
   )
@@ -403,74 +491,32 @@ def schedule_single_token(token_offset: int, token_pos: int):
   dae.i(
     clear_interm,
     clear_gateout,
-    QProj
-      .bar("load", layerg['bar_pre_attn_rms']),
-    QRope
-      .bar("store", layerg['bar_q_proj']),
+    QProj,
+    QRope,
     KProj,
-    KRope
-      .bar("store", layerg['bar_qkv_attn']),
-    VProj
-      .bar("store", layerg['bar_qkv_attn']),
+    KRope,
+    VProj,
 
-    Gqa
-      .bar("q", layerg['bar_q_proj'])
-      .bar("k", layerg['bar_qkv_attn'])
-      .bar("o", layerg['bar_attn_out']),
-    OutProj
-      .bar("load", layerg['bar_attn_out'])
-      .bar("store", layerg['bar_out_mlp']),
+    Gqa,
+    OutProj,
 
     # RMS
-    post_attn_rms
-      .bar("input", layerg['bar_out_mlp'])
-      .bar("output", layerg['bar_post_attn_rms']),
+    post_attn_rms,
     
     # MLP
-    SchedGemv(Gemv_M64N8,
-      MNK=(4096, N, HIDDEN),
-      tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),)
-      .place(64)
-      .bar("load", layerg['bar_post_attn_rms']),
-    SchedGemv(Gemv_M64N8,
-      MNK=((4096, 2048), N, HIDDEN),
-      tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['reduceGateOut']),)
-      .place(64)
-      .bar("store", layerg['bar_silu_in']),
-    SchedGemv(Gemv_M64N8,
-      MNK=(4096, N, HIDDEN),
-      tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-      ).place(64, base_sm=64)
-      .bar("load", layerg['bar_post_attn_rms']),
-    SchedGemv(Gemv_M64N8,
-      MNK=((4096, 2048), N, HIDDEN),
-      tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['reduceInterm']),
-      ).place(64, base_sm=64)
-      .bar("store", layerg['bar_silu_in']),
+    gate_proj_low,
+    gate_proj_high,
+    up_proj_low,
+    up_proj_high,
     silu1,
-    SchedGemv(Gemv_M64N8,
-      MNK=((6144,8192), N, HIDDEN),
-      tmas=(layerg['loadGate'], layerg['loadRMSLayer'], regStoreGate)).place(128),
-    SchedGemv(Gemv_M64N8,
-      MNK=((6144,8192), N, HIDDEN),
-      tmas=(layerg['loadUp'], layerg['loadRMSLayer'], regStoreUp)).place(128),
+    gate_proj_fused,
+    up_proj_fused,
     silu_fused,
-    SchedGemv(Gemv_M64N8,
-      MNK=(HIDDEN, N, 6144),
-      tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer']))
-      .place(128)
-      .bar("load", layerg['bar_silu_out1']),
-    SchedGemv(Gemv_M64N8,
-      MNK=(HIDDEN, N, (6144, 8192)),
-      tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer']))
-      .place(128)
-      .bar("load", layerg['bar_silu_out2'])
-      .bar("store", layerg['bar_layer']),
+    down_proj_low,
+    down_proj_high,
 
     # rms for next layer
-    pre_attn_rms
-      .bar("input", layerg['bar_layer'])
-      .bar("output", layerg.next('bar_pre_attn_rms')),
+    pre_attn_rms,
 
     # # all 132 SM need loop
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
@@ -480,15 +526,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
     LogitsProj,
 
     # argmax and cleanup
-    Argmax
-      .bar("load", systemg['bar_logits'])
-      .bar("val", systemg['bar_argmax_val'])
-      .bar("idx", systemg['bar_argmax_idx'])
-      .bar("final", systemg['bar_token_finish']),
+    Argmax,
 
-    restore_bars_low
-      .bar("load", layerg.over('bar_pre_attn_rms'))
-      .bar("store", systemg['bar_token_finish']),
+    restore_bars_low,
   )
 
 ###################################
