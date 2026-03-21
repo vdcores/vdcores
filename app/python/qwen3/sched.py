@@ -224,8 +224,10 @@ embed_rms = SchedRMSShared(
 # copy the HIDDEN from embedding
 copy_hidden = SchedCopy(
   size = HIDDEN * matHidden.element_size(),
-  tmas = (loadEmbed1D, storeHidden1D),
-  cords = (None, sm_cord_1d(HIDDEN * 2)),
+  tmas = (
+    StaticCordAdapter(loadEmbed1D),
+    ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
+  ),
   before_copy = CC0(matTokens, 0),
 ).place(N, base_sm=64)
 
@@ -247,8 +249,11 @@ QProj = SchedGemv(Gemv_M64N8,
   tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
 ).place(128)
 QRope = SchedRope(ROPE_INTERLEAVE_512,
-  tmas=(defaultg['loadRope'], regLoadQ, layerg['storeQ']),
-  cords=(sm_cord_rope(batch_seq_len), None, sm_cord_splitM(128, TileM))
+  tmas=(
+    ToRopeTableCordAdapter(defaultg['loadRope'], batch_seq_len),
+    regLoadQ,
+    ToSplitMCordAdapter(layerg['storeQ'], 128, TileM),
+  )
 ).place(128)
 regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
 regLoadK = RegLoad(0)
@@ -257,8 +262,11 @@ KProj = SchedGemv(Gemv_M64N8,
   tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
 ).place(64, base_sm=64)
 KRope = SchedRope(ROPE_INTERLEAVE_512,
-  tmas=(defaultg['loadRope'], regLoadK, layerg['storeK']),
-  cords=(sm_cord_rope(batch_seq_len), None, sm_cord_splitM(64, TileM)),
+  tmas=(
+    ToRopeTableCordAdapter(defaultg['loadRope'], batch_seq_len),
+    regLoadK,
+    ToSplitMCordAdapter(layerg['storeK'], 64, TileM),
+  ),
 ).place(64, base_sm=64)
 VProj = SchedGemv(Gemv_M64N8,
   MNK=(VW, N, HIDDEN),

@@ -269,19 +269,27 @@ def schedule_single_token(token_offset: int, token_pos: int):
   # copy the HIDDEN from embedding
   copy_hidden = SchedCopy(
     size = HIDDEN * matHidden.element_size(),
-    tmas = (loadEmbed1D, storeHidden1D),
-    cords = (None, sm_cord_1d(HIDDEN * 2)),
+    tmas = (
+      StaticCordAdapter(loadEmbed1D),
+      ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
+    ),
     before_copy = CC0(matTokens[0], token_offset),
   )
 
   # TODO(zhiyuang): finish a set of clear functions
   clear_interm = SchedCopy(
     size = 2048 * matInterm.element_size(),
-    tmas = (TmaLoad1D(matZero[:2048]), TmaStore1D(matInterm[0,4096:4096+2048])),
+    tmas = wrap_static(
+      TmaLoad1D(matZero[:2048]),
+      TmaStore1D(matInterm[0,4096:4096+2048]),
+    ),
   )
   clear_gateout = SchedCopy(
     size = 2048 * matGateOut.element_size(),
-    tmas = (TmaLoad1D(matZero[:2048]), TmaStore1D(matGateOut[0, 4096:4096+2048])),
+    tmas = wrap_static(
+      TmaLoad1D(matZero[:2048]),
+      TmaStore1D(matGateOut[0, 4096:4096+2048]),
+    ),
   )
 
   pre_attn_rms = SchedRMSShared(
@@ -302,8 +310,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
     tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
   ).bar("load", layerg['bar_pre_attn_rms'])
   QRope = SchedRope(ROPE_INTERLEAVE_512,
-    tmas=(defaultg['loadRope'], regLoadQ, layerg['storeQ']),
-    cords=(sm_cord_rope(token_pos), None, sm_cord_splitM(128//2, TileM))
+    tmas=(
+      ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+      regLoadQ,
+      ToSplitMCordAdapter(layerg['storeQ'], 128//2, TileM),
+    ),
   ).bar("store", layerg['bar_q_proj'])
   regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
   regLoadK = RegLoad(0)
@@ -312,13 +323,19 @@ def schedule_single_token(token_offset: int, token_pos: int):
     tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
   )
   KRope = SchedRope(ROPE_INTERLEAVE_512,
-    tmas=(defaultg['loadRope'], regLoadK, layerg['storeK']),
-    cords=(sm_cord_rope(token_pos), None, sm_cord_store_attn_kv(64//4, TileM, token_pos)),
+    tmas=(
+      ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+      regLoadK,
+      ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos),
+    ),
   ).bar("store", layerg['bar_qkv_attn'])
   VProj = SchedGemv(Gemv_M64N8,
     MNK=(VW, N, HIDDEN),
-    tmas=(layerg['loadVW'], layerg['loadRMSLayer'], layerg['storeV']),
-    cordconv=(None, None, conv_m2cord_attn_store_v(token_pos)),
+    tmas=(
+      layerg['loadVW'],
+      layerg['loadRMSLayer'],
+      ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
+    ),
   ).bar("store", layerg['bar_qkv_attn'])
 
   QWen8BGemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
@@ -417,10 +434,10 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
   # restore barrier
   restore_bars_low = SchedCopy(
-    tmas = (TmaLoad1D(dae.bars_src[:sstart]), TmaStore1D(dae.bars[:sstart]))
+    tmas = wrap_static(TmaLoad1D(dae.bars_src[:sstart]), TmaStore1D(dae.bars[:sstart]))
   ).bar("load", layerg.over('bar_pre_attn_rms')).bar("store", systemg['bar_token_finish'])
   restore_bars_high = SchedCopy(
-    tmas = (TmaLoad1D(dae.bars_src[sstart:send]), TmaStore1D(dae.bars[sstart:send]))
+    tmas = wrap_static(TmaLoad1D(dae.bars_src[sstart:send]), TmaStore1D(dae.bars[sstart:send]))
   )
 
   embed_rms = embed_rms.place(rms_sms)

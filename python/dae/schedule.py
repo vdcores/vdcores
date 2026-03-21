@@ -186,17 +186,13 @@ class ListSchedule(Schedule):
 
 class SchedCopy(Schedule):
     def __init__(self,
-                 tmas, cords = None,
+                 tmas,
                  size = None,
                  before_copy = None,
                  count = 1):
         super().__init__()
         self.tmas = tmas
-        self.cords = cords
         self.count = count
-        if self.cords is None:
-            self.cords = [None for _ in range(len(tmas))]
-        assert len(self.tmas) == len(self.cords), "Number of TMA tensors must match number of cord specifications"
         self.before_copy = before_copy
 
         if size is None:
@@ -209,9 +205,8 @@ class SchedCopy(Schedule):
             return []
 
         load, store = self.tmas
-        cord_load, cord_store = self.cords
-        load = load if cord_load is None else cord_load(sm, load)
-        store = store if cord_store is None else cord_store(sm, store)
+        load = load.cord(sm)
+        store = store.cord(sm)
         if self.before_copy is not None:
             load.jump()
 
@@ -229,23 +224,15 @@ class SchedCopy(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 class SchedRope(Schedule):
-    def __init__(self, Atom, tmas, cords = None):
+    def __init__(self, Atom, tmas):
         super().__init__()
         self.Atom = Atom
         self.tmas = tmas
-        self.cords = cords
-
-        if self.cords is None:
-            self.cords = [None for _ in range(len(tmas))]
-        assert len(self.tmas) == len(self.cords), "Number of TMA tensors must match number of cord specifications"
 
     def schedule(self, sm: int):
         if sm < 0:
             return []
-        table, load, store = [
-            cord(sm, tma) if cord is not None else tma
-            for cord, tma in zip(self.cords, self.tmas)
-        ]
+        table, load, store = [tma.cord(sm) for tma in self.tmas]
 
         return [
             self.Atom(),
@@ -395,16 +382,11 @@ class SchedGemv(Schedule):
                  fold : int | None = None,
                  exec = True,
                  prefetch = True,
-                 group = True,
-                 cordconv = None):
+                 group = True):
         super().__init__()
         self.Atom = Atom
         self.MNK = MNK
         self.tmas = tmas
-        if cordconv is None:
-            cordconv = [None for _ in range(len(tmas))]
-        assert len(tmas) == len(cordconv), "Number of TMA tensors must match number of cord converters"
-        self.cordconv = cordconv
 
         TileM, TileN, TileK = Atom.MNK
         # process MNK
@@ -477,7 +459,6 @@ class SchedGemv(Schedule):
         n_batch = self.Atom.n_batch
 
         loadA, loadB, storeC = self.tmas
-        convA, convB, convC = self.cordconv
 
         m = baseM + (sm % self.sm_per_fold) * TileM
         k = baseK + (sm // self.sm_per_fold) * self.k_per_fold
@@ -488,10 +469,7 @@ class SchedGemv(Schedule):
         load_group = self.group and (self._bar("load") is not None)
         store_group = self.group and (self._bar("store") is not None)
 
-        if convC is None:
-            storeC_cord = storeC.cord(0, m)
-        else:
-            storeC_cord = convC(m, storeC)
+        storeC_cord = storeC.cord(0, m)
 
         insts = [
             self.Atom(self.k_per_fold // TileK),
@@ -532,7 +510,6 @@ class SchedGemv(Schedule):
                 fold=self.fold,
                 prefetch=self.prefetch,
                 group=self.group,
-                cordconv=self.cordconv,
             )
             new_schedules.append(new_schedule)
         split_schedule = ListSchedule(new_schedules, lead_bars={"load"}, tail_bars={"store"})
