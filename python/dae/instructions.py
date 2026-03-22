@@ -114,10 +114,9 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
     def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
-        need_flag = (need_norm << 0) | (need_rope << 1)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
-            args=[num_kv_block, last_kv_active_token_len, need_flag],
+            args=[num_kv_block, last_kv_active_token_len],
         )
 
 
@@ -125,12 +124,28 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
     def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
-        need_flag = (need_norm << 0) | (need_rope << 1)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
-            args=[num_kv_block, last_kv_active_token_len, need_flag],
+            args=[num_kv_block, last_kv_active_token_len],
         )
 
+class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
+    HEAD_DIM = 128
+    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+        # pack need_norm and need_rope into a uint16 arg
+        arg0 = num_kv_block | (split_idx << 8)
+        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        arg2 = kv_start_idx # make this 16bit to support long seq
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 
+            args=[arg0, arg1, arg2]
+        )
+
+class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
+    HEAD_DIM = 128
+    Q_TILE = 4
+    def __init__(self, num_split: int):
+        super().__init__(opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE, args=[num_split])
 
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):
@@ -720,6 +735,8 @@ __all__ = [
     "ROPE_INTERLEAVE_512",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
+    "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
+    "ATTN_SPLIT_POST_REDUCE",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",

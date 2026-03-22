@@ -10,7 +10,7 @@ from qwen3.utils import *
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 64
+KV_SEQ_LEN = 4096
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
 NUM_REQ = 1
@@ -132,7 +132,7 @@ def gqa_ref():
     # Q: [B, Hkv, G, D]
     # K.transpose(-1, -2): [B, Hkv, D, S]
     # result: [B, Hkv, G, S]
-    QK = torch.matmul(Q, K.transpose(-1, -2))
+    QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
     # apply mask according to lsat_active_kv_len
     total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
     mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
