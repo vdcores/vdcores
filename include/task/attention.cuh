@@ -172,13 +172,16 @@ struct OnlineSoftmax {
 template <int HEAD_DIM,
           int Q_BLOCK_SIZE,
           int KV_BLOCK_SIZE,
+          bool SPLIT_KV,
+          int MAX_SPLIT,
           bool NEED_NORM, bool NEED_ROPE,
           typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int num_kv_blocks,
+    const int split_idx,
+    const int num_active_q, // to avoid overwriting other split_kv metadata buffer
     const int last_kv_active_token_len, // real kv tokens in the last block
-    const bool need_norm,
-    const bool need_rope,
+    const int kv_start_idx, // global token-pos of first kv token, for prefill mask calculation
     void *base,
     float *smem_reduce,
     const MInst *st_insts,
@@ -455,10 +458,8 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     // final correction
     // row sum is still thread local now
     butterfly_reduce<4>(online_softmax.row_sum, cute::plus{});
-
     // wait for last O
     warpgroup_wait<0>();
-
     online_softmax.post_correction(o_mn_view);
 
     const int slot_O = m2c.template pop<0>();
@@ -466,7 +467,105 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     auto sO = make_tensor(make_smem_ptr(sO_ptr), layout_sO);
     auto partition_sO = thr_mma_pv.partition_C(sO);
     copy(frag_O, partition_sO);
-
     c2m.template push<0, true>(thread_id, slot_O);
+
+    if constexpr (SPLIT_KV) {
+        const int slot_lse = m2c.template pop<0>();
+        // assume sM_glob is of shape [H, N, G, max_split]
+        // each SM will get its slice of [N, G, max_split] so no need to index the KV head dim
+        accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
+        constexpr int tSRow = decltype(size<1>(o_mn_view))::value;
+        #pragma unroll
+        for (int r = 0; r < tSRow; ++r) {
+            const int q_row = (thread_id / 32) * 16 + (thread_id % 32) / 4 + r * 8;
+            if (q_row < num_active_q) {
+                const accum_t lse = online_softmax.row_max(r) + logf(online_softmax.row_sum(r));
+                sLSE_ptr[q_row * MAX_SPLIT + split_idx] = lse;
+            }
+        }
+        __sync_compute_group(128);
+        c2m.template push<31, true, false>(thread_id, 1 << slot_lse);
+    }
 }
 
+template <int HEAD_DIM,
+          int NUM_Q,
+          int KV_BLOCK_SIZE,
+          int MAX_SPLIT,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_split_post_reduce(
+    const int num_split,
+    void *base,
+    float* smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+    // we now have output: exp(QK^T) / sum_local @ V and sum_local
+    // get final score with exp(QK^T) / sum_global @ V
+    using namespace cute;
+    using data_t = __nv_bfloat16;
+    using accum_t = float;
+    using Tr = F16Traits<data_t>;
+    using vec2_t = typename Tr::vec2_t;
+
+    static_assert(HEAD_DIM == 128, "currently we hardcode head dim to 128 for simplicity");
+
+    const int thread_id = threadIdx.x;
+
+    auto layout_lse = make_layout(
+        make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
+        LayoutRight{});
+    const int slot_lse = m2c.template pop<0>();
+    accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
+    auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
+    auto layout_sO = make_layout(
+        make_shape(Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
+        LayoutRight{});
+    auto frag_O = make_tensor<float2>(layout_sO);
+    auto frag_max = make_tensor<accum_t>(Shape<Int<NUM_Q>>{});
+    auto frag_sum = make_tensor<accum_t>(Shape<Int<NUM_Q>>{});
+
+    clear(frag_O);
+    clear(frag_sum);
+    fill(frag_max, -FLT_MAX);
+    
+    // still do rolling update to ensure numerical stability
+#pragma unroll
+    for (int split_idx = 0; split_idx < num_split; ++split_idx) {
+        const int slot_O = m2c.template pop<0>();
+        vec2_t* sO_ptr = (vec2_t*)get_slot_address(base, extract(slot_O));
+        auto sO = make_tensor(make_smem_ptr(sO_ptr), layout_sO);
+
+#pragma unroll
+        for (int q = 0; q < NUM_Q; ++q) {
+            const accum_t _old_max = frag_max(q), _old_sum = frag_sum(q);
+            const accum_t _cur_max = gLSE(q, split_idx);
+            const accum_t _max = max(_old_max, _cur_max);
+            const accum_t scale_prev = expf(_old_max - _max);
+            const accum_t scale_new = expf(_cur_max - _max);
+
+            frag_sum(q) = _old_sum * scale_prev + scale_new;
+            for (int i = thread_id; i < HEAD_DIM/2; i += 128) {
+                float2 oo = Tr::to_float2(sO(q, i));
+                frag_O(q,i).x = frag_O(q,i).x * scale_prev + oo.x * scale_new;
+                frag_O(q,i).y = frag_O(q,i).y * scale_prev + oo.y * scale_new;
+            }
+        }
+        __sync_compute_group(128);
+        c2m.push(thread_id, slot_O);
+    }
+
+    const int slot_final = m2c.template pop<0>();
+    vec2_t* sF_ptr = (vec2_t*)get_slot_address(base, extract(slot_final));
+    auto sF = make_tensor(make_smem_ptr(sF_ptr), layout_sO);
+#pragma unroll
+    for (int q = 0; q < NUM_Q; ++ q) {
+        for (int i = thread_id; i < HEAD_DIM/2; i += 128) {
+            frag_O(q,i).x = frag_O(q,i).x / frag_sum(q);
+            frag_O(q,i).y = frag_O(q,i).y / frag_sum(q);
+            sF(q, i) = Tr::from_float2(frag_O(q,i));
+        }
+    }
+    c2m.template push<0, true>(thread_id, slot_final);
+}
