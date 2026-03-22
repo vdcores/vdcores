@@ -118,16 +118,22 @@ make pyext
 ```
 
 - The MMA GEMV harness defaults to `M=4096`, `K=4096`, and `N=8`, and supports quick smaller checks through `GEMV_M`, `GEMV_K`, and `GEMV_SMS`.
+- Before performance benchmarking `app/python/llama32_1b/sched.py`, clear leftover Python workers with `killall python || true`; stale decode jobs can distort both timing and apparent correctness.
+- For risky multi-token or partial-stage experiments on the Llama 3.2 1B path, prefer `tests/script/run_with_launch_timeout.py` first to separate deadlocks from slow-but-completing schedules.
+- For longer multi-token timing on the current Llama 3.2 1B branch, prefer fresh-process `-b 1` measurements over larger `-b` counts until launch-state reset behavior is audited; repeated launches in one process showed inconsistent timings.
 
 ## Last Verified Result
 
 On 2026-03-21:
 
 - `python -m py_compile app/python/gemv_mma_out.py python/dae/launcher.py`: succeeded
+- `python -m py_compile app/python/llama32_1b/sched.py python/dae/launcher.py`: succeeded
 - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && make pyext`: succeeded
 - `GEMV_M=64 GEMV_K=256 GEMV_SMS=1 python app/python/gemv_mma_out.py -l`: succeeded with `0.0%` average diff
 - `python app/python/gemv_mma_out.py -l`: succeeded with `0.0%` average diff
 - `python app/python/gemv_out.py -l`: succeeded
+- `python tests/script/run_with_launch_timeout.py --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python app/python/llama32_1b/sched.py -N 2 -l`: succeeded
+- `python tests/script/run_with_launch_timeout.py --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python app/python/llama32_1b/sched.py -N 2 --debug-num-layers 8 -l`: succeeded
 
 On 2026-03-20:
 
