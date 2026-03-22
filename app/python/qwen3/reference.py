@@ -34,7 +34,15 @@ def check_tensor_threshold(
     return passed, diff
 
 
-def reference_pass(model, inputs, verbose=False):
+def reference_pass(
+    model,
+    inputs,
+    verbose=False,
+    *,
+    use_cache=False,
+    past_key_values=None,
+    cache_position=None,
+):
     captured_data = defaultdict(dict)
 
     def register_qwen_hooks(model):
@@ -73,13 +81,19 @@ def reference_pass(model, inputs, verbose=False):
             handles.append(mlp.down_proj.register_forward_hook(get_hook(i, "down_proj")))
             handles.append(layer.register_forward_hook(get_hook(i, "hidden_state_out")))
 
+        handles.append(model.model.norm.register_forward_pre_hook(get_pre_hook("final", "final_rms_in")))
         handles.append(model.model.norm.register_forward_hook(get_hook("final", "final_rms")))
         handles.append(model.lm_head.register_forward_hook(get_hook("final", "lm_head")))
         return handles
 
     hooks = register_qwen_hooks(model)
     with torch.no_grad():
-        output = model(**inputs, use_cache=False)
+        output = model(
+            **inputs,
+            use_cache=use_cache,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+        )
         if verbose:
             print(output)
 
@@ -89,7 +103,56 @@ def reference_pass(model, inputs, verbose=False):
     return captured_data, output
 
 
-def input_batch1(*tokens, mat=None, positions=None):
+def cached_reference_pass(
+    model,
+    prefix_token_ids,
+    current_token_id: int,
+    *,
+    prefix_position: int = 0,
+    current_position: int | None = None,
+):
+    if isinstance(prefix_token_ids, int):
+        prefix_token_ids = [prefix_token_ids]
+    prefix_token_ids = list(prefix_token_ids)
+    if len(prefix_token_ids) == 0:
+        raise ValueError("cached_reference_pass requires at least one prefix token")
+    if current_position is None:
+        current_position = prefix_position + len(prefix_token_ids)
+
+    prefix_inputs = input_batch1(
+        *prefix_token_ids,
+        positions=list(range(prefix_position, prefix_position + len(prefix_token_ids))),
+        attention_len=prefix_position + len(prefix_token_ids),
+    )
+    prefix_captured, prefix_output = reference_pass(
+        model,
+        prefix_inputs,
+        use_cache=True,
+        cache_position=torch.arange(prefix_position, prefix_position + len(prefix_token_ids), device="cuda"),
+    )
+
+    current_inputs = input_batch1(
+        current_token_id,
+        positions=[current_position],
+        attention_len=current_position + 1,
+    )
+    current_captured, current_output = reference_pass(
+        model,
+        current_inputs,
+        use_cache=True,
+        past_key_values=prefix_output.past_key_values,
+        cache_position=torch.arange(current_position, current_position + 1, device="cuda"),
+    )
+
+    return {
+        "prefix_captured": prefix_captured,
+        "prefix_output": prefix_output,
+        "current_captured": current_captured,
+        "current_output": current_output,
+    }
+
+
+def input_batch1(*tokens, mat=None, positions=None, attention_len=None):
     seq_len = len(tokens)
     if mat is not None:
         for i in range(seq_len):
@@ -99,10 +162,12 @@ def input_batch1(*tokens, mat=None, positions=None):
         position_ids = torch.tensor(positions, dtype=torch.long, device="cuda").unsqueeze(0)
     else:
         position_ids = torch.zeros((1, seq_len), dtype=torch.long, device="cuda")
+    if attention_len is None:
+        attention_len = seq_len
 
     return {
         "input_ids": torch.tensor([tokens], device="cuda"),
-        "attention_mask": torch.ones((1, seq_len), dtype=torch.long, device="cuda"),
+        "attention_mask": torch.ones((1, attention_len), dtype=torch.long, device="cuda"),
         "position_ids": position_ids,
     }
 

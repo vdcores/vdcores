@@ -154,7 +154,7 @@ def attention():
 
     # ---- 4. Scaled dot-product attention ---------------------------------
 
-    S = torch.matmul(Q.float(), K.float().transpose(-1, -2)) # [B, KV, GROUP, Qlen, KVlen] f32 as accumulate type
+    S = torch.matmul(Q.float(), K.float().transpose(-1, -2)) / sqrt(HEAD_DIM) # [B, KV, GROUP, Qlen, KVlen] f32 as accumulate type
     P = torch.softmax(S, dim=-1)
     O = torch.matmul(P, V.float()) # [B, KV, GROUP, Qlen, D]
 
@@ -189,7 +189,7 @@ def attention_online(req, head):
         for ki in range(KV_SEQ_LEN // KVTile):
             K_block = K[ki * KVTile: (ki + 1) * KVTile] # [KVTile, HEAD_DIM]
             V_block = V[ki * KVTile: (ki + 1) * KVTile] # [KVTile, HEAD_DIM]
-            S_block = Q_block.float() @ K_block.T.float() # [QTile * HEAD_GROUP_SIZE, KVTile] f32 as accumulate type
+            S_block = (Q_block.float() @ K_block.T.float()) / sqrt(HEAD_DIM) # [QTile * HEAD_GROUP_SIZE, KVTile] f32 as accumulate type
             qk[qi * QTile * HEAD_GROUP_SIZE: (qi + 1) * QTile * HEAD_GROUP_SIZE, ki * KVTile: (ki + 1) * KVTile] = S_block
             # mask S_block column after active kv len to -inf
             for c in range(KVTile):
@@ -227,7 +227,6 @@ refO_detail = refO.view(NUM_REQ, Q_SEQ_LEN, HEAD_GROUP_SIZE, NUM_KV_HEAD, HEAD_D
 # print(rope_table[15,:128])
 
 tensor_diff("Ref and DAE", refO_detail, matO_attn_view.view(NUM_REQ, Q_SEQ_LEN, HEAD_GROUP_SIZE, NUM_KV_HEAD, HEAD_DIM))
-
 dae_app(dae)
 
 # daeQK = matR[0, :, 0].view(KV_SEQ_LEN, Q_SEQ_LEN, HEAD_GROUP_SIZE)

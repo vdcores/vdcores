@@ -11,6 +11,7 @@ from dae.model import *
 from dae.schedule import *
 from dae.util import dae_app
 from reference import (
+    cached_reference_pass,
     check_tensor_threshold,
     input_batch1,
     mean_relative_diff_pct,
@@ -46,6 +47,8 @@ def parse_args():
     arg_parser.add_argument("--correctness", action="store_true")
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     arg_parser.add_argument("--token-pos", type=int, default=0)
+    arg_parser.add_argument("--prefix-token-id", type=int, default=None)
+    arg_parser.add_argument("--prefix-token-ids", default=None)
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
     arg_parser.add_argument("--debug-skip-attn-out-bar", action="store_true")
@@ -142,6 +145,12 @@ def plain_rms_per_head(x, eps):
     return x * torch.rsqrt(variance + eps)
 
 
+def rms_affine(x, weight, eps):
+    x = x.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    return (x * torch.rsqrt(variance + eps)) * weight.float()
+
+
 def build_mlp_chunks(intermediate_size):
     chunks = []
     base = 0
@@ -157,6 +166,18 @@ def build_mlp_chunks(intermediate_size):
         base += size
         remaining -= size
     return tuple(chunks)
+
+
+def parse_prefix_token_ids(prefix_token_ids_arg: str | None):
+    if prefix_token_ids_arg is None:
+        return []
+    prefix_token_ids = []
+    for raw_token in prefix_token_ids_arg.split(","):
+        raw_token = raw_token.strip()
+        if not raw_token:
+            continue
+        prefix_token_ids.append(int(raw_token))
+    return prefix_token_ids
 
 
 def stage_enabled(stop_after: str, stage_name: str) -> bool:
@@ -210,9 +231,17 @@ dae = Launcher(full_sms, device=gpu)
 input_token_id_and_pos = [(791, 0)]
 if parsed_args.token_pos < 0:
     raise ValueError("--token-pos must be non-negative")
+if parsed_args.prefix_token_id is not None and parsed_args.prefix_token_ids is not None:
+    raise ValueError("Use either --prefix-token-id or --prefix-token-ids, not both")
 input_token_id_and_pos = [(791, parsed_args.token_pos)]
 token_offset = 0
 token_id, token_pos = input_token_id_and_pos[0]
+prefix_token_ids = parse_prefix_token_ids(parsed_args.prefix_token_ids)
+if parsed_args.prefix_token_id is not None:
+    prefix_token_ids = [parsed_args.prefix_token_id]
+cached_prefix_mode = len(prefix_token_ids) > 0
+if cached_prefix_mode and token_pos != len(prefix_token_ids):
+    raise ValueError("--token-pos must equal the number of provided prefix tokens")
 
 model = AutoModelForCausalLM.from_pretrained(
     parsed_args.model_name,
@@ -250,6 +279,7 @@ if parsed_args.debug_num_layers is not None:
     layers = layers[:num_layers]
 
 full_correctness = num_layers == len(model.model.layers)
+cached_reference_data = None
 
 assert QW == HIDDEN, "Q projection must map to hidden size"
 
@@ -531,6 +561,20 @@ Argmax = Argmax.place(full_sms)
 
 matTokens[0, token_offset] = token_id
 
+if parsed_args.correctness and cached_prefix_mode:
+    cached_reference_data = cached_reference_pass(
+        model,
+        prefix_token_ids,
+        token_id,
+        prefix_position=0,
+        current_position=token_pos,
+    )
+    prefix_captured = cached_reference_data["prefix_captured"]
+    for i in range(num_layers):
+        for prefix_slot in range(token_pos):
+            attnKs[i][0, prefix_slot].copy_(prefix_captured[i]["k_proj"][0, prefix_slot])
+            attnVs[i][0, prefix_slot].copy_(prefix_captured[i]["v_proj"][0, prefix_slot])
+
 stage_items = [
     ("q_proj", [] if parsed_args.debug_disable_qkv else [QProj]),
     ("k_proj", [] if parsed_args.debug_disable_qkv else [KProj]),
@@ -599,15 +643,50 @@ dae_app(dae)
 
 
 def run_correctness_check():
-    inputs = input_batch1(
-        input_token_id_and_pos[0][0],
-        mat=matTokens[0],
-        positions=[input_token_id_and_pos[0][1]],
-    )
-    captured, _ = reference_pass(model, inputs)
+    if cached_prefix_mode:
+        ref_data = cached_reference_data
+        if ref_data is None:
+            ref_data = cached_reference_pass(
+                model,
+                prefix_token_ids,
+                input_token_id_and_pos[0][0],
+                prefix_position=0,
+                current_position=input_token_id_and_pos[0][1],
+            )
+        captured = ref_data["current_captured"]
+        prefix_captured = ref_data["prefix_captured"]
+        output = ref_data["current_output"]
+    else:
+        inputs = input_batch1(
+            input_token_id_and_pos[0][0],
+            mat=matTokens[0],
+            positions=[input_token_id_and_pos[0][1]],
+        )
+        captured, output = reference_pass(model, inputs)
+        prefix_captured = None
     all_ok = True
     projection_ok = True
+    cache_seed_ok = True
     warnings = []
+
+    if full_correctness:
+        final_rms_input_ref = captured["final"]["final_rms_in"][0, 0]
+        final_rms_ref = captured["final"]["final_rms"][0, 0]
+        dae_manual_final_rms = rms_affine(matHidden[0], matRMSInputW[-1], eps)
+        ref_manual_final_rms = rms_affine(final_rms_input_ref, matRMSInputW[-1], eps)
+        final_rms_input_delta = mean_relative_diff_pct(final_rms_input_ref, matHidden[0], ref=final_rms_input_ref)
+        final_rms_kernel_delta = mean_relative_diff_pct(dae_manual_final_rms, matRMSHidden[0], ref=dae_manual_final_rms)
+        ref_manual_final_rms_delta = mean_relative_diff_pct(ref_manual_final_rms, final_rms_ref, ref=final_rms_ref)
+        logits0_manual = F.linear(matRMSHidden[0].float().unsqueeze(0), matLogitsW[0].float()).squeeze(0)
+        logits0_kernel_delta = mean_relative_diff_pct(
+            logits0_manual[:logits_slice],
+            matLogits[0][0, :logits_slice],
+            ref=logits0_manual[:logits_slice],
+        )
+        print(f"[correctness] final_rms input delta: {final_rms_input_delta:.3f}%")
+        print(f"[correctness] final_rms kernel-only delta: {final_rms_kernel_delta:.3f}%")
+        print(f"[correctness] final_rms HF-manual delta: {ref_manual_final_rms_delta:.3f}%")
+        print(f"[correctness] logits_0 kernel-only delta: {logits0_kernel_delta:.3f}%")
 
     for i in range(min(2, num_layers)):
         layer = captured[i]
@@ -617,6 +696,24 @@ def run_correctness_check():
             check_tensor_threshold("k_proj", layer["k_proj"][0, 0], attnKs[i][0, token_pos], 5.0),
             check_tensor_threshold("v_proj", layer["v_proj"][0, 0], attnVs[i][0, token_pos], 5.0),
         ]
+        if cached_prefix_mode:
+            for prefix_slot in range(token_pos):
+                prefix_checks = [
+                    check_tensor_threshold(
+                        f"prefix_k_proj_{prefix_slot}",
+                        prefix_captured[i]["k_proj"][0, prefix_slot],
+                        attnKs[i][0, prefix_slot],
+                        5.0,
+                    ),
+                    check_tensor_threshold(
+                        f"prefix_v_proj_{prefix_slot}",
+                        prefix_captured[i]["v_proj"][0, prefix_slot],
+                        attnVs[i][0, prefix_slot],
+                        5.0,
+                    ),
+                ]
+                cache_seed_ok = cache_seed_ok and all(passed for passed, _ in prefix_checks)
+            all_ok = all_ok and cache_seed_ok
         prefix_k_max = 0.0
         prefix_v_max = 0.0
         if token_pos > 0:
@@ -649,6 +746,7 @@ def run_correctness_check():
     if full_correctness:
         final_checks.extend(
             [
+                check_tensor_threshold("final_rms_input", captured["final"]["final_rms_in"][0, 0], matHidden[0], 5.0),
                 check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
                 check_tensor_threshold("logits_0", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
             ]
@@ -699,7 +797,7 @@ def run_correctness_check():
 
     token_ok = True
     if full_correctness:
-        ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
+        ref_idx = torch.argmax(output.logits, dim=-1)
         dae_idx = matTokens[0, 1].item()
         token_ok = ref_idx[0, 0].item() == dae_idx
         print(
@@ -708,7 +806,12 @@ def run_correctness_check():
         )
         all_ok = all_ok and token_ok
 
-    if projection_ok and not attn_ok:
+    if cached_prefix_mode and projection_ok and cache_seed_ok and not attn_ok:
+        print(
+            "[correctness] classification: cached prefix/raw KV slots match HF decode; "
+            "remaining gap starts at attention and is consistent with the current per-position K-RoPE limitation"
+        )
+    elif projection_ok and not attn_ok:
         print("[correctness] classification: projections match; fused attention path is the likely mismatch source")
     if not projection_ok:
         print("[correctness] classification: mismatch appears before fused attention, likely in Q/K/V scheduling or stores")

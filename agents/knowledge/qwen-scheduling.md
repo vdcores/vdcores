@@ -23,4 +23,28 @@
   - the packed side-input row layout is `[q_norm_weight[HEAD_DIM], k_norm_weight[HEAD_DIM], rope_row[HEAD_DIM]]`
 - The standalone operator harness for that packed side-input contract is `app/python/attention_qwen_packed_side_input.py`:
   - it isolates one decode attention op with a single active KV token at a nonzero logical position
-  - on 2026-03-21 it matched the PyTorch reference at `0.0%` average diff
+  - it now accepts `--token-pos`, `--cache-mode`, `--rope-mode`, and related debug flags to separate true kernel mismatches from harness mismatches
+  - on 2026-03-21 it matched the PyTorch reference at `0.0%` average diff in single-token mode and about `0.2%` in the empty-prefix-cache operator mode after the QK scaling fix
+- A major fused-attention bug found on 2026-03-21: the decode kernel intended to scale `QK` scores by `1 / sqrt(head_dim)`, but scaling the `frag_Q` operand descriptor did not affect the actual GMMA scores. Moving the scale to the post-GEMM `frag_S` accumulator restored operator correctness for multi-position attention.
+- After that QK scaling fix:
+  - `python app/python/qwen3/sched.py --correctness --token-pos 0` still passes end to end
+  - `python app/python/qwen3/sched.py --correctness --debug-num-layers 1 --token-pos 7` gets worse at `attn_context` (`~12.4%`), which is useful evidence rather than a regression in understanding
+  - that worsening is consistent with the fused operator now matching the true scaled attention math while the runtime path still attends over zero-filled prefix cache slots, unlike the HF single-token reference at `position_ids=[7]`
+  - in other words, the remaining nonzero-position mismatch is now squarely in the debug harness semantics, not in Qwen RoPE layout or packed-side-input attention math
+- As of 2026-03-22, `app/python/qwen3/reference.py` can drive a true HF cached decode step for Qwen:
+  - `reference_pass(...)` now accepts `use_cache`, `past_key_values`, and `cache_position`
+  - `cached_reference_pass(...)` runs one prefix token at position `0`, then replays the current token with the returned `past_key_values`
+  - the reference hooks now also capture `final_rms_in`, which is useful for separating final-stage kernel errors from upstream hidden-state drift
+- As of 2026-03-22, `app/python/qwen3/sched.py` also has a narrow cached-prefix correctness mode:
+  - `--prefix-token-id` enables a `--token-pos 1` check that seeds prefix raw `k_proj` / `v_proj` into DAE cache slot `0` before launch
+  - the current token still writes slot `1` through the normal schedule path and is compared against HF cached decode tensors
+  - `python app/python/qwen3/sched.py --correctness --token-pos 1 --prefix-token-id 791` now passes with explicit prefix/current cache-slot checks
+- On 2026-03-22, token-0 correctness was reconfirmed after adding stronger final-stage diagnostics:
+  - `python app/python/qwen3/sched.py --correctness --token-pos 0` passes end to end
+  - the extra diagnostics showed the final RMS kernel itself stays close (`~0.23%` kernel-only delta) and the previous `final_rms` miss was largely inherited from upstream hidden-state drift rather than a broken final RMS or logits stage
+- As of 2026-03-22, the cached-prefix Qwen correctness path supports more than one prefetched token:
+  - `--prefix-token-ids` accepts a comma-separated prefix sequence and requires `--token-pos` to equal the prefix length
+  - `cached_reference_pass(...)` now runs a true multi-token HF prefix pass, returns `past_key_values`, and replays the current token against that cache
+  - `python app/python/qwen3/sched.py --correctness --token-pos 7 --prefix-token-ids 791,791,791,791,791,791,791` passed end to end with explicit raw prefix-slot checks
+  - this is the strongest maintained in-repo verification for “prefill-like cache then single-token decode” on the Qwen path today
+- The older standalone multi-token prefill attention experiments in `app/python/attention*.py` are currently stale relative to the attention opcode/runtime contract and should not be treated as a source of truth until they are repaired.

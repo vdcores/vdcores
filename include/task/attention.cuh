@@ -333,13 +333,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
         );
     }
 
-    // TODO(zhiyuang): implement scale here for now. could be fused with gemv?
-    // TODO(zhiyuang): vecorized scale?
-    const data_t scale_fp16 = static_cast<data_t>(1.0f / sqrtf((float)HEAD_DIM));
-    #pragma unroll
-    for (int i = 0; i < size(frag_Q); ++i) {
-        frag_Q[i] = frag_Q[i] * scale_fp16;
-    }
+    const accum_t qk_scale = accum_t(1.0f / sqrtf((float)HEAD_DIM));
 
     // O layout
     Tensor t_dummyO = make_tensor(make_smem_ptr((accum_t*)nullptr), layout_sO);
@@ -401,6 +395,10 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
 
         // wait for both previous O and current K
         warpgroup_wait<0>();
+        #pragma unroll
+        for (int i = 0; i < size(frag_S); ++i) {
+            frag_S[i] *= qk_scale;
+        }
         if (kv_block_idx == num_kv_blocks - 1) {
             // mask invalid positions for the last block
             _mask(s_mn_view, last_kv_active_token_len);
