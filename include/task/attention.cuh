@@ -88,7 +88,7 @@ __device__ __forceinline__ void exp_scale(Tensor<EngineS, LayoutS> &acc_fragS, T
 
         #pragma unroll
         for (int c = 0; c < size<0>(acc_fragS); ++c) {
-            acc_fragS(c, r) = (accum_t)expf(acc_fragS(c, r) - row_max(r));
+            acc_fragS(c, r) = (accum_t)exp2f(acc_fragS(c, r) - row_max(r));
         }
     }
 }
@@ -140,7 +140,7 @@ struct OnlineSoftmax {
         // post correction for output fragments
         #pragma unroll
         for (int r = 0; r < tSRow; ++r) {
-            accum_t score_scaler = (accum_t)expf(row_max_prev(r) - row_max(r));
+            accum_t score_scaler = (accum_t)exp2f(row_max_prev(r) - row_max(r));
             // row_sum(r) *= score_scaler;
             scaler(r) = score_scaler;
 
@@ -297,11 +297,10 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     int slot_Q = m2c.template pop<0>();
     data_t* sQ_ptr = (data_t*)get_slot_address(base, extract(slot_Q));
     auto sQ = make_tensor(make_smem_ptr(sQ_ptr), layout_sQ);
-    auto frag_Q = thr_mma_qk.partition_fragment_A(sQ);
-
-    // TODO(zhiyuang): implement scale here for now. could be fused with gemv?
-    // TODO(zhiyuang): vecorized scale?
-    const data_t scale_fp16 = static_cast<data_t>(1.0f / sqrtf((float)HEAD_DIM));
+    // Scale Q in smem cooperatively before WGMMA.
+    // Fuse log2(e) into the scale so all subsequent exp calls can use exp2
+    // exp(x / sqrt(D)) = exp2(x * log2(e) / sqrt(D))
+    const data_t scale_fp16 = static_cast<data_t>(M_LOG2E / sqrtf((float)HEAD_DIM));
     {
         auto sQ_part = thr_mma_qk.partition_A(sQ);
         #pragma unroll
@@ -309,7 +308,9 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
             sQ_part(i) = sQ_part(i) * scale_fp16;
         }
     }
-    __sync_compute_group(128);
+    __sync_compute_group(128); // all threads must finish writing before WGMMA reads
+
+    auto frag_Q = thr_mma_qk.partition_fragment_A(sQ);
 
     // O layout
     Tensor t_dummyO = make_tensor(make_smem_ptr((accum_t*)nullptr), layout_sO);
@@ -483,7 +484,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
         for (int r = 0; r < tSRow; ++r) {
             const int q_row = (thread_id / 32) * 16 + (thread_id % 32) / 4 + r * 8;
             if (q_row < num_active_q) {
-                const accum_t lse = online_softmax.row_max(r) + logf(online_softmax.row_sum(r));
+                const accum_t lse = online_softmax.row_max(r) + log2f(online_softmax.row_sum(r));
                 sLSE_ptr[q_row * MAX_SPLIT + split_idx] = lse;
             }
         }
@@ -548,7 +549,7 @@ __device__ __forceinline__ void task_split_post_reduce(
         for (int s = 0; s < num_split; ++s)
             max_all = fmaxf(max_all, gLSE(my_q, s));
         for (int s = 0; s < num_split; ++s) {
-            sn_arr[s] = expf(gLSE(my_q, s) - max_all);
+            sn_arr[s] = exp2f(gLSE(my_q, s) - max_all);
             sum_all  += sn_arr[s];
         }
     }

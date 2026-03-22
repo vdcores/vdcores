@@ -242,5 +242,5 @@ def split_ref(split_stage):
 #     ref_lse_hkv = ref_lse[0]  # [Hkv, G]
 #     tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
 
-# refQK, refO = gqa_ref()
-# tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
+refQK, refO = gqa_ref()
+tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])

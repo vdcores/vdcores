@@ -10,7 +10,7 @@ from qwen3.utils import *
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 64
+KV_SEQ_LEN = 2048
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
 NUM_REQ = 1
