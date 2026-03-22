@@ -127,12 +127,12 @@ def tma_load_tbl(mat: torch.Tensor, TileM: int, TileN: int):
 
     # assign a different ROPE table for each single req in a batch of TileN
     s = mat.element_size()
-    vec_width = head_dim // 2
     tile_repeats = head_dim // 64
+    rope_tile_width = 64
     # repeat for tileN times
-    glob_dims = [vec_width, TileN, tile_repeats, MAX_SEQ_LEN]
-    glob_strides = [head_dim * s, vec_width * s, head_dim * TileN * s]
-    box_dims = [vec_width, TileN, 1, 1]
+    glob_dims = [rope_tile_width, TileN, tile_repeats, MAX_SEQ_LEN]
+    glob_strides = [head_dim * s, rope_tile_width * s, head_dim * TileN * s]
+    box_dims = [rope_tile_width, TileN, 1, 1]
     rank = len(glob_dims)
     box_strides = [1] * rank
     return rank, runtime.build_tma_desc(
