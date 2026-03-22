@@ -98,7 +98,7 @@ Typical Python-only areas include:
 - `app/python/`
 - `python/dae/`
 
-For fused attention work, reread [agents/knowledge/attention-queue-semantics.md](/home1/11362/depctg/vdcores/agents/knowledge/attention-queue-semantics.md) before changing queue order or adding side inputs. The `m2c.pop()` order must match the schedule's emitted memory order.
+For fused task work, reread [agents/knowledge/task-queue-semantics.md](/home1/11362/depctg/vdcores/agents/knowledge/task-queue-semantics.md) before changing queue order or adding side inputs. The `m2c.pop()` order must match the schedule's emitted memory order.
 
 ## Notes
 

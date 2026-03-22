@@ -39,6 +39,7 @@ struct NormRope {
         const int token_glob_ofst,
         float* smem_reduce,
         const float epsilon, 
+        const vec2_t* norm_weight,
         const vec2_t* rope_table,
         const bool need_rope
     ) {
@@ -48,6 +49,7 @@ struct NormRope {
         const int ofst_in_token_group = __compute_tid() / num_thread_per_token;
         const int lane_in_one_token = __compute_tid() % num_thread_per_token;
         constexpr int num_warp_per_token = num_thread_per_token / 32;
+        constexpr int half_vec_count = HEAD_DIM / 4;
 
         #pragma unroll
         for (int r = ofst_in_token_group; r < total_num_token; r += token_group_size) {
@@ -79,7 +81,8 @@ struct NormRope {
             __sync_barrier<num_thread_per_token>(ofst_in_token_group);
             float rms_rcp = rsqrtf(smem_reduce[ofst_in_token_group] / float(HEAD_DIM) + epsilon);
 
-            // apply scale and rope together
+            // Apply norm first so rotate_half can safely read both halves
+            // from shared memory before any thread overwrites its partner lane.
             const int logical_token_id_in_glob = token_glob_ofst + r / NUM_HEAD;
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
@@ -89,15 +92,32 @@ struct NormRope {
                 // apply norm
                 val_f32.x = val_f32.x * rms_rcp;
                 val_f32.y = val_f32.y * rms_rcp;
+                if (norm_weight != nullptr) {
+                    float2 weight_f32 = __bfloat1622float2(norm_weight[i]);
+                    val_f32.x = val_f32.x * weight_f32.x;
+                    val_f32.y = val_f32.y * weight_f32.y;
+                }
+                input(r, i) = __float22bfloat162_rn(val_f32);
+            }
+            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
 
-                // apply rope
-                if (need_rope) {
-                    float2 cos_sin = __bfloat1622float2(rope_table[HEAD_DIM/2 * logical_token_id_in_glob + i]);
-                    float rotated_even = val_f32.x * cos_sin.x - val_f32.y * cos_sin.y;
-                    float rotated_odd = val_f32.x * cos_sin.y + val_f32.y * cos_sin.x;
-                    input(r, i) = __float22bfloat162_rn({rotated_even, rotated_odd});
-                } else {
-                    input(r, i) = __float22bfloat162_rn(val_f32);
+            if (need_rope) {
+                #pragma unroll
+                for (int i = lane_in_one_token; i < half_vec_count; i += num_thread_per_token) {
+                    float2 first_half = __bfloat1622float2(input(r, i));
+                    float2 second_half = __bfloat1622float2(input(r, i + half_vec_count));
+                    const int rope_row_base = HEAD_DIM / 2 * logical_token_id_in_glob;
+                    float2 cos_pair = __bfloat1622float2(rope_table[rope_row_base + i]);
+                    float2 sin_pair = __bfloat1622float2(rope_table[rope_row_base + half_vec_count + i]);
+
+                    input(r, i) = __float22bfloat162_rn({
+                        first_half.x * cos_pair.x - second_half.x * sin_pair.x,
+                        first_half.y * cos_pair.y - second_half.y * sin_pair.y,
+                    });
+                    input(r, i + half_vec_count) = __float22bfloat162_rn({
+                        second_half.x * cos_pair.x + first_half.x * sin_pair.x,
+                        second_half.y * cos_pair.y + first_half.y * sin_pair.y,
+                    });
                 }
             }
             __sync_barrier<num_thread_per_token>(ofst_in_token_group);

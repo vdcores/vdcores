@@ -45,6 +45,7 @@ def parse_args():
     arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
     arg_parser.add_argument("--correctness", action="store_true")
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
+    arg_parser.add_argument("--token-pos", type=int, default=0)
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
     arg_parser.add_argument("--debug-skip-attn-out-bar", action="store_true")
@@ -80,6 +81,19 @@ def build_interleaved_rope_table(max_seq_len, head_dim, rope_theta, start_pos, d
     return table.contiguous()
 
 
+def build_qwen_rotate_half_rope_table(max_seq_len, head_dim, rope_theta, device, dtype):
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+    )
+    pos_range = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(pos_range, inv_freq)
+    table = torch.empty(max_seq_len, head_dim, dtype=dtype, device=device)
+    table[:, : head_dim // 2] = freqs.cos().to(dtype=dtype)
+    table[:, head_dim // 2 :] = freqs.sin().to(dtype=dtype)
+    return table.contiguous()
+
+
 def rotate_half(x):
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
@@ -98,6 +112,16 @@ def rope_cos_sin(position, head_dim, rope_theta, device):
 def apply_qwen_rotate_half_rope(x, position, head_dim, rope_theta):
     cos, sin = rope_cos_sin(position, head_dim, rope_theta, x.device)
     return (x.float() * cos) + (rotate_half(x.float()) * sin)
+
+
+def apply_qwen_rotate_half_rope_from_table(x, rope_row):
+    half = x.shape[-1] // 2
+    cos = rope_row[:half].float()
+    sin = rope_row[half:].float()
+    x = x.float()
+    first = x[..., :half]
+    second = x[..., half:]
+    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
 
 
 def apply_interleaved_rope(x, position, head_dim, rope_theta):
@@ -184,6 +208,9 @@ full_sms = 132
 dae = Launcher(full_sms, device=gpu)
 
 input_token_id_and_pos = [(791, 0)]
+if parsed_args.token_pos < 0:
+    raise ValueError("--token-pos must be non-negative")
+input_token_id_and_pos = [(791, parsed_args.token_pos)]
 token_offset = 0
 token_id, token_pos = input_token_id_and_pos[0]
 
@@ -222,8 +249,7 @@ if parsed_args.debug_num_layers is not None:
     num_layers = min(num_layers, parsed_args.debug_num_layers)
     layers = layers[:num_layers]
 
-if parsed_args.correctness and num_layers != len(model.model.layers):
-    raise ValueError("Single-token correctness requires the full Qwen3 layer stack")
+full_correctness = num_layers == len(model.model.layers)
 
 assert QW == HIDDEN, "Q projection must map to hidden size"
 
@@ -245,11 +271,10 @@ layerg.addBarrier("bar_post_attn_rms")
 layerg.addBarrier("bar_silu_in")
 layerg.addBarrier("bar_silu_out")
 
-matRope = build_interleaved_rope_table(
+matQwenRope = build_qwen_rotate_half_rope_table(
     MAX_SEQ_LEN,
     HEAD_DIM,
     rope_theta,
-    token_pos,
     gpu,
     torch.bfloat16,
 )
@@ -278,6 +303,11 @@ matGates = [l.mlp.gate_proj.weight for l in layers]
 matDowns = [l.mlp.down_proj.weight for l in layers]
 matQNormWs = [l.self_attn.q_norm.weight for l in layers]
 matKNormWs = [l.self_attn.k_norm.weight for l in layers]
+matAttnSideInput = torch.empty((num_layers, HEAD_DIM * 3), dtype=dtype, device=gpu)
+for i in range(num_layers):
+    matAttnSideInput[i, :HEAD_DIM] = matQNormWs[i]
+    matAttnSideInput[i, HEAD_DIM : 2 * HEAD_DIM] = matKNormWs[i]
+    matAttnSideInput[i, 2 * HEAD_DIM :] = matQwenRope[token_pos]
 
 logits_slice = 64 * full_sms * 6
 vocab_size = model.lm_head.weight.shape[0]
@@ -308,6 +338,7 @@ layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store
 
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
+layerg.addTma("loadAttnSideInput", matAttnSideInput, lambda t: t.tensor1d("load", HEAD_DIM * 3))
 layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
@@ -340,8 +371,6 @@ loadEmbed1D = TmaLoad1D(matEmbed, bytes=HIDDEN * 2)
 storeHidden1D = TmaStore1D(matHidden, bytes=HIDDEN * 2)
 loadHidden1D = TmaLoad1D(matHidden, bytes=HIDDEN * 2)
 storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
-loadRope1D = TmaLoad1D(matRope[token_pos], bytes=HEAD_DIM * matRope.element_size())
-
 embed_rms = SchedRMSShared(
     num_token=N,
     epsilon=eps,
@@ -408,7 +437,7 @@ Gqa = SchedAttentionDecoding(
     tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
     need_norm=True,
     need_rope=True,
-    rope_table=loadRope1D,
+    side_input=layerg["loadAttnSideInput"],
 ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
 OutProj = SchedGemv(
@@ -588,13 +617,20 @@ def run_correctness_check():
             check_tensor_threshold("k_proj", layer["k_proj"][0, 0], attnKs[i][0, token_pos], 5.0),
             check_tensor_threshold("v_proj", layer["v_proj"][0, 0], attnVs[i][0, token_pos], 5.0),
         ]
+        prefix_k_max = 0.0
+        prefix_v_max = 0.0
+        if token_pos > 0:
+            prefix_k_max = attnKs[i][0, :token_pos].abs().max().item()
+            prefix_v_max = attnVs[i][0, :token_pos].abs().max().item()
         future_k_max = 0.0
         if token_pos + 1 < MAX_SEQ_LEN:
             future_k_max = attnKs[i][0, token_pos + 1 :].abs().max().item()
         print(
             f"[correctness] k_cache[{i}] current-token diff uses raw k_proj; "
-            f"future-position max={future_k_max:.6f}"
+            f"prefix max={prefix_k_max:.6f}, future-position max={future_k_max:.6f}"
         )
+        if token_pos > 0:
+            print(f"[correctness] v_cache[{i}] prefix max={prefix_v_max:.6f}")
         if future_k_max > 1e-5:
             print("[correctness] FAIL k_cache_future_positions: K cache store touched positions beyond the current token")
             all_ok = False
@@ -609,34 +645,41 @@ def run_correctness_check():
         check_tensor_threshold("up_proj", last_layer["up_proj"][0, 0], matInterm[0], 5.0),
         check_tensor_threshold("silu", F.silu(last_layer["gate_proj"][0, 0]) * last_layer["up_proj"][0, 0], matSiLUOut[0], 5.0),
         check_tensor_threshold("final_hidden", last_layer["hidden_state_out"][0, 0], matHidden[0], 5.0),
-        check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
-        check_tensor_threshold("logits_0", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
     ]
-    if logits_epoch > 1:
-        for i in range(1, logits_epoch):
-            start = i * logits_slice
-            end = min(vocab_size, start + logits_slice)
-            final_checks.append(
-                check_tensor_threshold(
-                    f"logits_{i}",
-                    captured["final"]["lm_head"][0, 0, start:end],
-                    matLogits[i][0, : end - start],
-                    10.0,
+    if full_correctness:
+        final_checks.extend(
+            [
+                check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
+                check_tensor_threshold("logits_0", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
+            ]
+        )
+        if logits_epoch > 1:
+            for i in range(1, logits_epoch):
+                start = i * logits_slice
+                end = min(vocab_size, start + logits_slice)
+                final_checks.append(
+                    check_tensor_threshold(
+                        f"logits_{i}",
+                        captured["final"]["lm_head"][0, 0, start:end],
+                        matLogits[i][0, : end - start],
+                        10.0,
+                    )
                 )
-            )
     all_ok = all_ok and attn_ok and all(passed for passed, _ in final_checks)
 
     q_norm_plain = plain_rms_per_head(last_layer["q_proj"][0, 0].view(config.num_attention_heads, HEAD_DIM), eps)
+    q_norm_weighted = q_norm_plain * matQNormWs[num_layers - 1].float().unsqueeze(0)
     q_norm_ref = last_layer["q_norm"][0, 0].float()
     k_norm_plain = plain_rms_per_head(last_layer["k_proj"][0, 0].view(config.num_key_value_heads, HEAD_DIM), eps)
+    k_norm_weighted = k_norm_plain * matKNormWs[num_layers - 1].float().unsqueeze(0)
     k_norm_ref = last_layer["k_norm"][0, 0].float()
-    q_affine_diff = mean_relative_diff_pct(q_norm_ref, q_norm_plain, ref=q_norm_ref)
-    k_affine_diff = mean_relative_diff_pct(k_norm_ref, k_norm_plain, ref=k_norm_ref)
+    q_affine_diff = mean_relative_diff_pct(q_norm_ref, q_norm_weighted, ref=q_norm_ref)
+    k_affine_diff = mean_relative_diff_pct(k_norm_ref, k_norm_weighted, ref=k_norm_ref)
     print(f"[correctness] q_norm affine delta: {q_affine_diff:.3f}%")
     print(f"[correctness] k_norm affine delta: {k_affine_diff:.3f}%")
     if q_affine_diff > 0.5 or k_affine_diff > 0.5:
         warnings.append("qk_norm_affine")
-        print("[correctness] WARN qk_norm_affine: HF Q/K norm weights are not identity-scale")
+        print("[correctness] WARN qk_norm_affine: weighted RMS still diverges from HF q_norm/k_norm")
 
     sanity_inputs = input_batch1(input_token_id_and_pos[0][0], positions=[7])
     sanity_captured, _ = reference_pass(model, sanity_inputs)
@@ -644,24 +687,26 @@ def run_correctness_check():
     q_norm_nonzero = sanity_layer["q_norm"][0, 0]
     k_norm_nonzero = sanity_layer["k_norm"][0, 0]
     q_hf = apply_qwen_rotate_half_rope(q_norm_nonzero, 7, HEAD_DIM, rope_theta)
-    q_inter = apply_interleaved_rope(q_norm_nonzero, 7, HEAD_DIM, rope_theta)
+    q_table = apply_qwen_rotate_half_rope_from_table(q_norm_nonzero, matQwenRope[7])
     k_hf = apply_qwen_rotate_half_rope(k_norm_nonzero, 7, HEAD_DIM, rope_theta)
-    k_inter = apply_interleaved_rope(k_norm_nonzero, 7, HEAD_DIM, rope_theta)
-    q_rope_diff = mean_relative_diff_pct(q_hf, q_inter, ref=q_hf)
-    k_rope_diff = mean_relative_diff_pct(k_hf, k_inter, ref=k_hf)
+    k_table = apply_qwen_rotate_half_rope_from_table(k_norm_nonzero, matQwenRope[7])
+    q_rope_diff = mean_relative_diff_pct(q_hf, q_table, ref=q_hf)
+    k_rope_diff = mean_relative_diff_pct(k_hf, k_table, ref=k_hf)
     print(f"[correctness] nonzero-pos rope delta q={q_rope_diff:.3f}% k={k_rope_diff:.3f}%")
     if q_rope_diff > 1.0 or k_rope_diff > 1.0:
         warnings.append("rope_rotation")
-        print("[correctness] WARN rope_rotation: current interleaved rotation diverges from HF rotate_half semantics")
+        print("[correctness] WARN rope_rotation: queued rope-table layout still diverges from HF rotate_half semantics")
 
-    ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
-    dae_idx = matTokens[0, 1].item()
-    token_ok = ref_idx[0, 0].item() == dae_idx
-    print(
-        f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: "
-        f"ref={ref_idx[0, 0].item()}, dae={dae_idx}"
-    )
-    all_ok = all_ok and token_ok
+    token_ok = True
+    if full_correctness:
+        ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
+        dae_idx = matTokens[0, 1].item()
+        token_ok = ref_idx[0, 0].item() == dae_idx
+        print(
+            f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: "
+            f"ref={ref_idx[0, 0].item()}, dae={dae_idx}"
+        )
+        all_ok = all_ok and token_ok
 
     if projection_ok and not attn_ok:
         print("[correctness] classification: projections match; fused attention path is the likely mismatch source")
@@ -672,9 +717,11 @@ def run_correctness_check():
         raise RuntimeError("Correctness check failed")
     if warnings:
         print(
-            "[correctness] single-token position-0 path passed; "
+            f"[correctness] single-token position-{token_pos} path passed; "
             f"supplemental warnings remain: {', '.join(warnings)}"
         )
+    if not full_correctness:
+        print(f"[correctness] partial-layer debug mode: validated {num_layers} layer(s) and skipped final logits/token checks")
     print("[correctness] all checks passed")
 
 

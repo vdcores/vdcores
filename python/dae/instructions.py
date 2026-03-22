@@ -119,9 +119,8 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
         last_kv_active_token_len: int,
         need_norm: bool = True,
         need_rope: bool = True,
-        use_tma_side_input: bool = False,
     ):
-        need_flag = (need_norm << 0) | (need_rope << 1) | (use_tma_side_input << 2)
+        need_flag = (need_norm << 0) | (need_rope << 1)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
             args=[num_kv_block, last_kv_active_token_len, need_flag],
@@ -137,9 +136,8 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
         last_kv_active_token_len: int,
         need_norm: bool = True,
         need_rope: bool = True,
-        use_tma_side_input: bool = False,
     ):
-        need_flag = (need_norm << 0) | (need_rope << 1) | (use_tma_side_input << 2)
+        need_flag = (need_norm << 0) | (need_rope << 1)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
             args=[num_kv_block, last_kv_active_token_len, need_flag],

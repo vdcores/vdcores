@@ -255,7 +255,7 @@ class SchedAttentionDecoding(Schedule):
                  tmas,
                  need_norm: bool = False,
                  need_rope: bool = False,
-                 rope_table = None,
+                 side_input = None,
                  output_tma = None):
         super().__init__()
         self.reqs = reqs
@@ -265,8 +265,7 @@ class SchedAttentionDecoding(Schedule):
         self.tmas = tmas
         self.need_norm = need_norm
         self.need_rope = need_rope
-        self.rope_table = rope_table
-        self.use_tma_side_input = need_rope and rope_table is not None and not isinstance(rope_table, RawAddress)
+        self.side_input = side_input
         self.output_tma = output_tma
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
@@ -274,8 +273,10 @@ class SchedAttentionDecoding(Schedule):
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
-        if self.need_rope and self.rope_table is None:
-            raise ValueError("SchedAttentionDecoding requires a rope_table when need_rope=True")
+        if (self.need_norm or self.need_rope) and self.side_input is None:
+            raise ValueError("SchedAttentionDecoding requires a queued side_input buffer when need_norm or need_rope is enabled")
+        if isinstance(self.side_input, RawAddress):
+            raise ValueError("SchedAttentionDecoding requires side_input to be a queued TMA/shared-memory input, not RawAddress")
 
     def schedule(self, sm: int):
         if sm < 0:
@@ -301,9 +302,8 @@ class SchedAttentionDecoding(Schedule):
                 seq_len_last_block,
                 need_norm=self.need_norm,
                 need_rope=self.need_rope,
-                use_tma_side_input=self.use_tma_side_input,
             ),
-            self.rope_table if self.need_rope else [],
+            self.side_input.cord(0) if (self.need_norm or self.need_rope) else [],
             tQ.cord(req, head).bar(self._bar("q")).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load

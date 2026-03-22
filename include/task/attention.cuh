@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cmath>
-#include <cfloat>
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
@@ -180,7 +179,6 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int last_kv_active_token_len, // real kv tokens in the last block
     const bool need_norm,
     const bool need_rope,
-    const bool use_tma_side_input,
     void *base,
     float *smem_reduce,
     const MInst *st_insts,
@@ -293,16 +291,25 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     // 4. O = diag(exp(m_old - m)) * O + PV
 
     int slot_side_input = -1;
+    const vec2_t* side_input_base = nullptr;
+    const vec2_t* q_norm_weight = nullptr;
+    const vec2_t* k_norm_weight = nullptr;
     const vec2_t* rope_side_input = nullptr;
     constexpr float qk_norm_epsilon = 1.0e-6f;
-    if (need_rope) {
-        if (use_tma_side_input) {
-            slot_side_input = m2c.template pop<0>();
-            rope_side_input = reinterpret_cast<const vec2_t*>(
-                get_slot_address(base, extract(slot_side_input))
-            );
-        } else {
-            rope_side_input = reinterpret_cast<const vec2_t*>(slot_2_glob_ptr(st_insts, 24));
+    if (need_norm || need_rope) {
+        slot_side_input = m2c.template pop<0>();
+        side_input_base = reinterpret_cast<const vec2_t*>(
+            get_slot_address(base, extract(slot_side_input))
+        );
+        int side_input_offset = 0;
+        if (need_norm) {
+            q_norm_weight = side_input_base + side_input_offset;
+            side_input_offset += HEAD_DIM / 2;
+            k_norm_weight = side_input_base + side_input_offset;
+            side_input_offset += HEAD_DIM / 2;
+        }
+        if (need_rope) {
+            rope_side_input = side_input_base + side_input_offset;
         }
     }
 
@@ -320,6 +327,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
             0,
             smem_reduce,
             qk_norm_epsilon,
+            q_norm_weight,
             rope_side_input,
             need_rope
         );
@@ -372,6 +380,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
                 0,
                 smem_reduce,
                 qk_norm_epsilon,
+                k_norm_weight,
                 rope_side_input,
                 need_rope
             );
