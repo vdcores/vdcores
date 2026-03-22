@@ -17,13 +17,15 @@ NUM_REQ = 1
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
+MAX_SPLIT = 16
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
 QTile = 16
 KVTile = 64
 
-split_kv = 1
+split_kv = 4
+assert split_kv <= MAX_SPLIT
 num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
 assert num_sms <= 132 # max sm count for HX00
 
@@ -34,7 +36,7 @@ matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(split_kv, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, split_kv, dtype=torch.bfloat16, device=gpu)
+matP = torch.zeros(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, MAX_SPLIT, dtype=torch.float, device=gpu)
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
@@ -83,10 +85,37 @@ def cord_load_o(mat: torch.Tensor, rank: int):
         return [0, 0, 0, cords[0] * NUM_KV_HEAD + cords[1]]
     return cfunc
 
+def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
+    assert tileS == split_kv
+    assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
+    S, R, H, G, D = mat.shape
+    permute = [4, 3, 0, 2, 1] # [D, G, S, H, R]
+    glob_dims = [mat.shape[i] for i in permute]
+    glob_strides = [mat.stride(i) * mat.element_size() for i in permute[1:]]
+    box_dims = [D, G, split_kv, 1, 1]
+    rank = len(glob_dims)
+    box_strides = [1] * rank
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        box_strides,
+        0,
+        0
+    )
+
+def cord_load_split_attn(mat: torch.Tensor, rank: int):
+    assert rank == 5, "Only support 5D TMA load for split attn output"
+    def cfunc(*cords):
+        assert len(cords) == 2, f"cords should be (head, req), but got {cords}"
+        return [0, 0, cords[0], cords[1]]
+    return cfunc
 
 tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
+tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
 
 need_norm = False
 need_rope = False
@@ -108,7 +137,6 @@ def sm_task(sm: int):
     kv_start_block = split_stage * num_block_per_split
     kv_start_idx = kv_start_block * KVTile
     split_last_active_kv_len = last_active_kv_len if split_stage == split_kv - 1 else KVTile
-    print(sm, num_block_per_split, split_stage)
     insts = [
         ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, split_stage, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_idx, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
@@ -129,8 +157,9 @@ def sm_task(sm: int):
     insts += [
         ATTN_SPLIT_POST_REDUCE(split_kv),
         RawAddress(matP[head], 25).bar(attn_bar),
-        RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
-        TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
+        # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
+        # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
+        tO_split.cord(head, req),
         TmaStore1D(matO_attn_view[req, head, ...]),
     ]
     return insts
@@ -159,7 +188,7 @@ def gqa_ref():
     # Q: [B, Hkv, G, D]
     # K.transpose(-1, -2): [B, Hkv, D, S]
     # result: [B, Hkv, G, S]
-    QK = torch.matmul(Q, K.transpose(-1, -2))
+    QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
     # apply mask according to lsat_active_kv_len
     total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
     mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
@@ -170,6 +199,48 @@ def gqa_ref():
 
     # output = attn @ V
     return QK, torch.matmul(attn, V)
+
+
+def split_ref(split_stage):
+    """Per-split reference: each split computes local softmax only over its own KV slice.
+    Returns O_local = softmax_local(Q @ K_split^T / sqrt(D)) @ V_split  [B, Hkv, G, D]
+    and     lse     = max_local + log(sum_local)                         [B, Hkv, G]
+    """
+    num_block_per_split = NUM_KV_BLOCK // split_kv
+    kv_start = split_stage * num_block_per_split * KVTile
+    kv_end   = kv_start + num_block_per_split * KVTile
+    split_last_active = last_active_kv_len if split_stage == split_kv - 1 else KVTile
+    total_active = (num_block_per_split - 1) * KVTile + split_last_active
+
+    Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+    K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
+    V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
+
+    K_split = K[:, :, kv_start:kv_end, :]   # [B, Hkv, S_split, D]
+    V_split = V[:, :, kv_start:kv_end, :]
+
+    scale = 1.0 / sqrt(HEAD_DIM)
+    QK = torch.matmul(Q * scale, K_split.transpose(-1, -2))  # [B, Hkv, G, S_split]
+
+    # mask tokens beyond the active length in this split's last block
+    S_split = kv_end - kv_start
+    mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= total_active
+    QK = QK.masked_fill(mask, float("-inf"))
+
+    lse  = torch.logsumexp(QK, dim=-1)    # [B, Hkv, G]
+    attn = torch.softmax(QK, dim=-1)      # [B, Hkv, G, S_split]
+    O    = torch.matmul(attn, V_split)    # [B, Hkv, G, D]
+
+    return O.bfloat16(), lse
+
+
+for s in range(split_kv):
+    ref_O, ref_lse = split_ref(s)
+    # matO_split_attn_view: [split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM]
+    tensor_diff(f"Split {s} O", ref_O[0], matO_split_attn_view[s, 0])
+    # matP: [NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, split_kv], written as float32 by kernel
+    ref_lse_hkv = ref_lse[0]  # [Hkv, G]
+    tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
 
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])

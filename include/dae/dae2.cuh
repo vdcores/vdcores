@@ -192,7 +192,7 @@ void dae2(
         }
           break;
         case OP_ATTN_SPLIT_POST_REDUCE: {
-          task_split_post_reduce<128, 4, 64, 16>(inst.args[0], smem_base, (float*)scratch_space, st_insts, m2c, c2m);
+          task_split_post_reduce<128, 4, 64, 16, 32>(inst.args[0], smem_base, (float*)scratch_space, st_insts, m2c, c2m);
         }
           break;
         case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64: {

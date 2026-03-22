@@ -302,10 +302,14 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     // TODO(zhiyuang): implement scale here for now. could be fused with gemv?
     // TODO(zhiyuang): vecorized scale?
     const data_t scale_fp16 = static_cast<data_t>(1.0f / sqrtf((float)HEAD_DIM));
-    #pragma unroll
-    for (int i = 0; i < size(frag_Q); ++i) {
-        frag_Q[i] = frag_Q[i] * scale_fp16;
+    {
+        auto sQ_part = thr_mma_qk.partition_A(sQ);
+        #pragma unroll
+        for (int i = 0; i < size(sQ_part); ++i) {
+            sQ_part(i) = sQ_part(i) * scale_fp16;
+        }
     }
+    __sync_compute_group(128);
 
     // O layout
     Tensor t_dummyO = make_tensor(make_smem_ptr((accum_t*)nullptr), layout_sO);
@@ -492,6 +496,7 @@ template <int HEAD_DIM,
           int NUM_Q,
           int KV_BLOCK_SIZE,
           int MAX_SPLIT,
+          int THREADS_PER_Q,   // tuning knob: threads assigned to each Q row
           typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_split_post_reduce(
     const int num_split,
@@ -501,71 +506,86 @@ __device__ __forceinline__ void task_split_post_reduce(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
-    // we now have output: exp(QK^T) / sum_local @ V and sum_local
-    // get final score with exp(QK^T) / sum_global @ V
-    using namespace cute;
-    using data_t = __nv_bfloat16;
-    using accum_t = float;
-    using Tr = F16Traits<data_t>;
-    using vec2_t = typename Tr::vec2_t;
+    static_assert(NUM_Q * THREADS_PER_Q <= 128, "active threads must not exceed warpgroup size");
+    static_assert((HEAD_DIM / 2) % THREADS_PER_Q == 0, "HEAD_DIM/2 must be divisible by THREADS_PER_Q");
 
-    static_assert(HEAD_DIM == 128, "currently we hardcode head dim to 128 for simplicity");
+    // ELEMS_PER_THREAD: consecutive vec2 columns each active thread accumulates.
+    // ACTIVE_THREADS: threads [0, ACTIVE_THREADS) do work; the rest participate in syncs only.
+    constexpr int ELEMS_PER_THREAD = (HEAD_DIM / 2) / THREADS_PER_Q;
+    constexpr int ACTIVE_THREADS   = NUM_Q * THREADS_PER_Q;
+
+    using namespace cute;
+    using data_t  = __nv_bfloat16;
+    using accum_t = float;
+    using Tr      = F16Traits<data_t>;
+    using vec2_t  = typename Tr::vec2_t;
 
     const int thread_id = threadIdx.x;
+    const int my_q      = thread_id / THREADS_PER_Q;
+    const int my_i_base = (thread_id % THREADS_PER_Q) * ELEMS_PER_THREAD;
 
-    auto layout_lse = make_layout(
-        make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
-        LayoutRight{});
-    const int slot_lse = m2c.template pop<0>();
-    accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
-    auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
     auto layout_sO = make_layout(
         make_shape(Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
         LayoutRight{});
-    auto frag_O = make_tensor<float2>(layout_sO);
-    auto frag_max = make_tensor<accum_t>(Shape<Int<NUM_Q>>{});
-    auto frag_sum = make_tensor<accum_t>(Shape<Int<NUM_Q>>{});
+    auto layout_split_O = make_layout(
+        make_shape(num_split, Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
+        LayoutRight{});
+    auto layout_lse = make_layout(
+        make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
+        LayoutRight{});
 
-    clear(frag_O);
-    clear(frag_sum);
-    fill(frag_max, -FLT_MAX);
-    
-    // still do rolling update to ensure numerical stability
-#pragma unroll
-    for (int split_idx = 0; split_idx < num_split; ++split_idx) {
-        const int slot_O = m2c.template pop<0>();
-        vec2_t* sO_ptr = (vec2_t*)get_slot_address(base, extract(slot_O));
-        auto sO = make_tensor(make_smem_ptr(sO_ptr), layout_sO);
+    // LSE lives in global memory.
+    const int slot_lse = m2c.template pop<0>();
+    const accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
+    auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
 
-#pragma unroll
-        for (int q = 0; q < NUM_Q; ++q) {
-            const accum_t _old_max = frag_max(q), _old_sum = frag_sum(q);
-            const accum_t _cur_max = gLSE(q, split_idx);
-            const accum_t _max = max(_old_max, _cur_max);
-            const accum_t scale_prev = expf(_old_max - _max);
-            const accum_t scale_new = expf(_cur_max - _max);
+    const int slot_split = m2c.template pop<0>();
+    const vec2_t* __restrict__ split_O_ptr = (vec2_t*)get_slot_address(base, extract(slot_split));
+    auto split_O = make_tensor(make_smem_ptr(split_O_ptr), layout_split_O);
 
-            frag_sum(q) = _old_sum * scale_prev + scale_new;
-            for (int i = thread_id; i < HEAD_DIM/2; i += 128) {
-                float2 oo = Tr::to_float2(sO(q, i));
-                frag_O(q,i).x = frag_O(q,i).x * scale_prev + oo.x * scale_new;
-                frag_O(q,i).y = frag_O(q,i).y * scale_prev + oo.y * scale_new;
+    // Per-thread accumulators: ELEMS_PER_THREAD float2 + scalar max/sum.
+    // Register footprint is O(ELEMS_PER_THREAD) per thread, independent of NUM_Q or MAX_SPLIT.
+    float2 acc[ELEMS_PER_THREAD];
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; ++e) acc[e] = {0.f, 0.f};
+    accum_t row_max = -FLT_MAX;
+    accum_t row_sum = 0.f;
+
+    if (thread_id < ACTIVE_THREADS) {
+        for (int s = 0; s < num_split; ++s) {
+            const accum_t lse     = gLSE(my_q, s);
+            const accum_t new_max = fmaxf(row_max, lse);
+            const accum_t sp      = expf(row_max - new_max);
+            const accum_t sn      = expf(lse     - new_max);
+            row_max = new_max;
+            row_sum = row_sum * sp + sn;
+
+            #pragma unroll
+            for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
+                float2 oo = Tr::to_float2(split_O(s, my_q, my_i_base + e));
+                acc[e].x = acc[e].x * sp + oo.x * sn;
+                acc[e].y = acc[e].y * sp + oo.y * sn;
             }
         }
-        __sync_compute_group(128);
-        c2m.push(thread_id, slot_O);
     }
 
+    // One sync covers all splits. Idle threads just wait here.
+    __sync_compute_group(128);
+    c2m.push(thread_id, slot_split);
+
+    // Normalize and write to output smem.
     const int slot_final = m2c.template pop<0>();
     vec2_t* sF_ptr = (vec2_t*)get_slot_address(base, extract(slot_final));
     auto sF = make_tensor(make_smem_ptr(sF_ptr), layout_sO);
-#pragma unroll
-    for (int q = 0; q < NUM_Q; ++ q) {
-        for (int i = thread_id; i < HEAD_DIM/2; i += 128) {
-            frag_O(q,i).x = frag_O(q,i).x / frag_sum(q);
-            frag_O(q,i).y = frag_O(q,i).y / frag_sum(q);
-            sF(q, i) = Tr::from_float2(frag_O(q,i));
+
+    if (thread_id < ACTIVE_THREADS) {
+        const accum_t inv_sum = 1.f / row_sum;
+        #pragma unroll
+        for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
+            sF(my_q, my_i_base + e) = Tr::from_float2({acc[e].x * inv_sum, acc[e].y * inv_sum});
         }
     }
+
+    __sync_compute_group(128);
     c2m.template push<0, true>(thread_id, slot_final);
 }
