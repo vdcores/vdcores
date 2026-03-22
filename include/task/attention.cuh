@@ -534,37 +534,43 @@ __device__ __forceinline__ void task_split_post_reduce(
         make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
         LayoutRight{});
 
-    // LSE lives in global memory.
+    // LSE lives in global memory — available immediately (raw address, no TMA wait).
     const int slot_lse = m2c.template pop<0>();
     const accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
     auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
 
+    // Phase 1: preprocess LSE while the split-O TMA load is still in flight.
+    // Each thread caches num_split scale factors (one scalar per split, not per element).
+    accum_t sn_arr[MAX_SPLIT];
+    accum_t sum_all = 0.f;
+    if (thread_id < ACTIVE_THREADS) {
+        accum_t max_all = -FLT_MAX;
+        for (int s = 0; s < num_split; ++s)
+            max_all = fmaxf(max_all, gLSE(my_q, s));
+        for (int s = 0; s < num_split; ++s) {
+            sn_arr[s] = expf(gLSE(my_q, s) - max_all);
+            sum_all  += sn_arr[s];
+        }
+    }
+
+    // Block on the TMA only now — overlap with phase 1 gives it extra time to complete.
     const int slot_split = m2c.template pop<0>();
     const vec2_t* __restrict__ split_O_ptr = (vec2_t*)get_slot_address(base, extract(slot_split));
     auto split_O = make_tensor(make_smem_ptr(split_O_ptr), layout_split_O);
 
-    // Per-thread accumulators: ELEMS_PER_THREAD float2 + scalar max/sum.
-    // Register footprint is O(ELEMS_PER_THREAD) per thread, independent of NUM_Q or MAX_SPLIT.
+    // Phase 2: accumulate. No rolling sp term — global max is fixed, inner loop is pure fma.
     float2 acc[ELEMS_PER_THREAD];
     #pragma unroll
     for (int e = 0; e < ELEMS_PER_THREAD; ++e) acc[e] = {0.f, 0.f};
-    accum_t row_max = -FLT_MAX;
-    accum_t row_sum = 0.f;
 
     if (thread_id < ACTIVE_THREADS) {
         for (int s = 0; s < num_split; ++s) {
-            const accum_t lse     = gLSE(my_q, s);
-            const accum_t new_max = fmaxf(row_max, lse);
-            const accum_t sp      = expf(row_max - new_max);
-            const accum_t sn      = expf(lse     - new_max);
-            row_max = new_max;
-            row_sum = row_sum * sp + sn;
-
+            const accum_t sn = sn_arr[s];
             #pragma unroll
             for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
                 float2 oo = Tr::to_float2(split_O(s, my_q, my_i_base + e));
-                acc[e].x = acc[e].x * sp + oo.x * sn;
-                acc[e].y = acc[e].y * sp + oo.y * sn;
+                acc[e].x += oo.x * sn;
+                acc[e].y += oo.y * sn;
             }
         }
     }
@@ -579,7 +585,7 @@ __device__ __forceinline__ void task_split_post_reduce(
     auto sF = make_tensor(make_smem_ptr(sF_ptr), layout_sO);
 
     if (thread_id < ACTIVE_THREADS) {
-        const accum_t inv_sum = 1.f / row_sum;
+        const accum_t inv_sum = 1.f / sum_all;
         #pragma unroll
         for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
             sF(my_q, my_i_base + e) = Tr::from_float2({acc[e].x * inv_sum, acc[e].y * inv_sum});

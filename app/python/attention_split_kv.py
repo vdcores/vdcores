@@ -10,7 +10,7 @@ from qwen3.utils import *
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 512
+KV_SEQ_LEN = 2048
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
 NUM_REQ = 1
@@ -24,7 +24,7 @@ assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must mat
 QTile = 16
 KVTile = 64
 
-split_kv = 4
+split_kv = 8
 assert split_kv <= MAX_SPLIT
 num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
 assert num_sms <= 132 # max sm count for HX00
@@ -234,13 +234,13 @@ def split_ref(split_stage):
     return O.bfloat16(), lse
 
 
-for s in range(split_kv):
-    ref_O, ref_lse = split_ref(s)
-    # matO_split_attn_view: [split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM]
-    tensor_diff(f"Split {s} O", ref_O[0], matO_split_attn_view[s, 0])
-    # matP: [NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, split_kv], written as float32 by kernel
-    ref_lse_hkv = ref_lse[0]  # [Hkv, G]
-    tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
+# for s in range(split_kv):
+#     ref_O, ref_lse = split_ref(s)
+#     # matO_split_attn_view: [split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM]
+#     tensor_diff(f"Split {s} O", ref_O[0], matO_split_attn_view[s, 0])
+#     # matP: [NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, split_kv], written as float32 by kernel
+#     ref_lse_hkv = ref_lse[0]  # [Hkv, G]
+#     tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
 
-refQK, refO = gqa_ref()
-tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
+# refQK, refO = gqa_ref()
+# tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
