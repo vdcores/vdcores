@@ -75,3 +75,8 @@ ncu_tmp
 *.sqlite
 .claude/
 .agentlog/
+
+# vdcores debug
+debug*.log
+inst*.txt
+inst*.dump
