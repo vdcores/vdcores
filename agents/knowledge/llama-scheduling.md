@@ -42,3 +42,19 @@
 - `CC0` now carries the embedding row stride as a shift width, so power-of-two row sizes like `4096` bytes (`2048` bf16) and `8192` bytes (`4096` bf16) use the same fast path.
 - The runtime now has a dedicated attention decode opcode/instruction path for `head_dim=64`, and the Python attention schedulers now select the decode instruction from `head_dim`.
 - The isolated 1B path now verifies end to end against `unsloth/Llama-3.2-1B-Instruct` for single-token correctness.
+
+## Performance Debugging Notes
+
+- Process hygiene matters for this app. Before collecting timings, clear leftover decode jobs with `killall python || true`; stale Python workers can make the benchmark look dramatically worse than the clean baseline.
+- The timeout wrapper is useful for separating deadlocks from slow schedules:
+  `python tests/script/run_with_launch_timeout.py --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python app/python/llama32_1b/sched.py ...`
+- On 2026-03-21, clean sequential benchmark measurements from the current branch were:
+  - `N=1`: about `1.22 ms`
+  - `N=2`: about `6.42 ms` total, `3.21 ms/token`
+  - `N=4`: about `9.94 ms` total, `2.49 ms/token`
+  - `N=8`: about `26.37 ms` total, `3.30 ms/token`
+  - `N=16`: about `65.45 ms` total, `4.09 ms/token`
+- For longer multi-token runs on the current branch, fresh one-shot `-b 1` launches were more trustworthy than repeated `-b 3` averages; repeated launches in one process showed unstable timings and likely need separate reset-path debugging.
+- The current one-token path is already close to the target; the larger remaining gap is multi-token scaling.
+- The full multi-token path launched successfully under the timeout wrapper for `N=2`, so the current main issue is not a full-path deadlock.
+- The partial multi-token debug harness is still incomplete: `--debug-stop-after final_rms` timed out after launch for `N=2` with both `7` and `8` layers, so stage-by-stage timing past that point should not yet be trusted on the multi-token path.

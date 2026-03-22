@@ -178,8 +178,10 @@ class ResourceGroup:
                 if i == 0:
                     self.tma_insts[name] = tmaInst
 
-        # TODO(zhiyuang): include over group by default
-        num_bar_repeat = 1 if self.repeat == 1 else self.repeat + 1
+        # Schedules may still use next()/over() even when repeat == 1, so always
+        # materialize the extra barrier instance for the "after the last repeat"
+        # state instead of special-casing single-repeat groups.
+        num_bar_repeat = self.repeat + 1
         for i in range(num_bar_repeat):
             for name, bar_info in self.bars.items():
                 bar_id = launcher.new_bar(bar_info["count"])

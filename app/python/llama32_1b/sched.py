@@ -190,6 +190,11 @@ def parse_args():
     arg_parser.add_argument("--debug-print-barriers", action="store_true")
     arg_parser.add_argument("--debug-q-sms", type=int, default=None)
     arg_parser.add_argument("--debug-q-store-mode", choices=("auto", "reduce", "store"), default="auto")
+    arg_parser.add_argument("--debug-k-sms", type=int, default=None)
+    arg_parser.add_argument("--debug-v-sms", type=int, default=None)
+    arg_parser.add_argument("--debug-out-sms", type=int, default=None)
+    arg_parser.add_argument("--debug-down-low-sms", type=int, default=None)
+    arg_parser.add_argument("--debug-down-high-sms", type=int, default=None)
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
         remaining_argv = [*remaining_argv, "--launch"]
@@ -470,6 +475,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
     regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
     regLoadQ = RegLoad(0)
     q_sms = parsed_args.debug_q_sms or 64
+    k_sms = parsed_args.debug_k_sms or 16
+    v_sms = parsed_args.debug_v_sms or 16
+    out_sms = parsed_args.debug_out_sms or 64
+    down_low_sms = parsed_args.debug_down_low_sms or 96
+    down_high_sms = parsed_args.debug_down_high_sms or 64
     q_store_mode = parsed_args.debug_q_store_mode
     if q_store_mode == "auto":
         q_store_mode = "store" if q_sms == (QW // TileM) else "reduce"
@@ -631,11 +641,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
     post_attn_rms = post_attn_rms.place(rms_sms)
     QProj = QProj.place(q_sms)
     QRope = QRope.place(q_sms)
-    KProj = KProj.place(16, base_sm=64)
-    KRope = KRope.place(16, base_sm=64)
-    VProj = VProj.place(16, base_sm=80)
+    KProj = KProj.place(k_sms, base_sm=64)
+    KRope = KRope.place(k_sms, base_sm=64)
+    VProj = VProj.place(v_sms, base_sm=64 + k_sms)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
-    OutProj = OutProj.place(64)
+    OutProj = OutProj.place(out_sms)
     gate_proj_low = gate_proj_low.place(64)
     gate_proj_high = gate_proj_high.place(64)
     up_proj_low = up_proj_low.place(64, base_sm=64)
@@ -644,8 +654,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
     gate_proj_fused = gate_proj_fused.place(32)
     up_proj_fused = up_proj_fused.place(32)
     silu_fused = silu_fused.place(32)
-    down_proj_low = down_proj_low.place(96)
-    down_proj_high = down_proj_high.place(64)
+    down_proj_low = down_proj_low.place(down_low_sms)
+    down_proj_high = down_proj_high.place(down_high_sms)
     Argmax = Argmax.place(128)
     restore_bars_low = restore_bars_low.place(1, base_sm=128)
     restore_bars_high = restore_bars_high.place(1, base_sm=128)
@@ -767,7 +777,11 @@ else:
         print(
             f"[debug] stop_after={parsed_args.debug_stop_after}, "
             f"num_layers={num_layers}, q_sms={parsed_args.debug_q_sms or 64}, "
-            f"q_store_mode={parsed_args.debug_q_store_mode}"
+            f"q_store_mode={parsed_args.debug_q_store_mode}, "
+            f"k_sms={parsed_args.debug_k_sms or 16}, v_sms={parsed_args.debug_v_sms or 16}, "
+            f"out_sms={parsed_args.debug_out_sms or 64}, "
+            f"down_low_sms={parsed_args.debug_down_low_sms or 96}, "
+            f"down_high_sms={parsed_args.debug_down_high_sms or 64}"
         )
     dae.s()
     dae_app(dae)
