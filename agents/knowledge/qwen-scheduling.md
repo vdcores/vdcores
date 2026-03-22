@@ -47,4 +47,19 @@
   - `cached_reference_pass(...)` now runs a true multi-token HF prefix pass, returns `past_key_values`, and replays the current token against that cache
   - `python app/python/qwen3/sched.py --correctness --token-pos 7 --prefix-token-ids 791,791,791,791,791,791,791` passed end to end with explicit raw prefix-slot checks
   - this is the strongest maintained in-repo verification for “prefill-like cache then single-token decode” on the Qwen path today
+- As of 2026-03-22, the Qwen app is split more cleanly by responsibility:
+  - `app/python/qwen3/sched.py` focuses on schedule/runtime setup
+  - `app/python/qwen3/correctness.py` owns the Qwen-specific correctness harness, cache seeding helper, and final-stage diagnostics
+  - `app/python/qwen3/debug_utils.py` owns the debug-stage ordering and late-barrier binding helpers
+- For this machine, rebuilding after CUDA/header edits should follow the workflow reset exactly:
+  - `source "$(conda info --base)/etc/profile.d/conda.sh"`
+  - `conda deactivate`
+  - `conda activate`
+  - `make pyext`
+  - this recovery path was reverified on 2026-03-22 after the default shell state hit the known `nvcc` unsupported-GCC failure
+- The Qwen decode attention changes that remain necessary against `main` are:
+  - queued packed side input for `[q_norm_weight, k_norm_weight, rope_row]`
+  - fused RMS+affine on both Q and K before RoPE
+  - score scaling on `frag_S` after `QK` GEMM, with `expf` softmax math to match that scaling path
+  - an updated kernel signature that uses runtime `need_norm` / `need_rope` flags; the old compile-time template booleans for those modes were redundant and were dropped during wrap-up
 - The older standalone multi-token prefill attention experiments in `app/python/attention*.py` are currently stale relative to the attention opcode/runtime contract and should not be treated as a source of truth until they are repaired.

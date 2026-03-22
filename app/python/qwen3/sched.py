@@ -5,17 +5,20 @@ import sys
 from functools import partial
 
 import torch
-import torch.nn.functional as F
 from dae.launcher import *
 from dae.model import *
 from dae.schedule import *
 from dae.util import dae_app
-from reference import (
-    cached_reference_pass,
-    check_tensor_threshold,
-    input_batch1,
-    mean_relative_diff_pct,
-    reference_pass,
+from correctness import (
+    QwenCorrectnessContext,
+    run_correctness_check,
+    seed_cached_prefix_kv,
+)
+from debug_utils import (
+    DEBUG_STAGE_ORDER,
+    bind_late_barriers_with_default,
+    bind_unused_late_barriers_to_zero,
+    stage_enabled,
 )
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -23,23 +26,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-8B"
 DEFAULT_MAX_SEQ_LEN = 512
 ATTN_REQS = 8
-DEBUG_STAGE_ORDER = (
-    "embed",
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "attn",
-    "out",
-    "post_attn_rms",
-    "gate",
-    "up",
-    "silu",
-    "down",
-    "final_rms",
-    "logits",
-    "argmax",
-    "full",
-)
+
+
 def parse_args():
     arg_parser = argparse.ArgumentParser(add_help=False)
     arg_parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
@@ -71,19 +59,6 @@ def get_rope_theta(config):
     raise ValueError("Could not determine rope_theta from config")
 
 
-def build_interleaved_rope_table(max_seq_len, head_dim, rope_theta, start_pos, device, dtype):
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
-    )
-    pos_range = torch.arange(start_pos, start_pos + max_seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(pos_range, inv_freq)
-    table = torch.empty(max_seq_len, head_dim, dtype=dtype, device=device)
-    table[:, 0::2] = freqs.cos().to(dtype=dtype)
-    table[:, 1::2] = freqs.sin().to(dtype=dtype)
-    return table.contiguous()
-
-
 def build_qwen_rotate_half_rope_table(max_seq_len, head_dim, rope_theta, device, dtype):
     inv_freq = 1.0 / (
         rope_theta
@@ -95,60 +70,6 @@ def build_qwen_rotate_half_rope_table(max_seq_len, head_dim, rope_theta, device,
     table[:, : head_dim // 2] = freqs.cos().to(dtype=dtype)
     table[:, head_dim // 2 :] = freqs.sin().to(dtype=dtype)
     return table.contiguous()
-
-
-def rotate_half(x):
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
-def rope_cos_sin(position, head_dim, rope_theta, device):
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
-    )
-    freqs = position * inv_freq
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos(), emb.sin()
-
-
-def apply_qwen_rotate_half_rope(x, position, head_dim, rope_theta):
-    cos, sin = rope_cos_sin(position, head_dim, rope_theta, x.device)
-    return (x.float() * cos) + (rotate_half(x.float()) * sin)
-
-
-def apply_qwen_rotate_half_rope_from_table(x, rope_row):
-    half = x.shape[-1] // 2
-    cos = rope_row[:half].float()
-    sin = rope_row[half:].float()
-    x = x.float()
-    first = x[..., :half]
-    second = x[..., half:]
-    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
-
-
-def apply_interleaved_rope(x, position, head_dim, rope_theta):
-    freqs = position * (
-        1.0
-        / (rope_theta ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim))
-    )
-    cos = freqs.cos()
-    sin = freqs.sin()
-    even = x.float()[..., 0::2]
-    odd = x.float()[..., 1::2]
-    return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
-
-
-def plain_rms_per_head(x, eps):
-    x = x.float()
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    return x * torch.rsqrt(variance + eps)
-
-
-def rms_affine(x, weight, eps):
-    x = x.float()
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    return (x * torch.rsqrt(variance + eps)) * weight.float()
 
 
 def build_mlp_chunks(intermediate_size):
@@ -178,44 +99,6 @@ def parse_prefix_token_ids(prefix_token_ids_arg: str | None):
             continue
         prefix_token_ids.append(int(raw_token))
     return prefix_token_ids
-
-
-def stage_enabled(stop_after: str, stage_name: str) -> bool:
-    requested_idx = DEBUG_STAGE_ORDER.index(stop_after)
-    stage_idx = DEBUG_STAGE_ORDER.index(stage_name)
-    return stage_idx <= requested_idx
-
-
-def bind_unused_late_barriers_to_zero(dae):
-    for group in dae.resource_groups.values():
-        for name, bar_info in group.bars.items():
-            if bar_info["late_bind"] and bar_info["count"] is None:
-                group.bindBarrier(name, 0)
-
-
-def bind_late_barriers_with_default(dae, *insts, unresolved_count=None):
-    bar_counts = dae.collect_barrier_release_counts(*insts)
-    for group in dae.resource_groups.values():
-        for name, bar_info in group.bars.items():
-            if not bar_info["late_bind"] or bar_info["count"] is not None:
-                continue
-
-            matched_counts = {
-                bar_counts[bar_id]
-                for bar_id in group.bar_instances.get(name, [])
-                if bar_id in bar_counts
-            }
-            if len(matched_counts) == 1:
-                group.bindBarrier(name, matched_counts.pop())
-                continue
-            if len(matched_counts) == 0 and unresolved_count is not None:
-                group.bindBarrier(name, unresolved_count)
-                continue
-            if len(matched_counts) > 1:
-                raise ValueError(
-                    f"Barrier {group.name}.{name} observed inconsistent release counts: {sorted(matched_counts)}"
-                )
-            raise ValueError(f"Could not infer release count for barrier {group.name}.{name}")
 
 
 parsed_args = parse_args()
@@ -562,18 +445,15 @@ Argmax = Argmax.place(full_sms)
 matTokens[0, token_offset] = token_id
 
 if parsed_args.correctness and cached_prefix_mode:
-    cached_reference_data = cached_reference_pass(
+    cached_reference_data = seed_cached_prefix_kv(
         model,
         prefix_token_ids,
         token_id,
-        prefix_position=0,
-        current_position=token_pos,
+        token_pos=token_pos,
+        num_layers=num_layers,
+        attnKs=attnKs,
+        attnVs=attnVs,
     )
-    prefix_captured = cached_reference_data["prefix_captured"]
-    for i in range(num_layers):
-        for prefix_slot in range(token_pos):
-            attnKs[i][0, prefix_slot].copy_(prefix_captured[i]["k_proj"][0, prefix_slot])
-            attnVs[i][0, prefix_slot].copy_(prefix_captured[i]["v_proj"][0, prefix_slot])
 
 stage_items = [
     ("q_proj", [] if parsed_args.debug_disable_qkv else [QProj]),
@@ -642,191 +522,40 @@ dae.s()
 dae_app(dae)
 
 
-def run_correctness_check():
-    if cached_prefix_mode:
-        ref_data = cached_reference_data
-        if ref_data is None:
-            ref_data = cached_reference_pass(
-                model,
-                prefix_token_ids,
-                input_token_id_and_pos[0][0],
-                prefix_position=0,
-                current_position=input_token_id_and_pos[0][1],
-            )
-        captured = ref_data["current_captured"]
-        prefix_captured = ref_data["prefix_captured"]
-        output = ref_data["current_output"]
-    else:
-        inputs = input_batch1(
-            input_token_id_and_pos[0][0],
-            mat=matTokens[0],
-            positions=[input_token_id_and_pos[0][1]],
-        )
-        captured, output = reference_pass(model, inputs)
-        prefix_captured = None
-    all_ok = True
-    projection_ok = True
-    cache_seed_ok = True
-    warnings = []
-
-    if full_correctness:
-        final_rms_input_ref = captured["final"]["final_rms_in"][0, 0]
-        final_rms_ref = captured["final"]["final_rms"][0, 0]
-        dae_manual_final_rms = rms_affine(matHidden[0], matRMSInputW[-1], eps)
-        ref_manual_final_rms = rms_affine(final_rms_input_ref, matRMSInputW[-1], eps)
-        final_rms_input_delta = mean_relative_diff_pct(final_rms_input_ref, matHidden[0], ref=final_rms_input_ref)
-        final_rms_kernel_delta = mean_relative_diff_pct(dae_manual_final_rms, matRMSHidden[0], ref=dae_manual_final_rms)
-        ref_manual_final_rms_delta = mean_relative_diff_pct(ref_manual_final_rms, final_rms_ref, ref=final_rms_ref)
-        logits0_manual = F.linear(matRMSHidden[0].float().unsqueeze(0), matLogitsW[0].float()).squeeze(0)
-        logits0_kernel_delta = mean_relative_diff_pct(
-            logits0_manual[:logits_slice],
-            matLogits[0][0, :logits_slice],
-            ref=logits0_manual[:logits_slice],
-        )
-        print(f"[correctness] final_rms input delta: {final_rms_input_delta:.3f}%")
-        print(f"[correctness] final_rms kernel-only delta: {final_rms_kernel_delta:.3f}%")
-        print(f"[correctness] final_rms HF-manual delta: {ref_manual_final_rms_delta:.3f}%")
-        print(f"[correctness] logits_0 kernel-only delta: {logits0_kernel_delta:.3f}%")
-
-    for i in range(min(2, num_layers)):
-        layer = captured[i]
-        print(f"[correctness] Layer {i}:")
-        checks = [
-            check_tensor_threshold("q_proj", layer["q_proj"][0, 0], attnQs[i][0], 5.0),
-            check_tensor_threshold("k_proj", layer["k_proj"][0, 0], attnKs[i][0, token_pos], 5.0),
-            check_tensor_threshold("v_proj", layer["v_proj"][0, 0], attnVs[i][0, token_pos], 5.0),
-        ]
-        if cached_prefix_mode:
-            for prefix_slot in range(token_pos):
-                prefix_checks = [
-                    check_tensor_threshold(
-                        f"prefix_k_proj_{prefix_slot}",
-                        prefix_captured[i]["k_proj"][0, prefix_slot],
-                        attnKs[i][0, prefix_slot],
-                        5.0,
-                    ),
-                    check_tensor_threshold(
-                        f"prefix_v_proj_{prefix_slot}",
-                        prefix_captured[i]["v_proj"][0, prefix_slot],
-                        attnVs[i][0, prefix_slot],
-                        5.0,
-                    ),
-                ]
-                cache_seed_ok = cache_seed_ok and all(passed for passed, _ in prefix_checks)
-            all_ok = all_ok and cache_seed_ok
-        prefix_k_max = 0.0
-        prefix_v_max = 0.0
-        if token_pos > 0:
-            prefix_k_max = attnKs[i][0, :token_pos].abs().max().item()
-            prefix_v_max = attnVs[i][0, :token_pos].abs().max().item()
-        future_k_max = 0.0
-        if token_pos + 1 < MAX_SEQ_LEN:
-            future_k_max = attnKs[i][0, token_pos + 1 :].abs().max().item()
-        print(
-            f"[correctness] k_cache[{i}] current-token diff uses raw k_proj; "
-            f"prefix max={prefix_k_max:.6f}, future-position max={future_k_max:.6f}"
-        )
-        if token_pos > 0:
-            print(f"[correctness] v_cache[{i}] prefix max={prefix_v_max:.6f}")
-        if future_k_max > 1e-5:
-            print("[correctness] FAIL k_cache_future_positions: K cache store touched positions beyond the current token")
-            all_ok = False
-        projection_ok = projection_ok and all(passed for passed, _ in checks)
-        all_ok = all_ok and projection_ok
-
-    last_layer = captured[num_layers - 1]
-    print(f"[correctness] Layer {num_layers - 1}:")
-    attn_ok, _ = check_tensor_threshold("attn_context", last_layer["attn_context"][0, 0], attnO[0], 5.0)
-    final_checks = [
-        check_tensor_threshold("gate_proj", last_layer["gate_proj"][0, 0], matGateOut[0], 5.0),
-        check_tensor_threshold("up_proj", last_layer["up_proj"][0, 0], matInterm[0], 5.0),
-        check_tensor_threshold("silu", F.silu(last_layer["gate_proj"][0, 0]) * last_layer["up_proj"][0, 0], matSiLUOut[0], 5.0),
-        check_tensor_threshold("final_hidden", last_layer["hidden_state_out"][0, 0], matHidden[0], 5.0),
-    ]
-    if full_correctness:
-        final_checks.extend(
-            [
-                check_tensor_threshold("final_rms_input", captured["final"]["final_rms_in"][0, 0], matHidden[0], 5.0),
-                check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
-                check_tensor_threshold("logits_0", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
-            ]
-        )
-        if logits_epoch > 1:
-            for i in range(1, logits_epoch):
-                start = i * logits_slice
-                end = min(vocab_size, start + logits_slice)
-                final_checks.append(
-                    check_tensor_threshold(
-                        f"logits_{i}",
-                        captured["final"]["lm_head"][0, 0, start:end],
-                        matLogits[i][0, : end - start],
-                        10.0,
-                    )
-                )
-    all_ok = all_ok and attn_ok and all(passed for passed, _ in final_checks)
-
-    q_norm_plain = plain_rms_per_head(last_layer["q_proj"][0, 0].view(config.num_attention_heads, HEAD_DIM), eps)
-    q_norm_weighted = q_norm_plain * matQNormWs[num_layers - 1].float().unsqueeze(0)
-    q_norm_ref = last_layer["q_norm"][0, 0].float()
-    k_norm_plain = plain_rms_per_head(last_layer["k_proj"][0, 0].view(config.num_key_value_heads, HEAD_DIM), eps)
-    k_norm_weighted = k_norm_plain * matKNormWs[num_layers - 1].float().unsqueeze(0)
-    k_norm_ref = last_layer["k_norm"][0, 0].float()
-    q_affine_diff = mean_relative_diff_pct(q_norm_ref, q_norm_weighted, ref=q_norm_ref)
-    k_affine_diff = mean_relative_diff_pct(k_norm_ref, k_norm_weighted, ref=k_norm_ref)
-    print(f"[correctness] q_norm affine delta: {q_affine_diff:.3f}%")
-    print(f"[correctness] k_norm affine delta: {k_affine_diff:.3f}%")
-    if q_affine_diff > 0.5 or k_affine_diff > 0.5:
-        warnings.append("qk_norm_affine")
-        print("[correctness] WARN qk_norm_affine: weighted RMS still diverges from HF q_norm/k_norm")
-
-    sanity_inputs = input_batch1(input_token_id_and_pos[0][0], positions=[7])
-    sanity_captured, _ = reference_pass(model, sanity_inputs)
-    sanity_layer = sanity_captured[0]
-    q_norm_nonzero = sanity_layer["q_norm"][0, 0]
-    k_norm_nonzero = sanity_layer["k_norm"][0, 0]
-    q_hf = apply_qwen_rotate_half_rope(q_norm_nonzero, 7, HEAD_DIM, rope_theta)
-    q_table = apply_qwen_rotate_half_rope_from_table(q_norm_nonzero, matQwenRope[7])
-    k_hf = apply_qwen_rotate_half_rope(k_norm_nonzero, 7, HEAD_DIM, rope_theta)
-    k_table = apply_qwen_rotate_half_rope_from_table(k_norm_nonzero, matQwenRope[7])
-    q_rope_diff = mean_relative_diff_pct(q_hf, q_table, ref=q_hf)
-    k_rope_diff = mean_relative_diff_pct(k_hf, k_table, ref=k_hf)
-    print(f"[correctness] nonzero-pos rope delta q={q_rope_diff:.3f}% k={k_rope_diff:.3f}%")
-    if q_rope_diff > 1.0 or k_rope_diff > 1.0:
-        warnings.append("rope_rotation")
-        print("[correctness] WARN rope_rotation: queued rope-table layout still diverges from HF rotate_half semantics")
-
-    token_ok = True
-    if full_correctness:
-        ref_idx = torch.argmax(output.logits, dim=-1)
-        dae_idx = matTokens[0, 1].item()
-        token_ok = ref_idx[0, 0].item() == dae_idx
-        print(
-            f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: "
-            f"ref={ref_idx[0, 0].item()}, dae={dae_idx}"
-        )
-        all_ok = all_ok and token_ok
-
-    if cached_prefix_mode and projection_ok and cache_seed_ok and not attn_ok:
-        print(
-            "[correctness] classification: cached prefix/raw KV slots match HF decode; "
-            "remaining gap starts at attention and is consistent with the current per-position K-RoPE limitation"
-        )
-    elif projection_ok and not attn_ok:
-        print("[correctness] classification: projections match; fused attention path is the likely mismatch source")
-    if not projection_ok:
-        print("[correctness] classification: mismatch appears before fused attention, likely in Q/K/V scheduling or stores")
-
-    if not all_ok:
-        raise RuntimeError("Correctness check failed")
-    if warnings:
-        print(
-            f"[correctness] single-token position-{token_pos} path passed; "
-            f"supplemental warnings remain: {', '.join(warnings)}"
-        )
-    if not full_correctness:
-        print(f"[correctness] partial-layer debug mode: validated {num_layers} layer(s) and skipped final logits/token checks")
-    print("[correctness] all checks passed")
-
-
 if parsed_args.correctness:
-    run_correctness_check()
+    run_correctness_check(
+        QwenCorrectnessContext(
+            model=model,
+            config=config,
+            eps=eps,
+            rope_theta=rope_theta,
+            token_id=token_id,
+            token_pos=token_pos,
+            prefix_token_ids=prefix_token_ids,
+            cached_prefix_mode=cached_prefix_mode,
+            num_layers=num_layers,
+            full_correctness=full_correctness,
+            max_seq_len=MAX_SEQ_LEN,
+            head_dim=HEAD_DIM,
+            logits_epoch=logits_epoch,
+            logits_slice=logits_slice,
+            vocab_size=vocab_size,
+            cached_reference_data=cached_reference_data,
+            matTokens=matTokens,
+            matHidden=matHidden,
+            matRMSHidden=matRMSHidden,
+            attnQs=attnQs,
+            attnKs=attnKs,
+            attnVs=attnVs,
+            attnO=attnO,
+            matInterm=matInterm,
+            matGateOut=matGateOut,
+            matSiLUOut=matSiLUOut,
+            matRMSInputW=matRMSInputW,
+            matQNormWs=matQNormWs,
+            matKNormWs=matKNormWs,
+            matQwenRope=matQwenRope,
+            matLogits=matLogits,
+            matLogitsW=matLogitsW,
+        )
+    )

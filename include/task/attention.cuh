@@ -172,7 +172,6 @@ struct OnlineSoftmax {
 template <int HEAD_DIM,
           int Q_BLOCK_SIZE,
           int KV_BLOCK_SIZE,
-          bool NEED_NORM, bool NEED_ROPE,
           typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int num_kv_blocks,
