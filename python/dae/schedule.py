@@ -252,19 +252,30 @@ class SchedAttentionDecoding(Schedule):
     def __init__(self, reqs: int, seq_len: int,
                  KV_BLOCK_SIZE : int, NUM_KV_HEADS : int,
                  matO : torch.Tensor,
-                 tmas):
+                 tmas,
+                 need_norm: bool = False,
+                 need_rope: bool = False,
+                 rope_table = None,
+                 output_tma = None):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
         self.num_heads = NUM_KV_HEADS
         self.matO = matO
         self.tmas = tmas
+        self.need_norm = need_norm
+        self.need_rope = need_rope
+        self.rope_table = rope_table
+        self.use_tma_side_input = need_rope and rope_table is not None and not isinstance(rope_table, RawAddress)
+        self.output_tma = output_tma
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
+        if self.need_rope and self.rope_table is None:
+            raise ValueError("SchedAttentionDecoding requires a rope_table when need_rope=True")
 
     def schedule(self, sm: int):
         if sm < 0:
@@ -278,9 +289,21 @@ class SchedAttentionDecoding(Schedule):
         num_kv_blocks = (self.seq_len + self.block_size - 1) // self.block_size
         seq_len_last_block = self.seq_len % self.block_size
 
+        if self.output_tma is None:
+            output_store = TmaStore1D(self.matO[req, head, ...])
+        else:
+            output_store = self.output_tma.cord(req, head)
+
         # we only handle a single Q token here
         insts = [
-            self.AttentionInst(num_kv_blocks, seq_len_last_block, need_norm=False, need_rope=False),
+            self.AttentionInst(
+                num_kv_blocks,
+                seq_len_last_block,
+                need_norm=self.need_norm,
+                need_rope=self.need_rope,
+                use_tma_side_input=self.use_tma_side_input,
+            ),
+            self.rope_table if self.need_rope else [],
             tQ.cord(req, head).bar(self._bar("q")).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
@@ -291,7 +314,7 @@ class SchedAttentionDecoding(Schedule):
             # only the last block has new generated KV cache
             tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group(),
             tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group(),
-            TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group(),
+            output_store.bar(self._bar("o")).group(),
         ]
         return insts
 

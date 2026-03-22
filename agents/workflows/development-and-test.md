@@ -98,6 +98,8 @@ Typical Python-only areas include:
 - `app/python/`
 - `python/dae/`
 
+For fused attention work, reread [agents/knowledge/attention-queue-semantics.md](/home1/11362/depctg/vdcores/agents/knowledge/attention-queue-semantics.md) before changing queue order or adding side inputs. The `m2c.pop()` order must match the schedule's emitted memory order.
+
 ## Notes
 
 - `-b` is the short form of `--bench` and defaults to one benchmark iteration.
@@ -109,6 +111,7 @@ Typical Python-only areas include:
 - The benchmark command succeeded against the existing environment and extension artifacts.
 - For the isolated `N=8` MMA GEMV path, use `app/python/gemv_mma_out.py` as the dedicated harness instead of modifying `app/python/gemv_out.py`.
 - If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
+  This repo already verified this exact recovery path on 2026-03-21; prefer it over ad hoc `nvcc` flag changes.
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"

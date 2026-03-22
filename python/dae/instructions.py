@@ -113,8 +113,15 @@ class ROPE_INTERLEAVE_512(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
-        need_flag = (need_norm << 0) | (need_rope << 1)
+    def __init__(
+        self,
+        num_kv_block: int,
+        last_kv_active_token_len: int,
+        need_norm: bool = True,
+        need_rope: bool = True,
+        use_tma_side_input: bool = False,
+    ):
+        need_flag = (need_norm << 0) | (need_rope << 1) | (use_tma_side_input << 2)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
             args=[num_kv_block, last_kv_active_token_len, need_flag],
@@ -124,8 +131,15 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
-        need_flag = (need_norm << 0) | (need_rope << 1)
+    def __init__(
+        self,
+        num_kv_block: int,
+        last_kv_active_token_len: int,
+        need_norm: bool = True,
+        need_rope: bool = True,
+        use_tma_side_input: bool = False,
+    ):
+        need_flag = (need_norm << 0) | (need_rope << 1) | (use_tma_side_input << 2)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
             args=[num_kv_block, last_kv_active_token_len, need_flag],

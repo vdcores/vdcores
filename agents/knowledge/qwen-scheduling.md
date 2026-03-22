@@ -1,0 +1,22 @@
+# Qwen Scheduling Notes
+
+- The current Qwen3 single-token path lives in `app/python/qwen3/sched.py` and targets `Qwen/Qwen3-8B`.
+- The app currently keeps both the GEMV batch width and decode attention request count at `N=8` / `REQ=8`, so decode attention occupies `reqs * num_kv_heads = 64` SMs on Qwen3-8B.
+- Q/K/V projections are stored to global buffers first. K/V cache writes use `ToAttnVStoreCordAdapter(..., token_pos)` so the schedule only updates the current token position instead of restaging a whole KV tile.
+- The Qwen correctness harness lives in `app/python/qwen3/reference.py` and captures `q_norm`, `k_norm`, and `attn_context` in addition to the standard layer outputs.
+- The current fused attention bring-up treats two kernel-risk areas as first-class diagnostics:
+  - Q/K norm affine weights may be non-identity even when plain RMS scaling matches.
+  - Qwen3 HF RoPE uses `rotate_half`, while the current runtime rope path is interleaved-pair based.
+- For the current decode attention bring-up, the RoPE side input is being moved from a raw special-slot pointer toward a queued side-input load. When debugging that path, use `agents/knowledge/attention-queue-semantics.md` as the source of truth for slot ordering and return timing.
+- On 2026-03-21, the single-token position-0 Qwen3-8B correctness path was brought back to green:
+  - `python app/python/qwen3/sched.py --correctness` now passes end to end.
+  - The decode attention path consumes the current RoPE row through a queued `TmaLoad1D` side input before `Q`, instead of relying on a raw special-slot pointer.
+  - The Qwen MLP SiLU stage must be sliced into two `6144`-wide passes; reusing the Llama `SchedSmemSiLUInterleaved` path on the full `12288` width leaves the tail half of the row uncomputed.
+- The correctness harness still prints two non-blocking Qwen-specific warnings that need future kernel work:
+  - learned Q/K norm affine weights are not fused yet
+  - nonzero-position Qwen `rotate_half` RoPE semantics still differ from the current interleaved fused rope path
+- One-layer debug runs on 2026-03-21 showed:
+  - `q_proj`, `k_proj`, and `v_proj` can match HF closely on the Qwen3 path.
+  - The first correctness collapse happens at attention output: `attnO` diverged by about `100%` relative mean diff from HF-attention context.
+  - HF `q_norm` vs plain per-head RMS scaling differed materially (`~52.6%` for Q, `~76.1%` for K), so the fused `need_norm` path is missing or mismatching learned affine weights for this model.
+  - HF `rotate_half` RoPE vs the current interleaved rotation differed materially at nonzero position (`~54.1%` for Q, `~23.8%` for K), so the current fused RoPE mode does not match Qwen3 semantics.

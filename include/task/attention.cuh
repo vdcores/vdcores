@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cfloat>
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
@@ -179,6 +180,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int last_kv_active_token_len, // real kv tokens in the last block
     const bool need_norm,
     const bool need_rope,
+    const bool use_tma_side_input,
     void *base,
     float *smem_reduce,
     const MInst *st_insts,
@@ -290,11 +292,38 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     // load V
     // 4. O = diag(exp(m_old - m)) * O + PV
 
+    int slot_side_input = -1;
+    const vec2_t* rope_side_input = nullptr;
+    constexpr float qk_norm_epsilon = 1.0e-6f;
+    if (need_rope) {
+        if (use_tma_side_input) {
+            slot_side_input = m2c.template pop<0>();
+            rope_side_input = reinterpret_cast<const vec2_t*>(
+                get_slot_address(base, extract(slot_side_input))
+            );
+        } else {
+            rope_side_input = reinterpret_cast<const vec2_t*>(slot_2_glob_ptr(st_insts, 24));
+        }
+    }
+
     // load Qtile
     int slot_Q = m2c.template pop<0>();
     data_t* sQ_ptr = (data_t*)get_slot_address(base, extract(slot_Q));
     auto sQ = make_tensor(make_smem_ptr(sQ_ptr), layout_sQ);
     auto frag_Q = thr_mma_qk.partition_fragment_A(sQ);
+    auto sQ_vec = make_tensor(make_smem_ptr((vec2_t*)sQ_ptr), layout_sQ_vec);
+
+    if (need_norm || need_rope) {
+        NormRope<Q_BLOCK_SIZE, HEAD_DIM, 128, data_t>::fused_norm_and_rope(
+            sQ_vec,
+            Q_BLOCK_SIZE,
+            0,
+            smem_reduce,
+            qk_norm_epsilon,
+            rope_side_input,
+            need_rope
+        );
+    }
 
     // TODO(zhiyuang): implement scale here for now. could be fused with gemv?
     // TODO(zhiyuang): vecorized scale?
@@ -335,6 +364,18 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
         auto sK = make_tensor(make_smem_ptr(sK_ptr), layout_sK);
         auto frag_K = thr_mma_qk.partition_fragment_B(sK);
         auto sK_vec = make_tensor(make_smem_ptr((vec2_t*)sK_ptr), layout_sK_vec);
+
+        if (need_norm || need_rope) {
+            NormRope<KV_BLOCK_SIZE, HEAD_DIM, 128, data_t>::fused_norm_and_rope(
+                sK_vec,
+                KV_BLOCK_SIZE,
+                0,
+                smem_reduce,
+                qk_norm_epsilon,
+                rope_side_input,
+                need_rope
+            );
+        }
 
         // 1. S = QK^T
         warpgroup_arrive();
@@ -451,6 +492,9 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     c2m.push(thread_id, slot_V);
     c2m.push(thread_id, slot_oldK);
     c2m.push(thread_id, slot_Q);
+    if (slot_side_input >= 0) {
+        c2m.push(thread_id, slot_side_input);
+    }
     
     // final correction
     // row sum is still thread local now
@@ -469,4 +513,3 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
 
     c2m.template push<0, true>(thread_id, slot_O);
 }
-
