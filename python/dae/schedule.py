@@ -432,6 +432,7 @@ class SchedGemv(Schedule):
         # TODO(zhiyuang): more validation on fold?
         TileM, TileN, TileK = self.Atom.MNK
         M, N, K = self.MNK
+        min_k_per_fold = TileK * self.Atom.n_batch
 
         assert K % TileK == 0
         assert M % TileM == 0
@@ -445,6 +446,14 @@ class SchedGemv(Schedule):
         assert K % self.fold == 0
         assert self.sm_per_fold == (M // TileM), "Invalid fold for given SMS and M size"
         assert self.k_per_fold % TileK == 0, "Invalid fold for given K size"
+        assert self.k_per_fold % min_k_per_fold == 0, (
+            f"Invalid fold for {self.Atom.__name__}: k_per_fold={self.k_per_fold} must be a multiple of "
+            f"TileK * n_batch = {TileK} * {self.Atom.n_batch} = {min_k_per_fold}"
+        )
+        assert self.k_per_fold >= min_k_per_fold, (
+            f"Invalid fold for {self.Atom.__name__}: k_per_fold={self.k_per_fold} must be at least "
+            f"TileK * n_batch = {TileK} * {self.Atom.n_batch} = {min_k_per_fold}"
+        )
 
         # verify storeC. if fold > 1, storeC must be reduction
         assert len(self.tmas) == 3, "Expect at 3 TMA tensors: loadA, loadB, storeC"

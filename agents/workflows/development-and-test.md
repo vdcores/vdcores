@@ -51,6 +51,48 @@ Prefer this mode after refactors in:
 - `app/python/llama3/sched.py`
 - `app/python/llama3/reference.py`
 
+## Launch Hang Detection
+
+When testing a new schedule, a common failure mode is a barrier deadlock: the app prints `[launch]` and then never makes forward progress. Use the timeout wrapper in `tests/script/run_with_launch_timeout.py` to catch that class of bug quickly.
+
+```bash
+python tests/script/run_with_launch_timeout.py \
+  --post-launch-timeout 60 \
+  --post-launch-idle-timeout 20 \
+  -- python app/python/llama32_1b/sched.py --correctness
+```
+
+Notes:
+
+- The wrapper starts its timer only after it sees the launch marker, which avoids treating checkpoint download or model loading as hangs.
+- It forwards child output live and prints the recent output tail on timeout.
+- A timeout after `[launch]` is a strong hint that a barrier count or dependency release is missing.
+
+## Stage Schedule Debugging
+
+When a new schedule hangs, do not debug all layers at once. Narrow it in this order:
+
+```bash
+python tests/script/run_with_launch_timeout.py \
+  --post-launch-timeout 120 \
+  --post-launch-idle-timeout 20 \
+  -- python app/python/llama32_1b/sched.py \
+    --debug-num-layers 1 \
+    --debug-stop-after q_rope
+```
+
+Then expand gradually:
+
+- first one layer, operator by operator with `--debug-stop-after`
+- then one full layer
+- then two layers
+- only after those pass, restore the full layer count
+
+This catches two common bugs quickly:
+
+- a missing release or wait that deadlocks immediately after one operator is added
+- an implicit dependency that only breaks after repartitioning work onto disjoint SM ranges
+
 Typical Python-only areas include:
 
 - `app/python/`
