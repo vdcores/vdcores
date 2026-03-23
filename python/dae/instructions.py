@@ -18,6 +18,13 @@ from .tma_utils import (
     get_tensor_address,
 )
 
+TMA_DESC_BITS = 10
+TMA_DESC_MASK = (1 << TMA_DESC_BITS) - 1
+TMA_INDEX_SHIFT = TMA_DESC_BITS
+TMA_INDEX_NONE = 0
+TMA_INDEX_LAYER = 1
+TMA_INDEX_LAYER_EXPERT = 2
+
 
 class Instruction:
     def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
@@ -90,6 +97,14 @@ class Gemv_M64N8_MMA(ComputeInstruction):
         super().__init__(opcode=opcode.OP_GEMV_M64N8_MMA, args=[kTiles])
 
 
+class Gemv_M64N8_MMA_SCALE(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 1
+
+    def __init__(self, kTiles: int):
+        super().__init__(opcode=opcode.OP_GEMV_M64N8_MMA_SCALE, args=[kTiles])
+
+
 class WGMMA_64x256x64_F16(ComputeInstruction):
     MNK = (64, 64, 256)
 
@@ -156,6 +171,14 @@ class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
     Q_TILE = 4
     def __init__(self, num_split: int):
         super().__init__(opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE, args=[num_split])
+
+class ROUTER_TOPK_SOFTMAX_128(ComputeInstruction):
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_ROUTER_TOPK_SOFTMAX_128, args=[num_active_token])
+
+class SCALE_ROWS_BF16_768(ComputeInstruction):
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_SCALE_ROWS_BF16_768, args=[num_active_token])
 
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):
@@ -580,6 +603,23 @@ class CC0(MemoryInstruction):
         super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
 
 
+class SetLayerIndex(MemoryInstruction):
+    def __init__(self, idx: int = 0):
+        super().__init__(opcode=opcode.OP_SET_LAYER_IDX, num_slots=0, arg=idx, size=0, address=0)
+
+
+class IncLayerIndex(MemoryInstruction):
+    def __init__(self, delta: int = 1):
+        super().__init__(opcode=opcode.OP_INC_LAYER_IDX, num_slots=0, arg=delta, size=0, address=0)
+
+
+class LoadExpertIndex(MemoryInstruction):
+    def __init__(self, expert_indices: torch.Tensor, slot: int, row: int = 0):
+        address = get_tensor_address(expert_indices[0, row, 0] if expert_indices.dim() == 3 else expert_indices[row, 0])
+        layer_stride = expert_indices.stride(0) * expert_indices.element_size() if expert_indices.dim() == 3 else 0
+        super().__init__(opcode=opcode.OP_LOAD_EXPERT_IDX, num_slots=0, arg=slot * expert_indices.element_size(), size=layer_stride, address=address)
+
+
 class RegStore(MemoryInstruction):
     def __init__(self, reg_id: int, shape: torch.Tensor = None, size=None):
         if size is None:
@@ -658,6 +698,7 @@ class TmaTensor(MemoryInstruction):
         self.launcher = launcher
         self.mat = mat
         self.cord_func = None
+        self.index_mode = TMA_INDEX_NONE
 
     def _rank2opcode(self, rank: int, action: str) -> int:
         opcode_map = {
@@ -697,8 +738,21 @@ class TmaTensor(MemoryInstruction):
 
         if not hasattr(self.launcher, "new_tma"):
             raise ValueError("launcher must expose new_tma()")
-        self.arg = self.launcher.new_tma(desc)
+        self.arg = (self.launcher.new_tma(desc) & TMA_DESC_MASK) | (self.index_mode << TMA_INDEX_SHIFT)
 
+        return self
+
+    def indexed(self, mode: str):
+        mapping = {
+            "none": TMA_INDEX_NONE,
+            "layer": TMA_INDEX_LAYER,
+            "layer_expert": TMA_INDEX_LAYER_EXPERT,
+        }
+        if mode not in mapping:
+            raise ValueError(f"Unknown indexed mode: {mode}")
+        self.index_mode = mapping[mode]
+        if self.arg:
+            self.arg = (self.arg & TMA_DESC_MASK) | (self.index_mode << TMA_INDEX_SHIFT)
         return self
 
     def cord2tma(self, *cords):
@@ -741,6 +795,7 @@ __all__ = [
     "Gemv_M64N8_ROPE_128",
     "Gemv_M192N16",
     "Gemv_M64N8_MMA",
+    "Gemv_M64N8_MMA_SCALE",
     "WGMMA_64x256x64_F16",
     "WGMMA_64x256x64_BF16",
     "ROPE_INTERLEAVE_512",
@@ -748,6 +803,8 @@ __all__ = [
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
     "ATTN_SPLIT_POST_REDUCE",
+    "ROUTER_TOPK_SOFTMAX_128",
+    "SCALE_ROWS_BF16_768",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
@@ -772,6 +829,9 @@ __all__ = [
     "RawAddress",
     "IssueBarrier",
     "CC0",
+    "SetLayerIndex",
+    "IncLayerIndex",
+    "LoadExpertIndex",
     "RegStore",
     "RegLoad",
     "TmaLoad1D",

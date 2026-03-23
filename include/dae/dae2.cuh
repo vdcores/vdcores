@@ -22,6 +22,7 @@
 #include "task/attention.cuh"
 #include "task/silu.cuh"
 #include "task/argmax.cuh"
+#include "task/router.cuh"
 
 static __device__ __forceinline__ void * align_to(void *ptr, size_t align) {
   uintptr_t addr = (uintptr_t)ptr;
@@ -169,6 +170,10 @@ void dae2(
           task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
           }
           break;
+        case OP_GEMV_M64N8_MMA_SCALE: {
+          task_gemv_mma_scale<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
+          }
+          break;
         // case OP_GEMV_M128N8: {
         //   using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
         //   task_gemv<gemv_atom, 128, 128, 4, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
@@ -203,6 +208,14 @@ void dae2(
           const bool need_norm = inst.args[2] & 0x1;
           const bool need_rope = inst.args[2] & 0x2;
           task_attention_fwd_flash3_grouped<64, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
+        }
+          break;
+        case OP_ROUTER_TOPK_SOFTMAX_128: {
+          task_router_topk_softmax<__nv_bfloat16>(inst.args[0], smem_base, st_insts, m2c, c2m);
+        }
+          break;
+        case OP_SCALE_ROWS_BF16_768: {
+          task_scale_rows<__nv_bfloat16, 768>(inst.args[0], smem_base, m2c, c2m);
         }
           break;
         case OP_SILU_MUL_SHARED_BF16_K_4096_INTER: {

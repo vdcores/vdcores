@@ -10,6 +10,44 @@ static __device__ __forceinline__ void prefetch_inst_window(
   }
 }
 
+static __device__ __forceinline__ bool is_indexable_tma_op(uint16_t opcode) {
+  switch (op(opcode)) {
+    case op(OP_ALLOC_TMA_LOAD_2D):
+    case op(OP_ALLOC_TMA_LOAD_3D):
+    case op(OP_ALLOC_TMA_LOAD_4D):
+    case op(OP_ALLOC_TMA_LOAD_5D_FIX0):
+    case op(OP_ALLOC_WB_TMA_STORE_2D):
+    case op(OP_ALLOC_WB_TMA_STORE_3D):
+    case op(OP_ALLOC_WB_TMA_STORE_4D):
+    case op(OP_ALLOC_WB_TMA_STORE_5D_FIX0):
+    case op(OP_ALLOC_WB_TMA_REDUCE_ADD_2D):
+    case op(OP_ALLOC_WB_TMA_REDUCE_ADD_3D):
+      return true;
+    default:
+      return false;
+  }
+}
+
+static __device__ __forceinline__ uint16_t *indexed_rest_coord_ptr(MInst &inst) {
+  switch (op(inst.opcode)) {
+    case op(OP_ALLOC_TMA_LOAD_2D):
+    case op(OP_ALLOC_WB_TMA_STORE_2D):
+    case op(OP_ALLOC_WB_TMA_REDUCE_ADD_2D):
+      return &inst.coords[1];
+    case op(OP_ALLOC_TMA_LOAD_3D):
+    case op(OP_ALLOC_WB_TMA_STORE_3D):
+    case op(OP_ALLOC_WB_TMA_REDUCE_ADD_3D):
+      return &inst.coords[2];
+    case op(OP_ALLOC_TMA_LOAD_4D):
+    case op(OP_ALLOC_TMA_LOAD_5D_FIX0):
+    case op(OP_ALLOC_WB_TMA_STORE_4D):
+    case op(OP_ALLOC_WB_TMA_STORE_5D_FIX0):
+      return &inst.coords[3];
+    default:
+      return nullptr;
+  }
+}
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -68,6 +106,19 @@ __device__ __forceinline__ void allocwarp_execute(
         shift, inst.bar(), inst.arg, inst.nslot());
       // __smprint(0, lane_id, "[Group] Updated: shift %x: bar=%d arg=%d nslot=%d bar=%d",
       //   shift, inst.bar(), inst.arg, inst.nslot(), inst.opcode & MEM_OP_FLAGS_BARRIER);
+    }
+
+    if (lane_id == 0 && is_indexable_tma_op(inst.opcode)) {
+      auto index_mode = decode_tma_index_mode(inst.arg);
+      inst.arg = decode_tma_desc_id(inst.arg);
+      uint16_t *rest_coord = indexed_rest_coord_ptr(inst);
+      if (rest_coord != nullptr) {
+        if (index_mode == TMA_INDEX_LAYER) {
+          *rest_coord = static_cast<uint16_t>(di.layer_idx);
+        } else if (index_mode == TMA_INDEX_LAYER_EXPERT) {
+          *rest_coord = static_cast<uint16_t>(di.layer_idx * 128 + di.expert_idx);
+        }
+      }
     }
 
     // TODO(zhiyuang): let the allocator decide whether to stall
@@ -182,6 +233,24 @@ __device__ __forceinline__ void allocwarp_execute(
           di.loop_start_pc = pc + 1;
           if (lane_id == 0) {
             di.gpr[1] = token << inst.arg;
+          }
+          break;
+        }
+        case op(OP_SET_LAYER_IDX): {
+          if (lane_id == 0) {
+            di.layer_idx = inst.arg;
+          }
+          break;
+        }
+        case op(OP_INC_LAYER_IDX): {
+          if (lane_id == 0) {
+            di.layer_idx += inst.arg;
+          }
+          break;
+        }
+        case op(OP_LOAD_EXPERT_IDX): {
+          if (lane_id == 0) {
+            di.expert_idx = *(int *)(inst.address + di.layer_idx * inst.size + inst.arg);
           }
           break;
         }

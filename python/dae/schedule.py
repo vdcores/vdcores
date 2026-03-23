@@ -569,6 +569,70 @@ class SchedGemv(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
+
+class SchedGemvMmaScale(Schedule):
+    def __init__(self, Atom, MNK: tuple[int, int, int], tmas: tuple, fold: int | None = None, group: bool = True):
+        super().__init__()
+        self.Atom = Atom
+        self.tmas = tmas
+        self.fold = fold
+        self.group = group
+
+        MNK_base = []
+        MNK_size = []
+        for dim in MNK:
+            if isinstance(dim, int):
+                MNK_base.append(0)
+                MNK_size.append(dim)
+            elif isinstance(dim, tuple) and len(dim) == 2:
+                base, size = dim
+                MNK_base.append(base)
+                MNK_size.append(size)
+            else:
+                raise ValueError(f"Invalid MNK dimension: {dim}")
+        self.MNK = MNK_size
+        self.MNK_base = MNK_base
+
+    def _on_place(self):
+        TileM, _, TileK = self.Atom.MNK
+        M, _, K = self.MNK
+        if self.fold is None:
+            assert self.num_sms % (M // TileM) == 0, f"SMS must be multiple of M tiles, got SMS={self.num_sms}, M={M}, TileM={TileM}"
+            self.fold = self.num_sms // (M // TileM)
+        self.sm_per_fold = self.num_sms // self.fold
+        self.k_per_fold = K // self.fold
+        assert len(self.tmas) == 4, "Scaled MMA GEMV expects (loadA, loadB, loadScale, storeC)"
+        assert self.k_per_fold % TileK == 0, "Invalid fold for scaled MMA GEMV"
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        baseM, _, baseK = self.MNK_base
+        loadA, loadB, loadScale, storeC = self.tmas
+
+        m = baseM + (sm % self.sm_per_fold) * TileM
+        k = baseK + (sm // self.sm_per_fold) * self.k_per_fold
+        n_repeat = self.k_per_fold // TileK
+
+        insts = [
+            self.Atom(self.k_per_fold // TileK),
+            loadScale.cord(0).bar(self._bar("load")).group(self.group and (self._bar("load") is not None)),
+            RepeatM.on(
+                n_repeat,
+                (loadB.cord(0, k), loadB.cord2tma(0, TileK)),
+                (loadA.cord(m, k), loadA.cord2tma(0, TileK)),
+            ),
+            storeC.cord(0, m).bar(self._bar("store")).group(self.group and (self._bar("store") is not None)),
+        ]
+        return insts
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
 class SchedGemvRope(Schedule):
     def __init__(self,
                  MNK: tuple[int, int, int],
@@ -1038,6 +1102,54 @@ class SchedArgmax(Schedule):
         if role == "final":
             return self._bar_release_if_present(role, min(self.num_token, self.num_sms))
         return 0
+
+
+class SchedRouterTopK(Schedule):
+    def __init__(self, num_token: int, logits_tma, weight_tma, idx_tma):
+        super().__init__()
+        self.num_token = num_token
+        self.logits_tma = logits_tma
+        self.weight_tma = weight_tma
+        self.idx_tma = idx_tma
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        return [
+            ROUTER_TOPK_SOFTMAX_128(self.num_token),
+            self.logits_tma.cord(0).bar(self._bar("input")).group(),
+            self.weight_tma.cord(0).bar(self._bar("output")).group(),
+            self.idx_tma.cord(0),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedScaleRows(Schedule):
+    def __init__(self, num_token: int, src_tma, weight_tma, out_tma):
+        super().__init__()
+        self.num_token = num_token
+        self.src_tma = src_tma
+        self.weight_tma = weight_tma
+        self.out_tma = out_tma
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        return [
+            SCALE_ROWS_BF16_768(self.num_token),
+            self.out_tma.cord(0).bar(self._bar("output")).group(),
+            self.src_tma.cord(0).bar(self._bar("input")).group(),
+            self.weight_tma.cord(0),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 def interleave(*schedules):

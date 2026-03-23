@@ -45,7 +45,17 @@ static constexpr int allocwarpInstructionTargetSpan = 2;
 
 constexpr int flagBits = 6;
 constexpr int slotBits = 6;
+static constexpr uint16_t tmaDescBits = 10;
+static constexpr uint16_t tmaDescMask = (1U << tmaDescBits) - 1;
+static constexpr uint16_t tmaIndexShift = tmaDescBits;
+static constexpr uint16_t tmaIndexMask = 0x3U << tmaIndexShift;
 static_assert(numSlots <= (1 << slotBits), "numSlots exceeds slotBits capacity");
+
+enum TmaIndexedRestMode : uint16_t {
+  TMA_INDEX_NONE = 0,
+  TMA_INDEX_LAYER = 1,
+  TMA_INDEX_LAYER_EXPERT = 2,
+};
 
 // definition of instruction formats
 struct alignas(8) CInst {
@@ -119,4 +129,17 @@ static __device__ __host__ constexpr uint16_t op(const uint16_t opcode) {
 
 static __device__ __host__ constexpr uint16_t jump(const uint16_t opcode) {
   return opcode | MEM_OP_FLAGS_JUMP;
+}
+
+static __device__ __host__ constexpr uint16_t encode_tma_arg(
+    uint16_t desc_id, TmaIndexedRestMode mode = TMA_INDEX_NONE) {
+  return (desc_id & tmaDescMask) | (static_cast<uint16_t>(mode) << tmaIndexShift);
+}
+
+static __device__ __host__ constexpr uint16_t decode_tma_desc_id(uint16_t arg) {
+  return arg & tmaDescMask;
+}
+
+static __device__ __host__ constexpr TmaIndexedRestMode decode_tma_index_mode(uint16_t arg) {
+  return static_cast<TmaIndexedRestMode>((arg & tmaIndexMask) >> tmaIndexShift);
 }

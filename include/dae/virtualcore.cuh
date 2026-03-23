@@ -117,6 +117,8 @@ union LdCmd {
 // definition of memory virtual core
 struct MemoryVirtualCore {
   uint64_t gpr[2]; // 0 for delta and 1 for accumulator
+  uint32_t layer_idx;
+  uint32_t expert_idx;
 
   int slot_alloc;
   // control flow structures
@@ -142,6 +144,8 @@ struct MemoryVirtualCore {
     loop_counter = 0;
     jmp_cnt = 0;
     slot_alloc = -1;
+    layer_idx = 0;
+    expert_idx = 0;
   }
 
   template<typename T>
