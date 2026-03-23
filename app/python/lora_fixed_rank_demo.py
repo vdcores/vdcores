@@ -181,11 +181,11 @@ def base_expand_sched():
         insts, expand_base_sm = split_N_M(expand_base_sm, num_sms, token_count, Gemv_M64N8K64)
         shrink_insts.extend(insts)
 
-vdc_shrink_sched()
-vdc_expand_sched()
+# vdc_shrink_sched()
+# vdc_expand_sched()
 
-# base_shrink_sched()
-# base_expand_sched()
+base_shrink_sched()
+base_expand_sched()
 
 
 dae.i(

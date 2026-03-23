@@ -210,8 +210,8 @@ void dae2(
         case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split: {
           using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
           using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-          const int num_kv_blocks = inst.args[0] & 0xFF;
-          const int split_idx = (inst.args[0] >> 8) & 0xFF;
+          const int num_kv_blocks = inst.args[0] & 0xFFF;
+          const int split_idx = (inst.args[0] >> 12) & 0xF;
           const int num_active_q = inst.args[1] & 0xFF;
           const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
           const int kv_start_idx = inst.args[2];

@@ -6,11 +6,12 @@ from dae.launcher import *
 from dae.util import *
 from dae.runtime import opcode, build_tma_desc 
 from qwen3.utils import *
+import sys
 
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 4096
+KV_SEQ_LEN = 65536
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
 NUM_REQ = 1
