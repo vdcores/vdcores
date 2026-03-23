@@ -20,6 +20,11 @@ Qwen3 decode attention differences from llama3
   - Decode attention now issues one grouped TMA load for all three aux inputs and splits that slot in-kernel.
   - The packed row size is `3 * HEAD_DIM` BF16 values, which is `768` bytes for the current 128-dim head path.
 
+- HF prefix caches can be used to bootstrap multi-token decode checks.
+  - Qwen3 returns a `DynamicCache` whose layers expose `keys` and `values` tensors shaped like `[batch, num_kv_heads, seq, head_dim]`.
+  - `values` can be flattened into `[seq, num_kv_heads * head_dim]` and copied straight into `attnVs`.
+  - `keys` need an interleaving conversion before copying into `attnKs`; `permute_rope_activation(...)` matches the cache layout expected by the fused decode path.
+
 - Queue semantics matter for any new writeback slot in attention.
   - Temporary inputs like Q/K norm weights or RoPE rows can be released with `c2m.push(...)`.
   - Any slot that should actually write to global memory must use the writeback queue path, for example `c2m.template push<0, true>(thread_id, slot_id)`.

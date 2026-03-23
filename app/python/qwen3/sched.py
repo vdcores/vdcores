@@ -1,11 +1,6 @@
-import argparse
-import math
-import os
-import sys
 from functools import partial
 
 import torch
-import torch.nn.functional as F
 from dae.launcher import *
 from dae.model import *
 from dae.schedule import *
@@ -14,137 +9,65 @@ from dae.tma_utils import (
     ToAttnVStoreCordAdapter,
 )
 from dae.util import dae_app
-from reference import (
-    check_tensor_threshold,
-    input_batch1,
-    permute_rope_activation,
-    reference_pass,
-)
-from transformers import AutoConfig, AutoModelForCausalLM
+from cli import parse_args
+from correctness import run_correctness_check
+from runtime_context import build_runtime_context, seed_prefill_kv_cache
+from utils import build_tma_wgmma_k, build_tma_wgmma_mn, cord_func_K_major, cord_func_MN_major
 
 
-MODEL_NAME = "Qwen/Qwen3-8B"
-DEFAULT_MAX_SEQ_LEN = 512
-DEFAULT_INPUT_TOKEN = 51
+ctx = build_runtime_context(parse_args())
 
-
-def parse_args():
-    raw_argv = sys.argv[1:]
-    arg_parser = argparse.ArgumentParser(add_help=False)
-    arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
-    arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
-    arg_parser.add_argument("--correctness", action="store_true")
-    parsed_args, remaining_argv = arg_parser.parse_known_args()
-    num_generates_explicit = any(arg == "-N" or arg.startswith("--num-generates") for arg in raw_argv)
-    if not num_generates_explicit and any(arg in ("-b", "--bench") for arg in remaining_argv):
-        parsed_args.num_generates = 1
-    if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
-        remaining_argv = [*remaining_argv, "--launch"]
-    sys.argv = [sys.argv[0], *remaining_argv]
-    return parsed_args
-
-
-def get_rope_theta(config):
-    rope_parameters = getattr(config, "rope_parameters", None)
-    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
-        return rope_parameters["rope_theta"]
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if isinstance(rope_scaling, dict) and "rope_theta" in rope_scaling:
-        return rope_scaling["rope_theta"]
-    rope_theta = getattr(config, "rope_theta", None)
-    if rope_theta is not None:
-        return rope_theta
-    raise ValueError("Could not determine rope theta from config")
-
-
-def build_interleaved_rope_rows(max_seq_len, head_dim, rope_theta, device, dtype):
-    inv_freq = 1.0 / (
-        rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
-    )
-    positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(positions, inv_freq)
-    rope = torch.empty(max_seq_len, head_dim, device=device, dtype=dtype)
-    rope[:, 0::2] = freqs.cos().to(dtype=dtype)
-    rope[:, 1::2] = freqs.sin().to(dtype=dtype)
-    return rope
-
-
-def permute_rope_weight(weight, num_heads, head_dim, hidden_size):
-    return (
-        weight.view(num_heads, 2, head_dim // 2, hidden_size)
-        .transpose(1, 2)
-        .reshape_as(weight)
-        .contiguous()
-    )
-
-
-def permute_rope_head_weight(weight):
-    head_dim = weight.shape[-1]
-    return (
-        weight.view(2, head_dim // 2)
-        .transpose(0, 1)
-        .reshape_as(weight)
-        .contiguous()
-    )
-
-
-def apply_rms_affine_rope_heads(hidden_states, weight, rope_row, eps):
-    hidden_states = hidden_states.float()
-    variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    hidden_states = hidden_states * weight.float().view(1, -1)
-    even = hidden_states[..., 0::2]
-    odd = hidden_states[..., 1::2]
-    cos = rope_row[0::2].float()
-    sin = rope_row[1::2].float()
-    return torch.stack(
-        (even * cos - odd * sin, even * sin + odd * cos),
-        dim=-1,
-    ).flatten(-2).to(dtype=weight.dtype)
-
-
-parsed_args = parse_args()
-
-gpu = torch.device("cuda")
-
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    cache_dir=parsed_args.hf_cache_dir,
-    dtype=torch.bfloat16,
-    device_map="auto",
-    token=os.environ["HF_TOKEN"],
-)
-config = AutoConfig.from_pretrained(
-    MODEL_NAME,
-    cache_dir=parsed_args.hf_cache_dir,
-    token=os.environ["HF_TOKEN"],
-)
-layers = model.model.layers
-
-REQ, N = 8, 8
-KVBlockSize = 64
-rms_sms = REQ
-num_sms = 128
-full_sms = 132
-MAX_SEQ_LEN = min(config.max_position_embeddings, DEFAULT_MAX_SEQ_LEN)
-dae = Launcher(full_sms, device=gpu)
-
-input_token_id_and_pos = [(DEFAULT_INPUT_TOKEN, 0)]
-num_generates = 0 if parsed_args.correctness else parsed_args.num_generates - 1
-
-dtype = model.dtype
-eps = config.rms_norm_eps
-rope_theta = get_rope_theta(config)
-HIDDEN = config.hidden_size
-INTERMIDIATE = config.intermediate_size
-HEAD_DIM = getattr(config, "head_dim", HIDDEN // config.num_attention_heads)
-NUM_Q_HEAD = config.num_attention_heads
-NUM_KV_HEAD = config.num_key_value_heads
-HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
-QW = HEAD_DIM * NUM_Q_HEAD
-KW = HEAD_DIM * NUM_KV_HEAD
-VW = HEAD_DIM * NUM_KV_HEAD
-num_layers = len(layers)
+dae = ctx.dae
+layers = ctx.layers
+REQ = ctx.REQ
+N = ctx.N
+KVBlockSize = ctx.KVBlockSize
+rms_sms = ctx.rms_sms
+num_sms = ctx.num_sms
+full_sms = ctx.full_sms
+MAX_SEQ_LEN = ctx.MAX_SEQ_LEN
+eps = ctx.eps
+HIDDEN = ctx.HIDDEN
+INTERMIDIATE = ctx.INTERMIDIATE
+HEAD_DIM = ctx.HEAD_DIM
+NUM_Q_HEAD = ctx.NUM_Q_HEAD
+NUM_KV_HEAD = ctx.NUM_KV_HEAD
+HEAD_GROUP_SIZE = ctx.HEAD_GROUP_SIZE
+QW = ctx.QW
+KW = ctx.KW
+VW = ctx.VW
+num_layers = ctx.num_layers
+prefill_token_id_and_pos = ctx.prefill_token_id_and_pos
+input_token_id_and_pos = ctx.input_token_id_and_pos
+num_generates = ctx.num_generates
+matTokens = ctx.matTokens
+matHidden = ctx.matHidden
+matRMSHidden = ctx.matRMSHidden
+attnQs = ctx.attnQs
+attnKs = ctx.attnKs
+attnVs = ctx.attnVs
+attnO = ctx.attnO
+matInterm = ctx.matInterm
+matGateOut = ctx.matGateOut
+matSiLUOut = ctx.matSiLUOut
+matEmbed = ctx.matEmbed
+matRMSInputW = ctx.matRMSInputW
+matRMSPostAttnW = ctx.matRMSPostAttnW
+matQwenSideInputs = ctx.matQwenSideInputs
+matqWs = ctx.matqWs
+matkWs = ctx.matkWs
+matvWs = ctx.matvWs
+matOutWs = ctx.matOutWs
+matUps = ctx.matUps
+matGates = ctx.matGates
+matDowns = ctx.matDowns
+vocab_size = ctx.vocab_size
+logits_slice = ctx.logits_slice
+logits_epoch = ctx.logits_epoch
+matLogits = ctx.matLogits
+matLogitsW = ctx.matLogitsW
+matArgmaxIdx = ctx.matArgmaxIdx
+matArgmaxVal = ctx.matArgmaxVal
 
 defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
@@ -168,65 +91,6 @@ layerg.addBarrier("bar_silu_out1")
 layerg.addBarrier("bar_silu_out2")
 layerg.addBarrier("bar_pre_attn_rms")
 layerg.addBarrier("bar_post_attn_rms")
-
-matRope = build_interleaved_rope_rows(MAX_SEQ_LEN, HEAD_DIM, rope_theta, gpu, dtype)
-matTokens = torch.zeros(N, MAX_SEQ_LEN, dtype=torch.int64, device=gpu)
-matHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
-matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
-
-attnQs = [torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
-matInterm = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
-matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
-matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
-
-matEmbed = model.model.embed_tokens.weight
-matRMSInputW = [l.input_layernorm.weight for l in layers] + [model.model.norm.weight]
-matRMSPostAttnW = [l.post_attention_layernorm.weight for l in layers]
-matQNormWs = [permute_rope_head_weight(l.self_attn.q_norm.weight.detach()) for l in layers]
-matKNormWs = [permute_rope_head_weight(l.self_attn.k_norm.weight.detach()) for l in layers]
-matQwenSideInputs = []
-for q_norm_w, k_norm_w in zip(matQNormWs, matKNormWs):
-    packed = torch.empty(MAX_SEQ_LEN, 3 * HEAD_DIM, dtype=dtype, device=gpu)
-    packed[:, 0:HEAD_DIM] = q_norm_w.view(1, HEAD_DIM)
-    packed[:, HEAD_DIM:2 * HEAD_DIM] = k_norm_w.view(1, HEAD_DIM)
-    packed[:, 2 * HEAD_DIM:3 * HEAD_DIM] = matRope
-    matQwenSideInputs.append(packed)
-
-matqWs = [
-    permute_rope_weight(l.self_attn.q_proj.weight, NUM_Q_HEAD, HEAD_DIM, HIDDEN)
-    for l in layers
-]
-matkWs = [
-    permute_rope_weight(l.self_attn.k_proj.weight, NUM_KV_HEAD, HEAD_DIM, HIDDEN)
-    for l in layers
-]
-matvWs = [l.self_attn.v_proj.weight for l in layers]
-matOutWs = [l.self_attn.o_proj.weight for l in layers]
-matUps = [l.mlp.up_proj.weight for l in layers]
-matGates = [l.mlp.gate_proj.weight for l in layers]
-matDowns = [l.mlp.down_proj.weight for l in layers]
-
-vocab_size = model.lm_head.weight.shape[0]
-logits_slice = 64 * full_sms * 6
-logits_epoch = math.ceil(vocab_size / logits_slice)
-matLogits = []
-matLogitsW = []
-matLmHeadW = model.lm_head.weight.detach()
-matLmHeadW.resize_(logits_slice * logits_epoch, HIDDEN)
-matLmHeadW[vocab_size:, :].zero_()
-
-for i in range(logits_epoch):
-    matLogitsW.append(matLmHeadW[i * logits_slice: (i + 1) * logits_slice])
-    matLogits.append(torch.zeros(N, logits_slice, dtype=dtype, device=gpu))
-
-matArgmaxIdx = torch.zeros(N, full_sms, dtype=torch.long, device=gpu)
-matArgmaxVal = torch.zeros(N, full_sms, dtype=dtype, device=gpu)
-
-dae.set_persistent(matTokens)
-dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
 
 TileM, _, TileK = Gemv_M64N8.MNK
 layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
@@ -505,10 +369,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
     )
 
 
-cur_offset, cur_pos = 0, 0
-for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
+seed_prefill_kv_cache(ctx)
+
+cur_offset = len(prefill_token_id_and_pos) - 1
+cur_pos = prefill_token_id_and_pos[-1][1] if prefill_token_id_and_pos else -1
+for token_offset, (token, pos) in enumerate(input_token_id_and_pos, start=len(prefill_token_id_and_pos)):
     matTokens[0, token_offset] = token
-    if token_offset > 0:
+    if token_offset > len(prefill_token_id_and_pos):
         dae.i(IssueBarrier(systemg["bar_token_finish"]))
     schedule_single_token(token_offset, pos)
     cur_offset, cur_pos = token_offset, pos
@@ -522,77 +389,5 @@ for _ in range(num_generates):
 print(f"run vdcores with {cur_offset + 1} tokens...")
 dae.s()
 dae_app(dae)
-
-
-def run_correctness_check():
-    silu_threshold = 10.0
-    final_hidden_threshold = 15.0
-    final_rms_threshold = 12.0
-
-    print("[correctness] running single-token reference capture...")
-    inputs = input_batch1(
-        *(token for token, _ in input_token_id_and_pos),
-        mat=matTokens[0],
-        positions=[pos for _, pos in input_token_id_and_pos],
-    )
-
-    captured, output = reference_pass(model, inputs, rope_theta=rope_theta)
-    rope_row = matRope[input_token_id_and_pos[0][1]]
-    all_ok = True
-
-    for i in range(min(2, num_layers)):
-        layer = captured[i]
-        dae_q_rope = apply_rms_affine_rope_heads(
-            attnQs[i][0].view(NUM_Q_HEAD, HEAD_DIM),
-            matQNormWs[i],
-            rope_row,
-            eps,
-        ).reshape(-1)
-        print(f"[correctness] Layer {i}:")
-        checks = [
-            check_tensor_threshold("v_proj", layer["v_proj"][0, 0], attnVs[i][0, 0], 5.0),
-            check_tensor_threshold("q_proj_interleaved", layer["q_proj_interleaved"][0, 0], attnQs[i][0], 5.0),
-            check_tensor_threshold("q_rope_interleaved", layer["q_rope_interleaved"][0, 0], dae_q_rope, 5.0),
-            check_tensor_threshold("k_rope_interleaved", layer["k_rope_interleaved"][0, 0], attnKs[i][0, 0], 5.0),
-        ]
-        all_ok = all_ok and all(passed for passed, _ in checks)
-
-    print(f"[correctness] Checking Layer {num_layers - 1}:")
-    layer = captured[num_layers - 1]
-    silu_ref = F.silu(layer["gate_proj"][0, 0]) * layer["up_proj"][0, 0]
-    final_checks = [
-        check_tensor_threshold("gate_proj_low", layer["gate_proj"][0, 0, :4096], matGateOut[0, :4096], 5.0),
-        check_tensor_threshold("up_proj_low", layer["up_proj"][0, 0, :4096], matInterm[0, :4096], 5.0),
-        check_tensor_threshold("silu", silu_ref, matSiLUOut[0], silu_threshold),
-        check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, 0], matHidden[0], final_hidden_threshold),
-        check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], final_rms_threshold),
-    ]
-
-    for i in range(logits_epoch):
-        start = i * logits_slice
-        end = min((i + 1) * logits_slice, vocab_size)
-        final_checks.append(
-            check_tensor_threshold(
-                f"logits_{i}",
-                captured["final"]["lm_head"][0, 0, start:end],
-                matLogits[i][0, : end - start],
-                10.0,
-            )
-        )
-
-    all_ok = all_ok and all(passed for passed, _ in final_checks)
-
-    ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
-    dae_idx = matTokens[0, 1].item()
-    ref_token = ref_idx[0, 0].item()
-    token_ok = ref_token == dae_idx
-    print(f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: ref={ref_token}, dae={dae_idx}")
-    all_ok = all_ok and token_ok
-
-    if not all_ok:
-        raise RuntimeError("Correctness check failed")
-    print("[correctness] all checks passed")
-
-
-if parsed_args.correctness:
-    run_correctness_check()
+if ctx.parsed_args.correctness:
+    run_correctness_check(ctx)
