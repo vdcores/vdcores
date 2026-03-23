@@ -11,13 +11,13 @@ gpu = torch.device("cuda")
 torch.manual_seed(0)
 dtype = torch.bfloat16
 
-Atom = Gemm_M64N64
+Atom = Gemm_M64N64K64
 TileM, TileN, TileK = Atom.MNK
 
 M = 64
-N = 64
-K = 4096
-num_sms = 32
+N = 4096
+K = 64
+num_sms = 64
 
 assert K % TileK == 0
 assert M % TileM == 0
