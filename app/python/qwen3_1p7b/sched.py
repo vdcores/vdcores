@@ -1,3 +1,4 @@
+import os
 from functools import partial
 
 import torch
@@ -69,6 +70,44 @@ matLogits = ctx.matLogits
 matLogitsW = ctx.matLogitsW
 matArgmaxIdx = ctx.matArgmaxIdx
 matArgmaxVal = ctx.matArgmaxVal
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return default if value is None else int(value)
+
+
+def env_prefetch_overrides() -> set[str]:
+    raw = os.environ.get("QWEN1P7B_NO_PREFETCH", "")
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+PREFETCH_OFF = env_prefetch_overrides()
+QPROJ_SMS = env_int("QWEN1P7B_QPROJ_SMS", 64)
+KPROJ_SMS = env_int("QWEN1P7B_KPROJ_SMS", 32)
+VPROJ_SMS = env_int("QWEN1P7B_VPROJ_SMS", 32)
+OUTPROJ_SMS = env_int("QWEN1P7B_OUTPROJ_SMS", 64)
+GATE_LOW_SMS = env_int("QWEN1P7B_GATE_LOW_SMS", 64)
+GATE_HIGH_SMS = env_int("QWEN1P7B_GATE_HIGH_SMS", 64)
+UP_LOW_SMS = env_int("QWEN1P7B_UP_LOW_SMS", 64)
+UP_HIGH_SMS = env_int("QWEN1P7B_UP_HIGH_SMS", 64)
+SILU_SMS = env_int("QWEN1P7B_SILU_SMS", 4)
+DOWNPROJ_SMS = env_int("QWEN1P7B_DOWNPROJ_SMS", 96)
+LOGITS_SPLIT_M = env_int("QWEN1P7B_LOGITS_SPLIT_M", 6)
+
+
+def maybe_no_prefetch(name: str, sched):
+    if "all" in PREFETCH_OFF or name in PREFETCH_OFF:
+        sched.no_prefetch()
+    return sched
+
+
+def maybe_no_prefetch_list(name: str, sched):
+    if "all" in PREFETCH_OFF or name in PREFETCH_OFF:
+        for item in sched:
+            if hasattr(item, "no_prefetch"):
+                item.no_prefetch()
+    return sched
 
 MLP_LOW = 4096
 MLP_HIGH = INTERMIDIATE - MLP_LOW
@@ -192,13 +231,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(layerg["loadRMSPostAttnW"].cord(0), loadHidden1D, storeRMSHidden1D),
     ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
 
-    QProj = SchedGemv(
+    QProj = maybe_no_prefetch("q_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], layerg["storeQ"]),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_q_proj"])
+    )).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_q_proj"])
 
-    KProj = SchedGemv(
+    KProj = maybe_no_prefetch("k_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(KW, N, HIDDEN),
         tmas=(
@@ -206,8 +245,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
             layerg["loadRMSLayer"],
             ToAttnVStoreCordAdapter(layerg["storeK"], token_pos),
         ),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
-    VProj = SchedGemv(
+    )).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
+    VProj = maybe_no_prefetch("v_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(VW, N, HIDDEN),
         tmas=(
@@ -215,7 +254,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             layerg["loadRMSLayer"],
             ToAttnVStoreCordAdapter(layerg["storeV"], token_pos),
         ),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
+    )).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
     current_k_store = [layerg[f"storeKCurrentReq{req}"] for req in range(REQ)]
 
     Gqa = SchedAttentionDecoding(
@@ -230,32 +269,32 @@ def schedule_single_token(token_offset: int, token_pos: int):
         token_pos=token_pos,
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
-    OutProj = SchedGemv(
+    OutProj = maybe_no_prefetch("out_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    )).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
 
-    gate_proj_low = SchedGemv(
+    gate_proj_low = maybe_no_prefetch("gate_low", SchedGemv(
         Gemv_M64N8,
         MNK=(MLP_LOW, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    gate_proj_high = SchedGemv(
+    )).bar("load", layerg["bar_post_attn_rms"])
+    gate_proj_high = maybe_no_prefetch("gate_high", SchedGemv(
         Gemv_M64N8,
         MNK=((MLP_LOW, MLP_HIGH), N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["reduceGateOut"]),
-    ).bar("store", layerg["bar_silu_in"])
-    up_proj_low = SchedGemv(
+    )).bar("store", layerg["bar_silu_in"])
+    up_proj_low = maybe_no_prefetch("up_low", SchedGemv(
         Gemv_M64N8,
         MNK=(MLP_LOW, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    up_proj_high = SchedGemv(
+    )).bar("load", layerg["bar_post_attn_rms"])
+    up_proj_high = maybe_no_prefetch("up_high", SchedGemv(
         Gemv_M64N8,
         MNK=((MLP_LOW, MLP_HIGH), N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["reduceInterm"]),
-    ).bar("store", layerg["bar_silu_in"])
+    )).bar("store", layerg["bar_silu_in"])
 
     silu1 = SchedSmemSiLUInterleaved(
         num_token=N,
@@ -264,20 +303,21 @@ def schedule_single_token(token_offset: int, token_pos: int):
         out_glob=matSiLUOut[:, :INTERMIDIATE],
     ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
 
-    down_proj = SchedGemv(
+    down_proj = maybe_no_prefetch("down_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(HIDDEN, N, INTERMIDIATE),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out1"]).bar("store", layerg["bar_layer"])
+    )).bar("load", layerg["bar_silu_out1"]).bar("store", layerg["bar_layer"])
 
     qwen_gemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
     logits_proj = []
     for i in range(logits_epoch):
         proj = qwen_gemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-        sched = proj.schedule_(group=False).split_M(6)
+        sched = maybe_no_prefetch_list("logits", proj.schedule_(group=False).split_M(LOGITS_SPLIT_M))
         if i == 0:
             sched.bar("load", layerg.over("bar_pre_attn_rms"))
-            sched[0].no_prefetch()
+            if "all" not in PREFETCH_OFF and "logits" not in PREFETCH_OFF:
+                sched[0].no_prefetch()
         if i == logits_epoch - 1:
             sched.bar("store", systemg["bar_logits"])
         logits_proj.append(sched.place(full_sms))
@@ -311,17 +351,17 @@ def schedule_single_token(token_offset: int, token_pos: int):
     clear_gateout = clear_gateout.place(1, base_sm=129)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    QProj = QProj.place(64)
-    KProj = KProj.place(32, base_sm=64)
-    VProj = VProj.place(32, base_sm=96)
+    QProj = QProj.place(QPROJ_SMS)
+    KProj = KProj.place(KPROJ_SMS, base_sm=64)
+    VProj = VProj.place(VPROJ_SMS, base_sm=96)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
-    OutProj = OutProj.place(64)
-    gate_proj_low = gate_proj_low.place(64)
-    gate_proj_high = gate_proj_high.place(64)
-    up_proj_low = up_proj_low.place(64, base_sm=64)
-    up_proj_high = up_proj_high.place(64, base_sm=64)
-    silu1 = silu1.place(4, base_sm=128)
-    down_proj = down_proj.place(96)
+    OutProj = OutProj.place(OUTPROJ_SMS)
+    gate_proj_low = gate_proj_low.place(GATE_LOW_SMS)
+    gate_proj_high = gate_proj_high.place(GATE_HIGH_SMS)
+    up_proj_low = up_proj_low.place(UP_LOW_SMS, base_sm=64)
+    up_proj_high = up_proj_high.place(UP_HIGH_SMS, base_sm=64)
+    silu1 = silu1.place(SILU_SMS, base_sm=128)
+    down_proj = down_proj.place(DOWNPROJ_SMS)
     argmax = argmax.place(full_sms)
     if restore_bars_low is not None:
         restore_bars_low = restore_bars_low.place(1, base_sm=128)
