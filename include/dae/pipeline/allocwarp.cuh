@@ -2,6 +2,18 @@
 
 #include "virtualcore.cuh"
 
+static __device__ __forceinline__ void prefetch_inst_window(
+    const MInst* insts, uint32_t start_pc, int count) {
+  if constexpr (!dae2LoadInstructions) {
+    #pragma unroll
+    for (int i = 0; i < allocwarpInstructionTargetSpan; ++i) {
+      if (i < count) {
+        prefetch_l1(insts + ((start_pc + i) % numInsts));
+      }
+    }
+  }
+}
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -20,16 +32,26 @@ __device__ __forceinline__ void allocwarp_execute(
   di.init();
   SharedMemoryAllocator<numSlots> alloc;
 
+  if constexpr (!dae2LoadInstructions) {
+    if (lane_id == 0) {
+      prefetch_inst_window(smem_minsts, 0, allocwarpInstructionSeedCount);
+    }
+  }
+
   __syncwarp();
 
   while (di.pred_continue) {
-
     inst = smem_minsts[next_pc % numInsts];
     // async zone after all shared memory read
     // IF/ID
     // 1. try to fetch a instruction
     // TODO(zhiyuang): inst to use is quite close. optimize? e.g, vector load?
     pc = next_pc;
+    if constexpr (!dae2LoadInstructions) {
+      if (lane_id == 0) {
+        prefetch_inst_window(smem_minsts, pc + allocwarpInstructionPrefetchDistance, 1);
+      }
+    }
     uint64_t addr_accum = __shfl_sync(0xFFFFFFFF, di.gpr[1], pc - di.loop_start_pc);
 
     __mprint("[exec][pc=%d]: opcode=%04x m2c.ptr=%d m2ld[0].ptr=%d m2ld[1].ptr=%d",
@@ -77,7 +99,7 @@ __device__ __forceinline__ void allocwarp_execute(
         if (di.slot_alloc >= 0)
           break;
 
-        __nanosleep(64); // try not to busy wait
+        __nanosleep(allocRetrySleepCycles);
       }
     }
 
@@ -108,8 +130,14 @@ __device__ __forceinline__ void allocwarp_execute(
       // have to keep this branch
       if (di.pred_jump) {
         --di.loop_counter;
-        if (di.loop_counter > 0)
+        if (di.loop_counter > 0) {
           next_pc = di.loop_start_pc;
+          if constexpr (!dae2LoadInstructions) {
+            if (lane_id == 0) {
+              prefetch_inst_window(smem_minsts, next_pc, allocwarpInstructionTargetSpan);
+            }
+          }
+        }
         di.gpr[1] += di.gpr[0];
       }
     } else { // Executing the non-allocation instructions (control flow instructions)
@@ -127,6 +155,11 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_REPEAT): {
           di.loop_counter = inst.size; // minus the current one
           di.loop_start_pc = pc + 1;
+          if constexpr (!dae2LoadInstructions) {
+            if (lane_id == 0) {
+              prefetch_inst_window(smem_minsts, di.loop_start_pc, allocwarpInstructionTargetSpan);
+            }
+          }
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
           if (lane_id >= reg_start && lane_id < reg_end) {
@@ -149,6 +182,11 @@ __device__ __forceinline__ void allocwarp_execute(
           }
           next_pc = __shfl_sync(0xFFFFFFFF, next_pc, inst.num_slots);
           shift = __shfl_sync(0xFFFFFFFF, shift, inst.num_slots);
+          if constexpr (!dae2LoadInstructions) {
+            if (lane_id == 0) {
+              prefetch_inst_window(smem_minsts, next_pc, allocwarpInstructionTargetSpan);
+            }
+          }
           __mprint("Loop: pc=%d reg=%d count=%d reg0=%d target_pc=%d arg_offset=%u",
             pc, inst.num_slots, inst.size, di.jmp_cnt, next_pc, shift);
         }
@@ -157,7 +195,7 @@ __device__ __forceinline__ void allocwarp_execute(
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();
             while (*bar != 0) {
-              __nanosleep(50);
+              __nanosleep(barrierPollSleepCycles);
             }
             __mprint("Issue barrier %d passed", inst.bar());
           }

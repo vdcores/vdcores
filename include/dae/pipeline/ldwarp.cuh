@@ -35,7 +35,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       // }
       while (*bar != 0) {
         // busy wait
-        __nanosleep(64);
+        __nanosleep(barrierPollSleepCycles);
         // if (blockIdx.x == 0 && first_wait) {
         //   printf("[LD][sm=%d] waiting bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
         //   first_wait = false;
