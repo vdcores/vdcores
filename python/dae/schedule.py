@@ -252,16 +252,25 @@ class SchedAttentionDecoding(Schedule):
     def __init__(self, reqs: int, seq_len: int,
                  KV_BLOCK_SIZE : int, NUM_KV_HEADS : int,
                  matO : torch.Tensor,
-                 tmas):
+                 tmas,
+                 side_input=None,
+                 k_store=None,
+                 token_pos=None):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
         self.num_heads = NUM_KV_HEADS
         self.matO = matO
         self.tmas = tmas
+        self.side_input = side_input
+        self.k_store = k_store
+        self.token_pos = token_pos
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
+        self.use_qwen_fused_qk = side_input is not None
+        if self.use_qwen_fused_qk and not all(side is not None for side in (side_input, k_store, token_pos)):
+            raise ValueError("SchedAttentionDecoding requires side_input, k_store, and token_pos together for the fused Qwen path")
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
@@ -272,15 +281,30 @@ class SchedAttentionDecoding(Schedule):
 
         req = sm // self.num_heads
         head = sm % self.num_heads
+        head_dim = self.matO.shape[-1]
 
         tQ, tK, tV = self.tmas
 
         num_kv_blocks = (self.seq_len + self.block_size - 1) // self.block_size
         seq_len_last_block = self.seq_len % self.block_size
+        if seq_len_last_block == 0:
+            seq_len_last_block = self.block_size
 
         # we only handle a single Q token here
         insts = [
-            self.AttentionInst(num_kv_blocks, seq_len_last_block, need_norm=False, need_rope=False),
+            self.AttentionInst(
+                num_kv_blocks,
+                seq_len_last_block,
+                need_norm=self.use_qwen_fused_qk,
+                need_rope=self.use_qwen_fused_qk,
+            ),
+        ]
+        if self.use_qwen_fused_qk:
+            insts += [
+                self.side_input.cord(self.token_pos * 3 * head_dim).group(),
+                self.k_store[req].cord((self.token_pos * self.num_heads + head) * head_dim).group(),
+            ]
+        insts += [
             tQ.cord(req, head).bar(self._bar("q")).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
@@ -291,8 +315,8 @@ class SchedAttentionDecoding(Schedule):
             # only the last block has new generated KV cache
             tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group(),
             tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group(),
-            TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group(),
         ]
+        insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
         return insts
 
     def bar_release_count(self, role: str):

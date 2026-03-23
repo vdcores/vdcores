@@ -84,6 +84,19 @@ class ToAttnVStoreCordAdapter(ToConvertedCordAdapter):
     def __init__(self, inner, position: int):
         super().__init__(inner, lambda _, m: (m, position, 0))
 
+class ToAttnCurrentKStore1DAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, position: int, max_seq_len: int, num_kv_heads: int, head_dim: int, dtype_size: int = 2):
+        row_elems = num_kv_heads * head_dim
+        super().__init__(
+            inner,
+            lambda sm: (
+                (
+                    ((sm // num_kv_heads) * max_seq_len + position) * row_elems
+                    + (sm % num_kv_heads) * head_dim
+                ) * dtype_size,
+            ),
+        )
+
 #####
 # TMA Builders
 #####

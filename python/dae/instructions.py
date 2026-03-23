@@ -36,6 +36,7 @@ class ComputeInstruction(Instruction):
             tensor = tensor.view(torch.uint16)
             assert tensor.numel() == 4
 
+        tensor.zero_()
         tensor[0] = self.opcode
         assert len(self.args) <= 3
         for i, arg in enumerate(self.args):
@@ -110,13 +111,22 @@ class ROPE_INTERLEAVE_512(ComputeInstruction):
         super().__init__(opcode=opcode.OP_ROPE_INTERLEAVE_512, args=[])
 
 
+def _encode_attention_runtime_flags(need_norm: bool, need_rope: bool) -> int:
+    flags = 0
+    if need_norm:
+        flags |= 1
+    if need_rope:
+        flags |= 2
+    return flags
+
+
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
     def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
-            args=[num_kv_block, last_kv_active_token_len],
+            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
         )
 
 
@@ -126,7 +136,7 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
-            args=[num_kv_block, last_kv_active_token_len],
+            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
         )
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
@@ -663,6 +673,7 @@ class TmaTensor(MemoryInstruction):
                 5: opcode.OP_ALLOC_TMA_LOAD_5D_FIX0,
             },
             "store": {
+                1: opcode.OP_ALLOC_WB_TMA_STORE_1D,
                 2: opcode.OP_ALLOC_WB_TMA_STORE_2D,
                 3: opcode.OP_ALLOC_WB_TMA_STORE_3D,
                 4: opcode.OP_ALLOC_WB_TMA_STORE_4D,
@@ -701,7 +712,7 @@ class TmaTensor(MemoryInstruction):
         return inst
 
     def tensor1d(self, action: str, size: int):
-        actions = ["load"]
+        actions = ["load", "store"]
         assert action in actions, f"action must be one of {actions}, got {action}"
         return self._build(action, size, 1, build_tma_1d, cord_func_tma_1d)
 

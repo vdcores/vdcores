@@ -177,7 +177,9 @@ void dae2(
         case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim: {
           using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
           using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-          task_attention_fwd_flash3_grouped<128, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
+          const bool need_norm = inst.args[2] & 0x1;
+          const bool need_rope = inst.args[2] & 0x2;
+          task_attention_fwd_flash3_grouped<128, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
         }
           break;
         case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split: {
@@ -188,7 +190,7 @@ void dae2(
           const int num_active_q = inst.args[1] & 0xFF;
           const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
           const int kv_start_idx = inst.args[2];
-          task_attention_fwd_flash3_grouped<128, 64, 64, true, 16, false, false, kernel_QK, kernel_PV>(num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len, kv_start_idx, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
+          task_attention_fwd_flash3_grouped<128, 64, 64, true, 16, false, false, kernel_QK, kernel_PV>(num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len, kv_start_idx, false, false, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
         }
           break;
         case OP_ATTN_SPLIT_POST_REDUCE: {
@@ -198,7 +200,9 @@ void dae2(
         case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64: {
           using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
           using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-          task_attention_fwd_flash3_grouped<64, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
+          const bool need_norm = inst.args[2] & 0x1;
+          const bool need_rope = inst.args[2] & 0x2;
+          task_attention_fwd_flash3_grouped<64, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
         }
           break;
         case OP_SILU_MUL_SHARED_BF16_K_4096_INTER: {

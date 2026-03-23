@@ -70,6 +70,132 @@ __device__ __forceinline__ void butterfly_reduce(TensorT &val, Op op) {
     }
 }
 
+template <int HEAD_DIM, int N_COMPUTE_THREAD, typename TensorVec, typename Vec2T>
+__device__ __forceinline__ void rms_affine_rope_rows(
+    TensorVec& input,
+    const int total_num_token,
+    float* smem_reduce,
+    const float epsilon,
+    const Vec2T* affine_weight,
+    const Vec2T* rope_row,
+    const bool need_norm,
+    const bool need_rope
+) {
+    constexpr int num_thread_per_token = (HEAD_DIM / 2 < N_COMPUTE_THREAD) ? HEAD_DIM / 2 : N_COMPUTE_THREAD;
+    constexpr int token_group_size = (N_COMPUTE_THREAD + num_thread_per_token - 1) / num_thread_per_token;
+    constexpr int num_warp_per_token = num_thread_per_token / 32;
+    static_assert(num_thread_per_token % 32 == 0, "to simplify warp-level reduce");
+
+    const int warp_id = __compute_tid() / 32;
+    const int lane_id = __compute_tid() % 32;
+    const int ofst_in_token_group = __compute_tid() / num_thread_per_token;
+    const int lane_in_one_token = __compute_tid() % num_thread_per_token;
+
+    #pragma unroll
+    for (int r = ofst_in_token_group; r < total_num_token; r += token_group_size) {
+        float sum = 0.0f;
+        if (need_norm) {
+            #pragma unroll
+            for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
+                auto val = __bfloat1622float2(input(r, i));
+                sum += val.x * val.x + val.y * val.y;
+            }
+
+            for (int offset = 16; offset > 0; offset /= 2)
+                sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
+            if (lane_id == 0)
+                smem_reduce[warp_id] = sum;
+            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+
+            if (lane_in_one_token == 0) {
+                #pragma unroll
+                for (int i = 1; i < num_warp_per_token; ++i)
+                    sum += smem_reduce[i + ofst_in_token_group * num_warp_per_token];
+                smem_reduce[ofst_in_token_group] = sum;
+            }
+            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+        }
+
+        const float rms_rcp = need_norm
+            ? rsqrtf(smem_reduce[ofst_in_token_group] / float(HEAD_DIM) + epsilon)
+            : 1.0f;
+
+        #pragma unroll
+        for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
+            auto val = __bfloat1622float2(input(r, i));
+            if (need_norm) {
+                val.x *= rms_rcp;
+                val.y *= rms_rcp;
+                if (affine_weight != nullptr) {
+                    auto weight = __bfloat1622float2(affine_weight[i]);
+                    val.x *= weight.x;
+                    val.y *= weight.y;
+                }
+            }
+            if (need_rope && rope_row != nullptr) {
+                auto cos_sin = __bfloat1622float2(rope_row[i]);
+                const float rotated_even = val.x * cos_sin.x - val.y * cos_sin.y;
+                const float rotated_odd = val.x * cos_sin.y + val.y * cos_sin.x;
+                val = {rotated_even, rotated_odd};
+            }
+            input(r, i) = __float22bfloat162_rn(val);
+        }
+        __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+    }
+}
+
+template <int HEAD_DIM, typename TensorVec, typename Vec2T>
+__device__ __forceinline__ void rms_affine_rope_single_row(
+    TensorVec& input,
+    const int row_idx,
+    float* smem_reduce,
+    const float epsilon,
+    const Vec2T* affine_weight,
+    const Vec2T* rope_row,
+    const bool need_norm,
+    const bool need_rope
+) {
+    constexpr int vec_cols = HEAD_DIM / 2;
+    const int thread_id = __compute_tid();
+    const int lane_id = thread_id % 32;
+
+    if (need_norm && thread_id < vec_cols) {
+        auto val = __bfloat1622float2(input(row_idx, thread_id));
+        float sum = val.x * val.x + val.y * val.y;
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
+        if (lane_id == 0)
+            smem_reduce[thread_id / 32] = sum;
+    }
+    __sync_compute_group(128);
+
+    if (need_norm && thread_id == 0)
+        smem_reduce[0] += smem_reduce[1];
+    __sync_compute_group(128);
+
+    const float rms_rcp = need_norm ? rsqrtf(smem_reduce[0] / float(HEAD_DIM) + epsilon) : 1.0f;
+    if (thread_id < vec_cols) {
+        auto val = __bfloat1622float2(input(row_idx, thread_id));
+        if (need_norm) {
+            val.x *= rms_rcp;
+            val.y *= rms_rcp;
+            if (affine_weight != nullptr) {
+                auto weight = __bfloat1622float2(affine_weight[thread_id]);
+                val.x *= weight.x;
+                val.y *= weight.y;
+            }
+        }
+        if (need_rope && rope_row != nullptr) {
+            auto cos_sin = __bfloat1622float2(rope_row[thread_id]);
+            const float rotated_even = val.x * cos_sin.x - val.y * cos_sin.y;
+            const float rotated_odd = val.x * cos_sin.y + val.y * cos_sin.x;
+            val = {rotated_even, rotated_odd};
+        }
+        input(row_idx, thread_id) = __float22bfloat162_rn(val);
+    }
+    __sync_compute_group(128);
+}
+
 
 template <typename EngineS, typename LayoutS, typename TensorRowMax>
 __device__ __forceinline__ void exp_scale(Tensor<EngineS, LayoutS> &acc_fragS, TensorRowMax& row_max) {
@@ -182,6 +308,8 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int num_active_q, // to avoid overwriting other split_kv metadata buffer
     const int last_kv_active_token_len, // real kv tokens in the last block
     const int kv_start_idx, // global token-pos of first kv token, for prefill mask calculation
+    const bool runtime_need_norm,
+    const bool runtime_need_rope,
     void *base,
     float *smem_reduce,
     const MInst *st_insts,
@@ -293,10 +421,40 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     // load V
     // 4. O = diag(exp(m_old - m)) * O + PV
 
+    const bool use_qwen_fused_qk = runtime_need_norm || runtime_need_rope;
+    int slot_side_input = 0;
+    int slot_k_store = 0;
+    const vec2_t* q_norm_weight = nullptr;
+    const vec2_t* k_norm_weight = nullptr;
+    const vec2_t* rope_row = nullptr;
+    vec2_t* sKStore_ptr = nullptr;
+    if (use_qwen_fused_qk) {
+        slot_side_input = m2c.template pop<0>();
+        const vec2_t* packed_side_input = (const vec2_t*)get_slot_address(base, extract(slot_side_input));
+        q_norm_weight = packed_side_input;
+        k_norm_weight = packed_side_input + HEAD_DIM / 2;
+        rope_row = packed_side_input + HEAD_DIM;
+        slot_k_store = m2c.template pop<0>();
+        sKStore_ptr = (vec2_t*)get_slot_address(base, extract(slot_k_store));
+    }
+
     // load Qtile
     int slot_Q = m2c.template pop<0>();
     data_t* sQ_ptr = (data_t*)get_slot_address(base, extract(slot_Q));
     auto sQ = make_tensor(make_smem_ptr(sQ_ptr), layout_sQ);
+    auto sQ_vec = make_tensor(make_smem_ptr((vec2_t*)sQ_ptr), layout_sQ_vec);
+    if (use_qwen_fused_qk) {
+        rms_affine_rope_rows<HEAD_DIM, 128>(
+            sQ_vec,
+            Q_BLOCK_SIZE,
+            smem_reduce,
+            1.0e-6f,
+            q_norm_weight,
+            rope_row,
+            runtime_need_norm,
+            runtime_need_rope
+        );
+    }
     auto frag_Q = thr_mma_qk.partition_fragment_A(sQ);
     // Keep scores in the log2 domain expected by the exp2-based softmax path
     // without rewriting the swizzled Q tile in shared memory.
@@ -333,6 +491,23 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
         auto sK = make_tensor(make_smem_ptr(sK_ptr), layout_sK);
         auto frag_K = thr_mma_qk.partition_fragment_B(sK);
         auto sK_vec = make_tensor(make_smem_ptr((vec2_t*)sK_ptr), layout_sK_vec);
+        if (use_qwen_fused_qk && kv_block_idx == num_kv_blocks - 1 && last_kv_active_token_len > 0) {
+            const int current_k_row = last_kv_active_token_len - 1;
+            rms_affine_rope_single_row<HEAD_DIM>(
+                sK_vec,
+                current_k_row,
+                smem_reduce,
+                1.0e-6f,
+                k_norm_weight,
+                rope_row,
+                runtime_need_norm,
+                runtime_need_rope
+            );
+            if (thread_id < HEAD_DIM / 2) {
+                sKStore_ptr[thread_id] = sK_vec(current_k_row, thread_id);
+            }
+            __sync_compute_group(128);
+        }
 
         // 1. S = QK^T
         warpgroup_arrive();
@@ -456,6 +631,10 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     c2m.push(thread_id, slot_V);
     c2m.push(thread_id, slot_oldK);
     c2m.push(thread_id, slot_Q);
+    if (use_qwen_fused_qk) {
+        c2m.push(thread_id, slot_side_input);
+        c2m.template push<0, true>(thread_id, slot_k_store);
+    }
     
     // final correction
     // row sum is still thread local now
