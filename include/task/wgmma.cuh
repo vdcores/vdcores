@@ -82,7 +82,7 @@ __device__ __forceinline__ void task_gemm(
             sb += b_tile_offset;
         }
         slot_a = m2c.template pop<0>();
-        sa = (data_t *)get_slot_address(base, slot_a);
+        sa = (data_t *)get_slot_address(base, extract(slot_a));
 
         if (i > 0) {
             warpgroup_wait<0>();

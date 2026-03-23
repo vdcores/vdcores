@@ -3,7 +3,7 @@ import argparse
 import torch
 
 from dae.launcher import *
-from dae.schedule import SchedGemv
+from dae.schedule import SchedGemm
 from dae.util import dae_app, tensor_diff
 
 
@@ -39,7 +39,6 @@ gemm = SchedGemm(
     Atom,
     MNK=(M, N, K),
     tmas=(loadA, loadB, store_tensor),
-    fold=1,
 ).place(num_sms)
 
 dae.i(
