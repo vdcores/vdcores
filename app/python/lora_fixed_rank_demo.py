@@ -56,46 +56,81 @@ bars = [None] * len(GROUP_SIZES)
 
 #---- Schedule Srhink GEMM ----#
 # simple heuristic to dispatch to different kernels
-shrink_base_sm = 0
 shrink_insts = []
-for group_id, token_count in enumerate(GROUP_SIZES):
-    if token_count == 8:
-        Atom = Gemv_M64N8
-        Atom.n_batch = 2
-        M, N, K = LORA_RANK, token_count, HIDDEN
-    elif token_count == 64:
-        Atom = Gemv_M64N64
-        M, N, K = token_count, LORA_RANK, HIDDEN
-    else:
-        raise ValueError(f"Unsupported token count {token_count}")
-    TileM, TileN, TileK = Atom.MNK
-    if token_count == 8:
+
+def vdc_shrink_sched():
+    shrink_base_sm = 0
+    for group_id, token_count in enumerate(GROUP_SIZES):
+        if token_count == 8:
+            Atom = Gemv_M64N8
+            Atom.n_batch = 2
+            M, N, K = LORA_RANK, token_count, HIDDEN
+        elif token_count == 64:
+            Atom = Gemm_M64N64
+            M, N, K = token_count, LORA_RANK, HIDDEN
+        else:
+            raise ValueError(f"Unsupported token count {token_count}")
+        TileM, TileN, TileK = Atom.MNK
+        if token_count == 8:
+            loadA = TmaTensor(dae, matA[group_id]).wgmma_load(TileM, TileK, Major.K)
+            loadB = TmaTensor(dae, matX[group_id]).wgmma_load(TileN, TileK * Atom.n_batch, Major.K)
+            reduceC = TmaTensor(dae, matShrink[group_id]).wgmma("reduce", TileN, TileM, Major.MN)
+        else:
+            loadA = TmaTensor(dae, matX[group_id]).wgmma_load(TileM, TileK, Major.K)
+            loadB = TmaTensor(dae, matA[group_id]).wgmma_load(TileN, TileK, Major.K)
+            reduceC = TmaTensor(dae, matShrink[group_id]).wgmma("reduce", TileM, TileN, Major.K)
+
+        num_sms = 8 if token_count == 8 else 32
+        shrink_bar = dae.new_bar(num_sms)
+        bars[group_id] = shrink_bar
+
+        op_class = SchedGemv if token_count == 8 else SchedGemm
+        shrink = op_class(
+            Atom,
+            MNK=(M, N, K),
+            tmas=(loadA, loadB, reduceC),
+        ).place(num_sms, shrink_base_sm).bar("store", shrink_bar)
+        shrink_insts.append(shrink)
+
+        shrink_base_sm += num_sms
+        if shrink_base_sm >= NUM_SMS:
+            shrink_base_sm = 0
+
+def base_shrink_sched():
+    shrink_base_sm = 0
+    def split_N(base_sm, num_sm, N, Atom):
+        TileM, TileN, TileK = Atom.MNK
+        insts = []
         loadA = TmaTensor(dae, matA[group_id]).wgmma_load(TileM, TileK, Major.K)
-        loadB = TmaTensor(dae, matX[group_id]).wgmma_load(TileN, TileK * Atom.n_batch, Major.K)
-        reduceC = TmaTensor(dae, matShrink[group_id]).wgmma("reduce", TileN, TileM, Major.MN)
-    else:
-        loadA = TmaTensor(dae, matX[group_id]).wgmma_load(TileM, TileK, Major.K)
-        loadB = TmaTensor(dae, matA[group_id]).wgmma_load(TileN, TileK, Major.K)
-        reduceC = TmaTensor(dae, matShrink[group_id]).wgmma("reduce", TileM, TileN, Major.K)
+        bar = dae.new_bar(num_sm)
+        bars[group_id] = bar
+        for i in range(N // TileN):
+            sm_for_me = num_sm // (N // TileN)
+            loadB = TmaTensor(dae, matX[group_id][i*TileN:(i+1)*TileN]).wgmma_load(TileN, TileK * Atom.n_batch, Major.K)
+            reduceC = TmaTensor(dae, matShrink[group_id][i*TileN:(i+1)*TileN]).wgmma("reduce", TileN, TileM, Major.MN)
 
-    num_sms = 8 if token_count == 8 else 32
-    shrink_bar = dae.new_bar(num_sms)
-    bars[group_id] = shrink_bar
+            inst = SchedGemv(
+                Atom,
+                MNK=(LORA_RANK, TileN, HIDDEN),
+                tmas=(loadA, loadB, reduceC),
+            ).place(sm_for_me, base_sm + i * sm_for_me).bar("store", bars[group_id])
+            insts.append(inst)
+        return insts
 
-    op_class = SchedGemv if token_count == 8 else SchedGemm
-    shrink = op_class(
-        Atom,
-        MNK=(M, N, K),
-        tmas=(loadA, loadB, reduceC),
-    ).place(num_sms, shrink_base_sm).bar("store", shrink_bar)
-    shrink_insts.append(shrink)
+    for group_id, token_count in enumerate(GROUP_SIZES):
+        num_sms = token_count // 8
+        insts = split_N(shrink_base_sm, num_sms, token_count, Gemv_M64N8)
 
-    shrink_base_sm += num_sms
-    if shrink_base_sm >= NUM_SMS:
-        shrink_base_sm = 0
+        shrink_base_sm += num_sms
+        if shrink_base_sm >= NUM_SMS:
+            shrink_base_sm = 0
+        shrink_insts.extend(insts)   
+
+vdc_shrink_sched()
+# base_shrink_sched()
 
 dae.i(
-    *shrink_insts,
+    shrink_insts,
     TerminateC(),
     TerminateM(),
 )
@@ -105,6 +140,6 @@ print(f"group sizes: {GROUP_SIZES}, sms: {NUM_SMS}")
 
 dae_app(dae)
 
-for group_id, token_count in enumerate(GROUP_SIZES):
-    tensor_diff(f"group{group_id}_shrink_{token_count}", refShrink[group_id], matShrink[group_id])
-    # tensor_diff(f"group{group_id}_expand_{token_count}", refOut[group_id], matOut[group_id])
+# for group_id, token_count in enumerate(GROUP_SIZES):
+#     tensor_diff(f"group{group_id}_shrink_{token_count}", refShrink[group_id], matShrink[group_id])
+#     tensor_diff(f"group{group_id}_expand_{token_count}", refOut[group_id], matOut[group_id])

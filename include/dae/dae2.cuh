@@ -170,6 +170,11 @@ void dae2(
           task_gemv<gemv_atom, 64, 64, 1, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
           }
           break;
+        case OP_GEMV_M64N8B2: {
+          using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
+          task_gemv<gemv_atom, 64, 256, 2, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
+          }
+          break;
         case OP_GEMV_M64N8_MMA: {
           task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
           }

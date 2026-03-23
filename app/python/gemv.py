@@ -13,11 +13,12 @@ dtype = torch.bfloat16
 
 Atom = Gemv_M64N8
 Atom.n_batch = 2
-TileM, N, TileK = Atom.MNK
+TileM, TileN, TileK = Atom.MNK
 
 M = 64
 K = 4096
-num_sms = 8
+N = 64
+num_sms = N // TileN * 8
 
 assert K % TileK == 0
 assert M % TileM == 0
@@ -29,19 +30,24 @@ matC = torch.zeros(N, M, dtype=dtype, device=gpu)
 dae = Launcher(num_sms, device=gpu)
 
 loadA = TmaTensor(dae, matA).wgmma_load(TileM, TileK, Major.K)
-loadB = TmaTensor(dae, matB).wgmma_load(N, TileK * Atom.n_batch, Major.K)
-reduceC = TmaTensor(dae, matC).wgmma("reduce", N, TileM, Major.MN)
 
-store_tensor = reduceC 
+insts = []
+for i in range(N // TileN):
+    sm_for_me = num_sms // (N // TileN)
+    loadB = TmaTensor(dae, matB[i*TileN:(i+1)*TileN]).wgmma_load(TileN, TileK * Atom.n_batch, Major.K)
+    reduceC = TmaTensor(dae, matC[i*TileN:(i+1)*TileN]).wgmma("reduce", TileN, TileM, Major.MN)
 
-gemv = SchedGemv(
-    Atom,
-    MNK=(M, N, K),
-    tmas=(loadA, loadB, store_tensor),
-).place(num_sms)
+    store_tensor = reduceC 
+
+    gemv = SchedGemv(
+        Atom,
+        MNK=(M, TileN, K),
+        tmas=(loadA, loadB, store_tensor),
+    ).place(sm_for_me, i * sm_for_me)
+    insts.append(gemv)
 
 dae.i(
-    gemv,
+    insts,
     TerminateC(),
     TerminateM(),
 )
