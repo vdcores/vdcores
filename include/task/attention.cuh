@@ -297,20 +297,10 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     int slot_Q = m2c.template pop<0>();
     data_t* sQ_ptr = (data_t*)get_slot_address(base, extract(slot_Q));
     auto sQ = make_tensor(make_smem_ptr(sQ_ptr), layout_sQ);
-    // Scale Q in smem cooperatively before WGMMA.
-    // Fuse log2(e) into the scale so all subsequent exp calls can use exp2
-    // exp(x / sqrt(D)) = exp2(x * log2(e) / sqrt(D))
-    const data_t scale_fp16 = static_cast<data_t>(M_LOG2E / sqrtf((float)HEAD_DIM));
-    {
-        auto sQ_part = thr_mma_qk.partition_A(sQ);
-        #pragma unroll
-        for (int i = 0; i < size(sQ_part); ++i) {
-            sQ_part(i) = sQ_part(i) * scale_fp16;
-        }
-    }
-    __sync_compute_group(128); // all threads must finish writing before WGMMA reads
-
     auto frag_Q = thr_mma_qk.partition_fragment_A(sQ);
+    // Keep scores in the log2 domain expected by the exp2-based softmax path
+    // without rewriting the swizzled Q tile in shared memory.
+    const accum_t score_scale = static_cast<accum_t>(M_LOG2E / sqrtf((float)HEAD_DIM));
 
     // O layout
     Tensor t_dummyO = make_tensor(make_smem_ptr((accum_t*)nullptr), layout_sO);
@@ -359,6 +349,13 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
 
         // wait for both previous O and current K
         warpgroup_wait<0>();
+        #pragma unroll
+        for (int r = 0; r < size<1>(s_mn_view); ++r) {
+            #pragma unroll
+            for (int c = 0; c < size<0>(s_mn_view); ++c) {
+                s_mn_view(c, r) *= score_scale;
+            }
+        }
         if (kv_block_idx == num_kv_blocks - 1) {
             // mask invalid positions for the last block
             _mask(s_mn_view, last_kv_active_token_len);
