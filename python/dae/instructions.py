@@ -87,6 +87,15 @@ class Gemm_M64N64(ComputeInstruction):
 
     def __init__(self, kTiles: int, residual: bool = False):
         super().__init__(opcode=opcode.OP_GEMM_M64N64, args=[kTiles])
+
+class Gemm_M64N64K64(ComputeInstruction):
+    MNK = (64, 64, 64)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMM_M64N64K64, args=[kTiles])
+
+
 class Gemm_M64N128K64(ComputeInstruction):
     MNK = (64, 128, 64)
     n_batch = 1
@@ -767,6 +776,7 @@ __all__ = [
     "Gemv_M64N8K64",
     "Gemv_M64N8B2",
     "Gemm_M64N64",
+    "Gemm_M64N64K64",
     "Gemm_M64N128K64",
     "Gemv_M64N8_ROPE_128",
     "Gemv_M192N16",
