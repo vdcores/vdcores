@@ -12,10 +12,13 @@ Use this directory as the first stop when a task needs stable repo context.
 - Runtime mechanics:
   - [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
   - [runtime/memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
+  - [runtime/gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
 - Model/framework behavior:
   - [modeling/pytorch-kv-cache.md](/home1/11362/depctg/vdcores/agents/knowledge/modeling/pytorch-kv-cache.md)
 - Performance/debugging lessons:
   - [attention-performance.md](/home1/11362/depctg/vdcores/agents/knowledge/attention-performance.md)
+- Scheduling demos:
+  - [lora-scheduling-demo.md](/home1/11362/depctg/vdcores/agents/knowledge/lora-scheduling-demo.md)
 - Utility abstractions:
   - [cord-adapters.md](/home1/11362/depctg/vdcores/agents/knowledge/cord-adapters.md)
 

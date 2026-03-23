@@ -107,7 +107,7 @@ __device__ __forceinline__ void task_gemv(
 
         if (thread_id == 0) {
             old_slots = slot_a;
-            if (i % b_load_interval == 3)
+            if (i % b_load_interval == b_load_interval - 1) 
                 old_slots |= slot_b;
         }
     }

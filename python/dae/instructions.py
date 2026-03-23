@@ -68,6 +68,19 @@ class Gemv_M128N8(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=opcode.OP_GEMV_M128N8, args=[kTiles, nprefeth])
 
+class Gemm_M64N64(ComputeInstruction):
+    MNK = (64, 64, 128)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMM_M64N64, args=[kTiles])
+class Gemm_M64N128K64(ComputeInstruction):
+    MNK = (64, 128, 64)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMM_M64N128K64, args=[kTiles])
+
 
 class Gemv_M64N8_ROPE_128(ComputeInstruction):
     MNK = (64, 8, 256)
@@ -738,6 +751,8 @@ __all__ = [
     "TerminateC",
     "Gemv_M64N8",
     "Gemv_M128N8",
+    "Gemm_M64N64",
+    "Gemm_M64N128K64",
     "Gemv_M64N8_ROPE_128",
     "Gemv_M192N16",
     "Gemv_M64N8_MMA",
