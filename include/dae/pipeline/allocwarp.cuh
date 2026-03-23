@@ -2,6 +2,14 @@
 
 #include "virtualcore.cuh"
 
+static __device__ __forceinline__ void prefetch_inst_window(
+    const int lane_id, const MInst* insts, uint32_t target_pc) {
+  if constexpr (!dae2LoadInstructions) {
+    if (lane_id == 0)
+      prefetch_l1(insts + (target_pc % numInsts));
+  }
+}
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -23,13 +31,13 @@ __device__ __forceinline__ void allocwarp_execute(
   __syncwarp();
 
   while (di.pred_continue) {
-
     inst = smem_minsts[next_pc % numInsts];
     // async zone after all shared memory read
     // IF/ID
     // 1. try to fetch a instruction
     // TODO(zhiyuang): inst to use is quite close. optimize? e.g, vector load?
     pc = next_pc;
+    prefetch_inst_window(lane_id, smem_minsts, pc + 2);
     uint64_t addr_accum = __shfl_sync(0xFFFFFFFF, di.gpr[1], pc - di.loop_start_pc);
 
     __mprint("[exec][pc=%d]: opcode=%04x m2c.ptr=%d m2ld[0].ptr=%d m2ld[1].ptr=%d",
@@ -77,7 +85,7 @@ __device__ __forceinline__ void allocwarp_execute(
         if (di.slot_alloc >= 0)
           break;
 
-        __nanosleep(64); // try not to busy wait
+        __nanosleep(allocRetrySleepCycles);
       }
     }
 
@@ -108,8 +116,10 @@ __device__ __forceinline__ void allocwarp_execute(
       // have to keep this branch
       if (di.pred_jump) {
         --di.loop_counter;
-        if (di.loop_counter > 0)
+        if (di.loop_counter > 0) {
           next_pc = di.loop_start_pc;
+          // prefetch_inst_window(lane_id, smem_minsts, next_pc + 2);
+        }
         di.gpr[1] += di.gpr[0];
       }
     } else { // Executing the non-allocation instructions (control flow instructions)
@@ -136,6 +146,7 @@ __device__ __forceinline__ void allocwarp_execute(
         }
         break;
         case op(OP_LOOP): {
+          prefetch_inst_window(lane_id, smem_minsts, inst.coords[0] + 1);
           // F0: jump to a different pc after certain iterations
           if (__memory_tid() == inst.num_slots) {
             if (++di.jmp_cnt < inst.size) {
@@ -157,7 +168,7 @@ __device__ __forceinline__ void allocwarp_execute(
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();
             while (*bar != 0) {
-              __nanosleep(50);
+              __nanosleep(barrierPollSleepCycles);
             }
             __mprint("Issue barrier %d passed", inst.bar());
           }

@@ -33,6 +33,14 @@ __device__ __forceinline__ int load_l2(const int* addr) {
     return val;
 }
 
+template<typename T>
+__device__ __forceinline__ void prefetch_l1(const T* addr) {
+    asm volatile(
+        "prefetch.global.L1 [%0];"
+        :
+        : "l"(addr));
+}
+
 #define __compute_tid() (threadIdx.x)
 #define __memory_tid() cuda::ptx::get_sreg_laneid()
 

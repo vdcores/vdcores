@@ -11,6 +11,7 @@ Use this directory as the first stop when a task needs stable repo context.
   - [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md)
 - Runtime mechanics:
   - [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
+  - [runtime/memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
 - Model/framework behavior:
   - [modeling/pytorch-kv-cache.md](/home1/11362/depctg/vdcores/agents/knowledge/modeling/pytorch-kv-cache.md)
 - Performance/debugging lessons:
@@ -25,6 +26,7 @@ Use this directory as the first stop when a task needs stable repo context.
   - then read [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md) or [llama-scheduling.md](/home1/11362/depctg/vdcores/agents/knowledge/llama-scheduling.md)
 - If the task touches attention writeback, new slots, or deadlocks after launch:
   - read [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
+  - then read [runtime/memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
   - then read [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md)
 - If the task is broad and unfamiliar:
   - start with [project-map.md](/home1/11362/depctg/vdcores/agents/knowledge/project-map.md)

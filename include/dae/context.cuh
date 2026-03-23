@@ -34,6 +34,15 @@ static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp 
 static constexpr int numThreadsC2MBarrier = numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsLDBarrier = 2;
 
+// Polling backoff for the memory core hot loops.
+static constexpr int allocRetrySleepCycles = 16;
+static constexpr int barrierPollSleepCycles = 16;
+
+// Allocwarp instruction prefetch policy.
+static constexpr int allocwarpInstructionPrefetchDistance = 2;
+static constexpr int allocwarpInstructionSeedCount = 2;
+static constexpr int allocwarpInstructionTargetSpan = 2;
+
 constexpr int flagBits = 6;
 constexpr int slotBits = 6;
 static_assert(numSlots <= (1 << slotBits), "numSlots exceeds slotBits capacity");
