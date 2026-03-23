@@ -253,9 +253,7 @@ class SchedAttentionDecoding(Schedule):
                  KV_BLOCK_SIZE : int, NUM_KV_HEADS : int,
                  matO : torch.Tensor,
                  tmas,
-                 q_norm=None,
-                 k_norm=None,
-                 rope=None,
+                 side_input=None,
                  k_store=None,
                  token_pos=None):
         super().__init__()
@@ -264,17 +262,15 @@ class SchedAttentionDecoding(Schedule):
         self.num_heads = NUM_KV_HEADS
         self.matO = matO
         self.tmas = tmas
-        self.q_norm = q_norm
-        self.k_norm = k_norm
-        self.rope = rope
+        self.side_input = side_input
         self.k_store = k_store
         self.token_pos = token_pos
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
-        self.use_qwen_fused_qk = any(side is not None for side in (q_norm, k_norm, rope))
-        if self.use_qwen_fused_qk and not all(side is not None for side in (q_norm, k_norm, rope, k_store, token_pos)):
-            raise ValueError("SchedAttentionDecoding requires q_norm, k_norm, rope, k_store, and token_pos together for the fused Qwen path")
+        self.use_qwen_fused_qk = side_input is not None
+        if self.use_qwen_fused_qk and not all(side is not None for side in (side_input, k_store, token_pos)):
+            raise ValueError("SchedAttentionDecoding requires side_input, k_store, and token_pos together for the fused Qwen path")
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
@@ -305,9 +301,7 @@ class SchedAttentionDecoding(Schedule):
         ]
         if self.use_qwen_fused_qk:
             insts += [
-                self.q_norm.cord(0).group(),
-                self.k_norm.cord(0).group(),
-                self.rope.cord(sm).group(),
+                self.side_input.cord(self.token_pos * 3 * head_dim).group(),
                 self.k_store[req].cord((self.token_pos * self.num_heads + head) * head_dim).group(),
             ]
         insts += [

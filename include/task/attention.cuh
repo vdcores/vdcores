@@ -422,21 +422,18 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     // 4. O = diag(exp(m_old - m)) * O + PV
 
     const bool use_qwen_fused_qk = runtime_need_norm || runtime_need_rope;
-    int slot_q_norm = 0;
-    int slot_k_norm = 0;
-    int slot_rope = 0;
+    int slot_side_input = 0;
     int slot_k_store = 0;
     const vec2_t* q_norm_weight = nullptr;
     const vec2_t* k_norm_weight = nullptr;
     const vec2_t* rope_row = nullptr;
     vec2_t* sKStore_ptr = nullptr;
     if (use_qwen_fused_qk) {
-        slot_q_norm = m2c.template pop<0>();
-        q_norm_weight = (const vec2_t*)get_slot_address(base, extract(slot_q_norm));
-        slot_k_norm = m2c.template pop<0>();
-        k_norm_weight = (const vec2_t*)get_slot_address(base, extract(slot_k_norm));
-        slot_rope = m2c.template pop<0>();
-        rope_row = (const vec2_t*)get_slot_address(base, extract(slot_rope));
+        slot_side_input = m2c.template pop<0>();
+        const vec2_t* packed_side_input = (const vec2_t*)get_slot_address(base, extract(slot_side_input));
+        q_norm_weight = packed_side_input;
+        k_norm_weight = packed_side_input + HEAD_DIM / 2;
+        rope_row = packed_side_input + HEAD_DIM;
         slot_k_store = m2c.template pop<0>();
         sKStore_ptr = (vec2_t*)get_slot_address(base, extract(slot_k_store));
     }
@@ -635,9 +632,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     c2m.push(thread_id, slot_oldK);
     c2m.push(thread_id, slot_Q);
     if (use_qwen_fused_qk) {
-        c2m.push(thread_id, slot_q_norm);
-        c2m.push(thread_id, slot_k_norm);
-        c2m.push(thread_id, slot_rope);
+        c2m.push(thread_id, slot_side_input);
         c2m.template push<0, true>(thread_id, slot_k_store);
     }
     

@@ -187,6 +187,13 @@ matRMSInputW = [l.input_layernorm.weight for l in layers] + [model.model.norm.we
 matRMSPostAttnW = [l.post_attention_layernorm.weight for l in layers]
 matQNormWs = [permute_rope_head_weight(l.self_attn.q_norm.weight.detach()) for l in layers]
 matKNormWs = [permute_rope_head_weight(l.self_attn.k_norm.weight.detach()) for l in layers]
+matQwenSideInputs = []
+for q_norm_w, k_norm_w in zip(matQNormWs, matKNormWs):
+    packed = torch.empty(MAX_SEQ_LEN, 3 * HEAD_DIM, dtype=dtype, device=gpu)
+    packed[:, 0:HEAD_DIM] = q_norm_w.view(1, HEAD_DIM)
+    packed[:, HEAD_DIM:2 * HEAD_DIM] = k_norm_w.view(1, HEAD_DIM)
+    packed[:, 2 * HEAD_DIM:3 * HEAD_DIM] = matRope
+    matQwenSideInputs.append(packed)
 
 matqWs = [
     permute_rope_weight(l.self_attn.q_proj.weight, NUM_Q_HEAD, HEAD_DIM, HIDDEN)
@@ -231,8 +238,7 @@ layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N
 layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
-layerg.addTma("loadQNormW", matQNormWs, lambda t: t.tensor1d("load", HEAD_DIM))
-layerg.addTma("loadKNormW", matKNormWs, lambda t: t.tensor1d("load", HEAD_DIM))
+layerg.addTma("loadQwenSideInput", matQwenSideInputs, lambda t: t.tensor1d("load", 3 * HEAD_DIM))
 layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
@@ -269,7 +275,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
     storeHidden1D = TmaStore1D(matHidden, bytes=HIDDEN * 2)
     loadHidden1D = TmaLoad1D(matHidden, bytes=HIDDEN * 2)
     storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
-    rope_row_load = StaticCordAdapter(TmaLoad1D(matRope[token_pos], bytes=HEAD_DIM * 2))
 
     embed_rms = SchedRMSShared(
         num_token=N,
@@ -330,9 +335,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
-        q_norm=layerg["loadQNormW"],
-        k_norm=layerg["loadKNormW"],
-        rope=rope_row_load,
+        side_input=layerg["loadQwenSideInput"],
         k_store=current_k_store,
         token_pos=token_pos,
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
