@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cutlass/numeric_types.h>
 #include <cstdint>
 #include <cuda/ptx>
 

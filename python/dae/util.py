@@ -2,6 +2,12 @@ import torch
 import argparse
 import numpy as np
 
+from .launcher import extract_compute_operator_names
+
+
+DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
+
+
 def tensor_diff(name : str,
                 t1 : torch.Tensor, t2 : torch.Tensor, ref : torch.Tensor | None = None):
     if ref is None:
@@ -27,6 +33,15 @@ def dump_insts(dae, smid : int):
     print(f"[sm={smid}] Memory Instructions:")
     for i, inst in enumerate(sm0.built_minsts):
         print(f"{i:02}: {inst}")
+
+
+def write_compute_operator_file(dae, path: str = DEFAULT_COMPUTE_OPS_FILE):
+    operator_names = extract_compute_operator_names(dae)
+    with open(path, "w", encoding="utf-8") as f:
+        for name in operator_names:
+            f.write(f"{name}\n")
+    print(f"[compute-ops] wrote {len(operator_names)} operators to {path}")
+    return path
 
 class ProfileParser:
     def __init__(self, dae):
@@ -88,12 +103,20 @@ def dae_app(dae, total_bytes = None):
                         help="Dump instructions for SM ID (default: 0)")
     parser.add_argument("-p", "--profile", type=str, nargs="+", default=None,
                         help="Profile with VDCores profiling counters")
+    parser.add_argument("-w", "--write-compute-ops", type=str, nargs="?", const=DEFAULT_COMPUTE_OPS_FILE, default=None,
+                        help=f"Write the launcher compute-operator list to a file (default: {DEFAULT_COMPUTE_OPS_FILE})")
     
     parsed = parser.parse_args()
+    did_work = False
     
     if parsed.instdump is not None:
         dump_insts(dae, parsed.instdump)
         print()
+        did_work = True
+
+    if parsed.write_compute_ops is not None:
+        write_compute_operator_file(dae, parsed.write_compute_ops)
+        did_work = True
 
     executed = False
     if parsed.launch:
@@ -110,7 +133,7 @@ def dae_app(dae, total_bytes = None):
         dae.bench(parsed.bench, total_bytes=total_bytes)
         torch.cuda.synchronize()
         executed = True
-    else:
+    elif not did_work:
         print(f"DAE NO EXECUTION MODE.")
 
     if executed and parsed.profile is not None:

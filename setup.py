@@ -1,7 +1,6 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
-import shutil
 
 import torch
 torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
@@ -11,11 +10,13 @@ extra_link_args = [
 ]
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+generated_include_dir = os.path.join(this_dir, "build", "generated")
 sources = [os.path.join(this_dir, "src", "torch_runtime.cu")]
 runtime_obj = os.path.join(this_dir, "runtime.o")
 include_dirs = [
     os.path.join(this_dir, "include"),
     os.path.join(this_dir, "include", "dae"),
+    generated_include_dir,
 ]
 
 setup(

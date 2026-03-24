@@ -4,6 +4,7 @@
 
 #include "allocator.cuh"
 #include "queue.cuh"
+#include "compute_dispatch.cuh"
 
 #include <cuda.h>
 #include <cuda/barrier>
@@ -14,14 +15,6 @@
 #include "pipeline/allocwarp.cuh"
 #include "pipeline/ldwarp.cuh"
 #include "pipeline/stwarp.cuh"
-
-// tasks
-#include "task/gemv.cuh"
-#include "task/wgmma.cuh"
-#include "task/rms_norm.cuh"
-#include "task/attention.cuh"
-#include "task/silu.cuh"
-#include "task/argmax.cuh"
 
 static __device__ __forceinline__ void * align_to(void *ptr, size_t align) {
   uintptr_t addr = (uintptr_t)ptr;
@@ -131,207 +124,20 @@ void dae2(
       inst = cinsts[(pc++) % numInsts];
     
       __cprint("Executing instruction at PC %d: opcode=%04x", pc - 1, inst.opcode);
-
-      switch (inst.opcode) {
-        case OP_DUMMY:
-          for (int i = 0; i < inst.args[0]; i++) {
-            __cprint("[Dummy][i=%d] before wait", i);
-            auto slot_id = m2c.pop();
-            __nanosleep(inst.args[1]); // simulate some compute
-            __cprint("[Dummy][i=%d] after pop slot_id=%d", i, slot_id);
-            c2m.push<0>(thread_id, slot_id);
-          }
-          break;
-        // TODO(zhiyuang): consider a "link" style implementation of COPY
-        case OP_COPY: {
-          for (int i = 0; i < inst.args[0]; i++) {
-            __cprint("[Copy][i=%d] before wait", i);
-            auto read_slot = m2c.pop();
-            uint32_t *read_data = (uint32_t*)get_slot_address(smem_base, extract(read_slot));
-            auto write_slot = m2c.pop();
-            uint32_t *write_data = (uint32_t*)get_slot_address(smem_base, extract(write_slot));
-
-            __cprint("[Copy][i=%d] after pop read_slot=%d, write_slot=%d", i, read_slot, write_slot);
-            for (int i = thread_id; i < inst.args[1]; i += 128)
-              write_data[i] = read_data[i];
-
-            c2m.push<0, true>(thread_id, write_slot);
-            c2m.push(thread_id, read_slot); // push the read slot back to indicate it's done and can be reused
-          }
-          break;
-        }
-        case OP_GEMV_M64N8: {
-          using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          task_gemv<gemv_atom, 64, 256, 4, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-          }
-          break;
-        case OP_GEMV_M64N8K64: {
-          using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          task_gemv<gemv_atom, 64, 64, 1, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-          }
-          break;
-        case OP_GEMV_M64N8B2: {
-          using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          task_gemv<gemv_atom, 64, 256, 2, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-          }
-          break;
-        case OP_GEMV_M64N8_MMA: {
-          task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
-          }
-          break;
-        // case OP_GEMV_M128N8: {
-        //   using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-        //   task_gemv<gemv_atom, 128, 128, 4, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-        //   }
-        //   break;
-        case OP_GEMM_M64N64: {
-          using gemm_atom = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          task_gemm<gemm_atom, 64, 64, 128, 1, false>(inst.args[0], smem_base, m2c, c2m);
-          }
-          break;
-        case OP_GEMM_M64N64K64: {
-          using gemm_atom = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          task_gemm<gemm_atom, 64, 64, 64, 1, false>(inst.args[0], smem_base, m2c, c2m);
-          }
-          break;
-        case OP_GEMM_M64N128K64: {
-          using gemm_atom = cute::SM90_64x128x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          task_gemm<gemm_atom, 64, 128, 64, 1, false>(inst.args[0], smem_base, m2c, c2m);
-          }
-          break;
-        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim: {
-          using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-          const bool need_norm = inst.args[2] & 0x1;
-          const bool need_rope = inst.args[2] & 0x2;
-          task_attention_fwd_flash3_grouped<128, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split: {
-          using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-          const int num_kv_blocks = inst.args[0] & 0xFFF;
-          const int split_idx = (inst.args[0] >> 12) & 0xF;
-          const int num_active_q = inst.args[1] & 0xFF;
-          const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
-          const int kv_start_idx = inst.args[2];
-          task_attention_fwd_flash3_grouped<128, 64, 64, true, 16, false, false, kernel_QK, kernel_PV>(num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len, kv_start_idx, false, false, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_ATTN_SPLIT_POST_REDUCE: {
-          task_split_post_reduce<128, 4, 64, 16, 32>(inst.args[0], smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64: {
-          using kernel_QK = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-          using kernel_PV = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-          const bool need_norm = inst.args[2] & 0x1;
-          const bool need_rope = inst.args[2] & 0x2;
-          task_attention_fwd_flash3_grouped<64, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA: {
-          using kernel_QK = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-          using kernel_PV = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-          const bool need_norm = inst.args[2] & 0x1;
-          const bool need_rope = inst.args[2] & 0x2;
-          task_attention_fwd_flash3_grouped_mma<128, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA: {
-          using kernel_QK = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-          using kernel_PV = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-          const int num_kv_blocks = inst.args[0] & 0xFFF;
-          const int split_idx = (inst.args[0] >> 12) & 0xF;
-          const int num_active_q = inst.args[1] & 0xFF;
-          const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
-          const int kv_start_idx = inst.args[2];
-          task_attention_fwd_flash3_grouped_mma<128, 64, 64, true, 16, false, false, kernel_QK, kernel_PV>(num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len, kv_start_idx, false, false, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA: {
-          using kernel_QK = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-          using kernel_PV = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-          const bool need_norm = inst.args[2] & 0x1;
-          const bool need_rope = inst.args[2] & 0x2;
-          task_attention_fwd_flash3_grouped_mma<64, 64, 64, false, 0, false, false, kernel_QK, kernel_PV>(inst.args[0], 0, 64, inst.args[1], 0, need_norm, need_rope, smem_base, (float*)scratch_space, st_insts, m2c, c2m);
-        }
-          break;
-        case OP_SILU_MUL_SHARED_BF16_K_4096_INTER: {
-          const int num_token = inst.args[0];
-          task_silu_smem_1D<6144>(num_token, smem_base, m2c, c2m);
-          }
-          break;
-        case OP_SILU_MUL_SHARED_BF16_K_64_SW128: {
-          const int num_token = inst.args[0];
-          auto layout_sV = tile_to_shape(
-              GMMA::Layout_MN_SW128_Atom<__nv_bfloat162>{},
-              make_shape(Int<32>{},num_token));
-          task_silu_smem<64>(num_token, layout_sV, smem_base, m2c, c2m);
-          }
-          break;
-        case OP_RMS_NORM_F16_K_4096_SMEM: {
-          task_rms_norm_f16_from_smem<4096,__nv_bfloat16>(smem_base, inst.args[0], *reinterpret_cast<__nv_bfloat16*>(inst.args+1), (float*)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_RMS_NORM_F16_K_2048_SMEM: {
-          task_rms_norm_f16_from_smem<2048,__nv_bfloat16>(smem_base, inst.args[0], *reinterpret_cast<__nv_bfloat16*>(inst.args+1), (float*)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_RMS_NORM_F16_K_128_SMEM: {
-          task_rms_norm_f16_from_smem<128,__nv_bfloat16>(smem_base, inst.args[0], *reinterpret_cast<__nv_bfloat16*>(inst.args[1]), (float*)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_ARGMAX_PARTIAL_bf16_1152_50688_132: {
-          task_argmax_partial<1152, 50688, 132, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_ARGMAX_REDUCE_bf16_1152_132: {
-          task_argmax_reduce_kernel<1152, 132, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_ARGMAX_PARTIAL_bf16_1024_65536_128: {
-          task_argmax_partial<1024, 65536, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_ARGMAX_REDUCE_bf16_1024_128: {
-          task_argmax_reduce_kernel<1024, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
-          }
-          break;
-        case OP_ROPE_INTERLEAVE_512: {
-          task_rope_interleaved<512>(smem_base, m2c, c2m);
-          break;
-        }
-        case OP_LOOPC: {
-          if (++count < inst.args[0]) {
-            pc = inst.args[1]; // jump back to the beginning of the loop
-            __cprint("LOOPC back to PC %d, count=%d", pc, count);
-          } else {
-            count = 0; // reset count for potential future loops
-            __cprint("LOOPC finished, count=%d", count);
-          }
-          // TODO(zhiyuang): this compute group is hardcoded
-          __sync_compute_group(128);
-          break;
-        }
-        case OP_TERMINATEC: {
-          finish = true;
-
-          // send the terminaion to st warp
-          c2m.push<0,true>(thread_id, 0);
-
-          if (thread_id == 0) {
-            int event_base = sm_id * numProfileEvents;
-            g_events[event_base + 1] = cuda::ptx::get_sreg_globaltimer();
-          }
-          __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);
-        }
-        break;
-        default:
-          // unknown opcode
-          __cprint("Unknown compute opcode: %d\n", inst.opcode);
-          assert(false && "Unknown compute opcode");
-      }
+      dispatch_compute_instruction(
+        sm_id,
+        thread_id,
+        pc,
+        count,
+        finish,
+        inst,
+        smem_base,
+        scratch_space,
+        st_insts,
+        m2c,
+        c2m,
+        g_events
+      );
       // if (blockIdx.x == 0 && threadIdx.x == 0) {
       //   printf("[COMP] after execution: pc=%d, opcode=%04x\n", pc-1, inst.opcode);
       // }

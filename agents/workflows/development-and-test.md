@@ -105,6 +105,10 @@ Typical Python-only areas include:
 - When a task reveals a stable repo fact or a reusable procedure, update `agents/knowledge/` or `agents/workflows/` in the same task instead of leaving it only in `.agentlog/`.
 - When a task changes the standard workflow or exposes a durable verification lesson, persist the concise takeaway in tracked `agents/` docs before closing the task.
 - `make pyext` requires the local CUDA toolkit version to match the CUDA version used by the installed PyTorch build.
+- To build only a subset of compute-warp operators, pass `DAE_COMPUTE_OPS=OP_A,OP_B,...` to `make pyext`; leaving it unset keeps the full supported compute-op set.
+- As a file-based alternative, put one operator symbol per line in a repo-root `dae_compute_ops.vdcore.build` file, or point `DAE_COMPUTE_OPS_FILE` at another file; the build prints which source it used.
+- To generate that file from a built launcher without hand-copying names, use the app-level `--write-compute-ops [path]` option exposed through `python/dae/util.py`'s `dae_app(...)`.
+- A clean `make pyext` now generates `build/generated/dae/selected_compute_ops.inc` in the Makefile before compiling `runtime.o`; `setup.py` consumes that generated include but does not create it.
 - In this environment, `make pyext` failed because the detected CUDA version was `12.5` while PyTorch was built with CUDA `13.0`.
 - The benchmark command succeeded against the existing environment and extension artifacts.
 - For the isolated `N=8` MMA GEMV path, use `app/python/gemv_mma_out.py` as the dedicated harness instead of modifying `app/python/gemv_out.py`.
