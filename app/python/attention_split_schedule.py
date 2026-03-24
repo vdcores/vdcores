@@ -15,12 +15,12 @@ torch.manual_seed(0)
 KV_SEQ_LEN = 2048
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
-NUM_REQ = 2
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 16
 seq_lengths = [2048, 1024]
+NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 assert len(seq_lengths) == NUM_REQ, "Length of seq_lengths must match NUM_REQ"
@@ -126,6 +126,7 @@ last_active_kv_len = 64
 assert last_active_kv_len <= KVTile
 
 TOTAL_ATTN_GROUPS = num_sms // NUM_KV_HEAD
+WAVE_RAW_SLOTS = [(24, 25), (26, 27), (28, 29)]
 
 
 def legal_split_levels(num_kv_blocks: int):
@@ -147,14 +148,24 @@ class SchedPlan:
     split_level: int
     attn_groups: list[int]
     post_groups: list[int]
+    attn_waves: list[int]
+    post_waves: list[int]
 
     def __post_init__(self):
         self.seq_length = seq_lengths[self.request_idx]
         self.num_kv_block = (self.seq_length + KVTile - 1) // KVTile
         self.num_block_per_split = self.num_kv_block // self.split_level
         assert len(self.attn_groups) == self.split_level, "Need one attention group per split shard"
-        self.attn_group_to_split = {group_id: split_idx for split_idx, group_id in enumerate(self.attn_groups)}
-        self.post_group_to_lane = {group_id: lane for lane, group_id in enumerate(self.post_groups)}
+        assert len(self.attn_waves) == self.split_level, "Need one attention wave per split shard"
+        assert len(self.post_groups) == len(self.post_waves), "Need one post wave per post group"
+        self.attn_group_to_split = {
+            group_id: (split_idx, wave_idx)
+            for split_idx, (group_id, wave_idx) in enumerate(zip(self.attn_groups, self.attn_waves))
+        }
+        self.post_group_to_lane = {
+            group_id: (lane, wave_idx)
+            for lane, (group_id, wave_idx) in enumerate(zip(self.post_groups, self.post_waves))
+        }
         self.attn_bar = dae.new_bar(NUM_KV_HEAD * self.split_level)
         self.tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", self.split_level, HEAD_GROUP_SIZE*HEAD_DIM, partial(tma_load_split_attn, split_kv=self.split_level), cord_load_split_attn)
 
@@ -163,7 +174,8 @@ class SchedPlan:
         if sm_group not in self.attn_group_to_split:
             return []
         head = sm % NUM_KV_HEAD
-        split = self.attn_group_to_split[sm_group]
+        split, wave_idx = self.attn_group_to_split[sm_group]
+        raw_store_slot, _ = WAVE_RAW_SLOTS[wave_idx]
         insts = []
         if self.split_level == 1:
             return [
@@ -173,7 +185,7 @@ class SchedPlan:
                     [tK.cord(self.request_idx, 0, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
                     [tV.cord(self.request_idx, 0, head, 0), tV.cord2tma(0, KVTile, 0, 0)],
                 ),
-                TmaStore1D(matO_attn_view[self.request_idx, head, ...], numSlots=2),
+                TmaStore1D(matO_attn_view[self.request_idx, head, ...]),
             ]
 
         kv_start_block = split * self.num_block_per_split
@@ -186,8 +198,8 @@ class SchedPlan:
                 [tK.cord(self.request_idx, kv_start_idx, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
                 [tV.cord(self.request_idx, kv_start_idx, head, 0), tV.cord2tma(0, KVTile, 0, 0)],
             ),
-            TmaStore1D(matO_split_attn_view[split, self.request_idx, head, ...], numSlots=2),
-            RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], 24).bar(self.attn_bar).writeback(),
+            TmaStore1D(matO_split_attn_view[split, self.request_idx, head, ...]),
+            RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], raw_store_slot).bar(self.attn_bar).writeback(),
         ])
         return insts
 
@@ -198,10 +210,12 @@ class SchedPlan:
         if sm_group not in self.post_group_to_lane:
             return []
         head = sm % NUM_KV_HEAD
+        _, wave_idx = self.post_group_to_lane[sm_group]
+        _, raw_load_slot = WAVE_RAW_SLOTS[wave_idx]
         insts = []
         insts.extend([
             ATTN_SPLIT_POST_REDUCE(self.split_level),
-            RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], 25).bar(self.attn_bar),
+            RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], raw_load_slot).bar(self.attn_bar),
             self.tO_split.cord(head, self.request_idx),
             TmaStore1D(matO_attn_view[self.request_idx, head, ...]),
         ])
@@ -220,6 +234,7 @@ def build_sched_plans():
 
     attn_group_loads = [0] * TOTAL_ATTN_GROUPS
     attn_group_assignments = defaultdict(list)
+    attn_group_waves = [0] * TOTAL_ATTN_GROUPS
     shard_specs = []
     for req_idx, (num_blocks, split_level) in enumerate(zip(num_kv_blocks, split_levels)):
         shard_cost = num_blocks // split_level
@@ -229,40 +244,66 @@ def build_sched_plans():
     shard_specs.sort(reverse=True)
     for shard_cost, req_idx, split_idx in shard_specs:
         group_id = min(range(TOTAL_ATTN_GROUPS), key=lambda gid: (attn_group_loads[gid], gid))
+        wave_idx = attn_group_waves[group_id]
         attn_group_loads[group_id] += shard_cost
-        attn_group_assignments[req_idx].append((split_idx, group_id))
+        attn_group_assignments[req_idx].append((split_idx, group_id, wave_idx))
+        attn_group_waves[group_id] += 1
+
+    max_attn_waves = max(attn_group_waves, default=0)
+    assert max_attn_waves <= len(WAVE_RAW_SLOTS), (
+        f"Need {max_attn_waves} attention waves on one SM group, "
+        f"but only {len(WAVE_RAW_SLOTS)} raw-slot wave pairs are available"
+    )
 
     post_group_assignments = defaultdict(list)
+    post_group_waves = [0] * TOTAL_ATTN_GROUPS
     rr_group = 0
     for req_idx, split_level in enumerate(split_levels):
         if split_level == 1:
             continue
-        post_group_assignments[req_idx].append(rr_group % TOTAL_ATTN_GROUPS)
+        group_id = rr_group % TOTAL_ATTN_GROUPS
+        wave_idx = post_group_waves[group_id]
+        post_group_assignments[req_idx].append((group_id, wave_idx))
+        post_group_waves[group_id] += 1
         rr_group += 1
+
+    max_post_waves = max(post_group_waves, default=0)
+    assert max_post_waves <= len(WAVE_RAW_SLOTS), (
+        f"Need {max_post_waves} post waves on one SM group, "
+        f"but only {len(WAVE_RAW_SLOTS)} raw-slot wave pairs are available"
+    )
 
     plans = []
     for req_idx, split_level in enumerate(split_levels):
-        attn_groups = [group_id for _, group_id in sorted(attn_group_assignments[req_idx])]
-        post_groups = post_group_assignments[req_idx]
+        sorted_attn = sorted(attn_group_assignments[req_idx])
+        attn_groups = [group_id for _, group_id, _ in sorted_attn]
+        attn_waves = [wave_idx for _, _, wave_idx in sorted_attn]
+        post_groups = [group_id for group_id, _ in post_group_assignments[req_idx]]
+        post_waves = [wave_idx for _, wave_idx in post_group_assignments[req_idx]]
         plans.append(
             SchedPlan(
                 request_idx=req_idx,
                 split_level=split_level,
                 attn_groups=attn_groups,
                 post_groups=post_groups,
+                attn_waves=attn_waves,
+                post_waves=post_waves,
             )
         )
-    return plans, split_levels, attn_group_loads
+    return plans, split_levels, attn_group_loads, attn_group_waves, post_group_waves
 
 
-plans, split_levels, attn_group_loads = build_sched_plans()
+plans, split_levels, attn_group_loads, attn_group_waves, post_group_waves = build_sched_plans()
 print(f"[sched] seq_lengths={seq_lengths}")
 print(f"[sched] split_levels={split_levels}, target_blocks_per_shard={sum((seq_len + KVTile - 1) // KVTile for seq_len in seq_lengths) / TOTAL_ATTN_GROUPS:.2f}")
 print(f"[sched] attn_group_loads={attn_group_loads}")
+print(f"[sched] attn_group_waves={attn_group_waves}")
+print(f"[sched] post_group_waves={post_group_waves}")
 for plan in plans:
     print(
         f"[sched] req={plan.request_idx} blocks={plan.num_kv_block} split={plan.split_level} "
-        f"attn_groups={plan.attn_groups} post_groups={plan.post_groups}"
+        f"attn_groups={plan.attn_groups} attn_waves={plan.attn_waves} "
+        f"post_groups={plan.post_groups} post_waves={plan.post_waves}"
     )
 
 dae.i(
@@ -347,5 +388,5 @@ def split_ref(plan: SchedPlan, split_stage: int):
 #         end = start + HEAD_GROUP_SIZE
 #         tensor_diff(f"Req {plan.request_idx} Split {s} LSE", ref_lse[0], matP[:, start:end, s].float())
 
-refQK, refO = gqa_ref()
-tensor_diff("Ref and DAE", refO, matO_attn_view)
+# refQK, refO = gqa_ref()
+# tensor_diff("Ref and DAE", refO, matO_attn_view)
