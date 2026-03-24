@@ -2,7 +2,8 @@ import argparse
 import sys
 
 
-MODEL_NAME = "Qwen/Qwen3-30B-A3B"
+# MODEL_NAME = "Qwen/Qwen3-30B-A3B"
+MODEL_NAME = "unsloth/Qwen3-30B-A3B-Instruct-2507"
 DEFAULT_MAX_SEQ_LEN = 512
 DEFAULT_PREFILL_TOKEN = 51
 DEFAULT_DECODE_INPUT_TOKEN = 52

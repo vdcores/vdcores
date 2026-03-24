@@ -162,7 +162,7 @@ def build_runtime_context(parsed_args):
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             cache_dir=parsed_args.hf_cache_dir,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
             token=os.environ["HF_TOKEN"],
         )
