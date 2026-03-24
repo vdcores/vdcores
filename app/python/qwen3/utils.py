@@ -63,12 +63,11 @@ def build_tma_wgmma_mn(mat: torch.Tensor, tileM: int, tileK: int, iK = -2, swizz
     
     if len(mat.shape) > 2:
         # collapse other dims
-        size_otherthan_k_or_m = 1
+        # the stride of the collapsed dim is in the unit of stride(inner_most_dim)
+        # to bypass glob_dim range check we need to also get logical size = numel / stride(inner_most_dim)
         other_dims = get_other_dims(len(mat.shape), iK)
         inner_most_others = other_dims[-1]
-        for i in other_dims:
-            # consider M = negative index
-            size_otherthan_k_or_m *= mat.shape[i]
+        size_otherthan_k_or_m = mat.numel() // mat.stride(inner_most_others)
         
         global_dims.append(size_otherthan_k_or_m)
         global_strides.append(mat.stride(inner_most_others))
@@ -124,11 +123,9 @@ def build_tma_wgmma_k(mat: torch.Tensor, tileK: int, tileN: int, iN: int = -2, s
 
     if len(mat.shape) > 2:
         # collapse other dims
-        size_otherthan_k_or_n = 1
         other_dims = get_other_dims(len(mat.shape), iN)
         inner_most_others = other_dims[-1]
-        for i in other_dims:
-            size_otherthan_k_or_n *= mat.shape[i]
+        size_otherthan_k_or_n = mat.numel() // mat.stride(inner_most_others)
         
         # find stride of inner most dims other than K or N
         glob_dims.append(size_otherthan_k_or_n)

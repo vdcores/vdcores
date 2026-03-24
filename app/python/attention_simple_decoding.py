@@ -12,15 +12,20 @@ import sys
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 65536
+KV_SEQ_LEN = 2048
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
-NUM_REQ = 1
+NUM_REQ = 2
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
+seq_lengths = [KV_SEQ_LEN] * NUM_REQ
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
+assert len(seq_lengths) == NUM_REQ, "Length of seq_lengths must match NUM_REQ"
+for seq_len in seq_lengths:
+    assert seq_len % 64 == 0, "Sequence length must be multiple of 64 for simplicity"
+    assert seq_len <= KV_SEQ_LEN, "Sequence length must be less than or equal to KV_SEQ_LEN"
 
 QTile = 16
 KVTile = 64
@@ -89,6 +94,7 @@ tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder
 need_norm = False
 need_rope = False
 
+<<<<<<< HEAD
 ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "hopper").lower()
 if ATTENTION_IMPL == "mma":
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA
@@ -99,16 +105,25 @@ else:
 
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
 last_active_kv_len = 48
+=======
+last_active_kv_len = 64
+>>>>>>> 3f67a0b (fix tma util collapsed dim)
 assert last_active_kv_len <= KVTile
 
 def sm_task(sm: int):
     head = sm % NUM_KV_HEAD
     req = sm // NUM_KV_HEAD
+    seq_length = seq_lengths[req]
+    num_kv_block = (seq_length + KVTile - 1) // KVTile
 
     insts = [
+<<<<<<< HEAD
         attention_inst(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+=======
+        ATTENTION_M64N64K16_F16_F32_64_64_hdim(num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+>>>>>>> 3f67a0b (fix tma util collapsed dim)
         tQ.cord(req, head),
-        RepeatM.on(NUM_KV_BLOCK,
+        RepeatM.on(num_kv_block,
             [tK.cord(req, 0, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
             [tV.cord(req, 0, head, 0), tV.cord2tma(0, KVTile, 0, 0)],
         ),
@@ -143,9 +158,10 @@ def gqa_ref():
     # K.transpose(-1, -2): [B, Hkv, D, S]
     # result: [B, Hkv, G, S]
     QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
-    # apply mask according to lsat_active_kv_len
-    total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
-    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
+    # Apply a per-request causal length mask so each request can expose a different
+    # active KV span while sharing the same backing K/V buffers.
+    active_kv_len = torch.tensor(seq_lengths, device=gpu, dtype=torch.long)
+    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= active_kv_len[:, None, None, None]
     QK = QK.masked_fill(mask, float("-inf"))
 
     # softmax on sequence dimension
@@ -155,6 +171,6 @@ def gqa_ref():
     return QK, torch.matmul(attn, V)
 
 refQK, refO = gqa_ref()
-tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
+tensor_diff("Ref and DAE", refO, matO_attn_view)
 
 dae_app(dae)
