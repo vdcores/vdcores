@@ -5,7 +5,7 @@ import numpy as np
 from .launcher import extract_compute_operator_names
 
 
-DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.txt"
+DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
 
 
 def tensor_diff(name : str,

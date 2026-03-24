@@ -255,7 +255,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   #undef DAE_OP
 
   py::list supported_compute_ops;
-  #define DAE_COMPUTE_OP(name, handler) supported_compute_ops.append(py::str(#name));
+  #define DAE_COMPUTE_OP(name) supported_compute_ops.append(py::str(#name));
   #include "dae/selected_compute_ops.inc"
   #undef DAE_COMPUTE_OP
   m.attr("supported_compute_ops") = supported_compute_ops;

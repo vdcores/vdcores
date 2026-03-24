@@ -22,15 +22,15 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
 - `python/dae/instructions.py`: serialized instruction types, compute operation definitions, memory-side instruction helpers, and TMA instruction wrappers used by `launcher.py`.
 - `python/dae/instruction_utils.py`: small opcode/packing helpers shared by the instruction and op modules.
-- `python/dae/util.py`: CLI helpers including instruction dumps, profiling output, and `--write-compute-ops` generation of a default `dae_compute_ops.txt` build-selection file from a built launcher.
+- `python/dae/util.py`: CLI helpers including instruction dumps, profiling output, and `--write-compute-ops` generation of a default `dae_compute_ops.vdcore.build` build-selection file from a built launcher.
 - `python/dae/schedule.py`: scheduling interface and composition layer.
 - `python/dae/model.py`: model-side Python support code.
 - `include/dae/`: runtime abstractions such as allocator, launcher, queues, runtime, and virtual cores.
-  The compute warp dispatch now lives in `include/dae/compute_dispatch.cuh`, and the checked-in selective-build registry for supported compute ops lives in `include/dae/compute_ops.inc`.
+  The compute warp dispatch now lives in `include/dae/compute_dispatch.cuh`, and supported selective-build ops are discovered from `DAE_COMPUTE_OP_HANDLER(OP_...)` declarations in that file.
 - `include/task/`: CUDA task building blocks including attention, GEMV, RMSNorm, RoPE, SiLU, WGMMA, and argmax.
 - `src/runtime.cu`: runtime implementation compiled to `runtime.o`.
 - `src/torch_runtime.cu`: Torch extension binding source.
-- `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.txt`, and emits `build/generated/dae/selected_compute_ops.inc` for both `make` and `setup.py`.
+- `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.vdcore.build`, and emits `build/generated/dae/selected_compute_ops.inc` for both `make` and `setup.py`.
 
 ## Operational Notes
 

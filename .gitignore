@@ -80,3 +80,4 @@ ncu_tmp
 debug*.log
 inst*.txt
 inst*.dump
+*.vdcore.build

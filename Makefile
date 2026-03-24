@@ -10,7 +10,7 @@ CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
 
 GENERATED_INCLUDE_DIR := build/generated
 SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc
-COMPUTE_OP_REGISTRY := include/dae/compute_ops.inc
+COMPUTE_DISPATCH := include/dae/compute_dispatch.cuh
 COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 
 # Compiler flags
@@ -49,26 +49,28 @@ all: pyext
 
 # Clean build artifacts
 clean:
-	rm -rf $(APPS) $(TARGETS)
-
-%.o: src/%.cu $(HEADERS)
-	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
+	rm -rf $(APPS) $(TARGETS) build/generated
 
 # Build the executable, this is wildcard rule for multiple targets
 %: app/%.cu $(TARGETS) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -o $@ $< $(TARGETS) $(LDFLAGS)
 
-$(SELECTED_COMPUTE_OPS): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_OP_REGISTRY)
+$(SELECTED_COMPUTE_OPS): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_DISPATCH)
 	@mkdir -p $(dir $@)
-	DAE_COMPUTE_OPS="$(DAE_COMPUTE_OPS)" $(PYTHON) $(COMPUTE_OP_GENERATOR) --registry $(COMPUTE_OP_REGISTRY) --output $@
+	@set -e; \
+	if [ -n "$(strip $(DAE_COMPUTE_OPS))" ]; then export DAE_COMPUTE_OPS='$(DAE_COMPUTE_OPS)'; fi; \
+	if [ -n "$(strip $(DAE_COMPUTE_OPS_FILE))" ]; then export DAE_COMPUTE_OPS_FILE='$(DAE_COMPUTE_OPS_FILE)'; fi; \
+	$(PYTHON) $(COMPUTE_OP_GENERATOR) --dispatch $(COMPUTE_DISPATCH) --output $@
 
-%.o: $(SELECTED_COMPUTE_OPS)
+runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(HEADERS)
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
+
 %: $(SELECTED_COMPUTE_OPS)
 
 run: $(BIN)
 	./$<
 
-pyext: $(TARGETS)
+pyext: $(SELECTED_COMPUTE_OPS) $(TARGETS)
 	pip install -e . --no-build-isolation
 
 FORCE:
