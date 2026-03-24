@@ -213,7 +213,7 @@ def reference_pass_local(ctx, inputs, verbose: bool = False):
         attn_out = (
             v_heads[:, :, None, :]
             .expand(1, ctx.NUM_KV_HEAD, ctx.HEAD_GROUP_SIZE, ctx.HEAD_DIM)
-            .reshape(1, ctx.HIDDEN)
+            .reshape(1, ctx.QW)
         )
         attn_block_out = F.linear(attn_out, ctx.matOutWs[i])
         post_attn_residual = layer_in + attn_block_out
@@ -235,8 +235,8 @@ def reference_pass_local(ctx, inputs, verbose: bool = False):
 
         hidden = post_attn_residual + mlp_out
 
-        captured_data[i]["hidden_state_in"] = layer_in
-        captured_data[i]["input_rms"] = input_rms
+        captured_data[i]["hidden_state_in"] = layer_in.unsqueeze(1)
+        captured_data[i]["input_rms"] = input_rms.unsqueeze(1)
         captured_data[i]["q_proj"] = q_proj.unsqueeze(1)
         captured_data[i]["k_proj"] = k_proj.unsqueeze(1)
         captured_data[i]["v_proj"] = v_proj.unsqueeze(1)
@@ -246,14 +246,14 @@ def reference_pass_local(ctx, inputs, verbose: bool = False):
         captured_data[i]["k_norm_interleaved"] = k_norm.reshape(1, 1, -1)
         captured_data[i]["q_rope_interleaved"] = q_rope.reshape(1, 1, -1)
         captured_data[i]["k_rope_interleaved"] = k_rope.reshape(1, 1, -1)
-        captured_data[i]["attn_block_out"] = attn_block_out
-        captured_data[i]["post_attn_residual"] = post_attn_residual
-        captured_data[i]["post_attn_rms"] = post_attn_rms
-        captured_data[i]["router_logits"] = router_logits
+        captured_data[i]["attn_block_out"] = attn_block_out.unsqueeze(1)
+        captured_data[i]["post_attn_residual"] = post_attn_residual.unsqueeze(1)
+        captured_data[i]["post_attn_rms"] = post_attn_rms.unsqueeze(1)
+        captured_data[i]["router_logits"] = router_logits.unsqueeze(1)
         captured_data[i]["router_topk_idx"] = topk_idx.unsqueeze(1)
         captured_data[i]["router_topk_weight"] = topk_weight.to(dtype=ctx.dtype).unsqueeze(1)
-        captured_data[i]["mlp_out"] = mlp_out
-        captured_data[i]["hidden_state_out"] = hidden
+        captured_data[i]["mlp_out"] = mlp_out.unsqueeze(1)
+        captured_data[i]["hidden_state_out"] = hidden.unsqueeze(1)
 
     final_rms_w = ctx.matRMSInputWLoop[ctx.num_layers - 1]
     final_rms = apply_rms_affine(hidden, final_rms_w, ctx.eps)

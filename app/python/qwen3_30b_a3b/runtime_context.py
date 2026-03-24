@@ -91,6 +91,7 @@ class QwenScheduleContext:
     INTERMIDIATE: int
     MOE_INTERMEDIATE: int
     TOP_K: int
+    EXPERT_BUFFER_COUNT: int
     NUM_EXPERTS: int
     HEAD_DIM: int
     NUM_Q_HEAD: int
@@ -191,7 +192,17 @@ def build_runtime_context(parsed_args):
     INTERMIDIATE = config.intermediate_size
     MOE_INTERMEDIATE = config.moe_intermediate_size
     TOP_K = config.num_experts_per_tok
+    if parsed_args.fixed_top_k is not None:
+        if parsed_args.fixed_top_k <= 0:
+            raise ValueError("--fixed-top-k must be positive")
+        TOP_K = min(TOP_K, parsed_args.fixed_top_k)
+    if parsed_args.correctness and parsed_args.fixed_top_k is not None:
+        raise ValueError("--fixed-top-k changes model semantics and is incompatible with --correctness")
     NUM_EXPERTS = getattr(config, "num_experts", getattr(config, "num_local_experts"))
+    expert_buffer_count = TOP_K if parsed_args.expert_buffers is None else parsed_args.expert_buffers
+    if expert_buffer_count <= 0:
+        raise ValueError("--expert-buffers must be positive")
+    expert_buffer_count = min(expert_buffer_count, TOP_K)
     HEAD_DIM = getattr(config, "head_dim", HIDDEN // config.num_attention_heads)
     NUM_Q_HEAD = config.num_attention_heads
     NUM_KV_HEAD = config.num_key_value_heads
@@ -213,8 +224,8 @@ def build_runtime_context(parsed_args):
     matRouterLogits = torch.zeros(N, NUM_EXPERTS, dtype=dtype, device=gpu)
     matRouterTopKIdx = torch.zeros(1, TOP_K, dtype=torch.int32, device=gpu)
     matRouterTopKWeight = torch.zeros(TOP_K, 32, dtype=dtype, device=gpu)
-    matExpertAct = [torch.zeros(N, MOE_INTERMEDIATE, dtype=dtype, device=gpu) for _ in range(TOP_K)]
-    matExpertActScaled = [torch.zeros(N, MOE_INTERMEDIATE, dtype=dtype, device=gpu) for _ in range(TOP_K)]
+    matExpertAct = [torch.zeros(N, MOE_INTERMEDIATE, dtype=dtype, device=gpu) for _ in range(expert_buffer_count)]
+    matExpertActScaled = [torch.zeros(N, MOE_INTERMEDIATE, dtype=dtype, device=gpu) for _ in range(expert_buffer_count)]
 
     if parsed_args.local_generated_weights:
         matEmbed = randn(config.vocab_size, HIDDEN, dtype=dtype, device=gpu)
@@ -327,6 +338,7 @@ def build_runtime_context(parsed_args):
         INTERMIDIATE=INTERMIDIATE,
         MOE_INTERMEDIATE=MOE_INTERMEDIATE,
         TOP_K=TOP_K,
+        EXPERT_BUFFER_COUNT=expert_buffer_count,
         NUM_EXPERTS=NUM_EXPERTS,
         HEAD_DIM=HEAD_DIM,
         NUM_Q_HEAD=NUM_Q_HEAD,

@@ -101,6 +101,7 @@ Typical Python-only areas include:
 ## Notes
 
 - `-b` is the short form of `--bench` and defaults to one benchmark iteration.
+- For new Qwen3 MoE bring-up work, follow `agents/workflows/qwen3-moe-bringup.md` before debugging the full schedule directly.
 - `app/python/llama3/sched.py --help` still performs model loading before printing usage, so prefer using it sparingly on large checkpoints.
 - When a task reveals a stable repo fact or a reusable procedure, update `agents/knowledge/` or `agents/workflows/` in the same task instead of leaving it only in `.agentlog/`.
 - When a task changes the standard workflow or exposes a durable verification lesson, persist the concise takeaway in tracked `agents/` docs before closing the task.

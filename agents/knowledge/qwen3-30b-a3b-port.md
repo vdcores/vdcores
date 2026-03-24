@@ -1,0 +1,30 @@
+## Qwen3-30B-A3B Port Notes
+
+- Entry path: `app/python/qwen3_30b_a3b/`.
+- Model geometry matches the existing Qwen3 fused decode-attention path:
+  - hidden size `2048`
+  - head dim `128`
+  - `32` query heads
+  - `4` KV heads
+  - grouped-query attention ratio `8`
+- MoE geometry for this model:
+  - `48` layers
+  - `128` experts
+  - top-`8` experts per token
+  - expert intermediate size `768`
+- The port uses dynamic layer/expert-indexed TMA loads instead of per-expert or repeated per-layer descriptor sets.
+- Current app runtime keeps Q/K/V scratch as current-layer-local while dense and expert weights are stacked per layer for dynamic indexed loading.
+- Single-launch looping still relies on a repeated barrier-only resource group so per-layer barriers advance across the outer layer loop without duplicating descriptors.
+- Router projection must not use `Gemv_M128N8` in the app path today: `OP_GEMV_M128N8` exists in Python/opcodes but is commented out in `include/dae/dae2.cuh`. The working app-level fallback is `Gemv_M64N8` over `M=128`.
+- Router top-k expert ids must use the raw-address special-slot pattern from `include/task/argmax.cuh`, not a normal TMA store.
+- For same-launch router-to-expert execution, `LoadExpertIndex(...)` does not honor `.bar(...)` as a wait. Use an explicit `IssueBarrier(...)` before `LoadExpertIndex(...)`.
+- The full single-token synthetic correctness path in `app/python/qwen3_30b_a3b/sched.py` now passes for `--local-generated-weights --synthetic-num-layers 1 --correctness`.
+- For performance exploration, fixed small `TOP_K` matters for both work and schedule encoding:
+  - with `TOP_K=8`, the repeated per-layer barrier count for 48 layers can exceed the `uint16` barrier-id encoding budget used in memory instructions
+  - `--fixed-top-k 2` keeps the repeated barrier footprint within range for a 48-layer build
+- Expert activation buffers are now decoupled from `TOP_K` through `--expert-buffers`. Reusing fewer buffers is safe because expert slots are executed sequentially in the current MoE block.
+- Current 1-layer synthetic timing samples on this branch:
+  - default `TOP_K=8`: about `0.91 ms` execution time
+  - `--fixed-top-k 2 --expert-buffers 1`: about `0.64 ms`
+  - `--fixed-top-k 2 --expert-buffers 2`: about `0.63 ms`
+- On this environment, CUDA rebuild verification is blocked by the active Conda GCC 14 toolchain with CUDA 12.5 `nvcc`; Python static checks pass, but runtime validation needs a supported host compiler setup.

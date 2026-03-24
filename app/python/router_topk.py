@@ -21,7 +21,7 @@ sched = SchedRouterTopK(
     num_token=N,
     logits_tma=StaticCordAdapter(TmaLoad1D(matLogits)),
     weight_tma=StaticCordAdapter(TmaStore1D(matTopKWeight)),
-    idx_tma=StaticCordAdapter(RawAddress(matTopKIdx, 24)),
+    idx_addr=StaticCordAdapter(RawAddress(matTopKIdx, 24)),
 ).place(1)
 
 dae.s(sched)

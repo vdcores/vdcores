@@ -38,9 +38,7 @@ __device__ __forceinline__ void task_router_topk_softmax(
   int weight_slot = m2c.template pop<0>();
   auto *weights = (data_t *)get_slot_address(base, extract(weight_slot));
   int idx_slot = m2c.template pop<0>();
-  auto *indices = idx_slot < numSlots
-      ? (int *)get_slot_address(base, extract(idx_slot))
-      : (int *)slot_2_glob_ptr(st_insts, idx_slot);
+  auto *indices = (int *)slot_2_glob_ptr(st_insts, idx_slot);
 
   __shared__ float probs[NUM_EXPERTS];
   __shared__ float warp_tmp[NUM_EXPERTS / 32];
@@ -129,9 +127,7 @@ __device__ __forceinline__ void task_router_topk_softmax(
   }
 
   c2m.template push<0, true>(tid, weight_slot);
-  if (idx_slot < numSlots) {
-    c2m.template push<0, true>(tid, idx_slot);
-  }
+  c2m.template push<31, true, false>(tid, 1 << idx_slot);
   c2m.push(tid, logits_slot);
 }
 

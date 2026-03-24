@@ -618,8 +618,10 @@ class SchedGemvMmaScale(Schedule):
 
         insts = [
             self.Atom(self.k_per_fold // TileK),
-            loadScale.cord(0).bar(self._bar("load")).group(self.group and (self._bar("load") is not None)),
-            RepeatM.on(
+            loadScale.cord(0),
+            RepeatM.onSync(
+                0,
+                self._bar("load"),
                 n_repeat,
                 (loadB.cord(0, k), loadB.cord2tma(0, TileK)),
                 (loadA.cord(m, k), loadA.cord2tma(0, TileK)),
@@ -1105,12 +1107,12 @@ class SchedArgmax(Schedule):
 
 
 class SchedRouterTopK(Schedule):
-    def __init__(self, num_token: int, logits_tma, weight_tma, idx_tma):
+    def __init__(self, num_token: int, logits_tma, weight_tma, idx_addr):
         super().__init__()
         self.num_token = num_token
         self.logits_tma = logits_tma
         self.weight_tma = weight_tma
-        self.idx_tma = idx_tma
+        self.idx_addr = idx_addr
 
     def schedule(self, sm: int):
         if sm < 0:
@@ -1119,13 +1121,13 @@ class SchedRouterTopK(Schedule):
             ROUTER_TOPK_SOFTMAX_128(self.num_token),
             self.logits_tma.cord(0).bar(self._bar("input")).group(),
             self.weight_tma.cord(0).bar(self._bar("output")).group(),
-            self.idx_tma.cord(0),
+            self.idx_addr.cord(0).bar(self._bar("output")).writeback(),
         ]
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, self.num_sms)
+        return self._bar_release_if_present(role, self.num_sms * 2)
 
 
 class SchedScaleRows(Schedule):

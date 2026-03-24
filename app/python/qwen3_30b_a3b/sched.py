@@ -35,6 +35,7 @@ eps = ctx.eps
 HIDDEN = ctx.HIDDEN
 MOE_INTERMEDIATE = ctx.MOE_INTERMEDIATE
 TOP_K = ctx.TOP_K
+EXPERT_BUFFER_COUNT = ctx.EXPERT_BUFFER_COUNT
 HEAD_DIM = ctx.HEAD_DIM
 NUM_Q_HEAD = ctx.NUM_Q_HEAD
 NUM_KV_HEAD = ctx.NUM_KV_HEAD
@@ -95,18 +96,17 @@ for name in (
     layerg.addBarrier(name)
 for slot in range(TOP_K):
     layerg.addBarrier(f"bar_scale{slot}")
-for name in ("bar_logits", "bar_argmax_idx", "bar_argmax_val", "bar_token_finish"):
+    layerg.addBarrier(f"bar_down{slot}")
+for name in ("bar_final_rms", "bar_logits", "bar_argmax_idx", "bar_argmax_val", "bar_token_finish"):
     systemg.addBarrier(name)
 
 TileM64, _, TileK64 = Gemv_M64N8.MNK
-TileM128, _, TileK128 = Gemv_M128N8.MNK
 _, _, TileKMma = Gemv_M64N8_MMA_SCALE.MNK
 
 weightg.addTma("loadRMSLayer64", [matRMSHidden], lambda t: t.wgmma_load(N, TileK64 * Gemv_M64N8.n_batch, Major.K))
-weightg.addTma("loadRMSLayer128", [matRMSHidden], lambda t: t.wgmma_load(N, TileK128 * Gemv_M128N8.n_batch, Major.K))
 weightg.addTma("reduceHiddenLayer", [matHidden], lambda t: t.wgmma("reduce", N, TileM64, Major.MN))
 weightg.addTma("loadAttnOLayer", [attnO], lambda t: t.wgmma_load(N, TileK64 * Gemv_M64N8.n_batch, Major.K))
-weightg.addTma("storeRouterLogits", [matRouterLogits], lambda t: t.wgmma_store(N, TileM128, Major.MN))
+weightg.addTma("storeRouterLogits", [matRouterLogits], lambda t: t.wgmma_store(N, TileM64, Major.MN))
 weightg.addTma(
     "loadRMSInputWLoop",
     [matRMSInputWLoop],
@@ -126,7 +126,7 @@ weightg.addTma("loadQW", [matqWs], lambda t: t.indexed("layer").wgmma_load(TileM
 weightg.addTma("loadKW", [matkWs], lambda t: t.indexed("layer").wgmma_load(TileM64, TileK64, Major.K))
 weightg.addTma("loadVW", [matvWs], lambda t: t.indexed("layer").wgmma_load(TileM64, TileK64, Major.K))
 weightg.addTma("loadOutWs", [matOutWs], lambda t: t.indexed("layer").wgmma_load(TileM64, TileK64, Major.K))
-weightg.addTma("loadRouterWs", [matRouterWs], lambda t: t.indexed("layer").wgmma_load(TileM128, TileK128, Major.K))
+weightg.addTma("loadRouterWs", [matRouterWs], lambda t: t.indexed("layer").wgmma_load(TileM64, TileK64, Major.K))
 weightg.addTma("loadExpertGateWs", [matExpertGateWs], lambda t: t.indexed("layer_expert").wgmma_load(TileM64, TileK64, Major.K))
 weightg.addTma("loadExpertUpWs", [matExpertUpWs], lambda t: t.indexed("layer_expert").wgmma_load(TileM64, TileK64, Major.K))
 weightg.addTma("loadExpertDownWs", [matExpertDownWs], lambda t: t.indexed("layer_expert").wgmma_load(TileM64, TileKMma, Major.K))
@@ -146,14 +146,17 @@ matO_attn_view = attnO.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 weightg.addTma("loadQ", [matQ_attn_view], lambda t: t._build("load", HEAD_DIM, 64, tma_gqa_load_q, cord_gqa_load_q))
 weightg.addTma("loadK", [matK_attn_view], lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_K, cord_func_K))
 weightg.addTma("loadV", [matV_attn_view], lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_MN, cord_func_MN))
-for slot in range(TOP_K):
-    weightg.addTma(f"storeExpertAct{slot}", [matExpertAct[slot]], lambda t: t.wgmma_store(N, TileM64, Major.MN))
-    weightg.addTma(f"loadExpertAct{slot}", [matExpertAct[slot]], lambda t: t.wgmma_load(N, TileKMma, Major.K))
+for buf in range(EXPERT_BUFFER_COUNT):
+    weightg.addTma(f"storeExpertAct{buf}", [matExpertAct[buf]], lambda t: t.wgmma_store(N, TileM64, Major.MN))
+    weightg.addTma(f"loadExpertAct{buf}", [matExpertAct[buf]], lambda t: t.wgmma_load(N, TileKMma, Major.K))
 
 dae.build_groups()
 
 
 def schedule_single_token(token_offset: int, token_pos: int):
+    next_pre_attn_bar = layerg.next("bar_pre_attn_rms") if num_layers > 1 else layerg["bar_pre_attn_rms"]
+    logits_load_bar = layerg.over("bar_pre_attn_rms") if num_layers > 1 else layerg["bar_pre_attn_rms"]
+
     dense_weight = lambda tma: IndexedWeightCordAdapter(tma, (0,))
     expert_weight = lambda tma: IndexedWeightCordAdapter(tma, (0, 0))
     side_input = ToConvertedCordAdapter(
@@ -191,13 +194,21 @@ def schedule_single_token(token_offset: int, token_pos: int):
         epsilon=eps,
         hidden_size=HIDDEN,
         tmas=(weightg["loadRMSInputWLoop"], loadHidden1D, storeRMSHidden1D),
-    ).bar("input", layerg["bar_layer"]).bar("output", layerg.next("bar_pre_attn_rms"))
+    ).bar("input", layerg["bar_layer"]).bar("output", next_pre_attn_bar)
     post_attn_rms = SchedRMSShared(
         num_token=N,
         epsilon=eps,
         hidden_size=HIDDEN,
         tmas=(weightg["loadRMSPostAttnW"], loadHidden1D, storeRMSHidden1D),
     ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
+    final_rms = None
+    if num_layers == 1:
+        final_rms = SchedRMSShared(
+            num_token=N,
+            epsilon=eps,
+            hidden_size=HIDDEN,
+            tmas=(weightg["loadRMSInputWLoop"], loadHidden1D, storeRMSHidden1D),
+        ).bar("output", systemg["bar_final_rms"])
 
     q_proj = SchedGemv(
         Gemv_M64N8,
@@ -232,27 +243,29 @@ def schedule_single_token(token_offset: int, token_pos: int):
     ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
 
     router_proj = SchedGemv(
-        Gemv_M128N8,
+        Gemv_M64N8,
         MNK=(128, N, HIDDEN),
-        tmas=(dense_weight(weightg["loadRouterWs"]), weightg["loadRMSLayer128"], weightg["storeRouterLogits"]),
+        tmas=(dense_weight(weightg["loadRouterWs"]), weightg["loadRMSLayer64"], weightg["storeRouterLogits"]),
     ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_router"])
     router_topk = SchedRouterTopK(
         num_token=N,
         logits_tma=StaticCordAdapter(TmaLoad1D(matRouterLogits)),
         weight_tma=StaticCordAdapter(TmaStore1D(matRouterTopKWeight)),
-        idx_tma=StaticCordAdapter(RawAddress(matRouterTopKIdx, 24)),
+        idx_addr=StaticCordAdapter(RawAddress(matRouterTopKIdx, 24)),
     ).bar("input", layerg["bar_router"]).bar("output", layerg["bar_router_topk"])
 
     expert_scheds = []
+    expert_scheds.append(IssueBarrier(layerg["bar_router_topk"]))
     reg_gate, reg_up = 0, 1
     for slot in range(TOP_K):
+        buf = slot % EXPERT_BUFFER_COUNT
         gate_proj = SchedGemv(
             Gemv_M64N8,
             MNK=(MOE_INTERMEDIATE, N, HIDDEN),
             tmas=(
                 expert_weight(weightg["loadExpertGateWs"]),
                 weightg["loadRMSLayer64"],
-                RegStore(reg_gate, matExpertAct[slot][:, :TileM64]),
+                RegStore(reg_gate, matExpertAct[buf][:, :TileM64]),
             ),
         ).bar("load", layerg["bar_post_attn_rms"])
         up_proj = SchedGemv(
@@ -261,12 +274,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
             tmas=(
                 expert_weight(weightg["loadExpertUpWs"]),
                 weightg["loadRMSLayer64"],
-                RegStore(reg_up, matExpertAct[slot][:, :TileM64]),
+                RegStore(reg_up, matExpertAct[buf][:, :TileM64]),
             ),
         ).bar("load", layerg["bar_post_attn_rms"])
         silu = SchedRegSiLUFused(
             num_token=N,
-            store_tma=weightg[f"storeExpertAct{slot}"],
+            store_tma=weightg[f"storeExpertAct{buf}"],
             reg_gate=reg_gate,
             reg_up=reg_up,
             base_offset=0,
@@ -277,19 +290,21 @@ def schedule_single_token(token_offset: int, token_pos: int):
             MNK=(HIDDEN, N, MOE_INTERMEDIATE),
             tmas=(
                 expert_weight(weightg["loadExpertDownWs"]),
-                weightg[f"loadExpertAct{slot}"],
+                weightg[f"loadExpertAct{buf}"],
                 StaticCordAdapter(TmaLoad1D(matRouterTopKWeight[slot], bytes=64)),
                 weightg["reduceHiddenLayer"],
             ),
         ).bar("load", layerg[f"bar_scale{slot}"])
-        if slot == TOP_K - 1:
-            down_proj.bar("store", layerg["bar_layer"])
+        down_store_bar = layerg["bar_layer"] if slot == TOP_K - 1 else layerg[f"bar_down{slot}"]
+        down_proj.bar("store", down_store_bar)
         expert_scheds.extend([
-            LoadExpertIndex(matRouterTopKIdx, slot).bar(layerg["bar_router_topk"]),
+            LoadExpertIndex(matRouterTopKIdx, slot),
             gate_proj,
             up_proj,
             silu,
+            IssueBarrier(layerg[f"bar_scale{slot}"]),
             down_proj,
+            IssueBarrier(down_store_bar),
         ])
 
     qwen_gemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
@@ -298,7 +313,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         proj = qwen_gemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
         sched = proj.schedule_(group=False).split_M(6)
         if i == 0:
-            sched.bar("load", layerg.over("bar_pre_attn_rms"))
+            sched.bar("load", systemg["bar_final_rms"] if num_layers == 1 else logits_load_bar)
         if i == logits_epoch - 1:
             sched.bar("store", systemg["bar_logits"])
         logits_proj.append(sched.place(full_sms))
@@ -323,17 +338,24 @@ def schedule_single_token(token_offset: int, token_pos: int):
     gqa = gqa.place(N * NUM_KV_HEAD)
     out_proj = out_proj.place(64)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    router_proj = router_proj.place(1)
+    router_proj = router_proj.place(2)
     router_topk = router_topk.place(1, base_sm=128)
     expert_scheds = [
         sched.place(12) if isinstance(sched, SchedGemv) and sched.MNK[0] == MOE_INTERMEDIATE else
-        sched.place(12, base_sm=64) if isinstance(sched, SchedRegSiLUFused) else
+        sched.place(12) if isinstance(sched, SchedRegSiLUFused) else
         sched.place(32) if isinstance(sched, SchedGemvMmaScale) else
         sched
         for sched in expert_scheds
     ]
     pre_attn_rms = pre_attn_rms.place(rms_sms)
+    if num_layers == 1:
+        final_rms = final_rms.place(rms_sms)
     argmax = argmax.place(full_sms)
+
+    if TOP_K > 0:
+        layerg.bindBarrier(f"bar_down{TOP_K - 1}", 0)
+    if final_rms is None:
+        systemg.bindBarrier("bar_final_rms", 0)
 
     dae.bind_late_barrier_counts(
         embed_rms,
@@ -347,29 +369,63 @@ def schedule_single_token(token_offset: int, token_pos: int):
         router_proj,
         router_topk,
         expert_scheds,
-        pre_attn_rms,
+        final_rms if final_rms is not None else pre_attn_rms,
         logits_proj,
         argmax,
     )
 
-    dae.i(embed_rms, copy_hidden, SetLayerIndex(0))
-    dae.i(
-        q_proj,
-        k_proj,
-        v_proj,
-        gqa,
-        out_proj,
-        post_attn_rms,
-        router_proj,
-        router_topk,
-        expert_scheds,
-        pre_attn_rms,
-        IncLayerIndex(1),
-        LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
-        LoopC.toNext(dae.copy_cptrs(), num_layers),
-        logits_proj,
-        argmax,
-    )
+    if final_rms is not None:
+        dae.i(
+            embed_rms,
+            copy_hidden,
+            IssueBarrier(layerg["bar_pre_attn_rms"]),
+            SetLayerIndex(0),
+            q_proj,
+            IssueBarrier(layerg["bar_q_proj"]),
+            k_proj,
+            v_proj,
+            IssueBarrier(layerg["bar_qkv_attn"]),
+            gqa,
+            IssueBarrier(layerg["bar_attn_out"]),
+            out_proj,
+            IssueBarrier(layerg["bar_out_mlp"]),
+            post_attn_rms,
+            IssueBarrier(layerg["bar_post_attn_rms"]),
+            router_proj,
+            IssueBarrier(layerg["bar_router"]),
+            router_topk,
+            expert_scheds,
+            final_rms,
+            IssueBarrier(systemg["bar_final_rms"]),
+            logits_proj,
+            argmax,
+        )
+    else:
+        dae.i(embed_rms, copy_hidden, SetLayerIndex(0))
+        dae.i(
+            q_proj,
+            IssueBarrier(layerg["bar_q_proj"]),
+            k_proj,
+            v_proj,
+            IssueBarrier(layerg["bar_qkv_attn"]),
+            gqa,
+            IssueBarrier(layerg["bar_attn_out"]),
+            out_proj,
+            IssueBarrier(layerg["bar_out_mlp"]),
+            post_attn_rms,
+            IssueBarrier(layerg["bar_post_attn_rms"]),
+            router_proj,
+            IssueBarrier(layerg["bar_router"]),
+            router_topk,
+            expert_scheds,
+            pre_attn_rms,
+            IssueBarrier(next_pre_attn_bar),
+            IncLayerIndex(1),
+            LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
+            LoopC.toNext(dae.copy_cptrs(), num_layers),
+            logits_proj,
+            argmax,
+        )
 
 
 seed_prefill_kv_cache(ctx)
