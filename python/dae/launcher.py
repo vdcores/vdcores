@@ -11,6 +11,22 @@ from math import prod
 import numpy as np
 import torch
 
+
+def extract_compute_operator_names(launcher) -> list[str]:
+    launcher.build_instructions()
+
+    operator_names = []
+    seen = set()
+    for builder in launcher.builder:
+        for inst in builder.built_cinsts:
+            name = decode_opcode(inst.opcode)
+            if name in seen:
+                continue
+            seen.add(name)
+            operator_names.append(name)
+    return operator_names
+
+
 class SMInstructionBuilder:
     def __init__(self, sm_id : int):
         self.sm_id = sm_id
@@ -339,6 +355,18 @@ class Launcher:
     def launch(self):
         self.build_instructions()
 
+        supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
+        if supported_compute_ops is not None:
+            required_compute_ops = self.compute_operator_names()
+            supported_compute_ops = set(supported_compute_ops)
+            missing_compute_ops = [name for name in required_compute_ops if name not in supported_compute_ops]
+            if missing_compute_ops:
+                rebuild_list = ",".join(required_compute_ops)
+                raise ValueError(
+                    "Launcher requires compute operators that are not compiled into dae.runtime: "
+                    f"{missing_compute_ops}. Rebuild with DAE_COMPUTE_OPS={rebuild_list} or a superset."
+                )
+
         unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
         if unbound_bar_ids:
             raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
@@ -378,6 +406,9 @@ class Launcher:
             stream
         )
         assert ret == 0
+
+    def compute_operator_names(self) -> list[str]:
+        return extract_compute_operator_names(self)
     
     def bench(self, iterations : int = 100,
                     total_bytes : int | None = None, total_flops : int | None = None):

@@ -9,6 +9,8 @@
 #include <vector>
 #include <cstdint>
 
+namespace py = pybind11;
+
 // function 1: set smem size
 size_t py_set_smem_size(size_t requested_size) {
   return set_smem_size(requested_size);
@@ -251,6 +253,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   #define DAE_OP(name, value) op.attr(#name) = (int)name;
   #include "dae/opcode.cuh.inc"
   #undef DAE_OP
+
+  py::list supported_compute_ops;
+  #define DAE_COMPUTE_OP(name, handler) supported_compute_ops.append(py::str(#name));
+  #include "dae/selected_compute_ops.inc"
+  #undef DAE_COMPUTE_OP
+  m.attr("supported_compute_ops") = supported_compute_ops;
 
   auto config = m.def_submodule("config", "DAE2 Configuration Constants");
   config.attr("slot_size") = slotSizeKb * 1024;

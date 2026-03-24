@@ -2,10 +2,16 @@
 
 # CUDA compiler
 NVCC = nvcc
+PYTHON ?= python
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
 CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
+
+GENERATED_INCLUDE_DIR := build/generated
+SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc
+COMPUTE_OP_REGISTRY := include/dae/compute_ops.inc
+COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 
 # Compiler flags
 # NVCC_FLAGS = -DNDEBUG -O3 -std=c++20 $(if $(profile),-DDAE_PROFILE) # --ptxas-options=--verbose
@@ -13,7 +19,7 @@ CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
 # Linker flags (add CUDA driver library for TMA support)
 LDFLAGS = -lcuda -lcublas
 
-NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -std=c++20 -Xptxas=-v -use_fast_math
+NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
 
 # Directories
@@ -52,10 +58,19 @@ clean:
 %: app/%.cu $(TARGETS) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -o $@ $< $(TARGETS) $(LDFLAGS)
 
+$(SELECTED_COMPUTE_OPS): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_OP_REGISTRY)
+	@mkdir -p $(dir $@)
+	DAE_COMPUTE_OPS="$(DAE_COMPUTE_OPS)" $(PYTHON) $(COMPUTE_OP_GENERATOR) --registry $(COMPUTE_OP_REGISTRY) --output $@
+
+%.o: $(SELECTED_COMPUTE_OPS)
+%: $(SELECTED_COMPUTE_OPS)
+
 run: $(BIN)
 	./$<
 
 pyext: $(TARGETS)
 	pip install -e . --no-build-isolation
 
-.PHONY: all clean run
+FORCE:
+
+.PHONY: all clean run FORCE

@@ -22,12 +22,15 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
 - `python/dae/instructions.py`: serialized instruction types, compute operation definitions, memory-side instruction helpers, and TMA instruction wrappers used by `launcher.py`.
 - `python/dae/instruction_utils.py`: small opcode/packing helpers shared by the instruction and op modules.
+- `python/dae/util.py`: CLI helpers including instruction dumps, profiling output, and `--write-compute-ops` generation of a default `dae_compute_ops.txt` build-selection file from a built launcher.
 - `python/dae/schedule.py`: scheduling interface and composition layer.
 - `python/dae/model.py`: model-side Python support code.
 - `include/dae/`: runtime abstractions such as allocator, launcher, queues, runtime, and virtual cores.
+  The compute warp dispatch now lives in `include/dae/compute_dispatch.cuh`, and the checked-in selective-build registry for supported compute ops lives in `include/dae/compute_ops.inc`.
 - `include/task/`: CUDA task building blocks including attention, GEMV, RMSNorm, RoPE, SiLU, WGMMA, and argmax.
 - `src/runtime.cu`: runtime implementation compiled to `runtime.o`.
 - `src/torch_runtime.cu`: Torch extension binding source.
+- `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.txt`, and emits `build/generated/dae/selected_compute_ops.inc` for both `make` and `setup.py`.
 
 ## Operational Notes
 
@@ -37,5 +40,6 @@ This note summarizes the stable structure confirmed during repository initializa
 - `app/python/llama3/sched.py` now includes a `--correctness` mode for a single-token, single-decoding-step validation against `app/python/llama3/reference.py`.
 - `python/dae/schedule.py` now treats SM-count placement as a post-construction concern across the main scheduler classes, including `SchedArgmax`.
 - `python/dae/launcher.py` and `app/python/llama3/sched.py` now support late-bound barrier counts: barrier ids are still built early, and the llama path now binds selected placement-dependent layer/system barriers from a generic scan of the placed schedule bundle's barrier-releasing memory instructions rather than from a handwritten per-bar table.
+- `python/dae/launcher.py` now exposes `extract_compute_operator_names(...)` and `Launcher.compute_operator_names()`, and `Launcher.launch()` now rejects schedules whose required compute ops are not present in the built extension's `runtime.supported_compute_ops`.
 - The llama/qwen shared-memory SiLU stages are no longer only inline callables in the app scripts; they now have dedicated schedule classes in `python/dae/schedule.py` for the interleaved phase and the fused register-backed phase.
 - `app/python/llama3/sched.py` now follows the newer schedule-construction style: build dependency-only schedules first, attach mostly-static bars immediately after construction, then apply `place(...)` in a grouped step before submission to `dae.i(...)`.
