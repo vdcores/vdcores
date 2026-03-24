@@ -174,7 +174,7 @@ class SchedPlan:
             head = i % NUM_KV_HEAD
             insts.extend([
                 ATTN_SPLIT_POST_REDUCE(self.split_level),
-                RawAddress(matP[head], 25).bar(self.attn_bar),
+                RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], 25).bar(self.attn_bar),
                 # RepeatM(self.split_level, delta_addr=matO.numel() * matO.element_size()),
                 # TmaLoad1D(matO_split_attn_view[0, self.request_idx, head, ...]).jump(),
                 self.tO_split.cord(head, self.request_idx),
@@ -199,8 +199,8 @@ for rid in range(NUM_REQ):
         post_base_sm=post_base_sm,
     )
     plans.append(plan)
-    attn_base_sm += plan.attn_num_sms
-    post_base_sm += plan.post_num_sms
+    attn_base_sm = (attn_base_sm + plan.attn_num_sms) % num_sms
+    post_base_sm = (post_base_sm + plan.post_num_sms) % num_sms
 
 dae.i(
     [plan.sm_attn_task for plan in plans],

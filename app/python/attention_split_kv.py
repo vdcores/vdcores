@@ -156,7 +156,7 @@ def sm_task(sm: int):
     req = sm // NUM_KV_HEAD
     insts += [
         ATTN_SPLIT_POST_REDUCE(split_kv),
-        RawAddress(matP[head], 25).bar(attn_bar),
+        RawAddress(matP[head, req*HEAD_GROUP_SIZE], 25).bar(attn_bar),
         # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
         # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
         tO_split.cord(head, req),
@@ -189,10 +189,9 @@ def gqa_ref():
     # K.transpose(-1, -2): [B, Hkv, D, S]
     # result: [B, Hkv, G, S]
     QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
-    # Apply a per-request causal length mask so each request can expose a different
-    # active KV span while sharing the same backing K/V buffers.
-    active_kv_len = torch.tensor(seq_lengths, device=gpu, dtype=torch.long)
-    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= active_kv_len[:, None, None, None]
+    # apply mask according to lsat_active_kv_len
+    total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
+    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
     QK = QK.masked_fill(mask, float("-inf"))
 
     # softmax on sequence dimension
@@ -243,5 +242,5 @@ def split_ref(split_stage):
 #     ref_lse_hkv = ref_lse[0]  # [Hkv, G]
 #     tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
 
-# refQK, refO = gqa_ref()
-# tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
+refQK, refO = gqa_ref()
+tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
