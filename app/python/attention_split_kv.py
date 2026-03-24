@@ -17,14 +17,14 @@ NUM_REQ = 1
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
-MAX_SPLIT = 16
+MAX_SPLIT = 64
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
 QTile = 16
 KVTile = 64
 
-split_kv = 2
+split_kv = 16
 assert split_kv <= MAX_SPLIT
 num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
 assert num_sms <= 132 # max sm count for HX00

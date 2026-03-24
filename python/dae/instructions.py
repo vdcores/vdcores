@@ -201,10 +201,11 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
     def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
-        assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
+        assert split_idx < 64, "split_idx must be less than 64 to fit in the instruction encoding"
+        assert num_active_q < 16, "for decoding only"
         # pack need_norm and need_rope into a uint16 arg
-        arg0 = num_kv_block | (split_idx << 12)
-        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        arg0 = num_kv_block | (num_active_q << 12)
+        arg1 = split_idx | (last_kv_active_token_len << 8)
         arg2 = kv_start_idx # make this 16bit to support long seq
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 
@@ -387,7 +388,10 @@ class MemoryInstruction(Instruction):
         assert len(cords) <= 4, "Maximum 4 cords are supported"
         self.cords = cords + [0] * (4 - len(cords))
         for i in range(4):
-            assert 0 <= self.cords[i] < 2**16 - 1, "cord values must be a uint16"
+            ok = 0 <= self.cords[i] < 2**16
+            if not ok:
+                print(f"cord value {self.cords[i]} at index {i} is out of uint16 range for instruction {self}")
+            assert ok, "cord values must be a uint16"
 
     def delta(self, delta):
         if isinstance(delta, int):

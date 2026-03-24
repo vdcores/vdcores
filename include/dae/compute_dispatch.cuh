@@ -100,8 +100,8 @@ static __device__ __forceinline__ void handle_attention_common(
 ) {
   if constexpr (SplitKv) {
     const int num_kv_blocks = inst.args[0] & 0xFFF;
-    const int split_idx = (inst.args[0] >> 12) & 0xF;
-    const int num_active_q = inst.args[1] & 0xFF;
+    const int num_active_q = (inst.args[0] >> 12) & 0xF;
+    const int split_idx = inst.args[1] & 0xFF;
     const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
     const int kv_start_idx = inst.args[2];
     if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {

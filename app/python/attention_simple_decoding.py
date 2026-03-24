@@ -86,9 +86,81 @@ def cord_load_o(mat: torch.Tensor, rank: int):
     return cfunc
 
 
+def tma_load_k(mat: torch.Tensor, tileK: int, tileN: int):
+    R, S, H, D = mat.shape
+    glob_dims = [64, S, 2, H, R]
+    elsize = mat.element_size()
+    glob_strides = [d * elsize for d in [mat.stride(1), 64, mat.stride(2), mat.stride(0)]]
+    box_dims = [64, tileN, 2, 1, 1]
+    rank = len(glob_dims)
+    box_strides = [1] * rank
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        box_strides,
+        128,
+        0
+    )
+
+def cord_load_k(mat: torch.Tensor, rank: int):
+    assert rank == 5, "Only support 5D TMA load for K/V"
+    def cfunc(*cords):
+        assert len(cords) == 3, f"cords should be (req, seq, head), but got {cords}"
+        r, s, h = cords
+        return [s, 0, h, r]
+    return cfunc
+
+def tma_load_v(mat: torch.Tensor, tileM: int, tileK: int):
+    # mat: [R, S, H, D]
+    R, S, H, D = mat.shape
+    elsize = mat.element_size()
+
+    assert D == HEAD_DIM
+    assert tileM == HEAD_DIM
+    assert tileK == KVTile
+    assert D % 64 == 0
+    assert S % 8 == 0
+
+    M_total = H * D  # fold head into M
+
+    glob_dims = [64, 8, M_total // 64, S // 8, R]
+    glob_strides = [
+        mat.stride(1),      # seq stride
+        64,                 # next 64 elems in folded M
+        mat.stride(1) * 8,  # next 8 seq elems
+        mat.stride(0),      # next request
+    ]
+    glob_strides = [s * elsize for s in glob_strides]
+
+    box_dims = [64, 8, tileM // 64, tileK // 8, 1]
+    rank = len(glob_dims)
+    box_strides = [1] * rank
+
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        box_strides,
+        128,
+        0,
+    )
+
+def cord_load_v(mat: torch.Tensor, rank: int):
+    assert rank == 5, "Only support 5D TMA load for V"
+    def cfunc(*cords):
+        # cords: (req, seq, head)
+        assert len(cords) == 3, f"cords should be (req, seq, head), but got {cords}"
+        r, s, h = cords
+        return [0, h * (HEAD_DIM // 64), s // 8, r]
+    return cfunc
+
+
 tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
-tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
-tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
+tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
+tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
 need_norm = False
 need_rope = False
@@ -123,8 +195,8 @@ def sm_task(sm: int):
 >>>>>>> 3f67a0b (fix tma util collapsed dim)
         tQ.cord(req, head),
         RepeatM.on(num_kv_block,
-            [tK.cord(req, 0, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
-            [tV.cord(req, 0, head, 0), tV.cord2tma(0, KVTile, 0, 0)],
+            [tK.cord(req, 0, head), tK.cord2tma(0, KVTile, 0)],
+            [tV.cord(req, 0, head), tV.cord2tma(0, KVTile, 0)],
         ),
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
