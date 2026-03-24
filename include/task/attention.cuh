@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cute/tensor.hpp>
+#include <cute/arch/mma_sm80.hpp>
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
 #include <cute/algorithm/gemm.hpp>     // cute::gemm
@@ -654,6 +655,267 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
         const int slot_lse = m2c.template pop<0>();
         // assume sM_glob is of shape [H, N, G, max_split]
         // each SM will get its slice of [N, G, max_split] so no need to index the KV head dim
+        accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
+        constexpr int tSRow = decltype(size<1>(o_mn_view))::value;
+        #pragma unroll
+        for (int r = 0; r < tSRow; ++r) {
+            const int q_row = (thread_id / 32) * 16 + (thread_id % 32) / 4 + r * 8;
+            if (q_row < num_active_q) {
+                const accum_t lse = online_softmax.row_max(r) + log2f(online_softmax.row_sum(r));
+                sLSE_ptr[q_row * MAX_SPLIT + split_idx] = lse;
+            }
+        }
+        __sync_compute_group(128);
+        c2m.template push<31, true, false>(thread_id, 1 << slot_lse);
+    }
+}
+
+template <int HEAD_DIM,
+          int Q_BLOCK_SIZE,
+          int KV_BLOCK_SIZE,
+          bool SPLIT_KV,
+          int MAX_SPLIT,
+          bool NEED_NORM, bool NEED_ROPE,
+          typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type,
+          template <class> class LayoutQAtom = cute::GMMA::Layout_K_SW128_Atom,
+          template <class> class LayoutKAtom = cute::GMMA::Layout_K_SW128_Atom,
+          template <class> class LayoutVAtom = cute::GMMA::Layout_MN_SW128_Atom>
+__device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
+    const int num_kv_blocks,
+    const int split_idx,
+    const int num_active_q,
+    const int last_kv_active_token_len,
+    const int kv_start_idx,
+    const bool runtime_need_norm,
+    const bool runtime_need_rope,
+    void *base,
+    float *smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+    using namespace cute;
+    using AtomTrait = MMA_Traits<AtomQK>;
+    using data_t = typename AtomTrait::ValTypeA;
+    using accum_t = typename AtomTrait::ValTypeC;
+
+    using AtomTrait_PV = MMA_Traits<AtomPV>;
+    using data_t_PV = typename AtomTrait_PV::ValTypeA;
+    using accum_t_PV = typename AtomTrait_PV::ValTypeC;
+    using Tr = F16Traits<data_t>;
+    using vec2_t = typename Tr::vec2_t;
+
+    static_assert(std::is_same<accum_t, accum_t_PV>::value, "accum type of QK and PV atom should be the same");
+    static_assert(std::is_same<data_t, data_t_PV>::value, "QK and PV operand types must match");
+
+    constexpr int MMA_M = shape<0>(typename AtomTrait::Shape_MNK{});
+    constexpr int MMA_N = shape<1>(typename AtomTrait::Shape_MNK{});
+    constexpr int MMA_K = shape<2>(typename AtomTrait::Shape_MNK{});
+
+    constexpr int MMA_M_PV = shape<0>(typename AtomTrait_PV::Shape_MNK{});
+    constexpr int MMA_N_PV = shape<1>(typename AtomTrait_PV::Shape_MNK{});
+    constexpr int MMA_K_PV = shape<2>(typename AtomTrait_PV::Shape_MNK{});
+
+    static_assert(Q_BLOCK_SIZE % MMA_M == 0, "Q block must be divisible by the QK atom M size");
+    static_assert(Q_BLOCK_SIZE % MMA_M_PV == 0, "Q block must be divisible by the PV atom M size");
+    static_assert(KV_BLOCK_SIZE % MMA_N == 0, "KV block must be divisible by the QK atom N size");
+    static_assert(HEAD_DIM % MMA_K == 0, "Head dim must be divisible by the QK atom K size");
+    static_assert(HEAD_DIM % MMA_N_PV == 0, "Head dim must be divisible by the PV atom N size");
+    static_assert(KV_BLOCK_SIZE % MMA_K_PV == 0, "KV block must be divisible by the PV atom K size");
+
+    constexpr int numThreadsQK = 32 * (Q_BLOCK_SIZE / MMA_M);
+    constexpr int numThreadsPV = 32 * (Q_BLOCK_SIZE / MMA_M_PV);
+    static_assert(numThreadsQK == 128, "Only support a 128-thread QK compute group for now");
+    static_assert(numThreadsPV == 128, "Only support a 128-thread PV compute group for now");
+
+    const int thread_id = __compute_tid();
+
+    auto tiled_mma_qk = make_tiled_mma(
+        MMA_Atom<AtomQK>{},
+        make_layout(make_shape(Int<Q_BLOCK_SIZE / MMA_M>{}, Int<1>{}, Int<1>{})),
+        make_tile(Int<Q_BLOCK_SIZE>{}, Int<KV_BLOCK_SIZE>{}, Int<HEAD_DIM>{})
+    );
+    auto tiled_mma_pv = make_tiled_mma(
+        MMA_Atom<AtomPV>{},
+        make_layout(make_shape(Int<Q_BLOCK_SIZE / MMA_M_PV>{}, Int<1>{}, Int<1>{})),
+        make_tile(Int<Q_BLOCK_SIZE>{}, Int<HEAD_DIM>{}, Int<KV_BLOCK_SIZE>{})
+    );
+
+    auto layout_sQ = tile_to_shape(
+        LayoutQAtom<data_t>{},
+        make_shape(Int<Q_BLOCK_SIZE>{}, Int<HEAD_DIM>{}));
+    auto layout_sK = tile_to_shape(
+        LayoutKAtom<data_t>{},
+        make_shape(Int<KV_BLOCK_SIZE>{}, Int<HEAD_DIM>{}));
+    auto layout_sV = tile_to_shape(
+        LayoutVAtom<data_t>{},
+        make_shape(Int<HEAD_DIM>{}, Int<KV_BLOCK_SIZE>{}));
+    auto layout_sP = make_layout(
+        make_shape(Int<Q_BLOCK_SIZE>{}, Int<KV_BLOCK_SIZE>{}),
+        make_stride(Int<KV_BLOCK_SIZE>{}, Int<1>{})
+    );
+    auto layout_sO = make_layout(
+        make_shape(Int<Q_BLOCK_SIZE>{}, Int<HEAD_DIM>{}),
+        make_stride(Int<HEAD_DIM>{}, Int<1>{})
+    );
+
+    auto layout_sQ_vec = tile_to_shape(
+        LayoutQAtom<vec2_t>{},
+        make_shape(Int<Q_BLOCK_SIZE>{}, Int<HEAD_DIM / 2>{}));
+    auto layout_sK_vec = tile_to_shape(
+        LayoutKAtom<vec2_t>{},
+        make_shape(Int<KV_BLOCK_SIZE>{}, Int<HEAD_DIM / 2>{}));
+
+    auto thr_mma_qk = tiled_mma_qk.get_slice(thread_id);
+    auto thr_mma_pv = tiled_mma_pv.get_slice(thread_id);
+
+    auto t_dummyQ = make_tensor(make_smem_ptr(static_cast<data_t*>(nullptr)), layout_sQ);
+    auto t_dummyK = make_tensor(make_smem_ptr(static_cast<data_t*>(nullptr)), layout_sK);
+    auto t_dummyV = make_tensor(make_smem_ptr(static_cast<data_t_PV*>(nullptr)), layout_sV);
+    auto t_dummyP = make_tensor(make_smem_ptr(static_cast<data_t_PV*>(nullptr)), layout_sP);
+    auto t_dummyS = make_tensor(
+        make_smem_ptr(static_cast<accum_t*>(nullptr)),
+        Layout<Shape<Int<Q_BLOCK_SIZE>, Int<KV_BLOCK_SIZE>>, Stride<Int<1>, Int<Q_BLOCK_SIZE>>>{}
+    );
+    auto t_dummyO = make_tensor(
+        make_smem_ptr(static_cast<accum_t_PV*>(nullptr)),
+        layout_sO
+    );
+
+    auto frag_Q = thr_mma_qk.partition_fragment_A(t_dummyQ);
+    auto frag_K = thr_mma_qk.partition_fragment_B(t_dummyK);
+    auto frag_S = thr_mma_qk.partition_fragment_C(t_dummyS);
+    auto frag_P = thr_mma_pv.partition_fragment_A(t_dummyP);
+    auto frag_V = thr_mma_pv.partition_fragment_B(t_dummyV);
+    auto frag_O = thr_mma_pv.partition_fragment_C(t_dummyO);
+
+    auto s_mn_view = acc_get_mn_view<Q_BLOCK_SIZE, KV_BLOCK_SIZE>(
+        tiled_mma_qk.get_layoutC_TV(),
+        frag_S
+    );
+    auto o_mn_view = acc_get_mn_view<Q_BLOCK_SIZE, HEAD_DIM>(
+        tiled_mma_pv.get_layoutC_TV(),
+        frag_O
+    );
+
+    clear(frag_O);
+
+    const bool use_qwen_fused_qk = runtime_need_norm || runtime_need_rope;
+    int slot_side_input = 0;
+    int slot_k_store = 0;
+    const vec2_t* q_norm_weight = nullptr;
+    const vec2_t* k_norm_weight = nullptr;
+    const vec2_t* rope_row = nullptr;
+    vec2_t* sKStore_ptr = nullptr;
+    if (use_qwen_fused_qk) {
+        slot_side_input = m2c.template pop<0>();
+        const vec2_t* packed_side_input = (const vec2_t*)get_slot_address(base, extract(slot_side_input));
+        q_norm_weight = packed_side_input;
+        k_norm_weight = packed_side_input + HEAD_DIM / 2;
+        rope_row = packed_side_input + HEAD_DIM;
+        slot_k_store = m2c.template pop<0>();
+        sKStore_ptr = (vec2_t*)get_slot_address(base, extract(slot_k_store));
+    }
+
+    int slot_Q = m2c.template pop<0>();
+    data_t* sQ_ptr = (data_t*)get_slot_address(base, extract(slot_Q));
+    auto sQ = make_tensor(make_smem_ptr(sQ_ptr), layout_sQ);
+    auto sQ_vec = make_tensor(make_smem_ptr((vec2_t*)sQ_ptr), layout_sQ_vec);
+    if (use_qwen_fused_qk) {
+        rms_affine_rope_rows<HEAD_DIM, 128>(
+            sQ_vec,
+            Q_BLOCK_SIZE,
+            smem_reduce,
+            1.0e-6f,
+            q_norm_weight,
+            rope_row,
+            runtime_need_norm,
+            runtime_need_rope
+        );
+    }
+    copy(thr_mma_qk.partition_A(sQ), frag_Q);
+
+    const accum_t score_scale = static_cast<accum_t>(M_LOG2E / sqrtf((float)HEAD_DIM));
+    OnlineSoftmax<size<1>(o_mn_view), accum_t> online_softmax;
+
+    for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
+        clear(frag_S);
+
+        const int slot_K = m2c.template pop<0>();
+        data_t* sK_ptr = (data_t*)get_slot_address(base, extract(slot_K));
+        auto sK = make_tensor(make_smem_ptr(sK_ptr), layout_sK);
+        auto sK_vec = make_tensor(make_smem_ptr((vec2_t*)sK_ptr), layout_sK_vec);
+
+        if (use_qwen_fused_qk && kv_block_idx == num_kv_blocks - 1 && last_kv_active_token_len > 0) {
+            const int current_k_row = last_kv_active_token_len - 1;
+            rms_affine_rope_single_row<HEAD_DIM>(
+                sK_vec,
+                current_k_row,
+                smem_reduce,
+                1.0e-6f,
+                k_norm_weight,
+                rope_row,
+                runtime_need_norm,
+                runtime_need_rope
+            );
+            if (thread_id < HEAD_DIM / 2) {
+                sKStore_ptr[thread_id] = sK_vec(current_k_row, thread_id);
+            }
+            __sync_compute_group(128);
+        }
+
+        copy(thr_mma_qk.partition_B(sK), frag_K);
+        gemm(tiled_mma_qk, frag_S, frag_Q, frag_K, frag_S);
+
+        #pragma unroll
+        for (int r = 0; r < size<1>(s_mn_view); ++r) {
+            #pragma unroll
+            for (int c = 0; c < size<0>(s_mn_view); ++c) {
+                s_mn_view(c, r) *= score_scale;
+            }
+        }
+        if (kv_block_idx == num_kv_blocks - 1) {
+            _mask(s_mn_view, last_kv_active_token_len);
+        }
+
+        online_softmax.update1(s_mn_view, o_mn_view);
+        online_softmax.update2(s_mn_view);
+
+        auto sP = make_tensor(make_smem_ptr((data_t_PV*)sK_ptr), layout_sP);
+        copy(frag_S, thr_mma_qk.partition_C(sP));
+        __sync_compute_group(128);
+
+        copy(thr_mma_pv.partition_A(sP), frag_P);
+
+        const int slot_V = m2c.template pop<0>();
+        data_t_PV* sV_ptr = (data_t_PV*)get_slot_address(base, extract(slot_V));
+        auto sV = make_tensor(make_smem_ptr(sV_ptr), layout_sV);
+        copy(thr_mma_pv.partition_B(sV), frag_V);
+
+        gemm(tiled_mma_pv, frag_O, frag_P, frag_V, frag_O);
+
+        __sync_compute_group(128);
+        c2m.push(thread_id, slot_V);
+        c2m.push(thread_id, slot_K);
+    }
+
+    c2m.push(thread_id, slot_Q);
+    if (use_qwen_fused_qk) {
+        c2m.push(thread_id, slot_side_input);
+        c2m.template push<0, true>(thread_id, slot_k_store);
+    }
+
+    butterfly_reduce<4>(online_softmax.row_sum, cute::plus{});
+    online_softmax.post_correction(o_mn_view);
+
+    const int slot_O = m2c.template pop<0>();
+    data_t* sO_ptr = (data_t*)get_slot_address(base, extract(slot_O));
+    auto sO = make_tensor(make_smem_ptr(sO_ptr), layout_sO);
+    copy(frag_O, thr_mma_pv.partition_C(sO));
+    c2m.template push<0, true>(thread_id, slot_O);
+
+    if constexpr (SPLIT_KV) {
+        const int slot_lse = m2c.template pop<0>();
         accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
         constexpr int tSRow = decltype(size<1>(o_mn_view))::value;
         #pragma unroll

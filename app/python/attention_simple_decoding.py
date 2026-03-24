@@ -1,5 +1,6 @@
 import torch
 import copy
+import os
 from math import sqrt
 from functools import partial
 from dae.launcher import *
@@ -88,6 +89,14 @@ tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder
 need_norm = False
 need_rope = False
 
+ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "hopper").lower()
+if ATTENTION_IMPL == "mma":
+    attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA
+elif ATTENTION_IMPL in ("hopper", "gmma", ""):
+    attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim
+else:
+    raise ValueError(f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; expected 'hopper' or 'mma'")
+
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
 last_active_kv_len = 48
 assert last_active_kv_len <= KVTile
@@ -97,7 +106,7 @@ def sm_task(sm: int):
     req = sm // NUM_KV_HEAD
 
     insts = [
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(NUM_KV_BLOCK,
             [tK.cord(req, 0, head, 0), tK.cord2tma(0, KVTile, 0, 0)],

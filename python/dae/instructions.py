@@ -165,6 +165,16 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
         )
 
 
+class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
+    HEAD_DIM = 128
+
+    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA,
+            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+        )
+
+
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
@@ -173,6 +183,17 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
             args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
         )
+
+
+class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
+    HEAD_DIM = 64
+
+    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA,
+            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+        )
+
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
@@ -184,6 +205,19 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
         arg2 = kv_start_idx # make this 16bit to support long seq
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 
+            args=[arg0, arg1, arg2]
+        )
+
+
+class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA(ComputeInstruction):
+    HEAD_DIM = 128
+    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+        assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
+        arg0 = num_kv_block | (split_idx << 12)
+        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        arg2 = kv_start_idx
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA,
             args=[arg0, arg1, arg2]
         )
 
@@ -786,8 +820,11 @@ __all__ = [
     "WGMMA_64x256x64_BF16",
     "ROPE_INTERLEAVE_512",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim",
+    "ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
+    "ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
+    "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA",
     "ATTN_SPLIT_POST_REDUCE",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
