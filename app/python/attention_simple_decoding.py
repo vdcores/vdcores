@@ -19,12 +19,11 @@ NUM_REQ = 2
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
-seq_lengths = [KV_SEQ_LEN] * NUM_REQ
+seq_lengths = [2048, 1024]
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 assert len(seq_lengths) == NUM_REQ, "Length of seq_lengths must match NUM_REQ"
 for seq_len in seq_lengths:
-    assert seq_len % 64 == 0, "Sequence length must be multiple of 64 for simplicity"
     assert seq_len <= KV_SEQ_LEN, "Sequence length must be less than or equal to KV_SEQ_LEN"
 
 QTile = 16
