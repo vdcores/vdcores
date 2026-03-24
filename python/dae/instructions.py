@@ -60,6 +60,19 @@ class Gemv_M64N8(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=opcode.OP_GEMV_M64N8, args=[kTiles, nprefeth])
 
+class Gemv_M64N8K64(ComputeInstruction):
+    MNK = (64, 8, 64)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMV_M64N8K64, args=[kTiles, nprefeth])
+
+class Gemv_M64N8B2(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 2
+
+    def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMV_M64N8B2, args=[kTiles, nprefeth])
 
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
@@ -67,6 +80,28 @@ class Gemv_M128N8(ComputeInstruction):
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=opcode.OP_GEMV_M128N8, args=[kTiles, nprefeth])
+
+class Gemm_M64N64(ComputeInstruction):
+    MNK = (64, 64, 128)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMM_M64N64, args=[kTiles])
+
+class Gemm_M64N64K64(ComputeInstruction):
+    MNK = (64, 64, 64)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMM_M64N64K64, args=[kTiles])
+
+
+class Gemm_M64N128K64(ComputeInstruction):
+    MNK = (64, 128, 64)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, residual: bool = False):
+        super().__init__(opcode=opcode.OP_GEMM_M64N128K64, args=[kTiles])
 
 
 class Gemv_M64N8_ROPE_128(ComputeInstruction):
@@ -142,8 +177,9 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
     def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+        assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
         # pack need_norm and need_rope into a uint16 arg
-        arg0 = num_kv_block | (split_idx << 8)
+        arg0 = num_kv_block | (split_idx << 12)
         arg1 = num_active_q | (last_kv_active_token_len << 8)
         arg2 = kv_start_idx # make this 16bit to support long seq
         super().__init__(
@@ -738,6 +774,11 @@ __all__ = [
     "TerminateC",
     "Gemv_M64N8",
     "Gemv_M128N8",
+    "Gemv_M64N8K64",
+    "Gemv_M64N8B2",
+    "Gemm_M64N64",
+    "Gemm_M64N64K64",
+    "Gemm_M64N128K64",
     "Gemv_M64N8_ROPE_128",
     "Gemv_M192N16",
     "Gemv_M64N8_MMA",

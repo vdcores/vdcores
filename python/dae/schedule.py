@@ -569,6 +569,173 @@ class SchedGemv(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
+class SchedGemm(Schedule):
+    def __init__(self, Atom,
+                 MNK: tuple[int, int, int],
+                 tmas: tuple[TmaTensor],
+                 fold: int | None = None,
+                 prefetch=True,
+                 group=True):
+        super().__init__()
+        self.Atom = Atom
+        self.tmas = tmas
+
+        mnk_base = []
+        mnk_size = []
+        assert len(MNK) == 3, "MNK must be a tuple of 3 dimensions"
+        for dim in MNK:
+            if isinstance(dim, int):
+                mnk_base.append(0)
+                mnk_size.append(dim)
+            elif isinstance(dim, tuple) and len(dim) == 2:
+                base, size = dim
+                mnk_base.append(base)
+                mnk_size.append(size)
+            else:
+                raise ValueError(f"Invalid MNK dimension: {dim}")
+
+        self.MNK = mnk_size
+        self.MNK_base = mnk_base
+
+        self.fold = fold
+        self.prefetch = prefetch
+        self.group = group
+        self.m_tiles = None
+        self.n_tiles = None
+        self.tiles_per_fold = None
+        self.total_workers = None
+        self.k_per_fold = None
+
+    def _on_place(self):
+        tile_m, tile_n, _ = self.Atom.MNK
+        m, n, k = self.MNK
+
+        self.m_tiles = m // tile_m
+        self.n_tiles = n // tile_n
+        self.tiles_per_fold = self.m_tiles * self.n_tiles
+
+        if self.fold is None:
+            self.fold = max(1, self.num_sms // self.tiles_per_fold)
+
+        self.total_workers = self.tiles_per_fold * self.fold
+        self.k_per_fold = k // self.fold
+        self.validate()
+
+    def validate(self):
+        tile_m, tile_n, tile_k = self.Atom.MNK
+        m, n, k = self.MNK
+        min_k_per_fold = tile_k * self.Atom.n_batch
+
+        assert m % tile_m == 0
+        assert n % tile_n == 0
+        assert k % tile_k == 0
+
+        assert self.fold >= 1
+        assert self.num_sms % self.fold == 0
+        assert k % self.fold == 0
+        assert self.k_per_fold % tile_k == 0
+        assert self.k_per_fold % min_k_per_fold == 0, (
+            f"Invalid fold for {self.Atom.__name__}: k_per_fold={self.k_per_fold} must be a multiple of "
+            f"TileK * n_batch = {tile_k} * {self.Atom.n_batch} = {min_k_per_fold}"
+        )
+        assert self.k_per_fold >= min_k_per_fold, (
+            f"Invalid fold for {self.Atom.__name__}: k_per_fold={self.k_per_fold} must be at least "
+            f"TileK * n_batch = {tile_k} * {self.Atom.n_batch} = {min_k_per_fold}"
+        )
+
+        assert len(self.tmas) == 3, "Expect at 3 TMA tensors: loadA, loadB, storeC"
+        if self.fold > 1:
+            assert self.tmas[-1].mode == "reduce", (
+                f"storeC must be reduction mode when fold > 1, got mode {self.tmas[-1].mode}"
+            )
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        tile_m, tile_n, tile_k = self.Atom.MNK
+        base_m, base_n, base_k = self.MNK_base
+        n_batch = self.Atom.n_batch
+        loadA, loadB, storeC = self.tmas
+
+        load_group = self.group and (self._bar("load") is not None)
+        store_group = self.group and (self._bar("store") is not None)
+
+        insts = []
+        for worker in range(sm, self.total_workers, self.num_sms):
+            tile_idx = worker % self.tiles_per_fold
+            fold_idx = worker // self.tiles_per_fold
+
+            m = base_m + (tile_idx % self.m_tiles) * tile_m
+            n = base_n + (tile_idx // self.m_tiles) * tile_n
+            k = base_k + fold_idx * self.k_per_fold
+
+            n_repeat = self.k_per_fold // (tile_k * n_batch)
+
+            insts.extend([
+                self.Atom(self.k_per_fold // tile_k),
+                RepeatM.onSync(0, self._bar("load"), n_repeat,
+                    (loadB.cord(n, k).group(load_group), loadB.cord2tma(0, tile_k * n_batch)),
+                    *[
+                        (loadA.cord(m, k + tile_k * i).group(load_group), loadA.cord2tma(0, tile_k * n_batch))
+                        for i in range(n_batch)
+                    ],
+                    asyncPort=self.prefetch,
+                ),
+                storeC.cord(m, n).bar(self._bar("store")).group(store_group),
+            ])
+        return insts
+
+    def split(self, dim: int, div: int):
+        assert dim in (0, 1, 2), "dim must be 0 (M), 1 (N), or 2 (K)"
+        assert self.MNK[dim] % div == 0, "Cannot split dimension that is not divisible by div"
+
+        new_schedules = []
+        for i in range(div):
+            new_mnk = list(self.MNK)
+            new_base = list(self.MNK_base)
+            size = new_mnk[dim] // div
+            base = new_base[dim] + i * size
+            new_mnk[dim] = size
+            new_base[dim] = base
+            new_schedule = SchedGemm(
+                self.Atom,
+                ((new_base[0], new_mnk[0]),
+                 (new_base[1], new_mnk[1]),
+                 (new_base[2], new_mnk[2])),
+                self.tmas,
+                fold=self.fold,
+                prefetch=self.prefetch,
+                group=self.group,
+            )
+            new_schedules.append(new_schedule)
+
+        split_schedule = ListSchedule(new_schedules, lead_bars={"load"}, tail_bars={"store"})
+        split_schedule._bars = self._bars.copy()
+        if self.num_sms is not None:
+            split_schedule = split_schedule.place(self.num_sms, self.base_sm)
+        else:
+            split_schedule._apply_boundary_bars()
+        return split_schedule
+
+    def split_M(self, div: int):
+        return self.split(0, div)
+
+    def split_N(self, div: int):
+        return self.split(1, div)
+
+    def split_K(self, div: int):
+        return self.split(2, div)
+
+    def no_prefetch(self):
+        self.prefetch = False
+        return self
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.total_workers)
+
 class SchedGemvRope(Schedule):
     def __init__(self,
                  MNK: tuple[int, int, int],
