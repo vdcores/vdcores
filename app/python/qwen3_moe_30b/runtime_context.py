@@ -108,9 +108,9 @@ class QwenScheduleContext:
     matTokens: torch.Tensor
     matHidden: torch.Tensor
     matRMSHidden: torch.Tensor
-    attnQs: torch.Tensor
-    attnKs: torch.Tensor
-    attnVs: torch.Tensor
+    attnQs: list
+    attnKs: list
+    attnVs: list
     attnO: torch.Tensor
     matRouterLogits: torch.Tensor
     matRouterTopKIdx: torch.Tensor
@@ -146,6 +146,23 @@ def randn(*shape, dtype, device):
     return torch.rand(*shape, dtype=dtype, device=device) - 0.5
 
 
+def copy_tensor_to_device(tensor: torch.Tensor, device: torch.device, dtype: torch.dtype | None = None):
+    target_dtype = tensor.dtype if dtype is None else dtype
+    return tensor.detach().to(device=device, dtype=target_dtype).contiguous()
+
+
+def stack_tensors_to_device(tensors, device: torch.device, dtype: torch.dtype | None = None):
+    tensors = list(tensors)
+    if not tensors:
+        raise ValueError("Expected at least one tensor to stack")
+    first = tensors[0]
+    target_dtype = first.dtype if dtype is None else dtype
+    stacked = torch.empty((len(tensors), *first.shape), dtype=target_dtype, device=device)
+    for idx, tensor in enumerate(tensors):
+        stacked[idx].copy_(tensor.detach().to(device=device, dtype=target_dtype))
+    return stacked.contiguous()
+
+
 def build_runtime_context(parsed_args):
     gpu = torch.device("cuda")
     if parsed_args.local_generated_weights:
@@ -159,17 +176,22 @@ def build_runtime_context(parsed_args):
         layers = [SimpleNamespace() for _ in range(num_layers)]
         dtype = torch.bfloat16
     else:
+        # Keep the reference model off CUDA so the runtime can own the device memory.
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             cache_dir=parsed_args.hf_cache_dir,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            dtype=torch.bfloat16,
+            device_map="cpu",
             token=os.environ["HF_TOKEN"],
+            trust_remote_code=True,
+            use_safetensors=True,
         )
         config = AutoConfig.from_pretrained(
             MODEL_NAME,
             cache_dir=parsed_args.hf_cache_dir,
             token=os.environ["HF_TOKEN"],
+            trust_remote_code=True,
+            use_safetensors=True,
         )
         layers = model.model.layers
         num_layers = len(layers)
@@ -216,9 +238,9 @@ def build_runtime_context(parsed_args):
     matHidden = torch.zeros(N, HIDDEN, dtype=dtype, device=gpu)
     matRMSHidden = torch.zeros(N, HIDDEN, dtype=dtype, device=gpu)
 
-    attnQs = torch.zeros(REQ, QW, dtype=dtype, device=gpu)
-    attnKs = torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu)
-    attnVs = torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu)
+    attnQs = [torch.zeros(REQ, QW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
     attnO = torch.zeros(REQ, QW, dtype=dtype, device=gpu)
 
     matRouterLogits = torch.zeros(N, NUM_EXPERTS, dtype=dtype, device=gpu)
@@ -235,18 +257,26 @@ def build_runtime_context(parsed_args):
         matQNormWs = [randn(HEAD_DIM, dtype=dtype, device=gpu) for _ in range(num_layers)]
         matKNormWs = [randn(HEAD_DIM, dtype=dtype, device=gpu) for _ in range(num_layers)]
     else:
-        matEmbed = model.model.embed_tokens.weight
-        matRMSInputW0 = layers[0].input_layernorm.weight
-        matRMSInputWLoop = torch.stack(
+        matEmbed = copy_tensor_to_device(model.model.embed_tokens.weight, gpu, dtype=dtype)
+        matRMSInputW0 = copy_tensor_to_device(layers[0].input_layernorm.weight, gpu, dtype=dtype)
+        matRMSInputWLoop = stack_tensors_to_device(
             [layer.input_layernorm.weight for layer in layers[1:]] + [model.model.norm.weight],
-            dim=0,
-        ).contiguous()
-        matRMSPostAttnW = torch.stack(
+            gpu,
+            dtype=dtype,
+        )
+        matRMSPostAttnW = stack_tensors_to_device(
             [layer.post_attention_layernorm.weight for layer in layers],
-            dim=0,
-        ).contiguous()
-        matQNormWs = [permute_rope_head_weight(layer.self_attn.q_norm.weight.detach()) for layer in layers]
-        matKNormWs = [permute_rope_head_weight(layer.self_attn.k_norm.weight.detach()) for layer in layers]
+            gpu,
+            dtype=dtype,
+        )
+        matQNormWs = [
+            copy_tensor_to_device(permute_rope_head_weight(layer.self_attn.q_norm.weight), gpu, dtype=dtype)
+            for layer in layers
+        ]
+        matKNormWs = [
+            copy_tensor_to_device(permute_rope_head_weight(layer.self_attn.k_norm.weight), gpu, dtype=dtype)
+            for layer in layers
+        ]
 
     matQwenSideInputs = torch.empty(num_layers, 3 * HEAD_DIM, dtype=dtype, device=gpu)
     for i, (q_norm_w, k_norm_w) in enumerate(zip(matQNormWs, matKNormWs)):
@@ -265,30 +295,35 @@ def build_runtime_context(parsed_args):
         matExpertDownWs = randn(num_layers, NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE, dtype=dtype, device=gpu)
         matLmHeadW = randn(config.vocab_size, HIDDEN, dtype=dtype, device=gpu)
     else:
-        matqWs = torch.stack(
+        matqWs = stack_tensors_to_device(
             [permute_rope_weight(layer.self_attn.q_proj.weight, NUM_Q_HEAD, HEAD_DIM, HIDDEN) for layer in layers],
-            dim=0,
-        ).contiguous()
-        matkWs = torch.stack(
+            gpu,
+            dtype=dtype,
+        )
+        matkWs = stack_tensors_to_device(
             [permute_rope_weight(layer.self_attn.k_proj.weight, NUM_KV_HEAD, HEAD_DIM, HIDDEN) for layer in layers],
-            dim=0,
-        ).contiguous()
-        matvWs = torch.stack([layer.self_attn.v_proj.weight for layer in layers], dim=0).contiguous()
-        matOutWs = torch.stack([layer.self_attn.o_proj.weight for layer in layers], dim=0).contiguous()
-        matRouterWs = torch.stack([layer.mlp.gate.weight for layer in layers], dim=0).contiguous()
-        matExpertGateWs = torch.stack(
+            gpu,
+            dtype=dtype,
+        )
+        matvWs = stack_tensors_to_device([layer.self_attn.v_proj.weight for layer in layers], gpu, dtype=dtype)
+        matOutWs = stack_tensors_to_device([layer.self_attn.o_proj.weight for layer in layers], gpu, dtype=dtype)
+        matRouterWs = stack_tensors_to_device([layer.mlp.gate.weight for layer in layers], gpu, dtype=dtype)
+        matExpertGateWs = stack_tensors_to_device(
             [layer.mlp.experts.gate_up_proj[:, :MOE_INTERMEDIATE, :] for layer in layers],
-            dim=0,
-        ).contiguous()
-        matExpertUpWs = torch.stack(
+            gpu,
+            dtype=dtype,
+        )
+        matExpertUpWs = stack_tensors_to_device(
             [layer.mlp.experts.gate_up_proj[:, MOE_INTERMEDIATE:, :] for layer in layers],
-            dim=0,
-        ).contiguous()
-        matExpertDownWs = torch.stack(
+            gpu,
+            dtype=dtype,
+        )
+        matExpertDownWs = stack_tensors_to_device(
             [layer.mlp.experts.down_proj for layer in layers],
-            dim=0,
-        ).contiguous()
-        matLmHeadW = model.lm_head.weight.detach()
+            gpu,
+            dtype=dtype,
+        )
+        matLmHeadW = copy_tensor_to_device(model.lm_head.weight, gpu, dtype=dtype)
 
     vocab_size = matLmHeadW.shape[0]
     logits_slice = 64 * full_sms * 6
@@ -305,7 +340,7 @@ def build_runtime_context(parsed_args):
     matArgmaxVal = torch.zeros(N, full_sms, dtype=dtype, device=gpu)
 
     dae.set_persistent(matTokens)
-    if not parsed_args.local_generated_weights:
+    if not parsed_args.local_generated_weights and not parsed_args.correctness:
         dae.set_streaming(
             matqWs,
             matkWs,

@@ -263,19 +263,19 @@ def reference_pass_local(ctx, inputs, verbose: bool = False):
     return captured_data, SimpleNamespace(logits=lm_head.unsqueeze(1))
 
 
-def input_batch1(*tokens, mat=None, positions=None):
+def input_batch1(*tokens, mat=None, positions=None, device="cuda"):
     seq_len = len(tokens)
     if mat is not None:
         for i in range(seq_len):
             mat[i] = tokens[i]
     if positions is not None:
         assert len(positions) == seq_len
-        position_ids = torch.tensor(positions, dtype=torch.long, device="cuda").unsqueeze(0)
+        position_ids = torch.tensor(positions, dtype=torch.long, device=device).unsqueeze(0)
     else:
-        position_ids = torch.zeros((1, seq_len), dtype=torch.long, device="cuda")
+        position_ids = torch.zeros((1, seq_len), dtype=torch.long, device=device)
 
     return {
-        "input_ids": torch.tensor([tokens], device="cuda"),
-        "attention_mask": torch.ones((1, seq_len), dtype=torch.long, device="cuda"),
+        "input_ids": torch.tensor([tokens], device=device),
+        "attention_mask": torch.ones((1, seq_len), dtype=torch.long, device=device),
         "position_ids": position_ids,
     }

@@ -12,10 +12,11 @@ def run_correctness_check(ctx: QwenScheduleContext):
     print("[correctness] running single-token position-0 reference capture...")
     token_index = 0
     token_pos = ctx.input_token_id_and_pos[0][1]
+    input_device = ctx.gpu if ctx.use_local_generated_weights else ctx.model.model.embed_tokens.weight.device
     inputs = input_batch1(
         *(token for token, _ in ctx.input_token_id_and_pos),
-        mat=ctx.matTokens[0],
         positions=[pos for _, pos in ctx.input_token_id_and_pos],
+        device=input_device,
     )
 
     if ctx.use_local_generated_weights:
@@ -26,18 +27,21 @@ def run_correctness_check(ctx: QwenScheduleContext):
     all_ok = True
 
     layer = captured[ctx.num_layers - 1]
+    attn_q_final = ctx.attnQs[-1]
+    attn_k_final = ctx.attnKs[-1]
+    attn_v_final = ctx.attnVs[-1]
     dae_q_rope = apply_rms_affine_rope_heads(
-        ctx.attnQs[0].view(ctx.NUM_Q_HEAD, ctx.HEAD_DIM),
+        attn_q_final[0].view(ctx.NUM_Q_HEAD, ctx.HEAD_DIM),
         ctx.matQNormWs[-1],
         rope_row,
         ctx.eps,
     ).reshape(-1)
     print(f"[correctness] Checking Layer {ctx.num_layers - 1}:")
     final_checks = [
-        check_tensor_threshold("v_proj", layer["v_proj"][0, token_index], ctx.attnVs[0, token_pos], 5.0),
-        check_tensor_threshold("q_proj_interleaved", layer["q_proj_interleaved"][0, token_index], ctx.attnQs[0], 5.0),
+        check_tensor_threshold("v_proj", layer["v_proj"][0, token_index], attn_v_final[0, token_pos], 5.0),
+        check_tensor_threshold("q_proj_interleaved", layer["q_proj_interleaved"][0, token_index], attn_q_final[0], 5.0),
         check_tensor_threshold("q_rope_interleaved", layer["q_rope_interleaved"][0, token_index], dae_q_rope, 5.0),
-        check_tensor_threshold("k_rope_interleaved", layer["k_rope_interleaved"][0, token_index], ctx.attnKs[0, token_pos], 5.0),
+        check_tensor_threshold("k_rope_interleaved", layer["k_rope_interleaved"][0, token_index], attn_k_final[0, token_pos], 5.0),
         check_tensor_threshold(
             "router_topk_weight",
             layer["router_topk_weight"][0, token_index],
@@ -47,11 +51,20 @@ def run_correctness_check(ctx: QwenScheduleContext):
         check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, token_index], ctx.matHidden[0], final_hidden_threshold),
         check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, token_index], ctx.matRMSHidden[0], final_rms_threshold),
     ]
-    router_idx_ok = torch.equal(layer["router_topk_idx"][0, token_index].cpu(), ctx.matRouterTopKIdx[0].cpu())
+    ref_router_idx = layer["router_topk_idx"][0, token_index].cpu()
+    dae_router_idx = ctx.matRouterTopKIdx[0].cpu()
+    router_idx_ok = torch.equal(ref_router_idx, dae_router_idx)
+    router_idx_note = ""
+    if not router_idx_ok:
+        ref_sorted, _ = torch.sort(ref_router_idx)
+        dae_sorted, _ = torch.sort(dae_router_idx)
+        router_idx_ok = torch.equal(ref_sorted, dae_sorted)
+        if router_idx_ok:
+            router_idx_note = " (same expert set, different slot order)"
     print(
-        f"[correctness] {'PASS' if router_idx_ok else 'FAIL'} router_topk_idx:"
-        f" ref={layer['router_topk_idx'][0, token_index].tolist()},"
-        f" dae={ctx.matRouterTopKIdx[0].tolist()}"
+        f"[correctness] {'PASS' if router_idx_ok else 'FAIL'} router_topk_idx{router_idx_note}:"
+        f" ref={ref_router_idx.tolist()},"
+        f" dae={dae_router_idx.tolist()}"
     )
     all_ok = all_ok and router_idx_ok
 

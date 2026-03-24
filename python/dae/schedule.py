@@ -1121,7 +1121,7 @@ class SchedRouterTopK(Schedule):
             ROUTER_TOPK_SOFTMAX_128(self.num_token),
             self.logits_tma.cord(0).bar(self._bar("input")).group(),
             self.weight_tma.cord(0).bar(self._bar("output")).group(),
-            self.idx_addr.cord(0).bar(self._bar("output")).writeback(),
+            self.idx_addr.cord(0).bar(self._bar("output")).group().writeback(),
         ]
 
     def bar_release_count(self, role: str):
