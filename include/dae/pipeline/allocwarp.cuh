@@ -185,6 +185,16 @@ __device__ __forceinline__ void allocwarp_execute(
           }
           break;
         }
+        case op(OP_CC0_ROW_BYTES): {
+          // Generalized CC0 path for non-power-of-two embedding row widths.
+          int token = *(int *)(inst.address);
+          di.loop_counter = 1;
+          di.loop_start_pc = pc + 1;
+          if (lane_id == 0) {
+            di.gpr[1] = token * inst.size;
+          }
+          break;
+        }
         default:
           // opcode we do not want to handle
           __mprint("Unknown mem opcode: %04x op=%d\n", inst.opcode, op(inst.opcode));
