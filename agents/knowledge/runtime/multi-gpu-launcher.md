@@ -48,5 +48,8 @@ These notes summarize the minimal multi-GPU runtime path added for NVLink-connec
 - Use [`app/python/tmacopy_multigpu_bench.py`](/root/vdcores/app/python/tmacopy_multigpu_bench.py) as the current local benchmark helper for:
   - single-GPU `tma1d`-style profile-vs-event timing
   - bidirectional DAE peer-copy timing
+  - bidirectional DAE pure remote-read timing
+  - bidirectional DAE remote-write timing
   - plain PyTorch peer-copy comparison
+- Use [`tests/nvlink_tma_standalone.cu`](/root/vdcores/tests/nvlink_tma_standalone.cu) for a standalone CUDA benchmark that allocates remote memory explicitly with `cudaMalloc`, enables peer access directly, and measures TMA-like remote read/write kernels outside VDCores.
 - On this host, plain PyTorch peer copies are still much faster than the current DAE peer-copy harness, so the remaining gap is not a system-wide NVLink limitation.
