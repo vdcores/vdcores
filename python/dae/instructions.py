@@ -2,7 +2,16 @@ import copy
 
 import torch
 
-from .instruction_utils import decode_opcode, dedcode_opcode, encode_bfloat16_u16
+from .instruction_utils import (
+    compute_operator_name as format_compute_operator_name,
+    decode_opcode,
+    dedcode_opcode,
+    encode_bfloat16_u16,
+    encode_compute_instruction_tensor,
+    normalize_compute_opcode_reference,
+    resolve_compute_opcode_value,
+)
+from .op_families import ComputeOpFamilyRef, family_ref
 from .runtime import config, opcode
 from .tma_utils import (
     Major,
@@ -25,27 +34,21 @@ class Instruction:
 
 
 class ComputeInstruction(Instruction):
-    def __init__(self, opcode: int, args: list[int]):
-        self.opcode = opcode
+    def __init__(self, opcode: int | str | ComputeOpFamilyRef, args: list[int]):
+        self.opcode, self.op_family_name = normalize_compute_opcode_reference(opcode)
         self.args = args
 
-    def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
-        if tensor is None:
-            tensor = torch.empty((4,), dtype=torch.uint16)
-        else:
-            tensor = tensor.view(torch.uint16)
-            assert tensor.numel() == 4
+    def opcode_value(self) -> int:
+        return resolve_compute_opcode_value(self.opcode, self.op_family_name)
 
-        tensor.zero_()
-        tensor[0] = self.opcode
-        assert len(self.args) <= 3
-        for i, arg in enumerate(self.args):
-            assert 0 <= arg < 2**16, "args must be uint16"
-            tensor[i + 1] = arg
-        return tensor.view(torch.uint8)
+    def compute_operator_name(self) -> str:
+        return format_compute_operator_name(self.opcode, self.op_family_name)
+
+    def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
+        return encode_compute_instruction_tensor(self.opcode, self.op_family_name, self.args, tensor)
 
     def __repr__(self):
-        return f"ComputeInstruction(opcode={decode_opcode(self.opcode)}, args={self.args})"
+        return f"ComputeInstruction(opcode={self.compute_operator_name()}, args={self.args})"
 
 
 class TerminateC(ComputeInstruction):
@@ -58,28 +61,28 @@ class Gemv_M64N8(ComputeInstruction):
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8, args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8K64, args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=64, BLOAD=1, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemv_M64N8B2(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 2
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8B2, args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=2, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M128N8, args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=128, N=8, K=128, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemm_M64N64(ComputeInstruction):
     MNK = (64, 64, 128)
@@ -122,7 +125,7 @@ class Gemv_M64N8_MMA(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 1
     def __init__(self, kTiles: int):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8_MMA, args=[kTiles])
+        super().__init__(opcode=family_ref("GEMV_MMA", M=64, N=8, K=256), args=[kTiles])
 
 
 class WGMMA_64x256x64_F16(ComputeInstruction):

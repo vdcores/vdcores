@@ -3,13 +3,30 @@
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PYTHON_DIR = ROOT / "python"
+if str(PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_DIR))
+
+from dae.op_family_specs import ComputeFamilyDefinition, parse_comp_family_registry_lines
 
 
 DISPATCH_PATTERN = re.compile(r"^\s*DAE_COMPUTE_OP_HANDLER\(\s*([A-Za-z0-9_]+)\s*\)\s*\{?\s*$")
+OPCODE_PATTERN = re.compile(r"^\s*DAE_OP\(\s*([A-Za-z0-9_]+)\s*,\s*(.+?)\s*\)\s*(?://.*)?$")
 DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
 COMPUTE_OPS_ENV = "DAE_COMPUTE_OPS"
 COMPUTE_OPS_FILE_ENV = "DAE_COMPUTE_OPS_FILE"
+COMPUTE_OPCODE_BASE = 0x7000
+
+
+def load_comp_family_definitions(path: Path) -> dict[str, ComputeFamilyDefinition]:
+    definitions = parse_comp_family_registry_lines(path.read_text().splitlines())
+    if not definitions:
+        raise ValueError(f"No compute family specs found in {path}")
+    return definitions
 
 
 def load_supported_compute_ops(path: Path) -> list[str]:
@@ -24,6 +41,25 @@ def load_supported_compute_ops(path: Path) -> list[str]:
         entries.append(match.group(1))
     if not entries:
         raise ValueError(f"No compute-op handlers found in {path}")
+    return entries
+
+
+def load_all_compute_ops(path: Path) -> list[str]:
+    entries: list[str] = []
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = OPCODE_PATTERN.match(line)
+        if match is not None:
+            name, value = match.groups()
+            if "MK_MOP" in value:
+                continue
+            entries.append(name)
+            continue
+
+    if not entries:
+        raise ValueError(f"No compute opcodes found in {path}")
     return entries
 
 
@@ -63,18 +99,98 @@ def resolve_requested_ops(base_dir: Path) -> tuple[list[str] | None, str]:
     return None, "default:full"
 
 
-def select_entries(supported_ops: list[str], requested_ops: list[str] | None) -> list[str]:
+def validate_family_fields(definition: ComputeFamilyDefinition, values: dict[str, int]) -> None:
+    for field in definition.fields:
+        value = values[field]
+        fixed_key = f"{field}_FIXED"
+        multiple_key = f"{field}_MULTIPLE"
+        min_key = f"{field}_MIN"
+        max_key = f"{field}_MAX"
+
+        if fixed_key in definition.constraints and value != definition.constraints[fixed_key]:
+            raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected {definition.constraints[fixed_key]}")
+        if multiple_key in definition.constraints and (value <= 0 or value % definition.constraints[multiple_key] != 0):
+            raise ValueError(
+                f"Unsupported {definition.family} {field.lower()}={value}; "
+                f"expected a positive multiple of {definition.constraints[multiple_key]}"
+            )
+        if min_key in definition.constraints and value < definition.constraints[min_key]:
+            raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected >= {definition.constraints[min_key]}")
+        if max_key in definition.constraints and value > definition.constraints[max_key]:
+            raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected <= {definition.constraints[max_key]}")
+
+
+def parse_dynamic_operator(name: str, definitions: dict[str, ComputeFamilyDefinition]) -> dict[str, int | str] | None:
+    if not isinstance(name, str) or not name.startswith("OP_"):
+        return None
+
+    parts = name.split("__")
+    if len(parts) < 2:
+        return None
+
+    family = parts[0][3:].upper()
+    definition = definitions.get(family)
+    if definition is None:
+        return None
+
+    if len(parts) != 1 + len(definition.fields):
+        raise ValueError(
+            f"Malformed {family} compute-op name: {name}. "
+            f"Expected fields {definition.fields}."
+        )
+
+    values: dict[str, int] = {}
+    for field, token in zip(definition.fields, parts[1:]):
+        prefix = f"{field}_"
+        if not token.startswith(prefix):
+            raise ValueError(
+                f"Malformed {family} compute-op name: {name}. "
+                f"Expected token starting with {prefix}."
+            )
+        raw_value = token[len(prefix):]
+        try:
+            values[field] = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Malformed {family} compute-op name: {name}. {field} must be an integer.") from exc
+
+    validate_family_fields(definition, values)
+    return {
+        "name": name,
+        "family": family.lower(),
+        **{field.lower(): value for field, value in values.items()},
+    }
+
+
+def select_entries(
+    supported_ops: list[str],
+    requested_ops: list[str] | None,
+    family_definitions: dict[str, ComputeFamilyDefinition],
+) -> tuple[list[str], list[dict[str, int | str]]]:
     if requested_ops is None:
-        return supported_ops
+        return supported_ops, []
 
     selected_names: list[str] = []
+    dynamic_entries: list[dict[str, int | str]] = []
+    supported_name_set = set(supported_ops)
     for name in requested_ops:
-        if name not in supported_ops:
+        dynamic_entry = parse_dynamic_operator(name, family_definitions)
+        if dynamic_entry is not None:
+            selected_names.append(dynamic_entry["name"])
+            dynamic_entries.append(dynamic_entry)
+            continue
+        if name not in supported_name_set:
             valid_names = ", ".join(sorted(supported_ops))
             raise ValueError(f"Unknown compute operator {name!r}. Valid compute operators: {valid_names}")
         selected_names.append(name)
-    selected_name_set = set(selected_names)
-    return [name for name in supported_ops if name in selected_name_set]
+    return selected_names, dynamic_entries
+
+
+def build_opcode_order(all_compute_ops: list[str], selected_ops: list[str], dynamic_entries: list[dict[str, int | str]]) -> list[str]:
+    selected_set = set(selected_ops)
+    dynamic_names = [entry["name"] for entry in dynamic_entries]
+    remaining_ops = [name for name in all_compute_ops if name not in selected_set]
+    remaining_ops = [name for name in remaining_ops if name not in dynamic_names]
+    return [*selected_ops, *remaining_ops]
 
 
 def write_selection(path: Path, entries: list[str], source: str) -> None:
@@ -88,21 +204,87 @@ def write_selection(path: Path, entries: list[str], source: str) -> None:
     path.write_text("\n".join(header + body + [""]))
 
 
+def write_opcode_order(path: Path, entries: list[str], source: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "// Generated by tools/generate_selected_compute_ops.py.",
+        f"// source={source}",
+        f"// base=0x{COMPUTE_OPCODE_BASE:04x}",
+        "",
+    ]
+    body = [
+        f"DAE_COMPUTE_OPCODE({name}, 0x{COMPUTE_OPCODE_BASE + index:04x})"
+        for index, name in enumerate(entries)
+    ]
+    path.write_text("\n".join(header + body + [""]))
+
+
+def render_dynamic_handler(entry: dict[str, int | str]) -> str:
+    name = entry["name"]
+    if not entry["family"].startswith("gemv_"):
+        raise ValueError(f"Unsupported dynamic family in code generation: {entry['family']}")
+
+    prelude = [
+        f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+        "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);",
+    ]
+    if entry["family"] == "gemv_wgmma":
+        body = [
+            "  using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;",
+            (
+                f"  task_gemv<gemv_atom, {entry['m']}, {entry['k']}, {entry['bload']}, false>"
+                "(inst.args[0], inst.args[1], smem_base, m2c, c2m);"
+            ),
+        ]
+    elif entry["family"] == "gemv_mma":
+        body = [
+            f"  task_gemv_mma<{entry['m']}, {entry['n']}, {entry['k']}>(inst.args[0], smem_base, m2c, c2m);",
+        ]
+    else:
+        raise ValueError(f"Unsupported GEMV family in code generation: {entry['family']}")
+    return "\n".join(prelude + body + ["}"])
+
+
+def write_dynamic_handlers(path: Path, entries: list[dict[str, int | str]], source: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "// Generated by tools/generate_selected_compute_ops.py.",
+        f"// source={source}",
+        "",
+    ]
+    body = [render_dynamic_handler(entry) for entry in entries]
+    path.write_text("\n\n".join(header + body + [""]))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate the selected compute-op include used by the build.")
     parser.add_argument("--dispatch", required=True, help="Path to compute_dispatch.cuh")
+    parser.add_argument("--opcode-registry", required=True, help="Path to opcode.cuh.inc")
     parser.add_argument("--output", required=True, help="Path to the generated selected-op include")
+    parser.add_argument("--opcode-output", required=True, help="Path to the generated compute-opcode-order include")
+    parser.add_argument("--dynamic-handlers-output", required=True, help="Path to the generated dynamic compute-handler include")
     args = parser.parse_args()
 
     try:
         dispatch_path = Path(args.dispatch)
+        opcode_registry_path = Path(args.opcode_registry)
         output_path = Path(args.output)
+        opcode_output_path = Path(args.opcode_output)
+        dynamic_handlers_output_path = Path(args.dynamic_handlers_output)
         requested_ops, source = resolve_requested_ops(Path.cwd())
 
         supported_ops = load_supported_compute_ops(dispatch_path)
-        selected = select_entries(supported_ops, requested_ops)
+        family_definitions = load_comp_family_definitions(opcode_registry_path)
+        all_compute_ops = load_all_compute_ops(opcode_registry_path)
+        selected, dynamic_entries = select_entries(supported_ops, requested_ops, family_definitions)
+        opcode_order = build_opcode_order(all_compute_ops, selected, dynamic_entries)
         write_selection(output_path, selected, source)
-        print(f"[compute-ops] source={source} selected={len(selected)}")
+        write_opcode_order(opcode_output_path, opcode_order, source)
+        write_dynamic_handlers(dynamic_handlers_output_path, dynamic_entries, source)
+        print(
+            f"[compute-ops] source={source} selected={len(selected)} "
+            f"dynamic={len(dynamic_entries)} all_compute={len(opcode_order)}"
+        )
     except ValueError as exc:
         parser.exit(1, f"{exc}\n")
     return 0

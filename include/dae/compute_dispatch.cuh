@@ -66,24 +66,6 @@ DAE_COMPUTE_OP_HANDLER(OP_COPY) {
   }
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
-  using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-  task_gemv<gemv_atom, 64, 256, 4, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8K64) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
-  using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-  task_gemv<gemv_atom, 64, 64, 1, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8B2) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
-  using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
-  task_gemv<gemv_atom, 64, 256, 2, false>(inst.args[0], inst.args[1], smem_base, m2c, c2m);
-}
-
 DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8_MMA) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
   task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
@@ -348,6 +330,10 @@ DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
   }
   __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);
 }
+
+#if __has_include("dae/dynamic_compute_handlers.inc")
+  #include "dae/dynamic_compute_handlers.inc"
+#endif
 
 #undef DAE_COMPUTE_OP_HANDLER
 

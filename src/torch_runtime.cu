@@ -263,6 +263,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   #include "dae/opcode.cuh.inc"
   #undef DAE_OP
 
+  py::list compute_family_specs;
+  #define DAE_OP(name, value)
+  #define DAE_DEFINE_COMP_FAMILY(name, ...) { \
+    py::dict spec; \
+    spec["family"] = py::str(#name); \
+    spec["definition"] = py::str(#__VA_ARGS__); \
+    compute_family_specs.append(spec); \
+  }
+  #include "dae/opcode.cuh.inc"
+  #undef DAE_OP
+  #undef DAE_DEFINE_COMP_FAMILY
+  m.attr("compute_family_specs") = compute_family_specs;
+
   py::list supported_compute_ops;
   #define DAE_COMPUTE_OP(name) supported_compute_ops.append(py::str(#name));
   #include "dae/selected_compute_ops.inc"
