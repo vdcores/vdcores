@@ -87,6 +87,18 @@ static constexpr int __bar_cgroup = 8;
 static constexpr unsigned ALL_THREADS = 0xFFFFFFFFU;
 static constexpr unsigned SLOT_END = 0xFFU;
 
+enum MemoryVirtualCoreGpr32 : int {
+  MVC_GPR32_LOOP_COUNTER = 0,
+  MVC_GPR32_JMP_CNT = 1,
+  MVC_GPR32_LOOP_START_PC = 2,
+  MVC_GPR32_BASE_REG = 3,
+};
+
+enum MemoryVirtualCoreGpr : int {
+  MVC_GPR_DELTA = 0,
+  MVC_GPR_ACC = 1,
+};
+
 static __device__ __forceinline__ void * get_slot_address(const void *base, uint8_t slot) {
   return (void *)((const unsigned char*)base + slot * slotSizeKb * 1024);
 }
@@ -118,14 +130,13 @@ union LdCmd {
 struct MemoryVirtualCore {
   uint64_t gpr[2]; // 0 for delta and 1 for accumulator
 
-  int slot_alloc;
   // control flow structures
   // 0 is special;
-  int loop_counter;
-  int jmp_cnt;
-  int loop_start_pc;
-  int port;
+  int gpr_32[6];
 
+  // runtime allocation state
+  int slot_alloc;
+  int port;
   // registers
   // TODO(zhiyuang): try better way to predict these? e.g, flag bits?
   bool pred_stall;
@@ -139,8 +150,9 @@ struct MemoryVirtualCore {
     pred_jump = false;
     pred_allocate = false;
 
-    loop_counter = 0;
-    jmp_cnt = 0;
+    gpr_32[MVC_GPR32_LOOP_COUNTER] = 0;
+    gpr_32[MVC_GPR32_JMP_CNT] = 0;
+    gpr_32[MVC_GPR32_LOOP_START_PC] = 0;
     slot_alloc = -1;
   }
 
@@ -164,7 +176,7 @@ struct MemoryVirtualCore {
   }
 
   __device__ __forceinline__ bool id_repeat() const {
-    return loop_counter;
+    return gpr_32[MVC_GPR32_LOOP_COUNTER];
   }
 };
 
