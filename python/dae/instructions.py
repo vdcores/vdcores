@@ -3,6 +3,7 @@ import copy
 import torch
 
 from .instruction_utils import decode_opcode, dedcode_opcode, encode_bfloat16_u16
+from .op_families import ComputeOpFamilyRef, GemvFamily, family_name
 from .runtime import config, opcode
 from .tma_utils import (
     Major,
@@ -25,9 +26,31 @@ class Instruction:
 
 
 class ComputeInstruction(Instruction):
-    def __init__(self, opcode: int, args: list[int]):
-        self.opcode = opcode
+    def __init__(self, opcode: int | str | ComputeOpFamilyRef, args: list[int]):
+        self.op_family_name = None
+        if isinstance(opcode, int):
+            self.opcode = opcode
+        else:
+            self.opcode = None
+            self.op_family_name = family_name(opcode)
         self.args = args
+
+    def opcode_value(self) -> int:
+        if self.opcode is not None:
+            return self.opcode
+        assert self.op_family_name is not None
+        try:
+            return int(getattr(opcode, self.op_family_name))
+        except AttributeError as exc:
+            raise ValueError(
+                f"Missing runtime opcode for op-family instruction {self.op_family_name}. "
+                "Rebuild dae.runtime with this generated compute op."
+            ) from exc
+
+    def compute_operator_name(self) -> str:
+        if self.op_family_name is not None:
+            return self.op_family_name
+        return decode_opcode(self.opcode)
 
     def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
         if tensor is None:
@@ -37,7 +60,7 @@ class ComputeInstruction(Instruction):
             assert tensor.numel() == 4
 
         tensor.zero_()
-        tensor[0] = self.opcode
+        tensor[0] = self.opcode_value()
         assert len(self.args) <= 3
         for i, arg in enumerate(self.args):
             assert 0 <= arg < 2**16, "args must be uint16"
@@ -45,7 +68,7 @@ class ComputeInstruction(Instruction):
         return tensor.view(torch.uint8)
 
     def __repr__(self):
-        return f"ComputeInstruction(opcode={decode_opcode(self.opcode)}, args={self.args})"
+        return f"ComputeInstruction(opcode={self.compute_operator_name()}, args={self.args})"
 
 
 class TerminateC(ComputeInstruction):
@@ -58,28 +81,28 @@ class Gemv_M64N8(ComputeInstruction):
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8, args=[kTiles, nprefeth])
+        super().__init__(opcode=GemvFamily.create_wgmma(m=64, n=8, k=256, bload=4, residual=residual), args=[kTiles, nprefeth])
 
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8K64, args=[kTiles, nprefeth])
+        super().__init__(opcode=GemvFamily.create_wgmma(m=64, n=8, k=64, bload=1, residual=residual), args=[kTiles, nprefeth])
 
 class Gemv_M64N8B2(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 2
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8B2, args=[kTiles, nprefeth])
+        super().__init__(opcode=GemvFamily.create_wgmma(m=64, n=8, k=256, bload=2, residual=residual), args=[kTiles, nprefeth])
 
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMV_M128N8, args=[kTiles, nprefeth])
+        super().__init__(opcode=GemvFamily.create_wgmma(m=128, n=8, k=128, bload=4, residual=residual), args=[kTiles, nprefeth])
 
 class Gemm_M64N64(ComputeInstruction):
     MNK = (64, 64, 128)
@@ -122,7 +145,7 @@ class Gemv_M64N8_MMA(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 1
     def __init__(self, kTiles: int):
-        super().__init__(opcode=opcode.OP_GEMV_M64N8_MMA, args=[kTiles])
+        super().__init__(opcode=GemvFamily.create_mma(m=64, n=8, k=256), args=[kTiles])
 
 
 class WGMMA_64x256x64_F16(ComputeInstruction):

@@ -349,6 +349,10 @@ DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
   __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);
 }
 
+#if __has_include("dae/dynamic_compute_handlers.inc")
+  #include "dae/dynamic_compute_handlers.inc"
+#endif
+
 #undef DAE_COMPUTE_OP_HANDLER
 
 template <typename M2CQueue, typename C2MQueue>

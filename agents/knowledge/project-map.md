@@ -22,6 +22,7 @@ This note summarizes the stable structure confirmed during repository initializa
   The current decode path is split across `sched.py` (graph/TMA/instruction scheduling), `runtime_context.py` (HF model load, tensor materialization, packed side-input prep, KV bootstrap), `correctness.py` (reference comparisons), and `cli.py` (prefiltered app args).
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
 - `python/dae/instructions.py`: serialized instruction types, compute operation definitions, memory-side instruction helpers, and TMA instruction wrappers used by `launcher.py`.
+- `python/dae/op_families.py`: minimal dynamic compute-op family registry; today it derives GEMV family definitions directly from `include/dae/opcode.cuh.inc`, including field order and numeric constraints, validates canonical dynamic names such as `OP_GEMV_WGMMA__...` against that declarative source, and leaves concrete opcode instances to generated build artifacts.
 - `python/dae/instruction_utils.py`: small opcode/packing helpers shared by the instruction and op modules.
 - `python/dae/util.py`: CLI helpers including instruction dumps, profiling output, and `--write-compute-ops` generation of a default `dae_compute_ops.vdcore.build` build-selection file from a built launcher.
 - `python/dae/schedule.py`: scheduling interface and composition layer.
@@ -32,6 +33,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `src/runtime.cu`: runtime implementation compiled to `runtime.o`.
 - `src/torch_runtime.cu`: Torch extension binding source.
 - `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.vdcore.build`, and emits both `build/generated/dae/selected_compute_ops.inc` and `build/generated/dae/compute_opcode_order.inc` for the selective-build flow.
+  It also emits `build/generated/dae/dynamic_compute_handlers.inc` for any selected dynamic op-family handlers.
 
 ## Operational Notes
 
@@ -43,6 +45,9 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/launcher.py` and `app/python/llama3/sched.py` now support late-bound barrier counts: barrier ids are still built early, and the llama path now binds selected placement-dependent layer/system barriers from a generic scan of the placed schedule bundle's barrier-releasing memory instructions rather than from a handwritten per-bar table.
 - `python/dae/launcher.py` now exposes `extract_compute_operator_names(...)` and `Launcher.compute_operator_names()`, and `Launcher.launch()` now rejects schedules whose required compute ops are not present in the built extension's `runtime.supported_compute_ops`.
 - When `build/generated/dae/compute_opcode_order.inc` is present, `include/dae/opcode.cuh.inc` uses it to renumber compute opcodes dynamically: selected build ops receive the first contiguous values, and remaining compute ops are appended afterward so `dae.runtime.opcode` still exposes the full compute-op namespace.
+- `python/dae/instructions.py` now keeps fixed compute instructions numeric-first, but allows registered op-family instructions to store a canonical family string and resolve the numeric opcode lazily from `dae.runtime.opcode` during tensor serialization.
+- `include/dae/opcode.cuh.inc` is now the source of truth for compute-family declarations through `DAE_DEFINE_COMP_FAMILY(...)` entries. For GEMV, those definitions describe both the mangling field order and the numeric constraints, while concrete opcode instances are still generated only for the selected Python-requested names.
+- `Makefile` now routes compute-op generation through a single generated stamp file so the generator runs once per build even though `runtime.o` depends on multiple generated include outputs.
 - `python/dae/instructions.py` and `include/dae/pipeline/allocwarp.cuh` now support non-power-of-two embedding row widths through `OP_CC0_ROW_BYTES`, so `CC0(...)` is no longer limited to power-of-two row-byte sizes.
 - `src/torch_runtime.cu` now clamps cache-policy windows to the device `accessPolicyMaxWindowSize`, which avoids `cudaStreamSetAttribute(... invalid argument)` on larger model weights.
 - The llama/qwen shared-memory SiLU stages are no longer only inline callables in the app scripts; they now have dedicated schedule classes in `python/dae/schedule.py` for the interleaved phase and the fused register-backed phase.

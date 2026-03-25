@@ -19,7 +19,7 @@ def extract_compute_operator_names(launcher) -> list[str]:
     seen = set()
     for builder in launcher.builder:
         for inst in builder.built_cinsts:
-            name = decode_opcode(inst.opcode)
+            name = inst.compute_operator_name()
             if name in seen:
                 continue
             seen.add(name)
