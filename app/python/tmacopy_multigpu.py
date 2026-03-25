@@ -3,14 +3,18 @@ import argparse
 import torch
 
 from dae.launcher import *
+from dae.schedule import ListSchedule
 
 
 def build_copy_schedule(src: torch.Tensor, dst: torch.Tensor, num_loads: int, load_bytes: int):
-    return SchedCopy(
-        tmas=wrap_static(TmaLoad1D(src), TmaStore1D(dst)),
-        size=load_bytes,
-        count=num_loads,
-    )
+    def repeat_copy(sm: int):
+        return RepeatM.on(
+            num_loads,
+            [TmaLoad1D(src[0, ...], bytes=load_bytes), load_bytes],
+            [TmaStore1D(dst[0, ...], bytes=load_bytes), load_bytes],
+        )
+
+    return ListSchedule([repeat_copy])
 
 
 def run_explicit_virtual_gpu_copy(gpu_ids: list[int], src_virtual_gpu: int, dst_virtual_gpu: int, num_loads: int, load_bytes: int):

@@ -124,6 +124,14 @@ conda activate
 make pyext
 ```
 
+- If launcher-based Python runs fail with `libstdc++.so.6: version 'CXXABI_1.3.15' not found` after building in the Conda base environment, prepend the Conda runtime libs before launching:
+
+```bash
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+```
+
+- For the NVLink multi-GPU harness, check `nvidia-smi topo -m` before treating a result as an NVLink verification. Expect an `NV#` link between the selected GPUs; a `SYS` link indicates a host-routed path and is not a direct NVLink validation setup.
+
 - The MMA GEMV harness defaults to `M=4096`, `K=4096`, and `N=8`, and supports quick smaller checks through `GEMV_M`, `GEMV_K`, and `GEMV_SMS`.
 - Before performance benchmarking `app/python/llama32_1b/sched.py`, clear leftover Python workers with `killall python || true`; stale decode jobs can distort both timing and apparent correctness.
 - Never run GPU performance benchmarks in parallel. For this repo, credible timing comes from sequential runs only; overlapping jobs contend for the device and can corrupt both throughput numbers and debugging conclusions.
