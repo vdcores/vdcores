@@ -14,7 +14,7 @@ def build_copy_schedule(src: torch.Tensor, dst: torch.Tensor, num_loads: int, lo
             [TmaStore1D(dst[0, ...], bytes=load_bytes), load_bytes],
         )
 
-    return ListSchedule([repeat_copy])
+    return ListSchedule([Copy(num_loads, load_bytes), repeat_copy])
 
 
 def run_explicit_virtual_gpu_copy(gpu_ids: list[int], src_virtual_gpu: int, dst_virtual_gpu: int, num_loads: int, load_bytes: int):

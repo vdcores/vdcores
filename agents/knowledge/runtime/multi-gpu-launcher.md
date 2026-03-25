@@ -26,7 +26,7 @@ These notes summarize the minimal multi-GPU runtime path added for NVLink-connec
   - explicit virtual-GPU placement
   - flattened global-SM placement
   - forward and reverse source/destination direction
-- The harness mirrors the known-good single-GPU copy pattern with `RepeatM.on(...)` and per-step `TmaLoad1D(..., bytes=load_bytes)` / `TmaStore1D(..., bytes=load_bytes)` calls; treating the full `[num_loads, load_bytes]` tensor as one `SchedCopy` overflows the 16-bit memory-instruction size field.
+- The harness mirrors the known-good single-GPU copy pattern with `Copy(num_loads, load_bytes)` plus `RepeatM.on(...)` and per-step `TmaLoad1D(..., bytes=load_bytes)` / `TmaStore1D(..., bytes=load_bytes)` calls; treating the full `[num_loads, load_bytes]` tensor as one `SchedCopy` overflows the 16-bit memory-instruction size field.
 
 ## Verification Preconditions
 
