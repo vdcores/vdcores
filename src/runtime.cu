@@ -52,8 +52,6 @@ cudaError_t launch_dae(
   int64_t stream
 ) {
   DeviceGuard guard(device_id);
-  // wait for all pre-launch meta-data copying
-  cudaDeviceSynchronize();
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
   dae2<<<numSMs, numThreads, smem_size, cuda_stream>>>(
     compute_instructions,
@@ -63,8 +61,6 @@ cudaError_t launch_dae(
     profile
   );
   // TODO(zhiyuang): check launch error here?
-
-  cudaDeviceSynchronize();
 
   return cudaGetLastError();
 }
