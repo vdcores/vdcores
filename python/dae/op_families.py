@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-import re
+
+from . import runtime
+from .op_family_specs import ComputeFamilyDefinition, parse_comp_family_runtime_specs
 
 
 @dataclass(frozen=True)
@@ -11,51 +12,14 @@ class ComputeOpFamilyRef:
     canonical_name: str
 
 
-@dataclass(frozen=True)
-class ComputeFamilyDefinition:
-    family: str
-    fields: tuple[str, ...]
-    constraints: dict[str, int]
-
-
-_COMP_FAMILY_PATTERN = re.compile(r"^\s*DAE_DEFINE_COMP_FAMILY\(\s*([A-Za-z0-9_]+)\s*,\s*(.+)\)\s*(?://.*)?$")
-
-
-def _opcode_registry_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "include" / "dae" / "opcode.cuh.inc"
-
-
 @lru_cache(maxsize=1)
 def _load_comp_family_definitions() -> dict[str, ComputeFamilyDefinition]:
-    definitions: dict[str, ComputeFamilyDefinition] = {}
-    for raw_line in _opcode_registry_path().read_text().splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        match = _COMP_FAMILY_PATTERN.match(line)
-        if match is None:
-            continue
-
-        family, raw_args = match.groups()
-        parts = [part.strip() for part in raw_args.split(",")]
-        values: dict[str, str] = {}
-        for part in parts:
-            if "=" not in part:
-                raise ValueError(f"Malformed family definition token in {_opcode_registry_path()}: {part}")
-            key, value = (item.strip() for item in part.split("=", 1))
-            values[key] = value
-
-        fields = tuple(field.strip().upper() for field in values.pop("FIELDS").split("|"))
-        constraints = {key.upper(): int(value) for key, value in values.items()}
-        definitions[family.upper()] = ComputeFamilyDefinition(
-            family=family.upper(),
-            fields=fields,
-            constraints=constraints,
-        )
-
+    raw_specs = getattr(runtime, "compute_family_specs", None)
+    if raw_specs is None:
+        raise ValueError("dae.runtime does not export compute_family_specs")
+    definitions = parse_comp_family_runtime_specs(list(raw_specs))
     if not definitions:
-        raise ValueError(f"No GEMV family specs found in {_opcode_registry_path()}")
+        raise ValueError("dae.runtime exported no compute family specs")
     return definitions
 
 

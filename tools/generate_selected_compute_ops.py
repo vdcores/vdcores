@@ -11,7 +11,7 @@ PYTHON_DIR = ROOT / "python"
 if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
 
-from dae.op_families import gemv_family_spec_by_name, is_registered_family_name, validate_family_name
+from dae.op_family_specs import ComputeFamilyDefinition, parse_comp_family_registry_lines
 
 
 DISPATCH_PATTERN = re.compile(r"^\s*DAE_COMPUTE_OP_HANDLER\(\s*([A-Za-z0-9_]+)\s*\)\s*\{?\s*$")
@@ -20,6 +20,13 @@ DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
 COMPUTE_OPS_ENV = "DAE_COMPUTE_OPS"
 COMPUTE_OPS_FILE_ENV = "DAE_COMPUTE_OPS_FILE"
 COMPUTE_OPCODE_BASE = 0x7000
+
+
+def load_comp_family_definitions(path: Path) -> dict[str, ComputeFamilyDefinition]:
+    definitions = parse_comp_family_registry_lines(path.read_text().splitlines())
+    if not definitions:
+        raise ValueError(f"No compute family specs found in {path}")
+    return definitions
 
 
 def load_supported_compute_ops(path: Path) -> list[str]:
@@ -92,19 +99,73 @@ def resolve_requested_ops(base_dir: Path) -> tuple[list[str] | None, str]:
     return None, "default:full"
 
 
-def parse_dynamic_operator(name: str) -> dict[str, int | str] | None:
-    if not is_registered_family_name(name):
+def validate_family_fields(definition: ComputeFamilyDefinition, values: dict[str, int]) -> None:
+    for field in definition.fields:
+        value = values[field]
+        fixed_key = f"{field}_FIXED"
+        multiple_key = f"{field}_MULTIPLE"
+        min_key = f"{field}_MIN"
+        max_key = f"{field}_MAX"
+
+        if fixed_key in definition.constraints and value != definition.constraints[fixed_key]:
+            raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected {definition.constraints[fixed_key]}")
+        if multiple_key in definition.constraints and (value <= 0 or value % definition.constraints[multiple_key] != 0):
+            raise ValueError(
+                f"Unsupported {definition.family} {field.lower()}={value}; "
+                f"expected a positive multiple of {definition.constraints[multiple_key]}"
+            )
+        if min_key in definition.constraints and value < definition.constraints[min_key]:
+            raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected >= {definition.constraints[min_key]}")
+        if max_key in definition.constraints and value > definition.constraints[max_key]:
+            raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected <= {definition.constraints[max_key]}")
+
+
+def parse_dynamic_operator(name: str, definitions: dict[str, ComputeFamilyDefinition]) -> dict[str, int | str] | None:
+    if not isinstance(name, str) or not name.startswith("OP_"):
         return None
 
-    canonical_name = validate_family_name(name)
-    spec = gemv_family_spec_by_name(canonical_name)
-    if spec is not None:
-        return spec
+    parts = name.split("__")
+    if len(parts) < 2:
+        return None
 
-    raise ValueError(f"Malformed dynamic compute-op family string: {canonical_name}")
+    family = parts[0][3:].upper()
+    definition = definitions.get(family)
+    if definition is None:
+        return None
+
+    if len(parts) != 1 + len(definition.fields):
+        raise ValueError(
+            f"Malformed {family} compute-op name: {name}. "
+            f"Expected fields {definition.fields}."
+        )
+
+    values: dict[str, int] = {}
+    for field, token in zip(definition.fields, parts[1:]):
+        prefix = f"{field}_"
+        if not token.startswith(prefix):
+            raise ValueError(
+                f"Malformed {family} compute-op name: {name}. "
+                f"Expected token starting with {prefix}."
+            )
+        raw_value = token[len(prefix):]
+        try:
+            values[field] = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Malformed {family} compute-op name: {name}. {field} must be an integer.") from exc
+
+    validate_family_fields(definition, values)
+    return {
+        "name": name,
+        "family": family.lower(),
+        **{field.lower(): value for field, value in values.items()},
+    }
 
 
-def select_entries(supported_ops: list[str], requested_ops: list[str] | None) -> tuple[list[str], list[dict[str, int | str]]]:
+def select_entries(
+    supported_ops: list[str],
+    requested_ops: list[str] | None,
+    family_definitions: dict[str, ComputeFamilyDefinition],
+) -> tuple[list[str], list[dict[str, int | str]]]:
     if requested_ops is None:
         return supported_ops, []
 
@@ -112,7 +173,7 @@ def select_entries(supported_ops: list[str], requested_ops: list[str] | None) ->
     dynamic_entries: list[dict[str, int | str]] = []
     supported_name_set = set(supported_ops)
     for name in requested_ops:
-        dynamic_entry = parse_dynamic_operator(name)
+        dynamic_entry = parse_dynamic_operator(name, family_definitions)
         if dynamic_entry is not None:
             selected_names.append(dynamic_entry["name"])
             dynamic_entries.append(dynamic_entry)
@@ -213,8 +274,9 @@ def main() -> int:
         requested_ops, source = resolve_requested_ops(Path.cwd())
 
         supported_ops = load_supported_compute_ops(dispatch_path)
+        family_definitions = load_comp_family_definitions(opcode_registry_path)
         all_compute_ops = load_all_compute_ops(opcode_registry_path)
-        selected, dynamic_entries = select_entries(supported_ops, requested_ops)
+        selected, dynamic_entries = select_entries(supported_ops, requested_ops, family_definitions)
         opcode_order = build_opcode_order(all_compute_ops, selected, dynamic_entries)
         write_selection(output_path, selected, source)
         write_opcode_order(opcode_output_path, opcode_order, source)
