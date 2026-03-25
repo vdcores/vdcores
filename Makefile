@@ -10,7 +10,9 @@ CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
 
 GENERATED_INCLUDE_DIR := build/generated
 SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc
+COMPUTE_OPCODE_ORDER := $(GENERATED_INCLUDE_DIR)/dae/compute_opcode_order.inc
 COMPUTE_DISPATCH := include/dae/compute_dispatch.cuh
+OPCODE_REGISTRY := include/dae/opcode.cuh.inc
 COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 
 # Compiler flags
@@ -55,22 +57,22 @@ clean:
 %: app/%.cu $(TARGETS) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -o $@ $< $(TARGETS) $(LDFLAGS)
 
-$(SELECTED_COMPUTE_OPS): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_DISPATCH)
+$(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_DISPATCH) $(OPCODE_REGISTRY)
 	@mkdir -p $(dir $@)
 	@set -e; \
 	if [ -n "$(strip $(DAE_COMPUTE_OPS))" ]; then export DAE_COMPUTE_OPS='$(DAE_COMPUTE_OPS)'; fi; \
 	if [ -n "$(strip $(DAE_COMPUTE_OPS_FILE))" ]; then export DAE_COMPUTE_OPS_FILE='$(DAE_COMPUTE_OPS_FILE)'; fi; \
-	$(PYTHON) $(COMPUTE_OP_GENERATOR) --dispatch $(COMPUTE_DISPATCH) --output $@
+	$(PYTHON) $(COMPUTE_OP_GENERATOR) --dispatch $(COMPUTE_DISPATCH) --opcode-registry $(OPCODE_REGISTRY) --output $(SELECTED_COMPUTE_OPS) --opcode-output $(COMPUTE_OPCODE_ORDER)
 
-runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(HEADERS)
+runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
 
-%: $(SELECTED_COMPUTE_OPS)
+%: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER)
 
 run: $(BIN)
 	./$<
 
-pyext: $(SELECTED_COMPUTE_OPS) $(TARGETS)
+pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(TARGETS)
 	pip install -e . --no-build-isolation
 
 FORCE:
