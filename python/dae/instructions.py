@@ -2,8 +2,16 @@ import copy
 
 import torch
 
-from .instruction_utils import decode_opcode, dedcode_opcode, encode_bfloat16_u16
-from .op_families import ComputeOpFamilyRef, GemvFamily, family_name
+from .instruction_utils import (
+    compute_operator_name as format_compute_operator_name,
+    decode_opcode,
+    dedcode_opcode,
+    encode_bfloat16_u16,
+    encode_compute_instruction_tensor,
+    normalize_compute_opcode_reference,
+    resolve_compute_opcode_value,
+)
+from .op_families import ComputeOpFamilyRef, family_ref
 from .runtime import config, opcode
 from .tma_utils import (
     Major,
@@ -27,45 +35,17 @@ class Instruction:
 
 class ComputeInstruction(Instruction):
     def __init__(self, opcode: int | str | ComputeOpFamilyRef, args: list[int]):
-        self.op_family_name = None
-        if isinstance(opcode, int):
-            self.opcode = opcode
-        else:
-            self.opcode = None
-            self.op_family_name = family_name(opcode)
+        self.opcode, self.op_family_name = normalize_compute_opcode_reference(opcode)
         self.args = args
 
     def opcode_value(self) -> int:
-        if self.opcode is not None:
-            return self.opcode
-        assert self.op_family_name is not None
-        try:
-            return int(getattr(opcode, self.op_family_name))
-        except AttributeError as exc:
-            raise ValueError(
-                f"Missing runtime opcode for op-family instruction {self.op_family_name}. "
-                "Rebuild dae.runtime with this generated compute op."
-            ) from exc
+        return resolve_compute_opcode_value(self.opcode, self.op_family_name)
 
     def compute_operator_name(self) -> str:
-        if self.op_family_name is not None:
-            return self.op_family_name
-        return decode_opcode(self.opcode)
+        return format_compute_operator_name(self.opcode, self.op_family_name)
 
     def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
-        if tensor is None:
-            tensor = torch.empty((4,), dtype=torch.uint16)
-        else:
-            tensor = tensor.view(torch.uint16)
-            assert tensor.numel() == 4
-
-        tensor.zero_()
-        tensor[0] = self.opcode_value()
-        assert len(self.args) <= 3
-        for i, arg in enumerate(self.args):
-            assert 0 <= arg < 2**16, "args must be uint16"
-            tensor[i + 1] = arg
-        return tensor.view(torch.uint8)
+        return encode_compute_instruction_tensor(self.opcode, self.op_family_name, self.args, tensor)
 
     def __repr__(self):
         return f"ComputeInstruction(opcode={self.compute_operator_name()}, args={self.args})"
@@ -81,28 +61,28 @@ class Gemv_M64N8(ComputeInstruction):
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=GemvFamily.create_wgmma(m=64, n=8, k=256, bload=4, residual=residual), args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=GemvFamily.create_wgmma(m=64, n=8, k=64, bload=1, residual=residual), args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=64, BLOAD=1, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemv_M64N8B2(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 2
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=GemvFamily.create_wgmma(m=64, n=8, k=256, bload=2, residual=residual), args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=2, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
-        super().__init__(opcode=GemvFamily.create_wgmma(m=128, n=8, k=128, bload=4, residual=residual), args=[kTiles, nprefeth])
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=128, N=8, K=128, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
 class Gemm_M64N64(ComputeInstruction):
     MNK = (64, 64, 128)
@@ -145,7 +125,7 @@ class Gemv_M64N8_MMA(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 1
     def __init__(self, kTiles: int):
-        super().__init__(opcode=GemvFamily.create_mma(m=64, n=8, k=256), args=[kTiles])
+        super().__init__(opcode=family_ref("GEMV_MMA", M=64, N=8, K=256), args=[kTiles])
 
 
 class WGMMA_64x256x64_F16(ComputeInstruction):

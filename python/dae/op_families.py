@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 
 from . import runtime
 from .op_family_specs import ComputeFamilyDefinition, parse_comp_family_runtime_specs
@@ -21,10 +22,6 @@ def _load_comp_family_definitions() -> dict[str, ComputeFamilyDefinition]:
     if not definitions:
         raise ValueError("dae.runtime exported no compute family specs")
     return definitions
-
-
-def _bool_to_int(value: bool) -> int:
-    return 1 if value else 0
 
 
 def _get_family_definition(family: str) -> ComputeFamilyDefinition:
@@ -61,9 +58,24 @@ def _validate_field_constraints(definition: ComputeFamilyDefinition, values: dic
             raise ValueError(f"Unsupported {definition.family} {field.lower()}={value}; expected <= {definition.constraints[max_key]}")
 
 
-def _build_family_ref(family: str, values: dict[str, int]) -> ComputeOpFamilyRef:
+def _normalize_family_values(values: dict[str, Any]) -> dict[str, int]:
+    normalized: dict[str, int] = {}
+    for field, value in values.items():
+        normalized[field.upper()] = int(value)
+    return normalized
+
+
+def family_definitions() -> dict[str, ComputeFamilyDefinition]:
+    return _load_comp_family_definitions()
+
+
+def family_definition(family: str) -> ComputeFamilyDefinition:
+    return _get_family_definition(family)
+
+
+def family_ref(family: str, /, **values: Any) -> ComputeOpFamilyRef:
     definition = _get_family_definition(family)
-    normalized = {field.upper(): int(value) for field, value in values.items()}
+    normalized = _normalize_family_values(values)
     missing = [field for field in definition.fields if field not in normalized]
     if missing:
         raise ValueError(f"Missing {family} family fields: {missing}")
@@ -74,43 +86,7 @@ def _build_family_ref(family: str, values: dict[str, int]) -> ComputeOpFamilyRef
     return ComputeOpFamilyRef(_mangle_name(definition, normalized))
 
 
-class GemvFamily:
-    FAMILY = "OP_GEMV"
-
-    @classmethod
-    def create_wgmma(
-        cls,
-        *,
-        m: int,
-        n: int,
-        k: int,
-        bload: int,
-        residual: bool = False,
-    ) -> ComputeOpFamilyRef:
-        return _build_family_ref(
-            "GEMV_WGMMA",
-            {
-                "M": m,
-                "N": n,
-                "K": k,
-                "BLOAD": bload,
-                "RESIDUAL": _bool_to_int(residual),
-            },
-        )
-
-    @classmethod
-    def create_mma(cls, *, m: int, n: int, k: int) -> ComputeOpFamilyRef:
-        return _build_family_ref(
-            "GEMV_MMA",
-            {
-                "M": m,
-                "N": n,
-                "K": k,
-            },
-        )
-
-
-def gemv_family_spec_by_name(name: str) -> dict[str, int | str] | None:
+def family_spec_by_name(name: str) -> dict[str, int | str] | None:
     if not isinstance(name, str) or not name.startswith("OP_"):
         return None
 
@@ -151,11 +127,10 @@ def gemv_family_spec_by_name(name: str) -> dict[str, int | str] | None:
         "family": family.lower(),
         **{field.lower(): value for field, value in values.items()},
     }
-    return None
 
 
 def is_registered_family_name(name: str) -> bool:
-    return gemv_family_spec_by_name(name) is not None
+    return family_spec_by_name(name) is not None
 
 
 def validate_family_name(name: str) -> str:
@@ -175,9 +150,11 @@ def family_name(ref: ComputeOpFamilyRef | str) -> str:
 __all__ = [
     "ComputeFamilyDefinition",
     "ComputeOpFamilyRef",
-    "GemvFamily",
+    "family_definition",
+    "family_definitions",
     "family_name",
-    "gemv_family_spec_by_name",
+    "family_ref",
+    "family_spec_by_name",
     "is_registered_family_name",
     "validate_family_name",
 ]
