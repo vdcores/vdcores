@@ -2,8 +2,33 @@
 #include "runtime.cuh"
 
 #include <cuda.h>
+#include <vector>
 
-size_t set_smem_size(size_t smem_size) {
+namespace {
+
+struct DeviceGuard {
+    int previous_device = 0;
+    bool restore = false;
+
+    explicit DeviceGuard(int device_id) {
+        cudaGetDevice(&previous_device);
+        if (previous_device != device_id) {
+            cudaSetDevice(device_id);
+            restore = true;
+        }
+    }
+
+    ~DeviceGuard() {
+        if (restore) {
+            cudaSetDevice(previous_device);
+        }
+    }
+};
+
+} // namespace
+
+size_t set_smem_size(int device_id, size_t smem_size) {
+    DeviceGuard guard(device_id);
     cudaError_t err = cudaFuncSetAttribute(
         dae2,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -16,6 +41,7 @@ size_t set_smem_size(size_t smem_size) {
 }
 
 cudaError_t launch_dae(
+  int device_id,
   int numSMs,
   size_t smem_size,
   CInst* compute_instructions,
@@ -25,6 +51,7 @@ cudaError_t launch_dae(
   uint64_t * profile,
   int64_t stream
 ) {
+  DeviceGuard guard(device_id);
   // wait for all pre-launch meta-data copying
   cudaDeviceSynchronize();
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
@@ -40,6 +67,31 @@ cudaError_t launch_dae(
   cudaDeviceSynchronize();
 
   return cudaGetLastError();
+}
+
+void enable_peer_access(const std::vector<int>& device_ids) {
+  for (int src_device : device_ids) {
+    DeviceGuard src_guard(src_device);
+    for (int dst_device : device_ids) {
+      if (src_device == dst_device) {
+        continue;
+      }
+      int can_access = 0;
+      auto access_err = cudaDeviceCanAccessPeer(&can_access, src_device, dst_device);
+      if (access_err != cudaSuccess || !can_access) {
+        continue;
+      }
+      auto err = cudaDeviceEnablePeerAccess(dst_device, 0);
+      if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+        std::cerr << "Failed to enable peer access from GPU " << src_device
+                  << " to GPU " << dst_device << ": "
+                  << cudaGetErrorString(err) << std::endl;
+      }
+      if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+      }
+    }
+  }
 }
 
 CUtensorMap create_tma_descriptor(

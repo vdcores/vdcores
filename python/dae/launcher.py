@@ -5,6 +5,7 @@ from .runtime import config, opcode
 from .tma_utils import *
 
 import copy
+from dataclasses import dataclass
 from enum import Enum
 from math import prod
 
@@ -17,7 +18,7 @@ def extract_compute_operator_names(launcher) -> list[str]:
 
     operator_names = []
     seen = set()
-    for builder in launcher.builder:
+    for builder in launcher.iter_builders():
         for inst in builder.built_cinsts:
             name = decode_opcode(inst.opcode)
             if name in seen:
@@ -63,23 +64,40 @@ class SMInstructionBuilder:
 
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],
-        mtensor : torch.Tensor, mptrs: list[int]):
+        mtensor : torch.Tensor, mptrs: list[int],
+        sm_slot: int):
         # TODO(zhiyuang): now we only keep this check for not submitting "too many"
         #                 insts, but not 100% safe it won't overwrite
         assert len(self.cinsts) <= ctensor.shape[0]
         assert len(self.minsts) <= mtensor.shape[0]
         for i, inst in enumerate(self.cinsts):
-            inst.tensor(ctensor[cptrs[self.sm_id],...])
-            cptrs[self.sm_id] = (cptrs[self.sm_id] + 1) % ctensor.shape[0]
+            inst.tensor(ctensor[cptrs[sm_slot],...])
+            cptrs[sm_slot] = (cptrs[sm_slot] + 1) % ctensor.shape[0]
         for i, inst in enumerate(self.minsts):
-            inst.tensor(mtensor[mptrs[self.sm_id],...])
-            mptrs[self.sm_id] = (mptrs[self.sm_id] + 1) % mtensor.shape[0]
+            inst.tensor(mtensor[mptrs[sm_slot],...])
+            mptrs[sm_slot] = (mptrs[sm_slot] + 1) % mtensor.shape[0]
 
         # after building, clear the inst list to avoid duplicate build
         self.built_cinsts += self.cinsts
         self.built_minsts += self.minsts
         self.cinsts = []
         self.minsts = []
+
+
+@dataclass
+class PerGpuContext:
+    virtual_gpu_id: int
+    physical_gpu_id: int
+    device: torch.device
+    capacity_sms: int
+    cinsts: torch.Tensor
+    minsts: torch.Tensor
+    cptrs: list[int]
+    mptrs: list[int]
+    bars: torch.Tensor
+    bars_src: torch.Tensor
+    profile: torch.Tensor
+    launch_sms: int = 0
 
 class ResourceGroup:
     def __init__(self, name, repeat = 1):
@@ -212,19 +230,25 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
-    def __init__(self, num_sms : int = 1, device = 'cuda'):
+    def __init__(self, num_sms : int = 1, device = 'cuda', gpu_ids: list[int] | None = None):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
-        self.device = device
+        self.gpu_ids = self._normalize_gpu_ids(device, gpu_ids)
+        self.multi_gpu = len(self.gpu_ids) > 1
 
         self.max_insts = config.max_insts
-        self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
-        self.profile = torch.empty((num_sms, config.num_profile_events), dtype=torch.uint64, device=self.device)
+        self.contexts = self._build_gpu_contexts()
+        self.device = self.contexts[0].device
+        self._builders: dict[tuple[int, int], SMInstructionBuilder] = {}
+        self.builder = []
+        self._default_builder_keys: list[tuple[int, int]] = []
+        self._build_default_builder_map()
+        self.profile = self.contexts[0].profile
 
-        self.cinsts = torch.empty((num_sms, self.max_insts, 8), dtype=torch.uint8)
-        self.minsts = torch.empty((num_sms, self.max_insts, 16), dtype=torch.uint8)
-        self.cptrs = [0 for _ in range(num_sms)]
-        self.mptrs = [0 for _ in range(num_sms)]
+        self.cinsts = self.contexts[0].cinsts
+        self.minsts = self.contexts[0].minsts
+        self.cptrs = self.contexts[0].cptrs
+        self.mptrs = self.contexts[0].mptrs
 
         self.tmas = []
 
@@ -234,14 +258,93 @@ class Launcher:
         self.bar_values = {}
         self._late_barriers_bound = False
 
-        self.bars = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
-        self.bars_src = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
+        self.bars = self.contexts[0].bars
+        self.bars_src = self.contexts[0].bars_src
 
         self.resource_groups = {
             'default': ResourceGroup('default')
         }
 
-        runtime.set_smem_size(self.smem_size)
+        for ctx in self.contexts:
+            runtime.set_smem_size(ctx.physical_gpu_id, self.smem_size)
+        if self.multi_gpu:
+            runtime.enable_peer_access(self.gpu_ids)
+
+    def _normalize_gpu_ids(self, device, gpu_ids):
+        if gpu_ids is not None:
+            if len(gpu_ids) == 0:
+                raise ValueError("gpu_ids must not be empty")
+            return [int(gpu_id) for gpu_id in gpu_ids]
+
+        torch_device = torch.device(device)
+        if torch_device.type != 'cuda':
+            raise ValueError("Launcher only supports CUDA devices")
+        if torch_device.index is not None:
+            return [torch_device.index]
+        return [torch.cuda.current_device()]
+
+    def _build_gpu_contexts(self):
+        contexts = []
+        for virtual_gpu_id, physical_gpu_id in enumerate(self.gpu_ids):
+            props = torch.cuda.get_device_properties(physical_gpu_id)
+            capacity_sms = props.multi_processor_count
+            gpu_device = torch.device(f"cuda:{physical_gpu_id}")
+            contexts.append(
+                PerGpuContext(
+                    virtual_gpu_id=virtual_gpu_id,
+                    physical_gpu_id=physical_gpu_id,
+                    device=gpu_device,
+                    capacity_sms=capacity_sms,
+                    cinsts=torch.empty((capacity_sms, self.max_insts, 8), dtype=torch.uint8),
+                    minsts=torch.empty((capacity_sms, self.max_insts, 16), dtype=torch.uint8),
+                    cptrs=[0 for _ in range(capacity_sms)],
+                    mptrs=[0 for _ in range(capacity_sms)],
+                    bars=torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=gpu_device),
+                    bars_src=torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=gpu_device),
+                    profile=torch.empty((capacity_sms, config.num_profile_events), dtype=torch.uint64, device=gpu_device),
+                )
+            )
+        return contexts
+
+    def _build_default_builder_map(self):
+        remaining_sms = self.num_sms
+        global_sm = 0
+        for ctx in self.contexts:
+            count = min(remaining_sms, ctx.capacity_sms)
+            for local_sm in range(count):
+                key = (ctx.virtual_gpu_id, local_sm)
+                self._default_builder_keys.append(key)
+                self.builder.append(self._get_builder(key, sm_id=global_sm))
+                global_sm += 1
+            ctx.launch_sms = max(ctx.launch_sms, count)
+            remaining_sms -= count
+        if remaining_sms != 0:
+            raise ValueError(
+                f"Requested {self.num_sms} SMs across gpu_ids={self.gpu_ids}, "
+                f"but only {self.num_sms - remaining_sms} logical slots are available"
+            )
+
+    def _get_builder(self, key: tuple[int, int], sm_id: int | None = None):
+        builder = self._builders.get(key)
+        if builder is None:
+            builder = SMInstructionBuilder(sm_id=0 if sm_id is None else sm_id)
+            self._builders[key] = builder
+        return builder
+
+    def _iter_launch_keys(self):
+        keys = []
+        for ctx in self.contexts:
+            for local_sm in range(ctx.launch_sms):
+                keys.append((ctx.virtual_gpu_id, local_sm))
+        return keys
+
+    def _placement_for_global_sm(self, sm: int):
+        if sm < 0 or sm >= len(self._default_builder_keys):
+            return (-1, -1)
+        return self._default_builder_keys[sm]
+
+    def iter_builders(self):
+        return self._builders.values()
 
     # resource management functions
     def add_group(self, name, size):
@@ -271,33 +374,55 @@ class Launcher:
     # instruction management
     def copy_cptrs(self):
         self.build_instructions()
-        return self.cptrs.copy()
+        return [self.contexts[vgpu].cptrs[local_sm] for vgpu, local_sm in self._default_builder_keys]
     def copy_mptrs(self):
         self.build_instructions()
-        return self.mptrs.copy()
+        return [self.contexts[vgpu].mptrs[local_sm] for vgpu, local_sm in self._default_builder_keys]
 
     def build_instructions(self):
         if self.need_instruction_build:
-            for i in range(self.num_sms):
-                self.builder[i].build(
-                    self.cinsts[i,...],
-                    self.cptrs,
-                    self.minsts[i,...],
-                    self.mptrs,
-                )
+            for ctx in self.contexts:
+                for local_sm in range(ctx.launch_sms):
+                    builder = self._get_builder((ctx.virtual_gpu_id, local_sm), sm_id=local_sm)
+                    if not builder.cinsts and not builder.minsts and not builder.built_cinsts and not builder.built_minsts:
+                        builder.add(TerminateC())
+                        builder.add(TerminateM())
+                    builder.build(
+                        ctx.cinsts[local_sm,...],
+                        ctx.cptrs,
+                        ctx.minsts[local_sm,...],
+                        ctx.mptrs,
+                        local_sm,
+                    )
             self.need_instruction_build = False
+            self._refresh_profile_view()
+
+    def _refresh_profile_view(self):
+        if not self.multi_gpu:
+            self.profile = self.contexts[0].profile[:self.contexts[0].launch_sms]
+            return
+        profiles = []
+        for ctx in self.contexts:
+            if ctx.launch_sms == 0:
+                continue
+            profiles.append(ctx.profile[:ctx.launch_sms].to(self.device))
+        if len(profiles) == 0:
+            self.profile = torch.empty((0, config.num_profile_events), dtype=torch.uint64, device=self.device)
+        else:
+            self.profile = torch.cat(profiles, dim=0)
 
     def set_persistent(self, *tensors):
-        stream = torch.cuda.current_stream().cuda_stream
         for tensor in tensors:
+            stream = torch.cuda.current_stream(device=tensor.device).cuda_stream
             runtime.set_cache_policy(tensor, stream, 1.0, 2, 0)
     def set_streaming(self, *tensors):
-        stream = torch.cuda.current_stream().cuda_stream
         for tensor in tensors:
             if isinstance(tensor, list):
                 for t in tensor:
+                    stream = torch.cuda.current_stream(device=t.device).cuda_stream
                     runtime.set_cache_policy(t, stream, 0, 0, 1)
             elif isinstance(tensor, torch.Tensor):
+                stream = torch.cuda.current_stream(device=tensor.device).cuda_stream
                 runtime.set_cache_policy(tensor, stream, 0, 0, 1)
             else:
                 raise ValueError("tensor must be a torch.Tensor or a list of torch.Tensor")
@@ -305,9 +430,51 @@ class Launcher:
     def i(self, *insts):
         """Add instructions to all SM builders."""
         for inst in insts:
-            for b in self.builder:
-                b.add(inst)
+            self._add_inst(inst)
         self.need_instruction_build = True
+
+    def _broadcast_inst(self, inst):
+        for key in self._iter_launch_keys():
+            self._get_builder(key).add(inst)
+
+    def _broadcast_default_schedule(self, schedule):
+        for builder in self.builder:
+            builder.add(schedule)
+
+    def _add_explicit_schedule(self, schedule):
+        if schedule.gpu is None:
+            raise ValueError("Explicit schedule dispatch requires a virtual gpu id")
+        if schedule.gpu < 0 or schedule.gpu >= len(self.contexts):
+            raise ValueError(
+                f"Schedule gpu={schedule.gpu} is out of range for gpu_ids={self.gpu_ids}"
+            )
+        ctx = self.contexts[schedule.gpu]
+        end_sm = schedule.base_sm + schedule.num_sms
+        if end_sm > ctx.capacity_sms:
+            raise ValueError(
+                f"Schedule {schedule.__class__.__name__} requires local SMs [0,{end_sm}), "
+                f"but virtual gpu {schedule.gpu} only has capacity {ctx.capacity_sms}"
+            )
+        ctx.launch_sms = max(ctx.launch_sms, end_sm)
+        for local_sm in range(schedule.base_sm, end_sm):
+            self._get_builder((schedule.gpu, local_sm), sm_id=local_sm).add(
+                schedule.dispatch_local(local_sm - schedule.base_sm)
+            )
+
+    def _add_inst(self, inst):
+        if inst is None:
+            return
+        if isinstance(inst, list):
+            for sub_inst in inst:
+                self._add_inst(sub_inst)
+            return
+        if hasattr(inst, "gpu") and inst.gpu is not None:
+            self._add_explicit_schedule(inst)
+            return
+        if hasattr(inst, "gpu"):
+            self._broadcast_default_schedule(inst)
+            return
+        self._broadcast_inst(inst)
 
     def collect_barrier_release_counts(self, *insts):
         counts = {}
@@ -347,7 +514,7 @@ class Launcher:
 
     def num_insts(self):
         ci, mi = 0, 0
-        for b in self.builder:
+        for b in self.iter_builders():
             ci += len(b.cinsts)
             mi += len(b.minsts)
         return ci / self.num_sms, mi / self.num_sms
@@ -371,41 +538,48 @@ class Launcher:
         if unbound_bar_ids:
             raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
 
-        # Load the model using the runtime
-        cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
-        minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
+        for ctx in self.contexts:
+            if ctx.launch_sms == 0:
+                continue
 
-        stream = torch.cuda.current_stream().cuda_stream
-        # TODO(zhiyuang): check this?
+            cinsts = ctx.cinsts[:ctx.launch_sms].to(ctx.device).view(ctx.launch_sms * self.max_insts, 8)
+            minsts = ctx.minsts[:ctx.launch_sms].to(ctx.device).view(ctx.launch_sms * self.max_insts, 16)
+            stream = torch.cuda.current_stream(device=ctx.device).cuda_stream
 
-        # init the bars based on dict
-        bar_int_view = self.bars.view(torch.uint32)
-        bar_src_int_view = self.bars_src.view(torch.uint32)
-        for bar_id, value in self.bar_values.items():
-            bar_int_view[bar_id] = value
-            bar_src_int_view[bar_id] = value
+            bar_int_view = ctx.bars.view(torch.uint32)
+            bar_src_int_view = ctx.bars_src.view(torch.uint32)
+            for bar_id, value in self.bar_values.items():
+                bar_int_view[bar_id] = value
+                bar_src_int_view[bar_id] = value
 
-        # print("bars before launch:", self.bar_values)
+            if len(self.tmas) == 0:
+                tma = torch.empty((4, 128), dtype=torch.uint8, device=ctx.device)
+            else:
+                tma = torch.stack(self.tmas).to(ctx.device)
+            profile = ctx.profile[:ctx.launch_sms].view(torch.uint8).view(ctx.launch_sms * config.num_profile_events, 8)
 
-        if len(self.tmas) == 0:
-            tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
-        else:
-            tma = torch.stack(self.tmas).to(self.device)
-        profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
+            runtime.set_cache_policy(ctx.bars, stream, 1, 2, 0)
+            runtime.set_cache_policy(tma, stream, 1, 2, 0)
+            for i in range((ctx.launch_sms + 3) // 4):
+                start = i * 4 * self.max_insts
+                end = min((i + 1) * 4 * self.max_insts, ctx.launch_sms * self.max_insts)
+                runtime.set_cache_policy(cinsts[start:end], stream, 1, 2, 0)
+                runtime.set_cache_policy(minsts[start:end], stream, 1, 2, 0)
 
-        runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
-        runtime.set_cache_policy(tma, stream, 1, 2, 0)
-        for i in range(self.num_sms // 4):
-            runtime.set_cache_policy(cinsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
-            runtime.set_cache_policy(minsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
+            ret = runtime.launch_dae(
+                ctx.physical_gpu_id,
+                ctx.launch_sms,
+                self.smem_size,
+                cinsts,
+                minsts,
+                tma,
+                ctx.bars,
+                profile,
+                stream
+            )
+            assert ret == 0
 
-        ret = runtime.launch_dae(
-            self.num_sms, self.smem_size,
-            cinsts, minsts, tma,
-            self.bars, profile,
-            stream
-        )
-        assert ret == 0
+        self._refresh_profile_view()
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)
