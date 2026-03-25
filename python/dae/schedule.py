@@ -8,6 +8,7 @@ class Schedule:
     def __init__(self):
         self.num_sms = None
         self.base_sm = 0
+        self.gpu = None
         self._bars = {}
 
     def _clone(self):
@@ -18,10 +19,11 @@ class Schedule:
     def _on_place(self):
         pass
 
-    def place(self, num_sms: int, base_sm: int = 0):
+    def place(self, num_sms: int, base_sm: int = 0, gpu: int | None = None):
         clone = self._clone()
         clone.num_sms = num_sms
         clone.base_sm = base_sm
+        clone.gpu = gpu
         clone._on_place()
         return clone
 
@@ -60,15 +62,31 @@ class Schedule:
         # we may want to map SMs in the same fold together.
         if self.num_sms is None:
             raise ValueError(f"{self.__class__.__name__} must be placed before scheduling")
+        if self.gpu is not None:
+            placement = getattr(self, "_active_multi_gpu_placement", None)
+            if placement is None:
+                raise ValueError(
+                    f"{self.__class__.__name__} with explicit gpu placement requires launcher multi-GPU placement context"
+                )
+            virtual_gpu, local_sm = placement(sm)
+            if virtual_gpu != self.gpu:
+                return -1
+            sm = local_sm
         sm -= self.base_sm
         if sm < 0 or sm >= self.num_sms:
             return -1
         return sm
+
+    def dispatch_local(self, sm: int):
+        if sm < 0:
+            return []
+        return self.schedule(sm)
+
     def schedule(self, sm: int):
         raise NotImplementedError("Schedule.schedule() must be implemented by subclass")
     def __call__(self, sm: int):
         mapped_sm = self.map_sm(sm)
-        return self.schedule(mapped_sm)
+        return self.dispatch_local(mapped_sm)
 
 
 class ListSchedule(Schedule):
@@ -134,12 +152,13 @@ class ListSchedule(Schedule):
                 else:
                     raise ValueError(f"ListSchedule cannot route bar role '{role}'")
 
-    def place(self, num_sms: int, base_sm: int = 0):
+    def place(self, num_sms: int, base_sm: int = 0, gpu: int | None = None):
         clone = self._clone()
         clone.num_sms = num_sms
         clone.base_sm = base_sm
+        clone.gpu = gpu
         clone.items = [
-            item.place(num_sms, base_sm) if isinstance(item, Schedule) else item
+            item.place(num_sms, base_sm, gpu=gpu) if isinstance(item, Schedule) else item
             for item in clone.items
         ]
         clone._apply_boundary_bars()
@@ -150,10 +169,12 @@ class ListSchedule(Schedule):
         self._apply_boundary_bars()
         return self
 
-    def __call__(self, sm: int):
+    def dispatch_local(self, sm: int):
         insts = []
         for item in self.items:
-            if callable(item):
+            if isinstance(item, Schedule):
+                insts.append(item.dispatch_local(sm))
+            elif callable(item):
                 insts.append(item(sm))
             else:
                 insts.append(item)

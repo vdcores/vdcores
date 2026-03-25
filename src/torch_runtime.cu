@@ -2,6 +2,7 @@
 #include "dae/context.cuh"
 
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 
 #include <cuda.h>            // Driver API
 #include <cuda_runtime.h>
@@ -12,8 +13,8 @@
 namespace py = pybind11;
 
 // function 1: set smem size
-size_t py_set_smem_size(size_t requested_size) {
-  return set_smem_size(requested_size);
+size_t py_set_smem_size(int64_t device_id, size_t requested_size) {
+  return set_smem_size(static_cast<int>(device_id), requested_size);
 }
 
 template <typename T>
@@ -64,8 +65,18 @@ static void set_persistent_cache() {
   // printf("persistentCacheSize: %zu bytes\n", set_aside);
 }
 
+static int64_t current_or_specified_device(int64_t device_id) {
+  if (device_id >= 0) {
+    return device_id;
+  }
+  int current_device = 0;
+  cudaGetDevice(&current_device);
+  return current_device;
+}
+
 // function 2: launch_dae
 int py_launch_dae(
+    int64_t device_id,
     int64_t num_sms,
     size_t smem_size,
     torch::Tensor compute_insts_bytes,   // uint8 buffer
@@ -75,6 +86,8 @@ int py_launch_dae(
     torch::Tensor profile_u64,           // uint64
     int64_t stream
 ) {
+  const int launch_device_id = static_cast<int>(current_or_specified_device(device_id));
+  cudaSetDevice(launch_device_id);
   set_persistent_cache();
 
   // fixed for H100 for now
@@ -88,6 +101,7 @@ int py_launch_dae(
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
 
   cudaError_t st = launch_dae(
+      launch_device_id,
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
       bars, prof, stream
@@ -167,6 +181,8 @@ torch::Tensor py_build_tma_desc(
   auto desc = torch::empty({(int64_t)sizeof(CUtensorMap)},
                            torch::TensorOptions().dtype(torch::kUInt8));
 
+  cudaSetDevice(base.get_device());
+
   // Prepare arrays
   std::vector<cuuint64_t> gdim(5, 0);
   std::vector<cuuint64_t> gstride(5, 0);
@@ -231,6 +247,8 @@ void py_tensor_set_cache_policy(torch::Tensor t, int64_t stream_id, float hit_ra
   TORCH_CHECK(t.is_cuda(), "Tensor must be a CUDA tensor");
   TORCH_CHECK(t.numel() > 0, "Tensor must have storage");
 
+  cudaSetDevice(t.get_device());
+
   // Get the current CUDA stream
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_id);
 
@@ -255,6 +273,15 @@ void py_tensor_set_cache_policy(torch::Tensor t, int64_t stream_id, float hit_ra
   attr.accessPolicyWindow = apw;
   auto err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
   TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute failed: ", cudaGetErrorString(err));
+}
+
+void py_enable_peer_access(std::vector<int64_t> gpu_ids) {
+  std::vector<int> devices;
+  devices.reserve(gpu_ids.size());
+  for (int64_t gpu_id : gpu_ids) {
+    devices.push_back(static_cast<int>(gpu_id));
+  }
+  enable_peer_access(devices);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -298,4 +325,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("set_cache_policy", &py_tensor_set_cache_policy,
             "Set cache policy for a CUDA tensor on the specified stream");
+  m.def("enable_peer_access", &py_enable_peer_access,
+            "Enable CUDA peer access for all provided GPU ids");
 }
