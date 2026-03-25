@@ -14,6 +14,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `app/python/`: runnable experiments and schedule prototypes.
 - `app/python/llama3/sched.py`: primary end-to-end decoding demo for `meta-llama/Llama-3.1-8B-Instruct`.
 - `app/python/llama32_1b/sched.py`: isolated Llama 3.2 1B scheduling path with a `--dry-build` mode that validates the Python schedule before the remaining low-level runtime support is added.
+- `app/python/mistral_small_24b/`: Mistral Small 24B single-token decode port with manual RoPE-table construction, `QW != hidden_size` attention wiring, and a 132-SM logits/argmax path.
 - `app/python/llama3/reference.py` and `app/python/llama3/llama_attention_reference.py`: local reference helpers worth checking before re-deriving model math.
 - `app/python/attention_simple_decoding.py`: dedicated isolated GQA decode-attention harness for validating the shared attention opcode path and collecting quick single-kernel timing.
 - `app/python/gemv_mma_out.py`: dedicated correctness harness for the isolated `N=8` MMA GEMV operator path.
@@ -41,5 +42,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/schedule.py` now treats SM-count placement as a post-construction concern across the main scheduler classes, including `SchedArgmax`.
 - `python/dae/launcher.py` and `app/python/llama3/sched.py` now support late-bound barrier counts: barrier ids are still built early, and the llama path now binds selected placement-dependent layer/system barriers from a generic scan of the placed schedule bundle's barrier-releasing memory instructions rather than from a handwritten per-bar table.
 - `python/dae/launcher.py` now exposes `extract_compute_operator_names(...)` and `Launcher.compute_operator_names()`, and `Launcher.launch()` now rejects schedules whose required compute ops are not present in the built extension's `runtime.supported_compute_ops`.
+- `python/dae/instructions.py` and `include/dae/pipeline/allocwarp.cuh` now support non-power-of-two embedding row widths through `OP_CC0_ROW_BYTES`, so `CC0(...)` is no longer limited to power-of-two row-byte sizes.
+- `src/torch_runtime.cu` now clamps cache-policy windows to the device `accessPolicyMaxWindowSize`, which avoids `cudaStreamSetAttribute(... invalid argument)` on larger model weights.
 - The llama/qwen shared-memory SiLU stages are no longer only inline callables in the app scripts; they now have dedicated schedule classes in `python/dae/schedule.py` for the interleaved phase and the fused register-backed phase.
 - `app/python/llama3/sched.py` now follows the newer schedule-construction style: build dependency-only schedules first, attach mostly-static bars immediately after construction, then apply `place(...)` in a grouped step before submission to `dae.i(...)`.

@@ -8,6 +8,7 @@ Use this directory as the first stop when a task needs stable repo context.
   - [project-map.md](/home1/11362/depctg/vdcores/agents/knowledge/project-map.md)
 - Scheduler and model-path specifics:
   - [llama-scheduling.md](/home1/11362/depctg/vdcores/agents/knowledge/llama-scheduling.md)
+  - [mistral-small-24b-port.md](/home1/11362/depctg/vdcores/agents/knowledge/mistral-small-24b-port.md)
   - [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md)
 - Runtime mechanics:
   - [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)

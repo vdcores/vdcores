@@ -236,7 +236,16 @@ void py_tensor_set_cache_policy(torch::Tensor t, int64_t stream_id, float hit_ra
 
   cudaAccessPolicyWindow apw{};
   apw.base_ptr  = (void*)t.data_ptr();          // some device pointer
-  apw.num_bytes = (size_t)t.numel() * (size_t)t.element_size(); // <= prop.accessPolicyMaxWindowSize recommended
+  cudaDeviceProp prop{};
+  int dev = 0;
+  cudaGetDevice(&dev);
+  cudaGetDeviceProperties(&prop, dev);
+
+  size_t requested_bytes = (size_t)t.numel() * (size_t)t.element_size();
+  if (prop.accessPolicyMaxWindowSize > 0) {
+    requested_bytes = std::min(requested_bytes, static_cast<size_t>(prop.accessPolicyMaxWindowSize));
+  }
+  apw.num_bytes = requested_bytes;
   apw.hitRatio  = hit_ratio;                    // 0..1
 
   apw.hitProp = static_cast<cudaAccessProperty>(hit_policy);

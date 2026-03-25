@@ -257,6 +257,11 @@ class RMS_NORM_F16_K_2048_SMEM(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_2048_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
+class RMS_NORM_F16_K_5120_SMEM(ComputeInstruction):
+    def __init__(self, num_token: int, epsilon: float):
+        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_5120_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
+
+
 def select_attention_decode_instruction(head_dim: int):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
@@ -282,22 +287,18 @@ def select_rms_smem_instruction(hidden_size: int):
         return RMS_NORM_F16_K_4096_SMEM
     if hidden_size == 2048:
         return RMS_NORM_F16_K_2048_SMEM
+    if hidden_size == 5120:
+        return RMS_NORM_F16_K_5120_SMEM
     if hidden_size == 128:
         return RMS_NORM_F16_K_128_SMEM
-    raise NotImplementedError(
-        f"Missing shared-memory RMS kernel support for hidden_size={hidden_size}. "
-        "Add a dedicated opcode/instruction path before launching this model."
-    )
+    raise NotImplementedError(f"Missing shared-memory RMS kernel support for hidden_size={hidden_size}. Add a dedicated opcode/instruction path before launching this model.")
 
 
 def ensure_cc0_supported_hidden_size(hidden_size: int):
     row_bytes = hidden_size * 2
-    if row_bytes > 0 and (row_bytes & (row_bytes - 1)) == 0:
+    if row_bytes > 0:
         return
-    raise NotImplementedError(
-        f"Missing CC0 embedding-stride support for hidden_size={hidden_size}. "
-        "Parameterize the memory op before launching this model."
-    )
+    raise NotImplementedError(f"Missing CC0 embedding-stride support for hidden_size={hidden_size}. Parameterize the memory op before launching this model.")
 
 
 class ARGMAX_PARTIAL_bf16_1152_50688_132(ComputeInstruction):
@@ -644,10 +645,13 @@ class CC0(MemoryInstruction):
     def __init__(self, tokens: torch.Tensor, idx: int, hidden_size: int = 4096, dtype_size: int = 2):
         addr = get_tensor_address(tokens[idx])
         row_bytes = hidden_size * dtype_size
-        if row_bytes <= 0 or (row_bytes & (row_bytes - 1)) != 0:
-            raise ValueError(f"CC0 requires a power-of-two embedding row size in bytes, got {row_bytes}")
-        shift = row_bytes.bit_length() - 1
-        super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
+        if row_bytes <= 0:
+            raise ValueError(f"CC0 requires a positive embedding row size in bytes, got {row_bytes}")
+        if (row_bytes & (row_bytes - 1)) == 0:
+            shift = row_bytes.bit_length() - 1
+            super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
+            return
+        super().__init__(opcode=opcode.OP_CC0_ROW_BYTES, num_slots=0, arg=0, size=row_bytes, address=addr)
 
 
 class RegStore(MemoryInstruction):
