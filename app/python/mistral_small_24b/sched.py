@@ -21,6 +21,13 @@ from dae.tma_utils import (
     tma_load_tbl,
 )
 from dae.util import dae_app
+from debug_utils import (
+    DEBUG_STAGE_ORDER,
+    bind_late_barriers_with_default,
+    bind_unused_late_barriers_to_zero,
+    print_barrier_counts,
+    stage_enabled,
+)
 from reference import check_tensor_threshold, input_batch1, reference_pass
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -28,7 +35,6 @@ from transformers import AutoConfig, AutoModelForCausalLM
 MODEL_NAME = "mistralai/Mistral-Small-24B-Instruct-2501"
 DEFAULT_MAX_SEQ_LEN = 512
 DEFAULT_INPUT_TOKEN = 1
-LOGITS_SPLIT_M = 6
 MLP_LOW = 6144
 TAIL_CHUNKS = (8192, 8192, 8192, 2048)
 
@@ -41,6 +47,9 @@ def parse_args():
     arg_parser.add_argument("--correctness", action="store_true")
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     arg_parser.add_argument("--input-token", type=int, default=DEFAULT_INPUT_TOKEN)
+    arg_parser.add_argument("--debug-num-layers", type=int, default=None)
+    arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
+    arg_parser.add_argument("--debug-print-barriers", action="store_true")
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     num_generates_explicit = any(arg == "-N" or arg.startswith("--num-generates") for arg in raw_argv)
     if not num_generates_explicit and any(arg in ("-b", "--bench") for arg in remaining_argv):
@@ -86,7 +95,64 @@ def permute_rope_weight(weight, head_dim, hidden, num_heads):
     )
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return default if value is None else int(value)
+
+
+def env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    values = tuple(int(token.strip()) for token in raw.split(",") if token.strip())
+    if len(values) != len(default):
+        raise ValueError(f"{name} expects {len(default)} comma-separated values, got {raw!r}")
+    return values
+
+
+def env_prefetch_overrides() -> set[str]:
+    raw = os.environ.get("MISTRAL24B_NO_PREFETCH", "")
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+def resolve_gemv_atom(name: str):
+    normalized = name.strip().lower()
+    if normalized in ("64", "64n8", "m64n8"):
+        return Gemv_M64N8
+    if normalized in ("64n8_mma", "m64n8_mma", "mma"):
+        return Gemv_M64N8_MMA
+    raise ValueError(f"Unsupported GEMV atom {name!r}")
+
+
+def maybe_no_prefetch(name: str, sched):
+    if "all" in PREFETCH_OFF or name in PREFETCH_OFF:
+        sched.no_prefetch()
+    return sched
+
+
+def maybe_no_prefetch_list(name: str, sched):
+    if "all" in PREFETCH_OFF or name in PREFETCH_OFF:
+        for item in sched:
+            if hasattr(item, "no_prefetch"):
+                item.no_prefetch()
+    return sched
+
+
 parsed_args = parse_args()
+PREFETCH_OFF = env_prefetch_overrides()
+LOGITS_SPLIT_M = env_int("MISTRAL24B_LOGITS_SPLIT_M", 6)
+DOWN_ATOM = resolve_gemv_atom(os.environ.get("MISTRAL24B_DOWN_ATOM", "m64n8"))
+QPROJ_SMS = env_int("MISTRAL24B_QPROJ_SMS", 64)
+KPROJ_SMS = env_int("MISTRAL24B_KPROJ_SMS", 16)
+VPROJ_SMS = env_int("MISTRAL24B_VPROJ_SMS", 16)
+OUTPROJ_SMS = env_int("MISTRAL24B_OUTPROJ_SMS", 80)
+GATE_LOW_SMS = env_int("MISTRAL24B_GATE_LOW_SMS", 96)
+UP_LOW_SMS = env_int("MISTRAL24B_UP_LOW_SMS", 96)
+SILU_LOW_SMS = env_int("MISTRAL24B_SILU_LOW_SMS", 4)
+DOWN_LOW_SMS = env_int("MISTRAL24B_DOWN_LOW_SMS", 80)
+TAIL_SMS = env_int_tuple("MISTRAL24B_TAIL_SMS", (128, 128, 128, 32))
+DOWN_TAIL_SMS = env_int_tuple("MISTRAL24B_DOWN_TAIL_SMS", (80, 80, 80, 80))
+USE_LOCAL_TAIL_BARRIERS = os.environ.get("MISTRAL24B_USE_LOCAL_TAIL_BARRIERS", "1") != "0"
 
 gpu = torch.device("cuda")
 REQ, N = 8, 8
@@ -127,6 +193,14 @@ KW = HEAD_DIM * NUM_KV_HEAD
 VW = HEAD_DIM * NUM_KV_HEAD
 MAX_SEQ_LEN = min(config.max_position_embeddings, parsed_args.max_seq_len)
 num_layers = len(layers)
+if parsed_args.debug_num_layers is not None:
+    if parsed_args.debug_num_layers <= 0:
+        raise ValueError("--debug-num-layers must be positive")
+    num_layers = min(num_layers, parsed_args.debug_num_layers)
+    layers = layers[:num_layers]
+
+if parsed_args.correctness and (parsed_args.debug_stop_after != "full" or num_layers != len(model.model.layers)):
+    raise ValueError("Single-token correctness requires the full schedule and full layer count")
 
 matRope = build_rope_table(
     MAX_SEQ_LEN,
@@ -207,8 +281,11 @@ layerg.addBarrier("bar_silu_out1")
 layerg.addBarrier("bar_silu_out2")
 layerg.addBarrier("bar_pre_attn_rms")
 layerg.addBarrier("bar_post_attn_rms")
+for i in range(len(TAIL_CHUNKS)):
+    layerg.addBarrier(f"bar_silu_tail_{i}")
 
 TileM, _, TileK = Gemv_M64N8.MNK
+DownTileM, _, DownTileK = DOWN_ATOM.MNK
 defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", TileM, N, tma_load_tbl, cord_load_tbl))
 
 layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
@@ -220,11 +297,22 @@ layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N
 layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("reduceInterm", [matInterm] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 layerg.addTma("reduceGateOut", [matGateOut] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
+layerg.addTma(
+    "loadSiluLayerDown",
+    [matSiLUOut] * num_layers,
+    lambda t: t.wgmma_load(N, DownTileK * DOWN_ATOM.n_batch, Major.K),
+)
+layerg.addTma(
+    "reduceHiddenLayerDown",
+    [matHidden] * num_layers,
+    lambda t: t.wgmma("reduce", N, DownTileM, Major.MN),
+)
 
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadDownWide", matDowns, lambda t: t.wgmma_load(DownTileM, DownTileK, Major.K))
 layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
@@ -249,6 +337,11 @@ layerg.addTma("loadK", matK_attn_views, lambda t: t._build("load", HEAD_DIM, KVB
 layerg.addTma("loadV", matV_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_MN, cord_func_MN))
 
 dae.build_groups()
+if USE_LOCAL_TAIL_BARRIERS:
+    layerg.bindBarrier("bar_silu_out2", 0)
+else:
+    for i in range(len(TAIL_CHUNKS)):
+        layerg.bindBarrier(f"bar_silu_tail_{i}", 0)
 
 
 def build_tail_chunks():
@@ -303,11 +396,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     reg_store_q = RegStore(0, size=N * TileM * attnQs[0].element_size())
     reg_load_q = RegLoad(0)
-    QProj = SchedGemv(
+    QProj = maybe_no_prefetch("q_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], reg_store_q),
-    ).bar("load", layerg["bar_pre_attn_rms"])
+    )).bar("load", layerg["bar_pre_attn_rms"])
     QRope = SchedRope(
         ROPE_INTERLEAVE_512,
         tmas=(
@@ -319,11 +412,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     reg_store_k = RegStore(1, size=N * TileM * matK_attn_views[0].element_size())
     reg_load_k = RegLoad(1)
-    KProj = SchedGemv(
+    KProj = maybe_no_prefetch("k_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(KW, N, HIDDEN),
         tmas=(layerg["loadKW"], layerg["loadRMSLayer"], reg_store_k),
-    ).bar("load", layerg["bar_pre_attn_rms"])
+    )).bar("load", layerg["bar_pre_attn_rms"])
     KRope = SchedRope(
         ROPE_INTERLEAVE_512,
         tmas=(
@@ -332,7 +425,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             ToAttnKVStoreCordAdapter(layerg["storeK"], KW // TileM, TileM, token_pos),
         ),
     ).bar("store", layerg["bar_qkv_attn"])
-    VProj = SchedGemv(
+    VProj = maybe_no_prefetch("v_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(VW, N, HIDDEN),
         tmas=(
@@ -340,7 +433,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             layerg["loadRMSLayer"],
             ToAttnVStoreCordAdapter(layerg["storeV"], token_pos),
         ),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
+    )).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
 
     GemvFactory = layers_like(GemvLayer, dae, Gemv_M64N8)
     Gqa = SchedAttentionDecoding(
@@ -352,22 +445,22 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
-    OutProj = SchedGemv(
+    OutProj = maybe_no_prefetch("out_proj", SchedGemv(
         Gemv_M64N8,
         MNK=(HIDDEN, N, QW),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    )).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
 
-    gate_proj_low = SchedGemv(
+    gate_proj_low = maybe_no_prefetch("gate_low", SchedGemv(
         Gemv_M64N8,
         MNK=(MLP_LOW, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
-    up_proj_low = SchedGemv(
+    )).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
+    up_proj_low = maybe_no_prefetch("up_low", SchedGemv(
         Gemv_M64N8,
         MNK=(MLP_LOW, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
+    )).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
     silu_low = SchedSmemSiLUInterleaved(
         num_token=N,
         gate_glob=matGateOut[:, :MLP_LOW],
@@ -383,19 +476,20 @@ def schedule_single_token(token_offset: int, token_pos: int):
     for (base_offset, size), (reg_gate, reg_up) in zip(TAIL_LAYOUT, tail_reg_pairs):
         reg_store_gate = RegStore(reg_gate, matGateOut[:, 0:TileM])
         reg_store_up = RegStore(reg_up, matInterm[:, 0:TileM])
+        tail_bar = layerg[f"bar_silu_tail_{len(gate_proj_tail)}"] if USE_LOCAL_TAIL_BARRIERS else layerg["bar_silu_out2"]
         gate_proj_tail.append(
-            SchedGemv(
+            maybe_no_prefetch("gate_tail", SchedGemv(
                 Gemv_M64N8,
                 MNK=((base_offset, size), N, HIDDEN),
                 tmas=(layerg["loadGate"], layerg["loadRMSLayer"], reg_store_gate),
-            ).bar("load", layerg["bar_post_attn_rms"])
+            )).bar("load", layerg["bar_post_attn_rms"])
         )
         up_proj_tail.append(
-            SchedGemv(
+            maybe_no_prefetch("up_tail", SchedGemv(
                 Gemv_M64N8,
                 MNK=((base_offset, size), N, HIDDEN),
                 tmas=(layerg["loadUp"], layerg["loadRMSLayer"], reg_store_up),
-            ).bar("load", layerg["bar_post_attn_rms"])
+            )).bar("load", layerg["bar_post_attn_rms"])
         )
         silu_tail.append(
             SchedRegSiLUFused(
@@ -405,29 +499,30 @@ def schedule_single_token(token_offset: int, token_pos: int):
                 reg_up=reg_up,
                 base_offset=base_offset,
                 stride=TileM,
-            ).bar("output", layerg["bar_silu_out2"])
+            ).bar("output", tail_bar)
         )
         down_proj_tail.append(
-            SchedGemv(
-                Gemv_M64N8,
+            maybe_no_prefetch("down_tail", SchedGemv(
+                DOWN_ATOM,
                 MNK=(HIDDEN, N, (base_offset, size)),
-                tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-            ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
+                tmas=(layerg["loadDownWide"], layerg["loadSiluLayerDown"], layerg["reduceHiddenLayerDown"]),
+            )).bar("load", tail_bar).bar("store", layerg["bar_layer"])
         )
 
-    down_proj_low = SchedGemv(
-        Gemv_M64N8,
+    down_proj_low = maybe_no_prefetch("down_low", SchedGemv(
+        DOWN_ATOM,
         MNK=(HIDDEN, N, MLP_LOW),
-        tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out1"]).bar("store", layerg["bar_layer"])
+        tmas=(layerg["loadDownWide"], layerg["loadSiluLayerDown"], layerg["reduceHiddenLayerDown"]),
+    )).bar("load", layerg["bar_silu_out1"]).bar("store", layerg["bar_layer"])
 
     logits_proj = []
     for i in range(logits_epoch):
         proj = GemvFactory(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-        sched = proj.schedule_(group=False).split_M(LOGITS_SPLIT_M)
+        sched = maybe_no_prefetch_list("logits", proj.schedule_(group=False).split_M(LOGITS_SPLIT_M))
         if i == 0:
             sched.bar("load", layerg.over("bar_pre_attn_rms"))
-            sched[0].no_prefetch()
+            if "all" not in PREFETCH_OFF and "logits" not in PREFETCH_OFF:
+                sched[0].no_prefetch()
         if i == logits_epoch - 1:
             sched.bar("store", systemg["bar_logits"])
         logits_proj.append(sched.place(full_sms))
@@ -459,84 +554,112 @@ def schedule_single_token(token_offset: int, token_pos: int):
     copy_hidden = copy_hidden.place(N, base_sm=64)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    QProj = QProj.place(64)
+    QProj = QProj.place(QPROJ_SMS)
     QRope = QRope.place(64)
-    KProj = KProj.place(16, base_sm=64)
+    KProj = KProj.place(KPROJ_SMS, base_sm=64)
     KRope = KRope.place(16, base_sm=64)
-    VProj = VProj.place(16, base_sm=80)
+    VProj = VProj.place(VPROJ_SMS, base_sm=80)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
-    OutProj = OutProj.place(80)
-    gate_proj_low = gate_proj_low.place(96)
-    up_proj_low = up_proj_low.place(96)
-    silu_low = silu_low.place(4, base_sm=128)
+    OutProj = OutProj.place(OUTPROJ_SMS)
+    gate_proj_low = gate_proj_low.place(GATE_LOW_SMS)
+    up_proj_low = up_proj_low.place(UP_LOW_SMS)
+    silu_low = silu_low.place(SILU_LOW_SMS, base_sm=128)
 
-    tail_places = [128, 128, 128, 32]
     for i in range(len(TAIL_LAYOUT)):
-        gate_proj_tail[i] = gate_proj_tail[i].place(tail_places[i])
-        up_proj_tail[i] = up_proj_tail[i].place(tail_places[i])
-        silu_tail[i] = silu_tail[i].place(tail_places[i])
-        down_proj_tail[i] = down_proj_tail[i].place(80)
+        gate_proj_tail[i] = gate_proj_tail[i].place(TAIL_SMS[i])
+        up_proj_tail[i] = up_proj_tail[i].place(TAIL_SMS[i])
+        silu_tail[i] = silu_tail[i].place(TAIL_SMS[i])
+        down_proj_tail[i] = down_proj_tail[i].place(DOWN_TAIL_SMS[i])
 
-    down_proj_low = down_proj_low.place(80)
+    down_proj_low = down_proj_low.place(DOWN_LOW_SMS)
     argmax = argmax.place(full_sms)
     if restore_bars_low is not None:
         restore_bars_low = restore_bars_low.place(1, base_sm=128)
         restore_bars_high = restore_bars_high.place(1, base_sm=128)
 
-    bind_items = [
-        embed_rms,
-        copy_hidden,
-        pre_attn_rms,
-        post_attn_rms,
-        QProj,
-        QRope,
-        KProj,
-        KRope,
-        VProj,
-        Gqa,
-        OutProj,
-        gate_proj_low,
-        up_proj_low,
-        silu_low,
-        gate_proj_tail,
-        up_proj_tail,
-        silu_tail,
-        down_proj_low,
-        down_proj_tail,
-        logits_proj,
-        argmax,
+    stage_items = [
+        ("embed", []),
+        ("q_proj", [QProj]),
+        ("q_rope", [QRope]),
+        ("k_proj", [KProj]),
+        ("k_rope", [KRope]),
+        ("v_proj", [VProj]),
+        ("attn", [Gqa]),
+        ("out", [OutProj]),
+        ("post_attn_rms", [post_attn_rms]),
+        ("gate_low", [gate_proj_low]),
+        ("up_low", [up_proj_low]),
+        ("silu_low", [silu_low]),
+        ("gate_tail", gate_proj_tail),
+        ("up_tail", up_proj_tail),
+        ("silu_tail", silu_tail),
+        ("down_low", [down_proj_low]),
+        ("down_tail", down_proj_tail),
+        ("final_rms", [pre_attn_rms]),
+        ("logits", [logits_proj]),
+        ("argmax", [argmax]),
+        ("restore", [restore_bars_low] if restore_bars_low is not None else []),
     ]
-    if restore_bars_low is not None:
-        bind_items.extend([restore_bars_low, restore_bars_high])
-    dae.bind_late_barrier_counts(*bind_items)
+
+    active_stage_items = []
+    for stage_name, items in stage_items:
+        if stage_enabled(parsed_args.debug_stop_after, stage_name):
+            active_stage_items.extend(items)
+
+    bind_items = [embed_rms, copy_hidden, *active_stage_items]
+    if restore_bars_high is not None:
+        bind_items.append(restore_bars_high)
+
+    if parsed_args.debug_stop_after != "full":
+        bind_late_barriers_with_default(dae, *bind_items, unresolved_count=0)
+        bind_unused_late_barriers_to_zero(dae)
+    else:
+        dae.bind_late_barrier_counts(*bind_items)
+    if parsed_args.debug_print_barriers:
+        print_barrier_counts(dae)
 
     if restore_bars_high is not None:
         dae.i(embed_rms, copy_hidden, restore_bars_high)
     else:
         dae.i(embed_rms, copy_hidden)
+
+    tail_stage_items = []
+    for i in range(len(TAIL_LAYOUT)):
+        if stage_enabled(parsed_args.debug_stop_after, "gate_tail"):
+            tail_stage_items.append(gate_proj_tail[i])
+        if stage_enabled(parsed_args.debug_stop_after, "up_tail"):
+            tail_stage_items.append(up_proj_tail[i])
+        if stage_enabled(parsed_args.debug_stop_after, "silu_tail"):
+            tail_stage_items.append(silu_tail[i])
+        if stage_enabled(parsed_args.debug_stop_after, "down_tail"):
+            tail_stage_items.append(down_proj_tail[i])
+
     dae.i(
-        QProj,
-        QRope,
-        KProj,
-        KRope,
-        VProj,
-        Gqa,
-        OutProj,
-        post_attn_rms,
-        gate_proj_low,
-        up_proj_low,
-        silu_low,
-        gate_proj_tail,
-        up_proj_tail,
-        silu_tail,
-        down_proj_low,
-        down_proj_tail,
-        pre_attn_rms,
-        LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
-        LoopC.toNext(dae.copy_cptrs(), num_layers),
-        logits_proj,
-        argmax,
-        *([restore_bars_low] if restore_bars_low is not None else []),
+        *([QProj] if stage_enabled(parsed_args.debug_stop_after, "q_proj") else []),
+        *([QRope] if stage_enabled(parsed_args.debug_stop_after, "q_rope") else []),
+        *([KProj] if stage_enabled(parsed_args.debug_stop_after, "k_proj") else []),
+        *([KRope] if stage_enabled(parsed_args.debug_stop_after, "k_rope") else []),
+        *([VProj] if stage_enabled(parsed_args.debug_stop_after, "v_proj") else []),
+        *([Gqa] if stage_enabled(parsed_args.debug_stop_after, "attn") else []),
+        *([OutProj] if stage_enabled(parsed_args.debug_stop_after, "out") else []),
+        *([post_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "post_attn_rms") else []),
+        *([gate_proj_low] if stage_enabled(parsed_args.debug_stop_after, "gate_low") else []),
+        *([up_proj_low] if stage_enabled(parsed_args.debug_stop_after, "up_low") else []),
+        *([silu_low] if stage_enabled(parsed_args.debug_stop_after, "silu_low") else []),
+        *tail_stage_items,
+        *([down_proj_low] if stage_enabled(parsed_args.debug_stop_after, "down_low") else []),
+        *([pre_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "final_rms") else []),
+        *(
+            [
+                LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
+                LoopC.toNext(dae.copy_cptrs(), num_layers),
+            ]
+            if stage_enabled(parsed_args.debug_stop_after, "final_rms")
+            else []
+        ),
+        *([logits_proj] if stage_enabled(parsed_args.debug_stop_after, "logits") else []),
+        *([argmax] if stage_enabled(parsed_args.debug_stop_after, "argmax") else []),
+        *([restore_bars_low] if stage_enabled(parsed_args.debug_stop_after, "restore") and restore_bars_low is not None else []),
     )
 
 
@@ -555,6 +678,8 @@ for _ in range(num_generates):
     schedule_single_token(cur_offset, cur_pos)
 
 print(f"run vdcores with {cur_offset + 1} tokens...")
+if parsed_args.debug_stop_after != "full" or parsed_args.debug_num_layers is not None:
+    print(f"[debug] stop_after={parsed_args.debug_stop_after}, num_layers={num_layers}")
 dae.s()
 dae_app(dae)
 
