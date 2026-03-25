@@ -58,3 +58,24 @@
 - The current one-token path is already close to the target; the larger remaining gap is multi-token scaling.
 - The full multi-token path launched successfully under the timeout wrapper for `N=2`, so the current main issue is not a full-path deadlock.
 - The partial multi-token debug harness is still incomplete: `--debug-stop-after final_rms` timed out after launch for `N=2` with both `7` and `8` layers, so stage-by-stage timing past that point should not yet be trusted on the multi-token path.
+
+## Prefill Prototype Status
+
+- `app/python/llama3/prefill_sched.py` is now a working prefill-chunk harness for the 8B path at `chunk=8`.
+- The stable loop pattern for the prefill harness matches the decode app:
+  - run one initial `pre_attn_rms` prologue for layer 0;
+  - keep `pre_attn_rms` in the tail of each layer and signal `layerg.next("bar_pre_attn_rms")`;
+  - keep `LoopM.toNext(...)` / `LoopC.toNext(...)` only on the full path after the tail RMS stage.
+- The direct-to-cache K/V path works, but `KRope` must modulo its SM index by `kw // 64` when choosing the output M tile; otherwise prefill K tiles scatter into the wrong columns.
+- For the current 8B prefill harness, the 2048-wide gate/up high slices are safer as fold-1 stores on 32 SMs than as reduction accumulators, because the harness does not clear those accumulators between layer iterations.
+- Correctness at `prefix=504, chunk=8, total=512` now passes end to end, including final hidden state and final logits.
+- Full verified timing on the same shape is about `14.415 ms` per 8-token chunk, or `1.802 ms/token` (`~555 tok/s`).
+
+## Prefill GEMM Lessons
+
+- For wider prefill chunks, `SchedGemv` scaling is not a safe drop-in extension. At `chunk=64`, the wide GEMV `loadRMSChunk` path overflowed the current memory-instruction size field, so the post-attention path had to switch to a 64-token GEMM decomposition.
+- The wide GEMM kernels themselves were not the main blocker. Standalone probes using the real Llama layer-0 tensors showed that `Gemm_M64N128K64` and `Gemm_M64N64K64` both reproduced `gate_proj` and `down_proj` accurately in isolation.
+- The larger errors came from schedule interaction. On the current prefill harness, the 64-token gate and down GEMM stages became accurate only after disabling grouped/prefetched load scheduling on those stages.
+- That same workaround did not transfer cleanly to every wide GEMM stage. Applying it to `up_proj` and `out_proj` improved one-layer local checks but made the full 32-layer run worse, so wide-stage scheduling changes should be revalidated on both one-layer and full-layer paths before keeping them.
+- For `chunk >= 128`, some TMAs that were harmless at smaller widths become invalid even if they are never used. In particular, registering `loadRMSChunk` for `chunk=256` failed tensor-map encoding; the wide path needs to avoid building chunk-specific TMAs that are only used by the `<64` branch.
+- After that TMA cleanup, the `chunk=256` harness now builds and the 1-layer attention cut launches, so the next blocker is downstream of attention. The current first runtime stall is the 1-layer `out_proj` cut.
