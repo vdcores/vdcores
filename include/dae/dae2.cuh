@@ -117,7 +117,7 @@ void dae2(
   if (threadIdx.x < numComputeWarps * 32) {
     CInst inst;
     uint32_t pc = 0;
-    uint32_t count = 0;
+    uint32_t count[4] = {0};
     bool finish = false;
 
     while (!finish) {

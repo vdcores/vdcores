@@ -3,6 +3,8 @@ import torch
 from .op_families import ComputeOpFamilyRef, family_name
 from .runtime import opcode
 
+UNRESOLVED_COMPUTE_OPCODE_PLACEHOLDER = 0xFFFF
+
 
 def decode_opcode(op: int) -> str:
     for name, value in vars(opcode).items():
@@ -29,13 +31,20 @@ def normalize_compute_opcode_reference(op_ref: int | str | ComputeOpFamilyRef) -
     return None, family_name(op_ref)
 
 
-def resolve_compute_opcode_value(opcode_value: int | None, op_family_name: str | None) -> int:
+def resolve_compute_opcode_value(
+    opcode_value: int | None,
+    op_family_name: str | None,
+    *,
+    allow_unresolved: bool = False,
+) -> int:
     if opcode_value is not None:
         return opcode_value
     assert op_family_name is not None
     try:
         return int(getattr(opcode, op_family_name))
     except AttributeError as exc:
+        if allow_unresolved:
+            return UNRESOLVED_COMPUTE_OPCODE_PLACEHOLDER
         raise ValueError(
             f"Missing runtime opcode for op-family instruction {op_family_name}. "
             "Rebuild dae.runtime with this generated compute op."
@@ -62,7 +71,11 @@ def encode_compute_instruction_tensor(
         assert tensor.numel() == 4
 
     tensor.zero_()
-    tensor[0] = resolve_compute_opcode_value(opcode_value, op_family_name)
+    tensor[0] = resolve_compute_opcode_value(
+        opcode_value,
+        op_family_name,
+        allow_unresolved=True,
+    )
     assert len(args) <= 3
     for index, arg in enumerate(args):
         assert 0 <= arg < 2**16, "args must be uint16"
@@ -82,4 +95,5 @@ __all__ = [
     "encode_bfloat16_u16",
     "normalize_compute_opcode_reference",
     "resolve_compute_opcode_value",
+    "UNRESOLVED_COMPUTE_OPCODE_PLACEHOLDER",
 ]

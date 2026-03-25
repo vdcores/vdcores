@@ -15,7 +15,7 @@
   int sm_id, \
   int thread_id, \
   uint32_t &pc, \
-  uint32_t &count, \
+  uint32_t (&count)[4], \
   bool &finish, \
   const CInst &inst, \
   void *smem_base, \
@@ -310,11 +310,11 @@ DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
 
 DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
   DAE_UNUSED(sm_id, thread_id, finish, smem_base, scratch_space, st_insts, m2c, c2m, g_events);
-  if (++count < inst.args[0]) {
+  if (++count[inst.args[2]] < inst.args[0]) {
     pc = inst.args[1];
     __cprint("LOOPC back to PC %d, count=%d", pc, count);
   } else {
-    count = 0;
+    count[inst.args[2]] = 0;
     __cprint("LOOPC finished, count=%d", count);
   }
   __sync_compute_group(128);
@@ -342,7 +342,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   int sm_id,
   int thread_id,
   uint32_t &pc,
-  uint32_t &count,
+  uint32_t (&count)[4],
   bool &finish,
   const CInst &inst,
   void *smem_base,

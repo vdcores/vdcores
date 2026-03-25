@@ -1,5 +1,8 @@
 from . import runtime
-from .instruction_utils import decode_opcode, dedcode_opcode
+from .instruction_utils import (
+    decode_opcode,
+    dedcode_opcode,
+)
 from .instructions import *
 from .runtime import config, opcode
 from .tma_utils import *
@@ -25,6 +28,31 @@ def extract_compute_operator_names(launcher) -> list[str]:
             seen.add(name)
             operator_names.append(name)
     return operator_names
+
+
+def validate_compute_operator_support(launcher) -> list[str]:
+    required_compute_ops = []
+    seen = set()
+    for builder in launcher.builder:
+        for inst in builder.built_cinsts:
+            name = inst.compute_operator_name()
+            if name not in seen:
+                seen.add(name)
+                required_compute_ops.append(name)
+
+    supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
+    if supported_compute_ops is None:
+        return required_compute_ops
+
+    supported_compute_ops = set(supported_compute_ops)
+    missing_compute_ops = [name for name in required_compute_ops if name not in supported_compute_ops]
+    if missing_compute_ops:
+        rebuild_list = ",".join(required_compute_ops)
+        raise ValueError(
+            "Launcher requires compute operators that are not compiled into dae.runtime: "
+            f"{missing_compute_ops}. Rebuild with DAE_COMPUTE_OPS={rebuild_list} or a superset."
+        )
+    return required_compute_ops
 
 
 class SMInstructionBuilder:
@@ -354,18 +382,7 @@ class Launcher:
 
     def launch(self):
         self.build_instructions()
-
-        supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
-        if supported_compute_ops is not None:
-            required_compute_ops = self.compute_operator_names()
-            supported_compute_ops = set(supported_compute_ops)
-            missing_compute_ops = [name for name in required_compute_ops if name not in supported_compute_ops]
-            if missing_compute_ops:
-                rebuild_list = ",".join(required_compute_ops)
-                raise ValueError(
-                    "Launcher requires compute operators that are not compiled into dae.runtime: "
-                    f"{missing_compute_ops}. Rebuild with DAE_COMPUTE_OPS={rebuild_list} or a superset."
-                )
+        validate_compute_operator_support(self)
 
         unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
         if unbound_bar_ids:
