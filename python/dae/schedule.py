@@ -286,15 +286,11 @@ class SchedAttentionDecoding(Schedule):
         tQ, tK, tV = self.tmas
 
         num_kv_blocks = (self.seq_len + self.block_size - 1) // self.block_size
-        seq_len_last_block = self.seq_len % self.block_size
-        if seq_len_last_block == 0:
-            seq_len_last_block = self.block_size
 
         # we only handle a single Q token here
         insts = [
             self.AttentionInst(
-                num_kv_blocks,
-                seq_len_last_block,
+                kv_seq_len=self.seq_len,
                 need_norm=self.use_qwen_fused_qk,
                 need_rope=self.use_qwen_fused_qk,
             ),

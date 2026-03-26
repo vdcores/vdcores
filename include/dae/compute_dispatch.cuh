@@ -99,20 +99,20 @@ static __device__ __forceinline__ void handle_attention_common(
   C2MQueue &c2m
 ) {
   if constexpr (SplitKv) {
-    const int num_kv_blocks = inst.args[0] & 0xFFF;
-    const int split_idx = (inst.args[0] >> 12) & 0xF;
-    const int num_active_q = inst.args[1] & 0xFF;
-    const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+    const int split_idx = inst.args[0] & 0xF;
+    const int num_active_q = (inst.args[0] >> 4) & 0xFF;
+    const bool need_norm = (inst.args[0] >> 12) & 0x1;
+    const bool need_rope = (inst.args[0] >> 13) & 0x1;
+    const int kv_seq_len = inst.args[1];
     const int kv_start_idx = inst.args[2];
     if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
       task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, true, 16, false, false, KernelQK, KernelPV>(
-        num_kv_blocks,
+        kv_seq_len,
         split_idx,
         num_active_q,
-        last_kv_active_token_len,
         kv_start_idx,
-        false,
-        false,
+        need_norm,
+        need_rope,
         smem_base,
         (float *)scratch_space,
         st_insts,
@@ -121,13 +121,12 @@ static __device__ __forceinline__ void handle_attention_common(
       );
     } else {
       task_attention_fwd_flash3_grouped<HeadDim, 64, 64, true, 16, false, false, KernelQK, KernelPV>(
-        num_kv_blocks,
+        kv_seq_len,
         split_idx,
         num_active_q,
-        last_kv_active_token_len,
         kv_start_idx,
-        false,
-        false,
+        need_norm,
+        need_rope,
         smem_base,
         (float *)scratch_space,
         st_insts,
@@ -138,14 +137,14 @@ static __device__ __forceinline__ void handle_attention_common(
     return;
   }
 
-  const bool need_norm = inst.args[2] & 0x1;
-  const bool need_rope = inst.args[2] & 0x2;
+  const int kv_seq_len = inst.args[0];
+  const bool need_norm = inst.args[1] & 0x1;
+  const bool need_rope = inst.args[1] & 0x2;
   if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
     task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
-      inst.args[0],
+      kv_seq_len,
       0,
       64,
-      inst.args[1],
       0,
       need_norm,
       need_rope,
@@ -157,10 +156,9 @@ static __device__ __forceinline__ void handle_attention_common(
     );
   } else {
     task_attention_fwd_flash3_grouped<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
-      inst.args[0],
+      kv_seq_len,
       0,
       64,
-      inst.args[1],
       0,
       need_norm,
       need_rope,

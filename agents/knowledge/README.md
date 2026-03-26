@@ -7,6 +7,7 @@ Use this directory as the first stop when a task needs stable repo context.
 - Project structure and main entry points:
   - [project-map.md](/home1/11362/depctg/vdcores/agents/knowledge/project-map.md)
 - Scheduler and model-path specifics:
+  - [decode-attention-interface.md](/home1/11362/depctg/vdcores/agents/knowledge/decode-attention-interface.md)
   - [llama-scheduling.md](/home1/11362/depctg/vdcores/agents/knowledge/llama-scheduling.md)
   - [mistral-small-24b-port.md](/home1/11362/depctg/vdcores/agents/knowledge/mistral-small-24b-port.md)
   - [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md)
@@ -27,6 +28,7 @@ Use this directory as the first stop when a task needs stable repo context.
 
 - If the task touches HF cache bootstrapping or multi-token decode:
   - read [modeling/pytorch-kv-cache.md](/home1/11362/depctg/vdcores/agents/knowledge/modeling/pytorch-kv-cache.md)
+  - then read [decode-attention-interface.md](/home1/11362/depctg/vdcores/agents/knowledge/decode-attention-interface.md)
   - then read [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md) or [llama-scheduling.md](/home1/11362/depctg/vdcores/agents/knowledge/llama-scheduling.md)
 - If the task touches attention writeback, new slots, or deadlocks after launch:
   - read [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)

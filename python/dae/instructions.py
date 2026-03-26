@@ -158,54 +158,133 @@ def _encode_attention_runtime_flags(need_norm: bool, need_rope: bool) -> int:
     return flags
 
 
+def _resolve_attention_kv_seq_len(
+    kv_seq_len: int | None = None,
+    *,
+    active_kv_len: int | None = None,
+    num_kv_block: int | None = None,
+    last_kv_active_token_len: int | None = None,
+    block_size: int = 64,
+) -> int:
+    if kv_seq_len is not None:
+        return kv_seq_len
+    if active_kv_len is not None:
+        return active_kv_len
+    if num_kv_block is not None and last_kv_active_token_len is not None:
+        return (num_kv_block - 1) * block_size + last_kv_active_token_len
+    raise ValueError("attention instruction requires kv_seq_len, active_kv_len, or both num_kv_block and last_kv_active_token_len")
+
+
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(
+        self,
+        kv_seq_len: int | None = None,
+        *,
+        hist_len: int | None = None,
+        active_kv_len: int | None = None,
+        num_kv_block: int | None = None,
+        last_kv_active_token_len: int | None = None,
+        need_norm: bool = True,
+        need_rope: bool = True,
+    ):
+        del hist_len
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[_resolve_attention_kv_seq_len(kv_seq_len, active_kv_len=active_kv_len, num_kv_block=num_kv_block, last_kv_active_token_len=last_kv_active_token_len), _encode_attention_runtime_flags(need_norm, need_rope)],
         )
 
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(
+        self,
+        kv_seq_len: int | None = None,
+        *,
+        hist_len: int | None = None,
+        active_kv_len: int | None = None,
+        num_kv_block: int | None = None,
+        last_kv_active_token_len: int | None = None,
+        need_norm: bool = True,
+        need_rope: bool = True,
+    ):
+        del hist_len
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[_resolve_attention_kv_seq_len(kv_seq_len, active_kv_len=active_kv_len, num_kv_block=num_kv_block, last_kv_active_token_len=last_kv_active_token_len), _encode_attention_runtime_flags(need_norm, need_rope)],
         )
 
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(
+        self,
+        kv_seq_len: int | None = None,
+        *,
+        hist_len: int | None = None,
+        active_kv_len: int | None = None,
+        num_kv_block: int | None = None,
+        last_kv_active_token_len: int | None = None,
+        need_norm: bool = True,
+        need_rope: bool = True,
+    ):
+        del hist_len
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[_resolve_attention_kv_seq_len(kv_seq_len, active_kv_len=active_kv_len, num_kv_block=num_kv_block, last_kv_active_token_len=last_kv_active_token_len), _encode_attention_runtime_flags(need_norm, need_rope)],
         )
 
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(
+        self,
+        kv_seq_len: int | None = None,
+        *,
+        hist_len: int | None = None,
+        active_kv_len: int | None = None,
+        num_kv_block: int | None = None,
+        last_kv_active_token_len: int | None = None,
+        need_norm: bool = True,
+        need_rope: bool = True,
+    ):
+        del hist_len
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[_resolve_attention_kv_seq_len(kv_seq_len, active_kv_len=active_kv_len, num_kv_block=num_kv_block, last_kv_active_token_len=last_kv_active_token_len), _encode_attention_runtime_flags(need_norm, need_rope)],
         )
 
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
-    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(
+        self,
+        kv_seq_len: int | None = None,
+        *,
+        split_idx: int,
+        num_active_q: int,
+        kv_start_idx: int,
+        active_kv_len: int | None = None,
+        num_kv_block: int | None = None,
+        last_kv_active_token_len: int | None = None,
+        need_norm: bool = True,
+        need_rope: bool = True,
+    ):
         assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
-        # pack need_norm and need_rope into a uint16 arg
-        arg0 = num_kv_block | (split_idx << 12)
-        arg1 = num_active_q | (last_kv_active_token_len << 8)
-        arg2 = kv_start_idx # make this 16bit to support long seq
+        assert num_active_q < 256, "num_active_q must fit in 8 bits"
+        flags = _encode_attention_runtime_flags(need_norm, need_rope)
+        arg0 = split_idx | (num_active_q << 4) | (flags << 12)
+        arg1 = _resolve_attention_kv_seq_len(
+            kv_seq_len,
+            active_kv_len=active_kv_len,
+            num_kv_block=num_kv_block,
+            last_kv_active_token_len=last_kv_active_token_len,
+        )
+        arg2 = kv_start_idx
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 
             args=[arg0, arg1, arg2]
@@ -214,10 +293,29 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA(ComputeInstruction):
     HEAD_DIM = 128
-    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(
+        self,
+        kv_seq_len: int | None = None,
+        *,
+        split_idx: int,
+        num_active_q: int,
+        kv_start_idx: int,
+        active_kv_len: int | None = None,
+        num_kv_block: int | None = None,
+        last_kv_active_token_len: int | None = None,
+        need_norm: bool = True,
+        need_rope: bool = True,
+    ):
         assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
-        arg0 = num_kv_block | (split_idx << 12)
-        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        assert num_active_q < 256, "num_active_q must fit in 8 bits"
+        flags = _encode_attention_runtime_flags(need_norm, need_rope)
+        arg0 = split_idx | (num_active_q << 4) | (flags << 12)
+        arg1 = _resolve_attention_kv_seq_len(
+            kv_seq_len,
+            active_kv_len=active_kv_len,
+            num_kv_block=num_kv_block,
+            last_kv_active_token_len=last_kv_active_token_len,
+        )
         arg2 = kv_start_idx
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA,

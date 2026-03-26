@@ -237,6 +237,16 @@ __device__ __forceinline__ void _mask(TensorS& acc_fragS, const int active_kv_le
     }
 }
 
+__device__ __forceinline__ void decode_attention_kv_seq_len(
+    const int kv_seq_len,
+    const int kv_block_size,
+    int& num_kv_blocks,
+    int& last_kv_active_token_len
+) {
+    num_kv_blocks = (kv_seq_len + kv_block_size - 1) / kv_block_size;
+    last_kv_active_token_len = kv_seq_len - (num_kv_blocks - 1) * kv_block_size;
+}
+
 template <int tSRow, typename accum_t>
 struct OnlineSoftmax {
     using TensorT = decltype(make_tensor<accum_t>(Shape<Int<tSRow>>{}));
@@ -304,10 +314,9 @@ template <int HEAD_DIM,
           bool NEED_NORM, bool NEED_ROPE,
           typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
-    const int num_kv_blocks,
+    const int kv_seq_len,
     const int split_idx,
     const int num_active_q, // to avoid overwriting other split_kv metadata buffer
-    const int last_kv_active_token_len, // real kv tokens in the last block
     const int kv_start_idx, // global token-pos of first kv token, for prefill mask calculation
     const bool runtime_need_norm,
     const bool runtime_need_rope,
@@ -332,6 +341,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     using vec2_t = typename Tr::vec2_t;
 
     static_assert(std::is_same<accum_t, accum_t_PV>::value, "accum type of QK and PV atom should be the same");
+    (void)kv_start_idx;
 
     constexpr int MMA_M = shape<0>(typename AtomTrait::Shape_MNK{});
     constexpr int MMA_N = shape<1>(typename AtomTrait::Shape_MNK{});
@@ -340,6 +350,9 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     assert(blockDim.x >= 128 && "At least 128 threads are required for wgmma_m64n256k16");
 
     const int thread_id = threadIdx.x;
+    int num_kv_blocks = 0;
+    int last_kv_active_token_len = 0;
+    decode_attention_kv_seq_len(kv_seq_len, KV_BLOCK_SIZE, num_kv_blocks, last_kv_active_token_len);
 
     auto tiled_mma_qk = make_tiled_mma(
         MMA_Atom<AtomQK>{},
@@ -681,10 +694,9 @@ template <int HEAD_DIM,
           template <class> class LayoutKAtom = cute::GMMA::Layout_K_SW128_Atom,
           template <class> class LayoutVAtom = cute::GMMA::Layout_MN_SW128_Atom>
 __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
-    const int num_kv_blocks,
+    const int kv_seq_len,
     const int split_idx,
     const int num_active_q,
-    const int last_kv_active_token_len,
     const int kv_start_idx,
     const bool runtime_need_norm,
     const bool runtime_need_rope,
@@ -707,6 +719,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
 
     static_assert(std::is_same<accum_t, accum_t_PV>::value, "accum type of QK and PV atom should be the same");
     static_assert(std::is_same<data_t, data_t_PV>::value, "QK and PV operand types must match");
+    (void)kv_start_idx;
 
     constexpr int MMA_M = shape<0>(typename AtomTrait::Shape_MNK{});
     constexpr int MMA_N = shape<1>(typename AtomTrait::Shape_MNK{});
@@ -729,6 +742,9 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
     static_assert(numThreadsPV == 128, "Only support a 128-thread PV compute group for now");
 
     const int thread_id = __compute_tid();
+    int num_kv_blocks = 0;
+    int last_kv_active_token_len = 0;
+    decode_attention_kv_seq_len(kv_seq_len, KV_BLOCK_SIZE, num_kv_blocks, last_kv_active_token_len);
 
     auto tiled_mma_qk = make_tiled_mma(
         MMA_Atom<AtomQK>{},

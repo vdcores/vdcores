@@ -137,8 +137,9 @@ def sm_task(sm: int):
     kv_start_block = split_stage * num_block_per_split
     kv_start_idx = kv_start_block * KVTile
     split_last_active_kv_len = last_active_kv_len if split_stage == split_kv - 1 else KVTile
+    split_kv_seq_len = (num_block_per_split - 1) * KVTile + split_last_active_kv_len
     insts = [
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, split_stage, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_idx, need_norm=need_norm, need_rope=need_rope),
+        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(kv_seq_len=split_kv_seq_len, split_idx=split_stage, num_active_q=HEAD_GROUP_SIZE, kv_start_idx=kv_start_idx, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_block_per_split,
             [tK.cord(req, kv_start_idx, head, 0), tK.cord2tma(0, KVTile, 0, 0)],

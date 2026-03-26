@@ -100,13 +100,14 @@ else:
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
 last_active_kv_len = 48
 assert last_active_kv_len <= KVTile
+active_kv_seq_len = (NUM_KV_BLOCK - 1) * KVTile + last_active_kv_len
 
 def sm_task(sm: int):
     head = sm % NUM_KV_HEAD
     req = sm // NUM_KV_HEAD
 
     insts = [
-        attention_inst(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(kv_seq_len=active_kv_seq_len, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(NUM_KV_BLOCK,
             [tK.cord(req, 0, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
@@ -144,8 +145,7 @@ def gqa_ref():
     # result: [B, Hkv, G, S]
     QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
     # apply mask according to lsat_active_kv_len
-    total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
-    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
+    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= active_kv_seq_len
     QK = QK.masked_fill(mask, float("-inf"))
 
     # softmax on sequence dimension
