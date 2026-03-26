@@ -38,8 +38,9 @@ __device__ __forceinline__ void allocwarp_execute(
     // TODO(zhiyuang): inst to use is quite close. optimize? e.g, vector load?
     pc = next_pc;
     prefetch_inst_window(lane_id, smem_minsts, pc + 2);
+    int reg_offset = pc - di.gpr_32[MVC_GPR32_LOOP_START_PC] + di.gpr_32[MVC_GPR32_BASE_REG];
     uint64_t addr_accum = __shfl_sync(
-        0xFFFFFFFF, di.gpr[MVC_GPR_ACC], pc - di.gpr_32[MVC_GPR32_LOOP_START_PC]);
+        0xFFFFFFFF, di.gpr[MVC_GPR_ACC], reg_offset);
 
     __mprint("[exec][pc=%d]: opcode=%04x m2c.ptr=%d m2ld[0].ptr=%d m2ld[1].ptr=%d",
             pc, inst.opcode, m2c.ptr, m2ld[0].ptr, m2ld[1].ptr);
@@ -121,8 +122,13 @@ __device__ __forceinline__ void allocwarp_execute(
           next_pc = di.gpr_32[MVC_GPR32_LOOP_START_PC];
           // prefetch_inst_window(lane_id, smem_minsts, next_pc + 2);
         }
-        // the accumulation happens regardless of jump or not, as long as repeat is enabled
-        di.gpr[MVC_GPR_ACC] += di.gpr[MVC_GPR_DELTA];
+        // the accumulation happens regardless of jump or not for the current range
+        __builtin_assume(di.gpr_32[MVC_GPR32_BASE_REG] >= 0);
+        __builtin_assume(di.gpr_32[MVC_GPR32_BASE_REG] < 32);
+        __builtin_assume(reg_offset >= 0);
+        __builtin_assume(reg_offset < 32);
+        if (lane_id >= di.gpr_32[MVC_GPR32_BASE_REG] && lane_id <= reg_offset)
+          di.gpr[MVC_GPR_ACC] += di.gpr[MVC_GPR_DELTA];
       }
     } else { // Executing the non-allocation instructions (control flow instructions)
       switch (op(inst.opcode)) {
@@ -138,7 +144,8 @@ __device__ __forceinline__ void allocwarp_execute(
         // repeat instruction will repeat the following instructions with NO overhead
         case op(OP_REPEAT): {
           di.gpr_32[MVC_GPR32_LOOP_COUNTER] = inst.size; // minus the current one
-          di.gpr_32[MVC_GPR32_LOOP_START_PC] = pc + 1 - inst.arg; // the instruction arg as base arg
+          di.gpr_32[MVC_GPR32_LOOP_START_PC] = pc + 1; // the instruction arg as base arg
+          di.gpr_32[MVC_GPR32_BASE_REG] = inst.arg;
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
           if (lane_id >= reg_start && lane_id < reg_end) {

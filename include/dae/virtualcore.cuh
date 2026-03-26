@@ -153,6 +153,7 @@ struct MemoryVirtualCore {
     gpr_32[MVC_GPR32_LOOP_COUNTER] = 0;
     gpr_32[MVC_GPR32_JMP_CNT] = 0;
     gpr_32[MVC_GPR32_LOOP_START_PC] = 0;
+    gpr_32[MVC_GPR32_BASE_REG] = 0;
     slot_alloc = -1;
   }
 

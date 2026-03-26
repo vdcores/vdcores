@@ -94,6 +94,7 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMM_M64N128K64) {
 template <int HeadDim, bool SplitKv, typename KernelQK, typename KernelPV, typename M2CQueue, typename C2MQueue>
 static __device__ __forceinline__ void handle_attention_common(
   const CInst &inst,
+  uint32_t (&count)[4],
   void *smem_base,
   uint64_t *scratch_space,
   MInst *st_insts,
@@ -174,17 +175,17 @@ static __device__ __forceinline__ void handle_attention_common(
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc,  finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc,  finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
@@ -193,31 +194,31 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc, finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc, finish, g_events);
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc, finish, g_events);
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc, finish, g_events);
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_4096_INTER) {
