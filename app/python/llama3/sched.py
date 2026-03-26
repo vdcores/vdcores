@@ -362,6 +362,50 @@ def _emit_token_insts(*insts, build_compute: bool = True):
   dae.i(*[_memory_only(inst) for inst in insts])
 
 
+def _count_memory_insts(inst, sm_id: int):
+  if inst is None:
+    return 0
+  if isinstance(inst, list):
+    return sum(_count_memory_insts(sub_inst, sm_id) for sub_inst in inst)
+  if isinstance(inst, MemoryInstruction):
+    return 1
+  if isinstance(inst, ComputeInstruction):
+    return 0
+  if callable(inst):
+    return _count_memory_insts(inst(sm_id), sm_id)
+  raise ValueError(f"Unsupported instruction wrapper type: {type(inst)}")
+
+
+def _count_compute_insts(inst, sm_id: int):
+  if inst is None:
+    return 0
+  if isinstance(inst, list):
+    return sum(_count_compute_insts(sub_inst, sm_id) for sub_inst in inst)
+  if isinstance(inst, MemoryInstruction):
+    return 0
+  if isinstance(inst, ComputeInstruction):
+    return 1
+  if callable(inst):
+    return _count_compute_insts(inst(sm_id), sm_id)
+  raise ValueError(f"Unsupported instruction wrapper type: {type(inst)}")
+
+
+def _loopm_after_prefix(ptrs, prefix_insts, count: int, **kwargs):
+  def smfunc(sm_id: int):
+    prefix_count = sum(_count_memory_insts(inst, sm_id) for inst in prefix_insts)
+    return LoopM(count, ptrs[sm_id] + prefix_count, **kwargs)
+
+  return smfunc
+
+
+def _loopc_after_prefix(ptrs, prefix_insts, count: int, **kwargs):
+  def smfunc(sm_id: int):
+    prefix_count = sum(_count_compute_insts(inst, sm_id) for inst in prefix_insts)
+    return LoopC(count, ptrs[sm_id] + prefix_count, **kwargs)
+
+  return smfunc
+
+
 def schedule_single_token(
   token_offset: int,
   token_pos: int,
@@ -643,30 +687,28 @@ def schedule_single_token(
   if token_loop_guard:
     _emit_token_insts(_token_loop_seed_registers(), build_compute=False)
 
-  outer_memory_loop_start = None
-  memory_loop_inst = []
+  token_prefix = []
   if prepend_issue_barrier:
-    outer_memory_loop_start = dae.copy_mptrs()
-    _emit_token_insts(IssueBarrier(systemg['bar_token_finish']), build_compute=False)
-  if outer_memory_loop_count is not None:
-    if outer_memory_loop_start is None:
-      outer_memory_loop_start = dae.copy_mptrs()
-    memory_loop_inst.append(LoopM.toNext(outer_memory_loop_start, outer_memory_loop_count, reg=1))
-
-  # build first rms with embedding
-  _emit_token_insts(
+    token_prefix.append(IssueBarrier(systemg['bar_token_finish']))
+  token_prefix += [
     embed_rms,
     copy_hidden,
     restore_bars_high,
-    build_compute=build_compute,
-  )
+  ]
+
+  body_start_ptrs = dae.copy_mptrs()
+  body_start_cptrs = dae.copy_cptrs()
+  memory_loop_inst = []
+  if outer_memory_loop_count is not None:
+    memory_loop_inst.append(LoopM.toNext(body_start_ptrs, outer_memory_loop_count, reg=1))
 
   outer_compute_loop_inst = []
   if outer_compute_loop_count is not None:
     outer_compute_loop_inst.append(LoopC(outer_compute_loop_count, 0, reg=1))
 
-  # start a new scheudule to mark the loop target
+  # start a new schedule to mark the token-body loop target
   _emit_token_insts(
+    token_prefix,
     clear_interm,
     clear_gateout,
     QProj,
@@ -697,8 +739,8 @@ def schedule_single_token(
     pre_attn_rms,
 
     # # all 132 SM need loop
-    LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
-    LoopC.toNext(dae.copy_cptrs(), num_layers, reg=0),
+    _loopm_after_prefix(body_start_ptrs, token_prefix, num_layers, resource_group=layerg),
+    _loopc_after_prefix(body_start_cptrs, token_prefix, num_layers, reg=0),
 
     # # logits
     LogitsProj,

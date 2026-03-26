@@ -71,6 +71,7 @@
 - `app/python/llama3/sched.py` now has a stable-body memory-side outer loop for generated tokens that stay within the same `KVBlockSize` bucket.
 - The loop seeds persistent allocwarp repeat registers once, then uses high-lane guarded memory ops for token-varying `CC0`, rope-table loads, KV-cache stores, and final token writeback.
 - The guarded embed/copy sequence is SIMT-sensitive: it must be emitted as `Repeat(token-delta) -> CC0 -> Repeat(zero-delta) -> load.jump()` so `CC0` advances the token source address while the following load keeps its original address lane.
+- The token body is emitted once for both memory and compute. The shared `token_prefix` covers `IssueBarrier` when needed plus the embed/copy/restore-high prefix, and the inner per-layer loops jump past that prefix by adjusting their target PCs instead of requiring a second copy of those memory instructions.
 - The outer memory token loop starts at `IssueBarrier(systemg['bar_token_finish'])`, before `restore_bars_high`; otherwise the bar restore would reset the system barrier before the wait and deadlock the next token.
 - The memory-side token loop uses `LoopM(..., reg=1)` while the existing per-layer loop keeps `LoopM(..., reg=0)`. This works with the existing runtime because loop-counter state is already lane-local.
 - If the generated span would cross a KV-block boundary, `sched.py` still falls back to the older explicit per-token memory emission path.
