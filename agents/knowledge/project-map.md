@@ -34,7 +34,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `include/task/`: CUDA task building blocks including attention, GEMV, RMSNorm, RoPE, SiLU, WGMMA, and argmax.
 - `src/runtime.cu`: runtime implementation compiled to `runtime.o`.
 - `src/torch_runtime.cu`: Torch extension binding source.
-- `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.vdcore.build`, and emits both `build/generated/dae/selected_compute_ops.inc` and `build/generated/dae/compute_opcode_order.inc` for the selective-build flow.
+- `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.vdcore.build`, and emits `build/generated/dae/selected_compute_ops.inc`, `build/generated/dae/compute_opcode_order.inc`, and `build/generated/dae/dynamic_compute_handlers.inc` for the selective-build flow.
   It also emits `build/generated/dae/dynamic_compute_handlers.inc` for any selected dynamic op-family handlers.
 
 ## Operational Notes

@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 
 import argparse
+import importlib.util
 import os
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON_DIR = ROOT / "python"
-if str(PYTHON_DIR) not in sys.path:
-    sys.path.insert(0, str(PYTHON_DIR))
+OP_FAMILY_SPECS_PATH = ROOT / "python" / "dae" / "op_family_specs.py"
 
-from dae.op_family_specs import ComputeFamilyDefinition, parse_comp_family_registry_lines
+
+def _load_op_family_specs_module():
+    module_name = "dae_op_family_specs"
+    spec = importlib.util.spec_from_file_location(module_name, OP_FAMILY_SPECS_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load module spec from {OP_FAMILY_SPECS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_op_family_specs = _load_op_family_specs_module()
+ComputeFamilyDefinition = _op_family_specs.ComputeFamilyDefinition
+parse_comp_family_registry_lines = _op_family_specs.parse_comp_family_registry_lines
 
 
 DISPATCH_PATTERN = re.compile(r"^\s*DAE_COMPUTE_OP_HANDLER\(\s*([A-Za-z0-9_]+)\s*\)\s*\{?\s*$")
