@@ -640,6 +640,7 @@ class RepeatM(MemoryInstruction):
         count: int,
         reg: int = 0,
         reg_end=None,
+        base_reg: int = 0,
         delta_addr: int | None = None,
         delta_cords=[],
     ):
@@ -647,11 +648,12 @@ class RepeatM(MemoryInstruction):
             reg_end = reg + 1
         assert 0 <= reg < 32, "reg must be in [0,31]"
         assert 0 <= reg_end <= 32, "reg_end must be in [0,32]"
-        assert reg_end > reg, "reg_end must be greater than reg"
+        assert reg_end >= reg, "reg_end must be greater than or equal to reg"
+        assert 0 <= base_reg < 32, "base_reg must be in [0,31]"
         super().__init__(
             opcode=opcode.OP_REPEAT,
             num_slots=(reg_end << 8) | reg,
-            arg=0,
+            arg=base_reg,
             size=count,
             address=delta_addr,
             cords=delta_cords,
@@ -741,6 +743,23 @@ class IssueBarrier(MemoryInstruction):
     def __init__(self, bar: int):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
         self.bar(bar)
+
+
+class LoadRegisterM(MemoryInstruction):
+    def __init__(self, reg_id: int, value: int, reg: int = 0, reg_end=None):
+        if reg_end is None:
+            reg_end = reg + 1
+        assert 0 <= reg_id < 2, "allocwarp currently exposes two 64-bit GPRs"
+        assert 0 <= reg < 32, "reg must be in [0,31]"
+        assert 0 <= reg_end <= 32, "reg_end must be in [0,32]"
+        assert reg_end > reg, "reg_end must be greater than reg"
+        super().__init__(
+            opcode=opcode.OP_LOAD_REGISTER,
+            num_slots=(reg_end << 8) | reg,
+            arg=0,
+            size=reg_id,
+            address=value,
+        )
 
 
 class CC0(MemoryInstruction):
@@ -955,6 +974,7 @@ __all__ = [
     "RepeatM",
     "RawAddress",
     "IssueBarrier",
+    "LoadRegisterM",
     "CC0",
     "RegStore",
     "RegLoad",

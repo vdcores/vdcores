@@ -153,6 +153,14 @@ __device__ __forceinline__ void allocwarp_execute(
           }
         }
         break;
+        case op(OP_LOAD_REGISTER): {
+          auto reg_start = inst.num_slots & 0xFF;
+          auto reg_end = inst.num_slots >> 8;
+          if (lane_in_half_open_range(lane_id, reg_start, reg_end)) {
+            di.gpr[inst.size] = inst.address;
+          }
+        }
+        break;
         case op(OP_LOOP): {
           prefetch_inst_window(lane_id, smem_minsts, inst.coords[0] + 1);
           // F0: jump to a different pc after certain iterations
