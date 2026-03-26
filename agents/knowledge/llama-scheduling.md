@@ -59,19 +59,13 @@
 - The full multi-token path launched successfully under the timeout wrapper for `N=2`, so the current main issue is not a full-path deadlock.
 - The partial multi-token debug harness is still incomplete: `--debug-stop-after final_rms` timed out after launch for `N=2` with both `7` and `8` layers, so stage-by-stage timing past that point should not yet be trusted on the multi-token path.
 
-## Multi-Token Compute Looping
+## Multi-Token Repeated Body
 
 - `LoopC` now carries an explicit loop-register index in `python/dae/instructions.py`, matching the runtime `count[4]` loop-counter array in `include/dae/dae2.cuh`.
-- The Llama3 decode path in `app/python/llama3/sched.py` uses register `0` for the existing per-layer compute loop and register `1` for the outer repeated-token compute loop.
-- The repeated-token refactor keeps per-token memory instructions linear, but emits the repeated compute body once and loops it with `LoopC` after `bar_token_finish`.
-- Non-split decode attention in `include/dae/compute_dispatch.cuh` now interprets its encoded KV sequence length as a base value and adds the outer compute loop counter from register `1` at runtime.
-
-## Multi-Token Memory Looping
-
-- `app/python/llama3/sched.py` now has a stable-body memory-side outer loop for generated tokens that stay within the same `KVBlockSize` bucket.
-- The loop seeds persistent allocwarp repeat registers once, then uses high-lane guarded memory ops for token-varying `CC0`, rope-table loads, KV-cache stores, and final token writeback.
-- The guarded embed/copy sequence is SIMT-sensitive: it must be emitted as `Repeat(token-delta) -> CC0 -> Repeat(zero-delta) -> load.jump()` so `CC0` advances the token source address while the following load keeps its original address lane.
-- The token body is emitted once for both memory and compute. The shared `token_prefix` covers `IssueBarrier` when needed plus the embed/copy/restore-high prefix, and the inner per-layer loops jump past that prefix by adjusting their target PCs instead of requiring a second copy of those memory instructions.
-- The outer memory token loop starts at `IssueBarrier(systemg['bar_token_finish'])`, before `restore_bars_high`; otherwise the bar restore would reset the system barrier before the wait and deadlock the next token.
-- The memory-side token loop uses `LoopM(..., reg=1)` while the existing per-layer loop keeps `LoopM(..., reg=0)`. This works with the existing runtime because loop-counter state is already lane-local.
-- If the generated span would cross a KV-block boundary, `sched.py` still falls back to the older explicit per-token memory emission path.
+- The Llama3 decode path in `app/python/llama3/sched.py` now has one repeated-token control: either emit a shared generated-token body for both memory and compute, or fall back to explicit per-token emission for both.
+- The shared generated-token body is only used when the whole generated span stays within one `KVBlockSize` bucket; otherwise the schedule keeps the simpler explicit path.
+- The loop seeds persistent allocwarp repeat registers once, then uses guarded memory ops for token-varying `CC0`, rope-table loads, KV-cache stores, and final token writeback.
+- The guarded embed/copy sequence is SIMT-sensitive: it should be emitted as `Repeat(token-delta) -> CC0 -> load.jump()`. `CC0` already arms the following allocation instruction as the one-step repeat target, so an extra post-`CC0` repeat is redundant.
+- The token body is emitted once for both memory and compute. The shared `token_prefix` covers `IssueBarrier` when needed plus the embed/copy/restore-high prefix, and the inner per-layer loops jump past that prefix by adjusting their target PCs instead of requiring a second copy of those instructions.
+- The outer generated-token loops use `LoopM(..., reg=1)` and `LoopC(..., reg=1)` while the existing per-layer loops keep register `0`.
+- Non-split decode attention in `include/dae/compute_dispatch.cuh` interprets its encoded KV sequence length as a base value and adds the outer compute loop counter from register `1` at runtime.

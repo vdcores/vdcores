@@ -10,6 +10,21 @@ static __device__ __forceinline__ void prefetch_inst_window(
   }
 }
 
+template<typename TokenOffsetFn>
+static __device__ __forceinline__ void cc0_start_repeat(
+    const int lane_id,
+    MemoryVirtualCore &di,
+    const uint32_t pc,
+    TokenOffsetFn &&token_offset_fn) {
+  di.gpr_32[MVC_GPR32_LOOP_COUNTER] = 1;
+  di.gpr_32[MVC_GPR32_LOOP_START_PC] = pc + 1;
+  di.gpr_32[MVC_GPR32_BASE_REG] = 0;
+  if (lane_id == 0) {
+    di.gpr[MVC_GPR_DELTA] = 0;
+    di.gpr[MVC_GPR_ACC] = token_offset_fn();
+  }
+}
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -192,23 +207,15 @@ __device__ __forceinline__ void allocwarp_execute(
         }
         // CV here for custom variation
         case op(OP_CC0): {
-          // CC0: embedding operator. A single tmaload1D instruction should come right after this one
+          // CC0 arms the following allocation instruction as a one-step repeat target.
           int token = *(int *)(inst.address);
-          di.gpr_32[MVC_GPR32_LOOP_COUNTER] = 1;
-          di.gpr_32[MVC_GPR32_LOOP_START_PC] = pc + 1;
-          if (lane_id == 0) {
-            di.gpr[MVC_GPR_ACC] = token << inst.arg;
-          }
+          cc0_start_repeat(lane_id, di, pc, [&] { return token << inst.arg; });
           break;
         }
         case op(OP_CC0_ROW_BYTES): {
           // Generalized CC0 path for non-power-of-two embedding row widths.
           int token = *(int *)(inst.address);
-          di.gpr_32[MVC_GPR32_LOOP_COUNTER] = 1;
-          di.gpr_32[MVC_GPR32_LOOP_START_PC] = pc + 1;
-          if (lane_id == 0) {
-            di.gpr[MVC_GPR_ACC] = token * inst.size;
-          }
+          cc0_start_repeat(lane_id, di, pc, [&] { return token * inst.size; });
           break;
         }
         default:
