@@ -13,12 +13,10 @@ import torch
 
 
 def extract_compute_operator_names(launcher) -> list[str]:
-    launcher.build_instructions()
-
     operator_names = []
     seen = set()
     for builder in launcher.builder:
-        for inst in builder.built_cinsts:
+        for inst in [*builder.built_cinsts, *builder.cinsts]:
             name = inst.compute_operator_name()
             if name in seen:
                 continue
@@ -269,12 +267,22 @@ class Launcher:
         return len(self.tmas) - 1
 
     # instruction management
+    def _projected_cptrs(self):
+        return [
+            (self.cptrs[i] + len(self.builder[i].cinsts)) % self.max_insts
+            for i in range(self.num_sms)
+        ]
+
+    def _projected_mptrs(self):
+        return [
+            (self.mptrs[i] + len(self.builder[i].minsts)) % self.max_insts
+            for i in range(self.num_sms)
+        ]
+
     def copy_cptrs(self):
-        self.build_instructions()
-        return self.cptrs.copy()
+        return self._projected_cptrs()
     def copy_mptrs(self):
-        self.build_instructions()
-        return self.mptrs.copy()
+        return self._projected_mptrs()
 
     def build_instructions(self):
         if self.need_instruction_build:
