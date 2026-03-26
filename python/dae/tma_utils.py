@@ -106,16 +106,35 @@ class ToLinearCordAdapter(ToConvertedCordAdapter):
 
 
 class ToRepeatedCordAdapter(ToConvertedCordAdapter):
-    def __init__(self, inner, convert, repeat_count: int, repeat_delta: int | list[int]):
+    def __init__(
+        self,
+        inner,
+        convert,
+        repeat_count: int,
+        repeat_delta: int | list[int],
+        *,
+        base_reg: int = 0,
+        persistent: bool = False,
+        jump_target: bool = True,
+    ):
         super().__init__(inner, convert)
         self.repeat_count = repeat_count
         self.repeat_delta = repeat_delta
+        self.base_reg = base_reg
+        self.persistent = persistent
+        self.jump_target = jump_target
 
     def cord(self, *cords):
         from .instructions import RepeatM
 
         inst = super().cord(*cords)
-        insts = RepeatM.on(self.repeat_count, (inst, self.repeat_delta))
+        if self.persistent:
+            assert self.repeat_count == 1, "persistent repeated adapters only support single-step guarded execution"
+            if self.jump_target:
+                inst.jump()
+            insts = [RepeatM(self.repeat_count, reg=0, reg_end=0, base_reg=self.base_reg), inst]
+            return CordInstList(insts, target_idx=1)
+        insts = RepeatM.on(self.repeat_count, (inst, self.repeat_delta), base_reg=self.base_reg)
         return CordInstList(insts, target_idx=len(insts) - 1)
 
 class ToRopeTableCordAdapter(ToConvertedCordAdapter):

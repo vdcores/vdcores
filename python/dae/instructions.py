@@ -660,9 +660,17 @@ class RepeatM(MemoryInstruction):
         )
 
     @classmethod
-    def onSync(cls, bar_inst_offset: int, bar_id: int | None, count: int, *steps, asyncPort: bool = True):
+    def onSync(
+        cls,
+        bar_inst_offset: int,
+        bar_id: int | None,
+        count: int,
+        *steps,
+        asyncPort: bool = True,
+        base_reg: int = 0,
+    ):
         if bar_id is None:
-            return cls.on(count, *steps)
+            return cls.on(count, *steps, base_reg=base_reg)
 
         port = 1 if asyncPort else 0
 
@@ -674,24 +682,25 @@ class RepeatM(MemoryInstruction):
             if i == bar_inst_offset:
                 new_inst.bar(bar_id)
             insts.append(new_inst)
-        insts += cls.on1(count, *steps)
+        insts += cls.on1(count, *steps, base_reg=base_reg)
         return insts
 
     @classmethod
-    def on1(cls, count: int, *steps):
+    def on1(cls, count: int, *steps, base_reg: int = 0):
         assert count > 0, "count must be greater than 0 to use on1"
         new_steps = []
         for inst, delta in steps:
             new_steps.append((inst.delta(delta), delta))
-        return cls.on(count - 1, *new_steps)
+        return cls.on(count - 1, *new_steps, base_reg=base_reg)
 
     @classmethod
-    def on(cls, count: int, *steps):
+    def on(cls, count: int, *steps, base_reg: int = 0):
         insts = []
         if len(steps) == 0:
             return insts
         if count == 0:
             return []
+        assert 0 <= base_reg < 32, "base_reg must be in [0,31]"
 
         regcords = []
         for i, (inst, delta) in enumerate(steps):
@@ -709,7 +718,15 @@ class RepeatM(MemoryInstruction):
 
         if count > 1:
             for reg_start, reg_end, delta_cords in regcords:
-                insts += [cls(0, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords)]
+                insts += [
+                    cls(
+                        0,
+                        reg=base_reg + reg_start,
+                        reg_end=base_reg + reg_end,
+                        base_reg=base_reg,
+                        delta_cords=delta_cords,
+                    )
+                ]
             insts[-1].size = count
 
         for inst, _ in steps:

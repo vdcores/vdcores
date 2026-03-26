@@ -14,7 +14,7 @@ Schedule-side cord conversion now lives in wrapper objects instead of `SchedCopy
 - `wrap_static(*tmas)`: convenience helper for building tuples of `StaticCordAdapter`
 - `ToConvertedCordAdapter`: generic callable-based translation
 - `ToLinearCordAdapter`: SM id to linear byte offset
-- `ToRepeatedCordAdapter`: wrap one converted instruction in a prepended `RepeatM.on(...)` bundle while keeping schedule-side modifier calls like `.group()` and `.bar()` targeted at the wrapped TMA instruction
+- `ToRepeatedCordAdapter`: wrap one converted instruction in either a prepended `RepeatM.on(...)` bundle or a persistent single-step `RepeatM(...) + inst.jump()` guard while keeping schedule-side modifier calls like `.group()` and `.bar()` targeted at the wrapped TMA instruction
 - `ToRopeTableCordAdapter`: SM id to rope-table coordinates
 - `ToSplitMCordAdapter`: SM id to `(0, m)` split-M coordinates
 - `ToAttnKVStoreCordAdapter`: SM id to attention KV-store coordinates
@@ -26,4 +26,5 @@ Schedule-side cord conversion now lives in wrapper objects instead of `SchedCopy
 - Plain cordable objects can be passed directly when their native `.cord(...)` behavior already matches the schedule call shape.
 - For GEMV schedules, keep the scheduler logic unchanged, especially `storeC.cord(0, m)`, and adapt only through the wrapper.
 - Adapters may now return a small instruction-list proxy instead of a bare instruction; the launcher already flattens lists, and modifier chaining still applies to the designated wrapped instruction.
+- The persistent `ToRepeatedCordAdapter(..., base_reg=..., persistent=True)` path is meant for outer-loop style schedules: seed the allocwarp repeat GPRs once with `LoadRegisterM`, then let each guarded instruction advance its own accumulator across loop iterations.
 - The llama and qwen app schedules use small local helpers to wrap common identity/static cases and keep schedule construction readable.

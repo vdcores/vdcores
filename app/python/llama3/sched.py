@@ -252,6 +252,92 @@ tma_shift, bar_shift = layerg.get_shift()
 # Start of Schedule
 ###################################
 
+TOKEN_LOOP_BASE_REG = 16
+TOKEN_LOOP_REGS = {
+  "embed_cc0": TOKEN_LOOP_BASE_REG + 0,
+  "embed_cc0_load": TOKEN_LOOP_BASE_REG + 1,
+  "copy_cc0": TOKEN_LOOP_BASE_REG + 2,
+  "copy_cc0_load": TOKEN_LOOP_BASE_REG + 3,
+  "q_rope": TOKEN_LOOP_BASE_REG + 4,
+  "k_rope_table": TOKEN_LOOP_BASE_REG + 5,
+  "k_store": TOKEN_LOOP_BASE_REG + 6,
+  "v_store": TOKEN_LOOP_BASE_REG + 7,
+  "argmax_final": TOKEN_LOOP_BASE_REG + 8,
+}
+TOKEN_LOOP_LAST_REG = max(TOKEN_LOOP_REGS.values())
+
+
+def _guard_preload_inst(inst: MemoryInstruction, *, base_reg: int):
+  return [RepeatM(1, reg=0, reg_end=0, base_reg=base_reg), inst]
+
+
+def _guard_alloc_inst(inst: MemoryInstruction, *, base_reg: int):
+  return [RepeatM(1, reg=0, reg_end=0, base_reg=base_reg), inst.jump()]
+
+
+def _wrap_persistent_adapter(inner, repeat_delta, *, base_reg: int):
+  return ToRepeatedCordAdapter(
+    inner,
+    lambda *cords: cords,
+    repeat_count=1,
+    repeat_delta=repeat_delta,
+    base_reg=base_reg,
+    persistent=True,
+  )
+
+
+def _wrap_persistent_static(inner, *, base_reg: int):
+  return ToRepeatedCordAdapter(
+    StaticCordAdapter(inner),
+    lambda *_: (),
+    repeat_count=1,
+    repeat_delta=0,
+    base_reg=base_reg,
+    persistent=True,
+  )
+
+
+def _guard_argmax_final_store(schedule, *, base_reg: int):
+  def smfunc(sm_id: int):
+    mapped_sm = schedule.map_sm(sm_id)
+    insts = schedule(sm_id)
+    if mapped_sm < 0 or mapped_sm >= schedule.num_token:
+      return insts
+    return [*insts[:-1], _guard_alloc_inst(insts[-1], base_reg=base_reg)]
+
+  return smfunc
+
+
+def _token_loop_seed_registers():
+  delta_by_reg = {
+    TOKEN_LOOP_REGS["embed_cc0"]: matTokens.element_size(),
+    TOKEN_LOOP_REGS["embed_cc0_load"]: 0,
+    TOKEN_LOOP_REGS["copy_cc0"]: matTokens.element_size(),
+    TOKEN_LOOP_REGS["copy_cc0_load"]: 0,
+    TOKEN_LOOP_REGS["q_rope"]: cords2addr([0, 0, 0, 1]),
+    TOKEN_LOOP_REGS["k_rope_table"]: cords2addr([0, 0, 0, 1]),
+    TOKEN_LOOP_REGS["k_store"]: cords2addr([0, 1, 0, 0]),
+    TOKEN_LOOP_REGS["v_store"]: cords2addr([0, 1, 0, 0]),
+    TOKEN_LOOP_REGS["argmax_final"]: matTokens.element_size(),
+  }
+  insts = [
+    LoadRegisterM(reg_id=0, value=delta, reg=reg, reg_end=reg + 1)
+    for reg, delta in delta_by_reg.items()
+  ]
+  insts.append(LoadRegisterM(reg_id=1, value=0, reg=TOKEN_LOOP_BASE_REG, reg_end=TOKEN_LOOP_LAST_REG + 1))
+  return insts
+
+
+def _num_kv_blocks_for_pos(token_pos: int):
+  return (token_pos + 1 + KVBlockSize - 1) // KVBlockSize
+
+
+def _supports_memory_outer_loop(start_token_pos: int, loop_count: int):
+  if loop_count <= 0:
+    return False
+  end_token_pos = start_token_pos + loop_count - 1
+  return _num_kv_blocks_for_pos(start_token_pos) == _num_kv_blocks_for_pos(end_token_pos)
+
 def _memory_only(inst):
   if inst is None:
     return None
@@ -281,8 +367,16 @@ def schedule_single_token(
   token_pos: int,
   *,
   build_compute: bool = True,
+  token_loop_guard: bool = False,
+  prepend_issue_barrier: bool = False,
   outer_compute_loop_count: int | None = None,
+  outer_memory_loop_count: int | None = None,
 ):
+  if token_loop_guard and build_compute:
+    raise ValueError("token_loop_guard is only supported for memory-only token bodies")
+  if outer_memory_loop_count is not None and not token_loop_guard:
+    raise ValueError("outer_memory_loop_count requires token_loop_guard")
+
   # RMS
   # group is not working on RMS tmas, as it uses TMA1D
   # TODO(zhiyuang): dup the matEmbed for now
@@ -290,20 +384,29 @@ def schedule_single_token(
   storeHidden1D = TmaStore1D(matHidden, bytes=HIDDEN * 2)
   loadHidden1D = TmaLoad1D(matHidden, bytes=HIDDEN * 2)
   storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
+  embed_load_tma = loadEmbed1D
+  copy_load_tma = StaticCordAdapter(loadEmbed1D)
+  embed_cc0 = CC0(matTokens[0], token_offset, hidden_size=HIDDEN)
+  copy_cc0 = CC0(matTokens[0], token_offset, hidden_size=HIDDEN)
+  if token_loop_guard:
+    embed_cc0 = _guard_preload_inst(embed_cc0, base_reg=TOKEN_LOOP_REGS["embed_cc0"])
+    copy_cc0 = _guard_preload_inst(copy_cc0, base_reg=TOKEN_LOOP_REGS["copy_cc0"])
+    embed_load_tma = _wrap_persistent_adapter(loadEmbed1D, 0, base_reg=TOKEN_LOOP_REGS["embed_cc0_load"])
+    copy_load_tma = _wrap_persistent_static(loadEmbed1D, base_reg=TOKEN_LOOP_REGS["copy_cc0_load"])
 
   embed_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
-    tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
-    embedding=CC0(matTokens[0], token_offset, hidden_size=HIDDEN)
+    tmas=(TmaLoad1D(matRMSInputW[0]), embed_load_tma, storeRMSHidden1D),
+    embedding=embed_cc0,
   ).bar("output", layerg['bar_pre_attn_rms'])
   # copy the HIDDEN from embedding
   copy_hidden = SchedCopy(
     size = HIDDEN * matHidden.element_size(),
     tmas = (
-      StaticCordAdapter(loadEmbed1D),
+      copy_load_tma,
       ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
     ),
-    before_copy = CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
+    before_copy = copy_cc0,
   )
 
   # TODO(zhiyuang): finish a set of clear functions
@@ -333,6 +436,15 @@ def schedule_single_token(
 
   # QKV Projection
   # TODO(zhiyuang): add the ROPE for Q and K
+  q_rope_table = ToRopeTableCordAdapter(defaultg['loadRope'], token_pos)
+  k_rope_table = ToRopeTableCordAdapter(defaultg['loadRope'], token_pos)
+  k_store_adapter = ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos)
+  v_store_adapter = ToAttnVStoreCordAdapter(layerg['storeV'], token_pos)
+  if token_loop_guard:
+    q_rope_table = _wrap_persistent_adapter(q_rope_table, [0, 0, 0, 1], base_reg=TOKEN_LOOP_REGS["q_rope"])
+    k_rope_table = _wrap_persistent_adapter(k_rope_table, [0, 0, 0, 1], base_reg=TOKEN_LOOP_REGS["k_rope_table"])
+    k_store_adapter = _wrap_persistent_adapter(k_store_adapter, [0, 1, 0], base_reg=TOKEN_LOOP_REGS["k_store"])
+    v_store_adapter = _wrap_persistent_adapter(v_store_adapter, [0, 1, 0], base_reg=TOKEN_LOOP_REGS["v_store"])
   regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
   regLoadQ = RegLoad(0)
   QProj = SchedGemv(Gemv_M64N8,
@@ -341,7 +453,7 @@ def schedule_single_token(
   ).bar("load", layerg['bar_pre_attn_rms'])
   QRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
-      ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+      q_rope_table,
       regLoadQ,
       ToSplitMCordAdapter(layerg['storeQ'], 128//2, TileM),
     ),
@@ -354,9 +466,9 @@ def schedule_single_token(
   )
   KRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
-      ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+      k_rope_table,
       regLoadK,
-      ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos),
+      k_store_adapter,
     ),
   ).bar("store", layerg['bar_qkv_attn'])
   VProj = SchedGemv(Gemv_M64N8,
@@ -364,7 +476,7 @@ def schedule_single_token(
     tmas=(
       layerg['loadVW'],
       layerg['loadRMSLayer'],
-      ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
+      v_store_adapter,
     ),
   ).bar("store", layerg['bar_qkv_attn'])
 
@@ -494,6 +606,7 @@ def schedule_single_token(
   down_proj_low = down_proj_low.place(128)
   down_proj_high = down_proj_high.place(128)
   Argmax = Argmax.place(128)
+  ArgmaxEmit = _guard_argmax_final_store(Argmax, base_reg=TOKEN_LOOP_REGS["argmax_final"]) if token_loop_guard else Argmax
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
 
@@ -527,6 +640,19 @@ def schedule_single_token(
     restore_bars_low,
   )
 
+  if token_loop_guard:
+    _emit_token_insts(_token_loop_seed_registers(), build_compute=False)
+
+  outer_memory_loop_start = None
+  memory_loop_inst = []
+  if prepend_issue_barrier:
+    outer_memory_loop_start = dae.copy_mptrs()
+    _emit_token_insts(IssueBarrier(systemg['bar_token_finish']), build_compute=False)
+  if outer_memory_loop_count is not None:
+    if outer_memory_loop_start is None:
+      outer_memory_loop_start = dae.copy_mptrs()
+    memory_loop_inst.append(LoopM.toNext(outer_memory_loop_start, outer_memory_loop_count, reg=1))
+
   # build first rms with embedding
   _emit_token_insts(
     embed_rms,
@@ -535,9 +661,9 @@ def schedule_single_token(
     build_compute=build_compute,
   )
 
-  outer_loop_inst = []
+  outer_compute_loop_inst = []
   if outer_compute_loop_count is not None:
-    outer_loop_inst.append(LoopC(outer_compute_loop_count, 0, reg=1))
+    outer_compute_loop_inst.append(LoopC(outer_compute_loop_count, 0, reg=1))
 
   # start a new scheudule to mark the loop target
   _emit_token_insts(
@@ -578,10 +704,11 @@ def schedule_single_token(
     LogitsProj,
 
     # argmax and cleanup
-    Argmax,
+    ArgmaxEmit,
 
     restore_bars_low,
-    outer_loop_inst,
+    outer_compute_loop_inst,
+    memory_loop_inst,
     build_compute=build_compute,
   )
 
@@ -602,11 +729,25 @@ for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
   cur_offset, cur_pos = token_offset, pos
 
 if num_generates > 0:
-  for _ in range(num_generates):
-    cur_offset += 1
-    cur_pos += 1
-    dae.i(IssueBarrier(systemg['bar_token_finish']))
-    schedule_single_token(cur_offset, cur_pos, build_compute=False)
+  first_generated_offset = cur_offset + 1
+  first_generated_pos = cur_pos + 1
+  if _supports_memory_outer_loop(first_generated_pos, num_generates):
+    schedule_single_token(
+      first_generated_offset,
+      first_generated_pos,
+      build_compute=False,
+      token_loop_guard=True,
+      prepend_issue_barrier=True,
+      outer_memory_loop_count=num_generates,
+    )
+    cur_offset += num_generates
+    cur_pos += num_generates
+  else:
+    for _ in range(num_generates):
+      cur_offset += 1
+      cur_pos += 1
+      dae.i(IssueBarrier(systemg['bar_token_finish']))
+      schedule_single_token(cur_offset, cur_pos, build_compute=False)
 
 print(f"run vdcors with {cur_offset+1} tokens...")
 dae.s()

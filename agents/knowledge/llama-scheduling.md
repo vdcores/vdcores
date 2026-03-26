@@ -65,3 +65,12 @@
 - The Llama3 decode path in `app/python/llama3/sched.py` uses register `0` for the existing per-layer compute loop and register `1` for the outer repeated-token compute loop.
 - The repeated-token refactor keeps per-token memory instructions linear, but emits the repeated compute body once and loops it with `LoopC` after `bar_token_finish`.
 - Non-split decode attention in `include/dae/compute_dispatch.cuh` now interprets its encoded KV sequence length as a base value and adds the outer compute loop counter from register `1` at runtime.
+
+## Multi-Token Memory Looping
+
+- `app/python/llama3/sched.py` now has a stable-body memory-side outer loop for generated tokens that stay within the same `KVBlockSize` bucket.
+- The loop seeds persistent allocwarp repeat registers once, then uses high-lane guarded memory ops for token-varying `CC0`, rope-table loads, KV-cache stores, and final token writeback.
+- The guarded embed/copy sequence is SIMT-sensitive: it must be emitted as `Repeat(token-delta) -> CC0 -> Repeat(zero-delta) -> load.jump()` so `CC0` advances the token source address while the following load keeps its original address lane.
+- The outer memory token loop starts at `IssueBarrier(systemg['bar_token_finish'])`, before `restore_bars_high`; otherwise the bar restore would reset the system barrier before the wait and deadlock the next token.
+- The memory-side token loop uses `LoopM(..., reg=1)` while the existing per-layer loop keeps `LoopM(..., reg=0)`. This works with the existing runtime because loop-counter state is already lane-local.
+- If the generated span would cross a KV-block boundary, `sched.py` still falls back to the older explicit per-token memory emission path.
