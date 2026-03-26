@@ -45,6 +45,45 @@ class CordAdapter:
     def __getattr__(self, name):
         return getattr(self.inner, name)
 
+
+class CordInstList(list):
+    def __init__(self, insts, target_idx: int = -1):
+        super().__init__(insts)
+        self.target_idx = target_idx
+
+    @property
+    def target(self):
+        return self[self.target_idx]
+
+    def group(self, enable=True):
+        self.target.group(enable)
+        return self
+
+    def jump(self):
+        self.target.jump()
+        return self
+
+    def bar(self, bar_id: int | None = None):
+        self.target.bar(bar_id)
+        return self
+
+    def writeback(self):
+        self.target.writeback()
+        return self
+
+    def port(self, port_id: int):
+        self.target.port(port_id)
+        return self
+
+    def copy(self):
+        return CordInstList(
+            [inst.copy() if hasattr(inst, "copy") else copy.copy(inst) for inst in self],
+            target_idx=self.target_idx,
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
 class StaticCordAdapter(CordAdapter):
     def cord(self, *cords):
         return self.inner
@@ -64,6 +103,20 @@ class ToConvertedCordAdapter(CordAdapter):
 class ToLinearCordAdapter(ToConvertedCordAdapter):
     def __init__(self, inner, delta: int):
         super().__init__(inner, lambda sm: (sm * delta,))
+
+
+class ToRepeatedCordAdapter(ToConvertedCordAdapter):
+    def __init__(self, inner, convert, repeat_count: int, repeat_delta: int | list[int]):
+        super().__init__(inner, convert)
+        self.repeat_count = repeat_count
+        self.repeat_delta = repeat_delta
+
+    def cord(self, *cords):
+        from .instructions import RepeatM
+
+        inst = super().cord(*cords)
+        insts = RepeatM.on(self.repeat_count, (inst, self.repeat_delta))
+        return CordInstList(insts, target_idx=len(insts) - 1)
 
 class ToRopeTableCordAdapter(ToConvertedCordAdapter):
     def __init__(self, inner, batch_seq_len: int, tile_repeats: int = 2):
