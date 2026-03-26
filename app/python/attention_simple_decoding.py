@@ -165,7 +165,6 @@ tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v,
 need_norm = False
 need_rope = False
 
-<<<<<<< HEAD
 ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "hopper").lower()
 if ATTENTION_IMPL == "mma":
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA
@@ -176,9 +175,6 @@ else:
 
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
 last_active_kv_len = 48
-=======
-last_active_kv_len = 64
->>>>>>> 3f67a0b (fix tma util collapsed dim)
 assert last_active_kv_len <= KVTile
 
 def sm_task(sm: int):
@@ -188,11 +184,7 @@ def sm_task(sm: int):
     num_kv_block = (seq_length + KVTile - 1) // KVTile
 
     insts = [
-<<<<<<< HEAD
         attention_inst(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
-=======
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim(num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
->>>>>>> 3f67a0b (fix tma util collapsed dim)
         tQ.cord(req, head),
         RepeatM.on(num_kv_block,
             [tK.cord(req, 0, head), tK.cord2tma(0, KVTile, 0)],

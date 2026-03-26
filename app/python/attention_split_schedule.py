@@ -19,7 +19,7 @@ NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 64
-seq_lengths = [1024] * 8 + [16384]
+seq_lengths = [16384] + [1024] * 8
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -200,7 +200,6 @@ last_active_kv_len = 64
 assert last_active_kv_len <= KVTile
 
 TOTAL_ATTN_GROUPS = num_sms // NUM_KV_HEAD
-WAVE_RAW_SLOTS = [(24, 25), (26, 27), (28, 29)]
 
 
 def legal_split_levels(num_kv_blocks: int):
@@ -237,6 +236,118 @@ def calc_group_metrics(group_loads: list[int], full_groups: int):
     }
 
 
+def next_finer_split(num_kv_blocks: int, current_split: int):
+    legal = legal_split_levels(num_kv_blocks)
+    idx = legal.index(current_split)
+    if idx + 1 >= len(legal):
+        return None
+    return legal[idx + 1]
+
+
+def place_split_levels(num_kv_blocks: list[int], split_levels: list[int]):
+    attn_group_loads = [0] * TOTAL_ATTN_GROUPS
+    attn_group_assignments = defaultdict(list)
+    attn_group_waves = [0] * TOTAL_ATTN_GROUPS
+    shard_specs = []
+    for req_idx, (num_blocks, split_level) in enumerate(zip(num_kv_blocks, split_levels)):
+        shard_cost = num_blocks // split_level
+        for split_idx in range(split_level):
+            shard_specs.append((shard_cost, req_idx, split_idx))
+
+    shard_specs.sort(reverse=True)
+    for shard_cost, req_idx, split_idx in shard_specs:
+        group_id = min(range(TOTAL_ATTN_GROUPS), key=lambda gid: (attn_group_loads[gid], gid))
+        wave_idx = attn_group_waves[group_id]
+        attn_group_loads[group_id] += shard_cost
+        attn_group_assignments[req_idx].append((split_idx, group_id, wave_idx))
+        attn_group_waves[group_id] += 1
+
+    post_group_assignments = defaultdict(list)
+    post_group_waves = [0] * TOTAL_ATTN_GROUPS
+    rr_group = 0
+    for req_idx, split_level in enumerate(split_levels):
+        if split_level == 1:
+            continue
+        group_id = rr_group % TOTAL_ATTN_GROUPS
+        wave_idx = post_group_waves[group_id]
+        post_group_assignments[req_idx].append((group_id, wave_idx))
+        post_group_waves[group_id] += 1
+        rr_group += 1
+
+    return attn_group_assignments, post_group_assignments, attn_group_loads, attn_group_waves, post_group_waves
+
+
+def refine_split_levels(num_kv_blocks: list[int], split_levels: list[int]):
+    best_split_levels = split_levels[:]
+    (
+        best_attn_assignments,
+        best_post_assignments,
+        best_group_loads,
+        best_attn_waves,
+        best_post_waves,
+    ) = place_split_levels(num_kv_blocks, best_split_levels)
+    best_metrics = calc_group_metrics(best_group_loads, TOTAL_ATTN_GROUPS)
+
+    while True:
+        shard_sizes = [num_blocks // split for num_blocks, split in zip(num_kv_blocks, best_split_levels)]
+        longest_shard = max(shard_sizes)
+        candidate_reqs = [idx for idx, shard_size in enumerate(shard_sizes) if shard_size == longest_shard]
+
+        improved = False
+        chosen = None
+        for req_idx in candidate_reqs:
+            finer_split = next_finer_split(num_kv_blocks[req_idx], best_split_levels[req_idx])
+            if finer_split is None:
+                continue
+
+            candidate_split_levels = best_split_levels[:]
+            candidate_split_levels[req_idx] = finer_split
+            try:
+                candidate = place_split_levels(num_kv_blocks, candidate_split_levels)
+            except ValueError:
+                continue
+
+            candidate_metrics = calc_group_metrics(candidate[2], TOTAL_ATTN_GROUPS)
+            candidate_total_splits = sum(candidate_split_levels)
+            best_total_splits = sum(best_split_levels)
+            if (
+                candidate_metrics["max_work"] < best_metrics["max_work"]
+                or (
+                    candidate_metrics["max_work"] == best_metrics["max_work"]
+                    and candidate_metrics["utilization"] > best_metrics["utilization"] + 1e-4
+                )
+                or (
+                    candidate_metrics["max_work"] == best_metrics["max_work"]
+                    and abs(candidate_metrics["utilization"] - best_metrics["utilization"]) <= 1e-4
+                    and candidate_total_splits < best_total_splits
+                )
+            ):
+                chosen = (req_idx, candidate_split_levels, candidate, candidate_metrics)
+                improved = True
+                break
+
+        if not improved:
+            break
+
+        _, best_split_levels, candidate, best_metrics = chosen
+        (
+            best_attn_assignments,
+            best_post_assignments,
+            best_group_loads,
+            best_attn_waves,
+            best_post_waves,
+        ) = candidate
+
+    return (
+        best_split_levels,
+        best_attn_assignments,
+        best_post_assignments,
+        best_group_loads,
+        best_attn_waves,
+        best_post_waves,
+    )
+
+
 @dataclass
 class SchedPlan:
     request_idx: int
@@ -270,7 +381,6 @@ class SchedPlan:
             return []
         head = sm % NUM_KV_HEAD
         split, wave_idx = self.attn_group_to_split[sm_group]
-        raw_store_slot, _ = WAVE_RAW_SLOTS[wave_idx]
         insts = []
         if self.split_level == 1:
             return [
@@ -294,7 +404,7 @@ class SchedPlan:
                 [tV.cord(self.request_idx, kv_start_idx, head), tV.cord2tma(0, KVTile, 0)],
             ),
             TmaStore1D(matO_split_attn_view[split, self.request_idx, head, ...]),
-            RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], raw_store_slot).bar(self.attn_bar).writeback(),
+            TmaStore1D(matP[head, self.request_idx * HEAD_GROUP_SIZE: (self.request_idx+1) * HEAD_GROUP_SIZE]).bar(self.attn_bar),
         ])
         return insts
 
@@ -305,12 +415,10 @@ class SchedPlan:
         if sm_group not in self.post_group_to_lane:
             return []
         head = sm % NUM_KV_HEAD
-        _, wave_idx = self.post_group_to_lane[sm_group]
-        _, raw_load_slot = WAVE_RAW_SLOTS[wave_idx]
         insts = []
         insts.extend([
             ATTN_SPLIT_POST_REDUCE(self.split_level),
-            RawAddress(matP[head, self.request_idx * HEAD_GROUP_SIZE], raw_load_slot).bar(self.attn_bar),
+            TmaLoad1D(matP[head, self.request_idx * HEAD_GROUP_SIZE: (self.request_idx+1) * HEAD_GROUP_SIZE]).bar(self.attn_bar),
             self.tO_split.cord(head, self.request_idx),
             TmaStore1D(matO_attn_view[self.request_idx, head, ...]),
         ])
@@ -326,47 +434,23 @@ def build_sched_plans():
         choose_split_level(num_blocks, target_blocks_per_shard, mode=schedule_mode)
         for num_blocks in num_kv_blocks
     ]
-
-    attn_group_loads = [0] * TOTAL_ATTN_GROUPS
-    attn_group_assignments = defaultdict(list)
-    attn_group_waves = [0] * TOTAL_ATTN_GROUPS
-    shard_specs = []
-    for req_idx, (num_blocks, split_level) in enumerate(zip(num_kv_blocks, split_levels)):
-        shard_cost = num_blocks // split_level
-        for split_idx in range(split_level):
-            shard_specs.append((shard_cost, req_idx, split_idx))
-
-    shard_specs.sort(reverse=True)
-    for shard_cost, req_idx, split_idx in shard_specs:
-        group_id = min(range(TOTAL_ATTN_GROUPS), key=lambda gid: (attn_group_loads[gid], gid))
-        wave_idx = attn_group_waves[group_id]
-        attn_group_loads[group_id] += shard_cost
-        attn_group_assignments[req_idx].append((split_idx, group_id, wave_idx))
-        attn_group_waves[group_id] += 1
-
-    max_attn_waves = max(attn_group_waves, default=0)
-    assert max_attn_waves <= len(WAVE_RAW_SLOTS), (
-        f"Need {max_attn_waves} attention waves on one SM group, "
-        f"but only {len(WAVE_RAW_SLOTS)} raw-slot wave pairs are available"
-    )
-
-    post_group_assignments = defaultdict(list)
-    post_group_waves = [0] * TOTAL_ATTN_GROUPS
-    rr_group = 0
-    for req_idx, split_level in enumerate(split_levels):
-        if split_level == 1:
-            continue
-        group_id = rr_group % TOTAL_ATTN_GROUPS
-        wave_idx = post_group_waves[group_id]
-        post_group_assignments[req_idx].append((group_id, wave_idx))
-        post_group_waves[group_id] += 1
-        rr_group += 1
-
-    max_post_waves = max(post_group_waves, default=0)
-    assert max_post_waves <= len(WAVE_RAW_SLOTS), (
-        f"Need {max_post_waves} post waves on one SM group, "
-        f"but only {len(WAVE_RAW_SLOTS)} raw-slot wave pairs are available"
-    )
+    if schedule_mode == 'vdc':
+        (
+            split_levels,
+            attn_group_assignments,
+            post_group_assignments,
+            attn_group_loads,
+            attn_group_waves,
+            post_group_waves,
+        ) = refine_split_levels(num_kv_blocks, split_levels)
+    else:
+        (
+            attn_group_assignments,
+            post_group_assignments,
+            attn_group_loads,
+            attn_group_waves,
+            post_group_waves,
+        ) = place_split_levels(num_kv_blocks, split_levels)
 
     plans = []
     for req_idx, split_level in enumerate(split_levels):

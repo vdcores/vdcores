@@ -653,20 +653,21 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
 
     if constexpr (SPLIT_KV) {
         const int slot_lse = m2c.template pop<0>();
-        // assume sM_glob is of shape [H, N, G, max_split]
-        // each SM will get its slice of [N, G, max_split] so no need to index the KV head dim
-        accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
+        accum_t* __restrict__ sLSE_ptr = (accum_t*)get_slot_address(base, extract(slot_lse));
+        auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), make_layout(
+            make_shape(num_active_q, Int<MAX_SPLIT>{}),
+            LayoutRight{}));
         constexpr int tSRow = decltype(size<1>(o_mn_view))::value;
         #pragma unroll
         for (int r = 0; r < tSRow; ++r) {
             const int q_row = (thread_id / 32) * 16 + (thread_id % 32) / 4 + r * 8;
             if (q_row < num_active_q) {
                 const accum_t lse = online_softmax.row_max(r) + log2f(online_softmax.row_sum(r));
-                sLSE_ptr[q_row * MAX_SPLIT + split_idx] = lse;
+                sLSE(q_row, split_idx) = lse;
             }
         }
         __sync_compute_group(128);
-        c2m.template push<31, true, false>(thread_id, 1 << slot_lse);
+        c2m.template push<0, true>(thread_id, slot_lse);
     }
 }
 
@@ -973,10 +974,9 @@ __device__ __forceinline__ void task_split_post_reduce(
         make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
         LayoutRight{});
 
-    // LSE lives in global memory — available immediately (raw address, no TMA wait).
     const int slot_lse = m2c.template pop<0>();
-    const accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
-    auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
+    const accum_t* __restrict__ sLSE_ptr = (accum_t*)get_slot_address(base, extract(slot_lse));
+    auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), layout_lse);
 
     // Phase 1: preprocess LSE while the split-O TMA load is still in flight.
     // Each thread caches num_split scale factors (one scalar per split, not per element).
@@ -985,12 +985,14 @@ __device__ __forceinline__ void task_split_post_reduce(
     if (thread_id < ACTIVE_THREADS) {
         accum_t max_all = -FLT_MAX;
         for (int s = 0; s < num_split; ++s)
-            max_all = fmaxf(max_all, gLSE(my_q, s));
+            max_all = fmaxf(max_all, sLSE(my_q, s));
         for (int s = 0; s < num_split; ++s) {
-            sn_arr[s] = exp2f(gLSE(my_q, s) - max_all);
+            sn_arr[s] = exp2f(sLSE(my_q, s) - max_all);
             sum_all  += sn_arr[s];
         }
     }
+    __sync_compute_group(128);
+    c2m.push(thread_id, slot_lse);
 
     // Block on the TMA only now — overlap with phase 1 gives it extra time to complete.
     const int slot_split = m2c.template pop<0>();
