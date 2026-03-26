@@ -448,14 +448,15 @@ class Copy(ComputeInstruction):
 
 
 class LoopC(ComputeInstruction):
-    def __init__(self, count: int, pc: int):
-        super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc])
+    def __init__(self, count: int, pc: int, reg: int = 0):
+        assert 0 <= reg < 4, "reg must be in [0,3]"
+        super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc, reg])
 
     @classmethod
-    def toNext(cls, ptrs, count):
+    def toNext(cls, ptrs, count, reg: int = 0):
         def smfunc(sm_id: int):
             pc = ptrs[sm_id]
-            return cls(count, pc)
+            return cls(count, pc, reg=reg)
 
         return smfunc
 

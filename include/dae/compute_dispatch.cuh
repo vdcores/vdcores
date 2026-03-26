@@ -36,6 +36,8 @@ static __device__ __forceinline__ void dae_ignore(Args const &...) {}
 
 #define DAE_UNUSED(...) dae_ignore(__VA_ARGS__)
 
+constexpr int DAE_COMPUTE_OUTER_LOOP_REG = 1;
+
 DAE_COMPUTE_OP_HANDLER(OP_DUMMY) {
   DAE_UNUSED(sm_id, pc, count, finish, smem_base, scratch_space, st_insts, g_events);
   for (int i = 0; i < inst.args[0]; i++) {
@@ -137,7 +139,7 @@ static __device__ __forceinline__ void handle_attention_common(
     return;
   }
 
-  const int kv_seq_len = inst.args[0];
+  const int kv_seq_len = inst.args[0] + count[DAE_COMPUTE_OUTER_LOOP_REG];
   const bool need_norm = inst.args[1] & 0x1;
   const bool need_rope = inst.args[1] & 0x2;
   if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {

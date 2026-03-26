@@ -121,6 +121,7 @@ __device__ __forceinline__ void allocwarp_execute(
           next_pc = di.gpr_32[MVC_GPR32_LOOP_START_PC];
           // prefetch_inst_window(lane_id, smem_minsts, next_pc + 2);
         }
+        // the accumulation happens regardless of jump or not, as long as repeat is enabled
         di.gpr[MVC_GPR_ACC] += di.gpr[MVC_GPR_DELTA];
       }
     } else { // Executing the non-allocation instructions (control flow instructions)

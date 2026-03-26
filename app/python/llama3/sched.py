@@ -252,7 +252,37 @@ tma_shift, bar_shift = layerg.get_shift()
 # Start of Schedule
 ###################################
 
-def schedule_single_token(token_offset: int, token_pos: int):
+def _memory_only(inst):
+  if inst is None:
+    return None
+  if isinstance(inst, list):
+    filtered = [_memory_only(sub_inst) for sub_inst in inst]
+    return [sub_inst for sub_inst in filtered if sub_inst is not None]
+  if isinstance(inst, MemoryInstruction):
+    return inst
+  if isinstance(inst, ComputeInstruction):
+    return None
+  if callable(inst):
+    def smfunc(sm_id: int):
+      return _memory_only(inst(sm_id))
+    return smfunc
+  raise ValueError(f"Unsupported instruction wrapper type: {type(inst)}")
+
+
+def _emit_token_insts(*insts, build_compute: bool = True):
+  if build_compute:
+    dae.i(*insts)
+    return
+  dae.i(*[_memory_only(inst) for inst in insts])
+
+
+def schedule_single_token(
+  token_offset: int,
+  token_pos: int,
+  *,
+  build_compute: bool = True,
+  outer_compute_loop_count: int | None = None,
+):
   # RMS
   # group is not working on RMS tmas, as it uses TMA1D
   # TODO(zhiyuang): dup the matEmbed for now
@@ -498,14 +528,19 @@ def schedule_single_token(token_offset: int, token_pos: int):
   )
 
   # build first rms with embedding
-  dae.i(
+  _emit_token_insts(
     embed_rms,
     copy_hidden,
     restore_bars_high,
+    build_compute=build_compute,
   )
 
+  outer_loop_inst = []
+  if outer_compute_loop_count is not None:
+    outer_loop_inst.append(LoopC(outer_compute_loop_count, 0, reg=1))
+
   # start a new scheudule to mark the loop target
-  dae.i(
+  _emit_token_insts(
     clear_interm,
     clear_gateout,
     QProj,
@@ -537,7 +572,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     # # all 132 SM need loop
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
-    LoopC.toNext(dae.copy_cptrs(), num_layers),
+    LoopC.toNext(dae.copy_cptrs(), num_layers, reg=0),
 
     # # logits
     LogitsProj,
@@ -546,6 +581,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
     Argmax,
 
     restore_bars_low,
+    outer_loop_inst,
+    build_compute=build_compute,
   )
 
 ###################################
@@ -557,14 +594,19 @@ for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
   matTokens[0, token_offset] = token
   if token_offset > 0:
     dae.i(IssueBarrier(systemg['bar_token_finish']))
-  schedule_single_token(token_offset, pos)
+  schedule_single_token(
+    token_offset,
+    pos,
+    outer_compute_loop_count=(len(input_token_id_and_pos) + num_generates) if (token_offset == len(input_token_id_and_pos) - 1 and num_generates > 0) else None,
+  )
   cur_offset, cur_pos = token_offset, pos
 
-for i in range(num_generates):
-  cur_offset += 1
-  cur_pos += 1
-  dae.i(IssueBarrier(systemg['bar_token_finish']))
-  schedule_single_token(cur_offset, cur_pos)
+if num_generates > 0:
+  for _ in range(num_generates):
+    cur_offset += 1
+    cur_pos += 1
+    dae.i(IssueBarrier(systemg['bar_token_finish']))
+    schedule_single_token(cur_offset, cur_pos, build_compute=False)
 
 print(f"run vdcors with {cur_offset+1} tokens...")
 dae.s()

@@ -58,3 +58,10 @@
 - The current one-token path is already close to the target; the larger remaining gap is multi-token scaling.
 - The full multi-token path launched successfully under the timeout wrapper for `N=2`, so the current main issue is not a full-path deadlock.
 - The partial multi-token debug harness is still incomplete: `--debug-stop-after final_rms` timed out after launch for `N=2` with both `7` and `8` layers, so stage-by-stage timing past that point should not yet be trusted on the multi-token path.
+
+## Multi-Token Compute Looping
+
+- `LoopC` now carries an explicit loop-register index in `python/dae/instructions.py`, matching the runtime `count[4]` loop-counter array in `include/dae/dae2.cuh`.
+- The Llama3 decode path in `app/python/llama3/sched.py` uses register `0` for the existing per-layer compute loop and register `1` for the outer repeated-token compute loop.
+- The repeated-token refactor keeps per-token memory instructions linear, but emits the repeated compute body once and loops it with `LoopC` after `bar_token_finish`.
+- Non-split decode attention in `include/dae/compute_dispatch.cuh` now interprets its encoded KV sequence length as a base value and adds the outer compute loop counter from register `1` at runtime.
