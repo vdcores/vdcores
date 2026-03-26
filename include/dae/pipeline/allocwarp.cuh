@@ -123,11 +123,10 @@ __device__ __forceinline__ void allocwarp_execute(
           // prefetch_inst_window(lane_id, smem_minsts, next_pc + 2);
         }
         // the accumulation happens regardless of jump or not for the current range
-        __builtin_assume(di.gpr_32[MVC_GPR32_BASE_REG] >= 0);
-        __builtin_assume(di.gpr_32[MVC_GPR32_BASE_REG] < 32);
-        __builtin_assume(reg_offset >= 0);
-        __builtin_assume(reg_offset < 32);
-        if (lane_id >= di.gpr_32[MVC_GPR32_BASE_REG] && lane_id <= reg_offset)
+        const int base_reg = di.gpr_32[MVC_GPR32_BASE_REG];
+        // Express the contiguous lane range as one unsigned interval test so nvcc
+        // can lower it to a single compare in the hot loop.
+        if (lane_in_closed_range(lane_id, base_reg, reg_offset))
           di.gpr[MVC_GPR_ACC] += di.gpr[MVC_GPR_DELTA];
       }
     } else { // Executing the non-allocation instructions (control flow instructions)
@@ -148,7 +147,7 @@ __device__ __forceinline__ void allocwarp_execute(
           di.gpr_32[MVC_GPR32_BASE_REG] = inst.arg;
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
-          if (lane_id >= reg_start && lane_id < reg_end) {
+          if (lane_in_half_open_range(lane_id, reg_start, reg_end)) {
             di.gpr[MVC_GPR_DELTA] = inst.address; // loop offset
             di.gpr[MVC_GPR_ACC] = 0;
           }

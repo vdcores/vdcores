@@ -185,6 +185,14 @@ __device__ __forceinline__ uint32_t mkSlotMask(uint8_t slot, uint8_t nslot) {
   return ((1U << slot) - 1) ^ ((1U << (slot + nslot)) - 1);
 }
 
+__device__ __forceinline__ bool lane_in_half_open_range(int lane, int start, int end) {
+  return (unsigned)(lane - start) < (unsigned)(end - start);
+}
+
+__device__ __forceinline__ bool lane_in_closed_range(int lane, int start, int end) {
+  return (unsigned)(lane - start) <= (unsigned)(end - start);
+}
+
 template<int N, typename SrcT, typename DstT>
 __device__ __forceinline__ void parallel_copy(int lane_id, SrcT *srcp, DstT *dstp) {
   static_assert(N % 4 == 0, "parallel_copy only supports copying multiple of 4 bytes");

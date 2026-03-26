@@ -61,7 +61,7 @@ struct CollectionMemoryAllocator {
     // ActiveMask ensures bits >= numSlots are 0, so no out-of-bounds allocation
     int slot_id = __ffs(candidate) - 1; // return -1 if no slot available
     if (slot_id >= 0) {
-      if (lane_id >= slot_id && lane_id < slot_id + req) {
+      if (lane_in_half_open_range(lane_id, slot_id, slot_id + req)) {
         opcode = inst.opcode; // mainly to get the flags
         cur_lead = slot_id;
       }
@@ -128,7 +128,7 @@ struct WarpParallelMemoryAllocator {
     // ActiveMask ensures bits >= numSlots are 0, so no out-of-bounds allocation
     int slot_id = __ffs(candidate) - 1; // return -1 if no slot available
     if (slot_id >= 0) {
-      if (__memory_tid() >= slot_id && __memory_tid() < slot_id + req) {
+      if (lane_in_half_open_range(__memory_tid(), slot_id, slot_id + req)) {
         slot = inst;
         cur_lead = slot_id;
       }
