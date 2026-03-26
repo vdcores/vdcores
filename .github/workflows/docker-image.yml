@@ -23,7 +23,7 @@ jobs:
     permissions:
       contents: read
     env:
-      IMAGE_NAME: vdcores
+      IMAGE_NAME: dev-vdcores
     steps:
       - name: Checkout
         uses: actions/checkout@v4

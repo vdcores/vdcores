@@ -8,10 +8,15 @@ RUN apt-get update && apt-get install -y \
     git \
     python3 \
     python3-dev \
+    python3-venv \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --upgrade pip
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+RUN python3 -m venv ${VIRTUAL_ENV}
+RUN pip install --upgrade pip
 
 # Match the repo's documented CUDA 13.0 / PyTorch build path.
 RUN pip install --index-url https://download.pytorch.org/whl/cu130 torch
