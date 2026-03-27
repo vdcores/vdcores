@@ -173,18 +173,17 @@ elif ATTENTION_IMPL in ("hopper", "gmma", ""):
 else:
     raise ValueError(f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; expected 'hopper' or 'mma'")
 
-NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
-last_active_kv_len = 48
-assert last_active_kv_len <= KVTile
-
 def sm_task(sm: int):
     head = sm % NUM_KV_HEAD
     req = sm // NUM_KV_HEAD
     seq_length = seq_lengths[req]
     num_kv_block = (seq_length + KVTile - 1) // KVTile
+    last_active_kv_len = seq_length % KVTile
+    if last_active_kv_len == 0:
+        last_active_kv_len = KVTile
 
     insts = [
-        attention_inst(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_kv_block,
             [tK.cord(req, 0, head), tK.cord2tma(0, KVTile, 0)],
@@ -205,7 +204,7 @@ dae.i(
 
 # print("Launching Attention DAE...")
 
-dae.launch()
+dae_app(dae)
 
 def gqa_ref():
     Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)     # [B, Hkv, G, D]
@@ -235,5 +234,3 @@ def gqa_ref():
 
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO, matO_attn_view)
-
-dae_app(dae)

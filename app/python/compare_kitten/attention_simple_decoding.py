@@ -6,8 +6,12 @@ from functools import partial
 from dae.launcher import *
 from dae.util import *
 from dae.runtime import opcode, build_tma_desc 
-from qwen3.utils import *
+
 import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from qwen3.utils import *
 
 gpu = torch.device("cuda")
 torch.manual_seed(0)
@@ -15,11 +19,11 @@ torch.manual_seed(0)
 KV_SEQ_LEN = 2048
 HEAD_DIM = 128
 HIDDEN_SIZE = 1024
-NUM_REQ = 1
 NUM_Q_HEAD = 8
 NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
-seq_lengths = [512]
+seq_lengths = [512] * 64
+NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 assert len(seq_lengths) == NUM_REQ, "Length of seq_lengths must match NUM_REQ"
@@ -171,18 +175,17 @@ elif ATTENTION_IMPL in ("hopper", "gmma", ""):
 else:
     raise ValueError(f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; expected 'hopper' or 'mma'")
 
-NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
-last_active_kv_len = 48
-assert last_active_kv_len <= KVTile
-
 def sm_task(sm: int):
     head = sm % NUM_KV_HEAD
     req = sm // NUM_KV_HEAD
     seq_length = seq_lengths[req]
     num_kv_block = (seq_length + KVTile - 1) // KVTile
+    last_active_kv_len = seq_length % KVTile
+    if last_active_kv_len == 0:
+        last_active_kv_len = KVTile
 
     insts = [
-        attention_inst(NUM_KV_BLOCK, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_kv_block,
             [tK.cord(req, 0, head), tK.cord2tma(0, KVTile, 0)],
@@ -203,7 +206,7 @@ dae.i(
 
 # print("Launching Attention DAE...")
 
-dae.launch()
+dae_app(dae)
 
 def gqa_ref():
     Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)     # [B, Hkv, G, D]
@@ -234,4 +237,3 @@ def gqa_ref():
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO, matO_attn_view)
 
-dae_app(dae)

@@ -120,6 +120,7 @@ Typical Python-only areas include:
 - The benchmark command succeeded against the existing environment and extension artifacts.
 - For the isolated `N=8` MMA GEMV path, use `app/python/gemv_mma_out.py` as the dedicated harness instead of modifying `app/python/gemv_out.py`.
 - For isolated decode-attention kernel changes, use `app/python/attention_simple_decoding.py` as the primary correctness and quick-timing harness; it exercises the shared attention opcode path without requiring a full model schedule.
+- In the isolated attention harnesses, derive `num_kv_block` and `last_active_kv_len` from each request's actual `seq_lengths[req]`, not from the backing `KV_SEQ_LEN`; if compute expects more KV blocks than `RepeatM.on(...)` produces, the launch can idle after `[launch]` waiting on missing K/V tiles.
 - Set `ATTENTION_IMPL=mma` when you want that harness to exercise the explicit non-Hopper MMA attention opcodes; leave it unset (or use `ATTENTION_IMPL=hopper`) to stay on the default Hopper GMMA path.
 - `app/python/attention.py` currently calls the attention instruction with a stale constructor signature and is not a reliable smoke test until that script is updated.
 - If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
