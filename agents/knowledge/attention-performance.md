@@ -18,3 +18,13 @@
   - `cuobjdump --dump-sass runtime.o | wc -l`
 - For an end-to-end timing sanity check, use:
   - `python tests/script/run_with_launch_timeout.py --post-launch-timeout 180 --post-launch-idle-timeout 30 -- python app/python/llama3/sched.py -b 1`
+
+## Split Post-Reduce Load Sizing
+
+- `MemoryInstruction` encodes `size` in a `uint16`, so a single memory op cannot exceed `65535` bytes.
+- For attention split post-reduce, the split-output load size is:
+  - `num_split * num_q * head_dim * sizeof(bf16)`
+- Large split counts like `split_kv=64` can overflow this field when `num_q=HEAD_GROUP_SIZE`.
+- The current compare-kitten split clients keep `num_q=HEAD_GROUP_SIZE` and instead chunk the split-output load along the split dimension so each `tO_split` load stays within about `32 KiB`.
+- The chunk size is:
+  - `floor(32 KiB / (HEAD_GROUP_SIZE * head_dim * sizeof(bf16)))`

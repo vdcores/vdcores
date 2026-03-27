@@ -14,14 +14,14 @@ from qwen3.utils import *
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 32768
+KV_SEQ_LEN = 65536
 HEAD_DIM = 128
 HIDDEN_SIZE = 1024
 NUM_Q_HEAD = 8
 NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 64
-seq_lengths = [512] * 1
+seq_lengths = [65536] * 1
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -29,10 +29,13 @@ assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must mat
 QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
-split_kv = 2
+split_kv = 64
 assert split_kv <= MAX_SPLIT
 num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
 assert num_sms <= 132 # max sm count for HX00
+POST_SPLIT_LOAD_LIMIT_BYTES = 32 * 1024
+SPLITS_PER_POST_LOAD = min(max(1, POST_SPLIT_LOAD_LIMIT_BYTES // (HEAD_GROUP_SIZE * HEAD_DIM * 2)), split_kv)
+assert split_kv % SPLITS_PER_POST_LOAD == 0, "For simplicity we require split_kv to be divisible by SPLITS_PER_POST_LOAD"
 
 dae = Launcher(num_sms, device=gpu)
 
@@ -169,13 +172,13 @@ tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v,
 
 
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
-    assert tileS == split_kv
+    assert tileS <= split_kv
     assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
     S, R, H, G, D = mat.shape
     permute = [4, 3, 0, 2, 1] # [D, G, S, H, R]
     glob_dims = [mat.shape[i] for i in permute]
     glob_strides = [mat.stride(i) * mat.element_size() for i in permute[1:]]
-    box_dims = [D, G, split_kv, 1, 1]
+    box_dims = [D, G, tileS, 1, 1]
     rank = len(glob_dims)
     box_strides = [1] * rank
     return rank, runtime.build_tma_desc(
@@ -191,11 +194,17 @@ def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
 def cord_load_split_attn(mat: torch.Tensor, rank: int):
     assert rank == 5, "Only support 5D TMA load for split attn output"
     def cfunc(*cords):
-        assert len(cords) == 2, f"cords should be (head, req), but got {cords}"
-        return [0, 0, cords[0], cords[1]]
+        assert len(cords) == 3, f"cords should be (head, req, split_start), but got {cords}"
+        return [0, 0, cords[2], cords[0], cords[1]]
     return cfunc
 
-tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
+tO_split = TmaTensor(dae, matO_split_attn_view)._build(
+    "load", 
+    SPLITS_PER_POST_LOAD, 
+    HEAD_GROUP_SIZE * HEAD_DIM, 
+    tma_load_split_attn, 
+    cord_load_split_attn,
+)
 
 need_norm = False
 need_rope = False
@@ -244,11 +253,11 @@ def sm_task(sm: int):
     head = sm % NUM_KV_HEAD
     req = sm // NUM_KV_HEAD
     insts += [
-        ATTN_SPLIT_POST_REDUCE(split_kv, num_q=HEAD_GROUP_SIZE),
+        ATTN_SPLIT_POST_REDUCE(SPLITS_PER_POST_LOAD, split_kv, num_q=HEAD_GROUP_SIZE),
         TmaLoad1D(matP[head, req, :split_kv]).bar(attn_bar),
-        # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
-        # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
-        tO_split.cord(head, req),
+        RepeatM.on((split_kv + SPLITS_PER_POST_LOAD - 1) // SPLITS_PER_POST_LOAD,
+            [tO_split.cord(head, req, 0), tO_split.cord2tma(0, 0, SPLITS_PER_POST_LOAD)]
+        ),
         TmaStore1D(matO_attn_view[req, head, ...]),
     ]
     return insts

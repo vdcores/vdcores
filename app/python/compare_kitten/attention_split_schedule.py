@@ -37,6 +37,8 @@ KVTile = 64
 num_sms = 132
 schedule_mode = 'vdc' # 'no_split', 'static_split', 'vdc'
 static_split_token_size = 512
+POST_SPLIT_LOAD_LIMIT_BYTES = 32 * 1024
+SPLITS_PER_POST_LOAD = max(1, POST_SPLIT_LOAD_LIMIT_BYTES // (HEAD_GROUP_SIZE * HEAD_DIM * 2))
 
 dae = Launcher(num_sms, device=gpu)
 
@@ -167,13 +169,13 @@ def cord_load_v(mat: torch.Tensor, rank: int):
 
 
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO, split_kv):
-    assert tileS == split_kv
+    assert tileS <= split_kv
     assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
     S, R, H, G, D = mat.shape
     permute = [4, 3, 0, 2, 1] # [D, G, S, H, R]
     glob_dims = [mat.shape[i] for i in permute]
     glob_strides = [mat.stride(i) * mat.element_size() for i in permute[1:]]
-    box_dims = [D, G, split_kv, 1, 1]
+    box_dims = [D, G, tileS, 1, 1]
     rank = len(glob_dims)
     box_strides = [1] * rank
     return rank, runtime.build_tma_desc(
@@ -189,8 +191,8 @@ def tma_load_split_attn(mat: torch.Tensor, tileS, tileO, split_kv):
 def cord_load_split_attn(mat: torch.Tensor, rank: int):
     assert rank == 5, "Only support 5D TMA load for split attn output"
     def cfunc(*cords):
-        assert len(cords) == 2, f"cords should be (head, req), but got {cords}"
-        return [0, 0, cords[0], cords[1]]
+        assert len(cords) == 3, f"cords should be (head, req, split_start), but got {cords}"
+        return [0, 0, cords[2], cords[0], cords[1]]
     return cfunc
 
 tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
@@ -376,7 +378,19 @@ class SchedPlan:
             for lane, (group_id, wave_idx) in enumerate(zip(self.post_groups, self.post_waves))
         }
         self.attn_bar = dae.new_bar(NUM_KV_HEAD * self.split_level)
-        self.tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", self.split_level, HEAD_GROUP_SIZE*HEAD_DIM, partial(tma_load_split_attn, split_kv=self.split_level), cord_load_split_attn)
+        self.tO_split_by_chunk = {
+            chunk: TmaTensor(
+                dae,
+                matO_split_attn_view,
+            )._build(
+                "load",
+                chunk,
+                HEAD_GROUP_SIZE * HEAD_DIM,
+                partial(tma_load_split_attn, split_kv=self.split_level),
+                cord_load_split_attn,
+            )
+            for chunk in range(1, min(SPLITS_PER_POST_LOAD, self.split_level) + 1)
+        }
 
     def sm_attn_task(self, sm: int):
         sm_group = sm // NUM_KV_HEAD
@@ -422,7 +436,14 @@ class SchedPlan:
         insts.extend([
             ATTN_SPLIT_POST_REDUCE(self.split_level, num_q=HEAD_GROUP_SIZE),
             TmaLoad1D(matP[head, self.request_idx, :self.split_level]).bar(self.attn_bar),
-            self.tO_split.cord(head, self.request_idx),
+            *[
+                self.tO_split_by_chunk[min(SPLITS_PER_POST_LOAD, self.split_level - split_base)].cord(
+                    head,
+                    self.request_idx,
+                    split_base,
+                )
+                for split_base in range(0, self.split_level, SPLITS_PER_POST_LOAD)
+            ],
             TmaStore1D(matO_attn_view[self.request_idx, head, ...]),
         ])
         return insts

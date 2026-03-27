@@ -933,6 +933,7 @@ template <int HEAD_DIM,
           int THREADS_PER_Q,   // tuning knob: threads assigned to each Q row
           typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_split_post_reduce(
+    const int split_block_size,
     const int num_split,
     void *base,
     float* smem_reduce,
@@ -953,16 +954,12 @@ __device__ __forceinline__ void task_split_post_reduce(
     using accum_t = float;
     using Tr      = F16Traits<data_t>;
     using vec2_t  = typename Tr::vec2_t;
-
     const int thread_id = threadIdx.x;
     const int my_q      = thread_id / THREADS_PER_Q;
     const int my_i_base = (thread_id % THREADS_PER_Q) * ELEMS_PER_THREAD;
 
     auto layout_sO = make_layout(
         make_shape(Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
-        LayoutRight{});
-    auto layout_split_O = make_layout(
-        make_shape(num_split, Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
         LayoutRight{});
     auto layout_lse = make_layout(
         make_shape(num_split, Int<NUM_Q>{}),
@@ -989,31 +986,39 @@ __device__ __forceinline__ void task_split_post_reduce(
     __sync_compute_group(128);
     c2m.push(thread_id, slot_lse);
 
-    // Block on the TMA only now — overlap with phase 1 gives it extra time to complete.
-    const int slot_split = m2c.template pop<0>();
-    const vec2_t* __restrict__ split_O_ptr = (vec2_t*)get_slot_address(base, extract(slot_split));
-    auto split_O = make_tensor(make_smem_ptr(split_O_ptr), layout_split_O);
 
     // Phase 2: accumulate. No rolling sp term — global max is fixed, inner loop is pure fma.
     float2 acc[ELEMS_PER_THREAD];
+    auto layout_split_O = make_layout(
+        make_shape(split_block_size, Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
+        LayoutRight{});
+
     #pragma unroll
     for (int e = 0; e < ELEMS_PER_THREAD; ++e) acc[e] = {0.f, 0.f};
 
     if (thread_id < ACTIVE_THREADS) {
-        for (int s = 0; s < num_split; ++s) {
-            const accum_t sn = sn_arr[s];
-            #pragma unroll
-            for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
-                float2 oo = Tr::to_float2(split_O(s, my_q, my_i_base + e));
-                acc[e].x += oo.x * sn;
-                acc[e].y += oo.y * sn;
+        for (int split_base = 0; split_base < num_split; split_base += split_block_size) {
+            const int chunk_split = min(num_split - split_base, split_block_size);
+            const int slot_split = m2c.template pop<0>();
+            const vec2_t* __restrict__ split_O_ptr = (vec2_t*)get_slot_address(base, extract(slot_split));
+            // layout is padded to block size but access should not
+            auto split_O = make_tensor(make_smem_ptr(split_O_ptr), layout_split_O);
+
+            for (int s = 0; s < chunk_split; ++s) {
+                const accum_t sn = sn_arr[split_base + s];
+                #pragma unroll
+                for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
+                    float2 oo = Tr::to_float2(split_O(s, my_q, my_i_base + e));
+                    acc[e].x += oo.x * sn;
+                    acc[e].y += oo.y * sn;
+                }
             }
+            __sync_compute_group(128);
+            c2m.push(thread_id, slot_split);
         }
     }
 
-    // One sync covers all splits. Idle threads just wait here.
     __sync_compute_group(128);
-    c2m.push(thread_id, slot_split);
 
     // Normalize and write to output smem.
     const int slot_final = m2c.template pop<0>();
