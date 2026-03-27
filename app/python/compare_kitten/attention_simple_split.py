@@ -167,6 +167,35 @@ tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cor
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
+def tma_store_lse(mat: torch.Tensor, tileS: int, tileD):
+    assert tileS == 1
+    assert tileD == HEAD_GROUP_SIZE
+    assert mat.element_size() == 4, "Only support float32 for lse output"
+    H, Q, S = mat.shape
+    assert Q == NUM_REQ * HEAD_GROUP_SIZE
+    assert S == MAX_SPLIT
+    glob_dims = [H, Q, S]
+    glob_strides = [e * mat.element_size() for e in [mat.stride(0), mat.stride(1), mat.stride(2)]]
+    box_dims = [1, tileD, 1]
+    rank = len(glob_dims)
+    box_strides = [1] * rank
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        box_strides,
+        0,
+        0
+    )
+
+def cord_store_lse(mat: torch.Tensor, rank: int):
+    assert rank == 3, "Only support 3D TMA store for lse"
+    def cfunc(*cords):
+        assert len(cords) == 3, f"cords should be (head, req, split), but got {cords}"
+        return [cords[0], cords[1] * HEAD_GROUP_SIZE, cords[2]]
+    return cfunc
+
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
     assert tileS == split_kv
     assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
@@ -194,6 +223,7 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
         return [0, 0, cords[0], cords[1]]
     return cfunc
 
+tLSE = TmaTensor(dae, matP)._build("store", 1, HEAD_GROUP_SIZE, tma_store_lse, cord_store_lse)
 tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
 
 need_norm = False
@@ -234,8 +264,8 @@ def sm_task(sm: int):
         ),
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(matO_split_attn_view[split_stage, req, head, ...]),
-        TmaStore1D(matP[head, req * HEAD_GROUP_SIZE: (req+1) * HEAD_GROUP_SIZE]).bar(attn_bar),
+        TmaStore1D(matO_split_attn_view[split_stage, req, head, ...], numSlots = 2),
+        tLSE.cord(head, req, split_stage).bar(attn_bar),
     ]
 
     if sm >= NUM_KV_HEAD * NUM_REQ:
@@ -294,42 +324,44 @@ def split_ref(split_stage):
     Returns O_local = softmax_local(Q @ K_split^T / sqrt(D)) @ V_split  [B, Hkv, G, D]
     and     lse     = max_local + log(sum_local)                         [B, Hkv, G]
     """
-    num_block_per_split = NUM_KV_BLOCK // split_kv
-    kv_start = split_stage * num_block_per_split * KVTile
-    kv_end   = kv_start + num_block_per_split * KVTile
-    split_last_active = last_active_kv_len if split_stage == split_kv - 1 else KVTile
-    total_active = (num_block_per_split - 1) * KVTile + split_last_active
-
     Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
     K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
     V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
-
-    K_split = K[:, :, kv_start:kv_end, :]   # [B, Hkv, S_split, D]
-    V_split = V[:, :, kv_start:kv_end, :]
+    ref_o = torch.zeros(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=gpu)
+    ref_lse = torch.full((NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE), float("-inf"), dtype=torch.float32, device=gpu)
 
     scale = 1.0 / sqrt(HEAD_DIM)
-    QK = torch.matmul(Q * scale, K_split.transpose(-1, -2))  # [B, Hkv, G, S_split]
+    for req in range(NUM_REQ):
+        _, num_block_per_split, _, kv_start, kv_end, total_active, _ = split_bounds(seq_lengths[req], split_stage)
+        if total_active == 0 or num_block_per_split == 0:
+            continue
 
-    # mask tokens beyond the active length in this split's last block
-    S_split = kv_end - kv_start
-    active_kv_len = torch.tensor(seq_lengths, device=gpu, dtype=torch.long)
-    mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= active_kv_len[:, None, None, None]
-    QK = QK.masked_fill(mask, float("-inf"))
+        k_split = K[req:req + 1, :, kv_start:kv_end, :]
+        v_split = V[req:req + 1, :, kv_start:kv_end, :]
+        q = Q[req:req + 1]
 
-    lse  = torch.logsumexp(QK, dim=-1)    # [B, Hkv, G]
-    attn = torch.softmax(QK, dim=-1)      # [B, Hkv, G, S_split]
-    O    = torch.matmul(attn, V_split)    # [B, Hkv, G, D]
+        qk = torch.matmul(q * scale, k_split.transpose(-1, -2))
+        split_span = kv_end - kv_start
+        mask = torch.arange(split_span, device=gpu)[None, None, None, :] >= total_active
+        qk = qk.masked_fill(mask, float("-inf"))
 
-    return O.bfloat16(), lse
+        qk_f = qk.float()
+        row_max = qk_f.amax(dim=-1)
+        qk_exp2 = torch.exp2(qk_f - row_max.unsqueeze(-1))
+        row_sum = qk_exp2.sum(dim=-1)
+        ref_lse[req] = (row_max + torch.log2(row_sum)).squeeze(0)
+        attn = (qk_exp2 / row_sum.unsqueeze(-1)).to(v_split.dtype)
+        ref_o[req] = torch.matmul(attn, v_split).to(torch.bfloat16).squeeze(0)
+
+    return ref_o, ref_lse
 
 
-# for s in range(split_kv):
-#     ref_O, ref_lse = split_ref(s)
-#     # matO_split_attn_view: [split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM]
-#     tensor_diff(f"Split {s} O", ref_O[0], matO_split_attn_view[s, 0])
-#     # matP: [NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, split_kv], written as float32 by kernel
-#     ref_lse_hkv = ref_lse[0]  # [Hkv, G]
-#     tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
+for s in range(split_kv):
+    ref_split_o, ref_split_lse = split_ref(s)
+    tensor_diff(f"Split {s} O", ref_split_o, matO_split_attn_view[s])
+
+    ref_split_lse_view = ref_split_lse.permute(1, 0, 2).reshape(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE)
+    tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, :, s].float())
 
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO, matO_attn_view)

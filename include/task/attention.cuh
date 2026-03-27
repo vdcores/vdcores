@@ -654,16 +654,13 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     if constexpr (SPLIT_KV) {
         const int slot_lse = m2c.template pop<0>();
         accum_t* __restrict__ sLSE_ptr = (accum_t*)get_slot_address(base, extract(slot_lse));
-        auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), make_layout(
-            make_shape(num_active_q, Int<MAX_SPLIT>{}),
-            LayoutRight{}));
         constexpr int tSRow = decltype(size<1>(o_mn_view))::value;
         #pragma unroll
         for (int r = 0; r < tSRow; ++r) {
             const int q_row = (thread_id / 32) * 16 + (thread_id % 32) / 4 + r * 8;
             if (q_row < num_active_q) {
                 const accum_t lse = online_softmax.row_max(r) + log2f(online_softmax.row_sum(r));
-                sLSE(q_row, split_idx) = lse;
+                sLSE_ptr[q_row] = lse;
             }
         }
         __sync_compute_group(128);
