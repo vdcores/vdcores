@@ -7,19 +7,23 @@ from collections import defaultdict
 from dae.launcher import *
 from dae.util import *
 from dae.runtime import opcode, build_tma_desc 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from qwen3.utils import *
 
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 32768
+KV_SEQ_LEN = 65536
 HEAD_DIM = 128
-HIDDEN_SIZE = 4096
-NUM_Q_HEAD = 32
-NUM_KV_HEAD = 8
+HIDDEN_SIZE = 1024
+NUM_Q_HEAD = 8
+NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 64
-seq_lengths = [16384] + [1024] * 8
+seq_lengths = [65536]
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -27,7 +31,7 @@ assert len(seq_lengths) == NUM_REQ, "Length of seq_lengths must match NUM_REQ"
 for seq_len in seq_lengths:
     assert seq_len <= KV_SEQ_LEN, "Sequence length must be less than or equal to KV_SEQ_LEN"
 
-QTile = 16
+QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
 num_sms = 132
@@ -66,9 +70,9 @@ def tma_load_o(mat: torch.Tensor, tileK: int, tileN: int):
     assert tileK == 128 and tileN == 64, "tile must be 128x64"
 
     # this will dup for 16 times, due to 0 in strides, do not know how tma engine will handle it
-    glob_dims = [64, 4, 16, 2, NUM_REQ * NUM_KV_HEAD]
+    glob_dims = [64, HEAD_GROUP_SIZE, QTile, 2, NUM_REQ * NUM_KV_HEAD]
     glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
-    box_dims = [64, 4, 16, 2, 1]
+    box_dims = [64, HEAD_GROUP_SIZE, QTile, 2, 1]
 
     rank = len(glob_dims)
     box_strides = [1] * rank
@@ -214,7 +218,6 @@ def choose_split_level(num_kv_blocks: int, target_blocks_per_shard: float, mode:
         chunk_size = static_split_token_size // KVTile
         return max(1, min(MAX_SPLIT, num_kv_blocks // chunk_size))
     legal = legal_split_levels(num_kv_blocks)
-    print(target_blocks_per_shard, num_kv_blocks, legal)
     for split in legal:
         if num_kv_blocks / split <= target_blocks_per_shard:
             return split
@@ -484,12 +487,12 @@ print(
     f"max={attn_metrics['max_work']} mean={attn_metrics['mean_work']:.2f} "
     f"imbalance={attn_metrics['imbalance']:.3f} utilization={attn_metrics['utilization']:.3f}"
 )
-for plan in plans:
-    print(
-        f"[sched] req={plan.request_idx} blocks={plan.num_kv_block} split={plan.split_level} "
-        f"attn_groups={plan.attn_groups} attn_waves={plan.attn_waves} "
-        f"post_groups={plan.post_groups} post_waves={plan.post_waves}"
-    )
+# for plan in plans:
+#     print(
+#         f"[sched] req={plan.request_idx} blocks={plan.num_kv_block} split={plan.split_level} "
+#         f"attn_groups={plan.attn_groups} attn_waves={plan.attn_waves} "
+#         f"post_groups={plan.post_groups} post_waves={plan.post_waves}"
+#     )
 
 dae.i(
     [plan.sm_attn_task for plan in plans],
@@ -530,40 +533,41 @@ def gqa_ref():
     return QK, torch.matmul(attn, V)
 
 
-def split_ref(plan: SchedPlan, split_stage: int):
+def split_ref(split_stage):
     """Per-split reference: each split computes local softmax only over its own KV slice.
     Returns O_local = softmax_local(Q @ K_split^T / sqrt(D)) @ V_split  [B, Hkv, G, D]
     and     lse     = max_local + log(sum_local)                         [B, Hkv, G]
     """
-    num_block_per_split = plan.num_block_per_split
-    kv_start = split_stage * num_block_per_split * KVTile
-    kv_end = kv_start + num_block_per_split * KVTile
-    total_active = min(max(plan.seq_length - kv_start, 0), kv_end - kv_start)
-
-    Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)[plan.request_idx : plan.request_idx + 1]
-    K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)[plan.request_idx : plan.request_idx + 1]
-    V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)[plan.request_idx : plan.request_idx + 1]
-
-    K_split = K[:, :, kv_start:kv_end, :]   # [B, Hkv, S_split, D]
-    V_split = V[:, :, kv_start:kv_end, :]
+    Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+    K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
+    V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
+    ref_o = torch.zeros(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=gpu)
+    ref_lse = torch.full((NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE), float("-inf"), dtype=torch.float32, device=gpu)
 
     scale = 1.0 / sqrt(HEAD_DIM)
-    QK = torch.matmul(Q * scale, K_split.transpose(-1, -2))  # [B, Hkv, G, S_split]
+    for req in range(NUM_REQ):
+        _, num_block_per_split, _, kv_start, kv_end, total_active, _ = split_bounds(seq_lengths[req], split_stage)
+        if total_active == 0 or num_block_per_split == 0:
+            continue
 
-    # mask tokens beyond the active length in this split's last block
-    S_split = kv_end - kv_start
-    mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= total_active
-    QK = QK.masked_fill(mask, float("-inf"))
+        k_split = K[req:req + 1, :, kv_start:kv_end, :]
+        v_split = V[req:req + 1, :, kv_start:kv_end, :]
+        q = Q[req:req + 1]
 
-    QKf = QK.float()
-    row_max = QKf.amax(dim=-1)
-    QKexp2 = torch.exp2(QKf - row_max.unsqueeze(-1))
-    row_sum = QKexp2.sum(dim=-1)
-    lse = row_max + torch.log2(row_sum)   # [B, Hkv, G]
-    attn = (QKexp2 / row_sum.unsqueeze(-1)).to(V_split.dtype)
-    O    = torch.matmul(attn, V_split)    # [B, Hkv, G, D]
+        qk = torch.matmul(q * scale, k_split.transpose(-1, -2))
+        split_span = kv_end - kv_start
+        mask = torch.arange(split_span, device=gpu)[None, None, None, :] >= total_active
+        qk = qk.masked_fill(mask, float("-inf"))
 
-    return O.bfloat16(), lse
+        qk_f = qk.float()
+        row_max = qk_f.amax(dim=-1)
+        qk_exp2 = torch.exp2(qk_f - row_max.unsqueeze(-1))
+        row_sum = qk_exp2.sum(dim=-1)
+        ref_lse[req] = (row_max + torch.log2(row_sum)).squeeze(0)
+        attn = (qk_exp2 / row_sum.unsqueeze(-1)).to(v_split.dtype)
+        ref_o[req] = torch.matmul(attn, v_split).to(torch.bfloat16).squeeze(0)
+
+    return ref_o, ref_lse
 
 
 # for plan in plans:
@@ -574,5 +578,5 @@ def split_ref(plan: SchedPlan, split_stage: int):
 #         tensor_diff(f"Req {plan.request_idx} Split {s} O", ref_O[0], matO_split_attn_view[s, plan.request_idx])
 #         tensor_diff(f"Req {plan.request_idx} Split {s} LSE", ref_lse[0], matP[:, plan.request_idx, s, :].float())
 
-# refQK, refO = gqa_ref()
-# tensor_diff("Ref and DAE", refO, matO_attn_view)
+refQK, refO = gqa_ref()
+tensor_diff("Ref and DAE", refO, matO_attn_view)
