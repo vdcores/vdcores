@@ -223,11 +223,11 @@ def sm_task(sm: int):
     head = ofst_in_group % NUM_KV_HEAD
     req = ofst_in_group // NUM_KV_HEAD
     seq_length = seq_lengths[req]
-    _, num_block_per_split, _, kv_start_idx, _, total_active, split_last_active_kv_len = split_bounds(seq_length, split_stage)
+    _, num_block_per_split, kv_start_block, kv_start_idx, _, total_active, split_last_active_kv_len = split_bounds(seq_length, split_stage)
     if total_active == 0:
         return []
     insts = [
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, split_stage, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_idx, need_norm=need_norm, need_rope=need_rope),
+        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_block, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_block_per_split,
             [tK.cord(req, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],

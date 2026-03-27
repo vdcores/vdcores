@@ -200,13 +200,12 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
-    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
-        assert split_idx < 64, "split_idx must be less than 64 to fit in the instruction encoding"
-        assert num_active_q < 16, "for decoding only"
-        # pack need_norm and need_rope into a uint16 arg
-        arg0 = num_kv_block | (num_active_q << 12)
-        arg1 = split_idx | (last_kv_active_token_len << 8)
-        arg2 = kv_start_idx # make this 16bit to support long seq
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, kv_start_block_idx: int, need_norm: bool = True, need_rope: bool = True):
+        assert 0 <= num_active_q < 256, "num_active_q must fit in 8 bits"
+        assert 0 <= last_kv_active_token_len < 256, "last_kv_active_token_len must fit in 8 bits"
+        arg0 = num_kv_block
+        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        arg2 = kv_start_block_idx
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 
             args=[arg0, arg1, arg2]
@@ -215,11 +214,12 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA(ComputeInstruction):
     HEAD_DIM = 128
-    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
-        assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
-        arg0 = num_kv_block | (split_idx << 12)
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, kv_start_block_idx: int, need_norm: bool = True, need_rope: bool = True):
+        assert 0 <= num_active_q < 256, "num_active_q must fit in 8 bits"
+        assert 0 <= last_kv_active_token_len < 256, "last_kv_active_token_len must fit in 8 bits"
+        arg0 = num_kv_block
         arg1 = num_active_q | (last_kv_active_token_len << 8)
-        arg2 = kv_start_idx
+        arg2 = kv_start_block_idx
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA,
             args=[arg0, arg1, arg2]

@@ -400,7 +400,7 @@ class SchedPlan:
         kv_start_idx = kv_start_block * KVTile
         split_last_active_kv_len = last_active_kv_len if split == self.split_level - 1 else KVTile
         insts.extend([
-            ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(self.num_block_per_split, split, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_idx, need_norm=need_norm, need_rope=need_rope),
+            ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(self.num_block_per_split, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_block, need_norm=need_norm, need_rope=need_rope),
             tQ.cord(self.request_idx, head),
             RepeatM.on(self.num_block_per_split,
                 [tK.cord(self.request_idx, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],

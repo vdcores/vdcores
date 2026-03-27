@@ -300,15 +300,13 @@ template <int HEAD_DIM,
           int Q_BLOCK_SIZE,
           int KV_BLOCK_SIZE,
           bool SPLIT_KV,
-          int MAX_SPLIT,
           bool NEED_NORM, bool NEED_ROPE,
           typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int num_kv_blocks,
-    const int split_idx,
     const int num_active_q, // to avoid overwriting other split_kv metadata buffer
     const int last_kv_active_token_len, // real kv tokens in the last block
-    const int kv_start_idx, // global token-pos of first kv token, for prefill mask calculation
+    const int kv_start_block_idx,
     const bool runtime_need_norm,
     const bool runtime_need_rope,
     void *base,
@@ -317,6 +315,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
+    (void)kv_start_block_idx;
     // Q: [HEAD_GROUP_SIZE, HEAD_DIM]
     // K, V: [SEQ_LEN, HEAD_DIM]
 
@@ -672,7 +671,6 @@ template <int HEAD_DIM,
           int Q_BLOCK_SIZE,
           int KV_BLOCK_SIZE,
           bool SPLIT_KV,
-          int MAX_SPLIT,
           bool NEED_NORM, bool NEED_ROPE,
           typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type,
           template <class> class LayoutQAtom = cute::GMMA::Layout_K_SW128_Atom,
@@ -680,10 +678,9 @@ template <int HEAD_DIM,
           template <class> class LayoutVAtom = cute::GMMA::Layout_MN_SW128_Atom>
 __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
     const int num_kv_blocks,
-    const int split_idx,
     const int num_active_q,
     const int last_kv_active_token_len,
-    const int kv_start_idx,
+    const int kv_start_block_idx,
     const bool runtime_need_norm,
     const bool runtime_need_rope,
     void *base,
@@ -692,6 +689,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
+    (void)kv_start_block_idx;
     using namespace cute;
     using AtomTrait = MMA_Traits<AtomQK>;
     using data_t = typename AtomTrait::ValTypeA;
@@ -932,7 +930,6 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
 template <int HEAD_DIM,
           int NUM_Q,
           int KV_BLOCK_SIZE,
-          int MAX_SPLIT,
           int THREADS_PER_Q,   // tuning knob: threads assigned to each Q row
           typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_split_post_reduce(
@@ -978,7 +975,7 @@ __device__ __forceinline__ void task_split_post_reduce(
     // Phase 1: preprocess LSE while the split-O TMA load is still in flight.
     // Each thread caches num_split scale factors (one scalar per spl
     // TODO(zijian): should have bank conflict, let 1 thread do reduce and broadcast
-    accum_t sn_arr[MAX_SPLIT];
+    accum_t sn_arr[64];
     accum_t sum_all = 0.f;
     if (thread_id < ACTIVE_THREADS) {
         accum_t max_all = -FLT_MAX;
