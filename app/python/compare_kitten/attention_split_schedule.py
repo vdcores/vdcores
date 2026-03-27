@@ -41,7 +41,7 @@ matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(MAX_SPLIT, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, MAX_SPLIT, dtype=torch.float, device=gpu)
+matP = torch.zeros(NUM_KV_HEAD, NUM_REQ, MAX_SPLIT, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
@@ -190,7 +190,7 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
     return cfunc
 
 tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
-tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_v)
+tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
 need_norm = False
@@ -403,8 +403,8 @@ class SchedPlan:
                 [tK.cord(self.request_idx, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],
                 [tV.cord(self.request_idx, kv_start_idx, head), tV.cord2tma(0, KVTile, 0)],
             ),
-            TmaStore1D(matO_split_attn_view[split, self.request_idx, head, ...]),
-            TmaStore1D(matP[head, self.request_idx * HEAD_GROUP_SIZE: (self.request_idx+1) * HEAD_GROUP_SIZE]).bar(self.attn_bar),
+            TmaStore1D(matO_split_attn_view[split, self.request_idx, head, ...], numSlots = 2),
+            TmaStore1D(matP[head, self.request_idx, split]).bar(self.attn_bar),
         ])
         return insts
 
@@ -418,7 +418,7 @@ class SchedPlan:
         insts = []
         insts.extend([
             ATTN_SPLIT_POST_REDUCE(self.split_level, num_q=HEAD_GROUP_SIZE),
-            TmaLoad1D(matP[head, self.request_idx * HEAD_GROUP_SIZE: (self.request_idx+1) * HEAD_GROUP_SIZE]).bar(self.attn_bar),
+            TmaLoad1D(matP[head, self.request_idx, :self.split_level]).bar(self.attn_bar),
             self.tO_split.cord(head, self.request_idx),
             TmaStore1D(matO_attn_view[self.request_idx, head, ...]),
         ])
@@ -537,9 +537,8 @@ def split_ref(plan: SchedPlan, split_stage: int):
     """
     num_block_per_split = plan.num_block_per_split
     kv_start = split_stage * num_block_per_split * KVTile
-    kv_end   = kv_start + num_block_per_split * KVTile
-    split_last_active = last_active_kv_len if split_stage == plan.split_level - 1 else KVTile
-    total_active = (num_block_per_split - 1) * KVTile + split_last_active
+    kv_end = kv_start + num_block_per_split * KVTile
+    total_active = min(max(plan.seq_length - kv_start, 0), kv_end - kv_start)
 
     Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)[plan.request_idx : plan.request_idx + 1]
     K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)[plan.request_idx : plan.request_idx + 1]
@@ -556,8 +555,12 @@ def split_ref(plan: SchedPlan, split_stage: int):
     mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= total_active
     QK = QK.masked_fill(mask, float("-inf"))
 
-    lse  = torch.logsumexp(QK, dim=-1)    # [B, Hkv, G]
-    attn = torch.softmax(QK, dim=-1)      # [B, Hkv, G, S_split]
+    QKf = QK.float()
+    row_max = QKf.amax(dim=-1)
+    QKexp2 = torch.exp2(QKf - row_max.unsqueeze(-1))
+    row_sum = QKexp2.sum(dim=-1)
+    lse = row_max + torch.log2(row_sum)   # [B, Hkv, G]
+    attn = (QKexp2 / row_sum.unsqueeze(-1)).to(V_split.dtype)
     O    = torch.matmul(attn, V_split)    # [B, Hkv, G, D]
 
     return O.bfloat16(), lse
@@ -569,9 +572,7 @@ def split_ref(plan: SchedPlan, split_stage: int):
 #     for s in range(plan.split_level):
 #         ref_O, ref_lse = split_ref(plan, s)
 #         tensor_diff(f"Req {plan.request_idx} Split {s} O", ref_O[0], matO_split_attn_view[s, plan.request_idx])
-#         start = plan.request_idx * HEAD_GROUP_SIZE
-#         end = start + HEAD_GROUP_SIZE
-#         tensor_diff(f"Req {plan.request_idx} Split {s} LSE", ref_lse[0], matP[:, start:end, s].float())
+#         tensor_diff(f"Req {plan.request_idx} Split {s} LSE", ref_lse[0], matP[:, plan.request_idx, s, :].float())
 
 # refQK, refO = gqa_ref()
 # tensor_diff("Ref and DAE", refO, matO_attn_view)
