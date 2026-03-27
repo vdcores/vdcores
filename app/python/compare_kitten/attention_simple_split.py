@@ -202,7 +202,7 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
 tO_split = TmaTensor(dae, matO_split_attn_view)._build(
     "load", 
     SPLITS_PER_POST_LOAD, 
-    1,
+    HEAD_DIM,
     tma_load_split_attn, 
     cord_load_split_attn,
 )

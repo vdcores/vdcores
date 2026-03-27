@@ -957,6 +957,7 @@ __device__ __forceinline__ void task_split_post_reduce(
     const int thread_id = threadIdx.x;
     const int my_q      = thread_id / THREADS_PER_Q;
     const int my_i_base = (thread_id % THREADS_PER_Q) * ELEMS_PER_THREAD;
+    const int q_lane    = thread_id % THREADS_PER_Q;
 
     auto layout_sO = make_layout(
         make_shape(Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
@@ -964,27 +965,39 @@ __device__ __forceinline__ void task_split_post_reduce(
     auto layout_lse = make_layout(
         make_shape(num_split, Int<NUM_Q>{}),
         LayoutRight{});
+    auto layout_scale = make_layout(
+        make_shape(num_split, Int<NUM_Q>{}),
+        LayoutRight{});
+    auto layout_qsum = make_layout(
+        make_shape(Int<NUM_Q>{}),
+        LayoutRight{});
+
+    accum_t* scale_ptr = smem_reduce;
+    accum_t* sum_ptr = scale_ptr + num_split * NUM_Q;
+    auto sScale = make_tensor(make_smem_ptr(scale_ptr), layout_scale);
+    auto sQSum = make_tensor(make_smem_ptr(sum_ptr), layout_qsum);
 
     const int slot_lse = m2c.template pop<0>();
     const accum_t* __restrict__ sLSE_ptr = (accum_t*)get_slot_address(base, extract(slot_lse));
     auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), layout_lse);
 
     // Phase 1: preprocess LSE while the split-O TMA load is still in flight.
-    // Each thread caches num_split scale factors (one scalar per spl
-    // TODO(zijian): should have bank conflict, let 1 thread do reduce and broadcast
-    accum_t sn_arr[64];
     accum_t sum_all = 0.f;
-    if (thread_id < ACTIVE_THREADS) {
+    if (thread_id < ACTIVE_THREADS && q_lane == 0) {
         accum_t max_all = -FLT_MAX;
         for (int s = 0; s < num_split; ++s)
             max_all = fmaxf(max_all, sLSE(s, my_q));
         for (int s = 0; s < num_split; ++s) {
-            sn_arr[s] = exp2f(sLSE(s, my_q) - max_all);
-            sum_all  += sn_arr[s];
+            accum_t sn = exp2f(sLSE(s, my_q) - max_all);
+            sScale(s, my_q) = sn;
+            sum_all += sn;
         }
+        sQSum(my_q) = sum_all;
     }
     __sync_compute_group(128);
     c2m.push(thread_id, slot_lse);
+    if (thread_id < ACTIVE_THREADS)
+        sum_all = sQSum(my_q);
 
 
     // Phase 2: accumulate. No rolling sp term — global max is fixed, inner loop is pure fma.
@@ -1005,7 +1018,7 @@ __device__ __forceinline__ void task_split_post_reduce(
             auto split_O = make_tensor(make_smem_ptr(split_O_ptr), layout_split_O);
 
             for (int s = 0; s < chunk_split; ++s) {
-                const accum_t sn = sn_arr[split_base + s];
+                const accum_t sn = sScale(split_base + s, my_q);
                 #pragma unroll
                 for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
                     float2 oo = Tr::to_float2(split_O(s, my_q, my_i_base + e));
