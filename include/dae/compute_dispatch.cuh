@@ -105,7 +105,7 @@ static __device__ __forceinline__ void handle_attention_common(
     const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
     const int kv_start_idx = inst.args[2];
     if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
-      task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, true, 16, false, false, KernelQK, KernelPV>(
+      task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, true, 64, false, false, KernelQK, KernelPV>(
         num_kv_blocks,
         split_idx,
         num_active_q,
@@ -120,7 +120,7 @@ static __device__ __forceinline__ void handle_attention_common(
         c2m
       );
     } else {
-      task_attention_fwd_flash3_grouped<HeadDim, 64, 64, true, 16, false, false, KernelQK, KernelPV>(
+      task_attention_fwd_flash3_grouped<HeadDim, 64, 64, true, 64, false, false, KernelQK, KernelPV>(
         num_kv_blocks,
         split_idx,
         num_active_q,
@@ -189,7 +189,12 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  task_split_post_reduce<128, 4, 64, 16, 32>(inst.args[0], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  task_split_post_reduce<128, 4, 64, 64, 32>(inst.args[0], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_post_reduce<128, 8, 64, 64, 16>(inst.args[0], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {

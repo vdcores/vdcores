@@ -227,9 +227,16 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA(ComputeInstruction):
 
 class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
     HEAD_DIM = 128
-    Q_TILE = 4
-    def __init__(self, num_split: int):
-        super().__init__(opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE, args=[num_split])
+    SUPPORTED_Q_TILES = (4, 8)
+    def __init__(self, num_split: int, num_q: int = 4):
+        assert num_q in self.SUPPORTED_Q_TILES, f"unsupported split post-reduce q tile: {num_q}"
+        self.Q_TILE = num_q
+        reduce_opcode = (
+            opcode.OP_ATTN_SPLIT_POST_REDUCE
+            if num_q == 4 else
+            opcode.OP_ATTN_SPLIT_POST_REDUCE_Q8
+        )
+        super().__init__(opcode=reduce_opcode, args=[num_split])
 
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):

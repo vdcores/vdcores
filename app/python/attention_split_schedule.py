@@ -417,7 +417,7 @@ class SchedPlan:
         head = sm % NUM_KV_HEAD
         insts = []
         insts.extend([
-            ATTN_SPLIT_POST_REDUCE(self.split_level),
+            ATTN_SPLIT_POST_REDUCE(self.split_level, num_q=HEAD_GROUP_SIZE),
             TmaLoad1D(matP[head, self.request_idx * HEAD_GROUP_SIZE: (self.request_idx+1) * HEAD_GROUP_SIZE]).bar(self.attn_bar),
             self.tO_split.cord(head, self.request_idx),
             TmaStore1D(matO_attn_view[self.request_idx, head, ...]),

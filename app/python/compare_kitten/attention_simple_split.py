@@ -5,6 +5,10 @@ from functools import partial
 from dae.launcher import *
 from dae.util import *
 from dae.runtime import opcode, build_tma_desc 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from qwen3.utils import *
 
 gpu = torch.device("cuda")
@@ -12,19 +16,20 @@ torch.manual_seed(0)
 
 KV_SEQ_LEN = 32768
 HEAD_DIM = 128
-HIDDEN_SIZE = 4096
-NUM_REQ = 1
-NUM_Q_HEAD = 32
-NUM_KV_HEAD = 8
+HIDDEN_SIZE = 1024
+NUM_Q_HEAD = 8
+NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 64
+seq_lengths = [512] * 1
+NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
-QTile = 16
+QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
-split_kv = 16
+split_kv = 2
 assert split_kv <= MAX_SPLIT
 num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
 assert num_sms <= 132 # max sm count for HX00
@@ -60,10 +65,10 @@ def tma_load_o(mat: torch.Tensor, tileK: int, tileN: int):
     assert mat.element_size() == 2, "Only support float16/bfloat16 output"
     assert tileK == 128 and tileN == 64, "tile must be 128x64"
 
-    # this will dup for 16 times, due to 0 in strides, do not know how tma engine will handle it
-    glob_dims = [64, 4, 16, 2, NUM_REQ * NUM_KV_HEAD]
+    # this will dup for QTile times, due to 0 in strides, do not know how tma engine will handle it
+    glob_dims = [64, HEAD_GROUP_SIZE, QTile, 2, NUM_REQ * NUM_KV_HEAD]
     glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
-    box_dims = [64, 4, 16, 2, 1]
+    box_dims = [64, HEAD_GROUP_SIZE, QTile, 2, 1]
 
     rank = len(glob_dims)
     box_strides = [1] * rank
@@ -84,6 +89,83 @@ def cord_load_o(mat: torch.Tensor, rank: int):
         assert len(cords) == 2, f"cords should be (req, head), but got {cords}"
         return [0, 0, 0, cords[0] * NUM_KV_HEAD + cords[1]]
     return cfunc
+
+
+def tma_load_k(mat: torch.Tensor, tileK: int, tileN: int):
+    R, S, H, D = mat.shape
+    glob_dims = [64, S, 2, H, R]
+    elsize = mat.element_size()
+    glob_strides = [d * elsize for d in [mat.stride(1), 64, mat.stride(2), mat.stride(0)]]
+    box_dims = [64, tileN, 2, 1, 1]
+    rank = len(glob_dims)
+    box_strides = [1] * rank
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        box_strides,
+        128,
+        0
+    )
+
+def cord_load_k(mat: torch.Tensor, rank: int):
+    assert rank == 5, "Only support 5D TMA load for K/V"
+    def cfunc(*cords):
+        assert len(cords) == 3, f"cords should be (req, seq, head), but got {cords}"
+        r, s, h = cords
+        return [s, 0, h, r]
+    return cfunc
+
+def tma_load_v(mat: torch.Tensor, tileM: int, tileK: int):
+    # mat: [R, S, H, D]
+    R, S, H, D = mat.shape
+    elsize = mat.element_size()
+
+    assert D == HEAD_DIM
+    assert tileM == HEAD_DIM
+    assert tileK == KVTile
+    assert D % 64 == 0
+    assert S % 8 == 0
+
+    M_total = H * D  # fold head into M
+
+    glob_dims = [64, 8, M_total // 64, S // 8, R]
+    glob_strides = [
+        mat.stride(1),      # seq stride
+        64,                 # next 64 elems in folded M
+        mat.stride(1) * 8,  # next 8 seq elems
+        mat.stride(0),      # next request
+    ]
+    glob_strides = [s * elsize for s in glob_strides]
+
+    box_dims = [64, 8, tileM // 64, tileK // 8, 1]
+    rank = len(glob_dims)
+    box_strides = [1] * rank
+
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        box_strides,
+        128,
+        0,
+    )
+
+def cord_load_v(mat: torch.Tensor, rank: int):
+    assert rank == 5, "Only support 5D TMA load for V"
+    def cfunc(*cords):
+        # cords: (req, seq, head)
+        assert len(cords) == 3, f"cords should be (req, seq, head), but got {cords}"
+        r, s, h = cords
+        return [0, h * (HEAD_DIM // 64), s // 8, r]
+    return cfunc
+
+
+tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
+tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
+tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
     assert tileS == split_kv
@@ -112,19 +194,25 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
         return [0, 0, cords[0], cords[1]]
     return cfunc
 
-tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
-tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
-tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
 
 need_norm = False
 need_rope = False
 
-NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
-last_active_kv_len = KV_SEQ_LEN % KVTile or KVTile
-assert last_active_kv_len <= KVTile
-
 attn_bar = dae.new_bar(num_sms)
+
+def split_bounds(seq_length: int, split_stage: int):
+    num_kv_block = (seq_length + KVTile - 1) // KVTile
+    num_block_per_split = num_kv_block // split_kv
+    kv_start_block = split_stage * num_block_per_split
+    kv_start = kv_start_block * KVTile
+    kv_end = kv_start + num_block_per_split * KVTile
+    total_active = min(max(seq_length - kv_start, 0), kv_end - kv_start)
+    split_last_active_kv_len = total_active % KVTile
+    if total_active > 0 and split_last_active_kv_len == 0:
+        split_last_active_kv_len = KVTile
+    return num_kv_block, num_block_per_split, kv_start_block, kv_start, kv_end, total_active, split_last_active_kv_len
+
 
 def sm_task(sm: int):
     if sm >= num_sms:
@@ -133,21 +221,21 @@ def sm_task(sm: int):
     ofst_in_group = sm % (NUM_KV_HEAD * NUM_REQ)
     head = ofst_in_group % NUM_KV_HEAD
     req = ofst_in_group // NUM_KV_HEAD
-    num_block_per_split = NUM_KV_BLOCK // split_kv
-    kv_start_block = split_stage * num_block_per_split
-    kv_start_idx = kv_start_block * KVTile
-    split_last_active_kv_len = last_active_kv_len if split_stage == split_kv - 1 else KVTile
+    seq_length = seq_lengths[req]
+    _, num_block_per_split, _, kv_start_idx, _, total_active, split_last_active_kv_len = split_bounds(seq_length, split_stage)
+    if total_active == 0:
+        return []
     insts = [
         ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, split_stage, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_idx, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_block_per_split,
-            [tK.cord(req, kv_start_idx, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
-            [tV.cord(req, kv_start_idx, head, 0), tV.cord2tma(0, KVTile, 0, 0)],
+            [tK.cord(req, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],
+            [tV.cord(req, kv_start_idx, head), tV.cord2tma(0, KVTile, 0)],
         ),
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
         TmaStore1D(matO_split_attn_view[split_stage, req, head, ...]),
-        RawAddress(matP[head, req * HEAD_GROUP_SIZE], 24).bar(attn_bar).writeback(),
+        TmaStore1D(matP[head, req * HEAD_GROUP_SIZE: (req+1) * HEAD_GROUP_SIZE]).bar(attn_bar),
     ]
 
     if sm >= NUM_KV_HEAD * NUM_REQ:
@@ -156,7 +244,7 @@ def sm_task(sm: int):
     req = sm // NUM_KV_HEAD
     insts += [
         ATTN_SPLIT_POST_REDUCE(split_kv, num_q=HEAD_GROUP_SIZE),
-        RawAddress(matP[head, req*HEAD_GROUP_SIZE], 25).bar(attn_bar),
+        TmaLoad1D(matP[head, req * HEAD_GROUP_SIZE: (req+1) * HEAD_GROUP_SIZE]).bar(attn_bar),
         # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
         # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
         tO_split.cord(head, req),
@@ -190,8 +278,8 @@ def gqa_ref():
     # result: [B, Hkv, G, S]
     QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
     # apply mask according to lsat_active_kv_len
-    total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
-    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
+    active_kv_len = torch.tensor(seq_lengths, device=gpu, dtype=torch.long)
+    mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= active_kv_len[:, None, None, None]
     QK = QK.masked_fill(mask, float("-inf"))
 
     # softmax on sequence dimension
@@ -224,7 +312,8 @@ def split_ref(split_stage):
 
     # mask tokens beyond the active length in this split's last block
     S_split = kv_end - kv_start
-    mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= total_active
+    active_kv_len = torch.tensor(seq_lengths, device=gpu, dtype=torch.long)
+    mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= active_kv_len[:, None, None, None]
     QK = QK.masked_fill(mask, float("-inf"))
 
     lse  = torch.logsumexp(QK, dim=-1)    # [B, Hkv, G]
@@ -243,4 +332,4 @@ def split_ref(split_stage):
 #     tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
 
 refQK, refO = gqa_ref()
-tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
+tensor_diff("Ref and DAE", refO, matO_attn_view)
