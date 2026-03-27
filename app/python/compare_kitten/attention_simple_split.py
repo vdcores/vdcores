@@ -41,7 +41,7 @@ matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(split_kv, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, MAX_SPLIT, dtype=torch.float, device=gpu)
+matP = torch.zeros(NUM_KV_HEAD, NUM_REQ, MAX_SPLIT, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
@@ -167,34 +167,6 @@ tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cor
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
-def tma_store_lse(mat: torch.Tensor, tileS: int, tileD):
-    assert tileS == 1
-    assert tileD == HEAD_GROUP_SIZE
-    assert mat.element_size() == 4, "Only support float32 for lse output"
-    H, Q, S = mat.shape
-    assert Q == NUM_REQ * HEAD_GROUP_SIZE
-    assert S == MAX_SPLIT
-    glob_dims = [H, Q, S]
-    glob_strides = [e * mat.element_size() for e in [mat.stride(0), mat.stride(1), mat.stride(2)]]
-    box_dims = [1, tileD, 1]
-    rank = len(glob_dims)
-    box_strides = [1] * rank
-    return rank, runtime.build_tma_desc(
-        mat,
-        glob_dims,
-        glob_strides,
-        box_dims,
-        box_strides,
-        0,
-        0
-    )
-
-def cord_store_lse(mat: torch.Tensor, rank: int):
-    assert rank == 3, "Only support 3D TMA store for lse"
-    def cfunc(*cords):
-        assert len(cords) == 3, f"cords should be (head, req, split), but got {cords}"
-        return [cords[0], cords[1] * HEAD_GROUP_SIZE, cords[2]]
-    return cfunc
 
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
     assert tileS == split_kv
@@ -223,7 +195,6 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
         return [0, 0, cords[0], cords[1]]
     return cfunc
 
-tLSE = TmaTensor(dae, matP)._build("store", 1, HEAD_GROUP_SIZE, tma_store_lse, cord_store_lse)
 tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
 
 need_norm = False
@@ -265,7 +236,7 @@ def sm_task(sm: int):
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
         TmaStore1D(matO_split_attn_view[split_stage, req, head, ...], numSlots = 2),
-        tLSE.cord(head, req, split_stage).bar(attn_bar),
+        TmaStore1D(matP[head, req, split_stage]).bar(attn_bar),
     ]
 
     if sm >= NUM_KV_HEAD * NUM_REQ:
@@ -274,7 +245,7 @@ def sm_task(sm: int):
     req = sm // NUM_KV_HEAD
     insts += [
         ATTN_SPLIT_POST_REDUCE(split_kv, num_q=HEAD_GROUP_SIZE),
-        TmaLoad1D(matP[head, req * HEAD_GROUP_SIZE: (req+1) * HEAD_GROUP_SIZE]).bar(attn_bar),
+        TmaLoad1D(matP[head, req, :split_kv]).bar(attn_bar),
         # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
         # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
         tO_split.cord(head, req),
@@ -360,8 +331,8 @@ for s in range(split_kv):
     ref_split_o, ref_split_lse = split_ref(s)
     tensor_diff(f"Split {s} O", ref_split_o, matO_split_attn_view[s])
 
-    ref_split_lse_view = ref_split_lse.permute(1, 0, 2).reshape(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE)
-    tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, :, s].float())
+    ref_split_lse_view = ref_split_lse.permute(1, 0, 2)
+    tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, :, s, :].float())
 
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO, matO_attn_view)

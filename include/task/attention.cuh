@@ -921,7 +921,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
             const int q_row = (thread_id / 32) * 16 + (thread_id % 32) / 4 + r * 8;
             if (q_row < num_active_q) {
                 const accum_t lse = online_softmax.row_max(r) + log2f(online_softmax.row_sum(r));
-                sLSE_ptr[q_row * MAX_SPLIT + split_idx] = lse;
+                sLSE_ptr[q_row] = lse;
             }
         }
         __sync_compute_group(128);
@@ -968,7 +968,7 @@ __device__ __forceinline__ void task_split_post_reduce(
         make_shape(num_split, Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
         LayoutRight{});
     auto layout_lse = make_layout(
-        make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
+        make_shape(num_split, Int<NUM_Q>{}),
         LayoutRight{});
 
     const int slot_lse = m2c.template pop<0>();
@@ -976,15 +976,16 @@ __device__ __forceinline__ void task_split_post_reduce(
     auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), layout_lse);
 
     // Phase 1: preprocess LSE while the split-O TMA load is still in flight.
-    // Each thread caches num_split scale factors (one scalar per split, not per element).
+    // Each thread caches num_split scale factors (one scalar per spl
+    // TODO(zijian): should have bank conflict, let 1 thread do reduce and broadcast
     accum_t sn_arr[MAX_SPLIT];
     accum_t sum_all = 0.f;
     if (thread_id < ACTIVE_THREADS) {
         accum_t max_all = -FLT_MAX;
         for (int s = 0; s < num_split; ++s)
-            max_all = fmaxf(max_all, sLSE(my_q, s));
+            max_all = fmaxf(max_all, sLSE(s, my_q));
         for (int s = 0; s < num_split; ++s) {
-            sn_arr[s] = exp2f(sLSE(my_q, s) - max_all);
+            sn_arr[s] = exp2f(sLSE(s, my_q) - max_all);
             sum_all  += sn_arr[s];
         }
     }
