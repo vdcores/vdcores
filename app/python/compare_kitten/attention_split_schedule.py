@@ -22,8 +22,8 @@ HIDDEN_SIZE = 1024
 NUM_Q_HEAD = 8
 NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
-MAX_SPLIT = 64
-seq_lengths = [65536]
+MAX_SPLIT = 128
+seq_lengths = [871,568,711,329,617,1015,348,978,543,837,650,1020,924,679,560,497,650,406,381,423,511,423,569,943,645,820,829,883,937,765,711,847,722,546,519,279,516,315,664,845,850,546,670,871,527,329,446,764,582,1011,453,655,532,985,1019,810,317,305,949,317,669,768,530,349]
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -45,7 +45,7 @@ matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(MAX_SPLIT, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ, MAX_SPLIT, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
+matP = torch.zeros(NUM_REQ, MAX_SPLIT, NUM_KV_HEAD, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
@@ -53,6 +53,8 @@ matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 matO_split_attn_view = matO_split.view(MAX_SPLIT, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matO_split_load_view = matO_split.view(MAX_SPLIT, NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
+matO_attn_Q_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=gpu)
 
@@ -165,34 +167,6 @@ def cord_load_v(mat: torch.Tensor, rank: int):
         return [0, h * (HEAD_DIM // 64), s // 8, r]
     return cfunc
 
-
-def tma_load_split_attn(mat: torch.Tensor, tileS, tileO, split_kv):
-    assert tileS == split_kv
-    assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
-    S, R, H, G, D = mat.shape
-    permute = [4, 3, 0, 2, 1] # [D, G, S, H, R]
-    glob_dims = [mat.shape[i] for i in permute]
-    glob_strides = [mat.stride(i) * mat.element_size() for i in permute[1:]]
-    box_dims = [D, G, split_kv, 1, 1]
-    rank = len(glob_dims)
-    box_strides = [1] * rank
-    return rank, runtime.build_tma_desc(
-        mat,
-        glob_dims,
-        glob_strides,
-        box_dims,
-        box_strides,
-        0,
-        0
-    )
-
-def cord_load_split_attn(mat: torch.Tensor, rank: int):
-    assert rank == 5, "Only support 5D TMA load for split attn output"
-    def cfunc(*cords):
-        assert len(cords) == 2, f"cords should be (head, req), but got {cords}"
-        return [0, 0, cords[0], cords[1]]
-    return cfunc
-
 tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
@@ -200,10 +174,15 @@ tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v,
 need_norm = False
 need_rope = False
 
-last_active_kv_len = 64
-assert last_active_kv_len <= KVTile
-
 TOTAL_ATTN_GROUPS = num_sms // NUM_KV_HEAD
+split_q_tile = max(1, NUM_Q_HEAD // max(1, TOTAL_ATTN_GROUPS // NUM_REQ))
+POST_GROUPS_PER_REQ = NUM_Q_HEAD // split_q_tile
+
+
+def required_post_groups(split_level: int):
+    if split_level <= 1:
+        return 0
+    return POST_GROUPS_PER_REQ
 
 
 def legal_split_levels(num_kv_blocks: int):
@@ -269,13 +248,12 @@ def place_split_levels(num_kv_blocks: list[int], split_levels: list[int]):
     post_group_waves = [0] * TOTAL_ATTN_GROUPS
     rr_group = 0
     for req_idx, split_level in enumerate(split_levels):
-        if split_level == 1:
-            continue
-        group_id = rr_group % TOTAL_ATTN_GROUPS
-        wave_idx = post_group_waves[group_id]
-        post_group_assignments[req_idx].append((group_id, wave_idx))
-        post_group_waves[group_id] += 1
-        rr_group += 1
+        for _ in range(required_post_groups(split_level)):
+            group_id = rr_group % TOTAL_ATTN_GROUPS
+            wave_idx = post_group_waves[group_id]
+            post_group_assignments[req_idx].append((group_id, wave_idx))
+            post_group_waves[group_id] += 1
+            rr_group += 1
 
     return attn_group_assignments, post_group_assignments, attn_group_loads, attn_group_waves, post_group_waves
 
@@ -350,6 +328,37 @@ def refine_split_levels(num_kv_blocks: list[int], split_levels: list[int]):
         best_post_waves,
     )
 
+def gen_tma_load_split(split_q_tile, splits_per_post_load):
+    def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
+        assert tileS == splits_per_post_load
+        tileQ = tileO // HEAD_DIM
+        assert tileQ == split_q_tile, f"qtile {tileQ} must match split_q_tile {split_q_tile}"
+        S, R, Q, D = mat.shape
+        permute = [3, 2, 0, 1]
+        glob_dims = [mat.shape[i] for i in permute]
+        glob_strides = [mat.stride(i) * mat.element_size() for i in permute[1:]]
+        box_dims = [D, tileQ, tileS, 1]
+        rank = len(glob_dims)
+        box_strides = [1] * rank
+        return rank, runtime.build_tma_desc(
+            mat,
+            glob_dims,
+            glob_strides,
+            box_dims,
+            box_strides,
+            0,
+            0
+        )
+    return tma_load_split_attn
+
+def cord_load_split_attn(mat: torch.Tensor, rank: int):
+    assert rank == 4
+    def cfunc(*cords):
+        assert len(cords) == 3, f"cords should be (split, req, head_query), but got {cords}"
+        s, r, hq = cords
+        return [0, hq, s, r]
+    return cfunc
+
 
 @dataclass
 class SchedPlan:
@@ -376,7 +385,32 @@ class SchedPlan:
             for lane, (group_id, wave_idx) in enumerate(zip(self.post_groups, self.post_waves))
         }
         self.attn_bar = dae.new_bar(NUM_KV_HEAD * self.split_level)
-        self.tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", self.split_level, HEAD_GROUP_SIZE*HEAD_DIM, partial(tma_load_split_attn, split_kv=self.split_level), cord_load_split_attn)
+
+        if self.split_level == 1:
+            assert len(self.post_groups) == 0, "Unsplit requests should not reserve post-reduce groups"
+            self.split_q_tile = NUM_Q_HEAD
+            self.post_split_load_limit_bytes = 16 * 1024
+            self.splits_per_post_load = 1
+            self.tO_split = None
+            return
+
+        assert len(self.post_groups) > 0, "Split requests need post-reduce groups"
+        assert NUM_Q_HEAD % len(self.post_groups) == 0, "Post groups must evenly tile Q heads"
+        self.split_q_tile = NUM_Q_HEAD // len(self.post_groups)
+        self.post_split_load_limit_bytes = 16 * 1024
+        self.splits_per_post_load = min(
+            max(1, self.post_split_load_limit_bytes // (self.split_q_tile * HEAD_DIM * 2)),
+            self.split_level,
+        )
+        assert self.split_level % self.splits_per_post_load == 0, "split_level must be divisible by splits_per_post_load"
+
+        self.tO_split = TmaTensor(dae, matO_split_load_view)._build(
+            "load", 
+            self.splits_per_post_load, 
+            HEAD_DIM * self.split_q_tile, 
+            gen_tma_load_split(self.split_q_tile, self.splits_per_post_load),
+            cord_load_split_attn
+        )
 
     def sm_attn_task(self, sm: int):
         sm_group = sm // NUM_KV_HEAD
@@ -386,6 +420,7 @@ class SchedPlan:
         split, wave_idx = self.attn_group_to_split[sm_group]
         insts = []
         if self.split_level == 1:
+            last_active_kv_len = self.seq_length % KVTile or KVTile
             return [
                 ATTENTION_M64N64K16_F16_F32_64_64_hdim(self.num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
                 tQ.cord(self.request_idx, head),
@@ -397,17 +432,19 @@ class SchedPlan:
             ]
 
         kv_start_block = split * self.num_block_per_split
-        kv_start_idx = kv_start_block * KVTile
-        split_last_active_kv_len = last_active_kv_len if split == self.split_level - 1 else KVTile
+        kv_start = kv_start_block * KVTile
+        kv_end = kv_start + self.num_block_per_split * KVTile
+        total_active = min(max(self.seq_length - kv_start, 0), kv_end - kv_start)
+        split_last_active_kv_len = total_active % KVTile or KVTile
         insts.extend([
             ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(self.num_block_per_split, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_block, need_norm=need_norm, need_rope=need_rope),
             tQ.cord(self.request_idx, head),
             RepeatM.on(self.num_block_per_split,
-                [tK.cord(self.request_idx, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],
-                [tV.cord(self.request_idx, kv_start_idx, head), tV.cord2tma(0, KVTile, 0)],
+                [tK.cord(self.request_idx, kv_start, head), tK.cord2tma(0, KVTile, 0)],
+                [tV.cord(self.request_idx, kv_start, head), tV.cord2tma(0, KVTile, 0)],
             ),
             TmaStore1D(matO_split_attn_view[split, self.request_idx, head, ...], numSlots = 2),
-            TmaStore1D(matP[head, self.request_idx, split]).bar(self.attn_bar),
+            TmaStore1D(matP[self.request_idx, split, head]).bar(self.attn_bar),
         ])
         return insts
 
@@ -417,14 +454,17 @@ class SchedPlan:
         sm_group = sm // NUM_KV_HEAD
         if sm_group not in self.post_group_to_lane:
             return []
-        head = sm % NUM_KV_HEAD
-        insts = []
-        insts.extend([
-            ATTN_SPLIT_POST_REDUCE(self.split_level, num_q=HEAD_GROUP_SIZE),
-            TmaLoad1D(matP[head, self.request_idx, :self.split_level]).bar(self.attn_bar),
-            self.tO_split.cord(head, self.request_idx),
-            TmaStore1D(matO_attn_view[self.request_idx, head, ...]),
-        ])
+        q_tile_idx, wave_idx = self.post_group_to_lane[sm_group]
+        q_ofst = q_tile_idx * self.split_q_tile
+        insts = [
+            ATTN_SPLIT_POST_REDUCE(self.split_level, self.splits_per_post_load, self.split_q_tile, q_ofst, NUM_Q_HEAD),
+            TmaLoad1D(matP[self.request_idx, :self.split_level]).bar(self.attn_bar),
+            RepeatM.on(
+                self.split_level // self.splits_per_post_load,
+                [self.tO_split.cord(0, self.request_idx, q_ofst), self.tO_split.cord2tma(self.splits_per_post_load, 0, 0)],
+            ),
+            TmaStore1D(matO_attn_Q_view[self.request_idx, q_ofst:q_ofst + self.split_q_tile]),
+        ]
         return insts
 
 
@@ -432,11 +472,13 @@ def build_sched_plans():
     num_kv_blocks = [(seq_len + KVTile - 1) // KVTile for seq_len in seq_lengths]
     total_blocks = sum(num_kv_blocks)
     target_blocks_per_shard = total_blocks / TOTAL_ATTN_GROUPS * 1.2
+    print(f"[sched] total_blocks={total_blocks}, target_blocks_per_shard={target_blocks_per_shard:.2f}")
 
     split_levels = [
         choose_split_level(num_blocks, target_blocks_per_shard, mode=schedule_mode)
         for num_blocks in num_kv_blocks
     ]
+    print(f"[sched] initial split_levels={split_levels}")
     if schedule_mode == 'vdc':
         (
             split_levels,
@@ -578,5 +620,5 @@ def split_ref(split_stage):
 #         tensor_diff(f"Req {plan.request_idx} Split {s} O", ref_O[0], matO_split_attn_view[s, plan.request_idx])
 #         tensor_diff(f"Req {plan.request_idx} Split {s} LSE", ref_lse[0], matP[:, plan.request_idx, s, :].float())
 
-refQK, refO = gqa_ref()
-tensor_diff("Ref and DAE", refO, matO_attn_view)
+# refQK, refO = gqa_ref()
+# tensor_diff("Ref and DAE", refO, matO_attn_view)

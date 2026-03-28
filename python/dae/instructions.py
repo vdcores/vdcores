@@ -242,6 +242,36 @@ class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
         super().__init__(opcode=reduce_opcode, args=[num_split, split_block_size, q_ofst])
 
 
+class ATTN_SPLIT_GLOBAL_REDUCE(ComputeInstruction):
+    SUPPORTED_Q_HEAD = {
+        8: {
+            1: opcode.OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N1,
+            2: opcode.OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N2,
+            4: opcode.OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N4,
+            8: opcode.OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N8,
+        },
+    }
+    def __init__(self, num_split: int, num_q: int, q_ofst: int, q_head: int):
+        assert q_head in self.SUPPORTED_Q_HEAD, f"unsupported split global reduce q head {q_head}"
+        assert num_q in self.SUPPORTED_Q_HEAD[q_head], f"unsupported qtile {num_q} for q head {q_head}"
+        super().__init__(opcode=self.SUPPORTED_Q_HEAD[q_head][num_q], args=[num_split, q_ofst])
+
+
+class ATTN_SPLIT_LOCAL_CORRECT(ComputeInstruction):
+    SUPPORTED_Q_HEAD = {
+        8: {
+            1: opcode.OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N1,
+            2: opcode.OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N2,
+            4: opcode.OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N4,
+            8: opcode.OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N8,
+        },
+    }
+    def __init__(self, num_q: int, q_head: int):
+        assert q_head in self.SUPPORTED_Q_HEAD, f"unsupported split local correct q head {q_head}"
+        assert num_q in self.SUPPORTED_Q_HEAD[q_head], f"unsupported qtile {num_q} for q head {q_head}"
+        super().__init__(opcode=self.SUPPORTED_Q_HEAD[q_head][num_q], args=[])
+
+
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):
         super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_4096_INTER, args=[num_token])
@@ -848,6 +878,8 @@ __all__ = [
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA",
     "ATTN_SPLIT_POST_REDUCE",
+    "ATTN_SPLIT_GLOBAL_REDUCE",
+    "ATTN_SPLIT_LOCAL_CORRECT",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",

@@ -207,6 +207,46 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8_N8) {
   task_split_post_reduce<128, 8, 8, 64, 16>(inst.args[0], inst.args[1], inst.args[2], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N1) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_global_reduce<8, 1, 64>(inst.args[0], inst.args[1], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N2) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_global_reduce<8, 2, 64>(inst.args[0], inst.args[1], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N4) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_global_reduce<8, 4, 32>(inst.args[0], inst.args[1], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_GLOBAL_REDUCE_Q8_N8) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_global_reduce<8, 8, 16>(inst.args[0], inst.args[1], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N1) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_local_correct<128, 1, 64>(smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N2) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_local_correct<128, 2, 64>(smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N4) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_local_correct<128, 4, 32>(smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_LOCAL_CORRECT_Q8_N8) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_local_correct<128, 8, 16>(smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;

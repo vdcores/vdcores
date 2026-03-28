@@ -1036,3 +1036,120 @@ __device__ __forceinline__ void task_split_post_reduce(
     __sync_compute_group(128);
     c2m.template push<0, true>(thread_id, slot_final);
 }
+
+template <int NUM_Q_HEAD,
+          int NUM_Q,
+          int THREADS_PER_Q,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_split_global_reduce(
+    const int num_split,
+    const int q_ofst,
+    void *base,
+    float* smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+    const int thread_id = threadIdx.x;
+    const int my_q = thread_id / THREADS_PER_Q;
+    const int lane_in_q = thread_id % THREADS_PER_Q;
+    const int ACTIVE_THREADS = NUM_Q * THREADS_PER_Q;
+
+    using namespace cute;
+    using accum_t = float;
+
+    auto layout_lse = make_layout(
+        make_shape(num_split, Int<NUM_Q_HEAD>{}),
+        LayoutRight{});
+    auto layout_stats = make_layout(
+        make_shape(Int<NUM_Q>{}, Int<2>{}),
+        LayoutRight{});
+
+    const int slot_lse = m2c.template pop<0>();
+    const accum_t* __restrict__ sLSE_ptr = (accum_t*)get_slot_address(base, extract(slot_lse));
+    auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), layout_lse);
+
+    const int slot_stats = m2c.template pop<0>();
+    accum_t* __restrict__ sStats_ptr = (accum_t*)get_slot_address(base, extract(slot_stats));
+    auto sStats = make_tensor(make_smem_ptr(sStats_ptr), layout_stats);
+
+    if (thread_id < ACTIVE_THREADS && lane_in_q == 0) {
+        accum_t max_all = -FLT_MAX;
+        for (int s = 0; s < num_split; ++s) {
+            max_all = fmaxf(max_all, sLSE(s, my_q + q_ofst));
+        }
+        accum_t sum_all = 0.f;
+        for (int s = 0; s < num_split; ++s) {
+            sum_all += exp2f(sLSE(s, my_q + q_ofst) - max_all);
+        }
+        sStats(my_q, 0) = max_all;
+        sStats(my_q, 1) = 1.f / sum_all;
+    }
+
+    __sync_compute_group(128);
+    c2m.push(thread_id, slot_lse);
+    c2m.template push<0, true>(thread_id, slot_stats);
+}
+
+template <int HEAD_DIM,
+          int NUM_Q,
+          int THREADS_PER_Q,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_split_local_correct(
+    void *base,
+    float* smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+    static_assert((HEAD_DIM / 2) % THREADS_PER_Q == 0, "HEAD_DIM/2 must be divisible by THREADS_PER_Q");
+
+    const int thread_id = threadIdx.x;
+    const int my_q = thread_id / THREADS_PER_Q;
+    const int ACTIVE_THREADS = NUM_Q * THREADS_PER_Q;
+    constexpr int ELEMS_PER_THREAD = (HEAD_DIM / 2) / THREADS_PER_Q;
+    const int my_i_base = (thread_id % THREADS_PER_Q) * ELEMS_PER_THREAD;
+
+    using namespace cute;
+    using data_t = __nv_bfloat16;
+    using accum_t = float;
+    using Tr = F16Traits<data_t>;
+    using vec2_t = typename Tr::vec2_t;
+
+    auto layout_lse = make_layout(make_shape(Int<NUM_Q>{}), LayoutRight{});
+    auto layout_stats = make_layout(make_shape(Int<NUM_Q>{}, Int<2>{}), LayoutRight{});
+    auto layout_split_O = make_layout(make_shape(Int<NUM_Q>{}, Int<HEAD_DIM/2>{}), LayoutRight{});
+
+    const int slot_lse = m2c.template pop<0>();
+    const accum_t* __restrict__ sLSE_ptr = (accum_t*)get_slot_address(base, extract(slot_lse));
+    auto sLSE = make_tensor(make_smem_ptr(sLSE_ptr), layout_lse);
+
+    const int slot_stats = m2c.template pop<0>();
+    const accum_t* __restrict__ sStats_ptr = (accum_t*)get_slot_address(base, extract(slot_stats));
+    auto sStats = make_tensor(make_smem_ptr(sStats_ptr), layout_stats);
+
+    const int slot_split = m2c.template pop<0>();
+    const vec2_t* __restrict__ split_O_ptr = (vec2_t*)get_slot_address(base, extract(slot_split));
+    auto split_O = make_tensor(make_smem_ptr(split_O_ptr), layout_split_O);
+
+    const int slot_out = m2c.template pop<0>();
+    vec2_t* __restrict__ sOut_ptr = (vec2_t*)get_slot_address(base, extract(slot_out));
+    auto sOut = make_tensor(make_smem_ptr(sOut_ptr), layout_split_O);
+
+    if (thread_id < ACTIVE_THREADS) {
+        const accum_t max_all = sStats(my_q, 0);
+        const accum_t inv_sum = sStats(my_q, 1);
+        const accum_t sn = exp2f(sLSE(my_q) - max_all) * inv_sum;
+        #pragma unroll
+        for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
+            float2 oo = Tr::to_float2(split_O(my_q, my_i_base + e));
+            sOut(my_q, my_i_base + e) = Tr::from_float2({oo.x * sn, oo.y * sn});
+        }
+    }
+
+    __sync_compute_group(128);
+    c2m.push(thread_id, slot_lse);
+    c2m.push(thread_id, slot_stats);
+    c2m.push(thread_id, slot_split);
+    c2m.template push<0, true>(thread_id, slot_out);
+}
