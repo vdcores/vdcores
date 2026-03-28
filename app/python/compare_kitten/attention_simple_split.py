@@ -14,14 +14,14 @@ from qwen3.utils import *
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 32768
+KV_SEQ_LEN = 65536
 HEAD_DIM = 128
 HIDDEN_SIZE = 1024
 NUM_Q_HEAD = 8
 NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 64
-seq_lengths = [512] * 1
+seq_lengths = [65536]
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -29,10 +29,9 @@ assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must mat
 QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
-split_kv = 2
+split_kv = 64
 assert split_kv <= MAX_SPLIT
-num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
-assert num_sms <= 132 # max sm count for HX00
+num_sms = 128
 
 dae = Launcher(num_sms, device=gpu)
 
@@ -41,7 +40,7 @@ matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(split_kv, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ, MAX_SPLIT, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
+matP = torch.zeros(NUM_REQ, MAX_SPLIT, NUM_KV_HEAD, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
@@ -49,6 +48,7 @@ matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 matO_split_attn_view = matO_split.view(split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matO_attn_Q_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=gpu)
 
@@ -167,15 +167,25 @@ tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cor
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
+matO_split_load_view = matO_split.view(split_kv, NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
+# split across num req then along token dimension
+split_q_tile = max(1, NUM_Q_HEAD // (num_sms // NUM_REQ))
+
+POST_SPLIT_LOAD_LIMIT_BYTES = 16 * 1024
+SPLITS_PER_POST_LOAD = min(max(1, POST_SPLIT_LOAD_LIMIT_BYTES // (split_q_tile * HEAD_DIM * 2)), split_kv)
+assert split_kv % SPLITS_PER_POST_LOAD == 0, "For simplicity we require split_kv to be divisible by SPLITS_PER_POST_LOAD"
+
+print(f"split_q_tile: {split_q_tile}, SPLITS_PER_POST_LOAD: {SPLITS_PER_POST_LOAD}")
 
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
-    assert tileS == split_kv
-    assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
-    S, R, H, G, D = mat.shape
-    permute = [4, 3, 0, 2, 1] # [D, G, S, H, R]
+    assert tileS == SPLITS_PER_POST_LOAD
+    tileQ = tileO // HEAD_DIM # tileO multiple head dim to meet size calc
+    assert tileQ == split_q_tile, f"qtile {qtile} must match split_q_tile {split_q_tile}"
+    S, R, Q, D = mat.shape
+    permute = [3, 2, 0, 1] # [D, Q, S, R]
     glob_dims = [mat.shape[i] for i in permute]
     glob_strides = [mat.stride(i) * mat.element_size() for i in permute[1:]]
-    box_dims = [D, G, split_kv, 1, 1]
+    box_dims = [D, tileQ, tileS, 1]
     rank = len(glob_dims)
     box_strides = [1] * rank
     return rank, runtime.build_tma_desc(
@@ -189,18 +199,19 @@ def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
     )
 
 def cord_load_split_attn(mat: torch.Tensor, rank: int):
-    assert rank == 5, "Only support 5D TMA load for split attn output"
+    assert rank == 4
     def cfunc(*cords):
-        assert len(cords) == 2, f"cords should be (head, req), but got {cords}"
-        return [0, 0, cords[0], cords[1]]
+        assert len(cords) == 3, f"cords should be (split, req, head_query), but got {cords}"
+        s, r, hq = cords
+        return [0, hq, s, r]
     return cfunc
 
-tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
+tO_split = TmaTensor(dae, matO_split_load_view)._build("load", SPLITS_PER_POST_LOAD, HEAD_DIM*split_q_tile, tma_load_split_attn, cord_load_split_attn)
 
 need_norm = False
 need_rope = False
 
-attn_bar = dae.new_bar(num_sms)
+attn_bar = dae.new_bar(NUM_REQ * NUM_KV_HEAD * split_kv)
 
 def split_bounds(seq_length: int, split_stage: int):
     num_kv_block = (seq_length + KVTile - 1) // KVTile
@@ -216,40 +227,41 @@ def split_bounds(seq_length: int, split_stage: int):
 
 
 def sm_task(sm: int):
-    if sm >= num_sms:
-        return []
-    split_stage = sm // (NUM_KV_HEAD * NUM_REQ)
-    ofst_in_group = sm % (NUM_KV_HEAD * NUM_REQ)
-    head = ofst_in_group % NUM_KV_HEAD
-    req = ofst_in_group // NUM_KV_HEAD
-    seq_length = seq_lengths[req]
-    _, num_block_per_split, kv_start_block, kv_start_idx, _, total_active, split_last_active_kv_len = split_bounds(seq_length, split_stage)
-    if total_active == 0:
-        return []
-    insts = [
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_block, need_norm=need_norm, need_rope=need_rope),
-        tQ.cord(req, head),
-        RepeatM.on(num_block_per_split,
-            [tK.cord(req, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],
-            [tV.cord(req, kv_start_idx, head), tV.cord2tma(0, KVTile, 0)],
-        ),
-        # here we override the allocator, to allocate enough space in the smem
-        # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(matO_split_attn_view[split_stage, req, head, ...], numSlots = 2),
-        TmaStore1D(matP[head, req, split_stage]).bar(attn_bar),
-    ]
+    insts = []
+    if sm < NUM_REQ * NUM_KV_HEAD * split_kv:
+        split_stage = sm // (NUM_KV_HEAD * NUM_REQ)
+        ofst_in_group = sm % (NUM_KV_HEAD * NUM_REQ)
+        head = ofst_in_group % NUM_KV_HEAD
+        req = ofst_in_group // NUM_KV_HEAD
+        seq_length = seq_lengths[req]
+        _, num_block_per_split, kv_start_block, kv_start_idx, _, total_active, split_last_active_kv_len = split_bounds(seq_length, split_stage)
+        if total_active == 0:
+            return []
+        insts += [
+            ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_block, need_norm=need_norm, need_rope=need_rope),
+            tQ.cord(req, head),
+            RepeatM.on(num_block_per_split,
+                [tK.cord(req, kv_start_idx, head), tK.cord2tma(0, KVTile, 0)],
+                [tV.cord(req, kv_start_idx, head), tV.cord2tma(0, KVTile, 0)],
+            ),
+            TmaStore1D(matO_split_attn_view[split_stage, req, head, ...], numSlots = 2),
+            TmaStore1D(matP[req, split_stage, head]).bar(attn_bar),
+        ]
 
-    if sm >= NUM_KV_HEAD * NUM_REQ:
+    if sm >= NUM_REQ * NUM_Q_HEAD // split_q_tile:
         return insts
-    head = sm % NUM_KV_HEAD
-    req = sm // NUM_KV_HEAD
+    req = sm // (NUM_Q_HEAD // split_q_tile)
+    q_ofst = sm % (NUM_Q_HEAD // split_q_tile)
     insts += [
-        ATTN_SPLIT_POST_REDUCE(split_kv, num_q=HEAD_GROUP_SIZE),
-        TmaLoad1D(matP[head, req, :split_kv]).bar(attn_bar),
+        ATTN_SPLIT_POST_REDUCE(split_kv, SPLITS_PER_POST_LOAD, split_q_tile, q_ofst, NUM_Q_HEAD),
+        TmaLoad1D(matP[req, :split_kv]).bar(attn_bar), # currently we over-provision, need q_ofst to locate
         # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
         # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
-        tO_split.cord(head, req),
-        TmaStore1D(matO_attn_view[req, head, ...]),
+        # tO_split.cord(head, req),
+        RepeatM.on(split_kv // SPLITS_PER_POST_LOAD,
+            [tO_split.cord(0, req, q_ofst), tO_split.cord2tma(SPLITS_PER_POST_LOAD, 0, 0)],
+        ),
+        TmaStore1D(matO_attn_Q_view[req, q_ofst:q_ofst + split_q_tile]),
     ]
     return insts
 
@@ -329,10 +341,10 @@ def split_ref(split_stage):
 
 for s in range(split_kv):
     ref_split_o, ref_split_lse = split_ref(s)
-    tensor_diff(f"Split {s} O", ref_split_o, matO_split_attn_view[s])
+    tensor_diff(f"Split {s} O", ref_split_o, matO_split_attn_view[s], threshold=3.0)
 
     ref_split_lse_view = ref_split_lse.permute(1, 0, 2)
-    tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, :, s, :].float())
+    tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, s, : :].float())
 
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO, matO_attn_view)

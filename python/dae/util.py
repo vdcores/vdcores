@@ -9,13 +9,13 @@ DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
 
 
 def tensor_diff(name : str,
-                t1 : torch.Tensor, t2 : torch.Tensor, ref : torch.Tensor | None = None):
+                t1 : torch.Tensor, t2 : torch.Tensor, ref : torch.Tensor | None = None, threshold : float = 1.5):
     if ref is None:
         ref = t1
     diff = (t1 - t2).abs().float().mean().item() / ref.abs().float().mean().item() * 100
     print(f"Ave Diff {name}: {diff} %. ")
     # print both mat if diff is large
-    if diff > 1.5:
+    if diff > threshold:
         print(f"{name} t1:", t1)
         print(f"{name} t2:", t2)
     # calculate checksum of both to verify if it's layout diff
