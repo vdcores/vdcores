@@ -184,16 +184,27 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  const int num_q = inst.args[2] & 0xFF;
-  const int q_ofst = (inst.args[2] >> 8) & 0xFF;
-  task_split_post_reduce<128, 4, 64, 32>(inst.args[0], inst.args[1], num_q, q_ofst, smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  task_split_post_reduce<128, 4, 4, 64, 32>(inst.args[0], inst.args[1], inst.args[2], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8_T64) {
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8_N1) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  const int num_q = inst.args[2] & 0xFF;
-  const int q_ofst = (inst.args[2] >> 8) & 0xFF;
-  task_split_post_reduce<128, 8, 64, 64>(inst.args[0], inst.args[1], num_q, q_ofst, smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  task_split_post_reduce<128, 8, 1, 64, 64>(inst.args[0], inst.args[1], inst.args[2], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8_N2) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_post_reduce<128, 8, 2, 64, 64>(inst.args[0], inst.args[1], inst.args[2], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8_N4) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_post_reduce<128, 8, 4, 64, 32>(inst.args[0], inst.args[1], inst.args[2], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE_Q8_N8) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_split_post_reduce<128, 8, 8, 64, 16>(inst.args[0], inst.args[1], inst.args[2], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {

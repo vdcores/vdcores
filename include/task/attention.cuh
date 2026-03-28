@@ -929,13 +929,13 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
 
 template <int HEAD_DIM,
           int NUM_Q_HEAD,
+          int NUM_Q,
           int KV_BLOCK_SIZE,
           int THREADS_PER_Q,   // tuning knob: threads assigned to each Q row
           typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_split_post_reduce(
     const int num_split,
     const int split_block_size,
-    const int num_q,
     const int q_ofst,
     void *base,
     float* smem_reduce,
@@ -948,7 +948,7 @@ __device__ __forceinline__ void task_split_post_reduce(
     // ELEMS_PER_THREAD: consecutive vec2 columns each active thread accumulates.
     // ACTIVE_THREADS: threads [0, ACTIVE_THREADS) do work; the rest participate in syncs only.
     constexpr int ELEMS_PER_THREAD = (HEAD_DIM / 2) / THREADS_PER_Q;
-    const int ACTIVE_THREADS   = num_q * THREADS_PER_Q;
+    const int ACTIVE_THREADS   = NUM_Q * THREADS_PER_Q;
 
     using namespace cute;
     using data_t  = __nv_bfloat16;
@@ -961,10 +961,10 @@ __device__ __forceinline__ void task_split_post_reduce(
     const int my_i_base = (thread_id % THREADS_PER_Q) * ELEMS_PER_THREAD;
 
     auto layout_sO = make_layout(
-        make_shape(num_q, Int<HEAD_DIM/2>{}),
+        make_shape(Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
         LayoutRight{});
     auto layout_split_O = make_layout(
-        make_shape(num_split, num_q, Int<HEAD_DIM/2>{}),
+        make_shape(num_split, Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
         LayoutRight{});
     auto layout_lse = make_layout(
         make_shape(num_split, Int<NUM_Q_HEAD>{}),

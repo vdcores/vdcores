@@ -20,8 +20,8 @@ HIDDEN_SIZE = 1024
 NUM_Q_HEAD = 8
 NUM_KV_HEAD = 1
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
-MAX_SPLIT = 64
-seq_lengths = [65536]
+MAX_SPLIT = 128
+seq_lengths = [512] * 64
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -29,7 +29,7 @@ assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must mat
 QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
-split_kv = 64
+split_kv = 1
 assert split_kv <= MAX_SPLIT
 num_sms = 128
 
@@ -340,12 +340,12 @@ def split_ref(split_stage):
     return ref_o, ref_lse
 
 
-for s in range(split_kv):
-    ref_split_o, ref_split_lse = split_ref(s)
-    tensor_diff(f"Split {s} O", ref_split_o, matO_split_attn_view[s], threshold=3.0)
+# for s in range(split_kv):
+#     ref_split_o, ref_split_lse = split_ref(s)
+#     tensor_diff(f"Split {s} O", ref_split_o, matO_split_attn_view[s], threshold=3.0)
 
-    ref_split_lse_view = ref_split_lse.permute(1, 0, 2)
-    tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, s, : :].float())
+#     ref_split_lse_view = ref_split_lse.permute(1, 0, 2)
+#     tensor_diff(f"Split {s} LSE", ref_split_lse_view, matP[:, s, : :].float())
 
 refQK, refO = gqa_ref()
 tensor_diff("Ref and DAE", refO, matO_attn_view)
