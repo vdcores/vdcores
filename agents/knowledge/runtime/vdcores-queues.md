@@ -69,3 +69,12 @@ The writeback form is required for slots that correspond to `OP_ALLOC_WB_*` memo
 - A descriptor-backed writeback path is usually cleaner than a raw-address side channel when data should land in an existing scheduled tensor.
 - For BF16 `tensor1d` descriptors in the current path, the effective `cord(...)` offset that worked for head placement was in BF16-element units, not raw bytes.
 - A wrong unit here causes regular placement errors such as writes landing on alternating heads.
+
+## Compute Arg Packing Lesson
+
+- `ATTN_SPLIT_POST_REDUCE` packs its metadata as:
+  - `args[0] = num_split`
+  - `args[1] = split_block_size`
+  - `args[2] = num_q | (q_ofst << 8)`
+- Decoding `num_q` and `q_ofst` from `args[1]` makes the kernel treat `split_block_size` as the Q tile count.
+- In the split-attention post-reduce path that inflates the shared-memory tensor stride for `split_O` and shows up as an invalid shared-memory read, even when the per-split outputs themselves were produced correctly.

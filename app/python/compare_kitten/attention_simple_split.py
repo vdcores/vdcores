@@ -251,7 +251,8 @@ def sm_task(sm: int):
     if sm >= NUM_REQ * NUM_Q_HEAD // split_q_tile:
         return insts
     req = sm // (NUM_Q_HEAD // split_q_tile)
-    q_ofst = sm % (NUM_Q_HEAD // split_q_tile)
+    q_tile_idx = sm % (NUM_Q_HEAD // split_q_tile)
+    q_ofst = q_tile_idx * split_q_tile
     insts += [
         ATTN_SPLIT_POST_REDUCE(split_kv, SPLITS_PER_POST_LOAD, split_q_tile, q_ofst, NUM_Q_HEAD),
         TmaLoad1D(matP[req, :split_kv]).bar(attn_bar), # currently we over-provision, need q_ofst to locate
