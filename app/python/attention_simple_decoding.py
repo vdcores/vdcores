@@ -29,7 +29,7 @@ for seq_len in seq_lengths:
 QTile = 16
 KVTile = 64
 
-num_sms = NUM_KV_HEAD * NUM_REQ
+num_sms = NUM_Q_HEAD * NUM_REQ
 assert num_sms <= 132 # max sm count for HX00
 
 dae = Launcher(num_sms, device=gpu)
@@ -40,12 +40,46 @@ matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 
 # interleaved QKV
-matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matQ_attn_view = matQ.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
-matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matO_attn_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=gpu)
+
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def build_interleaved_rope_rows(max_seq_len: int, head_dim: int, rope_theta: float, device, dtype):
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+    )
+    positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    rope = torch.empty(max_seq_len, head_dim, device=device, dtype=dtype)
+    rope[:, 0::2] = freqs.cos().to(dtype=dtype)
+    rope[:, 1::2] = freqs.sin().to(dtype=dtype)
+    return rope
+
+
+def apply_rms_affine_rope_heads(hidden_states: torch.Tensor, weight: torch.Tensor, rope_row: torch.Tensor, eps: float):
+    hidden_states = hidden_states.float()
+    variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    hidden_states = hidden_states * weight.float().view(*([1] * (hidden_states.ndim - 1)), -1)
+    even = hidden_states[..., 0::2]
+    odd = hidden_states[..., 1::2]
+    cos = rope_row[..., 0::2].float()
+    sin = rope_row[..., 1::2].float()
+    return torch.stack(
+        (even * cos - odd * sin, even * sin + odd * cos),
+        dim=-1,
+    ).flatten(-2).to(dtype=weight.dtype)
 
 tma_builder_K_inter = partial(build_tma_wgmma_k, iN = -3, swizzle=0)
 tma_builder_K = partial(build_tma_wgmma_k, iN = -3)
@@ -61,9 +95,9 @@ def tma_load_o(mat: torch.Tensor, tileK: int, tileN: int):
     assert tileK == 128 and tileN == 64, "tile must be 128x64"
 
     # this will dup for 16 times, due to 0 in strides, do not know how tma engine will handle it
-    glob_dims = [64, 4, 16, 2, NUM_REQ * NUM_KV_HEAD]
-    glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
-    box_dims = [64, 4, 16, 2, 1]
+    glob_dims = [64, 1, 64, 2, NUM_REQ * NUM_Q_HEAD]
+    glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * 2]
+    box_dims = [64, 1, 64, 2, 1]
 
     rank = len(glob_dims)
     box_strides = [1] * rank
@@ -82,7 +116,7 @@ def cord_load_o(mat: torch.Tensor, rank: int):
     assert rank == 5, "Only support 5D TMA load for load Q"
     def cfunc(*cords):
         assert len(cords) == 2, f"cords should be (req, head), but got {cords}"
-        return [0, 0, 0, cords[0] * NUM_KV_HEAD + cords[1]]
+        return [0, 0, 0, cords[0] * NUM_Q_HEAD + cords[1]]
     return cfunc
 
 
@@ -162,8 +196,10 @@ tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cor
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_k, cord_load_k)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_load_v, cord_load_v)
 
-need_norm = False
-need_rope = False
+need_norm = env_flag("ATTENTION_NEED_NORM", False)
+need_rope = env_flag("ATTENTION_NEED_ROPE", False)
+if need_norm != need_rope:
+    raise ValueError("attention_simple_decoding.py mirrors the fused Qwen decode path, so norm and rope must be enabled together")
 
 ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "hopper").lower()
 if ATTENTION_IMPL == "mma":
@@ -183,15 +219,17 @@ def sm_task(sm: int):
         last_active_kv_len = KVTile
 
     insts = [
-        attention_inst(num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(num_kv_block, 1, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_kv_block,
             [tK.cord(req, 0, head), tK.cord2tma(0, KVTile, 0)],
             [tV.cord(req, 0, head), tV.cord2tma(0, KVTile, 0)],
         ),
+        tK.cord(req, KVTile * (NUM_KV_BLOCK - 1), kv_head, 0),
+        tV.cord(req, KVTile * (NUM_KV_BLOCK - 1), kv_head, 0),
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(matO_attn_view[req, head, ...], numSlots = 2)
+        TmaStore1D(matO_attn_view[req, head, ...])
     ]
     return insts
 
@@ -208,6 +246,14 @@ dae_app(dae)
 
 def gqa_ref():
     Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)     # [B, Hkv, G, D]
+    if need_norm and need_rope:
+        Q = apply_rms_affine_rope_heads(
+            Q.view(NUM_REQ, 1, NUM_Q_HEAD, HEAD_DIM),
+            q_norm_weight,
+            rope_table[token_pos].view(1, 1, 1, HEAD_DIM),
+            eps=1.0e-6,
+        ).view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+
     K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)     # [B, S, Hkv, D]
     V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)     # [B, S, Hkv, D]
 
