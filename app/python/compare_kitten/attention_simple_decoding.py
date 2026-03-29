@@ -185,7 +185,7 @@ def sm_task(sm: int):
         last_active_kv_len = KVTile
 
     insts = [
-        attention_inst(num_kv_block, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(num_kv_block, HEAD_GROUP_SIZE, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
         tQ.cord(req, head),
         RepeatM.on(num_kv_block,
             [tK.cord(req, 0, head), tK.cord2tma(0, KVTile, 0)],
