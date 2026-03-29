@@ -255,7 +255,8 @@ class SchedAttentionDecoding(Schedule):
                  tmas,
                  side_input=None,
                  k_store=None,
-                 token_pos=None):
+                 token_pos=None,
+                 num_active_q=64):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -265,6 +266,7 @@ class SchedAttentionDecoding(Schedule):
         self.side_input = side_input
         self.k_store = k_store
         self.token_pos = token_pos
+        self.num_active_q = num_active_q
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
@@ -294,6 +296,7 @@ class SchedAttentionDecoding(Schedule):
         insts = [
             self.AttentionInst(
                 num_kv_blocks,
+                self.num_active_q,
                 seq_len_last_block,
                 need_norm=self.use_qwen_fused_qk,
                 need_rope=self.use_qwen_fused_qk,

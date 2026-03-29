@@ -157,14 +157,20 @@ def _encode_attention_runtime_flags(need_norm: bool, need_rope: bool) -> int:
         flags |= 2
     return flags
 
+def _encode_attention_qkv_workload_flag(num_active_q: int, last_kv_active_token_len: int) -> int:
+    return num_active_q | (last_kv_active_token_len << 8)
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[
+                num_kv_block, 
+                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
+                _encode_attention_runtime_flags(need_norm, need_rope)
+            ],
         )
 
 
@@ -181,10 +187,14 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[
+                num_kv_block, 
+                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
+                _encode_attention_runtime_flags(need_norm, need_rope)
+            ],
         )
 
 
