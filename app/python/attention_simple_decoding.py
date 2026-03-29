@@ -36,7 +36,7 @@ matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bflo
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 
 # interleaved QKV
-matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matQ_attn_view = matQ.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matO_attn_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
@@ -92,7 +92,7 @@ def tma_load_o(mat: torch.Tensor, tileK: int, tileN: int):
 
     # this will dup for 16 times, due to 0 in strides, do not know how tma engine will handle it
     glob_dims = [64, 1, 64, 2, NUM_REQ * NUM_Q_HEAD]
-    glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    glob_strides = [128 * 2, 0, 64 * 2, HEAD_DIM * 2]
     box_dims = [64, 1, 64, 2, 1]
 
     rank = len(glob_dims)
