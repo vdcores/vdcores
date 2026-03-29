@@ -267,6 +267,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         side_input=layerg["loadQwenSideInput"],
         k_store=current_k_store,
         token_pos=token_pos,
+        num_active_q=HEAD_GROUP_SIZE,
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
     OutProj = maybe_no_prefetch("out_proj", SchedGemv(

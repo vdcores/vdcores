@@ -9,7 +9,7 @@
 constexpr bool dae2EnableLooping = true;
 constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
-constexpr bool dae2LoadInstructions = false;
+constexpr bool dae2LoadInstructions = true;
 
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
