@@ -144,7 +144,7 @@ static __device__ __forceinline__ void handle_attention_common(
     task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
       inst.args[0],
       0,
-      64,
+      1,
       inst.args[1],
       0,
       need_norm,
@@ -159,7 +159,7 @@ static __device__ __forceinline__ void handle_attention_common(
     task_attention_fwd_flash3_grouped<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
       inst.args[0],
       0,
-      64,
+      1,
       inst.args[1],
       0,
       need_norm,
