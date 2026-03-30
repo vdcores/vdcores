@@ -107,10 +107,10 @@ static __device__ __forceinline__ void append_mem_trace(
   if constexpr (!dae2EnableMemTrace) {
     return;
   }
-  const uint16_t decoded_op = op(inst.opcode);
-  if (decoded_op == op(OP_ALLOC_REG_LOAD) || decoded_op == op(OP_ALLOC_WB_REG_STORE)) {
-    return;
-  }
+  // const uint16_t decoded_op = op(inst.opcode);
+  // if (decoded_op == op(OP_ALLOC_REG_LOAD) || decoded_op == op(OP_ALLOC_WB_REG_STORE)) {
+  //   return;
+  // }
   uint32_t slot = atomicAdd(trace_counts + sm_id, 1U);
   if (slot >= maxMemTraceRecords) {
     return;

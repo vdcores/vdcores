@@ -39,7 +39,7 @@ config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, token=os.en
 eps = config.rms_norm_eps # 1e-6
 rope_theta = config.rope_parameters["rope_theta"]
 
-layers = model.model.layers[:1]
+layers = model.model.layers
 
 ###################################
 # basic parameter of DAE
@@ -539,13 +539,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
     LoopC.toNext(dae.copy_cptrs(), num_layers),
 
-    # # logits
-    # LogitsProj,
+    # logits
+    LogitsProj,
 
     # argmax and cleanup
-    # Argmax,
+    Argmax,
 
-    # restore_bars_low,
+    restore_bars_low,
   )
 
 ###################################
