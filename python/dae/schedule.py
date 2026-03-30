@@ -328,6 +328,131 @@ class SchedAttentionDecoding(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedAttentionSplit(Schedule):
+    def __init__(self,
+                 dae: Launcher,
+                 seq_len: int,
+                 KV_BLOCK_SIZE: int,
+                 NUM_Q_HEADS: int,
+                 NUM_KV_HEADS: int,
+                 split_kv: int,
+                 split_q_tile: int,
+                 splits_per_post_load: int,
+                 matO: torch.Tensor,
+                 matO_split: torch.Tensor,
+                 matP: torch.Tensor,
+                 tmas,
+                 need_norm: bool = False,
+                 need_rope: bool = False):
+        super().__init__()
+        self.dae = dae
+        self.seq_len = seq_len
+        self.block_size = KV_BLOCK_SIZE
+        self.num_q_heads = NUM_Q_HEADS
+        self.num_kv_heads = NUM_KV_HEADS
+        self.head_group_size = NUM_Q_HEADS // NUM_KV_HEADS
+        self.split_kv = split_kv
+        self.split_q_tile = split_q_tile
+        self.splits_per_post_load = splits_per_post_load
+        self.matO = matO
+        self.matO_split = matO_split
+        self.matP = matP
+        self.tmas = tmas
+        self.need_norm = need_norm
+        self.need_rope = need_rope
+        self.head_dim = matO.shape[-1]
+        self.compute_sms = self.num_kv_heads * self.split_kv
+        self.post_tiles_per_head = (self.head_group_size + self.split_q_tile - 1) // self.split_q_tile
+        self.num_post_sms = self.num_kv_heads * self.post_tiles_per_head
+        if self.head_dim != ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM:
+            raise ValueError(f"SchedAttentionSplit only supports head_dim={ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM}, got {self.head_dim}")
+        self.AttentionInst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
+        self.attn_bar = self.dae.new_bar(self._active_split_count() * self.num_kv_heads)
+
+    def _on_place(self):
+        required_sms = max(self.compute_sms, self.num_post_sms)
+        assert self.num_sms >= required_sms, (
+            f"SchedAttentionSplit requires at least {required_sms} SMs, got {self.num_sms}"
+        )
+
+    def _active_split_count(self):
+        active = 0
+        for split_stage in range(self.split_kv):
+            if self.split_bounds(split_stage)[5] > 0:
+                active += 1
+        return active
+
+    def split_bounds(self, split_stage: int):
+        num_kv_blocks = (self.seq_len + self.block_size - 1) // self.block_size
+        num_block_per_split = (num_kv_blocks + self.split_kv - 1) // self.split_kv
+        kv_start_block = split_stage * num_block_per_split
+        kv_start = kv_start_block * self.block_size
+        kv_end = kv_start + num_block_per_split * self.block_size
+        total_active = min(max(self.seq_len - kv_start, 0), kv_end - kv_start)
+        split_last_active_kv_len = total_active % self.block_size
+        if total_active > 0 and split_last_active_kv_len == 0:
+            split_last_active_kv_len = self.block_size
+        return (
+            num_kv_blocks,
+            num_block_per_split,
+            kv_start_block,
+            kv_start,
+            kv_end,
+            total_active,
+            split_last_active_kv_len,
+        )
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        tQ, tK, tV, tO_split = self.tmas
+        insts = []
+
+        if sm < self.compute_sms:
+            split_stage = sm // self.num_kv_heads
+            head = sm % self.num_kv_heads
+            _, num_block_per_split, kv_start_block, kv_start_idx, _, total_active, split_last_active_kv_len = self.split_bounds(split_stage)
+            if total_active > 0:
+                insts += [
+                    self.AttentionInst(
+                        num_block_per_split,
+                        self.head_group_size,
+                        split_last_active_kv_len,
+                        kv_start_block,
+                        need_norm=self.need_norm,
+                        need_rope=self.need_rope,
+                    ),
+                    tQ.cord(head),
+                    RepeatM.on(
+                        num_block_per_split,
+                        [tK.cord(kv_start_idx, head), tK.cord2tma(self.block_size, 0)],
+                        [tV.cord(kv_start_idx, head), tV.cord2tma(self.block_size, 0)],
+                    ),
+                    TmaStore1D(self.matO_split[split_stage, head, ...], numSlots=2),
+                    TmaStore1D(self.matP[split_stage, head]).bar(self.attn_bar),
+                ]
+
+        if sm >= self.num_post_sms:
+            return insts
+
+        post_tile_idx = sm // self.num_kv_heads
+        head = sm % self.num_kv_heads
+        q_ofst_in_head = post_tile_idx * self.split_q_tile
+        q_ofst = head * self.head_group_size + q_ofst_in_head
+        matO_q = self.matO.view(self.num_q_heads, self.head_dim)
+        insts += [
+            ATTN_SPLIT_POST_REDUCE(self.split_kv, self.splits_per_post_load, self.split_q_tile, q_ofst, self.head_group_size),
+            TmaLoad1D(self.matP[:self.split_kv]).bar(self.attn_bar),
+            RepeatM.on(
+                self.split_kv // self.splits_per_post_load,
+                [tO_split.cord(0, q_ofst), tO_split.cord2tma(self.splits_per_post_load, 0)],
+            ),
+            TmaStore1D(matO_q[q_ofst:q_ofst + self.split_q_tile]),
+        ]
+        return insts
+
+
 class SchedAttention(Schedule):
     def __init__(self,
                  reqs : int,
