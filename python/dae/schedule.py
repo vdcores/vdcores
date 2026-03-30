@@ -362,7 +362,7 @@ class SchedAttentionSplit(Schedule):
         self.need_rope = need_rope
         self.head_dim = matO.shape[-1]
         self.compute_sms = self.num_kv_heads * self.split_kv
-        self.num_post_sms = (self.num_q_heads * self.split_q_tile) // self.head_dim
+        self.num_post_sms = (self.num_q_heads + self.split_q_tile - 1) // self.split_q_tile 
         if self.head_dim != ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM:
             raise ValueError(f"SchedAttentionSplit only supports head_dim={ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM}, got {self.head_dim}")
         self.AttentionInst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
@@ -435,7 +435,7 @@ class SchedAttentionSplit(Schedule):
                 self.split_kv // self.splits_per_post_load,
                 [tO_split.cord(0, q_ofst), tO_split.cord2tma(self.splits_per_post_load, 0)],
             ),
-            TmaStore1D(matO_q[q_ofst:q_ofst + self.split_q_tile]).bar(self._bar("o")).group(),
+            TmaStore1D(self.matO[q_ofst:q_ofst + self.split_q_tile]).bar(self._bar("o")).group(),
         ]
         return insts
 

@@ -68,14 +68,14 @@ matO_split_post_load_view = matO_split.view(MAX_SPLIT, NUM_REQ, NUM_Q_HEAD, HEAD
 matO_post_store_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 tasks = []
+base_sm = 0
 for req in range(NUM_REQ):
     split_kv, split_q_tile, splits_per_post_load = calc_split_meta(
-        seq_lengths[req],
-        KV_TILE,
+        16,
         NUM_Q_HEAD,
         NUM_KV_HEAD,
         HEAD_DIM,
-        16,
+        (seq_lengths[req] // KV_TILE),
     )
 
     tQ = TmaTensor(dae, matQ_attn_view[req:req + 1])._build("load", HEAD_DIM, 64, tma_split_load_q, cord_split_load_q)
@@ -109,26 +109,17 @@ for req in range(NUM_REQ):
             matO_split=matO_split_store_req,
             matP=matP[req],
             tmas=(tQ, tK, tV, tO_split_post_load),
-        ).place(split_kv, req * split_kv).bar('o_split', bar)
+        ).place(split_kv * NUM_KV_HEAD, base_sm).bar('o_split', bar)
     )
+    base_sm += split_kv * NUM_KV_HEAD
 
 dae.i(
-    [task.schedule for task in tasks],
+    tasks,
     TerminateC(),
     TerminateM(),
 )
 
-print(
-    "llama3 split mvp:",
-    f"reqs={NUM_REQ}",
-    f"q_heads={NUM_Q_HEAD}",
-    f"kv_heads={NUM_KV_HEAD}",
-    f"split_kv={ATTN_SPLIT_KV}",
-    f"sms_per_req={ATTN_SPLIT_SMS_PER_REQ}",
-)
-
 dae_app(dae)
-
 
 def gqa_ref():
     q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
