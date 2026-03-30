@@ -29,8 +29,6 @@ assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must mat
 QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
-split_kv = 1
-assert split_kv <= MAX_SPLIT
 num_sms = 128
 
 dae = Launcher(num_sms, device=gpu)
@@ -39,7 +37,7 @@ matQ = torch.rand(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu) - 0.5
 matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matO_split = torch.zeros(split_kv, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
+matO_split = torch.zeros(MAX_SPLIT, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matP = torch.zeros(NUM_REQ, MAX_SPLIT, NUM_KV_HEAD, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
 
 # interleaved QKV
@@ -47,12 +45,9 @@ matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
-matO_split_attn_view = matO_split.view(split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 matO_attn_Q_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=gpu)
-
-matO_split_load_view = matO_split.view(split_kv, NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 need_norm = False
 need_rope = False
@@ -63,7 +58,6 @@ tasks = [
     SchedAttentionSplit(
         dae=dae,
         req_id=req,
-        split_level=split_kv,
         num_sms=sms_per_req,
         base_sm=req * sms_per_req,
         seq_length=seq_lengths[req],
@@ -80,9 +74,11 @@ tasks = [
     for req in range(NUM_REQ)
 ]
 
+split_kv = schedulers[0].split_kv
+matO_split_attn_view = matO_split[:split_kv].view(split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 split_q_tile = schedulers[0].split_q_tile
 SPLITS_PER_POST_LOAD = schedulers[0].splits_per_post_load
-print(f"split_q_tile: {split_q_tile}, SPLITS_PER_POST_LOAD: {SPLITS_PER_POST_LOAD}")
+print(f"split_kv: {split_kv}, split_q_tile: {split_q_tile}, SPLITS_PER_POST_LOAD: {SPLITS_PER_POST_LOAD}")
 
 def split_bounds(seq_length: int, split_stage: int):
     num_kv_block = (seq_length + KVTile - 1) // KVTile

@@ -8,7 +8,6 @@ class SchedAttentionSplit:
     def __init__(self,
                  dae: Launcher,
                  req_id: int,
-                 split_level: int,
                  num_sms: int,
                  base_sm: int,
                  seq_length: int,
@@ -24,7 +23,6 @@ class SchedAttentionSplit:
                  post_split_load_limit_bytes: int = 16 * 1024):
         self.dae = dae
         self.req_id = req_id
-        self.split_kv = split_level
         self.num_sms = num_sms
         self.base_sm = base_sm
         self.seq_length = seq_length
@@ -49,17 +47,23 @@ class SchedAttentionSplit:
         self.num_q_head = self.num_kv_head * self.head_group_size
         self.head_dim = matK.shape[1] // self.num_kv_head
         self.kv_seq_len = matK.shape[0] // self.num_req
+        self.num_kv_block = (self.seq_length + self.kv_tile - 1) // self.kv_tile
 
         assert 0 <= self.req_id < self.num_req, f"req_id {self.req_id} out of range for {self.num_req} requests"
-        assert self.split_kv > 0, "split_level must be positive"
-        assert self.split_kv <= self.max_split, f"split_level {self.split_kv} exceeds matP capacity {self.max_split}"
         assert self.num_sms > 0, "num_sms must be positive"
         assert self.base_sm >= 0, "base_sm must be non-negative"
         assert self.hidden_size == self.num_q_head * self.head_dim, "Q size must match inferred attention shape"
         assert self.kv_seq_len * self.num_req == matK.shape[0], "matK must reshape cleanly into [req, seq, head, dim]"
         assert matV.shape == matK.shape, "matV must match matK layout"
         assert matO.shape == matQ.shape, "matO must match matQ layout"
-        assert matO_split.shape[0] >= self.split_kv, "matO_split must reserve at least split_level slices"
+        assert self.num_sms >= self.num_kv_head, (
+            f"num_sms={self.num_sms} must cover all KV heads ({self.num_kv_head}) before sequence splitting"
+        )
+
+        # Prefer head parallelism first since it does not introduce post-reduce overhead.
+        # Only the residual per-head budget is used for sequence splitting.
+        self.split_kv = max(1, min(self.num_sms // self.num_kv_head, self.num_kv_block, self.max_split))
+        assert matO_split.shape[0] >= self.split_kv, "matO_split must reserve at least the inferred split count"
 
         self.q_tile = 64 // self.head_group_size
         self.compute_sms = self.num_kv_head * self.split_kv
@@ -99,8 +103,7 @@ class SchedAttentionSplit:
         return active
 
     def split_bounds(self, split_stage: int):
-        num_kv_block = (self.seq_length + self.kv_tile - 1) // self.kv_tile
-        num_block_per_split = (num_kv_block + self.split_kv - 1) // self.split_kv
+        num_block_per_split = (self.num_kv_block + self.split_kv - 1) // self.split_kv
         kv_start_block = split_stage * num_block_per_split
         kv_start = kv_start_block * self.kv_tile
         kv_end = kv_start + num_block_per_split * self.kv_tile
@@ -109,7 +112,7 @@ class SchedAttentionSplit:
         if total_active > 0 and split_last_active_kv_len == 0:
             split_last_active_kv_len = self.kv_tile
         return (
-            num_kv_block,
+            self.num_kv_block,
             num_block_per_split,
             kv_start_block,
             kv_start,
