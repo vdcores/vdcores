@@ -142,7 +142,6 @@ static __device__ __forceinline__ void handle_attention_common(
   if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
     task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, false, false, false, KernelQK, KernelPV>(
       inst.args[0],
-      0,
       num_active_q,
       last_kv_active_token_len,
       0,
@@ -157,7 +156,6 @@ static __device__ __forceinline__ void handle_attention_common(
   } else {
     task_attention_fwd_flash3_grouped<HeadDim, 64, 64, false, false, false, KernelQK, KernelPV>(
       inst.args[0],
-      0,
       num_active_q,
       last_kv_active_token_len,
       0,

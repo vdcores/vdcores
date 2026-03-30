@@ -4,7 +4,7 @@ from math import sqrt
 from dae.launcher import *
 from dae.util import *
 from dae.runtime import opcode, build_tma_desc
-from split_sched import SchedAttentionSplit
+from split_sched import GlobalSchedAttentionSplit
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -51,38 +51,29 @@ matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=g
 
 need_norm = False
 need_rope = False
-sms_per_req = num_sms // NUM_REQ
-assert sms_per_req > 0 and sms_per_req * NUM_REQ == num_sms, "num_sms must divide evenly across requests for this demo"
+global_scheduler = GlobalSchedAttentionSplit(
+    dae=dae,
+    total_sms=num_sms,
+    seq_lengths=seq_lengths,
+    matQ=matQ,
+    matK=matK,
+    matV=matV,
+    matO=matO,
+    matO_split=matO_split,
+    matP=matP,
+    need_norm=need_norm,
+    need_rope=need_rope,
+    kv_tile=KVTile,
+)
+schedulers = global_scheduler.schedulers
+max_split_kv = max(scheduler.split_kv for scheduler in schedulers)
+matO_split_attn_view = matO_split[:max_split_kv].view(max_split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+print("sms_assignment:", [scheduler.num_sms for scheduler in schedulers])
+print("split_kv_assignment:", [scheduler.split_kv for scheduler in schedulers])
 
-tasks = [
-    SchedAttentionSplit(
-        dae=dae,
-        req_id=req,
-        num_sms=sms_per_req,
-        base_sm=req * sms_per_req,
-        seq_length=seq_lengths[req],
-        matQ=matQ,
-        matK=matK,
-        matV=matV,
-        matO=matO,
-        matO_split=matO_split,
-        matP=matP,
-        need_norm=need_norm,
-        need_rope=need_rope,
-        kv_tile=KVTile,
-    )
-    for req in range(NUM_REQ)
-]
-
-split_kv = schedulers[0].split_kv
-matO_split_attn_view = matO_split[:split_kv].view(split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
-split_q_tile = schedulers[0].split_q_tile
-SPLITS_PER_POST_LOAD = schedulers[0].splits_per_post_load
-print(f"split_kv: {split_kv}, split_q_tile: {split_q_tile}, SPLITS_PER_POST_LOAD: {SPLITS_PER_POST_LOAD}")
-
-def split_bounds(seq_length: int, split_stage: int):
+def split_bounds(seq_length: int, split_stage: int, split_kv: int):
     num_kv_block = (seq_length + KVTile - 1) // KVTile
-    num_block_per_split = num_kv_block // split_kv
+    num_block_per_split = (num_kv_block + split_kv - 1) // split_kv
     kv_start_block = split_stage * num_block_per_split
     kv_start = kv_start_block * KVTile
     kv_end = kv_start + num_block_per_split * KVTile
@@ -93,7 +84,7 @@ def split_bounds(seq_length: int, split_stage: int):
     return num_kv_block, num_block_per_split, kv_start_block, kv_start, kv_end, total_active, split_last_active_kv_len
 
 dae.i(
-    [t.schedule for t in tasks],   
+    global_scheduler.schedule,
 
     TerminateC(),
     TerminateM(),
@@ -142,7 +133,10 @@ def split_ref(split_stage):
 
     scale = 1.0 / sqrt(HEAD_DIM)
     for req in range(NUM_REQ):
-        _, num_block_per_split, _, kv_start, kv_end, total_active, _ = split_bounds(seq_lengths[req], split_stage)
+        req_split_kv = schedulers[req].split_kv
+        if split_stage >= req_split_kv:
+            continue
+        _, num_block_per_split, _, kv_start, kv_end, total_active, _ = split_bounds(seq_lengths[req], split_stage, req_split_kv)
         if total_active == 0 or num_block_per_split == 0:
             continue
 

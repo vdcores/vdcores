@@ -4,6 +4,32 @@ from dae import runtime
 from dae.launcher import *
 
 
+def kv_blocks_for_seq(seq_length: int, kv_tile: int) -> int:
+    return (seq_length + kv_tile - 1) // kv_tile
+
+
+def infer_split_kv(num_sms: int, num_kv_head: int, num_kv_block: int, max_split: int) -> int:
+    if num_kv_block <= 0:
+        return 1
+    if num_sms < num_kv_head:
+        raise ValueError(f"num_sms={num_sms} must be at least num_kv_head={num_kv_head}")
+    return max(1, min(num_sms // num_kv_head, num_kv_block, max_split))
+
+
+def estimate_request_steps(num_sms: int, num_kv_head: int, num_kv_block: int, max_split: int) -> int:
+    split_kv = infer_split_kv(num_sms, num_kv_head, num_kv_block, max_split)
+    return (num_kv_block + split_kv - 1) // split_kv
+
+
+def min_sms_for_target_steps(target_steps: int, num_kv_head: int, num_kv_block: int, max_split: int) -> int | None:
+    if num_kv_block <= 0:
+        return num_kv_head
+    required_split = (num_kv_block + target_steps - 1) // target_steps
+    if required_split > max_split:
+        return None
+    return num_kv_head * max(1, required_split)
+
+
 class SchedAttentionSplit:
     def __init__(self,
                  dae: Launcher,
@@ -62,7 +88,7 @@ class SchedAttentionSplit:
 
         # Prefer head parallelism first since it does not introduce post-reduce overhead.
         # Only the residual per-head budget is used for sequence splitting.
-        self.split_kv = max(1, min(self.num_sms // self.num_kv_head, self.num_kv_block, self.max_split))
+        self.split_kv = infer_split_kv(self.num_sms, self.num_kv_head, self.num_kv_block, self.max_split)
         assert matO_split.shape[0] >= self.split_kv, "matO_split must reserve at least the inferred split count"
 
         self.q_tile = 64 // self.head_group_size
@@ -80,15 +106,15 @@ class SchedAttentionSplit:
         self.matQ_attn_view = matQ.view(self.num_req, self.num_kv_head, self.head_group_size, self.head_dim)
         self.matK_attn_view = matK.view(self.num_req, self.kv_seq_len, self.num_kv_head, self.head_dim)
         self.matV_attn_view = matV.view(self.num_req, self.kv_seq_len, self.num_kv_head, self.head_dim)
-        self.matO_split_attn_view = matO_split.view(self.split_kv, self.num_req, self.num_kv_head, self.head_group_size, self.head_dim)
-        self.matO_split_load_view = matO_split.view(self.split_kv, self.num_req, self.num_q_head, self.head_dim)
+        self.matO_split_attn_view = matO_split.view(self.max_split, self.num_req, self.num_kv_head, self.head_group_size, self.head_dim)
+        self.matO_split_load_view = matO_split.view(self.max_split, self.num_req, self.num_q_head, self.head_dim)
         self.matO_attn_q_view = matO.view(self.num_req, self.num_q_head, self.head_dim)
 
         self.q_req = self.matQ_attn_view[self.req_id:self.req_id + 1]
         self.k_req = self.matK_attn_view[self.req_id:self.req_id + 1]
         self.v_req = self.matV_attn_view[self.req_id:self.req_id + 1]
-        self.o_split_req = self.matO_split_attn_view[:, self.req_id:self.req_id + 1]
-        self.o_split_load_req = self.matO_split_load_view[:, self.req_id:self.req_id + 1]
+        self.o_split_req = self.matO_split_attn_view[:self.split_kv, self.req_id:self.req_id + 1]
+        self.o_split_load_req = self.matO_split_load_view[:self.split_kv, self.req_id:self.req_id + 1]
         self.o_post_req = self.matO_attn_q_view[self.req_id]
         self.p_req = self.matP[self.req_id:self.req_id + 1]
 
@@ -272,8 +298,8 @@ class SchedAttentionSplit:
                     self.tQ.cord(head),
                     RepeatM.on(
                         num_block_per_split,
-                        [self.tK.cord(kv_start_idx, head), self.tK.cord2tma(0, self.kv_tile, 0)],
-                        [self.tV.cord(kv_start_idx, head), self.tV.cord2tma(0, self.kv_tile, 0)],
+                        [self.tK.cord(kv_start_idx, head), self.tK.cord2tma(self.kv_tile, 0)],
+                        [self.tV.cord(kv_start_idx, head), self.tV.cord2tma(self.kv_tile, 0)],
                     ),
                     TmaStore1D(self.o_split_req[split_stage, 0, head, ...], numSlots=2),
                     TmaStore1D(self.p_req[0, split_stage, head]).bar(self.attn_bar),
@@ -288,7 +314,7 @@ class SchedAttentionSplit:
             TmaLoad1D(self.p_req[0, :self.split_kv]).bar(self.attn_bar),
             RepeatM.on(
                 self.split_kv // self.splits_per_post_load,
-                [self.tO_split.cord(0, q_ofst), self.tO_split.cord2tma(self.splits_per_post_load, 0, 0)],
+                [self.tO_split.cord(0, q_ofst), self.tO_split.cord2tma(self.splits_per_post_load, 0)],
             ),
             TmaStore1D(self.o_post_req[q_ofst:q_ofst + self.split_q_tile]),
         ]
@@ -299,5 +325,159 @@ class SchedAttentionSplit:
         if local_sm < 0 or local_sm >= self.num_sms:
             return []
         return self.sm_task(local_sm)
+
+    __call__ = schedule
+
+
+class GlobalSchedAttentionSplit:
+    def __init__(self,
+                 dae: Launcher,
+                 total_sms: int,
+                 seq_lengths: list[int] | tuple[int, ...],
+                 matQ: torch.Tensor,
+                 matK: torch.Tensor,
+                 matV: torch.Tensor,
+                 matO: torch.Tensor,
+                 matO_split: torch.Tensor,
+                 matP: torch.Tensor,
+                 need_norm: bool = False,
+                 need_rope: bool = False,
+                 kv_tile: int = 64,
+                 post_split_load_limit_bytes: int = 16 * 1024):
+        self.dae = dae
+        self.total_sms = total_sms
+        self.seq_lengths = list(seq_lengths)
+        self.matQ = matQ
+        self.matK = matK
+        self.matV = matV
+        self.matO = matO
+        self.matO_split = matO_split
+        self.matP = matP
+        self.need_norm = need_norm
+        self.need_rope = need_rope
+        self.kv_tile = kv_tile
+        self.post_split_load_limit_bytes = post_split_load_limit_bytes
+
+        self.num_req = matQ.shape[0]
+        self.max_split = matP.shape[1]
+        self.num_kv_head = matP.shape[2]
+        self.head_group_size = matP.shape[3]
+        self.num_q_head = self.num_kv_head * self.head_group_size
+        self.head_dim = matK.shape[1] // self.num_kv_head
+        self.num_kv_blocks = [kv_blocks_for_seq(seq_len, self.kv_tile) for seq_len in self.seq_lengths]
+
+        if len(self.seq_lengths) != self.num_req:
+            raise ValueError(f"seq_lengths has {len(self.seq_lengths)} entries, expected {self.num_req}")
+        min_total_sms = self.num_req * self.num_kv_head
+        if self.total_sms < min_total_sms:
+            raise ValueError(
+                f"total_sms={self.total_sms} is insufficient for {self.num_req} requests; need at least {min_total_sms}"
+            )
+
+        self.sms_assignment = self._assign_sms()
+        self.schedulers = self._build_request_schedulers()
+
+    def _feasible_assignment_for_steps(self, target_steps: int):
+        assignment = []
+        for num_blocks in self.num_kv_blocks:
+            required_sms = min_sms_for_target_steps(target_steps, self.num_kv_head, num_blocks, self.max_split)
+            if required_sms is None:
+                return None
+            assignment.append(required_sms)
+        if sum(assignment) > self.total_sms:
+            return None
+        return assignment
+
+    def _assign_sms(self):
+        lo = 1
+        hi = max(max(self.num_kv_blocks, default=1), 1)
+        best_assignment = [self.num_kv_head for _ in range(self.num_req)]
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            assignment = self._feasible_assignment_for_steps(mid)
+            if assignment is None:
+                lo = mid + 1
+            else:
+                best_assignment = assignment
+                hi = mid - 1
+
+        assignment = best_assignment[:]
+        remaining = self.total_sms - sum(assignment)
+
+        while remaining >= self.num_kv_head:
+            best_req = None
+            best_gain = 0
+            best_next_steps = None
+
+            for req_id, (cur_sms, num_blocks) in enumerate(zip(assignment, self.num_kv_blocks)):
+                cur_steps = estimate_request_steps(cur_sms, self.num_kv_head, num_blocks, self.max_split)
+                next_sms = cur_sms + self.num_kv_head
+                next_steps = estimate_request_steps(next_sms, self.num_kv_head, num_blocks, self.max_split)
+                gain = cur_steps - next_steps
+                if gain <= 0:
+                    continue
+                if gain > best_gain or (gain == best_gain and (best_next_steps is None or next_steps < best_next_steps)):
+                    best_req = req_id
+                    best_gain = gain
+                    best_next_steps = next_steps
+
+            if best_req is None:
+                break
+
+            assignment[best_req] += self.num_kv_head
+            remaining -= self.num_kv_head
+
+        return assignment
+
+    def _build_request_schedulers(self):
+        schedulers = []
+        base_sm = 0
+        for req_id, (seq_length, num_sms) in enumerate(zip(self.seq_lengths, self.sms_assignment)):
+            schedulers.append(
+                SchedAttentionSplit(
+                    dae=self.dae,
+                    req_id=req_id,
+                    num_sms=num_sms,
+                    base_sm=base_sm,
+                    seq_length=seq_length,
+                    matQ=self.matQ,
+                    matK=self.matK,
+                    matV=self.matV,
+                    matO=self.matO,
+                    matO_split=self.matO_split,
+                    matP=self.matP,
+                    need_norm=self.need_norm,
+                    need_rope=self.need_rope,
+                    kv_tile=self.kv_tile,
+                    post_split_load_limit_bytes=self.post_split_load_limit_bytes,
+                )
+            )
+            base_sm += num_sms
+        return schedulers
+
+    def schedule(self, sm: int):
+        for scheduler in self.schedulers:
+            if scheduler.base_sm <= sm < scheduler.base_sm + scheduler.num_sms:
+                return scheduler.schedule(sm)
+        return []
+
+    def describe(self):
+        return [
+            {
+                "req_id": scheduler.req_id,
+                "seq_length": scheduler.seq_length,
+                "num_sms": scheduler.num_sms,
+                "split_kv": scheduler.split_kv,
+                "base_sm": scheduler.base_sm,
+                "estimated_steps": estimate_request_steps(
+                    scheduler.num_sms,
+                    scheduler.num_kv_head,
+                    scheduler.num_kv_block,
+                    scheduler.max_split,
+                ),
+            }
+            for scheduler in self.schedulers
+        ]
 
     __call__ = schedule
