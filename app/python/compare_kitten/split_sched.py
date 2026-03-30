@@ -99,6 +99,7 @@ class SchedAttentionSplit:
             max(1, self.post_split_load_limit_bytes // (self.split_q_tile * self.head_dim * 2)),
             self.split_kv,
         )
+        # print(f"req_id {self.req_id}: split_kv={self.split_kv}, compute_sms={self.compute_sms}, split_q_tile={self.split_q_tile}, num_post_sms={self.num_post_sms}, splits_per_post_load={self.splits_per_post_load}")
         assert self.split_kv % self.splits_per_post_load == 0, (
             f"split_level {self.split_kv} must be divisible by SPLITS_PER_POST_LOAD {self.splits_per_post_load}"
         )

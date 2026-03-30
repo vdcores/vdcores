@@ -14,14 +14,14 @@ from qwen3.utils import *
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 65536
+KV_SEQ_LEN = 8192
 HEAD_DIM = 128
-HIDDEN_SIZE = 1024
-NUM_Q_HEAD = 8
-NUM_KV_HEAD = 1
+HIDDEN_SIZE = 4096
+NUM_Q_HEAD = 32
+NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 128
-seq_lengths = [512] * 64
+seq_lengths = [8192] * 8
 NUM_REQ = len(seq_lengths)
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
@@ -29,7 +29,7 @@ assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must mat
 QTile = 64 // HEAD_GROUP_SIZE
 KVTile = 64
 
-num_sms = 128
+num_sms = 64
 
 dae = Launcher(num_sms, device=gpu)
 

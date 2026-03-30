@@ -243,10 +243,19 @@ class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
             1: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q8_N1, 
             2: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q8_N2, 
             4: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q8_N4, 
-            8: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q8_N8},
+            8: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q8_N8
+        },
+        32: {
+            1: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q32_N1,
+            2: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q32_N2,
+            4: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q32_N4,
+            8: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q32_N8,
+            16: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q32_N16,
+            32: opcode.OP_ATTN_SPLIT_POST_REDUCE_Q32_N32,
+        },
     }
     def __init__(self, num_split: int, split_block_size: int, num_q: int, q_ofst: int, q_head: int):
-        assert q_head in self.SUPPORTED_Q_HEAD, f"unsupported split post-reduce q head {q_head}; supported values are {self.SUPPORTED_Q_TILES}"
+        assert q_head in self.SUPPORTED_Q_HEAD, f"unsupported split post-reduce q head {q_head}; supported values are {self.SUPPORTED_Q_HEAD.keys()}"
         assert num_q in self.SUPPORTED_Q_HEAD[q_head], f"unsupported qtile {num_q}; supported values for q head {q_head} are {self.SUPPORTED_Q_HEAD[q_head].keys()}"
         reduce_opcode = self.SUPPORTED_Q_HEAD[q_head][num_q]
         super().__init__(opcode=reduce_opcode, args=[num_split, split_block_size, q_ofst])
