@@ -820,7 +820,7 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
     if (use_qwen_fused_qk) {
         rms_affine_rope_rows<HEAD_DIM, 128>(
             sQ_vec,
-            Q_BLOCK_SIZE,
+            num_active_q,
             smem_reduce,
             1.0e-6f,
             q_norm_weight,
