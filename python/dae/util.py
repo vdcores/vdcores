@@ -147,6 +147,57 @@ def read_mem_trace(dae):
     return np.concatenate(records)
 
 
+def _build_mem_trace_records(sm_id, start, end, size, opcode):
+    return np.rec.fromarrays(
+        [sm_id, start, end, size, opcode],
+        names=["sm_id", "start", "end", "size", "opcode"],
+    )
+
+
+def load_mem_trace_npz(path: str):
+    with np.load(path) as data:
+        required = {"sm_id", "start", "end", "size", "opcode"}
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"Missing required trace arrays in {path}: {sorted(missing)}")
+        return _build_mem_trace_records(
+            data["sm_id"].astype(np.int32, copy=False),
+            data["start"].astype(np.uint64, copy=False),
+            data["end"].astype(np.uint64, copy=False),
+            data["size"].astype(np.uint32, copy=False),
+            data["opcode"].astype(np.uint16, copy=False),
+        )
+
+
+def load_mem_trace_runs_npz(path: str):
+    with np.load(path) as data:
+        required = {"iteration", "sm_id", "start", "end", "size", "opcode"}
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"Missing required benchmark trace arrays in {path}: {sorted(missing)}")
+
+        iteration = data["iteration"].astype(np.int32, copy=False)
+        sm_id = data["sm_id"].astype(np.int32, copy=False)
+        start = data["start"].astype(np.uint64, copy=False)
+        end = data["end"].astype(np.uint64, copy=False)
+        size = data["size"].astype(np.uint32, copy=False)
+        opcode = data["opcode"].astype(np.uint16, copy=False)
+
+        if iteration.size == 0:
+            num_runs = int(data["num_runs"][0]) if "num_runs" in data.files else 0
+            return [np.recarray(0, dtype=EMPTY_MEM_TRACE_DTYPE) for _ in range(num_runs)]
+
+        num_runs = int(max(iteration.max() + 1, int(data["num_runs"][0]) if "num_runs" in data.files else 0))
+        runs = []
+        for run_idx in range(num_runs):
+            mask = iteration == run_idx
+            if not np.any(mask):
+                runs.append(np.recarray(0, dtype=EMPTY_MEM_TRACE_DTYPE))
+                continue
+            runs.append(_build_mem_trace_records(sm_id[mask], start[mask], end[mask], size[mask], opcode[mask]))
+        return runs
+
+
 def compute_effective_bw_series(trace_records, bin_us: float = 1.0):
     if trace_records.size == 0:
         return np.array([]), np.array([])
@@ -301,6 +352,32 @@ def save_effective_bw_plot(dae, path: str | None = None, bin_us: float = 1.0):
     return path
 
 
+def save_effective_bw_plot_from_trace(trace_records, path: str | None = None, bin_us: float = 1.0, title: str = "Effective Memory Bandwidth Over Time"):
+    if plt is None:
+        raise RuntimeError("matplotlib is required to save the effective bandwidth plot")
+    if trace_records.size == 0:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    times_us, bw_gbps = compute_effective_bw_series(trace_records, bin_us=bin_us)
+    if path is None:
+        path = f"effective_bw_{int(time.time())}.png"
+
+    fig, ax = plt.subplots(figsize=(12, 4), dpi=200)
+    ax.plot(times_us, bw_gbps, linewidth=1.5)
+    ax.set_xlabel("Time (us)")
+    ax.set_ylabel("Effective BW (GB/s)")
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"[mem-trace] wrote effective bandwidth plot to {path}")
+    print(f"[mem-trace] average effective bandwidth: {bw_gbps.mean():.3f} GB/s")
+    print(f"[mem-trace] peak effective bandwidth: {bw_gbps.max():.3f} GB/s")
+    return path
+
+
 def save_effective_bw_heatmap(dae, path: str | None = None, bin_us: float = 1.0):
     if plt is None:
         raise RuntimeError("matplotlib is required to save the effective bandwidth heatmap")
@@ -330,6 +407,41 @@ def save_effective_bw_heatmap(dae, path: str | None = None, bin_us: float = 1.0)
     ax.set_xlabel("Time (us)")
     ax.set_ylabel("SM ID")
     ax.set_title("Per-SM Effective Memory Bandwidth Heatmap")
+    fig.colorbar(im, ax=ax, label="Effective BW (GB/s)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"[mem-trace] wrote effective bandwidth heatmap to {path}")
+    return path
+
+
+def save_effective_bw_heatmap_from_trace(trace_records, num_sms: int, path: str | None = None, bin_us: float = 1.0, title: str = "Per-SM Effective Memory Bandwidth Heatmap"):
+    if plt is None:
+        raise RuntimeError("matplotlib is required to save the effective bandwidth heatmap")
+    if trace_records.size == 0:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    times_us, bw_heatmap = compute_effective_bw_heatmap(trace_records, num_sms=num_sms, bin_us=bin_us)
+    if bw_heatmap.size == 0:
+        print("[mem-trace] no valid memory trace samples captured")
+        return None
+    if path is None:
+        path = f"effective_bw_heatmap_{int(time.time())}.png"
+
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=200)
+    time_extent = times_us[-1] + 0.5 * bin_us if times_us.size > 0 else bin_us
+    im = ax.imshow(
+        bw_heatmap,
+        aspect="auto",
+        origin="lower",
+        interpolation="nearest",
+        extent=[0.0, time_extent, -0.5, num_sms - 0.5],
+        cmap="magma",
+    )
+    ax.set_xlabel("Time (us)")
+    ax.set_ylabel("SM ID")
+    ax.set_title(title)
     fig.colorbar(im, ax=ax, label="Effective BW (GB/s)")
     fig.tight_layout()
     fig.savefig(path, dpi=200)
