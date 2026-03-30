@@ -38,7 +38,7 @@ setup(
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
-                    "-Xptxas=-v"
+                    "-Xptxas=-v",
                 ],
             },
             libraries=["cuda"],             # REQUIRED for cuTensorMap

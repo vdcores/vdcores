@@ -406,7 +406,8 @@ class Launcher:
         else:
             tma = torch.stack(self.tmas).to(self.device)
         profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
-        self.mem_trace_count.zero_()
+        if config.enable_mem_trace:
+            self.mem_trace_count.zero_()
 
         runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
         runtime.set_cache_policy(tma, stream, 1, 2, 0)

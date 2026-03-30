@@ -45,7 +45,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       __ldprint("wait for global barrier before load: bar=%d", inst.bar());
     };
 
-    uint64_t start_ts = cuda::ptx::get_sreg_globaltimer();
+    uint64_t start_ts = 0;
+    if constexpr (dae2EnableMemTrace) {
+      start_ts = cuda::ptx::get_sreg_globaltimer();
+    }
 
     // TODO(zhiyuang): change location?
     switch(op(opcode)) {
@@ -185,15 +188,17 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       }
     }
 
-    uint64_t end_ts = cuda::ptx::get_sreg_globaltimer();
-    append_mem_trace(
-      mem_trace_counts,
-      mem_trace_records,
-      blockIdx.x,
-      inst,
-      start_ts,
-      end_ts
-    );
+    if constexpr (dae2EnableMemTrace) {
+      uint64_t end_ts = cuda::ptx::get_sreg_globaltimer();
+      append_mem_trace(
+        mem_trace_counts,
+        mem_trace_records,
+        blockIdx.x,
+        inst,
+        start_ts,
+        end_ts
+      );
+    }
 
     // m2c data should be prepared in the CFU
     (void)m2c.barriers[bar].arrive();

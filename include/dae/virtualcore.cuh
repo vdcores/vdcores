@@ -104,6 +104,9 @@ static __device__ __forceinline__ void append_mem_trace(
     const MInst &inst,
     uint64_t start,
     uint64_t end) {
+  if constexpr (!dae2EnableMemTrace) {
+    return;
+  }
   uint32_t slot = atomicAdd(trace_counts + sm_id, 1U);
   if (slot >= maxMemTraceRecords) {
     return;

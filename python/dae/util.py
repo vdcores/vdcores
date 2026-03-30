@@ -109,6 +109,9 @@ class ProfileParser:
 
 
 def read_mem_trace(dae):
+    if not config.enable_mem_trace or config.max_mem_trace_records == 0:
+        return np.rec.array([], dtype=[("sm_id", np.int32), ("start", np.uint64), ("end", np.uint64), ("size", np.uint32), ("opcode", np.uint16)])
+
     counts = dae.mem_trace_count.cpu().numpy().astype(np.int64, copy=False)
     trace = dae.mem_trace.cpu().numpy().view(MEM_TRACE_DTYPE).reshape(
         dae.num_sms, config.max_mem_trace_records

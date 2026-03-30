@@ -10,6 +10,7 @@ constexpr bool dae2EnableLooping = true;
 constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
 constexpr bool dae2LoadInstructions = true;
+static constexpr bool dae2EnableMemTrace = false;
 
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
@@ -28,7 +29,7 @@ static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
-static constexpr int maxMemTraceRecords = 2048;
+static constexpr int maxMemTraceRecords = dae2EnableMemTrace ? 2048 : 0;
 
 // barrier configurations
 static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
