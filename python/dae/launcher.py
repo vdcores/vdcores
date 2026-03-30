@@ -426,11 +426,15 @@ class Launcher:
         return extract_compute_operator_names(self)
     
     def bench(self, iterations : int = 100,
-                    total_bytes : int | None = None, total_flops : int | None = None):
+                    total_bytes : int | None = None, total_flops : int | None = None,
+                    trace_collector = None):
         duration_ns = torch.zeros(self.num_sms, dtype=torch.uint64)
         execution_time = 0.0
+        trace_runs = [] if trace_collector is not None else None
         for i in range(iterations):
             self.launch()
+            if trace_collector is not None:
+                trace_runs.append(trace_collector(self))
 
             # fetch profile data
             profile_data = self.profile[:,0:2].cpu().numpy()
@@ -452,3 +456,9 @@ class Launcher:
         if total_flops is not None:
             gflops = total_flops / avg_duration_ns / 1e6
             print(f"Effective GFLOPS: {gflops:.2f}")
+
+        return {
+            "avg_duration_ns": float(avg_duration_ns),
+            "avg_execution_time_ns": float(avg_execution_time),
+            "trace_runs": trace_runs,
+        }

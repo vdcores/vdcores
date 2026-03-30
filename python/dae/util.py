@@ -168,6 +168,35 @@ def compute_effective_bw_series(trace_records, bin_us: float = 1.0):
     return times_us, bw_gbps
 
 
+def average_effective_bw_series(trace_runs, bin_us: float = 1.0):
+    if not trace_runs:
+        return np.array([]), np.array([])
+
+    bw_runs = []
+    max_bins = 0
+    for trace in trace_runs:
+        _, bw = compute_effective_bw_series(trace, bin_us=bin_us)
+        bw_runs.append(bw)
+        max_bins = max(max_bins, bw.shape[0])
+
+    if max_bins == 0:
+        return np.array([]), np.array([])
+
+    bw_sum = np.zeros(max_bins, dtype=np.float64)
+    bw_count = np.zeros(max_bins, dtype=np.int32)
+    for bw in bw_runs:
+        if bw.size == 0:
+            continue
+        bw_sum[:bw.shape[0]] += bw
+        bw_count[:bw.shape[0]] += 1
+
+    valid = bw_count > 0
+    avg_bw = np.zeros(max_bins, dtype=np.float64)
+    avg_bw[valid] = bw_sum[valid] / bw_count[valid]
+    times_us = (np.arange(max_bins) + 0.5) * bin_us
+    return times_us, avg_bw
+
+
 def save_effective_bw_plot(dae, path: str | None = None, bin_us: float = 1.0):
     if plt is None:
         raise RuntimeError("matplotlib is required to save the effective bandwidth plot")
@@ -196,6 +225,35 @@ def save_effective_bw_plot(dae, path: str | None = None, bin_us: float = 1.0):
     return path
 
 
+def save_effective_bw_plot_from_runs(trace_runs, path: str | None = None, bin_us: float = 1.0):
+    if plt is None:
+        raise RuntimeError("matplotlib is required to save the effective bandwidth plot")
+    if not trace_runs:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    times_us, bw_gbps = average_effective_bw_series(trace_runs, bin_us=bin_us)
+    if bw_gbps.size == 0:
+        print("[mem-trace] no valid memory trace samples captured")
+        return None
+    if path is None:
+        path = f"effective_bw_avg_{int(time.time())}.png"
+
+    fig, ax = plt.subplots(figsize=(12, 4), dpi=200)
+    ax.plot(times_us, bw_gbps, linewidth=1.5)
+    ax.set_xlabel("Time (us)")
+    ax.set_ylabel("Effective BW (GB/s)")
+    ax.set_title(f"Average Effective Memory Bandwidth Over Time ({len(trace_runs)} runs)")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"[mem-trace] wrote averaged effective bandwidth plot to {path}")
+    print(f"[mem-trace] average effective bandwidth: {bw_gbps.mean():.3f} GB/s")
+    print(f"[mem-trace] peak effective bandwidth: {bw_gbps.max():.3f} GB/s")
+    return path
+
+
 def save_mem_trace(dae, path: str | None = None):
     trace_records = read_mem_trace(dae)
     if trace_records.size == 0:
@@ -214,6 +272,35 @@ def save_mem_trace(dae, path: str | None = None):
         opcode=trace_records["opcode"],
     )
     print(f"[mem-trace] wrote raw trace to {path}")
+    return path
+
+
+def save_mem_trace_runs(trace_runs, path: str | None = None):
+    nonempty_runs = [trace for trace in trace_runs if trace.size > 0]
+    if not nonempty_runs:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    if path is None:
+        path = f"mem_trace_runs_{int(time.time())}.npz"
+
+    iteration = np.concatenate([
+        np.full(trace.shape[0], idx, dtype=np.int32)
+        for idx, trace in enumerate(trace_runs)
+        if trace.size > 0
+    ])
+    concatenated = np.concatenate(nonempty_runs)
+    np.savez(
+        path,
+        iteration=iteration,
+        sm_id=concatenated["sm_id"],
+        start=concatenated["start"],
+        end=concatenated["end"],
+        size=concatenated["size"],
+        opcode=concatenated["opcode"],
+        num_runs=np.array([len(trace_runs)], dtype=np.int32),
+    )
+    print(f"[mem-trace] wrote {len(trace_runs)} benchmark traces to {path}")
     return path
 
 def dae_app(dae, total_bytes = None):
@@ -249,6 +336,7 @@ def dae_app(dae, total_bytes = None):
         did_work = True
 
     executed = False
+    trace_runs = None
     if parsed.launch:
         print(f"[launch] VDCores with {dae.num_sms} SMs...")
         dae.launch()
@@ -260,7 +348,13 @@ def dae_app(dae, total_bytes = None):
         torch.cuda.synchronize()
 
         print(f"[bench] VDCores with {dae.num_sms} SMs...")
-        dae.bench(parsed.bench, total_bytes=total_bytes)
+        collect_traces = parsed.mem_trace_save is not None or parsed.mem_bw_plot is not None
+        bench_result = dae.bench(
+            parsed.bench,
+            total_bytes=total_bytes,
+            trace_collector=read_mem_trace if collect_traces else None,
+        )
+        trace_runs = bench_result["trace_runs"]
         torch.cuda.synchronize()
         executed = True
     elif not did_work:
@@ -273,8 +367,14 @@ def dae_app(dae, total_bytes = None):
 
     if executed and parsed.mem_trace_save is not None:
         output_path = parsed.mem_trace_save or None
-        save_mem_trace(dae, path=output_path)
+        if parsed.bench is not None:
+            save_mem_trace_runs(trace_runs or [], path=output_path)
+        else:
+            save_mem_trace(dae, path=output_path)
 
     if executed and parsed.mem_bw_plot is not None:
         output_path = parsed.mem_bw_plot or None
-        save_effective_bw_plot(dae, path=output_path, bin_us=parsed.mem_bw_bin_us)
+        if parsed.bench is not None:
+            save_effective_bw_plot_from_runs(trace_runs or [], path=output_path, bin_us=parsed.mem_bw_bin_us)
+        else:
+            save_effective_bw_plot(dae, path=output_path, bin_us=parsed.mem_bw_bin_us)
