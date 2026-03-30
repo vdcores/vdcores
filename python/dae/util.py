@@ -195,6 +195,27 @@ def save_effective_bw_plot(dae, path: str | None = None, bin_us: float = 1.0):
     print(f"[mem-trace] peak effective bandwidth: {bw_gbps.max():.3f} GB/s")
     return path
 
+
+def save_mem_trace(dae, path: str | None = None):
+    trace_records = read_mem_trace(dae)
+    if trace_records.size == 0:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    if path is None:
+        path = f"mem_trace_{int(time.time())}.npz"
+
+    np.savez(
+        path,
+        sm_id=trace_records["sm_id"],
+        start=trace_records["start"],
+        end=trace_records["end"],
+        size=trace_records["size"],
+        opcode=trace_records["opcode"],
+    )
+    print(f"[mem-trace] wrote raw trace to {path}")
+    return path
+
 def dae_app(dae, total_bytes = None):
     parser = argparse.ArgumentParser(description="VDCores frontend")
     group = parser.add_mutually_exclusive_group()
@@ -210,6 +231,8 @@ def dae_app(dae, total_bytes = None):
                         help="Save a memory-trace effective bandwidth plot (default filename if omitted)")
     parser.add_argument("--mem-bw-bin-us", type=float, default=1.0,
                         help="Time bin width in microseconds for memory-trace bandwidth plots")
+    parser.add_argument("--mem-trace-save", type=str, nargs="?", const="", default=None,
+                        help="Save raw memory-trace data as .npz (default filename if omitted)")
     parser.add_argument("-w", "--write-compute-ops", type=str, nargs="?", const=DEFAULT_COMPUTE_OPS_FILE, default=None,
                         help=f"Write the launcher compute-operator list to a file (default: {DEFAULT_COMPUTE_OPS_FILE})")
     
@@ -247,6 +270,10 @@ def dae_app(dae, total_bytes = None):
         pp = ProfileParser(dae)
         for prof in parsed.profile:
             pp.parse(prof)
+
+    if executed and parsed.mem_trace_save is not None:
+        output_path = parsed.mem_trace_save or None
+        save_mem_trace(dae, path=output_path)
 
     if executed and parsed.mem_bw_plot is not None:
         output_path = parsed.mem_bw_plot or None
