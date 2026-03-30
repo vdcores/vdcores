@@ -219,6 +219,166 @@ def build_tma_wgmma_k(mat: torch.Tensor, tileK: int, tileN: int, iN: int = -2):
         0
     )
 
+def calc_split_meta(num_sms, num_q_head, num_kv_head, head_dim, num_kv_block, split_o_load_limit_bytes: int = 16 * 1024):
+    # determine split level
+    def infer_split_kv(num_sms: int, num_kv_head: int, num_kv_block: int, max_split: int) -> int:
+        if num_kv_block <= 0:
+            return 1
+        if num_sms < num_kv_head:
+            raise ValueError(f"num_sms={num_sms} must be at least num_kv_head={num_kv_head}")
+        return max(1, min(num_sms // num_kv_head, num_kv_block, max_split))
+
+    split_kv = infer_split_kv(num_sms, num_kv_head, num_kv_block, 128)
+    split_q_tile = max(1, (num_q_head + num_sms - 1) // num_sms)
+    splits_per_post_load = min(
+        max(1, split_o_load_limit_bytes // (split_q_tile * head_dim * 2)),
+        split_kv,
+    )
+    return split_kv, split_q_tile, splits_per_post_load
+
+def tma_split_load_q(mat: torch.Tensor, tileK: int, tileN: int):
+    assert len(mat.shape) == 4, "split-attention Q load expects [1, Hkv, G, D]"
+    assert mat.shape[0] == 1, "split-attention Q load expects a single-request slice"
+    _, num_kv_head, head_group_size, head_dim = mat.shape
+    assert mat.element_size() == 2, "Only support float16/bfloat16 Q tensors"
+    assert tileK == head_dim, "tileK must match HEAD_DIM"
+    assert tileN == 64, "tileN must be 64"
+    assert head_dim % 64 == 0, "HEAD_DIM must be a multiple of 64"
+    assert 64 % head_group_size == 0, "HEAD_GROUP_SIZE must divide the 64-row Q tile"
+
+    rope_tiles = head_dim // 64
+    q_tile_repeat = 64 // head_group_size
+    glob_dims = [64, head_group_size, q_tile_repeat, rope_tiles, num_kv_head]
+    glob_strides = [head_dim * 2, 0, 64 * 2, head_dim * head_group_size * 2]
+    box_dims = [64, head_group_size, q_tile_repeat, rope_tiles, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        [1] * rank,
+        128,
+        0,
+    )
+
+
+def cord_split_load_q(mat: torch.Tensor, rank: int):
+    assert rank == 5, "split-attention Q load expects a 5D descriptor"
+
+    def cfunc(*cords):
+        assert len(cords) == 1, f"split-attention Q load expects (head), got {cords}"
+        return [0, 0, 0, cords[0]]
+
+    return cfunc
+
+
+def tma_split_load_k(mat: torch.Tensor, tileK: int, tileN: int):
+    assert len(mat.shape) == 4, "split-attention K load expects [1, S, Hkv, D]"
+    assert mat.shape[0] == 1, "split-attention K load expects a single-request slice"
+    _, seq_len, num_kv_head, _ = mat.shape
+    elsize = mat.element_size()
+    glob_dims = [64, seq_len, 2, num_kv_head, 1]
+    glob_strides = [d * elsize for d in [mat.stride(1), 64, mat.stride(2), mat.stride(0)]]
+    box_dims = [64, tileN, 2, 1, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        [1] * rank,
+        128,
+        0,
+    )
+
+
+def cord_split_load_k(mat: torch.Tensor, rank: int):
+    assert rank == 5, "split-attention K load expects a 5D descriptor"
+
+    def cfunc(*cords):
+        assert len(cords) == 2, f"split-attention K load expects (seq, head), got {cords}"
+        s, h = cords
+        return [s, 0, h, 0]
+
+    return cfunc
+
+
+def tma_split_load_v(mat: torch.Tensor, tileM: int, tileK: int):
+    assert len(mat.shape) == 4, "split-attention V load expects [1, S, Hkv, D]"
+    assert mat.shape[0] == 1, "split-attention V load expects a single-request slice"
+    _, seq_len, num_kv_head, head_dim = mat.shape
+    elsize = mat.element_size()
+
+    assert tileM == head_dim, "tileM must match HEAD_DIM"
+    assert head_dim % 64 == 0, "HEAD_DIM must be a multiple of 64"
+    assert seq_len % 8 == 0, "sequence length must be a multiple of 8 for this TMA layout"
+
+    m_total = num_kv_head * head_dim
+    glob_dims = [64, 8, m_total // 64, seq_len // 8, 1]
+    glob_strides = [
+        mat.stride(1),
+        64,
+        mat.stride(1) * 8,
+        mat.stride(0),
+    ]
+    glob_strides = [s * elsize for s in glob_strides]
+    box_dims = [64, 8, tileM // 64, tileK // 8, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        [1] * rank,
+        128,
+        0,
+    )
+
+
+def cord_split_load_v(mat: torch.Tensor, rank: int):
+    assert rank == 5, "split-attention V load expects a 5D descriptor"
+
+    def cfunc(*cords):
+        assert len(cords) == 2, f"split-attention V load expects (seq, head), got {cords}"
+        s, h = cords
+        return [0, h * (mat.shape[-1] // 64), s // 8, 0]
+
+    return cfunc
+
+
+def tma_split_load_o(mat: torch.Tensor, tileS: int, tileO: int):
+    assert len(mat.shape) == 4, "split-attention O reload expects [S, 1, Q, D]"
+    assert mat.shape[1] == 1, "split-attention O reload expects a single-request slice"
+    _, _, num_q_head, head_dim = mat.shape
+    tile_q = tileO // head_dim
+    assert tile_q * head_dim == tileO, "tileO must be a multiple of HEAD_DIM"
+
+    glob_dims = [head_dim, num_q_head, mat.shape[0], mat.shape[1]]
+    glob_strides = [mat.stride(i) * mat.element_size() for i in [2, 0, 1]]
+    box_dims = [head_dim, tile_q, tileS, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat,
+        glob_dims,
+        glob_strides,
+        box_dims,
+        [1] * rank,
+        0,
+        0,
+    )
+
+
+def cord_split_load_o(mat: torch.Tensor, rank: int):
+    assert rank == 4, "split-attention O reload expects a 4D descriptor"
+
+    def cfunc(*cords):
+        assert len(cords) == 2, f"split-attention O reload expects (split, q_head), got {cords}"
+        s, hq = cords
+        return [0, hq, s, 0]
+
+    return cfunc
+
 class Layer:
     def __init__(self, dae, name : str):
         self.dae = dae

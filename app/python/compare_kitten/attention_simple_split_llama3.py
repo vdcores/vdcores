@@ -3,7 +3,7 @@ from math import sqrt
 
 from dae.launcher import *
 from dae.schedule import SchedAttentionSplit
-from dae.tma_utils import (
+from dae.model import (
     cord_split_load_k,
     cord_split_load_o,
     cord_split_load_q,
@@ -12,6 +12,7 @@ from dae.tma_utils import (
     tma_split_load_o,
     tma_split_load_q,
     tma_split_load_v,
+    calc_split_meta,
 )
 from dae.util import dae_app, tensor_diff
 
@@ -27,24 +28,22 @@ HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 HIDDEN_SIZE = NUM_Q_HEAD * HEAD_DIM
 NUM_REQ = 8
 KV_TILE = 64
+MAX_SPLIT = 128
 
-ATTN_SPLIT_KV = 2
-ATTN_SPLIT_SMS_PER_REQ = 16
-ATTN_SPLIT_Q_TILE = 4
-ATTN_SPLITS_PER_POST_LOAD = 2
+seq_lengths = [2048] * NUM_REQ
 
-seq_lengths = [512, 640, 768, 896, 1024, 1152, 1280, 1408]
 assert len(seq_lengths) == NUM_REQ
 
-num_sms = NUM_REQ * ATTN_SPLIT_SMS_PER_REQ
+num_sms = 128
 dae = Launcher(num_sms, device=gpu)
 
 matQ = torch.rand(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu) - 0.5
 matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
+
 matO_split = torch.zeros(
-    ATTN_SPLIT_KV,
+    MAX_SPLIT,
     NUM_REQ,
     NUM_KV_HEAD,
     HEAD_GROUP_SIZE,
@@ -53,8 +52,8 @@ matO_split = torch.zeros(
     device=gpu,
 )
 matP = torch.zeros(
-    ATTN_SPLIT_KV,
     NUM_REQ,
+    MAX_SPLIT,
     NUM_KV_HEAD,
     HEAD_GROUP_SIZE,
     dtype=torch.float,
@@ -64,21 +63,38 @@ matP = torch.zeros(
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
 matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
-matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
-matO_split_load_view = matO_split.view(ATTN_SPLIT_KV, NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
+
+matO_split_post_load_view = matO_split.view(MAX_SPLIT, NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
+matO_post_store_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
 
 tasks = []
 for req in range(NUM_REQ):
+    split_kv, split_q_tile, splits_per_post_load = calc_split_meta(
+        seq_lengths[req],
+        KV_TILE,
+        NUM_Q_HEAD,
+        NUM_KV_HEAD,
+        HEAD_DIM,
+        16,
+    )
+
     tQ = TmaTensor(dae, matQ_attn_view[req:req + 1])._build("load", HEAD_DIM, 64, tma_split_load_q, cord_split_load_q)
     tK = TmaTensor(dae, matK_attn_view[req:req + 1])._build("load", HEAD_DIM, KV_TILE, tma_split_load_k, cord_split_load_k)
     tV = TmaTensor(dae, matV_attn_view[req:req + 1])._build("load", HEAD_DIM, KV_TILE, tma_split_load_v, cord_split_load_v)
-    tO_split = TmaTensor(dae, matO_split_load_view[:, req:req + 1])._build(
-        "load",
-        ATTN_SPLITS_PER_POST_LOAD,
-        HEAD_DIM * ATTN_SPLIT_Q_TILE,
+
+    matO_split_store_req = matO_split[:split_kv, req:req + 1]
+    matO_split_post_load_req = matO_split_post_load_view[:split_kv, req:req + 1]
+    matO_post_store_req = matO_post_store_view[req]
+
+    tO_split_post_load = TmaTensor(dae, matO_split_post_load_req)._build(
+        "store",
+        splits_per_post_load,
+        split_q_tile * HEAD_DIM,
         tma_split_load_o,
         cord_split_load_o,
     )
+    bar = dae.new_bar(NUM_KV_HEAD * split_kv)
+
     tasks.append(
         SchedAttentionSplit(
             dae=dae,
@@ -86,14 +102,14 @@ for req in range(NUM_REQ):
             KV_BLOCK_SIZE=KV_TILE,
             NUM_Q_HEADS=NUM_Q_HEAD,
             NUM_KV_HEADS=NUM_KV_HEAD,
-            split_kv=ATTN_SPLIT_KV,
-            split_q_tile=ATTN_SPLIT_Q_TILE,
-            splits_per_post_load=ATTN_SPLITS_PER_POST_LOAD,
-            matO=matO_attn_view[req],
-            matO_split=matO_split[:, req],
-            matP=matP[:, req],
-            tmas=(tQ, tK, tV, tO_split),
-        ).place(ATTN_SPLIT_SMS_PER_REQ, req * ATTN_SPLIT_SMS_PER_REQ)
+            split_kv=split_kv,
+            split_q_tile=split_q_tile,
+            splits_per_post_load=splits_per_post_load,
+            matO=matO_post_store_req,
+            matO_split=matO_split_store_req,
+            matP=matP[req],
+            tmas=(tQ, tK, tV, tO_split_post_load),
+        ).place(split_kv, req * split_kv).bar('o_split', bar)
     )
 
 dae.i(

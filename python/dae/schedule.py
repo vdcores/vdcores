@@ -362,25 +362,16 @@ class SchedAttentionSplit(Schedule):
         self.need_rope = need_rope
         self.head_dim = matO.shape[-1]
         self.compute_sms = self.num_kv_heads * self.split_kv
-        self.post_tiles_per_head = (self.head_group_size + self.split_q_tile - 1) // self.split_q_tile
-        self.num_post_sms = self.num_kv_heads * self.post_tiles_per_head
+        self.num_post_sms = (self.num_q_heads * self.split_q_tile) // self.head_dim
         if self.head_dim != ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM:
             raise ValueError(f"SchedAttentionSplit only supports head_dim={ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM}, got {self.head_dim}")
         self.AttentionInst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
-        self.attn_bar = self.dae.new_bar(self._active_split_count() * self.num_kv_heads)
 
     def _on_place(self):
         required_sms = max(self.compute_sms, self.num_post_sms)
         assert self.num_sms >= required_sms, (
             f"SchedAttentionSplit requires at least {required_sms} SMs, got {self.num_sms}"
         )
-
-    def _active_split_count(self):
-        active = 0
-        for split_stage in range(self.split_kv):
-            if self.split_bounds(split_stage)[5] > 0:
-                active += 1
-        return active
 
     def split_bounds(self, split_stage: int):
         num_kv_blocks = (self.seq_len + self.block_size - 1) // self.block_size
@@ -423,32 +414,28 @@ class SchedAttentionSplit(Schedule):
                         need_norm=self.need_norm,
                         need_rope=self.need_rope,
                     ),
-                    tQ.cord(head),
+                    tQ.cord(head).bar(self._bar("q")).group(),
                     RepeatM.on(
                         num_block_per_split,
                         [tK.cord(kv_start_idx, head), tK.cord2tma(self.block_size, 0)],
                         [tV.cord(kv_start_idx, head), tV.cord2tma(self.block_size, 0)],
                     ),
-                    TmaStore1D(self.matO_split[split_stage, head, ...], numSlots=2),
-                    TmaStore1D(self.matP[split_stage, head]).bar(self.attn_bar),
+                    TmaStore1D(self.matO_split[split_stage, 0, head, ...], numSlots=2).group(),
+                    TmaStore1D(self.matP[split_stage, head]).bar(self._bar("o_split")).group(),
                 ]
 
         if sm >= self.num_post_sms:
             return insts
 
-        post_tile_idx = sm // self.num_kv_heads
-        head = sm % self.num_kv_heads
-        q_ofst_in_head = post_tile_idx * self.split_q_tile
-        q_ofst = head * self.head_group_size + q_ofst_in_head
-        matO_q = self.matO.view(self.num_q_heads, self.head_dim)
+        q_ofst = sm * self.split_q_tile
         insts += [
-            ATTN_SPLIT_POST_REDUCE(self.split_kv, self.splits_per_post_load, self.split_q_tile, q_ofst, self.head_group_size),
-            TmaLoad1D(self.matP[:self.split_kv]).bar(self.attn_bar),
+            ATTN_SPLIT_POST_REDUCE(self.split_kv, self.splits_per_post_load, self.split_q_tile, q_ofst, self.num_q_heads),
+            TmaLoad1D(self.matP[:self.split_kv]).bar(self._bar("o_split")).group(),
             RepeatM.on(
                 self.split_kv // self.splits_per_post_load,
                 [tO_split.cord(0, q_ofst), tO_split.cord2tma(self.splits_per_post_load, 0)],
             ),
-            TmaStore1D(matO_q[q_ofst:q_ofst + self.split_q_tile]),
+            TmaStore1D(matO_q[q_ofst:q_ofst + self.split_q_tile]).bar(self._bar("o")).group(),
         ]
         return insts
 
