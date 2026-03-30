@@ -3,6 +3,14 @@ import argparse
 import numpy as np
 import time
 
+EMPTY_MEM_TRACE_DTYPE = [
+    ("sm_id", np.int32),
+    ("start", np.uint64),
+    ("end", np.uint64),
+    ("size", np.uint32),
+    ("opcode", np.uint16),
+]
+
 try:
     import matplotlib.pyplot as plt
 except ImportError:  # pragma: no cover - optional dependency
@@ -110,7 +118,7 @@ class ProfileParser:
 
 def read_mem_trace(dae):
     if not config.enable_mem_trace or config.max_mem_trace_records == 0:
-        return np.rec.array([], dtype=[("sm_id", np.int32), ("start", np.uint64), ("end", np.uint64), ("size", np.uint32), ("opcode", np.uint16)])
+        return np.recarray(0, dtype=EMPTY_MEM_TRACE_DTYPE)
 
     counts = dae.mem_trace_count.cpu().numpy().astype(np.int64, copy=False)
     trace = dae.mem_trace.cpu().numpy().view(MEM_TRACE_DTYPE).reshape(
@@ -134,7 +142,7 @@ def read_mem_trace(dae):
         )
 
     if not records:
-        return np.rec.array([], dtype=[("sm_id", np.int32), ("start", np.uint64), ("end", np.uint64), ("size", np.uint32), ("opcode", np.uint16)])
+        return np.recarray(0, dtype=EMPTY_MEM_TRACE_DTYPE)
 
     return np.concatenate(records)
 
@@ -171,6 +179,42 @@ def compute_effective_bw_series(trace_records, bin_us: float = 1.0):
     return times_us, bw_gbps
 
 
+def compute_effective_bw_heatmap(trace_records, num_sms: int, bin_us: float = 1.0):
+    if trace_records.size == 0:
+        return np.array([]), np.zeros((num_sms, 0), dtype=np.float64)
+
+    bin_ns = max(bin_us * 1e3, 1.0)
+    start_ns = float(trace_records["start"].min())
+    end_ns = float(trace_records["end"].max())
+    num_bins = max(1, int(np.ceil((end_ns - start_ns) / bin_ns)))
+    bytes_per_bin = np.zeros((num_sms, num_bins), dtype=np.float64)
+
+    for record in trace_records:
+        rec_start = float(record["start"])
+        rec_end = float(record["end"])
+        if rec_end <= rec_start:
+            continue
+
+        sm_id = int(record["sm_id"])
+        if sm_id < 0 or sm_id >= num_sms:
+            continue
+
+        total_bytes = float(record["size"])
+        left = int((rec_start - start_ns) // bin_ns)
+        right = int(np.ceil((rec_end - start_ns) / bin_ns))
+        for bin_idx in range(max(0, left), min(num_bins, right)):
+            bin_start = start_ns + bin_idx * bin_ns
+            bin_end = bin_start + bin_ns
+            overlap = max(0.0, min(rec_end, bin_end) - max(rec_start, bin_start))
+            if overlap <= 0:
+                continue
+            bytes_per_bin[sm_id, bin_idx] += total_bytes * overlap / (rec_end - rec_start)
+
+    bw_gbps = bytes_per_bin / (bin_ns * 1e-9) / 1e9
+    times_us = (start_ns + (np.arange(num_bins) + 0.5) * bin_ns - start_ns) / 1e3
+    return times_us, bw_gbps
+
+
 def average_effective_bw_series(trace_runs, bin_us: float = 1.0):
     if not trace_runs:
         return np.array([]), np.array([])
@@ -198,6 +242,35 @@ def average_effective_bw_series(trace_runs, bin_us: float = 1.0):
     avg_bw[valid] = bw_sum[valid] / bw_count[valid]
     times_us = (np.arange(max_bins) + 0.5) * bin_us
     return times_us, avg_bw
+
+
+def average_effective_bw_heatmap(trace_runs, num_sms: int, bin_us: float = 1.0):
+    if not trace_runs:
+        return np.array([]), np.zeros((num_sms, 0), dtype=np.float64)
+
+    heatmaps = []
+    max_bins = 0
+    for trace in trace_runs:
+        _, heatmap = compute_effective_bw_heatmap(trace, num_sms=num_sms, bin_us=bin_us)
+        heatmaps.append(heatmap)
+        max_bins = max(max_bins, heatmap.shape[1])
+
+    if max_bins == 0:
+        return np.array([]), np.zeros((num_sms, 0), dtype=np.float64)
+
+    bw_sum = np.zeros((num_sms, max_bins), dtype=np.float64)
+    bw_count = np.zeros((num_sms, max_bins), dtype=np.int32)
+    for heatmap in heatmaps:
+        if heatmap.size == 0:
+            continue
+        bw_sum[:, :heatmap.shape[1]] += heatmap
+        bw_count[:, :heatmap.shape[1]] += 1
+
+    valid = bw_count > 0
+    avg_heatmap = np.zeros((num_sms, max_bins), dtype=np.float64)
+    avg_heatmap[valid] = bw_sum[valid] / bw_count[valid]
+    times_us = (np.arange(max_bins) + 0.5) * bin_us
+    return times_us, avg_heatmap
 
 
 def save_effective_bw_plot(dae, path: str | None = None, bin_us: float = 1.0):
@@ -228,6 +301,43 @@ def save_effective_bw_plot(dae, path: str | None = None, bin_us: float = 1.0):
     return path
 
 
+def save_effective_bw_heatmap(dae, path: str | None = None, bin_us: float = 1.0):
+    if plt is None:
+        raise RuntimeError("matplotlib is required to save the effective bandwidth heatmap")
+
+    trace_records = read_mem_trace(dae)
+    if trace_records.size == 0:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    times_us, bw_heatmap = compute_effective_bw_heatmap(trace_records, num_sms=dae.num_sms, bin_us=bin_us)
+    if bw_heatmap.size == 0:
+        print("[mem-trace] no valid memory trace samples captured")
+        return None
+    if path is None:
+        path = f"effective_bw_heatmap_{int(time.time())}.png"
+
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=200)
+    time_extent = times_us[-1] + 0.5 * bin_us if times_us.size > 0 else bin_us
+    im = ax.imshow(
+        bw_heatmap,
+        aspect="auto",
+        origin="lower",
+        interpolation="nearest",
+        extent=[0.0, time_extent, -0.5, dae.num_sms - 0.5],
+        cmap="magma",
+    )
+    ax.set_xlabel("Time (us)")
+    ax.set_ylabel("SM ID")
+    ax.set_title("Per-SM Effective Memory Bandwidth Heatmap")
+    fig.colorbar(im, ax=ax, label="Effective BW (GB/s)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"[mem-trace] wrote effective bandwidth heatmap to {path}")
+    return path
+
+
 def save_effective_bw_plot_from_runs(trace_runs, path: str | None = None, bin_us: float = 1.0):
     if plt is None:
         raise RuntimeError("matplotlib is required to save the effective bandwidth plot")
@@ -254,6 +364,41 @@ def save_effective_bw_plot_from_runs(trace_runs, path: str | None = None, bin_us
     print(f"[mem-trace] wrote averaged effective bandwidth plot to {path}")
     print(f"[mem-trace] average effective bandwidth: {bw_gbps.mean():.3f} GB/s")
     print(f"[mem-trace] peak effective bandwidth: {bw_gbps.max():.3f} GB/s")
+    return path
+
+
+def save_effective_bw_heatmap_from_runs(trace_runs, num_sms: int, path: str | None = None, bin_us: float = 1.0):
+    if plt is None:
+        raise RuntimeError("matplotlib is required to save the effective bandwidth heatmap")
+    if not trace_runs:
+        print("[mem-trace] no memory trace records captured")
+        return None
+
+    times_us, bw_heatmap = average_effective_bw_heatmap(trace_runs, num_sms=num_sms, bin_us=bin_us)
+    if bw_heatmap.size == 0:
+        print("[mem-trace] no valid memory trace samples captured")
+        return None
+    if path is None:
+        path = f"effective_bw_heatmap_avg_{int(time.time())}.png"
+
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=200)
+    time_extent = times_us[-1] + 0.5 * bin_us if times_us.size > 0 else bin_us
+    im = ax.imshow(
+        bw_heatmap,
+        aspect="auto",
+        origin="lower",
+        interpolation="nearest",
+        extent=[0.0, time_extent, -0.5, num_sms - 0.5],
+        cmap="magma",
+    )
+    ax.set_xlabel("Time (us)")
+    ax.set_ylabel("SM ID")
+    ax.set_title(f"Average Per-SM Effective Memory Bandwidth Heatmap ({len(trace_runs)} runs)")
+    fig.colorbar(im, ax=ax, label="Effective BW (GB/s)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"[mem-trace] wrote averaged effective bandwidth heatmap to {path}")
     return path
 
 
@@ -319,6 +464,8 @@ def dae_app(dae, total_bytes = None):
                         help="Profile with VDCores profiling counters")
     parser.add_argument("--mem-bw-plot", type=str, nargs="?", const="", default=None,
                         help="Save a memory-trace effective bandwidth plot (default filename if omitted)")
+    parser.add_argument("--mem-bw-heatmap", type=str, nargs="?", const="", default=None,
+                        help="Save a per-SM memory-trace effective bandwidth heatmap (default filename if omitted)")
     parser.add_argument("--mem-bw-bin-us", type=float, default=1.0,
                         help="Time bin width in microseconds for memory-trace bandwidth plots")
     parser.add_argument("--mem-trace-save", type=str, nargs="?", const="", default=None,
@@ -351,7 +498,11 @@ def dae_app(dae, total_bytes = None):
         torch.cuda.synchronize()
 
         print(f"[bench] VDCores with {dae.num_sms} SMs...")
-        collect_traces = parsed.mem_trace_save is not None or parsed.mem_bw_plot is not None
+        collect_traces = (
+            parsed.mem_trace_save is not None
+            or parsed.mem_bw_plot is not None
+            or parsed.mem_bw_heatmap is not None
+        )
         bench_result = dae.bench(
             parsed.bench,
             total_bytes=total_bytes,
@@ -381,3 +532,15 @@ def dae_app(dae, total_bytes = None):
             save_effective_bw_plot_from_runs(trace_runs or [], path=output_path, bin_us=parsed.mem_bw_bin_us)
         else:
             save_effective_bw_plot(dae, path=output_path, bin_us=parsed.mem_bw_bin_us)
+
+    if executed and parsed.mem_bw_heatmap is not None:
+        output_path = parsed.mem_bw_heatmap or None
+        if parsed.bench is not None:
+            save_effective_bw_heatmap_from_runs(
+                trace_runs or [],
+                num_sms=dae.num_sms,
+                path=output_path,
+                bin_us=parsed.mem_bw_bin_us,
+            )
+        else:
+            save_effective_bw_heatmap(dae, path=output_path, bin_us=parsed.mem_bw_bin_us)

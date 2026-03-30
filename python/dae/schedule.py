@@ -361,11 +361,15 @@ class SchedAttentionSplit(Schedule):
         self.need_norm = need_norm
         self.need_rope = need_rope
         self.head_dim = matO.shape[-1]
+        self.use_direct_decode = self.split_kv == 1
         self.compute_sms = self.num_kv_heads * self.split_kv
-        self.num_post_sms = (self.num_q_heads + self.split_q_tile - 1) // self.split_q_tile 
-        if self.head_dim != ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM:
-            raise ValueError(f"SchedAttentionSplit only supports head_dim={ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM}, got {self.head_dim}")
-        self.AttentionInst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
+        self.num_post_sms = 0 if self.use_direct_decode else (self.num_q_heads + self.split_q_tile - 1) // self.split_q_tile
+        if self.use_direct_decode:
+            self.AttentionInst = select_attention_decode_instruction(self.head_dim)
+        else:
+            if self.head_dim != ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM:
+                raise ValueError(f"SchedAttentionSplit only supports head_dim={ATTENTION_M64N64K16_F16_F32_64_64_hdim_split.HEAD_DIM}, got {self.head_dim}")
+            self.AttentionInst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
 
     def _on_place(self):
         required_sms = max(self.compute_sms, self.num_post_sms)
@@ -403,8 +407,30 @@ class SchedAttentionSplit(Schedule):
         if sm < self.compute_sms:
             split_stage = sm // self.num_kv_heads
             head = sm % self.num_kv_heads
-            _, num_block_per_split, kv_start_block, kv_start_idx, _, total_active, split_last_active_kv_len = self.split_bounds(split_stage)
-            if total_active > 0:
+            num_kv_blocks, num_block_per_split, kv_start_block, kv_start_idx, _, total_active, split_last_active_kv_len = self.split_bounds(split_stage)
+            if total_active > 0 and self.use_direct_decode:
+                insts += [
+                    self.AttentionInst(
+                        num_kv_blocks,
+                        self.head_group_size,
+                        split_last_active_kv_len,
+                        need_norm=self.need_norm,
+                        need_rope=self.need_rope,
+                    ),
+                    tQ.cord(head).bar(self._bar("q")).group(),
+                    RepeatM.on(
+                        num_kv_blocks - 1,
+                        [tK.cord(0, head), tK.cord2tma(self.block_size, 0)],
+                        [tV.cord(0, head), tV.cord2tma(self.block_size, 0)],
+                    ),
+                    tK.cord(self.block_size * (num_kv_blocks - 1), head).bar(self._bar("k")).group(),
+                    tV.cord(self.block_size * (num_kv_blocks - 1), head).group(),
+                    TmaStore1D(
+                        self.matO[head * self.head_group_size:(head + 1) * self.head_group_size],
+                        numSlots=2,
+                    ).bar(self._bar("o")).group(),
+                ]
+            elif total_active > 0:
                 insts += [
                     self.AttentionInst(
                         num_block_per_split,
@@ -424,7 +450,7 @@ class SchedAttentionSplit(Schedule):
                     TmaStore1D(self.matP[split_stage, head]).bar(self._bar("o_split")).group(),
                 ]
 
-        if sm >= self.num_post_sms:
+        if self.use_direct_decode or sm >= self.num_post_sms:
             return insts
 
         q_ofst = sm * self.split_q_tile
@@ -438,6 +464,15 @@ class SchedAttentionSplit(Schedule):
             TmaStore1D(self.matO[q_ofst:q_ofst + self.split_q_tile]).bar(self._bar("o")).group(),
         ]
         return insts
+
+    def bar_release_count(self, role: str):
+        if role == "o":
+            return self._bar_release_if_present(role, self.num_kv_heads if self.use_direct_decode else self.num_post_sms)
+        if role == "o_split" and not self.use_direct_decode:
+            active_splits = (self.seq_len + self.block_size - 1) // self.block_size
+            active_splits = min(active_splits, self.split_kv)
+            return self._bar_release_if_present(role, active_splits * self.num_kv_heads)
+        return 0
 
 
 class SchedAttention(Schedule):
