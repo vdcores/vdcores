@@ -41,6 +41,7 @@ matQ = torch.rand(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu) - 0.5
 matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
+matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
 matO_split = torch.zeros(
     MAX_SPLIT,
@@ -75,7 +76,7 @@ for req in range(NUM_REQ):
         NUM_Q_HEAD,
         NUM_KV_HEAD,
         HEAD_DIM,
-        (seq_lengths[req] // KV_TILE),
+        (seq_lengths[req] + KV_TILE - 1) // KV_TILE,
     )
 
     tQ = TmaTensor(dae, matQ_attn_view[req:req + 1])._build("load", HEAD_DIM, 64, tma_split_load_q, cord_split_load_q)
@@ -87,7 +88,7 @@ for req in range(NUM_REQ):
     matO_post_store_req = matO_post_store_view[req]
 
     tO_split_post_load = TmaTensor(dae, matO_split_post_load_req)._build(
-        "store",
+        "load",
         splits_per_post_load,
         split_q_tile * HEAD_DIM,
         tma_split_load_o,

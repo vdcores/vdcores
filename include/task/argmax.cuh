@@ -2,6 +2,7 @@
 
 #include "virtualcore.cuh"
 #include "type.cuh"
+#include <cfloat>
 
 template <typename T>
 __device__ __forceinline__ void warp_reduce_max_idx(T &val, long long &idx) {

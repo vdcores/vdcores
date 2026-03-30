@@ -39,7 +39,7 @@ config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, token=os.en
 eps = config.rms_norm_eps # 1e-6
 rope_theta = config.rope_parameters["rope_theta"]
 
-layers = model.model.layers
+layers = model.model.layers[:1]
 
 ###################################
 # basic parameter of DAE
@@ -56,11 +56,6 @@ rms_sms = REQ
 num_sms = 128
 full_sms = 132
 dae = Launcher(132, device=gpu)
-
-ATTN_SPLIT_KV = 2
-ATTN_SPLIT_SMS_PER_REQ = 16
-ATTN_SPLIT_Q_TILE = 4
-ATTN_SPLITS_PER_POST_LOAD = 2
 
 
 input_token_id_and_pos = [
@@ -132,8 +127,6 @@ attnQs = [torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu) for _ in range(num_l
 attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
 attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
 attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
-attnOSplit = torch.zeros(ATTN_SPLIT_KV, REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM, dtype=dtype, device=gpu)
-attnSplitStats = torch.zeros(ATTN_SPLIT_KV, REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, dtype=torch.float, device=gpu)
 matInterm = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
@@ -238,7 +231,6 @@ matQ_attn_views = [attnQ.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM) for att
 matK_attn_views = [attnK.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKs]
 matV_attn_views = [attnV.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
 matO_attn_view = attnO.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
-matO_split_load_view = attnOSplit.view(ATTN_SPLIT_KV, REQ, NUM_Q_HEAD, HEAD_DIM)
 
 layerg.addTma('loadQ', matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 64, tma_gqa_load_q, cord_gqa_load_q))
 layerg.addTma('loadK', matK_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_K, cord_func_K))
@@ -255,31 +247,6 @@ layerg.addTma("testReduce", matTestHidden, lambda t: t.wgmma("reduce", N, TileM,
 
 dae.build_groups()
 tma_shift, bar_shift = layerg.get_shift()
-
-attn_split_tmas = []
-for req in range(REQ):
-  split_tQ = MappedCordAdapter(
-    layerg['loadQ'],
-    cord_convert=lambda head, req=req: (req, head),
-  )
-  split_tK = MappedCordAdapter(
-    layerg['loadK'],
-    cord_convert=lambda seq, head, req=req: (req, seq, head, 0),
-    cord2tma_convert=lambda dseq, dhead, req=req: (0, dseq, dhead, 0),
-  )
-  split_tV = MappedCordAdapter(
-    layerg['loadV'],
-    cord_convert=lambda seq, head, req=req: (req, seq, head, 0),
-    cord2tma_convert=lambda dseq, dhead, req=req: (0, dseq, dhead, 0),
-  )
-  split_tO = TmaTensor(dae, matO_split_load_view[:, req:req+1])._build(
-    "load",
-    ATTN_SPLITS_PER_POST_LOAD,
-    HEAD_DIM * ATTN_SPLIT_Q_TILE,
-    tma_split_load_o,
-    cord_split_load_o,
-  )
-  attn_split_tmas.append((split_tQ, split_tK, split_tV, split_tO))
 
 ###################################
 # Start of Schedule
@@ -372,23 +339,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
   ).bar("store", layerg['bar_qkv_attn'])
 
   QWen8BGemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
-  Gqa = [
-    SchedAttentionSplit(
-      dae=dae,
-      seq_len=token_pos + 1,
-      KV_BLOCK_SIZE=KVBlockSize,
-      NUM_Q_HEADS=NUM_Q_HEAD,
-      NUM_KV_HEADS=NUM_KV_HEAD,
-      split_kv=ATTN_SPLIT_KV,
-      split_q_tile=ATTN_SPLIT_Q_TILE,
-      splits_per_post_load=ATTN_SPLITS_PER_POST_LOAD,
-      matO=matO_attn_view[req],
-      matO_split=attnOSplit[:, req],
-      matP=attnSplitStats[:, req],
-      tmas=attn_split_tmas[req],
-    ).place(ATTN_SPLIT_SMS_PER_REQ, req * ATTN_SPLIT_SMS_PER_REQ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
-    for req in range(REQ)
-  ]
+  Gqa = SchedAttentionDecoding(
+    reqs = N, seq_len = token_pos + 1,
+    KV_BLOCK_SIZE = KVBlockSize,
+    NUM_KV_HEADS = NUM_KV_HEAD,
+    matO = matO_attn_view,
+    tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
+  ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
 
   # accumulate to matHidden, which auto applies the residual add
   OutProj = SchedGemv(Gemv_M64N8,
@@ -494,6 +451,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   KProj = KProj.place(64, base_sm=64)
   KRope = KRope.place(64, base_sm=64)
   VProj = VProj.place(64)
+  Gqa = Gqa.place(N * NUM_KV_HEAD)
   OutProj = OutProj.place(num_sms)
   gate_proj_low = gate_proj_low.place(64)
   gate_proj_high = gate_proj_high.place(64)
@@ -582,12 +540,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
     LoopC.toNext(dae.copy_cptrs(), num_layers),
 
     # # logits
-    LogitsProj,
+    # LogitsProj,
 
     # argmax and cleanup
-    Argmax,
+    # Argmax,
 
-    restore_bars_low,
+    # restore_bars_low,
   )
 
 ###################################
