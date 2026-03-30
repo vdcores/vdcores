@@ -97,6 +97,27 @@ static __device__ __forceinline__ void * slot_2_glob_ptr(const MInst *st_insts, 
   return glob_ptr;
 }
 
+static __device__ __forceinline__ void append_mem_trace(
+    uint32_t *trace_counts,
+    MemTraceRecord *trace_records,
+    int sm_id,
+    const MInst &inst,
+    uint64_t start,
+    uint64_t end) {
+  uint32_t slot = atomicAdd(trace_counts + sm_id, 1U);
+  if (slot >= maxMemTraceRecords) {
+    return;
+  }
+
+  MemTraceRecord &record = trace_records[sm_id * maxMemTraceRecords + slot];
+  record.start = start;
+  record.end = end;
+  record.size = inst.size;
+  record.opcode = inst.opcode;
+  record._pad0 = 0;
+  record._pad1 = 0;
+}
+
 // TODO(zhiyuang): do we want to put barrier index in the command?
 // TODO(zhiyuang): do we want to do int32 or 64?
 union LdCmd {

@@ -6,7 +6,8 @@
 template<typename C2M_Type>
 __device__ __forceinline__ void stwarp_execute_singlethread(
     C2M_Type &c2m, const MInst* slot_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    uint32_t *mem_trace_counts, MemTraceRecord *mem_trace_records) {
 
   __stprint("[ST Warp] Start ST warp execution");
     
@@ -21,6 +22,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     auto &inst = slot_insts[slot];
     uint16_t opcode = inst.opcode;
     // all ops are writeback ops
+    uint64_t start_ts = cuda::ptx::get_sreg_globaltimer();
 
     switch(op(opcode)) {
       case op(OP_ALLOC_WB_TMA_STORE_1D):
@@ -162,6 +164,16 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     } else {
       cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
     }
+
+    uint64_t end_ts = cuda::ptx::get_sreg_globaltimer();
+    append_mem_trace(
+      mem_trace_counts,
+      mem_trace_records,
+      blockIdx.x,
+      inst,
+      start_ts,
+      end_ts
+    );
 
     // write back to free the slot
     __stprint("finish slot=%d op=%d flags=%02x",

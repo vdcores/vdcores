@@ -28,6 +28,7 @@ static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
+static constexpr int maxMemTraceRecords = 2048;
 
 // barrier configurations
 static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
@@ -110,6 +111,21 @@ struct alignas(16) MInst {
   __device__ __forceinline__ uint16_t bar() const {
     return num_slots >> slotBits;
   }
+};
+
+enum MemTraceKind : uint16_t {
+  MEM_TRACE_KIND_NONE = 0,
+  MEM_TRACE_KIND_LOAD = 1,
+  MEM_TRACE_KIND_STORE = 2,
+};
+
+struct alignas(32) MemTraceRecord {
+  uint64_t start;
+  uint64_t end;
+  uint32_t size;
+  uint16_t opcode;
+  uint16_t _pad0;
+  uint32_t _pad1;
 };
 
 // helpers for building opcode

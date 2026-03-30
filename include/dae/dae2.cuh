@@ -30,7 +30,9 @@ void dae2(
   const MInst* __restrict__ memory_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
-  uint64_t *  __restrict__ g_events
+  uint64_t *  __restrict__ g_events,
+  uint32_t * __restrict__ mem_trace_counts,
+  MemTraceRecord * __restrict__ mem_trace_records
 ) {
 
   int sm_id = blockIdx.x;
@@ -158,7 +160,7 @@ void dae2(
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars, mem_trace_counts, mem_trace_records
         );
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
@@ -167,7 +169,7 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars, mem_trace_counts, mem_trace_records
         );
       }
     } // End of warps

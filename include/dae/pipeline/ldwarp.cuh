@@ -6,7 +6,8 @@ template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     const MInst *st_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    uint32_t *mem_trace_counts, MemTraceRecord *mem_trace_records) {
 
   __ldprint("[LD Warp] Start LD warp execution");
 
@@ -43,6 +44,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       }
       __ldprint("wait for global barrier before load: bar=%d", inst.bar());
     };
+
+    uint64_t start_ts = cuda::ptx::get_sreg_globaltimer();
 
     // TODO(zhiyuang): change location?
     switch(op(opcode)) {
@@ -181,6 +184,16 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break;
       }
     }
+
+    uint64_t end_ts = cuda::ptx::get_sreg_globaltimer();
+    append_mem_trace(
+      mem_trace_counts,
+      mem_trace_records,
+      blockIdx.x,
+      inst,
+      start_ts,
+      end_ts
+    );
 
     // m2c data should be prepared in the CFU
     (void)m2c.barriers[bar].arrive();

@@ -218,6 +218,12 @@ class Launcher:
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
         self.profile = torch.empty((num_sms, config.num_profile_events), dtype=torch.uint64, device=self.device)
+        self.mem_trace_count = torch.zeros((num_sms,), dtype=torch.uint32, device=self.device)
+        self.mem_trace = torch.empty(
+            (num_sms * config.max_mem_trace_records, config.mem_trace_record_size),
+            dtype=torch.uint8,
+            device=self.device,
+        )
 
         self.cinsts = torch.empty((num_sms, self.max_insts, 8), dtype=torch.uint8)
         self.minsts = torch.empty((num_sms, self.max_insts, 16), dtype=torch.uint8)
@@ -400,6 +406,7 @@ class Launcher:
         else:
             tma = torch.stack(self.tmas).to(self.device)
         profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
+        self.mem_trace_count.zero_()
 
         runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
         runtime.set_cache_policy(tma, stream, 1, 2, 0)
@@ -410,7 +417,7 @@ class Launcher:
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
-            self.bars, profile,
+            self.bars, profile, self.mem_trace_count, self.mem_trace,
             stream
         )
         assert ret == 0

@@ -73,6 +73,8 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
+    torch::Tensor mem_trace_counts_u32,  // uint32
+    torch::Tensor mem_trace_records_bytes, // uint8 buffer
     int64_t stream
 ) {
   set_persistent_cache();
@@ -86,11 +88,18 @@ int py_launch_dae(
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+  TORCH_CHECK(mem_trace_counts_u32.defined(), "mem_trace_counts_u32 must be defined");
+  TORCH_CHECK(mem_trace_counts_u32.is_cuda(), "mem_trace_counts_u32 must be CUDA");
+  TORCH_CHECK(mem_trace_counts_u32.scalar_type() == torch::kUInt32, "mem_trace_counts_u32 must be uint32");
+  TORCH_CHECK(mem_trace_counts_u32.dim() == 1, "mem_trace_counts_u32 must be rank-1");
+  TORCH_CHECK(mem_trace_counts_u32.is_contiguous(), "mem_trace_counts_u32 must be contiguous");
+  auto* mem_trace_counts = mem_trace_counts_u32.data_ptr<uint32_t>();
+  auto mem_trace_records = check_tensor_ptr<MemTraceRecord>(mem_trace_records_bytes, "mem_trace_records_bytes");
 
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, prof, mem_trace_counts, mem_trace_records, stream
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -287,6 +296,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
   config.attr("num_profile_events") = numProfileEvents;
+  config.attr("max_mem_trace_records") = maxMemTraceRecords;
+  config.attr("mem_trace_record_size") = (int64_t)sizeof(MemTraceRecord);
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;

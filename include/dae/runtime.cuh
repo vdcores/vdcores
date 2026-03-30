@@ -14,6 +14,8 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
+  uint32_t * mem_trace_counts,
+  MemTraceRecord * mem_trace_records,
   int64_t stream
 );
 
@@ -26,4 +28,3 @@ CUtensorMap create_tma_descriptor(
   CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
   std::array<uint64_t, 5> global_strides_opt = {0, 0, 0, 0, 0}
 );
-
