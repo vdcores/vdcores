@@ -601,7 +601,7 @@ def _draw_schedule_axis(ax, entries, title, x_label, y_label=True, height_getter
                 f"{entry['group_id']} {entry['stage_name'][0].upper()}",
                 ha="center",
                 va="center",
-                fontsize=7,
+                fontsize=12,
                 color="black",
             )
 
