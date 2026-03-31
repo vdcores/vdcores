@@ -21,11 +21,11 @@ EXPAND_GEMV = globals().get("Gemv_M64N8K64")
 
 HIDDEN = 4096
 LORA_RANK = 64
-GROUP_SIZES = [128] + [64] * 2 + [8] * 5
+GROUP_SIZES = [128] + [64] * 4 + [8] * 11
 NUM_SMS = 128
 
 if EXPAND_GEMV is None:
-    raise RuntimeError("Gemv_M64N8K64 must be added before running app/python/lora_fixed_rank_demo.py")
+    raise RuntimeError("Gemv_M64N8K64 must be added before running app/python/lora/lora_fixed_rank_demo_ori.py")
 
 
 @dataclass(frozen=True)
@@ -172,6 +172,13 @@ def critical_tail(spec, expand_specs):
     return tail
 
 
+def tail_for_choice(spec, choice, expand_specs):
+    tail = choice.latency
+    if spec.stage_name == "shrink":
+        tail += expand_specs[spec.group_id].min_latency
+    return tail
+
+
 def stage_priority(spec, expand_specs):
     expand_bonus = 1 if spec.stage_name == "expand" else 0
     return (
@@ -224,7 +231,11 @@ def choose_stage_batch(ready_specs, free_segments, expand_specs):
     total_free = sum(seg_size for _, seg_size in free_segments)
     ready_specs = sorted(
         ready_specs,
-        key=lambda spec: stage_priority(spec, expand_specs),
+        key=lambda spec: (
+            critical_tail(spec, expand_specs),
+            1 if spec.stage_name == "expand" else 0,
+            spec.token_count,
+        ),
         reverse=True,
     )
 
@@ -239,10 +250,33 @@ def choose_stage_batch(ready_specs, free_segments, expand_specs):
     while selected:
         choice_pos = [0] * len(selected)
         used_sms = sum(spec.choices[pos].num_sms for spec, pos in zip(selected, choice_pos))
+        selected_tails = [
+            tail_for_choice(spec, spec.choices[pos], expand_specs)
+            for spec, pos in zip(selected, choice_pos)
+        ]
+        bottleneck_idx = max(range(len(selected)), key=lambda idx: selected_tails[idx])
+
+        while True:
+            spec = selected[bottleneck_idx]
+            next_pos = choice_pos[bottleneck_idx] + 1
+            if next_pos >= len(spec.choices):
+                break
+
+            extra_sms = spec.choices[next_pos].num_sms - spec.choices[choice_pos[bottleneck_idx]].num_sms
+            if used_sms + extra_sms > total_free:
+                break
+
+            choice_pos[bottleneck_idx] = next_pos
+            used_sms += extra_sms
 
         while True:
             best_upgrade = None
             best_score = None
+            selected_tails = [
+                tail_for_choice(spec, spec.choices[pos], expand_specs)
+                for spec, pos in zip(selected, choice_pos)
+            ]
+            current_max_tail = max(selected_tails)
             for idx, spec in enumerate(selected):
                 next_pos = choice_pos[idx] + 1
                 if next_pos >= len(spec.choices):
@@ -252,16 +286,22 @@ def choose_stage_batch(ready_specs, free_segments, expand_specs):
                 if used_sms + extra_sms > total_free:
                     continue
 
-                improvement = spec.choices[choice_pos[idx]].latency - spec.choices[next_pos].latency
-                if improvement <= 0:
+                current_tail = tail_for_choice(spec, spec.choices[choice_pos[idx]], expand_specs)
+                next_tail = tail_for_choice(spec, spec.choices[next_pos], expand_specs)
+                tail_improvement = current_tail - next_tail
+                if tail_improvement <= 0:
                     continue
 
-                priority = critical_tail(spec, expand_specs)
-                expand_bias = 1.25 if spec.stage_name == "expand" else 1.0
+                new_tails = list(selected_tails)
+                new_tails[idx] = next_tail
+                max_tail_improvement = current_max_tail - max(new_tails)
+                is_bottleneck = 1 if current_tail == current_max_tail else 0
+                expand_bias = 1.1 if spec.stage_name == "expand" else 1.0
                 score = (
-                    improvement * priority * expand_bias / extra_sms,
-                    improvement / extra_sms,
-                    priority,
+                    max_tail_improvement,
+                    is_bottleneck,
+                    tail_improvement * expand_bias / extra_sms,
+                    tail_improvement,
                 )
                 if best_score is None or score > best_score:
                     best_score = score
@@ -288,8 +328,11 @@ def choose_stage_batch(ready_specs, free_segments, expand_specs):
                 cur_choice = current_choice(spec, choice_pos[idx])
                 prev_choice = current_choice(spec, choice_pos[idx] - 1)
                 freed_sms = cur_choice.num_sms - prev_choice.num_sms
-                latency_penalty = prev_choice.latency - cur_choice.latency
-                score = (latency_penalty / freed_sms, latency_penalty, freed_sms)
+                tail_penalty = (
+                    tail_for_choice(spec, prev_choice, expand_specs)
+                    - tail_for_choice(spec, cur_choice, expand_specs)
+                )
+                score = (tail_penalty / freed_sms, tail_penalty, freed_sms)
                 if downgrade_score is None or score < downgrade_score:
                     downgrade_score = score
                     downgrade = idx
@@ -377,6 +420,34 @@ def build_pipeline_schedule(shrink_specs, expand_specs):
     return insts, plan, barrier_counts
 
 
+def make_group_tensors():
+    xs = []
+    a_weights = []
+    b_weights = []
+    shrink_outs = []
+    expand_outs = []
+
+    for token_count in GROUP_SIZES:
+        xs.append(torch.rand(token_count, HIDDEN, dtype=dtype, device=gpu) - 0.5)
+        a_weights.append(torch.rand(LORA_RANK, HIDDEN, dtype=dtype, device=gpu) - 0.5)
+        b_weights.append(torch.rand(HIDDEN, LORA_RANK, dtype=dtype, device=gpu) - 0.5)
+        shrink_outs.append(torch.zeros(token_count, LORA_RANK, dtype=dtype, device=gpu))
+        expand_outs.append(torch.zeros(token_count, HIDDEN, dtype=dtype, device=gpu))
+
+    return xs, a_weights, b_weights, shrink_outs, expand_outs
+
+
+def build_reference(xs, a_weights, b_weights):
+    shrink_refs = []
+    expand_refs = []
+    for x, a_weight, b_weight in zip(xs, a_weights, b_weights):
+        shrink_ref = x.float() @ a_weight.t().float()
+        expand_ref = shrink_ref @ b_weight.t().float()
+        shrink_refs.append(shrink_ref.to(dtype))
+        expand_refs.append(expand_ref.to(dtype))
+    return shrink_refs, expand_refs
+
+
 def visualize_pipeline_plan(plan, output_path):
     try:
         import matplotlib.pyplot as plt
@@ -422,7 +493,7 @@ def visualize_pipeline_plan(plan, output_path):
     ax.set_ylim(0, NUM_SMS)
     ax.set_xlabel("Proxy Time")
     ax.set_ylabel("SM ID")
-    ax.set_title("LoRA Pipeline Schedule Plan (Reference)")
+    ax.set_title("LoRA Pipeline Schedule Plan (Original Scheduler)")
     ax.grid(True, axis="x", linestyle="--", alpha=0.25)
 
     output_path = Path(output_path)
@@ -432,37 +503,13 @@ def visualize_pipeline_plan(plan, output_path):
     plt.close(fig)
     print(f"Saved schedule visualization to {output_path}")
 
-def make_group_tensors():
-    xs = []
-    a_weights = []
-    b_weights = []
-    shrink_outs = []
-    expand_outs = []
-
-    for token_count in GROUP_SIZES:
-        xs.append(torch.rand(token_count, HIDDEN, dtype=dtype, device=gpu) - 0.5)
-        a_weights.append(torch.rand(LORA_RANK, HIDDEN, dtype=dtype, device=gpu) - 0.5)
-        b_weights.append(torch.rand(HIDDEN, LORA_RANK, dtype=dtype, device=gpu) - 0.5)
-        shrink_outs.append(torch.zeros(token_count, LORA_RANK, dtype=dtype, device=gpu))
-        expand_outs.append(torch.zeros(token_count, HIDDEN, dtype=dtype, device=gpu))
-
-    return xs, a_weights, b_weights, shrink_outs, expand_outs
-
-def build_reference(xs, a_weights, b_weights):
-    shrink_refs = []
-    expand_refs = []
-    for x, a_weight, b_weight in zip(xs, a_weights, b_weights):
-        shrink_ref = x.float() @ a_weight.t().float()
-        expand_ref = shrink_ref @ b_weight.t().float()
-        shrink_refs.append(shrink_ref.to(dtype))
-        expand_refs.append(expand_ref.to(dtype))
-    return shrink_refs, expand_refs
 
 matX, matA, matB, matShrink, matOut = make_group_tensors()
 refShrink, refOut = build_reference(matX, matA, matB)
 
 dae = Launcher(NUM_SMS, device=gpu)
-bars = [None] * (len(GROUP_SIZES) + 1) # last one for global barrier baseline
+bars = [None] * (len(GROUP_SIZES) + 1)
+
 
 def make_shrink_spec(group_id, token_count):
     if token_count == 8:
@@ -504,30 +551,6 @@ def make_shrink_spec(group_id, token_count):
         make_schedule=schedule_ctor,
     )
 
-def base_shrink_sched():
-    shrink_base_sm = 0
-    def split_N(base_sm, num_sm, N, Atom):
-        TileM, TileN, TileK = Atom.MNK
-        insts = []
-        loadA = TmaTensor(dae, matA[group_id]).wgmma_load(TileM, TileK, Major.K)
-        for i in range(N // TileN):
-            loadB = TmaTensor(dae, matX[group_id][i*TileN:(i+1)*TileN]).wgmma_load(TileN, TileK * Atom.n_batch, Major.K)
-            reduceC = TmaTensor(dae, matShrink[group_id][i*TileN:(i+1)*TileN]).wgmma("reduce", TileN, TileM, Major.MN)
-
-            inst = SchedGemv(
-                Atom,
-                MNK=(LORA_RANK, TileN, HIDDEN),
-                tmas=(loadA, loadB, reduceC),
-            ).place(num_sm, base_sm).bar("store", bars[-1])
-            insts.append(inst)
-            base_sm = (base_sm + num_sm) % NUM_SMS
-        return insts, base_sm
-
-    bar_cnt = sum(t for t in GROUP_SIZES) // 8
-    bars[-1] = dae.new_bar(bar_cnt)
-    for group_id, token_count in enumerate(GROUP_SIZES):
-        insts, shrink_base_sm = split_N(shrink_base_sm, 1, token_count, Gemv_M64N8)
-        shrink_insts.extend(insts)
 
 def make_expand_spec(group_id, token_count):
     if token_count == 8:
@@ -565,29 +588,6 @@ def make_expand_spec(group_id, token_count):
         make_schedule=schedule_ctor,
     )
 
-def base_expand_sched():
-    expand_base_sm = 0
-    def split_N_M(base_sm, num_sm, N, Atom):
-        TileM, TileN, TileK = Atom.MNK
-        insts = []
-        loadA = TmaTensor(dae, matB[group_id]).wgmma_load(TileM, TileK, Major.K)
-        for i in range(N // TileN):
-            loadB = TmaTensor(dae, matShrink[group_id][i*TileN:(i+1)*TileN]).wgmma_load(TileN, TileK * Atom.n_batch, Major.K)
-            reduceC = TmaTensor(dae, matOut[group_id][i*TileN:(i+1)*TileN]).wgmma("reduce", TileN, TileM, Major.MN)
-
-            inst = SchedGemv(
-                Atom,
-                MNK=(HIDDEN, TileN, LORA_RANK),
-                tmas=(loadA, loadB, reduceC),
-            ).place(num_sm, (base_sm + num_sm)).bar("load", bars[-1])
-            insts.append(inst)
-            base_sm = (base_sm + num_sm) % NUM_SMS
-        return insts, base_sm
-    
-    for group_id, token_count in enumerate(GROUP_SIZES):
-        num_sms = HIDDEN // 64
-        insts, expand_base_sm = split_N_M(expand_base_sm, num_sms, token_count, Gemv_M64N8K64)
-        shrink_insts.extend(insts)
 
 shrink_specs = [make_shrink_spec(group_id, token_count) for group_id, token_count in enumerate(GROUP_SIZES)]
 expand_specs = {
@@ -605,7 +605,7 @@ dae.i(
     TerminateM(),
 )
 
-print("LoRA fixed-rank mixed pipeline")
+print("LoRA fixed-rank mixed pipeline (original scheduler)")
 print(f"group sizes: {GROUP_SIZES}, sms: {NUM_SMS}")
 print("Predicted pipeline plan:")
 for entry in pipeline_plan:
@@ -615,10 +615,9 @@ for entry in pipeline_plan:
         f"group {entry['group_id']} {entry['stage_name']} "
         f"tokens={entry['token_count']} sms={entry['num_sms']} base_sm={entry['base_sm']}"
     )
-
 visualize_pipeline_plan(
     pipeline_plan,
-    Path("build") / "plots" / "lora_ori_ref_schedule.png",
+    Path("build") / "plots" / "lora_fixed_rank_schedule_ori.png",
 )
 
 dae_app(dae)
