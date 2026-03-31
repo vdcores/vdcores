@@ -1,3 +1,5 @@
+import os
+
 import torch
 import argparse
 import numpy as np
@@ -124,9 +126,9 @@ def dae_app(dae, total_bytes = None):
         dae.launch()
         executed = True
     elif parsed.bench is not None:
-        # Prewarm
-        # for _ in range(1):
-        #     dae.launch()
+        warmup = int(os.environ.get("DAE_BENCH_WARMUP", "0"))
+        for _ in range(max(warmup, 0)):
+            dae.launch()
         torch.cuda.synchronize()
 
         print(f"[bench] VDCores with {dae.num_sms} SMs...")

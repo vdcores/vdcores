@@ -25,6 +25,21 @@ def env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def env_text(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    return default if raw is None else raw.strip()
+
+
+def env_int_optional(name: str) -> int | None:
+    raw = env_text(name)
+    return None if raw == "" else int(raw)
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
 def hf_auth_kwargs() -> dict[str, str]:
     token = os.environ.get("HF_TOKEN")
     if token:
@@ -315,9 +330,10 @@ def build_runtime_context(parsed_args):
         matDowns = [layer.mlp.down_proj.weight for layer in layers]
         matLmHeadW = model.lm_head.weight.detach()
 
+    matQwenSideInputsTensor = torch.empty(num_layers, MAX_SEQ_LEN, 3 * HEAD_DIM, dtype=dtype, device=gpu)
     matQwenSideInputs = []
-    for q_norm_w, k_norm_w in zip(matQNormWs, matKNormWs):
-        packed = torch.empty(MAX_SEQ_LEN, 3 * HEAD_DIM, dtype=dtype, device=gpu)
+    for layer_idx, (q_norm_w, k_norm_w) in enumerate(zip(matQNormWs, matKNormWs)):
+        packed = matQwenSideInputsTensor[layer_idx]
         packed[:, 0:HEAD_DIM] = q_norm_w.view(1, HEAD_DIM)
         packed[:, HEAD_DIM:2 * HEAD_DIM] = k_norm_w.view(1, HEAD_DIM)
         packed[:, 2 * HEAD_DIM:3 * HEAD_DIM] = matRope
@@ -338,9 +354,56 @@ def build_runtime_context(parsed_args):
     matArgmaxIdx = torch.zeros(N, full_sms, dtype=torch.long, device=gpu)
     matArgmaxVal = torch.zeros(N, full_sms, dtype=dtype, device=gpu)
 
-    if env_flag("QWEN1P7B_ENABLE_CACHE_HINTS", False):
-        dae.set_persistent(matTokens)
-        dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+    cache_target = env_text(
+        "QWEN1P7B_CACHE_WINDOW_TARGET",
+        "tokens" if env_flag("QWEN1P7B_ENABLE_CACHE_HINTS", False) else "none",
+    ).lower()
+    if cache_target not in {"", "none", "off"}:
+        cache_targets = {
+            "tokens": matTokens,
+            "embed": matEmbed,
+            "rms_input_w0": matRMSInputW[0],
+            "qwen_side_inputs_all": matQwenSideInputsTensor,
+            "attn_k_l0": attnKs[0],
+            "attn_v_l0": attnVs[0],
+            "q_proj_l0": matqWs[0],
+            "k_proj_l0": matkWs[0],
+            "v_proj_l0": matvWs[0],
+            "out_proj_l0": matOutWs[0],
+            "up_proj_l0": matUps[0],
+            "gate_proj_l0": matGates[0],
+            "down_proj_l0": matDowns[0],
+            "lm_head": matLmHeadW,
+        }
+        if cache_target not in cache_targets:
+            raise ValueError(
+                "Unsupported QWEN1P7B_CACHE_WINDOW_TARGET="
+                f"{cache_target!r}; expected one of {sorted(cache_targets)} or none"
+            )
+
+        cache_mode = env_text("QWEN1P7B_CACHE_WINDOW_MODE", "persisting").lower()
+        cache_num_bytes = env_int_optional("QWEN1P7B_CACHE_WINDOW_BYTES")
+        if cache_mode == "persisting":
+            dae.set_cache_window(
+                cache_targets[cache_target],
+                hit_ratio=env_float("QWEN1P7B_CACHE_WINDOW_HIT_RATIO", 1.0),
+                hit_policy=2,
+                miss_policy=0,
+                num_bytes=cache_num_bytes,
+            )
+        elif cache_mode == "streaming":
+            dae.set_cache_window(
+                cache_targets[cache_target],
+                hit_ratio=env_float("QWEN1P7B_CACHE_WINDOW_HIT_RATIO", 0.0),
+                hit_policy=0,
+                miss_policy=1,
+                num_bytes=cache_num_bytes,
+            )
+        else:
+            raise ValueError(
+                "Unsupported QWEN1P7B_CACHE_WINDOW_MODE="
+                f"{cache_mode!r} (expected persisting or streaming)"
+            )
 
     return QwenScheduleContext(
         parsed_args=parsed_args,

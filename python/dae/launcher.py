@@ -5,6 +5,7 @@ from .runtime import config, opcode
 from .tma_utils import *
 
 import copy
+import os
 from enum import Enum
 from math import prod
 
@@ -239,6 +240,9 @@ class Launcher:
             'default': ResourceGroup('default')
         }
 
+        self._cache_window_override = None
+        self._cache_window_requests = []
+
         runtime.set_smem_size(self.smem_size)
 
     # resource management functions
@@ -295,20 +299,119 @@ class Launcher:
                 )
             self.need_instruction_build = False
 
-    def set_persistent(self, *tensors):
-        stream = torch.cuda.current_stream().cuda_stream
+    def _cache_window_dict(self, tensor, *, hit_ratio, hit_policy, miss_policy, num_bytes=None):
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError("tensor must be a torch.Tensor")
+        if num_bytes is not None:
+            num_bytes = int(num_bytes)
+            if num_bytes <= 0:
+                raise ValueError("num_bytes must be positive when provided")
+        return {
+            "tensor": tensor,
+            "hit_ratio": float(hit_ratio),
+            "hit_policy": int(hit_policy),
+            "miss_policy": int(miss_policy),
+            "num_bytes": num_bytes,
+        }
+
+    def _flatten_cache_tensors(self, *tensors):
         for tensor in tensors:
-            runtime.set_cache_policy(tensor, stream, 1.0, 2, 0)
-    def set_streaming(self, *tensors):
-        stream = torch.cuda.current_stream().cuda_stream
-        for tensor in tensors:
-            if isinstance(tensor, list):
-                for t in tensor:
-                    runtime.set_cache_policy(t, stream, 0, 0, 1)
+            if tensor is None:
+                continue
+            if isinstance(tensor, (list, tuple)):
+                yield from self._flatten_cache_tensors(*tensor)
             elif isinstance(tensor, torch.Tensor):
-                runtime.set_cache_policy(tensor, stream, 0, 0, 1)
+                yield tensor
             else:
-                raise ValueError("tensor must be a torch.Tensor or a list of torch.Tensor")
+                raise ValueError("tensor must be a torch.Tensor or a list/tuple of torch.Tensor")
+
+    def set_cache_window(self, tensor, *, hit_ratio=1.0, hit_policy=2, miss_policy=0, num_bytes=None):
+        self._cache_window_override = self._cache_window_dict(
+            tensor,
+            hit_ratio=hit_ratio,
+            hit_policy=hit_policy,
+            miss_policy=miss_policy,
+            num_bytes=num_bytes,
+        )
+
+    def clear_cache_window(self):
+        self._cache_window_override = None
+        self._cache_window_requests.clear()
+
+    def set_persistent(self, *tensors, num_bytes=None, hit_ratio=1.0):
+        for tensor in self._flatten_cache_tensors(*tensors):
+            self._cache_window_requests.append(
+                self._cache_window_dict(
+                    tensor,
+                    hit_ratio=hit_ratio,
+                    hit_policy=2,
+                    miss_policy=0,
+                    num_bytes=num_bytes,
+                )
+            )
+
+    def set_streaming(self, *tensors, num_bytes=None):
+        for tensor in self._flatten_cache_tensors(*tensors):
+            self._cache_window_requests.append(
+                self._cache_window_dict(
+                    tensor,
+                    hit_ratio=0.0,
+                    hit_policy=0,
+                    miss_policy=1,
+                    num_bytes=num_bytes,
+                )
+            )
+
+    def _select_requested_cache_window(self):
+        if self._cache_window_override is not None:
+            return self._cache_window_override
+        if not self._cache_window_requests:
+            return None
+
+        selection = os.environ.get("DAE_CACHE_REQUEST_SELECTION", "last").strip().lower()
+        if selection == "first":
+            return self._cache_window_requests[0]
+        if selection == "last":
+            return self._cache_window_requests[-1]
+        if selection == "largest":
+            return max(
+                self._cache_window_requests,
+                key=lambda req: req["tensor"].numel() * req["tensor"].element_size(),
+            )
+        raise ValueError(f"Unsupported DAE_CACHE_REQUEST_SELECTION={selection!r}")
+
+    def _select_launch_cache_window(self, *, bars, tma, cinsts, minsts):
+        requested = self._select_requested_cache_window()
+        if requested is not None:
+            return requested
+
+        target = os.environ.get("DAE_LAUNCH_CACHE_WINDOW", "minsts").strip().lower()
+        if target in {"", "none", "off"}:
+            return None
+
+        target_map = {
+            "bars": bars,
+            "tma": tma,
+            "cinsts": cinsts,
+            "minsts": minsts,
+            "cinsts_tail": cinsts[-4 * self.max_insts :],
+            "minsts_tail": minsts[-4 * self.max_insts :],
+        }
+        if target not in target_map:
+            raise ValueError(
+                "Unsupported DAE_LAUNCH_CACHE_WINDOW="
+                f"{target!r} (expected none/bars/tma/cinsts/minsts/cinsts_tail/minsts_tail)"
+            )
+
+        num_bytes_raw = os.environ.get("DAE_LAUNCH_CACHE_WINDOW_BYTES")
+        num_bytes = None if num_bytes_raw in (None, "") else int(num_bytes_raw)
+        return self._cache_window_dict(
+            target_map[target],
+            hit_ratio=1.0,
+            hit_policy=2,
+            miss_policy=0,
+            num_bytes=num_bytes,
+        )
 
     def i(self, *insts):
         """Add instructions to all SM builders."""
@@ -401,11 +504,22 @@ class Launcher:
             tma = torch.stack(self.tmas).to(self.device)
         profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
 
-        runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
-        runtime.set_cache_policy(tma, stream, 1, 2, 0)
-        for i in range(self.num_sms // 4):
-            runtime.set_cache_policy(cinsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
-            runtime.set_cache_policy(minsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
+        runtime.reset_cache_policy(stream)
+        cache_window = self._select_launch_cache_window(
+            bars=self.bars,
+            tma=tma,
+            cinsts=cinsts,
+            minsts=minsts,
+        )
+        if cache_window is not None:
+            runtime.set_cache_policy(
+                cache_window["tensor"],
+                stream,
+                cache_window["hit_ratio"],
+                cache_window["hit_policy"],
+                cache_window["miss_policy"],
+                cache_window["num_bytes"] if cache_window["num_bytes"] is not None else -1,
+            )
 
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,

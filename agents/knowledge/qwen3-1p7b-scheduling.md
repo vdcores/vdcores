@@ -88,6 +88,27 @@ make pyext
   - the current remaining gap to `~1 ms` is therefore larger than a simple logits split or small SM placement tweak
 - Full single-token timings on this host were still noisy after the slim build. On 2026-03-31, fresh-process `-b 20` full runs ranged from about `2.29 ms` in a warmed rerun to about `3.90 ms` in the colder stage-breakdown sweep.
 - `QWEN1P7B_ENABLE_CACHE_HINTS` is now an opt-in knob rather than a baked-in assumption. Cache/prefetch experiments on this host were too noisy to justify another default change yet.
+- Follow-up cache-window/runtime work on 2026-03-31:
+  - `python/dae/launcher.py` now clears `cudaStreamAttributeAccessPolicyWindow` and applies at most one selected window per launch instead of overwriting the same stream attribute several times.
+  - `src/torch_runtime.cu` now defaults the persisting-L2 carveout to `1/16` of `persistingL2CacheMaxSize`, supports `DAE_PERSISTING_L2_{FRACTION,BYTES}`, and adds `DAE_TMA_L2_PROMOTION={none,64,128,256}` for non-window cache experiments.
+  - `app/python/qwen3_1p7b/runtime_context.py` now supports one explicit Qwen cache-window target through:
+    - `QWEN1P7B_CACHE_WINDOW_TARGET`
+    - `QWEN1P7B_CACHE_WINDOW_MODE`
+    - `QWEN1P7B_CACHE_WINDOW_BYTES`
+    - `QWEN1P7B_CACHE_WINDOW_HIT_RATIO`
+  - A contiguous `qwen_side_inputs_all` buffer now exists so one window can cover all packed `[q_norm | k_norm | rope]` side inputs across layers.
+- Measured on 2026-03-31 with the specialized build:
+  - fresh-process `python app/python/qwen3_1p7b/sched.py -b 1` stayed bimodal even after the single-window fix; representative sweeps still bounced between about `2.28 ms` and `3.91 ms`
+  - same-process steady-state `python app/python/qwen3_1p7b/sched.py -b 6` on the new default runtime path measured about `2.315 ms`
+  - exploratory non-window knob:
+    - `DAE_LAUNCH_CACHE_WINDOW=minsts DAE_PERSISTING_L2_FRACTION=0.0625 DAE_TMA_L2_PROMOTION=none python app/python/qwen3_1p7b/sched.py -b 6`
+    - measured about `2.275 ms`
+  - exploratory single-window targets `QWEN1P7B_CACHE_WINDOW_TARGET=qwen_side_inputs_all` and `QWEN1P7B_CACHE_WINDOW_TARGET=lm_head` did not stabilize fresh one-shot runs
+- Current takeaway after this cache round:
+  - the incorrect multi-window access-policy setup is fixed
+  - steady-state decode performance is back in the `~2.3 ms` range on this branch
+  - remaining fresh-process one-shot variance likely involves a separate cold-start effect beyond the access-policy window itself
+  - `DAE_TMA_L2_PROMOTION=none` is the most promising non-window follow-up knob, but it is still experimental rather than a baked-in default
 
 ## Schedule Sweep Notes
 
@@ -106,6 +127,17 @@ make pyext
   - `QWEN1P7B_NO_PREFETCH`
 - Additional perf toggle:
   - `QWEN1P7B_ENABLE_CACHE_HINTS`
+  - `QWEN1P7B_CACHE_WINDOW_TARGET`
+  - `QWEN1P7B_CACHE_WINDOW_MODE`
+  - `QWEN1P7B_CACHE_WINDOW_BYTES`
+  - `QWEN1P7B_CACHE_WINDOW_HIT_RATIO`
+- Generic runtime cache knobs:
+  - `DAE_LAUNCH_CACHE_WINDOW`
+  - `DAE_LAUNCH_CACHE_WINDOW_BYTES`
+  - `DAE_PERSISTING_L2_FRACTION`
+  - `DAE_PERSISTING_L2_BYTES`
+  - `DAE_TMA_L2_PROMOTION`
+  - `DAE_BENCH_WARMUP`
 - The current default schedule remains the original placement/prefetch configuration; the knobs are for exploration, not a baked-in alternate preset.
 - Measured on 2026-03-23 with fresh-process `-b 1` runs:
   - baseline:
