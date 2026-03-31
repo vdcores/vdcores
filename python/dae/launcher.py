@@ -405,6 +405,7 @@ class Launcher:
             tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
         else:
             tma = torch.stack(self.tmas).to(self.device)
+        self.profile.zero_()
         profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
         if config.enable_mem_trace:
             self.mem_trace_count.zero_()

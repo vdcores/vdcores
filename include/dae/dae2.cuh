@@ -120,6 +120,7 @@ void dae2(
     CInst inst;
     uint32_t pc = 0;
     uint32_t count = 0;
+    uint32_t profile_idx = 2;
     bool finish = false;
 
     while (!finish) {
@@ -131,6 +132,7 @@ void dae2(
         thread_id,
         pc,
         count,
+        profile_idx,
         finish,
         inst,
         smem_base,

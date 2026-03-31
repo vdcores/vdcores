@@ -392,6 +392,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   int thread_id,
   uint32_t &pc,
   uint32_t &count,
+  uint32_t &profile_idx,
   bool &finish,
   const CInst &inst,
   void *smem_base,
@@ -401,6 +402,19 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   C2MQueue &c2m,
   uint64_t *g_events
 ) {
+  constexpr bool enable_compute_profile = dae2EnableComputeProfile;
+  const bool profile_compute =
+      enable_compute_profile &&
+      thread_id == 0 &&
+      inst.opcode != OP_LOOPC &&
+      inst.opcode != OP_TERMINATEC;
+  uint64_t start_ts = 0;
+  if constexpr (enable_compute_profile) {
+    if (profile_compute) {
+      start_ts = cuda::ptx::get_sreg_globaltimer();
+    }
+  }
+
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
@@ -411,6 +425,14 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
     default:
       __cprint("Unknown compute opcode: %d\n", inst.opcode);
       assert(false && "Unknown compute opcode");
+  }
+
+  if constexpr (enable_compute_profile) {
+    if (profile_compute && profile_idx < numProfileEvents) {
+      int event_base = sm_id * numProfileEvents;
+      g_events[event_base + profile_idx] = cuda::ptx::get_sreg_globaltimer() - start_ts;
+      profile_idx++;
+    }
   }
 }
 

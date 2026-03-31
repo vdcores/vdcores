@@ -11,6 +11,7 @@ constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
 constexpr bool dae2LoadInstructions = true;
 static constexpr bool dae2EnableMemTrace = false;
+static constexpr bool dae2EnableComputeProfile = false;
 
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;

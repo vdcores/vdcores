@@ -297,6 +297,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("max_insts") = numInsts;
   config.attr("num_profile_events") = numProfileEvents;
   config.attr("enable_mem_trace") = dae2EnableMemTrace;
+  config.attr("enable_compute_profile") = dae2EnableComputeProfile;
   config.attr("max_mem_trace_records") = maxMemTraceRecords;
   config.attr("mem_trace_record_size") = (int64_t)sizeof(MemTraceRecord);
   config.attr("max_tmas") = numTmas;

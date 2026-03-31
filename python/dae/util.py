@@ -147,6 +147,19 @@ def read_mem_trace(dae):
     return np.concatenate(records)
 
 
+def read_compute_durations(dae):
+    if not getattr(config, "enable_compute_profile", False):
+        return [np.array([], dtype=np.uint64) for _ in range(dae.num_sms)]
+
+    profile = dae.profile.cpu().numpy()
+    durations = []
+    for sm_id in range(dae.num_sms):
+        sm_durations = profile[sm_id, 2:]
+        sm_durations = sm_durations[sm_durations > 0]
+        durations.append(sm_durations.astype(np.uint64, copy=False))
+    return durations
+
+
 def _build_mem_trace_records(sm_id, start, end, size, opcode):
     return np.rec.fromarrays(
         [sm_id, start, end, size, opcode],
