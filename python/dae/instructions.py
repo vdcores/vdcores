@@ -348,6 +348,70 @@ class ARGMAX_REDUCE_bf16_1024_128(ComputeInstruction):
         super().__init__(opcode=opcode.OP_ARGMAX_REDUCE_bf16_1024_128, args=[num_active_token])
 
 
+class ARGMAX_PARTIAL_bf16_1024_32768_128(ComputeInstruction):
+    CHUNK_SIZE = 1024
+    I_STRIDE = 32768
+    SMS = 128
+
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_ARGMAX_PARTIAL_bf16_1024_32768_128, args=[num_active_token])
+
+
+class ARGMAX_PARTIAL_bf16_1024_131072_128(ComputeInstruction):
+    CHUNK_SIZE = 1024
+    I_STRIDE = 131072
+    SMS = 128
+
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_ARGMAX_PARTIAL_bf16_1024_131072_128, args=[num_active_token])
+
+
+class ARGMAX_PARTIAL_bf16_2048_65536_64(ComputeInstruction):
+    CHUNK_SIZE = 2048
+    I_STRIDE = 65536
+    SMS = 64
+
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_ARGMAX_PARTIAL_bf16_2048_65536_64, args=[num_active_token])
+
+
+class ARGMAX_REDUCE_bf16_2048_64(ComputeInstruction):
+    CHUNK_SIZE = 2048
+    SMS = 64
+
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_ARGMAX_REDUCE_bf16_2048_64, args=[num_active_token])
+
+
+class ARGMAX_PARTIAL_bf16_2048_32768_64(ComputeInstruction):
+    CHUNK_SIZE = 2048
+    I_STRIDE = 32768
+    SMS = 64
+
+    def __init__(self, num_active_token: int):
+        super().__init__(opcode=opcode.OP_ARGMAX_PARTIAL_bf16_2048_32768_64, args=[num_active_token])
+
+
+def select_argmax_instructions(logits_slice: int, num_sms: int):
+    if num_sms == 132 and logits_slice == 50688:
+        return ARGMAX_PARTIAL_bf16_1152_50688_132, ARGMAX_REDUCE_bf16_1152_132
+    if num_sms == 128:
+        if logits_slice == 32768:
+            return ARGMAX_PARTIAL_bf16_1024_32768_128, ARGMAX_REDUCE_bf16_1024_128
+        if logits_slice == 65536:
+            return ARGMAX_PARTIAL_bf16_1024_65536_128, ARGMAX_REDUCE_bf16_1024_128
+        if logits_slice == 131072:
+            return ARGMAX_PARTIAL_bf16_1024_131072_128, ARGMAX_REDUCE_bf16_1024_128
+    if num_sms == 64 and logits_slice == 65536:
+        return ARGMAX_PARTIAL_bf16_2048_65536_64, ARGMAX_REDUCE_bf16_2048_64
+    if num_sms == 64 and logits_slice == 32768:
+        return ARGMAX_PARTIAL_bf16_2048_32768_64, ARGMAX_REDUCE_bf16_2048_64
+    raise NotImplementedError(
+        f"Missing argmax opcode support for logits_slice={logits_slice}, num_sms={num_sms}. "
+        "Add a matching partial/reduce opcode pair before selecting this schedule."
+    )
+
+
 class Dummy(ComputeInstruction):
     def __init__(self, iters: int):
         super().__init__(opcode=opcode.OP_DUMMY, args=[iters])
@@ -855,8 +919,14 @@ __all__ = [
     "ensure_cc0_supported_hidden_size",
     "ARGMAX_PARTIAL_bf16_1152_50688_132",
     "ARGMAX_REDUCE_bf16_1152_132",
+    "ARGMAX_PARTIAL_bf16_1024_32768_128",
     "ARGMAX_PARTIAL_bf16_1024_65536_128",
+    "ARGMAX_PARTIAL_bf16_1024_131072_128",
     "ARGMAX_REDUCE_bf16_1024_128",
+    "ARGMAX_PARTIAL_bf16_2048_32768_64",
+    "ARGMAX_PARTIAL_bf16_2048_65536_64",
+    "ARGMAX_REDUCE_bf16_2048_64",
+    "select_argmax_instructions",
     "Dummy",
     "Copy",
     "LoopC",

@@ -152,7 +152,8 @@ void dae2(
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
-        st_insts, smem_base, tma_descs, bars
+        st_insts, smem_base, tma_descs, bars,
+        sm_id, g_events
       );
     } else if (warp_id == 1) {
       if (lane_id == 0) {
@@ -167,7 +168,8 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars,
+          sm_id, port_id, g_events
         );
       }
     } // End of warps

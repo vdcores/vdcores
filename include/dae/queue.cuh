@@ -251,6 +251,9 @@ struct SingleBarrierQueue {
     // likely?
     while (head - tail >= QSIZE) [[unlikely]] {
       tail = *shared_tail;
+      if constexpr (queuePollSleepCycles > 0) {
+        __nanosleep(queuePollSleepCycles);
+      }
     }
     return head % QSIZE;
   }

@@ -58,3 +58,59 @@
 - The current one-token path is already close to the target; the larger remaining gap is multi-token scaling.
 - The full multi-token path launched successfully under the timeout wrapper for `N=2`, so the current main issue is not a full-path deadlock.
 - The partial multi-token debug harness is still incomplete: `--debug-stop-after final_rms` timed out after launch for `N=2` with both `7` and `8` layers, so stage-by-stage timing past that point should not yet be trusted on the multi-token path.
+
+## 2026-03-31 1B One-Token Debug
+
+- On this branch, a fresh rebuild with the selected compute-ops file mattered before profiling:
+  `source /root/miniconda3/etc/profile.d/conda.sh && conda activate base && DAE_COMPUTE_OPS_FILE=dae_compute_ops.vdcore.build make pyext`
+- A useful one-token narrowing path was:
+  `-N1 --debug-num-layers 1 --debug-stop-after down_high`
+  vs.
+  `-N1 --debug-stop-after final_rms`
+  vs.
+  `-N1 --debug-stop-after logits`
+- With the rebuilt runtime, the layer body through `final_rms` was much smaller than the full pass, so the dominant remaining hotspot was the logits tail rather than `OP_RMS_NORM_F16_K_2048_SMEM` or `OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64`.
+- The more durable issue was cache-policy plumbing, not the new RMS or attention opcodes. CUDA only exposes one active `cudaStreamAttributeAccessPolicyWindow` per stream, so repeated `runtime.set_cache_policy(...)` calls do not stack; the last call wins.
+- `python/dae/launcher.py` was overwriting the stream APW with internal metadata buffers at launch time, which also masked any schedule-side tensor hinting. For the 1B path, disabling those internal launcher cache windows and leaving the launch APW empty cut the 30-iteration `-N1 -b` average from about `9.5 ms` to about `1.4 ms` on this machine.
+- A single explicit launch-time APW can still be useful, but only when chosen intentionally. On this path, `LLAMA32_1B_LAUNCH_CACHE_WINDOW=rms_hidden_persist` stayed near target at about `1.8 ms`, while `lm_head_streaming` regressed back toward `11 ms`.
+- Disabling prefetch across the split logits GEMV list remained helpful, and `logits_fold` is effectively fixed at `8` for this app today because the argmax partial opcode is hard-wired to `I_STRIDE=65536`.
+- Fresh-launch timings on this machine were still noisy, so prefer repeated in-process benchmarks for comparison after the APW fix and treat isolated `-b 1` wins as directional only.
+- A later pass added a second argmax partial opcode for `logits_slice=32768` and generalized the 1B schedule to tune `LLAMA32_1B_LOGITS_SPLIT_M`, `LLAMA32_1B_LOGITS_WAVE_DIV`, and `LLAMA32_1B_ARGMAX_SMS`.
+- The most reliable shared-build improvement was simpler than the experimental schedule search: for `app/python/llama32_1b/sched.py`, defaulting `DAE_PERSISTING_L2_BYTES=0` brought the normal fold-8 path back to about `1.41 ms` while preserving the existing correctness check.
+- There is still an experimental fold-4 lane. Build with `DAE_COMPUTE_OPS_FILE=dae_compute_ops.llama32_1b.fast.build`, then run `DAE_PERSISTING_L2_BYTES=0 LLAMA32_1B_LOGITS_SPLIT_M=4 python app/python/llama32_1b/sched.py -N1 -b ...`. On this machine that reached about `1.40 ms`, but the exact HF-reference argmax token was not stable enough to make it the default path.
+- A later tuning pass found a more structural logits-schedule issue: using `SchedGemv.split_M(...)` on the large logits tensor pushes the generated TMA coordinates into large base offsets, and that path both blocks larger logical slices (`131072` hits the current uint16 cord limit) and performs poorly on this machine.
+- The kept schedule change was to replace logits `split_M(...)` with explicit tensor subviews per logits wave. Each wave now launches a normal GEMV on a real `[8192, 2048]` weight slice and writes into a matching `matLogits[:, start:end]` view, so the logical logits slice can stay large while each wave still uses small coordinates.
+- Within-session A/B runs after that refactor consistently showed `LLAMA32_1B_LOGITS_NO_PREFETCH=1` outperforming the prefetched logits path by a large margin on `--debug-stop-after logits`, while `LLAMA32_1B_LOGITS_SPLIT_M=8` remained better than both `4` and `16`.
+- Absolute one-token timings on this machine became too unstable to trust across separate launches. `nvidia-smi` showed the H100 often parked at low or mid clocks, and clock locking was not permitted for this user, so treat local absolute timing claims as directional unless they come from the same warmed session.
+
+## 2026-03-31 Layer-Growth Follow-Up
+
+- On the current branch state, a fresh `final_rms` layer-count sweep showed the main increase is over layer depth, not logits tail:
+  - `1` layer: about `0.126 ms`
+  - `4` layers: about `1.38 ms`
+  - `8` layers: about `3.99 ms`
+  - `16` layers through `final_rms`: about `11.43 ms`
+  - `16` layers through `logits`: about `11.76 ms`
+- For the current tree, treat the logits tail as secondary until the layer body is back under control.
+- `app/python/llama32_1b/sched.py` now has broader GEMV tuning hooks:
+  - `LLAMA32_1B_NO_PREFETCH` accepts a comma-separated stage list or `all`; `none` reenables prefetch everywhere.
+  - `LLAMA32_1B_GEMV_ATOM` accepts `m64n8` or `b2`.
+- On this machine, `LLAMA32_1B_NO_PREFETCH=all` consistently improved both `--debug-stop-after final_rms` and the full `-N1 -b` run relative to the prefetched path from earlier passes, but keep it opt-in until the exact-token correctness mismatch on this host is explained.
+- `LLAMA32_1B_GEMV_ATOM=b2` was not a winning operator change for the 1B path. It made the layer body substantially slower in repeated tests, so keep it only as an experiment knob.
+- The runtime polling backoff is now tunable through compile-time macros exposed in `include/dae/context.cuh` and passed through `Makefile` via `EXTRA_NVCC_FLAGS`.
+- Rebuilding with `-DDAE_ALLOC_RETRY_SLEEP_CYCLES=0 -DDAE_BARRIER_POLL_SLEEP_CYCLES=0 -DDAE_QUEUE_POLL_SLEEP_CYCLES=0` reduced the current `final_rms` timing enough to treat barrier or queue waiting as a real contributor on this tree.
+- `DAE_TMA_L2_PROMOTION_BYTES` remains a useful hint knob but not a stable default on this host. Endpoint re-checks with `0` and `256` bytes changed order across fresh-process runs, so only trust that knob when comparing within the same warmed session.
+- A deeper repeated-profile pass showed the dominant wait is specifically the LD read-barrier loop, not allocwarp issue barriers. In the added profile slots, alloc wait counters stayed at zero while `ld0` accumulated almost all barrier wait cycles and `ld1` stayed idle on the one-token `final_rms` path.
+- Static larger sleeps did not convincingly improve time. Moving the barrier sleep from `16` to `64` reduced raw poll count but left total wait time near-flat, which is more consistent with a late producer or long barrier residency than with barrier metadata read latency being the main issue.
+- The runtime now supports adaptive barrier polling: `DAE_BARRIER_POLL_SLEEP_CYCLES` is the starting sleep, `DAE_BARRIER_POLL_MAX_SLEEP_CYCLES` is the cap, and the wait loops double the sleep every 8 unchanged polls. This is meant to reduce cache pressure when a barrier is clearly not progressing without paying the full latency of a coarse fixed sleep.
+- The metadata-only launcher cache path is now stronger: when `DAE_LAUNCHER_INTERNAL_CACHE_MODE=metadata`, the packed bars+TMA window is kept persistent and the instruction buffers are explicitly marked streaming so instruction fetch does not claim the same APW budget as reusable metadata.
+- The launcher now has placement knobs for metadata experiments without changing model schedules:
+  - `DAE_LAUNCHER_BAR_ID_STRIDE`
+  - `DAE_LAUNCHER_TMA_ID_STRIDE`
+  - `DAE_LAUNCHER_METADATA_ALIGN_BYTES`
+  - `DAE_LAUNCHER_METADATA_FRONT_PAD_BYTES`
+  - `DAE_LAUNCHER_METADATA_GAP_BYTES`
+  - `DAE_LAUNCHER_METADATA_ORDER`
+- For `app/python/llama32_1b/sched.py`, sparse placement is feasible within current encoding limits because the dry build uses only about `214` barriers and `391` TMA descriptors. A tested `bar_stride=4`, `tma_stride=2` layout stayed within the `1024`-entry runtime limits.
+- On this host, sparse barrier/TMA placement plus padded metadata packing did not produce a clear stable improvement on the one-token `final_rms` path. Good runs stayed near the same `~2.03 ms` band as the baseline metadata layout, so keep these knobs for exploration rather than as defaults.
+- A descriptor-free `TmaLoad1D` GEMV weight path is still blocked on an offline swizzle/packing step. The current GEMV kernels consume `GMMA::Layout_K_SW128_Atom` tiles from shared memory, so a TMA1D weight load only works if the global source bytes are already packed in that exact tile layout.

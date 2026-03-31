@@ -25,7 +25,8 @@ sys.argv = [sys.argv[0], *remaining_argv]
 # load model
 ###################################
 
-model_name = 'meta-llama/Llama-3.1-8B-Instruct'
+# model_name = 'meta-llama/Llama-3.1-8B-Instruct'
+model_name = 'unsloth/Llama-3.1-8B-Instruct'
 cache_dir = parsed_args.hf_cache_dir
 
 model = AutoModelForCausalLM.from_pretrained(

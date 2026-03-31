@@ -25,6 +25,7 @@ LDFLAGS = -lcuda -lcublas
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
+NVCC_FLAGS += $(EXTRA_NVCC_FLAGS)
 
 # Directories
 ifeq ($(debug),)

@@ -6,11 +6,16 @@ template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     const MInst *st_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    const int sm_id, const int port_id, uint64_t *g_events) {
 
   __ldprint("[LD Warp] Start LD warp execution");
 
   int regFile[4];
+  uint64_t barrier_wait_cycles = 0;
+  uint64_t barrier_poll_count = 0;
+  uint64_t barrier_wait_count = 0;
+  uint64_t barrier_value_changes = 0;
   m2ld.wait();
   LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
 
@@ -33,14 +38,30 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       // if (blockIdx.x == 0 && first_wait) {
       //   printf("[LD][sm=%d] check bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
       // }
-      while (*bar != 0) {
+      int last_value = *bar;
+      int stagnant_polls = 0;
+      if (last_value != 0) {
+        barrier_wait_count++;
+      }
+      uint64_t wait_start = cuda::ptx::get_sreg_globaltimer();
+      while (last_value != 0) {
+        barrier_poll_count++;
         // busy wait
-        __nanosleep(barrierPollSleepCycles);
+        __nanosleep(barrier_poll_sleep_cycles(stagnant_polls));
+        int current_value = *bar;
+        if (current_value != last_value) {
+          barrier_value_changes++;
+          last_value = current_value;
+          stagnant_polls = 0;
+        } else {
+          stagnant_polls++;
+        }
         // if (blockIdx.x == 0 && first_wait) {
         //   printf("[LD][sm=%d] waiting bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
         //   first_wait = false;
         // }
       }
+      barrier_wait_cycles += cuda::ptx::get_sreg_globaltimer() - wait_start;
       __ldprint("wait for global barrier before load: bar=%d", inst.bar());
     };
 
@@ -190,5 +211,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   } // End of LD warp loop
 
   __ldprint("End of LD warp execution");
+  int event_base = sm_id * numProfileEvents;
+  int slot_base = (port_id == 0) ? profileEventLd0BarrierWaitCycles : profileEventLd1BarrierWaitCycles;
+  g_events[event_base + slot_base + 0] = barrier_wait_cycles;
+  g_events[event_base + slot_base + 1] = barrier_poll_count;
+  g_events[event_base + slot_base + 2] = barrier_wait_count;
+  g_events[event_base + slot_base + 3] = barrier_value_changes;
   // __print(0, "End of LD warp execution");
 }

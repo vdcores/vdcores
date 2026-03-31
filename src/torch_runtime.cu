@@ -8,8 +8,47 @@
 
 #include <vector>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
 
 namespace py = pybind11;
+
+static double env_double(const char* name, double default_value) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  const double parsed = std::strtod(raw, &end);
+  return (end != raw) ? parsed : default_value;
+}
+
+static long long env_int64(const char* name, long long default_value) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(raw, &end, 10);
+  return (end != raw) ? parsed : default_value;
+}
+
+static CUtensorMapL2promotion env_tma_l2_promotion() {
+  const long long bytes = env_int64("DAE_TMA_L2_PROMOTION_BYTES", 256);
+  switch (bytes) {
+    case 0:
+      return CU_TENSOR_MAP_L2_PROMOTION_NONE;
+    case 64:
+      return CU_TENSOR_MAP_L2_PROMOTION_L2_64B;
+    case 128:
+      return CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+    case 256:
+      return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+    default:
+      return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+  }
+}
 
 // function 1: set smem size
 size_t py_set_smem_size(size_t requested_size) {
@@ -57,7 +96,12 @@ static void set_persistent_cache() {
   // printf("persistingL2CacheMaxSize: %zu bytes\n", prop.persistingL2CacheMaxSize);
   // printf("accessPolicyMaxWindowSize: %zu bytes\n", prop.accessPolicyMaxWindowSize);
 
-  size_t recommended_size = prop.persistingL2CacheMaxSize * 2 / 8; // Example heuristic
+  const double fraction = std::clamp(env_double("DAE_PERSISTING_L2_FRACTION", 0.5), 0.0, 1.0);
+  size_t recommended_size = static_cast<size_t>(static_cast<double>(prop.persistingL2CacheMaxSize) * fraction);
+  const long long override_bytes = env_int64("DAE_PERSISTING_L2_BYTES", -1);
+  if (override_bytes >= 0) {
+    recommended_size = static_cast<size_t>(override_bytes);
+  }
 
   size_t set_aside = std::min<size_t>(recommended_size, prop.persistingL2CacheMaxSize);
   cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
@@ -192,8 +236,7 @@ torch::Tensor py_build_tma_desc(
   CUtensorMapSwizzle swz = to_swizzle(swizzle_bytes);
   CUtensorMapInterleave interleave = to_interleave(interleave_bytes);
 
-  // CUtensorMapL2promotion l2p = CU_TENSOR_MAP_L2_PROMOTION_NONE;
-  CUtensorMapL2promotion l2p = CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+  CUtensorMapL2promotion l2p = env_tma_l2_promotion();
   CUtensorMapFloatOOBfill oob = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
 
   // Fill descriptor in device memory
@@ -257,6 +300,22 @@ void py_tensor_set_cache_policy(torch::Tensor t, int64_t stream_id, float hit_ra
   TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute failed: ", cudaGetErrorString(err));
 }
 
+void py_clear_cache_policy(int64_t stream_id) {
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_id);
+
+  cudaAccessPolicyWindow apw{};
+  apw.base_ptr = nullptr;
+  apw.num_bytes = 0;
+  apw.hitRatio = 0.0f;
+  apw.hitProp = cudaAccessPropertyNormal;
+  apw.missProp = cudaAccessPropertyNormal;
+
+  cudaStreamAttrValue attr{};
+  attr.accessPolicyWindow = apw;
+  auto err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+  TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute failed: ", cudaGetErrorString(err));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   auto op = m.def_submodule("opcode", "DAE2 OpCodes");
   #define DAE_OP(name, value) op.attr(#name) = (int)name;
@@ -311,4 +370,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("set_cache_policy", &py_tensor_set_cache_policy,
             "Set cache policy for a CUDA tensor on the specified stream");
+  m.def("clear_cache_policy", &py_clear_cache_policy,
+            "Clear the CUDA stream access-policy window");
 }

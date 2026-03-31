@@ -14,7 +14,8 @@ template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
-    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    const int sm_id, uint64_t *g_events
 ) {
   static_assert(numSlots < 32, "Too many slots for single warp");
 
@@ -29,6 +30,11 @@ __device__ __forceinline__ void allocwarp_execute(
   SharedMemoryAllocator<numSlots> alloc;
 
   __syncwarp();
+
+  uint64_t barrier_wait_cycles = 0;
+  uint64_t barrier_poll_count = 0;
+  uint64_t barrier_wait_count = 0;
+  uint64_t barrier_value_changes = 0;
 
   while (di.pred_continue) {
     inst = smem_minsts[next_pc % numInsts];
@@ -167,9 +173,25 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();
-            while (*bar != 0) {
-              __nanosleep(barrierPollSleepCycles);
+            int last_value = *bar;
+            int stagnant_polls = 0;
+            if (last_value != 0) {
+              barrier_wait_count++;
             }
+            uint64_t wait_start = cuda::ptx::get_sreg_globaltimer();
+            while (last_value != 0) {
+              barrier_poll_count++;
+              __nanosleep(barrier_poll_sleep_cycles(stagnant_polls));
+              int current_value = *bar;
+              if (current_value != last_value) {
+                barrier_value_changes++;
+                last_value = current_value;
+                stagnant_polls = 0;
+              } else {
+                stagnant_polls++;
+              }
+            }
+            barrier_wait_cycles += cuda::ptx::get_sreg_globaltimer() - wait_start;
             __mprint("Issue barrier %d passed", inst.bar());
           }
           break;
@@ -209,5 +231,12 @@ __device__ __forceinline__ void allocwarp_execute(
   }
 
   // __print(lane_id, "End of Alloc warp execution");
+  if (lane_id == 0) {
+    int event_base = sm_id * numProfileEvents;
+    g_events[event_base + profileEventAllocBarrierWaitCycles] = barrier_wait_cycles;
+    g_events[event_base + profileEventAllocBarrierPolls] = barrier_poll_count;
+    g_events[event_base + profileEventAllocBarrierWaits] = barrier_wait_count;
+    g_events[event_base + profileEventAllocBarrierValueChanges] = barrier_value_changes;
+  }
   __mprint("End of allocwarp");
 }

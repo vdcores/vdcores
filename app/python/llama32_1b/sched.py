@@ -27,6 +27,56 @@ DEFAULT_MAX_SEQ_LEN = 512
 DEFAULT_VOCAB_SIZE = 128256
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value is not None and value != "" else default
+
+
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value not in ("0", "false", "False", "no", "NO")
+
+
+def env_str(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return value if value is not None and value != "" else default
+
+
+def env_csv(name: str, default: str = "") -> set[str]:
+    raw = os.environ.get(name, default)
+    tokens = {token.strip() for token in raw.split(",") if token.strip()}
+    if "none" in {token.lower() for token in tokens}:
+        return set()
+    return tokens
+
+
+def select_gemv_atom(name: str):
+    normalized = name.strip().lower()
+    if normalized in ("m64n8", "default"):
+        return Gemv_M64N8
+    if normalized in ("m64n8b2", "b2"):
+        return Gemv_M64N8B2
+    raise ValueError(
+        f"Unsupported LLAMA32_1B_GEMV_ATOM value {name!r}; expected 'm64n8' or 'm64n8b2'"
+    )
+
+
+def maybe_no_prefetch(name: str, sched, disabled: set[str]):
+    if "all" in disabled or name in disabled:
+        sched.no_prefetch()
+    return sched
+
+
+def maybe_no_prefetch_list(name: str, sched, disabled: set[str]):
+    if "all" in disabled or name in disabled:
+        for item in sched:
+            if hasattr(item, "no_prefetch"):
+                item.no_prefetch()
+    return sched
+
+
 def build_rope_table(max_seq_len, batch, head_dim, rope_theta, positions, device, dtype):
     inv_freq = 1.0 / (
         rope_theta
@@ -131,6 +181,12 @@ def parse_args():
 
 parsed_args = parse_args()
 
+# This path is consistently faster and more stable when the runtime does not
+# reserve a global persisting-L2 window. Respect an explicit user setting, but
+# treat an unset or empty variable as "disabled".
+if os.environ.get("DAE_PERSISTING_L2_BYTES", "") == "":
+    os.environ["DAE_PERSISTING_L2_BYTES"] = "0"
+
 gpu = torch.device("cuda")
 REQ, N = 8, 8
 KVBlockSize = 64
@@ -192,6 +248,9 @@ if runtime_gaps and not parsed_args.dry_build:
 
 if parsed_args.correctness and (parsed_args.debug_stop_after != "full" or num_layers != config.num_hidden_layers):
     raise ValueError("Single-token correctness requires the full schedule and full layer count")
+
+GemvAtom = select_gemv_atom(env_str("LLAMA32_1B_GEMV_ATOM", "m64n8"))
+PREFETCH_OFF = env_csv("LLAMA32_1B_NO_PREFETCH")
 
 if parsed_args.dry_build:
     tensors = build_synthetic_inputs(config, gpu, dtype, num_layers, HIDDEN, INTERMIDIATE, QW, KW, VW)
@@ -255,17 +314,35 @@ matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 
 logits_fold = 8
+logits_fold = env_int("LLAMA32_1B_LOGITS_SPLIT_M", logits_fold)
 logits_slice = 8192 * logits_fold
+logits_wave_div = env_int("LLAMA32_1B_LOGITS_WAVE_DIV", logits_fold)
+logits_sms = env_int("LLAMA32_1B_LOGITS_SMS", num_sms)
+logits_k_fold = env_int("LLAMA32_1B_LOGITS_K_FOLD", 1)
+argmax_sms = env_int("LLAMA32_1B_ARGMAX_SMS", 128)
+if not (1 <= logits_sms <= full_sms):
+    raise ValueError(f"LLAMA32_1B_LOGITS_SMS must be in [1, {full_sms}], got {logits_sms}")
+if not (1 <= argmax_sms <= full_sms):
+    raise ValueError(f"LLAMA32_1B_ARGMAX_SMS must be in [1, {full_sms}], got {argmax_sms}")
+if logits_k_fold <= 0:
+    raise ValueError(f"LLAMA32_1B_LOGITS_K_FOLD must be positive, got {logits_k_fold}")
+if logits_wave_div <= 0 or logits_slice % logits_wave_div != 0:
+    raise ValueError(
+        f"LLAMA32_1B_LOGITS_WAVE_DIV must be a positive divisor of logits_slice={logits_slice}, "
+        f"got {logits_wave_div}"
+    )
 vocab_size = matLmHeadW.shape[0]
 logits_epoch = math.ceil(vocab_size / logits_slice)
 matLmHeadW.resize_(logits_slice * logits_epoch, HIDDEN)
 if logits_slice * logits_epoch > vocab_size:
     matLmHeadW[vocab_size:,].zero_()
 
+ArgmaxPartial, ArgmaxReduce = select_argmax_instructions(logits_slice, argmax_sms)
+
 matLogits = []
 matLogitsW = []
-matArgmaxIdx = torch.zeros(N, 128, dtype=torch.long, device=gpu)
-matArgmaxVal = torch.zeros(N, 128, dtype=dtype, device=gpu)
+matArgmaxIdx = torch.zeros(N, argmax_sms, dtype=torch.long, device=gpu)
+matArgmaxVal = torch.zeros(N, argmax_sms, dtype=dtype, device=gpu)
 matArgmaxOut = torch.zeros(N, dtype=torch.long, device=gpu)
 
 for i in range(logits_epoch):
@@ -274,6 +351,25 @@ for i in range(logits_epoch):
 
 dae.set_persistent(matTokens)
 dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+if env_flag("LLAMA32_1B_PERSIST_LOGITS_IO", False):
+    dae.set_persistent(matRMSHidden, *matLogits)
+if env_flag("LLAMA32_1B_STREAM_LM_HEAD", False):
+    dae.set_streaming(matLmHeadW)
+
+dae.enable_internal_cache_windows(env_flag("LLAMA32_1B_INTERNAL_CACHE_WINDOW", False))
+launch_cache_window = env_str("LLAMA32_1B_LAUNCH_CACHE_WINDOW", "none")
+if launch_cache_window == "none":
+    dae.clear_launch_cache_window()
+elif launch_cache_window == "lm_head_streaming":
+    dae.set_launch_streaming(matLmHeadW)
+elif launch_cache_window == "rms_hidden_persist":
+    dae.set_launch_persistent(matRMSHidden)
+else:
+    raise ValueError(
+        "Unsupported LLAMA32_1B_LAUNCH_CACHE_WINDOW value "
+        f"{launch_cache_window!r}; expected one of "
+        "'none', 'lm_head_streaming', 'rms_hidden_persist'"
+    )
 
 defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
@@ -299,14 +395,14 @@ layerg.addBarrier("bar_silu_out2")
 layerg.addBarrier("bar_pre_attn_rms")
 layerg.addBarrier("bar_post_attn_rms")
 
-TileM, _, TileK = Gemv_M64N8.MNK
+TileM, _, TileK = GemvAtom.MNK
 defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", TileM, N, tma_load_tbl, cord_load_tbl))
 
-layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * GemvAtom.n_batch, Major.K))
 layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * GemvAtom.n_batch, Major.K))
 layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
-layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * GemvAtom.n_batch, Major.K))
 layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("reduceInterm", [matInterm] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
@@ -400,11 +496,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
     regLoadQ = RegLoad(0)
-    QProj = SchedGemv(
-        Gemv_M64N8,
+    QProj = maybe_no_prefetch("q_proj", SchedGemv(
+        GemvAtom,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], regStoreQ),
-    ).bar("load", layerg["bar_pre_attn_rms"])
+    ).bar("load", layerg["bar_pre_attn_rms"]), PREFETCH_OFF)
     QRope = SchedRope(
         ROPE_INTERLEAVE_512,
         tmas=(
@@ -416,11 +512,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
     regLoadK = RegLoad(0)
-    KProj = SchedGemv(
-        Gemv_M64N8,
+    KProj = maybe_no_prefetch("k_proj", SchedGemv(
+        GemvAtom,
         MNK=(KW, N, HIDDEN),
         tmas=(layerg["loadKW"], layerg["loadRMSLayer"], regStoreK),
-    ).bar("load", layerg["bar_pre_attn_rms"])
+    ).bar("load", layerg["bar_pre_attn_rms"]), PREFETCH_OFF)
     KRope = SchedRope(
         ROPE_INTERLEAVE_512,
         tmas=(
@@ -429,17 +525,17 @@ def schedule_single_token(token_offset: int, token_pos: int):
             ToAttnKVStoreCordAdapter(layerg["storeK"], KW // TileM, TileM, token_pos),
         ),
     ).bar("store", layerg["bar_qkv_attn"])
-    VProj = SchedGemv(
-        Gemv_M64N8,
+    VProj = maybe_no_prefetch("v_proj", SchedGemv(
+        GemvAtom,
         MNK=(VW, N, HIDDEN),
         tmas=(
             layerg["loadVW"],
             layerg["loadRMSLayer"],
             ToAttnVStoreCordAdapter(layerg["storeV"], token_pos),
         ),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
+    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"]), PREFETCH_OFF)
 
-    GemvFactory = layers_like(GemvLayer, dae, Gemv_M64N8)
+    GemvFactory = layers_like(GemvLayer, dae, GemvAtom)
     Gqa = SchedAttentionDecoding(
         reqs=N,
         seq_len=token_pos + 1,
@@ -449,36 +545,36 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
-    OutProj = SchedGemv(
-        Gemv_M64N8,
+    OutProj = maybe_no_prefetch("out_proj", SchedGemv(
+        GemvAtom,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"]), PREFETCH_OFF)
 
     regGate, regUp = 0, 1
     regStoreGate = RegStore(regGate, matGateOut[:, 0:TileM])
     regStoreUp = RegStore(regUp, matInterm[:, 0:TileM])
 
-    gate_proj_low = SchedGemv(
-        Gemv_M64N8,
+    gate_proj_low = maybe_no_prefetch("gate_low", SchedGemv(
+        GemvAtom,
         MNK=(4096, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    gate_proj_high = SchedGemv(
-        Gemv_M64N8,
+    ).bar("load", layerg["bar_post_attn_rms"]), PREFETCH_OFF)
+    gate_proj_high = maybe_no_prefetch("gate_high", SchedGemv(
+        GemvAtom,
         MNK=((4096, 2048), N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["reduceGateOut"]),
-    ).bar("store", layerg["bar_silu_in"])
-    up_proj_low = SchedGemv(
-        Gemv_M64N8,
+    ).bar("store", layerg["bar_silu_in"]), PREFETCH_OFF)
+    up_proj_low = maybe_no_prefetch("up_low", SchedGemv(
+        GemvAtom,
         MNK=(4096, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    up_proj_high = SchedGemv(
-        Gemv_M64N8,
+    ).bar("load", layerg["bar_post_attn_rms"]), PREFETCH_OFF)
+    up_proj_high = maybe_no_prefetch("up_high", SchedGemv(
+        GemvAtom,
         MNK=((4096, 2048), N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["reduceInterm"]),
-    ).bar("store", layerg["bar_silu_in"])
+    ).bar("store", layerg["bar_silu_in"]), PREFETCH_OFF)
 
     mlp_split = 6144
     mlp_tail = INTERMIDIATE - mlp_split
@@ -488,16 +584,16 @@ def schedule_single_token(token_offset: int, token_pos: int):
         up_glob=matInterm[:, :mlp_split],
         out_glob=matSiLUOut[:, :mlp_split],
     ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
-    gate_proj_fused = SchedGemv(
-        Gemv_M64N8,
+    gate_proj_fused = maybe_no_prefetch("gate_fused", SchedGemv(
+        GemvAtom,
         MNK=((mlp_split, mlp_tail), N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], regStoreGate),
-    )
-    up_proj_fused = SchedGemv(
-        Gemv_M64N8,
+    ), PREFETCH_OFF)
+    up_proj_fused = maybe_no_prefetch("up_fused", SchedGemv(
+        GemvAtom,
         MNK=((mlp_split, mlp_tail), N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], regStoreUp),
-    )
+    ), PREFETCH_OFF)
     silu_fused = SchedRegSiLUFused(
         num_token=N,
         store_tma=layerg["storeSiluLayer"],
@@ -506,35 +602,42 @@ def schedule_single_token(token_offset: int, token_pos: int):
         base_offset=mlp_split,
         stride=TileM,
     ).bar("output", layerg["bar_silu_out2"])
-    down_proj_low = SchedGemv(
-        Gemv_M64N8,
+    down_proj_low = maybe_no_prefetch("down_low", SchedGemv(
+        GemvAtom,
         MNK=(HIDDEN, N, 6144),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    )
-    down_proj_high = SchedGemv(
-        Gemv_M64N8,
+    ), PREFETCH_OFF)
+    down_proj_high = maybe_no_prefetch("down_high", SchedGemv(
+        GemvAtom,
         MNK=(HIDDEN, N, (mlp_split, mlp_tail)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
+    ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"]), PREFETCH_OFF)
     down_proj_low.bar("load", layerg["bar_silu_out1"])
 
     LogitsProj = []
     for i in range(logits_epoch):
         proj = GemvFactory(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-        sched = proj.schedule_(group=False).split_M(logits_fold)
+        sched = maybe_no_prefetch_list(
+            "logits",
+            proj.schedule_(group=False, fold=logits_k_fold).split_M(logits_wave_div),
+            PREFETCH_OFF,
+        )
+        if env_flag("LLAMA32_1B_LOGITS_NO_PREFETCH", True) and not ("all" in PREFETCH_OFF or "logits" in PREFETCH_OFF):
+            for item in sched:
+                if hasattr(item, "no_prefetch"):
+                    item.no_prefetch()
         if i == 0:
             sched.bar("load", layerg.over("bar_pre_attn_rms"))
-            sched[0].no_prefetch()
         if i == logits_epoch - 1:
             sched.bar("store", systemg["bar_logits"])
-        LogitsProj.append(sched.place(num_sms))
+        LogitsProj.append(sched.place(logits_sms))
 
     Argmax = SchedArgmax(
         num_token=N,
         logits_slice=logits_slice,
         num_slice=logits_epoch,
-        AtomPartial=ARGMAX_PARTIAL_bf16_1024_65536_128,
-        AtomReduce=ARGMAX_REDUCE_bf16_1024_128,
+        AtomPartial=ArgmaxPartial,
+        AtomReduce=ArgmaxReduce,
         matLogits=matLogits,
         matOutVal=matArgmaxVal,
         matOutIdx=matArgmaxIdx,
@@ -572,7 +675,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     silu_fused = silu_fused.place(32)
     down_proj_low = down_proj_low.place(96)
     down_proj_high = down_proj_high.place(64)
-    Argmax = Argmax.place(128)
+    Argmax = Argmax.place(argmax_sms)
     restore_bars_low = restore_bars_low.place(1, base_sm=128)
     restore_bars_high = restore_bars_high.place(1, base_sm=128)
 
@@ -737,14 +840,15 @@ def run_correctness_check():
         check_tensor_threshold("silu", silu_ref, matSiLUOut[0, :], 5.0),
         check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, 0], matHidden[0], 5.0),
         check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
-        check_tensor_threshold("logits_low", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
     ]
-    if logits_epoch > 1:
+    for i in range(logits_epoch):
+        start = i * logits_slice
+        end = min((i + 1) * logits_slice, vocab_size)
         final_checks.append(
             check_tensor_threshold(
-                "logits_high",
-                captured["final"]["lm_head"][0, 0, logits_slice:vocab_size],
-                matLogits[1][0, : vocab_size - logits_slice],
+                f"logits_{i}",
+                captured["final"]["lm_head"][0, 0, start:end],
+                matLogits[i][0, : end - start],
                 10.0,
             )
         )

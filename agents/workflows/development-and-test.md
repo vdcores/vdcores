@@ -110,6 +110,15 @@ Typical Python-only areas include:
 - To generate that file from a built launcher without hand-copying names, use the app-level `--write-compute-ops [path]` option exposed through `python/dae/util.py`'s `dae_app(...)`.
 - `--write-compute-ops` now extracts canonical compute-op names directly from the queued `ComputeInstruction`s without serializing them first, so it can bootstrap dynamic family-backed ops before those opcodes are compiled into `dae.runtime`.
 - `Launcher.copy_cptrs()` and `Launcher.copy_mptrs()` now return projected instruction pointers from queued instructions instead of forcing `build_instructions()`, which keeps schedule construction compatible with the `--write-compute-ops` bootstrap flow.
+- For polling or queue-backoff experiments, pass build-time macros through `EXTRA_NVCC_FLAGS` instead of editing headers between runs. Example:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate base
+DAE_COMPUTE_OPS_FILE=dae_compute_ops.vdcore.build \
+make pyext \
+  EXTRA_NVCC_FLAGS='-DDAE_ALLOC_RETRY_SLEEP_CYCLES=0 -DDAE_BARRIER_POLL_SLEEP_CYCLES=0 -DDAE_QUEUE_POLL_SLEEP_CYCLES=0'
+```
 - A clean `make pyext` generates `build/generated/dae/selected_compute_ops.inc`, `build/generated/dae/compute_opcode_order.inc`, and `build/generated/dae/dynamic_compute_handlers.inc` in the Makefile before compiling `runtime.o`; `setup.py` consumes those generated includes but does not create them.
 - `.github/workflows/docker-image.yml` builds the repo image on GitHub Actions and pushes it to Docker Hub. It expects repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, and publishes both `latest` and short-SHA tags under `docker.io/<DOCKERHUB_USERNAME>/vdcores`.
 - For family-backed compute instructions such as the new canonical GEMV strings, `-w` writes the family string directly; after changing that file you must rebuild `dae.runtime` before those instructions can serialize successfully, because opcode resolution happens lazily through the rebuilt `runtime.opcode` export.
@@ -136,6 +145,9 @@ make pyext
 - Never run GPU performance benchmarks in parallel. For this repo, credible timing comes from sequential runs only; overlapping jobs contend for the device and can corrupt both throughput numbers and debugging conclusions.
 - For risky multi-token or partial-stage experiments on the Llama 3.2 1B path, prefer `tests/script/run_with_launch_timeout.py` first to separate deadlocks from slow-but-completing schedules.
 - For longer multi-token timing on the current Llama 3.2 1B branch, prefer fresh-process `-b 1` measurements over larger `-b` counts until launch-state reset behavior is audited; repeated launches in one process showed inconsistent timings.
+- For one-token layer-body barrier debugging on `app/python/llama32_1b/sched.py`, a useful stable-ish harness is to import the module in-process with `sys.argv=['sched.py', '-N1', '--debug-stop-after', 'final_rms']`, run 10-12 launches after warmup, and read profile slots `0:14` from `dae.profile`. Slots `2:5` are alloc wait stats, `6:9` are LD-port 0 wait stats, and `10:13` are LD-port 1 wait stats.
+- When testing poll-backoff changes, compare warmed repeated runs within the same rebuild rather than trusting one fresh process. The current host can still throw multi-millisecond outliers even when the average path is near `~2 ms`.
+- When testing metadata-placement changes, keep `LLAMA32_1B_INTERNAL_CACHE_WINDOW=1` and `DAE_LAUNCHER_INTERNAL_CACHE_MODE=metadata` fixed, then vary only the launcher placement knobs (`DAE_LAUNCHER_BAR_ID_STRIDE`, `DAE_LAUNCHER_TMA_ID_STRIDE`, `DAE_LAUNCHER_METADATA_*`) so the comparison isolates address placement rather than APW enablement.
 
 ## Last Verified Result
 

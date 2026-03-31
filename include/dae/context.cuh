@@ -28,6 +28,20 @@ static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
+static constexpr int profileEventKernelStart = 0;
+static constexpr int profileEventKernelEnd = 1;
+static constexpr int profileEventAllocBarrierWaitCycles = 2;
+static constexpr int profileEventAllocBarrierPolls = 3;
+static constexpr int profileEventAllocBarrierWaits = 4;
+static constexpr int profileEventAllocBarrierValueChanges = 5;
+static constexpr int profileEventLd0BarrierWaitCycles = 6;
+static constexpr int profileEventLd0BarrierPolls = 7;
+static constexpr int profileEventLd0BarrierWaits = 8;
+static constexpr int profileEventLd0BarrierValueChanges = 9;
+static constexpr int profileEventLd1BarrierWaitCycles = 10;
+static constexpr int profileEventLd1BarrierPolls = 11;
+static constexpr int profileEventLd1BarrierWaits = 12;
+static constexpr int profileEventLd1BarrierValueChanges = 13;
 
 // barrier configurations
 static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
@@ -35,8 +49,35 @@ static constexpr int numThreadsC2MBarrier = numComputeWarps * numThreadsPerWarp 
 static constexpr int numThreadsLDBarrier = 2;
 
 // Polling backoff for the memory core hot loops.
-static constexpr int allocRetrySleepCycles = 16;
-static constexpr int barrierPollSleepCycles = 16;
+#ifndef DAE_ALLOC_RETRY_SLEEP_CYCLES
+#define DAE_ALLOC_RETRY_SLEEP_CYCLES 16
+#endif
+
+#ifndef DAE_BARRIER_POLL_SLEEP_CYCLES
+#define DAE_BARRIER_POLL_SLEEP_CYCLES 16
+#endif
+
+#ifndef DAE_BARRIER_POLL_MAX_SLEEP_CYCLES
+#define DAE_BARRIER_POLL_MAX_SLEEP_CYCLES 64
+#endif
+
+#ifndef DAE_QUEUE_POLL_SLEEP_CYCLES
+#define DAE_QUEUE_POLL_SLEEP_CYCLES 16
+#endif
+
+static constexpr int allocRetrySleepCycles = DAE_ALLOC_RETRY_SLEEP_CYCLES;
+static constexpr int barrierPollSleepCycles = DAE_BARRIER_POLL_SLEEP_CYCLES;
+static constexpr int barrierPollMaxSleepCycles = DAE_BARRIER_POLL_MAX_SLEEP_CYCLES;
+static constexpr int queuePollSleepCycles = DAE_QUEUE_POLL_SLEEP_CYCLES;
+
+static __device__ __host__ __forceinline__ constexpr int barrier_poll_sleep_cycles(int stagnant_polls) {
+  int sleep_cycles = barrierPollSleepCycles;
+  int backoff_steps = stagnant_polls >> 3;
+  while (backoff_steps-- > 0 && sleep_cycles < barrierPollMaxSleepCycles) {
+    sleep_cycles <<= 1;
+  }
+  return sleep_cycles > barrierPollMaxSleepCycles ? barrierPollMaxSleepCycles : sleep_cycles;
+}
 
 // Allocwarp instruction prefetch policy.
 static constexpr int allocwarpInstructionPrefetchDistance = 2;

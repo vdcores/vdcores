@@ -305,6 +305,31 @@ DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_REDUCE_bf16_1024_128) {
   task_argmax_reduce_kernel<1024, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_PARTIAL_bf16_1024_32768_128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_argmax_partial<1024, 32768, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_PARTIAL_bf16_1024_131072_128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_argmax_partial<1024, 131072, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_PARTIAL_bf16_2048_65536_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_argmax_partial<2048, 65536, 64, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_REDUCE_bf16_2048_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_argmax_reduce_kernel<2048, 64, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_PARTIAL_bf16_2048_32768_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_argmax_partial<2048, 32768, 64, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, inst, scratch_space, st_insts, g_events);
   task_rope_interleaved<512>(smem_base, m2c, c2m);
