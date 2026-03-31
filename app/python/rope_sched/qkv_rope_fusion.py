@@ -44,6 +44,18 @@ def parse_args():
     parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN)
     parser.add_argument("--token-pos", type=int, default=TOKEN_POS)
     parser.add_argument("--rope-theta", type=float, default=500000.0)
+    parser.add_argument(
+        "--rope-handoff",
+        choices=("reg", "glob"),
+        default="reg",
+        help="How to pass Q/K projection tiles into ROPE: register handoff or global-memory TMA handoff",
+    )
+    parser.add_argument(
+        "--barrier-mode",
+        choices=("load", "issue"),
+        default="load",
+        help="Use current load-path behavior or prepend an explicit IssueBarrier before all scheduled ops",
+    )
     parsed_args, remaining_argv = parser.parse_known_args()
     if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
         remaining_argv = [*remaining_argv, "--launch"]
@@ -196,21 +208,38 @@ t_store_q = TmaTensor(dae, mat_q_out).wgmma("reduce", parsed_args.tokens, tile_m
 t_store_k = TmaTensor(dae, mat_k_out)._build("reduce", 64, parsed_args.tokens, tma_store_attn_kv, cord_id)
 t_store_v = TmaTensor(dae, mat_v_out)._build("reduce", 64, parsed_args.tokens, tma_store_attn_kv, cord_id)
 
-reg_store_q = RegStore(0, size=parsed_args.tokens * tile_m * mat_q_out.element_size())
-reg_load_q = RegLoad(0)
-reg_store_k = RegStore(0, size=parsed_args.tokens * tile_m * mat_k_out.element_size())
-reg_load_k = RegLoad(0)
+q_proj_store = None
+q_rope_load = None
+k_proj_store = None
+k_rope_load = None
+
+if parsed_args.rope_handoff == "reg":
+    q_proj_store = RegStore(0, size=parsed_args.tokens * tile_m * mat_q_out.element_size())
+    q_rope_load = RegLoad(0)
+    k_proj_store = RegStore(0, size=parsed_args.tokens * tile_m * mat_k_out.element_size())
+    k_rope_load = RegLoad(0)
+else:
+    mat_q_handoff = torch.zeros(parsed_args.tokens, qw, dtype=DTYPE, device=gpu)
+    mat_k_handoff = torch.zeros(parsed_args.tokens, kw, dtype=DTYPE, device=gpu)
+    t_store_q_handoff = TmaTensor(dae, mat_q_handoff).wgmma("reduce", parsed_args.tokens, tile_m, Major.MN)
+    t_load_q_handoff = TmaTensor(dae, mat_q_handoff).wgmma_load(parsed_args.tokens, tile_m, Major.MN)
+    t_store_k_handoff = TmaTensor(dae, mat_k_handoff).wgmma("reduce", parsed_args.tokens, tile_m, Major.MN)
+    t_load_k_handoff = TmaTensor(dae, mat_k_handoff).wgmma_load(parsed_args.tokens, tile_m, Major.MN)
+    q_proj_store = t_store_q_handoff
+    q_rope_load = ToSplitMCordAdapter(t_load_q_handoff, qw // tile_m, tile_m)
+    k_proj_store = t_store_k_handoff
+    k_rope_load = ToSplitMCordAdapter(t_load_k_handoff, kw // tile_m, tile_m)
 
 q_proj = SchedGemv(
     Gemv_M64N8,
     MNK=(qw, parsed_args.tokens, parsed_args.hidden),
-    tmas=(t_load_qw, t_load_rms, reg_store_q),
+    tmas=(t_load_qw, t_load_rms, q_proj_store),
 )
 q_rope = SchedRope(
     ROPE_INTERLEAVE_512,
     tmas=(
         ToRopeTableCordAdapter(t_load_rope, parsed_args.token_pos, tile_repeats=max(1, parsed_args.head_dim // 64)),
-        reg_load_q,
+        q_rope_load,
         ToSplitMCordAdapter(t_store_q, qw // tile_m, tile_m),
     ),
 )
@@ -218,13 +247,13 @@ q_rope = SchedRope(
 k_proj = SchedGemv(
     Gemv_M64N8,
     MNK=(kw, parsed_args.tokens, parsed_args.hidden),
-    tmas=(t_load_kw, t_load_rms, reg_store_k),
+    tmas=(t_load_kw, t_load_rms, k_proj_store),
 )
 k_rope = SchedRope(
     ROPE_INTERLEAVE_512,
     tmas=(
         ToRopeTableCordAdapter(t_load_rope, parsed_args.token_pos, tile_repeats=max(1, parsed_args.head_dim // 64)),
-        reg_load_k,
+        k_rope_load,
         ToAttnKVStoreCordAdapter(t_store_k, kw // tile_m, tile_m, parsed_args.token_pos),
     ),
 )
@@ -245,18 +274,32 @@ k_proj = k_proj.place(64, base_sm=64)
 k_rope = k_rope.place(64, base_sm=64)
 v_proj = v_proj.place(64)
 
-dae.s(
-    q_proj,
-    q_rope,
-    k_proj,
-    k_rope,
-    v_proj,
-)
-
 print(
     "run rope qkv harness "
-    f"hidden={parsed_args.hidden} qw={qw} kw={kw} tokens={parsed_args.tokens} token_pos={parsed_args.token_pos}..."
+    f"hidden={parsed_args.hidden} qw={qw} kw={kw} tokens={parsed_args.tokens} "
+    f"token_pos={parsed_args.token_pos} rope_handoff={parsed_args.rope_handoff} "
+    f"barrier_mode={parsed_args.barrier_mode}..."
 )
+if parsed_args.barrier_mode == "issue":
+    barrier_id = dae.new_bar(0)
+    dae.i(
+        IssueBarrier(barrier_id),
+        q_proj,
+        q_rope,
+        k_proj,
+        k_rope,
+        v_proj,
+        TerminateC(),
+        TerminateM(),
+    )
+else:
+    dae.s(
+        q_proj,
+        q_rope,
+        k_proj,
+        k_rope,
+        v_proj,
+    )
 dae_app(dae)
 if parsed_args.correctness:
     run_correctness_check(

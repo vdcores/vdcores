@@ -25,3 +25,4 @@ Schedule-side cord conversion now lives in wrapper objects instead of `SchedCopy
 - Plain cordable objects can be passed directly when their native `.cord(...)` behavior already matches the schedule call shape.
 - For GEMV schedules, keep the scheduler logic unchanged, especially `storeC.cord(0, m)`, and adapt only through the wrapper.
 - The llama and qwen app schedules use small local helpers to wrap common identity/static cases and keep schedule construction readable.
+- For Q/K GEMV->ROPE global-memory handoff, keep GEMV store as raw TMA (`storeC.cord(0, m)` call shape) and use `ToSplitMCordAdapter` on the ROPE-side TMA load to map `sm -> (0, m)`.
