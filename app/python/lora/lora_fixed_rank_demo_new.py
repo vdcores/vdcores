@@ -1,4 +1,5 @@
 import math
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -56,7 +57,19 @@ class StageSpec:
         return self.choices[-1].latency
 
 
-def estimate_schedule_latency(schedule):
+DEFAULT_CALIBRATION_FACTORS = {
+    ("shrink_gemm_t64", 32): 0.005005,
+    ("expand_gemm_t64", 32): 0.007111,
+    ("expand_gemm_t64", 64): 0.006348,
+    ("shrink_gemv_t8", 4): 0.007701,
+    ("shrink_gemv_t8", 8): 0.011426,
+    ("expand_gemv_t8", 16): 0.049205,
+}
+
+_CALIBRATION_FACTOR_CACHE = None
+
+
+def estimate_schedule_proxy_latency(schedule):
     tile_m, tile_n, _ = schedule.Atom.MNK
     tile_work = tile_m * tile_n * schedule.k_per_fold
 
@@ -66,6 +79,64 @@ def estimate_schedule_latency(schedule):
     if isinstance(schedule, SchedGemv):
         return tile_work
     raise TypeError(f"Unsupported schedule type {type(schedule)}")
+
+
+def normalized_family_name(name):
+    return name.replace("_chunk", "")
+
+
+def schedule_family_name(schedule):
+    _, n_dim, k_dim = schedule.MNK
+    if isinstance(schedule, SchedGemm):
+        return "expand_gemm_t64" if k_dim <= 64 else "shrink_gemm_t64"
+    if isinstance(schedule, SchedGemv):
+        return "expand_gemv_t8" if k_dim <= 64 else "shrink_gemv_t8"
+    raise TypeError(f"Unsupported schedule type {type(schedule)}")
+
+
+def load_calibration_factors():
+    global _CALIBRATION_FACTOR_CACHE
+    if _CALIBRATION_FACTOR_CACHE is not None:
+        return _CALIBRATION_FACTOR_CACHE
+
+    factors = dict(DEFAULT_CALIBRATION_FACTORS)
+    calibration_path = Path("build") / "plots" / "lora_fixed_rank_schedule_calibration.json"
+    if calibration_path.exists():
+        try:
+            payload = json.loads(calibration_path.read_text(encoding="utf-8"))
+            grouped = {}
+            for entry in payload.get("groups", []):
+                family = normalized_family_name(entry["family"])
+                key = (family, int(entry["num_sms"]))
+                grouped.setdefault(key, {"weighted_sum": 0.0, "count": 0})
+                grouped[key]["weighted_sum"] += float(entry["max_over_proxy_avg"]) * int(entry["num_samples"])
+                grouped[key]["count"] += int(entry["num_samples"])
+            for key, values in grouped.items():
+                if values["count"] > 0:
+                    factors[key] = values["weighted_sum"] / values["count"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"failed to load calibration factors from {calibration_path}: {exc}")
+
+    _CALIBRATION_FACTOR_CACHE = factors
+    return _CALIBRATION_FACTOR_CACHE
+
+
+def calibration_factor_for_schedule(schedule):
+    family = schedule_family_name(schedule)
+    factors = load_calibration_factors()
+    key = (family, int(schedule.num_sms))
+    if key in factors:
+        return factors[key]
+
+    family_factors = [factor for (name, _), factor in factors.items() if name == family]
+    if family_factors:
+        return sum(family_factors) / len(family_factors)
+    return 1.0
+
+
+def estimate_schedule_latency(schedule):
+    proxy_latency = estimate_schedule_proxy_latency(schedule)
+    return proxy_latency * calibration_factor_for_schedule(schedule)
 
 
 def barrier_release_count(schedule):
@@ -497,10 +568,55 @@ def build_reference(xs, a_weights, b_weights):
     return shrink_refs, expand_refs
 
 
+SHRINK_ALPHA = 0.9
+EXPAND_ALPHA = 0.5
+
+
+def _draw_schedule_axis(ax, entries, title, x_label, y_label=True, height_getter=None, label_entries=True):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    cmap = plt.get_cmap("tab20")
+    height_getter = height_getter or (lambda entry: entry["num_sms"])
+
+    for entry in entries:
+        color = cmap(entry["group_id"] % cmap.N)
+        width = entry["end_time"] - entry["start_time"]
+        height = height_getter(entry)
+        rect = Rectangle(
+            (entry["start_time"], entry["base_sm"] if "base_sm" in entry else entry["sm_id"]),
+            width,
+            height,
+            facecolor=color,
+            edgecolor="black",
+            linewidth=0.8 if "base_sm" in entry else 0.4,
+            alpha=SHRINK_ALPHA if entry["stage_name"] == "shrink" else EXPAND_ALPHA,
+        )
+        ax.add_patch(rect)
+
+        if label_entries and width > 0:
+            ax.text(
+                entry["start_time"] + width / 2,
+                (entry["base_sm"] if "base_sm" in entry else entry["sm_id"]) + height / 2,
+                f"{entry['group_id']} {entry['stage_name'][0].upper()}",
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="black",
+            )
+
+    ax.set_xlim(0, max(entry["end_time"] for entry in entries) * 1.02)
+    ax.set_ylim(0, NUM_SMS)
+    ax.set_xlabel(x_label)
+    if y_label:
+        ax.set_ylabel("SM ID")
+    ax.set_title(title)
+    ax.grid(True, axis="x", linestyle="--", alpha=0.25)
+
+
 def visualize_pipeline_plan(plan, output_path):
     try:
         import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
     except ImportError:
         print("matplotlib not available, skipping schedule visualization")
         return
@@ -510,41 +626,7 @@ def visualize_pipeline_plan(plan, output_path):
         return
 
     fig, ax = plt.subplots(figsize=(15, 7))
-    cmap = plt.get_cmap("tab20")
-
-    for entry in plan:
-        color_idx = (entry["group_id"] * 2) + (0 if entry["stage_name"] == "shrink" else 1)
-        color = cmap(color_idx % cmap.N)
-        width = entry["end_time"] - entry["start_time"]
-        rect = Rectangle(
-            (entry["start_time"], entry["base_sm"]),
-            width,
-            entry["num_sms"],
-            facecolor=color,
-            edgecolor="black",
-            linewidth=0.8,
-            alpha=0.85,
-        )
-        ax.add_patch(rect)
-
-        if width > 0:
-            ax.text(
-                entry["start_time"] + width / 2,
-                entry["base_sm"] + entry["num_sms"] / 2,
-                f"g{entry['group_id']} {entry['stage_name'][0].upper()}"
-                + (f" {entry['chunk_label']}" if entry["chunk_label"] else ""),
-                ha="center",
-                va="center",
-                fontsize=7,
-                color="black",
-            )
-
-    ax.set_xlim(0, max(entry["end_time"] for entry in plan) * 1.02)
-    ax.set_ylim(0, NUM_SMS)
-    ax.set_xlabel("Proxy Time")
-    ax.set_ylabel("SM ID")
-    ax.set_title("LoRA Pipeline Schedule Plan")
-    ax.grid(True, axis="x", linestyle="--", alpha=0.25)
+    _draw_schedule_axis(ax, plan, "LoRA Pipeline Schedule Plan", "Proxy Time", y_label=True)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -560,10 +642,11 @@ def count_compute_ops_for_sm(schedule, sm_id):
 
 def build_real_time_segments(plan, spec_by_key, durations_per_sm, profile_data):
     segments = []
+    records = []
     global_start = int(profile_data[:, 0].min())
-    sm_cursors = [int(profile_data[sm_id, 0]) for sm_id in range(NUM_SMS)]
     sm_offsets = [0 for _ in range(NUM_SMS)]
     plan_by_sm = [[] for _ in range(NUM_SMS)]
+    records_by_key = {}
 
     for entry in plan:
         for sm_id in range(entry["base_sm"], entry["base_sm"] + entry["num_sms"]):
@@ -585,25 +668,64 @@ def build_real_time_segments(plan, spec_by_key, durations_per_sm, profile_data):
             if measured.size == 0:
                 continue
 
-            width = int(measured.sum())
-            start = sm_cursors[sm_id] - global_start
-            segments.append({
+            record = {
+                "key": entry["key"],
                 "group_id": entry["group_id"],
                 "stage_name": entry["stage_name"],
                 "chunk_label": entry["chunk_label"],
                 "sm_id": sm_id,
-                "start_time": start,
-                "end_time": start + width,
-            })
-            sm_cursors[sm_id] += width
+                "op_count": op_count,
+                "durations_ns": [int(x) for x in measured.tolist()],
+                "measured_sum_ns": int(measured.sum()),
+                "num_sms": entry["num_sms"],
+                "base_sm": entry["base_sm"],
+                "proxy_latency": entry["latency"],
+            }
+            records.append(record)
+            records_by_key.setdefault(entry["key"], []).append(record)
 
-    return segments
+    sm_available = [0 for _ in range(NUM_SMS)]
+    group_shrink_finish = {}
+    sorted_plan = sorted(plan, key=lambda entry: (entry["start_time"], entry["group_id"], entry["key"]))
+
+    for entry in sorted_plan:
+        stage_records = records_by_key.get(entry["key"], [])
+        if not stage_records:
+            continue
+
+        pred_ready = 0
+        if entry["stage_name"] == "expand":
+            pred_ready = group_shrink_finish.get(entry["group_id"], 0)
+        record_end_times = []
+        for record in stage_records:
+            record_start = max(pred_ready, sm_available[record["sm_id"]])
+            record_end = record_start + record["measured_sum_ns"]
+            record["cursor_start_ns"] = record_start
+            record["cursor_end_ns"] = record_end
+            segments.append({
+                "key": record["key"],
+                "group_id": record["group_id"],
+                "stage_name": record["stage_name"],
+                "chunk_label": record["chunk_label"],
+                "sm_id": record["sm_id"],
+                "start_time": record["cursor_start_ns"],
+                "end_time": record["cursor_end_ns"],
+            })
+            sm_available[record["sm_id"]] = record_end
+            record_end_times.append(record_end)
+
+        if entry["stage_name"] == "shrink" and record_end_times:
+            group_shrink_finish[entry["group_id"]] = max(
+                group_shrink_finish.get(entry["group_id"], 0),
+                max(record_end_times),
+            )
+
+    return segments, records, sm_offsets
 
 
 def visualize_real_time_segments(segments, output_path):
     try:
         import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
     except ImportError:
         print("matplotlib not available, skipping real-time schedule visualization")
         return
@@ -613,29 +735,15 @@ def visualize_real_time_segments(segments, output_path):
         return
 
     fig, ax = plt.subplots(figsize=(15, 7))
-    cmap = plt.get_cmap("tab20")
-
-    for entry in segments:
-        color_idx = (entry["group_id"] * 2) + (0 if entry["stage_name"] == "shrink" else 1)
-        color = cmap(color_idx % cmap.N)
-        width = entry["end_time"] - entry["start_time"]
-        rect = Rectangle(
-            (entry["start_time"], entry["sm_id"]),
-            width,
-            1.0,
-            facecolor=color,
-            edgecolor="black",
-            linewidth=0.4,
-            alpha=0.85,
-        )
-        ax.add_patch(rect)
-
-    ax.set_xlim(0, max(entry["end_time"] for entry in segments) * 1.02)
-    ax.set_ylim(0, NUM_SMS)
-    ax.set_xlabel("Measured Compute Time (ns)")
-    ax.set_ylabel("SM ID")
-    ax.set_title("LoRA Pipeline Schedule (Measured Compute Durations)")
-    ax.grid(True, axis="x", linestyle="--", alpha=0.25)
+    _draw_schedule_axis(
+        ax,
+        segments,
+        "LoRA Pipeline Schedule (Measured Compute Durations)",
+        "Measured Compute Time (ns)",
+        y_label=True,
+        height_getter=lambda _entry: 1.0,
+        label_entries=False,
+    )
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -643,6 +751,228 @@ def visualize_real_time_segments(segments, output_path):
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
     print(f"Saved real-time schedule visualization to {output_path}")
+
+
+def visualize_schedule_comparison(plan, segments, output_path):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available, skipping combined schedule visualization")
+        return
+
+    if not plan or not segments:
+        print("missing predicted or measured schedule data, skipping combined schedule visualization")
+        return
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(22, 7), sharey=True)
+    # fig.suptitle("LoRA Schedule", fontsize=14)
+    _draw_schedule_axis(ax_left, plan, "Schedule Plan", "Proxy Time", y_label=True)
+    _draw_schedule_axis(
+        ax_right,
+        segments,
+        "Execution Timeline",
+        "Measured Operation Duration (ns)",
+        y_label=False,
+        height_getter=lambda _entry: 1.0,
+        label_entries=False,
+    )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved combined schedule visualization to {output_path}")
+
+
+def dump_schedule_replay(plan, durations_per_sm, profile_data, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "group_sizes": GROUP_SIZES,
+        "num_sms": NUM_SMS,
+        "plan": plan,
+        "profile_start_ns": [int(x) for x in profile_data[:, 0].tolist()],
+        "profile_end_ns": [int(x) for x in profile_data[:, 1].tolist()],
+        "durations_per_sm_ns": [[int(v) for v in durations.tolist()] for durations in durations_per_sm],
+    }
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Saved schedule replay artifact to {output_path}")
+
+
+def dump_schedule_debug(plan, spec_by_key, durations_per_sm, profile_data, records, sm_offsets, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    records_by_key = {}
+    for record in records:
+        records_by_key.setdefault(record["key"], []).append(record)
+
+    stage_summaries = []
+    for entry in plan:
+        stage_records = records_by_key.get(entry["key"], [])
+        stage_summaries.append({
+            "key": entry["key"],
+            "group_id": entry["group_id"],
+            "stage_name": entry["stage_name"],
+            "chunk_label": entry["chunk_label"],
+            "token_count": entry["token_count"],
+            "proxy_latency": entry["latency"],
+            "num_sms": entry["num_sms"],
+            "base_sm": entry["base_sm"],
+            "measured_max_ns": max((record["measured_sum_ns"] for record in stage_records), default=0),
+            "measured_sum_ns": sum(record["measured_sum_ns"] for record in stage_records),
+            "per_sm": stage_records,
+            "choices": [
+                {"num_sms": choice.num_sms, "latency": choice.latency}
+                for choice in spec_by_key[entry["key"]].choices
+            ],
+        })
+
+    sm_summaries = []
+    for sm_id in range(NUM_SMS):
+        sm_summaries.append({
+            "sm_id": sm_id,
+            "profile_start_ns": int(profile_data[sm_id, 0]),
+            "profile_end_ns": int(profile_data[sm_id, 1]),
+            "used_duration_slots": int(sm_offsets[sm_id]),
+            "total_duration_slots": int(len(durations_per_sm[sm_id])),
+            "unused_durations_ns": [int(x) for x in durations_per_sm[sm_id][sm_offsets[sm_id]:].tolist()],
+        })
+
+    payload = {
+        "global_start_ns": int(profile_data[:, 0].min()),
+        "global_end_ns": int(profile_data[:, 1].max()),
+        "stage_summaries": stage_summaries,
+        "sm_summaries": sm_summaries,
+    }
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Saved schedule debug dump to {output_path}")
+
+    text_path = output_path.with_suffix(".txt")
+    lines = []
+    lines.append("LoRA Schedule Debug Summary")
+    lines.append(f"global_start_ns={payload['global_start_ns']} global_end_ns={payload['global_end_ns']}")
+    lines.append("")
+    lines.append("Per-stage predicted vs measured:")
+    for summary in stage_summaries:
+        lines.append(
+            f"{summary['key']} proxy={summary['proxy_latency']:.0f} "
+            f"measured_max_ns={summary['measured_max_ns']} "
+            f"measured_sum_ns={summary['measured_sum_ns']} "
+            f"sms={summary['num_sms']} base_sm={summary['base_sm']}"
+        )
+        for record in summary["per_sm"]:
+            lines.append(
+                f"  sm{record['sm_id']}: ops={record['op_count']} "
+                f"sum_ns={record['measured_sum_ns']} durations={record['durations_ns']}"
+            )
+        lines.append(
+            f"  choices={[(choice['num_sms'], int(choice['latency'])) for choice in summary['choices']]}"
+        )
+    lines.append("")
+    lines.append("Per-SM leftover duration slots:")
+    for summary in sm_summaries:
+        if summary["unused_durations_ns"]:
+            lines.append(
+                f"sm{summary['sm_id']}: unused={summary['unused_durations_ns']} "
+                f"used_slots={summary['used_duration_slots']}/{summary['total_duration_slots']}"
+            )
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Saved schedule debug text summary to {text_path}")
+    return payload
+
+
+def stage_family_name(stage_summary):
+    token_count = stage_summary["token_count"]
+    stage_name = stage_summary["stage_name"]
+    chunk_label = stage_summary["chunk_label"] or ""
+    if token_count == 8 and stage_name == "shrink":
+        return "shrink_gemv_t8"
+    if token_count == 8 and stage_name == "expand":
+        return "expand_gemv_t8_chunk"
+    if token_count == 64 and "tok" in chunk_label and stage_name == "shrink":
+        return "shrink_gemm_t64_chunk"
+    if token_count == 64 and "tok" in chunk_label and stage_name == "expand":
+        return "expand_gemm_t64_chunk"
+    if token_count == 64 and stage_name == "shrink":
+        return "shrink_gemm_t64"
+    if token_count == 64 and stage_name == "expand":
+        return "expand_gemm_t64"
+    return f"{stage_name}_t{token_count}"
+
+
+def dump_calibration_summary(debug_payload, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path = output_path.with_suffix(".txt")
+
+    if output_path.exists():
+        print(f"Calibration summary already exists at {output_path}, keeping existing file")
+        if text_path.exists():
+            print(f"Calibration text summary already exists at {text_path}, keeping existing file")
+        return
+
+    grouped = {}
+    for summary in debug_payload["stage_summaries"]:
+        family = stage_family_name(summary)
+        key = (family, int(summary["num_sms"]))
+        grouped.setdefault(key, []).append(summary)
+
+    calibration = []
+    for (family, num_sms), summaries in sorted(grouped.items()):
+        proxy_vals = [float(summary["proxy_latency"]) for summary in summaries if summary["proxy_latency"] > 0]
+        measured_max_vals = [float(summary["measured_max_ns"]) for summary in summaries]
+        measured_sum_vals = [float(summary["measured_sum_ns"]) for summary in summaries]
+        ratio_max_vals = [
+            float(summary["measured_max_ns"]) / float(summary["proxy_latency"])
+            for summary in summaries
+            if summary["proxy_latency"] > 0
+        ]
+        ratio_sum_vals = [
+            float(summary["measured_sum_ns"]) / float(summary["proxy_latency"])
+            for summary in summaries
+            if summary["proxy_latency"] > 0
+        ]
+        op_counts = sorted({record["op_count"] for summary in summaries for record in summary["per_sm"]})
+        calibration.append({
+            "family": family,
+            "num_sms": num_sms,
+            "num_samples": len(summaries),
+            "op_counts": op_counts,
+            "proxy_latency_values": proxy_vals,
+            "measured_max_ns_avg": sum(measured_max_vals) / len(measured_max_vals),
+            "measured_max_ns_min": min(measured_max_vals),
+            "measured_max_ns_max": max(measured_max_vals),
+            "measured_sum_ns_avg": sum(measured_sum_vals) / len(measured_sum_vals),
+            "max_over_proxy_avg": sum(ratio_max_vals) / len(ratio_max_vals) if ratio_max_vals else 0.0,
+            "sum_over_proxy_avg": sum(ratio_sum_vals) / len(ratio_sum_vals) if ratio_sum_vals else 0.0,
+            "samples": [summary["key"] for summary in summaries],
+        })
+
+    payload = {
+        "global_span_ns": int(debug_payload["global_end_ns"] - debug_payload["global_start_ns"]),
+        "groups": calibration,
+    }
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Saved calibration summary to {output_path}")
+
+    lines = []
+    lines.append("LoRA Calibration Summary")
+    lines.append(f"global_span_ns={payload['global_span_ns']}")
+    lines.append("")
+    for entry in calibration:
+        lines.append(
+            f"{entry['family']} sms={entry['num_sms']} samples={entry['num_samples']} "
+            f"op_counts={entry['op_counts']} "
+            f"measured_max_avg_ns={entry['measured_max_ns_avg']:.1f} "
+            f"measured_sum_avg_ns={entry['measured_sum_ns_avg']:.1f} "
+            f"max_over_proxy_avg={entry['max_over_proxy_avg']:.6f} "
+            f"sum_over_proxy_avg={entry['sum_over_proxy_avg']:.6f}"
+        )
+        lines.append(f"  samples={entry['samples']}")
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Saved calibration text summary to {text_path}")
 
 matX, matA, matB, matShrink, matOut = make_group_tensors()
 refShrink, refOut = build_reference(matX, matA, matB)
@@ -962,25 +1292,40 @@ for entry in pipeline_plan:
         f"{entry['chunk_label'] + ' ' if entry['chunk_label'] else ''}"
         f"sms={entry['num_sms']} base_sm={entry['base_sm']}"
     )
-visualize_pipeline_plan(
-    pipeline_plan,
-    Path("build") / "plots" / "lora_fixed_rank_schedule.png",
-)
-
 dae_app(dae)
 
 durations_per_sm = read_compute_durations(dae)
 if any(len(durations) > 0 for durations in durations_per_sm):
     profile_data = dae.profile.cpu().numpy()
-    real_time_segments = build_real_time_segments(
+    dump_schedule_replay(
+        pipeline_plan,
+        durations_per_sm,
+        profile_data,
+        Path("build") / "plots" / "lora_fixed_rank_schedule_replay.json",
+    )
+    real_time_segments, real_time_records, sm_offsets = build_real_time_segments(
         pipeline_plan,
         spec_by_key,
         durations_per_sm,
         profile_data,
     )
-    visualize_real_time_segments(
+    visualize_schedule_comparison(
+        pipeline_plan,
         real_time_segments,
-        Path("build") / "plots" / "lora_fixed_rank_schedule_measured.png",
+        Path("build") / "plots" / "lora_fixed_rank_schedule_comparison.png",
+    )
+    debug_payload = dump_schedule_debug(
+        pipeline_plan,
+        spec_by_key,
+        durations_per_sm,
+        profile_data,
+        real_time_records,
+        sm_offsets,
+        Path("build") / "plots" / "lora_fixed_rank_schedule_debug.json",
+    )
+    dump_calibration_summary(
+        debug_payload,
+        Path("build") / "plots" / "lora_fixed_rank_schedule_calibration.json",
     )
 
 # for group_id, token_count in enumerate(GROUP_SIZES):
