@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include "context.cuh"
 #include <cuda.h>
 
