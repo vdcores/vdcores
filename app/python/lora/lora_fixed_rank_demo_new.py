@@ -7,7 +7,7 @@ import torch
 
 from dae.launcher import *
 from dae.schedule import SchedGemm, SchedGemv
-from dae.util import dae_app, tensor_diff
+from dae.util import dae_app, read_compute_durations, tensor_diff
 
 
 torch.manual_seed(0)
@@ -553,6 +553,97 @@ def visualize_pipeline_plan(plan, output_path):
     plt.close(fig)
     print(f"Saved schedule visualization to {output_path}")
 
+
+def count_compute_ops_for_sm(schedule, sm_id):
+    return sum(1 for inst in schedule(sm_id) if isinstance(inst, ComputeInstruction))
+
+
+def build_real_time_segments(plan, spec_by_key, durations_per_sm, profile_data):
+    segments = []
+    global_start = int(profile_data[:, 0].min())
+    sm_cursors = [int(profile_data[sm_id, 0]) for sm_id in range(NUM_SMS)]
+    sm_offsets = [0 for _ in range(NUM_SMS)]
+    plan_by_sm = [[] for _ in range(NUM_SMS)]
+
+    for entry in plan:
+        for sm_id in range(entry["base_sm"], entry["base_sm"] + entry["num_sms"]):
+            if 0 <= sm_id < NUM_SMS:
+                plan_by_sm[sm_id].append(entry)
+
+    for sm_id in range(NUM_SMS):
+        plan_by_sm[sm_id].sort(key=lambda entry: (entry["start_time"], entry["group_id"], entry["key"]))
+        for entry in plan_by_sm[sm_id]:
+            schedule = spec_by_key[entry["key"]].make_schedule(entry["num_sms"], entry["base_sm"])
+            op_count = count_compute_ops_for_sm(schedule, sm_id)
+            if op_count <= 0:
+                continue
+
+            sm_durations = durations_per_sm[sm_id]
+            next_offset = min(sm_offsets[sm_id] + op_count, len(sm_durations))
+            measured = sm_durations[sm_offsets[sm_id]:next_offset]
+            sm_offsets[sm_id] = next_offset
+            if measured.size == 0:
+                continue
+
+            width = int(measured.sum())
+            start = sm_cursors[sm_id] - global_start
+            segments.append({
+                "group_id": entry["group_id"],
+                "stage_name": entry["stage_name"],
+                "chunk_label": entry["chunk_label"],
+                "sm_id": sm_id,
+                "start_time": start,
+                "end_time": start + width,
+            })
+            sm_cursors[sm_id] += width
+
+    return segments
+
+
+def visualize_real_time_segments(segments, output_path):
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except ImportError:
+        print("matplotlib not available, skipping real-time schedule visualization")
+        return
+
+    if not segments:
+        print("empty real-time segments, skipping real-time schedule visualization")
+        return
+
+    fig, ax = plt.subplots(figsize=(15, 7))
+    cmap = plt.get_cmap("tab20")
+
+    for entry in segments:
+        color_idx = (entry["group_id"] * 2) + (0 if entry["stage_name"] == "shrink" else 1)
+        color = cmap(color_idx % cmap.N)
+        width = entry["end_time"] - entry["start_time"]
+        rect = Rectangle(
+            (entry["start_time"], entry["sm_id"]),
+            width,
+            1.0,
+            facecolor=color,
+            edgecolor="black",
+            linewidth=0.4,
+            alpha=0.85,
+        )
+        ax.add_patch(rect)
+
+    ax.set_xlim(0, max(entry["end_time"] for entry in segments) * 1.02)
+    ax.set_ylim(0, NUM_SMS)
+    ax.set_xlabel("Measured Compute Time (ns)")
+    ax.set_ylabel("SM ID")
+    ax.set_title("LoRA Pipeline Schedule (Measured Compute Durations)")
+    ax.grid(True, axis="x", linestyle="--", alpha=0.25)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved real-time schedule visualization to {output_path}")
+
 matX, matA, matB, matShrink, matOut = make_group_tensors()
 refShrink, refOut = build_reference(matX, matA, matB)
 
@@ -848,6 +939,7 @@ for group_id, token_count in enumerate(GROUP_SIZES):
 all_stage_specs = [*shrink_specs, *expand_specs]
 compute_downstream_latencies(all_stage_specs)
 pipeline_insts, pipeline_plan, pipeline_barrier_counts = build_pipeline_schedule(all_stage_specs)
+spec_by_key = {spec.key: spec for spec in all_stage_specs}
 for bar_id, count in pipeline_barrier_counts.items():
     dae.set_bar(bar_id, count)
 
@@ -876,6 +968,20 @@ visualize_pipeline_plan(
 )
 
 dae_app(dae)
+
+durations_per_sm = read_compute_durations(dae)
+if any(len(durations) > 0 for durations in durations_per_sm):
+    profile_data = dae.profile.cpu().numpy()
+    real_time_segments = build_real_time_segments(
+        pipeline_plan,
+        spec_by_key,
+        durations_per_sm,
+        profile_data,
+    )
+    visualize_real_time_segments(
+        real_time_segments,
+        Path("build") / "plots" / "lora_fixed_rank_schedule_measured.png",
+    )
 
 # for group_id, token_count in enumerate(GROUP_SIZES):
 #     tensor_diff(f"group{group_id}_shrink_{token_count}", refShrink[group_id], matShrink[group_id])
