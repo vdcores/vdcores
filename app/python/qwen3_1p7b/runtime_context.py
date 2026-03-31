@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 from dae.launcher import Launcher
@@ -11,6 +12,60 @@ from cli import (
     DEFAULT_MAX_SEQ_LEN,
     MODEL_NAME,
 )
+
+
+DEFAULT_VOCAB_SIZE = 151936
+DEFAULT_NUM_LAYERS = 28
+
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def hf_auth_kwargs() -> dict[str, str]:
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        return {"token": token}
+    return {}
+
+
+def build_synthetic_inputs(
+    *,
+    vocab_size: int,
+    hidden_size: int,
+    intermediate_size: int,
+    head_dim: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_layers: int,
+    device,
+    dtype,
+):
+    def empty(*shape):
+        return torch.empty(*shape, dtype=dtype, device=device)
+
+    qw = head_dim * num_q_heads
+    kw = head_dim * num_kv_heads
+    vw = head_dim * num_kv_heads
+
+    return {
+        "embed": empty(vocab_size, hidden_size),
+        "rms_input_w": [empty(hidden_size) for _ in range(num_layers)] + [empty(hidden_size)],
+        "rms_post_attn_w": [empty(hidden_size) for _ in range(num_layers)],
+        "q_norm_w": [empty(head_dim) for _ in range(num_layers)],
+        "k_norm_w": [empty(head_dim) for _ in range(num_layers)],
+        "qws": [empty(qw, hidden_size) for _ in range(num_layers)],
+        "kws": [empty(kw, hidden_size) for _ in range(num_layers)],
+        "vws": [empty(vw, hidden_size) for _ in range(num_layers)],
+        "out_ws": [empty(hidden_size, hidden_size) for _ in range(num_layers)],
+        "ups": [empty(intermediate_size, hidden_size) for _ in range(num_layers)],
+        "gates": [empty(intermediate_size, hidden_size) for _ in range(num_layers)],
+        "downs": [empty(hidden_size, intermediate_size) for _ in range(num_layers)],
+        "lm_head": empty(vocab_size, hidden_size),
+    }
 
 
 def get_rope_theta(config):
@@ -138,19 +193,43 @@ class QwenScheduleContext:
 
 def build_runtime_context(parsed_args):
     gpu = torch.device("cuda")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        cache_dir=parsed_args.hf_cache_dir,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        token=os.environ["HF_TOKEN"],
-    )
-    config = AutoConfig.from_pretrained(
-        MODEL_NAME,
-        cache_dir=parsed_args.hf_cache_dir,
-        token=os.environ["HF_TOKEN"],
-    )
-    layers = model.model.layers
+
+    if parsed_args.dry_build:
+        config = SimpleNamespace(
+            max_position_embeddings=DEFAULT_MAX_SEQ_LEN,
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            rms_norm_eps=1.0e-6,
+            rope_scaling={"rope_theta": 1000000.0},
+            vocab_size=DEFAULT_VOCAB_SIZE,
+        )
+        model = None
+        dtype = torch.bfloat16
+        layers = [None] * DEFAULT_NUM_LAYERS
+    else:
+        auth_kwargs = hf_auth_kwargs()
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            cache_dir=parsed_args.hf_cache_dir,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            **auth_kwargs,
+        )
+        config = AutoConfig.from_pretrained(
+            MODEL_NAME,
+            cache_dir=parsed_args.hf_cache_dir,
+            **auth_kwargs,
+        )
+        layers = list(model.model.layers)
+        dtype = model.dtype
+
+    if parsed_args.debug_num_layers is not None:
+        if parsed_args.debug_num_layers <= 0:
+            raise ValueError("--debug-num-layers must be positive")
+        layers = layers[: parsed_args.debug_num_layers]
 
     REQ, N = 8, 8
     KVBlockSize = 64
@@ -162,9 +241,8 @@ def build_runtime_context(parsed_args):
 
     prefill_token_id_and_pos = []
     input_token_id_and_pos = [(DEFAULT_DECODE_INPUT_TOKEN, 0)]
-    num_generates = 0 if parsed_args.correctness else parsed_args.num_generates - 1
+    num_generates = 0 if (parsed_args.correctness or parsed_args.dry_build) else parsed_args.num_generates - 1
 
-    dtype = model.dtype
     eps = config.rms_norm_eps
     rope_theta = get_rope_theta(config)
     HIDDEN = config.hidden_size
@@ -191,11 +269,52 @@ def build_runtime_context(parsed_args):
     matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
     matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 
-    matEmbed = model.model.embed_tokens.weight
-    matRMSInputW = [layer.input_layernorm.weight for layer in layers] + [model.model.norm.weight]
-    matRMSPostAttnW = [layer.post_attention_layernorm.weight for layer in layers]
-    matQNormWs = [permute_rope_head_weight(layer.self_attn.q_norm.weight.detach()) for layer in layers]
-    matKNormWs = [permute_rope_head_weight(layer.self_attn.k_norm.weight.detach()) for layer in layers]
+    if parsed_args.dry_build:
+        synthetic = build_synthetic_inputs(
+            vocab_size=getattr(config, "vocab_size", DEFAULT_VOCAB_SIZE),
+            hidden_size=HIDDEN,
+            intermediate_size=INTERMIDIATE,
+            head_dim=HEAD_DIM,
+            num_q_heads=NUM_Q_HEAD,
+            num_kv_heads=NUM_KV_HEAD,
+            num_layers=num_layers,
+            device=gpu,
+            dtype=dtype,
+        )
+        matEmbed = synthetic["embed"]
+        matRMSInputW = synthetic["rms_input_w"]
+        matRMSPostAttnW = synthetic["rms_post_attn_w"]
+        matQNormWs = synthetic["q_norm_w"]
+        matKNormWs = synthetic["k_norm_w"]
+        matqWs = synthetic["qws"]
+        matkWs = synthetic["kws"]
+        matvWs = synthetic["vws"]
+        matOutWs = synthetic["out_ws"]
+        matUps = synthetic["ups"]
+        matGates = synthetic["gates"]
+        matDowns = synthetic["downs"]
+        matLmHeadW = synthetic["lm_head"]
+    else:
+        matEmbed = model.model.embed_tokens.weight
+        matRMSInputW = [layer.input_layernorm.weight for layer in layers] + [model.model.norm.weight]
+        matRMSPostAttnW = [layer.post_attention_layernorm.weight for layer in layers]
+        matQNormWs = [permute_rope_head_weight(layer.self_attn.q_norm.weight.detach()) for layer in layers]
+        matKNormWs = [permute_rope_head_weight(layer.self_attn.k_norm.weight.detach()) for layer in layers]
+        matqWs = [
+            permute_rope_weight(layer.self_attn.q_proj.weight, NUM_Q_HEAD, HEAD_DIM, HIDDEN)
+            for layer in layers
+        ]
+        matkWs = [
+            permute_rope_weight(layer.self_attn.k_proj.weight, NUM_KV_HEAD, HEAD_DIM, HIDDEN)
+            for layer in layers
+        ]
+        matvWs = [layer.self_attn.v_proj.weight for layer in layers]
+        matOutWs = [layer.self_attn.o_proj.weight for layer in layers]
+        matUps = [layer.mlp.up_proj.weight for layer in layers]
+        matGates = [layer.mlp.gate_proj.weight for layer in layers]
+        matDowns = [layer.mlp.down_proj.weight for layer in layers]
+        matLmHeadW = model.lm_head.weight.detach()
+
     matQwenSideInputs = []
     for q_norm_w, k_norm_w in zip(matQNormWs, matKNormWs):
         packed = torch.empty(MAX_SEQ_LEN, 3 * HEAD_DIM, dtype=dtype, device=gpu)
@@ -204,26 +323,11 @@ def build_runtime_context(parsed_args):
         packed[:, 2 * HEAD_DIM:3 * HEAD_DIM] = matRope
         matQwenSideInputs.append(packed)
 
-    matqWs = [
-        permute_rope_weight(layer.self_attn.q_proj.weight, NUM_Q_HEAD, HEAD_DIM, HIDDEN)
-        for layer in layers
-    ]
-    matkWs = [
-        permute_rope_weight(layer.self_attn.k_proj.weight, NUM_KV_HEAD, HEAD_DIM, HIDDEN)
-        for layer in layers
-    ]
-    matvWs = [layer.self_attn.v_proj.weight for layer in layers]
-    matOutWs = [layer.self_attn.o_proj.weight for layer in layers]
-    matUps = [layer.mlp.up_proj.weight for layer in layers]
-    matGates = [layer.mlp.gate_proj.weight for layer in layers]
-    matDowns = [layer.mlp.down_proj.weight for layer in layers]
-
-    vocab_size = model.lm_head.weight.shape[0]
+    vocab_size = matLmHeadW.shape[0]
     logits_slice = 64 * full_sms * 6
     logits_epoch = (vocab_size + logits_slice - 1) // logits_slice
     matLogits = []
     matLogitsW = []
-    matLmHeadW = model.lm_head.weight.detach()
     matLmHeadW.resize_(logits_slice * logits_epoch, HIDDEN)
     matLmHeadW[vocab_size:, :].zero_()
 
@@ -234,8 +338,9 @@ def build_runtime_context(parsed_args):
     matArgmaxIdx = torch.zeros(N, full_sms, dtype=torch.long, device=gpu)
     matArgmaxVal = torch.zeros(N, full_sms, dtype=dtype, device=gpu)
 
-    dae.set_persistent(matTokens)
-    dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+    if env_flag("QWEN1P7B_ENABLE_CACHE_HINTS", False):
+        dae.set_persistent(matTokens)
+        dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
 
     return QwenScheduleContext(
         parsed_args=parsed_args,
@@ -302,6 +407,9 @@ def build_runtime_context(parsed_args):
 
 
 def seed_prefill_kv_cache(ctx: QwenScheduleContext):
+    if ctx.model is None:
+        return None
+
     for layer_k, layer_v in zip(ctx.attnKs, ctx.attnVs):
         layer_k.zero_()
         layer_v.zero_()
