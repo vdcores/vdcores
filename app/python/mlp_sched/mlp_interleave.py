@@ -13,11 +13,10 @@ HIDDEN = 4096
 INTERMEDIATE = 12288
 TOKENS = 8
 FULL_SMS = 132
-PROJ_SMS = 96
-DOWN_SMS = 128
-SLICE_INTERMEDIATE = 6144
+STAGE_SMS = 128
+SILU_SMS = 4
+SLICE_INTERMEDIATE = 4096
 DTYPE = torch.bfloat16
-SILU_RAW_SLOT = 24
 
 
 def parse_args():
@@ -66,7 +65,7 @@ if parsed_args.hidden != HIDDEN:
     raise ValueError(f"Expected hidden == {HIDDEN}, got {parsed_args.hidden}")
 if parsed_args.intermediate != INTERMEDIATE:
     raise ValueError(
-        "This serial harness currently targets the Qwen3 MLP width exactly: "
+        "This interleaved harness currently targets the Qwen3 MLP width exactly: "
         f"expected intermediate == {INTERMEDIATE}, got {parsed_args.intermediate}"
     )
 
@@ -86,9 +85,8 @@ mat_down_w = torch.rand(parsed_args.hidden, parsed_args.intermediate, dtype=DTYP
 dae.set_streaming(mat_gate_w, mat_up_w, mat_down_w)
 
 num_slices = parsed_args.intermediate // SLICE_INTERMEDIATE
-num_silu_slices = parsed_args.intermediate // 4096
-bar_up_done = dae.new_bar(num_slices * PROJ_SMS)
-bar_silu_done = dae.new_bar(num_silu_slices * TOKENS)
+bar_silu_in = [dae.new_bar(2 * STAGE_SMS) for _ in range(num_slices)]
+bar_silu_out = [dae.new_bar(parsed_args.tokens) for _ in range(num_slices)]
 
 tile_m, _, tile_k = Gemv_M64N8.MNK
 t_rms_hidden = TmaTensor(dae, mat_rms_hidden).wgmma_load(parsed_args.tokens, tile_k * Gemv_M64N8.n_batch, Major.K)
@@ -97,55 +95,60 @@ t_reduce_hidden = TmaTensor(dae, mat_hidden).wgmma("reduce", parsed_args.tokens,
 t_load_gate = TmaTensor(dae, mat_gate_w).wgmma_load(tile_m, tile_k, Major.K)
 t_load_up = TmaTensor(dae, mat_up_w).wgmma_load(tile_m, tile_k, Major.K)
 t_load_down = TmaTensor(dae, mat_down_w).wgmma_load(tile_m, tile_k, Major.K)
-t_store_gate = TmaTensor(dae, mat_gate_out).wgmma_store(parsed_args.tokens, tile_m, Major.MN)
-t_store_interm = TmaTensor(dae, mat_interm).wgmma_store(parsed_args.tokens, tile_m, Major.MN)
+t_reduce_gate = TmaTensor(dae, mat_gate_out).wgmma("reduce", parsed_args.tokens, tile_m, Major.MN)
+t_reduce_interm = TmaTensor(dae, mat_interm).wgmma("reduce", parsed_args.tokens, tile_m, Major.MN)
 
 gate_schedules = []
 up_schedules = []
+down_schedules = []
 silu_schedules = []
-for base_offset in range(0, parsed_args.intermediate, SLICE_INTERMEDIATE):
-    gate_schedules.append(
+stage_items = []
+for slice_idx, base_offset in enumerate(range(0, parsed_args.intermediate, SLICE_INTERMEDIATE)):
+    gate_proj = (
         SchedGemv(
             Gemv_M64N8,
             MNK=((base_offset, SLICE_INTERMEDIATE), parsed_args.tokens, parsed_args.hidden),
-            tmas=(t_load_gate, t_rms_hidden, t_store_gate),
-        ).place(PROJ_SMS)
+            tmas=(t_load_gate, t_rms_hidden, t_reduce_gate),
+        ).bar("store", bar_silu_in[slice_idx]).place(STAGE_SMS)
     )
-    up_schedules.append(
+    up_proj = (
         SchedGemv(
             Gemv_M64N8,
             MNK=((base_offset, SLICE_INTERMEDIATE), parsed_args.tokens, parsed_args.hidden),
-            tmas=(t_load_up, t_rms_hidden, t_store_interm),
-        ).bar("store", bar_up_done).place(PROJ_SMS)
+            tmas=(t_load_up, t_rms_hidden, t_reduce_interm),
+        ).bar("store", bar_silu_in[slice_idx]).place(STAGE_SMS)
     )
-
-for base_offset in range(0, parsed_args.intermediate, 4096):
-    silu_schedules.append(
+    silu = (
         SchedSmemSiLUInterleaved(
             num_token=parsed_args.tokens,
-            gate_glob=mat_gate_out[:, base_offset:base_offset + 4096],
-            up_glob=mat_interm[:, base_offset:base_offset + 4096],
-            out_glob=mat_silu_out[:, base_offset:base_offset + 4096],
-        ).bar("input", bar_up_done).bar("output", bar_silu_done).place(TOKENS)
+            gate_glob=mat_gate_out[:, base_offset:base_offset + SLICE_INTERMEDIATE],
+            up_glob=mat_interm[:, base_offset:base_offset + SLICE_INTERMEDIATE],
+            out_glob=mat_silu_out[:, base_offset:base_offset + SLICE_INTERMEDIATE],
+        ).bar("output", bar_silu_out[slice_idx]).place(SILU_SMS, base_sm=STAGE_SMS)
+        # .bar("input", bar_silu_in[slice_idx])
     )
-
-down_proj = SchedGemv(
-    Gemv_M64N8,
-    MNK=(parsed_args.hidden, parsed_args.tokens, parsed_args.intermediate),
-    tmas=(t_load_down, t_load_silu, t_reduce_hidden),
-).bar("load", bar_silu_done).place(DOWN_SMS)
+    down_proj = (
+        SchedGemv(
+            Gemv_M64N8,
+            MNK=(parsed_args.hidden, parsed_args.tokens, (base_offset, SLICE_INTERMEDIATE)),
+            tmas=(t_load_down, t_load_silu, t_reduce_hidden),
+        ).place(STAGE_SMS)
+        # .bar("load", bar_silu_out[slice_idx])
+    )
+    gate_schedules.append(gate_proj)
+    up_schedules.append(up_proj)
+    silu_schedules.append(silu)
+    down_schedules.append(down_proj)
+    stage_items.extend([gate_proj, up_proj, silu, down_proj])
 
 dae.s(
-    *gate_schedules,
-    *up_schedules,
-    *silu_schedules,
-    down_proj,
+    *stage_items,
 )
 
 print(
-    "run qwen3 mlp-only serialized "
+    "run qwen3 mlp-only interleaved "
     f"hidden={parsed_args.hidden} intermediate={parsed_args.intermediate} "
-    f"tokens={parsed_args.tokens} proj_sms={PROJ_SMS} down_sms={DOWN_SMS}..."
+    f"tokens={parsed_args.tokens} stage_sms={STAGE_SMS} silu_sms={SILU_SMS}..."
 )
 dae_app(dae)
 if parsed_args.correctness:

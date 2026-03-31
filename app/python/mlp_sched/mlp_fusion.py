@@ -5,8 +5,7 @@ import torch
 import torch.nn.functional as F
 from dae.launcher import *
 from dae.schedule import *
-from dae.util import dae_app
-from qwen3.reference import check_tensor_threshold
+from dae.util import dae_app, tensor_diff
 
 
 HIDDEN = 4096
@@ -15,7 +14,7 @@ LOW_INTERMEDIATE = 4096
 N = 8
 FULL_SMS = 132
 GEMM_SMS = 128
-SILU_SMS = 4
+SILU_SMS = 1
 DTYPE = torch.bfloat16
 
 
@@ -28,16 +27,16 @@ def parse_args():
     parser.add_argument("--intermediate", type=int, default=INTERMEDIATE)
     parser.add_argument("--tokens", type=int, default=N)
     parser.add_argument(
-        "--low-path",
-        choices=("gmem",),
-        default="gmem",
-        help="Low slice path. Only global-memory mode is supported because low gate/up use disjoint SM sets.",
-    )
-    parser.add_argument(
         "--high-path",
         choices=("fused", "gmem"),
         default="fused",
         help="Use RegStore fusion for the high slice or spill it through global memory",
+    )
+    parser.add_argument(
+        "--wait-mode",
+        choices=("load", "issue"),
+        default="load",
+        help="Wait on producer barriers either through the consumer load/input instruction or with a standalone IssueBarrier before the operation",
     )
     parsed_args, remaining_argv = parser.parse_known_args()
     if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
@@ -54,14 +53,17 @@ def run_correctness_check(mat_rms_hidden, mat_gate_w, mat_up_w, mat_down_w, mat_
         down_ref = F.linear(silu_ref, mat_down_w)
 
     checks = [
-        # check_tensor_threshold("gate_proj", gate_ref, mat_gate_out, 5.0),
-        # check_tensor_threshold("up_proj", up_ref, mat_interm, 5.0),
-        # check_tensor_threshold("silu", silu_ref, mat_silu_out, 10.0),
-        check_tensor_threshold("down_proj", down_ref, mat_hidden, 10.0),
+        tensor_diff("down_proj", down_ref, mat_hidden),
     ]
     if not all(passed for passed, _ in checks):
         raise RuntimeError("MLP correctness check failed")
     print("[correctness] all checks passed")
+
+
+def apply_wait(schedule_or_inst, bar, role):
+    if parsed_args.wait_mode == "load":
+        return schedule_or_inst.bar(role, bar)
+    return [IssueBarrier(bar), schedule_or_inst]
 
 
 parsed_args = parse_args()
@@ -78,11 +80,6 @@ if (parsed_args.intermediate - LOW_INTERMEDIATE) % Gemv_M64N8.MNK[0] != 0:
     )
 if parsed_args.tokens % SILU_SMS != 0:
     raise ValueError(f"--tokens must be divisible by {SILU_SMS}, got {parsed_args.tokens}")
-if parsed_args.low_path != "gmem":
-    raise ValueError(
-        "low_path=fused is unsupported: low gate/up projections run on disjoint SM sets, "
-        "so silu_low must stay on the original shared-memory/global-memory path"
-    )
 
 gpu = torch.device("cuda")
 dae = Launcher(FULL_SMS, device=gpu)
@@ -100,9 +97,9 @@ mat_down_w = torch.rand(parsed_args.hidden, parsed_args.intermediate, dtype=DTYP
 dae.set_streaming(mat_gate_w, mat_up_w, mat_down_w)
 
 bar_silu_in_low = dae.new_bar(128)
-bar_silu_out1 = dae.new_bar(parsed_args.tokens)
+bar_silu_out1 = dae.new_bar(1)
 bar_silu_in_high = dae.new_bar(256) if parsed_args.high_path == "gmem" else None
-bar_silu_out2 = dae.new_bar(parsed_args.tokens if parsed_args.high_path == "gmem" else GEMM_SMS)
+bar_silu_out2 = dae.new_bar(1 if parsed_args.high_path == "gmem" else GEMM_SMS)
 
 tile_m, _, tile_k = Gemv_M64N8.MNK
 t_rms_hidden = TmaTensor(dae, mat_rms_hidden).wgmma_load(parsed_args.tokens, tile_k * Gemv_M64N8.n_batch, Major.K)
@@ -128,11 +125,11 @@ up_proj_low = SchedGemv(
 gate_proj_low = gate_proj_low.bar("store", bar_silu_in_low)
 up_proj_low = up_proj_low.bar("store", bar_silu_in_low)
 silu_low = SchedSmemSiLUInterleaved(
-    num_token=parsed_args.tokens,
+    num_token=1,
     gate_glob=mat_gate_out[:, :LOW_INTERMEDIATE],
     up_glob=mat_interm[:, :LOW_INTERMEDIATE],
     out_glob=mat_silu_out[:, :LOW_INTERMEDIATE],
-).bar("input", bar_silu_in_low).bar("output", bar_silu_out1)
+).bar("output", bar_silu_out1)
 
 reg_gate = 0
 reg_up = 1
@@ -153,14 +150,14 @@ if parsed_args.high_path == "gmem":
     gate_proj_high = gate_proj_high.bar("store", bar_silu_in_high)
     up_proj_high = up_proj_high.bar("store", bar_silu_in_high)
     silu_high = SchedSmemSiLUInterleaved(
-        num_token=parsed_args.tokens,
+        num_token=1,
         gate_glob=mat_gate_out[:, LOW_INTERMEDIATE:],
         up_glob=mat_interm[:, LOW_INTERMEDIATE:],
         out_glob=mat_silu_out[:, LOW_INTERMEDIATE:],
-    ).bar("input", bar_silu_in_high).bar("output", bar_silu_out2)
+    ).bar("output", bar_silu_out2)
 else:
     silu_high = SchedRegSiLUFused(
-        num_token=parsed_args.tokens,
+        num_token=1,
         store_tma=t_store_silu,
         reg_gate=reg_gate,
         reg_up=reg_up,
@@ -172,12 +169,12 @@ down_proj_low = SchedGemv(
     Gemv_M64N8,
     MNK=(parsed_args.hidden, parsed_args.tokens, LOW_INTERMEDIATE),
     tmas=(t_load_down, t_load_silu, t_reduce_hidden),
-).bar("load", bar_silu_out1)
+)
 down_proj_high = SchedGemv(
     Gemv_M64N8,
     MNK=(parsed_args.hidden, parsed_args.tokens, (LOW_INTERMEDIATE, parsed_args.intermediate - LOW_INTERMEDIATE)),
     tmas=(t_load_down, t_load_silu, t_reduce_hidden),
-).bar("load", bar_silu_out2)
+)
 
 gate_proj_low = gate_proj_low.place(64)
 up_proj_low = up_proj_low.place(64, base_sm=64)
@@ -190,6 +187,12 @@ silu_high = silu_high.place(
 )
 down_proj_low = down_proj_low.place(GEMM_SMS)
 down_proj_high = down_proj_high.place(GEMM_SMS)
+
+silu_low = apply_wait(silu_low, bar_silu_in_low, "input")
+if parsed_args.high_path == "gmem":
+    silu_high = apply_wait(silu_high, bar_silu_in_high, "input")
+down_proj_low = apply_wait(down_proj_low, bar_silu_out1, "load")
+down_proj_high = apply_wait(down_proj_high, bar_silu_out2, "load")
 
 dae.s(
     gate_proj_low,
@@ -205,7 +208,8 @@ dae.s(
 print(
     "run qwen3 mlp-only "
     f"hidden={parsed_args.hidden} intermediate={parsed_args.intermediate} "
-    f"tokens={parsed_args.tokens} low_path={parsed_args.low_path} high_path={parsed_args.high_path}..."
+    f"tokens={parsed_args.tokens} high_path={parsed_args.high_path} "
+    f"wait_mode={parsed_args.wait_mode}..."
 )
 dae_app(dae)
 if parsed_args.correctness:

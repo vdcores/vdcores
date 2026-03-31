@@ -18,7 +18,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `app/python/llama3/reference.py` and `app/python/llama3/llama_attention_reference.py`: local reference helpers worth checking before re-deriving model math.
 - `app/python/attention_simple_decoding.py`: dedicated isolated GQA decode-attention harness for validating the shared attention opcode path and collecting quick single-kernel timing.
 - `app/python/gemv_mma_out.py`: dedicated correctness harness for the isolated `N=8` MMA GEMV operator path.
-- `app/python/mlp_sched/`: isolated MLP schedule microbenchmarks and schedule-variant harnesses, including the split/overlapped fusion path and a serialized 128-SM Qwen3 MLP-only path.
+- `app/python/mlp_sched/`: isolated MLP schedule microbenchmarks and schedule-variant harnesses, including the original split/overlapped fusion path, an interleaved 128-SM Qwen3 MLP-only harness, and a stricter serial variant with narrower projection-stage placement.
 - `app/python/qwen3/`: Qwen 3 client, layer, utilities, and schedule variants.
   The current decode path is split across `sched.py` (graph/TMA/instruction scheduling), `runtime_context.py` (HF model load, tensor materialization, packed side-input prep, KV bootstrap), `correctness.py` (reference comparisons), and `cli.py` (prefiltered app args).
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
