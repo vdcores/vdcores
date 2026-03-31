@@ -120,6 +120,7 @@ Typical Python-only areas include:
 - The benchmark command succeeded against the existing environment and extension artifacts.
 - For the isolated `N=8` MMA GEMV path, use `app/python/gemv_mma_out.py` as the dedicated harness instead of modifying `app/python/gemv_out.py`.
 - For isolated decode-attention kernel changes, use `app/python/attention_simple_decoding.py` as the primary correctness and quick-timing harness; it exercises the shared attention opcode path without requiring a full model schedule.
+- For isolated Qwen MLP debugging, use `app/python/qwen3/mlp_only.py`; it runs only gate projection, up projection, SiLU, and down projection with the same split/placement pattern as the full `app/python/qwen3/sched.py` MLP stage.
 - Set `ATTENTION_IMPL=mma` when you want that harness to exercise the explicit non-Hopper MMA attention opcodes; leave it unset (or use `ATTENTION_IMPL=hopper`) to stay on the default Hopper GMMA path.
 - `app/python/attention.py` currently calls the attention instruction with a stale constructor signature and is not a reliable smoke test until that script is updated.
 - If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
