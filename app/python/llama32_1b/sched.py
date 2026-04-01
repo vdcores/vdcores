@@ -27,6 +27,10 @@ DEFAULT_MAX_SEQ_LEN = 512
 DEFAULT_VOCAB_SIZE = 128256
 
 
+def wait_op(bar, op):
+    return [IssueBarrier(bar).group(), op]
+
+
 def build_rope_table(max_seq_len, batch, head_dim, rope_theta, positions, device, dtype):
     inv_freq = 1.0 / (
         rope_theta
@@ -390,13 +394,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
         epsilon=eps,
         hidden_size=HIDDEN,
         tmas=(layerg["loadRMSInputW"].cord(0), loadHidden1D, storeRMSHidden1D),
-    ).bar("input", layerg["bar_layer"]).bar("output", layerg.next("bar_pre_attn_rms"))
+    ).bar("output", layerg.next("bar_pre_attn_rms"))
     post_attn_rms = SchedRMSShared(
         num_token=N,
         epsilon=eps,
         hidden_size=HIDDEN,
         tmas=(layerg["loadRMSPostAttnW"].cord(0), loadHidden1D, storeRMSHidden1D),
-    ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
+    ).bar("output", layerg["bar_post_attn_rms"])
 
     regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
     regLoadQ = RegLoad(0)
@@ -404,7 +408,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], regStoreQ),
-    ).bar("load", layerg["bar_pre_attn_rms"])
+    )
     QRope = SchedRope(
         ROPE_INTERLEAVE_512,
         tmas=(
@@ -420,7 +424,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(KW, N, HIDDEN),
         tmas=(layerg["loadKW"], layerg["loadRMSLayer"], regStoreK),
-    ).bar("load", layerg["bar_pre_attn_rms"])
+    )
     KRope = SchedRope(
         ROPE_INTERLEAVE_512,
         tmas=(
@@ -437,7 +441,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             layerg["loadRMSLayer"],
             ToAttnVStoreCordAdapter(layerg["storeV"], token_pos),
         ),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
+    ).bar("store", layerg["bar_qkv_attn"])
 
     GemvFactory = layers_like(GemvLayer, dae, Gemv_M64N8)
     Gqa = SchedAttentionDecoding(
@@ -453,7 +457,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    ).bar("store", layerg["bar_out_mlp"])
 
     regGate, regUp = 0, 1
     regStoreGate = RegStore(regGate, matGateOut[:, 0:TileM])
@@ -463,7 +467,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(4096, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
+    )
     gate_proj_high = SchedGemv(
         Gemv_M64N8,
         MNK=((4096, 2048), N, HIDDEN),
@@ -473,7 +477,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(4096, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
+    )
     up_proj_high = SchedGemv(
         Gemv_M64N8,
         MNK=((4096, 2048), N, HIDDEN),
@@ -487,7 +491,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         gate_glob=matGateOut[:, :mlp_split],
         up_glob=matInterm[:, :mlp_split],
         out_glob=matSiLUOut[:, :mlp_split],
-    ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
+    ).bar("output", layerg["bar_silu_out1"])
     gate_proj_fused = SchedGemv(
         Gemv_M64N8,
         MNK=((mlp_split, mlp_tail), N, HIDDEN),
@@ -515,15 +519,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(HIDDEN, N, (mlp_split, mlp_tail)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
-    down_proj_low.bar("load", layerg["bar_silu_out1"])
+    ).bar("store", layerg["bar_layer"])
 
     LogitsProj = []
     for i in range(logits_epoch):
         proj = GemvFactory(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
         sched = proj.schedule_(group=False).split_M(logits_fold)
         if i == 0:
-            sched.bar("load", layerg.over("bar_pre_attn_rms"))
             sched[0].no_prefetch()
         if i == logits_epoch - 1:
             sched.bar("store", systemg["bar_logits"])
@@ -539,12 +541,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
         matOutVal=matArgmaxVal,
         matOutIdx=matArgmaxIdx,
         matFinalOut=matTokens[:, token_offset + 1],
-    ).bar("load", systemg["bar_logits"]).bar("val", systemg["bar_argmax_val"]).bar("idx", systemg["bar_argmax_idx"]).bar("final", systemg["bar_token_finish"])
+    ).bar("val", systemg["bar_argmax_val"]).bar("idx", systemg["bar_argmax_idx"]).bar("final", systemg["bar_token_finish"])
 
     sstart, send = systemg.range_bars()
     restore_bars_low = SchedCopy(
         tmas=wrap_static(TmaLoad1D(dae.bars_src[:sstart]), TmaStore1D(dae.bars[:sstart]))
-    ).bar("load", layerg.over("bar_pre_attn_rms")).bar("store", systemg["bar_token_finish"])
+    ).bar("store", systemg["bar_token_finish"])
     restore_bars_high = SchedCopy(
         tmas=wrap_static(TmaLoad1D(dae.bars_src[sstart:send]), TmaStore1D(dae.bars[sstart:send]))
     )
@@ -630,25 +632,25 @@ def schedule_single_token(token_offset: int, token_pos: int):
     dae.i(embed_rms, copy_hidden, restore_bars_high)
     dae.i(
         *([clear_interm, clear_gateout] if stage_enabled(parsed_args.debug_stop_after, "embed") else []),
-        *([QProj] if stage_enabled(parsed_args.debug_stop_after, "q_proj") else []),
+        *([wait_op(layerg["bar_pre_attn_rms"], QProj)] if stage_enabled(parsed_args.debug_stop_after, "q_proj") else []),
         *([QRope] if stage_enabled(parsed_args.debug_stop_after, "q_rope") else []),
-        *([KProj] if stage_enabled(parsed_args.debug_stop_after, "k_proj") else []),
+        *([wait_op(layerg["bar_pre_attn_rms"], KProj)] if stage_enabled(parsed_args.debug_stop_after, "k_proj") else []),
         *([KRope] if stage_enabled(parsed_args.debug_stop_after, "k_rope") else []),
-        *([VProj] if stage_enabled(parsed_args.debug_stop_after, "v_proj") else []),
+        *([wait_op(layerg["bar_pre_attn_rms"], VProj)] if stage_enabled(parsed_args.debug_stop_after, "v_proj") else []),
         *([Gqa] if stage_enabled(parsed_args.debug_stop_after, "attn") else []),
-        *([OutProj] if stage_enabled(parsed_args.debug_stop_after, "out") else []),
-        *([post_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "post_attn_rms") else []),
-        *([gate_proj_low] if stage_enabled(parsed_args.debug_stop_after, "gate_low") else []),
+        *([wait_op(layerg["bar_attn_out"], OutProj)] if stage_enabled(parsed_args.debug_stop_after, "out") else []),
+        *([wait_op(layerg["bar_out_mlp"], post_attn_rms)] if stage_enabled(parsed_args.debug_stop_after, "post_attn_rms") else []),
+        *([wait_op(layerg["bar_post_attn_rms"], gate_proj_low)] if stage_enabled(parsed_args.debug_stop_after, "gate_low") else []),
         *([gate_proj_high] if stage_enabled(parsed_args.debug_stop_after, "gate_high") else []),
-        *([up_proj_low] if stage_enabled(parsed_args.debug_stop_after, "up_low") else []),
+        *([wait_op(layerg["bar_post_attn_rms"], up_proj_low)] if stage_enabled(parsed_args.debug_stop_after, "up_low") else []),
         *([up_proj_high] if stage_enabled(parsed_args.debug_stop_after, "up_high") else []),
-        *([silu1] if stage_enabled(parsed_args.debug_stop_after, "silu_split") else []),
+        *([wait_op(layerg["bar_silu_in"], silu1)] if stage_enabled(parsed_args.debug_stop_after, "silu_split") else []),
         *([gate_proj_fused] if stage_enabled(parsed_args.debug_stop_after, "gate_fused") else []),
         *([up_proj_fused] if stage_enabled(parsed_args.debug_stop_after, "up_fused") else []),
         *([silu_fused] if stage_enabled(parsed_args.debug_stop_after, "silu_fused") else []),
-        *([down_proj_low] if stage_enabled(parsed_args.debug_stop_after, "down_low") else []),
-        *([down_proj_high] if stage_enabled(parsed_args.debug_stop_after, "down_high") else []),
-        *([pre_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "final_rms") else []),
+        *([wait_op(layerg["bar_silu_out1"], down_proj_low)] if stage_enabled(parsed_args.debug_stop_after, "down_low") else []),
+        *([wait_op(layerg["bar_silu_out2"], down_proj_high)] if stage_enabled(parsed_args.debug_stop_after, "down_high") else []),
+        *([wait_op(layerg["bar_layer"], pre_attn_rms)] if stage_enabled(parsed_args.debug_stop_after, "final_rms") else []),
         *(
             [
                 LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
@@ -657,9 +659,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
             if stage_enabled(parsed_args.debug_stop_after, "final_rms")
             else []
         ),
-        *([LogitsProj] if stage_enabled(parsed_args.debug_stop_after, "logits") else []),
-        *([Argmax] if stage_enabled(parsed_args.debug_stop_after, "argmax") else []),
-        *([restore_bars_low] if stage_enabled(parsed_args.debug_stop_after, "restore") and need_token_restore else []),
+        *([wait_op(layerg.over("bar_pre_attn_rms"), LogitsProj)] if stage_enabled(parsed_args.debug_stop_after, "logits") else []),
+        *([wait_op(systemg["bar_logits"], Argmax)] if stage_enabled(parsed_args.debug_stop_after, "argmax") else []),
+        *([wait_op(layerg.over("bar_pre_attn_rms"), restore_bars_low)] if stage_enabled(parsed_args.debug_stop_after, "restore") and need_token_restore else []),
     )
 
 

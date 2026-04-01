@@ -12,6 +12,11 @@ from reference import input_batch1, reference_pass, check_tensor_threshold
 import os
 import math
 
+
+def wait_op(bar, op):
+  return [IssueBarrier(bar).group(), op]
+
+
 arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
@@ -295,11 +300,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
   pre_attn_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(layerg['loadRMSInputW'].cord(0), loadHidden1D, storeRMSHidden1D)
-  ).bar("input", layerg['bar_layer']).bar("output", layerg.next('bar_pre_attn_rms'))
+  ).bar("output", layerg.next('bar_pre_attn_rms'))
   post_attn_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(layerg['loadRMSPostAttnW'].cord(0), loadHidden1D, storeRMSHidden1D)
-  ).bar("input", layerg['bar_out_mlp']).bar("output", layerg['bar_post_attn_rms'])
+  ).bar("output", layerg['bar_post_attn_rms'])
 
   # QKV Projection
   # TODO(zhiyuang): add the ROPE for Q and K
@@ -308,7 +313,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   QProj = SchedGemv(Gemv_M64N8,
     MNK=(QW, N, HIDDEN),
     tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
-  ).bar("load", layerg['bar_pre_attn_rms'])
+  )
   QRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
       ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
@@ -351,7 +356,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   OutProj = SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, HIDDEN),
     tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
+  ).bar("store", layerg['bar_out_mlp'])
 
   # Gate Up + SiLU
   regGate, regUp = 0, 1
@@ -361,7 +366,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   gate_proj_low = SchedGemv(Gemv_M64N8,
     MNK=(4096, N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),
-  ).bar("load", layerg['bar_post_attn_rms'])
+  )
   gate_proj_high = SchedGemv(Gemv_M64N8,
     MNK=((4096, 2048), N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['reduceGateOut']),
@@ -369,7 +374,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   up_proj_low = SchedGemv(Gemv_M64N8,
     MNK=(4096, N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-  ).bar("load", layerg['bar_post_attn_rms'])
+  )
   up_proj_high = SchedGemv(Gemv_M64N8,
     MNK=((4096, 2048), N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['reduceInterm']),
@@ -381,7 +386,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     gate_glob=matGateOut[:, :mlp_split],
     up_glob=matInterm[:, :mlp_split],
     out_glob=matSiLUOut[:, :mlp_split],
-  ).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
+  ).bar("output", layerg['bar_silu_out1'])
   gate_proj_fused = SchedGemv(Gemv_M64N8,
     MNK=((6144,8192), N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], regStoreGate))
@@ -402,8 +407,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   down_proj_high = SchedGemv(Gemv_M64N8,
     MNK=(HIDDEN, N, (6144, 8192)),
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
-  down_proj_low.bar("load", layerg['bar_silu_out1'])
+  ).bar("store", layerg['bar_layer'])
 
   # after all layers, logits projection
   LogitsProj = []
@@ -411,7 +415,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
     proj = QWen8BGemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
     sched = proj.schedule_(group=False).split_M(logits_fold)
     if i == 0:
-      sched.bar("load", layerg.over('bar_pre_attn_rms'))
       sched[0].no_prefetch()
     if i == logits_epoch - 1:
       sched.bar("store", systemg['bar_logits'])
@@ -428,14 +431,14 @@ def schedule_single_token(token_offset: int, token_pos: int):
     matOutVal=matArgmaxVal,
     matOutIdx=matArgmaxIdx,
     matFinalOut=matTokens[:, token_offset+1],
-  ).bar("load", systemg['bar_logits']).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
+  ).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
 
   sstart, send = systemg.range_bars()
 
   # restore barrier
   restore_bars_low = SchedCopy(
     tmas = wrap_static(TmaLoad1D(dae.bars_src[:sstart]), TmaStore1D(dae.bars[:sstart]))
-  ).bar("load", layerg.over('bar_pre_attn_rms')).bar("store", systemg['bar_token_finish'])
+  ).bar("store", systemg['bar_token_finish'])
   restore_bars_high = SchedCopy(
     tmas = wrap_static(TmaLoad1D(dae.bars_src[sstart:send]), TmaStore1D(dae.bars[sstart:send]))
   )
@@ -508,44 +511,44 @@ def schedule_single_token(token_offset: int, token_pos: int):
   dae.i(
     clear_interm,
     clear_gateout,
-    QProj,
+    wait_op(layerg['bar_pre_attn_rms'], QProj),
     QRope,
     KProj,
     KRope,
     VProj,
 
     Gqa,
-    OutProj,
+    wait_op(layerg['bar_attn_out'], OutProj),
 
     # RMS
-    post_attn_rms,
+    wait_op(layerg['bar_out_mlp'], post_attn_rms),
     
     # MLP
-    gate_proj_low,
+    wait_op(layerg['bar_post_attn_rms'], gate_proj_low),
     gate_proj_high,
-    up_proj_low,
+    wait_op(layerg['bar_post_attn_rms'], up_proj_low),
     up_proj_high,
-    silu1,
+    wait_op(layerg['bar_silu_in'], silu1),
     gate_proj_fused,
     up_proj_fused,
     silu_fused,
-    down_proj_low,
-    down_proj_high,
+    wait_op(layerg['bar_silu_out1'], down_proj_low),
+    wait_op(layerg['bar_silu_out2'], down_proj_high),
 
     # rms for next layer
-    pre_attn_rms,
+    wait_op(layerg['bar_layer'], pre_attn_rms),
 
     # # all 132 SM need loop
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
     LoopC.toNext(dae.copy_cptrs(), num_layers),
 
     # # logits
-    LogitsProj,
+    wait_op(layerg.over('bar_pre_attn_rms'), LogitsProj),
 
     # argmax and cleanup
-    Argmax,
+    wait_op(systemg['bar_logits'], Argmax),
 
-    restore_bars_low,
+    wait_op(layerg.over('bar_pre_attn_rms'), restore_bars_low),
   )
 
 ###################################
@@ -622,3 +625,5 @@ if parsed_args.correctness:
   run_correctness_check()
 
 # print("output tokens: ", matTokens[0, :cur_offset+2])
+def wait_op(bar, op):
+  return [IssueBarrier(bar), op]

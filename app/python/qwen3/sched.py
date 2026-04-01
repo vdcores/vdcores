@@ -15,6 +15,10 @@ from runtime_context import build_runtime_context, seed_prefill_kv_cache
 from utils import build_tma_wgmma_k, build_tma_wgmma_mn, cord_func_K_major, cord_func_MN_major
 
 
+def wait_op(bar, op):
+    return [IssueBarrier(bar).group(), op]
+
+
 ctx = build_runtime_context(parse_args())
 
 dae = ctx.dae
@@ -159,18 +163,18 @@ def schedule_single_token(token_offset: int, token_pos: int):
         num_token=N,
         epsilon=eps,
         tmas=(layerg["loadRMSInputW"].cord(0), loadHidden1D, storeRMSHidden1D),
-    ).bar("input", layerg["bar_layer"]).bar("output", layerg.next("bar_pre_attn_rms"))
+    ).bar("output", layerg.next("bar_pre_attn_rms"))
     post_attn_rms = SchedRMSShared(
         num_token=N,
         epsilon=eps,
         tmas=(layerg["loadRMSPostAttnW"].cord(0), loadHidden1D, storeRMSHidden1D),
-    ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
+    ).bar("output", layerg["bar_post_attn_rms"])
 
     QProj = SchedGemv(
         Gemv_M64N8,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], layerg["storeQ"]),
-    ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_q_proj"])
+    ).bar("store", layerg["bar_q_proj"])
 
     KProj = SchedGemv(
         Gemv_M64N8,
@@ -209,25 +213,25 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    ).bar("store", layerg["bar_out_mlp"])
 
     gate_proj_low = SchedGemv(
         Gemv_M64N8,
         MNK=(4096, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
+    ).bar("store", layerg["bar_silu_in"])
     up_proj_low = SchedGemv(
         Gemv_M64N8,
         MNK=(4096, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
+    ).bar("store", layerg["bar_silu_in"])
 
     silu1 = SchedSmemSiLUInterleaved(
         num_token=N,
         gate_glob=matGateOut[:, :4096],
         up_glob=matInterm[:, :4096],
         out_glob=matSiLUOut[:, :4096],
-    ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
+    ).bar("output", layerg["bar_silu_out1"])
 
     reg_gate, reg_up = 0, 1
     regStoreGate = RegStore(reg_gate, matGateOut[:, 0:TileM])
@@ -256,12 +260,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(HIDDEN, N, 4096),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out1"])
+    )
     down_proj_high = SchedGemv(
         Gemv_M64N8,
         MNK=(HIDDEN, N, (4096, 8192)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
+    ).bar("store", layerg["bar_layer"])
 
     qwen_gemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
     logits_proj = []
@@ -269,7 +273,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
         proj = qwen_gemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
         sched = proj.schedule_(group=False).split_M(6)
         if i == 0:
-            sched.bar("load", layerg.over("bar_pre_attn_rms"))
             sched[0].no_prefetch()
         if i == logits_epoch - 1:
             sched.bar("store", systemg["bar_logits"])
@@ -285,12 +288,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
         matOutVal=matArgmaxVal,
         matOutIdx=matArgmaxIdx,
         matFinalOut=matTokens[:, token_offset + 1],
-    ).bar("load", systemg["bar_logits"]).bar("val", systemg["bar_argmax_val"]).bar("idx", systemg["bar_argmax_idx"]).bar("final", systemg["bar_token_finish"])
+    ).bar("val", systemg["bar_argmax_val"]).bar("idx", systemg["bar_argmax_idx"]).bar("final", systemg["bar_token_finish"])
 
     sstart, send = systemg.range_bars()
     restore_bars_low = SchedCopy(
         tmas=(StaticCordAdapter(TmaLoad1D(dae.bars_src[:sstart])), StaticCordAdapter(TmaStore1D(dae.bars[:sstart]))),
-    ).bar("load", layerg.over("bar_pre_attn_rms")).bar("store", systemg["bar_token_finish"])
+    ).bar("store", systemg["bar_token_finish"])
     restore_bars_high = SchedCopy(
         tmas=(StaticCordAdapter(TmaLoad1D(dae.bars_src[sstart:send])), StaticCordAdapter(TmaStore1D(dae.bars[sstart:send]))),
     )
@@ -347,26 +350,26 @@ def schedule_single_token(token_offset: int, token_pos: int):
     )
 
     dae.i(
-        QProj,
+        wait_op(layerg["bar_pre_attn_rms"], QProj),
         KProj,
         VProj,
         Gqa,
-        OutProj,
-        post_attn_rms,
-        gate_proj_low,
-        up_proj_low,
-        silu1,
+        wait_op(layerg["bar_attn_out"], OutProj),
+        wait_op(layerg["bar_out_mlp"], post_attn_rms),
+        wait_op(layerg["bar_post_attn_rms"], gate_proj_low),
+        wait_op(layerg["bar_post_attn_rms"], up_proj_low),
+        wait_op(layerg["bar_silu_in"], silu1),
         gate_proj_fused,
         up_proj_fused,
         silu_fused,
-        down_proj_low,
-        down_proj_high,
-        pre_attn_rms,
+        wait_op(layerg["bar_silu_out1"], down_proj_low),
+        wait_op(layerg["bar_silu_out2"], down_proj_high),
+        wait_op(layerg["bar_layer"], pre_attn_rms),
         LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
         LoopC.toNext(dae.copy_cptrs(), num_layers),
-        logits_proj,
-        argmax,
-        restore_bars_low,
+        wait_op(layerg.over("bar_pre_attn_rms"), logits_proj),
+        wait_op(systemg["bar_logits"], argmax),
+        wait_op(layerg.over("bar_pre_attn_rms"), restore_bars_low),
     )
 
 
