@@ -12,6 +12,8 @@ This note summarizes the stable structure confirmed during repository initializa
 ## Code Areas
 
 - `app/python/`: runnable experiments and schedule prototypes.
+- `app/python/tma1d.py` and `app/tma1d_pure_cuda_bench.cu`: pure-CUDA 1D async bulk microbenchmark wrapper and source for sweeping 1 KB to 32 KB read/write block sizes across all SMs.
+  In the current repo, the `TmaLoad1D` / `TmaStore1D` naming on this path refers to raw bulk global<->shared copies, not tensor-map descriptor-backed TMA loads/stores.
 - `app/python/llama3/sched.py`: primary end-to-end decoding demo for `meta-llama/Llama-3.1-8B-Instruct`.
 - `app/python/llama32_1b/sched.py`: isolated Llama 3.2 1B scheduling path with a `--dry-build` mode that validates the Python schedule before the remaining low-level runtime support is added.
 - `app/python/mistral_small_24b/`: Mistral Small 24B single-token decode port with manual RoPE-table construction, `QW != hidden_size` attention wiring, and a 132-SM logits/argmax path.

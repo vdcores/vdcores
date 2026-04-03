@@ -122,6 +122,13 @@ Typical Python-only areas include:
 - For isolated decode-attention kernel changes, use `app/python/attention_simple_decoding.py` as the primary correctness and quick-timing harness; it exercises the shared attention opcode path without requiring a full model schedule.
 - Set `ATTENTION_IMPL=mma` when you want that harness to exercise the explicit non-Hopper MMA attention opcodes; leave it unset (or use `ATTENTION_IMPL=hopper`) to stay on the default Hopper GMMA path.
 - `app/python/attention.py` currently calls the attention instruction with a stale constructor signature and is not a reliable smoke test until that script is updated.
+- For the standalone pure-CUDA 1D load/store sweep that matches the repo's current `TmaLoad1D` / `TmaStore1D` bulk path, run:
+
+```bash
+python app/python/tma1d.py
+```
+
+- The wrapper builds [app/tma1d_pure_cuda_bench.cu](/home1/11362/depctg/vdcores/app/tma1d_pure_cuda_bench.cu) directly with `nvcc`, launches one CTA per SM, keeps a 4-stage non-blocking pipeline in flight, and prints separate read/write GB/s for block sizes `1 KB` through `32 KB`.
 - If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
 
 ```bash
