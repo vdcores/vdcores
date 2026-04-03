@@ -14,6 +14,7 @@ Use this directory as the first stop when a task needs stable repo context.
   - [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
   - [runtime/memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
   - [runtime/gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
+  - [runtime/compile-mode.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/compile-mode.md)
 - Model/framework behavior:
   - [modeling/pytorch-kv-cache.md](/home1/11362/depctg/vdcores/agents/knowledge/modeling/pytorch-kv-cache.md)
 - Performance/debugging lessons:

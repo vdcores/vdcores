@@ -1,4 +1,5 @@
 from . import runtime
+from .compiler import CompileModeError, compile_builders
 from .instruction_utils import decode_opcode, dedcode_opcode
 from .instructions import *
 from .runtime import config, opcode
@@ -7,6 +8,7 @@ from .tma_utils import *
 import copy
 from enum import Enum
 from math import prod
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -61,23 +63,31 @@ class SMInstructionBuilder:
 
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],
-        mtensor : torch.Tensor, mptrs: list[int]):
+        mtensor : torch.Tensor, mptrs: list[int],
+        compute_insts: list[ComputeInstruction] | tuple[ComputeInstruction, ...] | None = None,
+        memory_insts: list[MemoryInstruction] | tuple[MemoryInstruction, ...] | None = None,
+        clear_pending: bool = True):
+        if compute_insts is None:
+            compute_insts = self.cinsts
+        if memory_insts is None:
+            memory_insts = self.minsts
+
         # TODO(zhiyuang): now we only keep this check for not submitting "too many"
         #                 insts, but not 100% safe it won't overwrite
-        assert len(self.cinsts) <= ctensor.shape[0]
-        assert len(self.minsts) <= mtensor.shape[0]
-        for i, inst in enumerate(self.cinsts):
+        assert len(compute_insts) <= ctensor.shape[0]
+        assert len(memory_insts) <= mtensor.shape[0]
+        for i, inst in enumerate(compute_insts):
             inst.tensor(ctensor[cptrs[self.sm_id],...])
             cptrs[self.sm_id] = (cptrs[self.sm_id] + 1) % ctensor.shape[0]
-        for i, inst in enumerate(self.minsts):
+        for i, inst in enumerate(memory_insts):
             inst.tensor(mtensor[mptrs[self.sm_id],...])
             mptrs[self.sm_id] = (mptrs[self.sm_id] + 1) % mtensor.shape[0]
 
-        # after building, clear the inst list to avoid duplicate build
-        self.built_cinsts += self.cinsts
-        self.built_minsts += self.minsts
-        self.cinsts = []
-        self.minsts = []
+        self.built_cinsts += list(compute_insts)
+        self.built_minsts += list(memory_insts)
+        if clear_pending:
+            self.cinsts = []
+            self.minsts = []
 
 class ResourceGroup:
     def __init__(self, name, repeat = 1):
@@ -210,6 +220,8 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
+    COMPILE_MODES = ("interp", "compile_ir", "compile_cuda")
+
     def __init__(self, num_sms : int = 1, device = 'cuda'):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
@@ -227,6 +239,7 @@ class Launcher:
         self.tmas = []
 
         self.need_instruction_build = True
+        self.last_compile_artifacts = None
 
         self.num_bars = 0
         self.bar_values = {}
@@ -284,14 +297,52 @@ class Launcher:
     def copy_mptrs(self):
         return self._projected_mptrs()
 
-    def build_instructions(self):
+    def _validate_compile_mode(self, mode: str):
+        if mode not in self.COMPILE_MODES:
+            raise ValueError(f"Unknown compile mode {mode!r}. Expected one of {self.COMPILE_MODES}")
+
+    def _pending_compile_builders(self):
+        if any(builder.built_cinsts or builder.built_minsts for builder in self.builder):
+            raise CompileModeError(
+                "compile modes currently require a fresh unbuilt launcher state. "
+                "Incremental compile after prior instruction builds is not supported."
+            )
+        return self.builder
+
+    def build_instructions(self, mode: str = "interp"):
+        self._validate_compile_mode(mode)
+        if not self.need_instruction_build and mode != "compile_cuda":
+            return
+
+        if mode == "compile_cuda":
+            self.last_compile_artifacts = compile_builders(
+                self._pending_compile_builders(),
+                mode=mode,
+            )
+            return
+
+        compile_artifacts = None
+        if mode == "compile_ir":
+            compile_artifacts = compile_builders(
+                self._pending_compile_builders(),
+                mode=mode,
+            )
+            self.last_compile_artifacts = compile_artifacts
+
         if self.need_instruction_build:
             for i in range(self.num_sms):
+                compute_insts = None
+                memory_insts = None
+                if compile_artifacts is not None:
+                    compute_insts = compile_artifacts.emitted_compute[i]
+                    memory_insts = compile_artifacts.emitted_memory[i]
                 self.builder[i].build(
                     self.cinsts[i,...],
                     self.cptrs,
                     self.minsts[i,...],
                     self.mptrs,
+                    compute_insts=compute_insts,
+                    memory_insts=memory_insts,
                 )
             self.need_instruction_build = False
 
@@ -316,6 +367,7 @@ class Launcher:
             for b in self.builder:
                 b.add(inst)
         self.need_instruction_build = True
+        self.last_compile_artifacts = None
 
     def collect_barrier_release_counts(self, *insts):
         counts = {}
@@ -360,8 +412,26 @@ class Launcher:
             mi += len(b.minsts)
         return ci / self.num_sms, mi / self.num_sms
 
-    def launch(self):
-        self.build_instructions()
+    def emit_cuda_source(self, output_path: str | Path = "build/generated/dae_compiled_program.cu"):
+        artifacts = compile_builders(
+            self._pending_compile_builders(),
+            mode="compile_cuda",
+            cuda_output_path=output_path,
+        )
+        self.last_compile_artifacts = artifacts
+        assert artifacts.generated_cuda is not None
+        return artifacts.generated_cuda
+
+    def launch(self, mode: str = "interp"):
+        self._validate_compile_mode(mode)
+        if mode == "compile_cuda":
+            generated = self.emit_cuda_source()
+            raise CompileModeError(
+                "compile_cuda emitted split-loop CUDA source but does not yet have an executable launch backend. "
+                f"Generated source: {generated.path}"
+            )
+
+        self.build_instructions(mode=mode)
 
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
         if supported_compute_ops is not None:
@@ -419,11 +489,13 @@ class Launcher:
         return extract_compute_operator_names(self)
     
     def bench(self, iterations : int = 100,
-                    total_bytes : int | None = None, total_flops : int | None = None):
+                    total_bytes : int | None = None, total_flops : int | None = None,
+                    mode: str = "interp"):
+        self._validate_compile_mode(mode)
         duration_ns = torch.zeros(self.num_sms, dtype=torch.uint64)
         execution_time = 0.0
         for i in range(iterations):
-            self.launch()
+            self.launch(mode=mode)
 
             # fetch profile data
             profile_data = self.profile[:,0:2].cpu().numpy()

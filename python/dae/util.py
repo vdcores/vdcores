@@ -23,14 +23,28 @@ def tensor_diff(name : str,
     checksum2 = (t2.float().sum().item(), t2.shape)
     print(f"{name} checksum t1: {checksum1}, t2: {checksum2}")
 
-def dump_insts(dae, smid : int):
-    dae.build_instructions()
+def dump_insts(dae, smid : int, mode: str = "interp"):
+    dae.build_instructions(mode=mode)
+
+    if mode == "compile_cuda":
+        artifacts = dae.last_compile_artifacts
+        if artifacts is None:
+            raise RuntimeError("compile_cuda dump requested before compile artifacts were generated")
+        print(f"[sm={smid}][mode={mode}] Compute Instructions:")
+        for i, inst in enumerate(artifacts.emitted_compute[smid]):
+            print(f"{i:02}: {inst}")
+        print(f"[sm={smid}][mode={mode}] Memory Instructions:")
+        for i, inst in enumerate(artifacts.emitted_memory[smid]):
+            print(f"{i:02}: {inst}")
+        if artifacts.generated_cuda is not None:
+            print(f"[cuda-source] {artifacts.generated_cuda.path}")
+        return
 
     sm0 = dae.builder[smid]
-    print(f"[sm={smid}] Compute Instructions:")
+    print(f"[sm={smid}][mode={mode}] Compute Instructions:")
     for i, inst in enumerate(sm0.built_cinsts):
         print(f"{i:02}: {inst}")
-    print(f"[sm={smid}] Memory Instructions:")
+    print(f"[sm={smid}][mode={mode}] Memory Instructions:")
     for i, inst in enumerate(sm0.built_minsts):
         print(f"{i:02}: {inst}")
 
@@ -105,12 +119,16 @@ def dae_app(dae, total_bytes = None):
                         help="Profile with VDCores profiling counters")
     parser.add_argument("-w", "--write-compute-ops", type=str, nargs="?", const=DEFAULT_COMPUTE_OPS_FILE, default=None,
                         help=f"Write the launcher compute-operator list to a file (default: {DEFAULT_COMPUTE_OPS_FILE})")
+    parser.add_argument("--mode", choices=dae.COMPILE_MODES, default="interp",
+                        help="Execution/compiler mode")
+    parser.add_argument("--emit-cuda", type=str, nargs="?", const="build/generated/dae_compiled_program.cu", default=None,
+                        help="Emit split-loop CUDA source for compile_cuda mode without launching")
     
     parsed = parser.parse_args()
     did_work = False
     
     if parsed.instdump is not None:
-        dump_insts(dae, parsed.instdump)
+        dump_insts(dae, parsed.instdump, mode=parsed.mode)
         print()
         did_work = True
 
@@ -118,10 +136,15 @@ def dae_app(dae, total_bytes = None):
         write_compute_operator_file(dae, parsed.write_compute_ops)
         did_work = True
 
+    if parsed.emit_cuda is not None:
+        generated = dae.emit_cuda_source(parsed.emit_cuda)
+        print(f"[emit-cuda] wrote {generated.path}")
+        did_work = True
+
     executed = False
     if parsed.launch:
-        print(f"[launch] VDCores with {dae.num_sms} SMs...")
-        dae.launch()
+        print(f"[launch] VDCores with {dae.num_sms} SMs in mode={parsed.mode}...")
+        dae.launch(mode=parsed.mode)
         executed = True
     elif parsed.bench is not None:
         # Prewarm
@@ -129,8 +152,8 @@ def dae_app(dae, total_bytes = None):
         #     dae.launch()
         torch.cuda.synchronize()
 
-        print(f"[bench] VDCores with {dae.num_sms} SMs...")
-        dae.bench(parsed.bench, total_bytes=total_bytes)
+        print(f"[bench] VDCores with {dae.num_sms} SMs in mode={parsed.mode}...")
+        dae.bench(parsed.bench, total_bytes=total_bytes, mode=parsed.mode)
         torch.cuda.synchronize()
         executed = True
     elif not did_work:
