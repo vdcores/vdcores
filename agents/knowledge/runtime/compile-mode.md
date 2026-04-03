@@ -22,9 +22,11 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
   - then uses the existing interpreter runtime
 - `compile_cuda`:
   - builds the same normalized IR
-  - emits split-loop CUDA source
-  - does not yet launch an executable generated kernel
-  - fails loudly after source emission if used through `Launcher.launch(...)`
+  - lowers to split-unit metadata first
+  - emits direct split-loop CUDA source with per-SM ALLOC, LDU, STU, and compute loops
+  - writes `build/generated/dae/generated_compiled_runtime.cuh` for the CUDA extension build
+  - launches through `runtime.launch_compiled_dae(...)` after `make pyext`
+  - currently launches one generated kernel per logical SM program on separate CUDA streams
 
 ## IR Shape
 
@@ -42,6 +44,13 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
   - `LoopMIR`
   - `BarrierIssueIR`
   - `TerminateMemoryIR`
+- Split-unit lowering:
+  - `SplitUnitProgramIR`
+  - `SMSplitUnitIR`
+  - `SplitAllocOpIR`
+  - `SplitMemOpIR`
+  - `SplitComputeOpIR`
+  - `SplitLoopSpanIR`
 
 ## Important Semantics Captured
 
@@ -58,9 +67,17 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
   - bar shift
   - TMA shift
 - `compile_cuda` treats ALLOC ordering as separate from LDU/STU address generation.
+- Generated CUDA keeps no instruction tables in the direct path:
+  - repeat regions become CUDA `for` loops
+  - address deltas become direct address or coord expressions
+  - unused LDU ports emit no-op bodies instead of dead local command state
 
 ## Current Limitations
 
 - Compile modes currently assume a fresh launcher state and do not support incremental compile after prior instruction builds.
-- `compile_cuda` is only validated for the early GEMV/TMA subset.
-- Full generated-kernel execution is still pending; current V2 work is source generation plus split-unit metadata.
+- `compile_cuda` is currently validated for:
+  - `GEMV_WGMMA` compute-family emission
+  - `Dummy` and `Copy` compute ops
+  - TMA load/store/reduce memory ops
+- `compile_cuda` now executes for the supported subset after rebuilding `dae.runtime`, but unsupported control-heavy programs still fail loudly during compilation.
+- For `app/python/gemv_out.py`, the printed layer diff is against the PyTorch reference path. A direct `interp` vs `compile_cuda` parity harness is the correct way to check compiler correctness, and that parity is currently exact on the supported GEMV path.

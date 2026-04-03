@@ -38,6 +38,7 @@ setup(
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
+                    "-allow-unsupported-compiler",
                     "-Xptxas=-v"
                 ],
             },

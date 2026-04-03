@@ -3,6 +3,13 @@
 
 #include <cuda.h>
 
+#if __has_include("dae/generated_compiled_runtime.cuh")
+#include "dae/generated_compiled_runtime.cuh"
+#define DAE_HAS_GENERATED_COMPILED_RUNTIME 1
+#else
+#define DAE_HAS_GENERATED_COMPILED_RUNTIME 0
+#endif
+
 size_t set_smem_size(size_t smem_size) {
     cudaError_t err = cudaFuncSetAttribute(
         dae2,
@@ -12,6 +19,12 @@ size_t set_smem_size(size_t smem_size) {
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
     }
+#if DAE_HAS_GENERATED_COMPILED_RUNTIME
+    err = dae::compiled::set_generated_compiled_runtime_smem_size(smem_size);
+    if (err != cudaSuccess) {
+        std::cerr << "Compiled runtime set parameter failed: " << cudaGetErrorString(err) << std::endl;
+    }
+#endif
     return smem_size;
 }
 
@@ -40,6 +53,43 @@ cudaError_t launch_dae(
   cudaDeviceSynchronize();
 
   return cudaGetLastError();
+}
+
+cudaError_t launch_compiled_dae(
+  int numSMs,
+  size_t smem_size,
+  CUtensorMap* tma_descs,
+  int * bars,
+  uint64_t * profile,
+  int64_t stream
+) {
+#if DAE_HAS_GENERATED_COMPILED_RUNTIME
+  cudaDeviceSynchronize();
+  return dae::compiled::launch_generated_compiled_runtime(
+    numSMs,
+    smem_size,
+    tma_descs,
+    bars,
+    profile,
+    stream
+  );
+#else
+  (void)numSMs;
+  (void)smem_size;
+  (void)tma_descs;
+  (void)bars;
+  (void)profile;
+  (void)stream;
+  return cudaErrorNotSupported;
+#endif
+}
+
+const char *compiled_runtime_tag() {
+#if DAE_HAS_GENERATED_COMPILED_RUNTIME
+  return dae::compiled::kCompiledProgramTag;
+#else
+  return "";
+#endif
 }
 
 CUtensorMap create_tma_descriptor(

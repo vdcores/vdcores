@@ -426,10 +426,50 @@ class Launcher:
         self._validate_compile_mode(mode)
         if mode == "compile_cuda":
             generated = self.emit_cuda_source()
-            raise CompileModeError(
-                "compile_cuda emitted split-loop CUDA source but does not yet have an executable launch backend. "
-                f"Generated source: {generated.path}"
+            runtime_tag_fn = getattr(runtime, "compiled_runtime_tag", None)
+            runtime_launch_fn = getattr(runtime, "launch_compiled_dae", None)
+            if runtime_tag_fn is None or runtime_launch_fn is None:
+                raise CompileModeError(
+                    "compile_cuda requires a rebuilt dae.runtime with generated-runtime support. "
+                    f"Emit completed at {generated.path}; run `make pyext` and retry."
+                )
+            runtime_tag = runtime_tag_fn()
+            if runtime_tag != generated.tag:
+                raise CompileModeError(
+                    "compile_cuda generated a new direct runtime, but dae.runtime was built against a different one. "
+                    f"generated tag={generated.tag}, runtime tag={runtime_tag or '<missing>'}. "
+                    "Rebuild with `make pyext` and retry."
+                )
+
+            unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
+            if unbound_bar_ids:
+                raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
+
+            stream = torch.cuda.current_stream().cuda_stream
+
+            bar_int_view = self.bars.view(torch.uint32)
+            bar_src_int_view = self.bars_src.view(torch.uint32)
+            for bar_id, value in self.bar_values.items():
+                bar_int_view[bar_id] = value
+                bar_src_int_view[bar_id] = value
+
+            if len(self.tmas) == 0:
+                tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
+            else:
+                tma = torch.stack(self.tmas).to(self.device)
+            profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
+
+            runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
+            runtime.set_cache_policy(tma, stream, 1, 2, 0)
+
+            ret = runtime_launch_fn(
+                self.num_sms, self.smem_size,
+                tma,
+                self.bars, profile,
+                stream
             )
+            assert ret == 0
+            return
 
         self.build_instructions(mode=mode)
 

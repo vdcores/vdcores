@@ -23,7 +23,7 @@ COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 # Linker flags (add CUDA driver library for TMA support)
 LDFLAGS = -lcuda -lcublas
 
-NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
+NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math -allow-unsupported-compiler
 NVCC_FLAGS += -lineinfo
 
 # Directories

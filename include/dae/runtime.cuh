@@ -17,6 +17,17 @@ cudaError_t launch_dae(
   int64_t stream
 );
 
+cudaError_t launch_compiled_dae(
+  int numSMs,
+  size_t smem_size,
+  CUtensorMap* tma_descs,
+  int * bars,
+  uint64_t * profile,
+  int64_t stream
+);
+
+const char *compiled_runtime_tag();
+
 CUtensorMap create_tma_descriptor(
   CUtensorMapDataType data_type,
   int dims,
@@ -26,4 +37,3 @@ CUtensorMap create_tma_descriptor(
   CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
   std::array<uint64_t, 5> global_strides_opt = {0, 0, 0, 0, 0}
 );
-

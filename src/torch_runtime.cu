@@ -99,6 +99,36 @@ int py_launch_dae(
   return 0;
 }
 
+int py_launch_compiled_dae(
+    int64_t num_sms,
+    size_t smem_size,
+    torch::Tensor tma_descs_bytes,       // uint8 buffer
+    torch::Tensor bars_int32,            // int32
+    torch::Tensor profile_u64,           // uint64
+    int64_t stream
+) {
+  set_persistent_cache();
+
+  TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
+
+  auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
+  auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
+  auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+
+  cudaError_t st = launch_compiled_dae(
+      static_cast<int>(num_sms), smem_size,
+      tma,
+      bars, prof, stream
+  );
+
+  TORCH_CHECK(st == cudaSuccess, "launch_compiled_dae failed: ", cudaGetErrorString(st));
+  return 0;
+}
+
+py::str py_compiled_runtime_tag() {
+  return py::str(compiled_runtime_tag());
+}
+
 // function 3: build TMA descriptors
 static inline CUtensorMapInterleave to_interleave(int64_t interleave) {
   switch (interleave) {
@@ -307,6 +337,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Set dynamic shared memory size for DAE2 kernel");
   m.def("launch_dae", &py_launch_dae,
             "Launch DAE2 kernel with given parameters");
+  m.def("launch_compiled_dae", &py_launch_compiled_dae,
+            "Launch generated compiled DAE runtime with given parameters");
+  m.def("compiled_runtime_tag", &py_compiled_runtime_tag,
+            "Return the build-time tag of the generated compiled runtime");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("set_cache_policy", &py_tensor_set_cache_policy,
