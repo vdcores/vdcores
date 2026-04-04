@@ -112,7 +112,7 @@ def build_synthetic_inputs(config, gpu, dtype, num_layers, hidden, intermediate,
         "lm_head": mat_lm_head,
     }
 def parse_args():
-    arg_parser = argparse.ArgumentParser(add_help=False)
+    arg_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
     arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
     arg_parser.add_argument("--correctness", action="store_true")
@@ -125,6 +125,7 @@ def parse_args():
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
         remaining_argv = [*remaining_argv, "--launch"]
+    parsed_args.dae_argv = tuple(remaining_argv)
     sys.argv = [sys.argv[0], *remaining_argv]
     return parsed_args
 
@@ -624,9 +625,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
     if parsed_args.debug_print_barriers:
         print_barrier_counts(dae)
 
-    if parsed_args.dry_build:
-        return
-
     dae.i(embed_rms, copy_hidden, restore_bars_high)
     dae.i(
         *([clear_interm, clear_gateout] if stage_enabled(parsed_args.debug_stop_after, "embed") else []),
@@ -687,6 +685,9 @@ if parsed_args.dry_build:
         for gap in runtime_gaps:
             print(f"  - {gap}")
     print(f"[dry-build] logits_epoch={logits_epoch}, logits_slice={logits_slice}, vocab_size={vocab_size}")
+    if parsed_args.dae_argv:
+        dae.s()
+        dae_app(dae)
 else:
     print(f"run vdcores with {cur_offset + 1} tokens...")
     if parsed_args.debug_stop_after != "full" or parsed_args.debug_num_layers is not None:

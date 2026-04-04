@@ -10,11 +10,11 @@ def decode_opcode(op: int) -> str:
             return name
 
     # Some memory instructions toggle the writeback bit after the base opcode
-    # has already been chosen, so try decoding with it set as well.
-    op_with_writeback = op | 2
-    for name, value in vars(opcode).items():
-        if value == op_with_writeback:
-            return name
+    # has already been chosen, so try decoding with it both set and cleared.
+    for candidate in (op | 2, op & ~2):
+        for name, value in vars(opcode).items():
+            if value == candidate:
+                return name
 
     return f"UNKNOWN_OPCODE[0x{op:04x}]"
 

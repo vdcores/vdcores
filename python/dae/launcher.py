@@ -9,6 +9,7 @@ import copy
 from enum import Enum
 from math import prod
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -17,13 +18,18 @@ import torch
 def extract_compute_operator_names(launcher) -> list[str]:
     operator_names = []
     seen = set()
+    has_program = False
     for builder in launcher.builder:
+        if builder.built_cinsts or builder.cinsts or builder.built_minsts or builder.minsts:
+            has_program = True
         for inst in [*builder.built_cinsts, *builder.cinsts]:
             name = inst.compute_operator_name()
             if name in seen:
                 continue
             seen.add(name)
             operator_names.append(name)
+    if has_program and "OP_TERMINATEC" not in seen:
+        operator_names.append("OP_TERMINATEC")
     return operator_names
 
 
@@ -240,6 +246,7 @@ class Launcher:
 
         self.need_instruction_build = True
         self.last_compile_artifacts = None
+        self._last_compile_cache_key = None
 
         self.num_bars = 0
         self.bar_values = {}
@@ -309,25 +316,62 @@ class Launcher:
             )
         return self.builder
 
+    def _snapshot_instruction_state(self):
+        return {
+            "cptrs": list(self.cptrs),
+            "mptrs": list(self.mptrs),
+            "need_instruction_build": self.need_instruction_build,
+            "last_compile_artifacts": self.last_compile_artifacts,
+            "last_compile_cache_key": self._last_compile_cache_key,
+            "builders": [
+                {
+                    "cinsts": [copy.copy(inst) for inst in builder.cinsts],
+                    "minsts": [copy.copy(inst) for inst in builder.minsts],
+                    "built_cinsts": [copy.copy(inst) for inst in builder.built_cinsts],
+                    "built_minsts": [copy.copy(inst) for inst in builder.built_minsts],
+                }
+                for builder in self.builder
+            ],
+        }
+
+    def _restore_instruction_state(self, snapshot):
+        self.cptrs = list(snapshot["cptrs"])
+        self.mptrs = list(snapshot["mptrs"])
+        self.need_instruction_build = snapshot["need_instruction_build"]
+        self.last_compile_artifacts = snapshot["last_compile_artifacts"]
+        self._last_compile_cache_key = snapshot["last_compile_cache_key"]
+        for builder, builder_state in zip(self.builder, snapshot["builders"], strict=True):
+            builder.cinsts = [copy.copy(inst) for inst in builder_state["cinsts"]]
+            builder.minsts = [copy.copy(inst) for inst in builder_state["minsts"]]
+            builder.built_cinsts = [copy.copy(inst) for inst in builder_state["built_cinsts"]]
+            builder.built_minsts = [copy.copy(inst) for inst in builder_state["built_minsts"]]
+
+    def _compile_cache_key(self, mode: str, cuda_output_path: str | Path | None = None):
+        builders = self._pending_compile_builders()
+        fingerprint = tuple(
+            (
+                tuple(repr(inst) for inst in builder.cinsts),
+                tuple(repr(inst) for inst in builder.minsts),
+            )
+            for builder in builders
+        )
+        if mode == "compile_cuda":
+            resolved_path = str(Path(cuda_output_path or "build/generated/dae_compiled_program.cu"))
+            return (mode, resolved_path, fingerprint)
+        return (mode, fingerprint)
+
     def build_instructions(self, mode: str = "interp"):
         self._validate_compile_mode(mode)
         if not self.need_instruction_build and mode != "compile_cuda":
             return
 
         if mode == "compile_cuda":
-            self.last_compile_artifacts = compile_builders(
-                self._pending_compile_builders(),
-                mode=mode,
-            )
+            self.last_compile_artifacts = self.compile_artifacts(mode=mode)
             return
 
         compile_artifacts = None
         if mode == "compile_ir":
-            compile_artifacts = compile_builders(
-                self._pending_compile_builders(),
-                mode=mode,
-            )
-            self.last_compile_artifacts = compile_artifacts
+            compile_artifacts = self.compile_artifacts(mode=mode)
 
         if self.need_instruction_build:
             for i in range(self.num_sms):
@@ -368,6 +412,7 @@ class Launcher:
                 b.add(inst)
         self.need_instruction_build = True
         self.last_compile_artifacts = None
+        self._last_compile_cache_key = None
 
     def collect_barrier_release_counts(self, *insts):
         counts = {}
@@ -413,14 +458,25 @@ class Launcher:
         return ci / self.num_sms, mi / self.num_sms
 
     def emit_cuda_source(self, output_path: str | Path = "build/generated/dae_compiled_program.cu"):
-        artifacts = compile_builders(
-            self._pending_compile_builders(),
-            mode="compile_cuda",
-            cuda_output_path=output_path,
-        )
-        self.last_compile_artifacts = artifacts
+        artifacts = self.compile_artifacts(mode="compile_cuda", cuda_output_path=output_path)
         assert artifacts.generated_cuda is not None
         return artifacts.generated_cuda
+
+    def compile_artifacts(self, mode: str = "compile_ir", cuda_output_path: str | Path | None = None):
+        self._validate_compile_mode(mode)
+        if mode == "interp":
+            raise ValueError("compile_artifacts requires compile_ir or compile_cuda mode")
+        cache_key = self._compile_cache_key(mode, cuda_output_path)
+        if self.last_compile_artifacts is not None and self._last_compile_cache_key == cache_key:
+            return self.last_compile_artifacts
+        artifacts = compile_builders(
+            self._pending_compile_builders(),
+            mode=mode,
+            cuda_output_path=cuda_output_path,
+        )
+        self.last_compile_artifacts = artifacts
+        self._last_compile_cache_key = cache_key
+        return artifacts
 
     def launch(self, mode: str = "interp"):
         self._validate_compile_mode(mode)
@@ -527,33 +583,104 @@ class Launcher:
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)
+
+    def benchmark(self, iterations: int = 100,
+                        total_bytes: int | None = None, total_flops: int | None = None,
+                        mode: str = "interp"):
+        self._validate_compile_mode(mode)
+        duration_ns = torch.zeros(self.num_sms, dtype=torch.uint64)
+        execution_time = 0.0
+        host_wall_ns = 0
+        for _ in range(iterations):
+            torch.cuda.synchronize()
+            host_start = time.perf_counter_ns()
+            self.launch(mode=mode)
+            torch.cuda.synchronize()
+            host_wall_ns += time.perf_counter_ns() - host_start
+
+            profile_data = self.profile[:, 0:2].cpu().numpy()
+            duration_ns += (profile_data[:, 1] - profile_data[:, 0])
+            execution_time += profile_data[:, 1].max() - profile_data[:, 0].min()
+
+        avg_duration_ns = float((duration_ns.double() / iterations).mean())
+        avg_execution_time_ns = float(execution_time / iterations)
+        avg_host_wall_ns = float(host_wall_ns / iterations)
+        result = {
+            "mode": mode,
+            "iterations": iterations,
+            "avg_duration_ns": avg_duration_ns,
+            "avg_execution_time_ns": avg_execution_time_ns,
+            "avg_host_wall_ns": avg_host_wall_ns,
+        }
+        if total_bytes is not None:
+            result["bandwidth_gbps"] = total_bytes / (avg_duration_ns / 1e9) / (1024 ** 3)
+        if total_flops is not None:
+            result["gflops"] = total_flops / avg_duration_ns / 1e6
+        return result
     
     def bench(self, iterations : int = 100,
                     total_bytes : int | None = None, total_flops : int | None = None,
                     mode: str = "interp"):
-        self._validate_compile_mode(mode)
-        duration_ns = torch.zeros(self.num_sms, dtype=torch.uint64)
-        execution_time = 0.0
-        for i in range(iterations):
-            self.launch(mode=mode)
-
-            # fetch profile data
-            profile_data = self.profile[:,0:2].cpu().numpy()
-            duration_ns += (profile_data[:,1] - profile_data[:,0])
-            execution_time += profile_data[:,1].max() - profile_data[:,0].min()
-        # print("SM durations (ns):", duration_ns)
+        result = self.benchmark(
+            iterations=iterations,
+            total_bytes=total_bytes,
+            total_flops=total_flops,
+            mode=mode,
+        )
         print(f"Benchmark Results on {self.num_sms} SMs and {iterations} iterations:")
-        avg_duration_ns = (duration_ns.double() / iterations).mean()
-        print(f"Average duration (ns): {avg_duration_ns:.2f}")
-        avg_execution_time = execution_time / iterations
-        print(f"Average execution time (ns): {avg_execution_time:.2f}")
+        print(f"Average duration (ns): {result['avg_duration_ns']:.2f}")
+        print(f"Average execution time (ns): {result['avg_execution_time_ns']:.2f}")
+        print(f"Average host wall time (ns): {result['avg_host_wall_ns']:.2f}")
+        if "bandwidth_gbps" in result:
+            print(f"Effective Bandwidth (GB/s): {result['bandwidth_gbps']:.2f}")
+        if "gflops" in result:
+            print(f"Effective GFLOPS: {result['gflops']:.2f}")
+        return result
 
-        # print(duration_ns)
+    def bench_compare(
+        self,
+        iterations: int = 100,
+        total_bytes: int | None = None,
+        total_flops: int | None = None,
+        modes: list[str] | tuple[str, ...] | None = None,
+    ):
+        if modes is None:
+            modes = list(self.COMPILE_MODES)
+        ordered_modes = []
+        for mode in modes:
+            self._validate_compile_mode(mode)
+            if mode not in ordered_modes:
+                ordered_modes.append(mode)
 
+        results = {}
+        snapshot = self._snapshot_instruction_state()
+        try:
+            for mode in ordered_modes:
+                self._restore_instruction_state(snapshot)
+                print(f"[bench-compare] running mode={mode}")
+                results[mode] = self.benchmark(
+                    iterations=iterations,
+                    total_bytes=total_bytes,
+                    total_flops=total_flops,
+                    mode=mode,
+                )
+        finally:
+            self._restore_instruction_state(snapshot)
 
-        if total_bytes is not None:
-            bandwidth = total_bytes / (avg_duration_ns / 1e9) / (1024 **3) # GB/s
-            print(f"Effective Bandwidth (GB/s): {bandwidth:.2f}")
-        if total_flops is not None:
-            gflops = total_flops / avg_duration_ns / 1e6
-            print(f"Effective GFLOPS: {gflops:.2f}")
+        baseline = results[ordered_modes[0]]
+        print(f"Benchmark Comparison on {self.num_sms} SMs and {iterations} iterations:")
+        for mode in ordered_modes:
+            result = results[mode]
+            speedup = baseline["avg_execution_time_ns"] / result["avg_execution_time_ns"]
+            host_speedup = baseline["avg_host_wall_ns"] / result["avg_host_wall_ns"]
+            print(
+                f"[{mode}] exec_ns={result['avg_execution_time_ns']:.2f} "
+                f"host_ns={result['avg_host_wall_ns']:.2f} "
+                f"speedup_vs_{ordered_modes[0]}={speedup:.3f} "
+                f"host_speedup_vs_{ordered_modes[0]}={host_speedup:.3f}"
+            )
+            if "bandwidth_gbps" in result:
+                print(f"[{mode}] bandwidth_gbps={result['bandwidth_gbps']:.2f}")
+            if "gflops" in result:
+                print(f"[{mode}] gflops={result['gflops']:.2f}")
+        return results

@@ -2,6 +2,7 @@ import torch
 import argparse
 import numpy as np
 
+from .compiler import render_program_ir
 from .launcher import extract_compute_operator_names
 
 
@@ -47,6 +48,25 @@ def dump_insts(dae, smid : int, mode: str = "interp"):
     print(f"[sm={smid}][mode={mode}] Memory Instructions:")
     for i, inst in enumerate(sm0.built_minsts):
         print(f"{i:02}: {inst}")
+
+
+def dump_optimized(dae, smid: int, mode: str, what: str):
+    if mode == "interp":
+        raise ValueError("optimized dumps require compile_ir or compile_cuda mode")
+
+    if what in {"ir", "both"}:
+        artifacts = dae.compile_artifacts(mode="compile_ir")
+        print(f"[optimized-ir][sm={smid}]")
+        print(render_program_ir(artifacts.normalized_program, sm_ids=[smid]))
+
+    if what in {"cuda", "both"}:
+        if mode != "compile_cuda":
+            raise ValueError("CUDA source dump requires --mode compile_cuda")
+        artifacts = dae.compile_artifacts(mode="compile_cuda")
+        if artifacts.generated_cuda is None:
+            raise RuntimeError("compile_cuda did not generate CUDA source")
+        print(f"[optimized-cuda] {artifacts.generated_cuda.path}")
+        print(artifacts.generated_cuda.source)
 
 
 def write_compute_operator_file(dae, path: str = DEFAULT_COMPUTE_OPS_FILE):
@@ -111,16 +131,22 @@ def dae_app(dae, total_bytes = None):
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-b", "--bench", type=int, nargs="?", const=1, default=None,
                         help="Run benchmark N times (default: 1)")
+    group.add_argument("--bench-compare", type=int, nargs="?", const=1, default=None,
+                        help="Benchmark multiple modes N times (default: 1)")
     group.add_argument("-l", "--launch", action="store_true",
                         help="Launch configuration")
     parser.add_argument("-i", "--instdump", type=int, nargs="?", const=0, default=None,
                         help="Dump instructions for SM ID (default: 0)")
+    parser.add_argument("--print-optimized", choices=("ir", "cuda", "both"), default=None,
+                        help="Print optimized IR or generated CUDA source")
     parser.add_argument("-p", "--profile", type=str, nargs="+", default=None,
                         help="Profile with VDCores profiling counters")
     parser.add_argument("-w", "--write-compute-ops", type=str, nargs="?", const=DEFAULT_COMPUTE_OPS_FILE, default=None,
                         help=f"Write the launcher compute-operator list to a file (default: {DEFAULT_COMPUTE_OPS_FILE})")
     parser.add_argument("--mode", choices=dae.COMPILE_MODES, default="interp",
                         help="Execution/compiler mode")
+    parser.add_argument("--compare-modes", type=str, nargs="+", default=None,
+                        help="Modes to include for --bench-compare (default: all)")
     parser.add_argument("--emit-cuda", type=str, nargs="?", const="build/generated/dae_compiled_program.cu", default=None,
                         help="Emit split-loop CUDA source for compile_cuda mode without launching")
     
@@ -141,11 +167,26 @@ def dae_app(dae, total_bytes = None):
         print(f"[emit-cuda] wrote {generated.path}")
         did_work = True
 
+    if parsed.print_optimized is not None:
+        optimized_smid = parsed.instdump if parsed.instdump is not None else 0
+        dump_optimized(dae, optimized_smid, mode=parsed.mode, what=parsed.print_optimized)
+        did_work = True
+
     executed = False
+    action = None
     if parsed.launch:
         print(f"[launch] VDCores with {dae.num_sms} SMs in mode={parsed.mode}...")
         dae.launch(mode=parsed.mode)
         executed = True
+        action = "launch"
+    elif parsed.bench_compare is not None:
+        compare_modes = parsed.compare_modes if parsed.compare_modes is not None else list(dae.COMPILE_MODES)
+        torch.cuda.synchronize()
+        print(f"[bench-compare] VDCores with {dae.num_sms} SMs across modes={compare_modes}...")
+        dae.bench_compare(parsed.bench_compare, total_bytes=total_bytes, modes=compare_modes)
+        torch.cuda.synchronize()
+        executed = True
+        action = "bench_compare"
     elif parsed.bench is not None:
         # Prewarm
         # for _ in range(1):
@@ -156,6 +197,7 @@ def dae_app(dae, total_bytes = None):
         dae.bench(parsed.bench, total_bytes=total_bytes, mode=parsed.mode)
         torch.cuda.synchronize()
         executed = True
+        action = "bench"
     elif not did_work:
         print(f"DAE NO EXECUTION MODE.")
 
@@ -163,3 +205,9 @@ def dae_app(dae, total_bytes = None):
         pp = ProfileParser(dae)
         for prof in parsed.profile:
             pp.parse(prof)
+
+    return {
+        "action": action,
+        "executed": executed,
+        "did_work": did_work,
+    }

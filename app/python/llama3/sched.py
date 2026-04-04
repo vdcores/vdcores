@@ -12,7 +12,7 @@ from reference import input_batch1, reference_pass, check_tensor_threshold
 import os
 import math
 
-arg_parser = argparse.ArgumentParser(add_help=False)
+arg_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--correctness", action="store_true")

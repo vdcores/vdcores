@@ -22,6 +22,7 @@ layer = GemvLayer(dae, Atom, "out_proj", (matA, matB, matC))
 
 dae.s(layer.schedule().place(num_sms))
 
-dae_app(dae)
+app_result = dae_app(dae)
 
-layer.diff()
+if app_result.get("action") == "launch":
+    layer.diff()

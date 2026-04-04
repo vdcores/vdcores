@@ -4,14 +4,15 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from dae.compiler import CompileModeError, RepeatRegionIR, compile_builders
+from dae.compiler import CompileModeError, RepeatRegionIR, compile_builders, render_program_ir
 from dae.instructions import Copy, Dummy, Gemv_M64N8, LoopC, LoopM, MemoryInstruction, RepeatM, TerminateC, TerminateM
-from dae.launcher import Launcher, SMInstructionBuilder
+from dae.launcher import Launcher, SMInstructionBuilder, extract_compute_operator_names
 from dae.runtime import opcode
 
 
@@ -22,6 +23,15 @@ def _memory_inst(op, *, num_slots=1, arg=0, size=128, cords=None):
 
 
 class CompilerIRTests(unittest.TestCase):
+    def test_extract_compute_operator_names_appends_terminatec_for_pending_program(self):
+        builder = SMInstructionBuilder(sm_id=0)
+        builder.add_compute(Dummy(4))
+        launcher = SimpleNamespace(builder=[builder])
+
+        operator_names = extract_compute_operator_names(launcher)
+
+        self.assertEqual(operator_names, ["OP_DUMMY", "OP_TERMINATEC"])
+
     def test_compile_ir_roundtrip_collapses_repeat_region(self):
         builder = SMInstructionBuilder(sm_id=0)
         builder.add_compute(Gemv_M64N8(16))
@@ -88,21 +98,26 @@ class CompilerIRTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "compiled_gemv.cu"
+            runtime_header_path = Path(tmpdir) / "generated_compiled_runtime.cuh"
             artifacts = compile_builders(
                 [builder],
                 mode="compile_cuda",
                 cuda_output_path=output_path,
+                runtime_header_path=runtime_header_path,
             )
 
             self.assertIsNotNone(artifacts.generated_cuda)
             assert artifacts.generated_cuda is not None
             self.assertTrue(artifacts.generated_cuda.path.exists())
             source = artifacts.generated_cuda.source
-            self.assertIn("compiled_alloc_sm_0", source)
-            self.assertIn("compiled_ldu_sm_0_0", source)
-            self.assertIn("compiled_stu_sm_0", source)
-            self.assertIn("compiled_compute_sm_0", source)
-            self.assertIn("dae_compiled_sm_kernel_0", source)
+            self.assertIn("compiled_alloc_template_0", source)
+            self.assertIn("compiled_ldu_template_0_0", source)
+            self.assertIn("compiled_stu_template_0", source)
+            self.assertIn("compiled_compute_template_0", source)
+            self.assertIn("CompiledProgramTemplate_0Params", source)
+            self.assertIn("CompiledProgramTemplateRuntime_0", source)
+            self.assertIn("template <typename Program>", source)
+            self.assertIn("dae_compiled_sm_kernel<CompiledProgramTemplateRuntime_0>", source)
             self.assertIn("no instruction tables are retained here", source)
             self.assertIn("cudaStreamCreateWithFlags", source)
             self.assertIn("cudaEventRecord(launch_ready, cuda_stream)", source)
@@ -112,6 +127,7 @@ class CompilerIRTests(unittest.TestCase):
             self.assertIsNotNone(artifacts.generated_runtime)
             assert artifacts.generated_runtime is not None
             self.assertTrue(artifacts.generated_runtime.path.exists())
+            self.assertEqual(artifacts.generated_runtime.path, runtime_header_path)
             self.assertIsNotNone(artifacts.split_unit_program)
 
     def test_compile_cuda_supports_dummy_copy_split_loops(self):
@@ -130,7 +146,13 @@ class CompilerIRTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "compiled_copy.cu"
-            artifacts = compile_builders([builder], mode="compile_cuda", cuda_output_path=output_path)
+            runtime_header_path = Path(tmpdir) / "generated_compiled_runtime.cuh"
+            artifacts = compile_builders(
+                [builder],
+                mode="compile_cuda",
+                cuda_output_path=output_path,
+                runtime_header_path=runtime_header_path,
+            )
             self.assertIsNotNone(artifacts.split_unit_program)
             assert artifacts.split_unit_program is not None
             sm = artifacts.split_unit_program.sms[0]
@@ -140,15 +162,46 @@ class CompilerIRTests(unittest.TestCase):
             self.assertEqual(len(sm.stu_ops), 1)
             self.assertEqual(sm.compute_ops[0].opcode_name, "OP_COPY")
             source = artifacts.generated_cuda.source
-            self.assertIn("for (int repeat_idx_0 = 0; repeat_idx_0 < 3; ++repeat_idx_0)", source)
-            self.assertIn("compiled_alloc_load", source)
-            self.assertIn("compiled_alloc_store", source)
+            self.assertIn("for (int repeat_idx_0 = 0; repeat_idx_0 < params.", source)
+            self.assertIn("compiled_run_alloc_op", source)
+            self.assertIn("alloc_kind_seq_0", source)
+            self.assertIn("alloc_repeat_seq_0", source)
             self.assertIn("compiled_load_1d", source)
             self.assertIn("compiled_store_1d", source)
             self.assertEqual(source.count("CompiledLdCmd cmd{};"), 1)
             self.assertNotIn("kAllocSpans", source)
             self.assertNotIn("kLduOps", source)
             self.assertNotIn("kStuOps", source)
+
+    def test_compile_cuda_folds_linear_memory_runs(self):
+        builder = SMInstructionBuilder(sm_id=0)
+        builder.add_compute(Dummy(1))
+        builder.add_compute(TerminateC())
+        for inst in RepeatM.on(
+            2,
+            (_memory_inst(opcode.OP_ALLOC_TMA_LOAD_3D, num_slots=1, arg=0, size=128, cords=[0, 0, 0, 0]), [0, 0, 16]),
+            (_memory_inst(opcode.OP_ALLOC_TMA_LOAD_3D, num_slots=1, arg=0, size=128, cords=[0, 0, 4, 0]), [0, 0, 16]),
+            (_memory_inst(opcode.OP_ALLOC_TMA_LOAD_3D, num_slots=1, arg=0, size=128, cords=[0, 0, 8, 0]), [0, 0, 16]),
+            (_memory_inst(opcode.OP_ALLOC_TMA_LOAD_3D, num_slots=1, arg=0, size=128, cords=[0, 0, 12, 0]), [0, 0, 16]),
+        ):
+            builder.add_memory(inst)
+        builder.add_memory(TerminateM())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "compiled_folded.cu"
+            runtime_header_path = Path(tmpdir) / "generated_compiled_runtime.cuh"
+            artifacts = compile_builders(
+                [builder],
+                mode="compile_cuda",
+                cuda_output_path=output_path,
+                runtime_header_path=runtime_header_path,
+            )
+            source = artifacts.generated_cuda.source
+            self.assertIn("for (int repeat_idx_0 = 0; repeat_idx_0 < params.", source)
+            self.assertIn("for (int fold_idx_0 = 0; fold_idx_0 < params.", source)
+            self.assertIn("compiled_tma_load_3d(cmd, tma_descs, params.", source)
+            self.assertIn("static_cast<int>(repeat_idx_0) * static_cast<int>(params.", source)
+            self.assertIn("static_cast<int>(fold_idx_0) * static_cast<int>(params.", source)
 
     def test_compile_cuda_rejects_memory_control_ops_for_now(self):
         builder = SMInstructionBuilder(sm_id=0)
@@ -198,10 +251,62 @@ class CompilerIRTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "compiled_addr.cu"
-            artifacts = compile_builders([builder], mode="compile_cuda", cuda_output_path=output_path)
+            runtime_header_path = Path(tmpdir) / "generated_compiled_runtime.cuh"
+            artifacts = compile_builders(
+                [builder],
+                mode="compile_cuda",
+                cuda_output_path=output_path,
+                runtime_header_path=runtime_header_path,
+            )
             source = artifacts.generated_cuda.source
-            self.assertIn("compiled_load_1d(cmd, (64ULL + static_cast<uint64_t>(repeat_idx_0) * 128ULL)", source)
-            self.assertIn("compiled_store_1d(c2m, (256ULL + static_cast<uint64_t>(repeat_idx_0) * 128ULL)", source)
+            self.assertIn("compiled_load_1d(cmd, (params.", source)
+            self.assertIn("compiled_store_1d(c2m, (params.", source)
+            self.assertIn("static_cast<uint64_t>(repeat_idx_0) * static_cast<uint64_t>(params.", source)
+
+    def test_render_program_ir_shows_repeat_region(self):
+        builder = SMInstructionBuilder(sm_id=0)
+        builder.add_compute(Dummy(2))
+        builder.add_compute(TerminateC())
+        for inst in RepeatM.on(
+            3,
+            (_memory_inst(opcode.OP_ALLOC_TMA_LOAD_1D, num_slots=1, size=128, cords=[32]), 128),
+        ):
+            builder.add_memory(inst)
+        builder.add_memory(TerminateM())
+
+        artifacts = compile_builders([builder], mode="compile_ir")
+        rendered = render_program_ir(artifacts.normalized_program, sm_ids=[0])
+        self.assertIn("SM 0", rendered)
+        self.assertIn("repeat x3", rendered)
+        self.assertIn("OP_ALLOC_TMA_LOAD_1D", rendered)
+
+    def test_compile_cuda_shares_template_for_same_shape_sms(self):
+        builders = [SMInstructionBuilder(sm_id=0), SMInstructionBuilder(sm_id=1)]
+        for sm_id, builder in enumerate(builders):
+            builder.add_compute(Copy(1, 32))
+            builder.add_compute(TerminateC())
+            for inst in RepeatM.on(
+                2,
+                (_memory_inst(opcode.OP_ALLOC_TMA_LOAD_2D, num_slots=1, arg=0, size=128, cords=[sm_id * 64, 0]), [128, 0]),
+                (_memory_inst(opcode.OP_ALLOC_WB_TMA_STORE_2D, num_slots=1, arg=1, size=128, cords=[sm_id * 64, 8]), [128, 0]),
+            ):
+                builder.add_memory(inst)
+            builder.add_memory(TerminateM())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "compiled_shared_templates.cu"
+            runtime_header_path = Path(tmpdir) / "generated_compiled_runtime.cuh"
+            artifacts = compile_builders(
+                builders,
+                mode="compile_cuda",
+                cuda_output_path=output_path,
+                runtime_header_path=runtime_header_path,
+            )
+            source = artifacts.generated_cuda.source
+            self.assertEqual(source.count("struct CompiledProgramTemplateRuntime_0 {"), 1)
+            self.assertIn("kCompiledProgramTemplate_0Params[2]", source)
+            self.assertIn("(0, 0, tma_descs, bars, profile);", source)
+            self.assertIn("(1, 1, tma_descs, bars, profile);", source)
 
 
 if __name__ == "__main__":
