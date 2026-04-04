@@ -119,9 +119,11 @@ class CompilerIRTests(unittest.TestCase):
             self.assertIn("template <typename Program>", source)
             self.assertIn("dae_compiled_sm_kernel<CompiledProgramTemplateRuntime_0>", source)
             self.assertIn("no instruction tables are retained here", source)
-            self.assertIn("cudaStreamCreateWithFlags", source)
-            self.assertIn("cudaEventRecord(launch_ready, cuda_stream)", source)
+            self.assertIn("<<<1, numThreads, smem_size, cuda_stream>>>", source)
+            self.assertIn("int program_index = static_cast<int>(blockIdx.x);", source)
             self.assertNotIn("cudaStreamSynchronize(cuda_stream);", source)
+            self.assertNotIn("cudaStreamCreateWithFlags", source)
+            self.assertNotIn("cudaEventRecord(launch_ready, cuda_stream)", source)
             self.assertNotIn("struct AllocOp", source)
             self.assertNotIn("kPrograms", source)
             self.assertIsNotNone(artifacts.generated_runtime)
@@ -305,8 +307,9 @@ class CompilerIRTests(unittest.TestCase):
             source = artifacts.generated_cuda.source
             self.assertEqual(source.count("struct CompiledProgramTemplateRuntime_0 {"), 1)
             self.assertIn("kCompiledProgramTemplate_0Params[2]", source)
-            self.assertIn("(0, 0, tma_descs, bars, profile);", source)
-            self.assertIn("(1, 1, tma_descs, bars, profile);", source)
+            self.assertIn("kCompiledProgramTemplate_0SMIds[2]", source)
+            self.assertIn("0, 1", source)
+            self.assertIn("<<<2, numThreads, smem_size, cuda_stream>>>", source)
 
 
 if __name__ == "__main__":

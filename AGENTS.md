@@ -17,7 +17,7 @@ This repository is a CUDA-heavy `dae` project with Python scheduling scripts and
 - Reference bootstrap is in `setup.sh`.
 - Typical dependencies: CUDA Toolkit 13.0.x, PyTorch CUDA 13.0 wheel, `numpy`, `transformers`, and `accelerate`.
 - Current build targets Hopper (`sm_90a`) in both `Makefile` and `setup.py`.
-- The project builds a CUDA extension via `make pyext`, linking `src/torch_runtime.cu` and `runtime.o`.
+- The project builds a CUDA extension via `make pyext`, refer to workflow for compilation failure issues. linking `src/torch_runtime.cu` and `runtime.o`.
 
 ## Agent Workspace
 

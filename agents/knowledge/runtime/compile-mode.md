@@ -27,7 +27,7 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
   - emits direct split-loop CUDA source with per-SM ALLOC, LDU, STU, and compute loops
   - writes `build/generated/dae/generated_compiled_runtime.cuh` for the CUDA extension build
   - launches through `runtime.launch_compiled_dae(...)` after `make pyext`
-  - currently launches one generated kernel per logical SM program on separate CUDA streams
+  - now launches one generated kernel grid per shared template on the caller stream, with `blockIdx.x` selecting the template member / logical SM
 
 ## CLI And Debugging
 
@@ -92,7 +92,7 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
 - Shared-template emission groups structurally equivalent SM programs together:
   - one generated template body per shape
   - per-SM scalar params in generated device arrays
-  - one kernel launch per SM, but shared code bodies across matching SMs
+  - one kernel grid launch per shared template, with one block per matching logical SM
 
 ## Current Limitations
 
@@ -111,19 +111,19 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
 
 ## Benchmarks
 
-- GEMV app benchmark on the current `compile_cuda` subset, 3 iterations:
-  - previous sample before code-size tuning:
-    - `interp`: `exec_ns=8256.00`
-    - `compile_ir`: `exec_ns=6954.67`
-    - `compile_cuda`: `exec_ns=279338.67`
-  - current sample after allocator-table codegen:
-    - `interp`: `exec_ns=8426.67`
-    - `compile_ir`: `exec_ns=6933.33`
-    - `compile_cuda`: `exec_ns=313429.33`
+- GEMV app benchmark on `app/python/gemv_out.py`, 10 iterations on 2026-04-04 after the launch/timing fix:
+  - `interp`: `exec_ns=7334.40`
+  - `compile_ir`: `exec_ns=6860.80`
+  - `compile_cuda`: `exec_ns=5968.00`
+- The large earlier `compile_cuda` regressions on GEMV were mostly a measurement artifact:
+  - the generated runtime launched one kernel per logical SM on separate streams
+  - `exec_ns` used `max(end) - min(start)`, so cross-stream launch skew showed up as fake device execution time
+  - moving to one grid launch per shared template removed that skew from the benchmark path for GEMV
+- The generated kernel now records its start timestamp after block-local runtime initialization, which avoids charging compile mode for setup work that interpreter mode had already excluded from its event window.
 - Synthetic one-layer llama32 dry-build benchmark, 3 iterations:
   - `interp`: `avg_execution_time_ns=238069.33`
   - `compile_ir`: `avg_execution_time_ns=236533.33`
-- The current direct CUDA backend is still slower than the interpreter on GEMV because it launches one generated kernel per SM program and has not yet eliminated the runtime overheads that V2 still carries today.
+- Host-visible wall time for `compile_cuda` is still slower than interpreter on GEMV, so the remaining optimization work is in the launch/runtime path rather than the measured device execution path.
 
 ## Code Size Reduction
 
@@ -131,10 +131,13 @@ These notes summarize the new compile-mode scaffolding added on the Python side.
   - allocator emission is now table-driven inside the generated ALLOC unit
   - repeated alloc-side runs become small local arrays plus a loop over `compiled_run_alloc_op(...)`
   - large generated ALLOC/LDU/STU template helpers are emitted `__noinline__`
+  - small generated ALLOC/LDU/STU helpers are emitted `__forceinline__` so short kernels such as `gemv_out` do not pay avoidable call / stack overhead
   - generated compute helpers stay inline, because making WGMMA compute noinline caused PTXAS function-boundary warnings and a worse GEMV result
 - Measured generated-source reduction versus the previous shared-template emitter:
   - GEMV compiled source: `149482 -> 143069` bytes
   - llama32 one-layer dry-build compiled source: `2510050 -> 2176179` bytes
+- The launch/timing fixes did not materially change GEMV generated-source size:
+  - `build/generated/gemv_out_compiled.cu`: `143069` bytes on 2026-04-04
 - Separate-compilation idea:
   - splitting by logical SM is probably too fine-grained now that shared-template grouping already collapses many SMs onto the same code body
   - if compile parallelism is needed later, splitting by shared template is the better next experiment than one translation unit per SM

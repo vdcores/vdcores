@@ -1733,11 +1733,15 @@ def _emit_shared_template_functions(
     template_id = template.template_id
     params_name = f"CompiledProgramTemplate_{template_id}Params"
     params_symbol = f"kCompiledProgramTemplate_{template_id}Params"
+    sm_ids_symbol = f"kCompiledProgramTemplate_{template_id}SMIds"
     alloc_lines, ldu0_lines, ldu1_lines, stu_lines, compute_lines = unit_lines
     uses_ldu0 = bool(ldu0_lines)
     uses_ldu1 = bool(ldu1_lines)
     param_values = [_template_param_values(program, schema) for program in template.members]
+    sm_ids = [program.sm_id for program in template.members]
     field_specs = schema if schema else (TemplateParamField(name="unused", ctype="int"),)
+    memory_unit_line_count = len(alloc_lines) + len(ldu0_lines) + len(ldu1_lines) + len(stu_lines)
+    memory_helper_qualifier = "__device__ __forceinline__" if memory_unit_line_count <= 24 else "__device__ __noinline__"
 
     lines = [
         f"struct {params_name} {{",
@@ -1751,15 +1755,22 @@ def _emit_shared_template_functions(
         ],
         "};",
         "",
+        f"static __device__ const int {sm_ids_symbol}[{len(template.members)}] = {{",
+        f"  {', '.join(str(sm_id) for sm_id in sm_ids)}",
+        "};",
+        "",
         f"struct CompiledProgramTemplate_{template_id} {{",
         f"  using Params = {params_name};",
         "  __device__ __forceinline__ static const Params &params(int program_index) {",
         f"    return {params_symbol}[program_index];",
         "  }",
+        "  __device__ __forceinline__ static int sm_id(int program_index) {",
+        f"    return {sm_ids_symbol}[program_index];",
+        "  }",
         "};",
         "",
         "template <typename M2CQueue, typename C2MQueue, typename LDQueue>",
-        f"__device__ __noinline__ void compiled_alloc_template_{template_id}(",
+        f"{memory_helper_qualifier} void compiled_alloc_template_{template_id}(",
         f"    const {params_name} &params,",
         "    int lane_id,",
         "    int *slot_avail,",
@@ -1782,7 +1793,7 @@ def _emit_shared_template_functions(
             "}",
             "",
             "template <typename M2CQueue, typename LDQueue>",
-            f"__device__ __noinline__ void compiled_ldu_template_{template_id}_0(",
+            f"{memory_helper_qualifier} void compiled_ldu_template_{template_id}_0(",
             f"    const {params_name} &params,",
             "    const void *smem_base,",
             "    const CUtensorMap *tma_descs,",
@@ -1814,7 +1825,7 @@ def _emit_shared_template_functions(
             "}",
             "",
             "template <typename M2CQueue, typename LDQueue>",
-            f"__device__ __noinline__ void compiled_ldu_template_{template_id}_1(",
+            f"{memory_helper_qualifier} void compiled_ldu_template_{template_id}_1(",
             f"    const {params_name} &params,",
             "    const void *smem_base,",
             "    const CUtensorMap *tma_descs,",
@@ -1846,7 +1857,7 @@ def _emit_shared_template_functions(
             "}",
             "",
             "template <typename C2MQueue>",
-            f"__device__ __noinline__ void compiled_stu_template_{template_id}(",
+            f"{memory_helper_qualifier} void compiled_stu_template_{template_id}(",
             f"    const {params_name} &params,",
             "    const void *smem_base,",
             "    const CUtensorMap *tma_descs,",
@@ -1892,6 +1903,9 @@ def _emit_shared_template_functions(
             f"  using Params = {params_name};",
             "  __device__ __forceinline__ static const Params &load_params(int program_index) {",
             f"    return CompiledProgramTemplate_{template_id}::params(program_index);",
+            "  }",
+            "  __device__ __forceinline__ static int load_sm_id(int program_index) {",
+            f"    return CompiledProgramTemplate_{template_id}::sm_id(program_index);",
             "  }",
             "  template <typename M2CQueue, typename C2MQueue, typename LDQueue>",
             "  __device__ __forceinline__ static void alloc(",
@@ -1960,11 +1974,7 @@ def _emit_kernel_body_wrapper(programs: tuple[SMProgramIR, ...]) -> list[str]:
     templates = _group_shared_program_templates(programs)
     template_entries = []
     smem_attr_entries = []
-    stream_decl_entries = []
-    stream_setup_entries = []
     launch_entries = []
-    sync_entries = []
-    destroy_entries = []
     for template in templates:
         schema, unit_lines = _template_param_schema_and_lines(template)
         template_entries.extend(_emit_shared_template_functions(template, schema, unit_lines))
@@ -1979,44 +1989,12 @@ def _emit_kernel_body_wrapper(programs: tuple[SMProgramIR, ...]) -> list[str]:
                 "  }",
             ]
         )
-        for program_index, program in enumerate(template.members):
-            sm_id = program.sm_id
-            launch_entries.append(
-                "  "
-                f"dae_compiled_sm_kernel<CompiledProgramTemplateRuntime_{template.template_id}>"
-                f"<<<1, numThreads, smem_size, launch_stream_{sm_id}>>>"
-                f"({sm_id}, {program_index}, tma_descs, bars, profile);"
-            )
-            stream_decl_entries.append(f"  cudaStream_t launch_stream_{sm_id} = nullptr;")
-            stream_setup_entries.extend(
-                [
-                    f"  err = cudaStreamCreateWithFlags(&launch_stream_{sm_id}, cudaStreamNonBlocking);",
-                    "  if (err != cudaSuccess) {",
-                    "    goto cleanup;",
-                    "  }",
-                    f"  err = cudaStreamWaitEvent(launch_stream_{sm_id}, launch_ready, 0);",
-                    "  if (err != cudaSuccess) {",
-                    "    goto cleanup;",
-                    "  }",
-                ]
-            )
-            sync_entries.extend(
-                [
-                    f"  if (launch_stream_{sm_id} != nullptr) {{",
-                    f"    cudaError_t stream_err = cudaStreamSynchronize(launch_stream_{sm_id});",
-                    "    if (err == cudaSuccess && stream_err != cudaSuccess) {",
-                    "      err = stream_err;",
-                    "    }",
-                    "  }",
-                ]
-            )
-            destroy_entries.extend(
-                [
-                    f"  if (launch_stream_{sm_id} != nullptr) {{",
-                    f"    cudaStreamDestroy(launch_stream_{sm_id});",
-                    "  }",
-                ]
-            )
+        launch_entries.append(
+            "  "
+            f"dae_compiled_sm_kernel<CompiledProgramTemplateRuntime_{template.template_id}>"
+            f"<<<{len(template.members)}, numThreads, smem_size, cuda_stream>>>"
+            f"(tma_descs, bars, profile);"
+        )
 
     wrapper = [
         "static constexpr bool kGeneratedRuntimeAvailable = true;",
@@ -2024,11 +2002,11 @@ def _emit_kernel_body_wrapper(programs: tuple[SMProgramIR, ...]) -> list[str]:
         *template_entries,
         "template <typename Program>",
         "__global__ void dae_compiled_sm_kernel(",
-        "    int compiled_sm_id,",
-        "    int program_index,",
         "    const CUtensorMap *__restrict__ tma_descs,",
         "    int *__restrict__ bars,",
         "    uint64_t *__restrict__ g_events) {",
+        "  int program_index = static_cast<int>(blockIdx.x);",
+        "  int compiled_sm_id = Program::load_sm_id(program_index);",
         "  int thread_id = threadIdx.x;",
         "  int warp_id = (thread_id % 128) / 32;",
         "  int lane_id = thread_id % 32;",
@@ -2040,8 +2018,6 @@ def _emit_kernel_body_wrapper(programs: tuple[SMProgramIR, ...]) -> list[str]:
         "  __shared__ uint64_t scratch_space[32];",
         "  __shared__ int compiled_reg_file[32];",
         "  if (thread_id == 0) {",
-        "    int event_base = compiled_sm_id * numProfileEvents;",
-        "    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();",
         "    slot_avail = (1U << numSlots) - 1;",
         "  }",
         "  if (thread_id < numSlots + numSpecialSlots) {",
@@ -2075,6 +2051,10 @@ def _emit_kernel_body_wrapper(programs: tuple[SMProgramIR, ...]) -> list[str]:
         "  extern __shared__ uint8_t shared_mem[];",
         "  void *smem_base = compiled_align_to((void*)shared_mem, 1024);",
         "  __syncthreads();",
+        "  if (thread_id == 0) {",
+        "    int event_base = compiled_sm_id * numProfileEvents;",
+        "    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();",
+        "  }",
         "  if (threadIdx.x < numComputeWarps * 32) {",
         "    Program::compute(params, compiled_sm_id, thread_id, smem_base, scratch_space, st_insts, g_events, m2c, c2m);",
         "    return;",
@@ -2114,31 +2094,8 @@ def _emit_kernel_body_wrapper(programs: tuple[SMProgramIR, ...]) -> list[str]:
         "    return cudaErrorInvalidValue;",
         "  }",
         "  cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);",
-        "  cudaError_t err = cudaSuccess;",
-        "  cudaEvent_t launch_ready = nullptr;",
-        *stream_decl_entries,
-        "  err = cudaEventCreateWithFlags(&launch_ready, cudaEventDisableTiming);",
-        "  if (err != cudaSuccess) {",
-        "    return err;",
-        "  }",
-        "  err = cudaEventRecord(launch_ready, cuda_stream);",
-        "  if (err != cudaSuccess) {",
-        "    cudaEventDestroy(launch_ready);",
-        "    return err;",
-        "  }",
-        *stream_setup_entries,
         *launch_entries,
-        "  err = cudaGetLastError();",
-        "  if (err != cudaSuccess) {",
-        "    goto cleanup;",
-        "  }",
-        *sync_entries,
-        "cleanup:",
-        "  if (launch_ready != nullptr) {",
-        "    cudaEventDestroy(launch_ready);",
-        "  }",
-        *destroy_entries,
-        "  return err == cudaSuccess ? cudaGetLastError() : err;",
+        "  return cudaGetLastError();",
         "}",
     ]
     return wrapper
