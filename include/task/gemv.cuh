@@ -90,10 +90,6 @@ __device__ __forceinline__ void task_gemv(
 
         // TODO(zhiyuang): move this before or after the commit?
         // currently putting here is better
-        if (i > 0) {
-            warpgroup_wait<0>();
-            c2m.push(thread_id, old_slots);
-        }
 
         auto sA = make_tensor(make_smem_ptr(sa), layout_sA);
         auto sB = make_tensor(make_smem_ptr(sb), layout_sB);
@@ -104,6 +100,11 @@ __device__ __forceinline__ void task_gemv(
         warpgroup_arrive();
         gemm(tiled_mma, frag_C, frag_A, frag_B, frag_C);   // C = A*B + C
         warpgroup_commit_batch();
+
+        if (i > 0) {
+            warpgroup_wait<1>();
+            c2m.push(thread_id, old_slots);
+        }
 
         if (thread_id == 0) {
             old_slots = slot_a;

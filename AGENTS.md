@@ -17,7 +17,7 @@ This repository is a CUDA-heavy `dae` project with Python scheduling scripts and
 - Reference bootstrap is in `setup.sh`.
 - Typical dependencies: CUDA Toolkit 13.0.x, PyTorch CUDA 13.0 wheel, `numpy`, `transformers`, and `accelerate`.
 - Current build targets Hopper (`sm_90a`) in both `Makefile` and `setup.py`.
-- The project builds a CUDA extension via `make pyext`, linking `src/torch_runtime.cu` and `runtime.o`.
+- The project builds a CUDA extension via `make pyext`, refer to workflow document when compile error happens. linking `src/torch_runtime.cu` and `runtime.o`.
 
 ## Agent Workspace
 
@@ -32,6 +32,11 @@ This repository is a CUDA-heavy `dae` project with Python scheduling scripts and
 - Check the repo state before editing so unrelated user changes are not described or overwritten.
 - Keep edits focused and fast when the task is a single requested implementation.
 - Prefer existing local reference helpers, especially under `app/python/llama3/`, over re-deriving model math.
+- Always refer to the runtime model and operator-semantics docs before reasoning about operator semantics, runtime changes, or the VDCores virtual machine:
+  - `agents/knowledge/runtime/README.md`
+  - `agents/knowledge/runtime/vdcores-vm-model.md`
+  - `agents/knowledge/runtime/vdcores-operator-semantics.md`
+  - `agents/workflows/runtime-vm-inspection.md`
 - Use `.agentlog/` for detailed task logs, verification notes, and environment blockers that do not belong in version control.
 - Use `agents/workflows/` to log durable project-specific workflow knowledge.
 - Update `agents/knowledge/` when you learn something structural or high-signal that will help later tasks.
@@ -43,15 +48,20 @@ When starting fresh in this repository:
 
 1. Check repo state with `git status --short` before editing.
 2. Read `README.md` and `AGENTS.md` to understand the runtime model, supported environment, and agent expectations.
-3. Inspect the relevant layout before making assumptions:
+3. If the task involves runtime internals, virtual-machine behavior, or instruction/operator semantics, read these before making assumptions:
+   - `agents/knowledge/runtime/README.md`
+   - `agents/knowledge/runtime/vdcores-vm-model.md`
+   - `agents/knowledge/runtime/vdcores-operator-semantics.md`
+   - `agents/workflows/runtime-vm-inspection.md`
+4. Inspect the relevant layout before making assumptions:
    `app/python/`, `python/dae/`, `include/dae/`, `include/task/`, `src/`, and `tests/`.
-4. If the task touches setup or build behavior, also inspect `Makefile`, `setup.py`, and `setup.sh`.
-5. Create or update agent notes:
+5. If the task touches setup or build behavior, also inspect `Makefile`, `setup.py`, and `setup.sh`.
+6. Create or update agent notes:
    - add a dated entry under `.agentlog/` for task-specific actions, verification, and blockers;
    - add or refine reusable guidance in `agents/workflows/`;
    - add structural or distilled high-signal notes in `agents/knowledge/` when new project understanding is gained;
    - summarize important changes and durable takeaways into tracked `agents/` files during the same task.
-6. Verify with the lightest meaningful check first and record any environment limitations in `.agentlog/`.
+7. Verify with the lightest meaningful check first and record any environment limitations in `.agentlog/`.
 
 ## Development And Test
 
