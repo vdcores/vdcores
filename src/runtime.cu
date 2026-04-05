@@ -53,8 +53,7 @@ cudaError_t launch_dae(
 cudaError_t launch_dae_compiled(
   int numSMs,
   size_t smem_size,
-  CInst* compute_instructions,
-  MInst* memory_instructions,
+  uint64_t* compiled_live_values,
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
@@ -63,8 +62,7 @@ cudaError_t launch_dae_compiled(
   cudaDeviceSynchronize();
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
   dae2_compiled<<<numSMs, numThreads, smem_size, cuda_stream>>>(
-    compute_instructions,
-    memory_instructions,
+    compiled_live_values,
     tma_descs,
     bars,
     profile

@@ -20,8 +20,7 @@ cudaError_t launch_dae(
 cudaError_t launch_dae_compiled(
   int numSMs,
   size_t smem_size,
-  CInst* compute_instructions,
-  MInst* memory_instructions,
+  uint64_t* compiled_live_values,
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,

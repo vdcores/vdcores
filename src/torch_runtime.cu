@@ -103,8 +103,7 @@ int py_launch_dae(
 int py_launch_dae_compiled(
     int64_t num_sms,
     size_t smem_size,
-    torch::Tensor compute_insts_bytes,
-    torch::Tensor memory_insts_bytes,
+    torch::Tensor compiled_live_values_bytes,
     torch::Tensor tma_descs_bytes,
     torch::Tensor bars_int32,
     torch::Tensor profile_u64,
@@ -114,15 +113,14 @@ int py_launch_dae_compiled(
 
   TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
 
-  auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");
-  auto minst = check_tensor_ptr<MInst>(memory_insts_bytes, "memory_insts_bytes");
+  auto live_values = check_tensor_ptr<uint64_t>(compiled_live_values_bytes, "compiled_live_values_bytes");
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
 
   cudaError_t st = launch_dae_compiled(
       static_cast<int>(num_sms), smem_size,
-      cinst, minst, tma,
+      live_values, tma,
       bars, prof, stream
   );
 
@@ -315,6 +313,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("compiled_program_enabled") = py::bool_(daeCompiledProgramEnabled);
   m.attr("compiled_program_hash") = py::str(daeCompiledProgramHash);
   m.attr("compiled_program_num_sms") = py::int_(daeCompiledProgramNumSms);
+  m.attr("compiled_program_live_value_count") = py::int_(daeCompiledProgramLiveValueCount);
 
   auto config = m.def_submodule("config", "DAE2 Configuration Constants");
   config.attr("slot_size") = slotSizeKb * 1024;

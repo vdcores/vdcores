@@ -12,10 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMPILED_SPEC_FILE = "dae_compiled_program.vdcore.json"
 COMPILED_SPEC_ENV = "DAE_COMPILED_SPEC_FILE"
 
-_ADDR_OPS = {
-    "OP_ALLOC_TMA_LOAD_1D",
-    "OP_ALLOC_WB_TMA_STORE_1D",
-}
 _LOAD_OPS = {
     "OP_ALLOC_TMA_LOAD_1D",
     "OP_ALLOC_TMA_LOAD_TENSOR_1D",
@@ -32,6 +28,11 @@ _WRITEBACK_OPS = {
     "OP_ALLOC_WB_TMA_STORE_5D_FIX0",
     "OP_ALLOC_WB_TMA_REDUCE_ADD_2D",
     "OP_ALLOC_WB_TMA_REDUCE_ADD_3D",
+}
+_SCALAR_ADDRESS_FIELD_BASE_OPS = {
+    "OP_ALLOC_TMA_LOAD_1D",
+    "OP_ALLOC_TMA_LOAD_TENSOR_1D",
+    "OP_ALLOC_WB_TMA_STORE_1D",
 }
 
 
@@ -52,36 +53,63 @@ def load_spec(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _emit_repeat_inst_expr(step: dict[str, object], indent: str) -> list[str]:
-    inst_index = step["inst_index"]
-    delta_seed_index = step["delta_seed_index"]
+def _u64_literal(value: int) -> str:
+    return f"{int(value)}ULL"
+
+
+def _compute_opcode_expr(name: str) -> str:
+    return name if "__" not in name else "0"
+
+
+def _emit_compute_inst_expr(entry: dict[str, object], indent: str) -> list[str]:
+    args = [0, 0, 0]
+    raw_args = [int(arg) for arg in entry.get("args", [])]
+    args[: len(raw_args)] = raw_args
+    return [
+        f"{indent}CInst inst = dae_make_compiled_cinst({_compute_opcode_expr(entry['name'])}, {args[0]}, {args[1]}, {args[2]});"
+    ]
+
+
+def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
     base_name = step["base_name"]
-    lines = [f"{indent}MInst inst = minsts[{inst_index}];"]
-    lines.append(f"{indent}const MInst &delta_inst = minsts[{delta_seed_index}];")
-    lines.append(f"{indent}if (__rep != 0) {{")
-    if base_name in _ADDR_OPS:
-        lines.append(f"{indent}  inst.address += static_cast<uint64_t>(__rep) * delta_inst.address;")
-    else:
-        lines.append(f"{indent}  inst.coords[0] += static_cast<uint16_t>(__rep * delta_inst.coords[0]);")
-        lines.append(f"{indent}  inst.coords[1] += static_cast<uint16_t>(__rep * delta_inst.coords[1]);")
-        lines.append(f"{indent}  inst.coords[2] += static_cast<uint16_t>(__rep * delta_inst.coords[2]);")
-        lines.append(f"{indent}  inst.coords[3] += static_cast<uint16_t>(__rep * delta_inst.coords[3]);")
-    lines.append(f"{indent}}}")
+    if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
+        if "live_address_index" in step:
+            address_expr = f"live_values[{int(step['live_address_index'])}]"
+        else:
+            address_expr = _u64_literal(int(step["address"]))
+        lines = [
+            f"{indent}MInst inst = dae_make_compiled_minst_address("
+            f"{base_name}, {int(step['size'])}, {int(step['nslot'])}, {int(step['arg'])}, {address_expr});"
+        ]
+        if "delta_address" in step and int(step["delta_address"]) != 0:
+            lines.append(
+                f"{indent}if (__rep != 0) inst.address += static_cast<uint64_t>(__rep) * {_u64_literal(int(step['delta_address']))};"
+            )
+        return lines
+
+    coords = [int(coord) for coord in step["coords"]]
+    lines = [
+        f"{indent}MInst inst = dae_make_compiled_minst_coords("
+        f"{base_name}, {int(step['size'])}, {int(step['nslot'])}, {int(step['arg'])}, "
+        f"{coords[0]}, {coords[1]}, {coords[2]}, {coords[3]});"
+    ]
+    delta_coords = step.get("delta_coords")
+    if delta_coords is not None:
+        for coord_index, delta in enumerate(delta_coords):
+            if int(delta) == 0:
+                continue
+            lines.append(
+                f"{indent}if (__rep != 0) inst.coords[{coord_index}] += static_cast<uint16_t>(__rep * {int(delta)});"
+            )
     return lines
-
-
-def _emit_linear_inst_expr(inst_index: int, indent: str) -> list[str]:
-    return [f"{indent}const MInst &inst = minsts[{inst_index}];"]
 
 
 def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -> None:
     if block["kind"] == "repeat":
-        count_seed_index = block["count_seed_index"]
-        lines.append(f"{indent}for (int __rep = 0; __rep < static_cast<int>(minsts[{count_seed_index}].size); ++__rep) {{")
+        lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
         for step in block["steps"]:
             lines.append(f"{indent}  {{")
-            inst_index = step["inst_index"]
-            lines.extend(_emit_linear_inst_expr(inst_index, indent + "    "))
+            lines.extend(_emit_memory_inst_expr(step, indent + "    "))
             lines.append(f"{indent}    int alloc_mask = 0;")
             lines.append(f"{indent}    int slot_alloc = -1;")
             lines.append(f"{indent}    while (true) {{")
@@ -90,10 +118,11 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
             lines.append(f"{indent}      __nanosleep(allocRetrySleepCycles);")
             lines.append(f"{indent}    }}")
             lines.append(f"{indent}    if (lane_id == 0) {{")
+            lines.append(f"{indent}      st_insts[slot_alloc] = inst;")
             lines.append(f"{indent}      m2c.put(alloc_mask);")
             lines.append(f"{indent}      CompiledLdCmd ld;")
             lines.append(f"{indent}      ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
-            lines.append(f"{indent}      auto &curld = m2ld[(inst.opcode & MEM_OP_FLAGS_PORT) ? 1 : 0];")
+            lines.append(f"{indent}      auto &curld = m2ld[0];")
             lines.append(f"{indent}      curld.put(ld.raw);")
             lines.append(f"{indent}      m2c.advance();")
             lines.append(f"{indent}      curld.commit();")
@@ -105,8 +134,7 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
 
     if block["kind"] == "op":
         lines.append(f"{indent}{{")
-        inst_index = block["inst_index"]
-        lines.extend(_emit_linear_inst_expr(inst_index, indent + "  "))
+        lines.extend(_emit_memory_inst_expr(block, indent + "  "))
         lines.append(f"{indent}  int alloc_mask = 0;")
         lines.append(f"{indent}  int slot_alloc = -1;")
         lines.append(f"{indent}  while (true) {{")
@@ -115,10 +143,11 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
         lines.append(f"{indent}    __nanosleep(allocRetrySleepCycles);")
         lines.append(f"{indent}  }}")
         lines.append(f"{indent}  if (lane_id == 0) {{")
+        lines.append(f"{indent}    st_insts[slot_alloc] = inst;")
         lines.append(f"{indent}    m2c.put(alloc_mask);")
         lines.append(f"{indent}    CompiledLdCmd ld;")
         lines.append(f"{indent}    ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
-        lines.append(f"{indent}    auto &curld = m2ld[(inst.opcode & MEM_OP_FLAGS_PORT) ? 1 : 0];")
+        lines.append(f"{indent}    auto &curld = m2ld[0];")
         lines.append(f"{indent}    curld.put(ld.raw);")
         lines.append(f"{indent}    m2c.advance();")
         lines.append(f"{indent}    curld.commit();")
@@ -144,7 +173,7 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f"{indent}  CompiledLdCmd cmd {{}};")
         lines.append(f"{indent}  cmd.raw = m2ld.pop();")
         lines.append(f"{indent}  if (cmd.slot == SLOT_END) {{ assert(false && \"compiled ld step terminated early\"); return; }}")
-        lines.extend(_emit_repeat_inst_expr(step, indent + "  ") if "delta_seed_index" in step else _emit_linear_inst_expr(step["inst_index"], indent + "  "))
+        lines.extend(_emit_memory_inst_expr(step, indent + "  "))
         if base_name == "OP_ALLOC_TMA_LOAD_1D":
             lines.append(f"{indent}  cuda::device::memcpy_async_tx(")
             lines.append(f"{indent}      static_cast<char *>(get_slot_address(smem_base, cmd.slot)),")
@@ -231,21 +260,16 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
     raise ValueError(f"Unsupported LDU step {base_name}")
 
 
-def _emit_ld_program(blocks: list[dict[str, object]], port_id: int, lines: list[str], indent: str) -> None:
+def _emit_ld_program(blocks: list[dict[str, object]], lines: list[str], indent: str) -> None:
     for block in blocks:
         if block["kind"] == "repeat":
-            port_steps = [step for step in block["steps"] if step.get("port", 0) == port_id]
-            if not port_steps:
-                continue
-            count_seed_index = block["count_seed_index"]
-            lines.append(f"{indent}for (int __rep = 0; __rep < static_cast<int>(minsts[{count_seed_index}].size); ++__rep) {{")
-            for step in port_steps:
+            lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
+            for step in block["steps"]:
                 _emit_ld_step(step, lines, indent + "  ")
             lines.append(f"{indent}}}")
             continue
         if block["kind"] == "op":
-            if block.get("port", 0) == port_id:
-                _emit_ld_step(block, lines, indent)
+            _emit_ld_step(block, lines, indent)
             continue
     lines.append(f"{indent}CompiledLdCmd __done {{}};")
     lines.append(f"{indent}__done.raw = m2ld.pop();")
@@ -258,7 +282,7 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
     lines.append(f"{indent}  int slot_mask = c2m.pop();")
     lines.append(f"{indent}  if (!slot_mask) {{ assert(false && \"compiled st step terminated early\"); return; }}")
     lines.append(f"{indent}  int slot = extract(slot_mask);")
-    lines.extend(_emit_repeat_inst_expr(step, indent + "  ") if "delta_seed_index" in step else _emit_linear_inst_expr(step["inst_index"], indent + "  "))
+    lines.extend(_emit_memory_inst_expr(step, indent + "  "))
     if base_name == "OP_ALLOC_WB_TMA_STORE_1D":
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk(")
         lines.append(f"{indent}    cuda::ptx::space_global,")
@@ -355,7 +379,7 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
                 write_blocks.append(
                     {
                         "kind": "repeat",
-                        "count_seed_index": block["count_seed_index"],
+                        "count": block["count"],
                         "steps": steps,
                     }
                 )
@@ -367,7 +391,7 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
         return
     for block in write_blocks:
         if block["kind"] == "repeat":
-            lines.append(f"{indent}for (int __rep = 0; __rep < static_cast<int>(minsts[{block['count_seed_index']}].size); ++__rep) {{")
+            lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
             for step in block["steps"]:
                 _emit_st_step(step, lines, indent + "  ")
             lines.append(f"{indent}}}")
@@ -384,16 +408,29 @@ def generate_enabled(spec: dict[str, object]) -> str:
         "",
         "static constexpr bool daeCompiledProgramEnabled = true;",
         f'static constexpr const char *daeCompiledProgramHash = "{spec["hash"]}";',
-        f'static constexpr int daeCompiledProgramNumSms = {spec["num_sms"]};',
+        f'static constexpr int daeCompiledProgramNumSms = {int(spec["num_sms"])};',
+        f'static constexpr int daeCompiledProgramLiveValueCount = {int(spec.get("num_live_values", 0))};',
         "",
         "static __device__ __forceinline__ int dae_compiled_program_id_for_sm(int sm_id) {",
         "  switch (sm_id) {",
     ]
     for sm_id, program_id in enumerate(spec["sm_program_ids"]):
-        lines.append(f"    case {sm_id}: return {program_id};")
+        lines.append(f"    case {sm_id}: return {int(program_id)};")
     lines.extend(
         [
             "    default: return -1;",
+            "  }",
+            "}",
+            "",
+            "static __device__ __forceinline__ int dae_compiled_live_offset_for_sm(int sm_id) {",
+            "  switch (sm_id) {",
+        ]
+    )
+    for sm_id, live_offset in enumerate(spec.get("sm_live_offsets", [])):
+        lines.append(f"    case {sm_id}: return {int(live_offset)};")
+    lines.extend(
+        [
+            "    default: return 0;",
             "  }",
             "}",
             "",
@@ -401,7 +438,6 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "static __device__ __forceinline__ void dae_compiled_compute_execute(",
             "  int sm_id,",
             "  int thread_id,",
-            "  const CInst *cinsts,",
             "  void *smem_base,",
             "  uint64_t *scratch_space,",
             "  MInst *st_insts,",
@@ -416,12 +452,15 @@ def generate_enabled(spec: dict[str, object]) -> str:
         ]
     )
     for program in spec["programs"]:
-        lines.append(f'    case {program["program_id"]}: {{')
+        lines.append(f"    case {int(program['program_id'])}: {{")
         for entry in program["compute"]:
-            idx = entry["index"]
-            name = entry["name"]
-            lines.append(f"      pc = {idx + 1};")
-            lines.append(f"      {{ const CInst &inst = cinsts[{idx}]; dae_compute_handler_{name}(sm_id, thread_id, pc, count, finish, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events); }}")
+            lines.append("      {")
+            lines.append(f"        pc = {int(entry['index']) + 1};")
+            lines.extend(_emit_compute_inst_expr(entry, "        "))
+            lines.append(
+                f"        dae_compute_handler_{entry['name']}(sm_id, thread_id, pc, count, finish, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events);"
+            )
+            lines.append("      }")
         lines.append("      break;")
         lines.append("    }")
     lines.extend(
@@ -436,7 +475,8 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "  int lane_id,",
             "  M2CQueue &m2c,",
             "  M2LDQueue m2ld[2],",
-            "  const MInst *minsts,",
+            "  MInst *st_insts,",
+            "  const uint64_t *live_values,",
             "  int *flags",
             ") {",
             "  SharedMemoryAllocator<numSlots> alloc;",
@@ -445,7 +485,7 @@ def generate_enabled(spec: dict[str, object]) -> str:
         ]
     )
     for program in spec["programs"]:
-        lines.append(f'    case {program["program_id"]}: {{')
+        lines.append(f"    case {int(program['program_id'])}: {{")
         for block in program["memory"]:
             _emit_alloc_block(block, lines, "      ")
         lines.append("      break;")
@@ -459,10 +499,9 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "template <typename M2LDQueue, typename M2CQueue>",
             "static __device__ __forceinline__ void dae_compiled_ld_execute(",
             "  int sm_id,",
-            "  int port_id,",
             "  M2LDQueue &m2ld,",
             "  M2CQueue &m2c,",
-            "  const MInst *minsts,",
+            "  const uint64_t *live_values,",
             "  const void *smem_base,",
             "  const CUtensorMap *tma_descs,",
             "  int *bars",
@@ -472,30 +511,8 @@ def generate_enabled(spec: dict[str, object]) -> str:
         ]
     )
     for program in spec["programs"]:
-        lines.append(f'    case {program["program_id"]}: {{')
-        port_blocks = []
-        for block in program["memory"]:
-            if block["kind"] == "repeat":
-                port_blocks.append(
-                    {
-                        "kind": "repeat",
-                        "count_seed_index": block["count_seed_index"],
-                        "steps": [
-                            {
-                                **step,
-                                "port": 1 if step.get("port1") else 0,
-                            }
-                            for step in block["steps"]
-                        ],
-                    }
-                )
-            else:
-                port_blocks.append({**block, "port": 1 if block.get("port1") else 0})
-        lines.append("      if (port_id == 0) {")
-        _emit_ld_program(port_blocks, 0, lines, "        ")
-        lines.append("      } else {")
-        _emit_ld_program(port_blocks, 1, lines, "        ")
-        lines.append("      }")
+        lines.append(f"    case {int(program['program_id'])}: {{")
+        _emit_ld_program(program["memory"], lines, "      ")
         lines.append("      break;")
         lines.append("    }")
     lines.extend(
@@ -508,7 +525,7 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "static __device__ __forceinline__ void dae_compiled_st_execute(",
             "  int sm_id,",
             "  C2MQueue &c2m,",
-            "  const MInst *minsts,",
+            "  const uint64_t *live_values,",
             "  const void *smem_base,",
             "  const CUtensorMap *tma_descs,",
             "  int *bars",
@@ -518,7 +535,7 @@ def generate_enabled(spec: dict[str, object]) -> str:
         ]
     )
     for program in spec["programs"]:
-        lines.append(f'    case {program["program_id"]}: {{')
+        lines.append(f"    case {int(program['program_id'])}: {{")
         _emit_st_program(program["memory"], lines, "      ")
         lines.append("      break;")
         lines.append("    }")
@@ -542,6 +559,11 @@ def generate_disabled(source: str) -> str:
             "static constexpr bool daeCompiledProgramEnabled = false;",
             'static constexpr const char *daeCompiledProgramHash = "";',
             "static constexpr int daeCompiledProgramNumSms = 0;",
+            "static constexpr int daeCompiledProgramLiveValueCount = 0;",
+            "",
+            "static __device__ __forceinline__ int dae_compiled_live_offset_for_sm(int) {",
+            "  return 0;",
+            "}",
             "",
             "template <typename... Args>",
             "static __device__ __forceinline__ void dae_compiled_compute_execute(Args&&...) {",

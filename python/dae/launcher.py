@@ -1,7 +1,13 @@
 from . import runtime
 from .instruction_utils import decode_opcode, dedcode_opcode
 from .instructions import *
-from .compiled_mode import build_compiled_spec, compiled_spec_hash, write_compiled_spec as write_compiled_spec_file
+from .compiled_mode import (
+    build_compiled_live_values,
+    build_compiled_runtime_bundle,
+    build_compiled_spec,
+    compiled_spec_hash,
+    write_compiled_spec as write_compiled_spec_file,
+)
 from .runtime import config, opcode
 from .tma_utils import *
 
@@ -306,6 +312,9 @@ class Launcher:
     def compiled_spec(self) -> dict:
         return build_compiled_spec(self)
 
+    def compiled_live_values(self) -> list[int]:
+        return build_compiled_live_values(self)
+
     def compiled_program_hash(self) -> str:
         return self.compiled_spec()["hash"]
 
@@ -394,10 +403,12 @@ class Launcher:
         if unbound_bar_ids:
             raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
 
+        compiled_bundle = None
         if self.mode == "compiled":
             if not getattr(runtime, "compiled_program_enabled", False):
                 raise ValueError("Compiled mode requested, but dae.runtime was built without a compiled program")
-            current_spec = self.compiled_spec()
+            compiled_bundle = build_compiled_runtime_bundle(self)
+            current_spec = compiled_bundle["spec"]
             runtime_hash = getattr(runtime, "compiled_program_hash", "")
             if current_spec["hash"] != runtime_hash:
                 raise ValueError(
@@ -411,11 +422,19 @@ class Launcher:
                     f"Compiled mode num_sms mismatch: launcher={self.num_sms}, runtime={runtime_num_sms}"
                 )
 
-        self.build_instructions()
-
-        # Load the model using the runtime
-        cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
-        minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
+        cinsts = None
+        minsts = None
+        compiled_live_values = None
+        if self.mode == "compiled":
+            live_values = compiled_bundle["live_values"] if compiled_bundle is not None else []
+            if len(live_values) == 0:
+                compiled_live_values = torch.empty((0, 8), dtype=torch.uint8, device=self.device)
+            else:
+                compiled_live_values = torch.tensor(live_values, dtype=torch.uint64, device=self.device).view(torch.uint8).view(-1, 8)
+        else:
+            self.build_instructions()
+            cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
+            minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
 
         stream = torch.cuda.current_stream().cuda_stream
         # TODO(zhiyuang): check this?
@@ -437,17 +456,25 @@ class Launcher:
 
         runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
         runtime.set_cache_policy(tma, stream, 1, 2, 0)
-        for i in range(self.num_sms // 4):
-            runtime.set_cache_policy(cinsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
-            runtime.set_cache_policy(minsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
-
-        launch_fn = runtime.launch_dae_compiled if self.mode == "compiled" else runtime.launch_dae
-        ret = launch_fn(
-            self.num_sms, self.smem_size,
-            cinsts, minsts, tma,
-            self.bars, profile,
-            stream
-        )
+        if self.mode == "compiled":
+            if compiled_live_values.numel() > 0:
+                runtime.set_cache_policy(compiled_live_values, stream, 1, 2, 0)
+            ret = runtime.launch_dae_compiled(
+                self.num_sms, self.smem_size,
+                compiled_live_values, tma,
+                self.bars, profile,
+                stream
+            )
+        else:
+            for i in range(self.num_sms // 4):
+                runtime.set_cache_policy(cinsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
+                runtime.set_cache_policy(minsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
+            ret = runtime.launch_dae(
+                self.num_sms, self.smem_size,
+                cinsts, minsts, tma,
+                self.bars, profile,
+                stream
+            )
         assert ret == 0
 
     def compute_operator_names(self) -> list[str]:

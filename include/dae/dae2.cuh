@@ -179,8 +179,7 @@ void dae2(
 
 static __global__
 void dae2_compiled(
-  const CInst* __restrict__ compute_instructions,
-  const MInst* __restrict__ memory_instructions,
+  const uint64_t* __restrict__ compiled_live_values,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
   uint64_t *  __restrict__ g_events
@@ -189,25 +188,6 @@ void dae2_compiled(
   int thread_id = threadIdx.x;
   int warp_id = (thread_id % 128) / 32;
   int lane_id = thread_id % 32;
-
-  const CInst* __restrict__ cinsts;
-  const MInst* __restrict__ minsts;
-
-  if constexpr (dae2LoadInstructions) {
-    __shared__ CInst smem_cinsts[numInsts];
-    __shared__ MInst smem_minsts[numInsts];
-
-    for (int i = thread_id; i < numInsts; i += blockDim.x) {
-      smem_cinsts[i] = compute_instructions[sm_id * numInsts + i];
-      smem_minsts[i] = memory_instructions[sm_id * numInsts + i];
-    }
-
-    cinsts = smem_cinsts;
-    minsts = smem_minsts;
-  } else {
-    cinsts = compute_instructions + sm_id * numInsts;
-    minsts = memory_instructions + sm_id * numInsts;
-  }
 
   constexpr int numQueueElements = 32;
   __shared__ MInst st_insts[numSlots + numSpecialSlots];
@@ -244,6 +224,7 @@ void dae2_compiled(
   extern __shared__ uint8_t shared_mem[];
   void * smem_base = align_to((void*)shared_mem, 1024);
   __shared__ uint64_t scratch_space[32];
+  const uint64_t *sm_live_values = compiled_live_values + dae_compiled_live_offset_for_sm(sm_id);
 
   if (threadIdx.x == 0) {
     int event_base = sm_id * numProfileEvents;
@@ -256,7 +237,6 @@ void dae2_compiled(
     dae_compiled_compute_execute(
       sm_id,
       thread_id,
-      cinsts,
       smem_base,
       scratch_space,
       st_insts,
@@ -271,7 +251,8 @@ void dae2_compiled(
         lane_id,
         m2c,
         m2ld,
-        minsts,
+        st_insts,
+        sm_live_values,
         &slot_avail
       );
     } else if (warp_id == 1) {
@@ -279,7 +260,7 @@ void dae2_compiled(
         dae_compiled_st_execute(
           sm_id,
           c2m,
-          minsts,
+          sm_live_values,
           smem_base,
           tma_descs,
           bars
@@ -290,10 +271,9 @@ void dae2_compiled(
         int port_id = warp_id - 2;
         dae_compiled_ld_execute(
           sm_id,
-          port_id,
           m2ld[port_id],
           m2c,
-          minsts,
+          sm_live_values,
           smem_base,
           tma_descs,
           bars
