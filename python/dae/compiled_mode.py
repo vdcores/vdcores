@@ -42,12 +42,6 @@ _SCALAR_ADDRESS_FIELD_BASE_OPS = {
     "OP_ALLOC_WB_TMA_STORE_1D",
 }
 
-_LIVE_ADDRESS_BASE_OPS = {
-    "OP_ALLOC_TMA_LOAD_1D",
-    "OP_ALLOC_WB_TMA_STORE_1D",
-}
-
-
 def _memory_base_opcode_name(inst: MemoryInstruction) -> str:
     return decode_opcode(inst.opcode & ~_MEM_DYNAMIC_FLAG_MASK)
 
@@ -104,7 +98,7 @@ def _encode_memory_fields(
     inst_index: int,
     inst: MemoryInstruction,
     base_name: str,
-    live_values: list[int],
+    payload_values: list[int],
 ) -> dict[str, object]:
     encoded = {
         "source_index": inst_index,
@@ -117,21 +111,19 @@ def _encode_memory_fields(
 
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
         raw_value = int(cords2addr(inst.cords))
-        if base_name in _LIVE_ADDRESS_BASE_OPS:
-            encoded["live_address_index"] = len(live_values)
-            live_values.append(raw_value)
-        else:
-            encoded["address"] = raw_value
+        encoded["address_payload_index"] = len(payload_values)
+        payload_values.append(raw_value)
         return encoded
 
-    encoded["coords"] = [int(coord) for coord in inst.cords]
+    encoded["coords_payload_index"] = len(payload_values)
+    payload_values.extend(int(coord) for coord in inst.cords)
     return encoded
 
 
 def _make_linear_step(
     inst_index: int,
     inst: MemoryInstruction,
-    live_values: list[int],
+    payload_values: list[int],
 ) -> dict[str, object]:
     base_name = _memory_base_opcode_name(inst)
     flags = _memory_flags(inst)
@@ -147,7 +139,7 @@ def _make_linear_step(
         raise ValueError(f"Compiled mode does not yet support PORT1 loads: minst[{inst_index}]")
     return {
         "kind": "op",
-        **_encode_memory_fields(inst_index, inst, base_name, live_values),
+        **_encode_memory_fields(inst_index, inst, base_name, payload_values),
     }
 
 
@@ -160,7 +152,7 @@ def _repeat_delta(seed_inst: MemoryInstruction, base_name: str) -> dict[str, obj
 def _parse_repeat_block(
     minsts: list[MemoryInstruction],
     start: int,
-    live_values: list[int],
+    payload_values: list[int],
 ) -> tuple[dict[str, object], int]:
     seed_ranges: list[tuple[MemoryInstruction, int, int, int]] = []
     cursor = start
@@ -219,7 +211,7 @@ def _parse_repeat_block(
 
         seed_inst, seed_index = matched_seed
         step = {
-            **_encode_memory_fields(cursor, inst, base_name, live_values),
+            **_encode_memory_fields(cursor, inst, base_name, payload_values),
             "delta_source_index": seed_index,
             **_repeat_delta(seed_inst, base_name),
         }
@@ -235,7 +227,7 @@ def _parse_repeat_block(
 
 def _validate_memory_stream(
     minsts: list[MemoryInstruction],
-    live_values: list[int],
+    payload_values: list[int],
 ) -> list[dict[str, object]]:
     blocks: list[dict[str, object]] = []
     cursor = 0
@@ -243,7 +235,7 @@ def _validate_memory_stream(
         inst = minsts[cursor]
         base_name = _memory_base_opcode_name(inst)
         if base_name == "OP_REPEAT":
-            block, cursor = _parse_repeat_block(minsts, cursor, live_values)
+            block, cursor = _parse_repeat_block(minsts, cursor, payload_values)
             blocks.append(block)
             continue
         if base_name == "OP_TERMINATE":
@@ -253,7 +245,7 @@ def _validate_memory_stream(
             blocks.append({"kind": "terminate", "source_index": cursor})
             cursor += 1
             continue
-        blocks.append(_make_linear_step(cursor, inst, live_values))
+        blocks.append(_make_linear_step(cursor, inst, payload_values))
         cursor += 1
     if not blocks or blocks[-1]["kind"] != "terminate":
         raise ValueError("Compiled mode requires a terminating memory instruction")
@@ -262,13 +254,13 @@ def _validate_memory_stream(
 
 def _program_structure(builder) -> tuple[dict[str, object], list[int]]:
     cinsts, minsts = _builder_stream(builder)
-    live_values: list[int] = []
+    payload_values: list[int] = []
     program = {
         "compute": _validate_compute_stream(cinsts),
-        "memory": _validate_memory_stream(minsts, live_values),
-        "num_live_values": len(live_values),
+        "memory": _validate_memory_stream(minsts, payload_values),
+        "num_live_values": len(payload_values),
     }
-    return program, live_values
+    return program, payload_values
 
 
 def _canonical_program_key(program: dict[str, object]) -> str:

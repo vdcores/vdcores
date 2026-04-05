@@ -70,11 +70,47 @@ def _emit_compute_inst_expr(entry: dict[str, object], indent: str) -> list[str]:
     ]
 
 
+def _payload_scalar_var(index: int) -> str:
+    return f"__payload_u64_{index}"
+
+
+def _payload_coord_var(index: int, coord: int) -> str:
+    return f"__payload_u16_{index}_{coord}"
+
+
+def _payload_indices_for_step(step: dict[str, object]) -> list[int]:
+    indices: list[int] = []
+    if "address_payload_index" in step:
+        indices.append(int(step["address_payload_index"]))
+    if "coords_payload_index" in step:
+        base = int(step["coords_payload_index"])
+        indices.extend(base + coord for coord in range(4))
+    return indices
+
+
+def _emit_payload_cache(step_list: list[dict[str, object]], lines: list[str], indent: str) -> None:
+    seen: set[int] = set()
+    for step in step_list:
+        for index in _payload_indices_for_step(step):
+            if index in seen:
+                continue
+            seen.add(index)
+            lines.append(f"{indent}const uint64_t {_payload_scalar_var(index)} = live_values[{index}];")
+    for step in step_list:
+        if "coords_payload_index" not in step:
+            continue
+        base = int(step["coords_payload_index"])
+        for coord in range(4):
+            lines.append(
+                f"{indent}const uint16_t {_payload_coord_var(base, coord)} = static_cast<uint16_t>({_payload_scalar_var(base + coord)});"
+            )
+
+
 def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
     base_name = step["base_name"]
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
-        if "live_address_index" in step:
-            address_expr = f"live_values[{int(step['live_address_index'])}]"
+        if "address_payload_index" in step:
+            address_expr = _payload_scalar_var(int(step["address_payload_index"]))
         else:
             address_expr = _u64_literal(int(step["address"]))
         lines = [
@@ -87,7 +123,11 @@ def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
             )
         return lines
 
-    coords = [int(coord) for coord in step["coords"]]
+    if "coords_payload_index" in step:
+        base = int(step["coords_payload_index"])
+        coords = [_payload_coord_var(base, coord) for coord in range(4)]
+    else:
+        coords = [str(int(coord)) for coord in step["coords"]]
     lines = [
         f"{indent}MInst inst = dae_make_compiled_minst_coords("
         f"{base_name}, {int(step['size'])}, {int(step['nslot'])}, {int(step['arg'])}, "
@@ -261,6 +301,13 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
 
 
 def _emit_ld_program(blocks: list[dict[str, object]], lines: list[str], indent: str) -> None:
+    step_list: list[dict[str, object]] = []
+    for block in blocks:
+        if block["kind"] == "repeat":
+            step_list.extend(step for step in block["steps"] if step["base_name"] in _LOAD_OPS)
+        elif block["kind"] == "op" and block["base_name"] in _LOAD_OPS:
+            step_list.append(block)
+    _emit_payload_cache(step_list, lines, indent)
     for block in blocks:
         if block["kind"] == "repeat":
             lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
@@ -385,6 +432,13 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
                 )
         elif block["kind"] == "op" and block["writeback"]:
             write_blocks.append(block)
+    step_list: list[dict[str, object]] = []
+    for block in write_blocks:
+        if block["kind"] == "repeat":
+            step_list.extend(block["steps"])
+        else:
+            step_list.append(block)
+    _emit_payload_cache(step_list, lines, indent)
     if not write_blocks:
         lines.append(f"{indent}int __done = c2m.pop();")
         lines.append(f"{indent}assert(__done == 0 && \"compiled st expected terminate sentinel\");")
@@ -486,6 +540,13 @@ def generate_enabled(spec: dict[str, object]) -> str:
     )
     for program in spec["programs"]:
         lines.append(f"    case {int(program['program_id'])}: {{")
+        alloc_steps: list[dict[str, object]] = []
+        for block in program["memory"]:
+            if block["kind"] == "repeat":
+                alloc_steps.extend(block["steps"])
+            elif block["kind"] == "op":
+                alloc_steps.append(block)
+        _emit_payload_cache(alloc_steps, lines, "      ")
         for block in program["memory"]:
             _emit_alloc_block(block, lines, "      ")
         lines.append("      break;")

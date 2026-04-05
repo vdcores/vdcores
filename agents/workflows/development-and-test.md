@@ -114,6 +114,8 @@ Typical Python-only areas include:
 - The compiled-mode AOT flow is now: emit a structural manifest with `--write-compiled-spec [path]`, rebuild with `make pyext` or `DAE_COMPILED_SPEC_FILE=... make pyext`, then run the app with `--mode compiled`; `Launcher.launch()` rejects hash or `num_sms` mismatches before launching the compiled kernel.
 - Compiled-mode rebuilds are not safe to run in parallel from the same repo checkout: each `make pyext` rewrites the shared generated includes under `build/generated/dae/`, so verify one compiled spec at a time.
 - `tools/generate_selected_compute_ops.py` now prefers a compiled spec over the repo-root `dae_compute_ops.vdcore.build` file when `DAE_COMPILED_SPEC_FILE` or `dae_compiled_program.vdcore.json` is present, so compiled builds pick the compute-op set required by the generated program instead of a stale default list.
+- For current compiled-mode GEMV schedules, structurally identical per-SM streams now deduplicate after spec export because per-SM address / coord seeds live in the compact payload instead of the structural manifest. If a new schedule still explodes into many generated programs, inspect the spec for accidentally baked per-SM fields first.
+- Generated compiled ALLOC/LDU/STU programs now treat the compact payload as read-only and hoist each referenced `live_values[...]` slot into a local once per role program. When tuning generated code, prefer encoding repeat deltas in the spec and reusing cached payload locals over re-reading the same payload index inside a loop.
 - `.github/workflows/docker-image.yml` builds the repo image on GitHub Actions and pushes it to Docker Hub. It expects repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, and publishes both `latest` and short-SHA tags under `docker.io/<DOCKERHUB_USERNAME>/vdcores`.
 - For family-backed compute instructions such as the new canonical GEMV strings, `-w` writes the family string directly; after changing that file you must rebuild `dae.runtime` before those instructions can serialize successfully, because opcode resolution happens lazily through the rebuilt `runtime.opcode` export.
 - For GEMV-family support specifically, `include/dae/opcode.cuh.inc` now declares only family rules, not checked-in GEMV instances. The concrete canonical GEMV strings still come from Python or `-w`, and `make pyext` materializes only those requested instances into the generated opcode/handler includes before the unchanged Python GEMV wrappers can run.
@@ -157,6 +159,7 @@ python app/python/tmacopy.py --mode compiled -l
 ```
 
 - The MMA GEMV harness defaults to `M=4096`, `K=4096`, and `N=8`, and supports quick smaller checks through `GEMV_M`, `GEMV_K`, and `GEMV_SMS`.
+- The GEMV benchmark harnesses (`app/python/gemv_out.py`, `app/python/gemv_mma_out.py`) currently reuse their output tensors across `-b N` iterations, so the diff/checksum printed at the end of a benchmark run is not a correctness signal. Use `-l` for correctness validation and use `-b` only for timing comparisons unless the harness is updated to reset outputs between iterations.
 - Before performance benchmarking `app/python/llama32_1b/sched.py`, clear leftover Python workers with `killall python || true`; stale decode jobs can distort both timing and apparent correctness.
 - Never run GPU performance benchmarks in parallel. For this repo, credible timing comes from sequential runs only; overlapping jobs contend for the device and can corrupt both throughput numbers and debugging conclusions.
 - For risky multi-token or partial-stage experiments on the Llama 3.2 1B path, prefer `tests/script/run_with_launch_timeout.py` first to separate deadlocks from slow-but-completing schedules.
@@ -175,6 +178,16 @@ On 2026-04-04:
 - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/tmacopy_compiled_spec.json make pyext && python app/python/tmacopy.py --mode compiled -l`: succeeded with `0.0%` average diff
 - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mma_out_compiled_spec.json make pyext && python app/python/gemv_mma_out.py --mode compiled -l`: succeeded with `0.0%` average diff
 - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_out_compiled_spec.json make pyext && python app/python/gemv_out.py --mode compiled -l`: succeeded with `0.1662%` average diff
+- Fresh optimized compiled-spec inspection:
+  - `python app/python/gemv_mma_out.py --write-compiled-spec build/generated/gemv_mma_out_compiled_spec.json`: produced `1` shared program for `64` SMs with `768` compact payload values
+  - `python app/python/gemv_out.py --write-compiled-spec build/generated/gemv_out_compiled_spec.json`: produced `1` shared program for `128` SMs with `3072` compact payload values
+- GEMV timing comparison after payload dedupe and hoisting:
+  - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_out_compiled_spec.json make pyext`: succeeded
+  - `python app/python/gemv_out.py -b 20`: `Average duration (ns): 6520.55`, `Average execution time (ns): 7257.60`
+  - `python app/python/gemv_out.py --mode compiled -b 20`: `Average duration (ns): 5604.29`, `Average execution time (ns): 6147.20`
+  - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mma_out_compiled_spec.json make pyext`: succeeded
+  - `python app/python/gemv_mma_out.py -b 20`: `Average duration (ns): 18805.30`, `Average execution time (ns): 19353.60`
+  - `python app/python/gemv_mma_out.py --mode compiled -b 20`: `Average duration (ns): 17711.88`, `Average execution time (ns): 18072.00`
 - Inline negative legality check with `IssueBarrier(0)` failed as expected during spec export with `ValueError: Compiled mode does not support memory op OP_ISSUE_BARRIER at minst[0]`
 
 On 2026-03-21:
