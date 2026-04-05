@@ -268,16 +268,27 @@ void dae2_compiled(
       }
     } else if (warp_id >= 2) {
       if (lane_id == 0) {
-        int port_id = warp_id - 2;
-        dae_compiled_ld_execute(
-          sm_id,
-          m2ld[port_id],
-          m2c,
-          sm_live_values,
-          smem_base,
-          tma_descs,
-          bars
-        );
+        if (warp_id == 2) {
+          dae_compiled_ld0_execute(
+            sm_id,
+            m2ld[0],
+            m2c,
+            sm_live_values,
+            smem_base,
+            tma_descs,
+            bars
+          );
+        } else {
+          dae_compiled_ld1_execute(
+            sm_id,
+            m2ld[1],
+            m2c,
+            sm_live_values,
+            smem_base,
+            tma_descs,
+            bars
+          );
+        }
       }
     }
   }

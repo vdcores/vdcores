@@ -117,9 +117,8 @@ def gemv_ref():
 
 interm, gate, out, sinterm = gemv_ref()
 
-dae_app(dae)
-
-# tensor_diff("interm", interm, matInterm)
-# tensor_diff("gate", gate, matGateOut)
-tensor_diff("out", out, matOut)
-tensor_diff("silu1", sinterm[:,4096:], matSiluOut[:,4096:])
+if dae_app(dae):
+    # tensor_diff("interm", interm, matInterm)
+    # tensor_diff("gate", gate, matGateOut)
+    tensor_diff("out", out, matOut)
+    tensor_diff("silu1", sinterm[:,4096:], matSiluOut[:,4096:])

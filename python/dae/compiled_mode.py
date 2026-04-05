@@ -11,6 +11,7 @@ from .tma_utils import cords2addr
 
 DEFAULT_COMPILED_SPEC_FILE = "dae_compiled_program.vdcore.json"
 _MEM_DYNAMIC_FLAG_MASK = 4 | 8 | 16 | 32
+_MEM_WRITEBACK_FLAG = 2
 
 _SUPPORTED_MEMORY_BASE_OPS = {
     "OP_TERMINATE",
@@ -28,26 +29,51 @@ _SUPPORTED_MEMORY_BASE_OPS = {
     "OP_ALLOC_WB_TMA_STORE_5D_FIX0",
     "OP_ALLOC_WB_TMA_REDUCE_ADD_2D",
     "OP_ALLOC_WB_TMA_REDUCE_ADD_3D",
+    "OP_ALLOC_WB_REG_STORE",
+    "OP_ALLOC_REG_LOAD",
+    "OP_ALLOC_WB_RAW_ADDRESS",
 }
 
 _SUPPORTED_COMPUTE_OPS = {
     "OP_DUMMY",
     "OP_COPY",
     "OP_TERMINATEC",
+    "OP_SILU_MUL_SHARED_BF16_K_4096_INTER",
+    "OP_SILU_MUL_SHARED_BF16_K_64_SW128",
+    "OP_RMS_NORM_F16_K_4096",
+    "OP_RMS_NORM_F16_K_4096_SMEM",
+    "OP_RMS_NORM_F16_K_2048_SMEM",
+    "OP_RMS_NORM_F16_K_5120_SMEM",
+    "OP_RMS_NORM_F16_K_128_SMEM",
+    "OP_ARGMAX_PARTIAL_bf16_1152_50688_132",
+    "OP_ARGMAX_REDUCE_bf16_1152_132",
+    "OP_ARGMAX_PARTIAL_bf16_1024_65536_128",
+    "OP_ARGMAX_REDUCE_bf16_1024_128",
 }
 
 _SCALAR_ADDRESS_FIELD_BASE_OPS = {
     "OP_ALLOC_TMA_LOAD_1D",
     "OP_ALLOC_TMA_LOAD_TENSOR_1D",
     "OP_ALLOC_WB_TMA_STORE_1D",
+    "OP_ALLOC_WB_RAW_ADDRESS",
+}
+
+_NO_ADDRESS_MEMORY_BASE_OPS = {
+    "OP_ALLOC_WB_REG_STORE",
+    "OP_ALLOC_REG_LOAD",
 }
 
 def _memory_base_opcode_name(inst: MemoryInstruction) -> str:
-    return decode_opcode(inst.opcode & ~_MEM_DYNAMIC_FLAG_MASK)
+    masked_opcode = inst.opcode & ~_MEM_DYNAMIC_FLAG_MASK
+    name = decode_opcode(masked_opcode)
+    if name.startswith("UNKNOWN_OPCODE") and (masked_opcode & _MEM_WRITEBACK_FLAG):
+        name = decode_opcode(masked_opcode & ~_MEM_WRITEBACK_FLAG)
+    return name
 
 
 def _memory_flags(inst: MemoryInstruction) -> dict[str, bool]:
     return {
+        "writeback": bool(inst.opcode & _MEM_WRITEBACK_FLAG),
         "jump": bool(inst.opcode & 8),
         "group": bool(inst.opcode & 4),
         "barrier": bool(inst.opcode & 16),
@@ -67,8 +93,10 @@ def _memory_base_is_supported(name: str) -> bool:
     return name in _SUPPORTED_MEMORY_BASE_OPS
 
 
-def _writeback_base(name: str) -> bool:
-    return "WB_" in name or "_WB_" in name or name.startswith("OP_ALLOC_WB_")
+def _st_consumes(base_name: str, flags: dict[str, bool]) -> bool:
+    if not flags["writeback"]:
+        return False
+    return base_name != "OP_ALLOC_WB_REG_STORE"
 
 
 def _builder_stream(builder) -> tuple[list[ComputeInstruction], list[MemoryInstruction]]:
@@ -103,11 +131,19 @@ def _encode_memory_fields(
     encoded = {
         "source_index": inst_index,
         "base_name": base_name,
+        "opcode_value": int(inst.opcode),
+        "num_slots_value": int(inst.num_slots),
         "nslot": int(inst.num_slots & 0x3F),
+        "bar_id": int(inst.num_slots >> 6),
         "arg": int(inst.arg),
         "size": int(inst.size),
-        "writeback": _writeback_base(base_name),
+        "flags": _memory_flags(inst),
+        "writeback": bool(inst.opcode & _MEM_WRITEBACK_FLAG),
+        "st_consumes": _st_consumes(base_name, _memory_flags(inst)),
     }
+
+    if base_name in _NO_ADDRESS_MEMORY_BASE_OPS:
+        return encoded
 
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
         raw_value = int(cords2addr(inst.cords))
@@ -129,14 +165,8 @@ def _make_linear_step(
     flags = _memory_flags(inst)
     if not _memory_base_is_supported(base_name):
         raise ValueError(f"Compiled mode does not support memory op {base_name} at minst[{inst_index}]")
-    if flags["group"] or flags["barrier"]:
-        raise ValueError(
-            f"Compiled mode does not support GROUP/BARRIER flags at minst[{inst_index}] ({base_name})"
-        )
     if flags["jump"]:
         raise ValueError(f"Compiled mode only supports JUMP inside RepeatM blocks: minst[{inst_index}]")
-    if flags["port1"]:
-        raise ValueError(f"Compiled mode does not yet support PORT1 loads: minst[{inst_index}]")
     return {
         "kind": "op",
         **_encode_memory_fields(inst_index, inst, base_name, payload_values),
@@ -194,11 +224,6 @@ def _parse_repeat_block(
             raise ValueError(
                 f"Compiled mode RepeatM blocks may only contain allocating ops, got {base_name} at minst[{cursor}]"
             )
-        if flags["group"] or flags["barrier"] or flags["port1"]:
-            raise ValueError(
-                f"Compiled mode RepeatM blocks do not support GROUP/BARRIER/PORT1 at minst[{cursor}] ({base_name})"
-            )
-
         matched_seed = None
         for seed_inst, seed_index, reg_start, reg_end in seed_ranges:
             if reg_start <= repeat_step_index < reg_end:
@@ -252,12 +277,77 @@ def _validate_memory_stream(
     return blocks
 
 
+def _iter_linear_memory_steps(
+    blocks: list[dict[str, object]],
+) -> list[tuple[int, str, dict[str, object]]]:
+    steps: list[tuple[int, str, dict[str, object]]] = []
+    order = 0
+    for block in blocks:
+        if block["kind"] == "repeat":
+            for step in block["steps"]:
+                steps.append((order, "repeat", step))
+                order += 1
+            continue
+        if block["kind"] == "op":
+            steps.append((order, "op", block))
+            order += 1
+    return steps
+
+
+def _annotate_reg_pairs(blocks: list[dict[str, object]]) -> dict[str, object]:
+    reg_ops: dict[int, list[tuple[int, str, dict[str, object]]]] = {}
+    for order, block_kind, step in _iter_linear_memory_steps(blocks):
+        base_name = step["base_name"]
+        if base_name not in _NO_ADDRESS_MEMORY_BASE_OPS:
+            continue
+        reg_ops.setdefault(int(step["size"]), []).append((order, block_kind, step))
+
+    reg_pairs: list[dict[str, object]] = []
+    for reg_id, entries in reg_ops.items():
+        stores = [entry for entry in entries if entry[2]["base_name"] == "OP_ALLOC_WB_REG_STORE"]
+        loads = [entry for entry in entries if entry[2]["base_name"] == "OP_ALLOC_REG_LOAD"]
+        if len(stores) != 1 or len(loads) != 1:
+            continue
+        store_order, store_block_kind, store_step = stores[0]
+        load_order, load_block_kind, load_step = loads[0]
+        if store_block_kind != "op" or load_block_kind != "op":
+            continue
+        if store_order >= load_order:
+            continue
+        if bool(store_step["flags"]["port1"]) != bool(load_step["flags"]["port1"]):
+            continue
+        pair_id = len(reg_pairs)
+        store_step["reg_pair_id"] = pair_id
+        load_step["reg_pair_id"] = pair_id
+        reg_pairs.append(
+            {
+                "pair_id": pair_id,
+                "reg_id": reg_id,
+                "port1": bool(store_step["flags"]["port1"]),
+            }
+        )
+
+    needs_generic_reg_file = any(
+        step["base_name"] in _NO_ADDRESS_MEMORY_BASE_OPS and "reg_pair_id" not in step
+        for _, _, step in _iter_linear_memory_steps(blocks)
+    )
+    return {
+        "memory": blocks,
+        "reg_pairs": reg_pairs,
+        "needs_generic_reg_file": needs_generic_reg_file,
+    }
+
+
 def _program_structure(builder) -> tuple[dict[str, object], list[int]]:
     cinsts, minsts = _builder_stream(builder)
     payload_values: list[int] = []
+    memory = _validate_memory_stream(minsts, payload_values)
+    reg_analysis = _annotate_reg_pairs(memory)
     program = {
         "compute": _validate_compute_stream(cinsts),
-        "memory": _validate_memory_stream(minsts, payload_values),
+        "memory": reg_analysis["memory"],
+        "reg_pairs": reg_analysis["reg_pairs"],
+        "needs_generic_reg_file": reg_analysis["needs_generic_reg_file"],
         "num_live_values": len(payload_values),
     }
     return program, payload_values
@@ -302,7 +392,7 @@ def _analyze_launcher(launcher) -> dict[str, object]:
 def build_compiled_runtime_bundle(launcher) -> dict[str, object]:
     analysis = _analyze_launcher(launcher)
     spec = {
-        "version": 2,
+        "version": 3,
         "num_sms": launcher.num_sms,
         "compute_ops": launcher.compute_operator_names(),
         "sm_program_ids": analysis["sm_program_ids"],

@@ -116,6 +116,12 @@ Typical Python-only areas include:
 - `tools/generate_selected_compute_ops.py` now prefers a compiled spec over the repo-root `dae_compute_ops.vdcore.build` file when `DAE_COMPILED_SPEC_FILE` or `dae_compiled_program.vdcore.json` is present, so compiled builds pick the compute-op set required by the generated program instead of a stale default list.
 - For current compiled-mode GEMV schedules, structurally identical per-SM streams now deduplicate after spec export because per-SM address / coord seeds live in the compact payload instead of the structural manifest. If a new schedule still explodes into many generated programs, inspect the spec for accidentally baked per-SM fields first.
 - Generated compiled ALLOC/LDU/STU programs now treat the compact payload as read-only and hoist each referenced `live_values[...]` slot into a local once per role program. When tuning generated code, prefer encoding repeat deltas in the spec and reusing cached payload locals over re-reading the same payload index inside a loop.
+- The compiled subset now covers barrier-tagged TMA loads/stores plus pseudo-memory carriers `RegLoad`, `RegStore`, and `RawAddress`. Preserve the spec/runtime split there too: keep full opcode bits and full `num_slots` packing in the structural manifest, but keep only per-SM pointer / coord seeds in the compact payload.
+- For simple non-repeat `RegStore`/`RegLoad` handoff pairs, prefer the compiled-mode pair lowering: spec export tags the pair and generated LDU code uses a dedicated one-shot local instead of a generic register table. If a new schedule needs multiple structural stores or loads for the same reg id, expect the generator to fall back to the generic path until that pattern is taught explicitly.
+- When inspecting or comparing compiled-mode experiments, preserve named generated outputs under `build/generated/` with `tools/generate_compiled_program.py --output build/generated/test_*.inc` or by copying files out of `build/generated/dae/` after the build. The shared `build/generated/dae/*.inc` files are overwritten by the next compiled rebuild.
+- For `app/python/gemv_mlp_mixed.py`, debug the `silu1` consumer in isolation first if compiled mode hangs. The decisive simple check was: if the first barrier-tagged `TmaLoad1D(...)` progresses but the next plain `TmaLoad1D(...)` never arrives, the compiled `OP_ALLOC_TMA_LOAD_1D` async path is the likely culprit. In the current tree, compiled `OP_ALLOC_TMA_LOAD_1D` uses a blocking byte-copy lowering for correctness and that clears the mixed-mode deadlock.
+- The compiled LDU path must be generated per load port. If a schedule uses `PORT1`, do not replay the full load sequence on both LDU warps; emit separate port-filtered sequences and pass `port_id` into the compiled LDU entry point.
+- For double-port compiled programs, go one step further and keep the port split at compile time too: generate separate `ld0` / `ld1` entry points and call them directly from the two LDU warps instead of branching on `port_id` inside one generated LDU function.
 - `.github/workflows/docker-image.yml` builds the repo image on GitHub Actions and pushes it to Docker Hub. It expects repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, and publishes both `latest` and short-SHA tags under `docker.io/<DOCKERHUB_USERNAME>/vdcores`.
 - For family-backed compute instructions such as the new canonical GEMV strings, `-w` writes the family string directly; after changing that file you must rebuild `dae.runtime` before those instructions can serialize successfully, because opcode resolution happens lazily through the rebuilt `runtime.opcode` export.
 - For GEMV-family support specifically, `include/dae/opcode.cuh.inc` now declares only family rules, not checked-in GEMV instances. The concrete canonical GEMV strings still come from Python or `-w`, and `make pyext` materializes only those requested instances into the generated opcode/handler includes before the unchanged Python GEMV wrappers can run.
@@ -160,6 +166,8 @@ python app/python/tmacopy.py --mode compiled -l
 
 - The MMA GEMV harness defaults to `M=4096`, `K=4096`, and `N=8`, and supports quick smaller checks through `GEMV_M`, `GEMV_K`, and `GEMV_SMS`.
 - The GEMV benchmark harnesses (`app/python/gemv_out.py`, `app/python/gemv_mma_out.py`) currently reuse their output tensors across `-b N` iterations, so the diff/checksum printed at the end of a benchmark run is not a correctness signal. Use `-l` for correctness validation and use `-b` only for timing comparisons unless the harness is updated to reset outputs between iterations.
+- `app/python/gemv_mlp_mixed.py`, `app/python/argmax.py`, and `app/python/rmsnorm.py` now only print diffs after an actual `-l` or `-b` execution. `--write-compiled-spec` no longer produces bogus zero-output diffs on those harnesses.
+- `app/python/rmsnorm.py` now follows the same `dae_app(...)` CLI flow as the other standalone harnesses, so `--mode compiled` and `--write-compiled-spec` work without editing the script.
 - Before performance benchmarking `app/python/llama32_1b/sched.py`, clear leftover Python workers with `killall python || true`; stale decode jobs can distort both timing and apparent correctness.
 - Never run GPU performance benchmarks in parallel. For this repo, credible timing comes from sequential runs only; overlapping jobs contend for the device and can corrupt both throughput numbers and debugging conclusions.
 - For risky multi-token or partial-stage experiments on the Llama 3.2 1B path, prefer `tests/script/run_with_launch_timeout.py` first to separate deadlocks from slow-but-completing schedules.
@@ -188,7 +196,32 @@ On 2026-04-04:
   - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mma_out_compiled_spec.json make pyext`: succeeded
   - `python app/python/gemv_mma_out.py -b 20`: `Average duration (ns): 18805.30`, `Average execution time (ns): 19353.60`
   - `python app/python/gemv_mma_out.py --mode compiled -b 20`: `Average duration (ns): 17711.88`, `Average execution time (ns): 18072.00`
+- Expanded compiled-mode verification:
+  - `python app/python/gemv_mlp_mixed.py --write-compiled-spec build/generated/gemv_mlp_mixed_compiled_spec.json`: succeeded
+  - `python app/python/rmsnorm.py --write-compiled-spec build/generated/rmsnorm_compiled_spec.json`: succeeded
+  - `python app/python/argmax.py --write-compiled-spec build/generated/argmax_compiled_spec.json`: succeeded
+  - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/rmsnorm_compiled_spec.json make pyext && python app/python/rmsnorm.py -l && python app/python/rmsnorm.py --mode compiled -l`: both paths succeeded with `0.0%` diff
+  - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/argmax_compiled_spec.json make pyext && python app/python/argmax.py -l && python app/python/argmax.py --mode compiled -l`: both paths succeeded with `0.0%` diff
+  - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext && python app/python/gemv_mlp_mixed.py -l`: interpreted path succeeded with `out ~0.3612%`, `silu1 ~0.0968%`
+  - `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext && python app/python/gemv_mlp_mixed.py --mode compiled -l`: still blocked by a device-side assert in generated compiled LDU code (`compiled ld step terminated early`) on blocks `128..131`
 - Inline negative legality check with `IssueBarrier(0)` failed as expected during spec export with `ValueError: Compiled mode does not support memory op OP_ISSUE_BARRIER at minst[0]`
+
+On 2026-04-05:
+
+- Minimal compiled producer/store/barrier/load repro:
+  - interpreted mode succeeded
+  - compiled mode originally hung until two fixes landed in `tools/generate_compiled_program.py`:
+    - pure writeback no-op steps were removed from compiled LDU queue consumption and turned into direct-ready `m2c` publication from alloc
+    - compiled `OP_ALLOC_TMA_LOAD_1D` was lowered to a blocking byte copy for correctness instead of `cuda::device::memcpy_async_tx(...)`
+- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext && python app/python/gemv_mlp_mixed.py --mode compiled -l`: now launches and completes
+- Mixed MLP current status after that fix:
+  - compiled `silu1` checksum matches interpreted exactly in side-by-side runs
+  - compiled final `out` still differs from interpreted in the downstream reduction path, but both interpreted and compiled remain at roughly `0.36%` average diff against the PyTorch reference on this harness
+- Preserved generated mixed artifacts for this pass:
+  - `build/generated/test_gemv_mlp_mixed_blocking1d.inc`
+  - `build/generated/test_gemv_mlp_mixed_blocking1d_selected.inc`
+  - `build/generated/test_gemv_mlp_mixed_blocking1d_op_order.inc`
+  - `build/generated/test_gemv_mlp_mixed_blocking1d_dyn.inc`
 
 On 2026-03-21:
 

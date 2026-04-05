@@ -33,6 +33,11 @@ _SCALAR_ADDRESS_FIELD_BASE_OPS = {
     "OP_ALLOC_TMA_LOAD_1D",
     "OP_ALLOC_TMA_LOAD_TENSOR_1D",
     "OP_ALLOC_WB_TMA_STORE_1D",
+    "OP_ALLOC_WB_RAW_ADDRESS",
+}
+_NO_ADDRESS_MEMORY_BASE_OPS = {
+    "OP_ALLOC_WB_REG_STORE",
+    "OP_ALLOC_REG_LOAD",
 }
 
 
@@ -106,8 +111,50 @@ def _emit_payload_cache(step_list: list[dict[str, object]], lines: list[str], in
             )
 
 
+def _reg_pair_var(pair_id: int) -> str:
+    return f"__reg_pair_{pair_id}"
+
+
+def _program_port_reg_pairs(program: dict[str, object], port_id: int) -> list[int]:
+    pair_ids = [
+        int(pair["pair_id"])
+        for pair in program.get("reg_pairs", [])
+        if int(bool(pair["port1"])) == port_id
+    ]
+    return sorted(pair_ids)
+
+
+def _program_port_uses_generic_reg_file(program: dict[str, object], port_id: int) -> bool:
+    if not program.get("needs_generic_reg_file", False):
+        return False
+    for block in program["memory"]:
+        steps = block["steps"] if block["kind"] == "repeat" else [block]
+        for step in steps:
+            if step.get("base_name") not in _NO_ADDRESS_MEMORY_BASE_OPS:
+                continue
+            if int(step["flags"]["port1"]) != port_id:
+                continue
+            if "reg_pair_id" not in step:
+                return True
+    return False
+
+
+def _emit_ld_locals(program: dict[str, object], lines: list[str], indent: str, port_id: int) -> None:
+    for pair_id in _program_port_reg_pairs(program, port_id):
+        lines.append(f"{indent}int {_reg_pair_var(pair_id)} = 0;")
+    if _program_port_uses_generic_reg_file(program, port_id):
+        lines.append(f"{indent}int __reg_file[32] = {{}};")
+
+
 def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
     base_name = step["base_name"]
+    opcode_expr = str(int(step["opcode_value"]))
+    num_slots_expr = str(int(step["num_slots_value"]))
+    if base_name in _NO_ADDRESS_MEMORY_BASE_OPS:
+        return [
+            f"{indent}MInst inst = dae_make_compiled_minst_empty("
+            f"{opcode_expr}, {int(step['size'])}, {num_slots_expr}, {int(step['arg'])});"
+        ]
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
         if "address_payload_index" in step:
             address_expr = _payload_scalar_var(int(step["address_payload_index"]))
@@ -115,7 +162,7 @@ def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
             address_expr = _u64_literal(int(step["address"]))
         lines = [
             f"{indent}MInst inst = dae_make_compiled_minst_address("
-            f"{base_name}, {int(step['size'])}, {int(step['nslot'])}, {int(step['arg'])}, {address_expr});"
+            f"{opcode_expr}, {int(step['size'])}, {num_slots_expr}, {int(step['arg'])}, {address_expr});"
         ]
         if "delta_address" in step and int(step["delta_address"]) != 0:
             lines.append(
@@ -130,7 +177,7 @@ def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
         coords = [str(int(coord)) for coord in step["coords"]]
     lines = [
         f"{indent}MInst inst = dae_make_compiled_minst_coords("
-        f"{base_name}, {int(step['size'])}, {int(step['nslot'])}, {int(step['arg'])}, "
+        f"{opcode_expr}, {int(step['size'])}, {num_slots_expr}, {int(step['arg'])}, "
         f"{coords[0]}, {coords[1]}, {coords[2]}, {coords[3]});"
     ]
     delta_coords = step.get("delta_coords")
@@ -160,13 +207,25 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
             lines.append(f"{indent}    if (lane_id == 0) {{")
             lines.append(f"{indent}      st_insts[slot_alloc] = inst;")
             lines.append(f"{indent}      m2c.put(alloc_mask);")
-            lines.append(f"{indent}      CompiledLdCmd ld;")
-            lines.append(f"{indent}      ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
-            lines.append(f"{indent}      auto &curld = m2ld[0];")
-            lines.append(f"{indent}      curld.put(ld.raw);")
-            lines.append(f"{indent}      m2c.advance();")
-            lines.append(f"{indent}      curld.commit();")
-            lines.append(f"{indent}      curld.advance();")
+            if step["base_name"] in _WRITEBACK_OPS:
+                lines.append(
+                    f'{indent}      __mprint("[compiled alloc] {step["base_name"]} direct-ready slot=%d m2c=%d", '
+                    f'slot_alloc, m2c.ptr);'
+                )
+                lines.append(f"{indent}      m2c.commit();")
+                lines.append(f"{indent}      m2c.advance();")
+            else:
+                lines.append(f"{indent}      CompiledLdCmd ld;")
+                lines.append(f"{indent}      ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
+                lines.append(f"{indent}      auto &curld = m2ld[{1 if step['flags']['port1'] else 0}];")
+                lines.append(
+                    f'{indent}      __mprint("[compiled alloc] {step["base_name"]} enqueue slot=%d m2c=%d ldq={1 if step["flags"]["port1"] else 0} ldptr=%d", '
+                    f'slot_alloc, m2c.ptr, curld.ptr);'
+                )
+                lines.append(f"{indent}      curld.put(ld.raw);")
+                lines.append(f"{indent}      m2c.advance();")
+                lines.append(f"{indent}      curld.commit();")
+                lines.append(f"{indent}      curld.advance();")
             lines.append(f"{indent}    }}")
             lines.append(f"{indent}  }}")
         lines.append(f"{indent}}}")
@@ -185,19 +244,32 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
         lines.append(f"{indent}  if (lane_id == 0) {{")
         lines.append(f"{indent}    st_insts[slot_alloc] = inst;")
         lines.append(f"{indent}    m2c.put(alloc_mask);")
-        lines.append(f"{indent}    CompiledLdCmd ld;")
-        lines.append(f"{indent}    ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
-        lines.append(f"{indent}    auto &curld = m2ld[0];")
-        lines.append(f"{indent}    curld.put(ld.raw);")
-        lines.append(f"{indent}    m2c.advance();")
-        lines.append(f"{indent}    curld.commit();")
-        lines.append(f"{indent}    curld.advance();")
+        if block["base_name"] in _WRITEBACK_OPS:
+            lines.append(
+                f'{indent}    __mprint("[compiled alloc] {block["base_name"]} direct-ready slot=%d m2c=%d", '
+                f'slot_alloc, m2c.ptr);'
+            )
+            lines.append(f"{indent}    m2c.commit();")
+            lines.append(f"{indent}    m2c.advance();")
+        else:
+            lines.append(f"{indent}    CompiledLdCmd ld;")
+            lines.append(f"{indent}    ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
+            lines.append(f"{indent}    auto &curld = m2ld[{1 if block['flags']['port1'] else 0}];")
+            lines.append(
+                f'{indent}    __mprint("[compiled alloc] {block["base_name"]} enqueue slot=%d m2c=%d ldq={1 if block["flags"]["port1"] else 0} ldptr=%d", '
+                f'slot_alloc, m2c.ptr, curld.ptr);'
+            )
+            lines.append(f"{indent}    curld.put(ld.raw);")
+            lines.append(f"{indent}    m2c.advance();")
+            lines.append(f"{indent}    curld.commit();")
+            lines.append(f"{indent}    curld.advance();")
         lines.append(f"{indent}  }}")
         lines.append(f"{indent}}}")
         return
 
     if block["kind"] == "terminate":
         lines.append(f"{indent}if (lane_id == 0) {{")
+        lines.append(f'{indent}  __mprint("[compiled alloc] enqueue end ld0_ptr=%d ld1_ptr=%d", m2ld[0].ptr, m2ld[1].ptr);')
         lines.append(f"{indent}  m2ld[0].push(CompiledLdCmd::end().raw);")
         lines.append(f"{indent}  m2ld[1].push(CompiledLdCmd::end().raw);")
         lines.append(f"{indent}}}")
@@ -206,21 +278,40 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
     raise ValueError(f"Unknown alloc block kind {block['kind']}")
 
 
+def _emit_ld_barrier_wait(step: dict[str, object], lines: list[str], indent: str) -> None:
+    if not step["flags"]["barrier"] or step["writeback"]:
+        return
+    lines.append(f"{indent}volatile int *bar = bars + inst.bar();")
+    lines.append(
+        f'{indent}__mprint("[compiled ld] {step["base_name"]} wait bar=%d value=%d slot=%d m2c=%d", '
+        f'inst.bar(), *bar, cmd.slot, cmd.m2c_slot);'
+    )
+    lines.append(f"{indent}while (*bar != 0) {{")
+    lines.append(f"{indent}  __nanosleep(barrierPollSleepCycles);")
+    lines.append(f"{indent}}}")
+    lines.append(f"{indent}__threadfence_system();")
+    lines.append(
+        f'{indent}__mprint("[compiled ld] {step["base_name"]} passed bar=%d slot=%d m2c=%d", '
+        f'inst.bar(), cmd.slot, cmd.m2c_slot);'
+    )
+
+
 def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
+    lines.append(f"{indent}  CompiledLdCmd cmd {{}};")
+    lines.append(f"{indent}  cmd.raw = m2ld.pop();")
+    lines.append(f"{indent}  if (cmd.slot == SLOT_END) {{ assert(false && \"compiled ld step terminated early\"); return; }}")
+    lines.append(
+        f'{indent}  __mprint("[compiled ld] {base_name} pop slot=%d m2c=%d", cmd.slot, cmd.m2c_slot);'
+    )
     if base_name in _LOAD_OPS:
-        lines.append(f"{indent}  CompiledLdCmd cmd {{}};")
-        lines.append(f"{indent}  cmd.raw = m2ld.pop();")
-        lines.append(f"{indent}  if (cmd.slot == SLOT_END) {{ assert(false && \"compiled ld step terminated early\"); return; }}")
         lines.extend(_emit_memory_inst_expr(step, indent + "  "))
+        _emit_ld_barrier_wait(step, lines, indent + "  ")
         if base_name == "OP_ALLOC_TMA_LOAD_1D":
-            lines.append(f"{indent}  cuda::device::memcpy_async_tx(")
-            lines.append(f"{indent}      static_cast<char *>(get_slot_address(smem_base, cmd.slot)),")
-            lines.append(f"{indent}      reinterpret_cast<char *>(inst.address),")
-            lines.append(f"{indent}      cuda::aligned_size_t<16>(inst.size),")
-            lines.append(f"{indent}      m2c.barriers[cmd.m2c_slot]);")
-            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
+            lines.append(f"{indent}  uint8_t *dst = static_cast<uint8_t *>(get_slot_address(smem_base, cmd.slot));")
+            lines.append(f"{indent}  const uint8_t *src = reinterpret_cast<const uint8_t *>(inst.address);")
+            lines.append(f"{indent}  for (int __i = 0; __i < inst.size; ++__i) dst[__i] = src[__i];")
         elif base_name == "OP_ALLOC_TMA_LOAD_TENSOR_1D":
             lines.append(f"{indent}  asm volatile(")
             lines.append(f'{indent}  "cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes"')
@@ -285,37 +376,74 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
             lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))")
             lines.append(f"{indent}  : \"memory\");")
             lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
-        lines.append(f"{indent}  (void)m2c.barriers[cmd.m2c_slot].arrive();")
-        lines.append(f"{indent}}}")
-        return
+    elif base_name == "OP_ALLOC_WB_REG_STORE":
+        lines.append(f"{indent}  const int slotMask = mkSlotMask(cmd.slot, {int(step['nslot'])});")
+        lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = slotMask | 0x80000000U;")
+        if "reg_pair_id" in step:
+            lines.append(f"{indent}  {_reg_pair_var(int(step['reg_pair_id']))} = slotMask;")
+        else:
+            lines.append(f"{indent}  __reg_file[{int(step['size'])}] = slotMask;")
+    elif base_name == "OP_ALLOC_REG_LOAD":
+        if "reg_pair_id" in step:
+            pair_var = _reg_pair_var(int(step["reg_pair_id"]))
+            lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = {pair_var};")
+            lines.append(f"{indent}  {pair_var} = 0;")
+        else:
+            lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = __reg_file[{int(step['size'])}];")
+    elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
+        lines.extend(_emit_memory_inst_expr(step, indent + "  "))
+        lines.append(f"{indent}  (void)inst;")
+    elif base_name in _WRITEBACK_OPS:
+        lines.extend(_emit_memory_inst_expr(step, indent + "  "))
+        lines.append(f"{indent}  (void)inst;")
+    else:
+        raise ValueError(f"Unsupported LDU step {base_name}")
+    lines.append(f"{indent}  (void)m2c.barriers[cmd.m2c_slot].arrive();")
+    lines.append(
+        f'{indent}  __mprint("[compiled ld] {base_name} arrive slot=%d m2c=%d", cmd.slot, cmd.m2c_slot);'
+    )
+    lines.append(f"{indent}}}")
+    return
 
-    if base_name in _WRITEBACK_OPS:
-        lines.append(f"{indent}  CompiledLdCmd cmd {{}};")
-        lines.append(f"{indent}  cmd.raw = m2ld.pop();")
-        lines.append(f"{indent}  if (cmd.slot == SLOT_END) {{ assert(false && \"compiled ld step terminated early\"); return; }}")
-        lines.append(f"{indent}  (void)m2c.barriers[cmd.m2c_slot].arrive();")
-        lines.append(f"{indent}}}")
-        return
 
-    raise ValueError(f"Unsupported LDU step {base_name}")
-
-
-def _emit_ld_program(blocks: list[dict[str, object]], lines: list[str], indent: str) -> None:
+def _emit_ld_program(program: dict[str, object], lines: list[str], indent: str, port_id: int) -> None:
+    blocks = program["memory"]
+    def _is_ld_step(step: dict[str, object]) -> bool:
+        return (
+            step["base_name"] in _LOAD_OPS
+            or step["base_name"] in _NO_ADDRESS_MEMORY_BASE_OPS
+            or step["base_name"] == "OP_ALLOC_WB_RAW_ADDRESS"
+        )
     step_list: list[dict[str, object]] = []
     for block in blocks:
         if block["kind"] == "repeat":
-            step_list.extend(step for step in block["steps"] if step["base_name"] in _LOAD_OPS)
-        elif block["kind"] == "op" and block["base_name"] in _LOAD_OPS:
+            step_list.extend(
+                step for step in block["steps"]
+                if int(step["flags"]["port1"]) == port_id
+                and _is_ld_step(step)
+            )
+        elif (
+            block["kind"] == "op"
+            and int(block["flags"]["port1"]) == port_id
+            and _is_ld_step(block)
+        ):
             step_list.append(block)
+    _emit_ld_locals(program, lines, indent, port_id)
     _emit_payload_cache(step_list, lines, indent)
     for block in blocks:
         if block["kind"] == "repeat":
+            port_steps = [
+                step for step in block["steps"]
+                if int(step["flags"]["port1"]) == port_id and _is_ld_step(step)
+            ]
+            if not port_steps:
+                continue
             lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
-            for step in block["steps"]:
+            for step in port_steps:
                 _emit_ld_step(step, lines, indent + "  ")
             lines.append(f"{indent}}}")
             continue
-        if block["kind"] == "op":
+        if block["kind"] == "op" and int(block["flags"]["port1"]) == port_id and _is_ld_step(block):
             _emit_ld_step(block, lines, indent)
             continue
     lines.append(f"{indent}CompiledLdCmd __done {{}};")
@@ -326,9 +454,15 @@ def _emit_ld_program(blocks: list[dict[str, object]], lines: list[str], indent: 
 def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
-    lines.append(f"{indent}  int slot_mask = c2m.pop();")
-    lines.append(f"{indent}  if (!slot_mask) {{ assert(false && \"compiled st step terminated early\"); return; }}")
-    lines.append(f"{indent}  int slot = extract(slot_mask);")
+    lines.append(f"{indent}  int slot_token = c2m.pop();")
+    lines.append(f"{indent}  if (!slot_token) {{ assert(false && \"compiled st step terminated early\"); return; }}")
+    if base_name == "OP_ALLOC_WB_RAW_ADDRESS":
+        lines.append(f"{indent}  int slot = slot_token;")
+    else:
+        lines.append(f"{indent}  int slot = extract(slot_token);")
+    lines.append(
+        f'{indent}  __mprint("[compiled st] {base_name} pop token=%x slot=%d", slot_token, slot);'
+    )
     lines.extend(_emit_memory_inst_expr(step, indent + "  "))
     if base_name == "OP_ALLOC_WB_TMA_STORE_1D":
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk(")
@@ -410,10 +544,27 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
+    elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
+        lines.append(f"{indent}  (void)slot;")
+        lines.append(f"{indent}  (void)inst;")
     else:
         raise ValueError(f"Unsupported STU step {base_name}")
-    lines.append(f"{indent}  cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{{}});")
-    lines.append(f"{indent}  c2m.reset(slot_mask);")
+    if step["flags"]["barrier"]:
+        if base_name != "OP_ALLOC_WB_RAW_ADDRESS":
+            lines.append(f"{indent}  cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{{}});")
+            lines.append(f"{indent}  __threadfence_system();")
+        lines.append(f"{indent}  cuda::std::atomic_ref<int> bar {{bars[inst.bar()]}};")
+        lines.append(f"{indent}  int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);")
+        lines.append(
+            f'{indent}  __mprint("[compiled st] {base_name} barrier=%d remaining=%d", inst.bar(), current_cnt - 1);'
+        )
+    elif base_name != "OP_ALLOC_WB_RAW_ADDRESS":
+        lines.append(f"{indent}  cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{{}});")
+    if base_name != "OP_ALLOC_WB_RAW_ADDRESS":
+        lines.append(f"{indent}  c2m.reset(slot_token);")
+        lines.append(
+            f'{indent}  __mprint("[compiled st] {base_name} reset token=%x slot=%d", slot_token, slot);'
+        )
     lines.append(f"{indent}}}")
 
 
@@ -421,7 +572,7 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
     write_blocks: list[dict[str, object]] = []
     for block in blocks:
         if block["kind"] == "repeat":
-            steps = [step for step in block["steps"] if step["writeback"]]
+            steps = [step for step in block["steps"] if step["st_consumes"]]
             if steps:
                 write_blocks.append(
                     {
@@ -430,7 +581,7 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
                         "steps": steps,
                     }
                 )
-        elif block["kind"] == "op" and block["writeback"]:
+        elif block["kind"] == "op" and block["st_consumes"]:
             write_blocks.append(block)
     step_list: list[dict[str, object]] = []
     for block in write_blocks:
@@ -509,6 +660,7 @@ def generate_enabled(spec: dict[str, object]) -> str:
         lines.append(f"    case {int(program['program_id'])}: {{")
         for entry in program["compute"]:
             lines.append("      {")
+            lines.append("        if (finish) break;")
             lines.append(f"        pc = {int(entry['index']) + 1};")
             lines.extend(_emit_compute_inst_expr(entry, "        "))
             lines.append(
@@ -558,7 +710,7 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "}",
             "",
             "template <typename M2LDQueue, typename M2CQueue>",
-            "static __device__ __forceinline__ void dae_compiled_ld_execute(",
+            "static __device__ __forceinline__ void dae_compiled_ld0_execute(",
             "  int sm_id,",
             "  M2LDQueue &m2ld,",
             "  M2CQueue &m2c,",
@@ -567,18 +719,41 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "  const CUtensorMap *tma_descs,",
             "  int *bars",
             ") {",
-            "  (void)bars;",
             "  switch (dae_compiled_program_id_for_sm(sm_id)) {",
         ]
     )
     for program in spec["programs"]:
         lines.append(f"    case {int(program['program_id'])}: {{")
-        _emit_ld_program(program["memory"], lines, "      ")
+        _emit_ld_program(program, lines, "      ", 0)
         lines.append("      break;")
         lines.append("    }")
     lines.extend(
         [
-            '    default: assert(false && "missing compiled ld program"); break;',
+            '    default: assert(false && "missing compiled ld0 program"); break;',
+            "  }",
+            "}",
+            "",
+            "template <typename M2LDQueue, typename M2CQueue>",
+            "static __device__ __forceinline__ void dae_compiled_ld1_execute(",
+            "  int sm_id,",
+            "  M2LDQueue &m2ld,",
+            "  M2CQueue &m2c,",
+            "  const uint64_t *live_values,",
+            "  const void *smem_base,",
+            "  const CUtensorMap *tma_descs,",
+            "  int *bars",
+            ") {",
+            "  switch (dae_compiled_program_id_for_sm(sm_id)) {",
+        ]
+    )
+    for program in spec["programs"]:
+        lines.append(f"    case {int(program['program_id'])}: {{")
+        _emit_ld_program(program, lines, "      ", 1)
+        lines.append("      break;")
+        lines.append("    }")
+    lines.extend(
+        [
+            '    default: assert(false && "missing compiled ld1 program"); break;',
             "  }",
             "}",
             "",
@@ -635,7 +810,11 @@ def generate_disabled(source: str) -> str:
             '  assert(false && "compiled mode was not built into this runtime");',
             "}",
             "template <typename... Args>",
-            "static __device__ __forceinline__ void dae_compiled_ld_execute(Args&&...) {",
+            "static __device__ __forceinline__ void dae_compiled_ld0_execute(Args&&...) {",
+            '  assert(false && "compiled mode was not built into this runtime");',
+            "}",
+            "template <typename... Args>",
+            "static __device__ __forceinline__ void dae_compiled_ld1_execute(Args&&...) {",
             '  assert(false && "compiled mode was not built into this runtime");',
             "}",
             "template <typename... Args>",

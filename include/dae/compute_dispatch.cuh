@@ -52,6 +52,7 @@ DAE_COMPUTE_OP_HANDLER(OP_COPY) {
   for (int i = 0; i < inst.args[0]; i++) {
     __cprint("[Copy][i=%d] before wait", i);
     auto read_slot = m2c.pop();
+    __cprint("[Copy][i=%d] after first pop read_slot=%d", i, read_slot);
     uint32_t *read_data = (uint32_t *)get_slot_address(smem_base, extract(read_slot));
     auto write_slot = m2c.pop();
     uint32_t *write_data = (uint32_t *)get_slot_address(smem_base, extract(write_slot));
@@ -235,6 +236,19 @@ DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_64_SW128) {
     make_shape(Int<32>{}, num_token)
   );
   task_silu_smem<64>(num_token, layout_sv, smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_rms_norm_f16_from_glob<4096, __nv_bfloat16>(
+    smem_base,
+    st_insts,
+    inst.args[0],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {

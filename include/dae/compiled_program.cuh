@@ -77,6 +77,21 @@ static __device__ __forceinline__ MInst dae_make_compiled_minst_coords(
   return inst;
 }
 
+static __device__ __forceinline__ MInst dae_make_compiled_minst_empty(
+  uint16_t opcode,
+  uint16_t size,
+  uint16_t num_slots,
+  uint16_t arg
+) {
+  MInst inst {};
+  inst.opcode = opcode;
+  inst.size = size;
+  inst.num_slots = num_slots;
+  inst.arg = arg;
+  inst.address = 0;
+  return inst;
+}
+
 #if __has_include("dae/compiled_program.inc")
   #include "dae/compiled_program.inc"
 #else
@@ -100,7 +115,12 @@ static __device__ __forceinline__ void dae_compiled_alloc_execute(Args&&...) {
 }
 
 template <typename... Args>
-static __device__ __forceinline__ void dae_compiled_ld_execute(Args&&...) {
+static __device__ __forceinline__ void dae_compiled_ld0_execute(Args&&...) {
+  assert(false && "compiled mode was not built into this runtime");
+}
+
+template <typename... Args>
+static __device__ __forceinline__ void dae_compiled_ld1_execute(Args&&...) {
   assert(false && "compiled mode was not built into this runtime");
 }
 

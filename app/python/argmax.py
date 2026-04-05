@@ -57,19 +57,20 @@ dae.i(
 
 print("Launching Attention DAE...")
 
-dae_app(dae)
+executed = dae_app(dae)
 
 matIn = torch.cat(matLogits, dim=-1)
 def ref():
     return torch.argmax(matIn, dim=-1)
 
-refO = ref()
-daeO = matArgOut
+if executed:
+    refO = ref()
+    daeO = matArgOut
 
-# compare max values of all rows instead of indice as value might duplicate
-refV = torch.gather(matIn, 1, refO.unsqueeze(1)).squeeze(1)
-daeV = torch.gather(matIn, 1, daeO.unsqueeze(1)).squeeze(1)
-tensor_diff("DAE", refV, daeV)
+    # compare max values of all rows instead of indice as value might duplicate
+    refV = torch.gather(matIn, 1, refO.unsqueeze(1)).squeeze(1)
+    daeV = torch.gather(matIn, 1, daeO.unsqueeze(1)).squeeze(1)
+    tensor_diff("DAE", refV, daeV)
 
 # total_bytes = matArgIn.nbytes * 2
 # dae.bench(total_bytes=total_bytes)

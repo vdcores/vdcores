@@ -61,17 +61,13 @@ dae.s(
 
 print("Launching Attention DAE...")
 
-dae.launch()
-
 def ref():
     var = matIn.pow(2).mean(dim=-1, keepdim=True)
     X = matIn * torch.rsqrt(var + 1.0)
     X = X * matWeights
     return X
 
-refO = ref()
-daeO = matOut
-
-tensor_diff("DAE", refO, daeO)
-
-dae_app(dae)
+if dae_app(dae):
+    refO = ref()
+    daeO = matOut
+    tensor_diff("DAE", refO, daeO)
