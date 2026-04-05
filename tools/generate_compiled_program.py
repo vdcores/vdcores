@@ -79,8 +79,9 @@ def _payload_scalar_var(index: int) -> str:
     return f"__payload_u64_{index}"
 
 
-def _payload_coord_var(index: int, coord: int) -> str:
-    return f"__payload_u16_{index}_{coord}"
+def _declare_local(indent: str, decl: str, init: str, *, maybe_unused: bool = True) -> str:
+    prefix = "[[maybe_unused]] " if maybe_unused else ""
+    return f"{indent}{prefix}{decl} = {init};"
 
 
 def _payload_indices_for_step(step: dict[str, object]) -> list[int]:
@@ -93,22 +94,14 @@ def _payload_indices_for_step(step: dict[str, object]) -> list[int]:
     return indices
 
 
-def _emit_payload_cache(step_list: list[dict[str, object]], lines: list[str], indent: str) -> None:
+def _emit_payload_aliases(step_list: list[dict[str, object]], lines: list[str], indent: str) -> None:
     seen: set[int] = set()
     for step in step_list:
         for index in _payload_indices_for_step(step):
             if index in seen:
                 continue
             seen.add(index)
-            lines.append(f"{indent}const uint64_t {_payload_scalar_var(index)} = live_values[{index}];")
-    for step in step_list:
-        if "coords_payload_index" not in step:
-            continue
-        base = int(step["coords_payload_index"])
-        for coord in range(4):
-            lines.append(
-                f"{indent}const uint16_t {_payload_coord_var(base, coord)} = static_cast<uint16_t>({_payload_scalar_var(base + coord)});"
-            )
+            lines.append(f"{indent}const uint64_t &{_payload_scalar_var(index)} = live_values[{index}];")
 
 
 def _reg_pair_var(pair_id: int) -> str:
@@ -146,49 +139,62 @@ def _emit_ld_locals(program: dict[str, object], lines: list[str], indent: str, p
         lines.append(f"{indent}int __reg_file[32] = {{}};")
 
 
-def _emit_memory_inst_expr(step: dict[str, object], indent: str) -> list[str]:
+def _emit_memory_field_locals(step: dict[str, object], lines: list[str], indent: str) -> None:
     base_name = step["base_name"]
-    opcode_expr = str(int(step["opcode_value"]))
-    num_slots_expr = str(int(step["num_slots_value"]))
+    lines.append(_declare_local(indent, "constexpr uint16_t __opcode", str(int(step["opcode_value"])) ))
+    lines.append(_declare_local(indent, "constexpr uint16_t __size", str(int(step["size"])) ))
+    lines.append(_declare_local(indent, "constexpr uint16_t __num_slots", str(int(step["num_slots_value"])) ))
+    lines.append(_declare_local(indent, "constexpr uint8_t __nslot", str(int(step["nslot"])) ))
+    lines.append(_declare_local(indent, "constexpr uint8_t __bar", str(int(step["bar_id"])) ))
+    lines.append(_declare_local(indent, "constexpr uint16_t __arg", str(int(step["arg"])) ))
     if base_name in _NO_ADDRESS_MEMORY_BASE_OPS:
-        return [
-            f"{indent}MInst inst = dae_make_compiled_minst_empty("
-            f"{opcode_expr}, {int(step['size'])}, {num_slots_expr}, {int(step['arg'])});"
-        ]
+        return
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
         if "address_payload_index" in step:
-            address_expr = _payload_scalar_var(int(step["address_payload_index"]))
+            base_expr = _payload_scalar_var(int(step["address_payload_index"]))
         else:
-            address_expr = _u64_literal(int(step["address"]))
-        lines = [
-            f"{indent}MInst inst = dae_make_compiled_minst_address("
-            f"{opcode_expr}, {int(step['size'])}, {num_slots_expr}, {int(step['arg'])}, {address_expr});"
-        ]
+            base_expr = _u64_literal(int(step["address"]))
         if "delta_address" in step and int(step["delta_address"]) != 0:
+            lines.append(_declare_local(indent, "uint64_t __address", base_expr))
             lines.append(
-                f"{indent}if (__rep != 0) inst.address += static_cast<uint64_t>(__rep) * {_u64_literal(int(step['delta_address']))};"
+                f"{indent}if (__rep != 0) __address += static_cast<uint64_t>(__rep) * {_u64_literal(int(step['delta_address']))};"
             )
-        return lines
+        else:
+            lines.append(_declare_local(indent, "const uint64_t __address", base_expr))
+        return
 
     if "coords_payload_index" in step:
         base = int(step["coords_payload_index"])
-        coords = [_payload_coord_var(base, coord) for coord in range(4)]
+        coord_exprs = [f"static_cast<uint16_t>({_payload_scalar_var(base + coord)})" for coord in range(4)]
     else:
-        coords = [str(int(coord)) for coord in step["coords"]]
-    lines = [
-        f"{indent}MInst inst = dae_make_compiled_minst_coords("
-        f"{opcode_expr}, {int(step['size'])}, {num_slots_expr}, {int(step['arg'])}, "
-        f"{coords[0]}, {coords[1]}, {coords[2]}, {coords[3]});"
-    ]
+        coord_exprs = [str(int(coord)) for coord in step["coords"]]
     delta_coords = step.get("delta_coords")
-    if delta_coords is not None:
-        for coord_index, delta in enumerate(delta_coords):
-            if int(delta) == 0:
-                continue
+    for coord_index, coord_expr in enumerate(coord_exprs):
+        coord_name = f"__coord{coord_index}"
+        delta = 0 if delta_coords is None else int(delta_coords[coord_index])
+        if delta != 0:
+            lines.append(_declare_local(indent, f"uint16_t {coord_name}", f"static_cast<uint16_t>({coord_expr})"))
             lines.append(
-                f"{indent}if (__rep != 0) inst.coords[{coord_index}] += static_cast<uint16_t>(__rep * {int(delta)});"
+                f"{indent}if (__rep != 0) {coord_name} = static_cast<uint16_t>({coord_name} + static_cast<uint16_t>(__rep * {delta}));"
             )
-    return lines
+        else:
+            lines.append(_declare_local(indent, f"const uint16_t {coord_name}", f"static_cast<uint16_t>({coord_expr})"))
+
+
+def _emit_store_slot_inst(step: dict[str, object], lines: list[str], indent: str, slot_expr: str) -> None:
+    lines.append(f"{indent}auto &__slot_inst = st_insts[{slot_expr}];")
+    lines.append(f"{indent}__slot_inst.opcode = __opcode;")
+    lines.append(f"{indent}__slot_inst.size = __size;")
+    lines.append(f"{indent}__slot_inst.num_slots = __num_slots;")
+    lines.append(f"{indent}__slot_inst.arg = __arg;")
+    if step["base_name"] in _NO_ADDRESS_MEMORY_BASE_OPS:
+        lines.append(f"{indent}__slot_inst.address = 0;")
+        return
+    if step["base_name"] in _SCALAR_ADDRESS_FIELD_BASE_OPS:
+        lines.append(f"{indent}__slot_inst.address = __address;")
+        return
+    for coord_index in range(4):
+        lines.append(f"{indent}__slot_inst.coords[{coord_index}] = __coord{coord_index};")
 
 
 def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -> None:
@@ -196,16 +202,16 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
         lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
         for step in block["steps"]:
             lines.append(f"{indent}  {{")
-            lines.extend(_emit_memory_inst_expr(step, indent + "    "))
+            _emit_memory_field_locals(step, lines, indent + "    ")
             lines.append(f"{indent}    int alloc_mask = 0;")
             lines.append(f"{indent}    int slot_alloc = -1;")
             lines.append(f"{indent}    while (true) {{")
-            lines.append(f"{indent}      slot_alloc = alloc.allocate(lane_id, flags, inst.nslot(), alloc_mask);")
+            lines.append(f"{indent}      slot_alloc = alloc.allocate(lane_id, flags, __nslot, alloc_mask);")
             lines.append(f"{indent}      if (slot_alloc >= 0) break;")
             lines.append(f"{indent}      __nanosleep(allocRetrySleepCycles);")
             lines.append(f"{indent}    }}")
             lines.append(f"{indent}    if (lane_id == 0) {{")
-            lines.append(f"{indent}      st_insts[slot_alloc] = inst;")
+            _emit_store_slot_inst(step, lines, indent + "      ", "slot_alloc")
             lines.append(f"{indent}      m2c.put(alloc_mask);")
             if step["base_name"] in _WRITEBACK_OPS:
                 lines.append(
@@ -233,16 +239,16 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
 
     if block["kind"] == "op":
         lines.append(f"{indent}{{")
-        lines.extend(_emit_memory_inst_expr(block, indent + "  "))
+        _emit_memory_field_locals(block, lines, indent + "  ")
         lines.append(f"{indent}  int alloc_mask = 0;")
         lines.append(f"{indent}  int slot_alloc = -1;")
         lines.append(f"{indent}  while (true) {{")
-        lines.append(f"{indent}    slot_alloc = alloc.allocate(lane_id, flags, inst.nslot(), alloc_mask);")
+        lines.append(f"{indent}    slot_alloc = alloc.allocate(lane_id, flags, __nslot, alloc_mask);")
         lines.append(f"{indent}    if (slot_alloc >= 0) break;")
         lines.append(f"{indent}    __nanosleep(allocRetrySleepCycles);")
         lines.append(f"{indent}  }}")
         lines.append(f"{indent}  if (lane_id == 0) {{")
-        lines.append(f"{indent}    st_insts[slot_alloc] = inst;")
+        _emit_store_slot_inst(block, lines, indent + "    ", "slot_alloc")
         lines.append(f"{indent}    m2c.put(alloc_mask);")
         if block["base_name"] in _WRITEBACK_OPS:
             lines.append(
@@ -269,9 +275,7 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
 
     if block["kind"] == "terminate":
         lines.append(f"{indent}if (lane_id == 0) {{")
-        lines.append(f'{indent}  __mprint("[compiled alloc] enqueue end ld0_ptr=%d ld1_ptr=%d", m2ld[0].ptr, m2ld[1].ptr);')
-        lines.append(f"{indent}  m2ld[0].push(CompiledLdCmd::end().raw);")
-        lines.append(f"{indent}  m2ld[1].push(CompiledLdCmd::end().raw);")
+        lines.append(f'{indent}  __mprint("[compiled alloc] terminate ld0_ptr=%d ld1_ptr=%d", m2ld[0].ptr, m2ld[1].ptr);')
         lines.append(f"{indent}}}")
         return
 
@@ -281,18 +285,17 @@ def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -
 def _emit_ld_barrier_wait(step: dict[str, object], lines: list[str], indent: str) -> None:
     if not step["flags"]["barrier"] or step["writeback"]:
         return
-    lines.append(f"{indent}volatile int *bar = bars + inst.bar();")
+    lines.append(f"{indent}volatile int *bar = bars + __bar;")
     lines.append(
         f'{indent}__mprint("[compiled ld] {step["base_name"]} wait bar=%d value=%d slot=%d m2c=%d", '
-        f'inst.bar(), *bar, cmd.slot, cmd.m2c_slot);'
+        f'__bar, *bar, cmd.slot, cmd.m2c_slot);'
     )
     lines.append(f"{indent}while (*bar != 0) {{")
     lines.append(f"{indent}  __nanosleep(barrierPollSleepCycles);")
     lines.append(f"{indent}}}")
-    lines.append(f"{indent}__threadfence_system();")
     lines.append(
         f'{indent}__mprint("[compiled ld] {step["base_name"]} passed bar=%d slot=%d m2c=%d", '
-        f'inst.bar(), cmd.slot, cmd.m2c_slot);'
+        f'__bar, cmd.slot, cmd.m2c_slot);'
     )
 
 
@@ -301,81 +304,83 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
     lines.append(f"{indent}{{")
     lines.append(f"{indent}  CompiledLdCmd cmd {{}};")
     lines.append(f"{indent}  cmd.raw = m2ld.pop();")
-    lines.append(f"{indent}  if (cmd.slot == SLOT_END) {{ assert(false && \"compiled ld step terminated early\"); return; }}")
     lines.append(
         f'{indent}  __mprint("[compiled ld] {base_name} pop slot=%d m2c=%d", cmd.slot, cmd.m2c_slot);'
     )
     if base_name in _LOAD_OPS:
-        lines.extend(_emit_memory_inst_expr(step, indent + "  "))
+        _emit_memory_field_locals(step, lines, indent + "  ")
         _emit_ld_barrier_wait(step, lines, indent + "  ")
         if base_name == "OP_ALLOC_TMA_LOAD_1D":
-            lines.append(f"{indent}  uint8_t *dst = static_cast<uint8_t *>(get_slot_address(smem_base, cmd.slot));")
-            lines.append(f"{indent}  const uint8_t *src = reinterpret_cast<const uint8_t *>(inst.address);")
-            lines.append(f"{indent}  for (int __i = 0; __i < inst.size; ++__i) dst[__i] = src[__i];")
+            lines.append(f"{indent}  cuda::device::memcpy_async_tx(")
+            lines.append(f"{indent}      static_cast<char *>(get_slot_address(smem_base, cmd.slot)),")
+            lines.append(f"{indent}      reinterpret_cast<char *>(__address),")
+            lines.append(f"{indent}      cuda::aligned_size_t<16>(__size),")
+            lines.append(f"{indent}      m2c.barriers[cmd.m2c_slot]);")
+            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
         elif base_name == "OP_ALLOC_TMA_LOAD_TENSOR_1D":
             lines.append(f"{indent}  asm volatile(")
             lines.append(f'{indent}  "cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes"')
             lines.append(f'{indent}  "[%0], [%1, {{%2}}], [%3];\\n"')
             lines.append(f"{indent}  :")
             lines.append(f"{indent}  : \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, cmd.slot))),")
-            lines.append(f"{indent}    \"l\"((void *)(tma_descs + inst.arg)),")
-            lines.append(f"{indent}    \"r\"((uint32_t)inst.address),")
+            lines.append(f"{indent}    \"l\"((void *)(tma_descs + __arg)),")
+            lines.append(f"{indent}    \"r\"((uint32_t)__address),")
             lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))")
             lines.append(f"{indent}  : \"memory\");")
-            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
+            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
         elif base_name == "OP_ALLOC_TMA_LOAD_2D":
             lines.append(f"{indent}  asm volatile(")
             lines.append(f'{indent}  "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"')
             lines.append(f'{indent}  "[%0], [%1, {{%2, %3}}], [%4];\\n"')
             lines.append(f"{indent}  :")
             lines.append(f"{indent}  : \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, cmd.slot))),")
-            lines.append(f"{indent}    \"l\"((void *)(tma_descs + inst.arg)),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
+            lines.append(f"{indent}    \"l\"((void *)(tma_descs + __arg)),")
+            lines.append(f"{indent}    \"r\"((int)__coord0),")
+            lines.append(f"{indent}    \"r\"((int)__coord1),")
             lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))")
             lines.append(f"{indent}  : \"memory\");")
-            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
+            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
         elif base_name == "OP_ALLOC_TMA_LOAD_3D":
             lines.append(f"{indent}  asm volatile(")
             lines.append(f'{indent}  "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"')
             lines.append(f'{indent}  "[%0], [%1, {{%2, %3, %4}}], [%5];\\n"')
             lines.append(f"{indent}  :")
             lines.append(f"{indent}  : \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, cmd.slot))),")
-            lines.append(f"{indent}    \"l\"((void *)(tma_descs + inst.arg)),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
+            lines.append(f"{indent}    \"l\"((void *)(tma_descs + __arg)),")
+            lines.append(f"{indent}    \"r\"((int)__coord0),")
+            lines.append(f"{indent}    \"r\"((int)__coord1),")
+            lines.append(f"{indent}    \"r\"((int)__coord2),")
             lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))")
             lines.append(f"{indent}  : \"memory\");")
-            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
+            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
         elif base_name == "OP_ALLOC_TMA_LOAD_4D":
             lines.append(f"{indent}  asm volatile(")
             lines.append(f'{indent}  "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes"')
             lines.append(f'{indent}  "[%0], [%1, {{%2, %3, %4, %5}}], [%6];\\n"')
             lines.append(f"{indent}  :")
             lines.append(f"{indent}  : \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, cmd.slot))),")
-            lines.append(f"{indent}    \"l\"((void *)(tma_descs + inst.arg)),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[3]),")
+            lines.append(f"{indent}    \"l\"((void *)(tma_descs + __arg)),")
+            lines.append(f"{indent}    \"r\"((int)__coord0),")
+            lines.append(f"{indent}    \"r\"((int)__coord1),")
+            lines.append(f"{indent}    \"r\"((int)__coord2),")
+            lines.append(f"{indent}    \"r\"((int)__coord3),")
             lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))")
             lines.append(f"{indent}  : \"memory\");")
-            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
+            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
         elif base_name == "OP_ALLOC_TMA_LOAD_5D_FIX0":
             lines.append(f"{indent}  asm volatile(")
             lines.append(f'{indent}  "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes"')
             lines.append(f'{indent}  "[%0], [%1, {{0, %2, %3, %4, %5}}], [%6];\\n"')
             lines.append(f"{indent}  :")
             lines.append(f"{indent}  : \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, cmd.slot))),")
-            lines.append(f"{indent}    \"l\"((void *)(tma_descs + inst.arg)),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
-            lines.append(f"{indent}    \"r\"((int)inst.coords[3]),")
+            lines.append(f"{indent}    \"l\"((void *)(tma_descs + __arg)),")
+            lines.append(f"{indent}    \"r\"((int)__coord0),")
+            lines.append(f"{indent}    \"r\"((int)__coord1),")
+            lines.append(f"{indent}    \"r\"((int)__coord2),")
+            lines.append(f"{indent}    \"r\"((int)__coord3),")
             lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))")
             lines.append(f"{indent}  : \"memory\");")
-            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(inst.size));")
+            lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
     elif base_name == "OP_ALLOC_WB_REG_STORE":
         lines.append(f"{indent}  const int slotMask = mkSlotMask(cmd.slot, {int(step['nslot'])});")
         lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = slotMask | 0x80000000U;")
@@ -391,11 +396,11 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         else:
             lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = __reg_file[{int(step['size'])}];")
     elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
-        lines.extend(_emit_memory_inst_expr(step, indent + "  "))
-        lines.append(f"{indent}  (void)inst;")
+        _emit_memory_field_locals(step, lines, indent + "  ")
+        lines.append(f"{indent}  (void)__address;")
     elif base_name in _WRITEBACK_OPS:
-        lines.extend(_emit_memory_inst_expr(step, indent + "  "))
-        lines.append(f"{indent}  (void)inst;")
+        _emit_memory_field_locals(step, lines, indent + "  ")
+        lines.append(f"{indent}  (void)__opcode;")
     else:
         raise ValueError(f"Unsupported LDU step {base_name}")
     lines.append(f"{indent}  (void)m2c.barriers[cmd.m2c_slot].arrive();")
@@ -429,7 +434,7 @@ def _emit_ld_program(program: dict[str, object], lines: list[str], indent: str, 
         ):
             step_list.append(block)
     _emit_ld_locals(program, lines, indent, port_id)
-    _emit_payload_cache(step_list, lines, indent)
+    _emit_payload_aliases(step_list, lines, indent)
     for block in blocks:
         if block["kind"] == "repeat":
             port_steps = [
@@ -446,16 +451,12 @@ def _emit_ld_program(program: dict[str, object], lines: list[str], indent: str, 
         if block["kind"] == "op" and int(block["flags"]["port1"]) == port_id and _is_ld_step(block):
             _emit_ld_step(block, lines, indent)
             continue
-    lines.append(f"{indent}CompiledLdCmd __done {{}};")
-    lines.append(f"{indent}__done.raw = m2ld.pop();")
-    lines.append(f"{indent}assert(__done.slot == SLOT_END && \"compiled ld expected SLOT_END\");")
 
 
 def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
     lines.append(f"{indent}  int slot_token = c2m.pop();")
-    lines.append(f"{indent}  if (!slot_token) {{ assert(false && \"compiled st step terminated early\"); return; }}")
     if base_name == "OP_ALLOC_WB_RAW_ADDRESS":
         lines.append(f"{indent}  int slot = slot_token;")
     else:
@@ -463,23 +464,23 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
     lines.append(
         f'{indent}  __mprint("[compiled st] {base_name} pop token=%x slot=%d", slot_token, slot);'
     )
-    lines.extend(_emit_memory_inst_expr(step, indent + "  "))
+    _emit_memory_field_locals(step, lines, indent + "  ")
     if base_name == "OP_ALLOC_WB_TMA_STORE_1D":
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk(")
         lines.append(f"{indent}    cuda::ptx::space_global,")
         lines.append(f"{indent}    cuda::ptx::space_shared,")
-        lines.append(f"{indent}    (void *)(inst.address),")
+        lines.append(f"{indent}    (void *)(__address),")
         lines.append(f"{indent}    (const void *)(get_slot_address(smem_base, slot)),")
-        lines.append(f"{indent}    inst.size);")
+        lines.append(f"{indent}    __size);")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
     elif base_name == "OP_ALLOC_WB_TMA_STORE_2D":
         lines.append(f"{indent}  asm volatile(")
         lines.append(f'{indent}  "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "')
         lines.append(f'{indent}  "[%0, {{%1, %2}}], [%3];\\n"')
         lines.append(f"{indent}  :")
-        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + inst.arg)),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
+        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + __arg)),")
+        lines.append(f"{indent}    \"r\"((int)__coord0),")
+        lines.append(f"{indent}    \"r\"((int)__coord1),")
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
@@ -488,10 +489,10 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f'{indent}  "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "')
         lines.append(f'{indent}  "[%0, {{%1, %2, %3}}], [%4];\\n"')
         lines.append(f"{indent}  :")
-        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + inst.arg)),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
+        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + __arg)),")
+        lines.append(f"{indent}    \"r\"((int)__coord0),")
+        lines.append(f"{indent}    \"r\"((int)__coord1),")
+        lines.append(f"{indent}    \"r\"((int)__coord2),")
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
@@ -500,11 +501,11 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f'{indent}  "cp.async.bulk.tensor.4d.global.shared::cta.bulk_group "')
         lines.append(f'{indent}  "[%0, {{%1, %2, %3, %4}}], [%5];\\n"')
         lines.append(f"{indent}  :")
-        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + inst.arg)),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[3]),")
+        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + __arg)),")
+        lines.append(f"{indent}    \"r\"((int)__coord0),")
+        lines.append(f"{indent}    \"r\"((int)__coord1),")
+        lines.append(f"{indent}    \"r\"((int)__coord2),")
+        lines.append(f"{indent}    \"r\"((int)__coord3),")
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
@@ -513,11 +514,11 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f'{indent}  "cp.async.bulk.tensor.5d.global.shared::cta.bulk_group "')
         lines.append(f'{indent}  "[%0, {{0, %1, %2, %3, %4}}], [%5];\\n"')
         lines.append(f"{indent}  :")
-        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + inst.arg)),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[3]),")
+        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + __arg)),")
+        lines.append(f"{indent}    \"r\"((int)__coord0),")
+        lines.append(f"{indent}    \"r\"((int)__coord1),")
+        lines.append(f"{indent}    \"r\"((int)__coord2),")
+        lines.append(f"{indent}    \"r\"((int)__coord3),")
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
@@ -526,9 +527,9 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f'{indent}  "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group "')
         lines.append(f'{indent}  "[%0, {{%1, %2}}], [%3];\\n"')
         lines.append(f"{indent}  :")
-        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + inst.arg)),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
+        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + __arg)),")
+        lines.append(f"{indent}    \"r\"((int)__coord0),")
+        lines.append(f"{indent}    \"r\"((int)__coord1),")
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
@@ -537,26 +538,25 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         lines.append(f'{indent}  "cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.bulk_group "')
         lines.append(f'{indent}  "[%0, {{%1, %2, %3}}], [%4];\\n"')
         lines.append(f"{indent}  :")
-        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + inst.arg)),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[0]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[1]),")
-        lines.append(f"{indent}    \"r\"((int)inst.coords[2]),")
+        lines.append(f"{indent}  : \"l\"((void *)(tma_descs + __arg)),")
+        lines.append(f"{indent}    \"r\"((int)__coord0),")
+        lines.append(f"{indent}    \"r\"((int)__coord1),")
+        lines.append(f"{indent}    \"r\"((int)__coord2),")
         lines.append(f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))")
         lines.append(f"{indent}  : \"memory\");")
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
     elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
         lines.append(f"{indent}  (void)slot;")
-        lines.append(f"{indent}  (void)inst;")
+        lines.append(f"{indent}  (void)__address;")
     else:
         raise ValueError(f"Unsupported STU step {base_name}")
     if step["flags"]["barrier"]:
         if base_name != "OP_ALLOC_WB_RAW_ADDRESS":
             lines.append(f"{indent}  cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{{}});")
-            lines.append(f"{indent}  __threadfence_system();")
-        lines.append(f"{indent}  cuda::std::atomic_ref<int> bar {{bars[inst.bar()]}};")
+        lines.append(f"{indent}  cuda::std::atomic_ref<int> bar {{bars[__bar]}};")
         lines.append(f"{indent}  int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);")
         lines.append(
-            f'{indent}  __mprint("[compiled st] {base_name} barrier=%d remaining=%d", inst.bar(), current_cnt - 1);'
+            f'{indent}  __mprint("[compiled st] {base_name} barrier=%d remaining=%d", __bar, current_cnt - 1);'
         )
     elif base_name != "OP_ALLOC_WB_RAW_ADDRESS":
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{{}});")
@@ -589,7 +589,7 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
             step_list.extend(block["steps"])
         else:
             step_list.append(block)
-    _emit_payload_cache(step_list, lines, indent)
+    _emit_payload_aliases(step_list, lines, indent)
     if not write_blocks:
         lines.append(f"{indent}int __done = c2m.pop();")
         lines.append(f"{indent}assert(__done == 0 && \"compiled st expected terminate sentinel\");")
@@ -606,12 +606,13 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
     lines.append(f"{indent}assert(__done == 0 && \"compiled st expected terminate sentinel\");")
 
 
-def generate_enabled(spec: dict[str, object]) -> str:
+def generate_enabled(spec: dict[str, object], *, debug: bool) -> str:
     lines = [
         "// Generated by tools/generate_compiled_program.py.",
         f'// compiled_hash={spec["hash"]}',
         "",
         "static constexpr bool daeCompiledProgramEnabled = true;",
+        f"static constexpr bool daeCompiledProgramDebug = {'true' if debug else 'false'};",
         f'static constexpr const char *daeCompiledProgramHash = "{spec["hash"]}";',
         f'static constexpr int daeCompiledProgramNumSms = {int(spec["num_sms"])};',
         f'static constexpr int daeCompiledProgramLiveValueCount = {int(spec.get("num_live_values", 0))};',
@@ -650,22 +651,34 @@ def generate_enabled(spec: dict[str, object]) -> str:
             "  C2MQueue &c2m,",
             "  uint64_t *g_events",
             ") {",
-            "  uint32_t pc = 0;",
-            "  uint32_t count = 0;",
-            "  bool finish = false;",
             "  switch (dae_compiled_program_id_for_sm(sm_id)) {",
         ]
     )
+    if debug:
+        lines.insert(-1, "  uint32_t pc = 0;")
     for program in spec["programs"]:
         lines.append(f"    case {int(program['program_id'])}: {{")
         for entry in program["compute"]:
             lines.append("      {")
-            lines.append("        if (finish) break;")
-            lines.append(f"        pc = {int(entry['index']) + 1};")
-            lines.extend(_emit_compute_inst_expr(entry, "        "))
-            lines.append(
-                f"        dae_compute_handler_{entry['name']}(sm_id, thread_id, pc, count, finish, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events);"
-            )
+            if debug:
+                lines.append(f"        pc = {int(entry['index']) + 1};")
+            if entry["name"] == "OP_TERMINATEC":
+                lines.extend(
+                    [
+                        "        c2m.template push<0, true>(thread_id, 0);",
+                        "        if (thread_id == 0) {",
+                        "          int event_base = sm_id * numProfileEvents;",
+                        "          g_events[event_base + 1] = cuda::ptx::get_sreg_globaltimer();",
+                        "        }",
+                        '        __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);',
+                    ]
+                )
+            else:
+                lines.extend(_emit_compute_inst_expr(entry, "        "))
+                lines.append(
+                    f"        dae_compute_handler_{entry['name']}(sm_id, thread_id, "
+                    f"{'&pc' if debug else 'nullptr'}, nullptr, nullptr, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events);"
+                )
             lines.append("      }")
         lines.append("      break;")
         lines.append("    }")
@@ -698,7 +711,7 @@ def generate_enabled(spec: dict[str, object]) -> str:
                 alloc_steps.extend(block["steps"])
             elif block["kind"] == "op":
                 alloc_steps.append(block)
-        _emit_payload_cache(alloc_steps, lines, "      ")
+        _emit_payload_aliases(alloc_steps, lines, "      ")
         for block in program["memory"]:
             _emit_alloc_block(block, lines, "      ")
         lines.append("      break;")
@@ -786,13 +799,14 @@ def generate_enabled(spec: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def generate_disabled(source: str) -> str:
+def generate_disabled(source: str, *, debug: bool) -> str:
     return "\n".join(
         [
             "// Generated by tools/generate_compiled_program.py.",
             f"// source={source}",
             "",
             "static constexpr bool daeCompiledProgramEnabled = false;",
+            f"static constexpr bool daeCompiledProgramDebug = {'true' if debug else 'false'};",
             'static constexpr const char *daeCompiledProgramHash = "";',
             "static constexpr int daeCompiledProgramNumSms = 0;",
             "static constexpr int daeCompiledProgramLiveValueCount = 0;",
@@ -828,15 +842,16 @@ def generate_disabled(source: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     spec_path, source = resolve_spec_path(ROOT)
     if spec_path is None or not spec_path.exists():
-        output = generate_disabled(source)
+        output = generate_disabled(source, debug=args.debug)
     else:
         spec = load_spec(spec_path)
-        output = generate_enabled(spec)
+        output = generate_enabled(spec, debug=args.debug)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

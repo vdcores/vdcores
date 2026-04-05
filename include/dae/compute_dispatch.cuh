@@ -14,9 +14,9 @@
 #define DAE_COMPUTE_OP_PARAMS \
   int sm_id, \
   int thread_id, \
-  uint32_t &pc, \
-  uint32_t &count, \
-  bool &finish, \
+  uint32_t *pc, \
+  uint32_t *count, \
+  bool *finish, \
   const CInst &inst, \
   void *smem_base, \
   uint64_t *scratch_space, \
@@ -326,19 +326,21 @@ DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
 
 DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
   DAE_UNUSED(sm_id, thread_id, finish, smem_base, scratch_space, st_insts, m2c, c2m, g_events);
-  if (++count < inst.args[0]) {
-    pc = inst.args[1];
-    __cprint("LOOPC back to PC %d, count=%d", pc, count);
+  assert(pc != nullptr && count != nullptr && "OP_LOOPC requires pc/count state");
+  if (++(*count) < inst.args[0]) {
+    *pc = inst.args[1];
+    __cprint("LOOPC back to PC %d, count=%d", *pc, *count);
   } else {
-    count = 0;
-    __cprint("LOOPC finished, count=%d", count);
+    *count = 0;
+    __cprint("LOOPC finished, count=%d", *count);
   }
   __sync_compute_group(128);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
   DAE_UNUSED(pc, count, inst, smem_base, scratch_space, st_insts, m2c);
-  finish = true;
+  if (finish != nullptr)
+    *finish = true;
   c2m.template push<0, true>(thread_id, 0);
   if (thread_id == 0) {
     int event_base = sm_id * numProfileEvents;
@@ -357,9 +359,9 @@ template <typename M2CQueue, typename C2MQueue>
 static __device__ __forceinline__ void dispatch_compute_instruction(
   int sm_id,
   int thread_id,
-  uint32_t &pc,
-  uint32_t &count,
-  bool &finish,
+  uint32_t *pc,
+  uint32_t *count,
+  bool *finish,
   const CInst &inst,
   void *smem_base,
   uint64_t *scratch_space,

@@ -59,6 +59,17 @@ This note summarizes the stable structure confirmed during repository initializa
 - `src/torch_runtime.cu` now clamps cache-policy windows to the device `accessPolicyMaxWindowSize`, which avoids `cudaStreamSetAttribute(... invalid argument)` on larger model weights.
 - `src/runtime.cu`, `src/torch_runtime.cu`, `include/dae/dae2.cuh`, and `include/dae/compiled_program.cuh` now include a second opt-in compiled-kernel path that reuses the current slot allocator and queue skeleton but swaps interpreter loops for generated per-role programs.
 - The compiled standalone subset no longer streams full `CInst` / `MInst` buffers at launch time: the generated compiled program now synthesizes spec-encoded compute/memory literals in CUDA and consumes only a compact per-SM `uint64` payload for address / coord seeds. `RepeatM` deltas stay baked into the spec, the generated alloc/LDU/STU code hoists each referenced payload slot into locals before the loop body, and the compiled LDU path now emits separate per-port entry points so `PORT1` load streams do not get replayed on both load warps or pay a runtime port-dispatch branch inside the generated program.
-- The compiled LDU path currently treats all generated `OP_ALLOC_TMA_LOAD_1D` steps as correctness-first blocking byte copies rather than `cuda::device::memcpy_async_tx(...)`. That change cleared the `gemv_mlp_mixed.py` hang in the `silu1` consumer program after the first barriered load; the remaining mixed-mode discrepancy is downstream output numerics, not a barrier deadlock.
+- `Launcher.launch()` already initializes the global `bars[]` table from `bar_values` for both interpreted and compiled mode before calling `runtime.launch_dae(...)` or `runtime.launch_dae_compiled(...)`. Current compiled barrier debugging therefore belongs in generated LDU/STU semantics rather than launch-time barrier setup.
+- Restoring compiled `OP_ALLOC_TMA_LOAD_1D` to the original `cuda::device::memcpy_async_tx(...)` path reintroduced the minimal compiled producer/store/barrier/load hang. The current preserved review bundle for that async-barrier repro is:
+  - `build/generated/debug_manual_copy_barrier_compiled_spec.json`
+  - `build/generated/debug_manual_copy_barrier_async.py`
+  - `build/generated/debug_manual_copy_barrier_async.inc`
+- The generated compiled compute path no longer carries a compiled-only `finish` state machine. Interpreter dispatch still passes real `pc` / `count` / `finish` pointers, but normal compiled builds now pass `nullptr` for all three and only emit compiled `pc` state in generator debug mode (`make pyext debug=<sm>`).
+- Generated compiled alloc/LDU/STU code now lowers memory ops through direct per-field locals instead of rebuilding temporary `MInst` values. Compiled alloc also no longer pushes synthetic LDU end tokens, so the generated LDU programs terminate by structure rather than by queue sentinel.
+- The preserved async-barrier review bundle now also includes:
+  - `build/generated/debug_manual_copy_barrier_async.log`
+  - `build/generated/debug_manual_copy_barrier_async_selected.inc`
+  - `build/generated/debug_manual_copy_barrier_async_op_order.inc`
+  - `build/generated/debug_manual_copy_barrier_async_dyn.inc`
 - The llama/qwen shared-memory SiLU stages are no longer only inline callables in the app scripts; they now have dedicated schedule classes in `python/dae/schedule.py` for the interleaved phase and the fused register-backed phase.
 - `app/python/llama3/sched.py` now follows the newer schedule-construction style: build dependency-only schedules first, attach mostly-static bars immediately after construction, then apply `place(...)` in a grouped step before submission to `dae.i(...)`.

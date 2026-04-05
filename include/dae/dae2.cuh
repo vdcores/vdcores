@@ -128,9 +128,9 @@ void dae2(
       dispatch_compute_instruction(
         sm_id,
         thread_id,
-        pc,
-        count,
-        finish,
+        &pc,
+        &count,
+        &finish,
         inst,
         smem_base,
         scratch_space,

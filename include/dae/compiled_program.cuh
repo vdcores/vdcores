@@ -17,12 +17,6 @@ union CompiledLdCmd {
     m2c_slot = mslot;
     reserved = 0;
   }
-
-  static __device__ __forceinline__ CompiledLdCmd end() {
-    CompiledLdCmd cmd {};
-    cmd.slot = SLOT_END;
-    return cmd;
-  }
 };
 
 static __device__ __forceinline__ CInst dae_make_compiled_cinst(
@@ -96,6 +90,7 @@ static __device__ __forceinline__ MInst dae_make_compiled_minst_empty(
   #include "dae/compiled_program.inc"
 #else
 static constexpr bool daeCompiledProgramEnabled = false;
+static constexpr bool daeCompiledProgramDebug = false;
 static constexpr const char *daeCompiledProgramHash = "";
 static constexpr int daeCompiledProgramNumSms = 0;
 static constexpr int daeCompiledProgramLiveValueCount = 0;

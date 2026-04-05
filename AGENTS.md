@@ -22,10 +22,29 @@ This repository is a CUDA-heavy `dae` project with Python scheduling scripts and
 ## Agent Workspace
 
 - Store concise in-tree agent summaries under `agents/`.
+- Store long-lived tracked task records under `agents/tasks/`.
 - Store task-by-task working logs under the gitignored `.agentlog/` directory.
 - Use `agents/workflows/` for durable, reusable procedures that future agents should follow.
 - Use `agents/knowledge/` for concise project knowledge captured from repo inspection, such as structure maps, entry points, and distilled lessons worth keeping in-tree.
+- Use `.agentlog/tasks/` for optional local-only per-task transcripts or bulky verification details when a tracked task needs more than the summary kept in `agents/tasks/`.
 - Keep agent docs short, factual, and tied to concrete files or commands.
+
+## Task Tracking
+
+- Treat substantial multi-conversation work as a tracked task.
+- When the user says `start task ...` or `continue task ...`, create or update a single tracked file under `agents/tasks/<task-slug>.md`.
+- Each tracked task file should contain:
+  - task title and short description
+  - status
+  - created / updated dates
+  - current state
+  - progress log
+  - remaining TODOs
+  - blockers / assumptions
+  - key files, commands, and artifacts
+- On every meaningful task turn, update the tracked task file before finishing.
+- If the task also needs detailed local notes or long command transcripts, keep those in `.agentlog/` and summarize only the durable/high-signal state in `agents/tasks/`.
+- Prefer continuing an existing task file when the slug or user wording clearly matches prior work; create a new one only when the work is materially different.
 
 ## Working Rules
 
@@ -40,6 +59,7 @@ This repository is a CUDA-heavy `dae` project with Python scheduling scripts and
 - Use `.agentlog/` for detailed task logs, verification notes, and environment blockers that do not belong in version control.
 - Use `agents/workflows/` to log durable project-specific workflow knowledge.
 - Update `agents/knowledge/` when you learn something structural or high-signal that will help later tasks.
+- Update `agents/tasks/` when the work belongs to a named multi-turn task, so future conversations can resume from the tracked state instead of reconstructing it from chat history.
 - Persist important changes and newly learned durable knowledge back into the tracked `agents/` docs; do not leave that context only in `.agentlog/`.
 
 ## Initialization Workflow
@@ -58,6 +78,7 @@ When starting fresh in this repository:
 5. If the task touches setup or build behavior, also inspect `Makefile`, `setup.py`, and `setup.sh`.
 6. Create or update agent notes:
    - add a dated entry under `.agentlog/` for task-specific actions, verification, and blockers;
+   - if the work belongs to a named task, create or refresh `agents/tasks/<task-slug>.md`;
    - add or refine reusable guidance in `agents/workflows/`;
    - add structural or distilled high-signal notes in `agents/knowledge/` when new project understanding is gained;
    - summarize important changes and durable takeaways into tracked `agents/` files during the same task.
@@ -75,9 +96,11 @@ When starting fresh in this repository:
 
 - Name `.agentlog/` entries with an ISO date prefix when possible, for example `2026-03-20-project-initialization.md`.
 - Each `.agentlog/` entry should capture: purpose, files touched, commands run for verification, and blockers or assumptions.
+- Name tracked task files with a stable slug, for example `agents/tasks/compiled-mode-cleanup.md`.
+- Tracked task files should stay concise and resume-friendly: a short description, recent progress, current TODOs, blockers, and the next recommended step.
 - Workflow docs should describe repeatable steps, not one-off task history.
 - Knowledge docs should summarize stable facts and distilled lessons that are worth keeping in-tree, and point to concrete entry files.
-- If a task produces an important repo change or durable lesson, record a concise persistent summary in `agents/workflows/` or `agents/knowledge/` instead of leaving it only in local logs.
+- If a task produces an important repo change or durable lesson, record a concise persistent summary in `agents/tasks/`, `agents/workflows/`, or `agents/knowledge/` instead of leaving it only in local logs.
 
 ## Verification
 

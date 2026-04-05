@@ -31,8 +31,7 @@ def repeat_func_tasks(sm: int):
     )
 
 dae.i(
-    # tasks,
-    repeat_func_tasks,
+    tasks,
     TerminateM(),
 
     # Compute instructions

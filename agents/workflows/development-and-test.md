@@ -120,6 +120,11 @@ Typical Python-only areas include:
 - For simple non-repeat `RegStore`/`RegLoad` handoff pairs, prefer the compiled-mode pair lowering: spec export tags the pair and generated LDU code uses a dedicated one-shot local instead of a generic register table. If a new schedule needs multiple structural stores or loads for the same reg id, expect the generator to fall back to the generic path until that pattern is taught explicitly.
 - When inspecting or comparing compiled-mode experiments, preserve named generated outputs under `build/generated/` with `tools/generate_compiled_program.py --output build/generated/test_*.inc` or by copying files out of `build/generated/dae/` after the build. The shared `build/generated/dae/*.inc` files are overwritten by the next compiled rebuild.
 - For `app/python/gemv_mlp_mixed.py`, debug the `silu1` consumer in isolation first if compiled mode hangs. The decisive simple check was: if the first barrier-tagged `TmaLoad1D(...)` progresses but the next plain `TmaLoad1D(...)` never arrives, the compiled `OP_ALLOC_TMA_LOAD_1D` async path is the likely culprit. In the current tree, compiled `OP_ALLOC_TMA_LOAD_1D` uses a blocking byte-copy lowering for correctness and that clears the mixed-mode deadlock.
+- Barrier init itself is not the missing piece in the current compiled path: `Launcher.launch()` already writes `bar_values` into `self.bars` before both interpreted and compiled launches. If a compiled barriered load/store schedule still hangs, generate and preserve a minimal spec/harness/include bundle first and review generated LDU/STU semantics before changing launch setup.
+- After the blocking-`OP_ALLOC_TMA_LOAD_1D` correctness fallback landed, re-run performance comparisons before drawing conclusions about compiled mode. Compute-heavy schedules such as GEMV / argmax still improved modestly, but 1D-load-heavy schedules (`tma1d`, `tmacopy`, `rmsnorm`, and the current `gemv_mlp_mixed`) regressed badly because compiled mode is no longer using the async 1D load path there.
+- Compiled-program generation now has a debug mode too: `make pyext debug=<sm>` forwards `--debug` into `tools/generate_compiled_program.py`, so compiled compute PC state is only emitted when you actually want debug traces. Leave `debug` unset for perf runs.
+- The preserved async 1D barrier repro harness is now self-contained again: `build/generated/debug_manual_copy_barrier_async.py` explicitly switches to compiled mode, and the freshest timeout trace lives at `build/generated/debug_manual_copy_barrier_async.log`.
+- If `app/python/tma1d.py` is left on the linear `tasks` form, interpreted launch asserts because `1024` standalone memory ops exceed the runtime instruction budget. For apples-to-apples interpreted/compiled checks, use the existing repeat-form schedule (`RepeatM.on(...)`) instead of treating that assertion as a new runtime bug.
 - The compiled LDU path must be generated per load port. If a schedule uses `PORT1`, do not replay the full load sequence on both LDU warps; emit separate port-filtered sequences and pass `port_id` into the compiled LDU entry point.
 - For double-port compiled programs, go one step further and keep the port split at compile time too: generate separate `ld0` / `ld1` entry points and call them directly from the two LDU warps instead of branching on `port_id` inside one generated LDU function.
 - `.github/workflows/docker-image.yml` builds the repo image on GitHub Actions and pushes it to Docker Hub. It expects repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, and publishes both `latest` and short-SHA tags under `docker.io/<DOCKERHUB_USERNAME>/vdcores`.
@@ -222,6 +227,44 @@ On 2026-04-05:
   - `build/generated/test_gemv_mlp_mixed_blocking1d_selected.inc`
   - `build/generated/test_gemv_mlp_mixed_blocking1d_op_order.inc`
   - `build/generated/test_gemv_mlp_mixed_blocking1d_dyn.inc`
+- Restoring compiled `OP_ALLOC_TMA_LOAD_1D` to the original async `cuda::device::memcpy_async_tx(...)` path reintroduced the minimal compiled producer/store/barrier/load hang. Preserved repro artifacts:
+  - `build/generated/debug_manual_copy_barrier_compiled_spec.json`
+  - `build/generated/debug_manual_copy_barrier_async.py`
+  - `build/generated/debug_manual_copy_barrier_async.inc`
+  - `build/generated/debug_manual_copy_barrier_async_selected.inc`
+  - `build/generated/debug_manual_copy_barrier_async_op_order.inc`
+  - `build/generated/debug_manual_copy_barrier_async_dyn.inc`
+- Control-flow / payload codegen cleanup:
+  - compiled compute now emits direct `OP_TERMINATEC` logic and passes `nullptr` for the finish pointer instead of maintaining a compiled-only `finish` variable and `if (finish) break` checks
+  - generated alloc/LDU/STU code now emits live payload aliases as `const uint64_t &` references instead of eagerly reading every used payload slot at function entry
+- Sequential rebuild-and-benchmark pass after those cleanups:
+  - `tma1d` (`-b 20`): interpreted `441881.07 ns`, compiled `233435297.65 ns`
+  - `tmacopy` (`-b 20`): interpreted `904656.63 ns`, compiled `233513523.25 ns`
+  - `gemv_out` (`-b 20`): interpreted `6540.05 ns`, compiled `5847.58 ns`
+  - `gemv_mma_out` (`-b 20`): interpreted `18828.22 ns`, compiled `18160.88 ns`
+  - `rmsnorm` (`-b 20`): interpreted `2519.0 ns`, compiled `220693.8 ns`
+  - `argmax` (`-b 10`): interpreted `6576.47 ns`, compiled `5793.92 ns`
+  - `gemv_mlp_mixed` (`-b 5`): interpreted `82727.08 ns`, compiled `1408020.85 ns`
+- Preserved generated benchmark artifacts:
+  - `build/generated/tma1d_perf.inc`
+  - `build/generated/tmacopy_perf.inc`
+  - `build/generated/gemv_out_perf.inc`
+  - `build/generated/gemv_mma_out_perf.inc`
+  - `build/generated/rmsnorm_perf.inc`
+  - `build/generated/argmax_perf.inc`
+  - `build/generated/gemv_mlp_mixed_perf.inc`
+- Compiled codegen cleanup round 2:
+  - compiled compute `pc` is now emitted only in debug builds; normal compiled builds pass `nullptr` for `pc/count/finish`
+  - generated alloc/LDU/STU code now lowers memory ops through direct per-field locals instead of rebuilding temporary `MInst` values
+  - compiled alloc no longer pushes synthetic LDU end tokens, and generated LDU code no longer consumes/asserts them
+- Rechecked `tma1d` and `gemv_out` after that cleanup:
+  - repeat-form `tma1d` (`20` iters): interpreted `446309.27 ns`, compiled `273290.29 ns`
+  - `gemv_out` same-input correctness: interpreted and compiled both `0.162586%` vs ref, `0.0%` interpreted-vs-compiled diff
+  - `gemv_out` (`20` iters): interpreted `6499.35 ns`, compiled `5792.10 ns`
+- Refreshed async 1D barrier debug bundle:
+  - `build/generated/debug_manual_copy_barrier_async.py` now forces compiled mode
+  - regenerated with `make pyext debug=0 DAE_COMPILED_SPEC_FILE=build/generated/debug_manual_copy_barrier_compiled_spec.json`
+  - latest timeout trace is `build/generated/debug_manual_copy_barrier_async.log`
 
 On 2026-03-21:
 
