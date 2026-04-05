@@ -5,6 +5,7 @@
 #include "allocator.cuh"
 #include "queue.cuh"
 #include "compute_dispatch.cuh"
+#include "compiled_program.cuh"
 
 #include <cuda.h>
 #include <cuda/barrier>
@@ -174,4 +175,130 @@ void dae2(
   } // End of memory warp group
 
   // end of megakernel
+}
+
+static __global__
+void dae2_compiled(
+  const CInst* __restrict__ compute_instructions,
+  const MInst* __restrict__ memory_instructions,
+  const CUtensorMap* __restrict__ tma_descs,
+  int * __restrict__ bars,
+  uint64_t *  __restrict__ g_events
+) {
+  int sm_id = blockIdx.x;
+  int thread_id = threadIdx.x;
+  int warp_id = (thread_id % 128) / 32;
+  int lane_id = thread_id % 32;
+
+  const CInst* __restrict__ cinsts;
+  const MInst* __restrict__ minsts;
+
+  if constexpr (dae2LoadInstructions) {
+    __shared__ CInst smem_cinsts[numInsts];
+    __shared__ MInst smem_minsts[numInsts];
+
+    for (int i = thread_id; i < numInsts; i += blockDim.x) {
+      smem_cinsts[i] = compute_instructions[sm_id * numInsts + i];
+      smem_minsts[i] = memory_instructions[sm_id * numInsts + i];
+    }
+
+    cinsts = smem_cinsts;
+    minsts = smem_minsts;
+  } else {
+    cinsts = compute_instructions + sm_id * numInsts;
+    minsts = memory_instructions + sm_id * numInsts;
+  }
+
+  constexpr int numQueueElements = 32;
+  __shared__ MInst st_insts[numSlots + numSpecialSlots];
+
+  __shared__ int slot_avail;
+  if (thread_id == 0)
+    slot_avail = (1U << numSlots) - 1;
+
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ cuda::barrier<cuda::thread_scope_block> barriers[4][numQueueElements];
+  assert(numQueueElements <= blockDim.x && "Too many slots for barriers");
+  if (threadIdx.x < numQueueElements) {
+    init(&barriers[0][threadIdx.x], numThreadsM2CBarrier);
+    init(&barriers[1][threadIdx.x], numThreadsC2MBarrier);
+    init(&barriers[2][threadIdx.x], numThreadsLDBarrier);
+    init(&barriers[3][threadIdx.x], numThreadsLDBarrier);
+  }
+
+  __shared__ int m2c_data[numQueueElements];
+  __shared__ int c2m_data[numQueueElements];
+  __shared__ int m2ld_data[2][numQueueElements];
+
+  SizeBoundedBarrierQueue<int, numQueueElements> m2c {
+    .barriers = barriers[0], .data = m2c_data, .ptr = 0
+  };
+  SizeBoundedBarrierAllocQueue<numQueueElements> c2m {
+    barriers[1], c2m_data, 0, &slot_avail
+  };
+  SizeBoundedBarrierQueue<int, numQueueElements> m2ld[2] = {
+    { .barriers = barriers[2], .data = m2ld_data[0], .ptr = 0 },
+    { .barriers = barriers[3], .data = m2ld_data[1], .ptr = 0 }
+  };
+
+  extern __shared__ uint8_t shared_mem[];
+  void * smem_base = align_to((void*)shared_mem, 1024);
+  __shared__ uint64_t scratch_space[32];
+
+  if (threadIdx.x == 0) {
+    int event_base = sm_id * numProfileEvents;
+    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x < numComputeWarps * 32) {
+    dae_compiled_compute_execute(
+      sm_id,
+      thread_id,
+      cinsts,
+      smem_base,
+      scratch_space,
+      st_insts,
+      m2c,
+      c2m,
+      g_events
+    );
+  } else {
+    if (warp_id == 0) {
+      dae_compiled_alloc_execute(
+        sm_id,
+        lane_id,
+        m2c,
+        m2ld,
+        minsts,
+        &slot_avail
+      );
+    } else if (warp_id == 1) {
+      if (lane_id == 0) {
+        dae_compiled_st_execute(
+          sm_id,
+          c2m,
+          minsts,
+          smem_base,
+          tma_descs,
+          bars
+        );
+      }
+    } else if (warp_id >= 2) {
+      if (lane_id == 0) {
+        int port_id = warp_id - 2;
+        dae_compiled_ld_execute(
+          sm_id,
+          port_id,
+          m2ld[port_id],
+          m2c,
+          minsts,
+          smem_base,
+          tma_descs,
+          bars
+        );
+      }
+    }
+  }
 }

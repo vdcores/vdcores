@@ -12,6 +12,14 @@ size_t set_smem_size(size_t smem_size) {
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
     }
+    err = cudaFuncSetAttribute(
+        dae2_compiled,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+    );
+    if (err != cudaSuccess) {
+        std::cerr << "Compiled kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
+    }
     return smem_size;
 }
 
@@ -39,6 +47,29 @@ cudaError_t launch_dae(
 
   cudaDeviceSynchronize();
 
+  return cudaGetLastError();
+}
+
+cudaError_t launch_dae_compiled(
+  int numSMs,
+  size_t smem_size,
+  CInst* compute_instructions,
+  MInst* memory_instructions,
+  CUtensorMap* tma_descs,
+  int * bars,
+  uint64_t * profile,
+  int64_t stream
+) {
+  cudaDeviceSynchronize();
+  cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  dae2_compiled<<<numSMs, numThreads, smem_size, cuda_stream>>>(
+    compute_instructions,
+    memory_instructions,
+    tma_descs,
+    bars,
+    profile
+  );
+  cudaDeviceSynchronize();
   return cudaGetLastError();
 }
 

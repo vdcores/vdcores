@@ -22,6 +22,5 @@ layer = GemvLayer(dae, Atom, "out_proj", (matA, matB, matC))
 
 dae.s(layer.schedule().place(num_sms))
 
-dae_app(dae)
-
-layer.diff()
+if dae_app(dae):
+    layer.diff()

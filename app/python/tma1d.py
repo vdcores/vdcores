@@ -1,5 +1,6 @@
 import torch
 from dae.launcher import *
+from dae.util import *
 
 gpu = torch.device("cuda")
 
@@ -39,6 +40,4 @@ dae.i(
     TerminateC()
 )
 
-dae.launch()
-
-dae.bench(1, total_bytes = num_loads * load_bytes * num_sms)
+dae_app(dae, total_bytes = num_loads * load_bytes * num_sms)

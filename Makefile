@@ -12,10 +12,13 @@ GENERATED_INCLUDE_DIR := build/generated
 SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc
 COMPUTE_OPCODE_ORDER := $(GENERATED_INCLUDE_DIR)/dae/compute_opcode_order.inc
 DYNAMIC_COMPUTE_HANDLERS := $(GENERATED_INCLUDE_DIR)/dae/dynamic_compute_handlers.inc
+COMPILED_PROGRAM := $(GENERATED_INCLUDE_DIR)/dae/compiled_program.inc
 COMPUTE_OP_GENERATED_STAMP := $(GENERATED_INCLUDE_DIR)/dae/compute_ops.generated.stamp
+COMPILED_PROGRAM_GENERATED_STAMP := $(GENERATED_INCLUDE_DIR)/dae/compiled_program.generated.stamp
 COMPUTE_DISPATCH := include/dae/compute_dispatch.cuh
 OPCODE_REGISTRY := include/dae/opcode.cuh.inc
 COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
+COMPILED_PROGRAM_GENERATOR := tools/generate_compiled_program.py
 
 # Compiler flags
 # NVCC_FLAGS = -DNDEBUG -O3 -std=c++20 $(if $(profile),-DDAE_PROFILE) # --ptxas-options=--verbose
@@ -25,6 +28,9 @@ LDFLAGS = -lcuda -lcublas
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
+ifneq ($(strip $(DAE_ALLOW_UNSUPPORTED_COMPILER)),)
+	NVCC_FLAGS += -allow-unsupported-compiler
+endif
 
 # Directories
 ifeq ($(debug),)
@@ -69,15 +75,24 @@ $(COMPUTE_OP_GENERATED_STAMP): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_DISPATCH)
 
 $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS): $(COMPUTE_OP_GENERATED_STAMP)
 
-runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
+$(COMPILED_PROGRAM_GENERATED_STAMP): FORCE $(COMPILED_PROGRAM_GENERATOR)
+	@mkdir -p $(dir $@)
+	@set -e; \
+	if [ -n "$(strip $(DAE_COMPILED_SPEC_FILE))" ]; then export DAE_COMPILED_SPEC_FILE='$(DAE_COMPILED_SPEC_FILE)'; fi; \
+	$(PYTHON) $(COMPILED_PROGRAM_GENERATOR) --output $(COMPILED_PROGRAM); \
+	touch $@
+
+$(COMPILED_PROGRAM): $(COMPILED_PROGRAM_GENERATED_STAMP)
+
+runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(COMPILED_PROGRAM) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
 
-%: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
+%: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(COMPILED_PROGRAM)
 
 run: $(BIN)
 	./$<
 
-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
+pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(COMPILED_PROGRAM) $(TARGETS)
 	pip install -e . --no-build-isolation
 
 FORCE:

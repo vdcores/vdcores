@@ -2,6 +2,7 @@
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -30,6 +31,8 @@ parse_comp_family_registry_lines = _op_family_specs.parse_comp_family_registry_l
 DISPATCH_PATTERN = re.compile(r"^\s*DAE_COMPUTE_OP_HANDLER\(\s*([A-Za-z0-9_]+)\s*\)\s*\{?\s*$")
 OPCODE_PATTERN = re.compile(r"^\s*DAE_OP\(\s*([A-Za-z0-9_]+)\s*,\s*(.+?)\s*\)\s*(?://.*)?$")
 DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
+DEFAULT_COMPILED_SPEC_FILE = "dae_compiled_program.vdcore.json"
+COMPILED_SPEC_ENV = "DAE_COMPILED_SPEC_FILE"
 COMPUTE_OPS_ENV = "DAE_COMPUTE_OPS"
 COMPUTE_OPS_FILE_ENV = "DAE_COMPUTE_OPS_FILE"
 COMPUTE_OPCODE_BASE = 0x7000
@@ -104,6 +107,21 @@ def resolve_requested_ops(base_dir: Path) -> tuple[list[str] | None, str]:
         if not requested_ops_file.exists():
             raise ValueError(f"Compute-op file {requested_ops_file} from {COMPUTE_OPS_FILE_ENV} does not exist")
         return parse_operator_list(requested_ops_file.read_text()), f"file:{requested_ops_file}"
+
+    compiled_spec_candidates = []
+    if COMPILED_SPEC_ENV in os.environ:
+        compiled_spec_file = Path(os.environ[COMPILED_SPEC_ENV]).expanduser()
+        if not compiled_spec_file.is_absolute():
+            compiled_spec_file = base_dir / compiled_spec_file
+        compiled_spec_candidates.append((compiled_spec_file, f"compiled-spec:{compiled_spec_file}"))
+    compiled_spec_candidates.append((base_dir / DEFAULT_COMPILED_SPEC_FILE, f"compiled-spec:{base_dir / DEFAULT_COMPILED_SPEC_FILE}"))
+    for compiled_spec_file, source in compiled_spec_candidates:
+        if not compiled_spec_file.exists():
+            continue
+        payload = json.loads(compiled_spec_file.read_text())
+        compute_ops = parse_operator_list("\n".join(payload.get("compute_ops", [])))
+        if compute_ops:
+            return compute_ops, source
 
     default_ops_file = base_dir / DEFAULT_COMPUTE_OPS_FILE
     if default_ops_file.exists():

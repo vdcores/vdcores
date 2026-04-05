@@ -2,6 +2,7 @@ import torch
 import argparse
 import numpy as np
 
+from .compiled_mode import DEFAULT_COMPILED_SPEC_FILE
 from .launcher import extract_compute_operator_names
 
 
@@ -42,6 +43,12 @@ def write_compute_operator_file(dae, path: str = DEFAULT_COMPUTE_OPS_FILE):
             f.write(f"{name}\n")
     print(f"[compute-ops] wrote {len(operator_names)} operators to {path}")
     return path
+
+
+def write_compiled_spec_file(dae, path: str = DEFAULT_COMPILED_SPEC_FILE):
+    written = dae.write_compiled_spec(path)
+    print(f"[compiled-spec] wrote {written}")
+    return written
 
 class ProfileParser:
     def __init__(self, dae):
@@ -105,6 +112,10 @@ def dae_app(dae, total_bytes = None):
                         help="Profile with VDCores profiling counters")
     parser.add_argument("-w", "--write-compute-ops", type=str, nargs="?", const=DEFAULT_COMPUTE_OPS_FILE, default=None,
                         help=f"Write the launcher compute-operator list to a file (default: {DEFAULT_COMPUTE_OPS_FILE})")
+    parser.add_argument("--write-compiled-spec", type=str, nargs="?", const=DEFAULT_COMPILED_SPEC_FILE, default=None,
+                        help=f"Write the launcher compiled-program spec to a file (default: {DEFAULT_COMPILED_SPEC_FILE})")
+    parser.add_argument("--mode", choices=["interpreted", "compiled"], default="interpreted",
+                        help="Select launcher execution mode")
     
     parsed = parser.parse_args()
     did_work = False
@@ -118,6 +129,11 @@ def dae_app(dae, total_bytes = None):
         write_compute_operator_file(dae, parsed.write_compute_ops)
         did_work = True
 
+    if parsed.write_compiled_spec is not None:
+        write_compiled_spec_file(dae, parsed.write_compiled_spec)
+        did_work = True
+
+    dae.set_mode(parsed.mode)
     executed = False
     if parsed.launch:
         print(f"[launch] VDCores with {dae.num_sms} SMs...")
@@ -140,3 +156,5 @@ def dae_app(dae, total_bytes = None):
         pp = ProfileParser(dae)
         for prof in parsed.profile:
             pp.parse(prof)
+
+    return executed

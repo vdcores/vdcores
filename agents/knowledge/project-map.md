@@ -26,7 +26,8 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/op_family_specs.py`: shared parser helpers for declarative compute-family definitions. Runtime Python parses the extension-exported spec objects through it, while the build-time generator reuses the same parsing rules against `include/dae/opcode.cuh.inc`.
 - `python/dae/instruction_utils.py`: small opcode/packing helpers shared by the instruction and op modules.
 - `python/dae/instruction_utils.py`: small opcode/packing helpers shared by the instruction and op modules; it now also owns compute-op family normalization, lazy runtime-opcode resolution, and compute-instruction tensor packing so `python/dae/instructions.py` stays mostly declarative.
-- `python/dae/util.py`: CLI helpers including instruction dumps, profiling output, and `--write-compute-ops` generation of a default `dae_compute_ops.vdcore.build` build-selection file from a built launcher.
+- `python/dae/compiled_mode.py`: compiled-mode structural-spec exporter that hashes per-SM instruction topology without baking in runtime tensor addresses, and writes the AOT build manifest consumed by the new compiled-kernel generator.
+- `python/dae/util.py`: CLI helpers including instruction dumps, profiling output, `--write-compute-ops`, and `--write-compiled-spec` / `--mode compiled` for the AOT compiled-mode workflow.
 - `python/dae/schedule.py`: scheduling interface and composition layer.
 - `python/dae/model.py`: model-side Python support code.
 - `include/dae/`: runtime abstractions such as allocator, launcher, queues, runtime, and virtual cores.
@@ -39,6 +40,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `src/torch_runtime.cu`: Torch extension binding source.
 - `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.vdcore.build`, and emits `build/generated/dae/selected_compute_ops.inc`, `build/generated/dae/compute_opcode_order.inc`, and `build/generated/dae/dynamic_compute_handlers.inc` for the selective-build flow.
   It also emits `build/generated/dae/dynamic_compute_handlers.inc` for any selected dynamic op-family handlers.
+- `tools/generate_compiled_program.py`: build-time helper that consumes `dae_compiled_program.vdcore.json` or `DAE_COMPILED_SPEC_FILE` and emits `build/generated/dae/compiled_program.inc` for the compiled-kernel path.
 
 ## Operational Notes
 
@@ -55,5 +57,6 @@ This note summarizes the stable structure confirmed during repository initializa
 - `Makefile` now routes compute-op generation through a single generated stamp file so the generator runs once per build even though `runtime.o` depends on multiple generated include outputs.
 - `python/dae/instructions.py` and `include/dae/pipeline/allocwarp.cuh` now support non-power-of-two embedding row widths through `OP_CC0_ROW_BYTES`, so `CC0(...)` is no longer limited to power-of-two row-byte sizes.
 - `src/torch_runtime.cu` now clamps cache-policy windows to the device `accessPolicyMaxWindowSize`, which avoids `cudaStreamSetAttribute(... invalid argument)` on larger model weights.
+- `src/runtime.cu`, `src/torch_runtime.cu`, `include/dae/dae2.cuh`, and `include/dae/compiled_program.cuh` now include a second opt-in compiled-kernel path that reuses the current slot allocator and queue skeleton but swaps interpreter loops for generated per-role programs.
 - The llama/qwen shared-memory SiLU stages are no longer only inline callables in the app scripts; they now have dedicated schedule classes in `python/dae/schedule.py` for the interleaved phase and the fused register-backed phase.
 - `app/python/llama3/sched.py` now follows the newer schedule-construction style: build dependency-only schedules first, attach mostly-static bars immediately after construction, then apply `place(...)` in a grouped step before submission to `dae.i(...)`.

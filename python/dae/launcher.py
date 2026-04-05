@@ -1,6 +1,7 @@
 from . import runtime
 from .instruction_utils import decode_opcode, dedcode_opcode
 from .instructions import *
+from .compiled_mode import build_compiled_spec, compiled_spec_hash, write_compiled_spec as write_compiled_spec_file
 from .runtime import config, opcode
 from .tma_utils import *
 
@@ -210,10 +211,11 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
-    def __init__(self, num_sms : int = 1, device = 'cuda'):
+    def __init__(self, num_sms : int = 1, device = 'cuda', mode: str = "interpreted"):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
         self.device = device
+        self.mode = mode
 
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
@@ -240,6 +242,12 @@ class Launcher:
         }
 
         runtime.set_smem_size(self.smem_size)
+
+    def set_mode(self, mode: str):
+        if mode not in {"interpreted", "compiled"}:
+            raise ValueError(f"Unsupported launcher mode {mode!r}")
+        self.mode = mode
+        return self
 
     # resource management functions
     def add_group(self, name, size):
@@ -294,6 +302,15 @@ class Launcher:
                     self.mptrs,
                 )
             self.need_instruction_build = False
+
+    def compiled_spec(self) -> dict:
+        return build_compiled_spec(self)
+
+    def compiled_program_hash(self) -> str:
+        return self.compiled_spec()["hash"]
+
+    def write_compiled_spec(self, path: str):
+        return write_compiled_spec_file(self, path)
 
     def set_persistent(self, *tensors):
         stream = torch.cuda.current_stream().cuda_stream
@@ -361,8 +378,6 @@ class Launcher:
         return ci / self.num_sms, mi / self.num_sms
 
     def launch(self):
-        self.build_instructions()
-
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
         if supported_compute_ops is not None:
             required_compute_ops = self.compute_operator_names()
@@ -378,6 +393,25 @@ class Launcher:
         unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
         if unbound_bar_ids:
             raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
+
+        if self.mode == "compiled":
+            if not getattr(runtime, "compiled_program_enabled", False):
+                raise ValueError("Compiled mode requested, but dae.runtime was built without a compiled program")
+            current_spec = self.compiled_spec()
+            runtime_hash = getattr(runtime, "compiled_program_hash", "")
+            if current_spec["hash"] != runtime_hash:
+                raise ValueError(
+                    "Compiled mode hash mismatch. "
+                    f"Current launcher hash={current_spec['hash']} runtime hash={runtime_hash}. "
+                    "Re-export the compiled spec and rebuild dae.runtime."
+                )
+            runtime_num_sms = int(getattr(runtime, "compiled_program_num_sms", 0))
+            if runtime_num_sms != self.num_sms:
+                raise ValueError(
+                    f"Compiled mode num_sms mismatch: launcher={self.num_sms}, runtime={runtime_num_sms}"
+                )
+
+        self.build_instructions()
 
         # Load the model using the runtime
         cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
@@ -407,7 +441,8 @@ class Launcher:
             runtime.set_cache_policy(cinsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
             runtime.set_cache_policy(minsts[i*4*self.max_insts:(i+1)*4*self.max_insts], stream, 1, 2, 0)
 
-        ret = runtime.launch_dae(
+        launch_fn = runtime.launch_dae_compiled if self.mode == "compiled" else runtime.launch_dae
+        ret = launch_fn(
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
             self.bars, profile,

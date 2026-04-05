@@ -9,6 +9,8 @@ extra_link_args = [
     f"-Wl,-rpath,{torch_lib}",
 ]
 
+allow_unsupported_compiler = bool(os.environ.get("DAE_ALLOW_UNSUPPORTED_COMPILER"))
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 generated_include_dir = os.path.join(this_dir, "build", "generated")
 sources = [os.path.join(this_dir, "src", "torch_runtime.cu")]
@@ -38,7 +40,8 @@ setup(
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
-                    "-Xptxas=-v"
+                    "-Xptxas=-v",
+                    *(["-allow-unsupported-compiler"] if allow_unsupported_compiler else []),
                 ],
             },
             libraries=["cuda"],             # REQUIRED for cuTensorMap

@@ -50,6 +50,5 @@ dae.i(
 
 ref = matA @ matB.t()
 
-dae_app(dae)
-
-tensor_diff("GEMV MMA M64N8", ref, matC.t())
+if dae_app(dae):
+    tensor_diff("GEMV MMA M64N8", ref, matC.t())

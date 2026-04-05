@@ -28,5 +28,5 @@ dae.i(
     TerminateC()
 )
 
-dae_app(dae)
-tensor_diff("copy", out, vec)
+if dae_app(dae):
+    tensor_diff("copy", out, vec)

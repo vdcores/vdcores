@@ -1,5 +1,6 @@
 #include "dae/runtime.cuh"
 #include "dae/context.cuh"
+#include "dae/compiled_program.cuh"
 
 #include <torch/extension.h>
 
@@ -96,6 +97,36 @@ int py_launch_dae(
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
 
   // Return something meaningful; often you return profile or nothing.
+  return 0;
+}
+
+int py_launch_dae_compiled(
+    int64_t num_sms,
+    size_t smem_size,
+    torch::Tensor compute_insts_bytes,
+    torch::Tensor memory_insts_bytes,
+    torch::Tensor tma_descs_bytes,
+    torch::Tensor bars_int32,
+    torch::Tensor profile_u64,
+    int64_t stream
+) {
+  set_persistent_cache();
+
+  TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
+
+  auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");
+  auto minst = check_tensor_ptr<MInst>(memory_insts_bytes, "memory_insts_bytes");
+  auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
+  auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
+  auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+
+  cudaError_t st = launch_dae_compiled(
+      static_cast<int>(num_sms), smem_size,
+      cinst, minst, tma,
+      bars, prof, stream
+  );
+
+  TORCH_CHECK(st == cudaSuccess, "launch_dae_compiled failed: ", cudaGetErrorString(st));
   return 0;
 }
 
@@ -281,6 +312,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   #include "dae/selected_compute_ops.inc"
   #undef DAE_COMPUTE_OP
   m.attr("supported_compute_ops") = supported_compute_ops;
+  m.attr("compiled_program_enabled") = py::bool_(daeCompiledProgramEnabled);
+  m.attr("compiled_program_hash") = py::str(daeCompiledProgramHash);
+  m.attr("compiled_program_num_sms") = py::int_(daeCompiledProgramNumSms);
 
   auto config = m.def_submodule("config", "DAE2 Configuration Constants");
   config.attr("slot_size") = slotSizeKb * 1024;
@@ -307,6 +341,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Set dynamic shared memory size for DAE2 kernel");
   m.def("launch_dae", &py_launch_dae,
             "Launch DAE2 kernel with given parameters");
+  m.def("launch_dae_compiled", &py_launch_dae_compiled,
+            "Launch compiled DAE2 kernel with given parameters");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("set_cache_policy", &py_tensor_set_cache_policy,
