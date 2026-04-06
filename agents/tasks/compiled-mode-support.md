@@ -115,6 +115,39 @@ Compiled mode is working end-to-end for the current supported subset and has bee
     - compiled benchmark: `87069.83 ns` average duration, `90056.00 ns` average execution time
     - compiled basic `ncu`: `101.38 us`, `75.05%` memory throughput, `13.13%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory
   - takeaway: the consumer-aware unpack cleanup is worth keeping for code quality and to avoid dead generated work, but it does not materially change the current mixed-MLP performance.
+- 2026-04-06: tried replacing alloc-side emitted per-step code with a table-driven alloc-command loop for programs that do not require `st_insts` metadata, then reverted it after measurement:
+  - the generated helper reduced `ptxas` compile time for `dae2_compiled` (`691.855 ms` to `364.817 ms`) but introduced `656` bytes of cumulative stack size in the compiled kernel
+  - `gemv_mlp_mixed` regressed sharply:
+    - compiled benchmark: `99289.62 ns` average duration, `120540.80 ns` average execution time
+    - compiled basic `ncu`: `127.07 us`, `60.63%` memory throughput, `10.67%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory
+  - takeaway: alloc-side table driving looked attractive from a code-size perspective, but on Hopper this version added enough overhead that it was clearly worse than the existing emitted alloc path, so it was backed out.
+- 2026-04-06: retried alloc-side dedup with a different shape: one inline generic alloc loop body after the per-program switch, fed by compact encoded command tables and selectable placement (`disabled`, `constant`, `shared`, `global`):
+  - unlike the earlier helper-based table path, this version keeps the alloc application logic inline and avoids the large stack regression
+  - `gemv_mlp_mixed` placement sweep results:
+    - `disabled`: `86585.76 ns` benchmark, `100.13 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `0` bytes compiled-kernel stack
+    - `constant`: `82059.16 ns` benchmark, `98.91 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
+    - `shared`: `82802.01 ns` benchmark, `98.62 us` compiled basic `ncu`, `40` registers/thread, `1952` bytes smem, `48` bytes compiled-kernel stack
+    - `global` with `prefetch.global.L1`: `81837.03 ns` benchmark, `99.46 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
+  - relative to the `disabled` baseline, the alloc-table placements improved the compiled benchmark by about `5.23%` (`constant`), `4.37%` (`shared`), and `5.48%` (`global`), while compiled `ncu` duration improved by about `1.22%`, `1.51%`, and `0.67%` respectively
+  - a fresh interpreted rerun in the same phase measured `80752.35 ns`, so the best compiled result (`global`) narrows the mixed-MLP gap to about `1.3%`
+  - selected `global` as the default alloc-table mode in `tools/generate_compiled_program.py`, while keeping `DAE_COMPILED_ALLOC_TABLE_MODE={disabled,constant,shared,global}` as an override for future tuning
+  - rebuilt once more with no alloc-table env override to verify the new default path:
+    - compiled: `82122.58 ns` average duration, `86465.60 ns` average execution time
+  - takeaway: table placement matters, but the main fix was keeping the alloc loop body inline; among the tested placements, `global` plus L1 prefetch is the best default for this mixed benchmark.
+- 2026-04-06: added selectable live-value placement on top of the new alloc-table path, with `DAE_COMPILED_LIVE_VALUE_MODE={global,shared,constant}`:
+  - `global`: existing per-SM slice pointer into the launcher-supplied tensor
+  - `shared`: copy each SM’s live-value slice into shared memory at kernel start, then read from shared for alloc/ld/st
+  - `constant`: upload the launcher-supplied live values once into a generated constant buffer and read per-SM slices from constant memory
+  - `gemv_mlp_mixed` live-value placement sweep results with alloc-table mode left on its current default:
+    - `global`: `82055.81 ns` benchmark, `99.90 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
+    - `shared`: `81677.42 ns` benchmark, `98.11 us` compiled basic `ncu`, `40` registers/thread, `1904` bytes smem, `48` bytes compiled-kernel stack
+    - `constant`: `82196.12 ns` benchmark, `97.66 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
+  - relative to the `global` live-value baseline, `shared` improved the compiled benchmark by about `0.46%` and `ncu` duration by about `1.79%`; `constant` had the best `ncu` duration but slightly worse benchmark time than `global`
+  - selected `shared` as the default live-value mode in `tools/generate_compiled_program.py`, while keeping `DAE_COMPILED_LIVE_VALUE_MODE` available for future tuning
+  - rebuilt once more with no live-value env override to verify the new default path:
+    - compiled: `81751.53 ns` average duration, `86372.80 ns` average execution time
+  - a recent interpreted rerun in the same phase measured `80752.35 ns`, so the current combined alloc/live placement path brings `gemv_mlp_mixed` to within about `1.24%` of interpreted on average duration
+  - takeaway: live-value placement matters too, but less dramatically than alloc placement; on this mixed benchmark the best default is shared-memory staging of the now-small per-SM live-value slices.
 
 ## TODO
 
@@ -126,6 +159,9 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 - Use the new `ncu` direction to target the next compiled-mode optimization beyond loop folding, now focusing on launch/setup overhead in the compiled path before chasing more generated-kernel rewrites.
 - If packed coord payloads stay, look for a lower-overhead unpack strategy or a way to consume packed coords directly in generated tensor ops so the payload-size win can translate into runtime.
 - If packed coord payloads stay, the next performance step is likely direct packed-coord consumption or launch-path work rather than more local dead-code pruning.
+- Avoid the current alloc-table approach for now; if alloc-side dedup is revisited, it likely needs to preserve the previous zero-stack straight-line fast path rather than routing every alloc through a generic helper.
+- Keep the new inline alloc-table mode architecture; future alloc-side tuning can continue exploring table encoding and placement via `DAE_COMPILED_ALLOC_TABLE_MODE` without going back to the helper-based design.
+- Keep both placement knobs (`DAE_COMPILED_ALLOC_TABLE_MODE`, `DAE_COMPILED_LIVE_VALUE_MODE`) available; for this benchmark the current best defaults are alloc-table `global` and live-value `shared`.
 - Keep tracked workflow/knowledge docs in sync as the compiled-mode support surface or build procedure changes.
 
 ## Blockers / Assumptions
@@ -202,6 +238,17 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 - `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.build.log 2>&1`
 - `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.compiled.log 2>&1`
 - `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.packedcoords-pruned.txt 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.alloctable.build.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.alloctable.compiled.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.alloctable.txt 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.restore.build.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && for mode in disabled constant shared global; do ... DAE_COMPILED_ALLOC_TABLE_MODE=$mode ... make pyext ... python app/python/gemv_mlp_mixed.py --mode compiled -b 20 ... ncu --set basic ...; done`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20 > .agentlog/tmp/gemv_mlp_mixed.allocmode.interpreted.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && unset DAE_COMPILED_ALLOC_TABLE_MODE && export DAE_ALLOW_UNSUPPORTED_COMPILER=1 && export DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json && make pyext > .agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.build.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.compiled.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && for mode in global shared constant; do ... DAE_COMPILED_LIVE_VALUE_MODE=$mode ... make pyext ... python app/python/gemv_mlp_mixed.py --mode compiled -b 20 ... ncu --set basic ...; done`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && unset DAE_COMPILED_LIVE_VALUE_MODE && unset DAE_COMPILED_ALLOC_TABLE_MODE && export DAE_ALLOW_UNSUPPORTED_COMPILER=1 && export DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json && make pyext > .agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.build.log 2>&1`
+- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.compiled.log 2>&1`
 
 ## Artifacts
 
@@ -268,6 +315,36 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 - `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.build.log`
 - `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.compiled.log`
 - `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.packedcoords-pruned.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.alloctable.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.alloctable.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.alloctable.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.restore.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.disabled.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.disabled.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.disabled.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.constant.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.constant.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.constant.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.shared.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.shared.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.shared.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.global.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.global.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.global.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.interpreted.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.global.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.global.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.livemode.global.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.shared.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.shared.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.livemode.shared.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.constant.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.constant.compiled.log`
+- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.livemode.constant.txt`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.build.log`
+- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.compiled.log`
 
 ## Next Step
 

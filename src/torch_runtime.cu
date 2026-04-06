@@ -128,6 +128,14 @@ int py_launch_dae_compiled(
   return 0;
 }
 
+int py_set_compiled_live_values_constant(torch::Tensor compiled_live_values_bytes) {
+  auto live_values = check_tensor_ptr<uint64_t>(compiled_live_values_bytes, "compiled_live_values_bytes");
+  size_t count = static_cast<size_t>(compiled_live_values_bytes.numel()) / sizeof(uint64_t);
+  cudaError_t st = set_compiled_live_values_constant(live_values, count);
+  TORCH_CHECK(st == cudaSuccess, "set_compiled_live_values_constant failed: ", cudaGetErrorString(st));
+  return 0;
+}
+
 // function 3: build TMA descriptors
 static inline CUtensorMapInterleave to_interleave(int64_t interleave) {
   switch (interleave) {
@@ -314,6 +322,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("compiled_program_hash") = py::str(daeCompiledProgramHash);
   m.attr("compiled_program_num_sms") = py::int_(daeCompiledProgramNumSms);
   m.attr("compiled_program_live_value_count") = py::int_(daeCompiledProgramLiveValueCount);
+  m.attr("compiled_program_live_value_mode") = py::int_(daeCompiledLiveValueMode);
 
   auto config = m.def_submodule("config", "DAE2 Configuration Constants");
   config.attr("slot_size") = slotSizeKb * 1024;
@@ -342,6 +351,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Launch DAE2 kernel with given parameters");
   m.def("launch_dae_compiled", &py_launch_dae_compiled,
             "Launch compiled DAE2 kernel with given parameters");
+  m.def("set_compiled_live_values_constant", &py_set_compiled_live_values_constant,
+            "Upload compiled live values into the compiled-program constant buffer");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("set_cache_policy", &py_tensor_set_cache_policy,

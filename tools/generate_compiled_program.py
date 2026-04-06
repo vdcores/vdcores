@@ -11,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMPILED_SPEC_FILE = "dae_compiled_program.vdcore.json"
 COMPILED_SPEC_ENV = "DAE_COMPILED_SPEC_FILE"
+ALLOC_TABLE_MODE_ENV = "DAE_COMPILED_ALLOC_TABLE_MODE"
+LIVE_VALUE_MODE_ENV = "DAE_COMPILED_LIVE_VALUE_MODE"
 
 _LOAD_OPS = {
     "OP_ALLOC_TMA_LOAD_1D",
@@ -56,6 +58,28 @@ _MEMORY_OP_COORD_COUNTS = {
     "OP_ALLOC_WB_TMA_STORE_5D_FIX0": 4,
     "OP_ALLOC_WB_TMA_REDUCE_ADD_2D": 2,
     "OP_ALLOC_WB_TMA_REDUCE_ADD_3D": 3,
+}
+
+_ALLOC_TABLE_MODE_DISABLED = "disabled"
+_ALLOC_TABLE_MODE_CONSTANT = "constant"
+_ALLOC_TABLE_MODE_SHARED = "shared"
+_ALLOC_TABLE_MODE_GLOBAL = "global"
+_ALLOC_TABLE_MODES = {
+    _ALLOC_TABLE_MODE_DISABLED,
+    _ALLOC_TABLE_MODE_CONSTANT,
+    _ALLOC_TABLE_MODE_SHARED,
+    _ALLOC_TABLE_MODE_GLOBAL,
+}
+
+_ALLOC_CMD_FLAG_DIRECT_READY = 1
+
+_LIVE_VALUE_MODE_GLOBAL = "global"
+_LIVE_VALUE_MODE_SHARED = "shared"
+_LIVE_VALUE_MODE_CONSTANT = "constant"
+_LIVE_VALUE_MODES = {
+    _LIVE_VALUE_MODE_GLOBAL,
+    _LIVE_VALUE_MODE_SHARED,
+    _LIVE_VALUE_MODE_CONSTANT,
 }
 
 
@@ -181,6 +205,24 @@ def resolve_spec_path(base_dir: Path) -> tuple[Path | None, str]:
 
 def load_spec(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_alloc_table_mode() -> str:
+    mode = os.environ.get(ALLOC_TABLE_MODE_ENV, _ALLOC_TABLE_MODE_GLOBAL).strip().lower()
+    if mode not in _ALLOC_TABLE_MODES:
+        raise ValueError(
+            f"Unsupported {ALLOC_TABLE_MODE_ENV}={mode!r}; expected one of {sorted(_ALLOC_TABLE_MODES)}"
+        )
+    return mode
+
+
+def load_live_value_mode() -> str:
+    mode = os.environ.get(LIVE_VALUE_MODE_ENV, _LIVE_VALUE_MODE_SHARED).strip().lower()
+    if mode not in _LIVE_VALUE_MODES:
+        raise ValueError(
+            f"Unsupported {LIVE_VALUE_MODE_ENV}={mode!r}; expected one of {sorted(_LIVE_VALUE_MODES)}"
+        )
+    return mode
 
 
 def _u64_literal(value: int) -> str:
@@ -363,6 +405,74 @@ def _group_repeat_steps(steps: list[dict[str, object]]) -> list[dict[str, object
             groups.append({"kind": "single", "step": step})
         index = run_end
     return groups
+
+
+def _flatten_alloc_steps(blocks: list[dict[str, object]]) -> list[dict[str, object]]:
+    steps: list[dict[str, object]] = []
+    for block in blocks:
+        if block["kind"] == "repeat":
+            repeat_count = int(block["count"])
+            for _ in range(repeat_count):
+                steps.extend(block["steps"])
+        elif block["kind"] == "op":
+            steps.append(block)
+    return steps
+
+
+def _alloc_terminate_count(blocks: list[dict[str, object]]) -> int:
+    return sum(1 for block in blocks if block["kind"] == "terminate")
+
+
+def _program_uses_table_driven_alloc(program: dict[str, object]) -> bool:
+    return all(step["base_name"] not in _SLOT_INST_REQUIRED_BASE_OPS for step in _flatten_alloc_steps(program["memory"]))
+
+
+def _encode_alloc_cmd(step: dict[str, object]) -> int:
+    flags = _ALLOC_CMD_FLAG_DIRECT_READY if step["base_name"] in _WRITEBACK_OPS else 0
+    port = 1 if step["flags"]["port1"] else 0
+    return int(step["nslot"]) | (port << 8) | (flags << 9)
+
+
+def _emit_alloc_cmd_array(
+    lines: list[str],
+    *,
+    name: str,
+    storage: str,
+    values: list[int],
+) -> None:
+    array_size = max(len(values), 1)
+    if storage == "constant":
+        lines.append(f"static __device__ __constant__ uint32_t {name}[{array_size}] = {{")
+    elif storage == "global":
+        lines.append(f"static __device__ uint32_t {name}[{array_size}] = {{")
+    else:
+        raise ValueError(f"unsupported alloc cmd storage {storage}")
+    if values:
+        lines.extend(_emit_int_array_initializer(values, indent="  "))
+    else:
+        lines.append("  0")
+        lines.append("};")
+    lines.append("")
+
+
+def _alloc_table_storage_kind(mode: str) -> str:
+    if mode in {_ALLOC_TABLE_MODE_CONSTANT, _ALLOC_TABLE_MODE_SHARED}:
+        return "constant"
+    if mode == _ALLOC_TABLE_MODE_GLOBAL:
+        return "global"
+    raise ValueError(f"alloc table storage is undefined for mode {mode}")
+
+
+def _sm_live_counts(spec: dict[str, object]) -> list[int]:
+    offsets = [int(offset) for offset in spec.get("sm_live_offsets", [])]
+    total = int(spec.get("num_live_values", 0))
+    if not offsets:
+        return []
+    counts: list[int] = []
+    for index, offset in enumerate(offsets):
+        next_offset = offsets[index + 1] if index + 1 < len(offsets) else total
+        counts.append(max(0, next_offset - offset))
+    return counts
 
 
 def _emit_payload_aliases(step_list: list[dict[str, object]], lines: list[str], indent: str) -> None:
@@ -962,18 +1072,46 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
     lines.append(f"{indent}assert(__done == 0 && \"compiled st expected terminate sentinel\");")
 
 
-def generate_enabled(spec: dict[str, object], *, debug: bool) -> str:
+def generate_enabled(
+    spec: dict[str, object], *, debug: bool, alloc_table_mode: str, live_value_mode: str
+) -> str:
     sm_program_ids = [int(program_id) for program_id in spec["sm_program_ids"]]
     sm_live_offsets = [int(live_offset) for live_offset in spec.get("sm_live_offsets", [])]
+    sm_live_counts = _sm_live_counts(spec)
+    max_live_values_per_sm = max(sm_live_counts, default=0)
+    table_driven_programs = {
+        int(program["program_id"]): _flatten_alloc_steps(program["memory"])
+        for program in spec["programs"]
+        if alloc_table_mode != _ALLOC_TABLE_MODE_DISABLED and _program_uses_table_driven_alloc(program)
+    }
+    table_storage_kind = (
+        _alloc_table_storage_kind(alloc_table_mode)
+        if alloc_table_mode != _ALLOC_TABLE_MODE_DISABLED
+        else None
+    )
+    max_alloc_cmds = max((len(steps) for steps in table_driven_programs.values()), default=0)
     lines = [
         "// Generated by tools/generate_compiled_program.py.",
         f'// compiled_hash={spec["hash"]}',
+        f"// alloc_table_mode={alloc_table_mode}",
+        f"// live_value_mode={live_value_mode}",
         "",
         "static constexpr bool daeCompiledProgramEnabled = true;",
         f"static constexpr bool daeCompiledProgramDebug = {'true' if debug else 'false'};",
         f'static constexpr const char *daeCompiledProgramHash = "{spec["hash"]}";',
         f'static constexpr int daeCompiledProgramNumSms = {int(spec["num_sms"])};',
         f'static constexpr int daeCompiledProgramLiveValueCount = {int(spec.get("num_live_values", 0))};',
+        f"static constexpr int daeCompiledLiveValueMaxPerSm = {max_live_values_per_sm};",
+        f"static constexpr int daeCompiledAllocMaxCmdCount = {max_alloc_cmds};",
+        "",
+        f"static constexpr int daeCompiledLiveValueModeGlobal = 0;",
+        f"static constexpr int daeCompiledLiveValueModeShared = 1;",
+        f"static constexpr int daeCompiledLiveValueModeConstant = 2;",
+        f"static constexpr int daeCompiledLiveValueMode = "
+        f"{'daeCompiledLiveValueModeGlobal' if live_value_mode == _LIVE_VALUE_MODE_GLOBAL else ('daeCompiledLiveValueModeShared' if live_value_mode == _LIVE_VALUE_MODE_SHARED else 'daeCompiledLiveValueModeConstant')};",
+        "",
+        "static __device__ __constant__ uint64_t "
+        "daeCompiledLiveValuesConst[(daeCompiledProgramLiveValueCount > 0) ? daeCompiledProgramLiveValueCount : 1] = {};",
         "",
     ]
     _emit_dense_lookup(
@@ -990,6 +1128,24 @@ def generate_enabled(spec: dict[str, object], *, debug: bool) -> str:
         values=sm_live_offsets,
         default_value=0,
     )
+    _emit_dense_lookup(
+        lines,
+        storage_name="daeCompiledLiveCountsBySm",
+        func_name="dae_compiled_live_count_for_sm",
+        values=sm_live_counts,
+        default_value=0,
+    )
+    if table_storage_kind is not None:
+        for program in spec["programs"]:
+            program_id = int(program["program_id"])
+            if program_id not in table_driven_programs:
+                continue
+            _emit_alloc_cmd_array(
+                lines,
+                name=f"daeCompiledAllocCmdsProgram{program_id}",
+                storage=table_storage_kind,
+                values=[_encode_alloc_cmd(step) for step in table_driven_programs[program_id]],
+            )
     lines.extend(
         [
             "template <typename M2CQueue, typename C2MQueue>",
@@ -1063,29 +1219,89 @@ def generate_enabled(spec: dict[str, object], *, debug: bool) -> str:
             "  M2LDQueue m2ld[2],",
             "  MInst *st_insts,",
             "  const uint64_t *live_values,",
+            "  uint32_t *shared_alloc_cmds,",
             "  int *flags",
             ") {",
             "  SharedMemoryAllocator<numSlots> alloc;",
             "  __syncwarp();",
+            "  const uint32_t *alloc_cmds = nullptr;",
+            "  int alloc_cmd_count = 0;",
+            "  int alloc_terminate_count = 0;",
             "  switch (dae_compiled_program_id_for_sm(sm_id)) {",
         ]
     )
     for program in spec["programs"]:
+        program_id = int(program["program_id"])
         lines.append(f"    case {int(program['program_id'])}: {{")
-        alloc_steps: list[dict[str, object]] = []
-        for block in program["memory"]:
-            if block["kind"] == "repeat":
-                alloc_steps.extend(block["steps"])
-            elif block["kind"] == "op":
-                alloc_steps.append(block)
-        _emit_payload_aliases(alloc_steps, lines, "      ")
-        for block in program["memory"]:
-            _emit_alloc_block(block, lines, "      ")
-        lines.append("      break;")
+        if program_id in table_driven_programs:
+            lines.append(f"      alloc_cmds = daeCompiledAllocCmdsProgram{program_id};")
+            lines.append(f"      alloc_cmd_count = {len(table_driven_programs[program_id])};")
+            lines.append(f"      alloc_terminate_count = {_alloc_terminate_count(program['memory'])};")
+            lines.append("      break;")
+        else:
+            alloc_steps: list[dict[str, object]] = []
+            for block in program["memory"]:
+                if block["kind"] == "repeat":
+                    alloc_steps.extend(block["steps"])
+                elif block["kind"] == "op":
+                    alloc_steps.append(block)
+            _emit_payload_aliases(alloc_steps, lines, "      ")
+            for block in program["memory"]:
+                _emit_alloc_block(block, lines, "      ")
+            lines.append("      return;")
         lines.append("    }")
     lines.extend(
         [
             '    default: assert(false && "missing compiled alloc program"); break;',
+            "  }",
+            f"  if (alloc_cmds != nullptr && alloc_cmd_count > 0 && {'true' if alloc_table_mode == _ALLOC_TABLE_MODE_SHARED else 'false'}) {{",
+            "    for (int __copy = lane_id; __copy < alloc_cmd_count; __copy += 32) {",
+            "      shared_alloc_cmds[__copy] = alloc_cmds[__copy];",
+            "    }",
+            "    __syncwarp();",
+            "    alloc_cmds = shared_alloc_cmds;",
+            "  }",
+            f"  if (alloc_cmds != nullptr && alloc_cmd_count > 0 && {'true' if alloc_table_mode == _ALLOC_TABLE_MODE_GLOBAL else 'false'}) {{",
+            "    if (lane_id < alloc_cmd_count && lane_id < 32) {",
+            "      prefetch_l1(alloc_cmds + lane_id);",
+            "    }",
+            "    __syncwarp();",
+            "  }",
+            "  for (int __ai = 0; __ai < alloc_cmd_count; ++__ai) {",
+            f"    if ({'true' if alloc_table_mode == _ALLOC_TABLE_MODE_GLOBAL else 'false'} && __ai + 32 < alloc_cmd_count && lane_id == (__ai & 31)) {{",
+            "      prefetch_l1(alloc_cmds + __ai + 32);",
+            "    }",
+            "    const uint32_t __cmd = alloc_cmds[__ai];",
+            "    const uint8_t __nslot = static_cast<uint8_t>(__cmd & 0xFFU);",
+            "    const uint8_t __ld_port = static_cast<uint8_t>((__cmd >> 8) & 0x1U);",
+            "    const uint8_t __direct_ready = static_cast<uint8_t>((__cmd >> 9) & 0x1U);",
+            "    int alloc_mask = 0;",
+            "    int slot_alloc = -1;",
+            "    while (true) {",
+            "      slot_alloc = alloc.allocate(lane_id, flags, __nslot, alloc_mask);",
+            "      if (slot_alloc >= 0) break;",
+            "      __nanosleep(allocRetrySleepCycles);",
+            "    }",
+            "    if (lane_id == 0) {",
+            "      m2c.put(alloc_mask);",
+            "      if (__direct_ready != 0) {",
+            "        m2c.commit();",
+            "        m2c.advance();",
+            "      } else {",
+            "        CompiledLdCmd ld;",
+            "        ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));",
+            "        auto &curld = m2ld[__ld_port];",
+            "        curld.put(ld.raw);",
+            "        m2c.advance();",
+            "        curld.commit();",
+            "        curld.advance();",
+            "      }",
+            "    }",
+            "  }",
+            "  for (int __ti = 0; __ti < alloc_terminate_count; ++__ti) {",
+            "    if (lane_id == 0) {",
+            '      __mprint("[compiled alloc] terminate ld0_ptr=%d ld1_ptr=%d", m2ld[0].ptr, m2ld[1].ptr);',
+            "    }",
             "  }",
             "}",
             "",
@@ -1166,21 +1382,33 @@ def generate_enabled(spec: dict[str, object], *, debug: bool) -> str:
     return "\n".join(lines)
 
 
-def generate_disabled(source: str, *, debug: bool) -> str:
+def generate_disabled(source: str, *, debug: bool, alloc_table_mode: str, live_value_mode: str) -> str:
     return "\n".join(
         [
             "// Generated by tools/generate_compiled_program.py.",
             f"// source={source}",
+            f"// alloc_table_mode={alloc_table_mode}",
+            f"// live_value_mode={live_value_mode}",
             "",
             "static constexpr bool daeCompiledProgramEnabled = false;",
             f"static constexpr bool daeCompiledProgramDebug = {'true' if debug else 'false'};",
             'static constexpr const char *daeCompiledProgramHash = "";',
             "static constexpr int daeCompiledProgramNumSms = 0;",
             "static constexpr int daeCompiledProgramLiveValueCount = 0;",
+            "static constexpr int daeCompiledLiveValueMaxPerSm = 0;",
+            "static constexpr int daeCompiledAllocMaxCmdCount = 0;",
+            "static constexpr int daeCompiledLiveValueModeGlobal = 0;",
+            "static constexpr int daeCompiledLiveValueModeShared = 1;",
+            "static constexpr int daeCompiledLiveValueModeConstant = 2;",
+            "static constexpr int daeCompiledLiveValueMode = daeCompiledLiveValueModeGlobal;",
             "",
             "static __device__ __forceinline__ int dae_compiled_live_offset_for_sm(int) {",
             "  return 0;",
             "}",
+            "static __device__ __forceinline__ int dae_compiled_live_count_for_sm(int) {",
+            "  return 0;",
+            "}",
+            "static __device__ __constant__ uint64_t daeCompiledLiveValuesConst[1] = {};",
             "",
             "template <typename... Args>",
             "static __device__ __forceinline__ void dae_compiled_compute_execute(Args&&...) {",
@@ -1214,11 +1442,23 @@ def main() -> None:
     args = parser.parse_args()
 
     spec_path, source = resolve_spec_path(ROOT)
+    alloc_table_mode = load_alloc_table_mode()
+    live_value_mode = load_live_value_mode()
     if spec_path is None or not spec_path.exists():
-        output = generate_disabled(source, debug=args.debug)
+        output = generate_disabled(
+            source,
+            debug=args.debug,
+            alloc_table_mode=alloc_table_mode,
+            live_value_mode=live_value_mode,
+        )
     else:
         spec = load_spec(spec_path)
-        output = generate_enabled(spec, debug=args.debug)
+        output = generate_enabled(
+            spec,
+            debug=args.debug,
+            alloc_table_mode=alloc_table_mode,
+            live_value_mode=live_value_mode,
+        )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

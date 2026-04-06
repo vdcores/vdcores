@@ -224,7 +224,20 @@ void dae2_compiled(
   extern __shared__ uint8_t shared_mem[];
   void * smem_base = align_to((void*)shared_mem, 1024);
   __shared__ uint64_t scratch_space[32];
-  const uint64_t *sm_live_values = compiled_live_values + dae_compiled_live_offset_for_sm(sm_id);
+  __shared__ uint32_t shared_alloc_cmds[(daeCompiledAllocMaxCmdCount > 0) ? daeCompiledAllocMaxCmdCount : 1];
+  __shared__ uint64_t shared_live_values[(daeCompiledLiveValueMaxPerSm > 0) ? daeCompiledLiveValueMaxPerSm : 1];
+
+  const int sm_live_offset = dae_compiled_live_offset_for_sm(sm_id);
+  const int sm_live_count = dae_compiled_live_count_for_sm(sm_id);
+  const uint64_t *sm_live_values = compiled_live_values + sm_live_offset;
+
+  if constexpr (daeCompiledLiveValueMode == daeCompiledLiveValueModeShared) {
+    for (int idx = threadIdx.x; idx < sm_live_count; idx += blockDim.x) {
+      shared_live_values[idx] = compiled_live_values[sm_live_offset + idx];
+    }
+  } else if constexpr (daeCompiledLiveValueMode == daeCompiledLiveValueModeConstant) {
+    sm_live_values = daeCompiledLiveValuesConst + sm_live_offset;
+  }
 
   if (threadIdx.x == 0) {
     int event_base = sm_id * numProfileEvents;
@@ -232,6 +245,10 @@ void dae2_compiled(
   }
 
   __syncthreads();
+
+  if constexpr (daeCompiledLiveValueMode == daeCompiledLiveValueModeShared) {
+    sm_live_values = shared_live_values;
+  }
 
   if (threadIdx.x < numComputeWarps * 32) {
     dae_compiled_compute_execute(
@@ -253,6 +270,7 @@ void dae2_compiled(
         m2ld,
         st_insts,
         sm_live_values,
+        shared_alloc_cmds,
         &slot_avail
       );
     } else if (warp_id == 1) {

@@ -237,6 +237,7 @@ class Launcher:
         self.need_instruction_build = True
         self._compiled_runtime_bundle_cache = None
         self._compiled_live_values_tensor_cache = None
+        self._compiled_live_values_constant_uploaded = False
 
         self.num_bars = 0
         self.bar_values = {}
@@ -254,6 +255,7 @@ class Launcher:
     def _invalidate_compiled_cache(self):
         self._compiled_runtime_bundle_cache = None
         self._compiled_live_values_tensor_cache = None
+        self._compiled_live_values_constant_uploaded = False
 
     def set_mode(self, mode: str):
         if mode not in {"interpreted", "compiled"}:
@@ -477,7 +479,11 @@ class Launcher:
         runtime.set_cache_policy(self.bars, stream, 1, 2, 0)
         runtime.set_cache_policy(tma, stream, 1, 2, 0)
         if self.mode == "compiled":
-            if compiled_live_values.numel() > 0:
+            live_value_mode = int(getattr(runtime, "compiled_program_live_value_mode", 0))
+            if live_value_mode == 2 and not self._compiled_live_values_constant_uploaded:
+                runtime.set_compiled_live_values_constant(compiled_live_values)
+                self._compiled_live_values_constant_uploaded = True
+            if compiled_live_values.numel() > 0 and live_value_mode != 2:
                 runtime.set_cache_policy(compiled_live_values, stream, 1, 2, 0)
             ret = runtime.launch_dae_compiled(
                 self.num_sms, self.smem_size,

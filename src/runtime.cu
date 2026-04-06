@@ -71,6 +71,25 @@ cudaError_t launch_dae_compiled(
   return cudaGetLastError();
 }
 
+cudaError_t set_compiled_live_values_constant(
+  const uint64_t* compiled_live_values,
+  size_t count
+) {
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  if (count != static_cast<size_t>(daeCompiledProgramLiveValueCount)) {
+    return cudaErrorInvalidValue;
+  }
+  return cudaMemcpyToSymbol(
+    daeCompiledLiveValuesConst,
+    compiled_live_values,
+    count * sizeof(uint64_t),
+    0,
+    cudaMemcpyDeviceToDevice
+  );
+}
+
 CUtensorMap create_tma_descriptor(
   CUtensorMapDataType data_type,
   int dims,

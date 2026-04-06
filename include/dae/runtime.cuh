@@ -27,6 +27,11 @@ cudaError_t launch_dae_compiled(
   int64_t stream
 );
 
+cudaError_t set_compiled_live_values_constant(
+  const uint64_t* compiled_live_values,
+  size_t count
+);
+
 CUtensorMap create_tma_descriptor(
   CUtensorMapDataType data_type,
   int dims,
