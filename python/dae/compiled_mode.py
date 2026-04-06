@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +13,8 @@ from .tma_utils import cords2addr
 DEFAULT_COMPILED_SPEC_FILE = "dae_compiled_program.vdcore.json"
 _MEM_DYNAMIC_FLAG_MASK = 4 | 8 | 16 | 32
 _MEM_WRITEBACK_FLAG = 2
+_COORD_DELTA_LIMIT = 0xFFFF
+_ADDRESS_STRUCTURAL_DELTA_MULTIPLIER = 64
 
 _SUPPORTED_MEMORY_BASE_OPS = {
     "OP_TERMINATE",
@@ -62,6 +65,24 @@ _NO_ADDRESS_MEMORY_BASE_OPS = {
     "OP_ALLOC_WB_REG_STORE",
     "OP_ALLOC_REG_LOAD",
 }
+
+_MEMORY_OP_COORD_COUNTS = {
+    "OP_ALLOC_TMA_LOAD_2D": 2,
+    "OP_ALLOC_TMA_LOAD_3D": 3,
+    "OP_ALLOC_TMA_LOAD_4D": 4,
+    "OP_ALLOC_TMA_LOAD_5D_FIX0": 4,
+    "OP_ALLOC_WB_TMA_STORE_2D": 2,
+    "OP_ALLOC_WB_TMA_STORE_3D": 3,
+    "OP_ALLOC_WB_TMA_STORE_4D": 4,
+    "OP_ALLOC_WB_TMA_STORE_5D_FIX0": 4,
+    "OP_ALLOC_WB_TMA_REDUCE_ADD_2D": 2,
+    "OP_ALLOC_WB_TMA_REDUCE_ADD_3D": 3,
+}
+
+
+def _memory_coord_count(base_name: str) -> int:
+    return _MEMORY_OP_COORD_COUNTS.get(base_name, 0)
+
 
 def _memory_base_opcode_name(inst: MemoryInstruction) -> str:
     masked_opcode = inst.opcode & ~_MEM_DYNAMIC_FLAG_MASK
@@ -126,7 +147,6 @@ def _encode_memory_fields(
     inst_index: int,
     inst: MemoryInstruction,
     base_name: str,
-    payload_values: list[int],
 ) -> dict[str, object]:
     encoded = {
         "source_index": inst_index,
@@ -146,20 +166,17 @@ def _encode_memory_fields(
         return encoded
 
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
-        raw_value = int(cords2addr(inst.cords))
-        encoded["address_payload_index"] = len(payload_values)
-        payload_values.append(raw_value)
+        encoded["address_value"] = int(cords2addr(inst.cords))
         return encoded
 
-    encoded["packed_coords_payload_index"] = len(payload_values)
-    payload_values.append(int(cords2addr(inst.cords)))
+    coord_count = _memory_coord_count(base_name)
+    encoded["coords_values"] = [int(coord) for coord in inst.cords[:coord_count]]
     return encoded
 
 
 def _make_linear_step(
     inst_index: int,
     inst: MemoryInstruction,
-    payload_values: list[int],
 ) -> dict[str, object]:
     base_name = _memory_base_opcode_name(inst)
     flags = _memory_flags(inst)
@@ -169,7 +186,7 @@ def _make_linear_step(
         raise ValueError(f"Compiled mode only supports JUMP inside RepeatM blocks: minst[{inst_index}]")
     return {
         "kind": "op",
-        **_encode_memory_fields(inst_index, inst, base_name, payload_values),
+        **_encode_memory_fields(inst_index, inst, base_name),
     }
 
 
@@ -182,7 +199,6 @@ def _repeat_delta(seed_inst: MemoryInstruction, base_name: str) -> dict[str, obj
 def _parse_repeat_block(
     minsts: list[MemoryInstruction],
     start: int,
-    payload_values: list[int],
 ) -> tuple[dict[str, object], int]:
     seed_ranges: list[tuple[MemoryInstruction, int, int, int]] = []
     cursor = start
@@ -236,7 +252,7 @@ def _parse_repeat_block(
 
         seed_inst, seed_index = matched_seed
         step = {
-            **_encode_memory_fields(cursor, inst, base_name, payload_values),
+            **_encode_memory_fields(cursor, inst, base_name),
             "delta_source_index": seed_index,
             **_repeat_delta(seed_inst, base_name),
         }
@@ -250,17 +266,14 @@ def _parse_repeat_block(
     raise ValueError(f"RepeatM block starting at minst[{start}] reached end of stream without a JUMP step")
 
 
-def _validate_memory_stream(
-    minsts: list[MemoryInstruction],
-    payload_values: list[int],
-) -> list[dict[str, object]]:
+def _validate_memory_stream(minsts: list[MemoryInstruction]) -> list[dict[str, object]]:
     blocks: list[dict[str, object]] = []
     cursor = 0
     while cursor < len(minsts):
         inst = minsts[cursor]
         base_name = _memory_base_opcode_name(inst)
         if base_name == "OP_REPEAT":
-            block, cursor = _parse_repeat_block(minsts, cursor, payload_values)
+            block, cursor = _parse_repeat_block(minsts, cursor)
             blocks.append(block)
             continue
         if base_name == "OP_TERMINATE":
@@ -270,7 +283,7 @@ def _validate_memory_stream(
             blocks.append({"kind": "terminate", "source_index": cursor})
             cursor += 1
             continue
-        blocks.append(_make_linear_step(cursor, inst, payload_values))
+        blocks.append(_make_linear_step(cursor, inst))
         cursor += 1
     if not blocks or blocks[-1]["kind"] != "terminate":
         raise ValueError("Compiled mode requires a terminating memory instruction")
@@ -338,48 +351,341 @@ def _annotate_reg_pairs(blocks: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def _program_structure(builder) -> tuple[dict[str, object], list[int]]:
+def _program_structure_raw(builder) -> dict[str, object]:
     cinsts, minsts = _builder_stream(builder)
-    payload_values: list[int] = []
-    memory = _validate_memory_stream(minsts, payload_values)
+    memory = _validate_memory_stream(minsts)
     reg_analysis = _annotate_reg_pairs(memory)
-    program = {
+    return {
         "compute": _validate_compute_stream(cinsts),
         "memory": reg_analysis["memory"],
         "reg_pairs": reg_analysis["reg_pairs"],
         "needs_generic_reg_file": reg_analysis["needs_generic_reg_file"],
-        "num_live_values": len(payload_values),
     }
-    return program, payload_values
 
 
-def _canonical_program_key(program: dict[str, object]) -> str:
-    return json.dumps(program, sort_keys=True, separators=(",", ":"))
+def _strip_dynamic_fields(value):
+    if isinstance(value, list):
+        return [_strip_dynamic_fields(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _strip_dynamic_fields(item)
+            for key, item in value.items()
+            if key not in {"address_value", "coords_values", "address_source", "coord_sources", "num_live_values"}
+        }
+    return value
+
+
+def _canonical_program_template_key(program: dict[str, object]) -> str:
+    return json.dumps(_strip_dynamic_fields(program), sort_keys=True, separators=(",", ":"))
+
+
+def _get_program_step(program: dict[str, object], occurrence: dict[str, object]) -> dict[str, object]:
+    block = program["memory"][int(occurrence["block_index"])]
+    if block["kind"] == "repeat":
+        return block["steps"][int(occurrence["step_index"])]
+    return block
+
+
+def _iter_program_occurrences(program: dict[str, object]) -> list[dict[str, object]]:
+    occurrences: list[dict[str, object]] = []
+    for block_index, block in enumerate(program["memory"]):
+        if block["kind"] not in {"repeat", "op"}:
+            continue
+        steps = block["steps"] if block["kind"] == "repeat" else [block]
+        for step_index, step in enumerate(steps):
+            shared = {
+                "block_index": block_index,
+                "step_index": step_index if block["kind"] == "repeat" else None,
+                "base_name": step["base_name"],
+                "size": int(step["size"]),
+            }
+            if "address_value" in step:
+                occurrences.append(
+                    {
+                        **shared,
+                        "domain": "address",
+                    }
+                )
+            for coord_index, _ in enumerate(step.get("coords_values", [])):
+                occurrences.append(
+                    {
+                        **shared,
+                        "domain": "coord",
+                        "coord_index": coord_index,
+                    }
+                )
+    return occurrences
+
+
+def _occurrence_values(raw_programs: list[dict[str, object]], occurrence: dict[str, object]) -> list[int]:
+    values: list[int] = []
+    for program in raw_programs:
+        step = _get_program_step(program, occurrence)
+        if occurrence["domain"] == "address":
+            values.append(int(step["address_value"]))
+        else:
+            values.append(int(step["coords_values"][int(occurrence["coord_index"])]))
+    return values
+
+
+def _all_same(values: list[int]) -> bool:
+    return all(value == values[0] for value in values[1:])
+
+
+def _invariant_delta(values: list[int], base_values: list[int]) -> int | None:
+    delta = int(values[0]) - int(base_values[0])
+    for value, base_value in zip(values[1:], base_values[1:]):
+        if int(value) - int(base_value) != delta:
+            return None
+    return delta
+
+
+def _coord_constant_source(values: list[int]) -> dict[str, int] | None:
+    if not _all_same(values):
+        return None
+    value = int(values[0])
+    if value == 0 or len(values) > 1:
+        return {"kind": "const", "value": value}
+    return None
+
+
+def _coord_sm_affine_const_source(values: list[int], sm_indices: list[int]) -> dict[str, int] | None:
+    if len(values) != len(sm_indices) or not values:
+        return None
+    if len(values) == 1:
+        return None
+
+    base_sm = int(sm_indices[0])
+    base_value = int(values[0])
+    stride: int | None = None
+    for sm_index, value in zip(sm_indices[1:], values[1:]):
+        sm_delta = int(sm_index) - base_sm
+        value_delta = int(value) - base_value
+        if sm_delta == 0:
+            if value_delta != 0:
+                return None
+            continue
+        if value_delta % sm_delta != 0:
+            return None
+        current_stride = value_delta // sm_delta
+        if stride is None:
+            stride = current_stride
+        elif current_stride != stride:
+            return None
+
+    return {
+        "kind": "sm_affine_const",
+        "base_sm": base_sm,
+        "value": base_value,
+        "stride": 0 if stride is None else int(stride),
+    }
+
+
+def _address_constant_source(values: list[int]) -> dict[str, int] | None:
+    if _all_same(values) and int(values[0]) == 0:
+        return {"kind": "const", "value": 0}
+    return None
+
+
+def _coord_addend_is_structural(delta: int) -> bool:
+    return -_COORD_DELTA_LIMIT <= int(delta) <= _COORD_DELTA_LIMIT
+
+
+def _address_addend_is_structural(delta: int, occurrence: dict[str, object]) -> bool:
+    if delta == 0:
+        return True
+    size = int(occurrence["size"])
+    if size <= 0:
+        return False
+    if delta % size != 0:
+        return False
+    return abs(delta) <= size * _ADDRESS_STRUCTURAL_DELTA_MULTIPLIER
+
+
+def _compose_source(
+    source: dict[str, int],
+    delta: int,
+    *,
+    domain: str,
+) -> dict[str, int] | None:
+    if source["kind"] == "const":
+        value = int(source["value"]) + int(delta)
+        if domain == "coord":
+            return {"kind": "const", "value": value}
+        if value == 0:
+            return {"kind": "const", "value": 0}
+        return None
+    if source["kind"] == "sm_affine_const":
+        value = int(source["value"]) + int(delta)
+        return {
+            "kind": "sm_affine_const",
+            "base_sm": int(source["base_sm"]),
+            "value": value,
+            "stride": int(source["stride"]),
+        }
+
+    add = int(source.get("add", 0)) + int(delta)
+    result = {
+        "kind": "live",
+        "index": int(source["index"]),
+    }
+    if add != 0:
+        result["add"] = add
+    return result
+
+
+def _candidate_score(source: dict[str, int], delta: int) -> tuple[int, int, int]:
+    return (
+        0 if source["kind"] == "sm_affine_const" else (1 if source["kind"] == "const" else 2),
+        abs(int(delta)),
+        int(source.get("index", 0)),
+    )
+
+
+def _set_occurrence_source(
+    compiled_program: dict[str, object],
+    occurrence: dict[str, object],
+    source: dict[str, int],
+) -> None:
+    step = _get_program_step(compiled_program, occurrence)
+    if occurrence["domain"] == "address":
+        step["address_source"] = source
+        step.pop("address_value", None)
+        return
+
+    coord_sources = step.setdefault("coord_sources", [None] * len(step.get("coords_values", [])))
+    coord_sources[int(occurrence["coord_index"])] = source
+    if all(item is not None for item in coord_sources):
+        step.pop("coords_values", None)
+
+
+def _optimize_program_group(
+    raw_programs: list[dict[str, object]],
+    sm_indices: list[int],
+) -> tuple[dict[str, object], list[list[int]]]:
+    if not raw_programs:
+        raise ValueError("internal error: empty raw program group")
+
+    template = raw_programs[0]
+    occurrences = _iter_program_occurrences(template)
+    occurrence_values = [_occurrence_values(raw_programs, occurrence) for occurrence in occurrences]
+    normalized_sources: list[dict[str, int]] = []
+    live_occurrences: list[int] = []
+
+    for occ_index, occurrence in enumerate(occurrences):
+        values = occurrence_values[occ_index]
+        if occurrence["domain"] == "coord":
+            const_source = _coord_constant_source(values)
+        else:
+            const_source = _address_constant_source(values)
+        if const_source is not None:
+            normalized_sources.append(const_source)
+            continue
+        if occurrence["domain"] == "coord":
+            sm_affine_source = _coord_sm_affine_const_source(values, sm_indices)
+            if sm_affine_source is not None:
+                normalized_sources.append(sm_affine_source)
+                continue
+
+        exact_candidate: tuple[tuple[int, int, int], dict[str, int]] | None = None
+        add_candidate: tuple[tuple[int, int, int], dict[str, int]] | None = None
+
+        for prev_index in range(occ_index):
+            delta = _invariant_delta(values, occurrence_values[prev_index])
+            if delta is None:
+                continue
+            if delta == 0:
+                candidate = _compose_source(
+                    normalized_sources[prev_index],
+                    0,
+                    domain=str(occurrence["domain"]),
+                )
+                if candidate is None:
+                    continue
+                score = _candidate_score(candidate, 0)
+                if exact_candidate is None or score < exact_candidate[0]:
+                    exact_candidate = (score, candidate)
+                continue
+
+            if occurrence["domain"] == "coord":
+                if not _coord_addend_is_structural(delta):
+                    continue
+            else:
+                if not _address_addend_is_structural(delta, occurrence):
+                    continue
+
+            candidate = _compose_source(
+                normalized_sources[prev_index],
+                delta,
+                domain=str(occurrence["domain"]),
+            )
+            if candidate is None:
+                continue
+            score = _candidate_score(candidate, delta)
+            if add_candidate is None or score < add_candidate[0]:
+                add_candidate = (score, candidate)
+
+        if exact_candidate is not None:
+            normalized_sources.append(exact_candidate[1])
+            continue
+        if add_candidate is not None:
+            normalized_sources.append(add_candidate[1])
+            continue
+
+        live_index = len(live_occurrences)
+        live_occurrences.append(occ_index)
+        normalized_sources.append({"kind": "live", "index": live_index})
+
+    compiled_program = copy.deepcopy(template)
+    for occurrence, source in zip(occurrences, normalized_sources):
+        _set_occurrence_source(compiled_program, occurrence, source)
+    compiled_program["num_live_values"] = len(live_occurrences)
+
+    per_builder_live_values: list[list[int]] = []
+    for builder_index in range(len(raw_programs)):
+        live_values: list[int] = []
+        for occ_index in live_occurrences:
+            live_values.append(int(occurrence_values[occ_index][builder_index]))
+        per_builder_live_values.append(live_values)
+    return compiled_program, per_builder_live_values
 
 
 def _analyze_launcher(launcher) -> dict[str, object]:
-    programs: list[dict[str, object]] = []
-    sm_program_ids: list[int] = []
-    sm_live_offsets: list[int] = []
+    grouped_programs: dict[str, dict[str, object]] = {}
+    ordered_group_keys: list[str] = []
+    sm_program_ids = [0] * len(launcher.builder)
+    sm_live_offsets = [0] * len(launcher.builder)
     live_values: list[int] = []
-    program_key_to_id: dict[str, int] = {}
+    programs: list[dict[str, object]] = []
 
-    for builder in launcher.builder:
-        program, sm_live_values = _program_structure(builder)
-        key = _canonical_program_key(program)
-        program_id = program_key_to_id.get(key)
-        if program_id is None:
-            program_id = len(programs)
-            program_key_to_id[key] = program_id
-            programs.append(
-                {
-                    "program_id": program_id,
-                    **program,
-                }
-            )
-        sm_program_ids.append(program_id)
-        sm_live_offsets.append(len(live_values))
-        live_values.extend(sm_live_values)
+    for sm_index, builder in enumerate(launcher.builder):
+        raw_program = _program_structure_raw(builder)
+        key = _canonical_program_template_key(raw_program)
+        group = grouped_programs.get(key)
+        if group is None:
+            group = {
+                "raw_programs": [],
+                "sm_indices": [],
+            }
+            grouped_programs[key] = group
+            ordered_group_keys.append(key)
+        group["raw_programs"].append(raw_program)
+        group["sm_indices"].append(sm_index)
+
+    for group_key in ordered_group_keys:
+        group = grouped_programs[group_key]
+        optimized_program, group_live_values = _optimize_program_group(group["raw_programs"], group["sm_indices"])
+        program_id = len(programs)
+        programs.append(
+            {
+                "program_id": program_id,
+                **optimized_program,
+            }
+        )
+        for sm_index, sm_live_values in zip(group["sm_indices"], group_live_values):
+            sm_program_ids[sm_index] = program_id
+            sm_live_offsets[sm_index] = len(live_values)
+            live_values.extend(sm_live_values)
 
     return {
         "programs": programs,
@@ -392,7 +698,7 @@ def _analyze_launcher(launcher) -> dict[str, object]:
 def build_compiled_runtime_bundle(launcher) -> dict[str, object]:
     analysis = _analyze_launcher(launcher)
     spec = {
-        "version": 4,
+        "version": 5,
         "num_sms": launcher.num_sms,
         "compute_ops": launcher.compute_operator_names(),
         "sm_program_ids": analysis["sm_program_ids"],

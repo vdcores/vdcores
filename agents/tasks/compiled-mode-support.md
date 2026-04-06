@@ -11,7 +11,7 @@ Track the multi-conversation effort to make compiled mode usable for real schedu
 
 ## Current State
 
-Compiled mode is working end-to-end for the current supported subset and has been verified on several standalone apps, including `gemv_out`, `gemv_mma_out`, `argmax`, `rmsnorm`, `tmacopy`, repeat-form `tma1d`, and `gemv_logits`. The compiled async `OP_ALLOC_TMA_LOAD_1D` path now uses inline PTX `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes` instead of `cuda::device::memcpy_async_tx(...)`, which clears the preserved barrier repro hang and restores the async path for `gemv_mlp_mixed`. Compiled alloc code now skips `st_insts[slot]` materialization for ordinary shared-memory slots and only writes `st_insts` for `OP_ALLOC_WB_RAW_ADDRESS`, which is the only current compiled-mode path that still needs slot-to-global-pointer metadata. The generator now also lowers per-SM program/live lookup helpers by table shape instead of always emitting giant `switch (sm_id)` trees: small piecewise-constant tables become uniform range checks, small piecewise-affine tables become arithmetic, and only irregular dense tables fall back to `__device__ __constant__` lookup arrays. The latest profiling pass shows `gemv_mlp_mixed` compiled mode is no longer losing inside the kernel itself after loop folding and launcher-side caching. A follow-up live-value compaction now packs coordinate payloads into one 64-bit value instead of four separate scalars, cutting the mixed-MLP payload size by about `74.9%`, but the first `gemv_mlp_mixed` measurements show that footprint win is roughly performance-neutral and slightly negative in-kernel because the generated code must unpack coords before tensor ops.
+Compiled mode is working end-to-end for the current supported subset and has been verified on several standalone apps, including `gemv_out`, `gemv_mma_out`, `argmax`, `rmsnorm`, `tmacopy`, repeat-form `tma1d`, and `gemv_logits`. The compiled async `OP_ALLOC_TMA_LOAD_1D` path now uses inline PTX `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes` instead of `cuda::device::memcpy_async_tx(...)`, which clears the preserved barrier repro hang and restores the async path for `gemv_mlp_mixed`. Compiled alloc code now skips `st_insts[slot]` materialization for ordinary shared-memory slots and only writes `st_insts` for `OP_ALLOC_WB_RAW_ADDRESS`, which is the only current compiled-mode path that still needs slot-to-global-pointer metadata. The generator now also lowers per-SM program/live lookup helpers by table shape instead of always emitting giant `switch (sm_id)` trees: small piecewise-constant tables become uniform range checks, small piecewise-affine tables become arithmetic, and only irregular dense tables fall back to `__device__ __constant__` lookup arrays. The latest profiling pass shows `gemv_mlp_mixed` compiled mode is no longer losing inside the kernel itself after loop folding and launcher-side caching. The current live-value lowering now works in two layers: it first identifies per-program root values and derivations instead of blindly materializing every address/coord payload, then it lowers schedule-style coord roots that are affine in `sm_id` directly into generated arithmetic. On `gemv_mlp_mixed`, that moves the exported spec to version `5`, cuts the total live-value count from `24` to `4`, and collapses the mixed schedule from `129` compiled programs to `3` without regressing the benchmark.
 
 ## Progress
 
@@ -148,6 +148,39 @@ Compiled mode is working end-to-end for the current supported subset and has bee
     - compiled: `81751.53 ns` average duration, `86372.80 ns` average execution time
   - a recent interpreted rerun in the same phase measured `80752.35 ns`, so the current combined alloc/live placement path brings `gemv_mlp_mixed` to within about `1.24%` of interpreted on average duration
   - takeaway: live-value placement matters too, but less dramatically than alloc placement; on this mixed benchmark the best default is shared-memory staging of the now-small per-SM live-value slices.
+- 2026-04-06: replaced the direct payload-index lowering with a reusable live-source optimizer in `python/dae/compiled_mode.py` and taught `tools/generate_compiled_program.py` to consume source descriptors (`const`, `live + add`, and `sm_id`-affine coord sources):
+  - program grouping now starts from a raw structural template that excludes literal coords/addresses, so the compiler can reason about derivations before final program dedup
+  - coord-based schedule roots that are affine in `sm_id` now lower into generated arithmetic instead of live payload entries, while 1D address-heavy tails still keep one real live root plus constant offsets
+  - `gemv_mlp_mixed` export now produces spec version `5`, `3` programs, and only `4` total live values versus the prior version-4 packed-coord export with `129` programs and `24` live values
+  - rebuilt `dae.runtime` against the new mixed spec and reran `app/python/gemv_mlp_mixed.py -b 20`:
+    - interpreted: `82252.06 ns` average duration, `87851.20 ns` average execution time
+    - compiled: `82212.79 ns` average duration, `86592.00 ns` average execution time
+  - both modes still report the same large `out` mismatch family (`1897.13%` interpreted / `1897.13%` compiled to two decimals) while `silu1` remains aligned at `0.0968%`, so this pass did not introduce a new mixed-path correctness regression
+  - takeaway: the new source model recovers the intended “real live values only” behavior on the mixed benchmark without giving back the benchmark parity already recovered by the earlier alloc/live placement work.
+- 2026-04-06: profiled the latest live-root `gemv_mlp_mixed` build with fresh `ncu` passes for compiled vs interpreted:
+  - basic profile:
+    - compiled: `98.85 us`, `77.31%` memory throughput, `14.38%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory, `12.17%` achieved occupancy
+    - interpreted: `101.22 us`, `76.45%` memory throughput, `15.97%` compute throughput, `40` registers/thread, `14.37 KB` static shared memory, `12.36%` achieved occupancy
+  - scheduler/instruction profile:
+    - compiled: `84.72%` no-eligible cycles, `0.16` eligible warps/scheduler, `0.15` issued warps/scheduler, `10,311,458` executed instructions
+    - interpreted: `82.02%` no-eligible cycles, `0.19` eligible warps/scheduler, `0.18` issued warps/scheduler, `11,786,417` executed instructions
+  - memory workload profile:
+    - compiled: `3.08 TB/s` memory throughput, `58.07%` L1/TEX hit rate, `28.43%` L2 hit rate, `76.58%` max-bandwidth utilization
+    - interpreted: `3.07 TB/s` memory throughput, `43.15%` L1/TEX hit rate, `28.39%` L2 hit rate, `76.41%` max-bandwidth utilization
+  - takeaway: the current compiled kernel is already slightly faster than interpreted in-kernel and uses fewer executed instructions, so the remaining improvement space is not obvious “more folding”; both paths are dominated by low eligible-warp rate at occupancy capped by shared memory, and compiled’s main remaining opportunity appears to be reducing latency / increasing overlap rather than cutting straight-line instruction count.
+- 2026-04-06: extended the source-diff folding path so it also folds consecutive linear op runs, not just `RepeatM` bodies:
+  - `tools/generate_compiled_program.py` now reuses one grouped-step emitter for repeat bodies and plain consecutive op sequences in alloc/LDU/STU generation
+  - on `gemv_mlp_mixed`, the later flattened `OP_ALLOC_TMA_LOAD_3D` stretches in `build/generated/dae/compiled_program.inc` now collapse into linear `for (__step ...)` loops, including the previously flat mid/later LDU runs that become `__step < 8` loops
+  - rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json` and reran compiled bench:
+    - compiled: `81881.39 ns` average duration, `86691.20 ns` average execution time
+  - versus the earlier live-root baseline (`82212.79 ns`), this check is about `0.40%` faster on average duration while keeping the same existing mixed-path diff profile (`1897.22%` final `out`, `0.0968%` `silu1`)
+  - takeaway: there was still real folding space in the later linear 3D-load region, and the coord/source-diff fold path can cover it cleanly without a model-specific special case.
+- 2026-04-06: reviewed and tidied the fold/codegen plumbing so the new optimization paths are modular instead of partly copy-pasted:
+  - renamed the fold grouping helper to match its real scope (`_group_foldable_steps`) and split the memory traversal into reusable sequence helpers that collect filtered repeat/op items, flatten them for payload aliasing, and emit grouped repeat plus linear-op runs from one shared path
+  - alloc/LDU/STU emission now all route their foldable memory sequences through the same helper stack, while alloc termination stays isolated in its own tiny emitter
+  - reran `python -m py_compile` for both `tools/generate_compiled_program.py` and `python/dae/compiled_mode.py`, regenerated `build/generated/gemv_mlp_mixed_compiled_spec.json`, rebuilt `dae.runtime`, and reran `app/python/gemv_mlp_mixed.py --mode compiled -b 20`
+  - latest mixed compiled bench after the tidy-up: `81971.54 ns` average duration, `86112.00 ns` average execution time, with the same existing diff profile (`1897.22%` final `out`, `0.0968%` `silu1`)
+  - takeaway: the fold optimization is now aligned with the current version-`5` live-source model and easier to reuse for future memory-op folding work without changing the current generated mixed-case behavior.
 
 ## TODO
 
@@ -157,8 +190,9 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 - Investigate the remaining compiled-vs-interpreted `out` mismatch in `gemv_mlp_mixed` after the 1D-load hang fix.
 - Investigate why `gemv_mlp_mixed.py -b` now reports a very large final-`out` diff in both interpreted and compiled modes even though the earlier launch-style checks were much smaller.
 - Use the new `ncu` direction to target the next compiled-mode optimization beyond loop folding, now focusing on launch/setup overhead in the compiled path before chasing more generated-kernel rewrites.
-- If packed coord payloads stay, look for a lower-overhead unpack strategy or a way to consume packed coords directly in generated tensor ops so the payload-size win can translate into runtime.
+- Extend the new live-source optimizer beyond the current `const` / `live + add` / `sm_id`-affine coord rules if larger cases still carry avoidable address roots or other derived payloads.
 - If packed coord payloads stay, the next performance step is likely direct packed-coord consumption or launch-path work rather than more local dead-code pruning.
+- Use the latest `ncu` comparison to look for latency-hiding opportunities in `gemv_mlp_mixed`, not just instruction-count reductions: occupancy is still shared-memory-limited at one block per SM and both paths spend more than `82%` of cycles with no eligible warp.
 - Avoid the current alloc-table approach for now; if alloc-side dedup is revisited, it likely needs to preserve the previous zero-stack straight-line fast path rather than routing every alloc through a generic helper.
 - Keep the new inline alloc-table mode architecture; future alloc-side tuning can continue exploring table encoding and placement via `DAE_COMPILED_ALLOC_TABLE_MODE` without going back to the helper-based design.
 - Keep both placement knobs (`DAE_COMPILED_ALLOC_TABLE_MODE`, `DAE_COMPILED_LIVE_VALUE_MODE`) available; for this benchmark the current best defaults are alloc-table `global` and live-value `shared`.
