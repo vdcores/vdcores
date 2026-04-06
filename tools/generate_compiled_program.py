@@ -311,11 +311,21 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         _emit_memory_field_locals(step, lines, indent + "  ")
         _emit_ld_barrier_wait(step, lines, indent + "  ")
         if base_name == "OP_ALLOC_TMA_LOAD_1D":
-            lines.append(f"{indent}  cuda::device::memcpy_async_tx(")
-            lines.append(f"{indent}      static_cast<char *>(get_slot_address(smem_base, cmd.slot)),")
-            lines.append(f"{indent}      reinterpret_cast<char *>(__address),")
-            lines.append(f"{indent}      cuda::aligned_size_t<16>(__size),")
-            lines.append(f"{indent}      m2c.barriers[cmd.m2c_slot]);")
+            lines.append(f"{indent}  asm volatile(")
+            lines.append(
+                f'{indent}  "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "'
+            )
+            lines.append(f'{indent}  "[%0], [%1], %2, [%3];\\n"')
+            lines.append(f"{indent}  :")
+            lines.append(
+                f"{indent}  : \"r\"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, cmd.slot))),"
+            )
+            lines.append(f"{indent}    \"l\"(reinterpret_cast<const void *>(__address)),")
+            lines.append(f"{indent}    \"r\"((uint32_t)__size),")
+            lines.append(
+                f"{indent}    \"r\"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(cmd.m2c_slot)))"
+            )
+            lines.append(f"{indent}  : \"memory\");")
             lines.append(f"{indent}  cuda::device::barrier_expect_tx(m2c.barriers[cmd.m2c_slot], cuda::aligned_size_t<16>(__size));")
         elif base_name == "OP_ALLOC_TMA_LOAD_TENSOR_1D":
             lines.append(f"{indent}  asm volatile(")
