@@ -93,7 +93,26 @@ static constexpr bool daeCompiledProgramEnabled = false;
 static constexpr bool daeCompiledProgramDebug = false;
 static constexpr const char *daeCompiledProgramHash = "";
 static constexpr int daeCompiledProgramNumSms = 0;
+static constexpr int daeCompiledProgramCount = 0;
 static constexpr int daeCompiledProgramLiveValueCount = 0;
+static constexpr int daeCompiledLaunchModeMonolithic = 0;
+static constexpr int daeCompiledLaunchModeSplit = 1;
+static constexpr int daeCompiledSplitLaunchReservedBars = 2;
+static constexpr int daeCompiledSplitLaunchArrivalBar = numBars - 2;
+static constexpr int daeCompiledSplitLaunchReleaseBar = numBars - 1;
+
+static __host__ __device__ __forceinline__ int dae_compiled_program_block_count(int) {
+  return 0;
+}
+
+template <int ProgramId>
+static __device__ __forceinline__ int dae_compiled_program_sm_id_for_block(int) {
+  (void)ProgramId;
+  assert(false && "compiled mode was not built into this runtime");
+  return 0;
+}
+
+#define DAE_COMPILED_SPLIT_PROGRAM_CASES(APPLY)
 
 static __device__ __forceinline__ int dae_compiled_live_offset_for_sm(int) {
   return 0;

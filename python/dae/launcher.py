@@ -12,6 +12,7 @@ from .runtime import config, opcode
 from .tma_utils import *
 
 import copy
+import os
 from enum import Enum
 from math import prod
 
@@ -217,7 +218,13 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
-    def __init__(self, num_sms : int = 1, device = 'cuda', mode: str = "interpreted"):
+    def __init__(
+        self,
+        num_sms: int = 1,
+        device='cuda',
+        mode: str = "interpreted",
+        compiled_launch_mode: str | None = None,
+    ):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
         self.device = device
@@ -250,6 +257,8 @@ class Launcher:
             'default': ResourceGroup('default')
         }
 
+        self._compiled_launch_mode = "monolithic"
+        self.set_compiled_launch_mode(compiled_launch_mode)
         runtime.set_smem_size(self.smem_size)
 
     def _invalidate_compiled_cache(self):
@@ -261,6 +270,15 @@ class Launcher:
         if mode not in {"interpreted", "compiled"}:
             raise ValueError(f"Unsupported launcher mode {mode!r}")
         self.mode = mode
+        return self
+
+    def set_compiled_launch_mode(self, launch_mode: str | None):
+        if launch_mode is None:
+            launch_mode = os.environ.get("DAE_COMPILED_LAUNCH_MODE", "monolithic")
+        launch_mode = launch_mode.strip().lower()
+        if launch_mode not in {"monolithic", "split"}:
+            raise ValueError(f"Unsupported compiled launch mode {launch_mode!r}")
+        self._compiled_launch_mode = launch_mode
         return self
 
     # resource management functions
@@ -447,6 +465,17 @@ class Launcher:
                 raise ValueError(
                     f"Compiled mode num_sms mismatch: launcher={self.num_sms}, runtime={runtime_num_sms}"
                 )
+            if (
+                self._compiled_launch_mode == "split"
+                and len(current_spec["programs"]) > 1
+            ):
+                reserved_bars = int(getattr(runtime, "compiled_split_launch_reserved_bars", 2))
+                if self.num_bars > config.max_bars - reserved_bars:
+                    raise ValueError(
+                        "Compiled split launch mode reserves the last "
+                        f"{reserved_bars} bars for startup sync, but launcher already uses "
+                        f"{self.num_bars} of {config.max_bars} bars."
+                    )
 
         cinsts = None
         minsts = None
@@ -480,6 +509,12 @@ class Launcher:
         runtime.set_cache_policy(tma, stream, 1, 2, 0)
         if self.mode == "compiled":
             live_value_mode = int(getattr(runtime, "compiled_program_live_value_mode", 0))
+            launch_mode = int(getattr(runtime, "compiled_launch_mode_monolithic", 0))
+            if (
+                self._compiled_launch_mode == "split"
+                and len(compiled_bundle["spec"]["programs"]) > 1
+            ):
+                launch_mode = int(getattr(runtime, "compiled_launch_mode_split", 1))
             if live_value_mode == 2 and not self._compiled_live_values_constant_uploaded:
                 runtime.set_compiled_live_values_constant(compiled_live_values)
                 self._compiled_live_values_constant_uploaded = True
@@ -489,7 +524,7 @@ class Launcher:
                 self.num_sms, self.smem_size,
                 compiled_live_values, tma,
                 self.bars, profile,
-                stream
+                stream, launch_mode
             )
         else:
             for i in range(self.num_sms // 4):

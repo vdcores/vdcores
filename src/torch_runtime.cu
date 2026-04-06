@@ -107,7 +107,8 @@ int py_launch_dae_compiled(
     torch::Tensor tma_descs_bytes,
     torch::Tensor bars_int32,
     torch::Tensor profile_u64,
-    int64_t stream
+    int64_t stream,
+    int64_t launch_mode
 ) {
   set_persistent_cache();
 
@@ -121,7 +122,7 @@ int py_launch_dae_compiled(
   cudaError_t st = launch_dae_compiled(
       static_cast<int>(num_sms), smem_size,
       live_values, tma,
-      bars, prof, stream
+      bars, prof, stream, static_cast<int>(launch_mode)
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae_compiled failed: ", cudaGetErrorString(st));
@@ -320,9 +321,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("supported_compute_ops") = supported_compute_ops;
   m.attr("compiled_program_enabled") = py::bool_(daeCompiledProgramEnabled);
   m.attr("compiled_program_hash") = py::str(daeCompiledProgramHash);
+  m.attr("compiled_program_count") = py::int_(daeCompiledProgramCount);
   m.attr("compiled_program_num_sms") = py::int_(daeCompiledProgramNumSms);
   m.attr("compiled_program_live_value_count") = py::int_(daeCompiledProgramLiveValueCount);
   m.attr("compiled_program_live_value_mode") = py::int_(daeCompiledLiveValueMode);
+  m.attr("compiled_launch_mode_monolithic") = py::int_(daeCompiledLaunchModeMonolithic);
+  m.attr("compiled_launch_mode_split") = py::int_(daeCompiledLaunchModeSplit);
+  m.attr("compiled_split_launch_reserved_bars") = py::int_(daeCompiledSplitLaunchReservedBars);
 
   auto config = m.def_submodule("config", "DAE2 Configuration Constants");
   config.attr("slot_size") = slotSizeKb * 1024;

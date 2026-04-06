@@ -402,6 +402,70 @@ def _group_foldable_steps(steps: list[dict[str, object]]) -> list[dict[str, obje
     return groups
 
 
+def _fold_group_signature(group: dict[str, object]) -> tuple[object, ...] | None:
+    if group["kind"] != "fold":
+        return None
+    return (
+        _memory_step_fold_signature(group["step"]),
+        int(group["count"]),
+        tuple(int(stride) for stride in group["source_strides"]),
+    )
+
+
+def _group_nested_foldable_groups(groups: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    index = 0
+    while index < len(groups):
+        group = groups[index]
+        signature = _fold_group_signature(group)
+        if signature is None:
+            merged.append(group)
+            index += 1
+            continue
+
+        sources = _step_sources(group["step"])
+        if not sources:
+            merged.append(group)
+            index += 1
+            continue
+
+        run_end = index + 1
+        outer_source_strides: list[int | None] = [None] * len(sources)
+        while run_end < len(groups):
+            candidate = groups[run_end]
+            if _fold_group_signature(candidate) != signature:
+                break
+            previous_sources = _step_sources(groups[run_end - 1]["step"])
+            candidate_sources = _step_sources(candidate["step"])
+            current_valid = True
+            for source_index, (current_source, previous_source) in enumerate(zip(candidate_sources, previous_sources)):
+                current_stride = _source_base_add(current_source) - _source_base_add(previous_source)
+                if outer_source_strides[source_index] is None:
+                    outer_source_strides[source_index] = current_stride
+                elif current_stride != outer_source_strides[source_index]:
+                    current_valid = False
+                    break
+            if not current_valid:
+                break
+            run_end += 1
+
+        if run_end - index > 1:
+            merged.append(
+                {
+                    "kind": "nested_fold",
+                    "step": group["step"],
+                    "outer_count": run_end - index,
+                    "inner_count": int(group["count"]),
+                    "inner_source_strides": [int(stride) for stride in group["source_strides"]],
+                    "outer_source_strides": [int(stride or 0) for stride in outer_source_strides],
+                }
+            )
+        else:
+            merged.append(group)
+        index = run_end
+    return merged
+
+
 def _collect_memory_sequence_items(
     blocks: list[dict[str, object]],
     *,
@@ -435,22 +499,301 @@ def _flatten_memory_sequence_items(items: list[dict[str, object]]) -> list[dict[
     return steps
 
 
+def _field_cpp_type(field: dict[str, object]) -> str:
+    return "uint16_t" if bool(field["coord"]) else "uint64_t"
+
+
+def _field_is_plain_compile_time_constant(field: dict[str, object]) -> bool:
+    return field["source"]["kind"] == "const" and int(field["delta"]) == 0
+
+
+def _field_source_expr(
+    field: dict[str, object],
+    *,
+    offset_terms: list[tuple[str, int]] | None = None,
+) -> str:
+    return _source_expr(
+        field["source"],
+        offset_terms=offset_terms,
+        coord=bool(field["coord"]),
+    )
+
+
+def _emit_field_local(
+    field: dict[str, object],
+    lines: list[str],
+    indent: str,
+    *,
+    var_name: str,
+    offset_terms: list[tuple[str, int]] | None = None,
+    mutable: bool,
+) -> None:
+    field_type = _field_cpp_type(field)
+    init_expr = _field_source_expr(field, offset_terms=offset_terms)
+    delta = int(field["delta"])
+    if bool(field["coord"]):
+        lines.append(
+            _declare_local(
+                indent,
+                f"{field_type} {var_name}" if mutable or delta != 0 else f"const {field_type} {var_name}",
+                f"static_cast<uint16_t>({init_expr})",
+            )
+        )
+        if delta != 0:
+            lines.append(
+                f"{indent}{var_name} = "
+                f"static_cast<uint16_t>(static_cast<int>({var_name}) + (__rep * {delta}));"
+            )
+        return
+
+    lines.append(
+        _declare_local(
+            indent,
+            f"{field_type} {var_name}" if mutable or delta != 0 else f"const {field_type} {var_name}",
+            init_expr,
+        )
+    )
+    if delta != 0:
+        lines.append(
+            f"{indent}{var_name} = "
+            f"static_cast<uint64_t>(static_cast<int64_t>({var_name}) + "
+            f"static_cast<int64_t>(__rep) * static_cast<int64_t>({delta}));"
+        )
+
+
+def _emit_field_increment(
+    field: dict[str, object],
+    lines: list[str],
+    indent: str,
+    *,
+    var_name: str,
+    stride: int,
+) -> None:
+    if int(stride) == 0:
+        return
+    if bool(field["coord"]):
+        lines.append(
+            f"{indent}{var_name} = static_cast<uint16_t>(static_cast<int>({var_name}) + ({int(stride)}));"
+        )
+        return
+    lines.append(
+        f"{indent}{var_name} = static_cast<uint64_t>(static_cast<int64_t>({var_name}) + "
+        f"static_cast<int64_t>({int(stride)}));"
+    )
+
+
+def _memory_field_specs(
+    step: dict[str, object],
+    *,
+    emit_address: bool,
+    emit_coord_count: int,
+) -> list[dict[str, object]]:
+    base_name = step["base_name"]
+    if base_name in _NO_ADDRESS_MEMORY_BASE_OPS:
+        return []
+
+    fields: list[dict[str, object]] = []
+    source_index = 0
+    if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS and emit_address:
+        fields.append(
+            {
+                "name": "__address",
+                "source": dict(step["address_source"]),
+                "delta": int(step.get("delta_address", 0)),
+                "coord": False,
+                "source_index": source_index,
+            }
+        )
+    if "address_source" in step:
+        source_index += 1
+
+    delta_coords = step.get("delta_coords")
+    coord_sources = step.get("coord_sources", [])
+    for coord_index in range(emit_coord_count):
+        fields.append(
+            {
+                "name": f"__coord{coord_index}",
+                "source": dict(coord_sources[coord_index]),
+                "delta": 0 if delta_coords is None else int(delta_coords[coord_index]),
+                "coord": True,
+                "source_index": source_index + coord_index,
+            }
+        )
+    return fields
+
+
+def _alloc_step_fields(step: dict[str, object]) -> list[dict[str, object]]:
+    return _memory_field_specs(
+        step,
+        emit_address=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS
+        and step["base_name"] in _SCALAR_ADDRESS_FIELD_BASE_OPS,
+        emit_coord_count=(
+            _memory_op_coord_count(step["base_name"])
+            if step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS
+            else 0
+        ),
+    )
+
+
+def _ld_step_fields(step: dict[str, object]) -> list[dict[str, object]]:
+    base_name = step["base_name"]
+    if base_name not in _LOAD_OPS:
+        return []
+    return _memory_field_specs(
+        step,
+        emit_address=base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS,
+        emit_coord_count=_memory_op_coord_count(base_name),
+    )
+
+
+def _st_step_fields(step: dict[str, object]) -> list[dict[str, object]]:
+    base_name = step["base_name"]
+    return _memory_field_specs(
+        step,
+        emit_address=base_name == "OP_ALLOC_WB_TMA_STORE_1D",
+        emit_coord_count=_memory_op_coord_count(base_name),
+    )
+
+
+def _should_hoist_field_for_fold(field: dict[str, object], *, stride: int) -> bool:
+    if int(stride) != 0 or int(field["delta"]) != 0:
+        return True
+    return not _field_is_plain_compile_time_constant(field)
+
+
+def _should_hoist_field_for_nested_fold(
+    field: dict[str, object], *, outer_stride: int, inner_stride: int
+) -> bool:
+    if int(outer_stride) != 0 or int(inner_stride) != 0 or int(field["delta"]) != 0:
+        return True
+    return not _field_is_plain_compile_time_constant(field)
+
+
 def _emit_grouped_step_sequence(
     step_list: list[dict[str, object]],
     lines: list[str],
     indent: str,
     emit_step,
+    step_fields,
 ) -> None:
-    for group in _group_foldable_steps(step_list):
+    for group in _group_nested_foldable_groups(_group_foldable_steps(step_list)):
         if group["kind"] == "fold":
+            field_expr_overrides: dict[str, str] = {}
+            fields = step_fields(group["step"])
+            for field in fields:
+                source_index = int(field["source_index"])
+                if source_index >= len(group["source_strides"]):
+                    continue
+                stride = int(group["source_strides"][source_index])
+                if not _should_hoist_field_for_fold(field, stride=stride):
+                    continue
+                var_name = f"{field['name']}_acc"
+                _emit_field_local(
+                    field,
+                    lines,
+                    indent,
+                    var_name=var_name,
+                    mutable=stride != 0,
+                )
+                field_expr_overrides[str(field["name"])] = var_name
             lines.append(f"{indent}for (int __step = 0; __step < {int(group['count'])}; ++__step) {{")
             emit_step(
                 group["step"],
                 lines,
                 indent + "  ",
-                step_offset_expr="__step",
-                source_strides=[int(stride) for stride in group["source_strides"]],
+                field_expr_overrides=field_expr_overrides or None,
             )
+            for field in fields:
+                field_name = str(field["name"])
+                if field_name not in field_expr_overrides:
+                    continue
+                source_index = int(field["source_index"])
+                _emit_field_increment(
+                    field,
+                    lines,
+                    indent + "  ",
+                    var_name=field_expr_overrides[field_name],
+                    stride=int(group["source_strides"][source_index]),
+                )
+            lines.append(f"{indent}}}")
+        elif group["kind"] == "nested_fold":
+            outer_var_names: dict[str, str] = {}
+            inner_var_names: dict[str, str] = {}
+            fields = step_fields(group["step"])
+            for field in fields:
+                source_index = int(field["source_index"])
+                if (
+                    source_index >= len(group["outer_source_strides"])
+                    or source_index >= len(group["inner_source_strides"])
+                ):
+                    continue
+                outer_stride = int(group["outer_source_strides"][source_index])
+                inner_stride = int(group["inner_source_strides"][source_index])
+                if not _should_hoist_field_for_nested_fold(
+                    field,
+                    outer_stride=outer_stride,
+                    inner_stride=inner_stride,
+                ):
+                    continue
+                outer_var_name = f"{field['name']}_outer_acc"
+                _emit_field_local(
+                    field,
+                    lines,
+                    indent,
+                    var_name=outer_var_name,
+                    mutable=outer_stride != 0 or inner_stride != 0,
+                )
+                outer_var_names[str(field["name"])] = outer_var_name
+                if inner_stride != 0:
+                    inner_var_names[str(field["name"])] = f"{field['name']}_acc"
+            lines.append(f"{indent}for (int __outer = 0; __outer < {int(group['outer_count'])}; ++__outer) {{")
+            for field in fields:
+                field_name = str(field["name"])
+                if field_name not in inner_var_names:
+                    continue
+                lines.append(
+                    _declare_local(
+                        indent + "  ",
+                        f"{_field_cpp_type(field)} {inner_var_names[field_name]}",
+                        outer_var_names[field_name],
+                    )
+                )
+            lines.append(f"{indent}  for (int __step = 0; __step < {int(group['inner_count'])}; ++__step) {{")
+            field_expr_overrides = {
+                field_name: inner_var_names.get(field_name, outer_var_name)
+                for field_name, outer_var_name in outer_var_names.items()
+            }
+            emit_step(
+                group["step"],
+                lines,
+                indent + "    ",
+                field_expr_overrides=field_expr_overrides or None,
+            )
+            for field in fields:
+                field_name = str(field["name"])
+                if field_name not in inner_var_names:
+                    continue
+                source_index = int(field["source_index"])
+                _emit_field_increment(
+                    field,
+                    lines,
+                    indent + "    ",
+                    var_name=inner_var_names[field_name],
+                    stride=int(group["inner_source_strides"][source_index]),
+                )
+            lines.append(f"{indent}  }}")
+            for field in fields:
+                field_name = str(field["name"])
+                if field_name not in outer_var_names:
+                    continue
+                source_index = int(field["source_index"])
+                _emit_field_increment(
+                    field,
+                    lines,
+                    indent + "  ",
+                    var_name=outer_var_names[field_name],
+                    stride=int(group["outer_source_strides"][source_index]),
+                )
             lines.append(f"{indent}}}")
         else:
             emit_step(group["step"], lines, indent)
@@ -461,13 +804,14 @@ def _emit_grouped_sequence_items(
     lines: list[str],
     indent: str,
     emit_step,
+    step_fields,
 ) -> None:
     index = 0
     while index < len(items):
         item = items[index]
         if item["kind"] == "repeat":
             lines.append(f"{indent}for (int __rep = 0; __rep < {int(item['count'])}; ++__rep) {{")
-            _emit_grouped_step_sequence(item["steps"], lines, indent + "  ", emit_step)
+            _emit_grouped_step_sequence(item["steps"], lines, indent + "  ", emit_step, step_fields)
             lines.append(f"{indent}}}")
             index += 1
             continue
@@ -477,7 +821,7 @@ def _emit_grouped_sequence_items(
         while run_end < len(items) and items[run_end]["kind"] == "op":
             op_steps.append(items[run_end]["step"])
             run_end += 1
-        _emit_grouped_step_sequence(op_steps, lines, indent, emit_step)
+        _emit_grouped_step_sequence(op_steps, lines, indent, emit_step, step_fields)
         index = run_end
 
 
@@ -550,6 +894,13 @@ def _sm_live_counts(spec: dict[str, object]) -> list[int]:
     return counts
 
 
+def _program_block_sm_ids(spec: dict[str, object]) -> dict[int, list[int]]:
+    program_sm_ids: dict[int, list[int]] = {}
+    for sm_id, program_id in enumerate(int(value) for value in spec.get("sm_program_ids", [])):
+        program_sm_ids.setdefault(program_id, []).append(sm_id)
+    return program_sm_ids
+
+
 def _emit_payload_aliases(step_list: list[dict[str, object]], lines: list[str], indent: str) -> None:
     seen: set[int] = set()
     for step in step_list:
@@ -600,30 +951,37 @@ def _emit_ld_locals(program: dict[str, object], lines: list[str], indent: str, p
 def _source_expr(
     source: dict[str, object],
     *,
-    step_offset_expr: str | None,
-    stride: int,
+    offset_terms: list[tuple[str, int]] | None,
     coord: bool,
 ) -> str:
+    term_exprs = [
+        f"({expr}) * {int(stride)}"
+        for expr, stride in (offset_terms or [])
+        if int(stride) != 0
+    ]
     if source["kind"] == "const":
         base_expr = str(int(source["value"]))
-        if step_offset_expr is not None and stride != 0:
-            return f"({base_expr} + ({step_offset_expr}) * {stride})"
+        if term_exprs:
+            return f"({base_expr} + {' + '.join(term_exprs)})"
         return base_expr
     if source["kind"] == "sm_affine_const":
         base_sm = int(source["base_sm"])
         base_expr = str(int(source["value"]))
-        stride_expr = int(source["stride"]) + int(stride)
+        stride_expr = int(source["stride"])
         if stride_expr == 0:
-            return base_expr
-        return f"({base_expr} + (sm_id - {base_sm}) * {stride_expr})"
+            expr = base_expr
+        else:
+            expr = f"({base_expr} + (sm_id - {base_sm}) * {stride_expr})"
+        if term_exprs:
+            return f"({expr} + {' + '.join(term_exprs)})"
+        return expr
 
     live_expr = _payload_scalar_var(int(source["index"]))
     add = int(source.get("add", 0))
     delta_terms: list[str] = []
     if add != 0:
         delta_terms.append(str(add))
-    if step_offset_expr is not None and stride != 0:
-        delta_terms.append(f"({step_offset_expr}) * {stride}")
+    delta_terms.extend(term_exprs)
     if coord:
         base_expr = f"static_cast<int>({live_expr} & 0xFFFFULL)"
         if delta_terms:
@@ -644,65 +1002,64 @@ def _emit_memory_field_locals(
     *,
     step_offset_expr: str | None = None,
     source_strides: list[int] | None = None,
+    source_offset_terms: list[list[tuple[str, int]]] | None = None,
+    field_expr_overrides: dict[str, str] | None = None,
+    emit_opcode: bool = False,
+    emit_size: bool = False,
+    emit_num_slots: bool = False,
+    emit_nslot: bool = False,
+    emit_bar: bool = False,
+    emit_arg: bool = False,
     emit_address: bool = False,
     emit_coord_count: int = 0,
 ) -> None:
     base_name = step["base_name"]
-    lines.append(_declare_local(indent, "constexpr uint16_t __opcode", str(int(step["opcode_value"])) ))
-    lines.append(_declare_local(indent, "constexpr uint16_t __size", str(int(step["size"])) ))
-    lines.append(_declare_local(indent, "constexpr uint16_t __num_slots", str(int(step["num_slots_value"])) ))
-    lines.append(_declare_local(indent, "constexpr uint8_t __nslot", str(int(step["nslot"])) ))
-    lines.append(_declare_local(indent, "constexpr uint8_t __bar", str(int(step["bar_id"])) ))
-    lines.append(_declare_local(indent, "constexpr uint16_t __arg", str(int(step["arg"])) ))
+    if emit_opcode:
+        lines.append(_declare_local(indent, "constexpr uint16_t __opcode", str(int(step["opcode_value"])) ))
+    if emit_size:
+        lines.append(_declare_local(indent, "constexpr uint16_t __size", str(int(step["size"])) ))
+    if emit_num_slots:
+        lines.append(_declare_local(indent, "constexpr uint16_t __num_slots", str(int(step["num_slots_value"])) ))
+    if emit_nslot:
+        lines.append(_declare_local(indent, "constexpr uint8_t __nslot", str(int(step["nslot"])) ))
+    if emit_bar:
+        lines.append(_declare_local(indent, "constexpr uint8_t __bar", str(int(step["bar_id"])) ))
+    if emit_arg:
+        lines.append(_declare_local(indent, "constexpr uint16_t __arg", str(int(step["arg"])) ))
     if base_name in _NO_ADDRESS_MEMORY_BASE_OPS:
         return
-    if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
-        if not emit_address:
-            return
-        address_source = step["address_source"]
-        address_stride = 0 if not source_strides else int(source_strides[0])
-        base_expr = _source_expr(
-            address_source,
-            step_offset_expr=step_offset_expr,
-            stride=address_stride,
-            coord=False,
-        )
-        if "delta_address" in step and int(step["delta_address"]) != 0:
-            lines.append(_declare_local(indent, "uint64_t __address", base_expr))
+    all_source_terms: list[list[tuple[str, int]]] = [[] for _ in _step_sources(step)]
+    if source_offset_terms:
+        all_source_terms = [
+            [(str(expr), int(stride)) for expr, stride in terms]
+            for terms in source_offset_terms
+        ]
+    elif step_offset_expr is not None and source_strides:
+        all_source_terms = [
+            ([(step_offset_expr, int(stride))] if int(stride) != 0 else [])
+            for stride in source_strides
+        ]
+    for field in _memory_field_specs(step, emit_address=emit_address, emit_coord_count=emit_coord_count):
+        field_name = str(field["name"])
+        if field_expr_overrides and field_name in field_expr_overrides:
             lines.append(
-                f"{indent}if (__rep != 0) __address += static_cast<uint64_t>(__rep) * {_u64_literal(int(step['delta_address']))};"
+                _declare_local(
+                    indent,
+                    f"const {_field_cpp_type(field)} {field_name}",
+                    field_expr_overrides[field_name],
+                )
             )
-        else:
-            lines.append(_declare_local(indent, "const uint64_t __address", base_expr))
-        return
-
-    if emit_coord_count <= 0:
-        return
-
-    delta_coords = step.get("delta_coords")
-    coord_sources = step.get("coord_sources", [])
-    coord_source_strides = []
-    if source_strides:
-        start_index = 1 if "address_source" in step else 0
-        coord_source_strides = [int(stride) for stride in source_strides[start_index: start_index + emit_coord_count]]
-    while len(coord_source_strides) < emit_coord_count:
-        coord_source_strides.append(0)
-    for coord_index in range(emit_coord_count):
-        coord_name = f"__coord{coord_index}"
-        coord_expr = _source_expr(
-            coord_sources[coord_index],
-            step_offset_expr=step_offset_expr,
-            stride=coord_source_strides[coord_index],
-            coord=True,
+            continue
+        source_index = int(field["source_index"])
+        offset_terms = all_source_terms[source_index] if source_index < len(all_source_terms) else None
+        _emit_field_local(
+            field,
+            lines,
+            indent,
+            var_name=field_name,
+            offset_terms=offset_terms,
+            mutable=int(field["delta"]) != 0,
         )
-        delta = 0 if delta_coords is None else int(delta_coords[coord_index])
-        if delta != 0:
-            lines.append(_declare_local(indent, f"uint16_t {coord_name}", f"static_cast<uint16_t>({coord_expr})"))
-            lines.append(
-                f"{indent}if (__rep != 0) {coord_name} = static_cast<uint16_t>({coord_name} + static_cast<uint16_t>(__rep * {delta}));"
-            )
-        else:
-            lines.append(_declare_local(indent, f"const uint16_t {coord_name}", f"static_cast<uint16_t>({coord_expr})"))
 
 
 def _emit_store_slot_inst(step: dict[str, object], lines: list[str], indent: str, slot_expr: str) -> None:
@@ -730,6 +1087,8 @@ def _emit_alloc_step(
     *,
     step_offset_expr: str | None = None,
     source_strides: list[int] | None = None,
+    source_offset_terms: list[list[tuple[str, int]]] | None = None,
+    field_expr_overrides: dict[str, str] | None = None,
 ) -> None:
     lines.append(f"{indent}{{")
     _emit_memory_field_locals(
@@ -738,6 +1097,13 @@ def _emit_alloc_step(
         indent + "  ",
         step_offset_expr=step_offset_expr,
         source_strides=source_strides,
+        source_offset_terms=source_offset_terms,
+        field_expr_overrides=field_expr_overrides,
+        emit_opcode=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS,
+        emit_size=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS,
+        emit_num_slots=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS,
+        emit_nslot=True,
+        emit_arg=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS,
         emit_address=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS and step["base_name"] in _SCALAR_ADDRESS_FIELD_BASE_OPS,
         emit_coord_count=_memory_op_coord_count(step["base_name"]) if step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS else 0,
     )
@@ -792,7 +1158,7 @@ def _emit_alloc_program(blocks: list[dict[str, object]], lines: list[str], inden
         while run_end < len(blocks) and blocks[run_end]["kind"] != "terminate":
             run_end += 1
         items = _collect_memory_sequence_items(blocks[index:run_end], include_step=lambda _step: True)
-        _emit_grouped_sequence_items(items, lines, indent, _emit_alloc_step)
+        _emit_grouped_sequence_items(items, lines, indent, _emit_alloc_step, _alloc_step_fields)
         index = run_end
 
 
@@ -820,6 +1186,8 @@ def _emit_ld_step(
     *,
     step_offset_expr: str | None = None,
     source_strides: list[int] | None = None,
+    source_offset_terms: list[list[tuple[str, int]]] | None = None,
+    field_expr_overrides: dict[str, str] | None = None,
 ) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
@@ -835,6 +1203,11 @@ def _emit_ld_step(
             indent + "  ",
             step_offset_expr=step_offset_expr,
             source_strides=source_strides,
+            source_offset_terms=source_offset_terms,
+            field_expr_overrides=field_expr_overrides,
+            emit_size=True,
+            emit_bar=bool(step["flags"]["barrier"]),
+            emit_arg=base_name != "OP_ALLOC_TMA_LOAD_1D",
             emit_address=base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS,
             emit_coord_count=_memory_op_coord_count(base_name),
         )
@@ -965,7 +1338,7 @@ def _emit_ld_program(program: dict[str, object], lines: list[str], indent: str, 
     step_list = _flatten_memory_sequence_items(filtered_items)
     _emit_ld_locals(program, lines, indent, port_id)
     _emit_payload_aliases(step_list, lines, indent)
-    _emit_grouped_sequence_items(filtered_items, lines, indent, _emit_ld_step)
+    _emit_grouped_sequence_items(filtered_items, lines, indent, _emit_ld_step, _ld_step_fields)
 
 
 def _emit_st_step(
@@ -975,6 +1348,8 @@ def _emit_st_step(
     *,
     step_offset_expr: str | None = None,
     source_strides: list[int] | None = None,
+    source_offset_terms: list[list[tuple[str, int]]] | None = None,
+    field_expr_overrides: dict[str, str] | None = None,
 ) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
@@ -992,6 +1367,11 @@ def _emit_st_step(
         indent + "  ",
         step_offset_expr=step_offset_expr,
         source_strides=source_strides,
+        source_offset_terms=source_offset_terms,
+        field_expr_overrides=field_expr_overrides,
+        emit_size=base_name == "OP_ALLOC_WB_TMA_STORE_1D",
+        emit_bar=bool(step["flags"]["barrier"]),
+        emit_arg=base_name in _WRITEBACK_OPS and base_name != "OP_ALLOC_WB_TMA_STORE_1D",
         emit_address=base_name == "OP_ALLOC_WB_TMA_STORE_1D",
         emit_coord_count=_memory_op_coord_count(base_name),
     )
@@ -1108,7 +1488,7 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
         lines.append(f"{indent}int __done = c2m.pop();")
         lines.append(f"{indent}assert(__done == 0 && \"compiled st expected terminate sentinel\");")
         return
-    _emit_grouped_sequence_items(write_items, lines, indent, _emit_st_step)
+    _emit_grouped_sequence_items(write_items, lines, indent, _emit_st_step, _st_step_fields)
     lines.append(f"{indent}int __done = c2m.pop();")
     lines.append(f"{indent}assert(__done == 0 && \"compiled st expected terminate sentinel\");")
 
@@ -1117,6 +1497,7 @@ def generate_enabled(
     spec: dict[str, object], *, debug: bool, alloc_table_mode: str, live_value_mode: str
 ) -> str:
     sm_program_ids = [int(program_id) for program_id in spec["sm_program_ids"]]
+    program_block_sm_ids = _program_block_sm_ids(spec)
     sm_live_offsets = [int(live_offset) for live_offset in spec.get("sm_live_offsets", [])]
     sm_live_counts = _sm_live_counts(spec)
     max_live_values_per_sm = max(sm_live_counts, default=0)
@@ -1141,9 +1522,15 @@ def generate_enabled(
         f"static constexpr bool daeCompiledProgramDebug = {'true' if debug else 'false'};",
         f'static constexpr const char *daeCompiledProgramHash = "{spec["hash"]}";',
         f'static constexpr int daeCompiledProgramNumSms = {int(spec["num_sms"])};',
+        f'static constexpr int daeCompiledProgramCount = {len(spec["programs"])};',
         f'static constexpr int daeCompiledProgramLiveValueCount = {int(spec.get("num_live_values", 0))};',
         f"static constexpr int daeCompiledLiveValueMaxPerSm = {max_live_values_per_sm};",
         f"static constexpr int daeCompiledAllocMaxCmdCount = {max_alloc_cmds};",
+        "static constexpr int daeCompiledLaunchModeMonolithic = 0;",
+        "static constexpr int daeCompiledLaunchModeSplit = 1;",
+        "static constexpr int daeCompiledSplitLaunchReservedBars = 2;",
+        "static constexpr int daeCompiledSplitLaunchArrivalBar = numBars - 2;",
+        "static constexpr int daeCompiledSplitLaunchReleaseBar = numBars - 1;",
         "",
         f"static constexpr int daeCompiledLiveValueModeGlobal = 0;",
         f"static constexpr int daeCompiledLiveValueModeShared = 1;",
@@ -1176,6 +1563,65 @@ def generate_enabled(
         values=sm_live_counts,
         default_value=0,
     )
+    lines.extend(
+        [
+            "static __host__ __device__ __forceinline__ int dae_compiled_program_block_count(int program_id) {",
+            "  switch (program_id) {",
+        ]
+    )
+    for program in spec["programs"]:
+        program_id = int(program["program_id"])
+        lines.append(
+            f"    case {program_id}: return {len(program_block_sm_ids.get(program_id, []))};"
+        )
+    lines.extend(
+        [
+            "    default: return 0;",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+    for program in spec["programs"]:
+        program_id = int(program["program_id"])
+        sm_ids = program_block_sm_ids.get(program_id, [])
+        lines.append(
+            f"static __device__ __constant__ int daeCompiledProgramBlockSmIds{program_id}[{max(1, len(sm_ids))}] = {{"
+        )
+        if sm_ids:
+            lines.extend(_emit_int_array_initializer(sm_ids, indent="  "))
+        else:
+            lines.append("  0")
+            lines.append("};")
+        lines.append("")
+    lines.extend(
+        [
+            "template <int ProgramId>",
+            "static __device__ __forceinline__ int dae_compiled_program_sm_id_for_block(int block_id) {",
+        ]
+    )
+    for index, program in enumerate(spec["programs"]):
+        program_id = int(program["program_id"])
+        prefix = "  if constexpr" if index == 0 else "  } else if constexpr"
+        lines.append(f"{prefix} (ProgramId == {program_id}) {{")
+        lines.append(f"    return daeCompiledProgramBlockSmIds{program_id}[block_id];")
+    lines.extend(
+        [
+            "  }",
+            '  assert(false && "missing compiled split program sm-id map");',
+            "  return 0;",
+            "}",
+            "",
+            "#define DAE_COMPILED_SPLIT_PROGRAM_CASES(APPLY) \\",
+        ]
+    )
+    if spec["programs"]:
+        for index, program in enumerate(spec["programs"]):
+            suffix = " \\" if index + 1 < len(spec["programs"]) else ""
+            lines.append(f"  APPLY({int(program['program_id'])});{suffix}")
+    else:
+        lines.append("  ")
+    lines.append("")
     if table_storage_kind is not None:
         for program in spec["programs"]:
             program_id = int(program["program_id"])
@@ -1434,13 +1880,30 @@ def generate_disabled(source: str, *, debug: bool, alloc_table_mode: str, live_v
             f"static constexpr bool daeCompiledProgramDebug = {'true' if debug else 'false'};",
             'static constexpr const char *daeCompiledProgramHash = "";',
             "static constexpr int daeCompiledProgramNumSms = 0;",
+            "static constexpr int daeCompiledProgramCount = 0;",
             "static constexpr int daeCompiledProgramLiveValueCount = 0;",
             "static constexpr int daeCompiledLiveValueMaxPerSm = 0;",
             "static constexpr int daeCompiledAllocMaxCmdCount = 0;",
+            "static constexpr int daeCompiledLaunchModeMonolithic = 0;",
+            "static constexpr int daeCompiledLaunchModeSplit = 1;",
+            "static constexpr int daeCompiledSplitLaunchReservedBars = 2;",
+            "static constexpr int daeCompiledSplitLaunchArrivalBar = numBars - 2;",
+            "static constexpr int daeCompiledSplitLaunchReleaseBar = numBars - 1;",
             "static constexpr int daeCompiledLiveValueModeGlobal = 0;",
             "static constexpr int daeCompiledLiveValueModeShared = 1;",
             "static constexpr int daeCompiledLiveValueModeConstant = 2;",
             "static constexpr int daeCompiledLiveValueMode = daeCompiledLiveValueModeGlobal;",
+            "",
+            "static __host__ __device__ __forceinline__ int dae_compiled_program_block_count(int) {",
+            "  return 0;",
+            "}",
+            "template <int ProgramId>",
+            "static __device__ __forceinline__ int dae_compiled_program_sm_id_for_block(int) {",
+            "  (void)ProgramId;",
+            '  assert(false && "compiled mode was not built into this runtime");',
+            "  return 0;",
+            "}",
+            "#define DAE_COMPILED_SPLIT_PROGRAM_CASES(APPLY)",
             "",
             "static __device__ __forceinline__ int dae_compiled_live_offset_for_sm(int) {",
             "  return 0;",

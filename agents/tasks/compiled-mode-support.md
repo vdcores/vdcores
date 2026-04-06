@@ -11,7 +11,7 @@ Track the multi-conversation effort to make compiled mode usable for real schedu
 
 ## Current State
 
-Compiled mode is working end-to-end for the current supported subset and has been verified on several standalone apps, including `gemv_out`, `gemv_mma_out`, `argmax`, `rmsnorm`, `tmacopy`, repeat-form `tma1d`, and `gemv_logits`. The compiled async `OP_ALLOC_TMA_LOAD_1D` path now uses inline PTX `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes` instead of `cuda::device::memcpy_async_tx(...)`, which clears the preserved barrier repro hang and restores the async path for `gemv_mlp_mixed`. Compiled alloc code now skips `st_insts[slot]` materialization for ordinary shared-memory slots and only writes `st_insts` for `OP_ALLOC_WB_RAW_ADDRESS`, which is the only current compiled-mode path that still needs slot-to-global-pointer metadata. The generator now also lowers per-SM program/live lookup helpers by table shape instead of always emitting giant `switch (sm_id)` trees: small piecewise-constant tables become uniform range checks, small piecewise-affine tables become arithmetic, and only irregular dense tables fall back to `__device__ __constant__` lookup arrays. The latest profiling pass shows `gemv_mlp_mixed` compiled mode is no longer losing inside the kernel itself after loop folding and launcher-side caching. The current live-value lowering now works in two layers: it first identifies per-program root values and derivations instead of blindly materializing every address/coord payload, then it lowers schedule-style coord roots that are affine in `sm_id` directly into generated arithmetic. On `gemv_mlp_mixed`, that moves the exported spec to version `5`, cuts the total live-value count from `24` to `4`, and collapses the mixed schedule from `129` compiled programs to `3` without regressing the benchmark.
+Compiled mode is working end-to-end for the current supported subset and has been verified on several standalone apps, including `gemv_out`, `gemv_mma_out`, `argmax`, `rmsnorm`, `tmacopy`, repeat-form `tma1d`, and `gemv_logits`. The compiled async `OP_ALLOC_TMA_LOAD_1D` path now uses inline PTX `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes` instead of `cuda::device::memcpy_async_tx(...)`, which clears the preserved barrier repro hang and restores the async path for `gemv_mlp_mixed`. Compiled alloc code now skips `st_insts[slot]` materialization for ordinary shared-memory slots and only writes `st_insts` for `OP_ALLOC_WB_RAW_ADDRESS`, which is the only current compiled-mode path that still needs slot-to-global-pointer metadata. The generator now also lowers per-SM program/live lookup helpers by table shape instead of always emitting giant `switch (sm_id)` trees: small piecewise-constant tables become uniform range checks, small piecewise-affine tables become arithmetic, and only irregular dense tables fall back to `__device__ __constant__` lookup arrays. The latest profiling pass shows `gemv_mlp_mixed` compiled mode is no longer losing inside the kernel itself after loop folding and launcher-side caching. The current live-value lowering now works in two layers: it first identifies per-program root values and derivations instead of blindly materializing every address/coord payload, then it lowers schedule-style coord roots that are affine in `sm_id` directly into generated arithmetic. On `gemv_mlp_mixed`, that moves the exported spec to version `5`, cuts the total live-value count from `24` to `4`, and collapses the mixed schedule from `129` compiled programs to `3` without regressing the benchmark. The generator now also has a post-fold accumulator lowering for loop-varying emitted fields, so repeated affine `__coordN` and `__address` values can stay in registers and advance by stride instead of being recomputed from full expressions on every loop iteration. There is now also an opt-in split compiled launch mode for experimentation, but on the current mixed benchmark it is slower and materially larger than the monolithic default, so the default launch path remains the single-kernel mode.
 
 ## Progress
 
@@ -52,6 +52,26 @@ Compiled mode is working end-to-end for the current supported subset and has bee
   - compiled remains about `9.5%` slower than interpreted, so the earlier rerun was not an artifact of concurrent benchmark execution.
   - the large final-`out` diff still appears in both modes (`1897.14%` interpreted, `1897.25%` compiled), while `silu1` remains aligned at `0.0968%`.
 - 2026-04-06: updated `app/python/gemv_logits.py` to use `dae_app(...)`, added `--mode` / `--write-compiled-spec` support, and added a direct reference diff/checksum print for executed runs.
+- 2026-04-06: added a loop-value accumulator pass to `tools/generate_compiled_program.py` so the post-fold codegen can keep emitted affine fields in registers instead of rebuilding the full expression every iteration:
+  - the generator now derives emitted `__address` / `__coordN` fields explicitly per alloc/ld/st consumer, then uses those field plans to lower single-level fold loops and nested fold loops through mutable accumulator registers
+  - confirmed in regenerated `build/generated/dae/compiled_program.inc` that mixed-MLP hot loops now use accumulator patterns such as `__coord2_outer_acc`, `__coord2_acc`, and `__address_acc` instead of repeated expressions like `(0 + (__outer) * 64 + (__step) * 4)` and `(-393216 + (__step) * 221184)`
+  - `python -m py_compile tools/generate_compiled_program.py` passed and `python app/python/gemv_mlp_mixed.py --write-compiled-spec ...` regenerated successfully
+- 2026-04-06: refined that loop-value pass so it also hoists loop-invariant per-SM affine fields like `(4096 + (sm_id - 0) * 64)` into reusable locals, and simplified repeat-delta lowering to always apply the `__rep * delta` adjustment without an `if (__rep != 0)` branch:
+  - after rebuilding through the documented reset-shell workflow
+    - `source "$(conda info --base)/etc/profile.d/conda.sh"`
+    - `conda deactivate`
+    - `conda activate`
+    - `DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext`
+    the extension built successfully
+  - regenerated mixed-MLP code now hoists invariant affine coords into `__coord1_acc` / `__coord1_outer_acc`, and repeat-adjusted accumulators initialize with direct `__rep * 16` adds instead of guarded branches
+  - compiled correctness remained stable:
+    - `python app/python/gemv_mlp_mixed.py --mode compiled -l`
+    - `Ave Diff out: 0.3623057499209479%`
+    - `Ave Diff silu1: 0.09682150983636482%`
+  - sequential benchmark after rebuild:
+    - interpreted: `82068.27 ns` average duration, `86880.00 ns` average execution time
+    - compiled: `82417.55 ns` average duration, `86251.20 ns` average execution time
+  - relative to the earlier nested-fold-only compiled point (`82847.54 ns`), the new hoist/accumulate cleanup improved compiled average duration by about `0.52%`, while compiled execution time is now slightly better than interpreted on the same fresh run
 - 2026-04-06: exported `build/generated/gemv_logits_compiled_spec.json`, rebuilt `dae.runtime` against it, and benchmarked `gemv_logits.py -b 20`:
   - interpreted: `322707.43 ns` average duration, `335904.00 ns` average execution time, `3826.78 GB/s`
   - compiled: `325879.03 ns` average duration, `334539.20 ns` average execution time, `3789.54 GB/s`
@@ -181,6 +201,71 @@ Compiled mode is working end-to-end for the current supported subset and has bee
   - reran `python -m py_compile` for both `tools/generate_compiled_program.py` and `python/dae/compiled_mode.py`, regenerated `build/generated/gemv_mlp_mixed_compiled_spec.json`, rebuilt `dae.runtime`, and reran `app/python/gemv_mlp_mixed.py --mode compiled -b 20`
   - latest mixed compiled bench after the tidy-up: `81971.54 ns` average duration, `86112.00 ns` average execution time, with the same existing diff profile (`1897.22%` final `out`, `0.0968%` `silu1`)
   - takeaway: the fold optimization is now aligned with the current version-`5` live-source model and easier to reuse for future memory-op folding work without changing the current generated mixed-case behavior.
+- 2026-04-06: added a generic launcher-side `--profile-sm-times` summary in `python/dae/util.py`, rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json`, and used it plus fresh Nsight Compute runs to re-check the mixed MLP performance story:
+  - fresh `-b 20` benchmark is now effectively exact parity on the current build:
+    - interpreted: `81734.51 ns` average duration, `87084.80 ns` average execution time
+    - compiled: `81722.55 ns` average duration, `86441.60 ns` average execution time
+  - per-SM start/end timestamps show compiled sharply tightening the two main 64-SM program groups:
+    - interpreted program 0: `231.424 us` min to `316.416 us` max, mean `266.620 us`
+    - interpreted program 1: `231.680 us` min to `317.184 us` max, mean `267.212 us`
+    - compiled program 0: `84.736 us` min to `88.576 us` max, mean `87.412 us`
+    - compiled program 1: `86.016 us` min to `88.832 us` max, mean `87.700 us`
+  - start skew is tiny in both modes (roughly `0-1.5 us` interpreted, `0-2.3 us` compiled), so the visible difference is cross-SM duration spread rather than staggered launch start
+  - fresh `ncu` summary still shows both kernels as memory-heavy one-block-per-SM launches with nearly identical duration:
+    - compiled: `99.39 us`, `76.88%` memory throughput, `14.30%` compute throughput, `12.16%` achieved occupancy
+    - interpreted: `100.03 us`, `77.22%` memory throughput, `16.12%` compute throughput, `12.36%` achieved occupancy
+  - takeaway: compiled mode no longer looks slower in the hot device compute window; the remaining optimization space is more likely schedule-level overlap / non-compute tail work than another round of local compute code pruning
+- 2026-04-06: attempted a direct per-SM Nsight Compute CLI dump for `sm__cycles_active.avg` using `--print-metric-instances`:
+  - the CLI still only emitted aggregate `avg/max/min/sum` for this metric, not a 132-instance vector that could be joined directly against the launcher SM timing data
+  - for now, per-SM reasoning has to combine the launcher-side timestamps with Nsight’s section-level spread clues instead of relying on a single joined per-instance export
+- 2026-04-06: tried replacing the load-side `cuda::device::barrier_expect_tx(...)` plus `barrier.arrive()` sequence with fused `cuda::device::barrier_arrive_tx(...)` in both the interpreted `ldwarp` path and the generated compiled LDU path:
+  - the repo built cleanly with the fused helper, and `app/python/gemv_mlp_mixed.py --mode compiled -l` still launched with the same existing diff profile (`~0.36%` `out`, `~0.0968%` `silu1`)
+  - but the mixed benchmark regressed:
+    - interpreted: `82337.58 ns` average duration, `87841.60 ns` average execution time
+    - compiled with `barrier_arrive_tx`: `83075.67 ns` average duration, `87078.40 ns` average execution time
+  - reverted the experiment and rebuilt back to the original `expect_tx + arrive()` path
+  - compiled after revert returned to the better result: `82449.98 ns` average duration, `86219.20 ns` average execution time
+  - takeaway: the fused arrive helper is semantically valid on this toolchain, but it is not a win for the current mixed MLP path
+- 2026-04-06: reran the current compiled mixed-MLP verification in the requested order, first `-l` then `-b 20`:
+  - launch verification completed successfully on the current installed runtime
+  - `-l` diff summary:
+    - `Ave Diff out: 0.360236947300394%`
+    - `Ave Diff silu1: 0.09682150983636482%`
+  - `-b 20` benchmark:
+    - compiled: `83917.84 ns` average duration, `87987.20 ns` average execution time
+  - the bench-path diff profile remains in the same existing family (`1897.2070%` final `out`, `0.0968215%` `silu1`)
+  - takeaway: the compiled runtime is still launch-correct on this path, but this specific rerun lands on the slower side of the recent run-to-run spread compared with the earlier near-parity points
+- 2026-04-06: made the memory-op fold pass more aggressive so it can fold adjacent already-folded affine runs into a nested loop when they only differ by a higher-level source-base stride:
+  - `tools/generate_compiled_program.py` now applies a second grouping pass over first-level fold groups and can emit nested affine source expressions such as `base + (__outer) * 64 + (__step) * 4`
+  - on `gemv_mlp_mixed`, the two separate `for (__step < 8)` `OP_ALLOC_TMA_LOAD_3D` regions that only differed by the base `coord2` offset now collapse into:
+    - `for (__outer = 0; __outer < 2; ++__outer) for (__step = 0; __step < 8; ++__step) ... __coord2 = 0 + __outer * 64 + __step * 4`
+    - and the analogous `base=32` variant for the second half
+  - launch verification stayed in the same family:
+    - `Ave Diff out: 0.36011817194032%`
+    - `Ave Diff silu1: 0.09682150983636482%`
+  - compiled benchmark after the nested fold:
+    - `82847.54 ns` average duration, `87643.20 ns` average execution time
+  - takeaway: the generator now catches the more complex adjacent-affine pattern the previous fold pass missed; the main clear win so far is cleaner generated structure, while runtime impact remains within the recent run-to-run band rather than showing a decisive new speedup
+- 2026-04-06: tightened generated compiled memory locals so alloc/LDU/STU only materialize the opcode/size/slot/bar/arg/address/coord fields they actually consume:
+  - alloc now only unpacks coord/address payloads when it must materialize a slot `MInst`
+  - ld now only emits barrier/arg/address/coord locals for real tensor-load cases
+  - st now emits only the coord arity the concrete opcode actually uses
+  - `python -m py_compile tools/generate_compiled_program.py python/dae/launcher.py` passed and the mixed benchmark kept the same correctness profile (`~1897%` `out`, `0.0968215%` `silu1`)
+- 2026-04-06: added an opt-in split compiled launch experiment alongside the existing monolithic launch:
+  - `python/dae/launcher.py` now accepts `DAE_COMPILED_LAUNCH_MODE={monolithic,split}` and keeps monolithic as the default
+  - `src/runtime.cu` now supports per-program compiled launches on nonblocking streams, while `include/dae/dae2.cuh` adds split-kernel entry points plus a device-side startup rendezvous using the last two global bars; split timing now starts only after all program kernels have reached that rendezvous
+  - rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json` and reran `app/python/gemv_mlp_mixed.py -b 20`:
+    - interpreted: `81697.84 ns` average duration, `86956.80 ns` average execution time
+    - compiled monolithic: `82257.04 ns` average duration, `87083.20 ns` average execution time
+    - compiled split: `85210.17 ns` average duration, `88219.20 ns` average execution time
+  - correctness stayed aligned with the previous mixed behavior:
+    - `Ave Diff out`: `1897.23%` interpreted, `1897.22%` monolithic compiled, `1897.17%` split compiled
+    - `Ave Diff silu1`: `0.09682150983636482%` in all three runs
+  - current artifact sizes on this split-capable build are:
+    - `build/generated/dae/compiled_program.inc`: `71375` bytes, `1464` lines
+    - `runtime.o`: `2243664` bytes
+    - `python/dae/runtime.cpython-313-aarch64-linux-gnu.so`: `2562456` bytes
+  - takeaway: the split-launch path works and gives a cleaner post-rendezvous timing point, but on `gemv_mlp_mixed` it is about `3.6%` slower than the monolithic compiled launch and significantly increases binary size, so it should stay experimental for now
 
 ## TODO
 
@@ -192,7 +277,12 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 - Use the new `ncu` direction to target the next compiled-mode optimization beyond loop folding, now focusing on launch/setup overhead in the compiled path before chasing more generated-kernel rewrites.
 - Extend the new live-source optimizer beyond the current `const` / `live + add` / `sm_id`-affine coord rules if larger cases still carry avoidable address roots or other derived payloads.
 - If packed coord payloads stay, the next performance step is likely direct packed-coord consumption or launch-path work rather than more local dead-code pruning.
+- If split compiled launch is revisited, it likely needs lower-overhead kernel specialization or fewer extra entry points; the current “one kernel per compiled program on separate streams” experiment is slower and much larger than monolithic on `gemv_mlp_mixed`.
 - Use the latest `ncu` comparison to look for latency-hiding opportunities in `gemv_mlp_mixed`, not just instruction-count reductions: occupancy is still shared-memory-limited at one block per SM and both paths spend more than `82%` of cycles with no eligible warp.
+- Keep the new `--profile-sm-times` launcher hook available for future mixed-schedule investigations; it is now the easiest way to spot cross-SM duration skew and tiny tail programs before reaching for heavier instrumentation.
+- If a true Nsight per-SM vector becomes necessary, investigate report-file or UI-side export paths; the current `ncu` CLI flow did not emit the full 132-instance `sm__cycles_active` vector even with `--print-metric-instances`.
+- Keep the original load-side `barrier_expect_tx(...)` plus `barrier.arrive()` sequence for now; the direct `barrier_arrive_tx(...)` substitution built and ran but regressed `gemv_mlp_mixed`.
+- Extend the new nested fold matcher beyond the current one-extra-dimension case if larger schedules expose more repeated affine block structure, especially mixed cases that combine `__rep` with multiple adjacent folded runs.
 - Avoid the current alloc-table approach for now; if alloc-side dedup is revisited, it likely needs to preserve the previous zero-stack straight-line fast path rather than routing every alloc through a generic helper.
 - Keep the new inline alloc-table mode architecture; future alloc-side tuning can continue exploring table encoding and placement via `DAE_COMPILED_ALLOC_TABLE_MODE` without going back to the helper-based design.
 - Keep both placement knobs (`DAE_COMPILED_ALLOC_TABLE_MODE`, `DAE_COMPILED_LIVE_VALUE_MODE`) available; for this benchmark the current best defaults are alloc-table `global` and live-value `shared`.
@@ -207,6 +297,7 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 - In the current compiled support set, only `OP_ALLOC_WB_RAW_ADDRESS` still needs `st_insts[slot]` metadata. Normal shared-memory slot producers do not need compiled alloc to materialize a full `MInst` in `st_insts`.
 - The current per-SM lookup strategy assumes `sm_id` is a dense hardware index with modest cardinality; for this shape on Hopper, uniform range checks / affine helpers / constant-memory table loads are preferable to large generated `switch (sm_id)` trees.
 - `app/python/tma1d.py` in its current linear form exceeds the interpreted memory-instruction budget, so repeat-form scheduling is the right apples-to-apples check for interpreted vs compiled verification.
+- The generic launcher `profile[:,0:2]` timestamps are useful for relative per-SM skew analysis, but on this workload their absolute magnitudes do not line up numerically with Nsight Compute kernel duration; treat them as comparative signals, not calibrated wall-clock replacements.
 
 ## Key Files
 
@@ -382,4 +473,4 @@ Compiled mode is working end-to-end for the current supported subset and has bee
 
 ## Next Step
 
-Decide whether to keep the packed-coord live-value layout as a footprint optimization or refine/revert it for `gemv_mlp_mixed`, then continue targeting the next win in the compiled launch path while separately deciding when to stop and fix the large non-compiled-specific bench-path output mismatches in `gemv_logits.py` and `gemv_mlp_mixed.py -b`.
+If we continue optimizing `gemv_mlp_mixed`, profile this hoist/accumulate build with `ncu` or the existing per-SM launcher timestamps to see whether the remaining small duration gap is still outside the kernel body or whether one of the repeated load regions got measurably cheaper.

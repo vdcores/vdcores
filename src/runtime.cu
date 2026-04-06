@@ -2,6 +2,23 @@
 #include "runtime.cuh"
 
 #include <cuda.h>
+#include <vector>
+
+static std::vector<cudaStream_t> &compiled_split_streams() {
+    static std::vector<cudaStream_t> streams;
+    if (streams.size() < static_cast<size_t>(daeCompiledProgramCount)) {
+        size_t old_size = streams.size();
+        streams.resize(static_cast<size_t>(daeCompiledProgramCount), nullptr);
+        for (size_t index = old_size; index < streams.size(); ++index) {
+            cudaError_t err = cudaStreamCreateWithFlags(&streams[index], cudaStreamNonBlocking);
+            if (err != cudaSuccess) {
+                streams.resize(old_size);
+                break;
+            }
+        }
+    }
+    return streams;
+}
 
 size_t set_smem_size(size_t smem_size) {
     cudaError_t err = cudaFuncSetAttribute(
@@ -19,6 +36,10 @@ size_t set_smem_size(size_t smem_size) {
     );
     if (err != cudaSuccess) {
         std::cerr << "Compiled kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
+    }
+    err = dae_set_compiled_program_smem_size(smem_size);
+    if (err != cudaSuccess) {
+        std::cerr << "Compiled split kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
     }
     return smem_size;
 }
@@ -57,16 +78,70 @@ cudaError_t launch_dae_compiled(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  int launch_mode
 ) {
   cudaDeviceSynchronize();
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-  dae2_compiled<<<numSMs, numThreads, smem_size, cuda_stream>>>(
-    compiled_live_values,
-    tma_descs,
-    bars,
-    profile
-  );
+  if (launch_mode == daeCompiledLaunchModeSplit && daeCompiledProgramCount > 1) {
+    cudaError_t err = cudaMemsetAsync(
+        bars + daeCompiledSplitLaunchArrivalBar,
+        0,
+        static_cast<size_t>(daeCompiledSplitLaunchReservedBars) * sizeof(int),
+        cuda_stream
+    );
+    if (err != cudaSuccess) {
+      return err;
+    }
+
+    cudaEvent_t ready_event = nullptr;
+    err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+      return err;
+    }
+    err = cudaEventRecord(ready_event, cuda_stream);
+    if (err != cudaSuccess) {
+      cudaEventDestroy(ready_event);
+      return err;
+    }
+
+    auto &streams = compiled_split_streams();
+    if (streams.size() < static_cast<size_t>(daeCompiledProgramCount)) {
+      cudaEventDestroy(ready_event);
+      return cudaErrorMemoryAllocation;
+    }
+
+    for (int program_id = 0; program_id < daeCompiledProgramCount; ++program_id) {
+      cudaStream_t program_stream = streams[static_cast<size_t>(program_id)];
+      err = cudaStreamWaitEvent(program_stream, ready_event, 0);
+      if (err != cudaSuccess) {
+        cudaEventDestroy(ready_event);
+        return err;
+      }
+      err = dae_launch_compiled_split_program(
+        program_id,
+        dae_compiled_program_block_count(program_id),
+        smem_size,
+        program_stream,
+        compiled_live_values,
+        tma_descs,
+        bars,
+        profile
+      );
+      if (err != cudaSuccess) {
+        cudaEventDestroy(ready_event);
+        return err;
+      }
+    }
+    cudaEventDestroy(ready_event);
+  } else {
+    dae2_compiled<<<numSMs, numThreads, smem_size, cuda_stream>>>(
+      compiled_live_values,
+      tma_descs,
+      bars,
+      profile
+    );
+  }
   cudaDeviceSynchronize();
   return cudaGetLastError();
 }

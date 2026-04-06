@@ -177,17 +177,53 @@ void dae2(
   // end of megakernel
 }
 
-static __global__
-void dae2_compiled(
+static __device__ __forceinline__ void dae_compiled_record_start_event(
+  int sm_id,
+  uint64_t * __restrict__ g_events
+) {
+  if (threadIdx.x == 0) {
+    int event_base = sm_id * numProfileEvents;
+    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+  }
+}
+
+static __device__ __forceinline__ void dae_compiled_split_launch_sync(
+  int sm_id,
+  int * __restrict__ bars,
+  uint64_t * __restrict__ g_events
+) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int arrived = atomicAdd(bars + daeCompiledSplitLaunchArrivalBar, 1) + 1;
+    if (arrived == daeCompiledProgramNumSms) {
+      __threadfence();
+      atomicExch(bars + daeCompiledSplitLaunchReleaseBar, 1);
+    } else {
+      while (atomicAdd(bars + daeCompiledSplitLaunchReleaseBar, 0) == 0) {
+        __nanosleep(barrierPollSleepCycles);
+      }
+    }
+    int event_base = sm_id * numProfileEvents;
+    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+  }
+  __syncthreads();
+}
+
+template <bool SplitLaunchMode, int ProgramId = -1>
+static __device__ __forceinline__ void dae2_compiled_body(
+  int sm_id,
   const uint64_t* __restrict__ compiled_live_values,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
   uint64_t *  __restrict__ g_events
 ) {
-  int sm_id = blockIdx.x;
   int thread_id = threadIdx.x;
   int warp_id = (thread_id % 128) / 32;
   int lane_id = thread_id % 32;
+
+  if constexpr (ProgramId >= 0) {
+    assert(dae_compiled_program_id_for_sm(sm_id) == ProgramId);
+  }
 
   constexpr int numQueueElements = 32;
   __shared__ MInst st_insts[numSlots + numSpecialSlots];
@@ -239,12 +275,12 @@ void dae2_compiled(
     sm_live_values = daeCompiledLiveValuesConst + sm_live_offset;
   }
 
-  if (threadIdx.x == 0) {
-    int event_base = sm_id * numProfileEvents;
-    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+  if constexpr (SplitLaunchMode) {
+    dae_compiled_split_launch_sync(sm_id, bars, g_events);
+  } else {
+    dae_compiled_record_start_event(sm_id, g_events);
+    __syncthreads();
   }
-
-  __syncthreads();
 
   if constexpr (daeCompiledLiveValueMode == daeCompiledLiveValueModeShared) {
     sm_live_values = shared_live_values;
@@ -310,4 +346,86 @@ void dae2_compiled(
       }
     }
   }
+}
+
+static __global__
+void dae2_compiled(
+  const uint64_t* __restrict__ compiled_live_values,
+  const CUtensorMap* __restrict__ tma_descs,
+  int * __restrict__ bars,
+  uint64_t *  __restrict__ g_events
+) {
+  dae2_compiled_body<false>(
+    blockIdx.x,
+    compiled_live_values,
+    tma_descs,
+    bars,
+    g_events
+  );
+}
+
+template <int ProgramId>
+static __global__
+void dae2_compiled_program(
+  const uint64_t* __restrict__ compiled_live_values,
+  const CUtensorMap* __restrict__ tma_descs,
+  int * __restrict__ bars,
+  uint64_t *  __restrict__ g_events
+) {
+  dae2_compiled_body<true, ProgramId>(
+    dae_compiled_program_sm_id_for_block<ProgramId>(blockIdx.x),
+    compiled_live_values,
+    tma_descs,
+    bars,
+    g_events
+  );
+}
+
+static inline cudaError_t dae_set_compiled_program_smem_size(size_t smem_size) {
+  cudaError_t err = cudaSuccess;
+#define DAE_SET_COMPILED_SPLIT_SMEM_ATTR(PROGRAM_ID) \
+  do { \
+    cudaError_t local_err = cudaFuncSetAttribute( \
+      dae2_compiled_program<PROGRAM_ID>, \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, \
+      smem_size \
+    ); \
+    if (local_err != cudaSuccess && err == cudaSuccess) { \
+      err = local_err; \
+    } \
+  } while (0)
+  DAE_COMPILED_SPLIT_PROGRAM_CASES(DAE_SET_COMPILED_SPLIT_SMEM_ATTR)
+#undef DAE_SET_COMPILED_SPLIT_SMEM_ATTR
+  return err;
+}
+
+static inline cudaError_t dae_launch_compiled_split_program(
+  int program_id,
+  int num_blocks,
+  size_t smem_size,
+  cudaStream_t stream,
+  const uint64_t* compiled_live_values,
+  const CUtensorMap* tma_descs,
+  int * bars,
+  uint64_t * g_events
+) {
+  if (num_blocks <= 0) {
+    return cudaSuccess;
+  }
+  switch (program_id) {
+#define DAE_LAUNCH_COMPILED_SPLIT_PROGRAM(PROGRAM_ID) \
+    case PROGRAM_ID: \
+      dae2_compiled_program<PROGRAM_ID><<<num_blocks, numThreads, smem_size, stream>>>( \
+        compiled_live_values, \
+        tma_descs, \
+        bars, \
+        g_events \
+      ); \
+      break;
+    DAE_COMPILED_SPLIT_PROGRAM_CASES(DAE_LAUNCH_COMPILED_SPLIT_PROGRAM)
+#undef DAE_LAUNCH_COMPILED_SPLIT_PROGRAM
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
 }

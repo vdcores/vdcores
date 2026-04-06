@@ -24,7 +24,8 @@ cudaError_t launch_dae_compiled(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  int launch_mode
 );
 
 cudaError_t set_compiled_live_values_constant(
