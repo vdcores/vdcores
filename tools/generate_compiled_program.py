@@ -186,6 +186,48 @@ def _emit_compute_inst_expr(entry: dict[str, object], indent: str) -> list[str]:
     ]
 
 
+def _compute_entry_signature(entry: dict[str, object]) -> tuple[object, ...]:
+    return (
+        entry["name"],
+        tuple(int(arg) for arg in entry.get("args", [])),
+    )
+
+
+def _group_compute_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    groups: list[dict[str, object]] = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        if entry["name"] == "OP_TERMINATEC":
+            groups.append({"kind": "single", "entry": entry})
+            index += 1
+            continue
+
+        signature = _compute_entry_signature(entry)
+        run_end = index + 1
+        while run_end < len(entries):
+            candidate = entries[run_end]
+            if candidate["name"] == "OP_TERMINATEC":
+                break
+            if _compute_entry_signature(candidate) != signature:
+                break
+            run_end += 1
+
+        if run_end - index > 1:
+            groups.append(
+                {
+                    "kind": "repeat",
+                    "entry": entry,
+                    "count": run_end - index,
+                    "start_index": index,
+                }
+            )
+        else:
+            groups.append({"kind": "single", "entry": entry})
+        index = run_end
+    return groups
+
+
 def _payload_scalar_var(index: int) -> str:
     return f"__payload_u64_{index}"
 
@@ -205,6 +247,100 @@ def _payload_indices_for_step(step: dict[str, object]) -> list[int]:
     return indices
 
 
+def _memory_step_payload_kind(step: dict[str, object]) -> str:
+    if "coords_payload_index" in step:
+        return "coords"
+    if "address_payload_index" in step:
+        return "address"
+    return "none"
+
+
+def _memory_step_fold_signature(step: dict[str, object]) -> tuple[object, ...]:
+    flags = {name: bool(value) for name, value in step["flags"].items() if name != "jump"}
+    opcode_value = (
+        int(step["opcode_value"])
+        if step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS
+        else 0
+    )
+    return (
+        step["base_name"],
+        opcode_value,
+        int(step["size"]),
+        int(step["num_slots_value"]),
+        int(step["nslot"]),
+        int(step["bar_id"]),
+        int(step["arg"]),
+        tuple(sorted(flags.items())),
+        tuple(int(value) for value in step.get("delta_coords", [])),
+        int(step.get("delta_address", 0)),
+        _memory_step_payload_kind(step),
+        bool(step.get("st_consumes", False)),
+    )
+
+
+def _memory_step_payload_index(step: dict[str, object]) -> int | None:
+    if "coords_payload_index" in step:
+        return int(step["coords_payload_index"])
+    if "address_payload_index" in step:
+        return int(step["address_payload_index"])
+    return None
+
+
+def _memory_step_payload_width(step: dict[str, object]) -> int:
+    if "coords_payload_index" in step:
+        return 4
+    if "address_payload_index" in step:
+        return 1
+    return 0
+
+
+def _group_repeat_steps(steps: list[dict[str, object]]) -> list[dict[str, object]]:
+    groups: list[dict[str, object]] = []
+    index = 0
+    while index < len(steps):
+        step = steps[index]
+        payload_width = _memory_step_payload_width(step)
+        if payload_width == 0:
+            groups.append({"kind": "single", "step": step})
+            index += 1
+            continue
+
+        signature = _memory_step_fold_signature(step)
+        payload_index = _memory_step_payload_index(step)
+        assert payload_index is not None
+        run_end = index + 1
+        payload_stride: int | None = None
+        while run_end < len(steps):
+            candidate = steps[run_end]
+            if _memory_step_fold_signature(candidate) != signature:
+                break
+            candidate_index = _memory_step_payload_index(candidate)
+            if candidate_index is None:
+                break
+            current_stride = candidate_index - _memory_step_payload_index(steps[run_end - 1])
+            if current_stride <= 0:
+                break
+            if payload_stride is None:
+                payload_stride = current_stride
+            elif current_stride != payload_stride:
+                break
+            run_end += 1
+
+        if payload_stride is not None and run_end - index > 1:
+            groups.append(
+                {
+                    "kind": "fold",
+                    "step": step,
+                    "count": run_end - index,
+                    "payload_stride": payload_stride,
+                }
+            )
+        else:
+            groups.append({"kind": "single", "step": step})
+        index = run_end
+    return groups
+
+
 def _emit_payload_aliases(step_list: list[dict[str, object]], lines: list[str], indent: str) -> None:
     seen: set[int] = set()
     for step in step_list:
@@ -212,7 +348,9 @@ def _emit_payload_aliases(step_list: list[dict[str, object]], lines: list[str], 
             if index in seen:
                 continue
             seen.add(index)
-            lines.append(f"{indent}const uint64_t &{_payload_scalar_var(index)} = live_values[{index}];")
+            lines.append(
+                f"{indent}[[maybe_unused]] const uint64_t &{_payload_scalar_var(index)} = live_values[{index}];"
+            )
 
 
 def _reg_pair_var(pair_id: int) -> str:
@@ -250,7 +388,14 @@ def _emit_ld_locals(program: dict[str, object], lines: list[str], indent: str, p
         lines.append(f"{indent}int __reg_file[32] = {{}};")
 
 
-def _emit_memory_field_locals(step: dict[str, object], lines: list[str], indent: str) -> None:
+def _emit_memory_field_locals(
+    step: dict[str, object],
+    lines: list[str],
+    indent: str,
+    *,
+    step_offset_expr: str | None = None,
+    payload_stride: int | None = None,
+) -> None:
     base_name = step["base_name"]
     lines.append(_declare_local(indent, "constexpr uint16_t __opcode", str(int(step["opcode_value"])) ))
     lines.append(_declare_local(indent, "constexpr uint16_t __size", str(int(step["size"])) ))
@@ -262,7 +407,11 @@ def _emit_memory_field_locals(step: dict[str, object], lines: list[str], indent:
         return
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
         if "address_payload_index" in step:
-            base_expr = _payload_scalar_var(int(step["address_payload_index"]))
+            if step_offset_expr is None:
+                base_expr = _payload_scalar_var(int(step["address_payload_index"]))
+            else:
+                assert payload_stride is not None
+                base_expr = f"live_values[{int(step['address_payload_index'])} + ({step_offset_expr}) * {payload_stride}]"
         else:
             base_expr = _u64_literal(int(step["address"]))
         if "delta_address" in step and int(step["delta_address"]) != 0:
@@ -276,7 +425,14 @@ def _emit_memory_field_locals(step: dict[str, object], lines: list[str], indent:
 
     if "coords_payload_index" in step:
         base = int(step["coords_payload_index"])
-        coord_exprs = [f"static_cast<uint16_t>({_payload_scalar_var(base + coord)})" for coord in range(4)]
+        if step_offset_expr is None:
+            coord_exprs = [f"static_cast<uint16_t>({_payload_scalar_var(base + coord)})" for coord in range(4)]
+        else:
+            assert payload_stride is not None
+            coord_exprs = [
+                f"static_cast<uint16_t>(live_values[{base} + ({step_offset_expr}) * {payload_stride} + {coord}])"
+                for coord in range(4)
+            ]
     else:
         coord_exprs = [str(int(coord)) for coord in step["coords"]]
     delta_coords = step.get("delta_coords")
@@ -310,80 +466,76 @@ def _emit_store_slot_inst(step: dict[str, object], lines: list[str], indent: str
         lines.append(f"{indent}__slot_inst.coords[{coord_index}] = __coord{coord_index};")
 
 
+def _emit_alloc_step(
+    step: dict[str, object],
+    lines: list[str],
+    indent: str,
+    *,
+    step_offset_expr: str | None = None,
+    payload_stride: int | None = None,
+) -> None:
+    lines.append(f"{indent}{{")
+    _emit_memory_field_locals(
+        step,
+        lines,
+        indent + "  ",
+        step_offset_expr=step_offset_expr,
+        payload_stride=payload_stride,
+    )
+    lines.append(f"{indent}  int alloc_mask = 0;")
+    lines.append(f"{indent}  int slot_alloc = -1;")
+    lines.append(f"{indent}  while (true) {{")
+    lines.append(f"{indent}    slot_alloc = alloc.allocate(lane_id, flags, __nslot, alloc_mask);")
+    lines.append(f"{indent}    if (slot_alloc >= 0) break;")
+    lines.append(f"{indent}    __nanosleep(allocRetrySleepCycles);")
+    lines.append(f"{indent}  }}")
+    lines.append(f"{indent}  if (lane_id == 0) {{")
+    _emit_store_slot_inst(step, lines, indent + "    ", "slot_alloc")
+    lines.append(f"{indent}    m2c.put(alloc_mask);")
+    if step["base_name"] in _WRITEBACK_OPS:
+        lines.append(
+            f'{indent}    __mprint("[compiled alloc] {step["base_name"]} direct-ready slot=%d m2c=%d", '
+            f'slot_alloc, m2c.ptr);'
+        )
+        lines.append(f"{indent}    m2c.commit();")
+        lines.append(f"{indent}    m2c.advance();")
+    else:
+        lines.append(f"{indent}    CompiledLdCmd ld;")
+        lines.append(f"{indent}    ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
+        lines.append(f"{indent}    auto &curld = m2ld[{1 if step['flags']['port1'] else 0}];")
+        lines.append(
+            f'{indent}    __mprint("[compiled alloc] {step["base_name"]} enqueue slot=%d m2c=%d ldq={1 if step["flags"]["port1"] else 0} ldptr=%d", '
+            f'slot_alloc, m2c.ptr, curld.ptr);'
+        )
+        lines.append(f"{indent}    curld.put(ld.raw);")
+        lines.append(f"{indent}    m2c.advance();")
+        lines.append(f"{indent}    curld.commit();")
+        lines.append(f"{indent}    curld.advance();")
+    lines.append(f"{indent}  }}")
+    lines.append(f"{indent}}}")
+
+
 def _emit_alloc_block(block: dict[str, object], lines: list[str], indent: str) -> None:
     if block["kind"] == "repeat":
         lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
-        for step in block["steps"]:
-            lines.append(f"{indent}  {{")
-            _emit_memory_field_locals(step, lines, indent + "    ")
-            lines.append(f"{indent}    int alloc_mask = 0;")
-            lines.append(f"{indent}    int slot_alloc = -1;")
-            lines.append(f"{indent}    while (true) {{")
-            lines.append(f"{indent}      slot_alloc = alloc.allocate(lane_id, flags, __nslot, alloc_mask);")
-            lines.append(f"{indent}      if (slot_alloc >= 0) break;")
-            lines.append(f"{indent}      __nanosleep(allocRetrySleepCycles);")
-            lines.append(f"{indent}    }}")
-            lines.append(f"{indent}    if (lane_id == 0) {{")
-            _emit_store_slot_inst(step, lines, indent + "      ", "slot_alloc")
-            lines.append(f"{indent}      m2c.put(alloc_mask);")
-            if step["base_name"] in _WRITEBACK_OPS:
-                lines.append(
-                    f'{indent}      __mprint("[compiled alloc] {step["base_name"]} direct-ready slot=%d m2c=%d", '
-                    f'slot_alloc, m2c.ptr);'
+        for group in _group_repeat_steps(block["steps"]):
+            if group["kind"] == "fold":
+                lines.append(f"{indent}  for (int __step = 0; __step < {int(group['count'])}; ++__step) {{")
+                _emit_alloc_step(
+                    group["step"],
+                    lines,
+                    indent + "    ",
+                    step_offset_expr="__step",
+                    payload_stride=int(group["payload_stride"]),
                 )
-                lines.append(f"{indent}      m2c.commit();")
-                lines.append(f"{indent}      m2c.advance();")
+                lines.append(f"{indent}  }}")
             else:
-                lines.append(f"{indent}      CompiledLdCmd ld;")
-                lines.append(f"{indent}      ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
-                lines.append(f"{indent}      auto &curld = m2ld[{1 if step['flags']['port1'] else 0}];")
-                lines.append(
-                    f'{indent}      __mprint("[compiled alloc] {step["base_name"]} enqueue slot=%d m2c=%d ldq={1 if step["flags"]["port1"] else 0} ldptr=%d", '
-                    f'slot_alloc, m2c.ptr, curld.ptr);'
-                )
-                lines.append(f"{indent}      curld.put(ld.raw);")
-                lines.append(f"{indent}      m2c.advance();")
-                lines.append(f"{indent}      curld.commit();")
-                lines.append(f"{indent}      curld.advance();")
-            lines.append(f"{indent}    }}")
-            lines.append(f"{indent}  }}")
+                _emit_alloc_step(group["step"], lines, indent + "  ")
         lines.append(f"{indent}}}")
         return
 
     if block["kind"] == "op":
-        lines.append(f"{indent}{{")
-        _emit_memory_field_locals(block, lines, indent + "  ")
-        lines.append(f"{indent}  int alloc_mask = 0;")
-        lines.append(f"{indent}  int slot_alloc = -1;")
-        lines.append(f"{indent}  while (true) {{")
-        lines.append(f"{indent}    slot_alloc = alloc.allocate(lane_id, flags, __nslot, alloc_mask);")
-        lines.append(f"{indent}    if (slot_alloc >= 0) break;")
-        lines.append(f"{indent}    __nanosleep(allocRetrySleepCycles);")
-        lines.append(f"{indent}  }}")
-        lines.append(f"{indent}  if (lane_id == 0) {{")
-        _emit_store_slot_inst(block, lines, indent + "    ", "slot_alloc")
-        lines.append(f"{indent}    m2c.put(alloc_mask);")
-        if block["base_name"] in _WRITEBACK_OPS:
-            lines.append(
-                f'{indent}    __mprint("[compiled alloc] {block["base_name"]} direct-ready slot=%d m2c=%d", '
-                f'slot_alloc, m2c.ptr);'
-            )
-            lines.append(f"{indent}    m2c.commit();")
-            lines.append(f"{indent}    m2c.advance();")
-        else:
-            lines.append(f"{indent}    CompiledLdCmd ld;")
-            lines.append(f"{indent}    ld.init(static_cast<uint8_t>(slot_alloc), static_cast<uint8_t>(m2c.ptr));")
-            lines.append(f"{indent}    auto &curld = m2ld[{1 if block['flags']['port1'] else 0}];")
-            lines.append(
-                f'{indent}    __mprint("[compiled alloc] {block["base_name"]} enqueue slot=%d m2c=%d ldq={1 if block["flags"]["port1"] else 0} ldptr=%d", '
-                f'slot_alloc, m2c.ptr, curld.ptr);'
-            )
-            lines.append(f"{indent}    curld.put(ld.raw);")
-            lines.append(f"{indent}    m2c.advance();")
-            lines.append(f"{indent}    curld.commit();")
-            lines.append(f"{indent}    curld.advance();")
-        lines.append(f"{indent}  }}")
-        lines.append(f"{indent}}}")
+        _emit_alloc_step(block, lines, indent)
         return
 
     if block["kind"] == "terminate":
@@ -412,7 +564,14 @@ def _emit_ld_barrier_wait(step: dict[str, object], lines: list[str], indent: str
     )
 
 
-def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> None:
+def _emit_ld_step(
+    step: dict[str, object],
+    lines: list[str],
+    indent: str,
+    *,
+    step_offset_expr: str | None = None,
+    payload_stride: int | None = None,
+) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
     lines.append(f"{indent}  CompiledLdCmd cmd {{}};")
@@ -421,7 +580,13 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         f'{indent}  __mprint("[compiled ld] {base_name} pop slot=%d m2c=%d", cmd.slot, cmd.m2c_slot);'
     )
     if base_name in _LOAD_OPS:
-        _emit_memory_field_locals(step, lines, indent + "  ")
+        _emit_memory_field_locals(
+            step,
+            lines,
+            indent + "  ",
+            step_offset_expr=step_offset_expr,
+            payload_stride=payload_stride,
+        )
         _emit_ld_barrier_wait(step, lines, indent + "  ")
         if base_name == "OP_ALLOC_TMA_LOAD_1D":
             lines.append(f"{indent}  asm volatile(")
@@ -519,10 +684,22 @@ def _emit_ld_step(step: dict[str, object], lines: list[str], indent: str) -> Non
         else:
             lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = __reg_file[{int(step['size'])}];")
     elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
-        _emit_memory_field_locals(step, lines, indent + "  ")
+        _emit_memory_field_locals(
+            step,
+            lines,
+            indent + "  ",
+            step_offset_expr=step_offset_expr,
+            payload_stride=payload_stride,
+        )
         lines.append(f"{indent}  (void)__address;")
     elif base_name in _WRITEBACK_OPS:
-        _emit_memory_field_locals(step, lines, indent + "  ")
+        _emit_memory_field_locals(
+            step,
+            lines,
+            indent + "  ",
+            step_offset_expr=step_offset_expr,
+            payload_stride=payload_stride,
+        )
         lines.append(f"{indent}  (void)__opcode;")
     else:
         raise ValueError(f"Unsupported LDU step {base_name}")
@@ -567,8 +744,19 @@ def _emit_ld_program(program: dict[str, object], lines: list[str], indent: str, 
             if not port_steps:
                 continue
             lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
-            for step in port_steps:
-                _emit_ld_step(step, lines, indent + "  ")
+            for group in _group_repeat_steps(port_steps):
+                if group["kind"] == "fold":
+                    lines.append(f"{indent}  for (int __step = 0; __step < {int(group['count'])}; ++__step) {{")
+                    _emit_ld_step(
+                        group["step"],
+                        lines,
+                        indent + "    ",
+                        step_offset_expr="__step",
+                        payload_stride=int(group["payload_stride"]),
+                    )
+                    lines.append(f"{indent}  }}")
+                else:
+                    _emit_ld_step(group["step"], lines, indent + "  ")
             lines.append(f"{indent}}}")
             continue
         if block["kind"] == "op" and int(block["flags"]["port1"]) == port_id and _is_ld_step(block):
@@ -576,7 +764,14 @@ def _emit_ld_program(program: dict[str, object], lines: list[str], indent: str, 
             continue
 
 
-def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> None:
+def _emit_st_step(
+    step: dict[str, object],
+    lines: list[str],
+    indent: str,
+    *,
+    step_offset_expr: str | None = None,
+    payload_stride: int | None = None,
+) -> None:
     base_name = step["base_name"]
     lines.append(f"{indent}{{")
     lines.append(f"{indent}  int slot_token = c2m.pop();")
@@ -587,7 +782,13 @@ def _emit_st_step(step: dict[str, object], lines: list[str], indent: str) -> Non
     lines.append(
         f'{indent}  __mprint("[compiled st] {base_name} pop token=%x slot=%d", slot_token, slot);'
     )
-    _emit_memory_field_locals(step, lines, indent + "  ")
+    _emit_memory_field_locals(
+        step,
+        lines,
+        indent + "  ",
+        step_offset_expr=step_offset_expr,
+        payload_stride=payload_stride,
+    )
     if base_name == "OP_ALLOC_WB_TMA_STORE_1D":
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk(")
         lines.append(f"{indent}    cuda::ptx::space_global,")
@@ -720,8 +921,19 @@ def _emit_st_program(blocks: list[dict[str, object]], lines: list[str], indent: 
     for block in write_blocks:
         if block["kind"] == "repeat":
             lines.append(f"{indent}for (int __rep = 0; __rep < {int(block['count'])}; ++__rep) {{")
-            for step in block["steps"]:
-                _emit_st_step(step, lines, indent + "  ")
+            for group in _group_repeat_steps(block["steps"]):
+                if group["kind"] == "fold":
+                    lines.append(f"{indent}  for (int __step = 0; __step < {int(group['count'])}; ++__step) {{")
+                    _emit_st_step(
+                        group["step"],
+                        lines,
+                        indent + "    ",
+                        step_offset_expr="__step",
+                        payload_stride=int(group["payload_stride"]),
+                    )
+                    lines.append(f"{indent}  }}")
+                else:
+                    _emit_st_step(group["step"], lines, indent + "  ")
             lines.append(f"{indent}}}")
         else:
             _emit_st_step(block, lines, indent)
@@ -777,7 +989,22 @@ def generate_enabled(spec: dict[str, object], *, debug: bool) -> str:
         lines.insert(-1, "  uint32_t pc = 0;")
     for program in spec["programs"]:
         lines.append(f"    case {int(program['program_id'])}: {{")
-        for entry in program["compute"]:
+        for group in _group_compute_entries(program["compute"]):
+            entry = group["entry"]
+            if group["kind"] == "repeat":
+                lines.append(f"      for (int __ci = 0; __ci < {int(group['count'])}; ++__ci) {{")
+                lines.append("        {")
+                if debug:
+                    lines.append(f"          pc = {int(group['start_index'])} + __ci + 1;")
+                lines.extend(_emit_compute_inst_expr(entry, "          "))
+                lines.append(
+                    f"          dae_compute_handler_{entry['name']}(sm_id, thread_id, "
+                    f"{'&pc' if debug else 'nullptr'}, nullptr, nullptr, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events);"
+                )
+                lines.append("        }")
+                lines.append("      }")
+                continue
+
             lines.append("      {")
             if debug:
                 lines.append(f"        pc = {int(entry['index']) + 1};")
