@@ -235,6 +235,8 @@ class Launcher:
         self.tmas = []
 
         self.need_instruction_build = True
+        self._compiled_runtime_bundle_cache = None
+        self._compiled_live_values_tensor_cache = None
 
         self.num_bars = 0
         self.bar_values = {}
@@ -248,6 +250,10 @@ class Launcher:
         }
 
         runtime.set_smem_size(self.smem_size)
+
+    def _invalidate_compiled_cache(self):
+        self._compiled_runtime_bundle_cache = None
+        self._compiled_live_values_tensor_cache = None
 
     def set_mode(self, mode: str):
         if mode not in {"interpreted", "compiled"}:
@@ -309,11 +315,28 @@ class Launcher:
                 )
             self.need_instruction_build = False
 
+    def _compiled_runtime_bundle(self):
+        if self._compiled_runtime_bundle_cache is None:
+            self._compiled_runtime_bundle_cache = build_compiled_runtime_bundle(self)
+        return self._compiled_runtime_bundle_cache
+
+    def _compiled_live_values_tensor(self):
+        if self._compiled_live_values_tensor_cache is not None:
+            return self._compiled_live_values_tensor_cache
+
+        live_values = self._compiled_runtime_bundle()["live_values"]
+        if len(live_values) == 0:
+            tensor = torch.empty((0, 8), dtype=torch.uint8, device=self.device)
+        else:
+            tensor = torch.tensor(live_values, dtype=torch.uint64, device=self.device).view(torch.uint8).view(-1, 8)
+        self._compiled_live_values_tensor_cache = tensor
+        return tensor
+
     def compiled_spec(self) -> dict:
-        return build_compiled_spec(self)
+        return self._compiled_runtime_bundle()["spec"]
 
     def compiled_live_values(self) -> list[int]:
-        return build_compiled_live_values(self)
+        return list(self._compiled_runtime_bundle()["live_values"])
 
     def compiled_program_hash(self) -> str:
         return self.compiled_spec()["hash"]
@@ -342,6 +365,7 @@ class Launcher:
             for b in self.builder:
                 b.add(inst)
         self.need_instruction_build = True
+        self._invalidate_compiled_cache()
 
     def collect_barrier_release_counts(self, *insts):
         counts = {}
@@ -407,7 +431,7 @@ class Launcher:
         if self.mode == "compiled":
             if not getattr(runtime, "compiled_program_enabled", False):
                 raise ValueError("Compiled mode requested, but dae.runtime was built without a compiled program")
-            compiled_bundle = build_compiled_runtime_bundle(self)
+            compiled_bundle = self._compiled_runtime_bundle()
             current_spec = compiled_bundle["spec"]
             runtime_hash = getattr(runtime, "compiled_program_hash", "")
             if current_spec["hash"] != runtime_hash:
@@ -426,11 +450,7 @@ class Launcher:
         minsts = None
         compiled_live_values = None
         if self.mode == "compiled":
-            live_values = compiled_bundle["live_values"] if compiled_bundle is not None else []
-            if len(live_values) == 0:
-                compiled_live_values = torch.empty((0, 8), dtype=torch.uint8, device=self.device)
-            else:
-                compiled_live_values = torch.tensor(live_values, dtype=torch.uint64, device=self.device).view(torch.uint8).view(-1, 8)
+            compiled_live_values = self._compiled_live_values_tensor()
         else:
             self.build_instructions()
             cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)

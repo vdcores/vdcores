@@ -151,8 +151,8 @@ def _encode_memory_fields(
         payload_values.append(raw_value)
         return encoded
 
-    encoded["coords_payload_index"] = len(payload_values)
-    payload_values.extend(int(coord) for coord in inst.cords)
+    encoded["packed_coords_payload_index"] = len(payload_values)
+    payload_values.append(int(cords2addr(inst.cords)))
     return encoded
 
 
@@ -392,7 +392,7 @@ def _analyze_launcher(launcher) -> dict[str, object]:
 def build_compiled_runtime_bundle(launcher) -> dict[str, object]:
     analysis = _analyze_launcher(launcher)
     spec = {
-        "version": 3,
+        "version": 4,
         "num_sms": launcher.num_sms,
         "compute_ops": launcher.compute_operator_names(),
         "sm_program_ids": analysis["sm_program_ids"],

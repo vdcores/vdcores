@@ -45,6 +45,20 @@ _SLOT_INST_REQUIRED_BASE_OPS = {
 }
 
 
+_MEMORY_OP_COORD_COUNTS = {
+    "OP_ALLOC_TMA_LOAD_2D": 2,
+    "OP_ALLOC_TMA_LOAD_3D": 3,
+    "OP_ALLOC_TMA_LOAD_4D": 4,
+    "OP_ALLOC_TMA_LOAD_5D_FIX0": 4,
+    "OP_ALLOC_WB_TMA_STORE_2D": 2,
+    "OP_ALLOC_WB_TMA_STORE_3D": 3,
+    "OP_ALLOC_WB_TMA_STORE_4D": 4,
+    "OP_ALLOC_WB_TMA_STORE_5D_FIX0": 4,
+    "OP_ALLOC_WB_TMA_REDUCE_ADD_2D": 2,
+    "OP_ALLOC_WB_TMA_REDUCE_ADD_3D": 3,
+}
+
+
 def _emit_int_array_initializer(values: list[int], *, indent: str) -> list[str]:
     if not values:
         return [f"{indent}}};"]
@@ -241,15 +255,14 @@ def _payload_indices_for_step(step: dict[str, object]) -> list[int]:
     indices: list[int] = []
     if "address_payload_index" in step:
         indices.append(int(step["address_payload_index"]))
-    if "coords_payload_index" in step:
-        base = int(step["coords_payload_index"])
-        indices.extend(base + coord for coord in range(4))
+    if "packed_coords_payload_index" in step:
+        indices.append(int(step["packed_coords_payload_index"]))
     return indices
 
 
 def _memory_step_payload_kind(step: dict[str, object]) -> str:
-    if "coords_payload_index" in step:
-        return "coords"
+    if "packed_coords_payload_index" in step:
+        return "packed_coords"
     if "address_payload_index" in step:
         return "address"
     return "none"
@@ -279,19 +292,30 @@ def _memory_step_fold_signature(step: dict[str, object]) -> tuple[object, ...]:
 
 
 def _memory_step_payload_index(step: dict[str, object]) -> int | None:
-    if "coords_payload_index" in step:
-        return int(step["coords_payload_index"])
+    if "packed_coords_payload_index" in step:
+        return int(step["packed_coords_payload_index"])
     if "address_payload_index" in step:
         return int(step["address_payload_index"])
     return None
 
 
 def _memory_step_payload_width(step: dict[str, object]) -> int:
-    if "coords_payload_index" in step:
-        return 4
+    if "packed_coords_payload_index" in step:
+        return 1
     if "address_payload_index" in step:
         return 1
     return 0
+
+
+def _packed_coords_literal(coords: list[int]) -> str:
+    value = 0
+    for coord_index, coord in enumerate(coords[:4]):
+        value |= (int(coord) & 0xFFFF) << (coord_index * 16)
+    return _u64_literal(value)
+
+
+def _memory_op_coord_count(base_name: str) -> int:
+    return _MEMORY_OP_COORD_COUNTS.get(base_name, 0)
 
 
 def _group_repeat_steps(steps: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -395,6 +419,8 @@ def _emit_memory_field_locals(
     *,
     step_offset_expr: str | None = None,
     payload_stride: int | None = None,
+    emit_address: bool = False,
+    emit_coord_count: int = 0,
 ) -> None:
     base_name = step["base_name"]
     lines.append(_declare_local(indent, "constexpr uint16_t __opcode", str(int(step["opcode_value"])) ))
@@ -406,6 +432,8 @@ def _emit_memory_field_locals(
     if base_name in _NO_ADDRESS_MEMORY_BASE_OPS:
         return
     if base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS:
+        if not emit_address:
+            return
         if "address_payload_index" in step:
             if step_offset_expr is None:
                 base_expr = _payload_scalar_var(int(step["address_payload_index"]))
@@ -423,21 +451,23 @@ def _emit_memory_field_locals(
             lines.append(_declare_local(indent, "const uint64_t __address", base_expr))
         return
 
-    if "coords_payload_index" in step:
-        base = int(step["coords_payload_index"])
+    if emit_coord_count <= 0:
+        return
+
+    if "packed_coords_payload_index" in step:
+        base = int(step["packed_coords_payload_index"])
         if step_offset_expr is None:
-            coord_exprs = [f"static_cast<uint16_t>({_payload_scalar_var(base + coord)})" for coord in range(4)]
+            packed_coords_expr = _payload_scalar_var(base)
         else:
             assert payload_stride is not None
-            coord_exprs = [
-                f"static_cast<uint16_t>(live_values[{base} + ({step_offset_expr}) * {payload_stride} + {coord}])"
-                for coord in range(4)
-            ]
+            packed_coords_expr = f"live_values[{base} + ({step_offset_expr}) * {payload_stride}]"
     else:
-        coord_exprs = [str(int(coord)) for coord in step["coords"]]
+        packed_coords_expr = _packed_coords_literal(step["coords"])
+    lines.append(_declare_local(indent, "const uint64_t __packed_coords", packed_coords_expr))
     delta_coords = step.get("delta_coords")
-    for coord_index, coord_expr in enumerate(coord_exprs):
+    for coord_index in range(emit_coord_count):
         coord_name = f"__coord{coord_index}"
+        coord_expr = f"static_cast<uint16_t>((__packed_coords >> {coord_index * 16}) & 0xFFFFULL)"
         delta = 0 if delta_coords is None else int(delta_coords[coord_index])
         if delta != 0:
             lines.append(_declare_local(indent, f"uint16_t {coord_name}", f"static_cast<uint16_t>({coord_expr})"))
@@ -462,7 +492,7 @@ def _emit_store_slot_inst(step: dict[str, object], lines: list[str], indent: str
     if step["base_name"] in _SCALAR_ADDRESS_FIELD_BASE_OPS:
         lines.append(f"{indent}__slot_inst.address = __address;")
         return
-    for coord_index in range(4):
+    for coord_index in range(_memory_op_coord_count(step["base_name"])):
         lines.append(f"{indent}__slot_inst.coords[{coord_index}] = __coord{coord_index};")
 
 
@@ -481,6 +511,8 @@ def _emit_alloc_step(
         indent + "  ",
         step_offset_expr=step_offset_expr,
         payload_stride=payload_stride,
+        emit_address=step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS and step["base_name"] in _SCALAR_ADDRESS_FIELD_BASE_OPS,
+        emit_coord_count=_memory_op_coord_count(step["base_name"]) if step["base_name"] in _SLOT_INST_REQUIRED_BASE_OPS else 0,
     )
     lines.append(f"{indent}  int alloc_mask = 0;")
     lines.append(f"{indent}  int slot_alloc = -1;")
@@ -586,6 +618,8 @@ def _emit_ld_step(
             indent + "  ",
             step_offset_expr=step_offset_expr,
             payload_stride=payload_stride,
+            emit_address=base_name in _SCALAR_ADDRESS_FIELD_BASE_OPS,
+            emit_coord_count=_memory_op_coord_count(base_name),
         )
         _emit_ld_barrier_wait(step, lines, indent + "  ")
         if base_name == "OP_ALLOC_TMA_LOAD_1D":
@@ -684,23 +718,9 @@ def _emit_ld_step(
         else:
             lines.append(f"{indent}  m2c.data[cmd.m2c_slot] = __reg_file[{int(step['size'])}];")
     elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
-        _emit_memory_field_locals(
-            step,
-            lines,
-            indent + "  ",
-            step_offset_expr=step_offset_expr,
-            payload_stride=payload_stride,
-        )
-        lines.append(f"{indent}  (void)__address;")
+        pass
     elif base_name in _WRITEBACK_OPS:
-        _emit_memory_field_locals(
-            step,
-            lines,
-            indent + "  ",
-            step_offset_expr=step_offset_expr,
-            payload_stride=payload_stride,
-        )
-        lines.append(f"{indent}  (void)__opcode;")
+        pass
     else:
         raise ValueError(f"Unsupported LDU step {base_name}")
     lines.append(f"{indent}  (void)m2c.barriers[cmd.m2c_slot].arrive();")
@@ -788,6 +808,8 @@ def _emit_st_step(
         indent + "  ",
         step_offset_expr=step_offset_expr,
         payload_stride=payload_stride,
+        emit_address=base_name == "OP_ALLOC_WB_TMA_STORE_1D",
+        emit_coord_count=_memory_op_coord_count(base_name),
     )
     if base_name == "OP_ALLOC_WB_TMA_STORE_1D":
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk(")
@@ -871,7 +893,6 @@ def _emit_st_step(
         lines.append(f"{indent}  cuda::ptx::cp_async_bulk_commit_group();")
     elif base_name == "OP_ALLOC_WB_RAW_ADDRESS":
         lines.append(f"{indent}  (void)slot;")
-        lines.append(f"{indent}  (void)__address;")
     else:
         raise ValueError(f"Unsupported STU step {base_name}")
     if step["flags"]["barrier"]:
