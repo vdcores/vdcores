@@ -168,6 +168,14 @@ There are two token shapes in flight.
 - The returned value is used directly as a special-slot index into `st_insts`.
 - This is how raw global pointers and some register/address carriers travel through the VM.
 
+Compiled-mode note:
+
+- `st_insts[]` is semantic slot metadata, not a mandatory write on every compiled alloc step.
+- In interpreted alloc, normal shared-memory producers still materialize the full `MInst` into `st_insts[lead_slot]` because later memory-side stages consume that metadata generically.
+- In compiled mode, a producer only needs to write the `st_insts[slot]` fields that some later compiled path still reads.
+- In the current compiled support set, only `OP_ALLOC_WB_RAW_ADDRESS` still requires `st_insts[slot].address`, because the store path recovers the raw global pointer through `slot_2_glob_ptr(st_insts, slot)`.
+- Ordinary compiled shared-memory producers and current reg-carrier paths do not need a full `st_insts` materialization once their consumers are lowered from the frozen compiled spec.
+
 ## Allocator Model
 
 The active allocator is [SharedMemoryAllocator](/home1/11362/depctg/vdcores/include/dae/allocator.cuh):
