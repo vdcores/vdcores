@@ -7,470 +7,77 @@
 
 ## Description
 
-Track the multi-conversation effort to make compiled mode usable for real schedules: export stable compiled specs, generate efficient role code, keep correctness aligned with interpreted mode, and recover performance for memory-heavy paths without regressing debuggability.
+Make compiled mode usable for real schedules by exporting stable compiled specs, generating efficient runtime code, keeping correctness aligned with interpreted mode, and recovering performance on larger mixed workloads.
 
 ## Current State
 
-Compiled mode is working end-to-end for the current supported subset and has been verified on several standalone apps, including `gemv_out`, `gemv_mma_out`, `argmax`, `rmsnorm`, `tmacopy`, repeat-form `tma1d`, and `gemv_logits`. The compiled async `OP_ALLOC_TMA_LOAD_1D` path now uses inline PTX `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes` instead of `cuda::device::memcpy_async_tx(...)`, which clears the preserved barrier repro hang and restores the async path for `gemv_mlp_mixed`. Compiled alloc code now skips `st_insts[slot]` materialization for ordinary shared-memory slots and only writes `st_insts` for `OP_ALLOC_WB_RAW_ADDRESS`, which is the only current compiled-mode path that still needs slot-to-global-pointer metadata. The generator now also lowers per-SM program/live lookup helpers by table shape instead of always emitting giant `switch (sm_id)` trees: small piecewise-constant tables become uniform range checks, small piecewise-affine tables become arithmetic, and only irregular dense tables fall back to `__device__ __constant__` lookup arrays. The latest profiling pass shows `gemv_mlp_mixed` compiled mode is no longer losing inside the kernel itself after loop folding and launcher-side caching. The current live-value lowering now works in two layers: it first identifies per-program root values and derivations instead of blindly materializing every address/coord payload, then it lowers schedule-style coord roots that are affine in `sm_id` directly into generated arithmetic. On `gemv_mlp_mixed`, that moves the exported spec to version `5`, cuts the total live-value count from `24` to `4`, and collapses the mixed schedule from `129` compiled programs to `3` without regressing the benchmark. The generator now also has a post-fold accumulator lowering for loop-varying emitted fields, so repeated affine `__coordN` and `__address` values can stay in registers and advance by stride instead of being recomputed from full expressions on every loop iteration. There is now also an opt-in split compiled launch mode for experimentation, but on the current mixed benchmark it is slower and materially larger than the monolithic default, so the default launch path remains the single-kernel mode.
+Compiled mode works end-to-end for the current supported subset and has been exercised on `gemv_out`, `gemv_mma_out`, `argmax`, `rmsnorm`, `tmacopy`, repeat-form `tma1d`, `gemv_logits`, and `gemv_mlp_mixed`.
 
-## Progress
+The current support surface includes the key correctness and codegen fixes that were blocking broader use:
 
-- 2026-04-04: added the initial opt-in compiled-mode export, build, and launch flow across Python export, generated includes, runtime entry points, and Torch extension wiring.
-- 2026-04-04: moved compiled memory/compute state toward a compact structural-spec plus per-SM payload model so structurally identical programs deduplicate instead of exploding per SM.
-- 2026-04-04: expanded compiled support to more compute ops and memory forms, including barrier-tagged alloc ops, `RegLoad`, `RegStore`, `RawAddress`, and split LDU generation by load port.
-- 2026-04-05: fixed the minimal barriered producer/store/load repro and `gemv_mlp_mixed` launch path by removing pure writeback queue no-ops and using a blocking 1D load fallback for correctness.
-- 2026-04-05: preserved a self-contained async 1D barrier repro bundle under `build/generated/` to debug the original non-blocking path without rebuilding the reproducer from scratch.
-- 2026-04-05: cleaned up compiled codegen to make compute `pc` debug-only, lower memory instructions through direct field locals, and stop routing synthetic end tokens through LDU queues.
-- 2026-04-05: rechecked `gemv_out` and repeat-form `tma1d`; `gemv_out` still shows a modest compiled win and repeat-form `tma1d` improved versus the earlier blocking-path regression.
-- 2026-04-05: silenced the new generator-side unused-field warning source by marking emitted per-step field locals `[[maybe_unused]]` until field emission is specialized per consumer context.
-- 2026-04-05: replaced compiled `OP_ALLOC_TMA_LOAD_1D` lowering with inline PTX `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes`, verified the preserved debug barrier repro completes, and confirmed `app/python/gemv_mlp_mixed.py --mode compiled -l` launches and finishes again on the async path.
-- 2026-04-05: changed compiled alloc codegen so only `OP_ALLOC_WB_RAW_ADDRESS` writes `st_insts[slot]`; normal shared-memory loads/stores and reg-carrier steps now skip that dead metadata store.
-- 2026-04-05: reran the support-set interpreter-vs-compiled benches after the slot-write cleanup:
-  - repeat-form `tma1d`: `442347.48 ns` interpreted vs `272461.68 ns` compiled
-  - `tmacopy`: `898424.46 ns` interpreted vs `661277.70 ns` compiled
-  - `gemv_out`: `6569.76 ns` interpreted vs `5777.76 ns` compiled
-  - `gemv_mma_out`: `18635.82 ns` interpreted vs `17931.53 ns` compiled
-  - `rmsnorm`: `2523.60 ns` interpreted vs `1824.80 ns` compiled
-  - `argmax`: `6545.26 ns` interpreted vs `5423.55 ns` compiled
-- 2026-04-05: measured Hopper codegen for the large per-SM lookup switches versus dense table lookups, then updated the generator to choose compact lookup helpers by table shape: piecewise-constant runs become range checks, piecewise-affine live-offset tables become arithmetic, and only irregular cases fall back to `__device__ __constant__` tables.
-- 2026-04-05: persisted the compiled-mode `st_insts[]` semantics into `agents/knowledge/runtime/vdcores-vm-model.md` so future ops can tell when slot metadata is semantically required versus just an interpreter-side implementation detail.
-- 2026-04-05: reran the support-set interpreter-vs-compiled benches after the per-SM lookup optimization:
-  - repeat-form `tma1d`: `442147.09 ns` interpreted vs `272464.27 ns` compiled
-  - `tmacopy`: `905226.75 ns` interpreted vs `653863.03 ns` compiled
-  - `gemv_out`: `6534.51 ns` interpreted vs `5815.72 ns` compiled
-  - `gemv_mma_out`: `18828.35 ns` interpreted vs `17849.05 ns` compiled
-  - `rmsnorm`: `2536.80 ns` interpreted vs `1825.40 ns` compiled
-  - `argmax`: `6584.64 ns` interpreted vs `4686.40 ns` compiled
-- 2026-04-05: reran `app/python/gemv_mlp_mixed.py` with `-b 20` after the lookup/codegen cleanups:
-  - interpreted: `81114.21 ns` average duration, `86684.80 ns` average execution time
-  - compiled: `89239.02 ns` average duration, `91590.40 ns` average execution time
-  - compiled is still about `10%` slower than interpreted on this larger mixed schedule, but much better than the earlier pre-inline-PTX regression where compiled mode was far slower.
-  - both benchmark runs printed an `Ave Diff out` near `1897%` while `Ave Diff silu1` stayed near `0.0968%`, so that specific bench-path `out` mismatch is not currently compiled-only.
-- 2026-04-05: repeated the same mixed-MLP benchmark strictly sequentially to rule out overlap between interpreted and compiled timing runs:
-  - interpreted: `81188.52 ns` average duration, `86947.20 ns` average execution time
-  - compiled: `88903.02 ns` average duration, `91160.00 ns` average execution time
-  - compiled remains about `9.5%` slower than interpreted, so the earlier rerun was not an artifact of concurrent benchmark execution.
-  - the large final-`out` diff still appears in both modes (`1897.14%` interpreted, `1897.25%` compiled), while `silu1` remains aligned at `0.0968%`.
-- 2026-04-06: updated `app/python/gemv_logits.py` to use `dae_app(...)`, added `--mode` / `--write-compiled-spec` support, and added a direct reference diff/checksum print for executed runs.
-- 2026-04-06: added a loop-value accumulator pass to `tools/generate_compiled_program.py` so the post-fold codegen can keep emitted affine fields in registers instead of rebuilding the full expression every iteration:
-  - the generator now derives emitted `__address` / `__coordN` fields explicitly per alloc/ld/st consumer, then uses those field plans to lower single-level fold loops and nested fold loops through mutable accumulator registers
-  - confirmed in regenerated `build/generated/dae/compiled_program.inc` that mixed-MLP hot loops now use accumulator patterns such as `__coord2_outer_acc`, `__coord2_acc`, and `__address_acc` instead of repeated expressions like `(0 + (__outer) * 64 + (__step) * 4)` and `(-393216 + (__step) * 221184)`
-  - `python -m py_compile tools/generate_compiled_program.py` passed and `python app/python/gemv_mlp_mixed.py --write-compiled-spec ...` regenerated successfully
-- 2026-04-06: refined that loop-value pass so it also hoists loop-invariant per-SM affine fields like `(4096 + (sm_id - 0) * 64)` into reusable locals, and simplified repeat-delta lowering to always apply the `__rep * delta` adjustment without an `if (__rep != 0)` branch:
-  - after rebuilding through the documented reset-shell workflow
-    - `source "$(conda info --base)/etc/profile.d/conda.sh"`
-    - `conda deactivate`
-    - `conda activate`
-    - `DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext`
-    the extension built successfully
-  - regenerated mixed-MLP code now hoists invariant affine coords into `__coord1_acc` / `__coord1_outer_acc`, and repeat-adjusted accumulators initialize with direct `__rep * 16` adds instead of guarded branches
-  - compiled correctness remained stable:
-    - `python app/python/gemv_mlp_mixed.py --mode compiled -l`
-    - `Ave Diff out: 0.3623057499209479%`
-    - `Ave Diff silu1: 0.09682150983636482%`
-  - sequential benchmark after rebuild:
-    - interpreted: `82068.27 ns` average duration, `86880.00 ns` average execution time
-    - compiled: `82417.55 ns` average duration, `86251.20 ns` average execution time
-  - relative to the earlier nested-fold-only compiled point (`82847.54 ns`), the new hoist/accumulate cleanup improved compiled average duration by about `0.52%`, while compiled execution time is now slightly better than interpreted on the same fresh run
-- 2026-04-06: exported `build/generated/gemv_logits_compiled_spec.json`, rebuilt `dae.runtime` against it, and benchmarked `gemv_logits.py -b 20`:
-  - interpreted: `322707.43 ns` average duration, `335904.00 ns` average execution time, `3826.78 GB/s`
-  - compiled: `325879.03 ns` average duration, `334539.20 ns` average execution time, `3789.54 GB/s`
-  - compiled is only about `0.98%` slower than interpreted on average duration, so this harness is now compile-mode runnable with near-parity performance.
-  - both modes reported the same large reference diff (`98.89147%`) and the same output checksum (`108.45755`), so the mismatch is not compile-mode-specific.
-- 2026-04-06: profiled `gemv_logits` with `ncu` before optimizing compiled codegen:
-  - compiled basic profile: `346.75 us`, `89.73%` memory throughput, `14.83%` compute throughput, `36` registers/thread
-  - interpreted basic profile: `367.62 us`, `84.83%` memory throughput, `16.16%` compute throughput, `38` registers/thread
-  - compiled scheduler/instruction profile: `85.08%` no-eligible cycles and `36,099,128` executed instructions
-  - takeaway: the harness is primarily memory-bound, so codegen cleanup is likely to deliver only modest wins unless it also changes memory behavior.
-- 2026-04-06: added generator-side loop folding in `tools/generate_compiled_program.py`:
-  - consecutive identical compiled compute ops now emit a `for (__ci ...)` loop instead of repeated cloned bodies
-  - consecutive repeat-block memory steps with the same lowered behavior and contiguous payload blocks now emit a `for (__step ...)` loop
-  - the common GEMV `RepeatM` pattern now folds the four affine `OP_ALLOC_TMA_LOAD_4D` steps into one loop body
-- 2026-04-06: rebuilt `gemv_logits` after loop folding and re-profiled/re-benched it:
-  - `ptxas` compiled-kernel register usage dropped from `36` to `34`
-  - compiled basic `ncu` profile moved to `351.14 us`, `89.43%` memory throughput, `15.32%` compute throughput, `34` registers/thread
-  - compiled scheduler/instruction profile moved to `83.91%` no-eligible cycles and `38,114,062` executed instructions
-  - benchmark: interpreted `322786.74 ns`, compiled `324617.83 ns`
-  - compiled improved by about `0.39%` versus the earlier compiled run, but the harness remains slightly slower than interpreted because it is still memory-bound.
-- 2026-04-06: rebuilt against `build/generated/gemv_mlp_mixed_compiled_spec.json` and reran the larger mixed benchmark after loop folding:
-  - interpreted: `81543.20 ns` average duration, `86784.00 ns` average execution time
-  - compiled: `87483.13 ns` average duration, `90217.60 ns` average execution time
-  - compiled improved by about `1.60%` versus the earlier `88903.02 ns` compiled baseline
-  - the compiled-vs-interpreted gap on this mixed schedule narrowed from about `9.5%` to about `7.3%`
-  - the large bench-path final-`out` diff still remains in both modes (`1897.20%` interpreted, `1897.22%` compiled), while `silu1` stays aligned at `0.09682%`
-- 2026-04-06: profiled `gemv_mlp_mixed` with `ncu` after loop folding to locate the remaining gap:
-  - compiled basic profile: `100.51 us`, `75.73%` memory throughput, `13.19%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory, `12.14%` achieved occupancy
-  - interpreted basic profile: `99.52 us`, `77.21%` memory throughput, `16.21%` compute throughput, `40` registers/thread, `14.37 KB` static shared memory, `12.36%` achieved occupancy
-  - compiled scheduler/instruction profile: `85.68%` no-eligible cycles and `9,666,282` executed instructions
-  - interpreted scheduler/instruction profile: `82.35%` no-eligible cycles and `11,817,477` executed instructions
-  - takeaway: compiled already executes fewer instructions than interpreted, so the remaining slowdown is not primarily due to excess generated control flow.
-- 2026-04-06: tried staging compiled `live_values` into shared memory inside `dae2_compiled`, then reverted it after measurement:
-  - compiled bench regressed to `88521.27 ns` average duration and `91539.20 ns` average execution time
-  - compiled `ncu` duration regressed to `104.38 us`, with static shared memory increasing from `1.55 KB` to `2.99 KB`
-  - takeaway: this schedule does not benefit from copying compiled payload state into shared memory up front.
-- 2026-04-06: cached the compiled runtime bundle and device `live_values` tensor in `python/dae/launcher.py`, invalidating the cache only when new instructions are appended:
-  - this removes repeated `build_compiled_runtime_bundle(...)` work and avoids recreating/uploading the same compiled live-value tensor on every launch/bench iteration
-  - rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json` and reran the mixed benchmark:
-    - interpreted: `82155.48 ns` average duration, `87478.40 ns` average execution time
-    - compiled: `86914.69 ns` average duration, `89593.60 ns` average execution time
-    - compiled improved by about `0.65%` versus the earlier loop-folded compiled run (`87483.13 ns`)
-    - the compiled-vs-interpreted benchmark gap narrowed further from about `7.3%` to about `5.8%`
-  - on the same rebuilt binary, `ncu` basic profiles now show:
-    - compiled: `98.24 us`, `77.46%` memory throughput, `13.61%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory, `12.15%` achieved occupancy
-    - interpreted: `99.20 us`, `77.44%` memory throughput, `16.26%` compute throughput, `40` registers/thread, `14.37 KB` static shared memory, `12.36%` achieved occupancy
-  - takeaway: after caching, compiled is slightly ahead on kernel duration under `ncu`, so the residual benchmark-only gap is most likely launch/setup/cache-state overhead outside the generated kernel body.
-- 2026-04-06: changed compiled live-value serialization so coord-based memory ops store one packed `uint64` payload entry per step instead of four separate coord scalars, and the generated code now unpacks coords only where tensor ops actually need them:
-  - `build/generated/gemv_mlp_mixed_compiled_spec.json` moved from spec version `3` to `4`
-  - `gemv_mlp_mixed` live values dropped from `23064` to `5784` entries, a `74.92%` reduction
-  - the rebuilt mixed benchmark remained essentially flat:
-    - interpreted: `81356.96 ns` average duration, `86379.20 ns` average execution time
-    - compiled: `87066.57 ns` average duration, `89993.60 ns` average execution time
-  - compiled basic `ncu` on this packed-coord build measured `99.84 us`, `76.22%` memory throughput, `13.36%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory
-  - takeaway: packing coords is a strong payload-footprint optimization, but on the cached `gemv_mlp_mixed` path it does not improve runtime and may slightly hurt kernel execution because coord unpack now happens on device.
-- 2026-04-06: kept the packed live-value layout and tightened generated field emission so stages only unpack coords when they actually consume them:
-  - alloc-side generated code no longer unpacks coords for ordinary tensor loads/stores because alloc only needs queue metadata
-  - ld-side generated code now unpacks coords only for real tensor load ops, not for writeback/raw-address bookkeeping paths
-  - st-side generated code now unpacks only the coord arity each opcode actually uses, for example 2 coords for 2D ops and 3 coords for 3D ops
-  - on `gemv_mlp_mixed`, this cleanup was performance-neutral in the first check:
-    - compiled benchmark: `87069.83 ns` average duration, `90056.00 ns` average execution time
-    - compiled basic `ncu`: `101.38 us`, `75.05%` memory throughput, `13.13%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory
-  - takeaway: the consumer-aware unpack cleanup is worth keeping for code quality and to avoid dead generated work, but it does not materially change the current mixed-MLP performance.
-- 2026-04-06: tried replacing alloc-side emitted per-step code with a table-driven alloc-command loop for programs that do not require `st_insts` metadata, then reverted it after measurement:
-  - the generated helper reduced `ptxas` compile time for `dae2_compiled` (`691.855 ms` to `364.817 ms`) but introduced `656` bytes of cumulative stack size in the compiled kernel
-  - `gemv_mlp_mixed` regressed sharply:
-    - compiled benchmark: `99289.62 ns` average duration, `120540.80 ns` average execution time
-    - compiled basic `ncu`: `127.07 us`, `60.63%` memory throughput, `10.67%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory
-  - takeaway: alloc-side table driving looked attractive from a code-size perspective, but on Hopper this version added enough overhead that it was clearly worse than the existing emitted alloc path, so it was backed out.
-- 2026-04-06: retried alloc-side dedup with a different shape: one inline generic alloc loop body after the per-program switch, fed by compact encoded command tables and selectable placement (`disabled`, `constant`, `shared`, `global`):
-  - unlike the earlier helper-based table path, this version keeps the alloc application logic inline and avoids the large stack regression
-  - `gemv_mlp_mixed` placement sweep results:
-    - `disabled`: `86585.76 ns` benchmark, `100.13 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `0` bytes compiled-kernel stack
-    - `constant`: `82059.16 ns` benchmark, `98.91 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
-    - `shared`: `82802.01 ns` benchmark, `98.62 us` compiled basic `ncu`, `40` registers/thread, `1952` bytes smem, `48` bytes compiled-kernel stack
-    - `global` with `prefetch.global.L1`: `81837.03 ns` benchmark, `99.46 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
-  - relative to the `disabled` baseline, the alloc-table placements improved the compiled benchmark by about `5.23%` (`constant`), `4.37%` (`shared`), and `5.48%` (`global`), while compiled `ncu` duration improved by about `1.22%`, `1.51%`, and `0.67%` respectively
-  - a fresh interpreted rerun in the same phase measured `80752.35 ns`, so the best compiled result (`global`) narrows the mixed-MLP gap to about `1.3%`
-  - selected `global` as the default alloc-table mode in `tools/generate_compiled_program.py`, while keeping `DAE_COMPILED_ALLOC_TABLE_MODE={disabled,constant,shared,global}` as an override for future tuning
-  - rebuilt once more with no alloc-table env override to verify the new default path:
-    - compiled: `82122.58 ns` average duration, `86465.60 ns` average execution time
-  - takeaway: table placement matters, but the main fix was keeping the alloc loop body inline; among the tested placements, `global` plus L1 prefetch is the best default for this mixed benchmark.
-- 2026-04-06: added selectable live-value placement on top of the new alloc-table path, with `DAE_COMPILED_LIVE_VALUE_MODE={global,shared,constant}`:
-  - `global`: existing per-SM slice pointer into the launcher-supplied tensor
-  - `shared`: copy each SM’s live-value slice into shared memory at kernel start, then read from shared for alloc/ld/st
-  - `constant`: upload the launcher-supplied live values once into a generated constant buffer and read per-SM slices from constant memory
-  - `gemv_mlp_mixed` live-value placement sweep results with alloc-table mode left on its current default:
-    - `global`: `82055.81 ns` benchmark, `99.90 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
-    - `shared`: `81677.42 ns` benchmark, `98.11 us` compiled basic `ncu`, `40` registers/thread, `1904` bytes smem, `48` bytes compiled-kernel stack
-    - `constant`: `82196.12 ns` benchmark, `97.66 us` compiled basic `ncu`, `40` registers/thread, `1552` bytes smem, `48` bytes compiled-kernel stack
-  - relative to the `global` live-value baseline, `shared` improved the compiled benchmark by about `0.46%` and `ncu` duration by about `1.79%`; `constant` had the best `ncu` duration but slightly worse benchmark time than `global`
-  - selected `shared` as the default live-value mode in `tools/generate_compiled_program.py`, while keeping `DAE_COMPILED_LIVE_VALUE_MODE` available for future tuning
-  - rebuilt once more with no live-value env override to verify the new default path:
-    - compiled: `81751.53 ns` average duration, `86372.80 ns` average execution time
-  - a recent interpreted rerun in the same phase measured `80752.35 ns`, so the current combined alloc/live placement path brings `gemv_mlp_mixed` to within about `1.24%` of interpreted on average duration
-  - takeaway: live-value placement matters too, but less dramatically than alloc placement; on this mixed benchmark the best default is shared-memory staging of the now-small per-SM live-value slices.
-- 2026-04-06: replaced the direct payload-index lowering with a reusable live-source optimizer in `python/dae/compiled_mode.py` and taught `tools/generate_compiled_program.py` to consume source descriptors (`const`, `live + add`, and `sm_id`-affine coord sources):
-  - program grouping now starts from a raw structural template that excludes literal coords/addresses, so the compiler can reason about derivations before final program dedup
-  - coord-based schedule roots that are affine in `sm_id` now lower into generated arithmetic instead of live payload entries, while 1D address-heavy tails still keep one real live root plus constant offsets
-  - `gemv_mlp_mixed` export now produces spec version `5`, `3` programs, and only `4` total live values versus the prior version-4 packed-coord export with `129` programs and `24` live values
-  - rebuilt `dae.runtime` against the new mixed spec and reran `app/python/gemv_mlp_mixed.py -b 20`:
-    - interpreted: `82252.06 ns` average duration, `87851.20 ns` average execution time
-    - compiled: `82212.79 ns` average duration, `86592.00 ns` average execution time
-  - both modes still report the same large `out` mismatch family (`1897.13%` interpreted / `1897.13%` compiled to two decimals) while `silu1` remains aligned at `0.0968%`, so this pass did not introduce a new mixed-path correctness regression
-  - takeaway: the new source model recovers the intended “real live values only” behavior on the mixed benchmark without giving back the benchmark parity already recovered by the earlier alloc/live placement work.
-- 2026-04-06: profiled the latest live-root `gemv_mlp_mixed` build with fresh `ncu` passes for compiled vs interpreted:
-  - basic profile:
-    - compiled: `98.85 us`, `77.31%` memory throughput, `14.38%` compute throughput, `40` registers/thread, `1.55 KB` static shared memory, `12.17%` achieved occupancy
-    - interpreted: `101.22 us`, `76.45%` memory throughput, `15.97%` compute throughput, `40` registers/thread, `14.37 KB` static shared memory, `12.36%` achieved occupancy
-  - scheduler/instruction profile:
-    - compiled: `84.72%` no-eligible cycles, `0.16` eligible warps/scheduler, `0.15` issued warps/scheduler, `10,311,458` executed instructions
-    - interpreted: `82.02%` no-eligible cycles, `0.19` eligible warps/scheduler, `0.18` issued warps/scheduler, `11,786,417` executed instructions
-  - memory workload profile:
-    - compiled: `3.08 TB/s` memory throughput, `58.07%` L1/TEX hit rate, `28.43%` L2 hit rate, `76.58%` max-bandwidth utilization
-    - interpreted: `3.07 TB/s` memory throughput, `43.15%` L1/TEX hit rate, `28.39%` L2 hit rate, `76.41%` max-bandwidth utilization
-  - takeaway: the current compiled kernel is already slightly faster than interpreted in-kernel and uses fewer executed instructions, so the remaining improvement space is not obvious “more folding”; both paths are dominated by low eligible-warp rate at occupancy capped by shared memory, and compiled’s main remaining opportunity appears to be reducing latency / increasing overlap rather than cutting straight-line instruction count.
-- 2026-04-06: extended the source-diff folding path so it also folds consecutive linear op runs, not just `RepeatM` bodies:
-  - `tools/generate_compiled_program.py` now reuses one grouped-step emitter for repeat bodies and plain consecutive op sequences in alloc/LDU/STU generation
-  - on `gemv_mlp_mixed`, the later flattened `OP_ALLOC_TMA_LOAD_3D` stretches in `build/generated/dae/compiled_program.inc` now collapse into linear `for (__step ...)` loops, including the previously flat mid/later LDU runs that become `__step < 8` loops
-  - rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json` and reran compiled bench:
-    - compiled: `81881.39 ns` average duration, `86691.20 ns` average execution time
-  - versus the earlier live-root baseline (`82212.79 ns`), this check is about `0.40%` faster on average duration while keeping the same existing mixed-path diff profile (`1897.22%` final `out`, `0.0968%` `silu1`)
-  - takeaway: there was still real folding space in the later linear 3D-load region, and the coord/source-diff fold path can cover it cleanly without a model-specific special case.
-- 2026-04-06: reviewed and tidied the fold/codegen plumbing so the new optimization paths are modular instead of partly copy-pasted:
-  - renamed the fold grouping helper to match its real scope (`_group_foldable_steps`) and split the memory traversal into reusable sequence helpers that collect filtered repeat/op items, flatten them for payload aliasing, and emit grouped repeat plus linear-op runs from one shared path
-  - alloc/LDU/STU emission now all route their foldable memory sequences through the same helper stack, while alloc termination stays isolated in its own tiny emitter
-  - reran `python -m py_compile` for both `tools/generate_compiled_program.py` and `python/dae/compiled_mode.py`, regenerated `build/generated/gemv_mlp_mixed_compiled_spec.json`, rebuilt `dae.runtime`, and reran `app/python/gemv_mlp_mixed.py --mode compiled -b 20`
-  - latest mixed compiled bench after the tidy-up: `81971.54 ns` average duration, `86112.00 ns` average execution time, with the same existing diff profile (`1897.22%` final `out`, `0.0968%` `silu1`)
-  - takeaway: the fold optimization is now aligned with the current version-`5` live-source model and easier to reuse for future memory-op folding work without changing the current generated mixed-case behavior.
-- 2026-04-06: added a generic launcher-side `--profile-sm-times` summary in `python/dae/util.py`, rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json`, and used it plus fresh Nsight Compute runs to re-check the mixed MLP performance story:
-  - fresh `-b 20` benchmark is now effectively exact parity on the current build:
-    - interpreted: `81734.51 ns` average duration, `87084.80 ns` average execution time
-    - compiled: `81722.55 ns` average duration, `86441.60 ns` average execution time
-  - per-SM start/end timestamps show compiled sharply tightening the two main 64-SM program groups:
-    - interpreted program 0: `231.424 us` min to `316.416 us` max, mean `266.620 us`
-    - interpreted program 1: `231.680 us` min to `317.184 us` max, mean `267.212 us`
-    - compiled program 0: `84.736 us` min to `88.576 us` max, mean `87.412 us`
-    - compiled program 1: `86.016 us` min to `88.832 us` max, mean `87.700 us`
-  - start skew is tiny in both modes (roughly `0-1.5 us` interpreted, `0-2.3 us` compiled), so the visible difference is cross-SM duration spread rather than staggered launch start
-  - fresh `ncu` summary still shows both kernels as memory-heavy one-block-per-SM launches with nearly identical duration:
-    - compiled: `99.39 us`, `76.88%` memory throughput, `14.30%` compute throughput, `12.16%` achieved occupancy
-    - interpreted: `100.03 us`, `77.22%` memory throughput, `16.12%` compute throughput, `12.36%` achieved occupancy
-  - takeaway: compiled mode no longer looks slower in the hot device compute window; the remaining optimization space is more likely schedule-level overlap / non-compute tail work than another round of local compute code pruning
-- 2026-04-06: attempted a direct per-SM Nsight Compute CLI dump for `sm__cycles_active.avg` using `--print-metric-instances`:
-  - the CLI still only emitted aggregate `avg/max/min/sum` for this metric, not a 132-instance vector that could be joined directly against the launcher SM timing data
-  - for now, per-SM reasoning has to combine the launcher-side timestamps with Nsight’s section-level spread clues instead of relying on a single joined per-instance export
-- 2026-04-06: tried replacing the load-side `cuda::device::barrier_expect_tx(...)` plus `barrier.arrive()` sequence with fused `cuda::device::barrier_arrive_tx(...)` in both the interpreted `ldwarp` path and the generated compiled LDU path:
-  - the repo built cleanly with the fused helper, and `app/python/gemv_mlp_mixed.py --mode compiled -l` still launched with the same existing diff profile (`~0.36%` `out`, `~0.0968%` `silu1`)
-  - but the mixed benchmark regressed:
-    - interpreted: `82337.58 ns` average duration, `87841.60 ns` average execution time
-    - compiled with `barrier_arrive_tx`: `83075.67 ns` average duration, `87078.40 ns` average execution time
-  - reverted the experiment and rebuilt back to the original `expect_tx + arrive()` path
-  - compiled after revert returned to the better result: `82449.98 ns` average duration, `86219.20 ns` average execution time
-  - takeaway: the fused arrive helper is semantically valid on this toolchain, but it is not a win for the current mixed MLP path
-- 2026-04-06: reran the current compiled mixed-MLP verification in the requested order, first `-l` then `-b 20`:
-  - launch verification completed successfully on the current installed runtime
-  - `-l` diff summary:
-    - `Ave Diff out: 0.360236947300394%`
-    - `Ave Diff silu1: 0.09682150983636482%`
-  - `-b 20` benchmark:
-    - compiled: `83917.84 ns` average duration, `87987.20 ns` average execution time
-  - the bench-path diff profile remains in the same existing family (`1897.2070%` final `out`, `0.0968215%` `silu1`)
-  - takeaway: the compiled runtime is still launch-correct on this path, but this specific rerun lands on the slower side of the recent run-to-run spread compared with the earlier near-parity points
-- 2026-04-06: made the memory-op fold pass more aggressive so it can fold adjacent already-folded affine runs into a nested loop when they only differ by a higher-level source-base stride:
-  - `tools/generate_compiled_program.py` now applies a second grouping pass over first-level fold groups and can emit nested affine source expressions such as `base + (__outer) * 64 + (__step) * 4`
-  - on `gemv_mlp_mixed`, the two separate `for (__step < 8)` `OP_ALLOC_TMA_LOAD_3D` regions that only differed by the base `coord2` offset now collapse into:
-    - `for (__outer = 0; __outer < 2; ++__outer) for (__step = 0; __step < 8; ++__step) ... __coord2 = 0 + __outer * 64 + __step * 4`
-    - and the analogous `base=32` variant for the second half
-  - launch verification stayed in the same family:
-    - `Ave Diff out: 0.36011817194032%`
-    - `Ave Diff silu1: 0.09682150983636482%`
-  - compiled benchmark after the nested fold:
-    - `82847.54 ns` average duration, `87643.20 ns` average execution time
-  - takeaway: the generator now catches the more complex adjacent-affine pattern the previous fold pass missed; the main clear win so far is cleaner generated structure, while runtime impact remains within the recent run-to-run band rather than showing a decisive new speedup
-- 2026-04-06: tightened generated compiled memory locals so alloc/LDU/STU only materialize the opcode/size/slot/bar/arg/address/coord fields they actually consume:
-  - alloc now only unpacks coord/address payloads when it must materialize a slot `MInst`
-  - ld now only emits barrier/arg/address/coord locals for real tensor-load cases
-  - st now emits only the coord arity the concrete opcode actually uses
-  - `python -m py_compile tools/generate_compiled_program.py python/dae/launcher.py` passed and the mixed benchmark kept the same correctness profile (`~1897%` `out`, `0.0968215%` `silu1`)
-- 2026-04-06: added an opt-in split compiled launch experiment alongside the existing monolithic launch:
-  - `python/dae/launcher.py` now accepts `DAE_COMPILED_LAUNCH_MODE={monolithic,split}` and keeps monolithic as the default
-  - `src/runtime.cu` now supports per-program compiled launches on nonblocking streams, while `include/dae/dae2.cuh` adds split-kernel entry points plus a device-side startup rendezvous using the last two global bars; split timing now starts only after all program kernels have reached that rendezvous
-  - rebuilt `dae.runtime` against `build/generated/gemv_mlp_mixed_compiled_spec.json` and reran `app/python/gemv_mlp_mixed.py -b 20`:
-    - interpreted: `81697.84 ns` average duration, `86956.80 ns` average execution time
-    - compiled monolithic: `82257.04 ns` average duration, `87083.20 ns` average execution time
-    - compiled split: `85210.17 ns` average duration, `88219.20 ns` average execution time
-  - correctness stayed aligned with the previous mixed behavior:
-    - `Ave Diff out`: `1897.23%` interpreted, `1897.22%` monolithic compiled, `1897.17%` split compiled
-    - `Ave Diff silu1`: `0.09682150983636482%` in all three runs
-  - current artifact sizes on this split-capable build are:
-    - `build/generated/dae/compiled_program.inc`: `71375` bytes, `1464` lines
-    - `runtime.o`: `2243664` bytes
-    - `python/dae/runtime.cpython-313-aarch64-linux-gnu.so`: `2562456` bytes
-  - takeaway: the split-launch path works and gives a cleaner post-rendezvous timing point, but on `gemv_mlp_mixed` it is about `3.6%` slower than the monolithic compiled launch and significantly increases binary size, so it should stay experimental for now
+- compiled `OP_ALLOC_TMA_LOAD_1D` uses inline PTX `cp.async.bulk...complete_tx::bytes`, which avoids the earlier preserved barrier hang;
+- compiled alloc lowering only materializes `st_insts[slot]` for `OP_ALLOC_WB_RAW_ADDRESS`, not ordinary shared-memory slots;
+- per-SM lookup lowering now prefers range/arithmetic helpers over large generated `switch (sm_id)` trees when table structure permits it;
+- live-value lowering now keeps only root values and affine `sm_id`-derived schedule coords, which cut the mixed MLP spec to version `5`, reduced live values from `24` to `4`, and collapsed the mixed schedule from `129` compiled programs to `3`;
+- loop-fold and accumulator lowering can keep repeated affine coord/address updates in registers instead of rebuilding full expressions each iteration.
+
+On the latest mixed-MLP work, compiled mode is no longer clearly losing in the hot kernel body. The remaining work is mostly around correctness investigation for known output diffs and deciding whether any further optimization should target launch/setup overhead instead of more local generated-kernel pruning.
+
+The split compiled launch path exists for experimentation, but it is currently slower and larger than the default monolithic launch and should remain experimental.
+
+## Progress Summary
+
+- Added the compiled export, build, and launch flow across Python export, generated includes, runtime entry points, and Torch extension wiring.
+- Moved compiled state toward structural spec plus payload dedup so structurally identical programs do not explode per SM.
+- Expanded compiled support across the current memory/compute subset, including barrier-tagged alloc ops, register load/store handling, raw-address cases, and more load/store lowering coverage.
+- Fixed the async 1D barriered load path by switching compiled lowering to inline PTX and kept the focused repro artifact for future regressions.
+- Simplified generated code by pruning dead slot metadata writes, narrowing emitted locals, and lowering per-SM tables and loop-varying values more compactly.
+- Added launcher-side profiling hooks and refreshed mixed-workload profiling; current evidence points to near-parity in kernel time on `gemv_mlp_mixed`.
+- Added an opt-in split compiled launch mode for experiments, but it is not a default candidate yet.
 
 ## TODO
 
-- Replace the broad `[[maybe_unused]]` suppression with narrower field emission once the alloc/LDU/STU consumers are stable enough to specialize cleanly.
-- Extend the refreshed bench/correctness sweep beyond the current support set if needed, especially `gemv_mlp_mixed` and other larger compiled schedules.
-- Investigate the large `gemv_logits` reference mismatch now that both interpreter and compiled paths are benchmarkable and produce the same output checksum.
-- Investigate the remaining compiled-vs-interpreted `out` mismatch in `gemv_mlp_mixed` after the 1D-load hang fix.
-- Investigate why `gemv_mlp_mixed.py -b` now reports a very large final-`out` diff in both interpreted and compiled modes even though the earlier launch-style checks were much smaller.
-- Use the new `ncu` direction to target the next compiled-mode optimization beyond loop folding, now focusing on launch/setup overhead in the compiled path before chasing more generated-kernel rewrites.
-- Extend the new live-source optimizer beyond the current `const` / `live + add` / `sm_id`-affine coord rules if larger cases still carry avoidable address roots or other derived payloads.
-- If packed coord payloads stay, the next performance step is likely direct packed-coord consumption or launch-path work rather than more local dead-code pruning.
-- If split compiled launch is revisited, it likely needs lower-overhead kernel specialization or fewer extra entry points; the current “one kernel per compiled program on separate streams” experiment is slower and much larger than monolithic on `gemv_mlp_mixed`.
-- Use the latest `ncu` comparison to look for latency-hiding opportunities in `gemv_mlp_mixed`, not just instruction-count reductions: occupancy is still shared-memory-limited at one block per SM and both paths spend more than `82%` of cycles with no eligible warp.
-- Keep the new `--profile-sm-times` launcher hook available for future mixed-schedule investigations; it is now the easiest way to spot cross-SM duration skew and tiny tail programs before reaching for heavier instrumentation.
-- If a true Nsight per-SM vector becomes necessary, investigate report-file or UI-side export paths; the current `ncu` CLI flow did not emit the full 132-instance `sm__cycles_active` vector even with `--print-metric-instances`.
-- Keep the original load-side `barrier_expect_tx(...)` plus `barrier.arrive()` sequence for now; the direct `barrier_arrive_tx(...)` substitution built and ran but regressed `gemv_mlp_mixed`.
-- Extend the new nested fold matcher beyond the current one-extra-dimension case if larger schedules expose more repeated affine block structure, especially mixed cases that combine `__rep` with multiple adjacent folded runs.
-- Avoid the current alloc-table approach for now; if alloc-side dedup is revisited, it likely needs to preserve the previous zero-stack straight-line fast path rather than routing every alloc through a generic helper.
-- Keep the new inline alloc-table mode architecture; future alloc-side tuning can continue exploring table encoding and placement via `DAE_COMPILED_ALLOC_TABLE_MODE` without going back to the helper-based design.
-- Keep both placement knobs (`DAE_COMPILED_ALLOC_TABLE_MODE`, `DAE_COMPILED_LIVE_VALUE_MODE`) available; for this benchmark the current best defaults are alloc-table `global` and live-value `shared`.
-- Keep tracked workflow/knowledge docs in sync as the compiled-mode support surface or build procedure changes.
+- Investigate the remaining `gemv_mlp_mixed` output mismatch, especially the large final-`out` diff that appears in benchmark-style runs.
+- Investigate the `gemv_logits` reference mismatch now that interpreted and compiled runs share the same checksum path.
+- Extend verification beyond the current support set when new schedules or operators are added.
+- Replace broad `[[maybe_unused]]` suppression with narrower field emission once alloc/LDU/STU consumers settle.
+- Use `ncu` plus `--profile-sm-times` to decide whether the next optimization target is launch/setup overhead, latency hiding, or another codegen pass.
+- Keep workflow and runtime knowledge docs aligned with any future compiled-mode semantic changes.
 
 ## Blockers / Assumptions
 
-- The current local build flow depends on `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate` plus `DAE_ALLOW_UNSUPPORTED_COMPILER=1` before `make pyext`.
-- Compiled rebuilds are single-checkout, single-spec operations because `make pyext` rewrites shared generated includes under `build/generated/dae/`.
-- The preserved async barrier repro remains the quickest focused signal for future regressions in compiled 1D-load lowering.
-- In this tree, compiled `OP_ALLOC_TMA_LOAD_1D` should use inline PTX rather than `cuda::device::memcpy_async_tx(...)`; the latter reproduces the preserved barrier hang while the inline PTX form completes.
-- In the current compiled support set, only `OP_ALLOC_WB_RAW_ADDRESS` still needs `st_insts[slot]` metadata. Normal shared-memory slot producers do not need compiled alloc to materialize a full `MInst` in `st_insts`.
-- The current per-SM lookup strategy assumes `sm_id` is a dense hardware index with modest cardinality; for this shape on Hopper, uniform range checks / affine helpers / constant-memory table loads are preferable to large generated `switch (sm_id)` trees.
-- `app/python/tma1d.py` in its current linear form exceeds the interpreted memory-instruction budget, so repeat-form scheduling is the right apples-to-apples check for interpreted vs compiled verification.
-- The generic launcher `profile[:,0:2]` timestamps are useful for relative per-SM skew analysis, but on this workload their absolute magnitudes do not line up numerically with Nsight Compute kernel duration; treat them as comparative signals, not calibrated wall-clock replacements.
+- Rebuilds are effectively single-spec because `make pyext` rewrites shared generated includes under `build/generated/dae/`.
+- Local rebuilds depend on the conda `base` environment and `DAE_ALLOW_UNSUPPORTED_COMPILER=1`.
+- The preserved async barrier repro remains the fastest targeted check for compiled 1D-load regressions.
+- In the current support set, only `OP_ALLOC_WB_RAW_ADDRESS` still semantically requires `st_insts[slot]`.
+- The generic launcher `profile[:,0:2]` timestamps are useful for comparative per-SM skew analysis, not calibrated wall-clock timing.
 
 ## Key Files
 
 - `/home1/11362/depctg/vdcores/tools/generate_compiled_program.py`
+- `/home1/11362/depctg/vdcores/python/dae/compiled_mode.py`
+- `/home1/11362/depctg/vdcores/python/dae/launcher.py`
 - `/home1/11362/depctg/vdcores/include/dae/compiled_program.cuh`
 - `/home1/11362/depctg/vdcores/include/dae/compute_dispatch.cuh`
 - `/home1/11362/depctg/vdcores/include/dae/dae2.cuh`
-- `/home1/11362/depctg/vdcores/python/dae/compiled_mode.py`
-- `/home1/11362/depctg/vdcores/python/dae/launcher.py`
-- `/home1/11362/depctg/vdcores/Makefile`
+- `/home1/11362/depctg/vdcores/src/runtime.cu`
 
 ## Commands / Verification
 
-- `python -m py_compile tools/generate_compiled_program.py`
-- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/debug_copy_barrier_compiled_spec.json make pyext`
-- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && python tests/script/run_with_launch_timeout.py --launch-pattern "[compiled alloc]" --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python build/generated/debug_manual_copy_barrier_async.py > build/generated/debug_manual_copy_barrier_async.inline-ptx.log 2>&1`
-- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext`
-- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate && conda activate && timeout 90s python app/python/gemv_mlp_mixed.py --mode compiled -l > build/generated/gemv_mlp_mixed.inline-ptx.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --write-compiled-spec build/generated/gemv_mlp_mixed_compiled_spec.json`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20 > .agentlog/tmp/gemv_mlp_mixed_seq.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed_seq.compiled.log 2>&1`
-- `python .agentlog/tmp/tma1d_repeat_bench.py --write-compiled-spec build/generated/tma1d_repeat_compiled_spec.json`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/<case>_compiled_spec.json make pyext`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python <script> --mode interpreted -b 20`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python <script> --mode compiled -b 20`
-- `python .agentlog/tmp/compiled_support_bench.py`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_logits.py --write-compiled-spec build/generated/gemv_logits_compiled_spec.json`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_logits_compiled_spec.json make pyext`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_logits.py --mode interpreted -b 20 > .agentlog/tmp/gemv_logits.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_logits.py --mode compiled -b 20 > .agentlog/tmp/gemv_logits.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name regex:.*dae2_compiled.* --launch-count 1 python app/python/gemv_logits.py --mode compiled -l > .agentlog/ncu/gemv_logits.compiled.basic.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2.*' --launch-count 1 python app/python/gemv_logits.py --mode interpreted -l > .agentlog/ncu/gemv_logits.interpreted.basic.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 --section LaunchStats --section Occupancy --section InstructionStats --section SchedulerStats python app/python/gemv_logits.py --mode compiled -l > .agentlog/ncu/gemv_logits.compiled.instr_sched.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2\\(.*' --launch-count 1 --section LaunchStats --section Occupancy --section InstructionStats --section SchedulerStats python app/python/gemv_logits.py --mode interpreted -l > .agentlog/ncu/gemv_logits.interpreted.instr_sched.txt 2>&1`
-- `python -m py_compile tools/generate_compiled_program.py`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_logits_compiled_spec.json make pyext`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_logits.py --mode interpreted -b 20 > .agentlog/tmp/gemv_logits.loopfold.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_logits.py --mode compiled -b 20 > .agentlog/tmp/gemv_logits.loopfold.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name regex:.*dae2_compiled.* --launch-count 1 python app/python/gemv_logits.py --mode compiled -l > .agentlog/ncu/gemv_logits.compiled.basic.loopfold.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 --section LaunchStats --section Occupancy --section InstructionStats --section SchedulerStats python app/python/gemv_logits.py --mode compiled -l > .agentlog/ncu/gemv_logits.compiled.instr_sched.loopfold.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --write-compiled-spec build/generated/gemv_mlp_mixed_compiled_spec.json > .agentlog/tmp/gemv_mlp_mixed.loopfold.spec.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.loopfold.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20 > .agentlog/tmp/gemv_mlp_mixed.loopfold.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.loopfold.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2\\(.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode interpreted -l > .agentlog/ncu/gemv_mlp_mixed.interpreted.basic.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 --section LaunchStats --section Occupancy --section InstructionStats --section SchedulerStats python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.instr_sched.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2\\(.*' --launch-count 1 --section LaunchStats --section Occupancy --section InstructionStats --section SchedulerStats python app/python/gemv_mlp_mixed.py --mode interpreted -l > .agentlog/ncu/gemv_mlp_mixed.interpreted.instr_sched.txt 2>&1`
-- `python -m py_compile python/dae/launcher.py`
-- `python -m py_compile python/dae/compiled_mode.py tools/generate_compiled_program.py python/dae/launcher.py`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.finalopt.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20 > .agentlog/tmp/gemv_mlp_mixed.finalopt.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.finalopt.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.finalopt.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2\\(.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode interpreted -l > .agentlog/ncu/gemv_mlp_mixed.interpreted.basic.finalopt.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --write-compiled-spec build/generated/gemv_mlp_mixed_compiled_spec.json > .agentlog/tmp/gemv_mlp_mixed.packedcoords.spec.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.packedcoords.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20 > .agentlog/tmp/gemv_mlp_mixed.packedcoords.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.packedcoords.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.packedcoords.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.packedcoords-pruned.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.alloctable.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.alloctable.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && ncu --set basic --target-processes all --kernel-name-base demangled --kernel-name 'regex:.*dae2_compiled.*' --launch-count 1 python app/python/gemv_mlp_mixed.py --mode compiled -l > .agentlog/ncu/gemv_mlp_mixed.compiled.basic.alloctable.txt 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext > .agentlog/tmp/gemv_mlp_mixed.restore.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && for mode in disabled constant shared global; do ... DAE_COMPILED_ALLOC_TABLE_MODE=$mode ... make pyext ... python app/python/gemv_mlp_mixed.py --mode compiled -b 20 ... ncu --set basic ...; done`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode interpreted -b 20 > .agentlog/tmp/gemv_mlp_mixed.allocmode.interpreted.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && unset DAE_COMPILED_ALLOC_TABLE_MODE && export DAE_ALLOW_UNSUPPORTED_COMPILER=1 && export DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json && make pyext > .agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.compiled.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && for mode in global shared constant; do ... DAE_COMPILED_LIVE_VALUE_MODE=$mode ... make pyext ... python app/python/gemv_mlp_mixed.py --mode compiled -b 20 ... ncu --set basic ...; done`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && unset DAE_COMPILED_LIVE_VALUE_MODE && unset DAE_COMPILED_ALLOC_TABLE_MODE && export DAE_ALLOW_UNSUPPORTED_COMPILER=1 && export DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json && make pyext > .agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.build.log 2>&1`
-- `source /home1/11362/depctg/miniconda3/etc/profile.d/conda.sh && conda deactivate >/dev/null 2>&1 || true && conda activate && timeout 180s python app/python/gemv_mlp_mixed.py --mode compiled -b 20 > .agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.compiled.log 2>&1`
+- `python -m py_compile tools/generate_compiled_program.py python/dae/compiled_mode.py python/dae/launcher.py`
+- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --write-compiled-spec build/generated/gemv_mlp_mixed_compiled_spec.json`
+- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate >/dev/null 2>&1 || true && conda activate && DAE_ALLOW_UNSUPPORTED_COMPILER=1 DAE_COMPILED_SPEC_FILE=build/generated/gemv_mlp_mixed_compiled_spec.json make pyext`
+- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode compiled -l`
+- `source "$(conda info --base)/etc/profile.d/conda.sh" && conda deactivate >/dev/null 2>&1 || true && conda activate && python app/python/gemv_mlp_mixed.py --mode compiled -b 20`
 
 ## Artifacts
 
-- `/home1/11362/depctg/vdcores/build/generated/debug_manual_copy_barrier_async.py`
-- `/home1/11362/depctg/vdcores/build/generated/debug_manual_copy_barrier_async.inc`
-- `/home1/11362/depctg/vdcores/build/generated/debug_manual_copy_barrier_async.log`
-- `/home1/11362/depctg/vdcores/build/generated/tma1d_perf.inc`
-- `/home1/11362/depctg/vdcores/build/generated/test_tma1d_compiled_enabled.inc`
-- `/home1/11362/depctg/vdcores/build/generated/debug_copy_barrier_compiled_spec.json`
-- `/home1/11362/depctg/vdcores/build/generated/debug_manual_copy_barrier_async.inline-ptx.log`
-- `/home1/11362/depctg/vdcores/build/generated/gemv_mlp_mixed.inline-ptx.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_bench.spec.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_bench.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_bench.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_bench.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_seq.spec.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_seq.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_seq.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed_seq.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/tma1d_repeat_bench.py`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/bench_slotinst_opt/`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/compiled_support_bench.py`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/bench_sm_lookup_opt/`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/sm_lookup_codegen_probe.cu`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/sm_lookup_codegen_probe.ptx`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/sm_lookup_codegen_probe.cubin`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/sm_lookup_codegen_probe.sass`
-- `/home1/11362/depctg/vdcores/build/generated/gemv_logits_compiled_spec.json`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_logits.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_logits.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_logits.compiled.basic.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_logits.interpreted.basic.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_logits.compiled.instr_sched.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_logits.interpreted.instr_sched.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_logits.loopfold.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_logits.loopfold.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_logits.compiled.basic.loopfold.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_logits.compiled.instr_sched.loopfold.txt`
 - `/home1/11362/depctg/vdcores/build/generated/gemv_mlp_mixed_compiled_spec.json`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.loopfold.spec.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.loopfold.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.loopfold.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.loopfold.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.interpreted.basic.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.instr_sched.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.interpreted.instr_sched.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.smemlive.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.smemlive.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.smemlive.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.smemlive.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.cached.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.cached.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.finalopt.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.finalopt.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.finalopt.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.finalopt.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.interpreted.basic.finalopt.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords.spec.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.packedcoords.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.packedcoords-pruned.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.packedcoords-pruned.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.alloctable.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.alloctable.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.alloctable.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.restore.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.disabled.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.disabled.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.disabled.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.constant.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.constant.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.constant.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.shared.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.shared.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.shared.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.global.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.global.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.allocmode.global.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.interpreted.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.allocmode.default-global.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.global.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.global.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.livemode.global.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.shared.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.shared.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.livemode.shared.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.constant.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.constant.compiled.log`
-- `/home1/11362/depctg/vdcores/.agentlog/ncu/gemv_mlp_mixed.compiled.basic.livemode.constant.txt`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.build.log`
-- `/home1/11362/depctg/vdcores/.agentlog/tmp/gemv_mlp_mixed.livemode.default-shared.compiled.log`
+- `/home1/11362/depctg/vdcores/build/generated/dae/compiled_program.inc`
+- `/home1/11362/depctg/vdcores/build/generated/dae/compute_opcode_order.inc`
+- `/home1/11362/depctg/vdcores/build/generated/dae/dynamic_compute_handlers.inc`
+- `/home1/11362/depctg/vdcores/build/generated/debug_copy_barrier_compiled_spec.json`
 
 ## Next Step
 
-If we continue optimizing `gemv_mlp_mixed`, profile this hoist/accumulate build with `ncu` or the existing per-SM launcher timestamps to see whether the remaining small duration gap is still outside the kernel body or whether one of the repeated load regions got measurably cheaper.
+Use the current mixed-MLP build to resolve the remaining correctness mismatch first, then decide whether any further compiled-mode optimization should focus on launch/setup overhead or on another generated-memory/codegen pass.
