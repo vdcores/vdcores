@@ -15,6 +15,7 @@ from debug_utils import (
     DEBUG_STAGE_ORDER,
     bind_late_barriers_with_default,
     bind_unused_late_barriers_to_zero,
+    normalize_stage_name,
     print_barrier_counts,
     stage_enabled,
 )
@@ -122,6 +123,7 @@ def parse_args():
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
     arg_parser.add_argument("--debug-print-barriers", action="store_true")
+    arg_parser.add_argument("--debug-isolate-downproj", action="store_true")
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
         remaining_argv = [*remaining_argv, "--launch"]
@@ -154,17 +156,20 @@ if parsed_args.dry_build:
     dtype = torch.bfloat16
     model = None
 else:
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        raise EnvironmentError("HF_TOKEN must be set in the environment to load the model")
     model = AutoModelForCausalLM.from_pretrained(
         parsed_args.model_name,
         cache_dir=parsed_args.hf_cache_dir,
         dtype=torch.bfloat16,
         device_map="auto",
-        token=os.environ["HF_TOKEN"],
+        token=hf_token,
     )
     config = AutoConfig.from_pretrained(
         parsed_args.model_name,
         cache_dir=parsed_args.hf_cache_dir,
-        token=os.environ["HF_TOKEN"],
+        token=hf_token,
     )
     dtype = model.dtype
 
@@ -253,6 +258,8 @@ attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
 matInterm = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
+if parsed_args.debug_isolate_downproj:
+    matSiLUOut.uniform_(-0.5, 0.5)
 
 logits_fold = 8
 logits_slice = 8192 * logits_fold
@@ -303,8 +310,10 @@ TileM, _, TileK = Gemv_M64N8.MNK
 defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", TileM, N, tma_load_tbl, cord_load_tbl))
 
 layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadRMSLayerB2", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8B2.n_batch, Major.K))
 layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadSiluLayerB2", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8B2.n_batch, Major.K))
 layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
 layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
@@ -346,6 +355,7 @@ dae.build_groups()
 
 
 def schedule_single_token(token_offset: int, token_pos: int):
+    isolate_downproj = parsed_args.debug_isolate_downproj
     need_token_restore = (len(input_token_id_and_pos) + num_generates) > 1
     loadEmbed1D = TmaLoad1D(matEmbed, bytes=HIDDEN * 2)
     storeHidden1D = TmaStore1D(matHidden, bytes=HIDDEN * 2)
@@ -368,6 +378,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ),
         before_copy=CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
     )
+    if isolate_downproj:
+        embed_rms = None
+        copy_hidden = None
 
     clear_size = INTERMIDIATE - 6144
     clear_interm = SchedCopy(
@@ -397,6 +410,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
         hidden_size=HIDDEN,
         tmas=(layerg["loadRMSPostAttnW"].cord(0), loadHidden1D, storeRMSHidden1D),
     ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
+    if isolate_downproj:
+        post_attn_rms = None
 
     regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
     regLoadQ = RegLoad(0)
@@ -459,64 +474,45 @@ def schedule_single_token(token_offset: int, token_pos: int):
     regStoreGate = RegStore(regGate, matGateOut[:, 0:TileM])
     regStoreUp = RegStore(regUp, matInterm[:, 0:TileM])
 
-    gate_proj_low = SchedGemv(
-        Gemv_M64N8,
-        MNK=(4096, N, HIDDEN),
-        tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    gate_proj_high = SchedGemv(
-        Gemv_M64N8,
-        MNK=((4096, 2048), N, HIDDEN),
-        tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["reduceGateOut"]),
-    ).bar("store", layerg["bar_silu_in"])
-    up_proj_low = SchedGemv(
-        Gemv_M64N8,
-        MNK=(4096, N, HIDDEN),
-        tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    up_proj_high = SchedGemv(
-        Gemv_M64N8,
-        MNK=((4096, 2048), N, HIDDEN),
-        tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["reduceInterm"]),
-    ).bar("store", layerg["bar_silu_in"])
+    gate_proj_low = None
+    gate_proj_high = None
+    up_proj_low = None
+    up_proj_high = None
 
     mlp_split = 6144
     mlp_tail = INTERMIDIATE - mlp_split
-    silu1 = SchedSmemSiLUInterleaved(
-        num_token=N,
-        gate_glob=matGateOut[:, :mlp_split],
-        up_glob=matInterm[:, :mlp_split],
-        out_glob=matSiLUOut[:, :mlp_split],
-    ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
+    silu1 = None
     gate_proj_fused = SchedGemv(
-        Gemv_M64N8,
-        MNK=((mlp_split, mlp_tail), N, HIDDEN),
-        tmas=(layerg["loadGate"], layerg["loadRMSLayer"], regStoreGate),
-    )
+        Gemv_M64N8B2,
+        MNK=(INTERMIDIATE, N, HIDDEN),
+        tmas=(layerg["loadGate"], layerg["loadRMSLayerB2"], regStoreGate),
+    ).bar("load", layerg["bar_post_attn_rms"])
     up_proj_fused = SchedGemv(
-        Gemv_M64N8,
-        MNK=((mlp_split, mlp_tail), N, HIDDEN),
-        tmas=(layerg["loadUp"], layerg["loadRMSLayer"], regStoreUp),
-    )
+        Gemv_M64N8B2,
+        MNK=(INTERMIDIATE, N, HIDDEN),
+        tmas=(layerg["loadUp"], layerg["loadRMSLayerB2"], regStoreUp),
+    ).bar("load", layerg["bar_post_attn_rms"])
     silu_fused = SchedRegSiLUFused(
         num_token=N,
         store_tma=layerg["storeSiluLayer"],
         reg_gate=regGate,
         reg_up=regUp,
-        base_offset=mlp_split,
+        base_offset=0,
         stride=TileM,
     ).bar("output", layerg["bar_silu_out2"])
     down_proj_low = SchedGemv(
-        Gemv_M64N8,
-        MNK=(HIDDEN, N, 6144),
-        tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
+        Gemv_M64N8B2,
+        MNK=(HIDDEN, N, INTERMIDIATE),
+        tmas=(layerg["loadDown"], layerg["loadSiluLayerB2"], layerg["reduceHiddenLayer"]),
     )
-    down_proj_high = SchedGemv(
-        Gemv_M64N8,
-        MNK=(HIDDEN, N, (mlp_split, mlp_tail)),
-        tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
-    down_proj_low.bar("load", layerg["bar_silu_out1"])
+    if not isolate_downproj:
+        down_proj_low.bar("load", layerg["bar_silu_out2"])
+    down_proj_low.bar("store", layerg["bar_layer"])
+    down_proj_high = None
+    if isolate_downproj:
+        gate_proj_fused = None
+        up_proj_fused = None
+        silu_fused = None
 
     LogitsProj = []
     for i in range(logits_epoch):
@@ -549,12 +545,15 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=wrap_static(TmaLoad1D(dae.bars_src[sstart:send]), TmaStore1D(dae.bars[sstart:send]))
     )
 
-    embed_rms = embed_rms.place(rms_sms)
-    copy_hidden = copy_hidden.place(N, base_sm=64)
+    if embed_rms is not None:
+        embed_rms = embed_rms.place(rms_sms)
+    if copy_hidden is not None:
+        copy_hidden = copy_hidden.place(N, base_sm=64)
     clear_interm = clear_interm.place(1, base_sm=128)
     clear_gateout = clear_gateout.place(1, base_sm=129)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
-    post_attn_rms = post_attn_rms.place(rms_sms)
+    if post_attn_rms is not None:
+        post_attn_rms = post_attn_rms.place(rms_sms)
     QProj = QProj.place(64)
     QRope = QRope.place(64)
     KProj = KProj.place(16, base_sm=64)
@@ -562,22 +561,19 @@ def schedule_single_token(token_offset: int, token_pos: int):
     VProj = VProj.place(16, base_sm=80)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
     OutProj = OutProj.place(64)
-    gate_proj_low = gate_proj_low.place(64)
-    gate_proj_high = gate_proj_high.place(64)
-    up_proj_low = up_proj_low.place(64, base_sm=64)
-    up_proj_high = up_proj_high.place(64, base_sm=64)
-    silu1 = silu1.place(4, base_sm=128)
-    gate_proj_fused = gate_proj_fused.place(32)
-    up_proj_fused = up_proj_fused.place(32)
-    silu_fused = silu_fused.place(32)
-    down_proj_low = down_proj_low.place(96)
-    down_proj_high = down_proj_high.place(64)
+    if gate_proj_fused is not None:
+        gate_proj_fused = gate_proj_fused.place(128)
+    if up_proj_fused is not None:
+        up_proj_fused = up_proj_fused.place(128)
+    if silu_fused is not None:
+        silu_fused = silu_fused.place(128)
+    down_proj_low = down_proj_low.place(128)
     Argmax = Argmax.place(128)
     restore_bars_low = restore_bars_low.place(1, base_sm=128)
     restore_bars_high = restore_bars_high.place(1, base_sm=128)
 
     stage_items = [
-        ("embed", [clear_interm, clear_gateout]),
+        ("embed", [embed_rms, copy_hidden, clear_interm, clear_gateout]),
         ("q_proj", [QProj]),
         ("q_rope", [QRope]),
         ("k_proj", [KProj]),
@@ -586,80 +582,75 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ("attn", [Gqa]),
         ("out", [OutProj]),
         ("post_attn_rms", [post_attn_rms]),
-        ("gate_low", [gate_proj_low]),
-        ("gate_high", [gate_proj_high]),
-        ("up_low", [up_proj_low]),
-        ("up_high", [up_proj_high]),
-        ("silu_split", [silu1]),
         ("gate_fused", [gate_proj_fused]),
         ("up_fused", [up_proj_fused]),
         ("silu_fused", [silu_fused]),
         ("down_low", [down_proj_low]),
-        ("down_high", [down_proj_high]),
         ("final_rms", [pre_attn_rms]),
         ("logits", [LogitsProj]),
         ("argmax", [Argmax]),
-        ("restore", [restore_bars_low] if need_token_restore else []),
+        ("restore", ([restore_bars_low, restore_bars_high] if need_token_restore else [])),
     ]
 
+    stage_items = [
+        (stage_name, [item for item in items if item is not None])
+        for stage_name, items in stage_items
+    ]
+
+    if isolate_downproj:
+        isolated_stages = {
+            "embed",
+            "q_proj",
+            "q_rope",
+            "k_proj",
+            "k_rope",
+            "v_proj",
+            "attn",
+            "out",
+            "post_attn_rms",
+            "gate_fused",
+            "up_fused",
+            "silu_fused",
+            "final_rms",
+            "logits",
+            "argmax",
+            "restore",
+        }
+        stage_items = [
+            (stage_name, [] if stage_name in isolated_stages else items)
+            for stage_name, items in stage_items
+        ]
+
+    active_stage_names = {
+        normalize_stage_name(stage_name)
+        for stage_name, _ in stage_items
+        if stage_enabled(parsed_args.debug_stop_after, stage_name)
+    }
     active_stage_items = []
     for stage_name, items in stage_items:
         if stage_enabled(parsed_args.debug_stop_after, stage_name):
             active_stage_items.extend(items)
 
-    bound_items = [
-        embed_rms,
-        copy_hidden,
-        restore_bars_high,
-        *active_stage_items,
-    ]
+    bound_items = [*active_stage_items]
 
-    if parsed_args.debug_stop_after != "full":
-        bind_late_barriers_with_default(dae, *bound_items, unresolved_count=0)
-        bind_unused_late_barriers_to_zero(dae)
-    else:
-        dae.bind_late_barrier_counts(
-            *bound_items,
-        )
+    bind_late_barriers_with_default(dae, *bound_items, unresolved_count=0)
+    bind_unused_late_barriers_to_zero(dae)
     if parsed_args.debug_print_barriers:
         print_barrier_counts(dae)
 
     if parsed_args.dry_build:
         return
 
-    dae.i(embed_rms, copy_hidden, restore_bars_high)
     dae.i(
-        *([clear_interm, clear_gateout] if stage_enabled(parsed_args.debug_stop_after, "embed") else []),
-        *([QProj] if stage_enabled(parsed_args.debug_stop_after, "q_proj") else []),
-        *([QRope] if stage_enabled(parsed_args.debug_stop_after, "q_rope") else []),
-        *([KProj] if stage_enabled(parsed_args.debug_stop_after, "k_proj") else []),
-        *([KRope] if stage_enabled(parsed_args.debug_stop_after, "k_rope") else []),
-        *([VProj] if stage_enabled(parsed_args.debug_stop_after, "v_proj") else []),
-        *([Gqa] if stage_enabled(parsed_args.debug_stop_after, "attn") else []),
-        *([OutProj] if stage_enabled(parsed_args.debug_stop_after, "out") else []),
-        *([post_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "post_attn_rms") else []),
-        *([gate_proj_low] if stage_enabled(parsed_args.debug_stop_after, "gate_low") else []),
-        *([gate_proj_high] if stage_enabled(parsed_args.debug_stop_after, "gate_high") else []),
-        *([up_proj_low] if stage_enabled(parsed_args.debug_stop_after, "up_low") else []),
-        *([up_proj_high] if stage_enabled(parsed_args.debug_stop_after, "up_high") else []),
-        *([silu1] if stage_enabled(parsed_args.debug_stop_after, "silu_split") else []),
-        *([gate_proj_fused] if stage_enabled(parsed_args.debug_stop_after, "gate_fused") else []),
-        *([up_proj_fused] if stage_enabled(parsed_args.debug_stop_after, "up_fused") else []),
-        *([silu_fused] if stage_enabled(parsed_args.debug_stop_after, "silu_fused") else []),
-        *([down_proj_low] if stage_enabled(parsed_args.debug_stop_after, "down_low") else []),
-        *([down_proj_high] if stage_enabled(parsed_args.debug_stop_after, "down_high") else []),
-        *([pre_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "final_rms") else []),
+        *active_stage_items,
         *(
             [
                 LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
                 LoopC.toNext(dae.copy_cptrs(), num_layers),
             ]
-            if stage_enabled(parsed_args.debug_stop_after, "final_rms")
+            if "final_rms" in active_stage_names
             else []
         ),
-        *([LogitsProj] if stage_enabled(parsed_args.debug_stop_after, "logits") else []),
-        *([Argmax] if stage_enabled(parsed_args.debug_stop_after, "argmax") else []),
-        *([restore_bars_low] if stage_enabled(parsed_args.debug_stop_after, "restore") and need_token_restore else []),
     )
 
 

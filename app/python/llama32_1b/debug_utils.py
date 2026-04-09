@@ -1,4 +1,4 @@
-DEBUG_STAGE_ORDER = (
+CANONICAL_DEBUG_STAGE_ORDER = (
     "embed",
     "q_proj",
     "q_rope",
@@ -8,27 +8,43 @@ DEBUG_STAGE_ORDER = (
     "attn",
     "out",
     "post_attn_rms",
-    "gate_low",
-    "gate_high",
-    "up_low",
-    "up_high",
-    "silu_split",
     "gate_fused",
     "up_fused",
     "silu_fused",
     "down_low",
-    "down_high",
     "final_rms",
     "logits",
     "argmax",
     "restore",
+)
+
+LEGACY_DEBUG_STAGE_ALIASES = {
+    "gate_low": "post_attn_rms",
+    "gate_high": "post_attn_rms",
+    "up_low": "post_attn_rms",
+    "up_high": "post_attn_rms",
+    "silu_split": "post_attn_rms",
+    "down_high": "down_low",
+}
+
+DEBUG_STAGE_ORDER = CANONICAL_DEBUG_STAGE_ORDER + tuple(LEGACY_DEBUG_STAGE_ALIASES) + (
     "full",
 )
 
 
+def normalize_stage_name(stage_name: str) -> str:
+    if stage_name == "full":
+        return stage_name
+    return LEGACY_DEBUG_STAGE_ALIASES.get(stage_name, stage_name)
+
+
 def stage_enabled(stop_after: str, stage_name: str) -> bool:
-    requested_idx = DEBUG_STAGE_ORDER.index(stop_after)
-    stage_idx = DEBUG_STAGE_ORDER.index(stage_name)
+    normalized_stop = normalize_stage_name(stop_after)
+    normalized_stage = normalize_stage_name(stage_name)
+    if normalized_stop == "full":
+        return True
+    requested_idx = CANONICAL_DEBUG_STAGE_ORDER.index(normalized_stop)
+    stage_idx = CANONICAL_DEBUG_STAGE_ORDER.index(normalized_stage)
     return stage_idx <= requested_idx
 
 

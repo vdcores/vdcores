@@ -48,6 +48,36 @@
 - Process hygiene matters for this app. Before collecting timings, clear leftover decode jobs with `killall python || true`; stale Python workers can make the benchmark look dramatically worse than the clean baseline.
 - The timeout wrapper is useful for separating deadlocks from slow schedules:
   `python tests/script/run_with_launch_timeout.py --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python app/python/llama32_1b/sched.py ...`
+- The most reliable one-layer timing method on the 1B path is still prefix subtraction with fresh processes:
+  - run `--debug-num-layers 1`
+  - benchmark `--debug-stop-after <stage>` in a fresh process
+  - subtract adjacent cumulative prefixes
+  - prefer medians over means when a stage occasionally spikes
+- For end-to-end stage comparisons against an external baseline, remember that the current 1B path is still built around `Gemv_M64N8`-style `N=8` WGMMA GEMV tiles, so comparisons against a true batch-1 matvec-style latency path are not apples-to-apples for `o_proj` and `down_proj`.
+- In the current branch, the most important runtime-geometry lesson is that `SchedGemv` legality depends on atom granularity:
+  - `Gemv_M64N8` requires `k_per_fold` to be a multiple of `256 * 4 = 1024`
+  - `Gemv_M64N8B2` lowers that to `256 * 2 = 512`
+  - this is why full `128`-SM one-wave down projection was illegal with `Gemv_M64N8` but legal with `Gemv_M64N8B2`
+- The current best down-proj experiment on the 1B path is:
+  - collapse split down projection into one full `MNK=(HIDDEN, N, INTERMIDIATE)` GEMV
+  - use `Gemv_M64N8B2`
+  - place it on `128` SM
+  - wait for full SiLU output on `bar_silu_out2`
+  - keep the completion signal on `bar_layer`
+- Measured down-proj variants on 2026-04-09:
+  - original split path (`down_low + down_high`): about `13.578 us`
+  - full single-stage `Gemv_M64N8B2`: about `12.288 us`
+  - full single-stage `Gemv_M64N8B2` without the load-side barrier: about `12.128 us`
+  - full single-stage `Gemv_M64N8K64`: about `34.784 us`
+- The load-side barrier on the full `Gemv_M64N8B2` down projection contributed only about `0.16 us`, so the down-proj bottleneck there is the actual GEMV work, not synchronization.
+- `Gemv_M64N8K64` was a useful negative result: deeper per-SM pipelining did not help this full down projection and instead made it much slower than both the split path and the `B2` path.
+- After collapsing down projection into one full stage, `debug_utils.py` still keeps the old `down_low` / `down_high` names. In that experimental shape:
+  - `down_low` means the real full down projection
+  - `down_high` is effectively an empty checkpoint and should be treated as subtraction noise
+- The biggest remaining latency gap versus the Megakernels baseline is likely in `upgate_silu`, not down projection:
+  - Megakernels fuses RMS + up matvec + gate matvec + SiLU + writeback in one latency op
+  - the current 1B path still separates `post_attn_rms`, gate/up GEMVs, intermediate global writes, and two different SiLU stages
+  - this path is therefore much more fragmented and likely pays extra global-memory traffic and barrier overhead
 - On 2026-03-21, clean sequential benchmark measurements from the current branch were:
   - `N=1`: about `1.22 ms`
   - `N=2`: about `6.42 ms` total, `3.21 ms/token`

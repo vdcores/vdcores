@@ -44,6 +44,26 @@ This note summarizes the stable structure confirmed during repository initializa
 - The repository currently includes built extension artifacts under `python/dae/`.
 - Full runtime verification may require Hopper-class CUDA hardware.
 - For Python-only edits, start with light checks such as `python -m py_compile`.
+- The main runtime interaction pattern for app schedules is:
+  - define persistent tensors and reusable `ResourceGroup` entries first (`addBarrier`, `addTma`)
+  - call `dae.build_groups()` before placing schedules
+  - construct schedule objects with bars attached to logical roles like `"load"` / `"store"`
+  - call `place(num_sms, base_sm=...)` only after the schedule shape is finalized
+  - bind late barriers after placement, because release counts depend on placement and fold
+  - submit schedules with `dae.i(...)`, then terminate with `dae.s()`
+- `SchedGemv` is the most important runtime contract to understand for performance work:
+  - placement chooses both output-tile coverage and split-K folding
+  - with `M / TileM` output tiles and `num_sms` placed SMs, `fold = num_sms / (M / TileM)`
+  - each SM gets one output tile and one `K` fold
+  - if `fold > 1`, the output TMA must be a reduction store
+  - legality depends on `k_per_fold` being a multiple of `TileK * Atom.n_batch`
+- `RepeatM.onSync(...)` is the standard memory-side pattern for WGMMA GEMV schedules:
+  - the first repeated load can carry the `"load"` barrier
+  - the repeated steps advance TMA coordinates across `K`
+  - the final store carries the `"store"` barrier
+- For schedule experiments, keep the Python-side structure and the low-level atom constraints in sync:
+  - changing from `Gemv_M64N8` to `Gemv_M64N8B2` or `Gemv_M64N8K64` changes the legal fold choices because `TileK * n_batch` changes
+  - any TMA used by that GEMV must match the atom tile shape, not just the tensor
 - `app/python/llama3/sched.py` now includes a `--correctness` mode for a single-token, single-decoding-step validation against `app/python/llama3/reference.py`.
 - `python/dae/schedule.py` now treats SM-count placement as a post-construction concern across the main scheduler classes, including `SchedArgmax`.
 - `python/dae/launcher.py` and `app/python/llama3/sched.py` now support late-bound barrier counts: barrier ids are still built early, and the llama path now binds selected placement-dependent layer/system barriers from a generic scan of the placed schedule bundle's barrier-releasing memory instructions rather than from a handwritten per-bar table.
