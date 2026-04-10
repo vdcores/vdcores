@@ -45,6 +45,23 @@
 
 ## Performance Debugging Notes
 
+- For attention-only comparisons on `app/python/llama32_1b/sched.py`, the cleanest metric is the prefix delta `attn - v_proj`, not the raw `attn` prefix. `attn` still includes `QProj`, `QRope`, `KProj`, `KRope`, and `VProj`.
+- On 2026-04-10, with `-N 1 --debug-num-layers 1` and the current grouped-query decode path:
+  - `--debug-stop-after v_proj -b 10`: about `11.59 us`
+  - `--debug-stop-after attn -b 10`: about `19.80 us`
+  - the pure GQA decode delta was therefore about `8.20 us`
+- The 1B grouped-query decode kernel is still structurally mismatched to the workload:
+  - `matO_attn_view` is shaped `[N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM]`
+  - for Llama 3.2 1B, `HEAD_GROUP_SIZE = 4` and `HEAD_DIM = 64`
+  - but `SchedAttentionDecoding` still dispatches the standard `M64N64K16` decode attention kernel
+  - `tma_gqa_load_q()` in `python/dae/model.py` explicitly duplicates the 4 active Q rows to fill a 64-row tile
+  - so the decode path is still paying for a 64-row Q tile even though only 4 rows are logically live
+- A first attempt at a dedicated small-Q decode opcode on 2026-04-10 confirmed the likely optimization direction but was not stable enough to keep:
+  - the idea was a warp-per-query-row online-softmax kernel for the `head_dim=64`, `num_active_q=4`, `KVBlockSize=64` path
+  - after integrating it as a new compute opcode, the monolithic `dae2` launcher became unstable even on earlier prefixes
+  - the experimental opcode was reverted, so the current tree is back on the original attention-decode kernel
+- Durable takeaway: the next serious attention optimization should still target a dedicated small-Q decode path, but it needs a safer integration strategy than simply dropping a new opcode into the current monolithic kernel.
+
 - Process hygiene matters for this app. Before collecting timings, clear leftover decode jobs with `killall python || true`; stale Python workers can make the benchmark look dramatically worse than the clean baseline.
 - The timeout wrapper is useful for separating deadlocks from slow schedules:
   `python tests/script/run_with_launch_timeout.py --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python app/python/llama32_1b/sched.py ...`

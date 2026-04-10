@@ -462,7 +462,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
-    ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
+    ).bar("o", layerg["bar_attn_out"])
+    # .bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"])
 
     OutProj = SchedGemv(
         Gemv_M64N8,

@@ -32,6 +32,12 @@ class Schedule:
     def _bar(self, role: str):
         return self._bars.get(role)
 
+    def _resolve_bar(self, role: str, *args):
+        bar = self._bar(role)
+        if callable(bar):
+            return bar(*args)
+        return bar
+
     def _require_placed(self):
         if self.num_sms is None:
             raise ValueError(f"{self.__class__.__name__} must be placed before querying barrier release counts")
@@ -48,6 +54,8 @@ class Schedule:
     def collect_barrier_release_counts(self):
         counts = {}
         for role, bar_id in self._bars.items():
+            if callable(bar_id):
+                continue
             count = self.bar_release_count(role)
             if count <= 0:
                 continue
@@ -233,13 +241,14 @@ class SchedRope(Schedule):
         if sm < 0:
             return []
         table, load, store = [tma.cord(sm) for tma in self.tmas]
+        store_bar = self._resolve_bar("store", sm)
 
         return [
             self.Atom(),
 
             table,
             load,
-            store.bar(self._bar("store")).group(),
+            store.bar(store_bar).group(),
         ]
 
     def bar_release_count(self, role: str):
@@ -256,7 +265,7 @@ class SchedAttentionDecoding(Schedule):
                  side_input=None,
                  k_store=None,
                  token_pos=None,
-                 num_active_q=64):
+                 num_active_q=None):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -266,13 +275,18 @@ class SchedAttentionDecoding(Schedule):
         self.side_input = side_input
         self.k_store = k_store
         self.token_pos = token_pos
+        if num_active_q is None:
+            if matO.dim() >= 4:
+                num_active_q = matO.shape[-2]
+            else:
+                num_active_q = 1
         self.num_active_q = num_active_q
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
-        self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
         self.use_qwen_fused_qk = side_input is not None
         if self.use_qwen_fused_qk and not all(side is not None for side in (side_input, k_store, token_pos)):
             raise ValueError("SchedAttentionDecoding requires side_input, k_store, and token_pos together for the fused Qwen path")
+        self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
@@ -284,6 +298,9 @@ class SchedAttentionDecoding(Schedule):
         req = sm // self.num_heads
         head = sm % self.num_heads
         head_dim = self.matO.shape[-1]
+        q_bar = self._resolve_bar("q", sm, req, head)
+        k_bar = self._resolve_bar("k", sm, req, head)
+        o_bar = self._resolve_bar("o", sm, req, head)
 
         tQ, tK, tV = self.tmas
 
@@ -308,7 +325,7 @@ class SchedAttentionDecoding(Schedule):
                 self.k_store[req].cord((self.token_pos * self.num_heads + head) * head_dim).group(),
             ]
         insts += [
-            tQ.cord(req, head).bar(self._bar("q")).group(),
+            tQ.cord(req, head).bar(q_bar).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
                 [tK.cord(req, 0, head, 0).group(), tK.cord2tma(0, self.block_size, 0, 0)],
@@ -316,10 +333,10 @@ class SchedAttentionDecoding(Schedule):
             ),
             # TODO(zhiyuang): reuse the accumulator register
             # only the last block has new generated KV cache
-            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group(),
+            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(k_bar).group(),
             tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group(),
         ]
-        insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
+        insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(o_bar).group())
         return insts
 
     def bar_release_count(self, role: str):
@@ -506,13 +523,15 @@ class SchedGemv(Schedule):
         # TODO(zhiyuang): more detailed group control
         load_group = self.group and (self._bar("load") is not None)
         store_group = self.group and (self._bar("store") is not None)
+        load_bar = self._resolve_bar("load", sm, m, k)
+        store_bar = self._resolve_bar("store", sm, m, k)
 
         storeC_cord = storeC.cord(0, m)
 
         insts = [
             self.Atom(self.k_per_fold // TileK),
 
-            RepeatM.onSync(0, self._bar("load"), n_repeat,
+            RepeatM.onSync(0, load_bar, n_repeat,
                 (loadB.cord(0, k).group(load_group), loadB.cord2tma(0, TileK * n_batch)),
                 *[
                     (loadA.cord(m, k + TileK * i).group(load_group), loadA.cord2tma(0, TileK * n_batch))
@@ -521,7 +540,7 @@ class SchedGemv(Schedule):
                 asyncPort=self.prefetch,
             ),
 
-            storeC_cord.bar(self._bar("store")).group(store_group),
+            storeC_cord.bar(store_bar).group(store_group),
         ]
         return insts
     
