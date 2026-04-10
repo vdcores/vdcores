@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cfloat>
 #include <cmath>
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>

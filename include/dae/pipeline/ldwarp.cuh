@@ -6,7 +6,9 @@ template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     const MInst *st_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    uint64_t *g_events, int sm_id, int debug_wait_bar_id, int debug_skip_load_bar_id,
+    int debug_barrier_poll_sleep_cycles) {
 
   __ldprint("[LD Warp] Start LD warp execution");
 
@@ -29,17 +31,27 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     // TODO(zhiyuang): wait bar here if bar is set
     if ((opcode & MEM_OP_FLAGS_BARRIER) && !(opcode & MEM_OP_FLAGS_WRITEBACK)) {
       volatile int *bar = bars + inst.bar();
+      uint64_t wait_start = cuda::ptx::get_sreg_globaltimer();
       // bool first_wait = true;
       // if (blockIdx.x == 0 && first_wait) {
       //   printf("[LD][sm=%d] check bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
       // }
       while (*bar != 0) {
         // busy wait
-        __nanosleep(barrierPollSleepCycles);
+        __nanosleep(debug_barrier_poll_sleep_cycles);
         // if (blockIdx.x == 0 && first_wait) {
         //   printf("[LD][sm=%d] waiting bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
         //   first_wait = false;
         // }
+      }
+      uint64_t wait_end = cuda::ptx::get_sreg_globaltimer();
+      uint64_t wait_cycles = wait_end - wait_start;
+      int event_base = sm_id * numProfileEvents;
+      atomicAdd(reinterpret_cast<unsigned long long *>(&g_events[event_base + 2]), static_cast<unsigned long long>(wait_cycles));
+      atomicAdd(reinterpret_cast<unsigned long long *>(&g_events[event_base + 3]), 1ULL);
+      if (debug_wait_bar_id >= 0 && inst.bar() == debug_wait_bar_id) {
+        atomicAdd(reinterpret_cast<unsigned long long *>(&g_events[event_base + 4]), static_cast<unsigned long long>(wait_cycles));
+        atomicAdd(reinterpret_cast<unsigned long long *>(&g_events[event_base + 5]), 1ULL);
       }
       __ldprint("wait for global barrier before load: bar=%d", inst.bar());
     };
@@ -47,6 +59,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     // TODO(zhiyuang): change location?
     switch(op(opcode)) {
       case op(OP_ALLOC_TMA_LOAD_1D): {
+        if (debug_skip_load_bar_id >= 0 && inst.bar() == debug_skip_load_bar_id) {
+          __ldprint("Skip matched TMA 1D load at bar=%d", inst.bar());
+          break;
+        }
         __ldprint("TMA 1D Load: size=%d", inst.size);
         // We need to get a slot ID first, as we will use its barrier
         cuda::device::memcpy_async_tx(
@@ -61,6 +77,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_TENSOR_1D): {
+        if (debug_skip_load_bar_id >= 0 && inst.bar() == debug_skip_load_bar_id) {
+          __ldprint("Skip matched TMA tensor 1D load at bar=%d", inst.bar());
+          break;
+        }
         __ldprint("TMA Tensor 1D Load: size=%d", inst.size);
         asm volatile(
           "cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes"
@@ -79,6 +99,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_2D): {
+        if (debug_skip_load_bar_id >= 0 && inst.bar() == debug_skip_load_bar_id) {
+          __ldprint("Skip matched TMA 2D load at bar=%d", inst.bar());
+          break;
+        }
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 2D Load: desc_idx=%d size=%d cord=(%d,%d)", inst.arg, inst.size, cord[0], cord[1]);
         asm volatile(
@@ -99,6 +123,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_3D): {
+        if (debug_skip_load_bar_id >= 0 && inst.bar() == debug_skip_load_bar_id) {
+          __ldprint("Skip matched TMA 3D load at bar=%d", inst.bar());
+          break;
+        }
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 3D Load: desc_idx=%d size=%d cord=(%d,%d,%d)", inst.arg, inst.size, cord[0], cord[1], cord[2]);
         asm volatile(
@@ -120,6 +148,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_4D): {
+        if (debug_skip_load_bar_id >= 0 && inst.bar() == debug_skip_load_bar_id) {
+          __ldprint("Skip matched TMA 4D load at bar=%d", inst.bar());
+          break;
+        }
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 4D Load: desc_idx=%d size=%d cord=(%d,%d,%d,%d)",
           inst.arg, inst.size, cord[0], cord[1], cord[2], cord[3]);
@@ -143,6 +175,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_5D_FIX0): {
+        if (debug_skip_load_bar_id >= 0 && inst.bar() == debug_skip_load_bar_id) {
+          __ldprint("Skip matched TMA 5D load at bar=%d", inst.bar());
+          break;
+        }
         const uint16_t *cord = inst.coords;
         // hardcode first coord to be 0
         __ldprint("TMA 5D Load: desc_idx=%d size=%d cord=(0,%d,%d,%d,%d)",

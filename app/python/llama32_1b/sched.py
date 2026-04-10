@@ -468,7 +468,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gemv_M64N8,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    ).bar("store", layerg["bar_out_mlp"]).bar("load", layerg["bar_attn_out"])
+    # 
 
     regGate, regUp = 0, 1
     regStoreGate = RegStore(regGate, matGateOut[:, 0:TileM])

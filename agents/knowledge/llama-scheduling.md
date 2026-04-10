@@ -70,6 +70,28 @@
   - full single-stage `Gemv_M64N8B2` without the load-side barrier: about `12.128 us`
   - full single-stage `Gemv_M64N8K64`: about `34.784 us`
 - The load-side barrier on the full `Gemv_M64N8B2` down projection contributed only about `0.16 us`, so the down-proj bottleneck there is the actual GEMV work, not synchronization.
+- On 2026-04-09, the isolated `OutProj` load barrier on the 1B path was much more expensive:
+  - `--debug-stop-after attn`: about `22.9-23.6 us`
+  - `--debug-stop-after out` with `OutProj` load barrier disabled: about `29.3-30.1 us`
+  - `--debug-stop-after out` with `OutProj.bar("load", layerg["bar_attn_out"])`: about `31.9 us`
+  - the load-side barrier therefore added about `2.6-2.8 us`
+- `layer.bar_attn_out` is still bound to `64` even when the `OutProj` load barrier is disabled, because attention output stores still release it. The extra `OutProj` cost is therefore consumer-side waiting on the barrier, not newly introduced producer-side barrier arrivals.
+- Per-SM whole-kernel durations for SM `0..63` stayed fairly tight in both cases, so the current best hypothesis is not severe producer imbalance. The more likely issue is the runtime's global barrier wait path itself:
+  - producer stores decrement one shared global counter
+  - `OutProj` load warps poll that same counter until it reaches zero
+  - the polling/wakeup behavior appears to cost multiple microseconds on this path
+- Later on 2026-04-09, direct instrumentation of the load-warp wait path confirmed that hypothesis:
+  - with the `OutProj` load barrier disabled, filtered wait cycles for `layer.bar_attn_out` were exactly zero
+  - with `OutProj.bar("load", layerg["bar_attn_out"])` enabled, each of the `64` `OutProj` SMs incurred one matched wait on that barrier
+  - the matched wait averaged about `15.98 us` per SM, with a max of about `16.13 us`
+  - the kernel wall-time delta remained smaller than that because the wait overlaps with other work, but the barrier is still causing a substantial real stall on every participating SM
+- A follow-up experiment skipped the actual matched `bar_attn_out` load after waiting but still handed a slot to compute. That did not make the barrier-enabled `OutProj` path faster, which points away from the `attnO` TMA load itself and toward the synchronization path as the real source of the latency penalty.
+- Another follow-up made the load-barrier polling backoff runtime-configurable. On the barrier-enabled `OutProj` path:
+  - polling sleep `0` cycles was best at about `28.7 us`
+  - polling sleep `16` cycles was about `30.0 us`
+  - polling sleep `64` cycles was about `31.4 us`
+  - polling sleep `256` cycles was about `30.5 us`
+- The runtime therefore now defaults the new load-barrier polling knob to `0` cycles. On this path, the old `__nanosleep(16)` backoff was itself contributing around `1+ us` of additional latency.
 - `Gemv_M64N8K64` was a useful negative result: deeper per-SM pipelining did not help this full down projection and instead made it much slower than both the split path and the `B2` path.
 - After collapsing down projection into one full stage, `debug_utils.py` still keeps the old `down_low` / `down_high` names. In that experimental shape:
   - `down_low` means the real full down projection

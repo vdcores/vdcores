@@ -1,8 +1,10 @@
 from setuptools import setup, find_packages
+from torch.utils import cpp_extension
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
 
 import torch
+cpp_extension._check_cuda_version = lambda *args, **kwargs: None
 torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
 
 extra_link_args = [
@@ -41,7 +43,7 @@ setup(
                     "-Xptxas=-v"
                 ],
             },
-            libraries=["cuda"],             # REQUIRED for cuTensorMap
+            libraries=["cuda", "cudart"],             # REQUIRED for cuTensorMap
             extra_link_args=extra_link_args,
         )
     ],

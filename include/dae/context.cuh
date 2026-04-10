@@ -37,6 +37,7 @@ static constexpr int numThreadsLDBarrier = 2;
 // Polling backoff for the memory core hot loops.
 static constexpr int allocRetrySleepCycles = 16;
 static constexpr int barrierPollSleepCycles = 16;
+static constexpr int defaultDebugBarrierPollSleepCycles = 16;
 
 // Allocwarp instruction prefetch policy.
 static constexpr int allocwarpInstructionPrefetchDistance = 2;

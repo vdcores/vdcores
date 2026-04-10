@@ -242,6 +242,9 @@ class Launcher:
 
         self._cache_window_override = None
         self._cache_window_requests = []
+        self.debug_wait_bar_id = -1
+        self.debug_skip_load_bar_id = -1
+        self.debug_barrier_poll_sleep_cycles = getattr(config, "default_debug_barrier_poll_sleep_cycles", 16)
 
         runtime.set_smem_size(self.smem_size)
 
@@ -525,7 +528,10 @@ class Launcher:
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
             self.bars, profile,
-            stream
+            stream,
+            self.debug_wait_bar_id,
+            self.debug_skip_load_bar_id,
+            self.debug_barrier_poll_sleep_cycles
         )
         assert ret == 0
 

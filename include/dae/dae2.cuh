@@ -30,7 +30,10 @@ void dae2(
   const MInst* __restrict__ memory_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
-  uint64_t *  __restrict__ g_events
+  uint64_t *  __restrict__ g_events,
+  int debug_wait_bar_id,
+  int debug_skip_load_bar_id,
+  int debug_barrier_poll_sleep_cycles
 ) {
 
   int sm_id = blockIdx.x;
@@ -109,6 +112,10 @@ void dae2(
   if (threadIdx.x == 0) {
     int event_base = sm_id * numProfileEvents;
     g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+    g_events[event_base + 2] = 0;
+    g_events[event_base + 3] = 0;
+    g_events[event_base + 4] = 0;
+    g_events[event_base + 5] = 0;
   }
 
   __syncthreads();
@@ -167,7 +174,9 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars,
+          g_events, sm_id, debug_wait_bar_id, debug_skip_load_bar_id,
+          debug_barrier_poll_sleep_cycles
         );
       }
     } // End of warps

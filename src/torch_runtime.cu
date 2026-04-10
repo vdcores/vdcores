@@ -48,14 +48,6 @@ static inline T* check_tensor_ptr(torch::Tensor t, const char* name) {
   return p;
 }
 
-static cudaDeviceProp current_device_prop() {
-  cudaDeviceProp prop{};
-  int dev = 0;
-  cudaGetDevice(&dev);
-  cudaGetDeviceProperties(&prop, dev);
-  return prop;
-}
-
 static std::optional<size_t> env_size_t(const char* name) {
   const char* raw = std::getenv(name);
   if (raw == nullptr || raw[0] == '\0') {
@@ -80,6 +72,19 @@ static std::optional<double> env_double(const char* name) {
     return std::nullopt;
   }
   return parsed;
+}
+
+static cudaDeviceProp current_device_prop() {
+  cudaDeviceProp prop{};
+  int dev = 0;
+  cudaGetDevice(&dev);
+
+  int access_policy_window = 0;
+  if (cudaDeviceGetAttribute(&access_policy_window, cudaDevAttrMaxAccessPolicyWindowSize, dev) == cudaSuccess) {
+    prop.accessPolicyMaxWindowSize = access_policy_window;
+  }
+
+  return prop;
 }
 
 static size_t select_persisting_l2_size(const cudaDeviceProp& prop) {
@@ -119,15 +124,9 @@ static CUtensorMapL2promotion select_tma_l2_promotion() {
 }
 
 static void set_persistent_cache() {
-  const cudaDeviceProp prop = current_device_prop();
-
-  // printf("L2 size: %d bytes\n", prop.l2CacheSize);
-  // printf("persistingL2CacheMaxSize: %zu bytes\n", prop.persistingL2CacheMaxSize);
-  // printf("accessPolicyMaxWindowSize: %zu bytes\n", prop.accessPolicyMaxWindowSize);
-
-  const size_t set_aside = select_persisting_l2_size(prop);
-  cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
-  // printf("persistentCacheSize: %zu bytes\n", set_aside);
+  // Temporary no-op for local instrumentation builds. The current machine's
+  // CUDA runtime export set does not match the symbol variant emitted for
+  // cudaGetDeviceProperties during extension rebuilds.
 }
 
 // function 2: launch_dae
@@ -139,7 +138,10 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
-    int64_t stream
+    int64_t stream,
+    int64_t debug_wait_bar_id,
+    int64_t debug_skip_load_bar_id,
+    int64_t debug_barrier_poll_sleep_cycles
 ) {
   set_persistent_cache();
 
@@ -156,7 +158,10 @@ int py_launch_dae(
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, prof, stream,
+      static_cast<int>(debug_wait_bar_id),
+      static_cast<int>(debug_skip_load_bar_id),
+      static_cast<int>(debug_barrier_poll_sleep_cycles)
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -372,6 +377,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
   config.attr("num_profile_events") = numProfileEvents;
+  config.attr("profile_total_load_wait_cycles") = 2;
+  config.attr("profile_total_load_wait_count") = 3;
+  config.attr("profile_debug_load_wait_cycles") = 4;
+  config.attr("profile_debug_load_wait_count") = 5;
+  config.attr("default_debug_barrier_poll_sleep_cycles") = defaultDebugBarrierPollSleepCycles;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;

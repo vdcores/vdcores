@@ -23,7 +23,10 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  int debug_wait_bar_id,
+  int debug_skip_load_bar_id,
+  int debug_barrier_poll_sleep_cycles
 ) {
   // wait for all pre-launch meta-data copying
   cudaDeviceSynchronize();
@@ -33,7 +36,10 @@ cudaError_t launch_dae(
     memory_instructions,
     tma_descs,
     bars,
-    profile
+    profile,
+    debug_wait_bar_id,
+    debug_skip_load_bar_id,
+    debug_barrier_poll_sleep_cycles
   );
   // TODO(zhiyuang): check launch error here?
 

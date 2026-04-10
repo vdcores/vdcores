@@ -14,7 +14,10 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  int debug_wait_bar_id = -1,
+  int debug_skip_load_bar_id = -1,
+  int debug_barrier_poll_sleep_cycles = defaultDebugBarrierPollSleepCycles
 );
 
 CUtensorMap create_tma_descriptor(
@@ -26,4 +29,3 @@ CUtensorMap create_tma_descriptor(
   CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
   std::array<uint64_t, 5> global_strides_opt = {0, 0, 0, 0, 0}
 );
-
