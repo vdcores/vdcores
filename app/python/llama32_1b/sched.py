@@ -431,7 +431,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
-    ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
+    ).bar("o", layerg["bar_attn_out"]).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"])
 
     OutProj = SchedGemv(
         Gemv_M64N8,
@@ -444,12 +444,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
     regStoreUp = RegStore(regUp, size=N * TileM * matSiLUOut.element_size())
 
     gate_proj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(INTERMIDIATE, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], regStoreGate),
     ).bar("load", layerg["bar_post_attn_rms"])
     up_proj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(INTERMIDIATE, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], regStoreUp),
     ).bar("load", layerg["bar_post_attn_rms"])
@@ -462,7 +462,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         stride=TileM,
     ).bar("output", layerg["bar_silu_out2"])
     down_proj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(HIDDEN, N, INTERMIDIATE),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
@@ -527,10 +527,10 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ("attn", [Gqa]),
         ("out", [OutProj]),
         ("post_attn_rms", [post_attn_rms]),
-        ("gate_fused", [gate_proj]),
-        ("up_fused", [up_proj]),
-        ("silu_fused", [silu_fused]),
-        ("down_high", [down_proj]),
+        ("gate", [gate_proj]),
+        ("up", [up_proj]),
+        ("silu", [silu_fused]),
+        ("down", [down_proj]),
         ("final_rms", [pre_attn_rms]),
         ("logits", [LogitsProj]),
         ("argmax", [Argmax]),
@@ -567,10 +567,10 @@ def schedule_single_token(token_offset: int, token_pos: int):
         *([Gqa] if stage_enabled(parsed_args.debug_stop_after, "attn") else []),
         *([OutProj] if stage_enabled(parsed_args.debug_stop_after, "out") else []),
         *([post_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "post_attn_rms") else []),
-        *([gate_proj] if stage_enabled(parsed_args.debug_stop_after, "gate_fused") else []),
-        *([up_proj] if stage_enabled(parsed_args.debug_stop_after, "up_fused") else []),
-        *([silu_fused] if stage_enabled(parsed_args.debug_stop_after, "silu_fused") else []),
-        *([down_proj] if stage_enabled(parsed_args.debug_stop_after, "down_high") else []),
+        *([gate_proj] if stage_enabled(parsed_args.debug_stop_after, "gate") else []),
+        *([up_proj] if stage_enabled(parsed_args.debug_stop_after, "up") else []),
+        *([silu_fused] if stage_enabled(parsed_args.debug_stop_after, "silu") else []),
+        *([down_proj] if stage_enabled(parsed_args.debug_stop_after, "down") else []),
         *([pre_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "final_rms") else []),
         *(
             [

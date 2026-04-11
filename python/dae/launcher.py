@@ -534,28 +534,29 @@ class Launcher:
     
     def bench(self, iterations : int = 100,
                     total_bytes : int | None = None, total_flops : int | None = None):
-        duration_ns = torch.zeros(self.num_sms, dtype=torch.uint64)
-        execution_time = 0.0
+        execution_times = []
         for i in range(iterations):
             self.launch()
 
             # fetch profile data
             profile_data = self.profile[:,0:2].cpu().numpy()
-            duration_ns += (profile_data[:,1] - profile_data[:,0])
-            execution_time += profile_data[:,1].max() - profile_data[:,0].min()
-        # print("SM durations (ns):", duration_ns)
+            execution_times.append(profile_data[:,1].max() - profile_data[:,0].min())
+
+        execution_times = np.asarray(execution_times, dtype=np.float64)
+        min_execution_time = float(execution_times.min())
+        median_execution_time = float(np.median(execution_times))
+        mean_execution_time = float(execution_times.mean())
+        max_execution_time = float(execution_times.max())
+
         print(f"Benchmark Results on {self.num_sms} SMs and {iterations} iterations:")
-        avg_duration_ns = (duration_ns.double() / iterations).mean()
-        print(f"Average duration (ns): {avg_duration_ns:.2f}")
-        avg_execution_time = execution_time / iterations
-        print(f"Average execution time (ns): {avg_execution_time:.2f}")
-
-        # print(duration_ns)
-
+        print(f"Min execution time (ns): {min_execution_time:.2f}")
+        print(f"Median execution time (ns): {median_execution_time:.2f}")
+        print(f"Average execution time (ns): {mean_execution_time:.2f}")
+        print(f"Max execution time (ns): {max_execution_time:.2f}")
 
         if total_bytes is not None:
-            bandwidth = total_bytes / (avg_duration_ns / 1e9) / (1024 **3) # GB/s
+            bandwidth = total_bytes / (mean_execution_time / 1e9) / (1024 **3) # GB/s
             print(f"Effective Bandwidth (GB/s): {bandwidth:.2f}")
         if total_flops is not None:
-            gflops = total_flops / avg_duration_ns / 1e6
+            gflops = total_flops / mean_execution_time / 1e6
             print(f"Effective GFLOPS: {gflops:.2f}")
