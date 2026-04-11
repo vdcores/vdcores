@@ -300,9 +300,11 @@ layerg.addBarrier("bar_pre_attn_rms")
 layerg.addBarrier("bar_post_attn_rms")
 
 TileM, _, TileK = Gemv_M64N8.MNK
+QTileK = Gemv_M64N8K128.MNK[2]
 defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", TileM, N, tma_load_tbl, cord_load_tbl))
 
 layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadRMSLayerQ", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, QTileK * Gemv_M64N8K128.n_batch, Major.K))
 layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
 layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
