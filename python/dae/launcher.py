@@ -535,20 +535,25 @@ class Launcher:
     def bench(self, iterations : int = 100,
                     total_bytes : int | None = None, total_flops : int | None = None):
         execution_times = []
+        duration_ns = np.zeros(self.num_sms, dtype=np.float64)
         for i in range(iterations):
             self.launch()
 
             # fetch profile data
             profile_data = self.profile[:,0:2].cpu().numpy()
+            duration_ns += profile_data[:,1] - profile_data[:,0]
             execution_times.append(profile_data[:,1].max() - profile_data[:,0].min())
 
         execution_times = np.asarray(execution_times, dtype=np.float64)
+        avg_duration_per_sm = duration_ns / iterations
         min_execution_time = float(execution_times.min())
         median_execution_time = float(np.median(execution_times))
         mean_execution_time = float(execution_times.mean())
         max_execution_time = float(execution_times.max())
 
         print(f"Benchmark Results on {self.num_sms} SMs and {iterations} iterations:")
+        for sm_id, dur in enumerate(avg_duration_per_sm):
+            print(f"SM {sm_id:3d} | Avg Duration (ns): {dur:10.2f}")
         print(f"Min execution time (ns): {min_execution_time:.2f}")
         print(f"Median execution time (ns): {median_execution_time:.2f}")
         print(f"Average execution time (ns): {mean_execution_time:.2f}")

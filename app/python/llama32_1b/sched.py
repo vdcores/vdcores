@@ -138,7 +138,7 @@ rms_sms = REQ
 num_sms = 128
 full_sms = 132
 dae = Launcher(full_sms, device=gpu)
-input_token_id_and_pos = [(791, 0)]
+input_token_id_and_pos = [(791, 110)]
 num_generates = 0 if (parsed_args.correctness or parsed_args.dry_build) else parsed_args.num_generates - 1
 
 if parsed_args.dry_build:
@@ -385,7 +385,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
     regLoadQ = RegLoad(0)
     QProj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], regStoreQ),
     ).bar("load", layerg["bar_pre_attn_rms"])
@@ -401,7 +401,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
     regLoadK = RegLoad(0)
     KProj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(KW, N, HIDDEN),
         tmas=(layerg["loadKW"], layerg["loadRMSLayer"], regStoreK),
     ).bar("load", layerg["bar_pre_attn_rms"])
@@ -414,7 +414,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ),
     ).bar("store", layerg["bar_qkv_attn"])
     VProj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(VW, N, HIDDEN),
         tmas=(
             layerg["loadVW"],
@@ -431,6 +431,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
+        num_active_q=4,
     ).bar("o", layerg["bar_attn_out"]).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"])
 
     OutProj = SchedGemv(
@@ -502,11 +503,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
     copy_hidden = copy_hidden.place(N, base_sm=64)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    QProj = QProj.place(64)
-    QRope = QRope.place(64)
-    KProj = KProj.place(16, base_sm=64)
-    KRope = KRope.place(16, base_sm=64)
-    VProj = VProj.place(16, base_sm=80)
+    QProj = QProj.place(128)
+    QRope = QRope.place(128)
+    KProj = KProj.place(32, base_sm=64)
+    KRope = KRope.place(32, base_sm=64)
+    VProj = VProj.place(32, base_sm=96)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
     OutProj = OutProj.place(128)
     gate_proj = gate_proj.place(128)
