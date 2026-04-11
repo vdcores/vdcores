@@ -294,7 +294,7 @@ def select_attention_decode_instruction(head_dim: int):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim64.HEAD_DIM:
-        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64
+        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA
     raise NotImplementedError(
         f"Missing attention decode kernel support for head_dim={head_dim}. "
         "Add a dedicated opcode/instruction path before launching this model."

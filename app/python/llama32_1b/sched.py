@@ -133,12 +133,12 @@ parsed_args = parse_args()
 
 gpu = torch.device("cuda")
 REQ, N = 8, 8
-KVBlockSize = 64
+KVBlockSize = 16
 rms_sms = REQ
 num_sms = 128
 full_sms = 132
 dae = Launcher(full_sms, device=gpu)
-input_token_id_and_pos = [(791, 110)]
+input_token_id_and_pos = [(791, 10)]
 num_generates = 0 if (parsed_args.correctness or parsed_args.dry_build) else parsed_args.num_generates - 1
 
 if parsed_args.dry_build:
@@ -505,11 +505,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
     copy_hidden = copy_hidden.place(N, base_sm=64)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    QProj = QProj.place(128)
-    QRope = QRope.place(128)
-    KProj = KProj.place(32, base_sm=64)
-    KRope = KRope.place(32, base_sm=64)
-    VProj = VProj.place(32, base_sm=96)
+    QProj = QProj.place(64)
+    QRope = QRope.place(64)
+    KProj = KProj.place(16, base_sm=64)
+    KRope = KRope.place(16, base_sm=64)
+    VProj = VProj.place(16, base_sm=80)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
     OutProj = OutProj.place(128)
     gate_proj = gate_proj.place(128)

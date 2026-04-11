@@ -552,8 +552,8 @@ class Launcher:
         max_execution_time = float(execution_times.max())
 
         print(f"Benchmark Results on {self.num_sms} SMs and {iterations} iterations:")
-        for sm_id, dur in enumerate(avg_duration_per_sm):
-            print(f"SM {sm_id:3d} | Avg Duration (ns): {dur:10.2f}")
+        # for sm_id, dur in enumerate(avg_duration_per_sm):
+        #     print(f"SM {sm_id:3d} | Avg Duration (ns): {dur:10.2f}")
         print(f"Min execution time (ns): {min_execution_time:.2f}")
         print(f"Median execution time (ns): {median_execution_time:.2f}")
         print(f"Average execution time (ns): {mean_execution_time:.2f}")
