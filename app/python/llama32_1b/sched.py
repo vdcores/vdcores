@@ -143,6 +143,9 @@ dae = Launcher(full_sms, device=gpu)
 input_token_id_and_pos = [(791, 0)]
 num_generates = 0 if (parsed_args.correctness or parsed_args.dry_build) else parsed_args.num_generates - 1
 
+dae.debug_wait_bar_id = -1
+dae.debug_skip_load_bar_id = -1
+
 if parsed_args.dry_build:
     config = SimpleNamespace(
         hidden_size=2048,
@@ -462,13 +465,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
         tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
-    ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
+    ).bar("o", layerg["bar_attn_out"]).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"])
 
     OutProj = SchedGemv(
         Gemv_M64N8,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
+    ).bar("store", layerg["bar_out_mlp"]).bar("load", layerg["bar_attn_out"])
 
     regGate, regUp = 0, 1
     regStoreGate = RegStore(regGate, matGateOut[:, 0:TileM])
@@ -627,9 +630,24 @@ def schedule_single_token(token_offset: int, token_pos: int):
         if stage_enabled(parsed_args.debug_stop_after, stage_name)
     }
     active_stage_items = []
+    loop_stage_items = []
+    tail_stage_items = []
+    loop_boundary_stage = "final_rms"
+    past_loop_boundary = False
     for stage_name, items in stage_items:
-        if stage_enabled(parsed_args.debug_stop_after, stage_name):
-            active_stage_items.extend(items)
+        if not stage_enabled(parsed_args.debug_stop_after, stage_name):
+            continue
+
+        active_stage_items.extend(items)
+
+        normalized_stage = normalize_stage_name(stage_name)
+        if past_loop_boundary:
+            tail_stage_items.extend(items)
+            continue
+
+        loop_stage_items.extend(items)
+        if normalized_stage == loop_boundary_stage:
+            past_loop_boundary = True
 
     bound_items = [*active_stage_items]
 
@@ -642,7 +660,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         return
 
     dae.i(
-        *active_stage_items,
+        *loop_stage_items,
         *(
             [
                 LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
@@ -651,6 +669,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             if "final_rms" in active_stage_names
             else []
         ),
+        *tail_stage_items,
     )
 
 

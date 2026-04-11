@@ -316,8 +316,8 @@ class SchedAttentionDecoding(Schedule):
             ),
             # TODO(zhiyuang): reuse the accumulator register
             # only the last block has new generated KV cache
-            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group(),
-            tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group(),
+            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group().port(1),
+            tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group().port(1),
         ]
         insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
         return insts

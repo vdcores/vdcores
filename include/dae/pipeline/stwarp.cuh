@@ -153,10 +153,11 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
     // do bar for all instructions all at once
     if (opcode & MEM_OP_FLAGS_BARRIER) {
-      cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
+      // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-      int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);
-      __stprint("Arrive for barrier %d, remaining count=%d", inst.bar(), current_cnt - 1);
+      atomicSub(&bars[inst.bar()], 1);
+      // int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);
+      // __stprint("Arrive for barrier %d, remaining count=%d", inst.bar(), current_cnt - 1);
       // if (inst.bar() == 0)
       //   printf("[sm=%d] Arrive for barrier %d, remaining count=%d\n", blockIdx.x, inst.bar(), current_cnt - 1);
     } else {

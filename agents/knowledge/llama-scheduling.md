@@ -8,6 +8,33 @@
 - The intended 1B geometry is:
   `hidden_size=2048`, `intermediate_size=8192`, `num_layers=16`, `num_attention_heads=32`, `num_key_value_heads=8`, `head_dim=64`.
 
+## 1B Runtime Interaction Shape
+
+- `Launcher(full_sms=132)` reserves the full Hopper-visible SM space, but most dataflow stages are explicitly placed onto subranges with `.place(num_sms, base_sm)`.
+- The steady-state decode work is mostly packed into the first `128` SMs, while SM `128+` is used for small utility work such as zero-fill and barrier restoration.
+- Placement in `sched.py` is stage-specific rather than global:
+  - `embed_rms` and the recurrent `pre_attn_rms` / `post_attn_rms` each use `8` SM because `N=8` and `SchedRMSShared` partitions by token.
+  - `QProj`, `QRope`, `OutProj` use `64` SM.
+  - `KProj`, `KRope`, and `VProj` use `16` SM slices in the `64..95` range.
+  - decode attention uses `N * NUM_KV_HEAD = 8 * 8 = 64` SM, one SM per `(request, kv_head)` pair.
+  - fused gate/up, fused SiLU, down projection, logits, and argmax are all placed on `128` SM.
+- `SchedGemv` maps placed SMs by output-tile first and split-K fold second:
+  - `m = baseM + (sm % sm_per_fold) * TileM`
+  - `k = baseK + (sm // sm_per_fold) * k_per_fold`
+  - using more SMs than `M / TileM` introduces split-K folding and therefore requires a reduction-mode output TMA.
+- Memory setup is expressed through reusable TMA descriptors registered in resource groups:
+  - weights use `wgmma_load(...)` or `tensor1d("load", ...)`
+  - activation/state tensors use `wgmma_load(...)`, `wgmma_store(...)`, or `wgmma("reduce", ...)`
+  - token embedding / hidden vectors use `TmaLoad1D` and `TmaStore1D`
+  - some adjacent stages bypass global memory with `RegStore` / `RegLoad`
+- In the 1B decode path:
+  - Q projection writes to a register buffer, rope consumes that register result, then stores into `attnQs`
+  - K projection does the same but stores into the KV cache tensor at the current `token_pos`
+  - V projection writes directly into the KV cache tensor without an intermediate rope stage
+  - attention loads Q/K/V through reshaped views of those cache-backed tensors
+  - `OutProj` and `down_proj` write back to `matHidden` through reduction TMAs because their placements fold K across many SMs
+  - fused gate/up GEMVs write to registers, `SchedRegSiLUFused` consumes those registers, then stores the SiLU result into `matSiLUOut`
+
 ## MLP Split Rationale
 
 - The 1B baseline keeps a two-phase MLP schedule with a `6144 + 2048` split.

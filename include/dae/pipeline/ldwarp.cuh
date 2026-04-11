@@ -29,11 +29,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     // TODO(zhiyuang): wait bar here if bar is set
     if ((opcode & MEM_OP_FLAGS_BARRIER) && !(opcode & MEM_OP_FLAGS_WRITEBACK)) {
       volatile int *bar = bars + inst.bar();
+      // cuda::std::atomic_ref<int> g_bar{bars[inst.bar()]};
+
       // bool first_wait = true;
       // if (blockIdx.x == 0 && first_wait) {
       //   printf("[LD][sm=%d] check bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
       // }
       while (*bar != 0) {
+      // while (g_bar.load(cuda::std::memory_order_acquire) != 0) {
         // busy wait
         __nanosleep(barrierPollSleepCycles);
         // if (blockIdx.x == 0 && first_wait) {

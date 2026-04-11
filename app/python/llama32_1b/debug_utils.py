@@ -61,7 +61,13 @@ def print_barrier_counts(dae):
         for name, bar_info in group.bars.items():
             if bar_info["count"] is None:
                 continue
-            print(f"[debug]   {group_name}.{name} = {bar_info['count']}")
+            bar_ids = group.bar_instances.get(name, [])
+            first_bar_id = group.bar_ids.get(name)
+            if len(bar_ids) <= 1:
+                id_suffix = f"id={first_bar_id}"
+            else:
+                id_suffix = f"id={first_bar_id}, ids={bar_ids}"
+            print(f"[debug]   {group_name}.{name}: count={bar_info['count']}, {id_suffix}")
 
 
 def bind_late_barriers_with_default(dae, *insts, unresolved_count=None):
