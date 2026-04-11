@@ -70,6 +70,13 @@ class Gemv_M64N8K64(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=64, BLOAD=1, RESIDUAL=residual), args=[kTiles, nprefeth])
 
+class Gemv_M64N8K128(ComputeInstruction):
+    MNK = (64, 8, 128)
+    n_batch = 1
+
+    def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
+        super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=128, BLOAD=1, RESIDUAL=residual), args=[kTiles, nprefeth])
+
 class Gemv_M64N8B2(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 2
@@ -177,10 +184,14 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[
+                num_kv_block,
+                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len),
+                _encode_attention_runtime_flags(need_norm, need_rope),
+            ],
         )
 
 
@@ -201,10 +212,14 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA,
-            args=[num_kv_block, last_kv_active_token_len, _encode_attention_runtime_flags(need_norm, need_rope)],
+            args=[
+                num_kv_block,
+                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len),
+                _encode_attention_runtime_flags(need_norm, need_rope),
+            ],
         )
 
 
@@ -279,7 +294,7 @@ def select_attention_decode_instruction(head_dim: int):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim64.HEAD_DIM:
-        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64
+        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA
     raise NotImplementedError(
         f"Missing attention decode kernel support for head_dim={head_dim}. "
         "Add a dedicated opcode/instruction path before launching this model."
@@ -826,6 +841,7 @@ __all__ = [
     "Gemv_M64N8",
     "Gemv_M128N8",
     "Gemv_M64N8K64",
+    "Gemv_M64N8K128",
     "Gemv_M64N8B2",
     "Gemm_M64N64",
     "Gemm_M64N64K64",

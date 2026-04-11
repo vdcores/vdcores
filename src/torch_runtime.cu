@@ -6,8 +6,12 @@
 #include <cuda.h>            // Driver API
 #include <cuda_runtime.h>
 
-#include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <optional>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -44,22 +48,84 @@ static inline T* check_tensor_ptr(torch::Tensor t, const char* name) {
   return p;
 }
 
-static void set_persistent_cache() {
-  // This function can be used to set up any global state or configuration
-  // needed for persistent caching. For now, it's a placeholder.
-
+static cudaDeviceProp current_device_prop() {
   cudaDeviceProp prop{};
   int dev = 0;
   cudaGetDevice(&dev);
   cudaGetDeviceProperties(&prop, dev);
+  return prop;
+}
+
+static std::optional<size_t> env_size_t(const char* name) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  unsigned long long parsed = std::strtoull(raw, &end, 10);
+  if (end == raw || (end != nullptr && *end != '\0')) {
+    return std::nullopt;
+  }
+  return static_cast<size_t>(parsed);
+}
+
+static std::optional<double> env_double(const char* name) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  double parsed = std::strtod(raw, &end);
+  if (end == raw || (end != nullptr && *end != '\0')) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
+static size_t select_persisting_l2_size(const cudaDeviceProp& prop) {
+  const size_t max_size = static_cast<size_t>(prop.persistingL2CacheMaxSize);
+  if (max_size == 0) {
+    return 0;
+  }
+  if (auto requested_bytes = env_size_t("DAE_PERSISTING_L2_BYTES")) {
+    return std::min(*requested_bytes, max_size);
+  }
+
+  const double requested_fraction = env_double("DAE_PERSISTING_L2_FRACTION").value_or(0.0625);
+  const double clamped_fraction = std::clamp(requested_fraction, 0.0, 1.0);
+  return std::min(static_cast<size_t>(clamped_fraction * max_size), max_size);
+}
+
+static CUtensorMapL2promotion select_tma_l2_promotion() {
+  const char* raw = std::getenv("DAE_TMA_L2_PROMOTION");
+  if (raw == nullptr || raw[0] == '\0') {
+    return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+  }
+
+  const std::string value(raw);
+  if (value == "0" || value == "none") {
+    return CU_TENSOR_MAP_L2_PROMOTION_NONE;
+  }
+  if (value == "64" || value == "64b" || value == "l2_64b") {
+    return CU_TENSOR_MAP_L2_PROMOTION_L2_64B;
+  }
+  if (value == "128" || value == "128b" || value == "l2_128b") {
+    return CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+  }
+  if (value == "256" || value == "256b" || value == "l2_256b") {
+    return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+  }
+  TORCH_CHECK(false, "Unsupported DAE_TMA_L2_PROMOTION=", value, " (expected none/64/128/256)");
+}
+
+static void set_persistent_cache() {
+  const cudaDeviceProp prop = current_device_prop();
 
   // printf("L2 size: %d bytes\n", prop.l2CacheSize);
   // printf("persistingL2CacheMaxSize: %zu bytes\n", prop.persistingL2CacheMaxSize);
   // printf("accessPolicyMaxWindowSize: %zu bytes\n", prop.accessPolicyMaxWindowSize);
 
-  size_t recommended_size = prop.persistingL2CacheMaxSize * 2 / 8; // Example heuristic
-
-  size_t set_aside = std::min<size_t>(recommended_size, prop.persistingL2CacheMaxSize);
+  const size_t set_aside = select_persisting_l2_size(prop);
   cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
   // printf("persistentCacheSize: %zu bytes\n", set_aside);
 }
@@ -192,8 +258,7 @@ torch::Tensor py_build_tma_desc(
   CUtensorMapSwizzle swz = to_swizzle(swizzle_bytes);
   CUtensorMapInterleave interleave = to_interleave(interleave_bytes);
 
-  // CUtensorMapL2promotion l2p = CU_TENSOR_MAP_L2_PROMOTION_NONE;
-  CUtensorMapL2promotion l2p = CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+  CUtensorMapL2promotion l2p = select_tma_l2_promotion();
   CUtensorMapFloatOOBfill oob = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
 
   // Fill descriptor in device memory
@@ -226,7 +291,25 @@ enum CachePolicy : int {
 };
 
 // Set cache policy for a CUDA tensor on the specified stream.
-void py_tensor_set_cache_policy(torch::Tensor t, int64_t stream_id, float hit_ratio, int hit_policy, int miss_policy) {
+void py_reset_cache_policy(int64_t stream_id) {
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_id);
+  cudaStreamAttrValue attr{};
+  attr.accessPolicyWindow.base_ptr = nullptr;
+  attr.accessPolicyWindow.num_bytes = 0;
+  attr.accessPolicyWindow.hitRatio = 0.0f;
+  attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  auto err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+  TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute reset failed: ", cudaGetErrorString(err));
+}
+
+void py_tensor_set_cache_policy(
+    torch::Tensor t,
+    int64_t stream_id,
+    float hit_ratio,
+    int hit_policy,
+    int miss_policy,
+    int64_t num_bytes) {
   TORCH_CHECK(t.defined(), "Tensor must be defined");
   TORCH_CHECK(t.is_cuda(), "Tensor must be a CUDA tensor");
   TORCH_CHECK(t.numel() > 0, "Tensor must have storage");
@@ -236,15 +319,17 @@ void py_tensor_set_cache_policy(torch::Tensor t, int64_t stream_id, float hit_ra
 
   cudaAccessPolicyWindow apw{};
   apw.base_ptr  = (void*)t.data_ptr();          // some device pointer
-  cudaDeviceProp prop{};
-  int dev = 0;
-  cudaGetDevice(&dev);
-  cudaGetDeviceProperties(&prop, dev);
+  const cudaDeviceProp prop = current_device_prop();
 
-  size_t requested_bytes = (size_t)t.numel() * (size_t)t.element_size();
+  const size_t tensor_bytes = (size_t)t.numel() * (size_t)t.element_size();
+  size_t requested_bytes = tensor_bytes;
+  if (num_bytes > 0) {
+    requested_bytes = std::min(requested_bytes, static_cast<size_t>(num_bytes));
+  }
   if (prop.accessPolicyMaxWindowSize > 0) {
     requested_bytes = std::min(requested_bytes, static_cast<size_t>(prop.accessPolicyMaxWindowSize));
   }
+  TORCH_CHECK(requested_bytes > 0, "cache window must be non-zero");
   apw.num_bytes = requested_bytes;
   apw.hitRatio  = hit_ratio;                    // 0..1
 
@@ -309,6 +394,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Launch DAE2 kernel with given parameters");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
+  m.def("reset_cache_policy", &py_reset_cache_policy,
+            py::arg("stream"),
+            "Clear the access-policy window on the specified CUDA stream");
   m.def("set_cache_policy", &py_tensor_set_cache_policy,
+            py::arg("tensor"),
+            py::arg("stream"),
+            py::arg("hit_ratio"),
+            py::arg("hit_policy"),
+            py::arg("miss_policy"),
+            py::arg("num_bytes") = -1,
             "Set cache policy for a CUDA tensor on the specified stream");
 }

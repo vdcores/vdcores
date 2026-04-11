@@ -72,6 +72,15 @@ matArgmaxIdx = ctx.matArgmaxIdx
 matArgmaxVal = ctx.matArgmaxVal
 
 
+DEBUG_STAGE_ORDER = (
+    "final_rms",
+    "logits",
+    "argmax",
+    "restore",
+    "full",
+)
+
+
 def env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return default if value is None else int(value)
@@ -108,6 +117,44 @@ def maybe_no_prefetch_list(name: str, sched):
             if hasattr(item, "no_prefetch"):
                 item.no_prefetch()
     return sched
+
+
+def stage_enabled(stop_after: str, stage_name: str) -> bool:
+    requested_idx = DEBUG_STAGE_ORDER.index(stop_after)
+    stage_idx = DEBUG_STAGE_ORDER.index(stage_name)
+    return stage_idx <= requested_idx
+
+
+def bind_unused_late_barriers_to_zero(dae):
+    for group in dae.resource_groups.values():
+        for name, bar_info in group.bars.items():
+            if bar_info["late_bind"] and bar_info["count"] is None:
+                group.bindBarrier(name, 0)
+
+
+def bind_late_barriers_with_default(dae, *insts, unresolved_count=None):
+    bar_counts = dae.collect_barrier_release_counts(*insts)
+    for group in dae.resource_groups.values():
+        for name, bar_info in group.bars.items():
+            if not bar_info["late_bind"] or bar_info["count"] is not None:
+                continue
+
+            matched_counts = {
+                bar_counts[bar_id]
+                for bar_id in group.bar_instances.get(name, [])
+                if bar_id in bar_counts
+            }
+            if len(matched_counts) == 1:
+                group.bindBarrier(name, matched_counts.pop())
+                continue
+            if len(matched_counts) == 0 and unresolved_count is not None:
+                group.bindBarrier(name, unresolved_count)
+                continue
+            if len(matched_counts) > 1:
+                raise ValueError(
+                    f"Barrier {group.name}.{name} observed inconsistent release counts: {sorted(matched_counts)}"
+                )
+            raise ValueError(f"Could not infer release count for barrier {group.name}.{name}")
 
 MLP_LOW = 4096
 MLP_HIGH = INTERMIDIATE - MLP_LOW
@@ -181,6 +228,7 @@ dae.build_groups()
 
 
 def schedule_single_token(token_offset: int, token_pos: int):
+    debug_stop_after = ctx.parsed_args.debug_stop_after
     need_token_restore = (len(input_token_id_and_pos) + num_generates) > 1
     loadEmbed1D = TmaLoad1D(matEmbed, bytes=HIDDEN * 2)
     storeHidden1D = TmaStore1D(matHidden, bytes=HIDDEN * 2)
@@ -368,37 +416,62 @@ def schedule_single_token(token_offset: int, token_pos: int):
         restore_bars_low = restore_bars_low.place(1, base_sm=128)
         restore_bars_high = restore_bars_high.place(1, base_sm=128)
 
-    dae.bind_late_barrier_counts(
-        embed_rms,
-        copy_hidden,
-        *([restore_bars_high] if restore_bars_high is not None else []),
-        clear_interm,
-        clear_gateout,
-        QProj,
-        KProj,
-        VProj,
-        Gqa,
-        OutProj,
-        post_attn_rms,
-        gate_proj_low,
-        gate_proj_high,
-        up_proj_low,
-        up_proj_high,
-        silu1,
-        down_proj,
-        pre_attn_rms,
-        logits_proj,
-        argmax,
-        *([restore_bars_low] if restore_bars_low is not None else []),
-    )
+    if debug_stop_after == "full":
+        dae.bind_late_barrier_counts(
+            embed_rms,
+            copy_hidden,
+            *([restore_bars_high] if restore_bars_high is not None else []),
+            clear_interm,
+            clear_gateout,
+            QProj,
+            KProj,
+            VProj,
+            Gqa,
+            OutProj,
+            post_attn_rms,
+            gate_proj_low,
+            gate_proj_high,
+            up_proj_low,
+            up_proj_high,
+            silu1,
+            down_proj,
+            pre_attn_rms,
+            logits_proj,
+            argmax,
+            *([restore_bars_low] if restore_bars_low is not None else []),
+        )
 
-    dae.i(
-        embed_rms,
-        copy_hidden,
-        *([restore_bars_high] if restore_bars_high is not None else []),
-    )
+        dae.i(
+            embed_rms,
+            copy_hidden,
+            *([restore_bars_high] if restore_bars_high is not None else []),
+        )
 
-    dae.i(
+        dae.i(
+            clear_interm,
+            clear_gateout,
+            QProj,
+            KProj,
+            VProj,
+            Gqa,
+            OutProj,
+            post_attn_rms,
+            gate_proj_low,
+            gate_proj_high,
+            up_proj_low,
+            up_proj_high,
+            silu1,
+            down_proj,
+            pre_attn_rms,
+            LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
+            LoopC.toNext(dae.copy_cptrs(), num_layers),
+            logits_proj,
+            argmax,
+            *([restore_bars_low] if restore_bars_low is not None else []),
+        )
+        return
+
+    final_rms_items = [
         clear_interm,
         clear_gateout,
         QProj,
@@ -416,10 +489,27 @@ def schedule_single_token(token_offset: int, token_pos: int):
         pre_attn_rms,
         LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
         LoopC.toNext(dae.copy_cptrs(), num_layers),
-        logits_proj,
-        argmax,
-        *([restore_bars_low] if restore_bars_low is not None else []),
-    )
+    ]
+    stage_items = [
+        ("final_rms", final_rms_items),
+        ("logits", [logits_proj]),
+        ("argmax", [argmax]),
+        ("restore", [restore_bars_low] if restore_bars_low is not None else []),
+    ]
+    active_stage_items = []
+    for stage_name, items in stage_items:
+        if stage_enabled(debug_stop_after, stage_name):
+            active_stage_items.extend(items)
+
+    startup_items = [embed_rms, copy_hidden]
+    if restore_bars_high is not None and stage_enabled(debug_stop_after, "restore"):
+        startup_items.append(restore_bars_high)
+
+    bind_late_barriers_with_default(dae, *startup_items, *active_stage_items, unresolved_count=0)
+    bind_unused_late_barriers_to_zero(dae)
+
+    dae.i(*startup_items)
+    dae.i(*active_stage_items)
 
 
 seed_prefill_kv_cache(ctx)
@@ -439,8 +529,25 @@ for _ in range(num_generates):
     dae.i(IssueBarrier(systemg["bar_token_finish"]))
     schedule_single_token(cur_offset, cur_pos)
 
-print(f"run vdcores with {cur_offset + 1} tokens...")
 dae.s()
+if ctx.parsed_args.correctness and (
+    ctx.parsed_args.debug_stop_after != "full" or ctx.parsed_args.debug_num_layers is not None
+):
+    raise ValueError("Single-token correctness requires the full schedule and full layer count")
+
+if ctx.parsed_args.dry_build:
+    print(
+        f"[dry-build] built qwen3-1.7b schedule with hidden={HIDDEN}, intermediate={INTERMIDIATE}, "
+        f"head_dim={HEAD_DIM}, layers={num_layers}, max_seq_len={MAX_SEQ_LEN}"
+    )
+    print(f"[dry-build] logits_epoch={logits_epoch}, logits_slice={logits_slice}, vocab_size={vocab_size}")
+else:
+    print(f"run vdcores with {cur_offset + 1} tokens...")
+    if ctx.parsed_args.debug_stop_after != "full" or ctx.parsed_args.debug_num_layers is not None:
+        print(
+            f"[debug] stop_after={ctx.parsed_args.debug_stop_after}, "
+            f"num_layers={num_layers}"
+        )
 dae_app(dae)
 if ctx.parsed_args.correctness:
     run_correctness_check(ctx)

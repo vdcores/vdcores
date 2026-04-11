@@ -311,13 +311,13 @@ class SchedAttentionDecoding(Schedule):
             tQ.cord(req, head).bar(self._bar("q")).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
-                [tK.cord(req, 0, head, 0).group(), tK.cord2tma(0, self.block_size, 0, 0)],
-                [tV.cord(req, 0, head, 0).group(), tV.cord2tma(0, self.block_size, 0, 0)],
+                [tK.cord(req, 0, head, 0).port(1).group(), tK.cord2tma(0, self.block_size, 0, 0)],
+                [tV.cord(req, 0, head, 0).port(1).group(), tV.cord2tma(0, self.block_size, 0, 0)],
             ),
             # TODO(zhiyuang): reuse the accumulator register
             # only the last block has new generated KV cache
-            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group(),
-            tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group(),
+            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group().port(1),
+            tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group().port(1),
         ]
         insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
         return insts

@@ -6,6 +6,13 @@ MODEL_NAME = "Qwen/Qwen3-1.7B"
 DEFAULT_MAX_SEQ_LEN = 512
 DEFAULT_PREFILL_TOKEN = 51
 DEFAULT_DECODE_INPUT_TOKEN = 52
+DEBUG_STAGE_ORDER = (
+    "final_rms",
+    "logits",
+    "argmax",
+    "restore",
+    "full",
+)
 
 
 def parse_args():
@@ -14,6 +21,9 @@ def parse_args():
     arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
     arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
     arg_parser.add_argument("--correctness", action="store_true")
+    arg_parser.add_argument("--dry-build", action="store_true")
+    arg_parser.add_argument("--debug-num-layers", type=int, default=None)
+    arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     num_generates_explicit = any(arg == "-N" or arg.startswith("--num-generates") for arg in raw_argv)
     if not num_generates_explicit and any(arg in ("-b", "--bench") for arg in remaining_argv):

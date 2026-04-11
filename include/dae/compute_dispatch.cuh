@@ -219,7 +219,24 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  const int num_active_q = inst.args[1] & 0xFF;
+  const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  const bool need_norm = inst.args[2] & 0x1;
+  const bool need_rope = inst.args[2] & 0x2;
+  task_attention_fwd_flash3_grouped_mma<64, 64, 16, false, 0, false, false, kernel_qk, kernel_pv>(
+    inst.args[0],
+    0,
+    num_active_q,
+    last_kv_active_token_len,
+    0,
+    need_norm,
+    need_rope,
+    smem_base,
+    (float *)scratch_space,
+    st_insts,
+    m2c,
+    c2m
+  );
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_4096_INTER) {
