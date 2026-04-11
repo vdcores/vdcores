@@ -434,7 +434,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     ).bar("o", layerg["bar_attn_out"]).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"])
 
     OutProj = SchedGemv(
-        Gemv_M64N8,
+        Gemv_M64N8B2,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
@@ -508,7 +508,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     KRope = KRope.place(16, base_sm=64)
     VProj = VProj.place(16, base_sm=80)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
-    OutProj = OutProj.place(64)
+    OutProj = OutProj.place(128)
     gate_proj = gate_proj.place(128)
     up_proj = up_proj.place(128)
     silu_fused = silu_fused.place(128)
