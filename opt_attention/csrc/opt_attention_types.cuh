@@ -45,4 +45,13 @@ __device__ __forceinline__ void compute_group_sync() {
   asm volatile("bar.sync 1, 128;" ::: "memory");
 }
 
+__device__ __forceinline__ void cp_async_16B(void* shared_dst, const void* global_src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const unsigned shared_addr = static_cast<unsigned>(__cvta_generic_to_shared(shared_dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(shared_addr), "l"(global_src) : "memory");
+#else
+  *reinterpret_cast<uint4*>(shared_dst) = *reinterpret_cast<const uint4*>(global_src);
+#endif
+}
+
 }  // namespace opt_attention

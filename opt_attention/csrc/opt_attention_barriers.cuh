@@ -26,6 +26,13 @@ __device__ __forceinline__ void producer_arrive(cuda::barrier<cuda::thread_scope
   static_cast<void>(barrier.arrive());
 }
 
+__device__ __forceinline__ void producer_async_arrive(cuda::barrier<cuda::thread_scope_block>& barrier) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const unsigned barrier_addr = static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+  asm volatile("cp.async.mbarrier.arrive.shared::cta.b64 [%0];" ::"r"(barrier_addr) : "memory");
+#endif
+}
+
 __device__ __forceinline__ void compute_arrive(cuda::barrier<cuda::thread_scope_block>& barrier) {
   __threadfence_block();
   static_cast<void>(barrier.arrive());

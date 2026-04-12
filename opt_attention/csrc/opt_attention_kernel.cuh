@@ -50,6 +50,34 @@ __device__ __forceinline__ scalar_t* output_ptr(const OptAttentionParams& params
 }
 
 template <typename scalar_t>
+__device__ __forceinline__ void producer_kv_copy_tile(
+    const OptAttentionParams& params,
+    SharedStorage<scalar_t>& smem,
+    const scalar_t* k0,
+    const scalar_t* v0,
+    int stage,
+    int lane) {
+  constexpr int elems_per_vec = sizeof(uint4) / sizeof(scalar_t);
+  constexpr int vec_count = kKvTile * kHeadDim / elems_per_vec;
+  constexpr int copies_per_lane = vec_count / kProducerThreads;
+  static_assert(vec_count % kProducerThreads == 0);
+
+  auto* sk_vec = reinterpret_cast<uint4*>(&smem.k[stage][0]);
+  auto* sv_vec = reinterpret_cast<uint4*>(&smem.v[stage][0]);
+  #pragma unroll 1
+  for (int iter = 0; iter < copies_per_lane; ++iter) {
+    const int vec = iter * kProducerThreads + lane;
+    const int elem = vec * elems_per_vec;
+    const int row = elem / kHeadDim;
+    const int col = elem - row * kHeadDim;
+    const scalar_t* k = k0 + row * params.k_stride_s + col;
+    const scalar_t* v = v0 + row * params.v_stride_s + col;
+    cp_async_16B(&sk_vec[vec], k);
+    cp_async_16B(&sv_vec[vec], v);
+  }
+}
+
+template <typename scalar_t>
 __device__ void producer_kv(
     const OptAttentionParams& params,
     SharedStorage<scalar_t>& smem,
@@ -71,20 +99,8 @@ __device__ void producer_kv(
     const scalar_t* k0 = key_ptr<scalar_t>(params, batch, head, block_start);
     const scalar_t* v0 = value_ptr<scalar_t>(params, batch, head, block_start);
 
-    constexpr int elems_per_vec = sizeof(uint4) / sizeof(scalar_t);
-    constexpr int vec_count = kKvTile * kHeadDim / elems_per_vec;
-    auto* sk_vec = reinterpret_cast<uint4*>(&smem.k[stage][0]);
-    auto* sv_vec = reinterpret_cast<uint4*>(&smem.v[stage][0]);
-    for (int vec = lane; vec < vec_count; vec += kProducerThreads) {
-      const int elem = vec * elems_per_vec;
-      const int row = elem / kHeadDim;
-      const int col = elem - row * kHeadDim;
-      const scalar_t* k = k0 + row * params.k_stride_s + col;
-      const scalar_t* v = v0 + row * params.v_stride_s + col;
-      sk_vec[vec] = *reinterpret_cast<const uint4*>(k);
-      sv_vec[vec] = *reinterpret_cast<const uint4*>(v);
-    }
-
+    producer_kv_copy_tile(params, smem, k0, v0, stage, lane);
+    producer_async_arrive(smem.barriers.kv_fill[stage]);
     producer_arrive(smem.barriers.kv_fill[stage]);
   }
 }
