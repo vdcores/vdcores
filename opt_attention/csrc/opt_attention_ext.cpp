@@ -2,6 +2,7 @@
 
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <optional>
 
 namespace opt_attention {
@@ -42,6 +43,30 @@ void check_mask(const torch::Tensor& mask, const torch::Tensor& query, const tor
   TORCH_CHECK(mask.stride(3) == 1 || mask.size(3) == 1, "attention_mask last dimension must be contiguous");
 }
 
+void check_static_cache_fast_path(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    int64_t split_size) {
+  constexpr uintptr_t kVectorBytes = 16;
+  const int64_t elems_per_vec = static_cast<int64_t>(kVectorBytes / query.element_size());
+
+  TORCH_CHECK(key.size(2) % opt_attention::kKvTile == 0,
+              "fast OPT StaticCache path requires key sequence length to be a multiple of 64");
+  TORCH_CHECK(split_size % opt_attention::kKvTile == 0,
+              "fast OPT StaticCache path requires split_size to be a multiple of 64");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(key.data_ptr()) % kVectorBytes == 0,
+              "key data pointer must be 16-byte aligned");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(value.data_ptr()) % kVectorBytes == 0,
+              "value data pointer must be 16-byte aligned");
+  TORCH_CHECK(key.stride(0) % elems_per_vec == 0 && key.stride(1) % elems_per_vec == 0 &&
+                  key.stride(2) % elems_per_vec == 0,
+              "key batch/head/sequence strides must preserve 16-byte row alignment");
+  TORCH_CHECK(value.stride(0) % elems_per_vec == 0 && value.stride(1) % elems_per_vec == 0 &&
+                  value.stride(2) % elems_per_vec == 0,
+              "value batch/head/sequence strides must preserve 16-byte row alignment");
+}
+
 }  // namespace
 
 torch::Tensor decode(
@@ -53,6 +78,7 @@ torch::Tensor decode(
     int64_t split_size) {
   check_qkv(query, key, value);
   TORCH_CHECK(split_size > 0, "split_size must be positive");
+  check_static_cache_fast_path(query, key, value, split_size);
 
   const bool has_mask = attention_mask.has_value() && attention_mask->defined();
   if (has_mask) {

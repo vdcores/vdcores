@@ -6,10 +6,9 @@ namespace opt_attention {
 
 constexpr int kHeadDim = 128;
 constexpr int kKvTile = 64;
-constexpr int kQTile = 64;
 constexpr int kComputeThreads = 128;
 constexpr int kProducerThreads = 32;
-constexpr int kThreads = kComputeThreads + 2 * kProducerThreads;
+constexpr int kThreads = kComputeThreads + kProducerThreads;
 
 struct OptAttentionParams {
   const void* query;

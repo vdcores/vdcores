@@ -12,11 +12,9 @@ namespace opt_attention {
 template <typename scalar_t>
 struct SharedStorage {
   PipelineBarriers barriers;
-  alignas(16) scalar_t q[kQTile * kHeadDim];
   alignas(16) scalar_t k[2][kKvTile * kHeadDim];
   alignas(16) scalar_t v[2][kKvTile * kHeadDim];
   alignas(16) float scores[kKvTile];
-  alignas(16) float reduce[kComputeThreads];
 };
 
 template <typename scalar_t>
@@ -52,19 +50,6 @@ __device__ __forceinline__ scalar_t* output_ptr(const OptAttentionParams& params
 }
 
 template <typename scalar_t>
-__device__ void producer_q(const OptAttentionParams& params, SharedStorage<scalar_t>& smem, int batch, int head) {
-  const int lane = threadIdx.x - kComputeThreads;
-  const scalar_t* q = query_ptr<scalar_t>(params, batch, head);
-
-  for (int col = lane; col < kHeadDim; col += kProducerThreads) {
-    smem.q[col] = q[col * params.q_stride_d];
-  }
-
-  producer_arrive(smem.barriers.q_fill);
-  smem.barriers.q_drain.arrive_and_wait();
-}
-
-template <typename scalar_t>
 __device__ void producer_kv(
     const OptAttentionParams& params,
     SharedStorage<scalar_t>& smem,
@@ -72,7 +57,7 @@ __device__ void producer_kv(
     int kv_end,
     int batch,
     int head) {
-  const int lane = threadIdx.x - kComputeThreads - kProducerThreads;
+  const int lane = threadIdx.x - kComputeThreads;
   const int chunk_len = max(0, kv_end - kv_start);
   const int num_blocks = (chunk_len + kKvTile - 1) / kKvTile;
 
@@ -83,41 +68,21 @@ __device__ void producer_kv(
     }
 
     const int block_start = kv_start + block * kKvTile;
-    const bool full_tile = block_start + kKvTile <= kv_end;
-    const bool contiguous = params.k_stride_d == 1 && params.v_stride_d == 1;
     const scalar_t* k0 = key_ptr<scalar_t>(params, batch, head, block_start);
     const scalar_t* v0 = value_ptr<scalar_t>(params, batch, head, block_start);
-    const bool aligned = (reinterpret_cast<uintptr_t>(k0) % alignof(uint4) == 0) &&
-                         (reinterpret_cast<uintptr_t>(v0) % alignof(uint4) == 0);
-    if (full_tile && contiguous && aligned) {
-      constexpr int elems_per_vec = sizeof(uint4) / sizeof(scalar_t);
-      constexpr int vec_count = kKvTile * kHeadDim / elems_per_vec;
-      auto* sk_vec = reinterpret_cast<uint4*>(&smem.k[stage][0]);
-      auto* sv_vec = reinterpret_cast<uint4*>(&smem.v[stage][0]);
-      for (int vec = lane; vec < vec_count; vec += kProducerThreads) {
-        const int elem = vec * elems_per_vec;
-        const int row = elem / kHeadDim;
-        const int col = elem - row * kHeadDim;
-        const scalar_t* k = k0 + row * params.k_stride_s + col;
-        const scalar_t* v = v0 + row * params.v_stride_s + col;
-        sk_vec[vec] = *reinterpret_cast<const uint4*>(k);
-        sv_vec[vec] = *reinterpret_cast<const uint4*>(v);
-      }
-    } else {
-      for (int idx = lane; idx < kKvTile * kHeadDim; idx += kProducerThreads) {
-        const int row = idx / kHeadDim;
-        const int col = idx - row * kHeadDim;
-        const int token = block_start + row;
-        if (token < kv_end) {
-          const scalar_t* k = key_ptr<scalar_t>(params, batch, head, token);
-          const scalar_t* v = value_ptr<scalar_t>(params, batch, head, token);
-          smem.k[stage][idx] = k[col * params.k_stride_d];
-          smem.v[stage][idx] = v[col * params.v_stride_d];
-        } else {
-          smem.k[stage][idx] = ScalarIO<scalar_t>::zero();
-          smem.v[stage][idx] = ScalarIO<scalar_t>::zero();
-        }
-      }
+
+    constexpr int elems_per_vec = sizeof(uint4) / sizeof(scalar_t);
+    constexpr int vec_count = kKvTile * kHeadDim / elems_per_vec;
+    auto* sk_vec = reinterpret_cast<uint4*>(&smem.k[stage][0]);
+    auto* sv_vec = reinterpret_cast<uint4*>(&smem.v[stage][0]);
+    for (int vec = lane; vec < vec_count; vec += kProducerThreads) {
+      const int elem = vec * elems_per_vec;
+      const int row = elem / kHeadDim;
+      const int col = elem - row * kHeadDim;
+      const scalar_t* k = k0 + row * params.k_stride_s + col;
+      const scalar_t* v = v0 + row * params.v_stride_s + col;
+      sk_vec[vec] = *reinterpret_cast<const uint4*>(k);
+      sv_vec[vec] = *reinterpret_cast<const uint4*>(v);
     }
 
     producer_arrive(smem.barriers.kv_fill[stage]);
@@ -136,25 +101,24 @@ __device__ void compute_score_group(
     const OptAttentionParams& params,
     SharedStorage<scalar_t>& smem,
     int batch,
+    int head,
     int block,
     int stage,
     int kv_start,
-    int kv_end,
     int row_base,
     int compute_tid) {
   const int warp_id = compute_tid / 32;
   const int lane_id = compute_tid & 31;
   const int row = row_base + warp_id;
   const int token = kv_start + block * kKvTile + row;
+  const scalar_t* q = query_ptr<scalar_t>(params, batch, head);
 
   float partial = 0.0f;
-  if (row < kKvTile && token < kv_end) {
-    #pragma unroll
-    for (int col = lane_id; col < kHeadDim; col += 32) {
-      const float q = ScalarIO<scalar_t>::load(&smem.q[col]);
-      const float k = ScalarIO<scalar_t>::load(&smem.k[stage][row * kHeadDim + col]);
-      partial += q * k;
-    }
+  #pragma unroll
+  for (int col = lane_id; col < kHeadDim; col += 32) {
+    const float q_value = ScalarIO<scalar_t>::load(&q[col]);
+    const float k = ScalarIO<scalar_t>::load(&smem.k[stage][row * kHeadDim + col]);
+    partial += q_value * k;
   }
 
   #pragma unroll
@@ -163,11 +127,7 @@ __device__ void compute_score_group(
   }
 
   if (lane_id == 0) {
-    float score = -FLT_MAX;
-    if (row < kKvTile && token < kv_end) {
-      score = partial * params.scaling + mask_value(params, batch, token);
-    }
-    smem.scores[row] = score;
+    smem.scores[row] = partial * params.scaling + mask_value(params, batch, token);
   }
   compute_group_sync();
 }
@@ -188,31 +148,25 @@ __device__ void compute_attention(
   float row_sum = 0.0f;
   float acc = 0.0f;
 
-  smem.barriers.q_fill.arrive_and_wait();
-  compute_arrive(smem.barriers.q_drain);
-
   for (int block = 0; block < num_blocks; ++block) {
     const int stage = block & 1;
     smem.barriers.kv_fill[stage].arrive_and_wait();
 
     #pragma unroll
     for (int row_base = 0; row_base < kKvTile; row_base += 4) {
-      compute_score_group(params, smem, batch, block, stage, kv_start, kv_end, row_base, compute_tid);
+      compute_score_group(params, smem, batch, head, block, stage, kv_start, row_base, compute_tid);
 
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int row = row_base + i;
-        const int token = kv_start + block * kKvTile + row;
-        if (token < kv_end) {
-          const float score = smem.scores[row];
-          const float value = ScalarIO<scalar_t>::load(&smem.v[stage][row * kHeadDim + compute_tid]);
-          const float new_max = fmaxf(row_max, score);
-          const float old_scale = (row_max == -FLT_MAX) ? 0.0f : __expf(row_max - new_max);
-          const float score_scale = __expf(score - new_max);
-          acc = acc * old_scale + value * score_scale;
-          row_sum = row_sum * old_scale + score_scale;
-          row_max = new_max;
-        }
+        const float score = smem.scores[row];
+        const float value = ScalarIO<scalar_t>::load(&smem.v[stage][row * kHeadDim + compute_tid]);
+        const float new_max = fmaxf(row_max, score);
+        const float old_scale = (row_max == -FLT_MAX) ? 0.0f : __expf(row_max - new_max);
+        const float score_scale = __expf(score - new_max);
+        acc = acc * old_scale + value * score_scale;
+        row_sum = row_sum * old_scale + score_scale;
+        row_max = new_max;
       }
       compute_group_sync();
     }
@@ -247,8 +201,6 @@ __global__ __launch_bounds__(kThreads, 1) void opt_attention_decode_kernel(OptAt
 
   if (threadIdx.x < kComputeThreads) {
     compute_attention(params, smem, kv_start, kv_end, batch, head, split_idx);
-  } else if (threadIdx.x < kComputeThreads + kProducerThreads) {
-    producer_q(params, smem, batch, head);
   } else {
     producer_kv(params, smem, kv_start, kv_end, batch, head);
   }

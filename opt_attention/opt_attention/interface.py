@@ -41,7 +41,11 @@ def _supported(module, query, key, value, attention_mask, dropout, **kwargs) -> 
         return False
     if key.shape[0] != query.shape[0] or key.shape[1] != query.shape[1] or key.shape[-1] != query.shape[-1]:
         return False
+    if key.shape[2] % 64 != 0:
+        return False
     if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
+        return False
+    if int(os.environ.get("OPT_ATTENTION_SPLIT_SIZE", "256")) % 64 != 0:
         return False
     if attention_mask is not None:
         if not attention_mask.is_cuda or attention_mask.dim() != 4:

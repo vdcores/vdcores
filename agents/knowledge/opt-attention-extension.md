@@ -5,4 +5,6 @@
 - The v1 path targets Hugging Face OPT `StaticCache` decode tensors: Q `[B,H,1,128]`, K/V `[B,H,S,128]`, output `[B,1,H,128]`.
 - Register the Transformers interface with `opt_attention.register()`, then use `_attn_implementation="vdcores_opt"`.
 - Runtime tuning is intentionally small: `OPT_ATTENTION_SPLIT_SIZE` controls split-KV parallelism and defaults to `256`, which is best for the measured OPT-6.7B/30B decode shape `B=64,S=256`.
-- For `B=64,S=256`, real OPT shape benchmarks use `H=32,hidden=4096` for OPT-6.7B and `H=56,hidden=7168` for OPT-30B; the extension is correct vs PyTorch SDPA but remains slower than SDPA at those high-head-count shapes.
+- The fast path assumes StaticCache-style aligned K/V rows and requires `S` and `OPT_ATTENTION_SPLIT_SIZE` to be multiples of 64. These assumptions are checked on the host so the KV producer has no runtime full-tile/contiguous/alignment branch.
+- The Transformers attention interface wrapper falls back to eager attention when `S` or `OPT_ATTENTION_SPLIT_SIZE` is not a multiple of 64; direct C++ `decode` calls enforce the fast-path layout with `TORCH_CHECK`.
+- For `B=64,S=256`, real OPT shape benchmarks use `H=32,hidden=4096` for OPT-6.7B and `H=56,hidden=7168` for OPT-30B. The cleaned no-Q-producer kernel is correct vs PyTorch SDPA and measured at about `0.185 ms` for OPT-6.7B and `0.292 ms` for OPT-30B, still slower than SDPA on those high-head-count shapes.
