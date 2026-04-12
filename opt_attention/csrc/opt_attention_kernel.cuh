@@ -62,6 +62,15 @@ __device__ __forceinline__ void producer_kv_copy_tile(
   constexpr int copies_per_lane = vec_count / kProducerThreads;
   static_assert(vec_count % kProducerThreads == 0);
 
+  // K/V global layout is PyTorch StaticCache [B, H, S, D], with D contiguous.
+  // The caller already fixed B=batch and H=head in k0/v0:
+  //   k0 = &K[batch, head, block_start, 0]
+  //   block_start = kv_start + block * kKvTile, the first global S index in this tile.
+  // Inside this 64x128 tile:
+  //   row is the local S offset in [0, 64), so global S = block_start + row.
+  //   col is the local D offset in [0, 128), so global D = col.
+  // Shared memory is linearized with D as the fastest dimension:
+  //   smem.{k,v}[stage][row * kHeadDim + col] == shared [S_tile=row, D=col].
   auto* sk_vec = reinterpret_cast<uint4*>(&smem.k[stage][0]);
   auto* sv_vec = reinterpret_cast<uint4*>(&smem.v[stage][0]);
   #pragma unroll 1
