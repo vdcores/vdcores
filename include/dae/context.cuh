@@ -28,6 +28,10 @@ static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
+static constexpr int numTraceEvents = numInsts;
+static constexpr int numTraceKindBits = 1;
+static constexpr int numTraceBarBits = 10;
+static constexpr uint64_t traceBarMask = (1ull << numTraceBarBits) - 1ull;
 
 // barrier configurations
 static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;

@@ -5,6 +5,7 @@ from .runtime import config, opcode
 from .tma_utils import *
 
 import copy
+import json
 import os
 from enum import Enum
 from math import prod
@@ -24,6 +25,76 @@ def extract_compute_operator_names(launcher) -> list[str]:
             seen.add(name)
             operator_names.append(name)
     return operator_names
+
+
+def decode_packed_mem_trace(
+    trace: torch.Tensor | np.ndarray,
+    counts: torch.Tensor | np.ndarray,
+    *,
+    trace_kind_bits: int | None = None,
+    trace_bar_bits: int | None = None,
+) -> dict[int, list[list[int | str]]]:
+    if trace_kind_bits is None:
+        trace_kind_bits = config.trace_kind_bits
+    if trace_bar_bits is None:
+        trace_bar_bits = config.trace_bar_bits
+
+    if isinstance(trace, torch.Tensor):
+        trace_np = trace.detach().cpu().numpy()
+    else:
+        trace_np = np.asarray(trace)
+
+    if isinstance(counts, torch.Tensor):
+        counts_np = counts.detach().cpu().numpy()
+    else:
+        counts_np = np.asarray(counts)
+
+    kind_mask = (1 << int(trace_kind_bits)) - 1
+    bar_mask = (1 << int(trace_bar_bits)) - 1
+    decoded: dict[int, list[list[int | str]]] = {}
+
+    for sm_id in range(int(counts_np.shape[0])):
+        num_events = int(counts_np[sm_id])
+        packed_events = trace_np[sm_id, :num_events]
+        for packed in packed_events:
+            packed_int = int(packed)
+            kind = "store" if (packed_int & kind_mask) else "load"
+            bar_id = (packed_int >> int(trace_kind_bits)) & bar_mask
+            timestamp = packed_int >> (int(trace_bar_bits) + int(trace_kind_bits))
+            if bar_id not in decoded:
+                decoded[bar_id] = []
+            decoded[bar_id].append([sm_id, timestamp, kind])
+
+    return decoded
+
+
+def format_decoded_mem_trace_for_json(decoded_trace: dict[int, list[list[int | str]]]) -> list[dict[str, object]]:
+    return [
+        {
+            "bar_id": bar_id,
+            "events": sorted(events, key=lambda item: (item[1], item[0], item[2])),
+        }
+        for bar_id, events in sorted(decoded_trace.items())
+    ]
+
+
+def dumps_bench_mem_traces_json(traces: list[dict[int, list[list[int | str]]]]) -> str:
+    lines = ["["]
+    for run_idx, trace in enumerate(traces):
+        if run_idx > 0:
+            lines[-1] += ","
+        lines.append("  [")
+        formatted_trace = format_decoded_mem_trace_for_json(trace)
+        for item_idx, item in enumerate(formatted_trace):
+            suffix = "," if item_idx + 1 < len(formatted_trace) else ""
+            events_json = json.dumps(item["events"], separators=(", ", ": "))
+            lines.append("    {")
+            lines.append(f'      "bar_id": {item["bar_id"]},')
+            lines.append(f'      "events": {events_json}')
+            lines.append(f"    }}{suffix}")
+        lines.append("  ]")
+    lines.append("]")
+    return "\n".join(lines) + "\n"
 
 
 class SMInstructionBuilder:
@@ -219,6 +290,10 @@ class Launcher:
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
         self.profile = torch.empty((num_sms, config.num_profile_events), dtype=torch.uint64, device=self.device)
+        self.trace_capacity = config.num_trace_events
+        self.mem_trace = torch.empty((num_sms, self.trace_capacity), dtype=torch.uint64, device=self.device)
+        self.mem_trace_counts = torch.zeros((num_sms,), dtype=torch.int32, device=self.device)
+        self.bench_mem_traces = []
 
         self.cinsts = torch.empty((num_sms, self.max_insts, 8), dtype=torch.uint8)
         self.minsts = torch.empty((num_sms, self.max_insts, 16), dtype=torch.uint8)
@@ -413,6 +488,19 @@ class Launcher:
             num_bytes=num_bytes,
         )
 
+    def print_barrier_counts(self):
+        print("[debug] barrier counts:")
+        for group_name, group in self.resource_groups.items():
+            for name, bar_info in group.bars.items():
+                if bar_info["count"] is None:
+                    continue
+                if group.built:
+                    bar_id = group.get(name)
+                    print(f"[debug]   {group_name}.{name} [bar_id={bar_id}] = {bar_info['count']}")
+                else:
+                    print(f"[debug]   {group_name}.{name} [bar_id=?] = {bar_info['count']}")
+
+
     def i(self, *insts):
         """Add instructions to all SM builders."""
         for inst in insts:
@@ -503,6 +591,9 @@ class Launcher:
         else:
             tma = torch.stack(self.tmas).to(self.device)
         profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
+        trace = self.mem_trace.view(torch.uint8).view(self.num_sms * self.trace_capacity, 8)
+        trace_counts = self.mem_trace_counts.view(torch.uint8).view(self.num_sms, 4)
+        self.mem_trace_counts.zero_()
 
         runtime.reset_cache_policy(stream)
         cache_window = self._select_launch_cache_window(
@@ -524,20 +615,26 @@ class Launcher:
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
-            self.bars, profile,
+            self.bars, profile, trace, trace_counts,
             stream
         )
         assert ret == 0
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)
+
+    def decode_mem_trace(self) -> dict[int, list[list[int | str]]]:
+        return decode_packed_mem_trace(self.mem_trace, self.mem_trace_counts)
     
     def bench(self, iterations : int = 100,
-                    total_bytes : int | None = None, total_flops : int | None = None):
+                    total_bytes : int | None = None, total_flops : int | None = None,
+                    trace_json_path: str | None = None):
         execution_times = []
         duration_ns = np.zeros(self.num_sms, dtype=np.float64)
+        self.bench_mem_traces = []
         for i in range(iterations):
             self.launch()
+            self.bench_mem_traces.append(self.decode_mem_trace())
 
             # fetch profile data
             profile_data = self.profile[:,0:2].cpu().numpy()
@@ -565,3 +662,7 @@ class Launcher:
         if total_flops is not None:
             gflops = total_flops / mean_execution_time / 1e6
             print(f"Effective GFLOPS: {gflops:.2f}")
+        if trace_json_path is not None:
+            with open(trace_json_path, "w", encoding="utf-8") as f:
+                f.write(dumps_bench_mem_traces_json(self.bench_mem_traces))
+            print(f"[bench-trace] wrote decoded traces to {trace_json_path}")

@@ -257,7 +257,9 @@ struct DAELauncher {
     cudaError_t err = launch_dae(
       numSMs, smem_size,
       comp_d, mem_d, tma_d, bars,
-      profile_d
+      profile_d,
+      nullptr, nullptr,
+      0
     );
 
     if (err != cudaSuccess) {
@@ -294,7 +296,9 @@ struct DAELauncher {
       launch_dae(
         numSMs, smem_size,
         comp_d, mem_d, tma_d, bars,
-        profile_d
+        profile_d,
+        nullptr, nullptr,
+        0
       );
 
       for (int sm = 0; sm < numSMs; sm++) {

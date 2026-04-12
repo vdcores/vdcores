@@ -94,6 +94,24 @@ class ProfileParser:
         self.history = data
         self.count += 1
 
+
+def print_mem_trace(decoded_trace: dict[int, list[list[int | str]]]):
+    print("[trace] Decoded memory trace:")
+    any_events = False
+    for bar_id in sorted(decoded_trace):
+        bar_events = decoded_trace[bar_id]
+        if not bar_events:
+            continue
+        any_events = True
+        ordered = sorted(bar_events, key=lambda item: (item[1], item[0], item[2]))
+        rendered = " ".join(
+            f"sm={sm_id}@{timestamp}:{kind}"
+            for sm_id, timestamp, kind in ordered
+        )
+        print(f"[trace][bar={bar_id}] {rendered}")
+    if not any_events:
+        print("[trace] no events recorded")
+
 def dae_app(dae, total_bytes = None):
     parser = argparse.ArgumentParser(description="VDCores frontend")
     group = parser.add_mutually_exclusive_group()
@@ -107,6 +125,8 @@ def dae_app(dae, total_bytes = None):
                         help="Profile with VDCores profiling counters")
     parser.add_argument("-w", "--write-compute-ops", type=str, nargs="?", const=DEFAULT_COMPUTE_OPS_FILE, default=None,
                         help=f"Write the launcher compute-operator list to a file (default: {DEFAULT_COMPUTE_OPS_FILE})")
+    parser.add_argument("--bench-trace-json", type=str, default=None,
+                        help="When used with -b/--bench, decode per-run memory traces and write them to a JSON file")
     
     parsed = parser.parse_args()
     did_work = False
@@ -124,6 +144,7 @@ def dae_app(dae, total_bytes = None):
     if parsed.launch:
         print(f"[launch] VDCores with {dae.num_sms} SMs...")
         dae.launch()
+        print_mem_trace(dae.decode_mem_trace())
         executed = True
     elif parsed.bench is not None:
         warmup = int(os.environ.get("DAE_BENCH_WARMUP", "0"))
@@ -132,7 +153,7 @@ def dae_app(dae, total_bytes = None):
         torch.cuda.synchronize()
 
         print(f"[bench] VDCores with {dae.num_sms} SMs...")
-        dae.bench(parsed.bench, total_bytes=total_bytes)
+        dae.bench(parsed.bench, total_bytes=total_bytes, trace_json_path=parsed.bench_trace_json)
         torch.cuda.synchronize()
         executed = True
     elif not did_work:

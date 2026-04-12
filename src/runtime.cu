@@ -23,6 +23,8 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
+  uint64_t * trace,
+  uint32_t * trace_counts,
   int64_t stream
 ) {
   // wait for all pre-launch meta-data copying
@@ -33,7 +35,9 @@ cudaError_t launch_dae(
     memory_instructions,
     tma_descs,
     bars,
-    profile
+    profile,
+    trace,
+    trace_counts
   );
   // TODO(zhiyuang): check launch error here?
 

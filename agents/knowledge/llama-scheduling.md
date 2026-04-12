@@ -29,6 +29,19 @@
 - `python/dae/model.py` now derives GQA Q-load TMA metadata from the tensor shape instead of assuming `head_dim=128` and `num_kv_head=4`.
 - `python/dae/schedule.py` now derives RMS per-token byte stride from the scheduled hidden size and routes kernel selection through helper selectors in `python/dae/instructions.py`.
 
+## Llama3 Runtime Interaction
+
+- `app/python/llama3/sched.py` programs the runtime by composing `Schedule` objects, then placing each schedule onto an SM range with `.place(num_sms, base_sm=...)`.
+- `python/dae/schedule.py` maps placed SM ids to logical workers; each schedule's `schedule(sm)` method returns the compute instruction plus the memory instructions for that worker.
+- `SchedGemv` partitions work over output `M` tiles first and folds over `K`. After placement, `sm_per_fold = M / TileM` and `k_per_fold = K / fold`, so one SM computes one output tile `m` and one `K` fold. With fold greater than `1`, the output path must use a reduce-mode store.
+- `SchedAttentionDecoding` uses one SM per `(request, kv_head)` pair. Each worker loads one Q tile, streams all KV blocks for that head, and stores one O tile.
+- Memory movement in the Llama3 path uses three patterns:
+- 2D/3D TMA load-store or reduce descriptors for normal tensor traffic such as GEMV weights, activations, KV cache, and residual accumulation.
+- raw-address operands for kernels that consume or produce GMEM pointers directly, such as argmax and the raw-address SiLU path in the generic scheduler library.
+- register handoff through `RegStore` and `RegLoad` when the next op can consume the producer output without writing that intermediate to GMEM first.
+- In the current Llama3 decode path, Q and K use register handoff into a separate rope stage before the rotated result is reduced into GMEM, while V writes straight to KV cache. The fused MLP tail similarly keeps gate and up outputs in registers until `SchedRegSiLUFused` writes the final SiLU result to GMEM.
+- `LoopM.toNext(..., resource_group=layerg)` and `LoopC.toNext(...)` advance memory and compute instruction streams across the repeated `layer` resource group, so a single scheduled layer body iterates through all transformer layers with shifted TMA and barrier ids.
+
 ## Deadlock Debugging Lessons
 
 - If a schedule prints `[launch]` and then stalls, treat it as a likely barrier or data-dependency bug before treating it as a kernel crash.

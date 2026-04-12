@@ -33,14 +33,6 @@ def bind_unused_late_barriers_to_zero(dae):
                 group.bindBarrier(name, 0)
 
 
-def print_barrier_counts(dae):
-    print("[debug] barrier counts:")
-    for group_name, group in dae.resource_groups.items():
-        for name, bar_info in group.bars.items():
-            if bar_info["count"] is None:
-                continue
-            print(f"[debug]   {group_name}.{name} = {bar_info['count']}")
-
 
 def bind_late_barriers_with_default(dae, *insts, unresolved_count=None):
     bar_counts = dae.collect_barrier_release_counts(*insts)

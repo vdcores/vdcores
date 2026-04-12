@@ -555,7 +555,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     bind_late_barriers_with_default(dae, *bound_items, unresolved_count=0)
     bind_unused_late_barriers_to_zero(dae)
     if parsed_args.debug_print_barriers:
-        print_barrier_counts(dae)
+        dae.print_barrier_counts()
 
     if parsed_args.dry_build:
         return

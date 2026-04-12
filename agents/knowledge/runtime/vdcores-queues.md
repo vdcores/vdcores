@@ -56,6 +56,19 @@ The writeback form is required for slots that correspond to `OP_ALLOC_WB_*` memo
   - `cp_async_bulk` for 1D stores
   - `cp.async.bulk.tensor.*` for descriptor-backed TMA stores
 - After the store completes, it frees the slot.
+- Barriered writebacks only release their software barrier after `cp_async_bulk_wait_group(...)`, so the next dependent barriered load cannot issue before the writeback DMA has completed.
+
+## Packed Memory Trace
+
+- The runtime now exposes a separate per-SM packed memory trace buffer through `Launcher.mem_trace` plus per-SM counts in `Launcher.mem_trace_counts`.
+- Each trace entry is a single `uint64_t` packed as `(delta_from_kernel_start << 10) | bar_id`.
+- The trace currently records:
+  - barriered load issue events from `ldwarp`
+  - barrier-release events from `stwarp`
+- `trace_bar_bits=10` matches the current `numBars=1024` limit in `context.cuh`.
+- Trace capacity is compile-time fixed by `numTraceEvents` in `context.cuh`.
+- The kernel selects the current SM's trace row once in `dae2.cuh` and passes that row to `ldwarp` and `stwarp`.
+- The per-SM event count is accumulated in shared memory during execution and written back to global memory once at block exit.
 
 ## Deadlock Debugging Heuristic
 

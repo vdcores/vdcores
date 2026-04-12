@@ -30,7 +30,9 @@ void dae2(
   const MInst* __restrict__ memory_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
-  uint64_t *  __restrict__ g_events
+  uint64_t *  __restrict__ g_events,
+  uint64_t *  __restrict__ trace,
+  uint32_t *  __restrict__ trace_counts
 ) {
 
   int sm_id = blockIdx.x;
@@ -105,10 +107,15 @@ void dae2(
   // alloc a small scratch space for temporary data
   // argmax uses this
   __shared__ uint64_t scratch_space[32]; // 8-bytes aligned
+  __shared__ uint64_t kernel_start_time;
+  __shared__ uint32_t trace_count_shared;
+  uint64_t *trace_row = trace == nullptr ? nullptr : trace + sm_id * numTraceEvents;
 
   if (threadIdx.x == 0) {
+    kernel_start_time = cuda::ptx::get_sreg_globaltimer();
+    trace_count_shared = 0;
     int event_base = sm_id * numProfileEvents;
-    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+    g_events[event_base + 0] = kernel_start_time;
   }
 
   __syncthreads();
@@ -158,7 +165,8 @@ void dae2(
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars,
+          kernel_start_time, trace_row, &trace_count_shared
         );
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
@@ -167,11 +175,17 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars,
+          kernel_start_time, trace_row, &trace_count_shared
         );
       }
     } // End of warps
   } // End of memory warp group
+
+  __syncthreads();
+  if (threadIdx.x == 0 && trace_counts != nullptr) {
+    trace_counts[sm_id] = trace_count_shared > numTraceEvents ? numTraceEvents : trace_count_shared;
+  }
 
   // end of megakernel
 }

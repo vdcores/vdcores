@@ -6,7 +6,9 @@
 template<typename C2M_Type>
 __device__ __forceinline__ void stwarp_execute_singlethread(
     C2M_Type &c2m, const MInst* slot_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    uint64_t kernel_start_time,
+    uint64_t *trace_row, uint32_t *trace_count) {
 
   __stprint("[ST Warp] Start ST warp execution");
     
@@ -156,6 +158,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
       // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
       atomicSub(&bars[inst.bar()], 1);
+      append_trace_delta_bar(trace_row, trace_count, kernel_start_time, inst.bar(), true);
       // int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);
       // __stprint("Arrive for barrier %d, remaining count=%d", inst.bar(), current_cnt - 1);
       // if (inst.bar() == 0)

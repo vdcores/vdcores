@@ -16,6 +16,7 @@ arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--correctness", action="store_true")
+arg_parser.add_argument("--debug-print-barriers", action="store_true")
 parsed_args, remaining_argv = arg_parser.parse_known_args()
 if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
   remaining_argv = [*remaining_argv, "--launch"]
@@ -39,7 +40,7 @@ config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, token=os.en
 eps = config.rms_norm_eps # 1e-6
 rope_theta = config.rope_parameters["rope_theta"]
 
-layers = model.model.layers
+layers = model.model.layers[:1]
 
 ###################################
 # basic parameter of DAE
@@ -100,6 +101,7 @@ layerg.addBarrier('bar_silu_out1')
 layerg.addBarrier('bar_silu_out2')
 layerg.addBarrier('bar_pre_attn_rms')
 layerg.addBarrier('bar_post_attn_rms')
+# layerg.addBarrier('bar_down_proj')
 
 ###################################
 # Define tensors
@@ -295,7 +297,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
   pre_attn_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(layerg['loadRMSInputW'].cord(0), loadHidden1D, storeRMSHidden1D)
-  ).bar("input", layerg['bar_layer']).bar("output", layerg.next('bar_pre_attn_rms'))
+  ).bar("output", layerg.next('bar_pre_attn_rms'))
+  # .bar("input", layerg['bar_layer'])
   post_attn_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(layerg['loadRMSPostAttnW'].cord(0), loadHidden1D, storeRMSHidden1D)
@@ -497,6 +500,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
     restore_bars_low,
   )
 
+  if parsed_args.debug_print_barriers:
+    dae.print_barrier_counts()
+
   # build first rms with embedding
   dae.i(
     embed_rms,
@@ -533,19 +539,19 @@ def schedule_single_token(token_offset: int, token_pos: int):
     down_proj_high,
 
     # rms for next layer
-    pre_attn_rms,
+    # pre_attn_rms,
 
     # # all 132 SM need loop
-    LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
-    LoopC.toNext(dae.copy_cptrs(), num_layers),
+    # LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
+    # LoopC.toNext(dae.copy_cptrs(), num_layers),
 
     # # logits
-    LogitsProj,
+    # LogitsProj,
 
-    # argmax and cleanup
-    Argmax,
+    # # argmax and cleanup
+    # Argmax,
 
-    restore_bars_low,
+    # restore_bars_low,
   )
 
 ###################################

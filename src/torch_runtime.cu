@@ -139,6 +139,8 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
+    torch::Tensor trace_u64,             // uint64
+    torch::Tensor trace_counts_u32,      // uint32
     int64_t stream
 ) {
   set_persistent_cache();
@@ -152,11 +154,13 @@ int py_launch_dae(
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+  auto trace = check_tensor_ptr<uint64_t>(trace_u64, "trace_u64");
+  auto trace_counts = check_tensor_ptr<uint32_t>(trace_counts_u32, "trace_counts_u32");
 
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, prof, trace, trace_counts, stream
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -372,6 +376,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
   config.attr("num_profile_events") = numProfileEvents;
+  config.attr("num_trace_events") = numTraceEvents;
+  config.attr("trace_kind_bits") = numTraceKindBits;
+  config.attr("trace_bar_bits") = numTraceBarBits;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;

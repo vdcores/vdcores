@@ -97,6 +97,46 @@ static __device__ __forceinline__ void * slot_2_glob_ptr(const MInst *st_insts, 
   return glob_ptr;
 }
 
+static __device__ __host__ __forceinline__ uint64_t pack_trace_delta_bar_kind(
+    uint64_t delta,
+    uint16_t bar_id,
+    bool is_store) {
+  constexpr int total_meta_bits = numTraceBarBits + numTraceKindBits;
+  return (delta << total_meta_bits)
+      | ((uint64_t(bar_id) & traceBarMask) << numTraceKindBits)
+      | uint64_t(is_store ? 1 : 0);
+}
+
+static __device__ __host__ __forceinline__ uint16_t unpack_trace_bar(uint64_t packed) {
+  return uint16_t((packed >> numTraceKindBits) & traceBarMask);
+}
+
+static __device__ __host__ __forceinline__ bool unpack_trace_is_store(uint64_t packed) {
+  return bool(packed & ((1ull << numTraceKindBits) - 1ull));
+}
+
+static __device__ __host__ __forceinline__ uint64_t unpack_trace_delta(uint64_t packed) {
+  return packed >> (numTraceBarBits + numTraceKindBits);
+}
+
+static __device__ __forceinline__ void append_trace_delta_bar(
+    uint64_t *trace_row,
+    uint32_t *trace_count,
+    uint64_t kernel_start_time,
+    uint16_t bar_id,
+    bool is_store) {
+  if (trace_row == nullptr || trace_count == nullptr) {
+    return;
+  }
+  uint32_t idx = atomicAdd(trace_count, 1u);
+  if (idx >= numTraceEvents) {
+    return;
+  }
+
+  uint64_t now = cuda::ptx::get_sreg_globaltimer();
+  trace_row[idx] = pack_trace_delta_bar_kind(now - kernel_start_time, bar_id, is_store);
+}
+
 // TODO(zhiyuang): do we want to put barrier index in the command?
 // TODO(zhiyuang): do we want to do int32 or 64?
 union LdCmd {

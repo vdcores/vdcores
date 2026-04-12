@@ -6,7 +6,9 @@ template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     const MInst *st_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    uint64_t kernel_start_time,
+    uint64_t *trace_row, uint32_t *trace_count) {
 
   __ldprint("[LD Warp] Start LD warp execution");
 
@@ -184,6 +186,9 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
     // m2c data should be prepared in the CFU
     (void)m2c.barriers[bar].arrive();
+    if ((opcode & MEM_OP_FLAGS_BARRIER) && !(opcode & MEM_OP_FLAGS_WRITEBACK)) {
+      append_trace_delta_bar(trace_row, trace_count, kernel_start_time, inst.bar(), false);
+    }
 
     m2ld.wait();
     cmd.raw = m2ld.data[m2ld.ptr];
