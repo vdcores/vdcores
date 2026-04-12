@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -5,6 +6,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 ROOT = Path(__file__).resolve().parent
+USE_TMA = os.environ.get("OPT_ATTENTION_USE_TMA", "1").lower() not in {"0", "false", "off", "no"}
+USE_TMA_DEFINE = f"-DOPT_ATTENTION_USE_TMA={1 if USE_TMA else 0}"
 
 
 setup(
@@ -19,12 +22,14 @@ setup(
                 str(ROOT / "csrc" / "opt_attention_kernel.cu"),
             ],
             include_dirs=[str(ROOT / "csrc")],
+            libraries=["cuda"],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++20", "-DNDEBUG"],
+                "cxx": ["-O3", "-std=c++20", "-DNDEBUG", USE_TMA_DEFINE],
                 "nvcc": [
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
+                    USE_TMA_DEFINE,
                     "-lineinfo",
                     "-Xptxas=-v",
                     "-gencode=arch=compute_90a,code=sm_90a",

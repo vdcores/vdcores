@@ -45,6 +45,16 @@ def _supported(module, query, key, value, attention_mask, dropout, **kwargs) -> 
         return False
     if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
         return False
+    if key.stride(-2) != key.shape[-1] or value.stride(-2) != value.shape[-1]:
+        return False
+    if key.stride(-3) != key.shape[-2] * key.shape[-1]:
+        return False
+    if value.stride(-3) != value.shape[-2] * value.shape[-1]:
+        return False
+    if key.stride(-4) != key.shape[-3] * key.shape[-2] * key.shape[-1]:
+        return False
+    if value.stride(-4) != value.shape[-3] * value.shape[-2] * value.shape[-1]:
+        return False
     if int(os.environ.get("OPT_ATTENTION_SPLIT_SIZE", "256")) % 64 != 0:
         return False
     if attention_mask is not None:

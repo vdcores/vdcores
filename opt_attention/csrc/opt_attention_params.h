@@ -1,14 +1,21 @@
 #pragma once
 
+#include <cuda.h>
+
 #include <cstdint>
 
 namespace opt_attention {
+
+#ifndef OPT_ATTENTION_USE_TMA
+#define OPT_ATTENTION_USE_TMA 1
+#endif
 
 constexpr int kHeadDim = 128;
 constexpr int kKvTile = 64;
 constexpr int kComputeThreads = 128;
 constexpr int kProducerThreads = 32;
 constexpr int kThreads = kComputeThreads + kProducerThreads;
+constexpr bool kUseTensorTma = OPT_ATTENTION_USE_TMA != 0;
 
 struct OptAttentionParams {
   const void* query;
@@ -19,6 +26,7 @@ struct OptAttentionParams {
   float* partial_out;
   float* partial_m;
   float* partial_l;
+  const CUtensorMap* tma_descs;
 
   int batch_size;
   int num_heads;

@@ -11,7 +11,7 @@ static void launch_typed(const OptAttentionParams& params) {
   const dim3 grid(params.batch_size * params.num_heads * params.num_splits);
   const dim3 block(kThreads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  opt_attention_decode_kernel<scalar_t><<<grid, block, 0, stream>>>(params);
+  opt_attention_decode_kernel<scalar_t, kUseTensorTma><<<grid, block, 0, stream>>>(params);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (params.num_splits > 1) {
     const dim3 reduce_grid(params.batch_size * params.num_heads);

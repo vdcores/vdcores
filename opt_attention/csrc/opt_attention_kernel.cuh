@@ -12,8 +12,8 @@ namespace opt_attention {
 template <typename scalar_t>
 struct SharedStorage {
   PipelineBarriers barriers;
-  alignas(16) scalar_t k[2][kKvTile * kHeadDim];
-  alignas(16) scalar_t v[2][kKvTile * kHeadDim];
+  alignas(128) scalar_t k[2][kKvTile * kHeadDim];
+  alignas(128) scalar_t v[2][kKvTile * kHeadDim];
   alignas(16) float scores[kKvTile];
 };
 
@@ -87,6 +87,37 @@ __device__ __forceinline__ void producer_kv_copy_tile(
 }
 
 template <typename scalar_t>
+__device__ __forceinline__ void producer_kv_tma_tile(
+    const OptAttentionParams& params,
+    SharedStorage<scalar_t>& smem,
+    int block_start,
+    int stage,
+    int batch,
+    int head,
+    int lane) {
+  if (lane != 0) {
+    return;
+  }
+
+  constexpr int tile_bytes = kKvTile * kHeadDim * static_cast<int>(sizeof(scalar_t));
+  const int flat_bhs_start = ((batch * params.num_heads + head) * params.key_seq_len + block_start);
+
+  // TMA global layout is the same PyTorch StaticCache [B, H, S, D] tensor, viewed as [D, BHS].
+  //   D coordinate = 0 because every load copies a full local D span [0, kHeadDim).
+  //   BHS coordinate = ((batch * H + head) * S + block_start), the first global S row in this tile.
+  // Shared memory receives a [S_tile=64, D=128] tile with D fastest:
+  //   smem.{k,v}[stage][row * kHeadDim + col] == shared [S_tile=row, D=col].
+  // Descriptor parameters:
+  //   globalDim={D=128, BHS=B*H*S}, globalStride[0]=D*sizeof(scalar_t),
+  //   boxDim={D=128, S_tile=64}, elementStrides={1,1}, no interleave, no swizzle.
+  cuda::device::barrier_expect_tx(
+      smem.barriers.kv_fill[stage],
+      cuda::aligned_size_t<16>(2 * tile_bytes));
+  tma_load_2d(&smem.k[stage][0], &params.tma_descs[0], smem.barriers.kv_fill[stage], 0, flat_bhs_start);
+  tma_load_2d(&smem.v[stage][0], &params.tma_descs[1], smem.barriers.kv_fill[stage], 0, flat_bhs_start);
+}
+
+template <typename scalar_t, bool UseTma>
 __device__ void producer_kv(
     const OptAttentionParams& params,
     SharedStorage<scalar_t>& smem,
@@ -97,6 +128,12 @@ __device__ void producer_kv(
   const int lane = threadIdx.x - kComputeThreads;
   const int chunk_len = max(0, kv_end - kv_start);
   const int num_blocks = (chunk_len + kKvTile - 1) / kKvTile;
+  if constexpr (UseTma) {
+    if (lane == 0) {
+      tma_fence_acquire(&params.tma_descs[0]);
+      tma_fence_acquire(&params.tma_descs[1]);
+    }
+  }
 
   for (int block = 0; block < num_blocks; ++block) {
     const int stage = block & 1;
@@ -105,11 +142,14 @@ __device__ void producer_kv(
     }
 
     const int block_start = kv_start + block * kKvTile;
-    const scalar_t* k0 = key_ptr<scalar_t>(params, batch, head, block_start);
-    const scalar_t* v0 = value_ptr<scalar_t>(params, batch, head, block_start);
-
-    producer_kv_copy_tile(params, smem, k0, v0, stage, lane);
-    producer_async_arrive(smem.barriers.kv_fill[stage]);
+    if constexpr (UseTma) {
+      producer_kv_tma_tile(params, smem, block_start, stage, batch, head, lane);
+    } else {
+      const scalar_t* k0 = key_ptr<scalar_t>(params, batch, head, block_start);
+      const scalar_t* v0 = value_ptr<scalar_t>(params, batch, head, block_start);
+      producer_kv_copy_tile(params, smem, k0, v0, stage, lane);
+      producer_async_arrive(smem.barriers.kv_fill[stage]);
+    }
     producer_arrive(smem.barriers.kv_fill[stage]);
   }
 }
@@ -213,7 +253,7 @@ __device__ void compute_attention(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool UseTma>
 __global__ __launch_bounds__(kThreads, 1) void opt_attention_decode_kernel(OptAttentionParams params) {
   __shared__ SharedStorage<scalar_t> smem;
   init_pipeline_barriers(smem.barriers);
@@ -227,7 +267,7 @@ __global__ __launch_bounds__(kThreads, 1) void opt_attention_decode_kernel(OptAt
   if (threadIdx.x < kComputeThreads) {
     compute_attention(params, smem, kv_start, kv_end, batch, head, split_idx);
   } else {
-    producer_kv(params, smem, kv_start, kv_end, batch, head);
+    producer_kv<scalar_t, UseTma>(params, smem, kv_start, kv_end, batch, head);
   }
 }
 

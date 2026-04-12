@@ -1,7 +1,10 @@
 #include "opt_attention_params.h"
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -67,6 +70,72 @@ void check_static_cache_fast_path(
               "value batch/head/sequence strides must preserve 16-byte row alignment");
 }
 
+void check_static_cache_tma_path(const torch::Tensor& key, const torch::Tensor& value) {
+  TORCH_CHECK(key.stride(3) == 1 && value.stride(3) == 1,
+              "TMA path requires StaticCache [B,H,S,D] with contiguous D");
+  TORCH_CHECK(key.stride(2) == opt_attention::kHeadDim &&
+                  value.stride(2) == opt_attention::kHeadDim,
+              "TMA path requires StaticCache [B,H,S,D] with S stride == D");
+  TORCH_CHECK(key.stride(1) == key.size(2) * opt_attention::kHeadDim &&
+                  value.stride(1) == value.size(2) * opt_attention::kHeadDim,
+              "TMA path requires StaticCache [B,H,S,D] with H stride == S*D");
+  TORCH_CHECK(key.stride(0) == key.size(1) * key.size(2) * opt_attention::kHeadDim &&
+                  value.stride(0) == value.size(1) * value.size(2) * opt_attention::kHeadDim,
+              "TMA path requires contiguous StaticCache [B,H,S,D] layout");
+}
+
+void check_driver(CUresult result, const char* call) {
+  if (result == CUDA_SUCCESS) {
+    return;
+  }
+  const char* name = "unknown";
+  const char* text = "unknown";
+  static_cast<void>(cuGetErrorName(result, &name));
+  static_cast<void>(cuGetErrorString(result, &text));
+  TORCH_CHECK(false, call, " failed: ", name, ": ", text);
+}
+
+CUtensorMapDataType tensor_map_dtype(at::ScalarType dtype) {
+  if (dtype == torch::kFloat16) {
+    return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+  }
+  if (dtype == torch::kBFloat16) {
+    return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+  }
+  TORCH_CHECK(false, "unsupported TMA dtype");
+}
+
+void encode_static_cache_tma_desc(CUtensorMap* desc, const torch::Tensor& tensor) {
+  const auto elem_size = static_cast<uint64_t>(tensor.element_size());
+  const uint64_t global_dim[2] = {
+      static_cast<uint64_t>(opt_attention::kHeadDim),
+      static_cast<uint64_t>(tensor.size(0) * tensor.size(1) * tensor.size(2)),
+  };
+  const uint64_t global_strides[1] = {
+      static_cast<uint64_t>(opt_attention::kHeadDim) * elem_size,
+  };
+  const uint32_t box_dim[2] = {
+      static_cast<uint32_t>(opt_attention::kHeadDim),
+      static_cast<uint32_t>(opt_attention::kKvTile),
+  };
+  const uint32_t element_strides[2] = {1, 1};
+
+  check_driver(cuTensorMapEncodeTiled(
+                   desc,
+                   tensor_map_dtype(tensor.scalar_type()),
+                   2,
+                   const_cast<void*>(tensor.data_ptr()),
+                   global_dim,
+                   global_strides,
+                   box_dim,
+                   element_strides,
+                   CU_TENSOR_MAP_INTERLEAVE_NONE,
+                   CU_TENSOR_MAP_SWIZZLE_NONE,
+                   CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+               "cuTensorMapEncodeTiled");
+}
+
 }  // namespace
 
 torch::Tensor decode(
@@ -79,6 +148,9 @@ torch::Tensor decode(
   check_qkv(query, key, value);
   TORCH_CHECK(split_size > 0, "split_size must be positive");
   check_static_cache_fast_path(query, key, value, split_size);
+  if constexpr (opt_attention::kUseTensorTma) {
+    check_static_cache_tma_path(key, value);
+  }
 
   const bool has_mask = attention_mask.has_value() && attention_mask->defined();
   if (has_mask) {
@@ -108,6 +180,7 @@ torch::Tensor decode(
   params.partial_out = num_splits > 1 ? partial_out.data_ptr<float>() : nullptr;
   params.partial_m = num_splits > 1 ? partial_m.data_ptr<float>() : nullptr;
   params.partial_l = num_splits > 1 ? partial_l.data_ptr<float>() : nullptr;
+  params.tma_descs = nullptr;
   params.batch_size = static_cast<int>(query.size(0));
   params.num_heads = static_cast<int>(query.size(1));
   params.key_seq_len = static_cast<int>(key.size(2));
@@ -140,10 +213,33 @@ torch::Tensor decode(
     params.m_stride_s = attention_mask->stride(3);
   }
 
+  torch::Tensor tma_storage;
+  if constexpr (opt_attention::kUseTensorTma) {
+    check_driver(cuInit(0), "cuInit");
+    std::array<CUtensorMap, 2> host_descs{};
+    encode_static_cache_tma_desc(&host_descs[0], key);
+    encode_static_cache_tma_desc(&host_descs[1], value);
+
+    const auto desc_align = static_cast<uintptr_t>(alignof(CUtensorMap));
+    tma_storage = torch::empty(
+        {static_cast<int64_t>(host_descs.size() * sizeof(CUtensorMap) + desc_align)},
+        query.options().dtype(torch::kUInt8));
+    const uintptr_t raw_ptr = reinterpret_cast<uintptr_t>(tma_storage.data_ptr());
+    const uintptr_t aligned_ptr = (raw_ptr + desc_align - 1) & ~(desc_align - 1);
+    params.tma_descs = reinterpret_cast<const CUtensorMap*>(aligned_ptr);
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        reinterpret_cast<void*>(aligned_ptr),
+        host_descs.data(),
+        host_descs.size() * sizeof(CUtensorMap),
+        cudaMemcpyHostToDevice,
+        at::cuda::getCurrentCUDAStream()));
+  }
+
   opt_attention::launch_decode(params, query.scalar_type());
   return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode", &decode, "OPT StaticCache decode attention");
+  m.def("uses_tma", []() { return opt_attention::kUseTensorTma; }, "Whether the extension was built with Tensor TMA loads");
 }
