@@ -1,0 +1,50 @@
+\subsection{\sys{} Scheduler}
+\label{sec:design-llm}
+
+\sys{} scheduler connects \sys{} to high level ML frameworks.
+It takes the an operator graph dispatched by the framework, and copmiles it into per-virutal core \sys{} \mop{} flows.
+
+% The challenge of scheduler lies in  to connect \sys{} to high-level frameworks while keeping the ablity to adaptive to dynamic workloads.
+% Most GPU stacks collapse high-level semantic structure too early: once an operator graph is lowered into fixed kernels, many scheduling and synchronization choices are no longer visible to the runtime. VDCores avoids this early commitment by introducing a stable assembly boundary and a persistent instruction-driven runtime. As a result, dynamic LLM jobs can be adapted through runtime changes in mapping, dependency wiring, and placement, rather than through repeated kernel replacement.
+
+The unique point of \sys{} scheduler is
+(1) it have both global and fine-grained view of the computation and data movement.
+(2) it could perform a memory-computation combination degree of specilaiziation.
+
+We fully leverage the unique points with a two-tier scheduling pipeline.
+The first tier globally considering active operators and virtual cores: packed submission and the adaptive tiling scheduler decide how multiple operators are lowered, partitioned, and mapped across VCs to maximize resource utilization (keep available cores busy, avoid unnecessary direct dependencies and strugglers).
+Other than normal translation from ML ops to \sys{} instructions,
+with additional capability to change the tiling of opeartors at runtime, leveraging the flexbility of \sys{}.
+The second tier works on individual \uop{} flow: the \mop{} optimizer further rewrites scheduled instruction flows online to maximize dynamic execution opportunities and reduce synchronization stalls.
+
+\subsubsection{Lightweight Adaptive Scheduling}
+
+\sys{} performs online batching and submits incoming operators in packs. A pack exposes cross-operator dependencies and overlap opportunities that are invisible under per-operator kernel lowering. This enables \sys{} to optimize the completion time of the active workload as a whole instead of the local latency of one task at a time.
+
+Within a pack, \sys{} views execution as a DAG of logical tasks. Each task is associated with a cost model and a space of valid ways of decomposing a logical operator into smaller units over its iteration space, \ie, tiling.
+Examples of tiling include partitioning a GEMM along the $M$, $N$, and $K$ dimensions or partitioning attention over token and head blocks.
+Different tilings expose different tradeoffs in locality, parallelism, and synchronization,
+and our cost model is responsible for exhibiting these tradeoffs accurately. In \sys{}, each tiling can be materialized by planning \mop{} differently, rather than regenerating and compiling a specialized kernel for each case, enabling more runtime adaptations without incurring large materialization overhead.
+
+Given this flexibility, \sys{} chooses tiling by iteratively morphing the DAG on dominant critical paths. A critical path is considered dominant if its cost exceeds the average per-SM cost by more than a threshold. The scheduler refines tasks on these paths by selecting better tilings until the expected gain becomes marginal or no dominant critical path remains. The refined graph is then mapped to SMs with precedence-constrained list scheduling to balance load and reduce makespan.
+
+\subsubsection{Dynamic Fusion Optimization}
+The runtime re-places tiles across memory spaces and rewrites memory instructions accordingly.
+\eg, intermidiate data can be promoted to shared memory to enable fusion-like locality,
+or be separated for better overlapping oppotunities. % when data is remote?
+
+This differs from conventional kernel fusion: because \sys{} already decouples memory and compute into separate \mop{}s, it can change intermediate placement without generating specialized fused kernels. The same computation can therefore be realized either as a locality-oriented fused pipeline or as a more weakly coupled flow that exposes additional overlap opportunities.
+
+% Together, these passes reduce avoidable stalls while preserving correctness.
+
+\subsubsection{Virtual-flow mapping} 
+% This pass resolves the DAG dependency, and maps instructions that
+% share dependencies to the same virtual execution unit, while placing independent
+% instructions on different units to maximize parallel progress.
+A VMC contains multiple LUs to moderate head-of-line blocking (\S~\ref{sec:design-runtime-memory}). This pass exploits this design by resolving fine-grained dependencies among memory \mop{}s mapped to the same VMC, assigning them to virtual flows so that only truly dependent operations remain ordered. Independent memory requests can therefore bypass stalled ones and overlap more aggressively, exposing parallelism that would be hidden in a conventional producer pipeline.
+
+\fixme{dependency chain}
+% \textbf{barrier-issue order}
+% scan over and tracks available space. 
+\subsubsection{Barrier elimination}
+After virtual-flow mapping, VDE removes synchronization that has become redundant: once two \mop{}s are placed on the same virtual flow, in-order execution already enforces their readiness order. VDE therefore eliminates a barrier only when correctness is already guaranteed by flow order or a stronger transitive dependence. Barriers are retained for fan-out edges and inter-flow memory visibility. This reduces polling and control overhead without weakening correctness.
