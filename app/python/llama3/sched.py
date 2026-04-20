@@ -8,19 +8,41 @@ from dae.schedule import *
 from dae.model import *
 from dae.util import dae_app
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+try:
+  from transformers.cache_utils import StaticKVCache
+except ImportError:
+  from transformers.cache_utils import StaticCache as StaticKVCache
 from reference import input_batch1, reference_pass, check_tensor_threshold
 import os
 import math
 
 arg_parser = argparse.ArgumentParser(add_help=False)
-arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
+arg_parser.add_argument("-N", "--num-generates", type=int, default=None)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--correctness", action="store_true")
-arg_parser.add_argument("--control-flow", action="store_true")
+arg_parser.add_argument("--prompt", default=None)
+arg_parser.add_argument("--message", action="append", default=None)
+arg_parser.add_argument("--control-flow", dest="control_flow", action="store_true", default=True)
+arg_parser.add_argument("--no-control-flow", dest="control_flow", action="store_false")
 parsed_args, remaining_argv = arg_parser.parse_known_args()
+if parsed_args.prompt is not None and parsed_args.message:
+  raise ValueError("Use either --prompt or --message, not both")
 if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
   remaining_argv = [*remaining_argv, "--launch"]
+will_execute = any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv)
 sys.argv = [sys.argv[0], *remaining_argv]
+
+def dae_execution_iterations(argv):
+  for idx, arg in enumerate(argv):
+    if arg == "-l" or arg == "--launch":
+      return 1
+    if arg.startswith("--bench="):
+      return int(arg.split("=", 1)[1])
+    if arg == "-b" or arg == "--bench":
+      if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
+        return int(argv[idx + 1])
+      return 1
+  return 0
 
 ###################################
 # load model
@@ -41,6 +63,69 @@ eps = config.rms_norm_eps # 1e-6
 rope_theta = config.rope_parameters["rope_theta"]
 
 layers = model.model.layers
+tokenizer = AutoTokenizer.from_pretrained(
+  model_name,
+  cache_dir=cache_dir,
+  token=os.environ['HF_TOKEN'],
+)
+
+def normalize_token_ids(tokens, *, add_special_tokens=False):
+  if isinstance(tokens, str):
+    tokens = tokenizer(tokens, add_special_tokens=add_special_tokens)["input_ids"]
+  elif hasattr(tokens, "input_ids"):
+    tokens = tokens.input_ids
+  elif isinstance(tokens, dict):
+    tokens = tokens["input_ids"]
+  elif torch.is_tensor(tokens):
+    tokens = tokens.detach().cpu().tolist()
+  if tokens and isinstance(tokens[0], list):
+    tokens = tokens[0]
+  return [int(token_id) for token_id in tokens]
+
+def prompt_token_ids():
+  if parsed_args.message:
+    messages = [{"role": "user", "content": message} for message in parsed_args.message]
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+      tokens = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+      )
+    else:
+      tokens = tokenizer("\n".join(parsed_args.message), add_special_tokens=True)["input_ids"]
+    tokens = normalize_token_ids(tokens)
+    if not tokens:
+      raise ValueError("--message produced no tokens")
+    print(f"[prompt] tokenized {len(parsed_args.message)} user message(s) to {len(tokens)} tokens")
+    return tokens
+
+  if parsed_args.prompt is None:
+    return [791]
+  tokens = normalize_token_ids(tokenizer(parsed_args.prompt, add_special_tokens=True))
+  if not tokens:
+    raise ValueError("--prompt produced no tokens")
+  print(f"[prompt] tokenized user prompt to {len(tokens)} tokens")
+  return tokens
+
+def eos_token_ids():
+  ids = set()
+  for value in (tokenizer.eos_token_id, getattr(config, "eos_token_id", None)):
+    if value is None:
+      continue
+    if isinstance(value, (list, tuple, set)):
+      ids.update(int(token_id) for token_id in value)
+    else:
+      ids.add(int(value))
+  return ids
+
+def trim_after_eos(token_ids):
+  eos_ids = eos_token_ids()
+  if not eos_ids:
+    return token_ids
+  for idx, token_id in enumerate(token_ids):
+    if int(token_id) in eos_ids:
+      return token_ids[:idx + 1]
+  return token_ids
 
 ###################################
 # basic parameter of DAE
@@ -59,11 +144,34 @@ full_sms = 132
 dae = Launcher(132, device=gpu)
 
 
-input_token_id_and_pos = [
-  (791, 0),
-]
-num_generates = parsed_args.num_generates - 1 if parsed_args.control_flow else (0 if parsed_args.correctness else parsed_args.num_generates - 1)
-total_decode_tokens = len(input_token_id_and_pos) + num_generates
+prompt_tokens = prompt_token_ids()
+prefill_token_id_and_pos = [(token, pos) for pos, token in enumerate(prompt_tokens[:-1])]
+input_token_id_and_pos = [(prompt_tokens[-1], len(prefill_token_id_and_pos))]
+remaining_kv_tokens = KVBlockSize - len(prefill_token_id_and_pos)
+if remaining_kv_tokens <= 0:
+  raise ValueError(
+    "Llama3 prompt prefill is currently scoped to one KV block: "
+    f"prefill_tokens={len(prefill_token_id_and_pos)}, KVBlockSize={KVBlockSize}"
+  )
+if parsed_args.num_generates is not None:
+  total_decode_tokens = parsed_args.num_generates
+elif parsed_args.correctness and not parsed_args.control_flow:
+  total_decode_tokens = 1
+else:
+  total_decode_tokens = remaining_kv_tokens
+if total_decode_tokens <= 0:
+  raise ValueError("--num-generates must be positive")
+num_generates = total_decode_tokens - len(input_token_id_and_pos)
+final_decode_pos = input_token_id_and_pos[0][1] + total_decode_tokens - 1
+if final_decode_pos >= KVBlockSize:
+  raise ValueError(
+    "Llama3 prompt prefill is currently scoped to one KV block: "
+    f"prefill_tokens={len(prefill_token_id_and_pos)}, decode_steps={total_decode_tokens}, KVBlockSize={KVBlockSize}"
+  )
+if final_decode_pos >= MAX_SEQ_LEN:
+  raise ValueError(
+    f"decode position {final_decode_pos} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}"
+  )
 if parsed_args.control_flow:
   if len(input_token_id_and_pos) != 1:
     raise ValueError("--control-flow currently supports exactly one initial token")
@@ -75,6 +183,13 @@ if parsed_args.control_flow:
       "--control-flow currently supports decoding within one KV block: "
       f"initial_pos={initial_pos}, total_tokens={total_decode_tokens}, KVBlockSize={KVBlockSize}"
     )
+print(
+  "[decode] "
+  f"prefill_tokens={len(prefill_token_id_and_pos)}, "
+  f"decode_steps={total_decode_tokens}, "
+  f"final_position={final_decode_pos}, "
+  f"KVBlockSize={KVBlockSize}"
+)
 
 dtype = model.dtype
 HIDDEN = config.hidden_size
@@ -124,12 +239,8 @@ matZero = torch.zeros(4096, dtype=dtype, device=gpu)
 _positions = torch.arange(MAX_SEQ_LEN).unsqueeze(0).to(gpu) # [1, seq]
 _cos, _sin = model.model.rotary_emb(torch.zeros(1, device=gpu), _positions) # tensor only device matters here
 matRope = torch.ones(MAX_SEQ_LEN, N, HEAD_DIM, dtype=torch.bfloat16, device=gpu)
-for i, (_, pos) in enumerate(input_token_id_and_pos):
-  _sub_cos = _cos[0, pos:MAX_SEQ_LEN, :HEAD_DIM//2] # llama duplicate it to full dim
-  _sub_sin = _sin[0, pos:MAX_SEQ_LEN, :HEAD_DIM//2]
-  # interleave cos and sin
-  matRope[0:MAX_SEQ_LEN-pos, i, 0::2] = _sub_cos
-  matRope[0:MAX_SEQ_LEN-pos, i, 1::2] = _sub_sin
+matRope[:, :, 0::2] = _cos[0, :, :HEAD_DIM//2].unsqueeze(1) # llama duplicate it to full dim
+matRope[:, :, 1::2] = _sin[0, :, :HEAD_DIM//2].unsqueeze(1)
 
 matTokens = torch.zeros(N, MAX_SEQ_LEN, dtype=torch.int64, device=gpu)
 matHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
@@ -156,7 +267,24 @@ matRMSPostAttnW = [l.post_attention_layernorm.weight for l in layers]
 def permute_rope_weight(weight, num_heads):
   return weight.view(num_heads, 2, HEAD_DIM // 2, HIDDEN).transpose(1, 2).reshape_as(weight).contiguous()
 def permute_rope_activation(activation, num_heads):
-  return activation.view(num_heads, 2, HEAD_DIM // 2).transpose(1, 2).reshape_as(activation).contiguous()
+  return (
+    activation.view(*activation.shape[:-1], num_heads, 2, HEAD_DIM // 2)
+    .transpose(-2, -1)
+    .reshape_as(activation)
+    .contiguous()
+  )
+
+def apply_interleaved_rope_activation(activation, num_heads, rope_row):
+  states = activation.view(*activation.shape[:-1], num_heads, HEAD_DIM).float()
+  cos = rope_row[0::2].float()
+  sin = rope_row[1::2].float()
+  even = states[..., 0::2]
+  odd = states[..., 1::2]
+  rotated = torch.stack(
+    (even * cos - odd * sin, even * sin + odd * cos),
+    dim=-1,
+  ).flatten(-2)
+  return rotated.reshape_as(activation).to(dtype=activation.dtype)
 
 matqWs = [permute_rope_weight(l.self_attn.q_proj.weight, QW // HEAD_DIM) for l in layers]
 matkWs = [permute_rope_weight(l.self_attn.k_proj.weight, KW // HEAD_DIM) for l in layers]
@@ -193,6 +321,51 @@ for i in range(logits_epoch):
 # tensor cache policy
 dae.set_persistent(matTokens)
 dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+
+def seed_prefill_kv_cache():
+  for layer_k, layer_v in zip(attnKs, attnVs):
+    layer_k.zero_()
+    layer_v.zero_()
+
+  if not prefill_token_id_and_pos:
+    return None
+
+  prefill_tokens = [token for token, _ in prefill_token_id_and_pos]
+  prefill_positions = [pos for _, pos in prefill_token_id_and_pos]
+  expected_positions = list(range(len(prefill_tokens)))
+  if prefill_positions != expected_positions:
+    raise ValueError(
+      "PyTorch StaticKVCache prefill currently expects contiguous prompt positions "
+      f"{expected_positions}, got {prefill_positions}"
+    )
+
+  inputs = input_batch1(
+    *prefill_tokens,
+    mat=matTokens[0],
+    positions=prefill_positions,
+  )
+  cache_position = torch.arange(len(prefill_tokens), dtype=torch.long, device=gpu)
+  static_cache = StaticKVCache(config=config, max_cache_len=MAX_SEQ_LEN)
+  with torch.no_grad():
+    output = model(
+      **inputs,
+      use_cache=True,
+      past_key_values=static_cache,
+      cache_position=cache_position,
+    )
+
+  cache = output.past_key_values
+  prefill_len = len(prefill_tokens)
+  for layer_idx in range(num_layers):
+    layer_cache = cache.layers[layer_idx]
+    k_cache = layer_cache.keys[0, :, :prefill_len, :].permute(1, 0, 2).reshape(prefill_len, KW)
+    v_cache = layer_cache.values[0, :, :prefill_len, :].permute(1, 0, 2).reshape(prefill_len, VW)
+    k_cache = permute_rope_activation(k_cache, KW // HEAD_DIM)
+    attnKs[layer_idx][:, :prefill_len].copy_(k_cache.unsqueeze(0).expand(REQ, -1, -1))
+    attnVs[layer_idx][:, :prefill_len].copy_(v_cache.unsqueeze(0).expand(REQ, -1, -1))
+
+  print(f"[prefill] seeded {prefill_len} prompt tokens with {type(static_cache).__name__}")
+  return output
 
 ###################################
 # Register Tensor for TMA
@@ -643,18 +816,22 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
 # finish schedule and ready to run
 ###################################
 
-cur_offset, cur_pos = 0, 0
+seed_prefill_kv_cache()
+
+decode_offset = len(prefill_token_id_and_pos)
+cur_offset = decode_offset - 1
+cur_pos = prefill_token_id_and_pos[-1][1] if prefill_token_id_and_pos else -1
 if parsed_args.control_flow:
   token, pos = input_token_id_and_pos[0]
-  matTokens[0, 0] = token
+  matTokens[0, decode_offset] = token
   token_loop_ptrs = (dae.copy_cptrs(), dae.copy_mptrs())
-  schedule_single_token(0, pos, control_flow_tokens=total_decode_tokens, token_loop_ptrs=token_loop_ptrs)
-  cur_offset = total_decode_tokens - 1
+  schedule_single_token(decode_offset, pos, control_flow_tokens=total_decode_tokens, token_loop_ptrs=token_loop_ptrs)
+  cur_offset = decode_offset + total_decode_tokens - 1
   cur_pos = pos + total_decode_tokens - 1
 else:
-  for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
+  for token_offset, (token, pos) in enumerate(input_token_id_and_pos, start=decode_offset):
     matTokens[0, token_offset] = token
-    if token_offset > 0:
+    if token_offset > decode_offset:
       dae.i(IssueBarrier(systemg['bar_token_finish']))
     schedule_single_token(token_offset, pos)
     cur_offset, cur_pos = token_offset, pos
@@ -668,37 +845,76 @@ else:
 print(f"run vdcors with {cur_offset+1} tokens...")
 dae.s()
 dae_app(dae)
+if will_execute:
+  profile_data = dae.profile[:, 0:2].cpu().numpy()
+  vdcores_time_ns = float(profile_data[:, 1].max() - profile_data[:, 0].min())
+  tbt_ns = vdcores_time_ns / total_decode_tokens
+  perf_summary = (
+    "[perf] "
+    f"vdcores_time_ms={vdcores_time_ns / 1e6:.3f}, "
+    f"decode_tokens={total_decode_tokens}, "
+    f"TBT_ms={tbt_ns / 1e6:.3f}, "
+    f"tokens_per_s={1e9 / tbt_ns:.2f}"
+  )
+else:
+  perf_summary = None
+
+def print_generated_text():
+  generated_token_ids = matTokens[
+    0,
+    decode_offset + 1:decode_offset + total_decode_tokens + 1,
+  ].detach().cpu().tolist()
+  generated_for_text = trim_after_eos(generated_token_ids)
+  generated_text = tokenizer.decode(generated_for_text, skip_special_tokens=True)
+
+  print(f"[output] generated_tokens={len(generated_token_ids)}")
+  print(f"[output] generated_text: {generated_text}")
 
 
 def run_correctness_check():
   if parsed_args.control_flow:
-    print(f"[correctness] running control-flow greedy reference for {total_decode_tokens} decode steps...")
-    tokens = [input_token_id_and_pos[0][0]]
+    print(
+      "[correctness] running control-flow greedy reference "
+      f"after {len(prefill_token_id_and_pos)} prefill tokens for {total_decode_tokens} decode steps..."
+    )
+    tokens = [token for token, _ in prefill_token_id_and_pos] + [input_token_id_and_pos[0][0]]
     base_pos = input_token_id_and_pos[0][1]
     generated = []
     with torch.no_grad():
       for step in range(total_decode_tokens):
-        positions = [base_pos + i for i in range(len(tokens))]
+        positions = list(range(len(tokens)))
         inputs = input_batch1(*tokens, positions=positions)
         output = model(**inputs, use_cache=False)
         next_token = torch.argmax(output.logits[0, -1]).item()
         generated.append(next_token)
         tokens.append(next_token)
 
-    dae_generated = matTokens[0, 1:total_decode_tokens + 1].detach().cpu().tolist()
+    dae_generated = matTokens[0, decode_offset + 1:decode_offset + total_decode_tokens + 1].detach().cpu().tolist()
     token_ok = dae_generated == generated
     print(f"[correctness] {'PASS' if token_ok else 'FAIL'} generated_tokens: ref={generated}, dae={dae_generated}")
     if not token_ok:
       print("[correctness] control-flow diagnostics for final repeated body:")
-      inputs = input_batch1(*tokens[:-1], positions=[base_pos + i for i in range(len(tokens) - 1)])
+      inputs = input_batch1(*tokens[:-1], positions=list(range(len(tokens) - 1)))
       captured, _ = reference_pass(model, inputs)
-      final_idx = total_decode_tokens - 1
+      final_idx = decode_offset + total_decode_tokens - 1
+      final_pos = base_pos + total_decode_tokens - 1
+      final_rope_row = matRope[final_pos, 0]
       for i in range(min(2, num_layers)):
         layer = captured[i]
+        q_ref = apply_interleaved_rope_activation(
+          permute_rope_activation(layer['q_proj'][0, final_idx], QW // HEAD_DIM),
+          QW // HEAD_DIM,
+          final_rope_row,
+        )
+        k_ref = apply_interleaved_rope_activation(
+          permute_rope_activation(layer['k_proj'][0, final_idx], KW // HEAD_DIM),
+          KW // HEAD_DIM,
+          final_rope_row,
+        )
         print(f"[correctness] Layer {i}, token {final_idx}:")
-        check_tensor_threshold("v_proj", layer['v_proj'][0, final_idx], attnVs[i][0, final_idx], 5.0)
-        check_tensor_threshold("q_proj", permute_rope_activation(layer['q_proj'][0, final_idx], QW // HEAD_DIM), attnQs[i][0], 5.0)
-        check_tensor_threshold("k_proj", permute_rope_activation(layer['k_proj'][0, final_idx], KW // HEAD_DIM), attnKs[i][0, final_idx], 5.0)
+        check_tensor_threshold("v_proj", layer['v_proj'][0, final_idx], attnVs[i][0, final_pos], 5.0)
+        check_tensor_threshold("q_rope", q_ref, attnQs[i][0], 5.0)
+        check_tensor_threshold("k_rope", k_ref, attnKs[i][0, final_pos], 5.0)
       check_tensor_threshold("final_hidden", captured[num_layers-1]['hidden_state_out'][0, final_idx], matHidden[0], 5.0)
       check_tensor_threshold("final_rms", captured['final']['final_rms'][0, final_idx], matRMSHidden[0], 5.0)
       check_tensor_threshold("logits_low", captured['final']['lm_head'][0, final_idx, :logits_slice], matLogits[0][0, :logits_slice], 10.0)
@@ -707,43 +923,60 @@ def run_correctness_check():
     print("[correctness] control-flow token check passed")
     return
 
-  print("[correctness] running single-token reference capture...")
+  print(
+    "[correctness] running single-token reference capture "
+    f"after {len(prefill_token_id_and_pos)} prefill tokens..."
+  )
   inputs = input_batch1(
+    *(e[0] for e in prefill_token_id_and_pos),
     *(e[0] for e in input_token_id_and_pos),
     mat=matTokens[0],
-    positions=[e[1] for e in input_token_id_and_pos],
+    positions=[e[1] for e in prefill_token_id_and_pos] + [e[1] for e in input_token_id_and_pos],
   )
 
   captured, output = reference_pass(model, inputs)
   all_ok = True
+  decode_index = len(prefill_token_id_and_pos)
+  decode_pos = input_token_id_and_pos[0][1]
+  decode_rope_row = matRope[decode_pos, 0]
 
   for i in range(min(2, num_layers)):
     layer = captured[i]
+    q_ref = apply_interleaved_rope_activation(
+      permute_rope_activation(layer['q_proj'][0, decode_index], QW // HEAD_DIM),
+      QW // HEAD_DIM,
+      decode_rope_row,
+    )
+    k_ref = apply_interleaved_rope_activation(
+      permute_rope_activation(layer['k_proj'][0, decode_index], KW // HEAD_DIM),
+      KW // HEAD_DIM,
+      decode_rope_row,
+    )
     print(f"[correctness] Layer {i}:")
     checks = [
-      check_tensor_threshold("v_proj", layer['v_proj'][0, 0], attnVs[i][0, 0], 5.0),
-      check_tensor_threshold("q_proj", permute_rope_activation(layer['q_proj'][0, 0], QW // HEAD_DIM), attnQs[i][0], 5.0),
-      check_tensor_threshold("k_proj", permute_rope_activation(layer['k_proj'][0, 0], KW // HEAD_DIM), attnKs[i][0, 0], 5.0),
+      check_tensor_threshold("v_proj", layer['v_proj'][0, decode_index], attnVs[i][0, decode_pos], 5.0),
+      check_tensor_threshold("q_rope", q_ref, attnQs[i][0], 5.0),
+      check_tensor_threshold("k_rope", k_ref, attnKs[i][0, decode_pos], 5.0),
     ]
     all_ok = all_ok and all(passed for passed, _ in checks)
 
   print(f"[correctness] Checking Layer {num_layers-1}:")
   layer = captured[num_layers-1]
-  silu_ref = F.silu(layer['gate_proj'][0, 0]) * layer['up_proj'][0, 0]
+  silu_ref = F.silu(layer['gate_proj'][0, decode_index]) * layer['up_proj'][0, decode_index]
   final_checks = [
-    check_tensor_threshold("gate_proj_high", layer['gate_proj'][0, 0, :6144], matGateOut[0, :6144], 5.0),
-    check_tensor_threshold("up_proj_high", layer['up_proj'][0, 0, :6144], matInterm[0, :6144], 5.0),
+    check_tensor_threshold("gate_proj_high", layer['gate_proj'][0, decode_index, :6144], matGateOut[0, :6144], 5.0),
+    check_tensor_threshold("up_proj_high", layer['up_proj'][0, decode_index, :6144], matInterm[0, :6144], 5.0),
     check_tensor_threshold("silu", silu_ref, matSiLUOut[0, :], 5.0),
-    check_tensor_threshold("final_hidden", layer['hidden_state_out'][0, 0], matHidden[0], 5.0),
-    check_tensor_threshold("final_rms", captured['final']['final_rms'][0, 0], matRMSHidden[0], 5.0),
-    check_tensor_threshold("logits_low", captured['final']['lm_head'][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
-    check_tensor_threshold("logits_high", captured['final']['lm_head'][0, 0, logits_slice:vocab_size], matLogits[1][0, :vocab_size - logits_slice], 10.0),
+    check_tensor_threshold("final_hidden", layer['hidden_state_out'][0, decode_index], matHidden[0], 5.0),
+    check_tensor_threshold("final_rms", captured['final']['final_rms'][0, decode_index], matRMSHidden[0], 5.0),
+    check_tensor_threshold("logits_low", captured['final']['lm_head'][0, decode_index, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
+    check_tensor_threshold("logits_high", captured['final']['lm_head'][0, decode_index, logits_slice:vocab_size], matLogits[1][0, :vocab_size - logits_slice], 10.0),
   ]
   all_ok = all_ok and all(passed for passed, _ in final_checks)
 
   ref_idx = torch.argmax(captured['final']['lm_head'], dim=-1)
-  dae_idx = matTokens[0, 1].item()
-  ref_token = ref_idx[0, 0].item()
+  dae_idx = matTokens[0, decode_index + 1].item()
+  ref_token = ref_idx[0, decode_index].item()
   token_ok = ref_token == dae_idx
   print(f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: ref={ref_token}, dae={dae_idx}")
   all_ok = all_ok and token_ok
@@ -755,5 +988,9 @@ def run_correctness_check():
 
 if parsed_args.correctness:
   run_correctness_check()
+
+if will_execute:
+  print_generated_text()
+  print(perf_summary)
 
 # print("output tokens: ", matTokens[0, :cur_offset+2])

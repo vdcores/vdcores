@@ -145,6 +145,7 @@ __device__ __forceinline__ void allocwarp_execute(
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
           const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
+          // TODO(zhiyuang): will this slowdown the critical path? if so we can also put the counter value in gpr and shuffle together with reg0
           if (lane_id >= reg_start && lane_id < reg_end) {
             di.gpr[0] = inst.address; // loop offset
             di.gpr[1] = counter_mode ? inst.address * counter_value : 0;
