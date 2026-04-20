@@ -32,6 +32,9 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/model.py`: model-side Python support code.
 - `include/dae/`: runtime abstractions such as allocator, launcher, queues, runtime, and virtual cores.
   The compute warp dispatch now lives in `include/dae/compute_dispatch.cuh`, and supported selective-build ops are discovered from `DAE_COMPUTE_OP_HANDLER(OP_...)` declarations in that file.
+- `agents/knowledge/runtime/README.md`: runtime-documentation entry point for the VM model, queue protocol, and operator semantics.
+- `agents/knowledge/runtime/vdcores-vm-model.md`: source-level virtual-machine model of one SM/block, including slots, queues, allocator, and `GROUP` / accumulate behavior.
+- `agents/knowledge/runtime/vdcores-operator-semantics.md`: operator-by-operator field packing and state-transition notes for memory and compute instructions.
 - `include/task/`: CUDA task building blocks including attention, GEMV, RMSNorm, RoPE, SiLU, WGMMA, and argmax.
 - `src/runtime.cu`: runtime implementation compiled to `runtime.o`.
 - `src/torch_runtime.cu`: Torch extension binding source.
