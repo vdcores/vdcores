@@ -256,7 +256,9 @@ class SchedAttentionDecoding(Schedule):
                  side_input=None,
                  k_store=None,
                  token_pos=None,
-                 num_active_q=64):
+                 num_active_q=64,
+                 seq_len_counter_reg: int | None = None,
+                 max_loop_count: int = 1):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -267,6 +269,8 @@ class SchedAttentionDecoding(Schedule):
         self.k_store = k_store
         self.token_pos = token_pos
         self.num_active_q = num_active_q
+        self.seq_len_counter_reg = seq_len_counter_reg
+        self.max_loop_count = max_loop_count
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
@@ -291,6 +295,15 @@ class SchedAttentionDecoding(Schedule):
         seq_len_last_block = self.seq_len % self.block_size
         if seq_len_last_block == 0:
             seq_len_last_block = self.block_size
+        if self.seq_len_counter_reg is not None:
+            if num_kv_blocks != 1:
+                raise ValueError("Dynamic decode attention sequence length currently supports only one KV block")
+            max_last_block_len = seq_len_last_block + self.max_loop_count - 1
+            if max_last_block_len > self.block_size:
+                raise ValueError(
+                    "Dynamic decode attention sequence length would cross the current KV block: "
+                    f"base={seq_len_last_block}, max_loop_count={self.max_loop_count}, block={self.block_size}"
+                )
 
         # we only handle a single Q token here
         insts = [
@@ -300,6 +313,7 @@ class SchedAttentionDecoding(Schedule):
                 seq_len_last_block,
                 need_norm=self.use_qwen_fused_qk,
                 need_rope=self.use_qwen_fused_qk,
+                seq_len_counter_reg=self.seq_len_counter_reg,
             ),
         ]
         if self.use_qwen_fused_qk:
@@ -1144,7 +1158,9 @@ class SchedArgmax(Schedule):
                  matLogits: list[torch.Tensor],
                  matOutVal: torch.Tensor,
                  matOutIdx: torch.Tensor,
-                 matFinalOut: torch.Tensor):
+                 matFinalOut: torch.Tensor,
+                 final_counter_reg: int | None = None,
+                 final_counter_stride: int = 0):
         super().__init__()
         self.num_token = num_token
         self.logits_slice = logits_slice
@@ -1155,6 +1171,8 @@ class SchedArgmax(Schedule):
         self.matFinalOut = matFinalOut
         self.AtomPartial = AtomPartial
         self.AtomReduce = AtomReduce
+        self.final_counter_reg = final_counter_reg
+        self.final_counter_stride = final_counter_stride
     
     def _on_place(self):
         self.validate()
@@ -1193,12 +1211,16 @@ class SchedArgmax(Schedule):
         if sm >= self.num_token:
             return insts
 
+        final_out = RawAddress(self.matFinalOut[sm], 29).bar(self._bar("final")).writeback()
+        if self.final_counter_reg is not None:
+            final_out = RepeatM.offsetByCounter(self.final_counter_reg, final_out, self.final_counter_stride)
+
         insts += [
             self.AtomReduce(1),
 
             RawAddress(self.matOutVal[sm], 27).bar(self._bar("val")),
             RawAddress(self.matOutIdx[sm], 28).bar(self._bar("idx")),
-            RawAddress(self.matFinalOut[sm], 29).bar(self._bar("final")).writeback(),
+            final_out,
         ]
         return insts
 

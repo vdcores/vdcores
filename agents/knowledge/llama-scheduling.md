@@ -43,6 +43,16 @@
 - The runtime now has a dedicated attention decode opcode/instruction path for `head_dim=64`, and the Python attention schedulers now select the decode instruction from `head_dim`.
 - The isolated 1B path now verifies end to end against `unsloth/Llama-3.2-1B-Instruct` for single-token correctness.
 
+## Llama 3.1 8B Control-Flow Decode
+
+- `app/python/llama3/sched.py --control-flow` emits one decode-token body and repeats it with top-level `LOOPC`/`LOOPM` on counter register/lane `1`.
+- The existing per-layer loop continues to use compute counter `0` and memory lane `0`.
+- This path is currently scoped to a single KV block; the scheduler rejects `initial_pos + total_decode_tokens > KVBlockSize`.
+- Dynamic memory offsets are applied with `RepeatM.offsetByCounter(...)` for embedding token reads, RoPE position loads, K/V cache writeback, and final argmax token writeback.
+- RoPE table offsets must be expressed after adapter conversion: the Llama rope table TMA coords are `[0, 0, tile, position]`, so token iteration advances by `[0, 0, 0, 1]`.
+- The current-Q buffer is reduce-add backed and reused across tokens, so the repeated body clears each layer's Q buffer after that layer has consumed it. The clear runs on spare SMs `128..131` without a per-layer clear barrier; by the time the next token reaches the same layer, the clear has ample slack to finish.
+- Control-flow correctness replays greedy HF decode for the same number of steps and compares `matTokens`.
+
 ## Performance Debugging Notes
 
 - Process hygiene matters for this app. Before collecting timings, clear leftover decode jobs with `killall python || true`; stale Python workers can make the benchmark look dramatically worse than the clean baseline.

@@ -54,7 +54,7 @@ The compute side is a simple PC loop over `CInst`:
 
 - registers:
   - `pc`
-  - `count`
+  - `count[]`
   - `finish`
 - dispatch:
   - `dispatch_compute_instruction(...)` in [include/dae/compute_dispatch.cuh](/home1/11362/depctg/vdcores/include/dae/compute_dispatch.cuh)
@@ -67,8 +67,15 @@ Control-flow detail:
   - `inst = cinsts[pc]`
   - `pc = pc + 1`
 - `OP_LOOPC` then optionally overwrites that post-incremented `pc`
-  - if `++count < inst.args[0]`, set `pc = inst.args[1]`
-  - else set `count = 0`
+  - `inst.args[2]` selects the counter register
+  - if `++count[inst.args[2]] < inst.args[0]`, set `pc = inst.args[1]`
+  - else set `count[inst.args[2]] = 0`
+
+Practical convention:
+
+- counter `0` is used for the per-layer compute loop
+- counter `1` is used by Llama control-flow decode for the top-level token loop
+- non-split decode attention may add a selected counter value to `last_kv_active_token_len`
 
 ### Memory VM
 
@@ -99,7 +106,7 @@ The alloc warp carries the explicit memory-VM register state in [include/dae/vir
 - `loop_counter`
   - repeat counter for zero-overhead repeating alloc ops
 - `jmp_cnt`
-  - counter for `OP_LOOP`
+  - per-thread counter for `OP_LOOP`
 - `loop_start_pc`
   - repeat-loop body start
 - `port`
@@ -269,6 +276,7 @@ This is the resource-group stepping path.
   - `next_pc`
   - a 32-bit `shift` value
 - it uses `jmp_cnt` as its own loop counter
+- `num_slots` selects the alloc-warp lane whose per-thread `jmp_cnt` owns that loop
 - `shift` is packed so that:
   - low 16 bits adjust `num_slots`
     - in practice this is used as `bar_shift << 6`, so slot count stays fixed while the encoded barrier id changes
@@ -289,7 +297,7 @@ Register transition summary:
 
 - on `OP_LOOP`:
   - changed:
-    - control lane increments `jmp_cnt`
+    - control lane increments its own `jmp_cnt`
     - maybe `next_pc = coords[0]`
     - maybe `shift += packed(coords[2:3])`
     - or, on the terminal iteration:
@@ -334,6 +342,21 @@ Register transition summary:
     - `gpr[0]`
     - `jmp_cnt`
     - `shift`
+
+### Counter-Derived `OP_REPEAT`
+
+`OP_REPEAT` also has a control-flow offset mode used by multi-token schedules.
+
+- `inst.arg & 0x8000` enables counter mode
+- `inst.arg & 0x00ff` selects an alloc-warp lane
+- the selected lane's per-thread `jmp_cnt` is broadcast with `shfl`
+- selected accumulator lanes are seeded with `inst.address * selected_jmp_cnt`
+
+Practical meaning:
+
+- a top-level `LoopM(..., reg=1)` can repeat one memory body over tokens
+- `RepeatM.offsetByCounter(1, inst, delta)` applies `base + delta * token_iteration` without unrolling the body
+- this does not create multiple memory counters per thread; it reuses the 32 existing per-lane `jmp_cnt` values
 
 ## Barrier Model
 

@@ -10,6 +10,9 @@ static __device__ __forceinline__ void prefetch_inst_window(
   }
 }
 
+static constexpr uint16_t repeatCounterModeFlag = 0x8000U;
+static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -137,11 +140,14 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_REPEAT): {
           di.loop_counter = inst.size; // minus the current one
           di.loop_start_pc = pc + 1;
+          const bool counter_mode = inst.arg & repeatCounterModeFlag;
+          const int counter_reg = inst.arg & repeatCounterRegMask;
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
+          const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
           if (lane_id >= reg_start && lane_id < reg_end) {
             di.gpr[0] = inst.address; // loop offset
-            di.gpr[1] = 0;
+            di.gpr[1] = counter_mode ? inst.address * counter_value : 0;
           }
         }
         break;
@@ -161,7 +167,7 @@ __device__ __forceinline__ void allocwarp_execute(
           next_pc = __shfl_sync(0xFFFFFFFF, next_pc, inst.num_slots);
           shift = __shfl_sync(0xFFFFFFFF, shift, inst.num_slots);
           __mprint("Loop: pc=%d reg=%d count=%d reg0=%d target_pc=%d arg_offset=%u",
-            pc, inst.num_slots, inst.size, di.jmp_cnt, next_pc, shift);
+            pc, inst.num_slots, inst.size, __shfl_sync(ALL_THREADS, di.jmp_cnt, inst.num_slots), next_pc, shift);
         }
         break;
         case op(OP_ISSUE_BARRIER): {
@@ -177,7 +183,7 @@ __device__ __forceinline__ void allocwarp_execute(
         // CV here for custom variation
         case op(OP_CC0): {
           // CC0: embedding operator. A single tmaload1D instruction should come right after this one
-          int token = *(int *)(inst.address);
+          int token = load_l2((const int *)(inst.address));
           di.loop_counter = 1;
           di.loop_start_pc = pc + 1;
           if (lane_id == 0) {
@@ -187,7 +193,7 @@ __device__ __forceinline__ void allocwarp_execute(
         }
         case op(OP_CC0_ROW_BYTES): {
           // Generalized CC0 path for non-power-of-two embedding row widths.
-          int token = *(int *)(inst.address);
+          int token = load_l2((const int *)(inst.address));
           di.loop_counter = 1;
           di.loop_start_pc = pc + 1;
           if (lane_id == 0) {

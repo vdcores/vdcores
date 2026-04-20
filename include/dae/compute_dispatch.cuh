@@ -15,7 +15,7 @@
   int sm_id, \
   int thread_id, \
   uint32_t &pc, \
-  uint32_t &count, \
+  uint32_t *count, \
   bool &finish, \
   const CInst &inst, \
   void *smem_base, \
@@ -92,6 +92,7 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMM_M64N128K64) {
 template <int HeadDim, bool SplitKv, typename KernelQK, typename KernelPV, typename M2CQueue, typename C2MQueue>
 static __device__ __forceinline__ void handle_attention_common(
   const CInst &inst,
+  const uint32_t *count,
   void *smem_base,
   uint64_t *scratch_space,
   MInst *st_insts,
@@ -139,9 +140,13 @@ static __device__ __forceinline__ void handle_attention_common(
   }
 
   const int num_active_q = inst.args[1] & 0xFF;
-  const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
   const bool need_norm = inst.args[2] & 0x1;
   const bool need_rope = inst.args[2] & 0x2;
+  if (inst.args[2] & 0x4) {
+    const int counter_reg = (inst.args[2] >> 8) & 0xFF;
+    last_kv_active_token_len += count[counter_reg];
+  }
   if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
     task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
       inst.args[0],
@@ -179,14 +184,14 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
@@ -198,21 +203,21 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
-  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, smem_base, scratch_space, st_insts, m2c, c2m);
+  handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA) {
@@ -220,9 +225,13 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA) {
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   const int num_active_q = inst.args[1] & 0xFF;
-  const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
   const bool need_norm = inst.args[2] & 0x1;
   const bool need_rope = inst.args[2] & 0x2;
+  if (inst.args[2] & 0x4) {
+    const int counter_reg = (inst.args[2] >> 8) & 0xFF;
+    last_kv_active_token_len += count[counter_reg];
+  }
   task_attention_fwd_flash3_grouped_mma<64, 64, 16, false, 0, false, false, kernel_qk, kernel_pv>(
     inst.args[0],
     0,
@@ -329,12 +338,13 @@ DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
 
 DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
   DAE_UNUSED(sm_id, thread_id, finish, smem_base, scratch_space, st_insts, m2c, c2m, g_events);
-  if (++count < inst.args[0]) {
+  const int counter_reg = inst.args[2];
+  if (++count[counter_reg] < inst.args[0]) {
     pc = inst.args[1];
-    __cprint("LOOPC back to PC %d, count=%d", pc, count);
+    __cprint("LOOPC back to PC %d, reg=%d count=%d", pc, counter_reg, count[counter_reg]);
   } else {
-    count = 0;
-    __cprint("LOOPC finished, count=%d", count);
+    count[counter_reg] = 0;
+    __cprint("LOOPC finished, reg=%d count=%d", counter_reg, count[counter_reg]);
   }
   __sync_compute_group(128);
 }
@@ -361,7 +371,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   int sm_id,
   int thread_id,
   uint32_t &pc,
-  uint32_t &count,
+  uint32_t *count,
   bool &finish,
   const CInst &inst,
   void *smem_base,

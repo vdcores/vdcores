@@ -16,6 +16,7 @@ arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--correctness", action="store_true")
+arg_parser.add_argument("--control-flow", action="store_true")
 parsed_args, remaining_argv = arg_parser.parse_known_args()
 if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
   remaining_argv = [*remaining_argv, "--launch"]
@@ -61,7 +62,19 @@ dae = Launcher(132, device=gpu)
 input_token_id_and_pos = [
   (791, 0),
 ]
-num_generates = 0 if parsed_args.correctness else parsed_args.num_generates - 1
+num_generates = parsed_args.num_generates - 1 if parsed_args.control_flow else (0 if parsed_args.correctness else parsed_args.num_generates - 1)
+total_decode_tokens = len(input_token_id_and_pos) + num_generates
+if parsed_args.control_flow:
+  if len(input_token_id_and_pos) != 1:
+    raise ValueError("--control-flow currently supports exactly one initial token")
+  if total_decode_tokens <= 0:
+    raise ValueError("--control-flow requires at least one token")
+  initial_pos = input_token_id_and_pos[0][1]
+  if initial_pos + total_decode_tokens > KVBlockSize:
+    raise ValueError(
+      "--control-flow currently supports decoding within one KV block: "
+      f"initial_pos={initial_pos}, total_tokens={total_decode_tokens}, KVBlockSize={KVBlockSize}"
+    )
 
 dtype = model.dtype
 HIDDEN = config.hidden_size
@@ -221,6 +234,7 @@ layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
+layerg.addTma("storeQClear", attnQs, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
 layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
 
@@ -252,7 +266,58 @@ tma_shift, bar_shift = layerg.get_shift()
 # Start of Schedule
 ###################################
 
-def schedule_single_token(token_offset: int, token_pos: int):
+TOKEN_LOOP_REG = 1
+
+
+class CounterOffsetCordAdapter(CordAdapter):
+  def __init__(self, inner, counter_reg: int, delta):
+    super().__init__(inner)
+    self.counter_reg = counter_reg
+    self.delta = delta
+
+  def cord(self, *cords):
+    return CounterOffsetMemoryInstruction(self.counter_reg, self.inner.cord(*cords), self.delta)
+
+
+def maybe_counter_offset(inst, delta, enabled: bool):
+  if not enabled:
+    return inst
+  return CounterOffsetMemoryInstruction(TOKEN_LOOP_REG, inst, delta)
+
+
+def maybe_counter_adapter(adapter, delta, enabled: bool):
+  if not enabled:
+    return adapter
+  return CounterOffsetCordAdapter(adapter, TOKEN_LOOP_REG, delta)
+
+
+class SchedClearQ(Schedule):
+  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int, num_clear_sms: int):
+    super().__init__()
+    self.load_zero = load_zero
+    self.store_q = store_q
+    self.tile_bytes = tile_bytes
+    self.tile_m = tile_m
+    self.num_clear_sms = num_clear_sms
+
+  def schedule(self, sm: int):
+    if sm < 0:
+      return []
+    count = (HIDDEN // self.tile_m + self.num_clear_sms - 1 - sm) // self.num_clear_sms
+    if count <= 0:
+      return []
+    return [
+      Copy(count, size=self.tile_bytes),
+      RepeatM.on(
+        count,
+        (self.load_zero.cord(0), 0),
+        (self.store_q.cord(sm).group(), [self.num_clear_sms * self.tile_m, 0]),
+      ),
+    ]
+
+
+def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tokens: int | None = None, token_loop_ptrs=None):
+  control_flow = control_flow_tokens is not None
   # RMS
   # group is not working on RMS tmas, as it uses TMA1D
   # TODO(zhiyuang): dup the matEmbed for now
@@ -264,7 +329,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   embed_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
-    embedding=CC0(matTokens[0], token_offset, hidden_size=HIDDEN)
+    embedding=maybe_counter_offset(CC0(matTokens[0], token_offset, hidden_size=HIDDEN), matTokens.element_size(), control_flow)
   ).bar("output", layerg['bar_pre_attn_rms'])
   # copy the HIDDEN from embedding
   copy_hidden = SchedCopy(
@@ -273,7 +338,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
       StaticCordAdapter(loadEmbed1D),
       ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
     ),
-    before_copy = CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
+    before_copy = maybe_counter_offset(CC0(matTokens[0], token_offset, hidden_size=HIDDEN), matTokens.element_size(), control_flow),
   )
 
   # TODO(zhiyuang): finish a set of clear functions
@@ -311,7 +376,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
   ).bar("load", layerg['bar_pre_attn_rms'])
   QRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
-      ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+      maybe_counter_adapter(ToRopeTableCordAdapter(defaultg['loadRope'], token_pos), [0, 0, 0, 1], control_flow),
       regLoadQ,
       ToSplitMCordAdapter(layerg['storeQ'], 128//2, TileM),
     ),
@@ -324,9 +389,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
   )
   KRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
-      ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+      maybe_counter_adapter(ToRopeTableCordAdapter(defaultg['loadRope'], token_pos), [0, 0, 0, 1], control_flow),
       regLoadK,
-      ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos),
+      maybe_counter_adapter(ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos), [0, 1, 0], control_flow),
     ),
   ).bar("store", layerg['bar_qkv_attn'])
   VProj = SchedGemv(Gemv_M64N8,
@@ -334,7 +399,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     tmas=(
       layerg['loadVW'],
       layerg['loadRMSLayer'],
-      ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
+      maybe_counter_adapter(ToAttnVStoreCordAdapter(layerg['storeV'], token_pos), [0, 1, 0], control_flow),
     ),
   ).bar("store", layerg['bar_qkv_attn'])
 
@@ -345,6 +410,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
     NUM_KV_HEADS = NUM_KV_HEAD,
     matO = matO_attn_view,
     tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
+    seq_len_counter_reg=TOKEN_LOOP_REG if control_flow else None,
+    max_loop_count=control_flow_tokens or 1,
   ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
 
   # accumulate to matHidden, which auto applies the residual add
@@ -428,6 +495,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
     matOutVal=matArgmaxVal,
     matOutIdx=matArgmaxIdx,
     matFinalOut=matTokens[:, token_offset+1],
+    final_counter_reg=TOKEN_LOOP_REG if control_flow else None,
+    final_counter_stride=matTokens.stride(1) * matTokens.element_size(),
   ).bar("load", systemg['bar_logits']).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
 
   sstart, send = systemg.range_bars()
@@ -444,6 +513,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
   copy_hidden = copy_hidden.place(N, base_sm=64)
   clear_interm = clear_interm.place(1, base_sm=128)
   clear_gateout = clear_gateout.place(1, base_sm=129)
+  clear_q = SchedClearQ(
+    TmaLoad1D(matZero[:N * TileM], bytes=N * TileM * matZero.element_size()),
+    ToSplitMCordAdapter(layerg['storeQClear'], 64, TileM),
+    N * TileM * matZero.element_size(),
+    TileM,
+    full_sms - num_sms,
+  ).place(full_sms - num_sms, base_sm=num_sms)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
   QProj = QProj.place(128)
@@ -473,6 +549,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     restore_bars_high,
     clear_interm,
     clear_gateout,
+    clear_q if control_flow else [],
     QProj,
     QRope,
     KProj,
@@ -535,6 +612,10 @@ def schedule_single_token(token_offset: int, token_pos: int):
     # rms for next layer
     pre_attn_rms,
 
+    # clear the per-layer Q buffer after its consumers are finished; the next
+    # token will not revisit this layer until the rest of the layers complete.
+    clear_q if control_flow else [],
+
     # # all 132 SM need loop
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
     LoopC.toNext(dae.copy_cptrs(), num_layers),
@@ -548,23 +629,41 @@ def schedule_single_token(token_offset: int, token_pos: int):
     restore_bars_low,
   )
 
+  if control_flow:
+    if token_loop_ptrs is None:
+      raise ValueError("control-flow scheduling requires token_loop_ptrs")
+    token_cptrs, token_mptrs = token_loop_ptrs
+    dae.i(
+      IssueBarrier(systemg['bar_token_finish']),
+      LoopM.toNext(token_mptrs, control_flow_tokens, reg=TOKEN_LOOP_REG),
+      LoopC.toNext(token_cptrs, control_flow_tokens, reg=TOKEN_LOOP_REG),
+    )
+
 ###################################
 # finish schedule and ready to run
 ###################################
 
 cur_offset, cur_pos = 0, 0
-for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
-  matTokens[0, token_offset] = token
-  if token_offset > 0:
-    dae.i(IssueBarrier(systemg['bar_token_finish']))
-  schedule_single_token(token_offset, pos)
-  cur_offset, cur_pos = token_offset, pos
+if parsed_args.control_flow:
+  token, pos = input_token_id_and_pos[0]
+  matTokens[0, 0] = token
+  token_loop_ptrs = (dae.copy_cptrs(), dae.copy_mptrs())
+  schedule_single_token(0, pos, control_flow_tokens=total_decode_tokens, token_loop_ptrs=token_loop_ptrs)
+  cur_offset = total_decode_tokens - 1
+  cur_pos = pos + total_decode_tokens - 1
+else:
+  for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
+    matTokens[0, token_offset] = token
+    if token_offset > 0:
+      dae.i(IssueBarrier(systemg['bar_token_finish']))
+    schedule_single_token(token_offset, pos)
+    cur_offset, cur_pos = token_offset, pos
 
-for i in range(num_generates):
-  cur_offset += 1
-  cur_pos += 1
-  dae.i(IssueBarrier(systemg['bar_token_finish']))
-  schedule_single_token(cur_offset, cur_pos)
+  for i in range(num_generates):
+    cur_offset += 1
+    cur_pos += 1
+    dae.i(IssueBarrier(systemg['bar_token_finish']))
+    schedule_single_token(cur_offset, cur_pos)
 
 print(f"run vdcors with {cur_offset+1} tokens...")
 dae.s()
@@ -572,6 +671,42 @@ dae_app(dae)
 
 
 def run_correctness_check():
+  if parsed_args.control_flow:
+    print(f"[correctness] running control-flow greedy reference for {total_decode_tokens} decode steps...")
+    tokens = [input_token_id_and_pos[0][0]]
+    base_pos = input_token_id_and_pos[0][1]
+    generated = []
+    with torch.no_grad():
+      for step in range(total_decode_tokens):
+        positions = [base_pos + i for i in range(len(tokens))]
+        inputs = input_batch1(*tokens, positions=positions)
+        output = model(**inputs, use_cache=False)
+        next_token = torch.argmax(output.logits[0, -1]).item()
+        generated.append(next_token)
+        tokens.append(next_token)
+
+    dae_generated = matTokens[0, 1:total_decode_tokens + 1].detach().cpu().tolist()
+    token_ok = dae_generated == generated
+    print(f"[correctness] {'PASS' if token_ok else 'FAIL'} generated_tokens: ref={generated}, dae={dae_generated}")
+    if not token_ok:
+      print("[correctness] control-flow diagnostics for final repeated body:")
+      inputs = input_batch1(*tokens[:-1], positions=[base_pos + i for i in range(len(tokens) - 1)])
+      captured, _ = reference_pass(model, inputs)
+      final_idx = total_decode_tokens - 1
+      for i in range(min(2, num_layers)):
+        layer = captured[i]
+        print(f"[correctness] Layer {i}, token {final_idx}:")
+        check_tensor_threshold("v_proj", layer['v_proj'][0, final_idx], attnVs[i][0, final_idx], 5.0)
+        check_tensor_threshold("q_proj", permute_rope_activation(layer['q_proj'][0, final_idx], QW // HEAD_DIM), attnQs[i][0], 5.0)
+        check_tensor_threshold("k_proj", permute_rope_activation(layer['k_proj'][0, final_idx], KW // HEAD_DIM), attnKs[i][0, final_idx], 5.0)
+      check_tensor_threshold("final_hidden", captured[num_layers-1]['hidden_state_out'][0, final_idx], matHidden[0], 5.0)
+      check_tensor_threshold("final_rms", captured['final']['final_rms'][0, final_idx], matRMSHidden[0], 5.0)
+      check_tensor_threshold("logits_low", captured['final']['lm_head'][0, final_idx, :logits_slice], matLogits[0][0, :logits_slice], 10.0)
+      check_tensor_threshold("logits_high", captured['final']['lm_head'][0, final_idx, logits_slice:vocab_size], matLogits[1][0, :vocab_size - logits_slice], 10.0)
+      raise RuntimeError("Control-flow correctness check failed")
+    print("[correctness] control-flow token check passed")
+    return
+
   print("[correctness] running single-token reference capture...")
   inputs = input_batch1(
     *(e[0] for e in input_token_id_and_pos),

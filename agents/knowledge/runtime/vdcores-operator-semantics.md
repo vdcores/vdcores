@@ -95,8 +95,12 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - `address` or `coords` = per-iteration delta
     - low byte of `num_slots` = first lane/register to seed
     - high byte of `num_slots` = end lane/register
+    - `arg == 0` = legacy repeat mode
+    - `arg & 0x8000` = counter-derived offset mode
+    - `arg & 0x00ff` = source memory-loop counter lane in counter mode
   - effect:
     - seed `gpr[0]` and clear `gpr[1]`
+    - in counter mode, seed `gpr[1] = delta * shfl(jmp_cnt, arg & 0x00ff)`
     - later allocating `JUMP` instructions consume this repeat state
     - set `loop_counter = size`
     - set `loop_start_pc = pc + 1`
@@ -109,7 +113,7 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 - `OP_LOOP`
   - fields:
     - `size` = trip count
-    - `num_slots` = control lane that owns the loop counter
+    - `num_slots` = control lane whose per-thread `jmp_cnt` owns this loop
     - `coords[0]` = jump target pc
     - packed `coords[2:3]` = group-shift increment
   - effect:
@@ -132,7 +136,7 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - `address` = pointer to token id
     - `arg` = log2(row_bytes)
   - effect:
-    - read token id
+    - read token id with an L2-cached global load
     - set `loop_counter = 1`
     - set `loop_start_pc = pc + 1`
     - seed lane `0` of `gpr[1] = token << arg`
@@ -148,6 +152,7 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - `size` = row width in bytes
   - effect:
     - same role as `OP_CC0`, but uses `token * size` for non-power-of-two row widths
+    - reads the token id with the same L2-cached global load as `OP_CC0`
     - also sets `loop_counter = 1` and `loop_start_pc = pc + 1`
   - registers changed:
     - `loop_counter`
@@ -303,11 +308,12 @@ The compute-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/de
   - args:
     - `args[0]` = repeat count
     - `args[1]` = target pc
+    - `args[2]` = compute loop-counter register id
   - effect:
-    - if `++count < args[0]`, jump to `pc = args[1]`
-    - else clear `count`
+    - if `++count[args[2]] < args[0]`, jump to `pc = args[1]`
+    - else clear `count[args[2]]`
   - registers changed:
-    - `count`
+    - `count[args[2]]`
     - maybe `pc`
 
 - `OP_DUMMY`
@@ -385,6 +391,8 @@ Shared packing rules from [include/dae/compute_dispatch.cuh](/home1/11362/depctg
   - `args[2]`:
     - bit 0 = `need_norm`
     - bit 1 = `need_rope`
+    - bit 2 = add a compute loop counter to `last_kv_active_token_len`
+    - bits 8..15 = counter register id for bit 2
 
 - split variants:
   - `args[0]`:

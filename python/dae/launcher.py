@@ -42,6 +42,8 @@ class SMInstructionBuilder:
         elif isinstance(inst, list):
             for subi in inst:
                 self.add(subi)
+        elif hasattr(inst, "expand_instructions"):
+            self.add(inst.expand_instructions())
         # expand callable to each SM
         elif callable(inst):
             sminst = inst(self.sm_id)

@@ -28,6 +28,7 @@ static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
+static constexpr int numComputeLoopCounters = 4;
 
 // barrier configurations
 static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
