@@ -49,15 +49,18 @@
 - `--prompt "..."` tokenizes a user prompt with the HF tokenizer. All prompt tokens except the last one are prefetched by PyTorch; the final prompt token becomes the first VDCores decode input.
 - `--message "..."` applies the tokenizer chat template when one is available, treats each flag as a user message, and prints `[output] generated_text:` after launch or benchmark.
 - After VDCores execution, the app prints `[perf]` from `dae.profile` timestamps, including total VDCores decode time, `TBT_ms`, and decode tokens/s.
-- If `-N/--num-generates` is omitted on the default control-flow path, the app decodes through the rest of the first KV block. For example, `prefill_tokens=32` gives `decode_steps=32` and ends at position `63`.
+- If `-N/--num-generates` is omitted on the default control-flow path, the app decodes through the rest of the current KV block. For example, `prefill_tokens=32` gives `decode_steps=32` and ends at position `63`; `prefill_tokens=64` gives `decode_steps=64` and ends at position `127`; `prefill_tokens=70` gives `decode_steps=58` and also ends at position `127`.
 - PyTorch prefill uses `transformers.cache_utils.StaticCache` when `StaticKVCache` is not present in the installed Transformers version. The returned cache tensors are shaped `[batch, kv_heads, seq, head_dim]`.
 - VDCores still consumes flattened KV buffers shaped `[REQ, MAX_SEQ_LEN, kv_heads * head_dim]`; prefilled keys are permuted from HF half-rotary layout into the interleaved RoPE layout before copying, while values only need the `[seq, kv_heads, head_dim]` to flat reshape.
 - The Llama3 app seeds the prefetched prompt KV rows into all active request lanes because the schedule still executes the fixed `N=8` decode tile even when only lane `0` is checked.
-- Prompt prefill is currently scoped to the first KV block. The Llama3 app rejects prompts plus decode steps whose final decode position reaches `KVBlockSize`.
-- The control-flow path emits one decode-token body and repeats it with top-level `LOOPC`/`LOOPM` on counter register/lane `1`.
+- Prompt prefill can seed full KV blocks through the PyTorch prefill path, then VDCores starts from the final prompt token as the first decode input.
+- Unaligned prompt prefill beyond the first KV block is covered by the same path. On 2026-04-21, `prefill_tokens=70` passed control-flow correctness both through the current block (`58` steps) and with one appended full block (`-N 122`).
+- The control-flow path emits one decode-token body for the current KV block and repeats it with top-level `LOOPC`/`LOOPM` on counter register/lane `1`.
+- When decode extends past that current block, the Llama3 schedule appends a second full-block body. That body has an inner token loop on register/lane `1` for exactly `KVBlockSize` steps and an outer full-block loop on register/lane `2`.
 - The existing per-layer loop continues to use compute counter `0` and memory lane `0`.
-- This path is currently scoped to a single KV block; the scheduler rejects `initial_pos + total_decode_tokens > KVBlockSize`.
-- Dynamic memory offsets are applied with `RepeatM.offsetByCounter(...)` for embedding token reads, RoPE position loads, K/V cache writeback, and final argmax token writeback.
+- After the initial/current block, the control-flow path only accepts appended decode lengths that are a multiple of `KVBlockSize`.
+- Dynamic memory offsets are applied with `RepeatM.offsetByCounter(...)` or `RepeatM.offsetByCounters(...)` for embedding token reads, RoPE position loads, K/V cache writeback, and final argmax token writeback.
+- Decode attention uses dynamic `last_kv_active_token_len` from token counter `1`; the appended full-block body also adds block counter `2` to the attention `num_kv_blocks` and to the memory repeat count for loading previous full K/V blocks.
 - RoPE table offsets must be absolute-position indexed. The Llama rope table TMA coords are `[0, 0, tile, position]`, so token iteration advances by `[0, 0, 0, 1]`; do not also slice the table to the prompt start position, or prompt position `p` will load position `2p`.
 - The current-Q buffer is reduce-add backed and reused across tokens, so the repeated body clears each layer's Q buffer after that layer has consumed it. The clear runs on spare SMs `128..131` without a per-layer clear barrier; by the time the next token reaches the same layer, the clear has ample slack to finish.
 - Control-flow correctness replays greedy HF decode after the same prompt prefix and compares generated `matTokens`.
@@ -67,6 +70,7 @@
 - Process hygiene matters for this app. Before collecting timings, clear leftover decode jobs with `killall python || true`; stale Python workers can make the benchmark look dramatically worse than the clean baseline.
 - The timeout wrapper is useful for separating deadlocks from slow schedules:
   `python tests/script/run_with_launch_timeout.py --post-launch-timeout 20 --post-launch-idle-timeout 10 -- python app/python/llama32_1b/sched.py ...`
+- For the 8B control-flow path with `prefill_tokens=70`, valid decode counts below 256 are `58`, `122`, `186`, and `250` because appended decode after the current block must be a multiple of `KVBlockSize`. On 2026-04-21, fresh-process `-b 1` measurements were `4.588`, `4.675`, `4.746`, and `4.759 ms/token` respectively.
 - On 2026-03-21, clean sequential benchmark measurements from the current branch were:
   - `N=1`: about `1.22 ms`
   - `N=2`: about `6.42 ms` total, `3.21 ms/token`

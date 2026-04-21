@@ -140,16 +140,21 @@ static __device__ __forceinline__ void handle_attention_common(
   }
 
   const int num_active_q = inst.args[1] & 0xFF;
+  int num_kv_blocks = inst.args[0];
   int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
   const bool need_norm = inst.args[2] & 0x1;
   const bool need_rope = inst.args[2] & 0x2;
+  if (inst.args[2] & 0x8) {
+    const int counter_reg = (inst.args[2] >> 4) & 0xF;
+    num_kv_blocks += count[counter_reg];
+  }
   if (inst.args[2] & 0x4) {
     const int counter_reg = (inst.args[2] >> 8) & 0xFF;
     last_kv_active_token_len += count[counter_reg];
   }
   if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
     task_attention_fwd_flash3_grouped_mma<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
-      inst.args[0],
+      num_kv_blocks,
       0,
       num_active_q,
       last_kv_active_token_len,
@@ -164,7 +169,7 @@ static __device__ __forceinline__ void handle_attention_common(
     );
   } else {
     task_attention_fwd_flash3_grouped<HeadDim, 64, 64, false, 0, false, false, KernelQK, KernelPV>(
-      inst.args[0],
+      num_kv_blocks,
       0,
       num_active_q,
       last_kv_active_token_len,
@@ -225,15 +230,20 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA) {
   using kernel_qk = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   using kernel_pv = cute::SM80_16x8x16_F32BF16BF16F32_TN;
   const int num_active_q = inst.args[1] & 0xFF;
+  int num_kv_blocks = inst.args[0];
   int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
   const bool need_norm = inst.args[2] & 0x1;
   const bool need_rope = inst.args[2] & 0x2;
+  if (inst.args[2] & 0x8) {
+    const int counter_reg = (inst.args[2] >> 4) & 0xF;
+    num_kv_blocks += count[counter_reg];
+  }
   if (inst.args[2] & 0x4) {
     const int counter_reg = (inst.args[2] >> 8) & 0xFF;
     last_kv_active_token_len += count[counter_reg];
   }
   task_attention_fwd_flash3_grouped_mma<64, 64, 16, false, 0, false, false, kernel_qk, kernel_pv>(
-    inst.args[0],
+    num_kv_blocks,
     0,
     num_active_q,
     last_kv_active_token_len,

@@ -258,6 +258,7 @@ class SchedAttentionDecoding(Schedule):
                  token_pos=None,
                  num_active_q=64,
                  seq_len_counter_reg: int | None = None,
+                 num_kv_block_counter_reg: int | None = None,
                  max_loop_count: int = 1):
         super().__init__()
         self.reqs = reqs
@@ -270,6 +271,7 @@ class SchedAttentionDecoding(Schedule):
         self.token_pos = token_pos
         self.num_active_q = num_active_q
         self.seq_len_counter_reg = seq_len_counter_reg
+        self.num_kv_block_counter_reg = num_kv_block_counter_reg
         self.max_loop_count = max_loop_count
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
@@ -296,8 +298,6 @@ class SchedAttentionDecoding(Schedule):
         if seq_len_last_block == 0:
             seq_len_last_block = self.block_size
         if self.seq_len_counter_reg is not None:
-            if num_kv_blocks != 1:
-                raise ValueError("Dynamic decode attention sequence length currently supports only one KV block")
             max_last_block_len = seq_len_last_block + self.max_loop_count - 1
             if max_last_block_len > self.block_size:
                 raise ValueError(
@@ -314,6 +314,7 @@ class SchedAttentionDecoding(Schedule):
                 need_norm=self.use_qwen_fused_qk,
                 need_rope=self.use_qwen_fused_qk,
                 seq_len_counter_reg=self.seq_len_counter_reg,
+                num_kv_block_counter_reg=self.num_kv_block_counter_reg,
             ),
         ]
         if self.use_qwen_fused_qk:
@@ -327,12 +328,17 @@ class SchedAttentionDecoding(Schedule):
                 # this k-barrier will also barrier following V load
                 [tK.cord(req, 0, head, 0).port(1).group(), tK.cord2tma(0, self.block_size, 0, 0)],
                 [tV.cord(req, 0, head, 0).port(1).group(), tV.cord2tma(0, self.block_size, 0, 0)],
+                count_counter_reg=self.num_kv_block_counter_reg,
             ),
             # TODO(zhiyuang): reuse the accumulator register
             # only the last block has new generated KV cache
-            tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group().port(1),
-            tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group().port(1),
         ]
+        last_k = tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group().port(1)
+        last_v = tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group().port(1)
+        if self.num_kv_block_counter_reg is not None:
+            last_k = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_k, tK.cord2tma(0, self.block_size, 0, 0))
+            last_v = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_v, tV.cord2tma(0, self.block_size, 0, 0))
+        insts += [last_k, last_v]
         insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
         return insts
 
@@ -1160,7 +1166,8 @@ class SchedArgmax(Schedule):
                  matOutIdx: torch.Tensor,
                  matFinalOut: torch.Tensor,
                  final_counter_reg: int | None = None,
-                 final_counter_stride: int = 0):
+                 final_counter_stride: int = 0,
+                 final_counter_offsets: list[tuple[int, int]] | None = None):
         super().__init__()
         self.num_token = num_token
         self.logits_slice = logits_slice
@@ -1173,6 +1180,7 @@ class SchedArgmax(Schedule):
         self.AtomReduce = AtomReduce
         self.final_counter_reg = final_counter_reg
         self.final_counter_stride = final_counter_stride
+        self.final_counter_offsets = final_counter_offsets
     
     def _on_place(self):
         self.validate()
@@ -1212,8 +1220,11 @@ class SchedArgmax(Schedule):
             return insts
 
         final_out = RawAddress(self.matFinalOut[sm], 29).bar(self._bar("final")).writeback()
-        if self.final_counter_reg is not None:
-            final_out = RepeatM.offsetByCounter(self.final_counter_reg, final_out, self.final_counter_stride)
+        final_counter_offsets = self.final_counter_offsets
+        if final_counter_offsets is None and self.final_counter_reg is not None:
+            final_counter_offsets = [(self.final_counter_reg, self.final_counter_stride)]
+        if final_counter_offsets:
+            final_out = RepeatM.offsetByCounters(final_counter_offsets, final_out)
 
         insts += [
             self.AtomReduce(1),

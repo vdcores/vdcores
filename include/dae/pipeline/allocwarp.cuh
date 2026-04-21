@@ -11,6 +11,8 @@ static __device__ __forceinline__ void prefetch_inst_window(
 }
 
 static constexpr uint16_t repeatCounterModeFlag = 0x8000U;
+static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
+static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
 template<typename M2C_Type, typename M2LD_Type>
@@ -138,17 +140,23 @@ __device__ __forceinline__ void allocwarp_execute(
         break;
         // repeat instruction will repeat the following instructions with NO overhead
         case op(OP_REPEAT): {
-          di.loop_counter = inst.size; // minus the current one
-          di.loop_start_pc = pc + 1;
           const bool counter_mode = inst.arg & repeatCounterModeFlag;
+          const bool count_counter_mode = inst.arg & repeatCountCounterModeFlag;
+          const bool accumulate_mode = inst.arg & repeatAccumulateModeFlag;
           const int counter_reg = inst.arg & repeatCounterRegMask;
+          const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
+          di.loop_counter = inst.size + (count_counter_mode ? counter_value : 0); // minus the current one
+          di.loop_start_pc = pc + 1;
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
-          const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
           // TODO(zhiyuang): will this slowdown the critical path? if so we can also put the counter value in gpr and shuffle together with reg0
           if (lane_id >= reg_start && lane_id < reg_end) {
-            di.gpr[0] = inst.address; // loop offset
-            di.gpr[1] = counter_mode ? inst.address * counter_value : 0;
+            if (accumulate_mode) {
+              di.gpr[1] += counter_mode ? inst.address * counter_value : inst.address;
+            } else {
+              di.gpr[0] = inst.address; // loop offset
+              di.gpr[1] = counter_mode ? inst.address * counter_value : 0;
+            }
           }
         }
         break;

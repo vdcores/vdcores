@@ -147,27 +147,18 @@ dae = Launcher(132, device=gpu)
 prompt_tokens = prompt_token_ids()
 prefill_token_id_and_pos = [(token, pos) for pos, token in enumerate(prompt_tokens[:-1])]
 input_token_id_and_pos = [(prompt_tokens[-1], len(prefill_token_id_and_pos))]
-remaining_kv_tokens = KVBlockSize - len(prefill_token_id_and_pos)
-if remaining_kv_tokens <= 0:
-  raise ValueError(
-    "Llama3 prompt prefill is currently scoped to one KV block: "
-    f"prefill_tokens={len(prefill_token_id_and_pos)}, KVBlockSize={KVBlockSize}"
-  )
+initial_decode_pos = input_token_id_and_pos[0][1]
+tokens_until_kv_block_end = KVBlockSize - (initial_decode_pos % KVBlockSize)
 if parsed_args.num_generates is not None:
   total_decode_tokens = parsed_args.num_generates
 elif parsed_args.correctness and not parsed_args.control_flow:
   total_decode_tokens = 1
 else:
-  total_decode_tokens = remaining_kv_tokens
+  total_decode_tokens = tokens_until_kv_block_end
 if total_decode_tokens <= 0:
   raise ValueError("--num-generates must be positive")
 num_generates = total_decode_tokens - len(input_token_id_and_pos)
 final_decode_pos = input_token_id_and_pos[0][1] + total_decode_tokens - 1
-if final_decode_pos >= KVBlockSize:
-  raise ValueError(
-    "Llama3 prompt prefill is currently scoped to one KV block: "
-    f"prefill_tokens={len(prefill_token_id_and_pos)}, decode_steps={total_decode_tokens}, KVBlockSize={KVBlockSize}"
-  )
 if final_decode_pos >= MAX_SEQ_LEN:
   raise ValueError(
     f"decode position {final_decode_pos} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}"
@@ -177,11 +168,12 @@ if parsed_args.control_flow:
     raise ValueError("--control-flow currently supports exactly one initial token")
   if total_decode_tokens <= 0:
     raise ValueError("--control-flow requires at least one token")
-  initial_pos = input_token_id_and_pos[0][1]
-  if initial_pos + total_decode_tokens > KVBlockSize:
+  remaining_after_initial_block = max(0, total_decode_tokens - tokens_until_kv_block_end)
+  if remaining_after_initial_block % KVBlockSize != 0:
     raise ValueError(
-      "--control-flow currently supports decoding within one KV block: "
-      f"initial_pos={initial_pos}, total_tokens={total_decode_tokens}, KVBlockSize={KVBlockSize}"
+      "--control-flow full-block decode currently requires the appended region "
+      f"to be a multiple of KVBlockSize: initial_pos={initial_decode_pos}, "
+      f"total_tokens={total_decode_tokens}, KVBlockSize={KVBlockSize}"
     )
 print(
   "[decode] "
@@ -440,28 +432,40 @@ tma_shift, bar_shift = layerg.get_shift()
 ###################################
 
 TOKEN_LOOP_REG = 1
+KV_BLOCK_LOOP_REG = 2
 
 
 class CounterOffsetCordAdapter(CordAdapter):
-  def __init__(self, inner, counter_reg: int, delta):
+  def __init__(self, inner, offsets):
     super().__init__(inner)
-    self.counter_reg = counter_reg
-    self.delta = delta
+    self.offsets = offsets
 
   def cord(self, *cords):
-    return CounterOffsetMemoryInstruction(self.counter_reg, self.inner.cord(*cords), self.delta)
+    inst = self.inner.cord(*cords)
+    for counter_reg, delta in self.offsets:
+      inst = CounterOffsetMemoryInstruction(counter_reg, inst, delta)
+    return inst
 
 
-def maybe_counter_offset(inst, delta, enabled: bool):
+def _control_flow_offsets(token_delta, block_delta=None):
+  offsets = [(TOKEN_LOOP_REG, token_delta)]
+  if block_delta is not None:
+    offsets.append((KV_BLOCK_LOOP_REG, block_delta))
+  return offsets
+
+
+def maybe_counter_offset(inst, delta, enabled: bool, block_delta=None):
   if not enabled:
     return inst
-  return CounterOffsetMemoryInstruction(TOKEN_LOOP_REG, inst, delta)
+  for counter_reg, counter_delta in _control_flow_offsets(delta, block_delta):
+    inst = CounterOffsetMemoryInstruction(counter_reg, inst, counter_delta)
+  return inst
 
 
-def maybe_counter_adapter(adapter, delta, enabled: bool):
+def maybe_counter_adapter(adapter, delta, enabled: bool, block_delta=None):
   if not enabled:
     return adapter
-  return CounterOffsetCordAdapter(adapter, TOKEN_LOOP_REG, delta)
+  return CounterOffsetCordAdapter(adapter, _control_flow_offsets(delta, block_delta))
 
 
 class SchedClearQ(Schedule):
@@ -489,8 +493,17 @@ class SchedClearQ(Schedule):
     ]
 
 
-def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tokens: int | None = None, token_loop_ptrs=None):
+def schedule_single_token(
+    token_offset: int,
+    token_pos: int,
+    *,
+    control_flow_tokens: int | None = None,
+    token_loop_ptrs=None,
+    block_loop_tokens: int | None = None,
+    block_loop_ptrs=None,
+):
   control_flow = control_flow_tokens is not None
+  block_control_flow = block_loop_tokens is not None
   # RMS
   # group is not working on RMS tmas, as it uses TMA1D
   # TODO(zhiyuang): dup the matEmbed for now
@@ -502,7 +515,12 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
   embed_rms = SchedRMSShared(
     num_token=N, epsilon=eps,
     tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
-    embedding=maybe_counter_offset(CC0(matTokens[0], token_offset, hidden_size=HIDDEN), matTokens.element_size(), control_flow)
+    embedding=maybe_counter_offset(
+      CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
+      matTokens.element_size(),
+      control_flow,
+      KVBlockSize * matTokens.element_size() if block_control_flow else None,
+    )
   ).bar("output", layerg['bar_pre_attn_rms'])
   # copy the HIDDEN from embedding
   copy_hidden = SchedCopy(
@@ -511,7 +529,12 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
       StaticCordAdapter(loadEmbed1D),
       ToLinearCordAdapter(storeHidden1D, HIDDEN * 2),
     ),
-    before_copy = maybe_counter_offset(CC0(matTokens[0], token_offset, hidden_size=HIDDEN), matTokens.element_size(), control_flow),
+    before_copy = maybe_counter_offset(
+      CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
+      matTokens.element_size(),
+      control_flow,
+      KVBlockSize * matTokens.element_size() if block_control_flow else None,
+    ),
   )
 
   # TODO(zhiyuang): finish a set of clear functions
@@ -549,7 +572,12 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
   ).bar("load", layerg['bar_pre_attn_rms'])
   QRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
-      maybe_counter_adapter(ToRopeTableCordAdapter(defaultg['loadRope'], token_pos), [0, 0, 0, 1], control_flow),
+      maybe_counter_adapter(
+        ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+        [0, 0, 0, 1],
+        control_flow,
+        [0, 0, 0, KVBlockSize] if block_control_flow else None,
+      ),
       regLoadQ,
       ToSplitMCordAdapter(layerg['storeQ'], 128//2, TileM),
     ),
@@ -562,9 +590,19 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
   )
   KRope = SchedRope(ROPE_INTERLEAVE_512,
     tmas=(
-      maybe_counter_adapter(ToRopeTableCordAdapter(defaultg['loadRope'], token_pos), [0, 0, 0, 1], control_flow),
+      maybe_counter_adapter(
+        ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+        [0, 0, 0, 1],
+        control_flow,
+        [0, 0, 0, KVBlockSize] if block_control_flow else None,
+      ),
       regLoadK,
-      maybe_counter_adapter(ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos), [0, 1, 0], control_flow),
+      maybe_counter_adapter(
+        ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos),
+        [0, 1, 0],
+        control_flow,
+        [0, KVBlockSize, 0] if block_control_flow else None,
+      ),
     ),
   ).bar("store", layerg['bar_qkv_attn'])
   VProj = SchedGemv(Gemv_M64N8,
@@ -572,7 +610,12 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
     tmas=(
       layerg['loadVW'],
       layerg['loadRMSLayer'],
-      maybe_counter_adapter(ToAttnVStoreCordAdapter(layerg['storeV'], token_pos), [0, 1, 0], control_flow),
+      maybe_counter_adapter(
+        ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
+        [0, 1, 0],
+        control_flow,
+        [0, KVBlockSize, 0] if block_control_flow else None,
+      ),
     ),
   ).bar("store", layerg['bar_qkv_attn'])
 
@@ -584,6 +627,7 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
     matO = matO_attn_view,
     tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
     seq_len_counter_reg=TOKEN_LOOP_REG if control_flow else None,
+    num_kv_block_counter_reg=KV_BLOCK_LOOP_REG if block_control_flow else None,
     max_loop_count=control_flow_tokens or 1,
   ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
 
@@ -668,8 +712,10 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
     matOutVal=matArgmaxVal,
     matOutIdx=matArgmaxIdx,
     matFinalOut=matTokens[:, token_offset+1],
-    final_counter_reg=TOKEN_LOOP_REG if control_flow else None,
-    final_counter_stride=matTokens.stride(1) * matTokens.element_size(),
+    final_counter_offsets=_control_flow_offsets(
+      matTokens.stride(1) * matTokens.element_size(),
+      KVBlockSize * matTokens.stride(1) * matTokens.element_size() if block_control_flow else None,
+    ) if control_flow else None,
   ).bar("load", systemg['bar_logits']).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
 
   sstart, send = systemg.range_bars()
@@ -811,6 +857,14 @@ def schedule_single_token(token_offset: int, token_pos: int, *, control_flow_tok
       LoopM.toNext(token_mptrs, control_flow_tokens, reg=TOKEN_LOOP_REG),
       LoopC.toNext(token_cptrs, control_flow_tokens, reg=TOKEN_LOOP_REG),
     )
+    if block_control_flow:
+      if block_loop_ptrs is None:
+        raise ValueError("block control-flow scheduling requires block_loop_ptrs")
+      block_cptrs, block_mptrs = block_loop_ptrs
+      dae.i(
+        LoopM.toNext(block_mptrs, block_loop_tokens, reg=KV_BLOCK_LOOP_REG),
+        LoopC.toNext(block_cptrs, block_loop_tokens, reg=KV_BLOCK_LOOP_REG),
+      )
 
 ###################################
 # finish schedule and ready to run
@@ -825,9 +879,38 @@ if parsed_args.control_flow:
   token, pos = input_token_id_and_pos[0]
   matTokens[0, decode_offset] = token
   token_loop_ptrs = (dae.copy_cptrs(), dae.copy_mptrs())
-  schedule_single_token(decode_offset, pos, control_flow_tokens=total_decode_tokens, token_loop_ptrs=token_loop_ptrs)
-  cur_offset = decode_offset + total_decode_tokens - 1
-  cur_pos = pos + total_decode_tokens - 1
+  initial_block_tokens = min(total_decode_tokens, tokens_until_kv_block_end)
+  schedule_single_token(
+    decode_offset,
+    pos,
+    control_flow_tokens=initial_block_tokens,
+    token_loop_ptrs=token_loop_ptrs,
+  )
+  cur_offset = decode_offset + initial_block_tokens - 1
+  cur_pos = pos + initial_block_tokens - 1
+
+  remaining_full_block_tokens = total_decode_tokens - initial_block_tokens
+  if remaining_full_block_tokens:
+    if remaining_full_block_tokens % KVBlockSize != 0:
+      raise ValueError(
+        "control-flow full-block decode requires remaining tokens after the initial block "
+        f"to be a multiple of KVBlockSize: remaining={remaining_full_block_tokens}, KVBlockSize={KVBlockSize}"
+      )
+    block_loop_tokens = remaining_full_block_tokens // KVBlockSize
+    full_block_offset = decode_offset + initial_block_tokens
+    full_block_pos = pos + initial_block_tokens
+    block_loop_ptrs = (dae.copy_cptrs(), dae.copy_mptrs())
+    inner_loop_ptrs = block_loop_ptrs
+    schedule_single_token(
+      full_block_offset,
+      full_block_pos,
+      control_flow_tokens=KVBlockSize,
+      token_loop_ptrs=inner_loop_ptrs,
+      block_loop_tokens=block_loop_tokens,
+      block_loop_ptrs=block_loop_ptrs,
+    )
+    cur_offset += remaining_full_block_tokens
+    cur_pos += remaining_full_block_tokens
 else:
   for token_offset, (token, pos) in enumerate(input_token_id_and_pos, start=decode_offset):
     matTokens[0, token_offset] = token

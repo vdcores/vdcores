@@ -97,12 +97,16 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - high byte of `num_slots` = end lane/register
     - `arg == 0` = legacy repeat mode
     - `arg & 0x8000` = counter-derived offset mode
+    - `arg & 0x4000` = add the selected counter value to the repeat count
+    - `arg & 0x2000` = accumulate into `gpr[1]` instead of replacing it
     - `arg & 0x00ff` = source memory-loop counter lane in counter mode
   - effect:
     - seed `gpr[0]` and clear `gpr[1]`
     - in counter mode, seed `gpr[1] = delta * shfl(jmp_cnt, arg & 0x00ff)`
+    - in count-counter mode, set `loop_counter = size + shfl(jmp_cnt, arg & 0x00ff)`
+    - in accumulate mode, add the selected delta contribution into `gpr[1]`; this supports combined token/block address offsets before one allocating instruction
     - later allocating `JUMP` instructions consume this repeat state
-    - set `loop_counter = size`
+    - set `loop_counter = size` when count-counter mode is not enabled
     - set `loop_start_pc = pc + 1`
   - registers changed:
     - `loop_counter`
@@ -392,6 +396,8 @@ Shared packing rules from [include/dae/compute_dispatch.cuh](/home1/11362/depctg
     - bit 0 = `need_norm`
     - bit 1 = `need_rope`
     - bit 2 = add a compute loop counter to `last_kv_active_token_len`
+    - bit 3 = add a compute loop counter to `num_kv_block`
+    - bits 4..7 = counter register id for bit 3
     - bits 8..15 = counter register id for bit 2
 
 - split variants:

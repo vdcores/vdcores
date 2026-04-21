@@ -75,7 +75,8 @@ Practical convention:
 
 - counter `0` is used for the per-layer compute loop
 - counter `1` is used by Llama control-flow decode for the top-level token loop
-- non-split decode attention may add a selected counter value to `last_kv_active_token_len`
+- counter `2` is used by Llama full-KV-block decode for the outer block loop
+- non-split decode attention may add selected counter values to `last_kv_active_token_len` and `num_kv_blocks`
 
 ### Memory VM
 
@@ -348,6 +349,8 @@ Register transition summary:
 `OP_REPEAT` also has a control-flow offset mode used by multi-token schedules.
 
 - `inst.arg & 0x8000` enables counter mode
+- `inst.arg & 0x4000` adds the selected counter value to `loop_counter`
+- `inst.arg & 0x2000` accumulates into `gpr[1]` instead of replacing it
 - `inst.arg & 0x00ff` selects an alloc-warp lane
 - the selected lane's per-thread `jmp_cnt` is broadcast with `shfl`
 - selected accumulator lanes are seeded with `inst.address * selected_jmp_cnt`
@@ -356,6 +359,8 @@ Practical meaning:
 
 - a top-level `LoopM(..., reg=1)` can repeat one memory body over tokens
 - `RepeatM.offsetByCounter(1, inst, delta)` applies `base + delta * token_iteration` without unrolling the body
+- `RepeatM.offsetByCounters([(1, token_delta), (2, block_delta)], inst)` combines multiple loop counters for one address update; the Llama3 full-block decode path uses this for token plus KV-block position offsets
+- `RepeatM.on(count, ..., count_counter_reg=2)` emits a repeat whose trip count is `count + jmp_cnt[2]`; the Llama3 full-block attention path uses this to load all previous full KV blocks as the outer block loop advances
 - this does not create multiple memory counters per thread; it reuses the 32 existing per-lane `jmp_cnt` values
 
 ## Barrier Model
