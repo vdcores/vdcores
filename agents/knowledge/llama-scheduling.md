@@ -46,10 +46,11 @@
 ## Llama 3.1 8B Control-Flow Decode
 
 - `app/python/llama3/sched.py` defaults to control-flow decode; use `--no-control-flow` for the older unrolled scheduling path.
+- The simplest launch form is now `python app/python/llama3/sched.py "prompt text"`. A positional prompt auto-launches when no explicit `-l`, `-b`, instruction dump, or compute-op write mode is supplied.
 - `--prompt "..."` tokenizes a user prompt with the HF tokenizer. All prompt tokens except the last one are prefetched by PyTorch; the final prompt token becomes the first VDCores decode input.
 - `--message "..."` applies the tokenizer chat template when one is available, treats each flag as a user message, and prints `[output] generated_text:` after launch or benchmark.
 - After VDCores execution, the app prints `[perf]` from `dae.profile` timestamps, including total VDCores decode time, `TBT_ms`, and decode tokens/s.
-- If `-N/--num-generates` is omitted on the default control-flow path, the app decodes through the rest of the current KV block. For example, `prefill_tokens=32` gives `decode_steps=32` and ends at position `63`; `prefill_tokens=64` gives `decode_steps=64` and ends at position `127`; `prefill_tokens=70` gives `decode_steps=58` and also ends at position `127`.
+- If `-N/--num-generates` is omitted on the default control-flow path, `--max-decode-steps` sets the decode budget and defaults to `128`. The scheduler chooses the largest supported decode count at or below that budget. For example, `prefill_tokens=0` schedules `128` decode steps, while `prefill_tokens=70` requests `128` but schedules `122` because appended decode after the current KV block must be a multiple of `64`. Passing `-N/--num-generates` is an exact override for this default budget.
 - PyTorch prefill uses `transformers.cache_utils.StaticCache` when `StaticKVCache` is not present in the installed Transformers version. The returned cache tensors are shaped `[batch, kv_heads, seq, head_dim]`.
 - VDCores still consumes flattened KV buffers shaped `[REQ, MAX_SEQ_LEN, kv_heads * head_dim]`; prefilled keys are permuted from HF half-rotary layout into the interleaved RoPE layout before copying, while values only need the `[seq, kv_heads, head_dim]` to flat reshape.
 - The Llama3 app seeds the prefetched prompt KV rows into all active request lanes because the schedule still executes the fixed `N=8` decode tile even when only lane `0` is checked.

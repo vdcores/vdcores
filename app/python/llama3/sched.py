@@ -16,8 +16,11 @@ from reference import input_batch1, reference_pass, check_tensor_threshold
 import os
 import math
 
+DEFAULT_MAX_DECODE_STEPS = 128
+
 arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=None)
+arg_parser.add_argument("--max-decode-steps", type=int, default=DEFAULT_MAX_DECODE_STEPS)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--correctness", action="store_true")
 arg_parser.add_argument("--prompt", default=None)
@@ -25,11 +28,40 @@ arg_parser.add_argument("--message", action="append", default=None)
 arg_parser.add_argument("--control-flow", dest="control_flow", action="store_true", default=True)
 arg_parser.add_argument("--no-control-flow", dest="control_flow", action="store_false")
 parsed_args, remaining_argv = arg_parser.parse_known_args()
+
+positional_prompt = None
+if remaining_argv and not remaining_argv[0].startswith("-"):
+  positional_prompt = remaining_argv[0]
+  remaining_argv = remaining_argv[1:]
+if positional_prompt is not None:
+  if parsed_args.prompt is not None:
+    raise ValueError("Use either positional prompt or --prompt, not both")
+  parsed_args.prompt = positional_prompt
 if parsed_args.prompt is not None and parsed_args.message:
-  raise ValueError("Use either --prompt or --message, not both")
-if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
+  raise ValueError("Use prompt text or --message, not both")
+
+def dae_execution_requested(argv):
+  return any(
+    arg in ("-l", "--launch", "-b", "--bench")
+    or arg.startswith("--bench=")
+    for arg in argv
+  )
+
+def dae_work_requested(argv):
+  return any(
+    arg in ("-l", "--launch", "-b", "--bench", "-i", "--instdump", "-w", "--write-compute-ops")
+    or arg.startswith("--bench=")
+    or arg.startswith("--instdump=")
+    or arg.startswith("--write-compute-ops=")
+    for arg in argv
+  )
+
+has_user_prompt = parsed_args.prompt is not None or bool(parsed_args.message)
+if parsed_args.correctness and not dae_execution_requested(remaining_argv):
   remaining_argv = [*remaining_argv, "--launch"]
-will_execute = any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv)
+elif has_user_prompt and not dae_work_requested(remaining_argv):
+  remaining_argv = [*remaining_argv, "--launch"]
+will_execute = dae_execution_requested(remaining_argv)
 sys.argv = [sys.argv[0], *remaining_argv]
 
 def dae_execution_iterations(argv):
@@ -149,14 +181,32 @@ prefill_token_id_and_pos = [(token, pos) for pos, token in enumerate(prompt_toke
 input_token_id_and_pos = [(prompt_tokens[-1], len(prefill_token_id_and_pos))]
 initial_decode_pos = input_token_id_and_pos[0][1]
 tokens_until_kv_block_end = KVBlockSize - (initial_decode_pos % KVBlockSize)
+def decode_steps_up_to_limit(limit: int):
+  if limit <= 0:
+    raise ValueError("--max-decode-steps must be positive")
+  available_decode_tokens = MAX_SEQ_LEN - initial_decode_pos
+  if available_decode_tokens <= 0:
+    raise ValueError(
+      f"prompt leaves no decode room: initial_decode_pos={initial_decode_pos}, MAX_SEQ_LEN={MAX_SEQ_LEN}"
+    )
+  target = min(limit, available_decode_tokens)
+  if target <= tokens_until_kv_block_end:
+    return target, target
+  remaining_after_initial_block = target - tokens_until_kv_block_end
+  full_block_tokens = (remaining_after_initial_block // KVBlockSize) * KVBlockSize
+  return tokens_until_kv_block_end + full_block_tokens, target
+
+requested_decode_tokens = None
 if parsed_args.num_generates is not None:
   total_decode_tokens = parsed_args.num_generates
 elif parsed_args.correctness and not parsed_args.control_flow:
   total_decode_tokens = 1
+elif parsed_args.control_flow:
+  total_decode_tokens, requested_decode_tokens = decode_steps_up_to_limit(parsed_args.max_decode_steps)
 else:
   total_decode_tokens = tokens_until_kv_block_end
 if total_decode_tokens <= 0:
-  raise ValueError("--num-generates must be positive")
+  raise ValueError("decode step count must be positive")
 num_generates = total_decode_tokens - len(input_token_id_and_pos)
 final_decode_pos = input_token_id_and_pos[0][1] + total_decode_tokens - 1
 if final_decode_pos >= MAX_SEQ_LEN:
@@ -175,6 +225,13 @@ if parsed_args.control_flow:
       f"to be a multiple of KVBlockSize: initial_pos={initial_decode_pos}, "
       f"total_tokens={total_decode_tokens}, KVBlockSize={KVBlockSize}"
     )
+if requested_decode_tokens is not None and total_decode_tokens != requested_decode_tokens:
+  print(
+    "[decode] "
+    f"requested_steps={requested_decode_tokens}, "
+    f"scheduled_steps={total_decode_tokens}; "
+    f"rounded down to current-block remainder plus full {KVBlockSize}-token blocks"
+  )
 print(
   "[decode] "
   f"prefill_tokens={len(prefill_token_id_and_pos)}, "
