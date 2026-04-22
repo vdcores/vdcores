@@ -198,7 +198,10 @@ def decode_steps_up_to_limit(limit: int):
 
 requested_decode_tokens = None
 if parsed_args.num_generates is not None:
-  total_decode_tokens = parsed_args.num_generates
+  if parsed_args.control_flow:
+    total_decode_tokens, requested_decode_tokens = decode_steps_up_to_limit(parsed_args.num_generates)
+  else:
+    total_decode_tokens = parsed_args.num_generates
 elif parsed_args.correctness and not parsed_args.control_flow:
   total_decode_tokens = 1
 elif parsed_args.control_flow:
@@ -526,13 +529,14 @@ def maybe_counter_adapter(adapter, delta, enabled: bool, block_delta=None):
 
 
 class SchedClearQ(Schedule):
-  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int, num_clear_sms: int):
+  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int, num_clear_sms: int, wait_bar: int | None = None):
     super().__init__()
     self.load_zero = load_zero
     self.store_q = store_q
     self.tile_bytes = tile_bytes
     self.tile_m = tile_m
     self.num_clear_sms = num_clear_sms
+    self.wait_bar = wait_bar
 
   def schedule(self, sm: int):
     if sm < 0:
@@ -540,7 +544,10 @@ class SchedClearQ(Schedule):
     count = (HIDDEN // self.tile_m + self.num_clear_sms - 1 - sm) // self.num_clear_sms
     if count <= 0:
       return []
-    return [
+    insts = []
+    if self.wait_bar is not None:
+      insts.append(IssueBarrier(self.wait_bar).group())
+    insts += [
       Copy(count, size=self.tile_bytes),
       RepeatM.on(
         count,
@@ -548,6 +555,7 @@ class SchedClearQ(Schedule):
         (self.store_q.cord(sm).group(), [self.num_clear_sms * self.tile_m, 0]),
       ),
     ]
+    return insts
 
 
 def schedule_single_token(
@@ -795,6 +803,7 @@ def schedule_single_token(
     N * TileM * matZero.element_size(),
     TileM,
     full_sms - num_sms,
+    wait_bar=layerg['bar_attn_out'],
   ).place(full_sms - num_sms, base_sm=num_sms)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
@@ -1034,6 +1043,13 @@ def run_correctness_check():
     print(f"[correctness] {'PASS' if token_ok else 'FAIL'} generated_tokens: ref={generated}, dae={dae_generated}")
     if not token_ok:
       print("[correctness] control-flow diagnostics for final repeated body:")
+      tail_start = max(0, decode_offset + total_decode_tokens - 80)
+      tail_end = decode_offset + total_decode_tokens + 1
+      token_tail = matTokens[0, tail_start:tail_end].detach().cpu().tolist()
+      print(
+        "[correctness] dae token tail: "
+        f"{list(zip(range(tail_start, tail_end), token_tail))}"
+      )
       inputs = input_batch1(*tokens[:-1], positions=list(range(len(tokens) - 1)))
       captured, _ = reference_pass(model, inputs)
       final_idx = decode_offset + total_decode_tokens - 1
@@ -1041,10 +1057,14 @@ def run_correctness_check():
       final_rope_row = matRope[final_pos, 0]
       for i in range(min(2, num_layers)):
         layer = captured[i]
-        q_ref = apply_interleaved_rope_activation(
-          permute_rope_activation(layer['q_proj'][0, final_idx], QW // HEAD_DIM),
-          QW // HEAD_DIM,
-          final_rope_row,
+        kv_start = max(0, final_pos - 8)
+        kv_end = min(MAX_SEQ_LEN, final_pos + 9)
+        v_row_sums = attnVs[i][0, kv_start:kv_end].float().abs().sum(dim=1)
+        k_row_sums = attnKs[i][0, kv_start:kv_end].float().abs().sum(dim=1)
+        print(
+          f"[correctness] layer {i} KV row abs sums near final: "
+          f"V={list(zip(range(kv_start, kv_end), v_row_sums.detach().cpu().tolist()))}, "
+          f"K={list(zip(range(kv_start, kv_end), k_row_sums.detach().cpu().tolist()))}"
         )
         k_ref = apply_interleaved_rope_activation(
           permute_rope_activation(layer['k_proj'][0, final_idx], KW // HEAD_DIM),
@@ -1053,12 +1073,26 @@ def run_correctness_check():
         )
         print(f"[correctness] Layer {i}, token {final_idx}:")
         check_tensor_threshold("v_proj", layer['v_proj'][0, final_idx], attnVs[i][0, final_pos], 5.0)
-        check_tensor_threshold("q_rope", q_ref, attnQs[i][0], 5.0)
+        print("[correctness] skip q_rope snapshot: control-flow clear_q zeros the reusable Q buffer after attention consumes it")
         check_tensor_threshold("k_rope", k_ref, attnKs[i][0, final_pos], 5.0)
       check_tensor_threshold("final_hidden", captured[num_layers-1]['hidden_state_out'][0, final_idx], matHidden[0], 5.0)
       check_tensor_threshold("final_rms", captured['final']['final_rms'][0, final_idx], matRMSHidden[0], 5.0)
       check_tensor_threshold("logits_low", captured['final']['lm_head'][0, final_idx, :logits_slice], matLogits[0][0, :logits_slice], 10.0)
       check_tensor_threshold("logits_high", captured['final']['lm_head'][0, final_idx, logits_slice:vocab_size], matLogits[1][0, :vocab_size - logits_slice], 10.0)
+      ref_logits = captured['final']['lm_head'][0, final_idx].float()
+      dae_logits = torch.cat(
+        (
+          matLogits[0][0, :logits_slice],
+          matLogits[1][0, :vocab_size - logits_slice],
+        )
+      ).float()
+      ref_top_vals, ref_top_idx = torch.topk(ref_logits, 5)
+      dae_top_vals, dae_top_idx = torch.topk(dae_logits, 5)
+      print(
+        "[correctness] final logits top5: "
+        f"ref={list(zip(ref_top_idx.detach().cpu().tolist(), ref_top_vals.detach().cpu().tolist()))}, "
+        f"dae={list(zip(dae_top_idx.detach().cpu().tolist(), dae_top_vals.detach().cpu().tolist()))}"
+      )
       raise RuntimeError("Control-flow correctness check failed")
     print("[correctness] control-flow token check passed")
     return

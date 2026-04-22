@@ -58,7 +58,9 @@ __device__ __forceinline__ void allocwarp_execute(
     // A1. shift the address field
     // load the address anyway regardless of allocate or not
     // TODO(zhiyuang): sometimes shuffle (esp, on 64bit) is slow?
-    if (lane_id == 0 && di.id_repeat()) {
+    // Repeat seeds compose through gpr[1]; shifting OP_REPEAT itself would make
+    // consecutive token/block repeat seeds perturb each other.
+    if (lane_id == 0 && di.id_repeat() && op(inst.opcode) != op(OP_REPEAT)) {
       inst.address += addr_accum;
       __mprint("[Loop][loop_counter=%d] Updated address addr + 0x? -> 0x%lx",
                 di.loop_counter, inst.address);

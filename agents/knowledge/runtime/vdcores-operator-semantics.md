@@ -106,6 +106,7 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - in count-counter mode, set `loop_counter = size + shfl(jmp_cnt, arg & 0x00ff)`
     - in accumulate mode, add the selected delta contribution into `gpr[1]`; this supports combined token/block address offsets before one allocating instruction
     - later allocating `JUMP` instructions consume this repeat state
+    - active repeat address accumulation is intentionally not applied to `OP_REPEAT` itself; consecutive repeat seeds must compose by writing `gpr[1]`, not by shifting the following seed instruction's encoded delta
     - set `loop_counter = size` when count-counter mode is not enabled
     - set `loop_start_pc = pc + 1`
   - registers changed:
