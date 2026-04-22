@@ -8,49 +8,39 @@ VDCores is a research runtime and programming interface for modern asynchronous 
 
 Decoupling brings three key benefits:
 
-**Asynchrony with Simplicity.** Kernel writers can focus on the **compute itself** while the runtime handles dynamic memory allocation, data movement, and dependency tracking under the hood. See a compact example in [`GEMV on VDCores`](include/task/gemv.cuh).
+**Asynchrony with Simplicity.** Kernel writers can focus on the computation logic while the runtime handles dynamic memory allocation, data movement, and dependency tracking under the hood. See a compact example in [`GEMV on VDCores`](include/task/gemv.cuh).
 
-**Compose to Adapt, on the Fly.** Recompose VDCores memory, compute, and control blocks to explore schedules and swap execution plans. Adapt to changing resources or input batches by changing how VDCores instructions are connected.
+**Overlapping for free.** The VDCores runtime automatically exploits prefetching, overlap, and scheduling opportunities. Say goodbye to manually fusing stages or hand-engineering overlap for every single workload.
 
-**Performance for FREE, Always.** The VDCores runtime automatically exploits prefetching, overlap, and scheduling opportunities. Say goodbye to manually fusing stages or hand-engineering overlap for every single workload.
+**Compose to adapt, on the fly.** Recompose VDCores memory, compute, and control blocks to explore schedules and swap execution plans. Adapt to changing resources or input batches by changing how VDCores instructions are connected.
 
 Learn more about VDCores in our
 [blog post](https://mlsys.wuklab.io/posts/vdcores/).
 
 ## Llama 3.1-8B-Instruct Decoding Demo
 
-The repository includes a decoding demo for `meta-llama/Llama-3.1-8B-Instruct` in [`app/python/llama3/sched.py`](app/python/llama3/sched.py).
+The repository includes a decoding demo for `meta-llama/Llama-3.1-8B` in [`app/python/llama3/sched.py`](app/python/llama3/sched.py).
 
-VDCores currently supports Hopper GPUs, and all current evaluations have been run on a GH200. For the cleanest setup, we recommend starting from a fresh environment with CUDA 13.0, following [`setup.sh`](setup.sh) as the reference setup path.
+![VDCores Performance on LLama3.1](assets/llama3_8b_decoding_performance_bf16_handdraw_flat.png)
+
+
+
+
+VDCores currently supports Hopper GPUs with 132SMs (eg, GH200, H100 NVL) . For the cleanest setup, we recommend starting from a fresh environment with CUDA 13.0, following [`setup.sh`](setup.sh) as the reference setup path.
 
 Typical setup:
 
 ```bash
-# 1) Install Python dependencies in a clean CUDA 13.0 environment
-pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install numpy transformers accelerate
-
-# 2) Build the runtime object and Python extension
+# 1) Build the runtime object and Python extension
 make pyext
 
-# 3) Provide a Hugging Face token for gated model access
+# 2) Provide a Hugging Face token for gated model access
 export HF_TOKEN=...
 
-# 4) Run the decoding demo
-python app/python/llama3/sched.py --launch
-```
-
-Useful options:
-
-```bash
-# Benchmark mode
-python app/python/llama3/sched.py --bench 10
-
-# Control generation length
-python app/python/llama3/sched.py -N 16 --bench 10
-
-# Override Hugging Face cache directory (default to /tmp)
-python app/python/llama3/sched.py --hf-cache-dir /tmp/huggingface_cache --launch
+# 3) Optimize runtime and run demo
+python app/python/llama3/sched.py -w
+make pyext
+python app/python/llama3/sched.py -N 256 "Write a hello world in Python."
 ```
 
 Notes:
@@ -70,7 +60,7 @@ The codebase is organized around three layers:
 If you are new to the repository (as a model programmer want to play with schedules), a practical path is:
 
 1. Build the extension with `make pyext`.
-2. Read a small example in [`app/python/`](app/python/) or jump directly to [`app/python/llama3/sched.py`](app/python/llama3/sched.py).
+2. Read a small application example in [`app/python/`](app/python/) or jump directly to full LLM inference example [`app/python/llama3/sched.py`](app/python/llama3/sched.py).
 3. Follow how Python schedules map to task primitives and runtime instructions through `launcher.py`, `schedule.py`, and the task headers.
 
 ## Contact and Reference
