@@ -58,9 +58,7 @@ __device__ __forceinline__ void allocwarp_execute(
     // A1. shift the address field
     // load the address anyway regardless of allocate or not
     // TODO(zhiyuang): sometimes shuffle (esp, on 64bit) is slow?
-    // Repeat seeds compose through gpr[1]; shifting OP_REPEAT itself would make
-    // consecutive token/block repeat seeds perturb each other.
-    if (lane_id == 0 && di.id_repeat() && op(inst.opcode) != op(OP_REPEAT)) {
+    if (lane_id == 0 && di.id_repeat()) {
       inst.address += addr_accum;
       __mprint("[Loop][loop_counter=%d] Updated address addr + 0x? -> 0x%lx",
                 di.loop_counter, inst.address);
@@ -147,8 +145,12 @@ __device__ __forceinline__ void allocwarp_execute(
           const bool accumulate_mode = inst.arg & repeatAccumulateModeFlag;
           const int counter_reg = inst.arg & repeatCounterRegMask;
           const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
-          di.loop_counter = inst.size + (count_counter_mode ? counter_value : 0); // minus the current one
-          di.loop_start_pc = pc + 1;
+          // Accumulator repeats extend the active seed; they do not start a new
+          // repeat window, so the final consumer keeps the original pc distance.
+          if (!accumulate_mode) {
+            di.loop_counter = inst.size + (count_counter_mode ? counter_value : 0); // minus the current one
+            di.loop_start_pc = pc + 1;
+          }
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
           // TODO(zhiyuang): will this slowdown the critical path? if so we can also put the counter value in gpr and shuffle together with reg0

@@ -709,6 +709,8 @@ class RepeatM(MemoryInstruction):
         offsets = [(counter_reg, delta) for counter_reg, delta in counter_offsets]
         if len(offsets) == 0:
             return inst
+        target_reg = len(offsets)
+        assert target_reg < 32, "offsetByCounters can combine at most 31 counter offsets"
 
         insts = [cls(1, reg=0, reg_end=32, delta_cords=[0])]
         for counter_reg, delta in offsets:
@@ -722,8 +724,8 @@ class RepeatM(MemoryInstruction):
                 raise ValueError("delta must be int or list[int]")
             insts.append(cls(
                 1,
-                reg=0,
-                reg_end=1,
+                reg=target_reg,
+                reg_end=target_reg + 1,
                 delta_addr=delta_addr,
                 delta_cords=delta_cords,
                 counter_reg=counter_reg,
