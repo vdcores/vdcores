@@ -171,5 +171,6 @@ __device__ __forceinline__ void task_argmax_reduce_kernel(int num_active_tokens,
     }
   }
 
+  __threadfence();
   c2m.template push<31, true, false>(tid, 1 << output_slot);
 }

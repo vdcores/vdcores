@@ -139,6 +139,30 @@ make pyext
 
 ## Last Verified Result
 
+On 2026-04-21:
+
+- In a stale shell, `make pyext` selected `/home1/apps/nvidia/.../cuda/12.5/bin/nvcc` and failed against Conda GCC 14.3. The documented reset flow below selected Conda CUDA 13.0 and rebuilt successfully:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda deactivate
+conda activate
+make pyext
+```
+
+- For Llama3 full-KV-block control-flow decode, 64 repetitions of `" hello"` tokenize to 65 IDs, giving `prefill_tokens=64` and first VDCores decode position `64`.
+- For Llama3 unaligned prefill coverage, 70 repetitions of `" hello"` tokenize to 71 IDs, giving `prefill_tokens=70` and first VDCores decode position `70`.
+- With that prompt, these timeout-wrapped tests succeeded:
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_65_TOKENS" -N 64 -l`
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_65_TOKENS" -N 128 -l`
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_65_TOKENS" -N 192 -l`
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_65_TOKENS" -N 128 --correctness`
+- With the 70-repetition prompt, these timeout-wrapped tests succeeded:
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_71_TOKENS" -l`
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_71_TOKENS" -N 122 -l`
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_71_TOKENS" --correctness`
+  - `python app/python/llama3/sched.py --prompt "$PROMPT_71_TOKENS" -N 122 --correctness`
+
 On 2026-03-21:
 
 - `python -m py_compile app/python/gemv_mma_out.py python/dae/launcher.py`: succeeded

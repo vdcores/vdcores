@@ -156,12 +156,32 @@ class ROPE_INTERLEAVE_512(ComputeInstruction):
         super().__init__(opcode=opcode.OP_ROPE_INTERLEAVE_512, args=[])
 
 
-def _encode_attention_runtime_flags(need_norm: bool, need_rope: bool) -> int:
+ATTENTION_DYNAMIC_LAST_KV_LEN_FLAG = 0x4
+ATTENTION_DYNAMIC_NUM_KV_BLOCKS_FLAG = 0x8
+ATTENTION_BLOCK_COUNTER_SHIFT = 4
+ATTENTION_BLOCK_COUNTER_MASK = 0xF
+ATTENTION_COUNTER_SHIFT = 8
+
+
+def _encode_attention_runtime_flags(
+    need_norm: bool,
+    need_rope: bool,
+    seq_len_counter_reg: int | None = None,
+    num_kv_block_counter_reg: int | None = None,
+) -> int:
     flags = 0
     if need_norm:
         flags |= 1
     if need_rope:
         flags |= 2
+    if seq_len_counter_reg is not None:
+        assert 0 <= seq_len_counter_reg < 256, "seq_len_counter_reg must fit in 8 bits"
+        flags |= ATTENTION_DYNAMIC_LAST_KV_LEN_FLAG
+        flags |= seq_len_counter_reg << ATTENTION_COUNTER_SHIFT
+    if num_kv_block_counter_reg is not None:
+        assert 0 <= num_kv_block_counter_reg <= ATTENTION_BLOCK_COUNTER_MASK, "num_kv_block_counter_reg must fit in 4 bits"
+        flags |= ATTENTION_DYNAMIC_NUM_KV_BLOCKS_FLAG
+        flags |= num_kv_block_counter_reg << ATTENTION_BLOCK_COUNTER_SHIFT
     return flags
 
 def _encode_attention_qkv_workload_flag(num_active_q: int, last_kv_active_token_len: int) -> int:
@@ -170,13 +190,13 @@ def _encode_attention_qkv_workload_flag(num_active_q: int, last_kv_active_token_
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
             args=[
                 num_kv_block, 
                 _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
-                _encode_attention_runtime_flags(need_norm, need_rope)
+                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg)
             ],
         )
 
@@ -184,13 +204,13 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA,
             args=[
                 num_kv_block,
                 _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len),
-                _encode_attention_runtime_flags(need_norm, need_rope),
+                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg),
             ],
         )
 
@@ -198,13 +218,13 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
             args=[
                 num_kv_block, 
                 _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
-                _encode_attention_runtime_flags(need_norm, need_rope)
+                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg)
             ],
         )
 
@@ -212,13 +232,13 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA,
             args=[
                 num_kv_block,
                 _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len),
-                _encode_attention_runtime_flags(need_norm, need_rope),
+                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg),
             ],
         )
 
@@ -375,14 +395,15 @@ class Copy(ComputeInstruction):
 
 
 class LoopC(ComputeInstruction):
-    def __init__(self, count: int, pc: int):
-        super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc])
+    def __init__(self, count: int, pc: int, reg: int = 0):
+        assert 0 <= reg < 2**16, "reg must fit in uint16"
+        super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc, reg])
 
     @classmethod
-    def toNext(cls, ptrs, count):
+    def toNext(cls, ptrs, count, reg: int = 0):
         def smfunc(sm_id: int):
             pc = ptrs[sm_id]
-            return cls(count, pc)
+            return cls(count, pc, reg=reg)
 
         return smfunc
 
@@ -560,7 +581,57 @@ class LoopM(MemoryInstruction):
         return smfunc
 
 
+class CounterOffsetMemoryInstruction:
+    def __init__(self, counter_reg: int, inst: MemoryInstruction, delta):
+        offsets = [(counter_reg, delta)]
+        if isinstance(inst, CounterOffsetMemoryInstruction):
+            self.inst = inst.inst
+            self.offsets = inst.offsets + offsets
+        else:
+            self.inst = inst
+            self.offsets = offsets
+
+    def expand_instructions(self):
+        return RepeatM.offsetByCounters(self.offsets, self.inst)
+
+    def bar(self, *args, **kwargs):
+        self.inst.bar(*args, **kwargs)
+        return self
+
+    def group(self, *args, **kwargs):
+        self.inst.group(*args, **kwargs)
+        return self
+
+    def jump(self, *args, **kwargs):
+        self.inst.jump(*args, **kwargs)
+        return self
+
+    def port(self, *args, **kwargs):
+        self.inst.port(*args, **kwargs)
+        return self
+
+    def writeback(self, *args, **kwargs):
+        self.inst.writeback(*args, **kwargs)
+        return self
+
+    def copy(self):
+        new_inst = CounterOffsetMemoryInstruction(self.offsets[0][0], self.inst.copy(), self.offsets[0][1])
+        new_inst.offsets = self.offsets.copy()
+        return new_inst
+
+    def __getattr__(self, name):
+        return getattr(self.inst, name)
+
+    def __repr__(self):
+        return f"CounterOffsetMemoryInstruction(offsets={self.offsets}, inst={self.inst!r})"
+
+
 class RepeatM(MemoryInstruction):
+    COUNTER_MODE_FLAG = 0x8000
+    COUNT_COUNTER_MODE_FLAG = 0x4000
+    ACCUMULATE_MODE_FLAG = 0x2000
+    COUNTER_REG_MASK = 0x00FF
+
     def __init__(
         self,
         count: int,
@@ -568,20 +639,100 @@ class RepeatM(MemoryInstruction):
         reg_end=None,
         delta_addr: int | None = None,
         delta_cords=[],
+        counter_reg: int | None = None,
+        count_counter_reg: int | None = None,
+        accumulate: bool = False,
     ):
         if reg_end is None:
             reg_end = reg + 1
         assert 0 <= reg < 32, "reg must be in [0,31]"
         assert 0 <= reg_end <= 32, "reg_end must be in [0,32]"
         assert reg_end > reg, "reg_end must be greater than reg"
+        arg = 0
+        encoded_counter_reg = None
+        if counter_reg is not None:
+            assert 0 <= counter_reg <= self.COUNTER_REG_MASK, "counter_reg must fit in the REPEAT counter field"
+            encoded_counter_reg = counter_reg
+            arg |= self.COUNTER_MODE_FLAG
+        if count_counter_reg is not None:
+            assert 0 <= count_counter_reg <= self.COUNTER_REG_MASK, "count_counter_reg must fit in the REPEAT counter field"
+            if encoded_counter_reg is not None and encoded_counter_reg != count_counter_reg:
+                raise ValueError("REPEAT can only encode one counter register")
+            encoded_counter_reg = count_counter_reg
+            arg |= self.COUNT_COUNTER_MODE_FLAG
+        if accumulate:
+            arg |= self.ACCUMULATE_MODE_FLAG
+        if encoded_counter_reg is not None:
+            arg |= encoded_counter_reg
         super().__init__(
             opcode=opcode.OP_REPEAT,
             num_slots=(reg_end << 8) | reg,
-            arg=0,
+            arg=arg,
             size=count,
             address=delta_addr,
             cords=delta_cords,
         )
+
+    @classmethod
+    def byCounter(cls, counter_reg: int, *steps):
+        insts = []
+        if len(steps) == 0:
+            return insts
+
+        regcords = []
+        for i, (inst, delta) in enumerate(steps):
+            if isinstance(delta, list):
+                cords = delta
+            elif isinstance(delta, int):
+                cords = addr2cords(delta)
+            else:
+                raise ValueError("delta must be int or list[int]")
+
+            if len(regcords) > 0 and regcords[-1][-1] == cords:
+                regcords[-1][1] = i + 1
+            else:
+                regcords.append([i, i + 1, cords])
+
+        insts.append(cls(1, reg=0, reg_end=32, delta_cords=[0], counter_reg=counter_reg))
+        for reg_start, reg_end, delta_cords in regcords:
+            insts += [cls(1, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords, counter_reg=counter_reg)]
+        for inst, _ in steps:
+            insts.append(inst)
+        return insts
+
+    @classmethod
+    def offsetByCounter(cls, counter_reg: int, inst, delta):
+        return cls.byCounter(counter_reg, (inst, delta))
+
+    @classmethod
+    def offsetByCounters(cls, counter_offsets, inst):
+        offsets = [(counter_reg, delta) for counter_reg, delta in counter_offsets]
+        if len(offsets) == 0:
+            return inst
+        target_reg = len(offsets)
+        assert target_reg < 32, "offsetByCounters can combine at most 31 counter offsets"
+
+        insts = [cls(1, reg=0, reg_end=32, delta_cords=[0])]
+        for counter_reg, delta in offsets:
+            if isinstance(delta, list):
+                delta_cords = delta
+                delta_addr = None
+            elif isinstance(delta, int):
+                delta_cords = []
+                delta_addr = delta
+            else:
+                raise ValueError("delta must be int or list[int]")
+            insts.append(cls(
+                1,
+                reg=target_reg,
+                reg_end=target_reg + 1,
+                delta_addr=delta_addr,
+                delta_cords=delta_cords,
+                counter_reg=counter_reg,
+                accumulate=True,
+            ))
+        insts.append(inst)
+        return insts
 
     @classmethod
     def onSync(cls, bar_inst_offset: int, bar_id: int | None, count: int, *steps, asyncPort: bool = True):
@@ -610,11 +761,11 @@ class RepeatM(MemoryInstruction):
         return cls.on(count - 1, *new_steps)
 
     @classmethod
-    def on(cls, count: int, *steps):
+    def on(cls, count: int, *steps, count_counter_reg: int | None = None):
         insts = []
         if len(steps) == 0:
             return insts
-        if count == 0:
+        if count == 0 and count_counter_reg is None:
             return []
 
         regcords = []
@@ -631,15 +782,15 @@ class RepeatM(MemoryInstruction):
             else:
                 regcords.append([i, i + 1, cords])
 
-        if count > 1:
+        if count > 1 or count_counter_reg is not None:
             for reg_start, reg_end, delta_cords in regcords:
-                insts += [cls(0, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords)]
+                insts += [cls(0, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords, count_counter_reg=count_counter_reg)]
             insts[-1].size = count
 
         for inst, _ in steps:
             insts.append(inst)
 
-        if count > 1:
+        if count > 1 or count_counter_reg is not None:
             insts[-1].jump()
         return insts
 
@@ -879,6 +1030,7 @@ __all__ = [
     "MemoryInstruction",
     "TerminateM",
     "LoopM",
+    "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",
     "IssueBarrier",
