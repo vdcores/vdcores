@@ -234,14 +234,15 @@ def write_opcode_order(path: Path, entries: list[str], source: str) -> None:
 
 def render_dynamic_handler(entry: dict[str, int | str]) -> str:
     name = entry["name"]
-    if not entry["family"].startswith("gemv_"):
+    family = str(entry["family"])
+    if not (family.startswith("gemv_") or family.startswith("gemm_")):
         raise ValueError(f"Unsupported dynamic family in code generation: {entry['family']}")
 
     prelude = [
         f"DAE_COMPUTE_OP_HANDLER({name}) {{",
         "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);",
     ]
-    if entry["family"] == "gemv_wgmma":
+    if family == "gemv_wgmma":
         body = [
             "  using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;",
             (
@@ -249,12 +250,35 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
                 "(inst.args[0], inst.args[1], smem_base, m2c, c2m);"
             ),
         ]
-    elif entry["family"] == "gemv_mma":
+    elif family == "gemv_mma":
         body = [
             f"  task_gemv_mma<{entry['m']}, {entry['n']}, {entry['k']}>(inst.args[0], smem_base, m2c, c2m);",
         ]
+    elif family == "gemm_wgmma":
+        m = int(entry["m"])
+        n = int(entry["n"])
+        k = int(entry["k"])
+        bload = int(entry["bload"])
+        residual_flag = int(entry["residual"])
+        residual = "true" if residual_flag else "false"
+
+        # The SM90 GMMA atom type encodes M/N; K is fixed by the atom (16) and the
+        # operator K extent is carried through the task template parameters.
+        if m != 64:
+            raise ValueError(f"Unsupported GEMM_WGMMA M={m}; only M=64 atoms are wired today")
+        if n == 64:
+            atom = "cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>"
+        elif n == 128:
+            atom = "cute::SM90_64x128x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>"
+        else:
+            raise ValueError(f"Unsupported GEMM_WGMMA N={n}; expected 64 or 128")
+
+        body = [
+            f"  using gemm_atom = {atom};",
+            f"  task_gemm<gemm_atom, {m}, {n}, {k}, {bload}, {residual}>(inst.args[0], smem_base, m2c, c2m);",
+        ]
     else:
-        raise ValueError(f"Unsupported GEMV family in code generation: {entry['family']}")
+        raise ValueError(f"Unsupported dynamic family in code generation: {entry['family']}")
     return "\n".join(prelude + body + ["}"])
 
 

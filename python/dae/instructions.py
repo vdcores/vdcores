@@ -96,14 +96,14 @@ class Gemm_M64N64(ComputeInstruction):
     n_batch = 1
 
     def __init__(self, kTiles: int, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMM_M64N64, args=[kTiles])
+        super().__init__(opcode=family_ref("GEMM_WGMMA", M=64, N=64, K=128, BLOAD=1, RESIDUAL=residual), args=[kTiles])
 
 class Gemm_M64N64K64(ComputeInstruction):
     MNK = (64, 64, 64)
     n_batch = 1
 
     def __init__(self, kTiles: int, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMM_M64N64K64, args=[kTiles])
+        super().__init__(opcode=family_ref("GEMM_WGMMA", M=64, N=64, K=64, BLOAD=1, RESIDUAL=residual), args=[kTiles])
 
 
 class Gemm_M64N128K64(ComputeInstruction):
@@ -111,7 +111,7 @@ class Gemm_M64N128K64(ComputeInstruction):
     n_batch = 1
 
     def __init__(self, kTiles: int, residual: bool = False):
-        super().__init__(opcode=opcode.OP_GEMM_M64N128K64, args=[kTiles])
+        super().__init__(opcode=family_ref("GEMM_WGMMA", M=64, N=128, K=64, BLOAD=1, RESIDUAL=residual), args=[kTiles])
 
 
 class Gemv_M64N8_ROPE_128(ComputeInstruction):
