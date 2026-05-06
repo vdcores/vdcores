@@ -14,7 +14,7 @@ Decoupling brings three key benefits:
 
 **Compose to adapt, on the fly.** Recompose VDCores memory, compute, and control blocks to explore schedules and swap execution plans. Adapt to changing resources or input batches by changing how VDCores instructions are connected.
 
-Learn more about VDCores in our
+Learn more about VDCores in our [paper](https://arxiv.org/abs/2605.03190) and
 [blog post](https://mlsys.wuklab.io/posts/vdcores/).
 
 ## Llama 3.1-8B-Instruct Decoding Demo
@@ -72,4 +72,5 @@ Contacts:
 
 Reference:
 
+- Zijian He, Adrian Sampson, Yiying Zhang, Zhiyuan Guo, "VDCores: Resource Decoupled Programming and Execution for Asynchronous GPU", arXiv 2026, https://arxiv.org/abs/2605.03190
 - Zhiyuan Guo, Zijian He, Adrian Sampson, and Yiying Zhang, “VDCores: A Runtime for Modern Async GPUs.” https://mlsys.wuklab.io/posts/vdcores/
