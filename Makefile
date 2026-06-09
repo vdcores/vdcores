@@ -6,6 +6,16 @@ PYTHON ?= python
 PYTHON_PREFIX := $(shell $(PYTHON) -c 'import sys; print(sys.prefix)' 2>/dev/null)
 CONDA_PREFIX ?= $(shell $(PYTHON) -c 'import os; print(os.environ.get("CONDA_PREFIX", ""))' 2>/dev/null)
 EXTRA_INCLUDE_DIRS := $(sort $(wildcard $(PYTHON_PREFIX)/include) $(wildcard $(CONDA_PREFIX)/include))
+CUDA_DRIVER_LIB_DIRS := $(sort $(dir $(wildcard \
+	$(CONDA_PREFIX)/targets/*/lib/stubs/libcuda.so \
+	$(CONDA_PREFIX)/lib/stubs/libcuda.so \
+	$(PYTHON_PREFIX)/targets/*/lib/stubs/libcuda.so \
+	$(PYTHON_PREFIX)/lib/stubs/libcuda.so \
+	/usr/local/cuda/lib64/stubs/libcuda.so \
+	/usr/local/cuda/lib64/libcuda.so \
+	/usr/lib/x86_64-linux-gnu/libcuda.so \
+	/usr/lib64/libcuda.so \
+)))
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
@@ -25,6 +35,7 @@ COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 
 # Linker flags (add CUDA driver library for TMA support)
 LDFLAGS = -lcuda -lcublas
+LDFLAGS += $(addprefix -L,$(CUDA_DRIVER_LIB_DIRS))
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += $(addprefix -I,$(EXTRA_INCLUDE_DIRS))
