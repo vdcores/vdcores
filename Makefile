@@ -3,6 +3,9 @@
 # CUDA compiler
 NVCC = nvcc
 PYTHON ?= python
+PYTHON_PREFIX := $(shell $(PYTHON) -c 'import sys; print(sys.prefix)' 2>/dev/null)
+CONDA_PREFIX ?= $(shell $(PYTHON) -c 'import os; print(os.environ.get("CONDA_PREFIX", ""))' 2>/dev/null)
+EXTRA_INCLUDE_DIRS := $(sort $(wildcard $(PYTHON_PREFIX)/include) $(wildcard $(CONDA_PREFIX)/include))
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
@@ -24,6 +27,7 @@ COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 LDFLAGS = -lcuda -lcublas
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
+NVCC_FLAGS += $(addprefix -I,$(EXTRA_INCLUDE_DIRS))
 NVCC_FLAGS += -lineinfo
 
 # Directories

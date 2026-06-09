@@ -105,6 +105,8 @@ Typical Python-only areas include:
 - When a task reveals a stable repo fact or a reusable procedure, update `agents/knowledge/` or `agents/workflows/` in the same task instead of leaving it only in `.agentlog/`.
 - When a task changes the standard workflow or exposes a durable verification lesson, persist the concise takeaway in tracked `agents/` docs before closing the task.
 - `make pyext` requires the local CUDA toolkit version to match the CUDA version used by the installed PyTorch build.
+- `make pyext` depends on CUTLASS headers from the active Python/Conda environment. If `cutlass/numeric_types.h` is missing, first confirm `test -f "$CONDA_PREFIX/include/cutlass/numeric_types.h"` after activating the environment from `setup.sh`; the Makefile and `setup.py` add that include directory when it exists.
+- Public CUDA headers under `include/` should include their own standard-library dependencies; `runtime.o` and the Torch extension compile different translation units, so transitive includes can hide missing headers in only one build stage.
 - To build only a subset of compute-warp operators, pass `DAE_COMPUTE_OPS=OP_A,OP_B,...` to `make pyext`; leaving it unset keeps the full supported compute-op set.
 - As a file-based alternative, put one operator symbol per line in a repo-root `dae_compute_ops.vdcore.build` file, or point `DAE_COMPUTE_OPS_FILE` at another file; the build prints which source it used.
 - To generate that file from a built launcher without hand-copying names, use the app-level `--write-compute-ops [path]` option exposed through `python/dae/util.py`'s `dae_app(...)`.

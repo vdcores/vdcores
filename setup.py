@@ -1,6 +1,7 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
+import sys
 
 import torch
 torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
@@ -18,6 +19,11 @@ include_dirs = [
     os.path.join(this_dir, "include", "dae"),
     generated_include_dir,
 ]
+for prefix in (os.environ.get("CONDA_PREFIX"), sys.prefix):
+    if prefix:
+        include_dir = os.path.join(prefix, "include")
+        if os.path.isdir(include_dir) and include_dir not in include_dirs:
+            include_dirs.append(include_dir)
 
 setup(
     name="dae",
