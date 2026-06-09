@@ -1,6 +1,8 @@
 #pragma once
 
 #include "context.cuh"
+
+#include <array>
 #include <cuda.h>
 
 // runtime interface for DAE kernels
@@ -26,4 +28,3 @@ CUtensorMap create_tma_descriptor(
   CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
   std::array<uint64_t, 5> global_strides_opt = {0, 0, 0, 0, 0}
 );
-

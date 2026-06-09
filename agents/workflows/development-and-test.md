@@ -123,7 +123,13 @@ Typical Python-only areas include:
 - For isolated decode-attention kernel changes, use `app/python/attention_simple_decoding.py` as the primary correctness and quick-timing harness; it exercises the shared attention opcode path without requiring a full model schedule.
 - Set `ATTENTION_IMPL=mma` when you want that harness to exercise the explicit non-Hopper MMA attention opcodes; leave it unset (or use `ATTENTION_IMPL=hopper`) to stay on the default Hopper GMMA path.
 - `app/python/attention.py` currently calls the attention instruction with a stale constructor signature and is not a reliable smoke test until that script is updated.
-- If `make pyext` fails immediately with an unsupported GCC version from the active Conda compiler toolchain, retry from a reset shell state with:
+- If `make pyext` fails in PyTorch extension setup with an unsupported GCC version from the active Conda compiler toolchain, select a CUDA-supported host compiler explicitly. For CUDA 12.9, PyTorch rejects GCC/G++ `14.x`; use a `<14.0` compiler, for example:
+
+```bash
+make pyext HOST_CXX=/usr/bin/g++-13 HOST_CC=/usr/bin/gcc-13
+```
+
+If the failure comes from a stale Conda/CUDA shell rather than an intentionally selected CUDA 12.x toolkit, first retry from a reset shell state:
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"

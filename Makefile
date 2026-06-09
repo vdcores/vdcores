@@ -3,6 +3,8 @@
 # CUDA compiler
 NVCC = nvcc
 PYTHON ?= python
+HOST_CC ?=
+HOST_CXX ?=
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
@@ -25,6 +27,7 @@ LDFLAGS = -lcuda -lcublas
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
+PYEXT_ENV := $(if $(strip $(HOST_CC)),CC=$(HOST_CC),) $(if $(strip $(HOST_CXX)),CXX=$(HOST_CXX),)
 
 # Directories
 ifeq ($(debug),)
@@ -78,7 +81,7 @@ run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
-	pip install -e . --no-build-isolation
+	$(PYEXT_ENV) $(PYTHON) -m pip install -e . --no-build-isolation
 
 FORCE:
 
