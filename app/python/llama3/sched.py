@@ -16,7 +16,7 @@ from reference import input_batch1, reference_pass, check_tensor_threshold
 import os
 import math
 
-DEFAULT_MAX_DECODE_STEPS = 128
+DEFAULT_MAX_DECODE_STEPS = 16
 
 arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=None)
@@ -175,6 +175,7 @@ num_sms = 128
 full_sms = 132
 dae = Launcher(132, device=gpu)
 
+h20_mode = False
 
 prompt_tokens = prompt_token_ids()
 prefill_token_id_and_pos = [(token, pos) for pos, token in enumerate(prompt_tokens[:-1])]
@@ -807,23 +808,43 @@ def schedule_single_token(
   ).place(full_sms - num_sms, base_sm=num_sms)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
-  QProj = QProj.place(64)
-  QRope = QRope.place(64)
-  KProj = KProj.place(32, base_sm=32)
-  KRope = KRope.place(32, base_sm=32)
-  VProj = VProj.place(32)
+  if h20_mode:
+    QProj = QProj.place(64)
+    QRope = QRope.place(64)
+    KProj = KProj.place(32, base_sm=32)
+    KRope = KRope.place(32, base_sm=32)
+    VProj = VProj.place(32)
+    OutProj = OutProj.place(64)
+  else:
+    QProj = QProj.place(128)
+    QRope = QRope.place(128)
+    KProj = KProj.place(64, base_sm=64)
+    KRope = KRope.place(64, base_sm=64)
+    VProj = VProj.place(64)
+    OutProj = OutProj.place(128)
   Gqa = Gqa.place(N * NUM_KV_HEAD)
-  OutProj = OutProj.place(num_sms)
-  gate_proj_low = gate_proj_low.place(64)
-  gate_proj_high = gate_proj_high.place(64)
-  up_proj_low = up_proj_low.place(64, base_sm=64)
-  up_proj_high = up_proj_high.place(64, base_sm=64)
-  silu1 = silu1.place(4, base_sm=128)
-  gate_proj_fused = gate_proj_fused.place(128)
-  up_proj_fused = up_proj_fused.place(128)
-  silu_fused = silu_fused.place(128)
-  down_proj_low = down_proj_low.place(128)
-  down_proj_high = down_proj_high.place(128)
+  if h20_mode:
+    gate_proj_low = gate_proj_low.place(64)
+    gate_proj_high = gate_proj_high.place(64)
+    up_proj_low = up_proj_low.place(64)
+    up_proj_high = up_proj_high.place(64)
+    silu1 = silu1.place(8, base_sm=64)
+    gate_proj_fused = gate_proj_fused.place(64)
+    up_proj_fused = up_proj_fused.place(64)
+    silu_fused = silu_fused.place(64)
+    down_proj_low = down_proj_low.place(64)
+    down_proj_high = down_proj_high.place(64)
+  else:
+    gate_proj_low = gate_proj_low.place(64)
+    gate_proj_high = gate_proj_high.place(64)
+    up_proj_low = up_proj_low.place(64, base_sm=64)
+    up_proj_high = up_proj_high.place(64, base_sm=64)
+    silu1 = silu1.place(4, base_sm=128)
+    gate_proj_fused = gate_proj_fused.place(128)
+    up_proj_fused = up_proj_fused.place(128)
+    silu_fused = silu_fused.place(128)
+    down_proj_low = down_proj_low.place(128)
+    down_proj_high = down_proj_high.place(128)
   Argmax = Argmax.place(128)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
