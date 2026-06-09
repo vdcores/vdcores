@@ -1,5 +1,12 @@
 # Llama Scheduling Notes
 
+## Llama 3.1 8B MLP Standalone
+
+- `app/python/llama3/mlp_sched.py` is the clean MLP-only workload that mirrors the default `app/python/llama3/sched.py` MLP schedule without ablation controls.
+- Its H20-oriented MLP split is `2048 + 4096 + 4096 + 4096`: gate/up A use 32 SMs each, gate/up B/C/D use 64 SMs each, SiLU chunks use 8 side SMs at base SM 64, and two down GEMVs consume `[0:6144)` and `[6144:14336)`.
+- The clean MLP schedule stores all gate/up chunks through TMA/global memory; it does not use the register-backed fused tail.
+- `app/python/llama3/mlp_standalone.py` is the ablation-oriented MLP harness and may include experimental controls such as serialized barriers or TMA tail storage.
+
 ## Llama 3.2 1B Baseline
 
 - The isolated 1B app path lives in `app/python/llama32_1b/sched.py`.

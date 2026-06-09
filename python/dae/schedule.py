@@ -1093,6 +1093,46 @@ class SchedSmemSiLUInterleaved(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_token)
 
+class SchedSmemSiLUInterleavedK(SchedSmemSiLUInterleaved):
+    Kernels = {
+        2048: SILU_MUL_SHARED_BF16_K_2048_INTER,
+        4096: SILU_MUL_SHARED_BF16_K_4096_ONLY,
+        6144: SILU_MUL_SHARED_BF16_K_4096_INTER,
+    }
+
+    def __init__(self,
+                 num_token: int,
+                 gate_glob: torch.Tensor,
+                 up_glob: torch.Tensor,
+                 out_glob: torch.Tensor):
+        super().__init__(num_token, gate_glob, up_glob, out_glob)
+        self.output_size = gate_glob.shape[-1]
+        if up_glob.shape[-1] != self.output_size or out_glob.shape[-1] != self.output_size:
+            raise ValueError("gate/up/out SiLU slices must have the same width")
+        if self.output_size not in self.Kernels:
+            raise NotImplementedError(f"Missing shared-memory SiLU kernel for width {self.output_size}")
+        self.Kernel = self.Kernels[self.output_size]
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+
+        start_token_id = sm * self.tokens_per_sm
+        end_token_id = (sm + 1) * self.tokens_per_sm
+        insts = []
+        for i in range(start_token_id, end_token_id):
+            gate = TmaLoad1D(self.gate_glob[i])
+            if i == start_token_id:
+                gate = gate.bar(self._bar("input")).group()
+
+            insts.extend([
+                self.Kernel(1),
+                TmaStore1D(self.out_glob[i]).bar(self._bar("output")).group(),
+                gate,
+                TmaLoad1D(self.up_glob[i]),
+            ])
+        return insts
+
 class SchedRegSiLUFused(Schedule):
     def __init__(self,
                  num_token: int,
