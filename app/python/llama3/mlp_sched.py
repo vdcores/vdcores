@@ -11,6 +11,7 @@ from dae.util import dae_app, tensor_diff
 
 arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("--correctness", action="store_true")
+arg_parser.add_argument("--skip-down", action="store_true")
 arg_parser.add_argument("--seed", type=int, default=0)
 parsed_args, remaining_argv = arg_parser.parse_known_args()
 if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
@@ -63,6 +64,10 @@ defaultg.addTma("storeSiluLayer", [matSiLUOut], lambda t: t.wgmma_store(N, TileM
 defaultg.addTma("storeInterm", [matInterm], lambda t: t.wgmma_store(N, TileM, Major.MN))
 defaultg.addTma("storeGateOut", [matGateOut], lambda t: t.wgmma_store(N, TileM, Major.MN))
 defaultg.addTma("reduceOut", [matOut], lambda t: t.wgmma("reduce", N, TileM, Major.MN))
+finish_bytes = 64
+finish_elems = finish_bytes // matOut.element_size()
+defaultg.addTma("loadFinish", [matOut[:, :finish_elems]], lambda t: t.tensor1d("load", finish_bytes))
+defaultg.addTma("storeFinish", [matOut[:, :finish_elems]], lambda t: t.tensor1d("store", finish_bytes))
 
 defaultg.addTma("loadDown", [matDown], lambda t: t.wgmma_load(TileM, TileK, Major.K))
 defaultg.addTma("loadUp", [matUp], lambda t: t.wgmma_load(TileM, TileK, Major.K))
@@ -130,16 +135,33 @@ silu_tail = SchedRegSiLUFused(
     stride=TileM,
 ).bar("output", defaultg["bar_silu_tail"]).place(MLP_TILES[2])
 
-down_low = SchedGemv(
+DOWN_FOLD_M = 14 * TileM
+DOWN_REST_M = HIDDEN - DOWN_FOLD_M
+
+down_low_fold = SchedGemv(
     Gemv_M64N8,
-    MNK=(HIDDEN, N, 8192),
+    MNK=(DOWN_FOLD_M, N, 8192),
     tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
-).bar("load", defaultg["bar_silu_low"]).place(64)
-down_tail = SchedGemv(
+).bar("load", defaultg["bar_silu_low"]).place(28)
+down_low_rest = SchedGemv(
     Gemv_M64N8,
-    MNK=(HIDDEN, N, (8192, INTERMEDIATE - 8192)),
+    MNK=((DOWN_FOLD_M, DOWN_REST_M), N, 8192),
     tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
-).bar("load", defaultg["bar_silu_tail"]).bar("store", defaultg["bar_out"]).place(64)
+).bar("load", defaultg["bar_silu_low"]).place(50, base_sm=28)
+down_tail_fold = SchedGemv(
+    Gemv_M64N8,
+    MNK=(DOWN_FOLD_M, N, (8192, INTERMEDIATE - 8192)),
+    tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
+).bar("load", defaultg["bar_silu_tail"]).bar("store", defaultg["bar_out"]).place(28)
+down_tail_rest = SchedGemv(
+    Gemv_M64N8,
+    MNK=((DOWN_FOLD_M, DOWN_REST_M), N, (8192, INTERMEDIATE - 8192)),
+    tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
+).bar("load", defaultg["bar_silu_tail"]).bar("store", defaultg["bar_out"]).place(50, base_sm=28)
+finish_without_down = SchedCopy(
+    tmas=(defaultg["loadFinish"], defaultg["storeFinish"]),
+    size=finish_bytes,
+).bar("load", defaultg["bar_silu_tail"]).bar("store", defaultg["bar_out"]).place(1)
 
 ordered_schedules = [
     gate_0,
@@ -148,24 +170,33 @@ ordered_schedules = [
     gate_1,
     up_1,
     silu_1,
-    down_low,
+]
+if not parsed_args.skip_down:
+    ordered_schedules.extend([down_low_fold, down_low_rest])
+ordered_schedules.extend([
     gate_tail,
     up_tail,
     silu_tail,
-    down_tail,
-]
+])
+if parsed_args.skip_down:
+    ordered_schedules.append(finish_without_down)
+else:
+    ordered_schedules.extend([down_tail_fold, down_tail_rest])
 
 dae.bind_late_barrier_counts(ordered_schedules)
 dae.i(ordered_schedules)
 
+mode = "skip-down" if parsed_args.skip_down else "with-down"
 print(
-    "Llama3 MLP sched-only (two side SiLU chunks, fused SiLU tail) "
+    f"Llama3 MLP sched-only ({mode}, two side SiLU chunks, fused SiLU tail) "
     f"on [N={N}, HIDDEN={HIDDEN}, INTERMEDIATE={INTERMEDIATE}], "
     f"split=({MLP_0}, {MLP_1}, {MLP_2}), tile split={MLP_TILES}, SMs={full_sms}"
 )
 dae.s()
 dae_app(dae)
 
-if parsed_args.correctness:
+if parsed_args.correctness and not parsed_args.skip_down:
     ref = F.linear(F.silu(F.linear(matHidden, matGate)) * F.linear(matHidden, matUp), matDown)
     tensor_diff("mlp_out", ref, matOut)
+elif parsed_args.correctness:
+    print("[correctness] skipped because --skip-down leaves matOut incomplete")

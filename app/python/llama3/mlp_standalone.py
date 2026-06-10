@@ -12,6 +12,8 @@ arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("--correctness", action="store_true")
 arg_parser.add_argument("--no-overlap", action="store_true",
                         help="Serialize logical MLP operations with explicit IssueBarrier waits")
+arg_parser.add_argument("--skip-down", action="store_true",
+                        help="Skip down projection and release the final barrier with a tiny finish copy")
 arg_parser.add_argument("--tail-store", choices=("reg", "tma"), default="reg",
                         help="Store the MLP tail gate/up projections through registers or TMA")
 arg_parser.add_argument("--seed", type=int, default=0)
@@ -73,6 +75,10 @@ defaultg.addTma("reduceInterm", [matInterm], lambda t: t.wgmma("reduce", N, Tile
 defaultg.addTma("reduceGateOut", [matGateOut], lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 defaultg.addTma("reduceOut", [matOut], lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 defaultg.addTma("storeSiluLayer", [matSiLUOut], lambda t: t.wgmma_store(N, TileM, Major.MN))
+finish_bytes = 64
+finish_elems = finish_bytes // matOut.element_size()
+defaultg.addTma("loadFinish", [matOut[:, :finish_elems]], lambda t: t.tensor1d("load", finish_bytes))
+defaultg.addTma("storeFinish", [matOut[:, :finish_elems]], lambda t: t.tensor1d("store", finish_bytes))
 defaultg.addTma("loadDown", [matDown], lambda t: t.wgmma_load(TileM, TileK, Major.K))
 defaultg.addTma("loadUp", [matUp], lambda t: t.wgmma_load(TileM, TileK, Major.K))
 defaultg.addTma("loadGate", [matGate], lambda t: t.wgmma_load(TileM, TileK, Major.K))
@@ -177,6 +183,10 @@ down_proj_high = SchedGemv(
     MNK=(HIDDEN, N, (MLP_SPLIT, MLP_TAIL)),
     tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
 ).bar("store", defaultg["bar_out"])
+finish_without_down = SchedCopy(
+    tmas=(defaultg["loadFinish"], defaultg["storeFinish"]),
+    size=finish_bytes,
+).bar("store", defaultg["bar_out"])
 
 if parsed_args.no_overlap:
     gate_proj_low.bar("store", defaultg["bar_gate_done"])
@@ -206,6 +216,7 @@ else:
         silu_tail1.bar("input", defaultg["bar_silu_tail_in"]).bar("output", defaultg["bar_silu_out2"])
     else:
         silu_fused.bar("output", defaultg["bar_silu_out2"])
+    finish_without_down.bar("load", defaultg["bar_silu_out2"])
     down_proj_low.bar("load", defaultg["bar_silu_out1"])
     down_proj_high.bar("load", defaultg["bar_silu_out2"])
 
@@ -240,6 +251,9 @@ else:
     ]
 down_proj_low = down_proj_low.place(num_sms)
 down_proj_high = down_proj_high.place(num_sms)
+finish_without_down = finish_without_down.place(1)
+
+terminal_schedules = [finish_without_down] if parsed_args.skip_down else [down_proj_low, down_proj_high]
 
 dae.bind_late_barrier_counts(
     gate_proj_low,
@@ -248,8 +262,7 @@ dae.bind_late_barrier_counts(
     up_proj_high,
     silu1,
     tail_schedules,
-    down_proj_low,
-    down_proj_high,
+    terminal_schedules,
 )
 
 if parsed_args.no_overlap:
@@ -273,8 +286,7 @@ if parsed_args.no_overlap:
             IssueBarrier(defaultg["bar_silu_low_done"]),
             IssueBarrier(defaultg["bar_silu_tail_done"]),
 
-            down_proj_low,
-            down_proj_high,
+            terminal_schedules,
         )
     else:
         dae.i(
@@ -294,8 +306,7 @@ if parsed_args.no_overlap:
             silu_fused,
             IssueBarrier(defaultg["bar_silu_tail_done"]),
 
-            down_proj_low,
-            down_proj_high,
+            terminal_schedules,
         )
 else:
     dae.i(
@@ -305,15 +316,17 @@ else:
         up_proj_high,
         silu1,
         tail_schedules,
-        down_proj_low,
-        down_proj_high,
+        terminal_schedules,
     )
 
 mode = "no-overlap" if parsed_args.no_overlap else "overlapped"
-print(f"Llama3 MLP standalone ({mode}, tail-store={parsed_args.tail_store}) on [N={N}, HIDDEN={HIDDEN}, INTERMEDIATE={INTERMEDIATE}], SMs={full_sms}")
+down_mode = "skip-down" if parsed_args.skip_down else "with-down"
+print(f"Llama3 MLP standalone ({mode}, {down_mode}, tail-store={parsed_args.tail_store}) on [N={N}, HIDDEN={HIDDEN}, INTERMEDIATE={INTERMEDIATE}], SMs={full_sms}")
 dae.s()
 dae_app(dae)
 
-if parsed_args.correctness:
+if parsed_args.correctness and not parsed_args.skip_down:
     ref = F.linear(F.silu(F.linear(matHidden, matGate)) * F.linear(matHidden, matUp), matDown)
     tensor_diff("mlp_out", ref, matOut)
+elif parsed_args.correctness:
+    print("[correctness] skipped because --skip-down leaves matOut incomplete")
