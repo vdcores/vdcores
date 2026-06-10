@@ -1097,6 +1097,8 @@ class SchedSmemSiLUInterleavedK(SchedSmemSiLUInterleaved):
     Kernels = {
         2048: SILU_MUL_SHARED_BF16_K_2048_INTER,
         4096: SILU_MUL_SHARED_BF16_K_4096_ONLY,
+        4736: SILU_MUL_SHARED_BF16_K_4736_ONLY,
+        4864: SILU_MUL_SHARED_BF16_K_4864_ONLY,
         6144: SILU_MUL_SHARED_BF16_K_4096_INTER,
     }
 

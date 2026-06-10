@@ -273,6 +273,16 @@ DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_4096_ONLY) {
   task_silu_smem_1D<4096>(inst.args[0], smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_4736_ONLY) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+  task_silu_smem_1D<4736>(inst.args[0], smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_4864_ONLY) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+  task_silu_smem_1D<4864>(inst.args[0], smem_base, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_64_SW128) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
   const int num_token = inst.args[0];

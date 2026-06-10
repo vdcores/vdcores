@@ -3,7 +3,10 @@
 ## Llama 3.1 8B MLP Standalone
 
 - `app/python/llama3/mlp_sched.py` is the clean MLP-only workload that mirrors the default `app/python/llama3/sched.py` MLP schedule without ablation controls.
-- Its H20-oriented MLP split is `2048 + 4096 + 4096 + 4096`: gate/up A use 32 SMs each, gate/up B/C/D use 64 SMs each, SiLU chunks use 8 side SMs at base SM 64, and two down GEMVs consume `[0:6144)` and `[6144:14336)`.
+- Its current H20 MLP experiment splits the intermediate dimension by M tiles as `74 + 74 + 76`, i.e. widths `4736 + 4736 + 4864`; no MLP stage is placed on more than 76 SMs.
+- The first two gate/up chunks store to global memory and use 8 side SMs for shared-memory SiLU, while the last 4864-wide chunk uses the register-backed fused gate/up SiLU path on 76 SMs.
+- The down projection is split as `8192 + 6144`, so the low down GEMV can overlap with the fused tail while preserving `Gemv_M64N8` K-repeat alignment.
+- `app/python/llama3/sched_h20.py` carries the same strict `74/74/76` MLP split inside the full-model pipeline.
 - The clean MLP schedule stores all gate/up chunks through TMA/global memory; it does not use the register-backed fused tail.
 - `app/python/llama3/mlp_standalone.py` is the ablation-oriented MLP harness and may include experimental controls such as serialized barriers or TMA tail storage.
 

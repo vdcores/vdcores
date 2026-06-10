@@ -25,18 +25,18 @@ dtype = torch.bfloat16
 N = 8
 HIDDEN = 4096
 INTERMEDIATE = 14336
-MLP_A = 2048
-MLP_B = 4096
-MLP_C = 4096
-MLP_D = 4096
-MLP_AB = MLP_A + MLP_B
-MLP_CD = MLP_C + MLP_D
+MLP_TILES = (74, 74, 76)
+MLP_0 = MLP_TILES[0] * 64
+MLP_1 = MLP_TILES[1] * 64
+MLP_2 = MLP_TILES[2] * 64
+MLP_01 = MLP_0 + MLP_1
 
 num_sms = 128
 full_sms = 132
 dae = Launcher(full_sms, device=gpu)
 
 TileM, _, TileK = Gemv_M64N8.MNK
+assert MLP_0 + MLP_1 + MLP_2 == INTERMEDIATE
 
 matHidden = torch.randn(N, HIDDEN, dtype=dtype, device=gpu)
 matRMSHidden = matHidden
@@ -50,12 +50,10 @@ matSiLUOut = torch.zeros(N, INTERMEDIATE, dtype=dtype, device=gpu)
 matOut = torch.zeros(N, HIDDEN, dtype=dtype, device=gpu)
 
 defaultg = dae.get_group()
-defaultg.addBarrier("bar_gateup_a")
-defaultg.addBarrier("bar_gateup_b")
-defaultg.addBarrier("bar_gateup_c")
-defaultg.addBarrier("bar_gateup_d")
-defaultg.addBarrier("bar_silu_ab")
-defaultg.addBarrier("bar_silu_cd")
+defaultg.addBarrier("bar_gateup_0")
+defaultg.addBarrier("bar_gateup_1")
+defaultg.addBarrier("bar_silu_low")
+defaultg.addBarrier("bar_silu_tail")
 defaultg.addBarrier("bar_out")
 
 defaultg.addTma("loadRMSLayer", [matRMSHidden], lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
@@ -75,136 +73,96 @@ dae.set_streaming(matGate, matUp, matDown)
 
 dae.build_groups()
 
-gate_a = SchedGemv(
+reg_gate, reg_up = 0, 1
+regStoreGate = RegStore(reg_gate, matGateOut[:, 0:TileM])
+regStoreUp = RegStore(reg_up, matInterm[:, 0:TileM])
+
+gate_0 = SchedGemv(
     Gemv_M64N8,
-    MNK=(MLP_A, N, HIDDEN),
+    MNK=(MLP_0, N, HIDDEN),
     tmas=(defaultg["loadGate"], defaultg["loadRMSLayer"], defaultg["storeGateOut"]),
-).bar("store", defaultg["bar_gateup_a"])
-up_a = SchedGemv(
+).bar("store", defaultg["bar_gateup_0"]).place(MLP_TILES[0])
+up_0 = SchedGemv(
     Gemv_M64N8,
-    MNK=(MLP_A, N, HIDDEN),
+    MNK=(MLP_0, N, HIDDEN),
     tmas=(defaultg["loadUp"], defaultg["loadRMSLayer"], defaultg["storeInterm"]),
-).bar("store", defaultg["bar_gateup_a"])
+).bar("store", defaultg["bar_gateup_0"]).place(MLP_TILES[0])
+silu_0 = SchedSmemSiLUInterleavedK(
+    num_token=N,
+    gate_glob=matGateOut[:, :MLP_0],
+    up_glob=matInterm[:, :MLP_0],
+    out_glob=matSiLUOut[:, :MLP_0],
+).bar("input", defaultg["bar_gateup_0"]).bar("output", defaultg["bar_silu_low"]).place(8, base_sm=64)
 
-gate_b = SchedGemv(
+gate_1 = SchedGemv(
     Gemv_M64N8,
-    MNK=((MLP_A, MLP_B), N, HIDDEN),
+    MNK=((MLP_0, MLP_1), N, HIDDEN),
     tmas=(defaultg["loadGate"], defaultg["loadRMSLayer"], defaultg["storeGateOut"]),
-).bar("store", defaultg["bar_gateup_b"])
-up_b = SchedGemv(
+).bar("store", defaultg["bar_gateup_1"]).place(MLP_TILES[1])
+up_1 = SchedGemv(
     Gemv_M64N8,
-    MNK=((MLP_A, MLP_B), N, HIDDEN),
+    MNK=((MLP_0, MLP_1), N, HIDDEN),
     tmas=(defaultg["loadUp"], defaultg["loadRMSLayer"], defaultg["storeInterm"]),
-).bar("store", defaultg["bar_gateup_b"])
-
-gate_c = SchedGemv(
-    Gemv_M64N8,
-    MNK=((MLP_AB, MLP_C), N, HIDDEN),
-    tmas=(defaultg["loadGate"], defaultg["loadRMSLayer"], defaultg["storeGateOut"]),
-).bar("store", defaultg["bar_gateup_c"])
-up_c = SchedGemv(
-    Gemv_M64N8,
-    MNK=((MLP_AB, MLP_C), N, HIDDEN),
-    tmas=(defaultg["loadUp"], defaultg["loadRMSLayer"], defaultg["storeInterm"]),
-).bar("store", defaultg["bar_gateup_c"])
-
-gate_d = SchedGemv(
-    Gemv_M64N8,
-    MNK=((MLP_AB + MLP_C, MLP_D), N, HIDDEN),
-    tmas=(defaultg["loadGate"], defaultg["loadRMSLayer"], defaultg["storeGateOut"]),
-).bar("store", defaultg["bar_gateup_d"])
-up_d = SchedGemv(
-    Gemv_M64N8,
-    MNK=((MLP_AB + MLP_C, MLP_D), N, HIDDEN),
-    tmas=(defaultg["loadUp"], defaultg["loadRMSLayer"], defaultg["storeInterm"]),
-).bar("store", defaultg["bar_gateup_d"])
-
-silu_a = SchedSmemSiLUInterleavedK(
+).bar("store", defaultg["bar_gateup_1"]).place(MLP_TILES[1])
+silu_1 = SchedSmemSiLUInterleavedK(
     num_token=N,
-    gate_glob=matGateOut[:, :MLP_A],
-    up_glob=matInterm[:, :MLP_A],
-    out_glob=matSiLUOut[:, :MLP_A],
-).bar("input", defaultg["bar_gateup_a"]).bar("output", defaultg["bar_silu_ab"])
-silu_b = SchedSmemSiLUInterleavedK(
-    num_token=N,
-    gate_glob=matGateOut[:, MLP_A:MLP_AB],
-    up_glob=matInterm[:, MLP_A:MLP_AB],
-    out_glob=matSiLUOut[:, MLP_A:MLP_AB],
-).bar("input", defaultg["bar_gateup_b"]).bar("output", defaultg["bar_silu_ab"])
-silu_c = SchedSmemSiLUInterleavedK(
-    num_token=N,
-    gate_glob=matGateOut[:, MLP_AB:MLP_AB + MLP_C],
-    up_glob=matInterm[:, MLP_AB:MLP_AB + MLP_C],
-    out_glob=matSiLUOut[:, MLP_AB:MLP_AB + MLP_C],
-).bar("input", defaultg["bar_gateup_c"]).bar("output", defaultg["bar_silu_cd"])
-silu_d = SchedSmemSiLUInterleavedK(
-    num_token=N,
-    gate_glob=matGateOut[:, MLP_AB + MLP_C:INTERMEDIATE],
-    up_glob=matInterm[:, MLP_AB + MLP_C:INTERMEDIATE],
-    out_glob=matSiLUOut[:, MLP_AB + MLP_C:INTERMEDIATE],
-).bar("input", defaultg["bar_gateup_d"]).bar("output", defaultg["bar_silu_cd"])
+    gate_glob=matGateOut[:, MLP_0:MLP_01],
+    up_glob=matInterm[:, MLP_0:MLP_01],
+    out_glob=matSiLUOut[:, MLP_0:MLP_01],
+).bar("input", defaultg["bar_gateup_1"]).bar("output", defaultg["bar_silu_low"]).place(8, base_sm=64)
 
-down_0 = SchedGemv(
+gate_tail = SchedGemv(
     Gemv_M64N8,
-    MNK=(HIDDEN, N, MLP_AB),
+    MNK=((MLP_01, MLP_2), N, HIDDEN),
+    tmas=(defaultg["loadGate"], defaultg["loadRMSLayer"], regStoreGate),
+).place(MLP_TILES[2])
+up_tail = SchedGemv(
+    Gemv_M64N8,
+    MNK=((MLP_01, MLP_2), N, HIDDEN),
+    tmas=(defaultg["loadUp"], defaultg["loadRMSLayer"], regStoreUp),
+).place(MLP_TILES[2])
+silu_tail = SchedRegSiLUFused(
+    num_token=N,
+    store_tma=defaultg["storeSiluLayer"],
+    reg_gate=reg_gate,
+    reg_up=reg_up,
+    base_offset=MLP_01,
+    stride=TileM,
+).bar("output", defaultg["bar_silu_tail"]).place(MLP_TILES[2])
+
+down_low = SchedGemv(
+    Gemv_M64N8,
+    MNK=(HIDDEN, N, 8192),
     tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
-).bar("load", defaultg["bar_silu_ab"])
-down_1 = SchedGemv(
+).bar("load", defaultg["bar_silu_low"]).place(64)
+down_tail = SchedGemv(
     Gemv_M64N8,
-    MNK=(HIDDEN, N, (MLP_AB, MLP_CD)),
+    MNK=(HIDDEN, N, (8192, INTERMEDIATE - 8192)),
     tmas=(defaultg["loadDown"], defaultg["loadSiluLayer"], defaultg["reduceOut"]),
-).bar("load", defaultg["bar_silu_cd"]).bar("store", defaultg["bar_out"])
+).bar("load", defaultg["bar_silu_tail"]).bar("store", defaultg["bar_out"]).place(64)
 
-gate_a = gate_a.place(32)
-up_a = up_a.place(32, base_sm=32)
-gate_b = gate_b.place(64)
-up_b = up_b.place(64)
-gate_c = gate_c.place(64)
-up_c = up_c.place(64)
-gate_d = gate_d.place(64)
-up_d = up_d.place(64)
-silu_a = silu_a.place(8, base_sm=64)
-silu_b = silu_b.place(8, base_sm=64)
-silu_c = silu_c.place(8, base_sm=64)
-silu_d = silu_d.place(8, base_sm=64)
-down_0 = down_0.place(64)
-down_1 = down_1.place(64)
+ordered_schedules = [
+    gate_0,
+    up_0,
+    silu_0,
+    gate_1,
+    up_1,
+    silu_1,
+    down_low,
+    gate_tail,
+    up_tail,
+    silu_tail,
+    down_tail,
+]
 
-dae.bind_late_barrier_counts(
-    gate_a,
-    up_a,
-    gate_b,
-    up_b,
-    gate_c,
-    up_c,
-    gate_d,
-    up_d,
-    silu_a,
-    silu_b,
-    silu_c,
-    silu_d,
-    down_0,
-    down_1,
+dae.bind_late_barrier_counts(ordered_schedules)
+dae.i(ordered_schedules)
+
+print(
+    "Llama3 MLP sched-only (two side SiLU chunks, fused SiLU tail) "
+    f"on [N={N}, HIDDEN={HIDDEN}, INTERMEDIATE={INTERMEDIATE}], "
+    f"split=({MLP_0}, {MLP_1}, {MLP_2}), tile split={MLP_TILES}, SMs={full_sms}"
 )
-
-dae.i(
-    gate_a,
-    up_a,
-    silu_a,
-    gate_b,
-    up_b,
-    silu_b,
-    down_0,
-    gate_c,
-    up_c,
-    silu_c,
-    gate_d,
-    up_d,
-    silu_d,
-    down_1,
-)
-
-print(f"Llama3 MLP sched-only on [N={N}, HIDDEN={HIDDEN}, INTERMEDIATE={INTERMEDIATE}], SMs={full_sms}")
 dae.s()
 dae_app(dae)
 
