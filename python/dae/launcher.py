@@ -533,12 +533,18 @@ class Launcher:
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)
+
+    def benchmark_barrier(self):
+        """Synchronize launch participants before a measured iteration."""
+
+        return None
     
     def bench(self, iterations : int = 100,
                     total_bytes : int | None = None, total_flops : int | None = None):
         execution_times = []
         duration_ns = np.zeros(self.num_sms, dtype=np.float64)
         for i in range(iterations):
+            self.benchmark_barrier()
             self.launch()
 
             # fetch profile data

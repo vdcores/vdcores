@@ -22,20 +22,27 @@ Option meanings:
 
 For this example, `-N 2 -n 2 -tpn 1` is important because each Vista GH node has one GPU, so we want one MPI rank / NVSHMEM PE per GPU.
 
-## 3. Install NVSHMEM if it is not already available
+## 3. Install NVSHMEM and its official Python binding
 
-If anything is missing, install the CUDA 13 NVSHMEM package into the conda environment:
+Use the NVSHMEM4Py release matched to NVSHMEM 3.4.5. Keep CUDA Python at
+13.0.3 because that is also the exact version required by the CUDA 13 PyTorch
+wheel used by this project:
 
 ```bash
-python -m pip install nvidia-nvshmem-cu13
+OMPI_CC=gcc \
+MPICC=/opt/apps/nvidia24/openmpi/5.0.5/bin/mpicc \
+python -m pip install --no-binary=mpi4py -r requirements.txt
 ```
+
+Building `mpi4py` through the loaded TACC wrapper keeps it on the same OpenMPI
+5.0.5 ABI used by `ibrun`.
 
 ## 4. Create NVSHMEM shared-object symlinks if needed
 
 Some pip-installed NVSHMEM packages may include versioned `.so` files but not the unversioned linker names. Check:
 
 ```bash
-export NVSHMEM_HOME=$(CONDA_PATH)/lib/python3.13/site-packages/nvidia/nvshmem
+export NVSHMEM_HOME=$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/nvshmem
 ls -lh $NVSHMEM_HOME/lib/libnvshmem*
 ```
 
@@ -68,17 +75,18 @@ This should produce:
 ./main
 ```
 
-Build the optional DAE Python runtime from the repository root. This compiles
-with `nvcc` and uses the TACC `mpicxx` wrapper only for the final link:
+Build the ordinary DAE runtime and optional symmetric-allocation extension from
+the repository root through the unified `setup.py`:
 
 ```bash
-make pyext
-make nvshmem-pyext
+make nvshmem-smoke
 ```
 
-The ordinary `dae.runtime` build remains independent of MPI and NVSHMEM. The
-optional module is installed as `dae._nvshmem_runtime` and loaded lazily by
-`dae.nvshmem`.
+This sets `DAE_ENABLE_NVSHMEM=1`, builds `dae.runtime` and
+`dae._nvshmem_runtime`, and verifies that the optional module imports without
+initializing a collective job. MPI bootstrap and host operations come from the
+official `nvshmem.core` / `nvshmem.bindings` packages; the DAE extension only
+allocates symmetric Torch tensors and signals.
 
 ## 6. Run with `ibrun`
 
@@ -101,11 +109,15 @@ ibrun ./main 128 50
 Run the Python binding smoke test from the repository root:
 
 ```bash
-ibrun python experimental/nvshmem/python_binding.py
+ibrun python app/python/nvshmem_example.py
 ```
 
 The Python test performs a one-SM DAE TMA copy between symmetric Torch tensors
 and exchanges one stream-ordered NVSHMEM signal per PE.
+
+When the NVSHMEM launcher is used with `dae_app(..., -b)`, every measured
+iteration performs a device synchronization followed by an all-PE barrier
+before launching the timed kernel.
 
 Arguments:
 
@@ -183,4 +195,5 @@ Allocation and finalization rules:
 - Symmetric tensors are non-owning Torch views. The runtime tracks their allocations and frees them collectively, in reverse order, during `finalize()`.
 - Do not use a symmetric tensor after `finalize()`. Finalization itself must be called by every PE after all CUDA work completes.
 - `signal()` and `wait_signal()` enqueue operations on the current Torch CUDA stream unless another stream is supplied.
+- `Launcher.bench()` synchronizes all NVSHMEM PEs before every measured iteration.
 - The runtime defaults unset Vista variables to MPI bootstrap, `ibrc`, IBGDA, GPU NIC handling, and a `512M` symmetric heap. Explicit environment variables remain authoritative except for a `symmetric_size=` argument.

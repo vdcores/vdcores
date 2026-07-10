@@ -8,7 +8,16 @@ Use this for the optional MPI-bootstrapped DAE runtime on Vista.
 idev -p gh-dev -N 2 -n 2 -tpn 1 -t 01:00:00
 ```
 
-2. Activate the CUDA 13/PyTorch environment and locate NVSHMEM:
+2. Activate the CUDA 13/PyTorch Conda environment and install the official
+   binding versions compatible with NVSHMEM 3.4.5 and PyTorch CUDA 13.0:
+
+```bash
+OMPI_CC=gcc \
+MPICC=/opt/apps/nvidia24/openmpi/5.0.5/bin/mpicc \
+python -m pip install --no-binary=mpi4py -r requirements.txt
+```
+
+3. Configure the runtime:
 
 ```bash
 export NVSHMEM_HOME="$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/nvshmem"
@@ -19,32 +28,30 @@ export NVSHMEM_IBGDA_NIC_HANDLER=gpu
 export NVSHMEM_SYMMETRIC_SIZE=512M
 ```
 
-3. Build the ordinary and optional extensions:
+4. Build both DAE extensions through the unified setup and run the import
+   smoke check:
 
 ```bash
-make pyext
-make nvshmem-pyext
+make nvshmem-smoke
 ```
 
-The optional build must show `nvcc` compiling
-`src/torch_nvshmem_runtime.cu` and `mpicxx` performing the final link.
+The build must define `DAE_ENABLE_NVSHMEM`, produce both `dae.runtime` and
+`dae._nvshmem_runtime`, and link only the allocator extension to
+`libnvshmem_host.so`. It must not compile a second MPI/NVSHMEM lifecycle layer.
 
-4. Verify the extension without initializing MPI:
+5. Confirm that `mpi4py` uses the loaded TACC OpenMPI:
 
 ```bash
-python -c 'import dae._nvshmem_runtime as r; print(r.is_initialized())'
-readelf -d python/dae/_nvshmem_runtime*.so | grep -E 'libmpi|libnvshmem'
+python -c 'from mpi4py import MPI; print(MPI.Get_library_version())'
 ```
 
-5. Run the collective smoke test only inside the allocation:
+6. Run real collective verification only inside the allocation:
 
 ```bash
-ibrun python experimental/nvshmem/python_binding.py
+ibrun python app/python/nvshmem_example.py
 ```
 
-Every rank must reach symmetric allocations, signal initialization, barriers,
-and finalization in the same order. Never use `mpirun` in place of TACC
-`ibrun`.
-
-Expected per-rank output includes the copied first/last values and the signal
-received from the preceding PE, followed by `TACC: Shutdown complete`.
+Every rank must reach allocations, signal initialization, barriers, benchmark
+iterations, and finalization in the same order. Use `ibrun`, not `mpirun`, on
+TACC. The checked-in pytest is compile/import smoke coverage and is not a
+substitute for this multi-node run.

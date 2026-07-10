@@ -375,6 +375,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;
+#ifdef DAE_ENABLE_NVSHMEM
+  config.attr("nvshmem_enabled") = true;
+#else
+  config.attr("nvshmem_enabled") = false;
+#endif
 
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");
   // flag.attr("jump") = MEM_OP_FLAGS_JUMP;

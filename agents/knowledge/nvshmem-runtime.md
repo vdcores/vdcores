@@ -1,43 +1,47 @@
 # NVSHMEM Runtime
 
-DAE's NVSHMEM support is an optional control runtime, isolated from the normal
-`dae.runtime` extension.
+DAE's NVSHMEM support has two deliberately separate pieces:
 
-## Entry Points
+- `python/dae/nvshmem.py` uses NVIDIA's official `nvshmem.core` and
+  `nvshmem.bindings` packages for MPI bootstrap, NVSHMEM lifecycle, PE queries,
+  barriers, and stream-ordered signal operations.
+- `src/torch_nvshmem_runtime.cu` is a small DAE-specific extension that only
+  allocates symmetric Torch tensors and the global signal array, exposes signal
+  addresses, and releases tracked allocations collectively.
 
-- `src/torch_nvshmem_runtime.cu`: MPI/NVSHMEM ownership, local-rank GPU mapping, symmetric allocation, signals, barriers, and finalization.
-- `python/dae/nvshmem.py`: lazy module API and `NVSHMEMLauncher` subclass.
-- `python/dae/nvshmem_launcher.py`: compatibility import exposing the alternative `Launcher`.
-- `setup_nvshmem.py` and `make nvshmem-pyext`: optional build using `nvcc` for compilation and TACC `mpicxx` for final linking.
-- `experimental/nvshmem/python_binding.py`: `ibrun` smoke test.
+`setup.py` builds the ordinary runtime by default. Setting
+`DAE_ENABLE_NVSHMEM=1` also builds `dae._nvshmem_runtime` and defines the same
+macro on both extensions. `make nvshmem-pyext` is the normal entry point;
+`setup_nvshmem.py` no longer exists.
 
-## Ownership Model
+## Versions And Ownership
 
-- `init()` calls `MPI_Init_thread` only when MPI is not already initialized and initializes NVSHMEM with `NVSHMEMX_INIT_WITH_MPI_COMM` only when needed.
-- Default GPU selection is node-local MPI rank. Vista's supported launch shape is one MPI rank per GH node/GPU.
-- Initialization is transactional: failures clean up communicators and any MPI/NVSHMEM state started by the extension.
-- Symmetric tensors are non-owning PyTorch CUDA views over `nvshmem_malloc` or `nvshmem_calloc` memory.
-- Tensor destruction never calls `nvshmem_free`, because rank-local Python destruction is not a valid collective free protocol.
-- The runtime records allocations and frees them in reverse collective order during explicit `finalize()`.
-- All PEs must allocate with identical shape, dtype, and call order. Tensors become invalid immediately after `finalize()`.
+- The Vista-tested combination is NVSHMEM 3.4.5 with
+  `nvshmem4py-cu13==0.1.3`; the full validated set is pinned in
+  `requirements.txt` and mirrored by the `setup.py` `nvshmem` extra.
+- PyTorch 2.10.0+cu130 requires `cuda-bindings==13.0.3`; keep
+  `cuda-python==13.0.3` pinned when installing NVSHMEM4Py.
+- Build `mpi4py` against TACC OpenMPI rather than mixing MPI implementations.
+- Importing `dae.nvshmem` is lazy. `init()` imports MPI/NVSHMEM4Py, maps the
+  node-local MPI rank to a CUDA device, and initializes NVSHMEM with
+  `MPI.COMM_WORLD`.
+- MPI is owned by `mpi4py`; DAE finalization releases its symmetric allocations
+  and owned NVSHMEM state, but does not finalize MPI itself.
 
-## Signal Space
+## Allocation And Signal Rules
 
-`init_signal_space(count)` allocates one zeroed symmetric `torch.uint64` array per
-PE and retains it as process-global runtime state. `signal()` and
-`wait_signal()` enqueue NVSHMEM operations on a Torch CUDA stream. The local
-tensor can also be passed to existing DAE instructions as an ordinary CUDA
-pointer.
+- Every PE must call `init_signal_space()`, `empty()`, `zeros()`, and
+  `finalize()` in the same order.
+- Returned tensors are non-owning Torch views. They become invalid when
+  `finalize()` calls `release_allocations()` in reverse allocation order.
+- Signal operations use the official low-level Python binding with addresses
+  from the DAE allocator and run on the current Torch CUDA stream by default.
+- `NVSHMEMLauncher.benchmark_barrier()` synchronizes the device and all PEs.
+  Base `Launcher.bench()` invokes this hook before every measured iteration, so
+  multi-rank profile timestamps begin only after all ranks are ready.
 
-The optional extension uses host-side NVSHMEM APIs. Existing DAE kernels can
-load/store their local symmetric allocation normally; a future kernel that
-directly invokes NVSHMEM device APIs will additionally need NVSHMEM device
-relocatable-code linking.
+## Verification Boundary
 
-## Verified Integration
-
-On a two-node Vista GH allocation, the Python smoke test completed with one MPI
-rank/PE per GH200. NVSHMEM 3.4.5 initialized `ibrc` and IBGDA with GPU NIC
-handling on both nodes. Cross-node signals returned the expected values, and a
-DAE `TmaLoad1D -> OP_COPY -> TmaStore1D` launch copied data exactly between two
-NVSHMEM-backed Torch tensors on both PEs.
+`tests/test_nvshmem.py` is intentionally only an import/API smoke test. Real
+collective validation requires a Vista allocation and runs through
+`app/python/nvshmem_example.py` under `ibrun`.

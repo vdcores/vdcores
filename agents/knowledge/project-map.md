@@ -5,9 +5,9 @@ This note summarizes the stable structure confirmed during repository initializa
 ## Main Entry Points
 
 - `README.md`: high-level project overview, setup path, and demo commands.
-- `Makefile`: builds `runtime.o` from `src/runtime.cu` and installs the Python extension with `make pyext`.
-- `setup.py`: packages the `dae` Python module and compiles `src/torch_runtime.cu` linked against `runtime.o`.
-- `setup_nvshmem.py`: separately builds the optional `dae._nvshmem_runtime` extension with NVSHMEM and TACC OpenMPI; `make nvshmem-pyext` is its entry point.
+- `Makefile`: builds `runtime.o` from `src/runtime.cu`; `make pyext` installs the normal extension and `make nvshmem-pyext` enables the optional allocator build.
+- `setup.py`: packages `dae`, always compiles `src/torch_runtime.cu` linked against `runtime.o`, and conditionally adds `dae._nvshmem_runtime` when `DAE_ENABLE_NVSHMEM=1`.
+- `requirements.txt`: Python application dependencies plus the exact CUDA 13 / NVSHMEM4Py compatibility pins used by the optional runtime.
 - `setup.sh`: reference environment bootstrap for Conda, CUDA Toolkit 13.0.2, and Python dependencies.
 
 ## Code Areas
@@ -18,12 +18,13 @@ This note summarizes the stable structure confirmed during repository initializa
 - `app/python/mistral_small_24b/`: Mistral Small 24B single-token decode port with manual RoPE-table construction, `QW != hidden_size` attention wiring, and a 132-SM logits/argmax path.
 - `app/python/llama3/reference.py` and `app/python/llama3/llama_attention_reference.py`: local reference helpers worth checking before re-deriving model math.
 - `app/python/attention_simple_decoding.py`: dedicated isolated GQA decode-attention harness for validating the shared attention opcode path and collecting quick single-kernel timing.
+- `app/python/nvshmem_example.py`: real MPI/NVSHMEM integration example for symmetric DAE copy and cross-PE signal verification under `ibrun`.
 - `app/python/gemv_mma_out.py`: dedicated correctness harness for the isolated `N=8` MMA GEMV operator path.
 - `app/python/qwen3/`: Qwen 3 client, layer, utilities, and schedule variants.
   The current decode path is split across `sched.py` (graph/TMA/instruction scheduling), `runtime_context.py` (HF model load, tensor materialization, packed side-input prep, KV bootstrap), `correctness.py` (reference comparisons), and `cli.py` (prefiltered app args).
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
   It now resets the CUDA stream access-policy window on each launch and applies at most one selected cache-policy target per launch, with runtime/env overrides instead of repeated immediate `cudaStreamSetAttribute(...)` calls.
-- `python/dae/nvshmem.py` and `python/dae/nvshmem_launcher.py`: lazy optional NVSHMEM API and alternative launcher, including global signal-space initialization and symmetric PyTorch tensor allocation.
+- `python/dae/nvshmem.py` and `python/dae/nvshmem_launcher.py`: lazy optional NVSHMEM API and alternative launcher. NVIDIA's official Python binding owns host control; DAE adds symmetric Torch/signal allocation and a pre-iteration benchmark barrier.
 - `python/dae/instructions.py`: serialized instruction types, compute operation definitions, memory-side instruction helpers, and TMA instruction wrappers used by `launcher.py`.
 - `python/dae/op_families.py`: minimal dynamic compute-op family registry; it now loads the declarative family definitions exported by `src/torch_runtime.cu` as `dae.runtime.compute_family_specs`, builds canonical family-backed op refs through a generic `family_ref(...)` helper, validates canonical dynamic names such as `OP_GEMV_WGMMA__...` against that runtime-exported source, and leaves concrete opcode instances to generated build artifacts.
 - `python/dae/op_family_specs.py`: shared parser helpers for declarative compute-family definitions. Runtime Python parses the extension-exported spec objects through it, while the build-time generator reuses the same parsing rules against `include/dae/opcode.cuh.inc`.
@@ -41,7 +42,7 @@ This note summarizes the stable structure confirmed during repository initializa
 - `src/runtime.cu`: runtime implementation compiled to `runtime.o`.
 - `src/torch_runtime.cu`: Torch extension binding source.
   It now exposes the stream access-policy reset path used by the launcher, defaults the persisting-L2 carveout to `1/16` of the device limit unless overridden, and allows env control of TMA L2 promotion (`DAE_TMA_L2_PROMOTION`).
-- `src/torch_nvshmem_runtime.cu`: isolated host-control extension for MPI bootstrap, NVSHMEM lifecycle, symmetric Torch storage, and stream-ordered signals.
+- `src/torch_nvshmem_runtime.cu`: minimal optional extension for symmetric Torch allocation, signal-address lookup, and collective release; it deliberately contains no MPI bootstrap or NVSHMEM lifecycle wrapper.
 - `tools/generate_selected_compute_ops.py`: build-time helper that prefers `DAE_COMPUTE_OPS`, then `DAE_COMPUTE_OPS_FILE`, then a repo-root `dae_compute_ops.vdcore.build`, and emits `build/generated/dae/selected_compute_ops.inc`, `build/generated/dae/compute_opcode_order.inc`, and `build/generated/dae/dynamic_compute_handlers.inc` for the selective-build flow.
   It also emits `build/generated/dae/dynamic_compute_handlers.inc` for any selected dynamic op-family handlers.
 
@@ -49,7 +50,7 @@ This note summarizes the stable structure confirmed during repository initializa
 
 - The repository currently includes built extension artifacts under `python/dae/`.
 - Full runtime verification may require Hopper-class CUDA hardware.
-- Multi-rank NVSHMEM verification requires a Vista allocation and `ibrun`; importing and linking the optional extension is safe outside an MPI job because initialization is explicit.
+- Multi-rank NVSHMEM verification requires a Vista allocation and `ibrun`; `tests/test_nvshmem.py` only checks compile/import structure, while `app/python/nvshmem_example.py` is the real collective example.
 - For Python-only edits, start with light checks such as `python -m py_compile`.
 - `app/python/llama3/sched.py` now includes a `--correctness` mode for a single-token, single-decoding-step validation against `app/python/llama3/reference.py`.
 - `python/dae/schedule.py` now treats SM-count placement as a post-construction concern across the main scheduler classes, including `SchedArgmax`.

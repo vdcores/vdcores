@@ -3,7 +3,6 @@
 # CUDA compiler
 NVCC = nvcc
 PYTHON ?= python
-MPICXX ?= mpicxx
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
@@ -79,13 +78,17 @@ run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
-	pip install -e . --no-build-isolation
+	$(PYTHON) -m pip install -e . --no-build-isolation
 
-# Optional MPI/NVSHMEM control runtime. This remains separate from dae.runtime
-# so normal builds do not acquire MPI or NVSHMEM link-time dependencies.
-nvshmem-pyext pyext-nvshmem:
-	MPICXX="$(MPICXX)" $(PYTHON) setup_nvshmem.py build_ext --inplace
+# Build the normal runtime and the small optional NVSHMEM allocation extension
+# through the same setup.py. Host control comes from the official NVSHMEM4Py
+# package and is therefore not linked into dae.runtime.
+nvshmem-pyext pyext-nvshmem: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
+	DAE_ENABLE_NVSHMEM=1 $(PYTHON) -m pip install -e . --no-build-isolation
+
+nvshmem-smoke: nvshmem-pyext
+	$(PYTHON) -c 'import dae._nvshmem_runtime as r; assert r.NVSHMEM_ENABLED'
 
 FORCE:
 
-.PHONY: all clean run FORCE nvshmem-pyext pyext-nvshmem
+.PHONY: all clean run FORCE nvshmem-pyext pyext-nvshmem nvshmem-smoke

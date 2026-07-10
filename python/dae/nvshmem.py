@@ -1,24 +1,29 @@
-"""MPI-bootstrapped NVSHMEM support for DAE.
+"""Optional NVSHMEM support for DAE.
 
-All symmetric allocations are collective. Every PE must call allocation APIs
-with the same shapes, dtypes, and order. Call :func:`finalize` only after all
-CUDA work is complete and no returned tensor will be used again.
+NVSHMEM4Py owns MPI/NVSHMEM initialization and host operations. The compiled
+``dae._nvshmem_runtime`` module only turns collective NVSHMEM allocations into
+Torch tensors. Every PE must allocate and release those tensors in the same
+order.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from importlib import import_module
+import os
+from dataclasses import dataclass, replace
+from importlib import import_module, util as importlib_util
 from numbers import Integral
 from types import ModuleType
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 import torch
 
 from .launcher import Launcher as _DAELauncher
 
 
-_backend: ModuleType | None = None
+_allocator_backend: ModuleType | None = None
+_host_backend: ModuleType | None = None
+_bindings_backend: ModuleType | None = None
+_mpi_backend: ModuleType | None = None
 
 
 @dataclass(frozen=True)
@@ -38,31 +43,75 @@ class RuntimeInfo:
     symmetric_size: str
     allocation_count: int
 
-    @classmethod
-    def from_mapping(cls, values: Mapping[str, Any]) -> "RuntimeInfo":
-        normalized = dict(values)
-        normalized["nvshmem_version"] = tuple(normalized["nvshmem_version"])
-        return cls(**normalized)
+
+@dataclass
+class _RuntimeState:
+    runtime_info: RuntimeInfo
+    local_comm: Any
+    host: ModuleType
+    bindings: ModuleType
 
 
-def _load_backend() -> ModuleType:
-    global _backend
-    if _backend is not None:
-        return _backend
-    try:
-        _backend = import_module("dae._nvshmem_runtime")
-    except ImportError as error:
-        raise RuntimeError(
-            "The optional DAE NVSHMEM runtime is unavailable. Run "
-            "`make nvshmem-pyext` and ensure its MPI/NVSHMEM shared libraries "
-            f"are visible. Original import error: {error}"
-        ) from error
-    return _backend
+_state: _RuntimeState | None = None
+
+
+def _missing_dependency(error: ImportError) -> RuntimeError:
+    return RuntimeError(
+        "DAE NVSHMEM support requires the optional allocator build and the "
+        "official NVSHMEM4Py packages. Run `make nvshmem-pyext` after "
+        "installing nvshmem4py-cu13==0.1.3 and an OpenMPI-compatible mpi4py. "
+        f"Original import error: {error}"
+    )
+
+
+def _load_allocator() -> ModuleType:
+    global _allocator_backend
+    if _allocator_backend is None:
+        try:
+            _allocator_backend = import_module("dae._nvshmem_runtime")
+        except ImportError as error:
+            raise _missing_dependency(error) from error
+    if not bool(getattr(_allocator_backend, "NVSHMEM_ENABLED", False)):
+        raise RuntimeError("dae._nvshmem_runtime was not built with NVSHMEM enabled")
+    return _allocator_backend
+
+
+def _load_host() -> ModuleType:
+    global _host_backend
+    if _host_backend is None:
+        try:
+            _host_backend = import_module("nvshmem.core")
+        except ImportError as error:
+            raise _missing_dependency(error) from error
+    return _host_backend
+
+
+def _load_bindings() -> ModuleType:
+    global _bindings_backend
+    if _bindings_backend is None:
+        try:
+            _bindings_backend = import_module("nvshmem.bindings")
+        except ImportError as error:
+            raise _missing_dependency(error) from error
+    return _bindings_backend
+
+
+def _load_mpi() -> ModuleType:
+    global _mpi_backend
+    if _mpi_backend is None:
+        try:
+            _mpi_backend = import_module("mpi4py.MPI")
+        except ImportError as error:
+            raise _missing_dependency(error) from error
+    return _mpi_backend
 
 
 def available() -> bool:
+    required_modules = ("nvshmem.core", "mpi4py.MPI", "cuda.core.experimental")
+    if any(importlib_util.find_spec(name) is None for name in required_modules):
+        return False
     try:
-        _load_backend()
+        _load_allocator()
     except RuntimeError:
         return False
     return True
@@ -91,32 +140,156 @@ def _device_index(device: torch.device | str | int | None) -> int | None:
     return parsed.index
 
 
+def _configure_environment(symmetric_size: str) -> None:
+    defaults = {
+        "NVSHMEM_BOOTSTRAP": "MPI",
+        "NVSHMEM_REMOTE_TRANSPORT": "ibrc",
+        "NVSHMEM_IB_ENABLE_IBGDA": "1",
+        "NVSHMEM_IBGDA_NIC_HANDLER": "gpu",
+        "NVSHMEM_SYMMETRIC_SIZE": "512M",
+    }
+    for name, value in defaults.items():
+        os.environ.setdefault(name, value)
+    if symmetric_size:
+        os.environ["NVSHMEM_SYMMETRIC_SIZE"] = symmetric_size
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    values = [int(part) for part in version.split(".")[:3]]
+    values.extend([0] * (3 - len(values)))
+    return values[0], values[1], values[2]
+
+
+def _host_is_initialized(host: ModuleType) -> bool:
+    status = int(host.init_status())
+    return 2 <= status <= 4
+
+
 def init(
     *,
     symmetric_size: str | int | None = None,
     device: torch.device | str | int | None = None,
 ) -> RuntimeInfo:
-    """Collectively initialize MPI and NVSHMEM for the current ``ibrun`` rank."""
+    """Collectively initialize NVSHMEM4Py for the current MPI rank."""
 
+    global _state
+    requested_size = _format_symmetric_size(symmetric_size)
     requested_device = _device_index(device)
-    values = _load_backend().initialize(
-        _format_symmetric_size(symmetric_size),
-        -1 if requested_device is None else requested_device,
+
+    if _state is not None:
+        current = info()
+        if requested_device is not None and requested_device != current.device:
+            raise ValueError(
+                f"NVSHMEM is already initialized on CUDA device {current.device}, "
+                f"not {requested_device}"
+            )
+        return current
+
+    _configure_environment(requested_size)
+    _load_allocator()
+    host = _load_host()
+    bindings = _load_bindings()
+    mpi = _load_mpi()
+
+    if mpi.Is_finalized():
+        raise RuntimeError("MPI was already finalized and cannot be reinitialized")
+
+    world = mpi.COMM_WORLD
+    rank = world.Get_rank()
+    world_size = world.Get_size()
+    local_comm = world.Split_type(mpi.COMM_TYPE_SHARED, key=rank)
+    local_rank = local_comm.Get_rank()
+    local_size = local_comm.Get_size()
+
+    owns_nvshmem = False
+    try:
+        device_count = torch.cuda.device_count()
+        if device_count <= 0:
+            raise RuntimeError("No CUDA devices are visible to this MPI rank")
+
+        if requested_device is None:
+            selected_device = 0 if device_count == 1 else local_rank
+        else:
+            selected_device = requested_device
+        if not 0 <= selected_device < device_count:
+            raise ValueError(
+                f"CUDA device {selected_device} is outside [0, {device_count}) for "
+                f"local MPI rank {local_rank}/{local_size}"
+            )
+
+        torch.cuda.set_device(selected_device)
+        cuda_device_type = getattr(
+            import_module("cuda.core.experimental"), "Device"
+        )
+        cuda_device = cuda_device_type(selected_device)
+        cuda_device.set_current()
+
+        if not _host_is_initialized(host):
+            host.init(
+                device=cuda_device,
+                mpi_comm=world,
+                initializer_method="mpi",
+            )
+            owns_nvshmem = True
+
+        pe = int(host.my_pe())
+        num_pes = int(host.n_pes())
+        if num_pes != world_size:
+            raise RuntimeError(
+                f"NVSHMEM PE count {num_pes} does not match MPI world size {world_size}"
+            )
+
+        version = host.get_version()
+        runtime_info = RuntimeInfo(
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            local_size=local_size,
+            device=selected_device,
+            pe=pe,
+            num_pes=num_pes,
+            mpi_thread_level=int(mpi.Query_thread()),
+            owns_mpi=False,
+            owns_nvshmem=owns_nvshmem,
+            nvshmem_name="NVSHMEM4Py",
+            nvshmem_version=_version_tuple(version.libnvshmem_version),
+            symmetric_size=os.environ["NVSHMEM_SYMMETRIC_SIZE"],
+            allocation_count=0,
+        )
+    except Exception:
+        if owns_nvshmem and _host_is_initialized(host):
+            host.finalize()
+        local_comm.Free()
+        raise
+
+    _state = _RuntimeState(
+        runtime_info=runtime_info,
+        local_comm=local_comm,
+        host=host,
+        bindings=bindings,
     )
-    result = RuntimeInfo.from_mapping(values)
-    torch.cuda.set_device(result.device)
-    return result
+    return runtime_info
 
 
 initialize = init
 
 
 def is_initialized() -> bool:
-    return bool(_load_backend().is_initialized())
+    return _state is not None and _host_is_initialized(_state.host)
+
+
+def _require_state() -> _RuntimeState:
+    if _state is None or not _host_is_initialized(_state.host):
+        raise RuntimeError("NVSHMEM is not initialized; call dae.nvshmem.init() first")
+    return _state
 
 
 def info() -> RuntimeInfo:
-    return RuntimeInfo.from_mapping(_load_backend().info())
+    state = _require_state()
+    return replace(
+        state.runtime_info,
+        allocation_count=int(_load_allocator().allocation_count()),
+    )
 
 
 def my_pe() -> int:
@@ -155,11 +328,12 @@ def _normalize_size_args(size: tuple[Any, ...]) -> tuple[int, ...]:
 
 def _validate_allocation_device(device: torch.device | str | int | None) -> None:
     requested = _device_index(device)
-    runtime = info() if requested is not None else None
-    if runtime is not None and requested != runtime.device:
+    runtime = info()
+    if requested is not None and requested != runtime.device:
         raise ValueError(
             f"NVSHMEM is initialized on CUDA device {runtime.device}, not {requested}"
         )
+    torch.cuda.set_device(runtime.device)
 
 
 def allocate_tensor(
@@ -175,7 +349,7 @@ def allocate_tensor(
     if not isinstance(dtype, torch.dtype):
         raise TypeError("dtype must be a torch.dtype")
     _validate_allocation_device(device)
-    tensor = _load_backend().allocate_tensor(
+    tensor = _load_allocator().allocate_tensor(
         _normalize_shape(shape), dtype, bool(zeroed)
     )
     return tensor.requires_grad_(requires_grad)
@@ -211,29 +385,39 @@ def zeros(
 
 
 def init_signal_space(signal_count: int) -> torch.Tensor:
-    """Collectively create the process-global symmetric ``uint64`` signal array."""
+    """Collectively allocate and zero the process-global uint64 signal array."""
 
+    runtime = info()
+    torch.cuda.set_device(runtime.device)
     if not isinstance(signal_count, Integral) or int(signal_count) <= 0:
         raise ValueError("signal_count must be a positive integer")
-    return _load_backend().init_signal_space(int(signal_count))
+    signals = _load_allocator().init_signal_space(int(signal_count))
+    barrier()
+    return signals
 
 
 init_global_signal_space = init_signal_space
 
 
 def get_signal_space() -> torch.Tensor:
-    return _load_backend().get_signal_space()
+    _require_state()
+    return _load_allocator().get_signal_space()
 
 
 def is_symmetric_tensor(tensor: torch.Tensor) -> bool:
     if not isinstance(tensor, torch.Tensor):
         return False
-    return bool(_load_backend().is_symmetric_tensor(tensor))
+    try:
+        allocator = _load_allocator()
+    except RuntimeError:
+        return False
+    return bool(allocator.is_symmetric_tensor(tensor))
 
 
 def _stream_id(stream: torch.cuda.Stream | int | None) -> int:
+    runtime = info()
     if stream is None:
-        return int(torch.cuda.current_stream(info().device).cuda_stream)
+        return int(torch.cuda.current_stream(runtime.device).cuda_stream)
     if isinstance(stream, Integral):
         return int(stream)
     if not hasattr(stream, "cuda_stream"):
@@ -249,16 +433,23 @@ def signal(
     op: str = "set",
     stream: torch.cuda.Stream | int | None = None,
 ) -> None:
+    state = _require_state()
     operations = {
-        "set": _load_backend().SIGNAL_SET,
-        "add": _load_backend().SIGNAL_ADD,
+        "set": state.host.SignalOp.SIGNAL_SET,
+        "add": state.host.SignalOp.SIGNAL_ADD,
     }
     try:
         operation = operations[op.lower()]
     except (AttributeError, KeyError) as error:
         raise ValueError("op must be 'set' or 'add'") from error
-    _load_backend().signal_on_stream(
-        int(index), int(value), operation, int(pe), _stream_id(stream)
+    if not 0 <= int(pe) < state.runtime_info.num_pes:
+        raise ValueError("target PE is out of range")
+    state.bindings.signal_op_on_stream(
+        _load_allocator().signal_address(int(index)),
+        int(value),
+        int(operation),
+        int(pe),
+        _stream_id(stream),
     )
 
 
@@ -269,38 +460,57 @@ def wait_signal(
     comparison: str = "eq",
     stream: torch.cuda.Stream | int | None = None,
 ) -> None:
+    state = _require_state()
     comparisons = {
-        "eq": _load_backend().CMP_EQ,
-        "ne": _load_backend().CMP_NE,
-        "gt": _load_backend().CMP_GT,
-        "ge": _load_backend().CMP_GE,
-        "lt": _load_backend().CMP_LT,
-        "le": _load_backend().CMP_LE,
+        "eq": state.host.ComparisonType.CMP_EQ,
+        "ne": state.host.ComparisonType.CMP_NE,
+        "gt": state.host.ComparisonType.CMP_GT,
+        "ge": state.host.ComparisonType.CMP_GE,
+        "lt": state.host.ComparisonType.CMP_LT,
+        "le": state.host.ComparisonType.CMP_LE,
     }
     try:
         comparison_code = comparisons[comparison.lower()]
     except (AttributeError, KeyError) as error:
         raise ValueError("comparison must be one of eq/ne/gt/ge/lt/le") from error
-    _load_backend().wait_signal_on_stream(
-        int(index), comparison_code, int(value), _stream_id(stream)
+    state.bindings.signal_wait_until_on_stream(
+        _load_allocator().signal_address(int(index)),
+        int(comparison_code),
+        int(value),
+        _stream_id(stream),
     )
 
 
 def quiet(stream: torch.cuda.Stream | int | None = None) -> None:
-    _load_backend().quiet_on_stream(_stream_id(stream))
+    _require_state().bindings.quiet_on_stream(_stream_id(stream))
 
 
 def barrier() -> None:
-    _load_backend().barrier_all()
+    """Block the host until every NVSHMEM PE reaches the barrier."""
+
+    _require_state().bindings.barrier_all()
 
 
 barrier_all = barrier
 
 
 def finalize() -> None:
-    """Collectively free tracked allocations and finalize owned runtimes."""
+    """Collectively release DAE allocations, then finalize owned NVSHMEM state."""
 
-    _load_backend().finalize()
+    global _state
+    if _state is None:
+        return
+
+    state = _require_state()
+    torch.cuda.set_device(state.runtime_info.device)
+    torch.cuda.synchronize(state.runtime_info.device)
+    state.bindings.barrier_all()
+    _load_allocator().release_allocations()
+    state.bindings.barrier_all()
+    if state.runtime_info.owns_nvshmem:
+        state.host.finalize()
+    state.local_comm.Free()
+    _state = None
 
 
 class NVSHMEMLauncher(_DAELauncher):
@@ -348,6 +558,10 @@ class NVSHMEMLauncher(_DAELauncher):
     def barrier(self) -> None:
         barrier()
 
+    def benchmark_barrier(self) -> None:
+        torch.cuda.synchronize(self.nvshmem_info.device)
+        barrier()
+
     def signal(self, index: int, value: int, pe: int, **kwargs) -> None:
         signal(index, value, pe, **kwargs)
 
@@ -355,6 +569,7 @@ class NVSHMEMLauncher(_DAELauncher):
         wait_signal(index, value, **kwargs)
 
     def finalize(self) -> None:
+        self.signal_space = None
         finalize()
 
 
