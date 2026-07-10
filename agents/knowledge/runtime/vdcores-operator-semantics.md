@@ -383,6 +383,21 @@ Static GEMM handlers:
     - write one shared-memory output tile
     - queue output as writeback
 
+GEMM family (selective-build / canonical-name path):
+
+- `GEMM_WGMMA`
+  - fields:
+    - `M`
+    - `N`
+    - `K`
+    - `BLOAD`
+    - `RESIDUAL`
+  - Python args:
+    - `args[0]` = number of K tiles
+  - task behavior:
+    - implemented by `task_gemm(...)` in `include/task/wgmma.cuh`
+    - consumes shared-memory `A/B` tiles and produces one shared-memory output tile queued as writeback
+
 ## Attention ops
 
 Shared packing rules from [include/dae/compute_dispatch.cuh](/home1/11362/depctg/vdcores/include/dae/compute_dispatch.cuh):

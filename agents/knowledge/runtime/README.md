@@ -11,6 +11,7 @@ Start here for the VDCores runtime and VM model.
 Then pull in narrower notes as needed:
 
 - [memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
+- [gemv-out-conversion.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemv-out-conversion.md)
 - [gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
 
 ## What Each Note Covers
