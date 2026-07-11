@@ -14,7 +14,8 @@ MPICC=/opt/apps/nvidia24/openmpi/5.0.5/bin/mpicc \
 python -m pip install --no-binary=mpi4py -r requirements.txt
 
 export NVSHMEM_HOME="$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/nvshmem"
-make nvshmem-smoke
+make nvshmem-pyext
+python -m pytest -q tests/test_nvshmem.py
 ```
 
 ## Run on TACC Vista

@@ -86,9 +86,6 @@ pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLER
 nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
 	DAE_ENABLE_NVSHMEM=1 $(PYTHON) -m pip install -e . --no-build-isolation
 
-nvshmem-smoke: nvshmem-pyext
-	$(PYTHON) -c 'import dae._nvshmem_runtime as r; assert r.NVSHMEM_ENABLED'
-
 FORCE:
 
-.PHONY: all clean run FORCE nvshmem-pyext nvshmem-smoke
+.PHONY: all clean run FORCE nvshmem-pyext

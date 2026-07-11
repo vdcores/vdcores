@@ -28,11 +28,12 @@ export NVSHMEM_IBGDA_NIC_HANDLER=gpu
 export NVSHMEM_SYMMETRIC_SIZE=512M
 ```
 
-4. Build both DAE extensions through the unified setup and run the import
-   smoke check:
+4. Build both DAE extensions through the unified setup, then run the focused
+   API smoke tests:
 
 ```bash
-make nvshmem-smoke
+make nvshmem-pyext
+python -m pytest -q tests/test_nvshmem.py
 ```
 
 The build must define `DAE_ENABLE_NVSHMEM`, produce both `dae.runtime` and

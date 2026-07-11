@@ -79,7 +79,8 @@ Build the ordinary DAE runtime and optional symmetric-allocation extension from
 the repository root through the unified `setup.py`:
 
 ```bash
-make nvshmem-smoke
+make nvshmem-pyext
+python -m pytest -q tests/test_nvshmem.py
 ```
 
 This sets `DAE_ENABLE_NVSHMEM=1`, builds `dae.runtime` and

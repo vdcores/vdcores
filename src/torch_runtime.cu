@@ -154,7 +154,7 @@ int py_launch_dae(
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
     int64_t stream,
-    py::object signal_array_u64
+    std::optional<torch::Tensor> signal_array_u64
 ) {
   set_persistent_cache();
 
@@ -168,10 +168,8 @@ int py_launch_dae(
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
   uint64_t* signal_array = nullptr;
-  torch::Tensor signal_tensor;
-  if (!signal_array_u64.is_none()) {
-    signal_tensor = signal_array_u64.cast<torch::Tensor>();
-    signal_array = check_signal_array_ptr(signal_tensor, "signal_array_u64");
+  if (signal_array_u64) {
+    signal_array = check_signal_array_ptr(*signal_array_u64, "signal_array_u64");
   }
 
   cudaError_t st = launch_dae(
@@ -427,7 +425,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("bars_int32"),
       py::arg("profile_u64"),
       py::arg("stream"),
-      py::arg("signal_array_u64") = py::none(),
+      py::arg("signal_array_u64") = std::nullopt,
       "Launch DAE2 kernel with an optional uint64 signal array");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
