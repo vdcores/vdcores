@@ -19,8 +19,10 @@ template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
-    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs,
+    int *bars, uint64_t *signal_array
 ) {
+  (void)signal_array;
   static_assert(numSlots < 32, "Too many slots for single warp");
 
   // register flags

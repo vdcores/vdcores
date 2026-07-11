@@ -22,6 +22,7 @@ cudaError_t launch_dae(
   MInst* memory_instructions,
   CUtensorMap* tma_descs,
   int * bars,
+  uint64_t * signal_array,
   uint64_t * profile,
   int64_t stream
 ) {
@@ -33,6 +34,7 @@ cudaError_t launch_dae(
     memory_instructions,
     tma_descs,
     bars,
+    signal_array,
     profile
   );
   // TODO(zhiyuang): check launch error here?

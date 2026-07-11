@@ -1,20 +1,26 @@
-"""Compile/import smoke coverage for the optional NVSHMEM runtime.
+"""Focused API smoke coverage for the optional NVSHMEM runtime.
 
-Collective behavior is verified by ``app/python/nvshmem_example.py``
+Collective behavior is verified by ``app/python/nvshmem/example.py``
 inside a real multi-node allocation; it is intentionally not emulated here.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 import dae.nvshmem as nvshmem
 
 
-def test_python_api_import_is_lazy():
+def test_python_api_surface_is_minimal():
     assert callable(nvshmem.init)
     assert callable(nvshmem.init_signal_space)
     assert callable(nvshmem.allocate_tensor)
+    assert callable(nvshmem.benchmark_barrier)
+    assert not hasattr(nvshmem, "Launcher")
+    assert not hasattr(nvshmem, "get_signal_space")
 
 
 def test_optional_allocator_extension_import_smoke():
@@ -23,12 +29,50 @@ def test_optional_allocator_extension_import_smoke():
 
     assert runtime.NVSHMEM_ENABLED is True
     assert dae_runtime.config.nvshmem_enabled is True
-    assert {
+    public = {name for name in dir(runtime) if not name.startswith("_")}
+    assert public == {
+        "NVSHMEM_ENABLED",
         "allocate_tensor",
-        "allocation_count",
-        "get_signal_space",
-        "init_signal_space",
         "is_symmetric_tensor",
         "release_allocations",
-        "signal_address",
-    } <= set(dir(runtime))
+    }
+
+
+def test_signal_space_uses_the_symmetric_tensor_factory(monkeypatch):
+    state = SimpleNamespace(
+        signal_space=None,
+        runtime_info=SimpleNamespace(device=3),
+    )
+    calls = []
+    signals = torch.zeros(4, dtype=torch.uint64)
+
+    def fake_zeros(*size, **kwargs):
+        calls.append((size, kwargs))
+        return signals
+
+    monkeypatch.setattr(nvshmem, "_require_state", lambda: state)
+    monkeypatch.setattr(nvshmem, "zeros", fake_zeros)
+    monkeypatch.setattr(nvshmem, "barrier", lambda: calls.append(("barrier",)))
+
+    result = nvshmem.init_signal_space(4)
+
+    assert result is signals
+    assert state.signal_space is signals
+    assert calls == [
+        ((4,), {"dtype": torch.uint64, "device": 3}),
+        ("barrier",),
+    ]
+    assert nvshmem._signal_address(2) == signals.data_ptr() + 16
+
+    assert nvshmem.init_signal_space(4) is signals
+    assert calls[-1] == ("barrier",)
+    with pytest.raises(ValueError, match="already initialized"):
+        nvshmem.init_signal_space(3)
+
+
+def test_available_handles_a_missing_optional_package(monkeypatch):
+    def missing(_name):
+        raise ModuleNotFoundError
+
+    monkeypatch.setattr(nvshmem.importlib_util, "find_spec", missing)
+    assert nvshmem.available() is False

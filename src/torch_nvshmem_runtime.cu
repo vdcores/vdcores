@@ -28,8 +28,6 @@ struct SymmetricAllocation {
 
 std::mutex allocation_mutex;
 std::vector<SymmetricAllocation> allocations;
-torch::Tensor signal_space;
-int64_t signal_count = 0;
 int allocation_device = -1;
 
 void require_initialized() {
@@ -121,51 +119,6 @@ torch::Tensor allocate_tensor(
   return allocate_tensor_unlocked(shape, dtype, zeroed);
 }
 
-torch::Tensor initialize_signal_space(int64_t count) {
-  std::lock_guard<std::mutex> lock(allocation_mutex);
-  require_initialized();
-  TORCH_CHECK(count > 0, "signal_count must be positive");
-
-  if (signal_space.defined()) {
-    TORCH_CHECK(
-        count == signal_count,
-        "Signal space is already initialized with ",
-        signal_count,
-        " entries, not ",
-        count);
-    return signal_space;
-  }
-
-  signal_space = allocate_tensor_unlocked(
-      {count}, at::ScalarType::UInt64, true);
-  signal_count = count;
-  return signal_space;
-}
-
-torch::Tensor get_signal_space() {
-  std::lock_guard<std::mutex> lock(allocation_mutex);
-  TORCH_CHECK(
-      signal_space.defined(),
-      "Signal space is not initialized; call init_signal_space() first");
-  return signal_space;
-}
-
-int64_t signal_address(int64_t index) {
-  std::lock_guard<std::mutex> lock(allocation_mutex);
-  TORCH_CHECK(
-      signal_space.defined(),
-      "Signal space is not initialized; call init_signal_space() first");
-  TORCH_CHECK(
-      index >= 0 && index < signal_count,
-      "signal index ",
-      index,
-      " is outside [0, ",
-      signal_count,
-      ")");
-  return reinterpret_cast<int64_t>(
-      signal_space.data_ptr<uint64_t>() + index);
-}
-
 bool is_symmetric_tensor(const torch::Tensor& tensor) {
   std::lock_guard<std::mutex> lock(allocation_mutex);
   if (!tensor.defined() || !tensor.is_cuda()) {
@@ -183,11 +136,6 @@ bool is_symmetric_tensor(const torch::Tensor& tensor) {
   return false;
 }
 
-size_t allocation_count() {
-  std::lock_guard<std::mutex> lock(allocation_mutex);
-  return allocations.size();
-}
-
 void release_allocations() {
   std::lock_guard<std::mutex> lock(allocation_mutex);
   if (allocations.empty()) {
@@ -195,8 +143,6 @@ void release_allocations() {
   }
   require_initialized();
 
-  signal_space = torch::Tensor();
-  signal_count = 0;
   for (auto allocation = allocations.rbegin();
        allocation != allocations.rend();
        ++allocation) {
@@ -217,13 +163,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("shape"),
       py::arg("dtype"),
       py::arg("zeroed") = false);
-  m.def(
-      "init_signal_space",
-      &initialize_signal_space,
-      py::arg("signal_count"));
-  m.def("get_signal_space", &get_signal_space);
-  m.def("signal_address", &signal_address, py::arg("index"));
   m.def("is_symmetric_tensor", &is_symmetric_tensor, py::arg("tensor"));
-  m.def("allocation_count", &allocation_count);
   m.def("release_allocations", &release_allocations);
 }

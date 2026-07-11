@@ -48,6 +48,20 @@ static inline T* check_tensor_ptr(torch::Tensor t, const char* name) {
   return p;
 }
 
+static inline uint64_t* check_signal_array_ptr(
+    const torch::Tensor& signal_array,
+    const char* name) {
+  TORCH_CHECK(signal_array.defined(), name, " must be defined");
+  TORCH_CHECK(signal_array.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(
+      signal_array.scalar_type() == torch::kUInt64,
+      name,
+      " must have dtype uint64");
+  TORCH_CHECK(signal_array.dim() == 1, name, " must be rank-1");
+  TORCH_CHECK(signal_array.is_contiguous(), name, " must be contiguous");
+  return signal_array.data_ptr<uint64_t>();
+}
+
 static cudaDeviceProp current_device_prop() {
   cudaDeviceProp prop{};
   int dev = 0;
@@ -139,7 +153,8 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
-    int64_t stream
+    int64_t stream,
+    py::object signal_array_u64
 ) {
   set_persistent_cache();
 
@@ -152,11 +167,17 @@ int py_launch_dae(
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+  uint64_t* signal_array = nullptr;
+  torch::Tensor signal_tensor;
+  if (!signal_array_u64.is_none()) {
+    signal_tensor = signal_array_u64.cast<torch::Tensor>();
+    signal_array = check_signal_array_ptr(signal_tensor, "signal_array_u64");
+  }
 
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, signal_array, prof, stream
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -395,8 +416,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("set_smem_size", &py_set_smem_size,
             "Set dynamic shared memory size for DAE2 kernel");
-  m.def("launch_dae", &py_launch_dae,
-            "Launch DAE2 kernel with given parameters");
+  m.def(
+      "launch_dae",
+      &py_launch_dae,
+      py::arg("num_sms"),
+      py::arg("smem_size"),
+      py::arg("compute_insts_bytes"),
+      py::arg("memory_insts_bytes"),
+      py::arg("tma_descs_bytes"),
+      py::arg("bars_int32"),
+      py::arg("profile_u64"),
+      py::arg("stream"),
+      py::arg("signal_array_u64") = py::none(),
+      "Launch DAE2 kernel with an optional uint64 signal array");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("reset_cache_policy", &py_reset_cache_policy,

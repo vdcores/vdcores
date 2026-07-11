@@ -37,7 +37,8 @@ make nvshmem-smoke
 
 The build must define `DAE_ENABLE_NVSHMEM`, produce both `dae.runtime` and
 `dae._nvshmem_runtime`, and link only the allocator extension to
-`libnvshmem_host.so`. It must not compile a second MPI/NVSHMEM lifecycle layer.
+`libnvshmem_host.so`. It must not compile a second MPI/NVSHMEM lifecycle layer
+or signal-specific allocator state.
 
 5. Confirm that `mpi4py` uses the loaded TACC OpenMPI:
 
@@ -48,10 +49,27 @@ python -c 'from mpi4py import MPI; print(MPI.Get_library_version())'
 6. Run real collective verification only inside the allocation:
 
 ```bash
-ibrun python app/python/nvshmem_example.py
+ibrun python app/python/nvshmem/example.py
 ```
 
 Every rank must reach allocations, signal initialization, barriers, benchmark
 iterations, and finalization in the same order. Use `ibrun`, not `mpirun`, on
 TACC. The checked-in pytest is compile/import smoke coverage and is not a
 substitute for this multi-node run.
+
+Use the ordinary launcher after initializing NVSHMEM:
+
+```python
+import torch
+import dae.nvshmem as nvshmem
+from dae.launcher import Launcher
+
+runtime = nvshmem.init(symmetric_size="512M")
+signals = nvshmem.init_signal_space(runtime.num_pes)
+dae = Launcher(
+    num_sms=1,
+    device=torch.device("cuda", runtime.device),
+    signal_array=signals,
+    benchmark_barrier=nvshmem.benchmark_barrier,
+)
+```

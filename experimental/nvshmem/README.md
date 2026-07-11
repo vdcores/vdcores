@@ -86,7 +86,8 @@ This sets `DAE_ENABLE_NVSHMEM=1`, builds `dae.runtime` and
 `dae._nvshmem_runtime`, and verifies that the optional module imports without
 initializing a collective job. MPI bootstrap and host operations come from the
 official `nvshmem.core` / `nvshmem.bindings` packages; the DAE extension only
-allocates symmetric Torch tensors and signals.
+allocates symmetric Torch tensors. Signals are ordinary zeroed `uint64`
+symmetric tensors managed by the Python layer.
 
 ## 6. Run with `ibrun`
 
@@ -109,15 +110,16 @@ ibrun ./main 128 50
 Run the Python binding smoke test from the repository root:
 
 ```bash
-ibrun python app/python/nvshmem_example.py
+ibrun python app/python/nvshmem/example.py
 ```
 
 The Python test performs a one-SM DAE TMA copy between symmetric Torch tensors
 and exchanges one stream-ordered NVSHMEM signal per PE.
 
-When the NVSHMEM launcher is used with `dae_app(..., -b)`, every measured
-iteration performs a device synchronization followed by an all-PE barrier
-before launching the timed kernel.
+When the ordinary launcher is configured with
+`benchmark_barrier=nvshmem.benchmark_barrier`, `dae_app(..., -b)` performs a
+device synchronization followed by an all-PE barrier before every measured
+kernel launch.
 
 Arguments:
 
@@ -163,22 +165,29 @@ idev -p gh-dev -N 2 -n 2 -tpn 1 -t 01:00:00
 
 ## 9. Python API
 
-Use the isolated launcher when a DAE process needs NVSHMEM:
+Initialize NVSHMEM, then use the ordinary DAE launcher:
 
 ```python
 import torch
-from dae.nvshmem_launcher import Launcher
+import dae.nvshmem as nvshmem
+from dae.launcher import Launcher
 
-dae = Launcher(num_sms=128, symmetric_size="2G")
-signals = dae.init_signal_space(dae.num_pes)
-weights = dae.empty((4096, 4096), dtype=torch.bfloat16)
-output = dae.zeros((8, 4096), dtype=torch.bfloat16)
+runtime = nvshmem.init(symmetric_size="2G")
+signals = nvshmem.init_signal_space(runtime.num_pes)
+dae = Launcher(
+    num_sms=128,
+    device=torch.device("cuda", runtime.device),
+    signal_array=signals,
+    benchmark_barrier=nvshmem.benchmark_barrier,
+)
+weights = nvshmem.empty((4096, 4096), dtype=torch.bfloat16)
+output = nvshmem.zeros((8, 4096), dtype=torch.bfloat16)
 
 # Build and launch schedules exactly as with dae.launcher.Launcher.
 # `weights` and `output` are normal contiguous CUDA tensors locally.
 ```
 
-The same functions are available without a launcher:
+Symmetric allocation and signal operations remain explicit module functions:
 
 ```python
 import dae.nvshmem as nvshmem
@@ -195,5 +204,6 @@ Allocation and finalization rules:
 - Symmetric tensors are non-owning Torch views. The runtime tracks their allocations and frees them collectively, in reverse order, during `finalize()`.
 - Do not use a symmetric tensor after `finalize()`. Finalization itself must be called by every PE after all CUDA work completes.
 - `signal()` and `wait_signal()` enqueue operations on the current Torch CUDA stream unless another stream is supplied.
-- `Launcher.bench()` synchronizes all NVSHMEM PEs before every measured iteration.
+- A `Launcher` configured with `benchmark_barrier=nvshmem.benchmark_barrier`
+  synchronizes all NVSHMEM PEs before every measured iteration.
 - The runtime defaults unset Vista variables to MPI bootstrap, `ibrc`, IBGDA, GPU NIC handling, and a `512M` symmetric heap. Explicit environment variables remain authoritative except for a `symmetric_size=` argument.

@@ -83,7 +83,7 @@ pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLER
 # Build the normal runtime and the small optional NVSHMEM allocation extension
 # through the same setup.py. Host control comes from the official NVSHMEM4Py
 # package and is therefore not linked into dae.runtime.
-nvshmem-pyext pyext-nvshmem: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
+nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
 	DAE_ENABLE_NVSHMEM=1 $(PYTHON) -m pip install -e . --no-build-isolation
 
 nvshmem-smoke: nvshmem-pyext
@@ -91,4 +91,4 @@ nvshmem-smoke: nvshmem-pyext
 
 FORCE:
 
-.PHONY: all clean run FORCE nvshmem-pyext pyext-nvshmem nvshmem-smoke
+.PHONY: all clean run FORCE nvshmem-pyext nvshmem-smoke

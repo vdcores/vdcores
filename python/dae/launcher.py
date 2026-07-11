@@ -213,10 +213,21 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
-    def __init__(self, num_sms : int = 1, device = 'cuda'):
+    def __init__(
+        self,
+        num_sms: int = 1,
+        device='cuda',
+        *,
+        signal_array: torch.Tensor | None = None,
+        benchmark_barrier=None,
+    ):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
         self.device = device
+        self.signal_array = self._validate_signal_array(signal_array)
+        if benchmark_barrier is not None and not callable(benchmark_barrier):
+            raise TypeError("benchmark_barrier must be callable or None")
+        self._benchmark_barrier = benchmark_barrier
 
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
@@ -246,6 +257,32 @@ class Launcher:
         self._cache_window_requests = []
 
         runtime.set_smem_size(self.smem_size)
+
+    def _validate_signal_array(
+        self, signal_array: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        if signal_array is None:
+            return None
+        if not isinstance(signal_array, torch.Tensor):
+            raise TypeError("signal_array must be a torch.Tensor or None")
+        if not signal_array.is_cuda:
+            raise ValueError("signal_array must be a CUDA tensor")
+        if signal_array.dtype != torch.uint64:
+            raise ValueError("signal_array must have dtype torch.uint64")
+        if signal_array.ndim != 1:
+            raise ValueError("signal_array must be rank-1")
+        if not signal_array.is_contiguous():
+            raise ValueError("signal_array must be contiguous")
+
+        launcher_device = torch.device(self.device)
+        if (
+            launcher_device.index is not None
+            and signal_array.device.index != launcher_device.index
+        ):
+            raise ValueError(
+                f"signal_array is on {signal_array.device}, not {launcher_device}"
+            )
+        return signal_array
 
     # resource management functions
     def add_group(self, name, size):
@@ -527,7 +564,7 @@ class Launcher:
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
             self.bars, profile,
-            stream
+            stream, self.signal_array,
         )
         assert ret == 0
 
@@ -537,6 +574,8 @@ class Launcher:
     def benchmark_barrier(self):
         """Synchronize launch participants before a measured iteration."""
 
+        if self._benchmark_barrier is not None:
+            return self._benchmark_barrier()
         return None
     
     def bench(self, iterations : int = 100,

@@ -9,15 +9,13 @@ order.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from importlib import import_module, util as importlib_util
 from numbers import Integral
 from types import ModuleType
 from typing import Any, Iterable
 
 import torch
-
-from .launcher import Launcher as _DAELauncher
 
 
 _allocator_backend: ModuleType | None = None
@@ -36,12 +34,10 @@ class RuntimeInfo:
     pe: int
     num_pes: int
     mpi_thread_level: int
-    owns_mpi: bool
     owns_nvshmem: bool
     nvshmem_name: str
     nvshmem_version: tuple[int, int, int]
     symmetric_size: str
-    allocation_count: int
 
 
 @dataclass
@@ -50,6 +46,7 @@ class _RuntimeState:
     local_comm: Any
     host: ModuleType
     bindings: ModuleType
+    signal_space: torch.Tensor | None = None
 
 
 _state: _RuntimeState | None = None
@@ -107,12 +104,12 @@ def _load_mpi() -> ModuleType:
 
 
 def available() -> bool:
-    required_modules = ("nvshmem.core", "mpi4py.MPI", "cuda.core.experimental")
-    if any(importlib_util.find_spec(name) is None for name in required_modules):
-        return False
     try:
+        required_modules = ("nvshmem.core", "mpi4py.MPI", "cuda.core.experimental")
+        if any(importlib_util.find_spec(name) is None for name in required_modules):
+            return False
         _load_allocator()
-    except RuntimeError:
+    except (ImportError, RuntimeError):
         return False
     return True
 
@@ -249,12 +246,10 @@ def init(
             pe=pe,
             num_pes=num_pes,
             mpi_thread_level=int(mpi.Query_thread()),
-            owns_mpi=False,
             owns_nvshmem=owns_nvshmem,
             nvshmem_name="NVSHMEM4Py",
             nvshmem_version=_version_tuple(version.libnvshmem_version),
             symmetric_size=os.environ["NVSHMEM_SYMMETRIC_SIZE"],
-            allocation_count=0,
         )
     except Exception:
         if owns_nvshmem and _host_is_initialized(host):
@@ -271,9 +266,6 @@ def init(
     return runtime_info
 
 
-initialize = init
-
-
 def is_initialized() -> bool:
     return _state is not None and _host_is_initialized(_state.host)
 
@@ -285,19 +277,15 @@ def _require_state() -> _RuntimeState:
 
 
 def info() -> RuntimeInfo:
-    state = _require_state()
-    return replace(
-        state.runtime_info,
-        allocation_count=int(_load_allocator().allocation_count()),
-    )
+    return _require_state().runtime_info
 
 
 def my_pe() -> int:
-    return info().pe
+    return _require_state().runtime_info.pe
 
 
 def n_pes() -> int:
-    return info().num_pes
+    return _require_state().runtime_info.num_pes
 
 
 def _normalize_shape(shape: int | Iterable[int]) -> tuple[int, ...]:
@@ -328,7 +316,7 @@ def _normalize_size_args(size: tuple[Any, ...]) -> tuple[int, ...]:
 
 def _validate_allocation_device(device: torch.device | str | int | None) -> None:
     requested = _device_index(device)
-    runtime = info()
+    runtime = _require_state().runtime_info
     if requested is not None and requested != runtime.device:
         raise ValueError(
             f"NVSHMEM is initialized on CUDA device {runtime.device}, not {requested}"
@@ -385,23 +373,46 @@ def zeros(
 
 
 def init_signal_space(signal_count: int) -> torch.Tensor:
-    """Collectively allocate and zero the process-global uint64 signal array."""
+    """Collectively allocate the uint64 signal array as a symmetric tensor."""
 
-    runtime = info()
-    torch.cuda.set_device(runtime.device)
     if not isinstance(signal_count, Integral) or int(signal_count) <= 0:
         raise ValueError("signal_count must be a positive integer")
-    signals = _load_allocator().init_signal_space(int(signal_count))
+    signal_count = int(signal_count)
+
+    state = _require_state()
+    if state.signal_space is not None:
+        if state.signal_space.numel() != signal_count:
+            raise ValueError(
+                "Signal space is already initialized with "
+                f"{state.signal_space.numel()} entries, not {signal_count}"
+            )
+        barrier()
+        return state.signal_space
+
+    state.signal_space = zeros(
+        signal_count,
+        dtype=torch.uint64,
+        device=state.runtime_info.device,
+    )
     barrier()
-    return signals
+    return state.signal_space
 
 
-init_global_signal_space = init_signal_space
-
-
-def get_signal_space() -> torch.Tensor:
-    _require_state()
-    return _load_allocator().get_signal_space()
+def _signal_address(index: int) -> int:
+    if not isinstance(index, Integral):
+        raise TypeError("signal index must be an integer")
+    state = _require_state()
+    if state.signal_space is None:
+        raise RuntimeError(
+            "Signal space is not initialized; call init_signal_space() first"
+        )
+    signals = state.signal_space
+    index = int(index)
+    if not 0 <= index < signals.numel():
+        raise ValueError(
+            f"signal index {index} is outside [0, {signals.numel()})"
+        )
+    return signals.data_ptr() + index * signals.element_size()
 
 
 def is_symmetric_tensor(tensor: torch.Tensor) -> bool:
@@ -415,7 +426,7 @@ def is_symmetric_tensor(tensor: torch.Tensor) -> bool:
 
 
 def _stream_id(stream: torch.cuda.Stream | int | None) -> int:
-    runtime = info()
+    runtime = _require_state().runtime_info
     if stream is None:
         return int(torch.cuda.current_stream(runtime.device).cuda_stream)
     if isinstance(stream, Integral):
@@ -445,7 +456,7 @@ def signal(
     if not 0 <= int(pe) < state.runtime_info.num_pes:
         raise ValueError("target PE is out of range")
     state.bindings.signal_op_on_stream(
-        _load_allocator().signal_address(int(index)),
+        _signal_address(index),
         int(value),
         int(operation),
         int(pe),
@@ -474,7 +485,7 @@ def wait_signal(
     except (AttributeError, KeyError) as error:
         raise ValueError("comparison must be one of eq/ne/gt/ge/lt/le") from error
     state.bindings.signal_wait_until_on_stream(
-        _load_allocator().signal_address(int(index)),
+        _signal_address(index),
         int(comparison_code),
         int(value),
         _stream_id(stream),
@@ -491,7 +502,12 @@ def barrier() -> None:
     _require_state().bindings.barrier_all()
 
 
-barrier_all = barrier
+def benchmark_barrier() -> None:
+    """Synchronize local CUDA work and all PEs before a measured launch."""
+
+    runtime = _require_state().runtime_info
+    torch.cuda.synchronize(runtime.device)
+    barrier()
 
 
 def finalize() -> None:
@@ -505,6 +521,7 @@ def finalize() -> None:
     torch.cuda.set_device(state.runtime_info.device)
     torch.cuda.synchronize(state.runtime_info.device)
     state.bindings.barrier_all()
+    state.signal_space = None
     _load_allocator().release_allocations()
     state.bindings.barrier_all()
     if state.runtime_info.owns_nvshmem:
@@ -513,93 +530,23 @@ def finalize() -> None:
     _state = None
 
 
-class NVSHMEMLauncher(_DAELauncher):
-    """DAE launcher initialized for one MPI rank / NVSHMEM PE per GPU."""
-
-    def __init__(
-        self,
-        num_sms: int = 1,
-        device: torch.device | str | int | None = None,
-        *,
-        symmetric_size: str | int | None = None,
-        signal_count: int | None = None,
-    ):
-        self.nvshmem_info = init(
-            symmetric_size=symmetric_size,
-            device=device,
-        )
-        selected_device = torch.device("cuda", self.nvshmem_info.device)
-        super().__init__(num_sms=num_sms, device=selected_device)
-        self.signal_space: torch.Tensor | None = None
-        if signal_count is not None:
-            self.signal_space = init_signal_space(signal_count)
-
-    @property
-    def pe(self) -> int:
-        return self.nvshmem_info.pe
-
-    @property
-    def num_pes(self) -> int:
-        return self.nvshmem_info.num_pes
-
-    def init_signal_space(self, signal_count: int) -> torch.Tensor:
-        self.signal_space = init_signal_space(signal_count)
-        return self.signal_space
-
-    def allocate_tensor(self, shape, **kwargs) -> torch.Tensor:
-        return allocate_tensor(shape, **kwargs)
-
-    def empty(self, *size, **kwargs) -> torch.Tensor:
-        return empty(*size, **kwargs)
-
-    def zeros(self, *size, **kwargs) -> torch.Tensor:
-        return zeros(*size, **kwargs)
-
-    def barrier(self) -> None:
-        barrier()
-
-    def benchmark_barrier(self) -> None:
-        torch.cuda.synchronize(self.nvshmem_info.device)
-        barrier()
-
-    def signal(self, index: int, value: int, pe: int, **kwargs) -> None:
-        signal(index, value, pe, **kwargs)
-
-    def wait_signal(self, index: int, value: int, **kwargs) -> None:
-        wait_signal(index, value, **kwargs)
-
-    def finalize(self) -> None:
-        self.signal_space = None
-        finalize()
-
-
-Launcher = NVSHMEMLauncher
-alloc_tensor = allocate_tensor
-
-
 __all__ = [
     "RuntimeInfo",
-    "NVSHMEMLauncher",
-    "Launcher",
     "available",
     "init",
-    "initialize",
     "is_initialized",
     "info",
     "my_pe",
     "n_pes",
     "allocate_tensor",
-    "alloc_tensor",
     "empty",
     "zeros",
     "init_signal_space",
-    "init_global_signal_space",
-    "get_signal_space",
     "is_symmetric_tensor",
     "signal",
     "wait_signal",
     "quiet",
     "barrier",
-    "barrier_all",
+    "benchmark_barrier",
     "finalize",
 ]
