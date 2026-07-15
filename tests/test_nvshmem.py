@@ -29,6 +29,10 @@ def test_optional_allocator_extension_import_smoke():
 
     assert runtime.NVSHMEM_ENABLED is True
     assert dae_runtime.config.nvshmem_enabled is True
+    assert not hasattr(dae_runtime, "nvshmem_module_init")
+    assert not hasattr(dae_runtime, "nvshmem_module_finalize")
+    assert callable(dae_runtime._nvshmem_module_init)
+    assert callable(dae_runtime._nvshmem_module_finalize)
     public = {name for name in dir(runtime) if not name.startswith("_")}
     assert public == {
         "NVSHMEM_ENABLED",

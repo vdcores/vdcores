@@ -19,6 +19,7 @@ import torch
 
 
 _allocator_backend: ModuleType | None = None
+_runtime_backend: ModuleType | None = None
 _host_backend: ModuleType | None = None
 _bindings_backend: ModuleType | None = None
 _mpi_backend: ModuleType | None = None
@@ -73,6 +74,15 @@ def _load_allocator() -> ModuleType:
     return _allocator_backend
 
 
+def _load_runtime() -> ModuleType:
+    global _runtime_backend
+    if _runtime_backend is None:
+        _runtime_backend = import_module("dae.runtime")
+    if not bool(getattr(_runtime_backend.config, "nvshmem_enabled", False)):
+        raise RuntimeError("dae.runtime was not built with NVSHMEM enabled")
+    return _runtime_backend
+
+
 def _load_host() -> ModuleType:
     global _host_backend
     if _host_backend is None:
@@ -109,6 +119,7 @@ def available() -> bool:
         if any(importlib_util.find_spec(name) is None for name in required_modules):
             return False
         _load_allocator()
+        _load_runtime()
     except (ImportError, RuntimeError):
         return False
     return True
@@ -167,7 +178,7 @@ def init(
     symmetric_size: str | int | None = None,
     device: torch.device | str | int | None = None,
 ) -> RuntimeInfo:
-    """Collectively initialize NVSHMEM4Py for the current MPI rank."""
+    """Collectively initialize NVSHMEM4Py and the DAE CUDA module."""
 
     global _state
     requested_size = _format_symmetric_size(symmetric_size)
@@ -184,6 +195,7 @@ def init(
 
     _configure_environment(requested_size)
     _load_allocator()
+    dae_runtime = _load_runtime()
     host = _load_host()
     bindings = _load_bindings()
     mpi = _load_mpi()
@@ -199,6 +211,7 @@ def init(
     local_size = local_comm.Get_size()
 
     owns_nvshmem = False
+    module_initialized = False
     try:
         device_count = torch.cuda.device_count()
         if device_count <= 0:
@@ -251,7 +264,16 @@ def init(
             nvshmem_version=_version_tuple(version.libnvshmem_version),
             symmetric_size=os.environ["NVSHMEM_SYMMETRIC_SIZE"],
         )
+
+        status = int(dae_runtime._nvshmem_module_init())
+        if status != 0:
+            raise RuntimeError(
+                f"DAE NVSHMEM CUDA module initialization failed with status {status}"
+            )
+        module_initialized = True
     except Exception:
+        if module_initialized:
+            dae_runtime._nvshmem_module_finalize()
         if owns_nvshmem and _host_is_initialized(host):
             host.finalize()
         local_comm.Free()
@@ -511,7 +533,7 @@ def benchmark_barrier() -> None:
 
 
 def finalize() -> None:
-    """Collectively release DAE allocations, then finalize owned NVSHMEM state."""
+    """Collectively release allocations, the CUDA module, and owned host state."""
 
     global _state
     if _state is None:
@@ -524,6 +546,11 @@ def finalize() -> None:
     state.signal_space = None
     _load_allocator().release_allocations()
     state.bindings.barrier_all()
+    status = int(_load_runtime()._nvshmem_module_finalize())
+    if status != 0:
+        raise RuntimeError(
+            f"DAE NVSHMEM CUDA module finalization failed with status {status}"
+        )
     if state.runtime_info.owns_nvshmem:
         state.host.finalize()
     state.local_comm.Free()

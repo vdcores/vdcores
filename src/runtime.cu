@@ -3,6 +3,56 @@
 
 #include <cuda.h>
 
+#ifdef DAE_ENABLE_NVSHMEM
+#include <nvshmemx.h>
+
+namespace {
+CUmodule nvshmem_module = nullptr;
+}
+
+int nvshmem_module_init() {
+    if (nvshmem_module != nullptr) {
+        return 0;
+    }
+
+    cudaFunction_t function = nullptr;
+    cudaError_t runtime_status = cudaGetFuncBySymbol(
+        &function,
+        reinterpret_cast<const void *>(dae2)
+    );
+    if (runtime_status != cudaSuccess) {
+        return static_cast<int>(runtime_status);
+    }
+
+    CUmodule module = nullptr;
+    CUresult driver_status = cuFuncGetModule(
+        &module,
+        reinterpret_cast<CUfunction>(function)
+    );
+    if (driver_status != CUDA_SUCCESS) {
+        return static_cast<int>(driver_status);
+    }
+
+    int status = nvshmemx_cumodule_init(module);
+    if (status == 0) {
+        nvshmem_module = module;
+    }
+    return status;
+}
+
+int nvshmem_module_finalize() {
+    if (nvshmem_module == nullptr) {
+        return 0;
+    }
+
+    int status = nvshmemx_cumodule_finalize(nvshmem_module);
+    if (status == 0) {
+        nvshmem_module = nullptr;
+    }
+    return status;
+}
+#endif
+
 size_t set_smem_size(size_t smem_size) {
     cudaError_t err = cudaFuncSetAttribute(
         dae2,
