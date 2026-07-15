@@ -1,5 +1,6 @@
 #pragma once
 
+#include <nvshmem.h>
 #include "virtualcore.cuh"
 
 static __device__ __forceinline__ void prefetch_inst_window(
@@ -22,7 +23,7 @@ __device__ __forceinline__ void allocwarp_execute(
     MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs,
     int *bars, uint64_t *signal_array
 ) {
-  (void)signal_array;
+  // (void)signal_array;
   static_assert(numSlots < 32, "Too many slots for single warp");
 
   // register flags
@@ -214,6 +215,66 @@ __device__ __forceinline__ void allocwarp_execute(
           if (lane_id == 0) {
             di.gpr[1] = token * inst.size;
           }
+          break;
+        }
+
+        static constexpr uint16_t nvshmemSignalIdShift = 8U;
+        static constexpr uint16_t nvshmemSignalIdMask = 0x00FFU;
+        static constexpr uint16_t nvshmemTargetPeMask = 0x00FFU;
+
+        case op(OP_NVSHMEM_PUT): {
+          if (lane_id == 0) {
+            void *symm_addr =
+                reinterpret_cast<void *>(inst.address);
+
+            uint32_t nbytes =
+                static_cast<uint32_t>(inst.size) |
+                (static_cast<uint32_t>(inst.num_slots) << 16);
+
+            uint32_t signal_id =
+                (static_cast<uint32_t>(inst.arg) >> nvshmemSignalIdShift) &
+                nvshmemSignalIdMask;
+
+            int target_pe =
+                static_cast<int>(
+                    static_cast<uint32_t>(inst.arg) &
+                    nvshmemTargetPeMask);
+
+            uint64_t *signal_addr =
+                signal_array + signal_id;
+
+            nvshmem_putmem_signal_nbi(
+                symm_addr,          // symmetric destination on target PE
+                symm_addr,          // local source
+                nbytes,
+                signal_addr,        // matching remote signal slot
+                1,
+                NVSHMEM_SIGNAL_SET,
+                target_pe);
+
+            nvshmem_quiet();
+          }
+
+          __syncwarp();
+          break;
+        }
+
+        case op(OP_NVSHMEM_WAIT): {
+          if (lane_id == 0) {
+            uint32_t signal_id =
+                (static_cast<uint32_t>(inst.arg) >> nvshmemSignalIdShift) &
+                nvshmemSignalIdMask;
+
+            uint64_t *signal_addr =
+                signal_array + signal_id;
+
+            nvshmem_signal_wait_until(
+                signal_addr,
+                NVSHMEM_CMP_GE,
+                1);
+          }
+
+          __syncwarp();
           break;
         }
         default:

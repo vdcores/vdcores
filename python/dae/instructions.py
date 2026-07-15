@@ -819,6 +819,46 @@ class IssueBarrier(MemoryInstruction):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
         self.bar(bar)
 
+NVSHMEM_SIGNAL_ID_SHIFT = 8
+NVSHMEM_SIGNAL_ID_MASK = 0xFF
+NVSHMEM_TARGET_PE_MASK = 0xFF
+
+
+def _encode_nvshmem_arg(signal_id: int, target_pe: int = 0) -> int:
+    assert 0 <= signal_id <= NVSHMEM_SIGNAL_ID_MASK, ("signal_id must fit in 8 bits")
+    assert 0 <= target_pe <= NVSHMEM_TARGET_PE_MASK, ("target_pe must fit in the low 8 bits of arg")
+
+    return ((signal_id << NVSHMEM_SIGNAL_ID_SHIFT) | target_pe)
+
+
+class NvshmemPut(MemoryInstruction):
+    def __init__(
+        self,
+        address: int,
+        nbytes: int,
+        target_pe: int,
+        signal_id: int,
+    ):
+        assert 0 < nbytes < 2**32, "nbytes must fit in uint32"
+
+        super().__init__(
+            opcode=opcode.OP_NVSHMEM_PUT,
+            num_slots=(nbytes >> 16) & 0xFFFF,
+            arg=_encode_nvshmem_arg(signal_id, target_pe),
+            size=nbytes & 0xFFFF,
+            address=address,
+        )
+
+
+class NvshmemWait(MemoryInstruction):
+    def __init__(self, signal_id: int):
+        super().__init__(
+            opcode=opcode.OP_NVSHMEM_WAIT,
+            num_slots=0,
+            arg=_encode_nvshmem_arg(signal_id),
+            size=0,
+            address=0,
+        )
 
 class CC0(MemoryInstruction):
     def __init__(self, tokens: torch.Tensor, idx: int, hidden_size: int = 4096, dtype_size: int = 2):
@@ -1034,6 +1074,8 @@ __all__ = [
     "RepeatM",
     "RawAddress",
     "IssueBarrier",
+    "NvshmemPut",
+    "NvshmemWait",
     "CC0",
     "RegStore",
     "RegLoad",
