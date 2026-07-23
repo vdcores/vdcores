@@ -52,7 +52,10 @@ extensions = [
     CUDAExtension(
         name="dae.runtime",
         sources=[str(ROOT / "src" / "torch_runtime.cu")],
-        extra_objects=[str(ROOT / "runtime.o")],
+        extra_objects=[
+            str(ROOT / "runtime.o"),
+            str(ROOT / "runtime_device_link.o"),
+        ],
         include_dirs=[
             str(ROOT / "include"),
             str(ROOT / "include" / "dae"),

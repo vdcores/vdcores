@@ -820,6 +820,28 @@ class IssueBarrier(MemoryInstruction):
         self.bar(bar)
 
 
+class NvshmemPut(MemoryInstruction):
+    def __init__(self, address: int, nbytes: int, target_pe: int):
+        super().__init__(
+            opcode=opcode.OP_NVSHMEM_PUT,
+            num_slots=(nbytes >> 16),
+            arg=target_pe,
+            size=(nbytes & 0xFFFF),
+            address=address,
+        )
+
+
+class NvshmemWait(MemoryInstruction):
+    def __init__(self):
+        super().__init__(
+            opcode=opcode.OP_NVSHMEM_WAIT,
+            num_slots=0,
+            arg=0,
+            size=0,
+            address=0,
+        )
+
+
 class CC0(MemoryInstruction):
     def __init__(self, tokens: torch.Tensor, idx: int, hidden_size: int = 4096, dtype_size: int = 2):
         addr = get_tensor_address(tokens[idx])
@@ -1034,6 +1056,8 @@ __all__ = [
     "RepeatM",
     "RawAddress",
     "IssueBarrier",
+    "NvshmemPut",
+    "NvshmemWait",
     "CC0",
     "RegStore",
     "RegLoad",

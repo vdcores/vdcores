@@ -1,6 +1,8 @@
 #pragma once
 
 #include "virtualcore.cuh"
+#include <nvshmem.h>
+#include <nvshmemx.h>
 
 static __device__ __forceinline__ void prefetch_inst_window(
     const int lane_id, const MInst* insts, uint32_t target_pc) {
@@ -214,6 +216,31 @@ __device__ __forceinline__ void allocwarp_execute(
           if (lane_id == 0) {
             di.gpr[1] = token * inst.size;
           }
+          break;
+        }
+        case op(OP_NVSHMEM_PUT): {
+          if (lane_id == 0) {
+            void *symm_addr = reinterpret_cast<void *>(inst.address);
+            uint32_t nbytes = static_cast<uint32_t>(inst.size) | (static_cast<uint32_t>(inst.num_slots) << 16);
+            int target_pe = inst.arg;
+            nvshmem_putmem_signal_nbi(
+                symm_addr,
+                symm_addr,
+                nbytes,
+                signal_array,
+                1,
+                NVSHMEM_SIGNAL_SET,
+                target_pe);
+            nvshmem_quiet();
+          }
+          __syncwarp();
+          break;
+        }
+        case op(OP_NVSHMEM_WAIT): {
+          if (lane_id == 0) {
+            nvshmem_signal_wait_until(signal_array, NVSHMEM_CMP_GE, 1);
+          }
+          __syncwarp();
           break;
         }
         default:

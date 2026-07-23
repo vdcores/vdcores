@@ -21,10 +21,12 @@ COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
 # NVCC_FLAGS = -DNDEBUG -O3 -std=c++20 $(if $(profile),-DDAE_PROFILE) # --ptxas-options=--verbose
 
 # Linker flags (add CUDA driver library for TMA support)
-LDFLAGS = -lcuda -lcublas
+LDFLAGS = -L$(CONDA_PREFIX)/lib/python3.13/site-packages/nvidia/nvshmem/lib \
+          -lcuda -lcublas -lnvshmem_host
 
-NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
+NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -I$(CONDA_PREFIX)/lib/python3.13/site-packages/nvidia/nvshmem/include -std=c++20 -Xptxas=-v -use_fast_math -rdc=true
 NVCC_FLAGS += -lineinfo
+NVSHMEM_DEVICE_LIB := $(CONDA_PREFIX)/lib/python3.13/site-packages/nvidia/nvshmem/lib/libnvshmem_device.a
 
 # Directories
 ifeq ($(debug),)
@@ -33,7 +35,7 @@ else
 	NVCC_FLAGS += -DDAE_DEBUG_PRINT=$(debug)
 endif
 
-TARGETS := runtime.o
+TARGETS := runtime.o runtime_device_link.o
 
 # Target executable
 CUFILES := $(wildcard app/*.cu)
@@ -71,6 +73,9 @@ $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS): $(C
 
 runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
+
+runtime_device_link.o: runtime.o
+	$(NVCC) $(CUDA_ARCH) -dlink runtime.o $(NVSHMEM_DEVICE_LIB) -o $@
 
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
 
