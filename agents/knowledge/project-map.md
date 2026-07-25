@@ -19,12 +19,18 @@ This note summarizes the stable structure confirmed during repository initializa
 - `app/python/llama3/reference.py` and `app/python/llama3/llama_attention_reference.py`: local reference helpers worth checking before re-deriving model math.
 - `app/python/attention_simple_decoding.py`: dedicated isolated GQA decode-attention harness for validating the shared attention opcode path and collecting quick single-kernel timing.
 - `app/python/nvshmem/example.py`: real MPI/NVSHMEM integration example for symmetric DAE copy and cross-PE signal verification under `ibrun`; `app/python/nvshmem/README.md` gives the short build/run procedure.
+- `app/python/memory_pool/`: dependency fan-in and top-1 EP integration tests
+  driven by VDCores HBM mailbox operators; the README covers singleton and
+  cross-node launch commands.
 - `app/python/gemv_mma_out.py`: dedicated correctness harness for the isolated `N=8` MMA GEMV operator path.
 - `app/python/qwen3/`: Qwen 3 client, layer, utilities, and schedule variants.
   The current decode path is split across `sched.py` (graph/TMA/instruction scheduling), `runtime_context.py` (HF model load, tensor materialization, packed side-input prep, KV bootstrap), `correctness.py` (reference comparisons), and `cli.py` (prefiltered app args).
 - `python/dae/launcher.py`: launcher/resource-management entry point and public compatibility surface for legacy `from dae.launcher import *` usage.
   It now resets the CUDA stream access-policy window on each launch and applies at most one selected cache-policy target per launch, with runtime/env overrides instead of repeated immediate `cudaStreamSetAttribute(...)` calls.
 - `python/dae/nvshmem.py`: lazy optional NVSHMEM API. NVIDIA's official Python binding owns host control; DAE adds symmetric Torch allocation, tensor-backed signal helpers, and a pre-iteration benchmark callback for the ordinary launcher.
+- `python/dae/memory_pool.py`: stable 128-byte request/config packing,
+  collective pool-buffer allocation, phase scheduling, and host reference
+  semantics for dependency ordering and row routing.
 - `python/dae/instructions.py`: serialized instruction types, compute operation definitions, memory-side instruction helpers, and TMA instruction wrappers used by `launcher.py`.
 - `python/dae/op_families.py`: minimal dynamic compute-op family registry; it now loads the declarative family definitions exported by `src/torch_runtime.cu` as `dae.runtime.compute_family_specs`, builds canonical family-backed op refs through a generic `family_ref(...)` helper, validates canonical dynamic names such as `OP_GEMV_WGMMA__...` against that runtime-exported source, and leaves concrete opcode instances to generated build artifacts.
 - `python/dae/op_family_specs.py`: shared parser helpers for declarative compute-family definitions. Runtime Python parses the extension-exported spec objects through it, while the build-time generator reuses the same parsing rules against `include/dae/opcode.cuh.inc`.
@@ -35,6 +41,8 @@ This note summarizes the stable structure confirmed during repository initializa
 - `python/dae/model.py`: model-side Python support code.
 - `include/dae/`: runtime abstractions such as allocator, launcher, queues, runtime, and virtual cores.
   The compute warp dispatch now lives in `include/dae/compute_dispatch.cuh`, and supported selective-build ops are discovered from `DAE_COMPUTE_OP_HANDLER(OP_...)` declarations in that file.
+- `include/dae/memory_pool.cuh`: optional NVSHMEM pool-core executor for HBM
+  mailboxes, dependency tickets, contiguous transfers, reduction, and routing.
 - `agents/knowledge/runtime/README.md`: runtime-documentation entry point for the VM model, queue protocol, and operator semantics.
 - `agents/knowledge/runtime/vdcores-vm-model.md`: source-level virtual-machine model of one SM/block, including slots, queues, allocator, and `GROUP` / accumulate behavior.
 - `agents/knowledge/runtime/vdcores-operator-semantics.md`: operator-by-operator field packing and state-transition notes for memory and compute instructions.

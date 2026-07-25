@@ -12,6 +12,7 @@ Then pull in narrower notes as needed:
 
 - [memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
 - [gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
+- [memory-pool-ep.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-ep.md)
 
 ## What Each Note Covers
 
@@ -21,3 +22,5 @@ Then pull in narrower notes as needed:
   instruction-field meanings and operator-by-operator state transitions
 - [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md):
   queue protocol and deadlock-oriented guidance
+- [memory-pool-ep.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-ep.md):
+  HBM mailbox layout, dependency tickets, pool-core execution, and EP routing

@@ -52,8 +52,9 @@ macro on both extensions. `make nvshmem-pyext` is the normal entry point;
   construct the ordinary `dae.launcher.Launcher` with `signal_array=signals`
   and `benchmark_barrier=dae.nvshmem.benchmark_barrier`.
 - `Launcher` forwards the optional signal tensor through `runtime.launch_dae`,
-  the `dae2` kernel, and into `allocwarp_execute()`. This plumbing does not add
-  an NVSHMEM opcode or consume the pointer yet.
+  the `dae2` kernel, and into `allocwarp_execute()`. The optional
+  `OP_NVSHMEM_*` and `OP_MEMORY_POOL_*` handlers consume it directly; the
+  ordinary build still has no NVSHMEM device calls.
 - `dae.nvshmem.benchmark_barrier()` synchronizes the device and all PEs. Base
   `Launcher.bench()` invokes the configured callback before every measured
   iteration, so multi-rank profile timestamps begin only after all ranks are
@@ -61,7 +62,8 @@ macro on both extensions. `make nvshmem-pyext` is the normal entry point;
 
 ## Verification Boundary
 
-`tests/test_nvshmem.py` is intentionally only an import/API smoke test. Real
-collective validation requires a Vista allocation and runs through
-`app/python/nvshmem/example.py` under `ibrun`; its adjacent `README.md` contains
-the concise build and launch commands.
+`tests/test_nvshmem.py` is intentionally only an import/API smoke test.
+`tests/test_memory_pool.py` covers the request ABI and host reference semantics,
+while `tests/test_memory_pool_gpu.py` is an opt-in singleton GPU test. Real
+cross-node validation runs `app/python/nvshmem/example.py` and the applications
+under `app/python/memory_pool/` with `ibrun` on Vista.

@@ -63,6 +63,11 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 - `OP_ISSUE_BARRIER`
 - `OP_CC0`
 - `OP_CC0_ROW_BYTES`
+- `OP_NVSHMEM_PUT`
+- `OP_NVSHMEM_WAIT`
+- `OP_MEMORY_POOL_SUBMIT`
+- `OP_MEMORY_POOL_WAIT`
+- `OP_MEMORY_POOL_RUN`
 - `OP_ALLOC_REG_LOAD`
 - `OP_ALLOC_TMA_LOAD_1D`
 - `OP_ALLOC_TMA_LOAD_TENSOR_1D`
@@ -170,6 +175,63 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - declared in the opcode registry, but there is no checked-in `allocwarp` case for it in this snapshot
   - status:
     - declared but unhandled in the checked-in runtime path
+
+### Optional NVSHMEM and memory-pool control ops
+
+These opcodes are declared in every build but their alloc-warp handlers are
+compiled only with `DAE_ENABLE_NVSHMEM`. All are non-allocating: they do not
+touch `slot_avail`, publish `m2c`, or enqueue `LdCmd` work.
+
+- `OP_NVSHMEM_PUT`
+  - fields:
+    - `address` = local symmetric source and same symmetric destination address
+    - `size` / `num_slots` = low/high 16 bits of byte count
+    - low 8 bits of `arg` = target PE
+    - high 8 bits of `arg` = signal id
+  - effect:
+    - lane 0 executes put-with-signal using value `1`, then `nvshmem_quiet()`
+    - use a preceding `IssueBarrier` when local VDCores stores produce the data
+
+- `OP_NVSHMEM_WAIT`
+  - fields:
+    - `size` = signal id
+    - `address` = expected 64-bit signal value
+  - effect:
+    - lane 0 waits for the local symmetric signal to be greater than or equal
+      to the expected value
+
+- `OP_MEMORY_POOL_SUBMIT`
+  - fields:
+    - `address` = local 128-byte `MemoryPoolRequest`
+    - `size` = pool submit signal id
+    - `arg` = pool PE
+  - effect:
+    - put the request into the same symmetric mailbox on the pool PE
+    - publish `request.sequence` with put-with-signal and quiet before advancing
+
+- `OP_MEMORY_POOL_WAIT`
+  - fields:
+    - `address` = the producer's local `MemoryPoolRequest`
+  - effect:
+    - load the completion signal id and sequence from the request and wait for
+      `signal >= sequence`
+
+- `OP_MEMORY_POOL_RUN`
+  - fields:
+    - `address` = 128-byte `MemoryPoolConfig`
+    - `size` / `num_slots` = low/high 16 bits of expected request count
+  - effect:
+    - lane 0 scans per-producer HBM mailboxes
+    - skip blocked requests and execute another request whose slot ticket is
+      ready
+    - support contiguous write/read, row-index scatter/gather, and optional
+      float32 sum-on-write
+    - update dependency tickets only after data completion, then signal the
+      producer/consumer and retire that mailbox sequence
+  - runtime role:
+    - this blocking op turns the selected SM's alloc warp into the V1 pool core
+    - stable 128-byte layouts and invariants are documented in
+      `agents/knowledge/runtime/memory-pool-ep.md`
 
 ### Load-side allocating ops
 

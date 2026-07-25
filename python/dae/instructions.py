@@ -433,7 +433,7 @@ class MemoryInstruction(Instruction):
         assert len(cords) <= 4, "Maximum 4 cords are supported"
         self.cords = cords + [0] * (4 - len(cords))
         for i in range(4):
-            assert 0 <= self.cords[i] < 2**16 - 1, "cord values must be a uint16"
+            assert 0 <= self.cords[i] < 2**16, "cord values must be a uint16"
 
     def delta(self, delta):
         if isinstance(delta, int):
@@ -820,6 +820,110 @@ class IssueBarrier(MemoryInstruction):
         self.bar(bar)
 
 
+def _control_pointer(value: torch.Tensor | int, name: str) -> int:
+    if isinstance(value, torch.Tensor):
+        return get_tensor_address(value)
+    if not isinstance(value, int):
+        raise TypeError(f"{name} must be a CUDA tensor or integer address")
+    if not 0 <= value < 2**64:
+        raise ValueError(f"{name} must fit in uint64")
+    return value
+
+
+class NvshmemPut(MemoryInstruction):
+    """Issue-#25 same-symmetric-address PUT with an explicit signal id."""
+
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        address: torch.Tensor | int,
+        nbytes: int,
+        target_pe: int,
+        signal_id: int = 0,
+    ):
+        if not 0 < nbytes < 2**32:
+            raise ValueError("nbytes must be in [1, 2**32)")
+        if not 0 <= target_pe < 2**8:
+            raise ValueError("target_pe must fit in 8 bits")
+        if not 0 <= signal_id < 2**8:
+            raise ValueError("signal_id must fit in 8 bits")
+        super().__init__(
+            opcode=opcode.OP_NVSHMEM_PUT,
+            num_slots=nbytes >> 16,
+            arg=(signal_id << 8) | target_pe,
+            size=nbytes & 0xFFFF,
+            address=_control_pointer(address, "address"),
+        )
+
+
+class NvshmemWait(MemoryInstruction):
+    requires_signal_array = True
+
+    def __init__(self, signal_id: int = 0, value: int = 1):
+        if not 0 <= signal_id < 2**16:
+            raise ValueError("signal_id must fit in 16 bits")
+        if not 0 <= value < 2**64:
+            raise ValueError("value must fit in uint64")
+        super().__init__(
+            opcode=opcode.OP_NVSHMEM_WAIT,
+            num_slots=0,
+            arg=0,
+            size=signal_id,
+            address=value,
+        )
+
+
+class MemoryPoolSubmit(MemoryInstruction):
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        request: torch.Tensor | int,
+        pool_pe: int,
+        submit_signal: int,
+    ):
+        if not 0 <= pool_pe < 2**16:
+            raise ValueError("pool_pe must fit in 16 bits")
+        if not 0 <= submit_signal < 2**16:
+            raise ValueError("submit_signal must fit in 16 bits")
+        super().__init__(
+            opcode=opcode.OP_MEMORY_POOL_SUBMIT,
+            num_slots=0,
+            arg=pool_pe,
+            size=submit_signal,
+            address=_control_pointer(request, "request"),
+        )
+
+
+class MemoryPoolWait(MemoryInstruction):
+    requires_signal_array = True
+
+    def __init__(self, request: torch.Tensor | int):
+        super().__init__(
+            opcode=opcode.OP_MEMORY_POOL_WAIT,
+            num_slots=0,
+            arg=0,
+            size=0,
+            address=_control_pointer(request, "request"),
+        )
+
+
+class MemoryPoolRun(MemoryInstruction):
+    requires_signal_array = True
+
+    def __init__(self, config_tensor: torch.Tensor | int, expected_requests: int):
+        if not 0 <= expected_requests < 2**32:
+            raise ValueError("expected_requests must fit in uint32")
+        super().__init__(
+            opcode=opcode.OP_MEMORY_POOL_RUN,
+            num_slots=expected_requests >> 16,
+            arg=0,
+            size=expected_requests & 0xFFFF,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
 class CC0(MemoryInstruction):
     def __init__(self, tokens: torch.Tensor, idx: int, hidden_size: int = 4096, dtype_size: int = 2):
         addr = get_tensor_address(tokens[idx])
@@ -1034,6 +1138,11 @@ __all__ = [
     "RepeatM",
     "RawAddress",
     "IssueBarrier",
+    "NvshmemPut",
+    "NvshmemWait",
+    "MemoryPoolSubmit",
+    "MemoryPoolWait",
+    "MemoryPoolRun",
     "CC0",
     "RegStore",
     "RegLoad",

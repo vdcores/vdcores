@@ -45,8 +45,9 @@ Each SM/block owns:
   - shared scratch used by some compute ops such as argmax
 
 The kernel also accepts an optional process-wide `uint64_t*` signal array and
-forwards it unchanged to each alloc warp. No checked-in memory opcode consumes
-that pointer yet.
+forwards it unchanged to each alloc warp. In an NVSHMEM-enabled build,
+`OP_NVSHMEM_*` and `OP_MEMORY_POOL_*` consume this symmetric signal array for
+request publication, completion, and waits.
 
 ## Virtual Cores
 
@@ -99,6 +100,11 @@ The memory side is split into four warp roles:
   - one per async load port
   - execute TMA/global-load side effects
   - publish ready tokens to compute
+
+The optional memory-pool path does not change this warp count. A selected SM's
+existing alloc warp can execute blocking `OP_MEMORY_POOL_RUN` and becomes the
+dedicated pool core for that phase; that SM must not also need ordinary alloc
+progress until the configured request count completes.
 
 The alloc warp carries the explicit memory-VM register state in [include/dae/virtualcore.cuh](/home1/11362/depctg/vdcores/include/dae/virtualcore.cuh):
 
@@ -389,6 +395,15 @@ The `bars` array is the externally visible dependency table.
   - load ops with `MEM_OP_FLAGS_BARRIER` also wait for `bars[bar] == 0` before issuing
 - write side:
   - writeback ops with `MEM_OP_FLAGS_BARRIER` decrement `bars[bar]` after the async store finishes
+
+### Memory-pool dependency tickets
+
+The optional NVSHMEM memory pool adds a separate HBM dependency table. A pool
+request can wait for `dependencies[slot] >= value` and can add a delta to a
+slot only after its data operation completes. These monotonic tickets are not
+the same object as the launcher's `bars[]`: `IssueBarrier` orders a local HBM
+producer before `OP_MEMORY_POOL_SUBMIT`, while pool tickets order remote pool
+operations against each other.
 
 ## Register-Like Facilities
 

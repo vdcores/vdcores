@@ -505,6 +505,21 @@ class Launcher:
     def launch(self):
         self.build_instructions()
 
+        signal_requiring_instructions = [
+            inst
+            for builder in self.builder
+            for inst in builder.built_minsts
+            if getattr(inst, "requires_signal_array", False)
+        ]
+        if signal_requiring_instructions and not bool(config.nvshmem_enabled):
+            raise RuntimeError(
+                "NVSHMEM and memory-pool instructions require `make nvshmem-pyext`"
+            )
+        if signal_requiring_instructions and self.signal_array is None:
+            raise ValueError(
+                "NVSHMEM and memory-pool instructions require Launcher(signal_array=...)"
+            )
+
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
         if supported_compute_ops is not None:
             required_compute_ops = self.compute_operator_names()
