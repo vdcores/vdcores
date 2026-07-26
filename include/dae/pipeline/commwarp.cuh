@@ -4,9 +4,7 @@
 #error "commwarp.cuh requires DAE_ENABLE_NVSHMEM"
 #endif
 
-#include "ep_pool.cuh"
 #include "memory_pool.cuh"
-#include "pool_slice.cuh"
 #include "virtualcore.cuh"
 
 #include <nvshmem.h>
@@ -109,76 +107,6 @@ static __device__ __noinline__ void communicationwarp_execute(
         __syncwarp();
         break;
       }
-
-      case COMM_EXPERT_POOL_RESET:
-        ep_pool_reset(
-            *reinterpret_cast<const EpPoolConfig*>(inst.address),
-            bars,
-            signal_array,
-            inst.arg0,
-            lane);
-        break;
-
-      case COMM_EXPERT_POOL_DISPATCH:
-        ep_pool_dispatch_expert(
-            *reinterpret_cast<const EpPoolConfig*>(inst.address),
-            bars,
-            signal_array,
-            inst.size,
-            inst.arg0,
-            lane);
-        break;
-
-      case COMM_EXPERT_POOL_RETURN:
-        ep_pool_return_expert(
-            *reinterpret_cast<const EpPoolConfig*>(inst.address),
-            bars,
-            signal_array,
-            inst.size,
-            inst.arg0,
-            lane);
-        break;
-
-      case COMM_POOL_SLICE_PUBLISH:
-        pool_slice_publish(
-            reinterpret_cast<const PoolSliceConfig*>(inst.address),
-            signal_array,
-            lane);
-        break;
-
-      case COMM_POOL_SLICE_GATHER: {
-        const auto* config = reinterpret_cast<const PoolSliceConfig*>(
-            inst.address);
-        if (config != nullptr &&
-            (config->flags & POOL_SLICE_FLAGS_STREAMING_GATHER) != 0) {
-          pool_slice_gather_streaming(
-              config,
-              bars,
-              signal_array,
-              g_events,
-              inst.size,
-              inst.arg0,
-              lane);
-        } else {
-          pool_slice_gather(
-              config,
-              bars,
-              signal_array,
-              inst.size,
-              inst.arg0,
-              lane);
-        }
-        break;
-      }
-
-      case COMM_POOL_SLICE_RETURN:
-        pool_slice_return(
-            reinterpret_cast<const PoolSliceConfig*>(inst.address),
-            bars,
-            signal_array,
-            inst.size,
-            lane);
-        break;
 
       case COMM_RECORD_EVENT:
         if (lane == 0) {

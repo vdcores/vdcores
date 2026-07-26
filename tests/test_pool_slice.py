@@ -7,31 +7,31 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dae.instructions import (
-    CommunicationInstruction,
-    PoolSliceGather,
-    PoolSlicePublish,
-    PoolSliceReturn,
-)
+from dae.instructions import CommunicationInstruction, PoolSliceExchange
 from dae.pool_slice import (
     POOL_SLICE_CONFIG_BYTES,
+    POOL_SLICE_MAX_LOCAL_READERS,
     POOL_SLICE_PROFILE_DONE,
     POOL_SLICE_PROFILE_DATA_PUBLISHED,
+    POOL_SLICE_PROFILE_COMPUTE_READY,
     POOL_SLICE_PROFILE_FIRST_DATA_PUBLISHED,
     POOL_SLICE_PROFILE_FIRST_PAYLOAD,
     POOL_SLICE_PROFILE_GATHER_READY,
     POOL_SLICE_PROFILE_METADATA_CLOSED,
     POOL_SLICE_PROFILE_PAYLOAD_DONE,
+    POOL_SLICE_PROFILE_RETURN_PAYLOAD_DONE,
+    POOL_SLICE_PROFILE_RETURN_SIGNALS_CLOSED,
+    POOL_SLICE_PROFILE_SCATTER_DONE,
     POOL_SLICE_PROFILE_START,
     POOL_SLICE_PUBLISH_BYTES,
     POOL_SLICE_RECEIVE_BYTES,
     PoolSliceBatchFlags,
     PoolSliceConfig,
-    PoolSliceFlags,
     PoolSliceProgram,
     PoolSlicePublishBatch,
     PoolSliceReceiveBatch,
     group_routes_by_reader,
+    select_pool_slice_pack_warps,
 )
 from dae.runtime import comm_opcode
 
@@ -43,25 +43,24 @@ def _config(**updates) -> PoolSliceConfig:
     values = dict(
         source_address=1,
         token_pool_address=2,
-        expert_input_address=3,
-        expert_output_address=4,
-        return_inbox_address=5,
-        returned_address=6,
-        send_offsets_address=7,
-        send_rows_address=8,
-        send_origin_rows_address=9,
-        send_batches_address=10,
-        receive_batches_address=11,
-        offsets_inbox_address=12,
-        rows_inbox_address=13,
-        receive_routes_address=15,
-        reader_tails_address=16,
-        sequence_address=17,
-        group_ready_address=18,
-        control_address=19,
+        delivery_pool_address=3,
+        expert_input_address=4,
+        expert_output_address=5,
+        return_inbox_address=6,
+        returned_address=7,
+        send_offsets_address=8,
+        send_rows_address=9,
+        send_origin_rows_address=10,
+        send_batches_address=11,
+        receive_batches_address=12,
+        receive_routes_address=13,
+        sequence_address=14,
+        group_ready_address=15,
+        control_address=16,
         row_bytes=1024,
         source_stride=1024,
         pool_stride=1024,
+        delivery_stride=1024,
         expert_row_stride=1024,
         return_stride=1024,
         expert_stride=16 * 1024,
@@ -72,11 +71,12 @@ def _config(**updates) -> PoolSliceConfig:
         local_readers=2,
         num_pes=2,
         my_pe=0,
-        queue_signal_base=0,
-        data_signal_base=2,
-        return_signal_base=4,
-        signal_count=6,
+        signal_base=0,
+        signal_count=2,
         return_capacity_rows=8,
+        pack_warps=2,
+        write_chunks=1,
+        write_chunk_rows=8,
     )
     values.update(updates)
     return PoolSliceConfig(**values)
@@ -108,6 +108,7 @@ def test_pool_slice_batch_abis_round_trip():
         active_rows=17,
         route_begin=4,
         route_end=11,
+        reader_counts=(2, 5, 0, 0, 0, 0, 0, 0),
         flags=PoolSliceBatchFlags.ERROR,
     )
     receive = PoolSliceReceiveBatch(
@@ -120,44 +121,51 @@ def test_pool_slice_batch_abis_round_trip():
         flags=PoolSliceBatchFlags.ERROR,
     )
 
-    assert len(publish.pack()) == POOL_SLICE_PUBLISH_BYTES
-    assert len(receive.pack()) == POOL_SLICE_RECEIVE_BYTES
+    assert len(publish.pack()) == POOL_SLICE_PUBLISH_BYTES == 64
+    assert len(receive.pack()) == POOL_SLICE_RECEIVE_BYTES == 48
     assert PoolSlicePublishBatch.unpack(publish.pack()) == publish
     assert PoolSliceReceiveBatch.unpack(receive.pack()) == receive
 
 
-def test_pool_slice_config_abi_and_ranges():
-    assert len(_config().pack()) == POOL_SLICE_CONFIG_BYTES
+def test_pack_warp_policy_preserves_receive_concurrency():
+    assert select_pool_slice_pack_warps(
+        num_pes=2, route_capacity=32, row_bytes=8192
+    ) == 4
+    assert select_pool_slice_pack_warps(
+        num_pes=2, route_capacity=128, row_bytes=8192
+    ) == 6
+    assert select_pool_slice_pack_warps(
+        num_pes=4, route_capacity=128, row_bytes=8192
+    ) == 4
+    assert select_pool_slice_pack_warps(
+        num_pes=8, route_capacity=128, row_bytes=8192
+    ) == 4
+    assert select_pool_slice_pack_warps(
+        num_pes=8, route_capacity=128, row_bytes=8192, requested=3
+    ) == 3
 
-    with pytest.raises(ValueError, match="data signal range"):
-        _config(data_signal_base=5).pack()
-    with pytest.raises(ValueError, match="signal ranges overlap"):
-        _config(data_signal_base=1).pack()
+
+def test_pool_slice_config_abi_and_ranges():
+    assert len(_config().pack()) == POOL_SLICE_CONFIG_BYTES == 208
+
+    with pytest.raises(ValueError, match="signal range"):
+        _config(signal_base=1).pack()
     with pytest.raises(ValueError, match="row_bytes"):
         _config(row_bytes=1008).pack()
+    with pytest.raises(ValueError, match="delivery rows"):
+        _config(delivery_stride=2048).pack()
     with pytest.raises(ValueError, match="expert_stride"):
         _config(expert_stride=15 * 1024).pack()
     with pytest.raises(ValueError, match="route_capacity"):
         _config(active_rows=9).pack()
     with pytest.raises(ValueError, match="PE range"):
         _config(my_pe=2).pack()
-    assert len(_config(flags=PoolSliceFlags.STREAMING_GATHER).pack()) == (
-        POOL_SLICE_CONFIG_BYTES
-    )
-    assert len(
-        _config(
-            flags=PoolSliceFlags.STREAMING_GATHER,
-            data_stages=2,
-            early_ready_rows=4,
-        ).pack()
-    ) == POOL_SLICE_CONFIG_BYTES
-    with pytest.raises(ValueError, match="strict row prefix"):
-        _config(
-            flags=PoolSliceFlags.STREAMING_GATHER,
-            data_stages=2,
-        ).pack()
-    with pytest.raises(ValueError, match="unsupported"):
-        _config(flags=2).pack()
+    with pytest.raises(ValueError, match="local_readers"):
+        _config(local_readers=POOL_SLICE_MAX_LOCAL_READERS + 1).pack()
+    with pytest.raises(ValueError, match="receive worker"):
+        _config(pack_warps=8).pack()
+    with pytest.raises(ValueError, match="write_chunks"):
+        _config(write_chunks=2).pack()
 
 
 def test_group_routes_is_stable_and_slice_offsets_are_composable():
@@ -172,8 +180,6 @@ def test_group_routes_is_stable_and_slice_offsets_are_composable():
     assert offsets.tolist() == [0, 2, 3, 4, 6]
     assert rows.tolist() == [11, 14, 13, 12, 10, 15]
     assert origins.tolist() == [21, 24, 23, 22, 20, 25]
-    # With two readers per PE, either pool slice can fetch one contiguous
-    # offsets span and then only its own route-row subspan.
     assert offsets[:3].tolist() == [0, 2, 3]
     assert offsets[2:].tolist() == [3, 4, 6]
 
@@ -185,7 +191,6 @@ def test_group_routes_supports_topk_and_explicit_zero_route_readers():
         source_rows=[0, 0, 1, 1],
         origin_rows=[0, 1, 2, 3],
     )
-
     assert offsets.tolist() == [0, 2, 2, 4, 4]
     assert rows.tolist() == [0, 1, 0, 1]
     assert origins.tolist() == [0, 2, 1, 3]
@@ -198,57 +203,48 @@ def test_group_routes_supports_topk_and_explicit_zero_route_readers():
     assert empty_origins.numel() == 0
 
 
-def test_pool_slice_instructions_are_communication_domain_operators():
+def test_pool_slice_exchange_is_a_macro_communication_operator():
     address = 0x123456789ABCDEF0
-    publish = PoolSlicePublish(address)
-    gather = PoolSliceGather(
-        address, write_barrier=7, dispatch_barrier_base=11
+    exchange = PoolSliceExchange(
+        address,
+        write_barrier=7,
+        dispatch_barrier_base=11,
+        compute_barrier_base=19,
     )
-    returned = PoolSliceReturn(address, compute_barrier_base=19)
-
-    assert _fields(publish)[:4] == [
-        comm_opcode.COMM_POOL_SLICE_PUBLISH,
-        0,
-        0,
-        0,
-    ]
-    assert _fields(gather)[:4] == [
-        comm_opcode.COMM_POOL_SLICE_GATHER,
+    assert _fields(exchange)[:4] == [
+        comm_opcode.COMM_POOL_SLICE_EXCHANGE,
         7,
         11,
-        0,
-    ]
-    assert _fields(returned)[:4] == [
-        comm_opcode.COMM_POOL_SLICE_RETURN,
         19,
-        0,
-        0,
     ]
-    for instruction in (publish, gather, returned):
-        assert isinstance(instruction, CommunicationInstruction)
-        assert instruction.requires_signal_array
+    assert isinstance(exchange, CommunicationInstruction)
+    assert exchange.requires_signal_array
 
 
 def test_pool_slice_timing_uses_only_vdcores_internal_events():
     profile = torch.zeros((3, 128), dtype=torch.uint64)
-    profile[0, POOL_SLICE_PROFILE_START] = 100
-    profile[0, POOL_SLICE_PROFILE_GATHER_READY] = 170
-    profile[0, POOL_SLICE_PROFILE_DONE] = 260
+    profile[1, POOL_SLICE_PROFILE_START] = 100
+    profile[1, POOL_SLICE_PROFILE_GATHER_READY] = 170
+    profile[1, POOL_SLICE_PROFILE_DONE] = 260
     program = PoolSliceProgram(
         launcher=SimpleNamespace(profile=profile),
         write_barrier=0,
         dispatch_barriers=(),
         compute_barriers=(),
         chunk_rows=1,
-        streaming_gather=True,
+        communication_block=1,
     )
 
     assert program.timing_ns() == (70, 90, 160)
-    profile[0, POOL_SLICE_PROFILE_DATA_PUBLISHED] = 120
-    profile[0, POOL_SLICE_PROFILE_FIRST_DATA_PUBLISHED] = 110
-    profile[0, POOL_SLICE_PROFILE_FIRST_PAYLOAD] = 130
-    profile[0, POOL_SLICE_PROFILE_METADATA_CLOSED] = 145
-    profile[0, POOL_SLICE_PROFILE_PAYLOAD_DONE] = 165
+    profile[1, POOL_SLICE_PROFILE_DATA_PUBLISHED] = 120
+    profile[1, POOL_SLICE_PROFILE_FIRST_DATA_PUBLISHED] = 110
+    profile[1, POOL_SLICE_PROFILE_FIRST_PAYLOAD] = 130
+    profile[1, POOL_SLICE_PROFILE_METADATA_CLOSED] = 145
+    profile[1, POOL_SLICE_PROFILE_PAYLOAD_DONE] = 165
+    profile[1, POOL_SLICE_PROFILE_COMPUTE_READY] = 180
+    profile[1, POOL_SLICE_PROFILE_RETURN_PAYLOAD_DONE] = 210
+    profile[1, POOL_SLICE_PROFILE_RETURN_SIGNALS_CLOSED] = 230
+    profile[1, POOL_SLICE_PROFILE_SCATTER_DONE] = 250
     assert program.overlap_timing_ns() == {
         "first_data_published": 10,
         "data_published": 20,
@@ -256,33 +252,50 @@ def test_pool_slice_timing_uses_only_vdcores_internal_events():
         "metadata_closed": 45,
         "payload_done": 65,
         "gather_ready": 70,
+        "compute_ready": 80,
+        "return_payload_done": 110,
+        "return_signals_closed": 130,
+        "scatter_done": 150,
     }
 
 
-def test_pool_program_keeps_all_communication_on_the_pool_block():
+def test_pool_program_is_only_vdcores_ops_and_uses_an_isolated_comm_block():
     source = _function_source(
         ROOT / "python" / "dae" / "pool_slice.py",
         "build_pool_slice_copy_program",
     )
-    assert "pool_builder.add_communication(PoolSlicePublish" in source
-    assert "pool_builder.add_communication(\n        PoolSliceGather" in source
-    assert "pool_builder.add_communication(\n        PoolSliceReturn" in source
-    assert "launcher.builder[1].add_communication(PoolSlicePublish" not in source
+    assert "communication_builder.add_communication(" in source
+    assert "PoolSliceExchange(" in source
+    assert "writer_builder.add_memory(TmaLoad1D" in source
+    assert "launcher.builder[local_reader + 2]" in source
+    assert "torch.cuda.Stream" not in source
+    assert "torch.cuda.Event" not in source
 
 
-def test_pool_mailbox_wait_is_warp_parallel():
+def test_pool_mailbox_scan_is_lane_parallel_and_uses_one_merged_word():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
-    assert "__ballot_sync(0xffffffffU, ready)" in source
-    assert "config.queue_signal_base" in source
-    assert "lane >= count" in source
+    assert "__ballot_sync(0xffffffffU, observed >= metadata_value)" in source
+    assert "__ballot_sync(0xffffffffU, observed >= data_value)" in source
+    assert "config.signal_base + lane" in source
+    assert "POOL_SLICE_SIGNAL_RETURN" in source
 
 
-def test_streaming_gather_intersects_independent_metadata_and_data_readiness():
+def test_macro_operator_batches_payload_and_uses_cooperative_quiet_per_direction():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
-    assert "queue_seen_mask" in source
-    assert "data_seen_mask" in source
-    assert (
-        "metadata_ready_mask & data_seen_mask & ~payload_issued_mask" in source
-    )
-    assert "poolSliceProfileFirstPayload" in source
-    assert "peak_inflight_sources" in source
+    assert "config.delivery_pool_address" in source
+    assert "route.row_count) * config.row_bytes" in source
+    assert "shared_dispatch_issued" in source
+    assert "shared_return_issued" in source
+    assert source.count("pool_slice_quiet(config.num_pes, thread_id);") == 2
+    assert "if (num_pes <= 2)" in source
+    assert "nvshmemi_quiet<NVSHMEMI_THREADGROUP_BLOCK>();" in source
+
+
+def test_runtime_specialization_does_not_change_the_ordinary_role_split():
+    source = (ROOT / "include" / "dae" / "dae2.cuh").read_text()
+    specialized = source.index("comminsts[0].opcode == COMM_POOL_SLICE_EXCHANGE")
+    ordinary = source.index("// start memory and computation execution")
+    assert specialized < ordinary
+    assert "pool_slice_exchange(" in source[specialized:ordinary]
+    context = (ROOT / "include" / "dae" / "context.cuh").read_text()
+    assert "static constexpr int numCommunicationWarps = 1;" in context

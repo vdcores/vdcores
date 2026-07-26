@@ -327,32 +327,23 @@ but rejects nonempty communication streams because it has no consumer warp.
   - `size | arg0 << 16` is the expected completion count;
   - lanes poll distinct mailboxes, ballot ready requests, execute one selected
     request cooperatively, then advance its dependency/completion state.
-- `COMM_EXPERT_POOL_RESET`: `address` is `EpPoolConfig`; `arg0` is the local
-  reset barrier to release.
-- `COMM_EXPERT_POOL_DISPATCH`: `size` is global expert; `arg0` is its dispatch
-  barrier to release after all source messages validate.
-- `COMM_EXPERT_POOL_RETURN`: `size` is global expert; `arg0` is the owner
-  compute barrier to await before output publication.
-- `COMM_POOL_SLICE_PUBLISH`: `address` is `PoolSliceConfig`; the source pool
-  core publishes one descriptor, including zero-route descriptors, to every
-  target slice's source-indexed queue.
-- `COMM_POOL_SLICE_GATHER`: `address` is `PoolSliceConfig`, `size` is the
-  source-pool write barrier, and `arg0` is the first contiguous reader dispatch
-  barrier. The pool warp polls sender queues and source readiness lane-parallel,
-  resolves contiguous reader ranges, and issues a source's gathered reads as
-  soon as both its descriptor and data ticket are ready. The default has one
-  final data stage; the optional two-stage config uses the same signal word for
-  first-write-chunk and final tickets. One final quiet precedes the shared
-  sender-set ticket and reader release.
-- `COMM_POOL_SLICE_RETURN`: `address` is `PoolSliceConfig`; `size` is the first
-  contiguous reader compute barrier. The pool warp returns per-source ranges,
-  waits one completion ticket per pool slice, and source-scatters by saved
-  provenance.
+- `COMM_POOL_SLICE_EXCHANGE` is a communication-specialized block macro:
+  - `address` is a `PoolSliceConfig` pointer;
+  - `size` is the first source-writer chunk barrier;
+  - `arg0` is the first contiguous reader-dispatch barrier;
+  - `arg1` is the first contiguous reader-compute barrier;
+  - it must be instruction zero in that block's communication stream;
+  - every thread enters the macro before normal compute/memory/communication
+    warp-role dispatch;
+  - it publishes route-count descriptors, packs source rows, performs batched
+    dynamic GETs, releases ordinary reader blocks, performs batched return
+    PUTs, waits merged return phases, and source-scatters the result;
+  - on return from the macro, the specialized block exits `dae2` rather than
+    executing the ordinary three virtual-core interpreters.
 
-Generic pool semantics are in `memory-pool-ep.md`; the optimized expert
-protocol and its ordering rules are in `expert-pool-v2.md`; pool-owned dynamic
-read semantics are in `pool-slice-dynamic-read.md` and
-`vdcores-communication-core.md`.
+Generic dependency semantics are in `memory-pool-protocol.md`. The batched gathered
+read ABI, warp roles, and ordering rules are in `pool-slice-dynamic-read.md`
+and `vdcores-communication-core.md`.
 
 ## Compute Operators
 

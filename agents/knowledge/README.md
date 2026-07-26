@@ -18,7 +18,7 @@ Use this directory as the first stop when a task needs stable repo context.
   - [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
   - [runtime/memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
   - [runtime/gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
-  - [runtime/memory-pool-ep.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-ep.md)
+  - [runtime/memory-pool-protocol.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-protocol.md)
 - Model/framework behavior:
   - [modeling/pytorch-kv-cache.md](/home1/11362/depctg/vdcores/agents/knowledge/modeling/pytorch-kv-cache.md)
 - Performance/debugging lessons:
@@ -47,5 +47,5 @@ Use this directory as the first stop when a task needs stable repo context.
   - read [nvshmem-runtime.md](/home1/11362/depctg/vdcores/agents/knowledge/nvshmem-runtime.md)
   - then follow [../workflows/nvshmem-tacc.md](/home1/11362/depctg/vdcores/agents/workflows/nvshmem-tacc.md)
 - If the task touches dependency-aware pool communication or expert routing:
-  - read [runtime/memory-pool-ep.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-ep.md)
-  - then follow [../workflows/memory-pool-ep.md](/home1/11362/depctg/vdcores/agents/workflows/memory-pool-ep.md)
+  - read [runtime/memory-pool-protocol.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-protocol.md)
+  - then follow [../workflows/memory-pool.md](/home1/11362/depctg/vdcores/agents/workflows/memory-pool.md)

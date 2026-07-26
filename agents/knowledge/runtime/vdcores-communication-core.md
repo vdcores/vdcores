@@ -1,163 +1,149 @@
 # VDCores Communication Core
 
-Communication is a third instruction domain inside the persistent `dae2`
-kernel. It is not an auxiliary kernel, host callback, or CUDA stream.
+Communication is an instruction domain inside the persistent `dae2` kernel.
+It is not an auxiliary kernel, host callback, or CUDA stream.
 
 ## VM Shape And Isolation
 
-The ordinary build is unchanged: four compute warps plus four memory warps,
-256 threads. `DAE_ENABLE_NVSHMEM` adds one communication warp, for 288 threads.
-Existing compute dispatch, allocation, store, and two load-warp roles retain
-their original code and relative warp ids.
+The optional NVSHMEM build has four compute warps, four memory warps, and one
+communication warp (288 threads). Existing compute dispatch, allocation,
+store, and load-warp ids and code paths are unchanged. A normal block consumes
+independent compute, memory, and communication instruction streams.
 
-Each block consumes three independent instruction streams:
+`CommInst` is a 16-byte instruction containing four 16-bit fields and one
+64-bit address. It has no allocator flags, consumes no shared-memory slots, and
+never enters the memory/compute queues. Opcode zero terminates, so an untouched
+communication stream is inert.
 
-| Domain | ABI | Capacity | Consumer |
-|---|---:|---:|---|
-| compute | `CInst`, 8 B | 512 | four-warp compute group |
-| memory | `MInst`, 16 B | 512 | alloc/store/load warps |
-| communication | `CommInst`, 16 B | 32 | optional communication warp |
+The unified pool hot path uses one isolated exception. If the first
+communication instruction is `COMM_POOL_SLICE_EXCHANGE`, every thread in that
+block enters the communication macro before the normal warp-role split. The
+same nine resident warps temporarily become one coordinator, configurable pack
+workers, and receive/return workers. Other blocks and all existing operators
+continue through the ordinary VM paths unchanged.
 
-`CommInst` has `opcode`, three 16-bit operands, and one 64-bit HBM address. It
-has no allocator flag bits and never consumes a shared-memory slot or enters a
-load/store queue. Zero is `COMM_TERMINATE`, so an untouched communication
-buffer is inert for existing programs.
+The single `Launcher.launch_dae` call always carries all instruction streams.
+There are no direct pool-kernel bindings. VDCores timing writes only the
+existing per-block `g_events` profile space. NCCL and CUDA-event timing live
+strictly under `benchmarks/`.
 
-The communication ISA is defined in
-`include/dae/communication_opcode.cuh.inc`:
+## Unified Batched Protocol
 
-- barrier wait and device timestamp;
-- corrected NVSHMEM put/wait primitives;
-- generic dependency-pool submit/wait/run;
-- expert-pool reset/dispatch/return;
-- pool-slice publish/gather/return.
+Each PE owns one logical pool slice and one communication-specialized block.
+The source metadata is stable-grouped by destination PE and local reader.
 
-`Launcher` always passes all three streams to the single `launch_dae` call.
-Communication instructions are rejected unless the optional runtime was
-built. There are no direct `launch_ep_pool_*` or control-kernel bindings.
+1. An ordinary VDCores writer block copies every active source row exactly
+   once into source-owned token slots and releases one barrier per TMA-sized
+   write chunk.
+2. The pool block builds one 64-byte descriptor per target. It embeds counts
+   for up to eight target-local readers, including a valid zero-row batch.
+3. Coordinator warp 0 publishes descriptors while pack warps wait only for the
+   source chunk containing their next row and copy routed rows into one
+   route-major symmetric delivery buffer. There is deliberately no block
+   barrier between descriptor publication and pack/receive work.
+4. Receive workers claim metadata-ready sources dynamically. Once that
+   source's data phase arrives, a worker issues one contiguous NBI GET for each
+   nonempty `(source, local_reader)` range. Multiple source batches remain in
+   flight until one dispatch quiet.
+5. The coordinator advances the shared group ticket and releases ordinary
+   reader blocks only after all source batches complete.
+6. After reader compute barriers retire, communication workers issue one
+   contiguous NBI PUT for each nonempty return range. One quiet completes all
+   return payloads.
+7. Every slice publishes its return phase. Once the source observes all return
+   phases, all nine warps scatter route-major inbox rows to saved origin rows.
 
-VDCores timing uses only `COMM_RECORD_EVENT` writes to the existing per-block
-`g_events` profile space. Backend comparisons and their timing mechanisms live
-under `benchmarks/`; NCCL and CUDA-event timing are not runtime operators or
-application dependencies.
+This is a dependent gathered read, not a special EP transport. Route metadata
+names which source slots each dynamic reader consumes; the shared sender set
+and sequence determine when the read can retire.
 
-## Code-Generation Boundary
+## HBM ABI And Merged Signals
 
-Relocatable NVSHMEM device calls and inline WGMMA in one function cause ptxas
-to insert conservative WGMMA serialization. In the optional build only, the
-WGMMA GEMV/GEMM/attention task bodies are no-inline boundaries. The ordinary
-build keeps their original force-inline definitions.
+All remotely addressed buffers use same-order NVSHMEM symmetric allocations.
+The hot path uses:
 
-Nine Hopper warps place three warps on one SM subpartition. The optional build
-therefore uses `-maxrregcount=168`; without it the final NVSHMEM device link
-raises the kernel to 254 registers/thread and launch fails. The EP WGMMA GEMV
-fits the limit with zero spills. Always inspect the final linked extension,
-not only pre-link ptxas output.
+- source token slots and a route-major delivery buffer;
+- one descriptor array indexed by source PE;
+- one local receive record per `(reader, source)`;
+- contiguous reader input/output regions;
+- a source return inbox and saved origin-row array;
+- one source-indexed signal word per PE.
 
-## Minimal EP Contract
+The signal word carries three monotonic values per sequence: metadata visible,
+packed data visible, and returned data visible. Thus one `P`-word range replaces
+three independent signal arrays. A target can retire a zero-row source after
+metadata validation; nonempty sources also wait for data. All readers with the
+same sender set share the group-ready ticket, so there is no epoch-end message.
 
-- one block per global expert, all resident concurrently;
-- `num_experts <= physical SM count <= 132`;
-- at most 32 PEs, so one lane polls one source;
-- contiguous rows, at least 1 KiB, 16-byte aligned, byte width divisible by 16;
-- stable expert-grouped route offsets, source rows, and return rows in HBM;
-- one outstanding sequence per buffer set, with strictly increasing sequence
-  values;
-- fixed-capacity, separately allocated message buffers; no fragmentation or
-  byte-tail path.
+The baseline permits one outstanding sequence per buffer set. More overlap is
+obtained by overlapping work within that sequence, not by adding unbounded
+mailboxes or fragmented allocation.
 
-These assumptions match common inference activation rows and keep the hot path
-to one vector-copy and one contiguous RMA form.
+## Warp Roles
 
-## Pool-Slice Dynamic Read
+- warp 0: descriptor/signal publication, lane-parallel phase polling, reader
+  release, compute-barrier polling, and phase timestamps;
+- warps `1..pack_warps`: route-major packing, each row waiting only for its
+  writer-chunk barrier;
+- remaining warps: dynamic source claims, contiguous dispatch GETs, and
+  contiguous return PUTs;
+- all nine warps: final source scatter.
 
-The newer protocol uses one pool block per PE instead of one owner block per
-global expert. Block 0's communication warp performs all publication, queue
-scan, dependency resolution, gathered reads, and return/scatter operations.
-Reader blocks have no communication instructions; their memory VMs wait on
-pool-released barriers.
+`pack_warps=0` selects the measured policy. It uses four pack/four receive
+warps for small payloads and for four or more PEs, and six pack/two receive
+warps for a large two-PE buffer. An explicit config value overrides the policy
+without changing the base VM.
 
-Every source pool publishes exactly one descriptor to every target slice,
-including an empty descriptor. Queue signal `source_pe` is the sender's
-monotonic ticket on that target. Consuming all `P` tickets advances one local
-`group_ready` sequence shared by every dynamic reader, so there is no
-reader-specific epoch-end message. Source data readiness and return completion
-each use another `P`-entry signal range, for a total baseline signal footprint
-of `3P` words per PE. Optional early/final source readiness reuses each data
-word with monotonic staged values.
+## Ordering Contract
 
-The three `P`-word signal ranges must be disjoint. Queue and data-ready slots
-are source-indexed; return slots are producing-slice-indexed. Plain reciprocal
-signal phases need no extra local quiet because every peer waits on the full
-set. Payload RMAs are quieted before their completion dependency is published.
+1. A descriptor is published with put-with-signal, so observing its metadata
+   value makes the full cache-line record consumable. After lane-parallel
+   publication, coordinator lane 0 fences before any later data-phase update;
+   in the pinned IBGDA 3.4 implementation this fence walks the active RC/DCI
+   QPs when more than one exists, so it also orders descriptors issued by the
+   peer lanes before the merged signal word advances.
+2. Pack-lane writes are system-fenced before the coordinator publishes the
+   data phase.
+3. A worker issues only after both descriptor validation and data readiness.
+4. All dispatch RMAs are nonblocking; an adaptive quiet completes them before
+   the group ticket and reader barriers are released. One remote peer uses
+   lane-0 quiet; three or more PEs use the pinned NVSHMEM block-cooperative
+   quiet so lanes share QP completion polling.
+5. Reader completion barriers order ordinary VDCores stores before return
+   workers read expert output.
+6. All return RMAs are nonblocking; a quiet precedes return-phase publication.
+7. Observing all return phases makes every source inbox range consumable before
+   scatter.
+8. Signal comparisons use `>=` and sequence-derived values. Signal words are
+   monotonic and are not cleared between phases.
 
-Token rows remain in the source slice and are copied there once. A route table
-may name one source row multiple times for top-k fan-out. The target pool pulls
-only its stable-grouped metadata span, assigns receiver-owned contiguous rows,
-and issues nonblocking gets from the named source slots. See
-`pool-slice-dynamic-read.md` for the HBM ABI and optimization order.
+Local CUDA barriers order VDCores blocks; NVSHMEM signals and quiet establish
+remote visibility. They are deliberately not treated as interchangeable.
 
-## Dependency Structure
+## Transport Boundary
 
-Global barrier words connect the three local VDCores domains. Monotonic HBM
-signals connect PEs.
+The installed Vista NVSHMEM 3.4.5 build exposes IBGDA environment mapping but
+not application-created QP handles. The macro keeps source batches independent
+and NBI so IBGDA can use its RC/DCI transport. Final 8-PE sweeps favored
+`NVSHMEM_IBGDA_NUM_RC_PER_PE=1` and `NVSHMEM_IBGDA_RC_MAP_BY=cta`; two and four
+RCs with warp mapping were slower. One communication block with four receive
+workers also beat three- and five-pack-warp alternatives. A second pool SM is
+therefore not justified by the measured issue rate and would add a new
+cross-core completion protocol.
 
-```text
-communication: reset -> dispatch(e) ------------> return(e) -> terminate
-memory(owner):           wait dispatch -> loads -------------> stores
-compute(owner):                          expert operators
-                                           |
-                                  last store releases
-                                  compute_barrier[e]
-```
-
-Reset is also explicit message traffic. Block 0 clears local tails/control,
-sends reset-ready sequence `reset_base + my_pe` to every PE, polls all local
-source slots warp-parallel, and releases a local reset barrier. Other expert
-blocks wait on that barrier. No NVSHMEM collective is hidden in the protocol.
-
-Dispatch on the owner releases `dispatch_barrier[e]` only after all source
-signals and descriptors validate. The owner memory stream waits on that word.
-The final expert store releases `compute_barrier[e]`; only the owner return
-warp waits on it. Nonowners wait directly for their return signal.
-
-If routing is produced inside the same larger program, the routing operator
-can release another ordinary barrier and place `CommWaitBarrier` before
-`ExpertPoolDispatch`. The checked-in harness prepares routes before launch.
-
-## Ordering Rules
-
-The protocol deliberately distinguishes local CUDA ordering from remote
-NVSHMEM completion:
-
-1. Reset system-fences local symmetric tail/control clears before publishing
-   reset-ready to remote PEs.
-2. Local direct gathers/scatters use `__syncwarp`, `__threadfence`, then a
-   local atomic signal.
-3. A remote 48-byte descriptor uses a blocking warp put. It is issued before
-   row packing, so its remote progress overlaps the gather.
-4. After packing, `nvshmem_fence` orders that blocking descriptor before one
-   nonblocking data-put-with-signal.
-5. Observing the put-with-signal flag means that payload is delivered; a plain
-   signal is never used as completion for an unordered NBI payload.
-6. Return issues one put-with-signal per source and performs one quiet after
-   all peer batches, making expert output reusable when the VDCores program
-   exits.
-7. Signal comparisons use `>= sequence`; buffers require monotonically
-   increasing sequences and are not cleared between phases.
-
-Generic pool requests use put-with-signal for their 128-byte mailbox record,
-warp-parallel mailbox polling, a quiet after request data movement, dependency
-ticket update, and then completion signal.
+NVSHMEM device calls remain behind communication-only function boundaries.
+The optional build preserves the WGMMA no-inline boundary and register cap;
+always inspect the final linked extension for WGMMA diagnostics, entry spills,
+and launch-resource growth.
 
 ## Entry Files
 
 - VM/ISA: `include/dae/context.cuh`, `include/dae/dae2.cuh`,
   `include/dae/pipeline/commwarp.cuh`
-- generic pool: `include/dae/memory_pool.cuh`, `python/dae/memory_pool.py`
-- expert pool: `include/dae/ep_pool_abi.cuh`, `include/dae/ep_pool.cuh`,
-  `python/dae/ep_pool.py`
-- pool-slice dynamic read: `include/dae/pool_slice_abi.cuh`,
+- generic mailbox pool: `include/dae/memory_pool.cuh`,
+  `python/dae/memory_pool.py`
+- batched dynamic read: `include/dae/pool_slice_abi.cuh`,
   `include/dae/pool_slice.cuh`, `python/dae/pool_slice.py`
 - encoding/launch: `python/dae/instructions.py`, `python/dae/launcher.py`
-- correctness/benchmark: `app/python/memory_pool/`
+- correctness app: `app/python/memory_pool/pool_slice_dynamic_read.py`
+- external comparison: `benchmarks/pool_slice_nccl_compare.py`

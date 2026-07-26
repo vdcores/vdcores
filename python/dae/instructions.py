@@ -985,75 +985,13 @@ class MemoryPoolRun(CommunicationInstruction):
         )
 
 
-class ExpertPoolReset(CommunicationInstruction):
-    requires_signal_array = True
+class PoolSliceExchange(CommunicationInstruction):
+    """Run the batched dependent-read/return loop on a pool communication core.
 
-    def __init__(self, config_tensor: torch.Tensor | int, release_barrier: int):
-        if not 0 <= release_barrier < 2**16:
-            raise ValueError("release_barrier must fit in uint16")
-        super().__init__(
-            comm_opcode.COMM_EXPERT_POOL_RESET,
-            arg0=release_barrier,
-            address=_control_pointer(config_tensor, "config_tensor"),
-        )
-
-
-class ExpertPoolDispatch(CommunicationInstruction):
-    requires_signal_array = True
-
-    def __init__(
-        self,
-        config_tensor: torch.Tensor | int,
-        global_expert: int,
-        release_barrier: int,
-    ):
-        if not 0 <= global_expert < 2**16:
-            raise ValueError("global_expert must fit in uint16")
-        if not 0 <= release_barrier < 2**16:
-            raise ValueError("release_barrier must fit in uint16")
-        super().__init__(
-            comm_opcode.COMM_EXPERT_POOL_DISPATCH,
-            size=global_expert,
-            arg0=release_barrier,
-            address=_control_pointer(config_tensor, "config_tensor"),
-        )
-
-
-class ExpertPoolReturn(CommunicationInstruction):
-    requires_signal_array = True
-
-    def __init__(
-        self,
-        config_tensor: torch.Tensor | int,
-        global_expert: int,
-        wait_barrier: int,
-    ):
-        if not 0 <= global_expert < 2**16:
-            raise ValueError("global_expert must fit in uint16")
-        if not 0 <= wait_barrier < 2**16:
-            raise ValueError("wait_barrier must fit in uint16")
-        super().__init__(
-            comm_opcode.COMM_EXPERT_POOL_RETURN,
-            size=global_expert,
-            arg0=wait_barrier,
-            address=_control_pointer(config_tensor, "config_tensor"),
-        )
-
-
-class PoolSlicePublish(CommunicationInstruction):
-    """Publish one source-owned route batch to every logical pool slice."""
-
-    requires_signal_array = True
-
-    def __init__(self, config_tensor: torch.Tensor | int):
-        super().__init__(
-            comm_opcode.COMM_POOL_SLICE_PUBLISH,
-            address=_control_pointer(config_tensor, "config_tensor"),
-        )
-
-
-class PoolSliceGather(CommunicationInstruction):
-    """Run pool-owned metadata ingestion and dynamic gathered reads."""
+    This macro instruction must be the first communication instruction of its
+    block. The runtime then gives all existing block warps to the operator
+    until the complete write/read/return dependency chain retires.
+    """
 
     requires_signal_array = True
 
@@ -1063,35 +1001,19 @@ class PoolSliceGather(CommunicationInstruction):
         *,
         write_barrier: int,
         dispatch_barrier_base: int,
+        compute_barrier_base: int,
     ):
         if not 0 <= write_barrier < 2**16:
             raise ValueError("write_barrier must fit in uint16")
         if not 0 <= dispatch_barrier_base < 2**16:
             raise ValueError("dispatch_barrier_base must fit in uint16")
-        super().__init__(
-            comm_opcode.COMM_POOL_SLICE_GATHER,
-            size=write_barrier,
-            arg0=dispatch_barrier_base,
-            address=_control_pointer(config_tensor, "config_tensor"),
-        )
-
-
-class PoolSliceReturn(CommunicationInstruction):
-    """Return reader outputs and source-scatter them under pool ownership."""
-
-    requires_signal_array = True
-
-    def __init__(
-        self,
-        config_tensor: torch.Tensor | int,
-        *,
-        compute_barrier_base: int,
-    ):
         if not 0 <= compute_barrier_base < 2**16:
             raise ValueError("compute_barrier_base must fit in uint16")
         super().__init__(
-            comm_opcode.COMM_POOL_SLICE_RETURN,
-            size=compute_barrier_base,
+            comm_opcode.COMM_POOL_SLICE_EXCHANGE,
+            size=write_barrier,
+            arg0=dispatch_barrier_base,
+            arg1=compute_barrier_base,
             address=_control_pointer(config_tensor, "config_tensor"),
         )
 
@@ -1319,12 +1241,7 @@ __all__ = [
     "MemoryPoolSubmit",
     "MemoryPoolWait",
     "MemoryPoolRun",
-    "ExpertPoolReset",
-    "ExpertPoolDispatch",
-    "ExpertPoolReturn",
-    "PoolSlicePublish",
-    "PoolSliceGather",
-    "PoolSliceReturn",
+    "PoolSliceExchange",
     "CC0",
     "RegStore",
     "RegLoad",

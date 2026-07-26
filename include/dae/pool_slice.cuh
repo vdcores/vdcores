@@ -9,9 +9,33 @@
 
 #include <nvshmem.h>
 #include <nvshmemx.h>
+#include <non_abi/device/common/nvshmemi_common_device.cuh>
 
 #include <cstddef>
 #include <cstdint>
+
+// NVSHMEM 3.4 does not publish a cooperative quiet wrapper, although its
+// pinned device implementation exposes the scope-generic primitive. Keep the
+// non-ABI dependency in this isolated helper so the pool macro can distribute
+// QP completion work without changing any base VDCores operator.
+static __device__ __forceinline__ void pool_slice_quiet_block() {
+#ifdef __CUDA_ARCH__
+  nvshmemi_quiet<NVSHMEMI_THREADGROUP_BLOCK>();
+#endif
+}
+
+static __device__ __forceinline__ void pool_slice_quiet(
+    uint32_t num_pes, uint32_t thread_id) {
+  // One remote peer has only one useful RC queue in the recommended profile;
+  // a block-wide cooperative quiet costs more than lane 0 polling that queue.
+  if (num_pes <= 2) {
+    if (thread_id == 0)
+      nvshmem_quiet();
+    __syncthreads();
+    return;
+  }
+  pool_slice_quiet_block();
+}
 
 static __device__ __forceinline__ void pool_slice_set_status(
     const PoolSliceConfig& config, PoolSliceStatus status) {
@@ -32,24 +56,15 @@ static __device__ __forceinline__ bool pool_slice_u64_product_fits(
   return true;
 }
 
-static __device__ __forceinline__ bool pool_slice_signal_range_fits(
-    uint32_t base, uint32_t count, uint32_t capacity) {
-  return base <= capacity && count <= capacity - base;
-}
-
-static __device__ __forceinline__ bool pool_slice_signal_ranges_disjoint(
-    uint32_t left,
-    uint32_t right,
-    uint32_t count) {
-  return static_cast<uint64_t>(left) + count <= right ||
-      static_cast<uint64_t>(right) + count <= left;
-}
-
 static __device__ __forceinline__ bool pool_slice_valid_config(
     const PoolSliceConfig& config) {
+  constexpr uint32_t total_warps =
+      numComputeWarps + numMemoryWarps + numCommunicationWarps;
+  constexpr uint32_t worker_warps = total_warps - 1;
   uint64_t required_expert_bytes = 0;
   return config.source_address != 0 &&
       config.token_pool_address != 0 &&
+      config.delivery_pool_address != 0 &&
       config.expert_input_address != 0 &&
       config.expert_output_address != 0 &&
       config.return_inbox_address != 0 &&
@@ -59,10 +74,7 @@ static __device__ __forceinline__ bool pool_slice_valid_config(
       config.send_origin_rows_address != 0 &&
       config.send_batches_address != 0 &&
       config.receive_batches_address != 0 &&
-      config.offsets_inbox_address != 0 &&
-      config.rows_inbox_address != 0 &&
       config.receive_routes_address != 0 &&
-      config.reader_tails_address != 0 &&
       config.sequence_address != 0 &&
       config.group_ready_address != 0 &&
       config.control_address != 0 &&
@@ -72,6 +84,7 @@ static __device__ __forceinline__ bool pool_slice_valid_config(
       config.source_stride % poolSliceAlignmentBytes == 0 &&
       config.pool_stride >= config.row_bytes &&
       config.pool_stride % poolSliceAlignmentBytes == 0 &&
+      config.delivery_stride == config.row_bytes &&
       config.expert_row_stride == config.row_bytes &&
       config.return_stride >= config.row_bytes &&
       config.return_stride % poolSliceAlignmentBytes == 0 &&
@@ -80,53 +93,44 @@ static __device__ __forceinline__ bool pool_slice_valid_config(
       config.route_capacity != 0 &&
       config.expert_capacity_rows != 0 &&
       config.local_readers != 0 &&
-      config.local_readers < 132 &&
+      config.local_readers <= poolSliceMaxLocalReaders &&
       config.num_pes != 0 &&
       config.num_pes <= poolSliceMaxPes &&
       config.my_pe < config.num_pes &&
+      config.signal_base <= config.signal_count &&
+      config.num_pes <= config.signal_count - config.signal_base &&
       config.return_capacity_rows != 0 &&
-      (config.flags & ~POOL_SLICE_FLAGS_STREAMING_GATHER) == 0 &&
-      (config.data_stages == 1 || config.data_stages == 2) &&
-      ((config.data_stages == 1 && config.early_ready_rows == 0) ||
-       (config.data_stages == 2 &&
-        (config.flags & POOL_SLICE_FLAGS_STREAMING_GATHER) != 0 &&
-        config.early_ready_rows != 0 &&
-        config.early_ready_rows < config.token_capacity)) &&
+      config.pack_warps != 0 &&
+      config.pack_warps < worker_warps &&
+      config.write_chunks != 0 &&
+      config.write_chunk_rows != 0 &&
+      config.write_chunks ==
+          (config.token_capacity + config.write_chunk_rows - 1) /
+              config.write_chunk_rows &&
       pool_slice_u64_product_fits(
           config.expert_capacity_rows,
           config.expert_row_stride,
           &required_expert_bytes) &&
       config.expert_stride >= required_expert_bytes &&
-      config.expert_stride % poolSliceAlignmentBytes == 0 &&
-      pool_slice_signal_range_fits(
-          config.queue_signal_base, config.num_pes, config.signal_count) &&
-      pool_slice_signal_range_fits(
-          config.data_signal_base, config.num_pes, config.signal_count) &&
-      pool_slice_signal_range_fits(
-          config.return_signal_base, config.num_pes, config.signal_count) &&
-      pool_slice_signal_ranges_disjoint(
-          config.queue_signal_base, config.data_signal_base, config.num_pes) &&
-      pool_slice_signal_ranges_disjoint(
-          config.queue_signal_base, config.return_signal_base, config.num_pes) &&
-      pool_slice_signal_ranges_disjoint(
-          config.data_signal_base, config.return_signal_base, config.num_pes);
+      config.expert_stride % poolSliceAlignmentBytes == 0;
 }
 
 static __device__ __forceinline__ uint64_t pool_slice_sequence(
     const PoolSliceConfig& config) {
-  auto* sequence = reinterpret_cast<unsigned long long*>(
+  const auto* sequence = reinterpret_cast<const unsigned long long*>(
       config.sequence_address);
-  return atomicAdd(sequence, 0ULL);
+  return atomicAdd(
+      const_cast<unsigned long long*>(sequence),
+      static_cast<unsigned long long>(0));
 }
 
-static __device__ __forceinline__ uint64_t pool_slice_data_signal_value(
-    uint64_t sequence,
-    uint32_t completed_stages,
-    uint32_t data_stages) {
-  return sequence * data_stages - (data_stages - completed_stages);
+static __device__ __forceinline__ uint64_t pool_slice_signal_value(
+    uint64_t sequence, PoolSliceSignalPhase phase) {
+  return (sequence - 1) * poolSliceSignalPhases +
+      static_cast<uint32_t>(phase);
 }
 
-// The hot data path deliberately supports only aligned, fixed-width LLM rows.
+// The hot path deliberately supports fixed-width, aligned LLM rows.
 static __device__ __forceinline__ void pool_slice_copy_warp(
     void* destination,
     const void* source,
@@ -141,12 +145,13 @@ static __device__ __forceinline__ void pool_slice_copy_warp(
       dst_bytes[index] = src_bytes[index];
     return;
   }
+
   auto* dst = reinterpret_cast<uint4*>(destination);
   const auto* src = reinterpret_cast<const uint4*>(source);
   const uint64_t vectors = bytes / sizeof(uint4);
-  constexpr uint64_t copyIlp = 4;
+  constexpr uint64_t copy_ilp = 4;
   uint64_t index = lane;
-  for (; index + (copyIlp - 1) * 32 < vectors; index += copyIlp * 32) {
+  for (; index + (copy_ilp - 1) * 32 < vectors; index += copy_ilp * 32) {
     const uint4 value0 = src[index];
     const uint4 value1 = src[index + 32];
     const uint4 value2 = src[index + 64];
@@ -194,34 +199,53 @@ static __device__ __forceinline__ void pool_slice_put_nbi_warp(
       destination, source, static_cast<size_t>(bytes), target_pe);
 }
 
-static __device__ __forceinline__ void pool_slice_complete_warp(
-    uint32_t lane) {
-  __syncwarp();
-  if (lane == 0) {
-    __threadfence_system();
-    nvshmem_quiet();
-  }
-  __syncwarp();
-}
-
-static __device__ __forceinline__ void pool_slice_publish_signal(
+static __device__ __forceinline__ void pool_slice_publish_phase_parallel(
     uint64_t* signal_array,
     uint32_t signal_id,
-    uint64_t sequence,
-    uint32_t target_pe,
+    uint64_t value,
     uint32_t my_pe,
+    uint32_t num_pes,
     uint32_t lane) {
+  if (num_pes <= 2) {
+    for (uint32_t index = 0; index < num_pes; ++index) {
+      const uint32_t unwrapped = index + my_pe + 1;
+      const uint32_t target_pe =
+          unwrapped >= num_pes ? unwrapped - num_pes : unwrapped;
+      __syncwarp();
+      if (lane == 0) {
+        if (target_pe == my_pe) {
+          __threadfence_system();
+          atomicExch(
+              reinterpret_cast<unsigned long long*>(
+                  signal_array + signal_id),
+              static_cast<unsigned long long>(value));
+        } else {
+          nvshmemx_signal_op(
+              signal_array + signal_id,
+              value,
+              NVSHMEM_SIGNAL_SET,
+              target_pe);
+        }
+      }
+    }
+    __syncwarp();
+    return;
+  }
+
   __syncwarp();
-  if (lane == 0) {
+  if (lane < num_pes) {
+    const uint32_t unwrapped = lane + my_pe + 1;
+    const uint32_t target_pe =
+        unwrapped >= num_pes ? unwrapped - num_pes : unwrapped;
     if (target_pe == my_pe) {
       __threadfence_system();
       atomicExch(
           reinterpret_cast<unsigned long long*>(signal_array + signal_id),
-          static_cast<unsigned long long>(sequence));
+          static_cast<unsigned long long>(value));
     } else {
       nvshmemx_signal_op(
           signal_array + signal_id,
-          sequence,
+          value,
           NVSHMEM_SIGNAL_SET,
           target_pe);
     }
@@ -229,46 +253,11 @@ static __device__ __forceinline__ void pool_slice_publish_signal(
   __syncwarp();
 }
 
-static __device__ __forceinline__ void pool_slice_wait_signals_warp(
-    uint64_t* signal_array,
-    uint32_t signal_base,
-    uint64_t sequence,
-    uint32_t count,
-    uint32_t lane) {
-  bool ready = lane >= count;
-  while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
-    if (!ready)
-      ready = nvshmem_signal_fetch(signal_array + signal_base + lane) >= sequence;
-    if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
-      __nanosleep(barrierPollSleepCycles);
-  }
-}
-
-static __device__ __forceinline__ void pool_slice_wait_barriers_warp(
-    int* bars,
-    uint32_t barrier_base,
-    uint32_t count,
-    uint32_t lane) {
-  for (uint32_t base = 0; base < count; base += 32) {
-    const uint32_t index = base + lane;
-    bool ready = index >= count;
-    while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
-      if (!ready)
-        ready = *reinterpret_cast<volatile int*>(bars + barrier_base + index) == 0;
-      if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
-        __nanosleep(barrierPollSleepCycles);
-    }
-  }
-}
-
 static __device__ __forceinline__ uint32_t pool_slice_pe_mask(
     uint32_t num_pes) {
   return num_pes == 32 ? 0xffffffffU : (1U << num_pes) - 1U;
 }
 
-// Rotate the PE order so remote operations are issued before the synchronous
-// local HBM copy. This leaves the local copy as useful overlap for remote NBI
-// traffic and avoids making PE 0 the systematic rank-max straggler.
 static __device__ __forceinline__ uint32_t pool_slice_remote_first_pe(
     uint32_t index,
     uint32_t my_pe,
@@ -278,9 +267,7 @@ static __device__ __forceinline__ uint32_t pool_slice_remote_first_pe(
 }
 
 static __device__ __forceinline__ void pool_slice_record_profile(
-    uint64_t* g_events,
-    uint32_t event,
-    uint32_t lane) {
+    uint64_t* g_events, uint32_t event, uint32_t lane) {
   if (g_events != nullptr && lane == 0) {
     g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents + event] =
         cuda::ptx::get_sreg_globaltimer();
@@ -288,994 +275,652 @@ static __device__ __forceinline__ void pool_slice_record_profile(
   __syncwarp();
 }
 
-// Transport-only producer action. Route semantics are not executed here: the
-// source only publishes one descriptor into each target pool slice's own
-// per-source mailbox.
-static __device__ __noinline__ void pool_slice_publish(
-    const PoolSliceConfig* config_pointer,
-    uint64_t* signal_array,
+static __device__ __forceinline__ void pool_slice_record_first_payload(
+    uint64_t* g_events,
+    uint32_t* recorded,
     uint32_t lane) {
-  __shared__ PoolSliceConfig shared_config;
-  if (config_pointer == nullptr || signal_array == nullptr)
-    return;
-  if (lane == 0)
-    shared_config = *config_pointer;
+  if (lane == 0 && atomicCAS(recorded, 0U, 1U) == 0U &&
+      g_events != nullptr) {
+    g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+             poolSliceProfileFirstPayload] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
   __syncwarp();
+}
+
+// A communication-specialized VDCores macro operation. It is invoked by every
+// thread in a block selected by COMM_POOL_SLICE_EXCHANGE. The normal block
+// shape remains 4 compute + 4 memory + 1 communication warp; this operator
+// temporarily gives all nine warps communication roles without changing any
+// ordinary virtual-core implementation.
+static __device__ __noinline__ void pool_slice_exchange(
+    const PoolSliceConfig* config_pointer,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* g_events,
+    uint32_t write_barrier,
+    uint32_t dispatch_barrier_base,
+    uint32_t compute_barrier_base,
+    uint32_t thread_id) {
+  constexpr uint32_t total_warps =
+      numComputeWarps + numMemoryWarps + numCommunicationWarps;
+
+  __shared__ PoolSliceConfig shared_config;
+  __shared__ uint32_t shared_status;
+  __shared__ uint32_t shared_metadata_mask;
+  __shared__ uint32_t shared_data_mask;
+  __shared__ uint32_t shared_source_state[poolSliceMaxPes];
+  __shared__ uint32_t shared_pack_done;
+  __shared__ uint32_t shared_dispatch_issued;
+  __shared__ uint32_t shared_return_next;
+  __shared__ uint32_t shared_return_issued;
+  __shared__ uint32_t shared_first_payload;
+  __shared__ uint32_t shared_payload_sources;
+  __shared__ uint32_t shared_dispatch_batches;
+  __shared__ unsigned long long
+      shared_reader_tails[poolSliceMaxLocalReaders];
+
+  if (config_pointer == nullptr || bars == nullptr || signal_array == nullptr)
+    return;
+
+  const uint32_t lane = thread_id & 31U;
+  const uint32_t warp = thread_id >> 5;
+  if (thread_id == 0)
+    shared_config = *config_pointer;
+  __syncthreads();
   const PoolSliceConfig& config = shared_config;
   if (!pool_slice_valid_config(config)) {
-    if (lane == 0)
+    if (thread_id == 0)
       pool_slice_set_status(config, POOL_SLICE_STATUS_BAD_CONFIG);
-    __syncwarp();
     return;
   }
 
   const uint64_t sequence = pool_slice_sequence(config);
+  if (sequence == 0 ||
+      sequence - 1 >
+          (UINT64_MAX - poolSliceSignalPhases) / poolSliceSignalPhases) {
+    if (thread_id == 0)
+      pool_slice_set_status(config, POOL_SLICE_STATUS_SEQUENCE);
+    return;
+  }
+
+  const uint64_t metadata_value = pool_slice_signal_value(
+      sequence, POOL_SLICE_SIGNAL_METADATA);
+  const uint64_t data_value = pool_slice_signal_value(
+      sequence, POOL_SLICE_SIGNAL_DATA);
+  const uint64_t return_value = pool_slice_signal_value(
+      sequence, POOL_SLICE_SIGNAL_RETURN);
+  const uint32_t expected_mask = pool_slice_pe_mask(config.num_pes);
+  auto* control = reinterpret_cast<unsigned long long*>(config.control_address);
+  auto* group_ready = reinterpret_cast<unsigned long long*>(
+      config.group_ready_address);
   auto* send_batches = reinterpret_cast<PoolSlicePublishBatch*>(
       config.send_batches_address);
   auto* receive_batches = reinterpret_cast<PoolSlicePublishBatch*>(
       config.receive_batches_address);
+  auto* receive_routes = reinterpret_cast<PoolSliceReceiveBatch*>(
+      config.receive_routes_address);
   const auto* send_offsets = reinterpret_cast<const uint32_t*>(
       config.send_offsets_address);
+  const auto* send_rows = reinterpret_cast<const uint32_t*>(
+      config.send_rows_address);
+  const auto* token_pool = reinterpret_cast<const uint8_t*>(
+      config.token_pool_address);
+  auto* delivery_pool = reinterpret_cast<uint8_t*>(
+      config.delivery_pool_address);
+  auto* expert_input = reinterpret_cast<uint8_t*>(
+      config.expert_input_address);
 
-  for (uint32_t target_pe = lane;
+  if (thread_id == 0) {
+    shared_status = POOL_SLICE_STATUS_OK;
+    shared_metadata_mask = 0;
+    shared_data_mask = 0;
+    shared_pack_done = 0;
+    shared_dispatch_issued = 0;
+    shared_return_next = 0;
+    shared_return_issued = 0;
+    shared_first_payload = 0;
+    shared_payload_sources = 0;
+    shared_dispatch_batches = 0;
+    *group_ready = 0;
+  }
+  for (uint32_t index = thread_id;
+       index < poolSliceMaxPes;
+       index += blockDim.x)
+    shared_source_state[index] = 0;
+  for (uint32_t index = thread_id;
+       index < poolSliceMaxLocalReaders;
+       index += blockDim.x)
+    shared_reader_tails[index] = 0;
+  for (uint32_t index = thread_id;
+       index < poolSliceControlWords;
+       index += blockDim.x)
+    control[index] = 0;
+  if (g_events != nullptr) {
+    uint64_t* block_events =
+        g_events + static_cast<uint64_t>(blockIdx.x) * numProfileEvents;
+    for (uint32_t event = poolSliceProfileStart + thread_id;
+         event <= poolSliceProfileScatterDone;
+         event += blockDim.x)
+      block_events[event] = 0;
+  }
+  __syncthreads();
+  if (thread_id == 0) {
+    __threadfence_system();
+    if (g_events != nullptr) {
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileStart] = cuda::ptx::get_sreg_globaltimer();
+    }
+  }
+  __syncthreads();
+
+  // Materialize one cache-line descriptor per target. The producer wrote only
+  // route metadata; this pool core converts offsets into target-local counts.
+  for (uint32_t target_pe = thread_id;
        target_pe < config.num_pes;
-       target_pe += 32) {
+       target_pe += blockDim.x) {
     PoolSlicePublishBatch& batch = send_batches[target_pe];
+    const uint32_t reader_begin = target_pe * config.local_readers;
     batch.sequence = sequence;
     batch.source_pe = config.my_pe;
     batch.target_pe = target_pe;
     batch.active_rows = config.active_rows;
     batch.flags = POOL_SLICE_BATCH_FLAGS_NONE;
-    const uint32_t reader_begin = target_pe * config.local_readers;
     batch.route_begin = send_offsets[reader_begin];
     batch.route_end = send_offsets[reader_begin + config.local_readers];
-  }
-  __syncwarp();
-  if (lane == 0)
-    __threadfence_system();
-  __syncwarp();
-
-  for (uint32_t target_pe = 0; target_pe < config.num_pes; ++target_pe) {
-    PoolSlicePublishBatch* destination = receive_batches + config.my_pe;
-    const PoolSlicePublishBatch* source = send_batches + target_pe;
-    if (target_pe == config.my_pe) {
-      pool_slice_copy_warp(
-          destination, source, sizeof(PoolSlicePublishBatch), lane);
-      __syncwarp();
-      if (lane == 0) {
-        __threadfence_system();
-        atomicExch(
-            reinterpret_cast<unsigned long long*>(
-                signal_array + config.queue_signal_base + config.my_pe),
-            static_cast<unsigned long long>(sequence));
-      }
-      __syncwarp();
-    } else {
-      nvshmemx_putmem_signal_nbi_warp(
-          destination,
-          source,
-          sizeof(PoolSlicePublishBatch),
-          signal_array + config.queue_signal_base + config.my_pe,
-          sequence,
-          NVSHMEM_SIGNAL_SET,
-          target_pe);
+    for (uint32_t reader = 0;
+         reader < poolSliceMaxLocalReaders;
+         ++reader) {
+      batch.reader_counts[reader] = reader < config.local_readers
+          ? send_offsets[reader_begin + reader + 1] -
+                send_offsets[reader_begin + reader]
+          : 0;
     }
   }
-  // The queue doorbell, rather than local source completion, gates every
-  // consumer.  The first metadata quiet in gather also retires these NBI
-  // publications before send_batches can be reused, so a separate quiet here
-  // would add a serialized network round trip to the fixed protocol floor.
-  __syncwarp();
-}
+  __syncthreads();
 
-static __device__ __noinline__ void pool_slice_gather(
-    const PoolSliceConfig* config_pointer,
-    int* bars,
-    uint64_t* signal_array,
-    uint32_t write_barrier,
-    uint32_t dispatch_barrier_base,
-    uint32_t lane) {
-  __shared__ PoolSliceConfig shared_config;
-  __shared__ uint32_t shared_status;
-  if (config_pointer == nullptr || bars == nullptr || signal_array == nullptr)
-    return;
-  if (lane == 0) {
-    shared_config = *config_pointer;
-    shared_status = POOL_SLICE_STATUS_OK;
-  }
-  __syncwarp();
-  const PoolSliceConfig& config = shared_config;
-  if (!pool_slice_valid_config(config)) {
-    if (lane == 0)
-      pool_slice_set_status(config, POOL_SLICE_STATUS_BAD_CONFIG);
-    __syncwarp();
-    return;
-  }
-
-  const uint64_t sequence = pool_slice_sequence(config);
-  auto* control = reinterpret_cast<unsigned long long*>(config.control_address);
-  auto* group_ready = reinterpret_cast<unsigned long long*>(
-      config.group_ready_address);
-  auto* reader_tails = reinterpret_cast<unsigned long long*>(
-      config.reader_tails_address);
-  auto* receive_batches = reinterpret_cast<const PoolSlicePublishBatch*>(
-      config.receive_batches_address);
-  auto* offsets_inbox = reinterpret_cast<uint32_t*>(
-      config.offsets_inbox_address);
-  auto* rows_inbox = reinterpret_cast<uint32_t*>(config.rows_inbox_address);
-  auto* receive_routes = reinterpret_cast<PoolSliceReceiveBatch*>(
-      config.receive_routes_address);
-  const auto* send_offsets = reinterpret_cast<const uint32_t*>(
-      config.send_offsets_address);
-  const auto* send_rows = reinterpret_cast<const uint32_t*>(
-      config.send_rows_address);
-
-  for (uint32_t index = lane;
-       index < poolSliceControlWords;
-       index += 32)
-    control[index] = 0;
-  for (uint32_t index = lane; index < config.local_readers; index += 32)
-    reader_tails[index] = 0;
-  if (lane == 0)
-    *group_ready = 0;
-  __syncwarp();
-  if (lane == 0)
-    __threadfence_system();
-  __syncwarp();
-
-  // Queue signals are transport doorbells. Consuming all source descriptors
-  // closes the shared sender group for every dynamic read on this slice.
-  pool_slice_wait_signals_warp(
-      signal_array,
-      config.queue_signal_base,
-      sequence,
-      config.num_pes,
-      lane);
-
-  const uint32_t global_reader_base = config.my_pe * config.local_readers;
-  for (uint32_t source_pe = 0;
-       source_pe < config.num_pes;
-       ++source_pe) {
-    const PoolSlicePublishBatch batch = receive_batches[source_pe];
-    if (lane == 0 &&
-        (batch.sequence != sequence ||
-         batch.source_pe != source_pe ||
-         batch.target_pe != config.my_pe ||
-         batch.active_rows > config.route_capacity ||
-         batch.route_begin > batch.route_end ||
-         batch.route_end > batch.active_rows ||
-         batch.flags != POOL_SLICE_BATCH_FLAGS_NONE)) {
-      shared_status = batch.sequence != sequence
-          ? POOL_SLICE_STATUS_SEQUENCE
-          : POOL_SLICE_STATUS_BATCH;
-    }
-    __syncwarp();
-    uint32_t* destination = offsets_inbox +
-        static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-    if (config.local_readers == 1) {
-      if (lane == 0) {
-        destination[0] = batch.route_begin;
-        destination[1] = batch.route_end;
-      }
-      __syncwarp();
-    } else {
-      pool_slice_get_nbi_warp(
-          destination,
-          send_offsets + global_reader_base,
-          static_cast<uint64_t>(config.local_readers + 1) * sizeof(uint32_t),
-          source_pe,
-          config.my_pe,
-          lane);
-    }
-  }
-  if (config.local_readers == 1) {
-    __syncwarp();
-  } else {
-    pool_slice_complete_warp(lane);
-  }
-  if (shared_status != POOL_SLICE_STATUS_OK) {
-    if (lane == 0)
-      pool_slice_set_status(
-          config, static_cast<PoolSliceStatus>(shared_status));
-    __syncwarp();
-    return;
-  }
-
-  if (lane == 0) {
-    for (uint32_t source_pe = 0;
-         source_pe < config.num_pes &&
-             shared_status == POOL_SLICE_STATUS_OK;
-         ++source_pe) {
-      const uint32_t* offsets = offsets_inbox +
-          static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-      const PoolSlicePublishBatch batch = receive_batches[source_pe];
-      const uint32_t source_begin = offsets[0];
-      const uint32_t source_end = offsets[config.local_readers];
-      if (source_begin != batch.route_begin ||
-          source_end != batch.route_end ||
-          source_end - source_begin > config.route_capacity) {
-        shared_status = POOL_SLICE_STATUS_ROUTE_RANGE;
-        break;
-      }
-      for (uint32_t local_reader = 0;
-           local_reader < config.local_readers;
-           ++local_reader) {
-        const uint32_t begin = offsets[local_reader];
-        const uint32_t end = offsets[local_reader + 1];
-        if (begin > end || begin < source_begin || end > source_end) {
-          shared_status = POOL_SLICE_STATUS_ROUTE_RANGE;
-          break;
-        }
-        const uint32_t count = end - begin;
-        const uint64_t base_row = reader_tails[local_reader];
-        if (base_row > config.expert_capacity_rows ||
-            count > config.expert_capacity_rows - base_row) {
-          shared_status = POOL_SLICE_STATUS_CAPACITY;
-          break;
-        }
-        reader_tails[local_reader] = base_row + count;
-        PoolSliceReceiveBatch& route = receive_routes[
-            static_cast<uint64_t>(local_reader) * config.num_pes + source_pe];
-        route.sequence = sequence;
-        route.base_row = base_row;
-        route.source_begin = begin;
-        route.row_count = count;
-        route.source_pe = source_pe;
-        route.local_reader = local_reader;
-        route.flags = POOL_SLICE_BATCH_FLAGS_NONE;
-        route.reserved_u32[0] = 0;
-        route.reserved_u32[1] = 0;
-        route.reserved_u32[2] = 0;
-      }
-    }
-  }
-  __syncwarp();
-  if (shared_status != POOL_SLICE_STATUS_OK) {
-    if (lane == 0)
-      pool_slice_set_status(
-          config, static_cast<PoolSliceStatus>(shared_status));
-    __syncwarp();
-    return;
-  }
-
-  // Pull each source's metadata slice into pool-owned HBM. Metadata movement
-  // is batched per source and completed with one quiet for the whole slice.
-  for (uint32_t source_pe = 0;
-       source_pe < config.num_pes;
-       ++source_pe) {
-    const uint32_t* offsets = offsets_inbox +
-        static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-    const uint32_t source_begin = offsets[0];
-    const uint32_t source_count =
-        offsets[config.local_readers] - source_begin;
-    pool_slice_get_nbi_warp(
-        rows_inbox + static_cast<uint64_t>(source_pe) * config.route_capacity,
-        send_rows + source_begin,
-        static_cast<uint64_t>(source_count) * sizeof(uint32_t),
-        source_pe,
-        config.my_pe,
-        lane);
-  }
-  pool_slice_complete_warp(lane);
-
-  bool routes_valid = true;
-  for (uint32_t source_pe = 0;
-       source_pe < config.num_pes;
-       ++source_pe) {
-    const uint32_t* offsets = offsets_inbox +
-        static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-    const uint32_t source_count =
-        offsets[config.local_readers] - offsets[0];
-    const uint32_t* rows = rows_inbox +
-        static_cast<uint64_t>(source_pe) * config.route_capacity;
-    for (uint32_t index = lane; index < source_count; index += 32) {
-      routes_valid = routes_valid && rows[index] < config.token_capacity;
-    }
-  }
-  if (!__all_sync(0xffffffffU, routes_valid)) {
-    if (lane == 0)
-      pool_slice_set_status(config, POOL_SLICE_STATUS_ROUTE_RANGE);
-    __syncwarp();
-    return;
-  }
-
-  // The pool memory/compute VMs perform the local token write. Only the pool
-  // communication warp publishes its readiness to every destination PE.
-  pool_slice_wait_barriers_warp(bars, write_barrier, 1, lane);
-  for (uint32_t target_pe = 0;
-       target_pe < config.num_pes;
-       ++target_pe) {
-    pool_slice_publish_signal(
-        signal_array,
-        config.data_signal_base + config.my_pe,
-        sequence,
-        target_pe,
-        config.my_pe,
-        lane);
-  }
-  // All peers wait on these source-indexed signals.  Waiting on the reciprocal
-  // set below provides global progress without an extra local quiet phase.
-  pool_slice_wait_signals_warp(
-      signal_array,
-      config.data_signal_base,
-      sequence,
-      config.num_pes,
-      lane);
-
-  const auto* token_pool = reinterpret_cast<const uint8_t*>(
-      config.token_pool_address);
-  auto* expert_input = reinterpret_cast<uint8_t*>(
-      config.expert_input_address);
-  for (uint32_t source_pe = 0;
-       source_pe < config.num_pes;
-       ++source_pe) {
-    const uint32_t* offsets = offsets_inbox +
-        static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-    const uint32_t source_begin = offsets[0];
-    const uint32_t* rows = rows_inbox +
-        static_cast<uint64_t>(source_pe) * config.route_capacity;
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader) {
-      const PoolSliceReceiveBatch route = receive_routes[
-          static_cast<uint64_t>(local_reader) * config.num_pes + source_pe];
-      const uint32_t metadata_begin =
-          offsets[local_reader] - source_begin;
-      for (uint32_t index = 0; index < route.row_count; ++index) {
-        const uint32_t source_row = rows[metadata_begin + index];
-        pool_slice_get_nbi_warp(
-            expert_input +
-                static_cast<uint64_t>(local_reader) * config.expert_stride +
-                (route.base_row + index) * config.expert_row_stride,
-            token_pool + static_cast<uint64_t>(source_row) * config.pool_stride,
-            config.row_bytes,
-            source_pe,
-            config.my_pe,
-            lane);
-      }
-    }
-  }
-  pool_slice_complete_warp(lane);
-
-  if (lane == 0) {
-    uint64_t received_rows = 0;
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader)
-      received_rows += reader_tails[local_reader];
-    *group_ready = sequence;
-    control[1] = config.num_pes;
-    control[2] = received_rows;
-    control[4] = sequence;
-    __threadfence_system();
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader)
-      atomicSub(bars + dispatch_barrier_base + local_reader, 1);
-  }
-  __syncwarp();
-}
-
-// Issue one source-row interval for every ready source. Two-stage activation
-// readiness calls this once for the early prefix and once for the remainder;
-// each row is therefore fetched exactly once while both batches can remain
-// NBI and in flight until the final gather quiet.
-static __device__ __forceinline__ uint32_t pool_slice_issue_payload_stage(
-    const PoolSliceConfig& config,
-    uint32_t source_mask,
-    uint32_t source_row_begin,
-    uint32_t source_row_end,
-    uint64_t* g_events,
-    uint32_t lane) {
-  const auto* offsets_inbox = reinterpret_cast<const uint32_t*>(
-      config.offsets_inbox_address);
-  const auto* rows_inbox = reinterpret_cast<const uint32_t*>(
-      config.rows_inbox_address);
-  const auto* receive_routes =
-      reinterpret_cast<const PoolSliceReceiveBatch*>(
-          config.receive_routes_address);
-  const auto* token_pool = reinterpret_cast<const uint8_t*>(
-      config.token_pool_address);
-  auto* expert_input = reinterpret_cast<uint8_t*>(
-      config.expert_input_address);
-  uint32_t issued_mask = 0;
-  uint32_t payload_recorded = g_events == nullptr;
-  if (g_events != nullptr && lane == 0) {
-    payload_recorded = g_events[
-        static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
-        poolSliceProfileFirstPayload] != 0;
-  }
-  payload_recorded = __shfl_sync(0xffffffffU, payload_recorded, 0);
-
-  for (uint32_t source_index = 0;
-       source_index < config.num_pes;
-       ++source_index) {
-    const uint32_t source_pe = pool_slice_remote_first_pe(
-        source_index, config.my_pe, config.num_pes);
-    const uint32_t source_bit = 1U << source_pe;
-    if ((source_mask & source_bit) == 0)
-      continue;
-    const uint32_t* offsets = offsets_inbox +
-        static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-    const uint32_t source_begin = offsets[0];
-    const uint32_t* rows = rows_inbox +
-        static_cast<uint64_t>(source_pe) * config.route_capacity;
-    bool source_issued = false;
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader) {
-      const PoolSliceReceiveBatch route = receive_routes[
-          static_cast<uint64_t>(local_reader) * config.num_pes + source_pe];
-      const uint32_t metadata_begin = offsets[local_reader] - source_begin;
-      for (uint32_t index = 0; index < route.row_count; ++index) {
-        const uint32_t source_row = rows[metadata_begin + index];
-        if (source_row < source_row_begin || source_row >= source_row_end)
-          continue;
-        if (!payload_recorded) {
-          pool_slice_record_profile(
-              g_events, poolSliceProfileFirstPayload, lane);
-          payload_recorded = true;
-        }
-        source_issued = true;
-        pool_slice_get_nbi_warp(
-            expert_input +
-                static_cast<uint64_t>(local_reader) * config.expert_stride +
-                (route.base_row + index) * config.expert_row_stride,
-            token_pool + static_cast<uint64_t>(source_row) * config.pool_stride,
-            config.row_bytes,
-            source_pe,
-            config.my_pe,
-            lane);
-      }
-    }
-    if (source_issued)
-      issued_mask |= source_bit;
-  }
-  return issued_mask;
-}
-
-// Event-driven gather. Descriptor ingestion, the local source write, remote
-// source readiness, and payload gets advance independently. A metadata wave
-// uses one quiet to make newly fetched route rows consumable; payload gets
-// remain NBI and in flight while the pool continues scanning later senders.
-static __device__ __noinline__ void pool_slice_gather_streaming(
-    const PoolSliceConfig* config_pointer,
-    int* bars,
-    uint64_t* signal_array,
-    uint64_t* g_events,
-    uint32_t write_barrier,
-    uint32_t dispatch_barrier_base,
-    uint32_t lane) {
-  __shared__ PoolSliceConfig shared_config;
-  __shared__ uint32_t shared_status;
-  if (config_pointer == nullptr || bars == nullptr || signal_array == nullptr)
-    return;
-  if (lane == 0) {
-    shared_config = *config_pointer;
-    shared_status = POOL_SLICE_STATUS_OK;
-    if (g_events != nullptr) {
-      uint64_t* block_events =
-          g_events + static_cast<uint64_t>(blockIdx.x) * numProfileEvents;
-      block_events[poolSliceProfileDataPublished] = 0;
-      block_events[poolSliceProfileFirstPayload] = 0;
-      block_events[poolSliceProfileMetadataClosed] = 0;
-      block_events[poolSliceProfilePayloadDone] = 0;
-      block_events[poolSliceProfileFirstDataPublished] = 0;
-    }
-  }
-  __syncwarp();
-  const PoolSliceConfig& config = shared_config;
-  if (!pool_slice_valid_config(config)) {
-    if (lane == 0)
-      pool_slice_set_status(config, POOL_SLICE_STATUS_BAD_CONFIG);
-    __syncwarp();
-    return;
-  }
-
-  const uint64_t sequence = pool_slice_sequence(config);
-  if (sequence > UINT64_MAX / config.data_stages) {
-    if (lane == 0)
-      pool_slice_set_status(config, POOL_SLICE_STATUS_SEQUENCE);
-    __syncwarp();
-    return;
-  }
-  auto* control = reinterpret_cast<unsigned long long*>(config.control_address);
-  auto* group_ready = reinterpret_cast<unsigned long long*>(
-      config.group_ready_address);
-  auto* reader_tails = reinterpret_cast<unsigned long long*>(
-      config.reader_tails_address);
-  const auto* receive_batches =
-      reinterpret_cast<const PoolSlicePublishBatch*>(
-          config.receive_batches_address);
-  auto* offsets_inbox = reinterpret_cast<uint32_t*>(
-      config.offsets_inbox_address);
-  auto* rows_inbox = reinterpret_cast<uint32_t*>(config.rows_inbox_address);
-  auto* receive_routes = reinterpret_cast<PoolSliceReceiveBatch*>(
-      config.receive_routes_address);
-  const auto* send_offsets = reinterpret_cast<const uint32_t*>(
-      config.send_offsets_address);
-  const auto* send_rows = reinterpret_cast<const uint32_t*>(
-      config.send_rows_address);
-
-  for (uint32_t index = lane;
-       index < poolSliceControlWords;
-       index += 32)
-    control[index] = 0;
-  for (uint32_t index = lane; index < config.local_readers; index += 32)
-    reader_tails[index] = 0;
-  if (lane == 0)
-    *group_ready = 0;
-  __syncwarp();
-  if (lane == 0)
-    __threadfence_system();
-  __syncwarp();
-
-  const uint32_t expected_mask = pool_slice_pe_mask(config.num_pes);
-  const uint32_t global_reader_base = config.my_pe * config.local_readers;
-  uint32_t queue_seen_mask = 0;
-  uint32_t early_seen_mask =
-      config.data_stages == 1 ? expected_mask : 0;
-  uint32_t data_seen_mask = 0;
-  uint32_t metadata_ready_mask = 0;
-  uint32_t early_issued_mask =
-      config.data_stages == 1 ? expected_mask : 0;
-  uint32_t payload_issued_mask = 0;
-  uint32_t needed_data_mask = 0;
-  uint32_t metadata_waves = 0;
-  uint32_t payload_sources = 0;
-  uint32_t inflight_sources = 0;
-  uint32_t peak_inflight_sources = 0;
-  uint32_t published_stages = 0;
-  bool metadata_closed_recorded = false;
-
-  while (published_stages != config.data_stages ||
-         metadata_ready_mask != expected_mask ||
-         payload_issued_mask != expected_mask) {
-    bool made_progress = false;
-
-    if (queue_seen_mask != expected_mask) {
-      bool queue_ready = lane >= config.num_pes ||
-          (queue_seen_mask & (1U << lane)) != 0;
-      if (!queue_ready) {
-        queue_ready = nvshmem_signal_fetch(
-            signal_array + config.queue_signal_base + lane) >= sequence;
-      }
-      const uint32_t polled_queue_mask =
-          __ballot_sync(0xffffffffU, queue_ready) & expected_mask;
-      if ((polled_queue_mask & ~queue_seen_mask) != 0)
-        made_progress = true;
-      queue_seen_mask |= polled_queue_mask;
-    }
-
-    if (payload_issued_mask != expected_mask &&
-        data_seen_mask != expected_mask) {
-      const bool final_seen = lane < config.num_pes &&
-          (data_seen_mask & (1U << lane)) != 0;
-      uint64_t observed = final_seen || lane >= config.num_pes
-          ? UINT64_MAX
-          : nvshmem_signal_fetch(
-                signal_array + config.data_signal_base + lane);
-      const uint64_t first_value = pool_slice_data_signal_value(
-          sequence, 1, config.data_stages);
-      const uint64_t final_value = pool_slice_data_signal_value(
-          sequence, config.data_stages, config.data_stages);
-      const bool early_ready = lane >= config.num_pes ||
-          (early_seen_mask & (1U << lane)) != 0 || observed >= first_value;
-      const bool data_ready = lane >= config.num_pes ||
-          final_seen || observed >= final_value;
-      if (config.data_stages == 2) {
-        const uint32_t polled_early_mask =
-            __ballot_sync(0xffffffffU, early_ready) & expected_mask;
-        if ((polled_early_mask & ~early_seen_mask) != 0)
-          made_progress = true;
-        early_seen_mask |= polled_early_mask;
-      }
-      const uint32_t polled_data_mask =
-          __ballot_sync(0xffffffffU, data_ready) & expected_mask;
-      if ((polled_data_mask & ~data_seen_mask) != 0)
-        made_progress = true;
-      data_seen_mask |= polled_data_mask;
-    }
-
-    if (queue_seen_mask == expected_mask && !metadata_closed_recorded) {
-      pool_slice_record_profile(
-          g_events, poolSliceProfileMetadataClosed, lane);
-      metadata_closed_recorded = true;
-    }
-
-    if (published_stages != config.data_stages) {
-      uint32_t local_write_ready = 0;
-      if (lane == 0) {
-        local_write_ready =
-            *reinterpret_cast<volatile int*>(
-                bars + write_barrier + published_stages) == 0;
-      }
-      local_write_ready = __shfl_sync(
-          0xffffffffU, local_write_ready, 0);
-      if (local_write_ready != 0) {
-        const uint32_t completed_stages = published_stages + 1;
-        const uint64_t signal_value = pool_slice_data_signal_value(
-            sequence, completed_stages, config.data_stages);
-        if (lane == 0)
-          __threadfence_system();
-        __syncwarp();
-        for (uint32_t index = 0;
-             index < config.num_pes;
-             ++index) {
-          const uint32_t target_pe = pool_slice_remote_first_pe(
-              index, config.my_pe, config.num_pes);
-          pool_slice_publish_signal(
-              signal_array,
-              config.data_signal_base + config.my_pe,
-              signal_value,
-              target_pe,
-              config.my_pe,
-              lane);
-        }
-        published_stages = completed_stages;
-        made_progress = true;
-        if (completed_stages == 1) {
-          pool_slice_record_profile(
-              g_events, poolSliceProfileFirstDataPublished, lane);
-        }
-        if (completed_stages == config.data_stages) {
-          pool_slice_record_profile(
-              g_events, poolSliceProfileDataPublished, lane);
-        }
-      }
-    }
-
-    const uint32_t metadata_wave = queue_seen_mask & ~metadata_ready_mask;
-    if (metadata_wave != 0) {
-      for (uint32_t index = 0;
-           index < config.num_pes;
-           ++index) {
-        const uint32_t source_pe = pool_slice_remote_first_pe(
+  // Warp 0 owns publication and all phase signals. Each active lane posts one
+  // peer descriptor so small control messages are not serialized by PE.
+  if (warp == 0) {
+    if (config.num_pes <= 2) {
+      for (uint32_t index = 0; index < config.num_pes; ++index) {
+        const uint32_t target_pe = pool_slice_remote_first_pe(
             index, config.my_pe, config.num_pes);
-        const uint32_t source_bit = 1U << source_pe;
-        if ((metadata_wave & source_bit) == 0)
-          continue;
-        const PoolSlicePublishBatch batch = receive_batches[source_pe];
-        if (lane == 0 &&
-            (batch.sequence != sequence ||
-             batch.source_pe != source_pe ||
-             batch.target_pe != config.my_pe ||
-             batch.active_rows > config.route_capacity ||
-             batch.route_begin > batch.route_end ||
-             batch.route_end > batch.active_rows ||
-             batch.flags != POOL_SLICE_BATCH_FLAGS_NONE)) {
-          shared_status = batch.sequence != sequence
-              ? POOL_SLICE_STATUS_SEQUENCE
-              : POOL_SLICE_STATUS_BATCH;
-        }
-        __syncwarp();
-
-        uint32_t* offsets = offsets_inbox +
-            static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-        if (config.local_readers == 1) {
+        PoolSlicePublishBatch* destination =
+            receive_batches + config.my_pe;
+        const PoolSlicePublishBatch* source = send_batches + target_pe;
+        if (target_pe == config.my_pe) {
+          pool_slice_copy_warp(
+              destination, source, sizeof(PoolSlicePublishBatch), lane);
+          __syncwarp();
           if (lane == 0) {
-            offsets[0] = batch.route_begin;
-            offsets[1] = batch.route_end;
+            __threadfence_system();
+            atomicExch(
+                reinterpret_cast<unsigned long long*>(
+                    signal_array + config.signal_base + config.my_pe),
+                static_cast<unsigned long long>(metadata_value));
           }
           __syncwarp();
         } else {
+          nvshmemx_putmem_signal_nbi_warp(
+              destination,
+              source,
+              sizeof(PoolSlicePublishBatch),
+              signal_array + config.signal_base + config.my_pe,
+              metadata_value,
+              NVSHMEM_SIGNAL_SET,
+              target_pe);
+        }
+      }
+    } else if (lane < config.num_pes) {
+      const uint32_t target_pe = pool_slice_remote_first_pe(
+          lane, config.my_pe, config.num_pes);
+      PoolSlicePublishBatch* destination = receive_batches + config.my_pe;
+      const PoolSlicePublishBatch* source = send_batches + target_pe;
+      if (target_pe == config.my_pe) {
+        *destination = *source;
+        __threadfence_system();
+        atomicExch(
+            reinterpret_cast<unsigned long long*>(
+                signal_array + config.signal_base + config.my_pe),
+            static_cast<unsigned long long>(metadata_value));
+      } else {
+        nvshmem_putmem_signal_nbi(
+            destination,
+            source,
+            sizeof(PoolSlicePublishBatch),
+            signal_array + config.signal_base + config.my_pe,
+            metadata_value,
+            NVSHMEM_SIGNAL_SET,
+            target_pe);
+      }
+    }
+    __syncwarp();
+    if (lane == 0)
+      nvshmem_fence();
+    __syncwarp();
+  }
+
+  // No block barrier here: descriptor publication, route packing, and receive
+  // polling are independent. The coordinator's signal scan supplies the
+  // actual dependency edge, and the dispatch quiet is their convergence.
+
+  const bool is_pack_warp = warp > 0 && warp <= config.pack_warps;
+  const bool is_receive_warp = warp > config.pack_warps;
+
+  // Pack route-major delivery rows as soon as the ordinary VDCores writer has
+  // made its token-slot pool ready. Pack warps operate concurrently with the
+  // receive workers ingesting remote descriptors.
+  if (is_pack_warp) {
+    const uint32_t pack_index = warp - 1;
+    for (uint32_t route = pack_index;
+         route < config.active_rows;
+         route += config.pack_warps) {
+      uint32_t source_row = 0;
+      if (lane == 0)
+        source_row = send_rows[route];
+      source_row = __shfl_sync(0xffffffffU, source_row, 0);
+      if (source_row >= config.token_capacity) {
+        if (lane == 0) {
+          atomicCAS(
+              &shared_status,
+              static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+              static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+        }
+        continue;
+      }
+
+      const uint32_t write_chunk = source_row / config.write_chunk_rows;
+      uint32_t write_ready = 0;
+      while (write_ready == 0) {
+        if (lane == 0) {
+          write_ready = *reinterpret_cast<volatile int*>(
+              bars + write_barrier + write_chunk) == 0;
+        }
+        write_ready = __shfl_sync(0xffffffffU, write_ready, 0);
+        if (write_ready == 0)
+          __nanosleep(barrierPollSleepCycles);
+      }
+      pool_slice_copy_warp(
+          delivery_pool + static_cast<uint64_t>(route) * config.delivery_stride,
+          token_pool + static_cast<uint64_t>(source_row) * config.pool_stride,
+          config.row_bytes,
+          lane);
+    }
+    __syncwarp();
+    // Every lane wrote a disjoint vector of the symmetric source buffer. A
+    // system fence before the release counter makes those writes NIC-visible.
+    __threadfence_system();
+    __syncwarp();
+    if (lane == 0)
+      atomicAdd(&shared_pack_done, 1U);
+  }
+
+  // Receive workers claim metadata-ready sources dynamically. Counts embedded
+  // in the descriptor make route resolution local; after the data phase each
+  // nonempty reader is one contiguous NBI GET into its assigned range.
+  if (is_receive_warp) {
+    while (*reinterpret_cast<volatile uint32_t*>(&shared_dispatch_issued) <
+           config.num_pes) {
+      uint32_t source_pe = UINT32_MAX;
+      if (lane == 0) {
+        const uint32_t ready_mask =
+            *reinterpret_cast<volatile uint32_t*>(&shared_metadata_mask);
+        for (uint32_t index = 0; index < config.num_pes; ++index) {
+          const uint32_t candidate = pool_slice_remote_first_pe(
+              index, config.my_pe, config.num_pes);
+          if ((ready_mask & (1U << candidate)) != 0 &&
+              atomicCAS(shared_source_state + candidate, 0U, 1U) == 0U) {
+            source_pe = candidate;
+            break;
+          }
+        }
+      }
+      source_pe = __shfl_sync(0xffffffffU, source_pe, 0);
+      if (source_pe == UINT32_MAX) {
+        __nanosleep(barrierPollSleepCycles);
+        continue;
+      }
+
+      const PoolSlicePublishBatch batch = receive_batches[source_pe];
+      uint32_t total_rows = 0;
+      uint32_t batch_valid = 1;
+      if (lane == 0) {
+        batch_valid = batch.sequence == sequence &&
+            batch.source_pe == source_pe &&
+            batch.target_pe == config.my_pe &&
+            batch.active_rows <= config.route_capacity &&
+            batch.route_begin <= batch.route_end &&
+            batch.route_end <= batch.active_rows &&
+            batch.flags == POOL_SLICE_BATCH_FLAGS_NONE;
+        uint32_t source_cursor = batch.route_begin;
+        for (uint32_t reader = 0;
+             reader < config.local_readers;
+             ++reader) {
+          const uint32_t count = batch.reader_counts[reader];
+          if (count > batch.route_end - source_cursor) {
+            batch_valid = 0;
+            break;
+          }
+          const uint64_t base_row = atomicAdd(
+              shared_reader_tails + reader,
+              static_cast<unsigned long long>(count));
+          if (base_row > config.expert_capacity_rows ||
+              count > config.expert_capacity_rows - base_row) {
+            batch_valid = 0;
+          }
+          PoolSliceReceiveBatch& route = receive_routes[
+              static_cast<uint64_t>(reader) * config.num_pes + source_pe];
+          route.sequence = sequence;
+          route.base_row = base_row;
+          route.source_begin = source_cursor;
+          route.row_count = count;
+          route.source_pe = source_pe;
+          route.local_reader = reader;
+          route.flags = POOL_SLICE_BATCH_FLAGS_NONE;
+          route.reserved_u32[0] = 0;
+          route.reserved_u32[1] = 0;
+          route.reserved_u32[2] = 0;
+          source_cursor += count;
+          total_rows += count;
+        }
+        if (source_cursor != batch.route_end)
+          batch_valid = 0;
+        if (!batch_valid) {
+          atomicCAS(
+              &shared_status,
+              static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+              static_cast<uint32_t>(POOL_SLICE_STATUS_BATCH));
+          total_rows = 0;
+        }
+      }
+      total_rows = __shfl_sync(0xffffffffU, total_rows, 0);
+      batch_valid = __shfl_sync(0xffffffffU, batch_valid, 0);
+      __syncwarp();
+
+      if (batch_valid && total_rows != 0) {
+        while ((*reinterpret_cast<volatile uint32_t*>(&shared_data_mask) &
+                (1U << source_pe)) == 0)
+          __nanosleep(barrierPollSleepCycles);
+
+        pool_slice_record_first_payload(
+            g_events, &shared_first_payload, lane);
+        if (lane == 0)
+          atomicAdd(&shared_payload_sources, 1U);
+        for (uint32_t reader = 0;
+             reader < config.local_readers;
+             ++reader) {
+          const PoolSliceReceiveBatch route = receive_routes[
+              static_cast<uint64_t>(reader) * config.num_pes + source_pe];
+          if (route.row_count == 0)
+            continue;
           pool_slice_get_nbi_warp(
-              offsets,
-              send_offsets + global_reader_base,
-              static_cast<uint64_t>(config.local_readers + 1) *
-                  sizeof(uint32_t),
+              expert_input +
+                  static_cast<uint64_t>(reader) * config.expert_stride +
+                  route.base_row * config.expert_row_stride,
+              delivery_pool +
+                  static_cast<uint64_t>(route.source_begin) *
+                      config.delivery_stride,
+              static_cast<uint64_t>(route.row_count) * config.row_bytes,
               source_pe,
               config.my_pe,
               lane);
-        }
-        pool_slice_get_nbi_warp(
-            rows_inbox +
-                static_cast<uint64_t>(source_pe) * config.route_capacity,
-            send_rows + batch.route_begin,
-            static_cast<uint64_t>(batch.route_end - batch.route_begin) *
-                sizeof(uint32_t),
-            source_pe,
-            config.my_pe,
-            lane);
-      }
-
-      // This makes the new metadata wave consumable. It may also retire
-      // payload gets issued by an earlier wave, which is useful bounded
-      // backpressure rather than a correctness dependency.
-      pool_slice_complete_warp(lane);
-      inflight_sources = 0;
-      ++metadata_waves;
-      if (shared_status != POOL_SLICE_STATUS_OK) {
-        if (lane == 0) {
-          pool_slice_set_status(
-              config, static_cast<PoolSliceStatus>(shared_status));
-        }
-        __syncwarp();
-        return;
-      }
-
-      if (lane == 0) {
-        for (uint32_t source_pe = 0;
-             source_pe < config.num_pes &&
-                 shared_status == POOL_SLICE_STATUS_OK;
-             ++source_pe) {
-          const uint32_t source_bit = 1U << source_pe;
-          if ((metadata_wave & source_bit) == 0)
-            continue;
-          const PoolSlicePublishBatch batch = receive_batches[source_pe];
-          const uint32_t* offsets = offsets_inbox +
-              static_cast<uint64_t>(source_pe) *
-                  (config.local_readers + 1);
-          const uint32_t source_begin = offsets[0];
-          const uint32_t source_end = offsets[config.local_readers];
-          if (source_begin != batch.route_begin ||
-              source_end != batch.route_end ||
-              source_end - source_begin > config.route_capacity) {
-            shared_status = POOL_SLICE_STATUS_ROUTE_RANGE;
-            break;
-          }
-          for (uint32_t local_reader = 0;
-               local_reader < config.local_readers;
-               ++local_reader) {
-            const uint32_t begin = offsets[local_reader];
-            const uint32_t end = offsets[local_reader + 1];
-            if (begin > end || begin < source_begin || end > source_end) {
-              shared_status = POOL_SLICE_STATUS_ROUTE_RANGE;
-              break;
-            }
-            const uint32_t count = end - begin;
-            const uint64_t base_row = reader_tails[local_reader];
-            if (base_row > config.expert_capacity_rows ||
-                count > config.expert_capacity_rows - base_row) {
-              shared_status = POOL_SLICE_STATUS_CAPACITY;
-              break;
-            }
-            reader_tails[local_reader] = base_row + count;
-            PoolSliceReceiveBatch& route = receive_routes[
-                static_cast<uint64_t>(local_reader) * config.num_pes +
-                source_pe];
-            route.sequence = sequence;
-            route.base_row = base_row;
-            route.source_begin = begin;
-            route.row_count = count;
-            route.source_pe = source_pe;
-            route.local_reader = local_reader;
-            route.flags = POOL_SLICE_BATCH_FLAGS_NONE;
-            route.reserved_u32[0] = 0;
-            route.reserved_u32[1] = 0;
-            route.reserved_u32[2] = 0;
-          }
+          if (lane == 0)
+            atomicAdd(&shared_dispatch_batches, 1U);
         }
       }
       __syncwarp();
-      if (shared_status != POOL_SLICE_STATUS_OK) {
-        if (lane == 0) {
-          pool_slice_set_status(
-              config, static_cast<PoolSliceStatus>(shared_status));
-        }
-        __syncwarp();
-        return;
+      if (lane == 0) {
+        __threadfence_block();
+        atomicExch(shared_source_state + source_pe, 2U);
+        atomicAdd(&shared_dispatch_issued, 1U);
+      }
+    }
+  }
+
+  // The coordinator continuously scans all source phase words lane-parallel.
+  // It publishes local data as soon as packing completes and waits only until
+  // every source batch has been issued, leaving all remote GETs in flight.
+  if (warp == 0) {
+    bool data_published = false;
+    bool metadata_closed_recorded = false;
+    while (!data_published ||
+           *reinterpret_cast<volatile uint32_t*>(&shared_dispatch_issued) <
+               config.num_pes) {
+      const uint64_t observed = lane < config.num_pes
+          ? nvshmem_signal_fetch(signal_array + config.signal_base + lane)
+          : UINT64_MAX;
+      const uint32_t metadata_mask =
+          __ballot_sync(0xffffffffU, observed >= metadata_value) & expected_mask;
+      const uint32_t data_mask =
+          __ballot_sync(0xffffffffU, observed >= data_value) & expected_mask;
+      if (lane == 0) {
+        shared_metadata_mask |= metadata_mask;
+        shared_data_mask |= data_mask;
+        __threadfence_block();
+      }
+      if (metadata_mask == expected_mask && !metadata_closed_recorded) {
+        pool_slice_record_profile(
+            g_events, poolSliceProfileMetadataClosed, lane);
+        metadata_closed_recorded = true;
       }
 
-      bool routes_valid = true;
-      for (uint32_t source_pe = 0;
-           source_pe < config.num_pes;
-           ++source_pe) {
-        const uint32_t source_bit = 1U << source_pe;
-        if ((metadata_wave & source_bit) == 0)
-          continue;
-        const uint32_t* offsets = offsets_inbox +
-            static_cast<uint64_t>(source_pe) * (config.local_readers + 1);
-        const uint32_t source_count =
-            offsets[config.local_readers] - offsets[0];
-        const uint32_t* rows = rows_inbox +
-            static_cast<uint64_t>(source_pe) * config.route_capacity;
-        for (uint32_t index = lane; index < source_count; index += 32)
-          routes_valid = routes_valid && rows[index] < config.token_capacity;
-      }
-      if (!__all_sync(0xffffffffU, routes_valid)) {
+      if (!data_published &&
+          *reinterpret_cast<volatile uint32_t*>(&shared_pack_done) ==
+              config.pack_warps) {
         if (lane == 0)
-          pool_slice_set_status(config, POOL_SLICE_STATUS_ROUTE_RANGE);
+          __threadfence_system();
         __syncwarp();
-        return;
-      }
-
-      for (uint32_t source_pe = 0;
-           source_pe < config.num_pes;
-           ++source_pe) {
-        const uint32_t source_bit = 1U << source_pe;
-        if ((metadata_wave & source_bit) == 0)
-          continue;
-        const PoolSlicePublishBatch batch = receive_batches[source_pe];
-        if (batch.route_begin == batch.route_end) {
-          early_issued_mask |= source_bit;
-          payload_issued_mask |= source_bit;
-        } else {
-          needed_data_mask |= source_bit;
-        }
-      }
-      metadata_ready_mask |= metadata_wave;
-      made_progress = true;
-    }
-
-    if (config.data_stages == 2) {
-      const uint32_t early_wave =
-          metadata_ready_mask & early_seen_mask & ~early_issued_mask;
-      if (early_wave != 0) {
-        const uint32_t issued_mask = pool_slice_issue_payload_stage(
-            config,
-            early_wave,
-            0,
-            config.early_ready_rows,
-            g_events,
+        pool_slice_publish_phase_parallel(
+            signal_array,
+            config.signal_base + config.my_pe,
+            data_value,
+            config.my_pe,
+            config.num_pes,
             lane);
-        early_issued_mask |= early_wave;
-        inflight_sources += __popc(issued_mask);
-        if (inflight_sources > peak_inflight_sources)
-          peak_inflight_sources = inflight_sources;
-        made_progress = true;
+        data_published = true;
+        pool_slice_record_profile(
+            g_events, poolSliceProfileFirstDataPublished, lane);
+        pool_slice_record_profile(
+            g_events, poolSliceProfileDataPublished, lane);
       }
+      if (!data_published ||
+          *reinterpret_cast<volatile uint32_t*>(&shared_dispatch_issued) <
+              config.num_pes)
+        __nanosleep(barrierPollSleepCycles);
     }
 
-    const uint32_t payload_wave =
-        metadata_ready_mask & data_seen_mask & ~payload_issued_mask;
-    if (payload_wave != 0) {
-      const uint32_t issued_mask = pool_slice_issue_payload_stage(
-          config,
-          payload_wave,
-          config.data_stages == 2 ? config.early_ready_rows : 0,
-          config.token_capacity,
-          g_events,
-          lane);
-      payload_issued_mask |= payload_wave;
-      payload_sources += __popc(payload_wave & needed_data_mask);
-      inflight_sources += __popc(issued_mask);
-      if (inflight_sources > peak_inflight_sources)
-        peak_inflight_sources = inflight_sources;
-      made_progress = true;
+  }
+
+  // NVSHMEM 3.4's public device quiet is thread-scoped. The pinned runtime's
+  // block-scope implementation distributes RC/DCI completion polling across
+  // the block, which avoids making coordinator lane 0 walk every QP after the
+  // workers have issued their batches. All roles are converged here.
+  __syncthreads();
+  pool_slice_quiet(config.num_pes, thread_id);
+
+  if (warp == 0) {
+    pool_slice_record_profile(
+        g_events, poolSliceProfilePayloadDone, lane);
+
+    if (lane == 0) {
+      uint64_t received_rows = 0;
+      for (uint32_t reader = 0;
+           reader < config.local_readers;
+           ++reader)
+        received_rows += shared_reader_tails[reader];
+      *group_ready = sequence;
+      control[1] = config.num_pes;
+      control[2] = received_rows;
+      control[4] = sequence;
+      control[5] = shared_payload_sources;
+      control[6] = shared_dispatch_batches;
+      control[7] = config.pack_warps;
+      if (shared_status != POOL_SLICE_STATUS_OK)
+        pool_slice_set_status(
+            config, static_cast<PoolSliceStatus>(shared_status));
+      __threadfence_system();
+      for (uint32_t reader = 0;
+           reader < config.local_readers;
+           ++reader)
+        atomicSub(bars + dispatch_barrier_base + reader, 1);
     }
-
-    if (!made_progress)
-      __nanosleep(barrierPollSleepCycles);
-  }
-
-  // All source batches have been issued, but readers remain blocked until one
-  // quiet makes every early NBI get visible in receiver-owned HBM.
-  pool_slice_complete_warp(lane);
-  pool_slice_record_profile(g_events, poolSliceProfilePayloadDone, lane);
-
-  if (lane == 0) {
-    uint64_t received_rows = 0;
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader)
-      received_rows += reader_tails[local_reader];
-    *group_ready = sequence;
-    control[1] = __popc(metadata_ready_mask);
-    control[2] = received_rows;
-    control[4] = sequence;
-    control[5] = metadata_waves;
-    control[6] = payload_sources;
-    control[7] = peak_inflight_sources;
-    __threadfence_system();
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader)
-      atomicSub(bars + dispatch_barrier_base + local_reader, 1);
-  }
-  __syncwarp();
-}
-
-static __device__ __noinline__ void pool_slice_return(
-    const PoolSliceConfig* config_pointer,
-    int* bars,
-    uint64_t* signal_array,
-    uint32_t compute_barrier_base,
-    uint32_t lane) {
-  __shared__ PoolSliceConfig shared_config;
-  if (config_pointer == nullptr || bars == nullptr || signal_array == nullptr)
-    return;
-  if (lane == 0)
-    shared_config = *config_pointer;
-  __syncwarp();
-  const PoolSliceConfig& config = shared_config;
-  if (!pool_slice_valid_config(config)) {
-    if (lane == 0)
-      pool_slice_set_status(config, POOL_SLICE_STATUS_BAD_CONFIG);
     __syncwarp();
-    return;
+    pool_slice_record_profile(
+        g_events, poolSliceProfileGatherReady, lane);
   }
 
-  const uint64_t sequence = pool_slice_sequence(config);
-  const auto* receive_routes =
-      reinterpret_cast<const PoolSliceReceiveBatch*>(
-          config.receive_routes_address);
+  __syncthreads();
+
+  // Reader blocks are ordinary VDCores programs. Only the coordinator polls
+  // their completion barriers; all communication workers sleep at the block
+  // barrier until expert output is ready.
+  if (warp == 0) {
+    bool ready = lane >= config.local_readers;
+    while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
+      if (!ready) {
+        ready = *reinterpret_cast<volatile int*>(
+            bars + compute_barrier_base + lane) == 0;
+      }
+      if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
+        __nanosleep(barrierPollSleepCycles);
+    }
+    pool_slice_record_profile(
+        g_events, poolSliceProfileComputeReady, lane);
+  }
+  __syncthreads();
+
+  if (thread_id == 0) {
+    shared_return_next = 0;
+    shared_return_issued = 0;
+  }
+  __syncthreads();
+
   const auto* expert_output = reinterpret_cast<const uint8_t*>(
       config.expert_output_address);
   auto* return_inbox = reinterpret_cast<uint8_t*>(
       config.return_inbox_address);
 
-  pool_slice_wait_barriers_warp(
-      bars, compute_barrier_base, config.local_readers, lane);
-
-  for (uint32_t source_pe = 0;
-       source_pe < config.num_pes;
-       ++source_pe) {
-    for (uint32_t local_reader = 0;
-         local_reader < config.local_readers;
-         ++local_reader) {
-      const PoolSliceReceiveBatch route = receive_routes[
-          static_cast<uint64_t>(local_reader) * config.num_pes + source_pe];
-      if (route.sequence != sequence || route.source_pe != source_pe ||
-          route.local_reader != local_reader ||
-          route.flags != POOL_SLICE_BATCH_FLAGS_NONE ||
-          route.source_begin > config.route_capacity ||
-          route.row_count > config.route_capacity - route.source_begin ||
-          route.base_row > config.expert_capacity_rows ||
-          route.row_count > config.expert_capacity_rows - route.base_row) {
-        if (lane == 0)
-          pool_slice_set_status(config, POOL_SLICE_STATUS_BATCH);
-        __syncwarp();
-        return;
+  if (warp != 0) {
+    while (true) {
+      uint32_t source_pe = UINT32_MAX;
+      if (lane == 0)
+        source_pe = atomicAdd(&shared_return_next, 1U);
+      source_pe = __shfl_sync(0xffffffffU, source_pe, 0);
+      if (source_pe >= config.num_pes)
+        break;
+      for (uint32_t reader = 0;
+           reader < config.local_readers;
+           ++reader) {
+        const PoolSliceReceiveBatch route = receive_routes[
+            static_cast<uint64_t>(reader) * config.num_pes + source_pe];
+        if (route.sequence != sequence ||
+            route.source_pe != source_pe ||
+            route.local_reader != reader ||
+            route.flags != POOL_SLICE_BATCH_FLAGS_NONE ||
+            route.source_begin > config.route_capacity ||
+            route.row_count > config.route_capacity - route.source_begin ||
+            route.base_row > config.expert_capacity_rows ||
+            route.row_count > config.expert_capacity_rows - route.base_row) {
+          if (lane == 0) {
+            atomicCAS(
+                &shared_status,
+                static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+                static_cast<uint32_t>(POOL_SLICE_STATUS_BATCH));
+          }
+          continue;
+        }
+        pool_slice_put_nbi_warp(
+            return_inbox +
+                static_cast<uint64_t>(route.source_begin) * config.row_bytes,
+            expert_output +
+                static_cast<uint64_t>(reader) * config.expert_stride +
+                route.base_row * config.expert_row_stride,
+            static_cast<uint64_t>(route.row_count) * config.row_bytes,
+            source_pe,
+            config.my_pe,
+            lane);
       }
-      pool_slice_put_nbi_warp(
-          return_inbox +
-              static_cast<uint64_t>(route.source_begin) * config.row_bytes,
-          expert_output +
-              static_cast<uint64_t>(local_reader) * config.expert_stride +
-              route.base_row * config.expert_row_stride,
-          static_cast<uint64_t>(route.row_count) * config.row_bytes,
-          source_pe,
-          config.my_pe,
-          lane);
+      __syncwarp();
+      if (lane == 0)
+        atomicAdd(&shared_return_issued, 1U);
     }
   }
-  pool_slice_complete_warp(lane);
 
-  // One completion signal per producing pool slice covers all reader batches
-  // that slice returned to the source PE.
-  for (uint32_t source_pe = 0;
-       source_pe < config.num_pes;
-       ++source_pe) {
-    pool_slice_publish_signal(
+  if (warp == 0)
+    while (*reinterpret_cast<volatile uint32_t*>(&shared_return_issued) <
+           config.num_pes)
+      __nanosleep(barrierPollSleepCycles);
+
+  __syncthreads();
+  pool_slice_quiet(config.num_pes, thread_id);
+  if (warp == 0)
+    pool_slice_record_profile(
+        g_events, poolSliceProfileReturnPayloadDone, lane);
+  __syncthreads();
+
+  if (warp == 0) {
+    pool_slice_publish_phase_parallel(
         signal_array,
-        config.return_signal_base + config.my_pe,
-        sequence,
-        source_pe,
+        config.signal_base + config.my_pe,
+        return_value,
         config.my_pe,
+        config.num_pes,
         lane);
+
+    bool returned = lane >= config.num_pes;
+    while (__ballot_sync(0xffffffffU, returned) != 0xffffffffU) {
+      if (!returned) {
+        returned = nvshmem_signal_fetch(
+            signal_array + config.signal_base + lane) >= return_value;
+      }
+      if (__ballot_sync(0xffffffffU, returned) != 0xffffffffU)
+        __nanosleep(barrierPollSleepCycles);
+    }
+    pool_slice_record_profile(
+        g_events, poolSliceProfileReturnSignalsClosed, lane);
   }
-  // Every source waits for the complete reciprocal signal set; the preceding
-  // payload quiet is the only data-completion fence required.
-  pool_slice_wait_signals_warp(
-      signal_array,
-      config.return_signal_base,
-      sequence,
-      config.num_pes,
-      lane);
+  __syncthreads();
 
   const auto* origins = reinterpret_cast<const uint32_t*>(
       config.send_origin_rows_address);
   auto* returned = reinterpret_cast<uint8_t*>(config.returned_address);
-  for (uint32_t index = 0; index < config.active_rows; ++index) {
-    const uint32_t origin = origins[index];
+  for (uint32_t route = warp;
+       route < config.active_rows;
+       route += total_warps) {
+    uint32_t origin = 0;
+    if (lane == 0)
+      origin = origins[route];
+    origin = __shfl_sync(0xffffffffU, origin, 0);
     if (origin >= config.return_capacity_rows) {
-      if (lane == 0)
-        pool_slice_set_status(config, POOL_SLICE_STATUS_ROUTE_RANGE);
+      if (lane == 0) {
+        atomicCAS(
+            &shared_status,
+            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+      }
       continue;
     }
     pool_slice_copy_warp(
         returned + static_cast<uint64_t>(origin) * config.return_stride,
-        return_inbox + static_cast<uint64_t>(index) * config.row_bytes,
+        return_inbox + static_cast<uint64_t>(route) * config.row_bytes,
         config.row_bytes,
         lane);
   }
-  __syncwarp();
-  if (lane == 0) {
-    auto* control = reinterpret_cast<unsigned long long*>(
-        config.control_address);
+  __syncthreads();
+
+  if (thread_id == 0) {
     control[3] = config.num_pes;
+    if (shared_status != POOL_SLICE_STATUS_OK)
+      pool_slice_set_status(
+          config, static_cast<PoolSliceStatus>(shared_status));
     __threadfence_system();
+    if (g_events != nullptr) {
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileScatterDone] = cuda::ptx::get_sreg_globaltimer();
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileDone] = cuda::ptx::get_sreg_globaltimer();
+    }
   }
-  __syncwarp();
+  __syncthreads();
 }

@@ -1,142 +1,149 @@
 # Pool-Slice Dynamic Read
 
-This is the pool-owned replacement for the sender-driven expert dispatch
-protocol. The authoritative implementation entry points are intended to be
-`include/dae/pool_slice_abi.cuh`, `include/dae/pool_slice.cuh`, and
+This is the unified pool-owned gathered-read protocol. Authoritative entry
+points are `include/dae/pool_slice_abi.cuh`, `include/dae/pool_slice.cuh`, and
 `python/dae/pool_slice.py`.
 
-## Ownership
+## Logical Ownership
 
-- A logical pool is horizontally split into one slice per PE initially.
-- Token slots are homed on the source PE's slice.
-- Dynamic readers are homed on the consuming PE's slice.
-- Only a pool communication warp executes writes, metadata delivery, gathered
-  reads, dependency resolution, and returns.
-- Producers only publish a batch into the target slice's per-sender mailbox;
-  consumers only wait on VDCores barriers and consume pool-owned HBM.
+- The logical pool is split into one slice per PE.
+- Source token slots and return origins are homed on the source slice.
+- Dynamic readers and their contiguous input/output regions are homed on the
+  consuming slice.
+- Producers write activation rows and route metadata; the pool PE interprets
+  that metadata and owns all inter-PE movement.
+- Reader blocks only execute ordinary VDCores memory/compute operations behind
+  pool-released barriers.
 
-The first implementation has one outstanding sequence per buffer set. A
-depth-one mailbox is therefore a valid SPSC queue. Sequence values increase
-monotonically when the mailbox is reused.
+The optimized implementation has one outstanding monotonic sequence per fixed
+buffer set. It does not retain the old expert-specific transport or its
+compatibility opcodes.
 
-## Slice Completion
+## Metadata And Dependency
 
-Every source publishes exactly one route batch to every target slice,
-including a zero-route batch. Queue publication is a transport doorbell, not a
-reader completion signal. After a target slice has consumed all source
-batches, it advances one local group-ready ticket shared by all dynamic reads
-on that slice.
+Source route rows are stable-grouped by target PE and target-local reader. One
+64-byte `PoolSlicePublishBatch` is sent from every source to every target,
+including zero-row targets. The descriptor contains the source route span and
+up to eight reader counts, so the target reconstructs all contiguous ranges
+without fetching route lists or offset tables.
 
-There is no expert-specific or epoch-end message. With multiple outstanding
-rounds, a future queue implementation must retain per-sender arrival tickets
-before advancing the shared group ticket; an untagged additive count can mix
-two rounds.
+One signal word per source PE carries three increasing values for each
+sequence:
 
-The source slice publishes readiness in one source-indexed signal word on
-every PE. The default publishes once after the pool write completes. An
-optional two-stage mode publishes monotonic early/final values in the same
-word, so it adds doorbells but no signal storage. All readers on a destination
-PE share the source ticket.
+1. metadata descriptor visible;
+2. packed delivery rows visible;
+3. returned rows visible.
 
-## Initial HBM Flow
+A target accepts all source descriptors as its sender-set completion. Empty
+sources retire at metadata; nonempty sources also wait for data. All dynamic
+reads on a slice share this sender set and one group-ready ticket, so no
+reader-specific end message or epoch-end record exists.
 
-1. The pool block's ordinary VDCores memory/compute streams copy source rows
-   once into the local token-slot pool and release a write barrier.
-2. At the same time, the communication warp publishes one small route-batch
-   descriptor to each target pool slice. The descriptor includes the target
-   slice's route begin and end; with one local reader this avoids a separate
-   offsets RMA.
-3. The target pool warp event loop scans one mailbox and one readiness word per
-   source lane. Descriptor and data arrival are independent; a payload is
-   eligible when both are present. The pool fetches the source-owned grouped
-   route rows and assigns receiver-local contiguous rows. Multiple local
-   readers fetch their internal offset boundaries in one source-batched RMA;
-   one local reader uses only the descriptor boundaries.
-4. As soon as any source is eligible, the target issues its named token-slot
-   gets without waiting for later sources. Remote gets precede the synchronous
-   local HBM copy; all are NBI and multiple source batches remain in flight
-   until a bounded metadata or final completion quiet.
-5. After all reads complete, the pool advances the shared group ticket and
-   releases the local reader barriers.
-6. After reader compute, the pool uses saved provenance to return contiguous
-   per-source/per-reader output batches and performs the source-local scatter.
+## Macro Operation
 
-The target does not fetch return provenance: it remains source-owned and is
-validated when the source pool scatters returned route-major rows. Queue
-descriptor publication, reciprocal data-ready signals, and reciprocal return
-signals do not add redundant local quiet phases. Metadata and row payloads use
-nonblocking warp RMAs with one required quiet per consumable batch.
+The pool block's first instruction is `PoolSliceExchange(config,
+write_barrier, dispatch_barrier_base, compute_barrier_base)`. `dae2` detects it
+uniformly before the normal warp-role split and executes one all-warp macro:
 
-The optional `activation_stages=2` mode puts a VDCores barrier on the first
-hardware-sized source-write chunk and another on the final chunk. The source
-publishes values `2*sequence-1` and `2*sequence`; targets issue prefix rows on
-the early value and remaining rows on the final value. Filtering by source row
-means route rows need not be sorted. Reader release still waits for the final
-quiet, so expert compute never observes a partial gathered buffer.
+1. Build and publish descriptors while the ordinary writer block copies source
+   activations once into token slots.
+2. Pack warps traverse route rows once. Before copying a row, they wait only on
+   the writer barrier for the TMA-sized chunk containing that source row.
+3. Coordinator lanes scan all source signal words in parallel. Receive workers
+   dynamically claim metadata-ready sources and wait independently for their
+   data phase.
+4. Each worker issues one contiguous NBI GET per nonempty
+   `(source, local_reader)` range. One quiet after all issuance completes all
+   dispatch batches.
+5. The coordinator records receiver tails, publishes the group ticket, and
+   releases ordinary reader blocks.
+6. After reader compute barriers reach zero, workers issue contiguous return
+   NBI PUTs by source. One quiet completes the direction.
+7. The coordinator publishes and waits for merged return phases. All nine
+   warps then scatter route-major inbox rows to source origin rows.
 
-## Minimal Assumptions
+The HBM protocol therefore overlaps descriptor delivery, source writes,
+route-major packing, signal scanning, and remote payload issue. There is no
+block barrier between descriptor publication and pack/receive work. It keeps
+many source batches in flight rather than quieting after each source or reader.
 
-- at most 32 PEs;
-- one pool slice per PE in the baseline;
+## Fixed Fast-Path Assumptions
+
+- at most 32 PEs and at most eight local readers per slice;
+- one pool communication block per PE initially;
 - one outstanding sequence per buffer set;
-- fixed-capacity HBM buffers, no fragmentation;
-- rows are contiguous, at least 1 KiB, 16-byte aligned, and a multiple of 16
-  bytes;
-- route metadata is stable-grouped by reader and remains live until the pool
-  sequence completes.
+- fixed-capacity, separately allocated symmetric buffers;
+- contiguous rows of at least 1 KiB, 16-byte aligned, with no fragmented or
+  unaligned tail path;
+- source routes remain live and grouped until return scatter completes.
 
-## Performance Accounting
+Larger logical reader counts are represented by additional slices, not by a
+larger common descriptor.
 
-Compared with sender-push dispatch, the pool-pull path removes sender packing
-and remote tail atomics. Network payload still scales with routed rows. Its
-main risk is smaller RMA granularity, so the refinement order is:
+## Transport And QPs
 
-1. issue all row gets nonblocking and quiet once per bounded window;
-2. coalesce consecutive source slots;
-3. ingest metadata while source writes are still running;
-4. add multiple SM slices only if one pool warp is demonstrably saturated.
+The Vista NVSHMEM 3.4.5 installation uses IBGDA for device communication but
+does not expose the newer explicit application-QP API. In the default setup it
+reported CTA mapping, one shared DCI QP, and two RC QPs. The implementation
+therefore expresses concurrency as independent NBI source batches; RC/DCI
+count and CTA/warp mapping are explored through NVSHMEM environment settings.
 
-The checked-in implementation completed steps 1 and 3: all row gets are NBI,
-mailbox and readiness polling are lane-parallel and skip accepted slots,
-metadata and source writes progress independently, and payload gets start per
-source instead of after a global data-ready phase. Remote gets are issued
-before local copies. Unused provenance traffic was removed and one-reader
-offsets are embedded in the existing descriptor.
+NVSHMEM 3.4's public device `quiet` is thread-scoped. The pool uses the pinned
+block-cooperative internal quiet at three or more PEs so QP completion polling
+is distributed across lanes; at one remote peer, lane 0 is faster. The
+dependency is isolated in `pool_slice_quiet_block`.
 
-Two-stage activation readiness is kept opt-in. It starts a small first-chunk
-payload earlier and creates early/final in-flight batches, but the extra
-doorbell and second route scan did not improve completion on the measured
-32/128-token cases. A half-buffer early experiment was rejected because its
-large issuance loop delayed the final-ready doorbell; the retained mode limits
-the early prefix to one 16-bit-TMA-sized VDCores chunk. A separate experiment
-that fused return payload and signaling also regressed and was reverted.
+Measured 128-token sweeps favored one RC per PE with CTA mapping. At eight PEs,
+one/two/four RC profiles were approximately 0.412/0.467/0.519 ms. The single
+pool SM already issued all seven remote source batches before quiet; more QPs
+increased control and straggler cost. Pack-warp sweeps at the same shape were
+0.517/0.412/0.427 ms for three/four/five pack warps. This does not justify a
+second pool SM: it would add cross-core ownership and completion coordination
+without addressing the measured bottleneck.
 
-## Measured Boundary
+## Measured Refinement Boundary
 
-On four Vista GH200 nodes, 32 tokens/PE, 4096 BF16 elements/row, one
-reader/PE, top-1, five warmups, and 20 samples:
+The predecessor issued one GET per routed row. At 128 tokens/PE and 4096 BF16
+elements/row on two GH200 PEs it took 0.903--1.098 ms versus 0.474--0.476 ms
+for the dense NCCL ring reference.
 
-| PEs | original pool | event-driven pool | NCCL ring | pool/ring |
+The unified route-major macro replaces tens of row RMAs with one batch per
+nonempty `(source, reader)`. Representative 50-sample results for 4096 BF16
+elements/row and one reader/PE are:
+
+| PEs | tokens/PE | pool | NCCL ring | pool/ring |
 |---:|---:|---:|---:|---:|
-| 2 | 0.329 ms | 0.328 ms | 0.544 ms | 0.60x |
-| 4 | 0.533 ms | 0.438 ms | 1.098 ms | 0.40x |
+| 2 | 8 | 0.113 ms | 0.289 ms | 0.39x |
+| 2 | 32 | 0.144 ms | 0.552 ms | 0.26x |
+| 2 | 128 | 0.356 ms | 0.486 ms | 0.73x |
+| 4 | 8 | 0.133 ms | 0.747 ms | 0.18x |
+| 4 | 32 | 0.173--0.213 ms | 1.095 ms | 0.16--0.19x |
+| 4 | 128 | 0.359--0.377 ms | 1.336 ms | 0.27--0.28x |
+| 8 | 8 | 0.165 ms | 1.669 ms | 0.10x |
+| 8 | 32 | 0.183 ms | 2.385 ms | 0.08x |
+| 8 | 128 | 0.412--0.438 ms | 4.193 ms | 0.10x |
 
-The final pool cost model reports 128 KiB and 192 KiB of remote routed payload
-per direction per PE at 2 and 4 PEs. The dense two-all-reduce ring model is
-1.5 MiB and 7.5 MiB per PE respectively. These are protocol comparisons, not
-claims about a production fused expert kernel: the checked-in reader compute
-is an identity copy and top-k output is route-major before a later combine.
+The ranges are repeated pool runs; NCCL columns are the dense two-all-reduce
+ring reference, not a production sparse all-to-all. The pool transfers only
+routed rows, while the reference materializes dense expert-major dispatch and
+token-major return tensors.
 
-Matched 50-sample phased/event-driven trials at the same 32-token shape were
-0.333/0.331 ms (2 PE) and 0.459/0.419 ms (4 PE). At 128 tokens/PE, the early
-stage moved first payload issue from 0.070 to 0.058 ms on 2 PE, but
-dispatch-ready was 0.588 versus 0.578 ms for one stage, so one stage remains
-the default.
+At eight PEs and 128 tokens, a representative phase split was about 0.112 ms
+to packed-data publication, 0.111 ms to all metadata, 0.236 ms to dispatch
+payload completion, 0.337 ms to reader completion, 0.375 ms to return-payload
+completion, 0.401 ms to all return phases, and 0.428 ms through scatter.
 
-The final NVSHMEM-linked `dae2` image is `REG=168, STACK=840`; the entry kernel
-has no spills and the build emits no WGMMA diagnostic. An initial noinline
-staging helper produced `STACK=1112` and was replaced with an inline helper.
+The default `pack_warps=0` policy selects four pack/four receive warps for
+small payloads and for four or more PEs. For a large two-PE buffer it selects
+six pack/two receive warps; this reduced 128-token time from about 0.412 to
+0.356 ms without hurting small-token receive concurrency.
 
-VDCores timing remains in the existing communication-warp profile space.
-NCCL comparisons remain outside runtime/application source under
-`benchmarks/`.
+Rejected variants include rescanning all routes per writer chunk, seven pack
+warps at two PEs, two-stage route scans, fused return signaling, and
+per-slice early scatter. The last saved only 4--5 microseconds at eight PEs but
+added polling contention at two and four PEs. The retained implementation uses
+one route traversal, waits only the named writer-chunk barrier, and performs
+one all-warp scatter after the merged return dependency closes.
+
+VDCores measurements use only internal `g_events` timestamps. The dense NCCL
+reference and CUDA-event timing remain external under `benchmarks/`.

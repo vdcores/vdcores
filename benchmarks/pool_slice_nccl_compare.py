@@ -19,7 +19,7 @@ from dae.pool_slice import (
     allocate_pool_slice,
     build_pool_slice_copy_program,
 )
-from ep_pool_nccl_compare import (
+from nccl_ep_reference import (
     Timing,
     initialize_nccl,
     print_result,
@@ -41,11 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("pool", "nccl", "both"), default="both")
     parser.add_argument("--symmetric-size", default="1G")
     parser.add_argument(
-        "--gather-mode",
-        choices=("streaming", "phased"),
-        default="streaming",
+        "--pack-warps",
+        type=int,
+        default=0,
+        help="pack warps; zero selects the PE/payload-aware policy",
     )
-    parser.add_argument("--activation-stages", type=int, choices=(1, 2), default=1)
     return parser.parse_args()
 
 
@@ -61,7 +61,7 @@ def run_pool(
     expert_capacity_rows = (
         global_tokens + num_readers - 1
     ) // num_readers
-    signals = nvshmem.init_signal_space(3 * runtime.num_pes)
+    signals = nvshmem.init_signal_space(runtime.num_pes)
     buffers = allocate_pool_slice(
         signals,
         num_pes=runtime.num_pes,
@@ -71,8 +71,7 @@ def run_pool(
         expert_capacity_rows=expert_capacity_rows,
         hidden_size=args.hidden_size,
         dtype=tokens.dtype,
-        streaming_gather=args.gather_mode == "streaming",
-        activation_stages=args.activation_stages,
+        pack_warps=args.pack_warps,
     )
     returned = nvshmem.zeros(tokens.shape, dtype=tokens.dtype)
     local_rows = torch.arange(args.tokens_per_pe, dtype=torch.int64)
@@ -96,6 +95,10 @@ def run_pool(
         "first_payload": [],
         "metadata_closed": [],
         "payload_done": [],
+        "compute_ready": [],
+        "return_payload_done": [],
+        "return_signals_closed": [],
+        "scatter_done": [],
     }
     rounds = args.warmup + args.iterations
     for iteration in range(rounds):
@@ -105,11 +108,7 @@ def run_pool(
         program.launch()
         torch.cuda.synchronize(runtime.device)
         gather_ns, tail_ns, total_ns = program.timing_ns()
-        overlap = (
-            program.overlap_timing_ns()
-            if args.gather_mode == "streaming"
-            else None
-        )
+        overlap = program.overlap_timing_ns()
         gather_ms = rank_max(comm, gather_ns / 1.0e6)
         tail_ms = rank_max(comm, tail_ns / 1.0e6)
         total_ms = rank_max(comm, total_ns / 1.0e6)
@@ -117,17 +116,16 @@ def run_pool(
             gather_samples.append(gather_ms)
             tail_samples.append(tail_ms)
             total_samples.append(total_ms)
-            if overlap is not None:
-                for name in overlap_samples:
-                    value = overlap[name]
-                    present = rank_max(comm, float(value is not None))
-                    if present:
-                        overlap_samples[name].append(
-                            rank_max(
-                                comm,
-                                -1.0 if value is None else value / 1.0e6,
-                            )
+            for name in overlap_samples:
+                value = overlap[name]
+                present = rank_max(comm, float(value is not None))
+                if present:
+                    overlap_samples[name].append(
+                        rank_max(
+                            comm,
+                            -1.0 if value is None else value / 1.0e6,
                         )
+                    )
 
     torch.testing.assert_close(returned, tokens, rtol=0, atol=0)
     status, senders, received_rows, returned_slices, observed, group_ready = (
@@ -150,23 +148,21 @@ def run_pool(
     remote_pes = runtime.num_pes - 1
     row_bytes = args.hidden_size * tokens.element_size()
     model = {
-        "gather_mode": args.gather_mode,
-        "activation_stages": args.activation_stages,
+        "protocol": "batched-macro",
+        "pack_warps": buffers.pack_warps,
         "remote_routes_per_pe": remote_routes,
         "payload_bytes_per_direction_per_pe": remote_routes * row_bytes,
         "descriptor_bytes_per_pe": remote_pes * POOL_SLICE_PUBLISH_BYTES,
-        "offset_metadata_bytes_received_per_pe": (
-            0
-            if args.experts_per_pe == 1
-            else runtime.num_pes * (args.experts_per_pe + 1) * 4
-        ),
-        "route_metadata_bytes_sent_remote_per_pe": remote_routes * 4,
-        "dispatch_data_rmas_per_pe_current": remote_routes,
+        "offset_metadata_bytes_received_per_pe": 0,
+        "route_metadata_bytes_sent_remote_per_pe": 0,
+        "dispatch_data_rmas_per_pe_current": remote_readers,
         "return_data_rmas_per_pe": remote_readers,
-        "queue_signals_per_pe": remote_pes,
-        "data_ready_signals_per_pe": remote_pes * args.activation_stages,
-        "return_signals_per_pe": remote_pes,
+        "merged_signal_words_per_pe": runtime.num_pes,
+        "metadata_phase_updates_per_pe": remote_pes,
+        "data_phase_updates_per_pe": remote_pes,
+        "return_phase_updates_per_pe": remote_pes,
         "local_token_pool_copy_bytes_per_pe": 2 * args.tokens_per_pe * row_bytes,
+        "local_delivery_pack_bytes_per_pe": 2 * buffers.active_rows * row_bytes,
         "local_reader_copy_bytes_per_pe": (
             2 * args.experts_per_pe * expert_capacity_rows * row_bytes
         ),
@@ -178,12 +174,12 @@ def run_pool(
         for name, samples in overlap_samples.items():
             if samples:
                 model[f"median_{name}_ms"] = statistics.median(samples)
-        metadata_waves, payload_sources, peak_inflight = (
-            buffers.streaming_state()
+        payload_sources, dispatch_batches, active_pack_warps = (
+            buffers.performance_state()
         )
-        model["metadata_waves"] = metadata_waves
         model["payload_sources"] = payload_sources
-        model["peak_inflight_sources"] = peak_inflight
+        model["dispatch_batches"] = dispatch_batches
+        model["active_pack_warps"] = active_pack_warps
     return Timing(gather_samples, tail_samples, total_samples), model
 
 
@@ -232,8 +228,8 @@ def main() -> None:
                 f"configuration: pes={runtime.num_pes} "
                 f"tokens/pe={args.tokens_per_pe} hidden={args.hidden_size} "
                 f"experts/pe={args.experts_per_pe} dtype={args.dtype} "
-                f"gather_mode={args.gather_mode} "
-                f"activation_stages={args.activation_stages} "
+                f"protocol=batched-macro pack_warps="
+                f"{pool_result[1]['pack_warps'] if pool_result else args.pack_warps} "
                 f"warmup={args.warmup} iterations={args.iterations}"
             )
             if pool_result is not None:

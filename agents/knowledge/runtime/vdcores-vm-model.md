@@ -138,10 +138,14 @@ The alloc-warp interpreter also keeps three local control variables in [include/
 ### Communication VM
 
 The optional ninth warp has an independent `CommInst` PC loop and no allocator
-state. It executes barriers/timestamps, NVSHMEM put/wait, generic memory-pool
-submit/wait/run, expert-pool reset/dispatch/return, and pool-slice
-publish/gather/return. These operators do not consume slots or enter `m2c`,
-`c2m`, or `m2ld`.
+state. It executes barriers/timestamps, NVSHMEM put/wait, and generic
+memory-pool submit/wait/run. These operators do not consume slots or enter
+`m2c`, `c2m`, or `m2ld`.
+
+One isolated macro opcode, `COMM_POOL_SLICE_EXCHANGE`, must appear first in a
+specialized block. It is detected uniformly before the normal role split and
+temporarily assigns all nine warps communication work for the lifetime of that
+operation. Ordinary blocks and their interpreters remain unchanged.
 
 Communication synchronizes with local memory/compute through `bars[]` and with
 other PEs through monotonic symmetric signals. See

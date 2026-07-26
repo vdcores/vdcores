@@ -3,14 +3,23 @@
 #include <cstdint>
 
 static constexpr uint32_t poolSliceMaxPes = 32;
+static constexpr uint32_t poolSliceMaxLocalReaders = 8;
 static constexpr uint32_t poolSliceMinimumRowBytes = 1024;
 static constexpr uint32_t poolSliceAlignmentBytes = 16;
 static constexpr uint32_t poolSliceControlWords = 8;
+static constexpr uint32_t poolSliceSignalPhases = 3;
+static constexpr uint32_t poolSliceProfileStart = 5;
+static constexpr uint32_t poolSliceProfileGatherReady = 6;
+static constexpr uint32_t poolSliceProfileDone = 7;
 static constexpr uint32_t poolSliceProfileDataPublished = 8;
 static constexpr uint32_t poolSliceProfileFirstPayload = 9;
 static constexpr uint32_t poolSliceProfileMetadataClosed = 10;
 static constexpr uint32_t poolSliceProfilePayloadDone = 11;
 static constexpr uint32_t poolSliceProfileFirstDataPublished = 12;
+static constexpr uint32_t poolSliceProfileComputeReady = 13;
+static constexpr uint32_t poolSliceProfileReturnPayloadDone = 14;
+static constexpr uint32_t poolSliceProfileReturnSignalsClosed = 15;
+static constexpr uint32_t poolSliceProfileScatterDone = 16;
 
 enum PoolSliceStatus : uint64_t {
   POOL_SLICE_STATUS_OK = 0,
@@ -27,16 +36,17 @@ enum PoolSliceBatchFlags : uint32_t {
   POOL_SLICE_BATCH_FLAGS_ERROR = 1U << 0,
 };
 
-enum PoolSliceFlags : uint32_t {
-  POOL_SLICE_FLAGS_NONE = 0,
-  POOL_SLICE_FLAGS_STREAMING_GATHER = 1U << 0,
+enum PoolSliceSignalPhase : uint32_t {
+  POOL_SLICE_SIGNAL_METADATA = 1,
+  POOL_SLICE_SIGNAL_DATA = 2,
+  POOL_SLICE_SIGNAL_RETURN = 3,
 };
 
-// One transport descriptor is published by every source to every pool slice.
-// route_begin/end cover that target slice's grouped route span; they fully
-// describe the common one-reader case. A zero-route descriptor is still
-// published, so consuming all source descriptors closes the shared sender
-// group without a reader-specific end message.
+// One descriptor is published by every source pool core to every target pool
+// slice, including targets with zero rows. Reader counts reconstruct the
+// target's complete grouped offset span without a metadata GET. Keeping the
+// common metadata in one cache line is deliberate: the pool protocol supports
+// at most eight local readers and uses larger logical fanout by adding slices.
 struct alignas(16) PoolSlicePublishBatch {
   uint64_t sequence;
   uint32_t source_pe;
@@ -45,14 +55,14 @@ struct alignas(16) PoolSlicePublishBatch {
   uint32_t flags;
   uint32_t route_begin;
   uint32_t route_end;
+  uint32_t reader_counts[poolSliceMaxLocalReaders];
 };
 static_assert(
-    sizeof(PoolSlicePublishBatch) == 32,
+    sizeof(PoolSlicePublishBatch) == 64,
     "PoolSlicePublishBatch ABI changed");
 
-// The target pool records the local contiguous range assigned to each
-// (reader, source) pair. The same record is later consumed by the pool-owned
-// return path.
+// The target records the local contiguous range assigned to each
+// (reader, source) batch. The same record drives the pool-owned return path.
 struct alignas(16) PoolSliceReceiveBatch {
   uint64_t sequence;
   uint64_t base_row;
@@ -67,13 +77,14 @@ static_assert(
     sizeof(PoolSliceReceiveBatch) == 48,
     "PoolSliceReceiveBatch ABI changed");
 
-// Python packs this stable 240-byte ABI in python/dae/pool_slice.py. Every
+// Python packs this stable 208-byte ABI in python/dae/pool_slice.py. Every
 // remotely addressed pointer names a same-order NVSHMEM symmetric allocation.
-// The config object itself is local CUDA memory and is only read by its pool
-// communication warp.
+// The config object itself is local CUDA memory and is read only by the
+// communication-specialized VDCores block.
 struct alignas(16) PoolSliceConfig {
   uint64_t source_address;
   uint64_t token_pool_address;
+  uint64_t delivery_pool_address;
   uint64_t expert_input_address;
   uint64_t expert_output_address;
   uint64_t return_inbox_address;
@@ -83,10 +94,7 @@ struct alignas(16) PoolSliceConfig {
   uint64_t send_origin_rows_address;
   uint64_t send_batches_address;
   uint64_t receive_batches_address;
-  uint64_t offsets_inbox_address;
-  uint64_t rows_inbox_address;
   uint64_t receive_routes_address;
-  uint64_t reader_tails_address;
   uint64_t sequence_address;
   uint64_t group_ready_address;
   uint64_t control_address;
@@ -94,6 +102,7 @@ struct alignas(16) PoolSliceConfig {
   uint32_t row_bytes;
   uint32_t source_stride;
   uint32_t pool_stride;
+  uint32_t delivery_stride;
   uint32_t expert_row_stride;
   uint32_t return_stride;
   uint32_t expert_stride;
@@ -104,14 +113,11 @@ struct alignas(16) PoolSliceConfig {
   uint32_t local_readers;
   uint32_t num_pes;
   uint32_t my_pe;
-  uint32_t queue_signal_base;
-  uint32_t data_signal_base;
-  uint32_t return_signal_base;
+  uint32_t signal_base;
   uint32_t signal_count;
   uint32_t return_capacity_rows;
-  uint32_t flags;
-  uint32_t data_stages;
-  uint32_t early_ready_rows;
-  uint32_t reserved_u32[1];
+  uint32_t pack_warps;
+  uint32_t write_chunks;
+  uint32_t write_chunk_rows;
 };
-static_assert(sizeof(PoolSliceConfig) == 240, "PoolSliceConfig ABI changed");
+static_assert(sizeof(PoolSliceConfig) == 208, "PoolSliceConfig ABI changed");

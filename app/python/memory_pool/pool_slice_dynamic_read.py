@@ -35,11 +35,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--symmetric-size", default="512M")
     parser.add_argument(
-        "--gather-mode",
-        choices=("streaming", "phased"),
-        default="streaming",
+        "--pack-warps",
+        type=int,
+        default=0,
+        help="pack warps; zero selects the PE/payload-aware policy",
     )
-    parser.add_argument("--activation-stages", type=int, choices=(1, 2), default=1)
     return parser.parse_args()
 
 
@@ -68,8 +68,8 @@ def main() -> None:
         global_routes = runtime.num_pes * local_routes
         expert_capacity_rows = (
             global_routes + num_readers - 1
-        ) // num_readers
-        signals = nvshmem.init_signal_space(3 * runtime.num_pes)
+        ) // num_readers + args.top_k
+        signals = nvshmem.init_signal_space(runtime.num_pes)
         buffers = allocate_pool_slice(
             signals,
             num_pes=runtime.num_pes,
@@ -80,8 +80,7 @@ def main() -> None:
             expert_capacity_rows=expert_capacity_rows,
             hidden_size=args.hidden_size,
             dtype=dtype,
-            streaming_gather=args.gather_mode == "streaming",
-            activation_stages=args.activation_stages,
+            pack_warps=args.pack_warps,
         )
         tokens = nvshmem.empty(
             (args.tokens_per_pe, args.hidden_size), dtype=dtype
@@ -130,16 +129,12 @@ def main() -> None:
             program.launch()
             torch.cuda.synchronize(runtime.device)
             gather_ns, return_ns, total_ns = program.timing_ns()
-            overlap = (
-                program.overlap_timing_ns()
-                if args.gather_mode == "streaming"
-                else None
-            )
+            overlap = program.overlap_timing_ns()
             if iteration >= args.warmup:
                 gather_samples.append(gather_ns / 1.0e6)
                 return_samples.append(return_ns / 1.0e6)
                 total_samples.append(total_ns / 1.0e6)
-                if overlap is not None and overlap["first_payload"] is not None:
+                if overlap["first_payload"] is not None:
                     first_payload_samples.append(
                         overlap["first_payload"] / 1.0e6
                     )
@@ -152,9 +147,14 @@ def main() -> None:
         assert returned_slices == runtime.num_pes
         assert observed == rounds
         assert group_ready == rounds
-        assert received_rows == int(buffers.reader_tails.sum().item())
-        metadata_waves, payload_sources, peak_inflight = (
-            buffers.streaming_state()
+        payload_sources, dispatch_batches, active_pack_warps = (
+            buffers.performance_state()
+        )
+        receive_routes = buffers.read_receive_routes()
+        assert received_rows == sum(
+            route.row_count
+            for per_reader in receive_routes
+            for route in per_reader
         )
 
         expected = tokens.index_select(0, source_rows.to(tokens.device))
@@ -162,6 +162,10 @@ def main() -> None:
             snapshots = {
                 "tokens": tokens[0, :8].float().cpu().tolist(),
                 "token_pool": buffers.token_pool[0, :8].float().cpu().tolist(),
+                "delivery_pool": buffers.delivery_pool[0, :8]
+                .float()
+                .cpu()
+                .tolist(),
                 "expert_input": buffers.expert_input[0, 0, :8]
                 .float()
                 .cpu()
@@ -179,9 +183,8 @@ def main() -> None:
                 "send_rows": buffers.send_rows[: buffers.active_rows]
                 .cpu()
                 .tolist(),
-                "offsets_inbox": buffers.offsets_inbox.cpu().tolist(),
                 "receive_batches": buffers.receive_batches.cpu().tolist(),
-                "reader_tails": buffers.reader_tails.cpu().tolist(),
+                "receive_routes": receive_routes,
             }
             raise AssertionError(
                 f"pool-slice data path mismatch; control="
@@ -193,9 +196,9 @@ def main() -> None:
         remote_slices = runtime.num_pes - 1
         overlap_summary = (
             f"first_payload_ms={statistics.median(first_payload_samples):.4f}, "
-            f"metadata_waves={metadata_waves}, "
             f"payload_sources={payload_sources}, "
-            f"peak_inflight={peak_inflight}"
+            f"dispatch_batches={dispatch_batches}, "
+            f"pack_warps={active_pack_warps}"
             if first_payload_samples
             else "disabled"
         )
@@ -204,8 +207,7 @@ def main() -> None:
             f"PE {runtime.pe}/{runtime.num_pes}: pool-slice dynamic-read PASS "
             f"tokens={args.tokens_per_pe} hidden={args.hidden_size} "
             f"readers={num_readers} top_k={args.top_k} "
-            f"gather_mode={args.gather_mode} "
-            f"activation_stages={args.activation_stages} "
+            f"protocol=batched-macro pack_warps={active_pack_warps} "
             f"received={received_rows} launches={rounds} "
             f"median_ms=(gather={statistics.median(gather_samples):.4f}, "
             f"return={statistics.median(return_samples):.4f}, "

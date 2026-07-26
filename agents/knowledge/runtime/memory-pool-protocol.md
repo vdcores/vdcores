@@ -1,8 +1,8 @@
 # Generic Dependency Memory Pool
 
 This is the correctness-first mailbox protocol used by
-`app/python/memory_pool/dependent_rw.py`. The sharded EP fast path is documented
-in `expert-pool-v2.md`.
+`app/python/memory_pool/dependent_rw.py`. The optimized batched gathered-read
+protocol is documented in `pool-slice-dynamic-read.md`.
 
 ## Execution Model
 
@@ -53,14 +53,13 @@ avoid ambiguous address-hazard inference.
 
 ## Operations
 
-- `WRITE`: get the producer bytes into the pool.
+- `WRITE`: get producer bytes into the pool.
 - `READ`: put pool bytes to the consumer.
 - `WRITE | REDUCE_SUM_F32`: stage and accumulate a contribution before adding
   its dependency ticket.
 - `SCATTER`: fetch route metadata, then gather source rows into routed pool
   rows.
-- `GATHER`: fetch route metadata, then return routed pool rows in request row
-  order.
+- `GATHER`: fetch route metadata, then return routed pool rows in request order.
 
 The selected operation is executed cooperatively by all 32 communication-warp
 lanes. Remote NBI movement is quieted before ticket/completion publication.
@@ -73,16 +72,16 @@ set an explicit status and terminate the pool program.
 blocks. A producer may place `CommWaitBarrier` in its communication stream
 before submit when local data is produced in the same launch. `IssueBarrier`
 belongs to the independent memory VM and therefore cannot order a
-communication submit. Host-prepared tests do not need that barrier.
+communication submit.
 
 ```text
 producer communication: [wait local barrier] -> submit -> wait completion
 pool communication:      scan -> choose ready -> move data -> ticket -> signal
 ```
 
-The checked-in dependent-read/write app uses only communication work, so it
-requests zero dynamic slot storage. It still launches one normal `dae2` program
-with terminating memory/compute streams.
+The dependent-read/write app uses only communication work, so it requests zero
+dynamic slot storage. It still launches one normal `dae2` program with
+terminating memory/compute streams.
 
 ## Verified Boundary
 

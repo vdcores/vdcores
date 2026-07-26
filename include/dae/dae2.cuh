@@ -17,6 +17,7 @@
 #include "pipeline/stwarp.cuh"
 #ifdef DAE_ENABLE_NVSHMEM
 #include "pipeline/commwarp.cuh"
+#include "pool_slice.cuh"
 #endif
 
 static __device__ __forceinline__ void * align_to(void *ptr, size_t align) {
@@ -132,6 +133,25 @@ void dae2(
   }
 
   __syncthreads();
+
+#ifdef DAE_ENABLE_NVSHMEM
+  // A pool exchange is an isolated communication-specialized VDCores block.
+  // It reuses this block's existing nine warps and returns before the ordinary
+  // VM role split; every other program follows the unchanged paths below.
+  if (comminsts[0].opcode == COMM_POOL_SLICE_EXCHANGE) {
+    const CommInst inst = comminsts[0];
+    pool_slice_exchange(
+        reinterpret_cast<const PoolSliceConfig*>(inst.address),
+        bars,
+        signal_array,
+        g_events,
+        inst.size,
+        inst.arg0,
+        inst.arg1,
+        thread_id);
+    return;
+  }
+#endif
 
   // start memory and computation execution
   if (threadIdx.x < numComputeWarps * 32) {
