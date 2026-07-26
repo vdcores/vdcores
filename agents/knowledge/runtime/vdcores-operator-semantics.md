@@ -35,6 +35,18 @@ Primary references:
   - `bar()`
     - upper bits of `num_slots`
 
+### `CommInst`
+
+- independent 16-byte communication format:
+  - `opcode`
+  - `size`
+  - `arg0`
+  - `arg1`
+  - `address`
+- the first four fields are `uint16`; `address` is `uint64`
+- communication opcodes have no memory flags and are consumed only by the
+  optional communication warp
+
 ## Memory-Opcode Flags
 
 The low 6 opcode bits are flags:
@@ -63,11 +75,6 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 - `OP_ISSUE_BARRIER`
 - `OP_CC0`
 - `OP_CC0_ROW_BYTES`
-- `OP_NVSHMEM_PUT`
-- `OP_NVSHMEM_WAIT`
-- `OP_MEMORY_POOL_SUBMIT`
-- `OP_MEMORY_POOL_WAIT`
-- `OP_MEMORY_POOL_RUN`
 - `OP_ALLOC_REG_LOAD`
 - `OP_ALLOC_TMA_LOAD_1D`
 - `OP_ALLOC_TMA_LOAD_TENSOR_1D`
@@ -175,63 +182,6 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - declared in the opcode registry, but there is no checked-in `allocwarp` case for it in this snapshot
   - status:
     - declared but unhandled in the checked-in runtime path
-
-### Optional NVSHMEM and memory-pool control ops
-
-These opcodes are declared in every build but their alloc-warp handlers are
-compiled only with `DAE_ENABLE_NVSHMEM`. All are non-allocating: they do not
-touch `slot_avail`, publish `m2c`, or enqueue `LdCmd` work.
-
-- `OP_NVSHMEM_PUT`
-  - fields:
-    - `address` = local symmetric source and same symmetric destination address
-    - `size` / `num_slots` = low/high 16 bits of byte count
-    - low 8 bits of `arg` = target PE
-    - high 8 bits of `arg` = signal id
-  - effect:
-    - lane 0 executes put-with-signal using value `1`, then `nvshmem_quiet()`
-    - use a preceding `IssueBarrier` when local VDCores stores produce the data
-
-- `OP_NVSHMEM_WAIT`
-  - fields:
-    - `size` = signal id
-    - `address` = expected 64-bit signal value
-  - effect:
-    - lane 0 waits for the local symmetric signal to be greater than or equal
-      to the expected value
-
-- `OP_MEMORY_POOL_SUBMIT`
-  - fields:
-    - `address` = local 128-byte `MemoryPoolRequest`
-    - `size` = pool submit signal id
-    - `arg` = pool PE
-  - effect:
-    - put the request into the same symmetric mailbox on the pool PE
-    - publish `request.sequence` with put-with-signal and quiet before advancing
-
-- `OP_MEMORY_POOL_WAIT`
-  - fields:
-    - `address` = the producer's local `MemoryPoolRequest`
-  - effect:
-    - load the completion signal id and sequence from the request and wait for
-      `signal >= sequence`
-
-- `OP_MEMORY_POOL_RUN`
-  - fields:
-    - `address` = 128-byte `MemoryPoolConfig`
-    - `size` / `num_slots` = low/high 16 bits of expected request count
-  - effect:
-    - lane 0 scans per-producer HBM mailboxes
-    - skip blocked requests and execute another request whose slot ticket is
-      ready
-    - support contiguous write/read, row-index scatter/gather, and optional
-      float32 sum-on-write
-    - update dependency tickets only after data completion, then signal the
-      producer/consumer and retire that mailbox sequence
-  - runtime role:
-    - this blocking op turns the selected SM's alloc warp into the V1 pool core
-    - stable 128-byte layouts and invariants are documented in
-      `agents/knowledge/runtime/memory-pool-ep.md`
 
 ### Load-side allocating ops
 
@@ -350,6 +300,59 @@ Barrier behavior for writeback ops:
     - the pointer becomes available through `st_insts[special_slot].address`
   - practical meaning:
     - carry raw global pointers through the VM for compute kernels that write or read global memory directly
+
+## Communication Operators
+
+The registry is `include/dae/communication_opcode.cuh.inc`. Python classes are
+`CommunicationInstruction` subclasses. The ordinary runtime exposes the ABI
+but rejects nonempty communication streams because it has no consumer warp.
+
+- `COMM_TERMINATE`: stop the communication PC loop.
+- `COMM_WAIT_BARRIER`: `size` is a local `bars[]` id; wait for zero.
+- `COMM_RECORD_EVENT`: `size` is a per-block profile index; lane 0 records
+  `globaltimer`.
+- `COMM_NVSHMEM_PUT`:
+  - `address` is the same symmetric source/destination address;
+  - `size | arg0 << 16` is bytes;
+  - `arg1[7:0]` is target PE and `arg1[15:8]` is signal id;
+  - warp put-with-signal followed by quiet.
+- `COMM_NVSHMEM_WAIT`: `size` is signal id and `address` is the expected value.
+- `COMM_MEMORY_POOL_SUBMIT`:
+  - `address` is a 128-byte request, `size` its submit signal, `arg0` pool PE;
+  - warp put-with-signal and quiet publishes the mailbox.
+- `COMM_MEMORY_POOL_WAIT`: `address` is the request whose completion sequence
+  is awaited.
+- `COMM_MEMORY_POOL_RUN`:
+  - `address` is `MemoryPoolConfig`;
+  - `size | arg0 << 16` is the expected completion count;
+  - lanes poll distinct mailboxes, ballot ready requests, execute one selected
+    request cooperatively, then advance its dependency/completion state.
+- `COMM_EXPERT_POOL_RESET`: `address` is `EpPoolConfig`; `arg0` is the local
+  reset barrier to release.
+- `COMM_EXPERT_POOL_DISPATCH`: `size` is global expert; `arg0` is its dispatch
+  barrier to release after all source messages validate.
+- `COMM_EXPERT_POOL_RETURN`: `size` is global expert; `arg0` is the owner
+  compute barrier to await before output publication.
+- `COMM_POOL_SLICE_PUBLISH`: `address` is `PoolSliceConfig`; the source pool
+  core publishes one descriptor, including zero-route descriptors, to every
+  target slice's source-indexed queue.
+- `COMM_POOL_SLICE_GATHER`: `address` is `PoolSliceConfig`, `size` is the
+  source-pool write barrier, and `arg0` is the first contiguous reader dispatch
+  barrier. The pool warp polls sender queues and source readiness lane-parallel,
+  resolves contiguous reader ranges, and issues a source's gathered reads as
+  soon as both its descriptor and data ticket are ready. The default has one
+  final data stage; the optional two-stage config uses the same signal word for
+  first-write-chunk and final tickets. One final quiet precedes the shared
+  sender-set ticket and reader release.
+- `COMM_POOL_SLICE_RETURN`: `address` is `PoolSliceConfig`; `size` is the first
+  contiguous reader compute barrier. The pool warp returns per-source ranges,
+  waits one completion ticket per pool slice, and source-scatters by saved
+  provenance.
+
+Generic pool semantics are in `memory-pool-ep.md`; the optimized expert
+protocol and its ordering rules are in `expert-pool-v2.md`; pool-owned dynamic
+read semantics are in `pool-slice-dynamic-read.md` and
+`vdcores-communication-core.md`.
 
 ## Compute Operators
 

@@ -12,7 +12,7 @@ from .instruction_utils import (
     resolve_compute_opcode_value,
 )
 from .op_families import ComputeOpFamilyRef, family_ref
-from .runtime import config, opcode
+from .runtime import comm_opcode, config, opcode
 from .tma_utils import (
     Major,
     addr2cords,
@@ -406,6 +406,55 @@ class LoopC(ComputeInstruction):
             return cls(count, pc, reg=reg)
 
         return smfunc
+
+
+class CommunicationInstruction(Instruction):
+    """A 16-byte instruction consumed only by the VDCores communication warp."""
+
+    requires_communication_core = True
+    requires_signal_array = False
+
+    def __init__(
+        self,
+        opcode: int,
+        *,
+        size: int = 0,
+        arg0: int = 0,
+        arg1: int = 0,
+        address: int = 0,
+    ):
+        for name, value in (("opcode", opcode), ("size", size), ("arg0", arg0), ("arg1", arg1)):
+            if not 0 <= int(value) < 2**16:
+                raise ValueError(f"{name} must fit in uint16")
+        if not 0 <= int(address) < 2**64:
+            raise ValueError("address must fit in uint64")
+        self.opcode = int(opcode)
+        self.size = int(size)
+        self.arg0 = int(arg0)
+        self.arg1 = int(arg1)
+        self.address = int(address)
+
+    def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
+        if tensor is None:
+            tensor = torch.empty((8,), dtype=torch.uint16)
+        else:
+            tensor = tensor.view(torch.uint16)
+            assert tensor.numel() == 8
+        tensor[0] = self.opcode
+        tensor[1] = self.size
+        tensor[2] = self.arg0
+        tensor[3] = self.arg1
+        address_words = addr2cords(self.address)
+        for index in range(4):
+            tensor[4 + index] = address_words[index]
+        return tensor.view(torch.uint8)
+
+    def __repr__(self):
+        return (
+            "CommunicationInstruction("
+            f"opcode={self.opcode}, size={self.size}, arg0={self.arg0}, "
+            f"arg1={self.arg1}, address=0x{self.address:x})"
+        )
 
 
 class MemoryInstruction(Instruction):
@@ -830,7 +879,26 @@ def _control_pointer(value: torch.Tensor | int, name: str) -> int:
     return value
 
 
-class NvshmemPut(MemoryInstruction):
+class TerminateComm(CommunicationInstruction):
+    def __init__(self):
+        super().__init__(comm_opcode.COMM_TERMINATE)
+
+
+class CommWaitBarrier(CommunicationInstruction):
+    def __init__(self, bar: int):
+        if not 0 <= bar < 2**16:
+            raise ValueError("bar must fit in uint16")
+        super().__init__(comm_opcode.COMM_WAIT_BARRIER, size=bar)
+
+
+class CommRecordEvent(CommunicationInstruction):
+    def __init__(self, event: int):
+        if not 0 <= event < config.num_profile_events:
+            raise ValueError("event is outside the VDCores profile buffer")
+        super().__init__(comm_opcode.COMM_RECORD_EVENT, size=event)
+
+
+class NvshmemPut(CommunicationInstruction):
     """Issue-#25 same-symmetric-address PUT with an explicit signal id."""
 
     requires_signal_array = True
@@ -849,15 +917,15 @@ class NvshmemPut(MemoryInstruction):
         if not 0 <= signal_id < 2**8:
             raise ValueError("signal_id must fit in 8 bits")
         super().__init__(
-            opcode=opcode.OP_NVSHMEM_PUT,
-            num_slots=nbytes >> 16,
-            arg=(signal_id << 8) | target_pe,
+            opcode=comm_opcode.COMM_NVSHMEM_PUT,
+            arg0=nbytes >> 16,
+            arg1=(signal_id << 8) | target_pe,
             size=nbytes & 0xFFFF,
             address=_control_pointer(address, "address"),
         )
 
 
-class NvshmemWait(MemoryInstruction):
+class NvshmemWait(CommunicationInstruction):
     requires_signal_array = True
 
     def __init__(self, signal_id: int = 0, value: int = 1):
@@ -866,15 +934,13 @@ class NvshmemWait(MemoryInstruction):
         if not 0 <= value < 2**64:
             raise ValueError("value must fit in uint64")
         super().__init__(
-            opcode=opcode.OP_NVSHMEM_WAIT,
-            num_slots=0,
-            arg=0,
+            opcode=comm_opcode.COMM_NVSHMEM_WAIT,
             size=signal_id,
             address=value,
         )
 
 
-class MemoryPoolSubmit(MemoryInstruction):
+class MemoryPoolSubmit(CommunicationInstruction):
     requires_signal_array = True
 
     def __init__(
@@ -888,38 +954,144 @@ class MemoryPoolSubmit(MemoryInstruction):
         if not 0 <= submit_signal < 2**16:
             raise ValueError("submit_signal must fit in 16 bits")
         super().__init__(
-            opcode=opcode.OP_MEMORY_POOL_SUBMIT,
-            num_slots=0,
-            arg=pool_pe,
+            opcode=comm_opcode.COMM_MEMORY_POOL_SUBMIT,
+            arg0=pool_pe,
             size=submit_signal,
             address=_control_pointer(request, "request"),
         )
 
 
-class MemoryPoolWait(MemoryInstruction):
+class MemoryPoolWait(CommunicationInstruction):
     requires_signal_array = True
 
     def __init__(self, request: torch.Tensor | int):
         super().__init__(
-            opcode=opcode.OP_MEMORY_POOL_WAIT,
-            num_slots=0,
-            arg=0,
-            size=0,
+            opcode=comm_opcode.COMM_MEMORY_POOL_WAIT,
             address=_control_pointer(request, "request"),
         )
 
 
-class MemoryPoolRun(MemoryInstruction):
+class MemoryPoolRun(CommunicationInstruction):
     requires_signal_array = True
 
     def __init__(self, config_tensor: torch.Tensor | int, expected_requests: int):
         if not 0 <= expected_requests < 2**32:
             raise ValueError("expected_requests must fit in uint32")
         super().__init__(
-            opcode=opcode.OP_MEMORY_POOL_RUN,
-            num_slots=expected_requests >> 16,
-            arg=0,
+            opcode=comm_opcode.COMM_MEMORY_POOL_RUN,
+            arg0=expected_requests >> 16,
             size=expected_requests & 0xFFFF,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class ExpertPoolReset(CommunicationInstruction):
+    requires_signal_array = True
+
+    def __init__(self, config_tensor: torch.Tensor | int, release_barrier: int):
+        if not 0 <= release_barrier < 2**16:
+            raise ValueError("release_barrier must fit in uint16")
+        super().__init__(
+            comm_opcode.COMM_EXPERT_POOL_RESET,
+            arg0=release_barrier,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class ExpertPoolDispatch(CommunicationInstruction):
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        config_tensor: torch.Tensor | int,
+        global_expert: int,
+        release_barrier: int,
+    ):
+        if not 0 <= global_expert < 2**16:
+            raise ValueError("global_expert must fit in uint16")
+        if not 0 <= release_barrier < 2**16:
+            raise ValueError("release_barrier must fit in uint16")
+        super().__init__(
+            comm_opcode.COMM_EXPERT_POOL_DISPATCH,
+            size=global_expert,
+            arg0=release_barrier,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class ExpertPoolReturn(CommunicationInstruction):
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        config_tensor: torch.Tensor | int,
+        global_expert: int,
+        wait_barrier: int,
+    ):
+        if not 0 <= global_expert < 2**16:
+            raise ValueError("global_expert must fit in uint16")
+        if not 0 <= wait_barrier < 2**16:
+            raise ValueError("wait_barrier must fit in uint16")
+        super().__init__(
+            comm_opcode.COMM_EXPERT_POOL_RETURN,
+            size=global_expert,
+            arg0=wait_barrier,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class PoolSlicePublish(CommunicationInstruction):
+    """Publish one source-owned route batch to every logical pool slice."""
+
+    requires_signal_array = True
+
+    def __init__(self, config_tensor: torch.Tensor | int):
+        super().__init__(
+            comm_opcode.COMM_POOL_SLICE_PUBLISH,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class PoolSliceGather(CommunicationInstruction):
+    """Run pool-owned metadata ingestion and dynamic gathered reads."""
+
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        config_tensor: torch.Tensor | int,
+        *,
+        write_barrier: int,
+        dispatch_barrier_base: int,
+    ):
+        if not 0 <= write_barrier < 2**16:
+            raise ValueError("write_barrier must fit in uint16")
+        if not 0 <= dispatch_barrier_base < 2**16:
+            raise ValueError("dispatch_barrier_base must fit in uint16")
+        super().__init__(
+            comm_opcode.COMM_POOL_SLICE_GATHER,
+            size=write_barrier,
+            arg0=dispatch_barrier_base,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class PoolSliceReturn(CommunicationInstruction):
+    """Return reader outputs and source-scatter them under pool ownership."""
+
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        config_tensor: torch.Tensor | int,
+        *,
+        compute_barrier_base: int,
+    ):
+        if not 0 <= compute_barrier_base < 2**16:
+            raise ValueError("compute_barrier_base must fit in uint16")
+        super().__init__(
+            comm_opcode.COMM_POOL_SLICE_RETURN,
+            size=compute_barrier_base,
             address=_control_pointer(config_tensor, "config_tensor"),
         )
 
@@ -1131,6 +1303,10 @@ __all__ = [
     "Dummy",
     "Copy",
     "LoopC",
+    "CommunicationInstruction",
+    "TerminateComm",
+    "CommWaitBarrier",
+    "CommRecordEvent",
     "MemoryInstruction",
     "TerminateM",
     "LoopM",
@@ -1143,6 +1319,12 @@ __all__ = [
     "MemoryPoolSubmit",
     "MemoryPoolWait",
     "MemoryPoolRun",
+    "ExpertPoolReset",
+    "ExpertPoolDispatch",
+    "ExpertPoolReturn",
+    "PoolSlicePublish",
+    "PoolSliceGather",
+    "PoolSliceReturn",
     "CC0",
     "RegStore",
     "RegLoad",

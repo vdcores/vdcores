@@ -115,6 +115,9 @@ def main() -> None:
             signal_array=signals,
             benchmark_barrier=nvshmem.benchmark_barrier,
         )
+        # This protocol uses only communication instructions; it does not
+        # allocate VDCores data slots in dynamic shared memory.
+        launcher.smem_size = 0
         launcher.i(schedule, TerminateM(), TerminateC())
         launcher.launch()
 

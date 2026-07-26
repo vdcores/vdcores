@@ -7,10 +7,16 @@
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
 #include <cute/algorithm/gemm.hpp>     // cute::gemm
 
+#ifdef DAE_ENABLE_NVSHMEM
+#define DAE_WGMMA_TASK_QUALIFIER __noinline__
+#else
+#define DAE_WGMMA_TASK_QUALIFIER __forceinline__
+#endif
+
 template<typename Atom, int M, int N, int K,
          int b_load_interval, bool residual,
          typename M2C_Type, typename C2M_Type>
-__device__ __forceinline__ void task_gemm(
+__device__ DAE_WGMMA_TASK_QUALIFIER void task_gemm(
     const int nKTiles, 
     void *base, 
     M2C_Type& m2c, 
@@ -118,3 +124,5 @@ __device__ __forceinline__ void task_gemm(
     copy(frag_C, thr_sC);
     c2m.template push<0, true>(thread_id, slot_c); // commit the output tile
 }
+
+#undef DAE_WGMMA_TASK_QUALIFIER

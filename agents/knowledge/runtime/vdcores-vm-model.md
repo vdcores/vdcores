@@ -16,15 +16,17 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
 
 ## Runtime Shape
 
-- One `dae2` block runs per SM.
-- Each block has `256` threads:
+- One `dae2` block runs per logical SM in the launch.
+- The ordinary build has `256` threads:
   - `4` compute warps, threads `0..127`
   - `4` memory-side warps, threads `128..255`
+- The optional NVSHMEM build adds one communication warp, threads `256..287`.
 - Current fixed configuration from [include/dae/context.cuh](/home1/11362/depctg/vdcores/include/dae/context.cuh):
   - `24` normal shared-memory slots
   - `9` special slots
   - slot size `8 KiB`
   - `512` instructions per SM when `dae2LoadInstructions=true`
+  - `32` communication instructions per SM
   - `1024` TMA descriptors max
   - `1024` global barrier ids max
 
@@ -33,6 +35,7 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
 Each SM/block owns:
 
 - Shared copies of the compute and memory instruction streams
+- In the optional build, a separate shared communication instruction stream
 - `st_insts[numSlots + numSpecialSlots]`
   - the allocated-memory instruction table
   - entry `st_insts[slot]` is the metadata for that live slot
@@ -44,14 +47,15 @@ Each SM/block owns:
 - `scratch_space[32]`
   - shared scratch used by some compute ops such as argmax
 
-The kernel also accepts an optional process-wide `uint64_t*` signal array and
-forwards it unchanged to each alloc warp. In an NVSHMEM-enabled build,
-`OP_NVSHMEM_*` and `OP_MEMORY_POOL_*` consume this symmetric signal array for
-request publication, completion, and waits.
+The kernel also accepts an optional process-wide symmetric `uint64_t*` signal
+array. In an NVSHMEM-enabled build the communication warp consumes it for
+request publication, completion, and waits. The alloc/load/store warps retain
+their ordinary roles.
 
 ## Virtual Cores
 
-The runtime is easiest to view as one compute VM plus one memory VM per SM.
+The runtime is one compute VM plus one memory VM per block, with an optional
+third communication VM.
 
 ### Compute VM
 
@@ -101,11 +105,6 @@ The memory side is split into four warp roles:
   - execute TMA/global-load side effects
   - publish ready tokens to compute
 
-The optional memory-pool path does not change this warp count. A selected SM's
-existing alloc warp can execute blocking `OP_MEMORY_POOL_RUN` and becomes the
-dedicated pool core for that phase; that SM must not also need ordinary alloc
-progress until the configured request count completes.
-
 The alloc warp carries the explicit memory-VM register state in [include/dae/virtualcore.cuh](/home1/11362/depctg/vdcores/include/dae/virtualcore.cuh):
 
 - `gpr[0]`
@@ -135,6 +134,18 @@ The alloc-warp interpreter also keeps three local control variables in [include/
   - pc for the next fetch
 - `shift`
   - the packed resource-group increment later consumed by `GROUP`
+
+### Communication VM
+
+The optional ninth warp has an independent `CommInst` PC loop and no allocator
+state. It executes barriers/timestamps, NVSHMEM put/wait, generic memory-pool
+submit/wait/run, expert-pool reset/dispatch/return, and pool-slice
+publish/gather/return. These operators do not consume slots or enter `m2c`,
+`c2m`, or `m2ld`.
+
+Communication synchronizes with local memory/compute through `bars[]` and with
+other PEs through monotonic symmetric signals. See
+`vdcores-communication-core.md` for its residency and ordering contract.
 
 ## Queue Model
 
@@ -401,8 +412,8 @@ The `bars` array is the externally visible dependency table.
 The optional NVSHMEM memory pool adds a separate HBM dependency table. A pool
 request can wait for `dependencies[slot] >= value` and can add a delta to a
 slot only after its data operation completes. These monotonic tickets are not
-the same object as the launcher's `bars[]`: `IssueBarrier` orders a local HBM
-producer before `OP_MEMORY_POOL_SUBMIT`, while pool tickets order remote pool
+the same object as the launcher's `bars[]`: `CommWaitBarrier` orders a local
+HBM producer before `MemoryPoolSubmit`, while pool tickets order remote pool
 operations against each other.
 
 ## Register-Like Facilities

@@ -31,9 +31,11 @@ class SMInstructionBuilder:
         self.sm_id = sm_id
         self.cinsts = []
         self.minsts = []
+        self.comminsts = []
 
         self.built_cinsts = []
         self.built_minsts = []
+        self.built_comminsts = []
 
     def add(self, inst : Instruction):
         # flatten list of instructions
@@ -53,6 +55,8 @@ class SMInstructionBuilder:
             self.cinsts.append(inst)
         elif isinstance(inst, MemoryInstruction):
             self.minsts.append(inst)
+        elif isinstance(inst, CommunicationInstruction):
+            self.comminsts.append(inst)
         else:
             raise ValueError("Unknown instruction type", inst)
 
@@ -62,25 +66,37 @@ class SMInstructionBuilder:
     def add_memory(self, inst : MemoryInstruction):
         self.minsts.append(inst)
 
+    def add_communication(self, inst: CommunicationInstruction):
+        self.comminsts.append(inst)
+
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],
-        mtensor : torch.Tensor, mptrs: list[int]):
+        mtensor : torch.Tensor, mptrs: list[int],
+        commtensor : torch.Tensor, commptrs: list[int]):
         # TODO(zhiyuang): now we only keep this check for not submitting "too many"
         #                 insts, but not 100% safe it won't overwrite
         assert len(self.cinsts) <= ctensor.shape[0]
         assert len(self.minsts) <= mtensor.shape[0]
+        assert len(self.comminsts) <= commtensor.shape[0]
         for i, inst in enumerate(self.cinsts):
             inst.tensor(ctensor[cptrs[self.sm_id],...])
             cptrs[self.sm_id] = (cptrs[self.sm_id] + 1) % ctensor.shape[0]
         for i, inst in enumerate(self.minsts):
             inst.tensor(mtensor[mptrs[self.sm_id],...])
             mptrs[self.sm_id] = (mptrs[self.sm_id] + 1) % mtensor.shape[0]
+        for inst in self.comminsts:
+            inst.tensor(commtensor[commptrs[self.sm_id], ...])
+            commptrs[self.sm_id] = (
+                commptrs[self.sm_id] + 1
+            ) % commtensor.shape[0]
 
         # after building, clear the inst list to avoid duplicate build
         self.built_cinsts += self.cinsts
         self.built_minsts += self.minsts
+        self.built_comminsts += self.comminsts
         self.cinsts = []
         self.minsts = []
+        self.comminsts = []
 
 class ResourceGroup:
     def __init__(self, name, repeat = 1):
@@ -230,13 +246,20 @@ class Launcher:
         self._benchmark_barrier = benchmark_barrier
 
         self.max_insts = config.max_insts
+        self.max_comm_insts = config.max_comm_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
         self.profile = torch.empty((num_sms, config.num_profile_events), dtype=torch.uint64, device=self.device)
 
         self.cinsts = torch.empty((num_sms, self.max_insts, 8), dtype=torch.uint8)
         self.minsts = torch.empty((num_sms, self.max_insts, 16), dtype=torch.uint8)
+        # COMM_TERMINATE is zero, so untouched communication streams terminate
+        # immediately without changing existing programs.
+        self.comminsts = torch.zeros(
+            (num_sms, self.max_comm_insts, 16), dtype=torch.uint8
+        )
         self.cptrs = [0 for _ in range(num_sms)]
         self.mptrs = [0 for _ in range(num_sms)]
+        self.commptrs = [0 for _ in range(num_sms)]
 
         self.tmas = []
 
@@ -327,6 +350,16 @@ class Launcher:
     def copy_mptrs(self):
         return self._projected_mptrs()
 
+    def _projected_commptrs(self):
+        return [
+            (self.commptrs[i] + len(self.builder[i].comminsts))
+            % self.max_comm_insts
+            for i in range(self.num_sms)
+        ]
+
+    def copy_commptrs(self):
+        return self._projected_commptrs()
+
     def build_instructions(self):
         if self.need_instruction_build:
             for i in range(self.num_sms):
@@ -335,6 +368,8 @@ class Launcher:
                     self.cptrs,
                     self.minsts[i,...],
                     self.mptrs,
+                    self.comminsts[i, ...],
+                    self.commptrs,
                 )
             self.need_instruction_build = False
 
@@ -419,7 +454,9 @@ class Launcher:
             )
         raise ValueError(f"Unsupported DAE_CACHE_REQUEST_SELECTION={selection!r}")
 
-    def _select_launch_cache_window(self, *, bars, tma, cinsts, minsts):
+    def _select_launch_cache_window(
+        self, *, bars, tma, cinsts, minsts, comminsts
+    ):
         requested = self._select_requested_cache_window()
         if requested is not None:
             return requested
@@ -433,13 +470,15 @@ class Launcher:
             "tma": tma,
             "cinsts": cinsts,
             "minsts": minsts,
+            "comminsts": comminsts,
             "cinsts_tail": cinsts[-4 * self.max_insts :],
             "minsts_tail": minsts[-4 * self.max_insts :],
         }
         if target not in target_map:
             raise ValueError(
                 "Unsupported DAE_LAUNCH_CACHE_WINDOW="
-                f"{target!r} (expected none/bars/tma/cinsts/minsts/cinsts_tail/minsts_tail)"
+                f"{target!r} (expected none/bars/tma/cinsts/minsts/comminsts/"
+                "cinsts_tail/minsts_tail)"
             )
 
         num_bytes_raw = os.environ.get("DAE_LAUNCH_CACHE_WINDOW_BYTES")
@@ -505,15 +544,19 @@ class Launcher:
     def launch(self):
         self.build_instructions()
 
-        signal_requiring_instructions = [
+        communication_instructions = [
             inst
             for builder in self.builder
-            for inst in builder.built_minsts
+            for inst in builder.built_comminsts
+        ]
+        signal_requiring_instructions = [
+            inst
+            for inst in communication_instructions
             if getattr(inst, "requires_signal_array", False)
         ]
-        if signal_requiring_instructions and not bool(config.nvshmem_enabled):
+        if communication_instructions and not bool(config.nvshmem_enabled):
             raise RuntimeError(
-                "NVSHMEM and memory-pool instructions require `make nvshmem-pyext`"
+                "communication instructions require `make nvshmem-pyext`"
             )
         if signal_requiring_instructions and self.signal_array is None:
             raise ValueError(
@@ -539,6 +582,9 @@ class Launcher:
         # Load the model using the runtime
         cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
         minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
+        comminsts = self.comminsts.to(self.device).view(
+            self.num_sms * self.max_comm_insts, 16
+        )
 
         stream = torch.cuda.current_stream().cuda_stream
         # TODO(zhiyuang): check this?
@@ -564,6 +610,7 @@ class Launcher:
             tma=tma,
             cinsts=cinsts,
             minsts=minsts,
+            comminsts=comminsts,
         )
         if cache_window is not None:
             runtime.set_cache_policy(
@@ -577,7 +624,7 @@ class Launcher:
 
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,
-            cinsts, minsts, tma,
+            cinsts, minsts, comminsts, tma,
             self.bars, profile,
             stream, self.signal_array,
         )

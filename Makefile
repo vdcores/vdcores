@@ -10,6 +10,15 @@ NVSHMEM_LIBRARY_DIR := $(NVSHMEM_HOME)/lib
 NVSHMEM_BUILD_DIR := build/nvshmem
 NVSHMEM_RUNTIME_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime.o
 NVSHMEM_DLINK_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime_dlink.o
+# CUDA 13 diagnoses deprecated volatile syntax in NVSHMEM 3.4.5 collective
+# headers even though this runtime does not instantiate those collectives.
+NVSHMEM_HEADER_DIAGNOSTICS := -diag-suppress=3012,3013
+# A nine-warp CTA places three warps on one of Hopper's four SM subpartitions,
+# so each thread must fit the resulting 168-register ceiling.  Without this
+# optional-build-only limit the NVSHMEM device link promotes the kernel to 254
+# registers and the CTA cannot launch.  The EP WGMMA GEMV naturally fits this
+# ceiling without spills; the standard eight-warp build remains unconstrained.
+NVSHMEM_REGISTER_LIMIT := -maxrregcount=168
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
@@ -83,11 +92,14 @@ $(NVSHMEM_RUNTIME_OBJECT): src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCO
 	@test -f $(NVSHMEM_INCLUDE_DIR)/nvshmem.h
 	@mkdir -p $(dir $@)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NVSHMEM=1 \
-		-I$(NVSHMEM_INCLUDE_DIR) -rdc=true -dc -Xcompiler -fPIC -o $@ $<
+		$(NVSHMEM_HEADER_DIAGNOSTICS) -I$(NVSHMEM_INCLUDE_DIR) \
+		$(NVSHMEM_REGISTER_LIMIT) \
+		-rdc=true -dc -Xcompiler -fPIC -o $@ $<
 
 $(NVSHMEM_DLINK_OBJECT): $(NVSHMEM_RUNTIME_OBJECT)
 	@test -f $(NVSHMEM_LIBRARY_DIR)/libnvshmem_device.a
-	$(NVCC) $(CUDA_ARCH) -dlink -Xcompiler -fPIC $< \
+	$(NVCC) $(CUDA_ARCH) -dlink -Xcompiler -fPIC \
+		$(NVSHMEM_RUNTIME_OBJECT) \
 		-L$(NVSHMEM_LIBRARY_DIR) -lnvshmem_device -o $@
 
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)

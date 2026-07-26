@@ -556,14 +556,14 @@ def make_phase_schedule(
     pool_sm: int = 0,
     producer_barriers: dict[int, int] | None = None,
 ):
-    """Build an SM-specific memory stream for one submit/wait pool phase.
+    """Build an SM-specific communication stream for one pool phase.
 
     The pool core owns ``pool_sm``. Local producer mailboxes are mapped to the
     following SMs so pool execution never shares an alloc warp with a submit.
     """
 
     from .instructions import (
-        IssueBarrier,
+        CommWaitBarrier,
         MemoryPoolRun,
         MemoryPoolSubmit,
         MemoryPoolWait,
@@ -594,7 +594,9 @@ def make_phase_schedule(
             if sm == producer_sm:
                 request = buffers.request_tensor(mailbox)
                 if mailbox in producer_barriers:
-                    instructions.append(IssueBarrier(producer_barriers[mailbox]))
+                    instructions.append(
+                        CommWaitBarrier(producer_barriers[mailbox])
+                    )
                 instructions.extend(
                     (
                         MemoryPoolSubmit(

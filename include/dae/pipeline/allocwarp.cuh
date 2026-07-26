@@ -1,9 +1,6 @@
 #pragma once
 
 #include "virtualcore.cuh"
-#ifdef DAE_ENABLE_NVSHMEM
-#include "memory_pool.cuh"
-#endif
 
 static __device__ __forceinline__ void prefetch_inst_window(
     const int lane_id, const MInst* insts, uint32_t target_pc) {
@@ -219,77 +216,6 @@ __device__ __forceinline__ void allocwarp_execute(
           }
           break;
         }
-#ifdef DAE_ENABLE_NVSHMEM
-        case op(OP_NVSHMEM_PUT): {
-          if (lane_id == 0) {
-            const uint32_t nbytes = static_cast<uint32_t>(inst.size) |
-                (static_cast<uint32_t>(inst.num_slots) << 16);
-            const int target_pe = inst.arg & 0x00ff;
-            const uint16_t signal_id = inst.arg >> 8;
-            void* symmetric_address = reinterpret_cast<void*>(inst.address);
-            nvshmem_putmem_signal_nbi(
-                symmetric_address,
-                symmetric_address,
-                nbytes,
-                signal_array + signal_id,
-                1,
-                NVSHMEM_SIGNAL_SET,
-                target_pe);
-            nvshmem_quiet();
-          }
-          __syncwarp();
-          break;
-        }
-        case op(OP_NVSHMEM_WAIT): {
-          if (lane_id == 0) {
-            nvshmem_signal_wait_until(
-                signal_array + inst.size,
-                NVSHMEM_CMP_GE,
-                inst.address);
-          }
-          __syncwarp();
-          break;
-        }
-        case op(OP_MEMORY_POOL_SUBMIT): {
-          if (lane_id == 0) {
-            const auto* request = reinterpret_cast<const MemoryPoolRequest*>(inst.address);
-            nvshmem_putmem_signal_nbi(
-                const_cast<MemoryPoolRequest*>(request),
-                request,
-                sizeof(MemoryPoolRequest),
-                signal_array + inst.size,
-                request->sequence,
-                NVSHMEM_SIGNAL_SET,
-                inst.arg);
-            nvshmem_quiet();
-          }
-          __syncwarp();
-          break;
-        }
-        case op(OP_MEMORY_POOL_WAIT): {
-          if (lane_id == 0) {
-            const auto* request = reinterpret_cast<const MemoryPoolRequest*>(inst.address);
-            nvshmem_signal_wait_until(
-                signal_array + request->completion_signal,
-                NVSHMEM_CMP_GE,
-                request->sequence);
-          }
-          __syncwarp();
-          break;
-        }
-        case op(OP_MEMORY_POOL_RUN): {
-          if (lane_id == 0) {
-            const uint32_t expected_requests = static_cast<uint32_t>(inst.size) |
-                (static_cast<uint32_t>(inst.num_slots) << 16);
-            memory_pool_run_singlethread(
-                reinterpret_cast<const MemoryPoolConfig*>(inst.address),
-                signal_array,
-                expected_requests);
-          }
-          __syncwarp();
-          break;
-        }
-#endif
         default:
           // opcode we do not want to handle
           __mprint("Unknown mem opcode: %04x op=%d\n", inst.opcode, op(inst.opcode));

@@ -51,10 +51,11 @@ macro on both extensions. `make nvshmem-pyext` is the normal entry point;
 - There is no NVSHMEM-specific launcher. Initialize with `dae.nvshmem`, then
   construct the ordinary `dae.launcher.Launcher` with `signal_array=signals`
   and `benchmark_barrier=dae.nvshmem.benchmark_barrier`.
-- `Launcher` forwards the optional signal tensor through `runtime.launch_dae`,
-  the `dae2` kernel, and into `allocwarp_execute()`. The optional
-  `OP_NVSHMEM_*` and `OP_MEMORY_POOL_*` handlers consume it directly; the
-  ordinary build still has no NVSHMEM device calls.
+- `Launcher` forwards the optional signal tensor and its independent
+  communication instruction stream through `runtime.launch_dae`. The optional
+  ninth warp executes `COMM_NVSHMEM_*`, `COMM_MEMORY_POOL_*`, and expert-pool
+  operations; the ordinary alloc/load/store paths still have no NVSHMEM device
+  calls.
 - `dae.nvshmem.benchmark_barrier()` synchronizes the device and all PEs. Base
   `Launcher.bench()` invokes the configured callback before every measured
   iteration, so multi-rank profile timestamps begin only after all ranks are

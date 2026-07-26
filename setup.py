@@ -91,6 +91,7 @@ extensions = [
                 "-std=c++20",
                 "-DNDEBUG",
                 "-Xptxas=-v",
+                *(["-diag-suppress=3012,3013"] if NVSHMEM_ENABLED else []),
             ],
         },
         libraries=runtime_libraries,

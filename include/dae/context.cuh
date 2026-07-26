@@ -14,6 +14,7 @@ constexpr bool dae2LoadInstructions = true;
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
+static constexpr int numCommInsts = 32;
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 
@@ -23,9 +24,15 @@ static_assert(numSlots + numSpecialSlots <= ((2<<6) - 1), "Total number of slots
 
 static constexpr int numComputeWarps = 4;
 static constexpr int numMemoryWarps = 4;
+#ifdef DAE_ENABLE_NVSHMEM
+static constexpr int numCommunicationWarps = 1;
+#else
+static constexpr int numCommunicationWarps = 0;
+#endif
 
 static constexpr int numThreadsPerWarp = 32;
-static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
+static constexpr int numThreads = numThreadsPerWarp *
+    (numComputeWarps + numMemoryWarps + numCommunicationWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
 static constexpr int numComputeLoopCounters = 4;
@@ -111,6 +118,24 @@ struct alignas(16) MInst {
   __device__ __forceinline__ uint16_t bar() const {
     return num_slots >> slotBits;
   }
+};
+
+// Communication instructions deliberately have no allocator flag bits.  They
+// are consumed only by the optional communication warp and never enter the
+// memory or compute virtual cores.
+struct alignas(16) CommInst {
+  uint16_t opcode;
+  uint16_t size;
+  uint16_t arg0;
+  uint16_t arg1;
+  uint64_t address;
+};
+static_assert(sizeof(CommInst) == 16, "CommInst ABI changed");
+
+enum CommOpcode : uint16_t {
+  #define DAE_COMM_OP(name, value) name = value,
+    #include "dae/communication_opcode.cuh.inc"
+  #undef DAE_COMM_OP
 };
 
 // helpers for building opcode

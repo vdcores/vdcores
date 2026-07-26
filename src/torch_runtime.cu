@@ -150,6 +150,7 @@ int py_launch_dae(
     size_t smem_size,
     torch::Tensor compute_insts_bytes,   // uint8 buffer
     torch::Tensor memory_insts_bytes,    // uint8 buffer
+    torch::Tensor communication_insts_bytes,
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
@@ -164,6 +165,8 @@ int py_launch_dae(
   // Make sure we run on the right device/stream
   auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");
   auto minst = check_tensor_ptr<MInst>(memory_insts_bytes, "memory_insts_bytes");
+  auto comminst = check_tensor_ptr<CommInst>(
+      communication_insts_bytes, "communication_insts_bytes");
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
@@ -174,7 +177,7 @@ int py_launch_dae(
 
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
-      cinst, minst, tma,
+      cinst, minst, comminst, tma,
       bars, signal_array, prof, stream
   );
 
@@ -380,6 +383,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   #undef DAE_DEFINE_COMP_FAMILY
   m.attr("compute_family_specs") = compute_family_specs;
 
+  auto comm_opcode = m.def_submodule(
+      "comm_opcode", "VDCores communication instruction opcodes");
+  #define DAE_COMM_OP(name, value) comm_opcode.attr(#name) = py::int_(value);
+  #include "dae/communication_opcode.cuh.inc"
+  #undef DAE_COMM_OP
+
   py::list supported_compute_ops;
   #define DAE_COMPUTE_OP(name) supported_compute_ops.append(py::str(#name));
   #include "dae/selected_compute_ops.inc"
@@ -390,6 +399,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("slot_size") = slotSizeKb * 1024;
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
+  config.attr("max_comm_insts") = numCommInsts;
   config.attr("num_profile_events") = numProfileEvents;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
@@ -429,6 +439,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("smem_size"),
       py::arg("compute_insts_bytes"),
       py::arg("memory_insts_bytes"),
+      py::arg("communication_insts_bytes"),
       py::arg("tma_descs_bytes"),
       py::arg("bars_int32"),
       py::arg("profile_u64"),

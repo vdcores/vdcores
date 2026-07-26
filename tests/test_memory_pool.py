@@ -4,6 +4,9 @@ import pytest
 import torch
 
 from dae.instructions import (
+    CommRecordEvent,
+    CommWaitBarrier,
+    CommunicationInstruction,
     MemoryPoolRun,
     MemoryPoolSubmit,
     MemoryPoolWait,
@@ -21,9 +24,10 @@ from dae.memory_pool import (
     MemoryPoolRequest,
     reference_gather_rows,
     reference_scatter_rows,
+    make_phase_schedule,
     resolve_dependency_order,
 )
-from dae.runtime import opcode
+from dae.runtime import comm_opcode
 
 
 def _fields(instruction) -> list[int]:
@@ -190,12 +194,12 @@ def test_memory_pool_instructions_are_nonallocating_and_encode_operands():
     wait_fields = _fields(wait)
     run_fields = _fields(run)
 
-    assert submit_fields[:4] == [opcode.OP_MEMORY_POOL_SUBMIT, 257, 0, 9]
-    assert wait_fields[:4] == [opcode.OP_MEMORY_POOL_WAIT, 0, 0, 0]
-    assert run_fields[:4] == [opcode.OP_MEMORY_POOL_RUN, 0x5678, 0x1234, 0]
-    assert submit.opcode & 1 == 0
-    assert wait.opcode & 1 == 0
-    assert run.opcode & 1 == 0
+    assert submit_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_SUBMIT, 257, 9, 0]
+    assert wait_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_WAIT, 0, 0, 0]
+    assert run_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_RUN, 0x5678, 0x1234, 0]
+    assert isinstance(submit, CommunicationInstruction)
+    assert isinstance(wait, CommunicationInstruction)
+    assert isinstance(run, CommunicationInstruction)
     assert submit.requires_signal_array
     assert wait.requires_signal_array
     assert run.requires_signal_array
@@ -211,16 +215,20 @@ def test_corrected_issue_25_put_wait_encoding_includes_signal_id():
     wait = NvshmemWait(signal_id=11, value=23)
 
     assert _fields(put)[:4] == [
-        opcode.OP_NVSHMEM_PUT,
+        comm_opcode.COMM_NVSHMEM_PUT,
         0x5678,
         0x1234,
         (11 << 8) | 7,
     ]
-    assert _fields(wait)[:4] == [opcode.OP_NVSHMEM_WAIT, 11, 0, 0]
-    assert put.opcode & 1 == 0
-    assert wait.opcode & 1 == 0
+    assert _fields(wait)[:4] == [comm_opcode.COMM_NVSHMEM_WAIT, 11, 0, 0]
     assert put.requires_signal_array
     assert wait.requires_signal_array
+
+
+def test_communication_profile_event_has_an_independent_opcode():
+    event = CommRecordEvent(7)
+    assert _fields(event)[:4] == [comm_opcode.COMM_RECORD_EVENT, 7, 0, 0]
+    assert not event.requires_signal_array
 
 
 def test_control_pointer_can_contain_full_uint16_address_words():
@@ -231,3 +239,38 @@ def test_control_pointer_can_contain_full_uint16_address_words():
 
 def test_no_dependency_sentinel_is_uint32_max():
     assert NO_DEPENDENCY == 0xFFFFFFFF
+
+
+def test_pool_submit_dependency_wait_is_in_the_communication_domain():
+    class FakeBuffers:
+        @staticmethod
+        def _mailbox_index(index):
+            return index
+
+        @staticmethod
+        def request_tensor(index):
+            return 0x1000 + index * 128
+
+        @staticmethod
+        def submit_signal(index):
+            return 8 + index
+
+        @staticmethod
+        def refresh_config():
+            return 0x2000
+
+    schedule = make_phase_schedule(
+        FakeBuffers(),
+        [2],
+        current_pe=0,
+        pool_pe=1,
+        expected_requests=1,
+        producer_barriers={2: 7},
+    )
+    instructions = schedule(1)
+
+    assert isinstance(instructions[0], CommWaitBarrier)
+    assert all(
+        isinstance(instruction, CommunicationInstruction)
+        for instruction in instructions
+    )

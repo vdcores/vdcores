@@ -33,6 +33,11 @@ def test_optional_allocator_extension_import_smoke():
     assert not hasattr(dae_runtime, "nvshmem_module_finalize")
     assert callable(dae_runtime._nvshmem_module_init)
     assert callable(dae_runtime._nvshmem_module_finalize)
+    assert not hasattr(dae_runtime, "launch_memory_pool_control")
+    assert not hasattr(dae_runtime, "launch_ep_pool_dispatch")
+    assert not hasattr(dae_runtime, "launch_ep_pool_return")
+    assert dae_runtime.comm_opcode.COMM_MEMORY_POOL_RUN == 6
+    assert dae_runtime.config.max_comm_insts == 32
     public = {name for name in dir(runtime) if not name.startswith("_")}
     assert public == {
         "NVSHMEM_ENABLED",

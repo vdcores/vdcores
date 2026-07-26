@@ -15,6 +15,9 @@
 #include "pipeline/allocwarp.cuh"
 #include "pipeline/ldwarp.cuh"
 #include "pipeline/stwarp.cuh"
+#ifdef DAE_ENABLE_NVSHMEM
+#include "pipeline/commwarp.cuh"
+#endif
 
 static __device__ __forceinline__ void * align_to(void *ptr, size_t align) {
   uintptr_t addr = (uintptr_t)ptr;
@@ -28,6 +31,7 @@ static __global__
 void dae2(
   const CInst* __restrict__ compute_instructions,
   const MInst* __restrict__ memory_instructions,
+  const CommInst* __restrict__ communication_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
   uint64_t * __restrict__ signal_array,
@@ -36,7 +40,6 @@ void dae2(
 
   int sm_id = blockIdx.x;
   int thread_id = threadIdx.x;
-  int warp_id = (thread_id % 128) / 32;
   int lane_id = thread_id % 32;
 
 
@@ -45,22 +48,38 @@ void dae2(
 
   const CInst* __restrict__ cinsts;
   const MInst* __restrict__ minsts;
+#ifdef DAE_ENABLE_NVSHMEM
+  const CommInst* __restrict__ comminsts;
+#endif
 
   // local datastructures
   if constexpr (dae2LoadInstructions) {
     __shared__ CInst smem_cinsts[numInsts];
     __shared__ MInst smem_minsts[numInsts];
+#ifdef DAE_ENABLE_NVSHMEM
+    __shared__ CommInst smem_comminsts[numCommInsts];
+#endif
 
     for (int i = thread_id; i < numInsts; i += blockDim.x) {
       smem_cinsts[i] = compute_instructions[sm_id * numInsts + i];
       smem_minsts[i] = memory_instructions[sm_id * numInsts + i];
     }
+#ifdef DAE_ENABLE_NVSHMEM
+    for (int i = thread_id; i < numCommInsts; i += blockDim.x)
+      smem_comminsts[i] = communication_instructions[sm_id * numCommInsts + i];
+#endif
 
     cinsts = smem_cinsts;
     minsts = smem_minsts;
+#ifdef DAE_ENABLE_NVSHMEM
+    comminsts = smem_comminsts;
+#endif
   } else {
     cinsts = compute_instructions + sm_id * numInsts;
     minsts = memory_instructions + sm_id * numInsts;
+#ifdef DAE_ENABLE_NVSHMEM
+    comminsts = communication_instructions + sm_id * numCommInsts;
+#endif
   }
 
   // intermidate insts
@@ -123,7 +142,6 @@ void dae2(
 
     while (!finish) {
       inst = cinsts[(pc++) % numInsts];
-    
       __cprint("Executing instruction at PC %d: opcode=%04x", pc - 1, inst.opcode);
       dispatch_compute_instruction(
         sm_id,
@@ -139,32 +157,33 @@ void dae2(
         c2m,
         g_events
       );
-      // if (blockIdx.x == 0 && threadIdx.x == 0) {
-      //   printf("[COMP] after execution: pc=%d, opcode=%04x\n", pc-1, inst.opcode);
-      // }
     }
     __cprint("Finished execution pc=%d", pc-1);
-  } else { // memory warp group
+  } else if (threadIdx.x <
+             (numComputeWarps + numMemoryWarps) * numThreadsPerWarp) {
+    // Existing memory warp roles retain their original relative ids 0..3.
+    const int memory_warp_id =
+        (thread_id - numComputeWarps * numThreadsPerWarp) / numThreadsPerWarp;
     // TODO(zhiyuang): reduce the register usage in memory warps
     // cuda::ptx::set_max_nreg();
 
     // TODO(zhiyuang): change this to threadIdx.x predicates. will be faster than lane_id based?
-    if (warp_id == 0) {
+    if (memory_warp_id == 0) {
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
         st_insts, smem_base, tma_descs, bars, signal_array
       );
-    } else if (warp_id == 1) {
+    } else if (memory_warp_id == 1) {
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
           smem_base, tma_descs, bars
         );
       }
-    } else if (warp_id >= 2) { // LD Warps 0-1
+    } else if (memory_warp_id >= 2) { // LD Warps 0-1
       if (lane_id == 0) {
-        int port_id = warp_id - 2;
+        int port_id = memory_warp_id - 2;
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
@@ -172,7 +191,13 @@ void dae2(
         );
       }
     } // End of warps
-  } // End of memory warp group
+  }
+#ifdef DAE_ENABLE_NVSHMEM
+  else {
+    communicationwarp_execute(
+        lane_id, comminsts, bars, signal_array, g_events);
+  }
+#endif
 
   // end of megakernel
 }

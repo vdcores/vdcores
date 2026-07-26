@@ -70,6 +70,7 @@ cudaError_t launch_dae(
   size_t smem_size,
   CInst* compute_instructions,
   MInst* memory_instructions,
+  CommInst* communication_instructions,
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * signal_array,
@@ -82,6 +83,7 @@ cudaError_t launch_dae(
   dae2<<<numSMs, numThreads, smem_size, cuda_stream>>>(
     compute_instructions,
     memory_instructions,
+    communication_instructions,
     tma_descs,
     bars,
     signal_array,

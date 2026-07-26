@@ -228,6 +228,167 @@ static __device__ __forceinline__ MemoryPoolStatus memory_pool_execute_request(
   return MEMORY_POOL_STATUS_OK;
 }
 
+static __device__ __forceinline__ void memory_pool_copy_warp(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    uint32_t lane) {
+  auto* dst = reinterpret_cast<uint8_t*>(destination);
+  const auto* src = reinterpret_cast<const uint8_t*>(source);
+  for (uint64_t offset = lane; offset < bytes; offset += 32)
+    dst[offset] = src[offset];
+}
+
+static __device__ __forceinline__ void memory_pool_get_nbi_warp(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    int source_pe,
+    uint32_t lane) {
+  if (bytes == 0)
+    return;
+  if (source_pe == nvshmem_my_pe()) {
+    memory_pool_copy_warp(destination, source, bytes, lane);
+    return;
+  }
+  nvshmemx_getmem_nbi_warp(
+      destination, source, static_cast<size_t>(bytes), source_pe);
+}
+
+static __device__ __forceinline__ void memory_pool_put_nbi_warp(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    int target_pe,
+    uint32_t lane) {
+  if (bytes == 0)
+    return;
+  if (target_pe == nvshmem_my_pe()) {
+    memory_pool_copy_warp(destination, source, bytes, lane);
+    return;
+  }
+  nvshmemx_putmem_nbi_warp(
+      destination, source, static_cast<size_t>(bytes), target_pe);
+}
+
+static __device__ __forceinline__ void memory_pool_complete_warp(uint32_t lane) {
+  __syncwarp();
+  if (lane == 0) {
+    __threadfence_system();
+    nvshmem_quiet();
+  }
+  __syncwarp();
+}
+
+static __device__ __forceinline__ MemoryPoolStatus
+memory_pool_execute_request_warp(
+    const MemoryPoolRequest& request,
+    const MemoryPoolConfig& config,
+    uint32_t lane) {
+  auto* pool_data = reinterpret_cast<uint8_t*>(config.pool_data_address);
+  auto* data_scratch = reinterpret_cast<uint8_t*>(config.data_scratch_address);
+  auto* route_scratch = reinterpret_cast<uint32_t*>(config.route_scratch_address);
+
+  if (request.opcode == MEMORY_POOL_WRITE) {
+    if (!memory_pool_span_fits(request.pool_offset, request.bytes, config.pool_bytes))
+      return MEMORY_POOL_STATUS_POOL_RANGE;
+
+    void* pool_destination = pool_data + request.pool_offset;
+    const void* remote_source = reinterpret_cast<const void*>(request.source_address);
+    if (request.flags & MEMORY_POOL_REDUCE_SUM_F32) {
+      if (request.bytes > config.data_scratch_bytes)
+        return MEMORY_POOL_STATUS_SCRATCH_RANGE;
+      if ((request.bytes & (sizeof(float) - 1)) != 0)
+        return MEMORY_POOL_STATUS_REDUCE_FORMAT;
+      memory_pool_get_nbi_warp(
+          data_scratch, remote_source, request.bytes, request.source_pe, lane);
+      memory_pool_complete_warp(lane);
+      auto* destination_f32 = reinterpret_cast<float*>(pool_destination);
+      const auto* source_f32 = reinterpret_cast<const float*>(data_scratch);
+      for (uint64_t index = lane;
+           index < request.bytes / sizeof(float);
+           index += 32)
+        destination_f32[index] += source_f32[index];
+      memory_pool_complete_warp(lane);
+      return MEMORY_POOL_STATUS_OK;
+    }
+
+    memory_pool_get_nbi_warp(
+        pool_destination, remote_source, request.bytes, request.source_pe, lane);
+    memory_pool_complete_warp(lane);
+    return MEMORY_POOL_STATUS_OK;
+  }
+
+  if (request.opcode == MEMORY_POOL_READ) {
+    if (!memory_pool_span_fits(request.pool_offset, request.bytes, config.pool_bytes))
+      return MEMORY_POOL_STATUS_POOL_RANGE;
+    memory_pool_put_nbi_warp(
+        reinterpret_cast<void*>(request.destination_address),
+        pool_data + request.pool_offset,
+        request.bytes,
+        request.target_pe,
+        lane);
+    memory_pool_complete_warp(lane);
+    return MEMORY_POOL_STATUS_OK;
+  }
+
+  if (request.opcode != MEMORY_POOL_SCATTER && request.opcode != MEMORY_POOL_GATHER)
+    return MEMORY_POOL_STATUS_BAD_OPCODE;
+  if (request.row_count > config.route_capacity)
+    return MEMORY_POOL_STATUS_ROUTE_RANGE;
+  if (request.row_count != 0 && (request.row_bytes == 0 || request.route_address == 0))
+    return MEMORY_POOL_STATUS_ROUTE_RANGE;
+
+  const int route_pe = request.opcode == MEMORY_POOL_SCATTER
+      ? static_cast<int>(request.source_pe)
+      : static_cast<int>(request.target_pe);
+  memory_pool_get_nbi_warp(
+      route_scratch,
+      reinterpret_cast<const void*>(request.route_address),
+      static_cast<uint64_t>(request.row_count) * sizeof(uint32_t),
+      route_pe,
+      lane);
+  memory_pool_complete_warp(lane);
+
+  const uint32_t source_stride = request.source_stride == 0
+      ? request.row_bytes
+      : request.source_stride;
+  const uint32_t destination_stride = request.destination_stride == 0
+      ? request.row_bytes
+      : request.destination_stride;
+
+  for (uint32_t row = 0; row < request.row_count; ++row) {
+    bool valid = false;
+    if (request.opcode == MEMORY_POOL_SCATTER) {
+      const uint64_t pool_row = memory_pool_row_offset(
+          request.pool_offset, route_scratch[row], destination_stride, &valid);
+      if (!valid || !memory_pool_span_fits(pool_row, request.row_bytes, config.pool_bytes))
+        return MEMORY_POOL_STATUS_POOL_RANGE;
+      memory_pool_get_nbi_warp(
+          pool_data + pool_row,
+          reinterpret_cast<const uint8_t*>(request.source_address) +
+              static_cast<uint64_t>(row) * source_stride,
+          request.row_bytes,
+          request.source_pe,
+          lane);
+    } else {
+      const uint64_t pool_row = memory_pool_row_offset(
+          request.pool_offset, route_scratch[row], source_stride, &valid);
+      if (!valid || !memory_pool_span_fits(pool_row, request.row_bytes, config.pool_bytes))
+        return MEMORY_POOL_STATUS_POOL_RANGE;
+      memory_pool_put_nbi_warp(
+          reinterpret_cast<uint8_t*>(request.destination_address) +
+              static_cast<uint64_t>(row) * destination_stride,
+          pool_data + pool_row,
+          request.row_bytes,
+          request.target_pe,
+          lane);
+    }
+  }
+  memory_pool_complete_warp(lane);
+  return MEMORY_POOL_STATUS_OK;
+}
+
 static __device__ __forceinline__ void memory_pool_record_control(
     const MemoryPoolConfig& config,
     MemoryPoolStatus status,
@@ -333,6 +494,155 @@ static __device__ __forceinline__ void memory_pool_run_singlethread(
       made_progress = true;
       memory_pool_record_control(
           config, MEMORY_POOL_STATUS_OK, completed, mailbox, request.user_tag);
+    }
+    if (!made_progress)
+      __nanosleep(barrierPollSleepCycles);
+  }
+}
+
+static __device__ __noinline__ void memory_pool_run_warp(
+    const MemoryPoolConfig* config_pointer,
+    uint64_t* signal_array,
+    uint32_t expected_requests,
+    uint32_t lane) {
+  __shared__ MemoryPoolConfig shared_config;
+  __shared__ MemoryPoolRequest selected_request;
+
+  if (config_pointer == nullptr || signal_array == nullptr)
+    return;
+  if (lane == 0)
+    shared_config = *config_pointer;
+  __syncwarp();
+  const MemoryPoolConfig config = shared_config;
+  if (config.mailboxes_address == 0 || config.pool_data_address == 0 ||
+      config.dependencies_address == 0 || config.consumed_sequences_address == 0 ||
+      config.control_address == 0 || config.mailbox_count == 0 ||
+      config.submit_signal_base > config.signal_count ||
+      config.mailbox_count > config.signal_count - config.submit_signal_base) {
+    if (lane == 0 && config.control_address != 0)
+      memory_pool_record_control(config, MEMORY_POOL_STATUS_BAD_CONFIG, 0, 0, 0);
+    __syncwarp();
+    return;
+  }
+
+  const auto* mailboxes = reinterpret_cast<const MemoryPoolRequest*>(
+      config.mailboxes_address);
+  auto* dependencies = reinterpret_cast<uint64_t*>(config.dependencies_address);
+  auto* consumed = reinterpret_cast<uint64_t*>(config.consumed_sequences_address);
+
+  uint64_t completed = 0;
+  if (lane == 0)
+    memory_pool_record_control(config, MEMORY_POOL_STATUS_OK, completed, 0, 0);
+  __syncwarp();
+
+  while (completed < expected_requests) {
+    bool made_progress = false;
+    for (uint32_t base = 0;
+         base < config.mailbox_count && completed < expected_requests;
+         base += 32) {
+      const uint32_t mailbox = base + lane;
+      uint64_t published = 0;
+      bool candidate = false;
+      if (mailbox < config.mailbox_count) {
+        published = nvshmem_signal_fetch(
+            signal_array + config.submit_signal_base + mailbox);
+        candidate = published > consumed[mailbox];
+        if (candidate) {
+          asm volatile("" ::: "memory");
+          const MemoryPoolRequest* request = mailboxes + mailbox;
+          if (request->sequence == published &&
+              request->wait_slot != memoryPoolNoDependency &&
+              request->wait_slot < config.dependency_count &&
+              dependencies[request->wait_slot] < request->wait_value)
+            candidate = false;
+        }
+      }
+
+      uint32_t ready_mask = __ballot_sync(0xffffffffU, candidate);
+      while (ready_mask != 0 && completed < expected_requests) {
+        const uint32_t selected_lane = __ffs(ready_mask) - 1;
+        const uint32_t selected_mailbox = __shfl_sync(
+            0xffffffffU, mailbox, selected_lane);
+        const uint64_t selected_sequence = __shfl_sync(
+            0xffffffffU, published, selected_lane);
+        if (lane == 0)
+          selected_request = mailboxes[selected_mailbox];
+        __syncwarp();
+        const MemoryPoolRequest request = selected_request;
+
+        MemoryPoolStatus validation = MEMORY_POOL_STATUS_OK;
+        bool dependency_ready = true;
+        if (lane == 0) {
+          if (request.sequence != selected_sequence) {
+            validation = MEMORY_POOL_STATUS_SEQUENCE;
+          } else if (request.completion_signal >= config.signal_count) {
+            validation = MEMORY_POOL_STATUS_SIGNAL_RANGE;
+          } else if (request.wait_slot != memoryPoolNoDependency &&
+                     request.wait_slot >= config.dependency_count) {
+            validation = MEMORY_POOL_STATUS_DEPENDENCY_RANGE;
+          } else if (request.signal_slot != memoryPoolNoDependency &&
+                     request.signal_slot >= config.dependency_count) {
+            validation = MEMORY_POOL_STATUS_DEPENDENCY_RANGE;
+          } else if (request.wait_slot != memoryPoolNoDependency &&
+                     dependencies[request.wait_slot] < request.wait_value) {
+            dependency_ready = false;
+          }
+        }
+        validation = static_cast<MemoryPoolStatus>(__shfl_sync(
+            0xffffffffU, static_cast<uint32_t>(validation), 0));
+        dependency_ready = __shfl_sync(
+            0xffffffffU, static_cast<uint32_t>(dependency_ready), 0);
+
+        if (validation != MEMORY_POOL_STATUS_OK) {
+          if (lane == 0)
+            memory_pool_record_control(
+                config,
+                validation,
+                completed,
+                selected_mailbox,
+                request.user_tag);
+          __syncwarp();
+          return;
+        }
+        if (!dependency_ready) {
+          ready_mask &= ~(1U << selected_lane);
+          continue;
+        }
+
+        const MemoryPoolStatus status = memory_pool_execute_request_warp(
+            request, config, lane);
+        if (status != MEMORY_POOL_STATUS_OK) {
+          if (lane == 0)
+            memory_pool_record_control(
+                config, status, completed, selected_mailbox, request.user_tag);
+          __syncwarp();
+          return;
+        }
+
+        if (lane == 0) {
+          if (request.signal_slot != memoryPoolNoDependency)
+            dependencies[request.signal_slot] += request.signal_delta;
+          consumed[selected_mailbox] = request.sequence;
+          __threadfence_system();
+          nvshmemx_signal_op(
+              signal_array + request.completion_signal,
+              request.sequence,
+              NVSHMEM_SIGNAL_SET,
+              request.completion_pe);
+          nvshmem_quiet();
+          ++completed;
+          memory_pool_record_control(
+              config,
+              MEMORY_POOL_STATUS_OK,
+              completed,
+              selected_mailbox,
+              request.user_tag);
+        }
+        completed = __shfl_sync(0xffffffffU, completed, 0);
+        made_progress = true;
+        ready_mask &= ~(1U << selected_lane);
+        __syncwarp();
+      }
     }
     if (!made_progress)
       __nanosleep(barrierPollSleepCycles);
