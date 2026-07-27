@@ -30,6 +30,14 @@ DAE_OP(OP_ALLOC_WB_TMA_REDUCE_ADD_3D, MK_MOP(22, MEM_OP_FLAGS_ALLOCATE | MEM_OP_
 //   2. always write to slot regardless of writeback flag
 
 DAE_OP(OP_ALLOC_WB_RAW_ADDRESS, MK_MOP(23, MEM_OP_FLAGS_ALLOCATE))
+// Pool-local dependencies are single-producer device-scope release/acquire
+// signals. They intentionally do not alter the generic countdown barrier ops.
+DAE_OP(OP_POOL_WAIT_SIGNAL, MK_MOP(24, MEM_OP_FLAGS_NONE))
+DAE_OP(OP_ALLOC_WB_POOL_TMA_STORE_1D, MK_MOP(25, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
+// Raw-address output token whose compute completion releases one named
+// device-scope pool dependency. WRITEBACK prevents the load side from
+// interpreting the BARRIER bit as a pre-load wait.
+DAE_OP(OP_ALLOC_WB_POOL_RAW_ADDRESS, MK_MOP(26, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
 // following ops must have a slot to be loaded, but not the full slot
 
 
@@ -72,6 +80,10 @@ DAE_DEFINE_COMP_FAMILY(GEMV_MMA, FIELDS=M|N|K, M_FIXED=64, N_FIXED=8, K_MULTIPLE
   DAE_OP(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA, 0x7119)
   DAE_OP(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA, 0x711a)
   DAE_OP(OP_RMS_NORM_F16_K_5120_SMEM, 0x711b)
+  DAE_OP(OP_POOL_RMS_NORM_F16_K_4096, 0x711c)
+  DAE_OP(OP_POOL_ZERO_WEIGHTED_RETURN, 0x711d)
+  DAE_OP(OP_POOL_EXPERT_ATOMIC_REDUCE_BF16, 0x711e)
+  DAE_OP(OP_POOL_TOKEN_REDUCE_BF16, 0x711f)
 
   DAE_OP(OP_GEMV_M64_PREFETCH, 0x8101)
   DAE_OP(OP_GEMV_M192, 0x8103)

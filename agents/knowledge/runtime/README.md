@@ -6,7 +6,8 @@ Start here for the VDCores runtime and VM model.
 
 1. [vdcores-vm-model.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-vm-model.md)
 2. [vdcores-operator-semantics.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-operator-semantics.md)
-3. [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
+3. [configurable-vdcores.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/configurable-vdcores.md)
+4. [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
 
 Then pull in narrower notes as needed:
 
@@ -22,6 +23,8 @@ Then pull in narrower notes as needed:
   per-SM runtime layout, register state, queues, allocator, slot lifetime, and `GROUP` / accumulate behavior
 - [vdcores-operator-semantics.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-operator-semantics.md):
   instruction-field meanings and operator-by-operator state transitions
+- [configurable-vdcores.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/configurable-vdcores.md):
+  compile-time kernel envelopes, per-block roles, and PoolInst executor assembly
 - [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md):
   queue protocol and deadlock-oriented guidance
 - [memory-pool-protocol.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-protocol.md):

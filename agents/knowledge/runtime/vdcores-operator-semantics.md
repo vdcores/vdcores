@@ -47,6 +47,14 @@ Primary references:
 - communication opcodes have no memory flags and are consumed only by the
   optional communication warp
 
+### `PoolInst`
+
+- independent 16-byte pool format with the same field widths as `CommInst`;
+- stored in a separate instruction array and never decoded by the ordinary
+  communication interpreter;
+- each wire opcode selects one compile-time execute-warp type during host
+  kernel assembly.
+
 ## Memory-Opcode Flags
 
 The low 6 opcode bits are flags:
@@ -321,25 +329,32 @@ but rejects nonempty communication streams because it has no consumer warp.
   - `address` is a 128-byte request, `size` its submit signal, `arg0` pool PE;
   - warp put-with-signal and quiet publishes the mailbox.
 - `COMM_MEMORY_POOL_WAIT`: `address` is the request whose completion sequence
-  is awaited.
+  is awaited; `arg0` identifies the pool PE, selecting a GPU-scope atomic
+  acquire for a local completion or an NVSHMEM wait for a remote completion.
 - `COMM_MEMORY_POOL_RUN`:
   - `address` is `MemoryPoolConfig`;
   - `size | arg0 << 16` is the expected completion count;
   - lanes poll distinct mailboxes, ballot ready requests, execute one selected
     request cooperatively, then advance its dependency/completion state.
-- `COMM_POOL_SLICE_EXCHANGE` is a communication-specialized block macro:
+## Pool Operators
+
+The registry is `include/dae/pool_opcode.cuh.inc`. Pool operators are
+`PoolInstruction` subclasses and execute only in a kernel assembly containing
+their registered execute-warp type.
+
+- `POOL_SLICE_EXCHANGE` is an eight-warp `PoolInst`:
   - `address` is a `PoolSliceConfig` pointer;
   - `size` is the first source-writer chunk barrier;
   - `arg0` is the first contiguous reader-dispatch barrier;
-  - `arg1` is the first contiguous reader-compute barrier;
-  - it must be instruction zero in that block's communication stream;
-  - every thread enters the macro before normal compute/memory/communication
-    warp-role dispatch;
+  - `arg1` is the first contiguous reader/reducer-compute barrier; weighted
+    return waits `PoolSliceConfig.reducer_count` signals from this base;
+  - host dispatch instantiates `PoolSliceExchangeExecuteWarp` and every thread
+    enters it before any ordinary VM state is allocated;
   - it publishes route-count descriptors, packs source rows, performs batched
     dynamic GETs, releases ordinary reader blocks, performs batched return
     PUTs, waits merged return phases, and source-scatters the result;
-  - on return from the macro, the specialized block exits `dae2` rather than
-    executing the ordinary three virtual-core interpreters.
+  - a fixed pool assembly contains no compute/memory/communication
+    interpreters; a mixed assembly may run them only on other blocks.
 
 Generic dependency semantics are in `memory-pool-protocol.md`. The batched gathered
 read ABI, warp roles, and ordering rules are in `pool-slice-dynamic-read.md`
@@ -353,6 +368,26 @@ The compute-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/de
 - `OP_LOOPC`
 - `OP_DUMMY`
 - `OP_COPY`
+
+Pool reduction operators are ordinary compute instructions; they are not
+PoolInst opcodes:
+
+- `OP_POOL_ZERO_WEIGHTED_RETURN`
+  - consumes raw config and PoolRawAddress completion tokens;
+  - zeros the private token-partial half of `return_inbox` while dispatch runs;
+  - the PoolRawAddress store path releases the named GPU-scope zero signal.
+- `OP_POOL_EXPERT_ATOMIC_REDUCE_BF16`
+  - `args[0]` is the local expert/reader;
+  - waits are ordinary `OP_POOL_WAIT_SIGNAL` memory instructions scheduled
+    before its raw operands;
+  - walks that expert's dynamic receive batches and uses native BF16x2
+    `atomicAdd` to contribute weighted rows to token-major staging;
+  - completion releases the corresponding PoolInst reducer signal.
+- `OP_POOL_TOKEN_REDUCE_BF16`
+  - `args[0:2]` are reducer rank/count;
+  - each block owns disjoint `(source PE, compact token)` tasks, reads the
+    reverse expert-row map, accumulates in FP32 registers, and stores BF16;
+  - up to 32 blocks release a contiguous signal range consumed by PoolInst.
 
 ## Control ops
 

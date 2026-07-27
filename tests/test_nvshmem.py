@@ -35,8 +35,14 @@ def test_optional_allocator_extension_import_smoke():
     assert callable(dae_runtime._nvshmem_module_finalize)
     assert not hasattr(dae_runtime, "launch_memory_pool_control")
     assert dae_runtime.comm_opcode.COMM_MEMORY_POOL_RUN == 6
-    assert dae_runtime.comm_opcode.COMM_POOL_SLICE_EXCHANGE == 8
+    assert not hasattr(dae_runtime.comm_opcode, "COMM_POOL_SLICE_EXCHANGE")
+    assert dae_runtime.pool_opcode.POOL_SLICE_EXCHANGE == 1
     assert dae_runtime.config.max_comm_insts == 32
+    assert dae_runtime.config.max_pool_insts == 1
+    assert dae_runtime.config.default_core_warps == 8
+    assert dae_runtime.config.runtime_core_warps == 8
+    assert dae_runtime.config.runtime_communication_core_warps == 9
+    assert dae_runtime.config.pool_slice_warps == 8
     public = {name for name in dir(runtime) if not name.startswith("_")}
     assert public == {
         "NVSHMEM_ENABLED",

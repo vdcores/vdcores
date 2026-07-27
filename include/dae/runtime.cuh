@@ -17,11 +17,15 @@ cudaError_t launch_dae(
   CInst* compute_instructions,
   MInst* memory_instructions,
   CommInst* communication_instructions,
+  PoolInst* pool_instructions,
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * signal_array,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  const DaeCoreConfig* core_configs = nullptr,
+  DaeKernelVariant kernel_variant = DAE_KERNEL_AUTO,
+  uint16_t pool_inst_opcode = 0
 );
 
 CUtensorMap create_tma_descriptor(

@@ -51,6 +51,13 @@ The common fan-in maps directly to a slot barrier: 16 writes each add one;
 dependent reads wait for value 16. Slot ids make epochs and fan-in explicit and
 avoid ambiguous address-hazard inference.
 
+Dependency slots are GPU-scope atomic message objects. The executor performs a
+release add only after the named data operation completes; a candidate request
+uses an acquire load of only its `wait_slot`. Consumed mailbox sequences use
+relaxed native CUDA atomics because they prevent replay but carry no payload
+ordering. Control/status words are telemetry read after kernel completion and
+are not synchronization objects.
+
 ## Operations
 
 - `WRITE`: get producer bytes into the pool.
@@ -62,9 +69,16 @@ avoid ambiguous address-hazard inference.
 - `GATHER`: fetch route metadata, then return routed pool rows in request order.
 
 The selected operation is executed cooperatively by all 32 communication-warp
-lanes. Remote NBI movement is quieted before ticket/completion publication.
+lanes. A warp sync makes every issuing lane visible before elected lane 0
+quiets remote NBI movement. Local copies skip quiet. A local completion uses a
+GPU-scope release/acquire completion word; a remote completion uses an
+NVSHMEM signal after the data RMA has completed.
 Malformed spans, dependencies, routes, signals, sequences, or reduction shapes
 set an explicit status and terminate the pool program.
+
+The generic executor contains no explicit system fence. NVSHMEM primitives
+own remote-message delivery, and the dependency/completion words name the
+specific local operations they order.
 
 ## VDCores Schedule
 
@@ -78,6 +92,10 @@ communication submit.
 producer communication: [wait local barrier] -> submit -> wait completion
 pool communication:      scan -> choose ready -> move data -> ticket -> signal
 ```
+
+`MemoryPoolWait.arg0` identifies the pool PE. A same-PE wait uses the local
+completion word's acquire load; a remote-pool wait uses the NVSHMEM signal-wait
+primitive.
 
 The dependent-read/write app uses only communication work, so it requests zero
 dynamic slot storage. It still launches one normal `dae2` program with

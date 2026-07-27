@@ -51,12 +51,14 @@ macro on both extensions. `make nvshmem-pyext` is the normal entry point;
 - There is no NVSHMEM-specific launcher. Initialize with `dae.nvshmem`, then
   construct the ordinary `dae.launcher.Launcher` with `signal_array=signals`
   and `benchmark_barrier=dae.nvshmem.benchmark_barrier`.
-- `Launcher` forwards the optional signal tensor and its independent
-  communication instruction stream through `runtime.launch_dae`. The optional
-  ninth warp executes `COMM_NVSHMEM_*` and `COMM_MEMORY_POOL_*`; a block whose
-  first instruction is `COMM_POOL_SLICE_EXCHANGE` instead enters the isolated
-  all-warp pool macro. Ordinary alloc/load/store paths still have no NVSHMEM
-  device calls.
+- `Launcher` forwards the signal tensor plus independent ordinary
+  communication and PoolInst instruction arrays through `runtime.launch_dae`.
+  These are statically assembled roles inside VDCores kernels, not auxiliary
+  CUDA streams or helper kernels. A
+  separately compiled ninth warp executes `COMM_NVSHMEM_*` and the generic
+  `COMM_MEMORY_POOL_*` proof path. `POOL_SLICE_EXCHANGE` selects its own
+  eight-warp execute type and never enters that interpreter. Ordinary
+  alloc/load/store paths still have no NVSHMEM device calls.
 - `dae.nvshmem.benchmark_barrier()` synchronizes the device and all PEs. Base
   `Launcher.bench()` invokes the configured callback before every measured
   iteration, so multi-rank profile timestamps begin only after all ranks are

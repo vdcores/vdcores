@@ -12,7 +12,7 @@ from .instruction_utils import (
     resolve_compute_opcode_value,
 )
 from .op_families import ComputeOpFamilyRef, family_ref
-from .runtime import comm_opcode, config, opcode
+from .runtime import comm_opcode, config, opcode, pool_opcode
 from .tma_utils import (
     Major,
     addr2cords,
@@ -290,6 +290,49 @@ class RMS_NORM_F16_K_4096(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_4096, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
+class POOL_RMS_NORM_F16_K_4096(ComputeInstruction):
+    """RMS over a pool-published dynamic contiguous row count."""
+
+    def __init__(self, max_num_token: int, epsilon: float):
+        super().__init__(
+            opcode=opcode.OP_POOL_RMS_NORM_F16_K_4096,
+            args=[max_num_token, encode_bfloat16_u16(epsilon)],
+        )
+
+
+class POOL_ZERO_WEIGHTED_RETURN(ComputeInstruction):
+    """Zero the private token-major partial buffer for external reducers."""
+
+    def __init__(self):
+        super().__init__(opcode=opcode.OP_POOL_ZERO_WEIGHTED_RETURN, args=[])
+
+
+class POOL_EXPERT_ATOMIC_REDUCE_BF16(ComputeInstruction):
+    """Accumulate one ready expert into pool-owned token-major partials."""
+
+    def __init__(self, local_reader: int):
+        if not 0 <= int(local_reader) < 2**16:
+            raise ValueError("local_reader must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_POOL_EXPERT_ATOMIC_REDUCE_BF16,
+            args=[int(local_reader)],
+        )
+
+
+class POOL_TOKEN_REDUCE_BF16(ComputeInstruction):
+    """Reduce a disjoint compact-token shard across all local experts."""
+
+    def __init__(self, reducer_rank: int, reducer_count: int):
+        if not 0 <= int(reducer_rank) < int(reducer_count) < 2**16:
+            raise ValueError(
+                "reducer_rank/count must satisfy 0 <= rank < count < 2**16"
+            )
+        super().__init__(
+            opcode=opcode.OP_POOL_TOKEN_REDUCE_BF16,
+            args=[int(reducer_rank), int(reducer_count)],
+        )
+
+
 class RMS_NORM_F16_K_4096_SMEM(ComputeInstruction):
     def __init__(self, num_token: int, epsilon: float):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_4096_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
@@ -452,6 +495,65 @@ class CommunicationInstruction(Instruction):
     def __repr__(self):
         return (
             "CommunicationInstruction("
+            f"opcode={self.opcode}, size={self.size}, arg0={self.arg0}, "
+            f"arg1={self.arg1}, address=0x{self.address:x})"
+        )
+
+
+class PoolInstruction(Instruction):
+    """A 16-byte instruction consumed by its compiled execute-warp type.
+
+    Pool instructions share only a wire layout.  They are not a bytecode
+    stream: the launcher's opcode selects a precompiled VDCores assembly, and
+    that assembly calls the matching multi-warp executor directly.
+    """
+
+    requires_pool_core = True
+    requires_signal_array = True
+
+    def __init__(
+        self,
+        opcode: int,
+        *,
+        size: int = 0,
+        arg0: int = 0,
+        arg1: int = 0,
+        address: int = 0,
+    ):
+        for name, value in (
+            ("opcode", opcode),
+            ("size", size),
+            ("arg0", arg0),
+            ("arg1", arg1),
+        ):
+            if not 0 <= int(value) < 2**16:
+                raise ValueError(f"{name} must fit in uint16")
+        if not 0 <= int(address) < 2**64:
+            raise ValueError("address must fit in uint64")
+        self.opcode = int(opcode)
+        self.size = int(size)
+        self.arg0 = int(arg0)
+        self.arg1 = int(arg1)
+        self.address = int(address)
+
+    def tensor(self, tensor: torch.Tensor | None = None) -> torch.Tensor:
+        if tensor is None:
+            tensor = torch.empty((8,), dtype=torch.uint16)
+        else:
+            tensor = tensor.view(torch.uint16)
+            assert tensor.numel() == 8
+        tensor[0] = self.opcode
+        tensor[1] = self.size
+        tensor[2] = self.arg0
+        tensor[3] = self.arg1
+        address_words = addr2cords(self.address)
+        for index in range(4):
+            tensor[4 + index] = address_words[index]
+        return tensor.view(torch.uint8)
+
+    def __repr__(self):
+        return (
+            "PoolInstruction("
             f"opcode={self.opcode}, size={self.size}, arg0={self.arg0}, "
             f"arg1={self.arg1}, address=0x{self.address:x})"
         )
@@ -863,10 +965,32 @@ class RawAddress(MemoryInstruction):
         )
 
 
+class PoolRawAddress(RawAddress):
+    """Direct-output address followed by a device-scope pool release."""
+
+    def __init__(self, tensor: torch.Tensor, slot_id: int):
+        super().__init__(tensor, slot_id)
+        self.opcode = opcode.OP_ALLOC_WB_POOL_RAW_ADDRESS
+
+
 class IssueBarrier(MemoryInstruction):
     def __init__(self, bar: int):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
         self.bar(bar)
+
+
+class PoolWaitSignal(MemoryInstruction):
+    """Wait on a single-producer device-scope pool dependency flag."""
+
+    def __init__(self, signal: int):
+        super().__init__(
+            opcode=opcode.OP_POOL_WAIT_SIGNAL,
+            num_slots=0,
+            arg=0,
+            size=0,
+            address=0,
+        )
+        self.bar(signal)
 
 
 def _control_pointer(value: torch.Tensor | int, name: str) -> int:
@@ -964,9 +1088,12 @@ class MemoryPoolSubmit(CommunicationInstruction):
 class MemoryPoolWait(CommunicationInstruction):
     requires_signal_array = True
 
-    def __init__(self, request: torch.Tensor | int):
+    def __init__(self, request: torch.Tensor | int, *, pool_pe: int):
+        if not 0 <= pool_pe < 2**16:
+            raise ValueError("pool_pe must fit in 16 bits")
         super().__init__(
             opcode=comm_opcode.COMM_MEMORY_POOL_WAIT,
+            arg0=pool_pe,
             address=_control_pointer(request, "request"),
         )
 
@@ -985,12 +1112,12 @@ class MemoryPoolRun(CommunicationInstruction):
         )
 
 
-class PoolSliceExchange(CommunicationInstruction):
-    """Run the batched dependent-read/return loop on a pool communication core.
+class PoolSliceExchange(PoolInstruction):
+    """Run the batched dependent-read/return loop as one PoolInst.
 
-    This macro instruction must be the first communication instruction of its
-    block. The runtime then gives all existing block warps to the operator
-    until the complete write/read/return dependency chain retires.
+    The selected specialized runtime gives the complete pool CTA to
+    ``PoolSliceExchangeExecuteWarp`` until the write/read/return dependency
+    chain retires.  It never enters the ordinary communication interpreter.
     """
 
     requires_signal_array = True
@@ -1010,7 +1137,7 @@ class PoolSliceExchange(CommunicationInstruction):
         if not 0 <= compute_barrier_base < 2**16:
             raise ValueError("compute_barrier_base must fit in uint16")
         super().__init__(
-            comm_opcode.COMM_POOL_SLICE_EXCHANGE,
+            pool_opcode.POOL_SLICE_EXCHANGE,
             size=write_barrier,
             arg0=dispatch_barrier_base,
             arg1=compute_barrier_base,
@@ -1101,6 +1228,19 @@ class TmaStore1D(MemoryInstruction):
         new_inst = copy.copy(self)
         new_inst.delta(addr)
         return new_inst
+
+
+class PoolTmaStore1D(TmaStore1D):
+    """TMA store followed by a device-scope pool release signal."""
+
+    def __init__(
+        self,
+        dst: torch.Tensor,
+        bytes: int | None = None,
+        numSlots: int | None = None,
+    ):
+        super().__init__(dst, bytes=bytes, numSlots=numSlots)
+        self.opcode = opcode.OP_ALLOC_WB_POOL_TMA_STORE_1D
 
 
 class TmaTensor(MemoryInstruction):
@@ -1211,6 +1351,10 @@ __all__ = [
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
+    "POOL_RMS_NORM_F16_K_4096",
+    "POOL_ZERO_WEIGHTED_RETURN",
+    "POOL_EXPERT_ATOMIC_REDUCE_BF16",
+    "POOL_TOKEN_REDUCE_BF16",
     "RMS_NORM_F16_K_4096_SMEM",
     "RMS_NORM_F16_K_128_SMEM",
     "RMS_NORM_F16_K_2048_SMEM",
@@ -1226,6 +1370,7 @@ __all__ = [
     "Copy",
     "LoopC",
     "CommunicationInstruction",
+    "PoolInstruction",
     "TerminateComm",
     "CommWaitBarrier",
     "CommRecordEvent",
@@ -1235,7 +1380,9 @@ __all__ = [
     "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",
+    "PoolRawAddress",
     "IssueBarrier",
+    "PoolWaitSignal",
     "NvshmemPut",
     "NvshmemWait",
     "MemoryPoolSubmit",
@@ -1247,5 +1394,6 @@ __all__ = [
     "RegLoad",
     "TmaLoad1D",
     "TmaStore1D",
+    "PoolTmaStore1D",
     "TmaTensor",
 ]

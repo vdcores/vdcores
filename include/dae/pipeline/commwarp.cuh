@@ -88,10 +88,16 @@ static __device__ __noinline__ void communicationwarp_execute(
         if (lane == 0) {
           const auto* request = reinterpret_cast<const MemoryPoolRequest*>(
               inst.address);
-          nvshmem_signal_wait_until(
-              signal_array + request->completion_signal,
-              NVSHMEM_CMP_GE,
-              request->sequence);
+          if (inst.arg0 == static_cast<uint32_t>(nvshmem_my_pe())) {
+            memory_pool_wait_completion_local(
+                signal_array + request->completion_signal,
+                request->sequence);
+          } else {
+            nvshmem_signal_wait_until(
+                signal_array + request->completion_signal,
+                NVSHMEM_CMP_GE,
+                request->sequence);
+          }
         }
         __syncwarp();
         break;

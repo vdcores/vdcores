@@ -40,6 +40,21 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="pack warps; zero selects the PE/payload-aware policy",
     )
+    parser.add_argument("--pool-blocks", type=int, default=1)
+    parser.add_argument("--dedicated-coordinator", action="store_true")
+    parser.add_argument("--put-phase-words", action="store_true")
+    parser.add_argument("--pipelined-return", action="store_true")
+    parser.add_argument("--no-reader-pipeline", action="store_true")
+    parser.add_argument(
+        "--in-place-identity",
+        action="store_true",
+        help="alias expert input/output and exclude identity-copy compute",
+    )
+    parser.add_argument(
+        "--source-preloaded",
+        action="store_true",
+        help="start from activations already written into source pool slots",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +66,7 @@ def main() -> None:
         "readers_per_pe",
         "top_k",
         "iterations",
+        "pool_blocks",
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
@@ -65,10 +81,7 @@ def main() -> None:
             raise ValueError("top-k cannot exceed the global reader count")
 
         local_routes = args.tokens_per_pe * args.top_k
-        global_routes = runtime.num_pes * local_routes
-        expert_capacity_rows = (
-            global_routes + num_readers - 1
-        ) // num_readers + args.top_k
+        expert_capacity_rows = runtime.num_pes * args.tokens_per_pe
         signals = nvshmem.init_signal_space(runtime.num_pes)
         buffers = allocate_pool_slice(
             signals,
@@ -81,9 +94,19 @@ def main() -> None:
             hidden_size=args.hidden_size,
             dtype=dtype,
             pack_warps=args.pack_warps,
+            pool_blocks=args.pool_blocks,
+            in_place_expert_output=args.in_place_identity,
+            dedicated_coordinator=args.dedicated_coordinator,
+            put_phase_words=args.put_phase_words,
+            pipelined_return=args.pipelined_return,
+            reader_pipeline=not args.no_reader_pipeline,
         )
-        tokens = nvshmem.empty(
-            (args.tokens_per_pe, args.hidden_size), dtype=dtype
+        tokens = (
+            buffers.token_pool
+            if args.source_preloaded
+            else nvshmem.empty(
+                (args.tokens_per_pe, args.hidden_size), dtype=dtype
+            )
         )
         # Top-k results are returned route-major.  A later pool reduction may
         # combine routes sharing a token; this harness isolates dynamic read.
@@ -106,6 +129,8 @@ def main() -> None:
         program = build_pool_slice_copy_program(
             buffers,
             benchmark_barrier=nvshmem.benchmark_barrier,
+            in_place_identity=args.in_place_identity,
+            source_preloaded=args.source_preloaded,
         )
 
         token_values = torch.arange(
@@ -194,6 +219,9 @@ def main() -> None:
 
         row_bytes = args.hidden_size * tokens.element_size()
         remote_slices = runtime.num_pes - 1
+        unique_target_rows = int(
+            buffers.send_token_counts.cpu().to(torch.int64).sum().item()
+        )
         overlap_summary = (
             f"first_payload_ms={statistics.median(first_payload_samples):.4f}, "
             f"payload_sources={payload_sources}, "
@@ -207,14 +235,20 @@ def main() -> None:
             f"PE {runtime.pe}/{runtime.num_pes}: pool-slice dynamic-read PASS "
             f"tokens={args.tokens_per_pe} hidden={args.hidden_size} "
             f"readers={num_readers} top_k={args.top_k} "
-            f"protocol=batched-macro pack_warps={active_pack_warps} "
+            f"protocol=pool-gather pool_blocks={buffers.pool_count} "
+            f"dedicated_coordinator={args.dedicated_coordinator} "
+            f"put_phase_words={args.put_phase_words} "
+            f"reader_pipeline={not args.no_reader_pipeline} "
+            f"source_preloaded={args.source_preloaded} "
+            f"worker_config={active_pack_warps} "
             f"received={received_rows} launches={rounds} "
             f"median_ms=(gather={statistics.median(gather_samples):.4f}, "
             f"return={statistics.median(return_samples):.4f}, "
             f"total={statistics.median(total_samples):.4f}) "
             f"overlap=({overlap_summary}) "
             f"model=(descriptor_B={remote_slices * POOL_SLICE_PUBLISH_BYTES}, "
-            f"route_payload_B={local_routes * row_bytes})"
+            f"logical_route_B={local_routes * row_bytes}, "
+            f"unique_target_rows={unique_target_rows})"
         )
     finally:
         nvshmem.finalize()

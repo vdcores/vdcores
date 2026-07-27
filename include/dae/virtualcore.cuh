@@ -86,6 +86,26 @@ static constexpr int __bar_cgroup = 8;
 
 static constexpr unsigned ALL_THREADS = 0xFFFFFFFFU;
 static constexpr unsigned SLOT_END = 0xFFU;
+// c2m normally carries a shared-slot bitmask. Raw global-address operators use
+// special slot IDs instead, so tag those completions explicitly rather than
+// relying on extract(mask), which aliases IDs such as 25 to slot zero.
+static constexpr unsigned SLOT_SPECIAL_COMPLETION_TAG = 1U << 30;
+static constexpr unsigned SLOT_SPECIAL_COMPLETION_MASK = 0xFFU;
+
+static __device__ __forceinline__ int special_slot_completion(int slot) {
+  return static_cast<int>(SLOT_SPECIAL_COMPLETION_TAG |
+                          (static_cast<unsigned>(slot) &
+                           SLOT_SPECIAL_COMPLETION_MASK));
+}
+
+static __device__ __forceinline__ bool is_special_slot_completion(int value) {
+  return (static_cast<unsigned>(value) & SLOT_SPECIAL_COMPLETION_TAG) != 0;
+}
+
+static __device__ __forceinline__ uint8_t special_completion_slot(int value) {
+  return static_cast<uint8_t>(static_cast<unsigned>(value) &
+                              SLOT_SPECIAL_COMPLETION_MASK);
+}
 
 static __device__ __forceinline__ void * get_slot_address(const void *base, uint8_t slot) {
   return (void *)((const unsigned char*)base + slot * slotSizeKb * 1024);

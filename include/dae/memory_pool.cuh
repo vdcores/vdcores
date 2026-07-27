@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.cuh"
+#include "scoped_atomic.cuh"
 
 #ifdef DAE_ENABLE_NVSHMEM
 
@@ -102,11 +103,57 @@ static __device__ __forceinline__ void memory_pool_copy_local(
     dst[i] = src[i];
 }
 
+// Dependency slots are pool-local HBM synchronization objects. A release
+// increment publishes exactly the data operation named by one request; a
+// matching acquire load gates only requests that name that slot/value.
+static __device__ __forceinline__ bool memory_pool_dependency_ready(
+    const uint64_t* address, uint64_t expected) {
+  return dae_atomic_load_acquire_gpu(address) >= expected;
+}
+
+static __device__ __forceinline__ void memory_pool_dependency_release(
+    uint64_t* address, uint64_t delta) {
+  dae_atomic_add_release_gpu(address, delta);
+}
+
+// Consumed sequences prevent mailbox replay; they do not publish request
+// payload. Keep this bookkeeping atomic but deliberately unordered.
+static __device__ __forceinline__ uint64_t memory_pool_sequence_load(
+    const uint64_t* address) {
+  return dae_atomic_load_relaxed_gpu(const_cast<uint64_t*>(address));
+}
+
+static __device__ __forceinline__ void memory_pool_sequence_store(
+    uint64_t* address, uint64_t value) {
+  dae_atomic_store_relaxed_gpu(address, value);
+}
+
+// A local completion is a same-device message and uses the completion word as
+// its release/acquire object. A remote completion remains an NVSHMEM signal;
+// the caller has already quieted any RMA whose delivery it acknowledges.
+static __device__ __forceinline__ void memory_pool_publish_completion(
+    uint64_t* signal_address,
+    uint64_t sequence,
+    uint32_t completion_pe) {
+  if (completion_pe == static_cast<uint32_t>(nvshmem_my_pe())) {
+    dae_atomic_store_release_gpu(signal_address, sequence);
+    return;
+  }
+  nvshmemx_signal_op(
+      signal_address, sequence, NVSHMEM_SIGNAL_SET, completion_pe);
+  nvshmem_quiet();
+}
+
+static __device__ __forceinline__ void memory_pool_wait_completion_local(
+    uint64_t* signal_address, uint64_t expected) {
+  while (dae_atomic_load_acquire_gpu(signal_address) < expected)
+    __nanosleep(barrierPollSleepCycles);
+}
+
 static __device__ __forceinline__ void memory_pool_get(
     void* destination, const void* source, uint64_t bytes, int source_pe) {
   if (source_pe == nvshmem_my_pe()) {
     memory_pool_copy_local(destination, source, bytes);
-    __threadfence_system();
     return;
   }
   nvshmem_getmem_nbi(destination, source, static_cast<size_t>(bytes), source_pe);
@@ -117,7 +164,6 @@ static __device__ __forceinline__ void memory_pool_put(
     void* destination, const void* source, uint64_t bytes, int target_pe) {
   if (target_pe == nvshmem_my_pe()) {
     memory_pool_copy_local(destination, source, bytes);
-    __threadfence_system();
     return;
   }
   nvshmem_putmem_nbi(destination, source, static_cast<size_t>(bytes), target_pe);
@@ -157,7 +203,6 @@ static __device__ __forceinline__ MemoryPoolStatus memory_pool_execute_request(
       const auto* source_f32 = reinterpret_cast<const float*>(data_scratch);
       for (uint64_t i = 0; i < request.bytes / sizeof(float); ++i)
         destination_f32[i] += source_f32[i];
-      __threadfence_system();
       return MEMORY_POOL_STATUS_OK;
     }
 
@@ -271,12 +316,11 @@ static __device__ __forceinline__ void memory_pool_put_nbi_warp(
       destination, source, static_cast<size_t>(bytes), target_pe);
 }
 
-static __device__ __forceinline__ void memory_pool_complete_warp(uint32_t lane) {
+static __device__ __forceinline__ void memory_pool_complete_warp(
+    uint32_t lane, bool issued_remote) {
   __syncwarp();
-  if (lane == 0) {
-    __threadfence_system();
+  if (lane == 0 && issued_remote)
     nvshmem_quiet();
-  }
   __syncwarp();
 }
 
@@ -302,20 +346,22 @@ memory_pool_execute_request_warp(
         return MEMORY_POOL_STATUS_REDUCE_FORMAT;
       memory_pool_get_nbi_warp(
           data_scratch, remote_source, request.bytes, request.source_pe, lane);
-      memory_pool_complete_warp(lane);
+      memory_pool_complete_warp(
+          lane, request.source_pe != static_cast<uint32_t>(nvshmem_my_pe()));
       auto* destination_f32 = reinterpret_cast<float*>(pool_destination);
       const auto* source_f32 = reinterpret_cast<const float*>(data_scratch);
       for (uint64_t index = lane;
            index < request.bytes / sizeof(float);
            index += 32)
         destination_f32[index] += source_f32[index];
-      memory_pool_complete_warp(lane);
+      memory_pool_complete_warp(lane, false);
       return MEMORY_POOL_STATUS_OK;
     }
 
     memory_pool_get_nbi_warp(
         pool_destination, remote_source, request.bytes, request.source_pe, lane);
-    memory_pool_complete_warp(lane);
+    memory_pool_complete_warp(
+        lane, request.source_pe != static_cast<uint32_t>(nvshmem_my_pe()));
     return MEMORY_POOL_STATUS_OK;
   }
 
@@ -328,7 +374,8 @@ memory_pool_execute_request_warp(
         request.bytes,
         request.target_pe,
         lane);
-    memory_pool_complete_warp(lane);
+    memory_pool_complete_warp(
+        lane, request.target_pe != static_cast<uint32_t>(nvshmem_my_pe()));
     return MEMORY_POOL_STATUS_OK;
   }
 
@@ -348,7 +395,7 @@ memory_pool_execute_request_warp(
       static_cast<uint64_t>(request.row_count) * sizeof(uint32_t),
       route_pe,
       lane);
-  memory_pool_complete_warp(lane);
+  memory_pool_complete_warp(lane, route_pe != nvshmem_my_pe());
 
   const uint32_t source_stride = request.source_stride == 0
       ? request.row_bytes
@@ -385,7 +432,11 @@ memory_pool_execute_request_warp(
           lane);
     }
   }
-  memory_pool_complete_warp(lane);
+  const uint32_t data_pe = request.opcode == MEMORY_POOL_SCATTER
+      ? request.source_pe
+      : request.target_pe;
+  memory_pool_complete_warp(
+      lane, data_pe != static_cast<uint32_t>(nvshmem_my_pe()));
   return MEMORY_POOL_STATUS_OK;
 }
 
@@ -400,7 +451,8 @@ static __device__ __forceinline__ void memory_pool_record_control(
   control[1] = completed;
   control[2] = mailbox;
   control[3] = user_tag;
-  __threadfence_system();
+  // Control words are telemetry, not a protocol signal. Host readers observe
+  // them only after kernel/stream completion.
 }
 
 static __device__ __forceinline__ void memory_pool_run_singlethread(
@@ -435,7 +487,7 @@ static __device__ __forceinline__ void memory_pool_run_singlethread(
          ++mailbox) {
       const uint64_t published = nvshmem_signal_fetch(
           signal_array + config.submit_signal_base + mailbox);
-      if (published <= consumed[mailbox])
+      if (published <= memory_pool_sequence_load(consumed + mailbox))
         continue;
 
       // put-with-signal publishes the request before the signal. Keep the
@@ -459,7 +511,8 @@ static __device__ __forceinline__ void memory_pool_run_singlethread(
               request.user_tag);
           return;
         }
-        if (dependencies[request.wait_slot] < request.wait_value)
+        if (!memory_pool_dependency_ready(
+                dependencies + request.wait_slot, request.wait_value))
           continue;
       }
       if (request.signal_slot != memoryPoolNoDependency &&
@@ -476,19 +529,15 @@ static __device__ __forceinline__ void memory_pool_run_singlethread(
         return;
       }
 
-      if (request.signal_slot != memoryPoolNoDependency) {
-        dependencies[request.signal_slot] += request.signal_delta;
-        __threadfence_system();
-      }
-      consumed[mailbox] = request.sequence;
-      __threadfence_system();
+      if (request.signal_slot != memoryPoolNoDependency)
+        memory_pool_dependency_release(
+            dependencies + request.signal_slot, request.signal_delta);
+      memory_pool_sequence_store(consumed + mailbox, request.sequence);
 
-      nvshmemx_signal_op(
+      memory_pool_publish_completion(
           signal_array + request.completion_signal,
           request.sequence,
-          NVSHMEM_SIGNAL_SET,
           request.completion_pe);
-      nvshmem_quiet();
 
       ++completed;
       made_progress = true;
@@ -546,14 +595,15 @@ static __device__ __noinline__ void memory_pool_run_warp(
       if (mailbox < config.mailbox_count) {
         published = nvshmem_signal_fetch(
             signal_array + config.submit_signal_base + mailbox);
-        candidate = published > consumed[mailbox];
+        candidate = published > memory_pool_sequence_load(consumed + mailbox);
         if (candidate) {
           asm volatile("" ::: "memory");
           const MemoryPoolRequest* request = mailboxes + mailbox;
           if (request->sequence == published &&
               request->wait_slot != memoryPoolNoDependency &&
               request->wait_slot < config.dependency_count &&
-              dependencies[request->wait_slot] < request->wait_value)
+              !memory_pool_dependency_ready(
+                  dependencies + request->wait_slot, request->wait_value))
             candidate = false;
         }
       }
@@ -584,7 +634,9 @@ static __device__ __noinline__ void memory_pool_run_warp(
                      request.signal_slot >= config.dependency_count) {
             validation = MEMORY_POOL_STATUS_DEPENDENCY_RANGE;
           } else if (request.wait_slot != memoryPoolNoDependency &&
-                     dependencies[request.wait_slot] < request.wait_value) {
+                     !memory_pool_dependency_ready(
+                         dependencies + request.wait_slot,
+                         request.wait_value)) {
             dependency_ready = false;
           }
         }
@@ -621,15 +673,14 @@ static __device__ __noinline__ void memory_pool_run_warp(
 
         if (lane == 0) {
           if (request.signal_slot != memoryPoolNoDependency)
-            dependencies[request.signal_slot] += request.signal_delta;
-          consumed[selected_mailbox] = request.sequence;
-          __threadfence_system();
-          nvshmemx_signal_op(
+            memory_pool_dependency_release(
+                dependencies + request.signal_slot, request.signal_delta);
+          memory_pool_sequence_store(
+              consumed + selected_mailbox, request.sequence);
+          memory_pool_publish_completion(
               signal_array + request.completion_signal,
               request.sequence,
-              NVSHMEM_SIGNAL_SET,
               request.completion_pe);
-          nvshmem_quiet();
           ++completed;
           memory_pool_record_control(
               config,

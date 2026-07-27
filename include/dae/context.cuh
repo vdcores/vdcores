@@ -5,6 +5,8 @@
 #include <cuda/barrier>
 #include <cuda/ptx>
 
+#include "core_config.cuh"
+
 // features
 constexpr bool dae2EnableLooping = true;
 constexpr bool dae2EnableGroup = true;
@@ -15,6 +17,7 @@ static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
 static constexpr int numCommInsts = 32;
+static constexpr int numPoolInsts = 1;
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 
@@ -22,13 +25,11 @@ static constexpr int numSpecialSlots = 9;
 
 static_assert(numSlots + numSpecialSlots <= ((2<<6) - 1), "Total number of slots must be less than or equal to 32");
 
-static constexpr int numComputeWarps = 4;
-static constexpr int numMemoryWarps = 4;
-#ifdef DAE_ENABLE_NVSHMEM
-static constexpr int numCommunicationWarps = 1;
-#else
+// Compatibility names describe the default compute+memory core. Optional
+// communication and heterogeneous envelopes are defined in core_config.cuh.
+static constexpr int numComputeWarps = daeComputeWarps;
+static constexpr int numMemoryWarps = daeDefaultMemoryWarps;
 static constexpr int numCommunicationWarps = 0;
-#endif
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp *
@@ -132,10 +133,29 @@ struct alignas(16) CommInst {
 };
 static_assert(sizeof(CommInst) == 16, "CommInst ABI changed");
 
+// PoolInst is a separate instruction ABI consumed by a compile-time selected,
+// generally multi-warp pool executor. It never enters the ordinary CommInst
+// interpreter. The common layout keeps launcher packing simple while allowing
+// each pool opcode to select its own warp type and kernel resources.
+struct alignas(16) PoolInst {
+  uint16_t opcode;
+  uint16_t size;
+  uint16_t arg0;
+  uint16_t arg1;
+  uint64_t address;
+};
+static_assert(sizeof(PoolInst) == 16, "PoolInst ABI changed");
+
 enum CommOpcode : uint16_t {
   #define DAE_COMM_OP(name, value) name = value,
     #include "dae/communication_opcode.cuh.inc"
   #undef DAE_COMM_OP
+};
+
+enum PoolOpcode : uint16_t {
+  #define DAE_POOL_OP(name, value, execute_warp_type) name = value,
+    #include "dae/pool_opcode.cuh.inc"
+  #undef DAE_POOL_OP
 };
 
 // helpers for building opcode

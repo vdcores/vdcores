@@ -17,16 +17,20 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
 ## Runtime Shape
 
 - One `dae2` block runs per logical SM in the launch.
-- The ordinary build has `256` threads:
+- The default build has `256` threads:
   - `4` compute warps, threads `0..127`
   - `4` memory-side warps, threads `128..255`
-- The optional NVSHMEM build adds one communication warp, threads `256..287`.
+- Enabling NVSHMEM does not change the default core. Compile-time variants
+  provide a seven-warp one-load VM, an eight-warp mixed compute/pool envelope,
+  an executor-sized pool-only kernel, and a separately compiled nine-warp
+  compute+memory+communication envelope. See `configurable-vdcores.md`.
 - Current fixed configuration from [include/dae/context.cuh](/home1/11362/depctg/vdcores/include/dae/context.cuh):
   - `24` normal shared-memory slots
   - `9` special slots
   - slot size `8 KiB`
   - `512` instructions per SM when `dae2LoadInstructions=true`
   - `32` communication instructions per SM
+  - `1` PoolInst per SM
   - `1024` TMA descriptors max
   - `1024` global barrier ids max
 
@@ -35,7 +39,7 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
 Each SM/block owns:
 
 - Shared copies of the compute and memory instruction streams
-- In the optional build, a separate shared communication instruction stream
+- In the nine-warp communication build, a separate shared communication stream
 - `st_insts[numSlots + numSpecialSlots]`
   - the allocated-memory instruction table
   - entry `st_insts[slot]` is the metadata for that live slot
@@ -48,14 +52,14 @@ Each SM/block owns:
   - shared scratch used by some compute ops such as argmax
 
 The kernel also accepts an optional process-wide symmetric `uint64_t*` signal
-array. In an NVSHMEM-enabled build the communication warp consumes it for
-request publication, completion, and waits. The alloc/load/store warps retain
-their ordinary roles.
+array. Ordinary communication and PoolInst executors consume it for named
+request/phase messages. Base alloc/load/store behavior is unchanged.
 
 ## Virtual Cores
 
-The runtime is one compute VM plus one memory VM per block, with an optional
-third communication VM.
+An ordinary block is one compute VM plus one memory VM, optionally with a
+third communication VM. A PoolInst block instead gives its complete CTA to one
+compile-time selected executor and does not enter those interpreters.
 
 ### Compute VM
 
@@ -135,21 +139,33 @@ The alloc-warp interpreter also keeps three local control variables in [include/
 - `shift`
   - the packed resource-group increment later consumed by `GROUP`
 
-### Communication VM
+### Ordinary Communication VM
 
 The optional ninth warp has an independent `CommInst` PC loop and no allocator
-state. It executes barriers/timestamps, NVSHMEM put/wait, and generic
-memory-pool submit/wait/run. These operators do not consume slots or enter
-`m2c`, `c2m`, or `m2ld`.
+state. It executes barriers/timestamps, NVSHMEM put/wait, and the generic
+mailbox-pool submit/wait/run proof path. These operators do not consume slots
+or enter `m2c`, `c2m`, or `m2ld`. This interpreter is built in a separate
+runtime object so its register ceiling and NVSHMEM code do not affect the
+default or PoolInst assemblies.
 
-One isolated macro opcode, `COMM_POOL_SLICE_EXCHANGE`, must appear first in a
-specialized block. It is detected uniformly before the normal role split and
-temporarily assigns all nine warps communication work for the lifetime of that
-operation. Ordinary blocks and their interpreters remain unchanged.
+### PoolInst Executor
 
-Communication synchronizes with local memory/compute through `bars[]` and with
-other PEs through monotonic symmetric signals. See
-`vdcores-communication-core.md` for its residency and ordering contract.
+`PoolInst` has its own instruction array and registry. Host launch dispatch
+selects a concrete execute-warp type at compile time; device code performs no
+pool opcode switch. The executor may own multiple physical warps or the entire
+CTA. `PoolSliceExchangeExecuteWarp` owns eight warps and implements the current
+dependent dynamic-read/return loop.
+
+PoolInst synchronizes with ordinary blocks through named `bars[]` entries and
+with other PEs through monotonic NVSHMEM signals. See
+`configurable-vdcores.md` and `vdcores-communication-core.md`.
+
+Weighted pool return may place reduction on the PoolInst CTAs or on additional
+ordinary VDCores blocks in the same launch. Expert-atomic blocks can begin from
+independent reader/compute releases; token-sharded blocks own disjoint rows and
+avoid atomics. Their PoolRawAddress completions release a contiguous
+`reducer_count` signal range that PoolInst acquires before network return. This
+is VM composition across blocks, not a helper stream or side kernel.
 
 ## Queue Model
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "virtualcore.cuh"
+#include "pool_signal.cuh"
 
 // TODO(zhiyuang): attach bars to the writeback
 template<typename C2M_Type>
@@ -13,7 +14,10 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
   int slot_mask = c2m.pop();
   while (slot_mask) {
   
-    auto slot = extract(slot_mask);
+    const bool special_completion = is_special_slot_completion(slot_mask);
+    const auto slot = special_completion
+        ? special_completion_slot(slot_mask)
+        : extract(slot_mask);
     bool do_free = true;
 
     __stprint("Receive ST slot: slot=%d", slot);
@@ -24,6 +28,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
     switch(op(opcode)) {
       case op(OP_ALLOC_WB_TMA_STORE_1D):
+      case op(OP_ALLOC_WB_POOL_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global,
@@ -34,6 +39,11 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
         );
         cuda::ptx::cp_async_bulk_commit_group();
       } 
+        break;
+      case op(OP_ALLOC_WB_POOL_RAW_ADDRESS):
+        // The compute operator wrote the global destination directly. The
+        // queued raw-address token exists only to publish its named release.
+        do_free = false;
         break;
       case op(OP_ALLOC_WB_TMA_STORE_2D):
         {
@@ -155,7 +165,11 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     if (opcode & MEM_OP_FLAGS_BARRIER) {
       // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-      atomicSub(&bars[inst.bar()], 1);
+      if (op(opcode) == op(OP_ALLOC_WB_POOL_TMA_STORE_1D) ||
+          op(opcode) == op(OP_ALLOC_WB_POOL_RAW_ADDRESS))
+        pool_signal_release(bars + inst.bar());
+      else
+        atomicSub(&bars[inst.bar()], 1);
       // int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);
       // __stprint("Arrive for barrier %d, remaining count=%d", inst.bar(), current_cnt - 1);
       // if (inst.bar() == 0)
@@ -168,7 +182,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     __stprint("finish slot=%d op=%d flags=%02x",
       slot, op(inst.opcode), opcode & ((1 << flagBits) - 1));
 
-    if (do_free)
+    if (do_free && !special_completion)
       c2m.reset(slot_mask);
     slot_mask = c2m.pop();
   }

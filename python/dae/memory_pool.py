@@ -604,7 +604,7 @@ def make_phase_schedule(
                             pool_pe=pool_pe,
                             submit_signal=buffers.submit_signal(mailbox),
                         ),
-                        MemoryPoolWait(request),
+                        MemoryPoolWait(request, pool_pe=pool_pe),
                     )
                 )
         return instructions

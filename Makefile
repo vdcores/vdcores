@@ -9,15 +9,15 @@ NVSHMEM_INCLUDE_DIR := $(NVSHMEM_HOME)/include
 NVSHMEM_LIBRARY_DIR := $(NVSHMEM_HOME)/lib
 NVSHMEM_BUILD_DIR := build/nvshmem
 NVSHMEM_RUNTIME_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime.o
+NVSHMEM_COMM_RUNTIME_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime_comm.o
 NVSHMEM_DLINK_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime_dlink.o
+DAE_POOL_SLICE_WARPS ?= 8
 # CUDA 13 diagnoses deprecated volatile syntax in NVSHMEM 3.4.5 collective
 # headers even though this runtime does not instantiate those collectives.
 NVSHMEM_HEADER_DIAGNOSTICS := -diag-suppress=3012,3013
-# A nine-warp CTA places three warps on one of Hopper's four SM subpartitions,
-# so each thread must fit the resulting 168-register ceiling.  Without this
-# optional-build-only limit the NVSHMEM device link promotes the kernel to 254
-# registers and the CTA cannot launch.  The EP WGMMA GEMV naturally fits this
-# ceiling without spills; the standard eight-warp build remains unconstrained.
+# Register limits are per assembly via CUDA 13's __maxnreg__: eight-warp VM and
+# PoolInst kernels may use 255 registers, while only the optional nine-warp
+# ordinary-communication assembly is capped at 168.
 NVSHMEM_REGISTER_LIMIT := -maxrregcount=168
 
 # CUDA architecture (adjust for your GPU)
@@ -41,6 +41,7 @@ LDFLAGS = -lcuda -lcublas
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
+NVCC_FLAGS += -DDAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS)
 
 # Directories
 ifeq ($(debug),)
@@ -93,13 +94,21 @@ $(NVSHMEM_RUNTIME_OBJECT): src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCO
 	@mkdir -p $(dir $@)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NVSHMEM=1 \
 		$(NVSHMEM_HEADER_DIAGNOSTICS) -I$(NVSHMEM_INCLUDE_DIR) \
+		-rdc=true -dc -Xcompiler -fPIC -o $@ $<
+
+$(NVSHMEM_COMM_RUNTIME_OBJECT): src/runtime_comm.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
+	@test -f $(NVSHMEM_INCLUDE_DIR)/nvshmem.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NVSHMEM=1 \
+		$(NVSHMEM_HEADER_DIAGNOSTICS) -I$(NVSHMEM_INCLUDE_DIR) \
 		$(NVSHMEM_REGISTER_LIMIT) \
 		-rdc=true -dc -Xcompiler -fPIC -o $@ $<
 
-$(NVSHMEM_DLINK_OBJECT): $(NVSHMEM_RUNTIME_OBJECT)
+$(NVSHMEM_DLINK_OBJECT): $(NVSHMEM_RUNTIME_OBJECT) $(NVSHMEM_COMM_RUNTIME_OBJECT)
 	@test -f $(NVSHMEM_LIBRARY_DIR)/libnvshmem_device.a
 	$(NVCC) $(CUDA_ARCH) -dlink -Xcompiler -fPIC \
 		$(NVSHMEM_RUNTIME_OBJECT) \
+		$(NVSHMEM_COMM_RUNTIME_OBJECT) \
 		-L$(NVSHMEM_LIBRARY_DIR) -lnvshmem_device -o $@
 
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
@@ -108,14 +117,17 @@ run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
+	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
 	$(PYTHON) -m pip install -e . --no-build-isolation
 
 # Build the device-linked DAE runtime and the small optional NVSHMEM allocation
 # extension through the same setup.py. Host control remains in NVSHMEM4Py.
-nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(NVSHMEM_RUNTIME_OBJECT) $(NVSHMEM_DLINK_OBJECT)
+nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(NVSHMEM_RUNTIME_OBJECT) $(NVSHMEM_COMM_RUNTIME_OBJECT) $(NVSHMEM_DLINK_OBJECT)
 	DAE_ENABLE_NVSHMEM=1 \
+	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
 	NVSHMEM_HOME=$(NVSHMEM_HOME) \
 	DAE_RUNTIME_OBJECT=$(abspath $(NVSHMEM_RUNTIME_OBJECT)) \
+	DAE_COMM_RUNTIME_OBJECT=$(abspath $(NVSHMEM_COMM_RUNTIME_OBJECT)) \
 	DAE_RUNTIME_DLINK_OBJECT=$(abspath $(NVSHMEM_DLINK_OBJECT)) \
 	$(PYTHON) -m pip install -e . --no-build-isolation
 

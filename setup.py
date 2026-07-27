@@ -49,7 +49,11 @@ def find_nvshmem_home() -> Path:
 
 torch_lib = Path(torch.__file__).resolve().parent / "lib"
 generated_include_dir = ROOT / "build" / "generated"
-runtime_macros = [("DAE_ENABLE_NVSHMEM", "1")] if NVSHMEM_ENABLED else []
+runtime_macros = [
+    ("DAE_POOL_SLICE_WARPS", os.environ.get("DAE_POOL_SLICE_WARPS", "8")),
+]
+if NVSHMEM_ENABLED:
+    runtime_macros.append(("DAE_ENABLE_NVSHMEM", "1"))
 runtime_include_dirs = [
     str(ROOT / "include"),
     str(ROOT / "include" / "dae"),
@@ -67,6 +71,12 @@ if nvshmem_home is not None:
     runtime_include_dirs.append(str(nvshmem_home / "include"))
     runtime_library_dirs.append(str(nvshmem_home / "lib"))
     runtime_libraries.extend(["nvshmem_host", "nvshmem_device", "dl", "pthread"])
+    runtime_objects.append(
+        os.environ.get(
+            "DAE_COMM_RUNTIME_OBJECT",
+            str(ROOT / "build" / "nvshmem" / "runtime_comm.o"),
+        )
+    )
     runtime_objects.append(
         os.environ.get(
             "DAE_RUNTIME_DLINK_OBJECT",

@@ -89,7 +89,53 @@ __device__ __forceinline__ void task_rms_norm_f16_from_glob(
     data_t* output_ptr = base_out_ptr + token_id * HIDDIM_SIZE;
     _rms_helper_one_row<HIDDIM_SIZE, nThreads>(base_weights_addr, input_ptr, output_ptr, smem_reduce, epsilon);
   }
-  c2m.template push<31, true, false>(__compute_tid(), out_addr_slot);
+  c2m.template push<31, true, false>(
+      __compute_tid(), special_slot_completion(out_addr_slot));
+}
+
+template<int HIDDIM_SIZE, typename data_t,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_pool_rms_norm_f16_from_glob(
+    void *base,
+    const MInst *st_insts,
+    const int max_num_token,
+    const data_t epsilon,
+    float *smem_reduce,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+  static_assert(HIDDIM_SIZE % 2 == 0,
+                "HIDDIM_SIZE must be even for half2 load");
+  constexpr int nThreads = 128;
+  __activate_compute_group(nThreads);
+  (void)base;
+
+  const int weights_slot = m2c.template pop<0>();
+  const auto* weights = static_cast<const data_t*>(
+      slot_2_glob_ptr(st_insts, weights_slot));
+  const int input_slot = m2c.template pop<0>();
+  const auto* input = static_cast<const data_t*>(
+      slot_2_glob_ptr(st_insts, input_slot));
+  const int output_slot = m2c.template pop<0>();
+  auto* output = static_cast<data_t*>(
+      slot_2_glob_ptr(st_insts, output_slot));
+  const int count_slot = m2c.template pop<0>();
+  const auto* count_address = static_cast<const uint64_t*>(
+      slot_2_glob_ptr(st_insts, count_slot));
+  int num_token = static_cast<int>(*count_address);
+  if (num_token > max_num_token)
+    num_token = max_num_token;
+
+  for (int token_id = 0; token_id < num_token; ++token_id) {
+    _rms_helper_one_row<HIDDIM_SIZE, nThreads>(
+        weights,
+        input + static_cast<uint64_t>(token_id) * HIDDIM_SIZE,
+        output + static_cast<uint64_t>(token_id) * HIDDIM_SIZE,
+        smem_reduce,
+        epsilon);
+  }
+  c2m.template push<31, true, false>(
+      __compute_tid(), special_slot_completion(output_slot));
 }
 
 template<int HIDDIM_SIZE, typename data_t,
@@ -131,4 +177,3 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
   c2m.template push<0, true>(thread_id, out_addr_slot);
   c2m.push(thread_id, in_addr_slot | weights_slot);
 }
-

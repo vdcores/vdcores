@@ -1,5 +1,8 @@
 #include "dae2.cuh"
 #include "runtime.cuh"
+#ifdef DAE_ENABLE_NVSHMEM
+#include "runtime_comm.cuh"
+#endif
 
 #include <cuda.h>
 
@@ -18,7 +21,8 @@ int nvshmem_module_init() {
     cudaFunction_t function = nullptr;
     cudaError_t runtime_status = cudaGetFuncBySymbol(
         &function,
-        reinterpret_cast<const void *>(dae2)
+        reinterpret_cast<const void *>(
+            dae2<NoPoolInstExecuteWarp, 2, 0, false, true>)
     );
     if (runtime_status != cudaSuccess) {
         return static_cast<int>(runtime_status);
@@ -55,15 +59,149 @@ int nvshmem_module_finalize() {
 
 size_t set_smem_size(size_t smem_size) {
     cudaError_t err = cudaFuncSetAttribute(
-        dae2,
+        dae2<NoPoolInstExecuteWarp, 2, 0, false, true>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_size
-    );
+        smem_size);
+    if (err == cudaSuccess) {
+        err = cudaFuncSetAttribute(
+            dae2<NoPoolInstExecuteWarp, 1, 0, false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size);
+    }
+    if (err == cudaSuccess) {
+        err = cudaFuncSetAttribute(
+            dae2<NoPoolInstExecuteWarp, 2, 0, true, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size);
+    }
+#ifdef DAE_ENABLE_NVSHMEM
+    // Every PoolInst registry entry owns two concrete assemblies: a mixed
+    // runtime envelope and a pool-only envelope.  Adding an instruction does
+    // not modify dae2 or the default compute/memory assembly.
+    #define DAE_POOL_OP(name, value, execute_warp_type) do { \
+      if (err == cudaSuccess) { \
+        err = cudaFuncSetAttribute( \
+            dae2<execute_warp_type, 2, 0, true, true>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, \
+            smem_size); \
+      } \
+      if (err == cudaSuccess) { \
+        err = cudaFuncSetAttribute( \
+            dae2<execute_warp_type, 0, 0, false, false>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, \
+            smem_size); \
+      } \
+    } while (0);
+    #include "dae/pool_opcode.cuh.inc"
+    #undef DAE_POOL_OP
+    if (err == cudaSuccess)
+        err = set_runtime_communication_smem_size(smem_size);
+#endif
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
     }
     return smem_size;
 }
+
+#ifdef DAE_ENABLE_NVSHMEM
+template <typename PoolInstExecuteWarp>
+static cudaError_t launch_runtime_pool_inst(
+    int num_sms,
+    size_t smem_size,
+    CInst* compute_instructions,
+    MInst* memory_instructions,
+    CommInst* communication_instructions,
+    PoolInst* pool_instructions,
+    CUtensorMap* tma_descs,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* profile,
+    const DaeCoreConfig* core_configs,
+    cudaStream_t stream) {
+  dae2<PoolInstExecuteWarp, 2, 0, true, true>
+      <<<num_sms,
+         (daeDefaultCoreWarps > PoolInstExecuteWarp::num_warps
+              ? daeDefaultCoreWarps
+              : PoolInstExecuteWarp::num_warps) * numThreadsPerWarp,
+         smem_size,
+         stream>>>(
+          compute_instructions,
+          memory_instructions,
+          communication_instructions,
+          pool_instructions,
+          tma_descs,
+          bars,
+          signal_array,
+          profile,
+          core_configs);
+  return cudaGetLastError();
+}
+
+template <typename PoolInstExecuteWarp>
+static cudaError_t launch_fixed_pool_inst(
+    int num_sms,
+    CInst* compute_instructions,
+    MInst* memory_instructions,
+    CommInst* communication_instructions,
+    PoolInst* pool_instructions,
+    CUtensorMap* tma_descs,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* profile,
+    const DaeCoreConfig* core_configs,
+    cudaStream_t stream) {
+  dae2<PoolInstExecuteWarp, 0, 0, false, false>
+      <<<num_sms,
+         PoolInstExecuteWarp::num_warps * numThreadsPerWarp,
+         0,
+         stream>>>(
+          compute_instructions,
+          memory_instructions,
+          communication_instructions,
+          pool_instructions,
+          tma_descs,
+          bars,
+          signal_array,
+          profile,
+          core_configs);
+  return cudaGetLastError();
+}
+
+static cudaError_t launch_selected_pool_inst(
+    uint16_t pool_inst_opcode,
+    bool pool_only,
+    int num_sms,
+    size_t smem_size,
+    CInst* compute_instructions,
+    MInst* memory_instructions,
+    CommInst* communication_instructions,
+    PoolInst* pool_instructions,
+    CUtensorMap* tma_descs,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* profile,
+    const DaeCoreConfig* core_configs,
+    cudaStream_t stream) {
+  switch (pool_inst_opcode) {
+    #define DAE_POOL_OP(name, value, execute_warp_type) \
+      case name: \
+        return pool_only \
+            ? launch_fixed_pool_inst<execute_warp_type>( \
+                  num_sms, compute_instructions, memory_instructions, \
+                  communication_instructions, pool_instructions, tma_descs, \
+                  bars, signal_array, profile, core_configs, stream) \
+            : launch_runtime_pool_inst<execute_warp_type>( \
+                  num_sms, smem_size, compute_instructions, \
+                  memory_instructions, communication_instructions, \
+                  pool_instructions, tma_descs, bars, signal_array, profile, \
+                  core_configs, stream);
+    #include "dae/pool_opcode.cuh.inc"
+    #undef DAE_POOL_OP
+    default:
+      return cudaErrorNotSupported;
+  }
+}
+#endif
 
 cudaError_t launch_dae(
   int numSMs,
@@ -71,24 +209,160 @@ cudaError_t launch_dae(
   CInst* compute_instructions,
   MInst* memory_instructions,
   CommInst* communication_instructions,
+  PoolInst* pool_instructions,
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * signal_array,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  const DaeCoreConfig* core_configs,
+  DaeKernelVariant kernel_variant,
+  uint16_t pool_inst_opcode
 ) {
   // wait for all pre-launch meta-data copying
   cudaDeviceSynchronize();
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-  dae2<<<numSMs, numThreads, smem_size, cuda_stream>>>(
-    compute_instructions,
-    memory_instructions,
-    communication_instructions,
-    tma_descs,
-    bars,
-    signal_array,
-    profile
-  );
+  if (kernel_variant == DAE_KERNEL_AUTO) {
+    kernel_variant = core_configs == nullptr
+        ? DAE_KERNEL_COMPUTE_MEMORY
+        : DAE_KERNEL_RUNTIME;
+  }
+
+  switch (kernel_variant) {
+    case DAE_KERNEL_COMPUTE_MEMORY:
+      if (pool_inst_opcode != 0)
+        return cudaErrorInvalidValue;
+      dae2<NoPoolInstExecuteWarp, 2, 0, false, true>
+          <<<numSMs,
+             daeDefaultCoreWarps * numThreadsPerWarp,
+             smem_size,
+             cuda_stream>>>(
+              compute_instructions,
+              memory_instructions,
+              communication_instructions,
+              pool_instructions,
+              tma_descs,
+              bars,
+              signal_array,
+              profile,
+              core_configs);
+      break;
+
+    case DAE_KERNEL_COMPUTE_MEMORY_ONE_LOAD:
+      if (pool_inst_opcode != 0)
+        return cudaErrorInvalidValue;
+      dae2<NoPoolInstExecuteWarp, 1, 0, false, true>
+          <<<numSMs,
+             (daeComputeWarps + daeMemoryControlWarps + 1) * numThreadsPerWarp,
+             smem_size,
+             cuda_stream>>>(
+              compute_instructions,
+              memory_instructions,
+              communication_instructions,
+              pool_instructions,
+              tma_descs,
+              bars,
+              signal_array,
+              profile,
+              core_configs);
+      break;
+
+    case DAE_KERNEL_RUNTIME:
+      if (pool_inst_opcode == 0) {
+        dae2<NoPoolInstExecuteWarp, 2, 0, true, true>
+            <<<numSMs,
+               daeDefaultCoreWarps * numThreadsPerWarp,
+               smem_size,
+               cuda_stream>>>(
+                compute_instructions,
+                memory_instructions,
+                communication_instructions,
+                pool_instructions,
+                tma_descs,
+                bars,
+                signal_array,
+                profile,
+                core_configs);
+      } else {
+#ifdef DAE_ENABLE_NVSHMEM
+        const cudaError_t launch_status = launch_selected_pool_inst(
+            pool_inst_opcode,
+            false,
+            numSMs,
+            smem_size,
+            compute_instructions,
+            memory_instructions,
+            communication_instructions,
+            pool_instructions,
+            tma_descs,
+            bars,
+            signal_array,
+            profile,
+            core_configs,
+            cuda_stream);
+        if (launch_status != cudaSuccess)
+          return launch_status;
+#else
+        return cudaErrorNotSupported;
+#endif
+      }
+      break;
+
+    case DAE_KERNEL_POOL:
+#ifdef DAE_ENABLE_NVSHMEM
+      {
+      const cudaError_t launch_status = launch_selected_pool_inst(
+          pool_inst_opcode,
+          true,
+          numSMs,
+          smem_size,
+          compute_instructions,
+          memory_instructions,
+          communication_instructions,
+          pool_instructions,
+          tma_descs,
+          bars,
+          signal_array,
+          profile,
+          core_configs,
+          cuda_stream);
+      if (launch_status != cudaSuccess)
+        return launch_status;
+      break;
+      }
+#else
+      return cudaErrorNotSupported;
+#endif
+
+    case DAE_KERNEL_RUNTIME_COMMUNICATION:
+#ifdef DAE_ENABLE_NVSHMEM
+      {
+      if (pool_inst_opcode != 0)
+        return cudaErrorInvalidValue;
+      const cudaError_t launch_status = launch_dae_runtime_communication(
+          numSMs,
+          smem_size,
+          compute_instructions,
+          memory_instructions,
+          communication_instructions,
+          pool_instructions,
+          tma_descs,
+          bars,
+          signal_array,
+          profile,
+          core_configs,
+          cuda_stream);
+      if (launch_status != cudaSuccess)
+        return launch_status;
+      break;
+      }
+#else
+      return cudaErrorNotSupported;
+#endif
+
+    default:
+      return cudaErrorInvalidValue;
+  }
   // TODO(zhiyuang): check launch error here?
 
   cudaDeviceSynchronize();

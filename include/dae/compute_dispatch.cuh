@@ -5,6 +5,7 @@
 #include "task/argmax.cuh"
 #include "task/attention.cuh"
 #include "task/gemv.cuh"
+#include "task/pool_reduce.cuh"
 #include "task/rms_norm.cuh"
 #include "task/silu.cuh"
 #include "task/wgmma.cuh"
@@ -271,6 +272,50 @@ DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_64_SW128) {
     make_shape(Int<32>{}, num_token)
   );
   task_silu_smem<64>(num_token, layout_sv, smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_rms_norm_f16_from_glob<4096, __nv_bfloat16>(
+    smem_base,
+    st_insts,
+    inst.args[0],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_RMS_NORM_F16_K_4096) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_pool_rms_norm_f16_from_glob<4096, __nv_bfloat16>(
+    smem_base,
+    st_insts,
+    inst.args[0],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_ZERO_WEIGHTED_RETURN) {
+  DAE_UNUSED(thread_id, pc, count, finish, smem_base, scratch_space);
+  task_pool_zero_weighted_return(
+      sm_id, st_insts, m2c, c2m, g_events);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_EXPERT_ATOMIC_REDUCE_BF16) {
+  DAE_UNUSED(thread_id, pc, count, finish, smem_base, scratch_space);
+  task_pool_expert_atomic_reduce_bf16(
+      sm_id, inst.args[0], st_insts, m2c, c2m, g_events);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_TOKEN_REDUCE_BF16) {
+  DAE_UNUSED(thread_id, pc, count, finish, smem_base, scratch_space);
+  task_pool_token_reduce_bf16(
+      sm_id, inst.args[0], inst.args[1], st_insts, m2c, c2m, g_events);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {

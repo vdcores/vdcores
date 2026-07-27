@@ -12,8 +12,40 @@ external NCCL reference.
 The harness also reports protocol bytes, batches, and merged signal counts so
 transport decisions can be evaluated before low-level profiling.
 
+For top-k placement studies, both the PoolInst and DeepEP V1 harnesses accept
+`--route-placement`:
+
+- `source-local`: all routes stay on the source PE, the locality upper bound;
+- `remote-clustered`: all routes use one forced remote PE;
+- `clustered`: each token uses one balanced destination PE;
+- `spread`: each token touches every PE round-robin.
+
+These are benchmark-controlled routing patterns, not runtime modes. They make
+the cost of pool-slice/expert ownership visible without adding placement logic
+to VDCores.
+
 The checked-in reference is intentionally dense: one expert-major ring
 all-reduce for dispatch and one token-major ring all-reduce for return. It is a
 stable NCCL comparison boundary, not a claim that production sparse EP must be
 implemented as all-reduce. Keep `NVSHMEM_IBGDA_NUM_RC_PER_PE` and mapping
 sweeps in the benchmark environment; they are not runtime operators.
+
+`deepep_low_latency_reference.py` is the production sparse comparison
+boundary. It imports an externally built DeepEP V1 package and measures the
+actual low-latency IBGDA dispatch/combine kernels with CUDA events and MPI
+rank-maximum reduction. The default shape is the production-style 128-token,
+7168-hidden, top-8 case, while `--dispatch-dtype bfloat16` provides a
+byte-matched comparison to the current pool protocol. DeepEP remains an
+external dependency and is never linked into VDCores.
+
+`deepep_v2_reference.py` is the corresponding current DeepEP V2 cached-decode
+boundary. It uses V2's token-deduplicated dispatch and weighted token-major
+combine through an external NCCL Gin build. DeepEP V2 requires NCCL 2.30.4 or
+newer; keep that library and the DeepEP build outside this repository and
+preload the same NCCL runtime used to link the extension. The script is a
+benchmark helper only and does not change VDCores profiling or runtime code.
+
+The tested Vista DeepEP V2 build at commit `dd758ca` linked against external
+NCCL 2.30.7, but cross-node Gin initialization stopped after topology probing
+and timed out before a timed iteration. Do not substitute V1 timings for V2 or
+claim a V2 comparison until that bootstrap issue is resolved.

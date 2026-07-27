@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -28,6 +30,9 @@ from dae.memory_pool import (
     resolve_dependency_order,
 )
 from dae.runtime import comm_opcode
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _fields(instruction) -> list[int]:
@@ -187,7 +192,7 @@ def test_reference_top1_ep_routes_across_four_pes():
 
 def test_memory_pool_instructions_are_nonallocating_and_encode_operands():
     submit = MemoryPoolSubmit(0x123456789ABCDEF0, pool_pe=9, submit_signal=257)
-    wait = MemoryPoolWait(0x123456789ABCDEF0)
+    wait = MemoryPoolWait(0x123456789ABCDEF0, pool_pe=9)
     run = MemoryPoolRun(0x1111222233334444, expected_requests=0x12345678)
 
     submit_fields = _fields(submit)
@@ -195,7 +200,7 @@ def test_memory_pool_instructions_are_nonallocating_and_encode_operands():
     run_fields = _fields(run)
 
     assert submit_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_SUBMIT, 257, 9, 0]
-    assert wait_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_WAIT, 0, 0, 0]
+    assert wait_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_WAIT, 0, 9, 0]
     assert run_fields[:4] == [comm_opcode.COMM_MEMORY_POOL_RUN, 0x5678, 0x1234, 0]
     assert isinstance(submit, CommunicationInstruction)
     assert isinstance(wait, CommunicationInstruction)
@@ -233,7 +238,7 @@ def test_communication_profile_event_has_an_independent_opcode():
 
 def test_control_pointer_can_contain_full_uint16_address_words():
     address = 0xFFFF0000FFFF0000
-    fields = _fields(MemoryPoolWait(address))
+    fields = _fields(MemoryPoolWait(address, pool_pe=0))
     assert fields[4:] == [0x0000, 0xFFFF, 0x0000, 0xFFFF]
 
 
@@ -274,3 +279,12 @@ def test_pool_submit_dependency_wait_is_in_the_communication_domain():
         isinstance(instruction, CommunicationInstruction)
         for instruction in instructions
     )
+
+
+def test_generic_pool_uses_scoped_atomic_dependency_messages():
+    source = (ROOT / "include" / "dae" / "memory_pool.cuh").read_text()
+    assert "memory_pool_dependency_release(" in source
+    assert "memory_pool_dependency_ready(" in source
+    assert "dae_atomic_add_release_gpu(" in source
+    assert "dae_atomic_load_acquire_gpu(" in source
+    assert "__threadfence_system" not in source

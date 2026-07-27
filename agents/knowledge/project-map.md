@@ -43,6 +43,12 @@ This note summarizes the stable structure confirmed during repository initializa
   The compute warp dispatch now lives in `include/dae/compute_dispatch.cuh`, and supported selective-build ops are discovered from `DAE_COMPUTE_OP_HANDLER(OP_...)` declarations in that file.
 - `include/dae/memory_pool.cuh`: optional NVSHMEM pool-core executor for HBM
   mailboxes, dependency tickets, contiguous transfers, reduction, and routing.
+- `include/dae/core_config.cuh`, `python/dae/core.py`: compile-time kernel
+  variants and the stable per-block VDCores role ABI.
+- `include/dae/pool_opcode.cuh.inc`, `include/dae/pipeline/poolinst.cuh`:
+  PoolInst-to-execute-warp registry and the current eight-warp pool executor.
+- `include/dae/scoped_atomic.cuh`: direct PTX GPU/system-scope HBM message
+  primitives used by pool dependency publication.
 - `agents/knowledge/runtime/README.md`: runtime-documentation entry point for the VM model, queue protocol, and operator semantics.
 - `agents/knowledge/runtime/vdcores-vm-model.md`: source-level virtual-machine model of one SM/block, including slots, queues, allocator, and `GROUP` / accumulate behavior.
 - `agents/knowledge/runtime/vdcores-operator-semantics.md`: operator-by-operator field packing and state-transition notes for memory and compute instructions.

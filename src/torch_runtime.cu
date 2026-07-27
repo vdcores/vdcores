@@ -151,11 +151,15 @@ int py_launch_dae(
     torch::Tensor compute_insts_bytes,   // uint8 buffer
     torch::Tensor memory_insts_bytes,    // uint8 buffer
     torch::Tensor communication_insts_bytes,
+    torch::Tensor pool_insts_bytes,
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
     int64_t stream,
-    std::optional<torch::Tensor> signal_array_u64
+    std::optional<torch::Tensor> signal_array_u64,
+    std::optional<torch::Tensor> core_configs_bytes,
+    int64_t kernel_variant,
+    int64_t pool_inst_opcode
 ) {
   set_persistent_cache();
 
@@ -167,6 +171,8 @@ int py_launch_dae(
   auto minst = check_tensor_ptr<MInst>(memory_insts_bytes, "memory_insts_bytes");
   auto comminst = check_tensor_ptr<CommInst>(
       communication_insts_bytes, "communication_insts_bytes");
+  auto poolinst = check_tensor_ptr<PoolInst>(
+      pool_insts_bytes, "pool_insts_bytes");
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
@@ -174,11 +180,29 @@ int py_launch_dae(
   if (signal_array_u64) {
     signal_array = check_signal_array_ptr(*signal_array_u64, "signal_array_u64");
   }
+  const DaeCoreConfig* core_configs = nullptr;
+  if (core_configs_bytes) {
+    core_configs = check_tensor_ptr<DaeCoreConfig>(
+        *core_configs_bytes, "core_configs_bytes");
+    TORCH_CHECK(
+        core_configs_bytes->size(0) == num_sms,
+        "core_configs_bytes must contain one record per launched block");
+  }
+  TORCH_CHECK(
+      kernel_variant >= DAE_KERNEL_AUTO &&
+          kernel_variant <= DAE_KERNEL_RUNTIME_COMMUNICATION,
+      "kernel_variant is outside the DaeKernelVariant range");
+  TORCH_CHECK(
+      pool_inst_opcode >= 0 && pool_inst_opcode <= UINT16_MAX,
+      "pool_inst_opcode must fit in uint16");
 
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
-      cinst, minst, comminst, tma,
-      bars, signal_array, prof, stream
+      cinst, minst, comminst, poolinst, tma,
+      bars, signal_array, prof, stream,
+      core_configs,
+      static_cast<DaeKernelVariant>(kernel_variant),
+      static_cast<uint16_t>(pool_inst_opcode)
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -389,6 +413,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   #include "dae/communication_opcode.cuh.inc"
   #undef DAE_COMM_OP
 
+  auto pool_opcode = m.def_submodule(
+      "pool_opcode", "VDCores compile-time pool instruction opcodes");
+  py::dict pool_execute_warp_types;
+  #define DAE_POOL_OP(name, value, execute_warp_type) \
+    pool_opcode.attr(#name) = py::int_(value); \
+    pool_execute_warp_types[py::int_(value)] = py::str(#execute_warp_type);
+  #include "dae/pool_opcode.cuh.inc"
+  #undef DAE_POOL_OP
+  m.attr("pool_execute_warp_types") = pool_execute_warp_types;
+
   py::list supported_compute_ops;
   #define DAE_COMPUTE_OP(name) supported_compute_ops.append(py::str(#name));
   #include "dae/selected_compute_ops.inc"
@@ -400,10 +434,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
   config.attr("max_comm_insts") = numCommInsts;
+  config.attr("max_pool_insts") = numPoolInsts;
   config.attr("num_profile_events") = numProfileEvents;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;
+  config.attr("core_config_bytes") = sizeof(DaeCoreConfig);
+  config.attr("compute_warps") = daeComputeWarps;
+  config.attr("default_load_warps") = daeDefaultLoadWarps;
+  config.attr("default_core_warps") = daeDefaultCoreWarps;
+  config.attr("runtime_core_warps") = daeRuntimeCoreWarps;
+  config.attr("runtime_communication_core_warps") =
+      daeRuntimeCommunicationCoreWarps;
+  config.attr("pool_slice_warps") = daePoolSliceWarps;
+  config.attr("kernel_auto") = static_cast<int>(DAE_KERNEL_AUTO);
+  config.attr("kernel_compute_memory") =
+      static_cast<int>(DAE_KERNEL_COMPUTE_MEMORY);
+  config.attr("kernel_compute_memory_one_load") =
+      static_cast<int>(DAE_KERNEL_COMPUTE_MEMORY_ONE_LOAD);
+  config.attr("kernel_runtime") = static_cast<int>(DAE_KERNEL_RUNTIME);
+  config.attr("kernel_pool") = static_cast<int>(DAE_KERNEL_POOL);
+  config.attr("kernel_runtime_communication") =
+      static_cast<int>(DAE_KERNEL_RUNTIME_COMMUNICATION);
 #ifdef DAE_ENABLE_NVSHMEM
   config.attr("nvshmem_enabled") = true;
   m.def(
@@ -440,12 +492,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("compute_insts_bytes"),
       py::arg("memory_insts_bytes"),
       py::arg("communication_insts_bytes"),
+      py::arg("pool_insts_bytes"),
       py::arg("tma_descs_bytes"),
       py::arg("bars_int32"),
       py::arg("profile_u64"),
       py::arg("stream"),
       py::arg("signal_array_u64") = std::nullopt,
-      "Launch DAE2 kernel with an optional uint64 signal array");
+      py::arg("core_configs_bytes") = std::nullopt,
+      py::arg("kernel_variant") = static_cast<int>(DAE_KERNEL_AUTO),
+      py::arg("pool_inst_opcode") = 0,
+      "Launch a fixed or runtime-configurable DAE2 core assembly");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("reset_cache_policy", &py_reset_cache_policy,

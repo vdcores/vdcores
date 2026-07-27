@@ -3,6 +3,7 @@ from .instruction_utils import decode_opcode, dedcode_opcode
 from .instructions import *
 from .runtime import config, opcode
 from .tma_utils import *
+from .core import CoreConfig, CoreKind, KernelVariant, parse_kernel_variant
 
 import copy
 import os
@@ -32,10 +33,12 @@ class SMInstructionBuilder:
         self.cinsts = []
         self.minsts = []
         self.comminsts = []
+        self.poolinsts = []
 
         self.built_cinsts = []
         self.built_minsts = []
         self.built_comminsts = []
+        self.built_poolinsts = []
 
     def add(self, inst : Instruction):
         # flatten list of instructions
@@ -57,6 +60,8 @@ class SMInstructionBuilder:
             self.minsts.append(inst)
         elif isinstance(inst, CommunicationInstruction):
             self.comminsts.append(inst)
+        elif isinstance(inst, PoolInstruction):
+            self.poolinsts.append(inst)
         else:
             raise ValueError("Unknown instruction type", inst)
 
@@ -69,15 +74,20 @@ class SMInstructionBuilder:
     def add_communication(self, inst: CommunicationInstruction):
         self.comminsts.append(inst)
 
+    def add_pool(self, inst: PoolInstruction):
+        self.poolinsts.append(inst)
+
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],
         mtensor : torch.Tensor, mptrs: list[int],
-        commtensor : torch.Tensor, commptrs: list[int]):
+        commtensor : torch.Tensor, commptrs: list[int],
+        pooltensor : torch.Tensor, poolptrs: list[int]):
         # TODO(zhiyuang): now we only keep this check for not submitting "too many"
         #                 insts, but not 100% safe it won't overwrite
         assert len(self.cinsts) <= ctensor.shape[0]
         assert len(self.minsts) <= mtensor.shape[0]
         assert len(self.comminsts) <= commtensor.shape[0]
+        assert len(self.poolinsts) <= pooltensor.shape[0]
         for i, inst in enumerate(self.cinsts):
             inst.tensor(ctensor[cptrs[self.sm_id],...])
             cptrs[self.sm_id] = (cptrs[self.sm_id] + 1) % ctensor.shape[0]
@@ -89,14 +99,21 @@ class SMInstructionBuilder:
             commptrs[self.sm_id] = (
                 commptrs[self.sm_id] + 1
             ) % commtensor.shape[0]
+        for inst in self.poolinsts:
+            inst.tensor(pooltensor[poolptrs[self.sm_id], ...])
+            poolptrs[self.sm_id] = (
+                poolptrs[self.sm_id] + 1
+            ) % pooltensor.shape[0]
 
         # after building, clear the inst list to avoid duplicate build
         self.built_cinsts += self.cinsts
         self.built_minsts += self.minsts
         self.built_comminsts += self.comminsts
+        self.built_poolinsts += self.poolinsts
         self.cinsts = []
         self.minsts = []
         self.comminsts = []
+        self.poolinsts = []
 
 class ResourceGroup:
     def __init__(self, name, repeat = 1):
@@ -236,17 +253,20 @@ class Launcher:
         *,
         signal_array: torch.Tensor | None = None,
         benchmark_barrier=None,
+        kernel_variant: KernelVariant | str | int = KernelVariant.AUTO,
     ):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
         self.device = device
         self.signal_array = self._validate_signal_array(signal_array)
+        self.kernel_variant = parse_kernel_variant(kernel_variant)
         if benchmark_barrier is not None and not callable(benchmark_barrier):
             raise TypeError("benchmark_barrier must be callable or None")
         self._benchmark_barrier = benchmark_barrier
 
         self.max_insts = config.max_insts
         self.max_comm_insts = config.max_comm_insts
+        self.max_pool_insts = config.max_pool_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
         self.profile = torch.empty((num_sms, config.num_profile_events), dtype=torch.uint64, device=self.device)
 
@@ -257,9 +277,14 @@ class Launcher:
         self.comminsts = torch.zeros(
             (num_sms, self.max_comm_insts, 16), dtype=torch.uint8
         )
+        self.poolinsts = torch.zeros(
+            (num_sms, self.max_pool_insts, 16), dtype=torch.uint8
+        )
         self.cptrs = [0 for _ in range(num_sms)]
         self.mptrs = [0 for _ in range(num_sms)]
         self.commptrs = [0 for _ in range(num_sms)]
+        self.poolptrs = [0 for _ in range(num_sms)]
+        self.core_configs: list[CoreConfig | None] = [None] * num_sms
 
         self.tmas = []
 
@@ -360,6 +385,13 @@ class Launcher:
     def copy_commptrs(self):
         return self._projected_commptrs()
 
+    def set_core(self, sm_id: int, core: CoreConfig) -> None:
+        if not 0 <= sm_id < self.num_sms:
+            raise IndexError("sm_id is outside the launched block range")
+        if not isinstance(core, CoreConfig):
+            raise TypeError("core must be a dae.core.CoreConfig")
+        self.core_configs[sm_id] = core
+
     def build_instructions(self):
         if self.need_instruction_build:
             for i in range(self.num_sms):
@@ -370,6 +402,8 @@ class Launcher:
                     self.mptrs,
                     self.comminsts[i, ...],
                     self.commptrs,
+                    self.poolinsts[i, ...],
+                    self.poolptrs,
                 )
             self.need_instruction_build = False
 
@@ -455,7 +489,7 @@ class Launcher:
         raise ValueError(f"Unsupported DAE_CACHE_REQUEST_SELECTION={selection!r}")
 
     def _select_launch_cache_window(
-        self, *, bars, tma, cinsts, minsts, comminsts
+        self, *, bars, tma, cinsts, minsts, comminsts, poolinsts
     ):
         requested = self._select_requested_cache_window()
         if requested is not None:
@@ -471,6 +505,7 @@ class Launcher:
             "cinsts": cinsts,
             "minsts": minsts,
             "comminsts": comminsts,
+            "poolinsts": poolinsts,
             "cinsts_tail": cinsts[-4 * self.max_insts :],
             "minsts_tail": minsts[-4 * self.max_insts :],
         }
@@ -478,6 +513,7 @@ class Launcher:
             raise ValueError(
                 "Unsupported DAE_LAUNCH_CACHE_WINDOW="
                 f"{target!r} (expected none/bars/tma/cinsts/minsts/comminsts/"
+                "poolinsts/"
                 "cinsts_tail/minsts_tail)"
             )
 
@@ -541,23 +577,182 @@ class Launcher:
             mi += len(b.minsts)
         return ci / self.num_sms, mi / self.num_sms
 
+    def _resolve_core_configs(self) -> list[CoreConfig]:
+        resolved = []
+        for sm_id, builder in enumerate(self.builder):
+            pool_insts = builder.built_poolinsts
+            comm_insts = builder.built_comminsts
+            if len(pool_insts) > 1:
+                raise ValueError("a pool core currently accepts one macro PoolInst")
+
+            core = self.core_configs[sm_id]
+            if core is None:
+                if pool_insts:
+                    core = CoreConfig.pool()
+                else:
+                    core = CoreConfig.compute_memory(
+                        communication_warps=1 if comm_insts else 0
+                    )
+
+            if core.kind == CoreKind.POOL:
+                if not pool_insts:
+                    raise ValueError(f"pool core {sm_id} has no PoolInst")
+                if comm_insts:
+                    raise ValueError(
+                        f"pool core {sm_id} cannot execute an ordinary CommInst stream"
+                    )
+            elif pool_insts:
+                raise ValueError(
+                    f"block {sm_id} contains PoolInst but is not configured as a pool core"
+                )
+
+            if core.kind == CoreKind.COMPUTE_MEMORY:
+                required_comm_warps = 1 if comm_insts else 0
+                if core.communication_warps < required_comm_warps:
+                    raise ValueError(
+                        f"block {sm_id} has CommInst instructions but no communication warp"
+                    )
+            resolved.append(core)
+        return resolved
+
+    def _resolve_pool_inst_opcode(self) -> int:
+        """Select the one execute-warp type assembled into this launch.
+
+        Different blocks may execute the same PoolInst type, but one CUDA grid
+        cannot contain different pool execute-warp types: blockDim, registers,
+        and static shared memory are properties of the compiled kernel.
+        """
+        opcodes = {
+            int(inst.opcode)
+            for builder in self.builder
+            for inst in builder.built_poolinsts
+        }
+        if not opcodes:
+            return 0
+        if len(opcodes) != 1:
+            raise ValueError(
+                "one VDCores launch can assemble only one PoolInst "
+                f"execute-warp type; requested opcodes {sorted(opcodes)}"
+            )
+
+        opcode = opcodes.pop()
+        execute_warp_types = getattr(runtime, "pool_execute_warp_types", {})
+        supported = {int(value) for value in execute_warp_types.keys()}
+        if opcode not in supported:
+            raise ValueError(
+                f"PoolInst opcode {opcode} has no compiled execute-warp type"
+            )
+        return opcode
+
+    def _select_kernel_variant(
+        self, core_configs: list[CoreConfig]
+    ) -> KernelVariant:
+        variant = self.kernel_variant
+        if variant == KernelVariant.AUTO:
+            if all(
+                core.kind == CoreKind.COMPUTE_MEMORY
+                and core.load_warps == 2
+                and core.communication_warps == 0
+                for core in core_configs
+            ):
+                variant = KernelVariant.COMPUTE_MEMORY
+            elif all(
+                core.kind == CoreKind.COMPUTE_MEMORY
+                and core.load_warps == 1
+                and core.communication_warps == 0
+                for core in core_configs
+            ):
+                variant = KernelVariant.COMPUTE_MEMORY_ONE_LOAD
+            elif all(core.kind == CoreKind.POOL for core in core_configs):
+                variant = KernelVariant.POOL
+            elif any(core.communication_warps for core in core_configs):
+                if any(core.kind == CoreKind.POOL for core in core_configs):
+                    raise ValueError(
+                        "PoolInst and ordinary CommInst warp types use separate "
+                        "specialized runtime assemblies"
+                    )
+                variant = KernelVariant.RUNTIME_COMMUNICATION
+            else:
+                variant = KernelVariant.RUNTIME
+
+        if variant == KernelVariant.COMPUTE_MEMORY:
+            valid = all(
+                core.kind == CoreKind.COMPUTE_MEMORY
+                and core.load_warps == 2
+                and core.communication_warps == 0
+                for core in core_configs
+            )
+        elif variant == KernelVariant.COMPUTE_MEMORY_ONE_LOAD:
+            valid = all(
+                core.kind == CoreKind.COMPUTE_MEMORY
+                and core.load_warps == 1
+                and core.communication_warps == 0
+                for core in core_configs
+            )
+        elif variant == KernelVariant.POOL:
+            valid = all(core.kind == CoreKind.POOL for core in core_configs)
+        elif variant == KernelVariant.RUNTIME:
+            valid = not any(core.communication_warps for core in core_configs)
+        else:
+            valid = (
+                variant == KernelVariant.RUNTIME_COMMUNICATION
+                and not any(core.kind == CoreKind.POOL for core in core_configs)
+            )
+        if not valid:
+            raise ValueError(
+                f"core configurations are incompatible with kernel variant {variant.name}"
+            )
+        return variant
+
+    def _pack_core_configs(
+        self, core_configs: list[CoreConfig], variant: KernelVariant
+    ) -> torch.Tensor:
+        runtime_warps = int(
+            config.runtime_communication_core_warps
+            if variant == KernelVariant.RUNTIME_COMMUNICATION
+            else config.runtime_core_warps
+        )
+        payload = b"".join(
+            core.pack(runtime_core_warps=runtime_warps) for core in core_configs
+        )
+        return torch.tensor(list(payload), dtype=torch.uint8).view(
+            self.num_sms, config.core_config_bytes
+        ).to(self.device)
+
     def launch(self):
         self.build_instructions()
+
+        core_configs = self._resolve_core_configs()
+        kernel_variant = self._select_kernel_variant(core_configs)
+        pool_inst_opcode = self._resolve_pool_inst_opcode()
+        core_config_tensor = self._pack_core_configs(core_configs, kernel_variant)
 
         communication_instructions = [
             inst
             for builder in self.builder
             for inst in builder.built_comminsts
         ]
+        pool_instructions = [
+            inst
+            for builder in self.builder
+            for inst in builder.built_poolinsts
+        ]
         signal_requiring_instructions = [
             inst
             for inst in communication_instructions
             if getattr(inst, "requires_signal_array", False)
         ]
-        if communication_instructions and not bool(config.nvshmem_enabled):
+        if (communication_instructions or pool_instructions) and not bool(
+            config.nvshmem_enabled
+        ):
             raise RuntimeError(
-                "communication instructions require `make nvshmem-pyext`"
+                "communication and pool instructions require `make nvshmem-pyext`"
             )
+        signal_requiring_instructions += [
+            inst
+            for inst in pool_instructions
+            if getattr(inst, "requires_signal_array", False)
+        ]
         if signal_requiring_instructions and self.signal_array is None:
             raise ValueError(
                 "NVSHMEM and memory-pool instructions require Launcher(signal_array=...)"
@@ -585,6 +780,9 @@ class Launcher:
         comminsts = self.comminsts.to(self.device).view(
             self.num_sms * self.max_comm_insts, 16
         )
+        poolinsts = self.poolinsts.to(self.device).view(
+            self.num_sms * self.max_pool_insts, 16
+        )
 
         stream = torch.cuda.current_stream().cuda_stream
         # TODO(zhiyuang): check this?
@@ -611,6 +809,7 @@ class Launcher:
             cinsts=cinsts,
             minsts=minsts,
             comminsts=comminsts,
+            poolinsts=poolinsts,
         )
         if cache_window is not None:
             runtime.set_cache_policy(
@@ -624,9 +823,10 @@ class Launcher:
 
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,
-            cinsts, minsts, comminsts, tma,
+            cinsts, minsts, comminsts, poolinsts, tma,
             self.bars, profile,
-            stream, self.signal_array,
+            stream, self.signal_array, core_config_tensor, int(kernel_variant),
+            pool_inst_opcode,
         )
         assert ret == 0
 

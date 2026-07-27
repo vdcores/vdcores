@@ -256,7 +256,7 @@ struct DAELauncher {
 
     cudaError_t err = launch_dae(
       numSMs, smem_size,
-      comp_d, mem_d, tma_d, bars,
+      comp_d, mem_d, nullptr, nullptr, tma_d, bars,
       nullptr, profile_d, 0
     );
 
@@ -276,7 +276,9 @@ struct DAELauncher {
     int *bars;
     cudaMalloc(&bars, sizeof(int) * 128);
 
-    std::cout << "Launching DAE2 kernel with " << numSMs << " SMs, " << (32 * (numComputeWarps + 1)) << " threads per block, " << smem_size << " bytes dynamic shared memory" << std::endl;
+    std::cout << "Launching DAE2 kernel with " << numSMs << " SMs, "
+              << numThreads << " threads per default compute+memory block, "
+              << smem_size << " bytes dynamic shared memory" << std::endl;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -293,7 +295,7 @@ struct DAELauncher {
 
       launch_dae(
         numSMs, smem_size,
-        comp_d, mem_d, tma_d, bars,
+        comp_d, mem_d, nullptr, nullptr, tma_d, bars,
         nullptr, profile_d, 0
       );
 
