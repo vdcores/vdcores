@@ -32,35 +32,56 @@ def find_nvshmem_home() -> Path:
     )
 
     for candidate in candidates:
-        if (candidate / "include" / "nvshmem.h").is_file() and (
-            candidate / "lib" / "libnvshmem_host.so"
-        ).exists():
+        if (
+            (candidate / "include" / "nvshmem.h").is_file()
+            and (candidate / "lib" / "libnvshmem_host.so").exists()
+            and (candidate / "lib" / "libnvshmem_device.a").is_file()
+        ):
             return candidate.resolve()
 
     searched = ", ".join(str(candidate) for candidate in candidates)
     raise RuntimeError(
-        "DAE_ENABLE_NVSHMEM is set, but NVSHMEM headers or "
-        f"libnvshmem_host.so were not found. Set NVSHMEM_HOME; searched: {searched}"
+        "DAE_ENABLE_NVSHMEM is set, but NVSHMEM headers, libnvshmem_host.so, "
+        "or libnvshmem_device.a were not found. "
+        f"Set NVSHMEM_HOME; searched: {searched}"
     )
 
 
 torch_lib = Path(torch.__file__).resolve().parent / "lib"
 generated_include_dir = ROOT / "build" / "generated"
 runtime_macros = [("DAE_ENABLE_NVSHMEM", "1")] if NVSHMEM_ENABLED else []
+runtime_include_dirs = [
+    str(ROOT / "include"),
+    str(ROOT / "include" / "dae"),
+    str(generated_include_dir),
+]
+runtime_library_dirs: list[str] = []
+runtime_libraries = ["cuda"]
+runtime_link_args = [f"-Wl,-rpath,{torch_lib}"]
+runtime_objects = [
+    os.environ.get("DAE_RUNTIME_OBJECT", str(ROOT / "runtime.o")),
+]
+
+nvshmem_home = find_nvshmem_home() if NVSHMEM_ENABLED else None
+if nvshmem_home is not None:
+    runtime_include_dirs.append(str(nvshmem_home / "include"))
+    runtime_library_dirs.append(str(nvshmem_home / "lib"))
+    runtime_libraries.extend(["nvshmem_host", "nvshmem_device", "dl", "pthread"])
+    runtime_objects.append(
+        os.environ.get(
+            "DAE_RUNTIME_DLINK_OBJECT",
+            str(ROOT / "build" / "nvshmem" / "runtime_dlink.o"),
+        )
+    )
+    runtime_link_args.append(f"-Wl,-rpath,{nvshmem_home / 'lib'}")
 
 extensions = [
     CUDAExtension(
         name="dae.runtime",
         sources=[str(ROOT / "src" / "torch_runtime.cu")],
-        extra_objects=[
-            str(ROOT / "runtime.o"),
-            str(ROOT / "runtime_device_link.o"),
-        ],
-        include_dirs=[
-            str(ROOT / "include"),
-            str(ROOT / "include" / "dae"),
-            str(generated_include_dir),
-        ],
+        extra_objects=runtime_objects,
+        include_dirs=runtime_include_dirs,
+        library_dirs=runtime_library_dirs,
         define_macros=runtime_macros,
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20", "-DNDEBUG"],
@@ -72,13 +93,13 @@ extensions = [
                 "-Xptxas=-v",
             ],
         },
-        libraries=["cuda"],
-        extra_link_args=[f"-Wl,-rpath,{torch_lib}"],
+        libraries=runtime_libraries,
+        extra_link_args=runtime_link_args,
     )
 ]
 
 if NVSHMEM_ENABLED:
-    nvshmem_home = find_nvshmem_home()
+    assert nvshmem_home is not None
     extensions.append(
         CUDAExtension(
             name="dae._nvshmem_runtime",

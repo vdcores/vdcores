@@ -221,16 +221,25 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_NVSHMEM_PUT): {
           if (lane_id == 0) {
             void *symm_addr = reinterpret_cast<void *>(inst.address);
-            uint32_t nbytes = static_cast<uint32_t>(inst.size) | (static_cast<uint32_t>(inst.num_slots) << 16);
-            int target_pe = inst.arg;
+
+            uint32_t nbytes =
+              static_cast<uint32_t>(inst.size) |
+              (static_cast<uint32_t>(inst.num_slots) << 16);
+
+            int target_pe = inst.arg & 0xFF;
+            int signal_id = (inst.arg >> 8) & 0xFF;
+
+            uint64_t *signal = signal_array + signal_id;
+
             nvshmem_putmem_signal_nbi(
-                symm_addr,
-                symm_addr,
-                nbytes,
-                signal_array,
-                1,
-                NVSHMEM_SIGNAL_SET,
-                target_pe);
+              symm_addr,
+              symm_addr,
+              nbytes,
+              signal,
+              1,
+              NVSHMEM_SIGNAL_SET,
+              target_pe);
+
             nvshmem_quiet();
           }
           __syncwarp();
@@ -238,7 +247,9 @@ __device__ __forceinline__ void allocwarp_execute(
         }
         case op(OP_NVSHMEM_WAIT): {
           if (lane_id == 0) {
-            nvshmem_signal_wait_until(signal_array, NVSHMEM_CMP_GE, 1);
+            int signal_id = inst.arg & 0xFF;
+            uint64_t *signal = signal_array + signal_id;
+            nvshmem_signal_wait_until(signal, NVSHMEM_CMP_GE, 1);
           }
           __syncwarp();
           break;
