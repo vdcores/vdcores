@@ -1,4 +1,5 @@
 #include <infiniband/verbs.h>
+#include <infiniband/mlx5dv.h>
 
 #include "host_sgl_ring_abi.h"
 
@@ -19,6 +20,13 @@
 #include <unistd.h>
 
 namespace {
+
+constexpr uint64_t hostSglDcKey = 0xffeeddccULL;
+// A DCI WQE carries an address-vector segment in addition to RDMA and data
+// segments.  Capping the scatter list at eight keeps the encoded WQE within a
+// single provider-supported size while still coalescing eight noncontiguous
+// activation rows into one network operation.
+constexpr uint32_t hostSglDcMaxSge = 8;
 
 struct HostSglPostedBatch {
   uint64_t completion_sequence = 0;
@@ -51,11 +59,46 @@ struct HostSglQueue {
   std::deque<HostSglPostedBatch> outstanding_batches;
 };
 
+struct HostSglDcPostedBatch {
+  uint64_t completion_id = 0;
+  uint32_t send_wr_count = 0;
+  uint32_t ring_index = 0;
+};
+
+struct HostSglDcPeer {
+  ibv_ah* ah = nullptr;
+  uint32_t dctn = 0;
+};
+
+struct HostSglDcQueue {
+  ibv_context* context = nullptr;
+  ibv_pd* pd = nullptr;
+  ibv_cq* cq = nullptr;
+  ibv_srq* srq = nullptr;
+  ibv_qp* dct = nullptr;
+  ibv_qp* dci = nullptr;
+  ibv_qp_ex* dci_ex = nullptr;
+  mlx5dv_qp_ex* mlx5_dci_ex = nullptr;
+  ibv_device_attr device_attr{};
+  ibv_port_attr port_attr{};
+  ibv_gid gid{};
+  uint8_t port_num = 1;
+  uint8_t gid_index = 0;
+  uint32_t psn = 0;
+  uint32_t max_send_wr = 0;
+  uint32_t max_sge = 0;
+  uint32_t outstanding_send_wrs = 0;
+  uint64_t next_completion_id = 1;
+  bool dct_ready = false;
+  bool connected = false;
+  std::vector<HostSglDcPeer> peers;
+  std::deque<HostSglDcPostedBatch> outstanding_batches;
+};
+
 struct HostSglRing {
   void* allocation = nullptr;
-  size_t allocation_bytes = 0;
   HostSglRingMemory* memory = nullptr;
-  char error[256]{};
+  uint64_t next_generation = 1;
 };
 
 void set_error(char* error, size_t error_bytes, const char* format, ...) {
@@ -93,11 +136,320 @@ void destroy_queue(HostSglQueue* queue) {
   delete queue;
 }
 
+void destroy_dc_queue(HostSglDcQueue* queue) {
+  if (queue == nullptr)
+    return;
+  for (HostSglDcPeer& peer : queue->peers) {
+    if (peer.ah != nullptr)
+      ibv_destroy_ah(peer.ah);
+  }
+  if (queue->dci != nullptr)
+    ibv_destroy_qp(queue->dci);
+  if (queue->dct != nullptr)
+    ibv_destroy_qp(queue->dct);
+  if (queue->srq != nullptr)
+    ibv_destroy_srq(queue->srq);
+  if (queue->cq != nullptr)
+    ibv_destroy_cq(queue->cq);
+  delete queue;
+}
+
+void fill_ah_attr(const HostSglDcQueue* queue,
+                  const HostSglEndpoint& endpoint,
+                  ibv_ah_attr* ah) {
+  *ah = ibv_ah_attr{};
+  ah->port_num = queue->port_num;
+  ah->sl = 0;
+  ah->src_path_bits = 0;
+  ah->dlid = endpoint.lid;
+  const bool use_global_route =
+      queue->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET ||
+      endpoint.lid == 0;
+  if (use_global_route) {
+    ah->is_global = 1;
+    std::memcpy(ah->grh.dgid.raw, endpoint.gid, sizeof(endpoint.gid));
+    ah->grh.sgid_index = queue->gid_index;
+    ah->grh.hop_limit = 64;
+  }
+}
+
 }  // namespace
 
 extern "C" {
 
-uint32_t host_sgl_abi_version() { return 4; }
+uint32_t host_sgl_abi_version() { return 7; }
+
+void* host_sgl_create_dc(void* context_pointer, void* pd_pointer,
+                         uint8_t port_num, uint8_t gid_index,
+                         uint32_t requested_send_wr,
+                         uint32_t requested_send_sge, char* error,
+                         size_t error_bytes) {
+  if (context_pointer == nullptr || pd_pointer == nullptr ||
+      requested_send_wr < 2 || requested_send_sge == 0) {
+    set_error(error, error_bytes, "invalid DC creation arguments");
+    return nullptr;
+  }
+  auto* queue = new (std::nothrow) HostSglDcQueue;
+  if (queue == nullptr) {
+    set_error(error, error_bytes, "failed to allocate HostSglDcQueue");
+    return nullptr;
+  }
+  queue->context = static_cast<ibv_context*>(context_pointer);
+  queue->pd = static_cast<ibv_pd*>(pd_pointer);
+  queue->port_num = port_num;
+  queue->gid_index = gid_index;
+
+  int result = ibv_query_device(queue->context, &queue->device_attr);
+  if (result == 0)
+    result = ibv_query_port(queue->context, port_num, &queue->port_attr);
+  if (result == 0)
+    result = ibv_query_gid(queue->context, port_num, gid_index, &queue->gid);
+  if (result != 0 || queue->port_attr.state != IBV_PORT_ACTIVE) {
+    set_error(error, error_bytes, "DC device/port query failed: %s",
+              result == 0 ? "port is not active" : std::strerror(result));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+
+  const uint32_t send_wr = std::min(
+      requested_send_wr, static_cast<uint32_t>(queue->device_attr.max_qp_wr));
+  const uint32_t send_sge = std::min(
+      {requested_send_sge, static_cast<uint32_t>(queue->device_attr.max_sge),
+       hostSglDcMaxSge});
+  queue->cq = ibv_create_cq(queue->context, 64, nullptr, nullptr, 0);
+  if (queue->cq == nullptr) {
+    set_error(error, error_bytes, "ibv_create_cq for DC failed: %s",
+              std::strerror(errno));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+  ibv_srq_init_attr srq_init{};
+  srq_init.attr.max_wr = 1;
+  srq_init.attr.max_sge = 1;
+  queue->srq = ibv_create_srq(queue->pd, &srq_init);
+  if (queue->srq == nullptr) {
+    set_error(error, error_bytes, "ibv_create_srq for DCT failed: %s",
+              std::strerror(errno));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+
+  ibv_qp_init_attr_ex dct_init{};
+  dct_init.qp_type = IBV_QPT_DRIVER;
+  dct_init.pd = queue->pd;
+  dct_init.comp_mask = IBV_QP_INIT_ATTR_PD;
+  dct_init.send_cq = queue->cq;
+  dct_init.recv_cq = queue->cq;
+  dct_init.srq = queue->srq;
+  mlx5dv_qp_init_attr dct_dv{};
+  dct_dv.comp_mask = MLX5DV_QP_INIT_ATTR_MASK_DC;
+  dct_dv.dc_init_attr.dc_type = MLX5DV_DCTYPE_DCT;
+  dct_dv.dc_init_attr.dct_access_key = hostSglDcKey;
+  queue->dct = mlx5dv_create_qp(queue->context, &dct_init, &dct_dv);
+  if (queue->dct == nullptr) {
+    set_error(error, error_bytes, "mlx5dv_create_qp(DCT) failed: %s",
+              std::strerror(errno));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+
+  ibv_qp_attr dct_qp_init{};
+  dct_qp_init.qp_state = IBV_QPS_INIT;
+  dct_qp_init.pkey_index = 0;
+  dct_qp_init.port_num = port_num;
+  dct_qp_init.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+  result = ibv_modify_qp(
+      queue->dct, &dct_qp_init,
+      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+          IBV_QP_ACCESS_FLAGS);
+  if (result != 0) {
+    set_error(error, error_bytes, "DCT RESET->INIT failed: %s",
+              std::strerror(result));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+  ibv_qp_init_attr_ex dci_init{};
+  dci_init.qp_type = IBV_QPT_DRIVER;
+  dci_init.pd = queue->pd;
+  dci_init.comp_mask =
+      IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+  dci_init.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
+  dci_init.send_cq = queue->cq;
+  dci_init.recv_cq = queue->cq;
+  dci_init.cap.max_send_wr = send_wr;
+  dci_init.cap.max_send_sge = send_sge;
+  dci_init.cap.max_inline_data = sizeof(uint64_t);
+  dci_init.sq_sig_all = 0;
+  mlx5dv_qp_init_attr dci_dv{};
+  dci_dv.comp_mask = MLX5DV_QP_INIT_ATTR_MASK_DC |
+      MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS;
+  dci_dv.dc_init_attr.dc_type = MLX5DV_DCTYPE_DCI;
+  dci_dv.create_flags = MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+  queue->dci = mlx5dv_create_qp(queue->context, &dci_init, &dci_dv);
+  if (queue->dci == nullptr) {
+    set_error(error, error_bytes, "mlx5dv_create_qp(DCI) failed: %s",
+              std::strerror(errno));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+  queue->max_send_wr = dci_init.cap.max_send_wr;
+  queue->max_sge = dci_init.cap.max_send_sge;
+  if (queue->max_send_wr < 2 || queue->max_sge == 0 ||
+      dci_init.cap.max_inline_data < sizeof(uint64_t)) {
+    set_error(error, error_bytes, "DCI capabilities are insufficient");
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+  queue->dci_ex = ibv_qp_to_qp_ex(queue->dci);
+  queue->mlx5_dci_ex = mlx5dv_qp_ex_from_ibv_qp_ex(queue->dci_ex);
+  if (queue->dci_ex == nullptr || queue->mlx5_dci_ex == nullptr) {
+    set_error(error, error_bytes, "DCI extended send API is unavailable");
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+  queue->psn = static_cast<uint32_t>(
+      ((static_cast<uint64_t>(::getpid()) << 12) ^
+       reinterpret_cast<uintptr_t>(queue) ^ queue->dci->qp_num) &
+      0x00ffffffU);
+  if (queue->psn == 0)
+    queue->psn = 1;
+  ibv_qp_attr dci_qp_init{};
+  dci_qp_init.qp_state = IBV_QPS_INIT;
+  dci_qp_init.pkey_index = 0;
+  dci_qp_init.port_num = port_num;
+  result = ibv_modify_qp(
+      queue->dci, &dci_qp_init,
+      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT);
+  if (result != 0) {
+    set_error(error, error_bytes, "DCI RESET->INIT failed: %s",
+              std::strerror(result));
+    destroy_dc_queue(queue);
+    return nullptr;
+  }
+  return queue;
+}
+
+int host_sgl_get_dc_endpoint(void* queue_pointer, HostSglEndpoint* endpoint,
+                             char* error, size_t error_bytes) {
+  auto* queue = static_cast<HostSglDcQueue*>(queue_pointer);
+  if (queue == nullptr || endpoint == nullptr) {
+    set_error(error, error_bytes, "DC queue and endpoint are required");
+    return -1;
+  }
+  std::memset(endpoint, 0, sizeof(*endpoint));
+  endpoint->qp_num = queue->dct->qp_num;
+  endpoint->psn = queue->psn;
+  endpoint->lid = queue->port_attr.lid;
+  endpoint->port_num = queue->port_num;
+  endpoint->gid_index = queue->gid_index;
+  endpoint->active_mtu = static_cast<uint8_t>(queue->port_attr.active_mtu);
+  endpoint->link_layer = queue->port_attr.link_layer;
+  std::memcpy(endpoint->gid, queue->gid.raw, sizeof(endpoint->gid));
+  return 0;
+}
+
+int host_sgl_activate_dct(void* queue_pointer,
+                          const HostSglEndpoint* remote_endpoint,
+                          char* error, size_t error_bytes) {
+  auto* queue = static_cast<HostSglDcQueue*>(queue_pointer);
+  if (queue == nullptr || remote_endpoint == nullptr || queue->dct_ready ||
+      remote_endpoint->active_mtu < IBV_MTU_256 ||
+      remote_endpoint->active_mtu > IBV_MTU_4096) {
+    set_error(error, error_bytes, "invalid DCT activation request");
+    return -1;
+  }
+  ibv_qp_attr dct_rtr{};
+  dct_rtr.qp_state = IBV_QPS_RTR;
+  dct_rtr.path_mtu = static_cast<ibv_mtu>(std::min<int>(
+      queue->port_attr.active_mtu, remote_endpoint->active_mtu));
+  dct_rtr.min_rnr_timer = 12;
+  fill_ah_attr(queue, *remote_endpoint, &dct_rtr.ah_attr);
+  const int result = ibv_modify_qp(
+      queue->dct, &dct_rtr,
+      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+          IBV_QP_MIN_RNR_TIMER);
+  if (result != 0) {
+    set_error(error, error_bytes, "DCT INIT->RTR failed: %s",
+              std::strerror(result));
+    return -1;
+  }
+  queue->dct_ready = true;
+  return 0;
+}
+
+int host_sgl_connect_dc(void* queue_pointer,
+                        const HostSglEndpoint* remote_endpoints,
+                        uint32_t endpoint_count, char* error,
+                        size_t error_bytes) {
+  auto* queue = static_cast<HostSglDcQueue*>(queue_pointer);
+  if (queue == nullptr || remote_endpoints == nullptr || endpoint_count == 0 ||
+      !queue->dct_ready || queue->connected) {
+    set_error(error, error_bytes, "invalid DC peer connection request");
+    return -1;
+  }
+  queue->peers.resize(endpoint_count);
+  ibv_ah_attr first_ah{};
+  for (uint32_t index = 0; index < endpoint_count; ++index) {
+    const HostSglEndpoint& endpoint = remote_endpoints[index];
+    if (endpoint.qp_num == 0 || endpoint.active_mtu < IBV_MTU_256 ||
+        endpoint.active_mtu > IBV_MTU_4096) {
+      set_error(error, error_bytes, "invalid DCT endpoint %u qpn=%u mtu=%u",
+                index, endpoint.qp_num, endpoint.active_mtu);
+      return -1;
+    }
+    ibv_ah_attr ah{};
+    fill_ah_attr(queue, endpoint, &ah);
+    queue->peers[index].ah = ibv_create_ah(queue->pd, &ah);
+    queue->peers[index].dctn = endpoint.qp_num;
+    if (queue->peers[index].ah == nullptr) {
+      set_error(error, error_bytes, "ibv_create_ah(%u) failed: %s", index,
+                std::strerror(errno));
+      return -1;
+    }
+    if (index == 0)
+      first_ah = ah;
+  }
+  ibv_qp_attr rtr{};
+  rtr.qp_state = IBV_QPS_RTR;
+  rtr.path_mtu = static_cast<ibv_mtu>(std::min<int>(
+      queue->port_attr.active_mtu, remote_endpoints[0].active_mtu));
+  rtr.ah_attr = first_ah;
+  int result = ibv_modify_qp(
+      queue->dci, &rtr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU);
+  if (result != 0) {
+    set_error(error, error_bytes, "DCI INIT->RTR failed: %s",
+              std::strerror(result));
+    return -1;
+  }
+  ibv_qp_attr rts{};
+  rts.qp_state = IBV_QPS_RTS;
+  rts.timeout = 14;
+  rts.retry_cnt = 7;
+  rts.rnr_retry = 7;
+  rts.sq_psn = queue->psn;
+  rts.max_rd_atomic = 1;
+  result = ibv_modify_qp(
+      queue->dci, &rts,
+      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+  if (result != 0) {
+    set_error(error, error_bytes, "DCI RTR->RTS failed: %s",
+              std::strerror(result));
+    return -1;
+  }
+  queue->connected = true;
+  return 0;
+}
+
+uint32_t host_sgl_dc_max_send_wr(void* queue_pointer) {
+  const auto* queue = static_cast<const HostSglDcQueue*>(queue_pointer);
+  return queue == nullptr ? 0 : queue->max_send_wr;
+}
+
+uint32_t host_sgl_dc_max_sge(void* queue_pointer) {
+  const auto* queue = static_cast<const HostSglDcQueue*>(queue_pointer);
+  return queue == nullptr ? 0 : queue->max_sge;
+}
 
 void* host_sgl_create_qp(void* context_pointer, void* pd_pointer,
                          uint8_t port_num, uint8_t gid_index,
@@ -590,14 +942,14 @@ void* host_sgl_create_ring(char* error, size_t error_bytes) {
     set_error(error, error_bytes, "failed to allocate ring handle");
     return nullptr;
   }
-  ring->allocation_bytes = indices_offset + indices_bytes;
+  const size_t allocation_bytes = indices_offset + indices_bytes;
   if (posix_memalign(
-          &ring->allocation, slot_alignment, ring->allocation_bytes) != 0) {
+          &ring->allocation, slot_alignment, allocation_bytes) != 0) {
     set_error(error, error_bytes, "aligned ring malloc failed");
     delete ring;
     return nullptr;
   }
-  std::memset(ring->allocation, 0, ring->allocation_bytes);
+  std::memset(ring->allocation, 0, allocation_bytes);
   ring->memory = static_cast<HostSglRingMemory*>(ring->allocation);
   auto* slots = reinterpret_cast<HostSglRingSlot*>(
       static_cast<uint8_t*>(ring->allocation) + slots_offset);
@@ -620,134 +972,615 @@ void* host_sgl_ring_memory(void* ring_pointer) {
   return ring == nullptr ? nullptr : ring->memory;
 }
 
+int host_sgl_consume_ring_group(
+    void* const* queue_pointers, void* const* ring_pointers,
+    uint32_t ring_count, const uint64_t* first_generations,
+    const uint32_t* request_counts, uint32_t* posted_data_wrs,
+    char* error, size_t error_bytes) {
+  constexpr uint32_t max_ring_group = 32;
+  if (queue_pointers == nullptr || ring_pointers == nullptr ||
+      first_generations == nullptr || request_counts == nullptr ||
+      ring_count == 0 || ring_count > max_ring_group) {
+    set_error(error, error_bytes, "invalid coherent-ring group request");
+    return -1;
+  }
+
+  struct RingProgress {
+    HostSglQueue* queue = nullptr;
+    HostSglRingMemory* memory = nullptr;
+    HostSglRingSlot* slots = nullptr;
+    uint64_t next_generation = 0;
+    uint64_t last_generation = 0;
+    uint64_t last_completed = 0;
+    uint64_t data_wrs = 0;
+    bool done = false;
+  };
+  std::array<RingProgress, max_ring_group> states{};
+  for (uint32_t index = 0; index < ring_count; ++index) {
+    auto* queue = static_cast<HostSglQueue*>(queue_pointers[index]);
+    auto* ring = static_cast<HostSglRing*>(ring_pointers[index]);
+    if (queue == nullptr || ring == nullptr || ring->memory == nullptr ||
+        first_generations[index] == 0 || request_counts[index] == 0 ||
+        request_counts[index] > hostSglRingMaxMessages) {
+      set_error(error, error_bytes,
+                "invalid coherent ring at group index %u", index);
+      return -1;
+    }
+    if (!queue->connected || !queue->outstanding_batches.empty()) {
+      set_error(error, error_bytes,
+                "ring %u requires one connected idle queue", index);
+      return -1;
+    }
+    HostSglRingMemory* memory = ring->memory;
+    if (memory->abi_version != 1 ||
+        memory->capacity != hostSglRingCapacity ||
+        memory->max_rows != hostSglRingMaxRows) {
+      set_error(error, error_bytes,
+                "coherent ring %u header is invalid", index);
+      return -1;
+    }
+    const uint64_t last_generation =
+        first_generations[index] + request_counts[index] - 1;
+    if (last_generation < first_generations[index]) {
+      set_error(error, error_bytes,
+                "coherent ring %u generation range overflows", index);
+      return -1;
+    }
+    states[index] = RingProgress{
+        queue,
+        memory,
+        reinterpret_cast<HostSglRingSlot*>(memory->slots_address),
+        first_generations[index],
+        last_generation,
+        first_generations[index] - 1,
+        0,
+        false};
+    if (posted_data_wrs != nullptr)
+      posted_data_wrs[index] = 0;
+  }
+
+  std::array<HostSglRequest, hostSglRingBatch> requests{};
+  uint32_t completed_rings = 0;
+  while (completed_rings < ring_count) {
+    bool made_progress = false;
+    for (uint32_t index = 0; index < ring_count; ++index) {
+      RingProgress& state = states[index];
+      if (state.done)
+        continue;
+
+      if (state.next_generation <= state.last_generation) {
+        HostSglRingSlot& head = state.slots[
+            (state.next_generation - 1) % state.memory->capacity];
+        if (__atomic_load_n(&head.ready_generation, __ATOMIC_ACQUIRE) ==
+            state.next_generation) {
+          uint32_t batch_count = 0;
+          uint64_t batch_end = state.next_generation;
+          while (batch_end <= state.last_generation &&
+                 batch_count < hostSglRingBatch) {
+            HostSglRingSlot& slot = state.slots[
+                (batch_end - 1) % state.memory->capacity];
+            if (__atomic_load_n(
+                    &slot.ready_generation, __ATOMIC_ACQUIRE) != batch_end)
+              break;
+            requests[batch_count++] = slot.request;
+            ++batch_end;
+          }
+
+          uint64_t required_wrs = batch_count;
+          for (uint32_t request = 0; request < batch_count; ++request) {
+            required_wrs +=
+                (requests[request].row_count + state.queue->max_sge - 1) /
+                state.queue->max_sge;
+          }
+          if (required_wrs > state.queue->max_send_wr) {
+            set_error(error, error_bytes,
+                      "ring %u batch needs %llu WRs but QP holds %u", index,
+                      static_cast<unsigned long long>(required_wrs),
+                      state.queue->max_send_wr);
+            return -1;
+          }
+          const bool has_batch_credit =
+              state.queue->outstanding_batches.size() <
+              state.queue->max_outstanding_batches;
+          const bool has_wr_credit =
+              required_wrs <= state.queue->max_send_wr -
+                                  state.queue->outstanding_send_wrs;
+          if (has_batch_credit && has_wr_credit) {
+            uint32_t batch_data_wrs = 0;
+            if (host_sgl_post_indexed_batch(
+                    state.queue, requests.data(), batch_count, 0,
+                    &batch_data_wrs, error, error_bytes) != 0) {
+              return -1;
+            }
+            state.data_wrs += batch_data_wrs;
+            for (uint64_t generation = state.next_generation;
+                 generation < batch_end; ++generation) {
+              HostSglRingSlot& slot = state.slots[
+                  (generation - 1) % state.memory->capacity];
+              __atomic_store_n(
+                  &slot.consumed_generation, generation, __ATOMIC_RELEASE);
+            }
+            state.next_generation = batch_end;
+            made_progress = true;
+          }
+        }
+      }
+
+      if (!state.queue->outstanding_batches.empty()) {
+        uint64_t completed = 0;
+        const int count = host_sgl_try_poll(
+            state.queue, &completed, error, error_bytes);
+        if (count < 0) {
+          return -1;
+        }
+        if (count == 1) {
+          state.last_completed = completed;
+          made_progress = true;
+        }
+      }
+
+      if (state.next_generation > state.last_generation &&
+          state.queue->outstanding_batches.empty()) {
+        if (state.last_completed != state.last_generation) {
+          set_error(error, error_bytes,
+                    "ring %u completed %llu instead of %llu", index,
+                    static_cast<unsigned long long>(state.last_completed),
+                    static_cast<unsigned long long>(state.last_generation));
+          return -1;
+        }
+        if (state.data_wrs > UINT32_MAX) {
+          set_error(error, error_bytes,
+                    "ring %u data WR count overflows", index);
+          return -1;
+        }
+        if (posted_data_wrs != nullptr)
+          posted_data_wrs[index] = static_cast<uint32_t>(state.data_wrs);
+        state.done = true;
+        ++completed_rings;
+        made_progress = true;
+      }
+    }
+    if (!made_progress)
+      asm volatile("" ::: "memory");
+  }
+  return 0;
+}
+
+static int host_sgl_post_dc_batch(
+    HostSglDcQueue* queue, const HostSglRequest* requests,
+    uint32_t request_count, uint32_t peer_index, uint32_t ring_index,
+    uint32_t* posted_data_wrs, char* error, size_t error_bytes) {
+  if (queue == nullptr || !queue->connected || requests == nullptr ||
+      request_count == 0 || peer_index >= queue->peers.size()) {
+    set_error(error, error_bytes, "invalid DC indexed-row batch");
+    return -1;
+  }
+  uint64_t total_rows = 0;
+  uint64_t data_wr_count = 0;
+  for (uint32_t index = 0; index < request_count; ++index) {
+    const HostSglRequest& request = requests[index];
+    if (request.row_indices == nullptr || request.row_count == 0 ||
+        request.row_bytes == 0 || request.source_stride < request.row_bytes ||
+        request.remote_data == 0 || request.remote_signal == 0 ||
+        request.sequence == 0) {
+      set_error(error, error_bytes, "invalid DC request at batch index %u",
+                index);
+      return -1;
+    }
+    total_rows += request.row_count;
+    data_wr_count +=
+        (request.row_count + queue->max_sge - 1) / queue->max_sge;
+  }
+  const uint64_t total_wr_count = data_wr_count + request_count;
+  if (total_wr_count > queue->max_send_wr - queue->outstanding_send_wrs ||
+      queue->outstanding_batches.size() >= 64 ||
+      total_rows > SIZE_MAX || total_wr_count > UINT32_MAX) {
+    set_error(error, error_bytes, "DC send-queue credits are exhausted");
+    return -1;
+  }
+
+  std::vector<ibv_sge> sges(static_cast<size_t>(total_rows));
+  size_t sge_cursor = 0;
+  const uint64_t completion_id = queue->next_completion_id++;
+  const HostSglDcPeer& peer = queue->peers[peer_index];
+  ibv_wr_start(queue->dci_ex);
+  uint64_t emitted_wrs = 0;
+  for (uint32_t request_index = 0; request_index < request_count;
+       ++request_index) {
+    const HostSglRequest& request = requests[request_index];
+    const size_t row_sge_base = sge_cursor;
+    for (uint32_t row = 0; row < request.row_count; ++row) {
+      ibv_sge& sge = sges[sge_cursor++];
+      sge.addr = request.source_base +
+          static_cast<uint64_t>(request.row_indices[row]) *
+              request.source_stride;
+      sge.length = request.row_bytes;
+      sge.lkey = request.local_lkey;
+    }
+    uint32_t first_row = 0;
+    uint64_t remote_offset = 0;
+    while (first_row < request.row_count) {
+      const uint32_t rows =
+          std::min(queue->max_sge, request.row_count - first_row);
+      queue->dci_ex->wr_id = 0;
+      queue->dci_ex->wr_flags = 0;
+      ibv_wr_rdma_write(
+          queue->dci_ex, request.remote_rkey,
+          request.remote_data + remote_offset);
+      mlx5dv_wr_set_dc_addr(
+          queue->mlx5_dci_ex, peer.ah, peer.dctn, hostSglDcKey);
+      ibv_wr_set_sge_list(
+          queue->dci_ex, rows, &sges[row_sge_base + first_row]);
+      first_row += rows;
+      remote_offset += static_cast<uint64_t>(rows) * request.row_bytes;
+      ++emitted_wrs;
+    }
+    uint64_t signal = request.sequence;
+    ++emitted_wrs;
+    queue->dci_ex->wr_id =
+        emitted_wrs == total_wr_count ? completion_id : 0;
+    queue->dci_ex->wr_flags = IBV_SEND_INLINE |
+        (emitted_wrs == total_wr_count ? IBV_SEND_SIGNALED : 0);
+    ibv_wr_rdma_write(
+        queue->dci_ex, request.remote_rkey, request.remote_signal);
+    mlx5dv_wr_set_dc_addr(
+        queue->mlx5_dci_ex, peer.ah, peer.dctn, hostSglDcKey);
+    ibv_wr_set_inline_data(queue->dci_ex, &signal, sizeof(signal));
+  }
+  const int result = ibv_wr_complete(queue->dci_ex);
+  if (result != 0) {
+    set_error(error, error_bytes, "ibv_wr_complete(DCI) failed: %s",
+              std::strerror(result));
+    return -1;
+  }
+  queue->outstanding_send_wrs += static_cast<uint32_t>(total_wr_count);
+  queue->outstanding_batches.push_back(HostSglDcPostedBatch{
+      completion_id, static_cast<uint32_t>(total_wr_count), ring_index});
+  if (posted_data_wrs != nullptr)
+    *posted_data_wrs = static_cast<uint32_t>(data_wr_count);
+  return 0;
+}
+
+static int host_sgl_try_poll_dc(HostSglDcQueue* queue,
+                                uint32_t* completed_ring,
+                                char* error, size_t error_bytes) {
+  if (queue == nullptr || queue->outstanding_batches.empty())
+    return 0;
+  ibv_wc completion{};
+  const int count = ibv_poll_cq(queue->cq, 1, &completion);
+  if (count < 0) {
+    set_error(error, error_bytes, "ibv_poll_cq(DCI) failed");
+    return -1;
+  }
+  if (count == 0)
+    return 0;
+  const HostSglDcPostedBatch& expected = queue->outstanding_batches.front();
+  if (completion.status != IBV_WC_SUCCESS ||
+      completion.wr_id != expected.completion_id ||
+      queue->outstanding_send_wrs < expected.send_wr_count) {
+    set_error(error, error_bytes,
+              "DCI completion failed: %s id=%llu expected=%llu vendor=%u",
+              ibv_wc_status_str(completion.status),
+              static_cast<unsigned long long>(completion.wr_id),
+              static_cast<unsigned long long>(expected.completion_id),
+              completion.vendor_err);
+    return -1;
+  }
+  queue->outstanding_send_wrs -= expected.send_wr_count;
+  if (completed_ring != nullptr)
+    *completed_ring = expected.ring_index;
+  queue->outstanding_batches.pop_front();
+  return 1;
+}
+
+int host_sgl_consume_ring_epoch_dc(
+    void* queue_pointer, void* const* ring_pointers, uint32_t ring_count,
+    uint32_t* posted_data_wrs, char* error, size_t error_bytes) {
+  constexpr uint32_t max_ring_group = 32;
+  auto* queue = static_cast<HostSglDcQueue*>(queue_pointer);
+  if (queue == nullptr || ring_pointers == nullptr || ring_count == 0 ||
+      ring_count > max_ring_group || !queue->connected ||
+      queue->peers.size() != ring_count ||
+      !queue->outstanding_batches.empty()) {
+    set_error(error, error_bytes, "invalid coherent-ring DC epoch group");
+    return -1;
+  }
+  struct RingProgress {
+    HostSglRing* ring = nullptr;
+    HostSglRingMemory* memory = nullptr;
+    HostSglRingSlot* slots = nullptr;
+    uint64_t next_generation = 0;
+    uint64_t data_wrs = 0;
+    uint32_t outstanding_batches = 0;
+    bool end_seen = false;
+    bool done = false;
+  };
+  std::array<RingProgress, max_ring_group> states{};
+  for (uint32_t index = 0; index < ring_count; ++index) {
+    auto* ring = static_cast<HostSglRing*>(ring_pointers[index]);
+    if (ring == nullptr || ring->memory == nullptr ||
+        ring->memory->abi_version != 1 ||
+        ring->memory->capacity != hostSglRingCapacity ||
+        ring->memory->max_rows != hostSglRingMaxRows) {
+      set_error(error, error_bytes, "coherent DC ring %u is invalid", index);
+      return -1;
+    }
+    states[index] = RingProgress{
+        ring,
+        ring->memory,
+        reinterpret_cast<HostSglRingSlot*>(ring->memory->slots_address),
+        ring->next_generation,
+        0,
+        0,
+        false,
+        false};
+    if (posted_data_wrs != nullptr)
+      posted_data_wrs[index] = 0;
+  }
+
+  std::array<HostSglRequest, hostSglRingBatch> requests{};
+  uint32_t completed_rings = 0;
+  while (completed_rings < ring_count) {
+    bool made_progress = false;
+    for (uint32_t index = 0; index < ring_count; ++index) {
+      RingProgress& state = states[index];
+      if (state.done || state.end_seen)
+        continue;
+      HostSglRingSlot& head = state.slots[
+          (state.next_generation - 1) % state.memory->capacity];
+      if (__atomic_load_n(&head.ready_generation, __ATOMIC_ACQUIRE) !=
+          state.next_generation)
+        continue;
+      if (head.request.row_count == 0) {
+        __atomic_store_n(
+            &head.consumed_generation, state.next_generation,
+            __ATOMIC_RELEASE);
+        ++state.next_generation;
+        state.end_seen = true;
+        made_progress = true;
+        continue;
+      }
+      uint32_t batch_count = 0;
+      uint64_t batch_end = state.next_generation;
+      while (batch_count < hostSglRingBatch) {
+        HostSglRingSlot& slot = state.slots[
+            (batch_end - 1) % state.memory->capacity];
+        if (__atomic_load_n(&slot.ready_generation, __ATOMIC_ACQUIRE) !=
+                batch_end ||
+            slot.request.row_count == 0)
+          break;
+        requests[batch_count++] = slot.request;
+        ++batch_end;
+      }
+      uint64_t required_wrs = batch_count;
+      for (uint32_t request = 0; request < batch_count; ++request) {
+        required_wrs +=
+            (requests[request].row_count + queue->max_sge - 1) /
+            queue->max_sge;
+      }
+      if (required_wrs <= queue->max_send_wr - queue->outstanding_send_wrs &&
+          queue->outstanding_batches.size() < 64) {
+        uint32_t batch_data_wrs = 0;
+        if (host_sgl_post_dc_batch(
+                queue, requests.data(), batch_count, index, index,
+                &batch_data_wrs, error, error_bytes) != 0)
+          return -1;
+        state.data_wrs += batch_data_wrs;
+        ++state.outstanding_batches;
+        for (uint64_t generation = state.next_generation;
+             generation < batch_end; ++generation) {
+          HostSglRingSlot& slot = state.slots[
+              (generation - 1) % state.memory->capacity];
+          __atomic_store_n(
+              &slot.consumed_generation, generation, __ATOMIC_RELEASE);
+        }
+        state.next_generation = batch_end;
+        made_progress = true;
+      }
+    }
+
+    uint32_t completed_ring = 0;
+    const int completion = host_sgl_try_poll_dc(
+        queue, &completed_ring, error, error_bytes);
+    if (completion < 0)
+      return -1;
+    if (completion == 1) {
+      if (completed_ring >= ring_count ||
+          states[completed_ring].outstanding_batches == 0) {
+        set_error(error, error_bytes, "DC ring completion accounting failed");
+        return -1;
+      }
+      --states[completed_ring].outstanding_batches;
+      made_progress = true;
+    }
+    for (uint32_t index = 0; index < ring_count; ++index) {
+      RingProgress& state = states[index];
+      if (!state.done && state.end_seen && state.outstanding_batches == 0) {
+        if (state.data_wrs > UINT32_MAX) {
+          set_error(error, error_bytes, "DC ring %u WR count overflows", index);
+          return -1;
+        }
+        state.ring->next_generation = state.next_generation;
+        if (posted_data_wrs != nullptr)
+          posted_data_wrs[index] = static_cast<uint32_t>(state.data_wrs);
+        state.done = true;
+        ++completed_rings;
+        made_progress = true;
+      }
+    }
+    if (!made_progress)
+      asm volatile("" ::: "memory");
+  }
+  return 0;
+}
+
+int host_sgl_consume_ring_epoch_group(
+    void* const* queue_pointers, void* const* ring_pointers,
+    uint32_t ring_count, uint32_t* posted_data_wrs,
+    char* error, size_t error_bytes) {
+  constexpr uint32_t max_ring_group = 32;
+  if (queue_pointers == nullptr || ring_pointers == nullptr ||
+      ring_count == 0 || ring_count > max_ring_group) {
+    set_error(error, error_bytes, "invalid coherent-ring epoch group");
+    return -1;
+  }
+
+  struct RingProgress {
+    HostSglQueue* queue = nullptr;
+    HostSglRing* ring = nullptr;
+    HostSglRingMemory* memory = nullptr;
+    HostSglRingSlot* slots = nullptr;
+    uint64_t next_generation = 0;
+    uint64_t data_wrs = 0;
+    bool end_seen = false;
+    bool done = false;
+  };
+  std::array<RingProgress, max_ring_group> states{};
+  for (uint32_t index = 0; index < ring_count; ++index) {
+    auto* queue = static_cast<HostSglQueue*>(queue_pointers[index]);
+    auto* ring = static_cast<HostSglRing*>(ring_pointers[index]);
+    if (queue == nullptr || ring == nullptr || ring->memory == nullptr ||
+        !queue->connected || !queue->outstanding_batches.empty()) {
+      set_error(error, error_bytes,
+                "epoch ring %u requires one connected idle queue", index);
+      return -1;
+    }
+    HostSglRingMemory* memory = ring->memory;
+    if (memory->abi_version != 1 ||
+        memory->capacity != hostSglRingCapacity ||
+        memory->max_rows != hostSglRingMaxRows) {
+      set_error(error, error_bytes,
+                "coherent epoch ring %u header is invalid", index);
+      return -1;
+    }
+    states[index] = RingProgress{
+        queue,
+        ring,
+        memory,
+        reinterpret_cast<HostSglRingSlot*>(memory->slots_address),
+        ring->next_generation,
+        0,
+        false,
+        false};
+    if (posted_data_wrs != nullptr)
+      posted_data_wrs[index] = 0;
+  }
+
+  std::array<HostSglRequest, hostSglRingBatch> requests{};
+  uint32_t completed_rings = 0;
+  while (completed_rings < ring_count) {
+    bool made_progress = false;
+    for (uint32_t index = 0; index < ring_count; ++index) {
+      RingProgress& state = states[index];
+      if (state.done)
+        continue;
+
+      if (!state.end_seen) {
+        HostSglRingSlot& head = state.slots[
+            (state.next_generation - 1) % state.memory->capacity];
+        if (__atomic_load_n(&head.ready_generation, __ATOMIC_ACQUIRE) ==
+            state.next_generation) {
+          if (head.request.row_count == 0) {
+            __atomic_store_n(
+                &head.consumed_generation,
+                state.next_generation,
+                __ATOMIC_RELEASE);
+            ++state.next_generation;
+            state.end_seen = true;
+            made_progress = true;
+          } else {
+            uint32_t batch_count = 0;
+            uint64_t batch_end = state.next_generation;
+            while (batch_count < hostSglRingBatch) {
+              HostSglRingSlot& slot = state.slots[
+                  (batch_end - 1) % state.memory->capacity];
+              if (__atomic_load_n(
+                      &slot.ready_generation, __ATOMIC_ACQUIRE) != batch_end ||
+                  slot.request.row_count == 0)
+                break;
+              requests[batch_count++] = slot.request;
+              ++batch_end;
+            }
+
+            uint64_t required_wrs = batch_count;
+            for (uint32_t request = 0; request < batch_count; ++request) {
+              required_wrs +=
+                  (requests[request].row_count + state.queue->max_sge - 1) /
+                  state.queue->max_sge;
+            }
+            if (required_wrs > state.queue->max_send_wr) {
+              set_error(error, error_bytes,
+                        "epoch ring %u batch needs %llu WRs but QP holds %u",
+                        index,
+                        static_cast<unsigned long long>(required_wrs),
+                        state.queue->max_send_wr);
+              return -1;
+            }
+            const bool has_batch_credit =
+                state.queue->outstanding_batches.size() <
+                state.queue->max_outstanding_batches;
+            const bool has_wr_credit =
+                required_wrs <= state.queue->max_send_wr -
+                                    state.queue->outstanding_send_wrs;
+            if (has_batch_credit && has_wr_credit) {
+              uint32_t batch_data_wrs = 0;
+              if (host_sgl_post_indexed_batch(
+                      state.queue, requests.data(), batch_count, 0,
+                      &batch_data_wrs, error, error_bytes) != 0) {
+                return -1;
+              }
+              state.data_wrs += batch_data_wrs;
+              for (uint64_t generation = state.next_generation;
+                   generation < batch_end; ++generation) {
+                HostSglRingSlot& slot = state.slots[
+                    (generation - 1) % state.memory->capacity];
+                __atomic_store_n(
+                    &slot.consumed_generation, generation, __ATOMIC_RELEASE);
+              }
+              state.next_generation = batch_end;
+              made_progress = true;
+            }
+          }
+        }
+      }
+
+      if (!state.queue->outstanding_batches.empty()) {
+        const int count = host_sgl_try_poll(
+            state.queue, nullptr, error, error_bytes);
+        if (count < 0)
+          return -1;
+        made_progress |= count == 1;
+      }
+
+      if (state.end_seen && state.queue->outstanding_batches.empty()) {
+        if (state.data_wrs > UINT32_MAX) {
+          set_error(error, error_bytes,
+                    "epoch ring %u data WR count overflows", index);
+          return -1;
+        }
+        state.ring->next_generation = state.next_generation;
+        if (posted_data_wrs != nullptr)
+          posted_data_wrs[index] = static_cast<uint32_t>(state.data_wrs);
+        state.done = true;
+        ++completed_rings;
+        made_progress = true;
+      }
+    }
+    if (!made_progress)
+      asm volatile("" ::: "memory");
+  }
+  return 0;
+}
+
 int host_sgl_consume_ring(void* queue_pointer, void* ring_pointer,
                           uint64_t first_generation, uint32_t request_count,
                           uint32_t* posted_data_wrs,
                           char* error, size_t error_bytes) {
-  auto* queue = static_cast<HostSglQueue*>(queue_pointer);
-  auto* ring = static_cast<HostSglRing*>(ring_pointer);
-  if (queue == nullptr || ring == nullptr || ring->memory == nullptr ||
-      first_generation == 0 || request_count == 0 ||
-      request_count > hostSglRingMaxMessages) {
-    set_error(error, error_bytes, "invalid coherent-ring consume request");
-    return -1;
-  }
-  if (!queue->connected || !queue->outstanding_batches.empty()) {
-    set_error(error, error_bytes,
-              "ring consume requires one connected idle queue");
-    return -1;
-  }
-  HostSglRingMemory* memory = ring->memory;
-  if (memory->abi_version != 1 ||
-      memory->capacity != hostSglRingCapacity ||
-      memory->max_rows != hostSglRingMaxRows) {
-    set_error(error, error_bytes, "coherent ring header is invalid");
-    return -1;
-  }
-  auto* slots = reinterpret_cast<HostSglRingSlot*>(memory->slots_address);
-  const uint64_t last_generation =
-      first_generation + request_count - 1;
-  if (last_generation < first_generation) {
-    set_error(error, error_bytes,
-              "coherent ring generation range overflows");
-    return -1;
-  }
-  std::array<HostSglRequest, hostSglRingBatch> requests{};
-  uint64_t next_generation = first_generation;
-  uint64_t last_completed = __atomic_load_n(
-      &memory->completed_generation, __ATOMIC_ACQUIRE);
-  uint64_t data_wrs = 0;
-
-  const auto poll_completion = [&]() -> int {
-    uint64_t completed = 0;
-    const int count =
-        host_sgl_try_poll(queue, &completed, error, error_bytes);
-    if (count == 1) {
-      last_completed = completed;
-      __atomic_store_n(
-          &memory->completed_generation, completed, __ATOMIC_RELEASE);
-    }
-    return count;
-  };
-
-  while (next_generation <= last_generation) {
-    HostSglRingSlot& head =
-        slots[(next_generation - 1) % memory->capacity];
-    const uint64_t ready =
-        __atomic_load_n(&head.ready_generation, __ATOMIC_ACQUIRE);
-    if (ready != next_generation) {
-      if (poll_completion() < 0)
-        return -1;
-      continue;
-    }
-
-    uint32_t batch_count = 0;
-    uint64_t batch_end = next_generation;
-    while (batch_end <= last_generation &&
-           batch_count < hostSglRingBatch) {
-      HostSglRingSlot& slot =
-          slots[(batch_end - 1) % memory->capacity];
-      if (__atomic_load_n(
-              &slot.ready_generation, __ATOMIC_ACQUIRE) != batch_end)
-        break;
-      requests[batch_count++] = slot.request;
-      ++batch_end;
-    }
-
-    uint64_t required_wrs = batch_count;
-    for (uint32_t index = 0; index < batch_count; ++index) {
-      const HostSglRequest& request = requests[index];
-      required_wrs +=
-          (request.row_count + queue->max_sge - 1) / queue->max_sge;
-    }
-    while (queue->outstanding_batches.size() >=
-               queue->max_outstanding_batches ||
-           required_wrs > queue->max_send_wr - queue->outstanding_send_wrs) {
-      if (poll_completion() < 0)
-        return -1;
-    }
-
-    uint32_t batch_data_wrs = 0;
-    if (host_sgl_post_indexed_batch(
-            queue,
-            requests.data(),
-            batch_count,
-            0,
-            &batch_data_wrs,
-            error,
-            error_bytes) != 0) {
-      memory->error_generation = next_generation;
-      return -1;
-    }
-    data_wrs += batch_data_wrs;
-    for (uint64_t generation = next_generation;
-         generation < batch_end;
-         ++generation) {
-      HostSglRingSlot& slot =
-          slots[(generation - 1) % memory->capacity];
-      __atomic_store_n(
-          &slot.consumed_generation, generation, __ATOMIC_RELEASE);
-    }
-    __atomic_store_n(
-        &memory->submitted_generation, batch_end - 1, __ATOMIC_RELEASE);
-    next_generation = batch_end;
-  }
-
-  while (!queue->outstanding_batches.empty()) {
-    if (poll_completion() < 0)
-      return -1;
-  }
-  if (last_completed != last_generation) {
-    memory->error_generation = last_generation;
-    set_error(error, error_bytes,
-              "coherent ring completed %llu instead of %llu",
-              static_cast<unsigned long long>(last_completed),
-              static_cast<unsigned long long>(last_generation));
-    return -1;
-  }
-  if (posted_data_wrs != nullptr)
-    *posted_data_wrs = static_cast<uint32_t>(data_wrs);
-  return 0;
+  void* queues[] = {queue_pointer};
+  void* rings[] = {ring_pointer};
+  return host_sgl_consume_ring_group(
+      queues, rings, 1, &first_generation, &request_count,
+      posted_data_wrs, error, error_bytes);
 }
 
 void host_sgl_destroy_ring(void* ring_pointer) {
@@ -760,6 +1593,10 @@ void host_sgl_destroy_ring(void* ring_pointer) {
 
 void host_sgl_destroy_qp(void* queue_pointer) {
   destroy_queue(static_cast<HostSglQueue*>(queue_pointer));
+}
+
+void host_sgl_destroy_dc(void* queue_pointer) {
+  destroy_dc_queue(static_cast<HostSglDcQueue*>(queue_pointer));
 }
 
 }  // extern "C"

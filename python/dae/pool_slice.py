@@ -28,6 +28,7 @@ POOL_SLICE_MAX_LOCAL_READERS = 8
 POOL_SLICE_MAX_POOL_BLOCKS = 32
 POOL_SLICE_RETURN_GROUPS_PER_SOURCE = 4
 POOL_SLICE_MAX_STREAM_QUEUES = 2
+POOL_HOST_RING_MAX_ROWS = 512
 POOL_SLICE_STREAM_QUEUE_DEPTH = (
     POOL_SLICE_MAX_POOL_BLOCKS + 2
 )
@@ -41,6 +42,8 @@ POOL_SLICE_METADATA_ENVELOPE_BYTES = (
 )
 POOL_SLICE_RECEIVE_BYTES = 32
 POOL_SLICE_CONFIG_BYTES = 192
+POOL_SLICE_HOST_CONFIG_BYTES = 224
+POOL_SLICE_HOST_PEER_WORDS = 5
 POOL_SLICE_CONTROL_STREAM_METADATA_TRANSPORT_READY = 115
 POOL_SLICE_CONTROL_STREAM_METADATA_READY = (
     POOL_SLICE_CONTROL_STREAM_METADATA_TRANSPORT_READY + POOL_SLICE_MAX_PES
@@ -96,9 +99,14 @@ POOL_SLICE_PROFILE_RETURN_CTA_DONE = 22
 _PUBLISH_STRUCT = struct.Struct("<Q6I8I")
 _RECEIVE_STRUCT = struct.Struct("<Q6I")
 _CONFIG_STRUCT = struct.Struct("<17Q14I")
+_HOST_CONFIG_TRAILER_STRUCT = struct.Struct("<2Q2I8x")
 assert _PUBLISH_STRUCT.size == POOL_SLICE_PUBLISH_BYTES
 assert _RECEIVE_STRUCT.size == POOL_SLICE_RECEIVE_BYTES
 assert _CONFIG_STRUCT.size == POOL_SLICE_CONFIG_BYTES
+assert (
+    POOL_SLICE_CONFIG_BYTES + _HOST_CONFIG_TRAILER_STRUCT.size
+    == POOL_SLICE_HOST_CONFIG_BYTES
+)
 
 
 class PoolSliceStatus(IntEnum):
@@ -348,6 +356,26 @@ class PoolSliceConfig:
         return _CONFIG_STRUCT.pack(*pointer_values, *values)
 
 
+@dataclass(frozen=True)
+class PoolSliceHostConfig:
+    pool: PoolSliceConfig
+    peers_address: int
+    producer_generations_address: int
+    local_lkey: int
+
+    def pack(self) -> bytes:
+        return self.pool.pack() + _HOST_CONFIG_TRAILER_STRUCT.pack(
+            _positive_uint("peers_address", self.peers_address, 64),
+            _positive_uint(
+                "producer_generations_address",
+                self.producer_generations_address,
+                64,
+            ),
+            _positive_uint("local_lkey", self.local_lkey, 32),
+            0,
+        )
+
+
 def group_routes_by_reader(
     reader_ids: Sequence[int] | torch.Tensor,
     *,
@@ -451,11 +479,15 @@ class PoolSliceBuffers:
     write_chunk_rows: int
     pool_count: int
     weighted_return: bool
+    data_plane_arena: torch.Tensor | None = None
     active_rows: int = 0
     _source: torch.Tensor | None = None
     _returned: torch.Tensor | None = None
     _required_return_rows: int = 0
     _last_sequence: int = 0
+    _host_peers: torch.Tensor | None = None
+    _host_generations: torch.Tensor | None = None
+    _host_config_tensor: torch.Tensor | None = None
 
     @property
     def num_readers(self) -> int:
@@ -612,6 +644,54 @@ class PoolSliceBuffers:
                 self.config(source, returned, pool_rank=pool_rank).pack(),
             )
         return self.config_tensor
+
+    def prepare_host_data_plane(
+        self,
+        peer_routes: torch.Tensor,
+        *,
+        local_lkey: int,
+    ) -> torch.Tensor:
+        """Pack the compile-time host payload backend for this PoolInst."""
+
+        if self._source is None or self._returned is None:
+            raise RuntimeError("call prepare(source, returned) first")
+        if not self.weighted_return:
+            raise ValueError("the host data plane currently requires weighted return")
+        if self.data_plane_arena is None:
+            raise ValueError("allocate with host_data_plane=True")
+        if (
+            peer_routes.dtype != torch.uint64
+            or peer_routes.ndim != 2
+            or peer_routes.shape != (self.num_pes, POOL_SLICE_HOST_PEER_WORDS)
+            or not peer_routes.is_cuda
+            or not peer_routes.is_contiguous()
+        ):
+            raise ValueError(
+                "peer_routes must be contiguous CUDA uint64[num_pes, 5]"
+            )
+        local_lkey = _positive_uint("local_lkey", local_lkey, 32)
+        self._host_peers = peer_routes
+        self._host_generations = torch.zeros(
+            self.num_pes,
+            dtype=torch.uint64,
+            device=peer_routes.device,
+        )
+        self._host_config_tensor = torch.empty(
+            (self.pool_count, POOL_SLICE_HOST_CONFIG_BYTES),
+            dtype=torch.uint8,
+            device=peer_routes.device,
+        )
+        for pool_rank in range(self.pool_count):
+            packed = PoolSliceHostConfig(
+                pool=self.config(
+                    self._source, self._returned, pool_rank=pool_rank
+                ),
+                peers_address=peer_routes.data_ptr(),
+                producer_generations_address=self._host_generations.data_ptr(),
+                local_lkey=local_lkey,
+            ).pack()
+            _copy_packed(self._host_config_tensor[pool_rank], packed)
+        return self._host_config_tensor
 
     def set_sequence(self, sequence: int) -> None:
         sequence = _positive_uint("sequence", sequence, 64)
@@ -821,6 +901,7 @@ def build_pool_slice_copy_program(
     source_preloaded: bool = False,
     reader_rms_weights: torch.Tensor | None = None,
     reader_rms_epsilon: float = 1.0e-5,
+    host_data_plane: bool = False,
 ) -> PoolSliceProgram:
     """Build writer, PoolInst, and reader VDCores operations."""
 
@@ -831,6 +912,7 @@ def build_pool_slice_copy_program(
         PoolTmaStore1D,
         PoolWaitSignal,
         PoolSliceExchange,
+        PoolSliceHostWeightedExchange,
         PoolSliceWeightedExchange,
         RawAddress,
         TerminateC,
@@ -841,6 +923,8 @@ def build_pool_slice_copy_program(
 
     if buffers._source is None or buffers._returned is None:
         raise RuntimeError("call buffers.prepare(source, returned) before building")
+    if host_data_plane and buffers._host_config_tensor is None:
+        raise RuntimeError("call buffers.prepare_host_data_plane(...) first")
     device = buffers.signals.device
     properties = torch.cuda.get_device_properties(device)
     if in_place_identity and (
@@ -926,13 +1010,17 @@ def build_pool_slice_copy_program(
     writer_builder = launcher.builder[0]
     for pool_rank in range(buffers.pool_count):
         pool_builder = launcher.builder[1 + pool_rank]
-        if buffers.weighted_return:
+        pool_config_tensor = buffers.config_tensor
+        if host_data_plane:
+            pool_instruction = PoolSliceHostWeightedExchange
+            pool_config_tensor = buffers._host_config_tensor
+        elif buffers.weighted_return:
             pool_instruction = PoolSliceWeightedExchange
         else:
             pool_instruction = PoolSliceExchange
         pool_builder.add_pool(
             pool_instruction(
-                buffers.config_tensor[pool_rank],
+                pool_config_tensor[pool_rank],
                 write_barrier=write_barrier,
                 dispatch_barrier_base=dispatch_barrier_base,
                 compute_barrier_base=compute_barrier_base,
@@ -1054,6 +1142,7 @@ def allocate_pool_slice(
     pool_blocks: int = 1,
     in_place_expert_output: bool = False,
     weighted_return: bool = False,
+    host_data_plane: bool = False,
 ) -> PoolSliceBuffers:
     """Collectively allocate one batched logical pool slice on every PE."""
 
@@ -1094,6 +1183,13 @@ def allocate_pool_slice(
         )
     if weighted_return and dtype != torch.bfloat16:
         raise ValueError("weighted return currently requires bfloat16 rows")
+    if host_data_plane and not weighted_return:
+        raise ValueError("the host data plane requires weighted return")
+    if host_data_plane and token_capacity > POOL_HOST_RING_MAX_ROWS:
+        raise ValueError(
+            "the host data plane supports at most "
+            f"{POOL_HOST_RING_MAX_ROWS} tokens per PE"
+        )
     if expert_capacity_rows < num_pes * token_capacity:
         raise ValueError(
             "slot-put expert capacity must provide one token-capacity "
@@ -1132,9 +1228,60 @@ def allocate_pool_slice(
         (token_row_planes, token_capacity), dtype=torch.uint32
     )
     send_token_counts = nvshmem.zeros(num_pes, dtype=torch.uint32)
-    token_pool = nvshmem.zeros((token_capacity, hidden_size), dtype=dtype)
     delivery_rows = num_pes * token_capacity * (2 if weighted_return else 1)
-    delivery_pool = nvshmem.zeros((delivery_rows, hidden_size), dtype=dtype)
+    return_inbox_rows = (
+        num_pes * token_capacity if weighted_return else route_capacity
+    )
+    data_plane_arena = None
+    if host_data_plane:
+        cursor = 0
+
+        def reserve(byte_count: int) -> int:
+            nonlocal cursor
+            cursor = (cursor + 4095) // 4096 * 4096
+            offset = cursor
+            cursor += byte_count
+            return offset
+
+        token_pool_offset = reserve(token_capacity * row_bytes)
+        delivery_pool_offset = reserve(delivery_rows * row_bytes)
+        return_inbox_offset = reserve(return_inbox_rows * row_bytes)
+        control_offset = reserve(POOL_SLICE_CONTROL_WORDS * 8)
+        arena_bytes = (cursor + 4095) // 4096 * 4096
+        data_plane_arena = nvshmem.zeros(arena_bytes, dtype=torch.uint8)
+
+        def arena_view(
+            offset: int, shape: tuple[int, ...], view_dtype: torch.dtype
+        ) -> torch.Tensor:
+            elements = 1
+            for dimension in shape:
+                elements *= dimension
+            byte_count = elements * torch.empty(
+                (), dtype=view_dtype
+            ).element_size()
+            return data_plane_arena.narrow(0, offset, byte_count).view(
+                view_dtype
+            ).view(shape)
+
+        token_pool = arena_view(
+            token_pool_offset, (token_capacity, hidden_size), dtype
+        )
+        delivery_pool = arena_view(
+            delivery_pool_offset, (delivery_rows, hidden_size), dtype
+        )
+        return_inbox = arena_view(
+            return_inbox_offset, (return_inbox_rows, hidden_size), dtype
+        )
+        control = arena_view(
+            control_offset, (POOL_SLICE_CONTROL_WORDS,), torch.uint64
+        )
+    else:
+        token_pool = nvshmem.zeros((token_capacity, hidden_size), dtype=dtype)
+        delivery_pool = nvshmem.zeros((delivery_rows, hidden_size), dtype=dtype)
+        return_inbox = nvshmem.zeros(
+            (return_inbox_rows, hidden_size), dtype=dtype
+        )
+        control = nvshmem.zeros(POOL_SLICE_CONTROL_WORDS, dtype=torch.uint64)
     expert_input = nvshmem.zeros(
         (local_readers, expert_capacity_rows, hidden_size), dtype=dtype
     )
@@ -1144,12 +1291,6 @@ def allocate_pool_slice(
         else nvshmem.zeros(
             (local_readers, expert_capacity_rows, hidden_size), dtype=dtype
         )
-    )
-    return_inbox_rows = (
-        num_pes * token_capacity if weighted_return else route_capacity
-    )
-    return_inbox = nvshmem.zeros(
-        (return_inbox_rows, hidden_size), dtype=dtype
     )
     # Every peer owns a fixed-capacity metadata packet. The runtime transfer
     # includes only the live queue prefix followed immediately by route words,
@@ -1168,7 +1309,6 @@ def allocate_pool_slice(
         (local_readers, num_pes, POOL_SLICE_RECEIVE_BYTES), dtype=torch.uint8
     )
     sequence = nvshmem.zeros(1, dtype=torch.uint64)
-    control = nvshmem.zeros(POOL_SLICE_CONTROL_WORDS, dtype=torch.uint64)
     config_tensor = torch.empty(
         (pool_blocks, POOL_SLICE_CONFIG_BYTES),
         dtype=torch.uint8,
@@ -1206,6 +1346,7 @@ def allocate_pool_slice(
         write_chunk_rows=write_chunk_rows,
         pool_count=pool_blocks,
         weighted_return=weighted_return,
+        data_plane_arena=data_plane_arena,
     )
     nvshmem.barrier()
     return buffers
@@ -1223,6 +1364,8 @@ __all__ = [
     "POOL_SLICE_METADATA_ENVELOPE_BYTES",
     "POOL_SLICE_RECEIVE_BYTES",
     "POOL_SLICE_CONFIG_BYTES",
+    "POOL_SLICE_HOST_CONFIG_BYTES",
+    "POOL_SLICE_HOST_PEER_WORDS",
     "POOL_SLICE_PROFILE_START",
     "POOL_SLICE_PROFILE_GATHER_READY",
     "POOL_SLICE_PROFILE_DONE",
@@ -1245,6 +1388,7 @@ __all__ = [
     "PoolSlicePublishBatch",
     "PoolSliceReceiveBatch",
     "PoolSliceConfig",
+    "PoolSliceHostConfig",
     "PoolSliceBuffers",
     "PoolSliceProgram",
     "group_routes_by_reader",

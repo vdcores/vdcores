@@ -10,10 +10,12 @@ import torch
 from dae.instructions import (
     PoolInstruction,
     PoolSliceExchange,
+    PoolSliceHostWeightedExchange,
     PoolSliceWeightedExchange,
 )
 from dae.pool_slice import (
     POOL_SLICE_CONFIG_BYTES,
+    POOL_SLICE_HOST_CONFIG_BYTES,
     POOL_SLICE_MAX_LOCAL_READERS,
     POOL_SLICE_MAX_POOL_BLOCKS,
     POOL_SLICE_MAX_STREAM_QUEUES,
@@ -35,6 +37,7 @@ from dae.pool_slice import (
     POOL_SLICE_RECEIVE_BYTES,
     PoolSliceBatchFlags,
     PoolSliceConfig,
+    PoolSliceHostConfig,
     PoolSliceProgram,
     PoolSlicePublishBatch,
     PoolSliceReceiveBatch,
@@ -190,6 +193,22 @@ def test_pool_slice_config_abi_and_ranges():
     ) == POOL_SLICE_CONFIG_BYTES
 
 
+def test_pool_slice_host_config_only_extends_the_data_plane():
+    host = PoolSliceHostConfig(
+        pool=_config(),
+        peers_address=0x1000,
+        producer_generations_address=0x2000,
+        local_lkey=17,
+    )
+    packed = host.pack()
+    assert len(packed) == POOL_SLICE_HOST_CONFIG_BYTES == 224
+    assert packed[:POOL_SLICE_CONFIG_BYTES] == _config().pack()
+
+    abi = (ROOT / "include" / "dae" / "pool_slice_abi.cuh").read_text()
+    assert "sizeof(PoolSliceHostPeer) == 40" in abi
+    assert "sizeof(PoolSliceHostConfig) == 224" in abi
+
+
 def test_group_routes_is_stable_and_slice_offsets_are_composable():
     offsets, rows, origins, weights = group_routes_by_reader(
         [3, 0, 2, 1, 0, 3],
@@ -258,6 +277,21 @@ def test_pool_slice_exchange_is_a_separate_macro_pool_instruction():
         11,
         19,
     ]
+
+    host_weighted = PoolSliceHostWeightedExchange(
+        address,
+        write_barrier=7,
+        dispatch_barrier_base=11,
+        compute_barrier_base=19,
+    )
+    assert _fields(host_weighted)[:4] == [
+        pool_opcode.POOL_SLICE_HOST_WEIGHTED_EXCHANGE,
+        7,
+        11,
+        19,
+    ]
+    assert isinstance(host_weighted, PoolInstruction)
+    assert host_weighted.requires_signal_array
 
 def test_pool_slice_timing_uses_only_vdcores_internal_events():
     profile = torch.zeros((3, 128), dtype=torch.uint64)
@@ -378,6 +412,7 @@ def test_weighted_scatter_bypasses_reduction_for_one_pool_contributor():
 def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
     abi = (ROOT / "include" / "dae" / "pool_slice_abi.cuh").read_text()
+    host_abi = (ROOT / "include" / "dae" / "pool_host_abi.h").read_text()
     python = (ROOT / "python" / "dae" / "pool_slice.py").read_text()
     assert POOL_SLICE_MAX_STREAM_QUEUES == 2
     assert POOL_SLICE_QUEUE_ENTRY_BYTES == 32
@@ -426,6 +461,9 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "pool_ibgda_sg_put_signal_warp(" not in source
     assert "target_group_bytes = 512ULL * 1024" in source
     assert "target_group_rows = 32" in source
+    assert "hostSglRingMaxRows = 512" in host_abi
+    assert "POOL_HOST_RING_MAX_ROWS = 512" in python
+    assert "token_capacity > POOL_HOST_RING_MAX_ROWS" in python
     assert "dae_atomic_fetch_or_acq_rel_gpu(" in source
     assert "index < 3; index += blockDim.x" in source
     assert "index < 4; index += blockDim.x" not in source
@@ -481,13 +519,16 @@ def test_pool_inst_has_its_own_compile_time_warp_type():
     pool_inst = (ROOT / "include" / "dae" / "pipeline" / "poolinst.cuh").read_text()
     assert "struct PoolSliceExchangeExecuteWarp" in pool_inst
     assert "struct PoolSliceWeightedExchangeExecuteWarp" in pool_inst
+    assert "struct PoolSliceHostWeightedExchangeExecuteWarp" in pool_inst
     assert "pool_slice_exchange<false, num_warps>(" in pool_inst
     assert "pool_slice_exchange<true, num_warps>(" in pool_inst
+    assert "pool_slice_host_weighted_exchange<num_warps>(" in pool_inst
     assert "(void)physical_warps;" in pool_inst
     assert "switch (inst.opcode)" not in pool_inst
     registry = (ROOT / "include" / "dae" / "pool_opcode.cuh.inc").read_text()
     assert "PoolSliceExchangeExecuteWarp" in registry
     assert "PoolSliceWeightedExchangeExecuteWarp" in registry
+    assert "PoolSliceHostWeightedExchangeExecuteWarp" in registry
     context = (ROOT / "include" / "dae" / "context.cuh").read_text()
     assert "struct alignas(16) PoolInst" in context
     assert "struct alignas(16) CommInst" in context

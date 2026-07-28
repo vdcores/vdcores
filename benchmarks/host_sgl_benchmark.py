@@ -109,7 +109,7 @@ class HostSglQueue:
             )
         self._library = ctypes.CDLL(str(library_path), use_errno=True)
         self._configure_abi()
-        if self._library.host_sgl_abi_version() != 4:
+        if self._library.host_sgl_abi_version() != 7:
             raise RuntimeError("unsupported host SGL helper ABI")
         error = ctypes.create_string_buffer(_ERROR_BYTES)
         self._handle = self._library.host_sgl_create_qp(
@@ -204,18 +204,85 @@ class HostSglQueue:
             ctypes.c_size_t,
         )
         library.host_sgl_consume_ring.restype = ctypes.c_int
+        library.host_sgl_consume_ring_group.argtypes = (
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_consume_ring_group.restype = ctypes.c_int
+        library.host_sgl_consume_ring_epoch_group.argtypes = (
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_consume_ring_epoch_group.restype = ctypes.c_int
+        library.host_sgl_create_dc.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint8,
+            ctypes.c_uint8,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_create_dc.restype = ctypes.c_void_p
+        library.host_sgl_get_dc_endpoint.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(HostSglEndpoint),
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_get_dc_endpoint.restype = ctypes.c_int
+        library.host_sgl_activate_dct.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(HostSglEndpoint),
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_activate_dct.restype = ctypes.c_int
+        library.host_sgl_connect_dc.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(HostSglEndpoint),
+            ctypes.c_uint32,
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_connect_dc.restype = ctypes.c_int
+        library.host_sgl_dc_max_send_wr.argtypes = (ctypes.c_void_p,)
+        library.host_sgl_dc_max_send_wr.restype = ctypes.c_uint32
+        library.host_sgl_dc_max_sge.argtypes = (ctypes.c_void_p,)
+        library.host_sgl_dc_max_sge.restype = ctypes.c_uint32
+        library.host_sgl_consume_ring_epoch_dc.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            error_pointer,
+            ctypes.c_size_t,
+        )
+        library.host_sgl_consume_ring_epoch_dc.restype = ctypes.c_int
+        library.host_sgl_destroy_dc.argtypes = (ctypes.c_void_p,)
+        library.host_sgl_destroy_dc.restype = None
         library.host_sgl_publish_ring_cuda.argtypes = (
             ctypes.c_void_p,
             ctypes.c_uint64,
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_uint32),
-            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_uint64,
             ctypes.c_uint64,
             ctypes.c_uint32,
-            ctypes.c_uint64,
             ctypes.c_uint64,
             ctypes.c_uint64,
             ctypes.c_uint64,
@@ -224,27 +291,24 @@ class HostSglQueue:
             ctypes.c_size_t,
         )
         library.host_sgl_publish_ring_cuda.restype = ctypes.c_int
-        library.host_sgl_publish_ring_resident_cuda.argtypes = (
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_uint32,
+        library.host_sgl_publish_ring_group_resident_cuda.argtypes = (
+            ctypes.POINTER(ctypes.c_uint64),
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_uint32),
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint64,
-            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint32),
             ctypes.c_uint32,
             ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
             ctypes.c_uint64,
             ctypes.c_uint64,
+            ctypes.c_uint32,
             ctypes.c_uint64,
             ctypes.c_void_p,
             error_pointer,
             ctypes.c_size_t,
         )
-        library.host_sgl_publish_ring_resident_cuda.restype = ctypes.c_int
+        library.host_sgl_publish_ring_group_resident_cuda.restype = ctypes.c_int
         library.host_sgl_destroy_ring.argtypes = (ctypes.c_void_p,)
         library.host_sgl_destroy_ring.restype = None
         library.host_sgl_destroy_qp.argtypes = (ctypes.c_void_p,)
@@ -360,6 +424,107 @@ class HostSglQueue:
             self._handle = None
 
 
+class HostSglDcQueue:
+    """One mlx5 DCI plus one local DCT for all remote PEs."""
+
+    def __init__(
+        self,
+        library_path: Path,
+        *,
+        context: object,
+        pd: object,
+        port: int,
+        gid_index: int,
+        requested_send_wr: int,
+        requested_send_sge: int,
+    ) -> None:
+        if not library_path.is_file():
+            raise FileNotFoundError(
+                f"{library_path} is missing; run make -C benchmarks/host_sgl"
+            )
+        self._library = ctypes.CDLL(str(library_path), use_errno=True)
+        HostSglQueue._configure_abi(self)
+        if self._library.host_sgl_abi_version() != 7:
+            raise RuntimeError("unsupported host SGL helper ABI")
+        error = ctypes.create_string_buffer(_ERROR_BYTES)
+        self._handle = self._library.host_sgl_create_dc(
+            ctypes.c_void_p(_pointer_value(context)),
+            ctypes.c_void_p(_pointer_value(pd)),
+            int(port),
+            int(gid_index),
+            int(requested_send_wr),
+            int(requested_send_sge),
+            error,
+            len(error),
+        )
+        if not self._handle:
+            raise RuntimeError(f"host_sgl_create_dc: {error.value.decode()}")
+
+    @property
+    def max_send_wr(self) -> int:
+        return int(self._library.host_sgl_dc_max_send_wr(self._handle))
+
+    @property
+    def max_sge(self) -> int:
+        return int(self._library.host_sgl_dc_max_sge(self._handle))
+
+    def endpoint(self) -> HostSglEndpoint:
+        endpoint = HostSglEndpoint()
+        error = ctypes.create_string_buffer(_ERROR_BYTES)
+        result = self._library.host_sgl_get_dc_endpoint(
+            self._handle, ctypes.byref(endpoint), error, len(error)
+        )
+        if result != 0:
+            detail = error.value.decode() or f"error code {result}"
+            raise RuntimeError(f"host_sgl_get_dc_endpoint: {detail}")
+        return endpoint
+
+    def connect(self, endpoints: list[HostSglEndpoint]) -> None:
+        if not endpoints:
+            raise ValueError("DC requires at least one remote DCT")
+        endpoint_array = (HostSglEndpoint * len(endpoints))(*endpoints)
+        error = ctypes.create_string_buffer(_ERROR_BYTES)
+        result = self._library.host_sgl_connect_dc(
+            self._handle,
+            endpoint_array,
+            len(endpoints),
+            error,
+            len(error),
+        )
+        if result != 0:
+            detail = error.value.decode() or f"error code {result}"
+            raise RuntimeError(f"host_sgl_connect_dc: {detail}")
+
+    def activate_target(self, endpoint: HostSglEndpoint) -> None:
+        error = ctypes.create_string_buffer(_ERROR_BYTES)
+        result = self._library.host_sgl_activate_dct(
+            self._handle, ctypes.byref(endpoint), error, len(error)
+        )
+        if result != 0:
+            detail = error.value.decode() or f"error code {result}"
+            raise RuntimeError(f"host_sgl_activate_dct: {detail}")
+
+    def create_coherent_ring(self) -> "HostSglCoherentRing":
+        error = ctypes.create_string_buffer(_ERROR_BYTES)
+        handle = self._library.host_sgl_create_ring(error, len(error))
+        if not handle:
+            raise RuntimeError(
+                f"host_sgl_create_ring: {error.value.decode()}"
+            )
+        memory = self._library.host_sgl_ring_memory(handle)
+        if not memory:
+            self._library.host_sgl_destroy_ring(handle)
+            raise RuntimeError("host_sgl_ring_memory returned null")
+        return HostSglCoherentRing(
+            self._library, handle=handle, memory=memory
+        )
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            self._library.host_sgl_destroy_dc(self._handle)
+            self._handle = None
+
+
 class HostSglCoherentRing:
     def __init__(self, library: ctypes.CDLL, *, handle: int, memory: int) -> None:
         self._library = library
@@ -369,6 +534,7 @@ class HostSglCoherentRing:
     def publish(
         self,
         row_indices: torch.Tensor,
+        route_groups: torch.Tensor,
         *,
         first_generation: int,
         local_lkey: int,
@@ -377,16 +543,23 @@ class HostSglCoherentRing:
         source_stride: int,
         row_bytes: int,
         remote_data_base: int,
-        remote_data_stride: int,
         remote_signal_base: int,
         remote_signal_stride: int,
         stream: torch.cuda.Stream,
     ) -> None:
-        if row_indices.dtype != torch.uint32 or row_indices.ndim != 2:
-            raise ValueError("ring row indices must be a 2D uint32 tensor")
+        if row_indices.dtype != torch.uint32 or row_indices.ndim != 1:
+            raise ValueError("ring row indices must be a 1D uint32 tensor")
         if not row_indices.is_cuda or not row_indices.is_contiguous():
             raise ValueError("ring row indices must be contiguous CUDA memory")
-        message_count, row_count = row_indices.shape
+        if (
+            route_groups.dtype != torch.uint32
+            or route_groups.ndim != 2
+            or route_groups.shape[1] != 4
+            or not route_groups.is_cuda
+            or not route_groups.is_contiguous()
+        ):
+            raise ValueError("route groups must be contiguous CUDA uint32[M, 4]")
+        message_count = route_groups.shape[0]
         error = ctypes.create_string_buffer(_ERROR_BYTES)
         result = self._library.host_sgl_publish_ring_cuda(
             self._memory,
@@ -396,14 +569,16 @@ class HostSglCoherentRing:
                 ctypes.c_void_p(row_indices.data_ptr()),
                 ctypes.POINTER(ctypes.c_uint32),
             ),
-            int(row_count),
+            ctypes.cast(
+                ctypes.c_void_p(route_groups.data_ptr()),
+                ctypes.POINTER(ctypes.c_uint32),
+            ),
             int(local_lkey),
             int(remote_rkey),
             int(source_base),
             int(source_stride),
             int(row_bytes),
             int(remote_data_base),
-            int(remote_data_stride),
             int(remote_signal_base),
             int(remote_signal_stride),
             ctypes.c_void_p(int(stream.cuda_stream)),
@@ -437,65 +612,215 @@ class HostSglCoherentRing:
             raise RuntimeError(f"host_sgl_consume_ring: {detail}")
         return int(data_wrs.value)
 
-    def publish_resident(
-        self,
-        row_indices: torch.Tensor,
-        *,
-        first_generation: int,
-        round_count: int,
-        local_lkey: int,
-        remote_rkey: int,
-        source_base: int,
-        source_stride: int,
-        row_bytes: int,
-        remote_data_base: int,
-        remote_data_stride: int,
-        remote_signal_base: int,
-        remote_signal_stride: int,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        if row_indices.dtype != torch.uint32 or row_indices.ndim != 2:
-            raise ValueError("ring row indices must be a 2D uint32 tensor")
-        if not row_indices.is_cuda or not row_indices.is_contiguous():
-            raise ValueError("ring row indices must be contiguous CUDA memory")
-        if round_count <= 0:
-            raise ValueError("resident ring round_count must be positive")
-        message_count, row_count = row_indices.shape
-        error = ctypes.create_string_buffer(_ERROR_BYTES)
-        result = self._library.host_sgl_publish_ring_resident_cuda(
-            self._memory,
-            int(first_generation),
-            int(round_count),
-            int(message_count),
-            ctypes.cast(
-                ctypes.c_void_p(row_indices.data_ptr()),
-                ctypes.POINTER(ctypes.c_uint32),
-            ),
-            int(row_count),
-            int(local_lkey),
-            int(remote_rkey),
-            int(source_base),
-            int(source_stride),
-            int(row_bytes),
-            int(remote_data_base),
-            int(remote_data_stride),
-            int(remote_signal_base),
-            int(remote_signal_stride),
-            ctypes.c_void_p(int(stream.cuda_stream)),
-            error,
-            len(error),
-        )
-        if result != 0:
-            detail = error.value.decode() or f"error code {result}"
-            raise RuntimeError(
-                f"host_sgl_publish_ring_resident_cuda: {detail}"
-            )
-
     def close(self) -> None:
         if self._handle is not None:
             self._library.host_sgl_destroy_ring(self._handle)
             self._handle = None
             self._memory = None
+
+
+class HostSglRingGroup:
+    """Persistent ctypes view for one Grace progress loop's peer QPs."""
+
+    def __init__(
+        self,
+        queues: list[HostSglQueue],
+        rings: list[HostSglCoherentRing],
+        request_counts: list[int],
+    ) -> None:
+        count = len(queues)
+        if count == 0 or len(rings) != count or len(request_counts) != count:
+            raise ValueError("ring groups require one nonempty entry per peer")
+        self._library = queues[0]._library
+        self._count = count
+        self._request_counts = tuple(request_counts)
+        self._queue_handles = (ctypes.c_void_p * count)(
+            *(queue._handle for queue in queues)
+        )
+        self._ring_handles = (ctypes.c_void_p * count)(
+            *(ring._handle for ring in rings)
+        )
+        self._generations = (ctypes.c_uint64 * count)()
+        self._counts = (ctypes.c_uint32 * count)(*request_counts)
+        self._posted_data_wrs = (ctypes.c_uint32 * count)()
+        self._error = ctypes.create_string_buffer(_ERROR_BYTES)
+
+    def consume(self, round_index: int) -> None:
+        for index, count in enumerate(self._request_counts):
+            self._generations[index] = round_index * count + 1
+        result = self._library.host_sgl_consume_ring_group(
+            self._queue_handles,
+            self._ring_handles,
+            self._count,
+            self._generations,
+            self._counts,
+            self._posted_data_wrs,
+            self._error,
+            len(self._error),
+        )
+        if result != 0:
+            detail = self._error.value.decode() or f"error code {result}"
+            raise RuntimeError(f"host_sgl_consume_ring_group: {detail}")
+
+    @property
+    def posted_data_wrs(self) -> list[int]:
+        return list(self._posted_data_wrs)
+
+
+class HostSglEpochRingGroup:
+    """Persistent Grace progress state terminated by ordered ring markers."""
+
+    def __init__(
+        self,
+        queues: list[HostSglQueue],
+        rings: list[HostSglCoherentRing],
+    ) -> None:
+        count = len(queues)
+        if count == 0 or len(rings) != count:
+            raise ValueError("epoch ring groups require one entry per peer")
+        self._library = queues[0]._library
+        self._count = count
+        self._queue_handles = (ctypes.c_void_p * count)(
+            *(queue._handle for queue in queues)
+        )
+        self._ring_handles = (ctypes.c_void_p * count)(
+            *(ring._handle for ring in rings)
+        )
+        self._posted_data_wrs = (ctypes.c_uint32 * count)()
+        self._error = ctypes.create_string_buffer(_ERROR_BYTES)
+
+    def consume(self) -> None:
+        result = self._library.host_sgl_consume_ring_epoch_group(
+            self._queue_handles,
+            self._ring_handles,
+            self._count,
+            self._posted_data_wrs,
+            self._error,
+            len(self._error),
+        )
+        if result != 0:
+            detail = self._error.value.decode() or f"error code {result}"
+            raise RuntimeError(
+                f"host_sgl_consume_ring_epoch_group: {detail}"
+            )
+
+    @property
+    def posted_data_wrs(self) -> list[int]:
+        return list(self._posted_data_wrs)
+
+
+class HostSglDcEpochRingGroup:
+    """One DCI progresses ordered rings targeting multiple remote DCTs."""
+
+    def __init__(
+        self,
+        queue: HostSglDcQueue,
+        rings: list[HostSglCoherentRing],
+    ) -> None:
+        if not rings:
+            raise ValueError("DC epoch groups require at least one peer ring")
+        self._library = queue._library
+        self._queue_handle = queue._handle
+        self._count = len(rings)
+        self._ring_handles = (ctypes.c_void_p * self._count)(
+            *(ring._handle for ring in rings)
+        )
+        self._posted_data_wrs = (ctypes.c_uint32 * self._count)()
+        self._error = ctypes.create_string_buffer(_ERROR_BYTES)
+
+    def consume(self) -> None:
+        result = self._library.host_sgl_consume_ring_epoch_dc(
+            self._queue_handle,
+            self._ring_handles,
+            self._count,
+            self._posted_data_wrs,
+            self._error,
+            len(self._error),
+        )
+        if result != 0:
+            detail = self._error.value.decode() or f"error code {result}"
+            raise RuntimeError(f"host_sgl_consume_ring_epoch_dc: {detail}")
+
+    @property
+    def posted_data_wrs(self) -> list[int]:
+        return list(self._posted_data_wrs)
+
+
+def publish_ring_group_resident(
+    rings: list[HostSglCoherentRing],
+    peer_routes: torch.Tensor,
+    row_indices: torch.Tensor,
+    route_groups: torch.Tensor,
+    *,
+    first_generation: int,
+    round_count: int,
+    local_lkey: int,
+    source_base: int,
+    source_stride: int,
+    row_bytes: int,
+    remote_signal_stride: int,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Publish every peer queue from one resident eight-warp CTA."""
+
+    if not rings:
+        raise ValueError("resident group publication requires a peer ring")
+    if (
+        peer_routes.dtype != torch.uint64
+        or peer_routes.ndim != 2
+        or peer_routes.shape[1] != 6
+        or not peer_routes.is_cuda
+        or not peer_routes.is_contiguous()
+    ):
+        raise ValueError("peer routes must be contiguous CUDA uint64[P, 6]")
+    if (
+        row_indices.dtype != torch.uint32
+        or row_indices.ndim != 1
+        or not row_indices.is_cuda
+        or not row_indices.is_contiguous()
+    ):
+        raise ValueError("row indices must be contiguous CUDA uint32[R]")
+    if (
+        route_groups.dtype != torch.uint32
+        or route_groups.ndim != 2
+        or route_groups.shape[1] != 4
+        or not route_groups.is_cuda
+        or not route_groups.is_contiguous()
+    ):
+        raise ValueError("route groups must be contiguous CUDA uint32[M, 4]")
+    error = ctypes.create_string_buffer(_ERROR_BYTES)
+    library = rings[0]._library
+    result = library.host_sgl_publish_ring_group_resident_cuda(
+        ctypes.cast(
+            ctypes.c_void_p(peer_routes.data_ptr()),
+            ctypes.POINTER(ctypes.c_uint64),
+        ),
+        int(peer_routes.shape[0]),
+        ctypes.cast(
+            ctypes.c_void_p(row_indices.data_ptr()),
+            ctypes.POINTER(ctypes.c_uint32),
+        ),
+        ctypes.cast(
+            ctypes.c_void_p(route_groups.data_ptr()),
+            ctypes.POINTER(ctypes.c_uint32),
+        ),
+        int(route_groups.shape[0]),
+        int(first_generation),
+        int(round_count),
+        int(local_lkey),
+        int(source_base),
+        int(source_stride),
+        int(row_bytes),
+        int(remote_signal_stride),
+        ctypes.c_void_p(int(stream.cuda_stream)),
+        error,
+        len(error),
+    )
+    if result != 0:
+        detail = error.value.decode() or f"error code {result}"
+        raise RuntimeError(
+            f"host_sgl_publish_ring_group_resident_cuda: {detail}"
+        )
 
 
 def _collective_call(comm: MPI.Comm, stage: str, function: Callable[[], _T]) -> _T:
@@ -717,10 +1042,20 @@ def main() -> None:
             for rotation in range(args.batch_depth)
         ]
         ring_route_indices = None
+        ring_route_groups = None
         if args.submission in {"both", "ring", "resident"}:
+            message_routes = [
+                route_lists[message % args.batch_depth]
+                for message in range(messages_per_round)
+            ]
             ring_route_indices = torch.tensor(
+                message_routes,
+                dtype=torch.uint32,
+                device=storage.device,
+            ).reshape(-1)
+            ring_route_groups = torch.tensor(
                 [
-                    route_lists[message % args.batch_depth]
+                    (message * args.rows, args.rows, message * args.rows, 0)
                     for message in range(messages_per_round)
                 ],
                 dtype=torch.uint32,
@@ -900,7 +1235,11 @@ def main() -> None:
             )
 
         def run_ring_once(first_generation: int) -> tuple[float, int]:
-            if ring is None or ring_route_indices is None:
+            if (
+                ring is None
+                or ring_route_indices is None
+                or ring_route_groups is None
+            ):
                 raise RuntimeError("coherent ring was not initialized")
             destination.zero_()
             signal.zero_()
@@ -914,6 +1253,7 @@ def main() -> None:
                 start_ns = time.perf_counter_ns()
                 ring.publish(
                     ring_route_indices,
+                    ring_route_groups,
                     first_generation=first_generation,
                     local_lkey=int(mr.lkey),
                     remote_rkey=remote_rkey,
@@ -921,7 +1261,6 @@ def main() -> None:
                     source_stride=source_stride,
                     row_bytes=args.row_bytes,
                     remote_data_base=remote_base + destination_offset,
-                    remote_data_stride=message_bytes,
                     remote_signal_base=remote_base + signal_offset,
                     remote_signal_stride=8,
                     stream=torch.cuda.current_stream(storage.device),
@@ -1042,25 +1381,42 @@ def main() -> None:
                 )
 
         if args.submission == "resident" and "sgl" in modes:
-            if ring is None or ring_route_indices is None:
+            if (
+                ring is None
+                or ring_route_indices is None
+                or ring_route_groups is None
+            ):
                 raise RuntimeError("coherent ring was not initialized")
             total_rounds = args.warmup + args.iterations
             destination.zero_()
             signal.zero_()
             torch.cuda.synchronize(runtime.device)
             comm.Barrier()
-            ring.publish_resident(
+            peer_routes = torch.tensor(
+                [
+                    (
+                        int(ring._memory),
+                        int(remote_base + destination_offset),
+                        int(remote_base + signal_offset),
+                        int(remote_rkey),
+                        0,
+                        messages_per_round,
+                    )
+                ],
+                dtype=torch.uint64,
+                device=storage.device,
+            )
+            publish_ring_group_resident(
+                [ring],
+                peer_routes,
                 ring_route_indices,
+                ring_route_groups,
                 first_generation=1,
                 round_count=total_rounds,
                 local_lkey=int(mr.lkey),
-                remote_rkey=remote_rkey,
                 source_base=storage.data_ptr(),
                 source_stride=source_stride,
                 row_bytes=args.row_bytes,
-                remote_data_base=remote_base + destination_offset,
-                remote_data_stride=message_bytes,
-                remote_signal_base=remote_base + signal_offset,
                 remote_signal_stride=8,
                 stream=torch.cuda.current_stream(storage.device),
             )

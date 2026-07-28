@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.cuh"
+#include "pool_host.cuh"
 #include "pool_signal.cuh"
 #include "pool_slice_abi.cuh"
 #include "scoped_atomic.cuh"
@@ -614,10 +615,12 @@ static __device__ __forceinline__ bool pool_slice_stream_decode_send_task(
 // authoritative source token slots; no source-side activation staging is
 // materialized. Public-NVSHMEM groups publish readiness after CTA-local quiet;
 // each readiness generation names exactly the compact rows it protects.
+template <bool HostDataPlane>
 static __device__ __noinline__ void pool_slice_stream_send_group(
     uint32_t target_pe,
     uint32_t group,
     const PoolSliceConfig& config,
+    const PoolSliceHostConfig* host_config,
     const uint8_t* token_pool,
     uint8_t* delivery_pool,
     const uint32_t* send_token_rows,
@@ -671,6 +674,64 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
 
   const uint32_t* target_rows = send_token_rows +
       static_cast<uint64_t>(target_pe) * config.token_capacity;
+  if constexpr (HostDataPlane) {
+    for (uint32_t packed_row = row_begin + thread_id;
+         packed_row < row_end;
+         packed_row += blockDim.x) {
+      const uint32_t source_row = target_rows[packed_row];
+      if (source_row >= config.token_capacity) {
+        atomicCAS(
+            shared_status,
+            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+        continue;
+      }
+      const uint32_t chunk = source_row / config.write_chunk_rows;
+      while (!pool_signal_ready(bars + write_barrier + chunk))
+        __nanosleep(barrierPollSleepCycles);
+    }
+    __syncthreads();
+    if (warp == 0) {
+      const auto* peers = reinterpret_cast<const PoolSliceHostPeer*>(
+          host_config->peers_address);
+      auto* generations = reinterpret_cast<uint64_t*>(
+          host_config->producer_generations_address);
+      const PoolSliceHostPeer peer = peers[target_pe];
+      const uint64_t generation = pool_host_reserve_generation_warp(
+          generations + target_pe, lane);
+      uint64_t* local_ready = pool_slice_stream_data_ready(
+          control, config.my_pe, group);
+      const uint64_t ready_offset =
+          reinterpret_cast<uint64_t>(local_ready) - config.control_address;
+      pool_host_publish_request_warp<true>(
+          reinterpret_cast<HostSglRingMemory*>(peer.ring_memory),
+          generation,
+          target_rows,
+          row_begin,
+          row_end - row_begin,
+          host_config->local_lkey,
+          static_cast<uint32_t>(peer.remote_rkey),
+          config.token_pool_address,
+          config.row_bytes,
+          config.row_bytes,
+          peer.remote_delivery_address +
+              (static_cast<uint64_t>(config.my_pe) * config.token_capacity +
+               row_begin) * config.row_bytes,
+          peer.remote_control_address + ready_offset,
+          sequence,
+          lane);
+    }
+    __syncthreads();
+    if (thread_id == 0) {
+      atomicAdd(
+          reinterpret_cast<unsigned long long*>(
+              control + poolSliceControlStreamSendDone),
+          1ULL);
+    }
+    __syncthreads();
+    return;
+  }
+
   uint32_t waited_chunk = UINT32_MAX;
   for (uint32_t packed_row = row_begin + warp;
        packed_row < row_end;
@@ -1260,9 +1321,10 @@ pool_slice_weighted_return_group_count(
 // reduce the at-most-one partial per destination slice at the source. PoolInst
 // rank modulo PE owns the source and rank/PE owns its shard; this static map
 // removes the destination-wide quiet and makes expected readiness local math.
-template <uint32_t TotalWarps>
+template <bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_return_weighted(
     const PoolSliceConfig& config,
+    const PoolSliceHostConfig* host_config,
     int* bars,
     uint64_t* g_events,
     uint32_t compute_barrier_base,
@@ -1424,14 +1486,44 @@ static __device__ __noinline__ void pool_slice_return_weighted(
         if (lane == 0)
           pool_slice_signal_release_local(ready, sequence);
       } else {
-        nvshmemx_putmem_signal_nbi_warp(
-            destination,
-            source,
-            static_cast<size_t>(bytes),
-            ready,
-            sequence,
-            NVSHMEM_SIGNAL_SET,
-            source_pe);
+        if constexpr (HostDataPlane) {
+          const auto* peers = reinterpret_cast<const PoolSliceHostPeer*>(
+              host_config->peers_address);
+          auto* generations = reinterpret_cast<uint64_t*>(
+              host_config->producer_generations_address);
+          const PoolSliceHostPeer peer = peers[source_pe];
+          const uint64_t generation = pool_host_reserve_generation_warp(
+              generations + source_pe, lane);
+          const uint64_t ready_offset =
+              reinterpret_cast<uint64_t>(ready) - config.control_address;
+          pool_host_publish_request_warp<false>(
+              reinterpret_cast<HostSglRingMemory*>(peer.ring_memory),
+              generation,
+              nullptr,
+              group_row_begin,
+              group_row_end - group_row_begin,
+              host_config->local_lkey,
+              static_cast<uint32_t>(peer.remote_rkey),
+              reinterpret_cast<uint64_t>(partial_output),
+              config.row_bytes,
+              config.row_bytes,
+              peer.remote_return_inbox_address +
+                  (static_cast<uint64_t>(config.my_pe) *
+                       config.token_capacity +
+                   group_row_begin) * config.row_bytes,
+              peer.remote_control_address + ready_offset,
+              sequence,
+              lane);
+        } else {
+          nvshmemx_putmem_signal_nbi_warp(
+              destination,
+              source,
+              static_cast<size_t>(bytes),
+              ready,
+              sequence,
+              NVSHMEM_SIGNAL_SET,
+              source_pe);
+        }
       }
     }
   }
@@ -2206,9 +2298,10 @@ static __device__ __noinline__ void pool_slice_return_unweighted(
 // begin before either the local send plane or the global sender set closes.
 // Ordered END bits alone retire the dynamic read and release ordinary VDCores
 // readers; the destination never reconstructs producer group counts.
-template <bool WeightedReturn, uint32_t TotalWarps>
+template <bool WeightedReturn, bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_exchange_streaming(
     const PoolSliceConfig& config,
+    const PoolSliceHostConfig* host_config,
     int* bars,
     uint64_t* signal_array,
     uint64_t* g_events,
@@ -2546,10 +2639,11 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
                 send_token_counts,
                 &target_pe,
                 &group)) {
-          pool_slice_stream_send_group(
+          pool_slice_stream_send_group<HostDataPlane>(
               target_pe,
               group,
               config,
+              host_config,
               token_pool,
               delivery_pool,
               send_token_rows,
@@ -2779,8 +2873,9 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   pool_slice_wait_value_warp(
       control + poolSliceControlDispatchReady, sequence, lane);
   if constexpr (WeightedReturn) {
-    pool_slice_return_weighted<TotalWarps>(
+    pool_slice_return_weighted<HostDataPlane, TotalWarps>(
         config,
+        host_config,
         bars,
         g_events,
         compute_barrier_base,
@@ -2825,8 +2920,9 @@ static __device__ __noinline__ void pool_slice_exchange(
   const PoolSliceConfig& config = shared_config;
   const uint64_t sequence = pool_slice_sequence(config);
   const uint64_t return_value = sequence;
-  pool_slice_exchange_streaming<WeightedReturn, TotalWarps>(
+  pool_slice_exchange_streaming<WeightedReturn, false, TotalWarps>(
       config,
+      nullptr,
       bars,
       signal_array,
       g_events,
@@ -2836,4 +2932,62 @@ static __device__ __noinline__ void pool_slice_exchange(
       thread_id,
       sequence,
       return_value);
+}
+
+// Host-routed EP is a distinct compile-time PoolInst. It reuses the complete
+// base metadata/gather/reduce/scatter state machine and substitutes only the
+// payload+ready publication sites above.
+template <uint32_t TotalWarps>
+static __device__ __noinline__ void pool_slice_host_weighted_exchange(
+    const PoolSliceHostConfig* config_pointer,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* g_events,
+    uint32_t write_barrier,
+    uint32_t dispatch_barrier_base,
+    uint32_t compute_barrier_base,
+    uint32_t thread_id) {
+  static_assert(TotalWarps >= 3, "PoolInst requires coordinator plus workers");
+  __shared__ PoolSliceHostConfig shared_host_config;
+
+  if (thread_id == 0)
+    shared_host_config = *config_pointer;
+  __syncthreads();
+
+  const PoolSliceConfig& config = shared_host_config.pool;
+  const uint64_t sequence = pool_slice_sequence(config);
+  pool_slice_exchange_streaming<true, true, TotalWarps>(
+      config,
+      &shared_host_config,
+      bars,
+      signal_array,
+      g_events,
+      write_barrier,
+      dispatch_barrier_base,
+      compute_barrier_base,
+      thread_id,
+      sequence,
+      sequence);
+
+  const uint32_t lane = thread_id & 31U;
+  const uint32_t warp = thread_id >> 5;
+  if (config.pool_rank == 0 && warp == 0 && lane < config.num_pes &&
+      lane != config.my_pe) {
+    const auto* peers = reinterpret_cast<const PoolSliceHostPeer*>(
+        shared_host_config.peers_address);
+    auto* generations = reinterpret_cast<uint64_t*>(
+        shared_host_config.producer_generations_address);
+    const PoolSliceHostPeer peer = peers[lane];
+    pool_host_publish_epoch_end_thread(
+        reinterpret_cast<HostSglRingMemory*>(peer.ring_memory),
+        generations + lane,
+        sequence);
+  }
+  if (config.pool_rank == 0 && warp == 0) {
+    __syncwarp();
+    if (lane == 0 && g_events != nullptr) {
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileDone] = cuda::ptx::get_sreg_globaltimer();
+    }
+  }
 }

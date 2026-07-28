@@ -35,14 +35,13 @@ __device__ __forceinline__ void publish_ring_request(
     uint64_t generation,
     uint32_t message,
     const uint32_t* source_row_indices,
-    uint32_t row_count,
+    HostSglRouteGroup group,
     uint32_t local_lkey,
     uint32_t remote_rkey,
     uint64_t source_base,
     uint64_t source_stride,
     uint32_t row_bytes,
     uint64_t remote_data_base,
-    uint64_t remote_data_stride,
     uint64_t remote_signal_base,
     uint64_t remote_signal_stride) {
   const uint32_t lane = threadIdx.x & 31U;
@@ -61,9 +60,9 @@ __device__ __forceinline__ void publish_ring_request(
   uint32_t* destination_indices = indices +
       static_cast<uint64_t>((generation - 1) % hostSglRingCapacity) *
           hostSglRingMaxRows;
-  for (uint32_t row = lane; row < row_count; row += 32) {
+  for (uint32_t row = lane; row < group.row_count; row += 32) {
     destination_indices[row] = source_row_indices[
-        static_cast<uint64_t>(message) * row_count + row];
+        static_cast<uint64_t>(group.source_row_begin) + row];
   }
   if (lane == 0) {
     HostSglRequest& request = slot.request;
@@ -72,9 +71,10 @@ __device__ __forceinline__ void publish_ring_request(
     request.source_base = source_base;
     request.source_stride = source_stride;
     request.row_bytes = row_bytes;
-    request.row_count = row_count;
+    request.row_count = group.row_count;
     request.remote_data =
-        remote_data_base + static_cast<uint64_t>(message) * remote_data_stride;
+        remote_data_base +
+        static_cast<uint64_t>(group.remote_row_begin) * row_bytes;
     request.remote_signal = remote_signal_base +
         static_cast<uint64_t>(message) * remote_signal_stride;
     request.sequence = generation;
@@ -90,14 +90,13 @@ __global__ void publish_ring_requests(
     uint64_t first_generation,
     uint32_t message_count,
     const uint32_t* source_row_indices,
-    uint32_t row_count,
+    const HostSglRouteGroup* route_groups,
     uint32_t local_lkey,
     uint32_t remote_rkey,
     uint64_t source_base,
     uint64_t source_stride,
     uint32_t row_bytes,
     uint64_t remote_data_base,
-    uint64_t remote_data_stride,
     uint64_t remote_signal_base,
     uint64_t remote_signal_stride) {
   const uint32_t message = blockIdx.x;
@@ -110,64 +109,58 @@ __global__ void publish_ring_requests(
       generation,
       message,
       source_row_indices,
-      row_count,
+      route_groups[message],
       local_lkey,
       remote_rkey,
       source_base,
       source_stride,
       row_bytes,
       remote_data_base,
-      remote_data_stride,
       remote_signal_base,
       remote_signal_stride);
 }
 
-// One communication-specialized CTA models a resident PoolInst producer.
-// Eight warps publish each fixed-size inference round, then advance together;
-// the kernel retires after the statically known number of rounds.
-__global__ void publish_ring_requests_resident(
-    HostSglRingSlot* slots,
-    uint32_t* indices,
+// One communication-specialized CTA publishes every peer ring. Route groups
+// already name their peer and compact destination offset, so device work is a
+// flat warp-strided loop with no per-QP kernel or stream.
+__global__ void publish_ring_group_resident(
+    const HostSglPeerRoute* peers,
+    const uint32_t* source_row_indices,
+    const HostSglRouteGroup* route_groups,
+    uint32_t group_count,
     uint64_t first_generation,
     uint32_t round_count,
-    uint32_t message_count,
-    const uint32_t* source_row_indices,
-    uint32_t row_count,
     uint32_t local_lkey,
-    uint32_t remote_rkey,
     uint64_t source_base,
     uint64_t source_stride,
     uint32_t row_bytes,
-    uint64_t remote_data_base,
-    uint64_t remote_data_stride,
-    uint64_t remote_signal_base,
     uint64_t remote_signal_stride) {
   const uint32_t warp = threadIdx.x >> 5;
   constexpr uint32_t resident_warps = 8;
   for (uint32_t round = 0; round < round_count; ++round) {
-    for (uint32_t message = warp;
-         message < message_count;
-         message += resident_warps) {
+    for (uint32_t task = warp; task < group_count; task += resident_warps) {
+      const HostSglRouteGroup group = route_groups[task];
+      const HostSglPeerRoute peer = peers[group.peer_index];
+      const uint32_t message = task - static_cast<uint32_t>(peer.group_begin);
+      auto* memory = reinterpret_cast<HostSglRingMemory*>(peer.ring_memory);
       const uint64_t generation = first_generation +
-          static_cast<uint64_t>(round) * message_count + message;
+          static_cast<uint64_t>(round) * peer.group_count + message;
       publish_ring_request(
-          slots,
-          indices,
+          reinterpret_cast<HostSglRingSlot*>(memory->slots_address),
+          reinterpret_cast<uint32_t*>(memory->indices_address),
           generation,
           message,
           source_row_indices,
-          row_count,
+          group,
           local_lkey,
-          remote_rkey,
+          static_cast<uint32_t>(peer.remote_rkey),
           source_base,
           source_stride,
           row_bytes,
-          remote_data_base,
-          remote_data_stride,
-          remote_signal_base,
+          peer.remote_data_base,
+          peer.remote_signal_base,
           remote_signal_stride);
     }
-    __syncthreads();
   }
 }
 
@@ -188,14 +181,13 @@ extern "C" int host_sgl_publish_ring_cuda(
     uint64_t first_generation,
     uint32_t message_count,
     const uint32_t* source_row_indices,
-    uint32_t row_count,
+    const HostSglRouteGroup* route_groups,
     uint32_t local_lkey,
     uint32_t remote_rkey,
     uint64_t source_base,
     uint64_t source_stride,
     uint32_t row_bytes,
     uint64_t remote_data_base,
-    uint64_t remote_data_stride,
     uint64_t remote_signal_base,
     uint64_t remote_signal_stride,
     void* stream_pointer,
@@ -204,8 +196,8 @@ extern "C" int host_sgl_publish_ring_cuda(
   auto* memory = static_cast<HostSglRingMemory*>(memory_pointer);
   if (memory == nullptr || first_generation == 0 || message_count == 0 ||
       message_count > hostSglRingMaxMessages ||
-      source_row_indices == nullptr || row_count == 0 ||
-      row_count > hostSglRingMaxRows || source_stride < row_bytes ||
+      source_row_indices == nullptr || route_groups == nullptr ||
+      source_stride < row_bytes ||
       row_bytes == 0 || source_base == 0 || remote_data_base == 0 ||
       remote_signal_base == 0) {
     set_cuda_error(error, error_bytes, "invalid coherent-ring publication");
@@ -218,14 +210,13 @@ extern "C" int host_sgl_publish_ring_cuda(
       first_generation,
       message_count,
       source_row_indices,
-      row_count,
+      route_groups,
       local_lkey,
       remote_rkey,
       source_base,
       source_stride,
       row_bytes,
       remote_data_base,
-      remote_data_stride,
       remote_signal_base,
       remote_signal_stride);
   const cudaError_t result = cudaPeekAtLastError();
@@ -237,57 +228,47 @@ extern "C" int host_sgl_publish_ring_cuda(
   return 0;
 }
 
-extern "C" int host_sgl_publish_ring_resident_cuda(
-    void* memory_pointer,
+extern "C" int host_sgl_publish_ring_group_resident_cuda(
+    const HostSglPeerRoute* peers,
+    uint32_t peer_count,
+    const uint32_t* source_row_indices,
+    const HostSglRouteGroup* route_groups,
+    uint32_t group_count,
     uint64_t first_generation,
     uint32_t round_count,
-    uint32_t message_count,
-    const uint32_t* source_row_indices,
-    uint32_t row_count,
     uint32_t local_lkey,
-    uint32_t remote_rkey,
     uint64_t source_base,
     uint64_t source_stride,
     uint32_t row_bytes,
-    uint64_t remote_data_base,
-    uint64_t remote_data_stride,
-    uint64_t remote_signal_base,
     uint64_t remote_signal_stride,
     void* stream_pointer,
     char* error,
     size_t error_bytes) {
-  auto* memory = static_cast<HostSglRingMemory*>(memory_pointer);
-  if (memory == nullptr || first_generation == 0 || round_count == 0 ||
-      message_count == 0 || message_count > hostSglRingMaxMessages ||
-      source_row_indices == nullptr || row_count == 0 ||
-      row_count > hostSglRingMaxRows || source_stride < row_bytes ||
-      row_bytes == 0 || source_base == 0 || remote_data_base == 0 ||
-      remote_signal_base == 0) {
+  if (peers == nullptr || peer_count == 0 || peer_count > 32 ||
+      source_row_indices == nullptr || route_groups == nullptr ||
+      group_count == 0 || first_generation == 0 || round_count == 0 ||
+      source_stride < row_bytes || row_bytes == 0 || source_base == 0 ||
+      remote_signal_stride == 0) {
     set_cuda_error(
-        error, error_bytes, "invalid resident coherent-ring publication");
+        error, error_bytes, "invalid resident coherent-ring group publication");
     return -1;
   }
   auto stream = reinterpret_cast<cudaStream_t>(stream_pointer);
-  publish_ring_requests_resident<<<1, 256, 0, stream>>>(
-      reinterpret_cast<HostSglRingSlot*>(memory->slots_address),
-      reinterpret_cast<uint32_t*>(memory->indices_address),
+  publish_ring_group_resident<<<1, 256, 0, stream>>>(
+      peers,
+      source_row_indices,
+      route_groups,
+      group_count,
       first_generation,
       round_count,
-      message_count,
-      source_row_indices,
-      row_count,
       local_lkey,
-      remote_rkey,
       source_base,
       source_stride,
       row_bytes,
-      remote_data_base,
-      remote_data_stride,
-      remote_signal_base,
       remote_signal_stride);
   const cudaError_t result = cudaPeekAtLastError();
   if (result != cudaSuccess) {
-    set_cuda_error(error, error_bytes, "publish_ring_requests_resident: %s",
+    set_cuda_error(error, error_bytes, "publish_ring_group_resident: %s",
                    cudaGetErrorString(result));
     return static_cast<int>(result);
   }

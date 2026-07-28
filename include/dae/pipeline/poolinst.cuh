@@ -67,3 +67,28 @@ struct PoolSliceWeightedExchangeExecuteWarp {
         thread_id);
   }
 };
+
+struct PoolSliceHostWeightedExchangeExecuteWarp {
+  static constexpr uint16_t opcode = POOL_SLICE_HOST_WEIGHTED_EXCHANGE;
+  static constexpr uint32_t num_warps = daePoolSliceWarps;
+  static constexpr int max_registers = daeWideRegisterLimit;
+
+  static __device__ __forceinline__ void execute(
+      const PoolInst& inst,
+      int* bars,
+      uint64_t* signal_array,
+      uint64_t* g_events,
+      uint32_t physical_warps,
+      uint32_t thread_id) {
+    (void)physical_warps;
+    pool_slice_host_weighted_exchange<num_warps>(
+        reinterpret_cast<const PoolSliceHostConfig*>(inst.address),
+        bars,
+        signal_array,
+        g_events,
+        inst.size,
+        inst.arg0,
+        inst.arg1,
+        thread_id);
+  }
+};

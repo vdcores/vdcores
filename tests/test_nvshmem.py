@@ -38,6 +38,7 @@ def test_optional_allocator_extension_import_smoke():
     assert not hasattr(dae_runtime.comm_opcode, "COMM_POOL_SLICE_EXCHANGE")
     assert dae_runtime.pool_opcode.POOL_SLICE_EXCHANGE == 1
     assert dae_runtime.pool_opcode.POOL_SLICE_WEIGHTED_EXCHANGE == 2
+    assert dae_runtime.pool_opcode.POOL_SLICE_HOST_WEIGHTED_EXCHANGE == 3
     assert dae_runtime.config.max_comm_insts == 32
     assert dae_runtime.config.max_pool_insts == 1
     assert dae_runtime.config.default_core_warps == 8

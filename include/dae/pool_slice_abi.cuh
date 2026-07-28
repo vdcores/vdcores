@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "pool_host_abi.h"
+
 static constexpr uint32_t poolSliceMaxPes = 32;
 static constexpr uint32_t poolSliceMaxLocalReaders = 8;
 static constexpr uint32_t poolSliceMaxPoolBlocks = 32;
@@ -206,3 +208,26 @@ struct alignas(16) PoolSliceConfig {
   uint32_t pool_count;
 };
 static_assert(sizeof(PoolSliceConfig) == 192, "PoolSliceConfig ABI changed");
+
+// Static per-peer host data-plane state. Metadata continues to use the base
+// PoolSliceConfig/NVSHMEM path; these addresses are consulted only where the
+// ordinary executor would deliver payload bytes and its ready generation.
+struct PoolSliceHostPeer {
+  uint64_t ring_memory;
+  uint64_t remote_delivery_address;
+  uint64_t remote_return_inbox_address;
+  uint64_t remote_control_address;
+  uint64_t remote_rkey;
+};
+static_assert(sizeof(PoolSliceHostPeer) == 40,
+              "PoolSliceHostPeer ABI changed");
+
+struct alignas(16) PoolSliceHostConfig {
+  PoolSliceConfig pool;
+  uint64_t peers_address;
+  uint64_t producer_generations_address;
+  uint32_t local_lkey;
+  uint32_t reserved;
+};
+static_assert(sizeof(PoolSliceHostConfig) == 224,
+              "PoolSliceHostConfig ABI changed");

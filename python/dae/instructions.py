@@ -1119,6 +1119,12 @@ class PoolSliceWeightedExchange(PoolSliceExchange):
     wire_opcode = pool_opcode.POOL_SLICE_WEIGHTED_EXCHANGE
 
 
+class PoolSliceHostWeightedExchange(PoolSliceExchange):
+    """Run weighted PoolInst with Grace verbs payload delivery only."""
+
+    wire_opcode = pool_opcode.POOL_SLICE_HOST_WEIGHTED_EXCHANGE
+
+
 class CC0(MemoryInstruction):
     def __init__(self, tokens: torch.Tensor, idx: int, hidden_size: int = 4096, dtype_size: int = 2):
         addr = get_tensor_address(tokens[idx])
@@ -1361,6 +1367,7 @@ __all__ = [
     "MemoryPoolRun",
     "PoolSliceExchange",
     "PoolSliceWeightedExchange",
+    "PoolSliceHostWeightedExchange",
     "CC0",
     "RegStore",
     "RegLoad",

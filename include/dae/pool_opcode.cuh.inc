@@ -9,3 +9,7 @@ DAE_POOL_OP(
     POOL_SLICE_WEIGHTED_EXCHANGE,
     2,
     PoolSliceWeightedExchangeExecuteWarp)
+DAE_POOL_OP(
+    POOL_SLICE_HOST_WEIGHTED_EXCHANGE,
+    3,
+    PoolSliceHostWeightedExchangeExecuteWarp)

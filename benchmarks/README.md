@@ -1,7 +1,8 @@
 # External Benchmarks
 
-Benchmark-only backends live here rather than in `src/`, `include/`,
-`python/dae/`, or the runnable VDCores applications.
+External baselines and host transport helpers live here. VDCores operator and
+protocol code remains under `include/` and `python/dae/`; NCCL, DeepEP, and
+verbs progress code is never linked into the main runtime.
 
 `pool_slice_nccl_compare.py` compares the unified pool-slice dynamic-read
 protocol with a dense two-ring NCCL reference implemented in
@@ -55,18 +56,18 @@ Grace-hosted scatter/gather transport. It attempts CUDA DMA-BUF registration
 first and legacy GPU peer-memory registration second on an actual NVSHMEM HBM
 range.
 
-`host_sgl_benchmark.py` and `host_sgl/host_sgl_verbs.cc` are the isolated
-two-PE transport experiment. They build RC QPs, concatenate multiple
-non-contiguous HBM rows through true multi-SGE RDMA writes, batch independent
-destination messages into one doorbell, and use one ordered readiness write
-per message with one local completion per batch. The receiver verifies every
-byte and readiness sequence. Its host post-to-CQ timings are external
-transport results, never VDCores `g_events` results.
+`host_sgl_benchmark.py` and `host_sgl/host_sgl_verbs.cc` exercise the external
+data plane. The default scalable path uses one mlx5 DCI per PE with one DCT
+target and concatenates up to eight non-contiguous HBM rows per RDMA write; RC
+remains a comparison fallback. Data is followed by one ordered readiness write
+per PoolInst message. Host post-to-CQ timings are external transport results,
+never VDCores `g_events` results.
 
-The ABI-v3 path also provides an ordinary-host-memory coherent request ring.
-Use `--submission both` to compare direct host submission with the asynchronous
-GPU-producer/Grace-consumer path. Ring slots retire only by monotonic
-generation; no timeout participates in the protocol.
+The ABI-v7 coherent ring uses ordinary host memory and monotonic generations;
+no timeout participates in the protocol. `pool_slice_host_e2e.py` is the full
+weighted-EP validation path. It uses the host only for dispatch/return payload
+delivery and ready notification; metadata, dependencies, dynamic gather,
+reduction, scatter, and retirement remain the ordinary PoolInst state machine.
 
 Build and run only in a compute allocation:
 

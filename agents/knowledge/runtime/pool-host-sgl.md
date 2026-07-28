@@ -1,125 +1,79 @@
-# Grace Host-Verbs Pool Transport
+# Grace Host Data Plane for PoolInst
 
-This is an experimental data-plane backend for the existing PoolInst queue
-protocol. It lives under `benchmarks/` and does not change the production
-VDCores runtime. Metadata publication, ordered receiver queue heads, dynamic
-read retirement, and expert ownership remain PoolInst work.
+The host backend is a compile-time `PoolInst` specialization, not a second EP
+protocol. Its only substitutions are the two remote payload publication sites
+in `include/dae/pool_slice.cuh`:
 
-## Plane Boundary
+- dispatch activation bytes followed by the normal data-ready generation;
+- weighted-combine bytes followed by the normal return-ready generation.
 
-The source activation stays in its original GPU HBM row and is written once.
-PoolInst still resolves routing and publishes receiver metadata. In the host
-variant it also makes a compact data request visible to a Grace worker; the
-request names source row indices, one contiguous destination interval, and
-the destination's normal data-ready word. No activation bytes enter host
-memory and no source staging buffer is required.
+Route metadata, per-source ordered queues, destination row reservation,
+dynamic gather, reduction, scatter, dependency checks, and retirement all run
+through the same `pool_slice_exchange_streaming` implementation as the device
+backend. The final zero-row host-ring entry is only the ordered data-plane epoch
+notification; it does not replace PoolInst `END` queue instructions.
 
-The worker translates one data request into verbs work:
+## Transport
 
-1. Each `ibv_sge` names one non-contiguous source HBM row.
-2. One RC RDMA WRITE consumes several SGEs. Verbs concatenates their bytes, in
-   SGE order, into the contiguous remote delivery interval.
-3. More than the queried `max_sge` rows become a short chain of multi-SGE data
-   WRs, not one WR per row.
-4. An inline 8-byte RDMA WRITE publishes that message's data-ready sequence
-   after its data WRs on the same RC QP.
+`PoolSliceHostWeightedExchange` publishes compact descriptors to coherent
+Grace/GPU rings allocated with ordinary aligned `malloc`. A descriptor names
+HBM row indices, a contiguous remote interval, the remote ready word, and its
+monotonic generation. It never stages activation bytes in host memory.
 
-Several ready data requests can share one `ibv_post_send`. Each keeps its own
-ordered remote readiness write, while only the last readiness WR is locally
-signaled. Its CQ completion reclaims the whole batch. This merges host/NIC
-doorbells and local completions without merging PoolInst dependencies.
+The Grace worker drives one mlx5 DCI per PE and one local DCT target. Each peer
+has an address handle, but does not consume a separate send QP. One RDMA write
+concatenates up to eight noncontiguous HBM rows into the destination interval;
+the eight-SGE cap keeps the DCI address-vector WQE within the provider-supported
+encoding. An inline eight-byte RDMA write publishes readiness after the data on
+the same ordered DCI. The 128-WR queue window permits several peer batches in
+flight while retaining one transport queue. A compile-time 512-row request
+bound covers the supported inference token capacity even when a low PoolInst
+group limit produces groups larger than 32 rows.
 
-The destination PoolInst is unchanged: it executes only the ordered metadata
-queue head, starts copying as soon as that head's data-ready sequence arrives,
-and uses the existing sender-set dependency only to retire the dynamic read.
+RC remains available as a comparison/fallback under `--host-transport rc`.
+It uses one QP per peer and was measurably more intrusive to NVSHMEM IBGDA at
+eight PEs, even when idle.
 
-## Placement And Ordering
+## Ordering
 
-- The GPU/Grace request ring uses ordinary aligned `malloc`;
-  `numa_alloc_onnode` remains an optional placement refinement. Only compact
-  descriptors and row indices cross the coherent CPU/GPU control boundary.
-- Payload stays in registered GPU HBM. Vista passed CUDA DMA-BUF export plus
-  `ibv_reg_dmabuf_mr` on `mlx5_0`; legacy peer-memory registration remains a
-  probe fallback.
-- The benchmark GPU producer publishes a task-owned request slot with one
-  semantic system-release ready word, and the CPU acquires that word. It does
-  not need a general system fence or a shared producer atomic.
-- Data and readiness use the same RC QP, so the readiness write cannot pass
-  that message's data writes.
-- GH200 reports CUDA GPUDirect RDMA write ordering `200` (`ALL_DEVICES`). A GPU
-  can therefore consume the remotely written data after observing readiness;
-  no receiver host flush or system fence is needed. The benchmark calls
-  `cuFlushGPUDirectRDMAWrites` only as a portability fallback when the queried
-  native ordering is below `OWNER`.
+- GPU producers and Grace consumers use release/acquire operations on
+  per-slot monotonic generations. There is no `threadfence_system`, logical
+  timeout, reset handshake, or shared producer atomic.
+- Data and its ready write share one ordered transport queue. Native GH200
+  GPUDirect owner ordering lets PoolInst consume HBM after observing readiness.
+- Metadata and payload are independent planes and remain concurrently issued.
+  No host-specific metadata fence, completion phase, dependency, or retirement
+  branch is present.
+- Ring entries execute in order. The zero-row entry retires one host transport
+  epoch only after all earlier data and ready writes complete.
 
-Vista ConnectX exposes 30 send SGEs. One RC QP per peer already reached about
-43 GiB/s per direction in the two-node experiment, so multiple QPs are not
-justified yet. Add them only if concurrent metadata/data traffic shows a
-single-QP issue bottleneck.
+## Entry Points
 
-## Two-PE Results
+- Common ABI: `include/dae/pool_host_abi.h`
+- GPU coherent-ring publisher: `include/dae/pool_host.cuh`
+- PoolInst ABI/operator: `include/dae/pool_slice_abi.cuh` and
+  `include/dae/pool_slice.cuh`
+- Grace verbs engine: `benchmarks/host_sgl/host_sgl_verbs.cc`
+- End-to-end EP harness: `benchmarks/pool_slice_host_e2e.py`
+- Standalone transport harness: `benchmarks/host_sgl_benchmark.py`
 
-`benchmarks/host_sgl_benchmark.py` sends bidirectionally and reports the
-maximum host post-to-CQ time across ranks. Reset, barriers, visibility fallback,
-and byte/readiness verification are outside the timed interval. These are
-transport microbenchmark numbers, not VDCores internal timings.
+Build the helper with `make -C benchmarks/host_sgl` and the VDCores extension
+with `make nvshmem-pyext`.
 
-For 128 BF16-7168 rows per message (1,835,008 bytes), SGL depth scaling was:
+## Vista Verification (2026-07-28)
 
-| batch depth | batch p50 (us) | amortized/message (us) | GiB/s/direction |
-| ---: | ---: | ---: | ---: |
-| 1 | 58.063 | 58.063 | 29.433 |
-| 2 | 93.328 | 46.664 | 36.623 |
-| 4 | 172.719 | 43.180 | 39.578 |
-| 8 | 329.437 | 41.180 | 41.501 |
-| 16 | 640.234 | 40.015 | 42.709 |
-| 32 | 1273.074 | 39.784 | 42.957 |
+Exact BF16 hidden-7168, top-8 weighted dispatch/combine correctness passed at
+2, 4, and 8 PEs and at 32, 128, and 256 tokens/PE. The final two-PE 32-token
+run measured 0.143 ms end to end; the final eight-PE 32-token run measured
+0.477 ms. Earlier eight-sample DC sweeps measured 0.181/0.417/0.431 ms at
+2 PEs and 32/128/256 tokens, 0.335/0.630/1.080 ms at 4 PEs, and
+0.440/0.973 ms at 8 PEs for 32/128 tokens. Eight-PE 256-token measurements
+were sensitive to simultaneous host-payload/IBGDA metadata HCA contention;
+increasing the single DCI window from 32 to 128 WRs improved one matched run
+from 2.706 to 1.973 ms, but repeated runs remained variable.
 
-Depth 16 is the useful default: depth 32 adds little throughput while doubling
-buffer and descriptor residency. At depth 8, SGL used 40 data WRs versus 1,024
-one-row WRs and measured 329.4 versus 339.0 us. An SGE-width sweep measured
-40.37, 41.34, and 41.50 GiB/s for 1, 4, and 30 SGEs respectively. Batching and
-one local completion provide most of the throughput gain; maximum-width SGL
-provides the smallest QP footprint.
-
-Smaller messages benefit similarly. Eight-row messages at depth 16 measured
-53.9 us per batch (3.37 us amortized) with SGL versus 56.2 us with one-row WRs.
-Thirty-two-row messages at depth 8 measured 93.1 versus 96.4 us.
-
-## Experimental Boundary
-
-Build with `make -C benchmarks/host_sgl`. The capability gate is
-`benchmarks/host_sgl_probe.py`; the true SGL, batching, ordering, and data
-verification harness is `benchmarks/host_sgl_benchmark.py`.
-
-The ABI-v3 benchmark includes the coherent ring, fixed 64-slot capacity,
-32-row request bound, 32-message epoch bound, and batches of up to 16 requests.
-The GPU and Grace consumer use monotonic generations and in-order queue heads;
-there is no deadline or timeout in retirement. In-flight posts own their
-descriptor storage through CQ completion.
-
-For one 32-row BF16-7168 message, direct submission measured 26.592 us and the
-ring 60.768 us. Fourteen 9-row messages measured 55.536 us direct and 89.344 us
-through the best one-CTA-per-message publisher. The standalone coherent
-handoff therefore costs about 34 us. Before merging, that fixed cost must be
-hidden inside the PoolInst lifetime and compared with GPU IBGDA under identical
-routes. Until then, no host-verbs code belongs in `src/`, `include/`, or the
-main application.
-
-Two targeted A/Bs show what does not cause that fixed gap. Recycling completed
-WR/SGE vectors measured 89.712 us, and publishing four descriptors behind one
-system-release head generation measured 89.360 us. Both variants were removed.
-The gap is therefore dominated by launching the standalone GPU publisher and
-observing its first Grace-coherent store, not by descriptor allocation or the
-number of release stores. The next valid host experiment must publish the same
-ABI-v3 slots from an already-resident PoolInst execute warp; do not complicate
-the ring with merged generations first.
-
-The isolated harness now includes that resident-producer experiment. On
-`c642-012`/`c642-031`, one resident eight-warp CTA plus the in-order Grace
-consumer measured 18.544 us for one 32-row BF16-7168 message (458,752 bytes).
-Four messages behind one epoch measured 49.504 us, or 12.376 us/message and
-34.52 GiB/s per direction. Both runs used DMA-BUF registration and native
-GPUDirect ordering 200. This removes the standalone launch/handoff penalty,
-but remains a benchmark-only data-plane option until a PoolInst instruction
-publishes the same ring ABI and is compared end-to-end with GPU IBGDA.
+The retained result is therefore the simpler one-DCI protocol, not DCI streams
+or a metadata-wide quiet. DCI streams added completion bookkeeping without a
+stable gain. A metadata quiet occasionally helped one short run but regressed
+longer samples and small messages, so it was removed. Future 8-PE tuning should
+target HCA arbitration/pacing without changing the PoolInst control protocol.
