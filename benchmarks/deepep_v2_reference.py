@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-sms", type=int, default=0)
     parser.add_argument("--num-qps", type=int, default=0)
     parser.add_argument("--prefer-overlap-with-compute", action="store_true")
+    parser.add_argument(
+        "--bootstrap-only",
+        action="store_true",
+        help="construct and destroy ElasticBuffer without launching EP kernels",
+    )
     parser.add_argument("--master-port", type=int, default=29671)
     return parser.parse_args()
 
@@ -56,6 +61,8 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     master = comm.bcast(socket.gethostname() if rank == 0 else None, root=0)
+    if rank == 0:
+        print("deepep-v2 bootstrap: initializing torch NCCL communicator", flush=True)
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://{master}:{args.master_port}",
@@ -65,6 +72,8 @@ def main() -> None:
     )
 
     try:
+        if rank == 0:
+            print("deepep-v2 bootstrap: importing external extension", flush=True)
         import deep_ep
     except BaseException:
         dist.destroy_process_group()
@@ -100,6 +109,8 @@ def main() -> None:
     )
 
     try:
+        if rank == 0:
+            print("deepep-v2 bootstrap: constructing ElasticBuffer", flush=True)
         buffer = deep_ep.ElasticBuffer(
             dist.group.WORLD,
             num_max_tokens_per_rank=args.tokens_per_pe,
@@ -120,11 +131,20 @@ def main() -> None:
         num_experts, args.top_k
     )
     num_qps = args.num_qps or buffer.get_theoretical_num_qps(num_sms)
+    if rank == 0:
+        print(
+            f"deepep-v2 bootstrap: ready theoretical_sms={num_sms} "
+            f"theoretical_qps={num_qps}",
+            flush=True,
+        )
     dispatch_samples: list[float] = []
     combine_samples: list[float] = []
     total_samples: list[float] = []
     combined = None
     try:
+        if args.bootstrap_only:
+            comm.Barrier()
+            return
         _, _, recv_weights, handle, _ = buffer.dispatch(
             tokens,
             topk_idx=topk_idx,

@@ -300,39 +300,6 @@ class POOL_RMS_NORM_F16_K_4096(ComputeInstruction):
         )
 
 
-class POOL_ZERO_WEIGHTED_RETURN(ComputeInstruction):
-    """Zero the private token-major partial buffer for external reducers."""
-
-    def __init__(self):
-        super().__init__(opcode=opcode.OP_POOL_ZERO_WEIGHTED_RETURN, args=[])
-
-
-class POOL_EXPERT_ATOMIC_REDUCE_BF16(ComputeInstruction):
-    """Accumulate one ready expert into pool-owned token-major partials."""
-
-    def __init__(self, local_reader: int):
-        if not 0 <= int(local_reader) < 2**16:
-            raise ValueError("local_reader must fit in uint16")
-        super().__init__(
-            opcode=opcode.OP_POOL_EXPERT_ATOMIC_REDUCE_BF16,
-            args=[int(local_reader)],
-        )
-
-
-class POOL_TOKEN_REDUCE_BF16(ComputeInstruction):
-    """Reduce a disjoint compact-token shard across all local experts."""
-
-    def __init__(self, reducer_rank: int, reducer_count: int):
-        if not 0 <= int(reducer_rank) < int(reducer_count) < 2**16:
-            raise ValueError(
-                "reducer_rank/count must satisfy 0 <= rank < count < 2**16"
-            )
-        super().__init__(
-            opcode=opcode.OP_POOL_TOKEN_REDUCE_BF16,
-            args=[int(reducer_rank), int(reducer_count)],
-        )
-
-
 class RMS_NORM_F16_K_4096_SMEM(ComputeInstruction):
     def __init__(self, num_token: int, epsilon: float):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_4096_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
@@ -1121,6 +1088,7 @@ class PoolSliceExchange(PoolInstruction):
     """
 
     requires_signal_array = True
+    wire_opcode = pool_opcode.POOL_SLICE_EXCHANGE
 
     def __init__(
         self,
@@ -1137,12 +1105,18 @@ class PoolSliceExchange(PoolInstruction):
         if not 0 <= compute_barrier_base < 2**16:
             raise ValueError("compute_barrier_base must fit in uint16")
         super().__init__(
-            pool_opcode.POOL_SLICE_EXCHANGE,
+            self.wire_opcode,
             size=write_barrier,
             arg0=dispatch_barrier_base,
             arg1=compute_barrier_base,
             address=_control_pointer(config_tensor, "config_tensor"),
         )
+
+
+class PoolSliceWeightedExchange(PoolSliceExchange):
+    """Run the same gathered-read protocol with compiled inline EP combine."""
+
+    wire_opcode = pool_opcode.POOL_SLICE_WEIGHTED_EXCHANGE
 
 
 class CC0(MemoryInstruction):
@@ -1352,9 +1326,6 @@ __all__ = [
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
     "POOL_RMS_NORM_F16_K_4096",
-    "POOL_ZERO_WEIGHTED_RETURN",
-    "POOL_EXPERT_ATOMIC_REDUCE_BF16",
-    "POOL_TOKEN_REDUCE_BF16",
     "RMS_NORM_F16_K_4096_SMEM",
     "RMS_NORM_F16_K_128_SMEM",
     "RMS_NORM_F16_K_2048_SMEM",
@@ -1389,6 +1360,7 @@ __all__ = [
     "MemoryPoolWait",
     "MemoryPoolRun",
     "PoolSliceExchange",
+    "PoolSliceWeightedExchange",
     "CC0",
     "RegStore",
     "RegLoad",

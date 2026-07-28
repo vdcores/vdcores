@@ -5,3 +5,7 @@
 // launch dispatch selects one of these precompiled assemblies; device code
 // never switches on PoolInst::opcode.
 DAE_POOL_OP(POOL_SLICE_EXCHANGE, 1, PoolSliceExchangeExecuteWarp)
+DAE_POOL_OP(
+    POOL_SLICE_WEIGHTED_EXCHANGE,
+    2,
+    PoolSliceWeightedExchangeExecuteWarp)

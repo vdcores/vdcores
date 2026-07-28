@@ -35,18 +35,53 @@ NVSHMEM_IBGDA_RC_MAP_BY=cta ibrun -n 2 \
 4. Compare 2, 4, or 8 PEs with the external NCCL ring reference:
 
 ```bash
-NVSHMEM_DISABLE_NCCL=1 NVSHMEM_IBGDA_NUM_RC_PER_PE=1 \
+NVSHMEM_DISABLE_NCCL=1 NVSHMEM_IBGDA_NUM_RC_PER_PE=8 \
 NVSHMEM_IBGDA_RC_MAP_BY=cta ibrun -n 8 \
   python benchmarks/pool_slice_nccl_compare.py \
   --mode both --tokens-per-pe 128 --hidden-size 4096 \
   --experts-per-pe 1 --warmup 10 --iterations 50
 ```
 
-`--pack-warps 0` is the default measured policy: four pack warps for small
-payloads and for four or more PEs, and six pack warps for large two-PE
-payloads. Override it only for an explicit sweep.
+For streaming dispatch, `--data-groups 0` selects a producer group ceiling from
+the available PoolInst CTAs and remote targets. Actual groups are derived from
+router output, targeting about 512 KiB and at most 32 activation rows each.
+The destination consumes exactly two compiled ordered queue heads per source
+and never reconstructs this count. Override the group ceiling only for an
+explicit sweep.
+
+Treat the RC count as a transport shape parameter, not protocol state. On the
+current two-PE GH200 path, use 4 for low-token latency, 8 as a conservative
+general setting, and test 16 for 256-token-or-larger payloads. More QPs did not
+improve the return tail and made metadata completion less stable.
+
+Before enabling the optional Grace host-verbs transport, gate direct HBM
+registration on the same allocation:
+
+```bash
+NVSHMEM_DISABLE_NCCL=1 ibrun -n 2 \
+  python benchmarks/host_sgl_probe.py
+```
+
+Then build and run the isolated true-SGL path:
+
+```bash
+make -C benchmarks/host_sgl
+NVSHMEM_DISABLE_NCCL=1 ibrun -n 2 \
+  python benchmarks/host_sgl_benchmark.py \
+  --rows 128 --batch-depth 16
+```
+
+The host request ring may use ordinary aligned `malloc`; only the CUDA
+DMA-BUF-to-verbs registration of symmetric GPU HBM is capability-sensitive.
+This experiment may replace data submission only. Metadata, ordered queue
+heads, readiness dependencies, and retirement remain PoolInst semantics. Keep
+it outside the main source tree until it beats the GPU path with real overlap;
+see `agents/knowledge/runtime/pool-host-sgl.md`.
 
 VDCores timings must come from internal `g_events`. NCCL remains under
 `benchmarks/` and uses CUDA events only for the external reference. Use
 monotonic sequences when reusing signal words and preserve identical symmetric
-allocation order on every PE.
+allocation order on every PE. Streaming metadata has two protected
+parts/source (route map and descriptor-plus-queues envelope); its merged counter advances
+by the sequence delta for every part, so skipped sequence IDs remain valid
+without clearing counters.

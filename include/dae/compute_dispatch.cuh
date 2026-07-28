@@ -5,7 +5,6 @@
 #include "task/argmax.cuh"
 #include "task/attention.cuh"
 #include "task/gemv.cuh"
-#include "task/pool_reduce.cuh"
 #include "task/rms_norm.cuh"
 #include "task/silu.cuh"
 #include "task/wgmma.cuh"
@@ -298,24 +297,6 @@ DAE_COMPUTE_OP_HANDLER(OP_POOL_RMS_NORM_F16_K_4096) {
     m2c,
     c2m
   );
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_POOL_ZERO_WEIGHTED_RETURN) {
-  DAE_UNUSED(thread_id, pc, count, finish, smem_base, scratch_space);
-  task_pool_zero_weighted_return(
-      sm_id, st_insts, m2c, c2m, g_events);
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_POOL_EXPERT_ATOMIC_REDUCE_BF16) {
-  DAE_UNUSED(thread_id, pc, count, finish, smem_base, scratch_space);
-  task_pool_expert_atomic_reduce_bf16(
-      sm_id, inst.args[0], st_insts, m2c, c2m, g_events);
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_POOL_TOKEN_REDUCE_BF16) {
-  DAE_UNUSED(thread_id, pc, count, finish, smem_base, scratch_space);
-  task_pool_token_reduce_bf16(
-      sm_id, inst.args[0], inst.args[1], st_insts, m2c, c2m, g_events);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {

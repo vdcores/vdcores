@@ -153,19 +153,17 @@ default or PoolInst assemblies.
 `PoolInst` has its own instruction array and registry. Host launch dispatch
 selects a concrete execute-warp type at compile time; device code performs no
 pool opcode switch. The executor may own multiple physical warps or the entire
-CTA. `PoolSliceExchangeExecuteWarp` owns eight warps and implements the current
-dependent dynamic-read/return loop.
+CTA. The generic and weighted pool-slice executors each own eight warps and
+instantiate the same dependent dynamic-read loop with a different compiled
+return policy.
 
 PoolInst synchronizes with ordinary blocks through named `bars[]` entries and
 with other PEs through monotonic NVSHMEM signals. See
 `configurable-vdcores.md` and `vdcores-communication-core.md`.
 
-Weighted pool return may place reduction on the PoolInst CTAs or on additional
-ordinary VDCores blocks in the same launch. Expert-atomic blocks can begin from
-independent reader/compute releases; token-sharded blocks own disjoint rows and
-avoid atomics. Their PoolRawAddress completions release a contiguous
-`reducer_count` signal range that PoolInst acquires before network return. This
-is VM composition across blocks, not a helper stream or side kernel.
+Weighted pool return is compiled into `PoolSliceWeightedExchangeExecuteWarp`.
+Previously explored external-reducer modes were removed from the hot ABI; a
+future placement alternative must register another concrete PoolInst type.
 
 ## Queue Model
 

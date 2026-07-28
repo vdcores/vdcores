@@ -28,9 +28,10 @@ struct PoolSliceExchangeExecuteWarp {
       uint64_t* g_events,
       uint32_t physical_warps,
       uint32_t thread_id) {
+    (void)physical_warps;
     // Host assembly selection guarantees the PoolInst type.  There is no
     // opcode check, switch, or defensive fallback in the specialized CTA.
-    pool_slice_exchange(
+    pool_slice_exchange<false, num_warps>(
         reinterpret_cast<const PoolSliceConfig*>(inst.address),
         bars,
         signal_array,
@@ -38,7 +39,31 @@ struct PoolSliceExchangeExecuteWarp {
         inst.size,
         inst.arg0,
         inst.arg1,
-        physical_warps,
+        thread_id);
+  }
+};
+
+struct PoolSliceWeightedExchangeExecuteWarp {
+  static constexpr uint16_t opcode = POOL_SLICE_WEIGHTED_EXCHANGE;
+  static constexpr uint32_t num_warps = daePoolSliceWarps;
+  static constexpr int max_registers = daeWideRegisterLimit;
+
+  static __device__ __forceinline__ void execute(
+      const PoolInst& inst,
+      int* bars,
+      uint64_t* signal_array,
+      uint64_t* g_events,
+      uint32_t physical_warps,
+      uint32_t thread_id) {
+    (void)physical_warps;
+    pool_slice_exchange<true, num_warps>(
+        reinterpret_cast<const PoolSliceConfig*>(inst.address),
+        bars,
+        signal_array,
+        g_events,
+        inst.size,
+        inst.arg0,
+        inst.arg1,
         thread_id);
   }
 };

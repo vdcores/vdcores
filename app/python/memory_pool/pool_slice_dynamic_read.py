@@ -35,16 +35,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--symmetric-size", default="512M")
     parser.add_argument(
-        "--pack-warps",
+        "--data-groups",
+        dest="group_limit",
         type=int,
         default=0,
-        help="pack warps; zero selects the PE/payload-aware policy",
+        help="maximum runtime data groups; zero selects the PE/CTA-aware policy",
     )
-    parser.add_argument("--pool-blocks", type=int, default=1)
-    parser.add_argument("--dedicated-coordinator", action="store_true")
-    parser.add_argument("--put-phase-words", action="store_true")
-    parser.add_argument("--pipelined-return", action="store_true")
-    parser.add_argument("--no-reader-pipeline", action="store_true")
+    parser.add_argument("--pool-blocks", type=int, default=32)
     parser.add_argument(
         "--in-place-identity",
         action="store_true",
@@ -93,13 +90,9 @@ def main() -> None:
             expert_capacity_rows=expert_capacity_rows,
             hidden_size=args.hidden_size,
             dtype=dtype,
-            pack_warps=args.pack_warps,
+            group_limit=args.group_limit,
             pool_blocks=args.pool_blocks,
             in_place_expert_output=args.in_place_identity,
-            dedicated_coordinator=args.dedicated_coordinator,
-            put_phase_words=args.put_phase_words,
-            pipelined_return=args.pipelined_return,
-            reader_pipeline=not args.no_reader_pipeline,
         )
         tokens = (
             buffers.token_pool
@@ -164,17 +157,20 @@ def main() -> None:
                         overlap["first_payload"] / 1.0e6
                     )
 
-        status, senders, received_rows, returned_slices, observed, group_ready = (
+        status, senders, received_rows, returned_slices, dispatch_ready = (
             buffers.control_state()
         )
-        assert status == PoolSliceStatus.OK
+        assert status == PoolSliceStatus.OK, (
+            status,
+            senders,
+            received_rows,
+            returned_slices,
+            dispatch_ready,
+        )
         assert senders == runtime.num_pes
         assert returned_slices == runtime.num_pes
-        assert observed == rounds
-        assert group_ready == rounds
-        payload_sources, dispatch_batches, active_pack_warps = (
-            buffers.performance_state()
-        )
+        assert dispatch_ready == rounds
+        active_groups = buffers.active_group_count()
         receive_routes = buffers.read_receive_routes()
         assert received_rows == sum(
             route.row_count
@@ -213,7 +209,7 @@ def main() -> None:
             }
             raise AssertionError(
                 f"pool-slice data path mismatch; control="
-                f"{(status, senders, received_rows, returned_slices, observed, group_ready)} "
+                f"{(status, senders, received_rows, returned_slices, dispatch_ready)} "
                 f"snapshots={snapshots}"
             )
 
@@ -224,9 +220,7 @@ def main() -> None:
         )
         overlap_summary = (
             f"first_payload_ms={statistics.median(first_payload_samples):.4f}, "
-            f"payload_sources={payload_sources}, "
-            f"dispatch_batches={dispatch_batches}, "
-            f"pack_warps={active_pack_warps}"
+            f"active_groups={active_groups}"
             if first_payload_samples
             else "disabled"
         )
@@ -235,12 +229,10 @@ def main() -> None:
             f"PE {runtime.pe}/{runtime.num_pes}: pool-slice dynamic-read PASS "
             f"tokens={args.tokens_per_pe} hidden={args.hidden_size} "
             f"readers={num_readers} top_k={args.top_k} "
-            f"protocol=pool-gather pool_blocks={buffers.pool_count} "
-            f"dedicated_coordinator={args.dedicated_coordinator} "
-            f"put_phase_words={args.put_phase_words} "
-            f"reader_pipeline={not args.no_reader_pipeline} "
+            f"protocol=pool-gather-streaming "
+            f"pool_blocks={buffers.pool_count} "
             f"source_preloaded={args.source_preloaded} "
-            f"worker_config={active_pack_warps} "
+            f"active_groups={active_groups} "
             f"received={received_rows} launches={rounds} "
             f"median_ms=(gather={statistics.median(gather_samples):.4f}, "
             f"return={statistics.median(return_samples):.4f}, "

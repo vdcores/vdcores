@@ -15,6 +15,9 @@ from mpi4py import MPI
 import dae.nvshmem as nvshmem
 from dae.pool_slice import (
     POOL_SLICE_PUBLISH_BYTES,
+    POOL_SLICE_QUEUE_ENTRY_BYTES,
+    POOL_SLICE_STREAM_QUEUE_DEPTH,
+    POOL_SLICE_RETURN_GROUPS_PER_SOURCE,
     PoolSliceStatus,
     allocate_pool_slice,
     build_pool_slice_copy_program,
@@ -52,35 +55,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("pool", "nccl", "both"), default="both")
     parser.add_argument("--symmetric-size", default="1G")
     parser.add_argument(
-        "--pack-warps",
+        "--data-groups",
+        dest="group_limit",
         type=int,
         default=0,
-        help="pack warps; zero selects the PE/payload-aware policy",
+        help="maximum runtime data groups; zero selects the PE/CTA-aware policy",
     )
-    parser.add_argument("--pool-blocks", type=int, default=1)
-    parser.add_argument("--dedicated-coordinator", action="store_true")
-    parser.add_argument("--put-phase-words", action="store_true")
-    parser.add_argument("--pipelined-return", action="store_true")
-    parser.add_argument("--no-reader-pipeline", action="store_true")
+    parser.add_argument("--pool-blocks", type=int, default=32)
     parser.add_argument(
         "--weighted-return",
         action="store_true",
         help="pool-local weighted partial reduction plus token-major source sum",
     )
-    parser.add_argument(
-        "--external-weighted-reducer",
-        action="store_true",
-        help=(
-            "use ordinary VDCores expert reducers and leave PoolInst to "
-            "network return/final scatter"
-        ),
-    )
-    parser.add_argument(
-        "--external-reducer-mode",
-        choices=("expert_atomic", "token_sharded"),
-        default="expert_atomic",
-    )
-    parser.add_argument("--external-reducer-blocks", type=int, default=0)
     parser.add_argument(
         "--reader-op",
         choices=("copy", "rms"),
@@ -101,27 +87,37 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _flat_return_rmas(rows_per_source: list[int], local_pe: int, shards: int) -> int:
-    """Count nonempty remote source intersections of flat CTA row shards."""
+def _source_grouped_return_rmas(
+    rows_per_source: list[int], local_pe: int, pool_blocks: int
+) -> int:
+    """Count source-owned return shards that carry a remote payload."""
 
-    total = sum(int(rows) for rows in rows_per_source)
-    if total == 0:
-        return 0
-    prefixes = [0]
-    for rows in rows_per_source:
-        prefixes.append(prefixes[-1] + int(rows))
+    num_pes = len(rows_per_source)
     rmas = 0
-    for shard in range(shards):
-        begin = total * shard // shards
-        end = total * (shard + 1) // shards
-        for source_pe, (source_begin, source_end) in enumerate(
-            zip(prefixes, prefixes[1:])
-        ):
-            if source_pe != local_pe and max(begin, source_begin) < min(
-                end, source_end
-            ):
-                rmas += 1
+    for source_pe, rows in enumerate(rows_per_source):
+        if source_pe == local_pe or source_pe >= pool_blocks:
+            continue
+        available = 1 + (pool_blocks - 1 - source_pe) // num_pes
+        rmas += min(
+            int(rows), available, POOL_SLICE_RETURN_GROUPS_PER_SOURCE
+        )
     return rmas
+
+
+def _stream_group_counts(
+    rows: torch.Tensor, *, row_bytes: int, group_limit: int
+) -> torch.Tensor:
+    """Mirror PoolInst's runtime-sized group policy for the cost model."""
+
+    byte_groups = (
+        rows * row_bytes + (512 * 1024 - 1)
+    ).div(512 * 1024, rounding_mode="floor")
+    row_groups = (rows + 31).div(32, rounding_mode="floor")
+    desired = torch.maximum(byte_groups, row_groups)
+    return torch.minimum(
+        rows,
+        torch.minimum(desired, torch.full_like(rows, group_limit)),
+    )
 
 
 def _balanced_expert_ids(
@@ -166,7 +162,6 @@ def run_pool(
 ) -> tuple[Timing, dict[str, int | float | str]]:
     num_readers = runtime.num_pes * args.experts_per_pe
     local_routes = args.tokens_per_pe * args.top_k
-    global_routes = runtime.num_pes * local_routes
     expert_capacity_rows = runtime.num_pes * args.tokens_per_pe
     signals = nvshmem.init_signal_space(runtime.num_pes)
     buffers = allocate_pool_slice(
@@ -179,17 +174,10 @@ def run_pool(
         expert_capacity_rows=expert_capacity_rows,
         hidden_size=args.hidden_size,
         dtype=tokens.dtype,
-        pack_warps=args.pack_warps,
+        group_limit=args.group_limit,
         pool_blocks=args.pool_blocks,
         in_place_expert_output=args.in_place_identity,
-        dedicated_coordinator=args.dedicated_coordinator,
-        put_phase_words=args.put_phase_words,
-        pipelined_return=args.pipelined_return,
-        reader_pipeline=not args.no_reader_pipeline,
         weighted_return=args.weighted_return,
-        external_weighted_reducer=args.external_weighted_reducer,
-        external_reducer_mode=args.external_reducer_mode,
-        external_reducer_blocks=args.external_reducer_blocks,
     )
     returned_rows = args.tokens_per_pe if args.weighted_return else local_routes
     returned = nvshmem.zeros((returned_rows, args.hidden_size), dtype=tokens.dtype)
@@ -242,6 +230,8 @@ def run_pool(
         "return_signals_closed": [],
         "scatter_done": [],
     }
+    overlap_samples["first_gather"] = []
+    overlap_samples["stream_gather_done"] = []
     if args.weighted_return:
         overlap_samples.update(
             {
@@ -251,20 +241,6 @@ def run_pool(
                 "return_cta_done": [],
             }
         )
-    if args.external_weighted_reducer:
-        overlap_samples.update(
-            {
-                "first_external_reduce_start": [],
-                "last_external_reduce_start": [],
-                "first_external_reduce_done": [],
-                "all_external_reduce_done": [],
-                "external_reduce_span": [],
-            }
-        )
-        if args.external_reducer_mode == "expert_atomic":
-            overlap_samples.update(
-                {"external_zero_start": [], "external_zero_done": []}
-            )
     rounds = args.warmup + args.iterations
     for iteration in range(rounds):
         buffers.set_sequence(iteration + 1)
@@ -276,8 +252,6 @@ def run_pool(
         overlap = program.overlap_timing_ns()
         if args.weighted_return:
             overlap.update(program.weighted_return_timing_ns())
-        if args.external_weighted_reducer:
-            overlap.update(program.external_reducer_timing_ns())
         gather_ms = rank_max(comm, gather_ns / 1.0e6)
         tail_ms = rank_max(comm, tail_ns / 1.0e6)
         total_ms = rank_max(comm, total_ns / 1.0e6)
@@ -314,14 +288,13 @@ def run_pool(
         rtol=1.0e-2 if args.reader_op == "rms" else 0,
         atol=1.0e-2 if args.reader_op == "rms" else 0,
     )
-    status, senders, received_rows, returned_slices, observed, group_ready = (
+    status, senders, received_rows, returned_slices, dispatch_ready = (
         buffers.control_state()
     )
     assert status == PoolSliceStatus.OK
     assert senders == runtime.num_pes
     assert returned_slices == runtime.num_pes
-    assert observed == rounds
-    assert group_ready == rounds
+    assert dispatch_ready == rounds
 
     counts = torch.bincount(expert_ids, minlength=num_readers)
     target_pes = torch.arange(num_readers).div(
@@ -347,29 +320,32 @@ def run_pool(
         torch.arange(runtime.num_pes) != runtime.pe
     ]
     nonempty_remote_targets = int((remote_target_rows != 0).sum().item())
-    dispatch_data_rmas = int(
-        torch.minimum(
-            remote_target_rows,
-            torch.full_like(remote_target_rows, buffers.pack_warps),
-        ).sum().item()
+    dynamic_groups = _stream_group_counts(
+        remote_target_rows,
+        row_bytes=row_bytes,
+        group_limit=buffers.group_limit,
     )
+    metadata_slot_rounds = 2 + (dynamic_groups + 1).div(
+        2, rounding_mode="floor"
+    )
+    dispatch_data_rmas = int(dynamic_groups.sum().item())
+    stream_queues_per_source = 2
     model = {
-        "protocol": "pool-gather",
+        "protocol": "pool-gather-streaming",
         "pool_blocks": buffers.pool_count,
-        "dedicated_coordinator": args.dedicated_coordinator,
-        "put_phase_words": args.put_phase_words,
-        "pipelined_return": args.pipelined_return,
         "weighted_return": args.weighted_return,
-        "external_weighted_reducer": args.external_weighted_reducer,
-        "external_reducer_mode": args.external_reducer_mode,
-        "external_reducer_blocks": (
-            buffers.reducer_count if args.external_weighted_reducer else 0
-        ),
-        "weighted_return_sharding": "flat",
+        "weighted_return_sharding": "source-grouped-4",
         "weighted_reduce": "fp32-ilp4",
-        "reader_pipeline": not args.no_reader_pipeline,
         "reader_op": args.reader_op,
-        "pack_warps": buffers.pack_warps,
+        "data_group_limit": buffers.group_limit,
+        "stream_queues_per_source": stream_queues_per_source,
+        "stream_queue_metadata_bytes_per_pe": int(
+            (
+                metadata_slot_rounds
+                * stream_queues_per_source
+                * POOL_SLICE_QUEUE_ENTRY_BYTES
+            ).sum().item()
+        ),
         "remote_routes_per_pe": remote_routes,
         "dispatch_payload_bytes_per_pe": compact_remote_rows * row_bytes,
         "return_payload_bytes_per_pe": (
@@ -378,43 +354,43 @@ def run_pool(
             else remote_routes * row_bytes
         ),
         "local_return_inbox_copy_bytes_per_pe": (
-            (compact_total_rows + args.tokens_per_pe) * row_bytes
+            0
             if args.weighted_return
-            else (
-                0
-                if args.pipelined_return
-                else 2 * local_target_routes * row_bytes
-            )
+            else 2 * local_target_routes * row_bytes
         ),
         "descriptor_bytes_per_pe": remote_pes * POOL_SLICE_PUBLISH_BYTES,
         "offset_metadata_bytes_received_per_pe": 0,
         "route_metadata_bytes_sent_remote_per_pe": remote_routes * 8,
         "dispatch_data_rmas_per_pe_current": dispatch_data_rmas,
         "return_data_rmas_per_pe": (
-            _flat_return_rmas(
+            _source_grouped_return_rmas(
                 unique_target_rows.tolist(),
                 runtime.pe,
-                buffers.pool_count - int(args.dedicated_coordinator),
+                buffers.pool_count,
             )
             if args.weighted_return
             else remote_readers
         ),
         "merged_signal_words_per_pe": runtime.num_pes,
-        "return_batch_signal_words_per_pe": (
-            num_readers if args.pipelined_return else 0
-        ),
+        "return_batch_signal_words_per_pe": 0,
         "return_fused_signal_updates_per_pe": (
-            remote_readers if args.pipelined_return else 0
+            _source_grouped_return_rmas(
+                unique_target_rows.tolist(),
+                runtime.pe,
+                buffers.pool_count,
+            )
+            if args.weighted_return
+            else 0
         ),
         "metadata_phase_updates_per_pe": remote_pes,
-        "data_phase_updates_per_pe": nonempty_remote_targets,
+        "data_phase_updates_per_pe": int(dynamic_groups.sum().item()),
         "return_phase_updates_per_pe": (
-            0 if args.pipelined_return else nonempty_remote_targets
+            0 if args.weighted_return else nonempty_remote_targets
         ),
         "local_token_pool_copy_bytes_per_pe": (
             0 if args.source_preloaded else 2 * args.tokens_per_pe * row_bytes
         ),
-        "local_delivery_pack_bytes_per_pe": 2 * compact_remote_rows * row_bytes,
+        "local_delivery_pack_bytes_per_pe": 0,
         "local_pool_gather_bytes_per_pe": 2 * received_rows * row_bytes,
         "local_reader_copy_bytes_per_pe": (
             0
@@ -435,12 +411,7 @@ def run_pool(
         for name, samples in overlap_samples.items():
             if samples:
                 model[f"median_{name}_ms"] = statistics.median(samples)
-        payload_sources, dispatch_batches, worker_config = (
-            buffers.performance_state()
-        )
-        model["payload_sources"] = payload_sources
-        model["dispatch_batches"] = dispatch_batches
-        model["worker_config"] = worker_config
+        model["active_groups"] = buffers.active_group_count()
     if args.print_pool_ctas and args.weighted_return:
         model["pool_cta_return_timing_ns"] = (
             program.weighted_return_cta_timing_ns()
@@ -508,30 +479,36 @@ def main() -> None:
             nccl_initialized = True
             nccl_result = run_nccl(args, runtime, comm, tokens, expert_ids)
 
+        pool_cta_profiles = None
+        if args.print_pool_ctas and pool_result is not None:
+            local_profile = pool_result[1].pop(
+                "pool_cta_return_timing_ns", None
+            )
+            pool_cta_profiles = comm.gather(local_profile, root=0)
+
         comm.Barrier()
         if runtime.rank == 0:
+            if pool_cta_profiles is not None:
+                pool_result[1]["pool_cta_return_timing_ns_by_rank"] = {
+                    rank: profile
+                    for rank, profile in enumerate(pool_cta_profiles)
+                }
             print(
                 f"configuration: pes={runtime.num_pes} "
                 f"tokens/pe={args.tokens_per_pe} hidden={args.hidden_size} "
                 f"experts/pe={args.experts_per_pe} dtype={args.dtype} "
                 f"top_k={args.top_k} "
                 f"route_placement={args.route_placement} "
-                f"protocol=pool-gather "
+                f"protocol={pool_result[1]['protocol'] if pool_result else 'pool-gather-streaming'} "
                 f"pool_blocks={args.pool_blocks} in_place_identity="
                 f"{args.in_place_identity} source_preloaded="
-                f"{args.source_preloaded} dedicated_coordinator="
-                f"{args.dedicated_coordinator} put_phase_words="
-                f"{args.put_phase_words} pipelined_return="
-                f"{args.pipelined_return} weighted_return="
-                f"{args.weighted_return} external_weighted_reducer="
-                f"{args.external_weighted_reducer} external_reducer_mode="
-                f"{args.external_reducer_mode} external_reducer_blocks="
-                f"{pool_result[1]['external_reducer_blocks'] if pool_result else args.external_reducer_blocks} "
-                f"reader_pipeline="
-                f"{pool_result[1]['reader_pipeline'] if pool_result else not args.no_reader_pipeline} "
+                f"{args.source_preloaded} weighted_return="
+                f"{args.weighted_return} "
                 f"reader_op={args.reader_op} "
-                f"pack_warps="
-                f"{pool_result[1]['pack_warps'] if pool_result else args.pack_warps} "
+                f"data_group_limit="
+                f"{pool_result[1]['data_group_limit'] if pool_result else args.group_limit} "
+                f"queues/source="
+                f"{pool_result[1]['stream_queues_per_source'] if pool_result else 2} "
                 f"warmup={args.warmup} iterations={args.iterations}"
             )
             if pool_result is not None:

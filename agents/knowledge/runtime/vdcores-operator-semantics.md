@@ -342,17 +342,17 @@ The registry is `include/dae/pool_opcode.cuh.inc`. Pool operators are
 `PoolInstruction` subclasses and execute only in a kernel assembly containing
 their registered execute-warp type.
 
-- `POOL_SLICE_EXCHANGE` is an eight-warp `PoolInst`:
+- `POOL_SLICE_EXCHANGE` and `POOL_SLICE_WEIGHTED_EXCHANGE` are eight-warp
+  `PoolInst` variants:
   - `address` is a `PoolSliceConfig` pointer;
   - `size` is the first source-writer chunk barrier;
   - `arg0` is the first contiguous reader-dispatch barrier;
-  - `arg1` is the first contiguous reader/reducer-compute barrier; weighted
-    return waits `PoolSliceConfig.reducer_count` signals from this base;
-  - host dispatch instantiates `PoolSliceExchangeExecuteWarp` and every thread
-    enters it before any ordinary VM state is allocated;
-  - it publishes route-count descriptors, packs source rows, performs batched
-    dynamic GETs, releases ordinary reader blocks, performs batched return
-    PUTs, waits merged return phases, and source-scatters the result;
+  - `arg1` is the first contiguous reader-compute barrier;
+  - host dispatch instantiates the matching generic or weighted execute-warp
+    type and every thread enters it before ordinary VM state is allocated;
+  - it publishes router metadata, directly PUTs source rows, executes ordered
+    gathered reads, releases ordinary reader blocks, performs batched return
+    PUTs, waits merged return signals, and source-scatters the result;
   - a fixed pool assembly contains no compute/memory/communication
     interpreters; a mixed assembly may run them only on other blocks.
 
@@ -368,26 +368,6 @@ The compute-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/de
 - `OP_LOOPC`
 - `OP_DUMMY`
 - `OP_COPY`
-
-Pool reduction operators are ordinary compute instructions; they are not
-PoolInst opcodes:
-
-- `OP_POOL_ZERO_WEIGHTED_RETURN`
-  - consumes raw config and PoolRawAddress completion tokens;
-  - zeros the private token-partial half of `return_inbox` while dispatch runs;
-  - the PoolRawAddress store path releases the named GPU-scope zero signal.
-- `OP_POOL_EXPERT_ATOMIC_REDUCE_BF16`
-  - `args[0]` is the local expert/reader;
-  - waits are ordinary `OP_POOL_WAIT_SIGNAL` memory instructions scheduled
-    before its raw operands;
-  - walks that expert's dynamic receive batches and uses native BF16x2
-    `atomicAdd` to contribute weighted rows to token-major staging;
-  - completion releases the corresponding PoolInst reducer signal.
-- `OP_POOL_TOKEN_REDUCE_BF16`
-  - `args[0:2]` are reducer rank/count;
-  - each block owns disjoint `(source PE, compact token)` tasks, reads the
-    reverse expert-row map, accumulates in FP32 registers, and stores BF16;
-  - up to 32 blocks release a contiguous signal range consumed by PoolInst.
 
 ## Control ops
 

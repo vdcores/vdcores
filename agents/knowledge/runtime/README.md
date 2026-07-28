@@ -16,6 +16,7 @@ Then pull in narrower notes as needed:
 - [memory-pool-protocol.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-protocol.md)
 - [vdcores-communication-core.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-communication-core.md)
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md)
+- [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md)
 
 ## What Each Note Covers
 
@@ -34,3 +35,5 @@ Then pull in narrower notes as needed:
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md):
   distributed slice ownership, merged signals, batched dynamic reads, and
   measured optimization results
+- [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md):
+  optional Grace coherent request ring and direct-HBM host-verbs transport

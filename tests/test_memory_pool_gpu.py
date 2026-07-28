@@ -58,7 +58,7 @@ def test_single_pe_pool_owned_dynamic_read():
         "0",
         "--iterations",
         "1",
-        "--pack-warps",
+        "--data-groups",
         "2",
     )
     assert (

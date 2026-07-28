@@ -8,6 +8,18 @@ Use this for the optional MPI-bootstrapped DAE runtime on Vista.
 idev -p gh-dev -N 2 -n 2 -tpn 1 -t 01:00:00
 ```
 
+Immediately verify placement before any benchmark:
+
+```bash
+export IBRUN_TASKS_PER_NODE=1
+ibrun -n 2 hostname
+```
+
+The two lines must name two distinct nodes. An allocation created with many
+task slots per node can make `ibrun -n 2` place both PEs on one GH node/GPU;
+discard those timings rather than treating the resulting serialization as a
+transport regression.
+
 2. Activate the CUDA 13/PyTorch Conda environment and install the official
    binding versions compatible with NVSHMEM 3.4.5 and PyTorch CUDA 13.0:
 
