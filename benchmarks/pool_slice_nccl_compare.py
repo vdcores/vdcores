@@ -67,12 +67,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="pool-local weighted partial reduction plus token-major source sum",
     )
-    parser.add_argument(
-        "--reader-op",
-        choices=("copy", "rms"),
-        default="copy",
-        help="ordinary VDCores work executed after each dynamic read",
-    )
     parser.add_argument("--in-place-identity", action="store_true")
     parser.add_argument(
         "--print-pool-ctas",
@@ -199,21 +193,11 @@ def run_pool(
         buffers.token_pool.copy_(tokens)
         pool_source = buffers.token_pool
     buffers.prepare(pool_source, returned)
-    rms_weights = None
-    if args.reader_op == "rms":
-        if args.dtype != "bfloat16" or args.hidden_size != 4096:
-            raise ValueError("reader RMS requires bfloat16 hidden-size 4096")
-        rms_weights = torch.ones(
-            args.hidden_size,
-            dtype=tokens.dtype,
-            device=tokens.device,
-        )
     program = build_pool_slice_copy_program(
         buffers,
         benchmark_barrier=nvshmem.benchmark_barrier,
         in_place_identity=args.in_place_identity,
         source_preloaded=args.source_preloaded,
-        reader_rms_weights=rms_weights,
     )
 
     gather_samples: list[float] = []
@@ -270,24 +254,12 @@ def run_pool(
                         )
                     )
 
-    expected_tokens = tokens
-    if args.reader_op == "rms":
-        input_f32 = tokens.float()
-        expected_tokens = (
-            input_f32
-            * torch.rsqrt(input_f32.square().mean(dim=-1, keepdim=True) + 1.0e-5)
-        ).to(tokens.dtype)
     expected_returned = (
-        expected_tokens
+        tokens
         if args.weighted_return
-        else expected_tokens.index_select(0, source_rows.to(tokens.device))
+        else tokens.index_select(0, source_rows.to(tokens.device))
     )
-    torch.testing.assert_close(
-        returned,
-        expected_returned,
-        rtol=1.0e-2 if args.reader_op == "rms" else 0,
-        atol=1.0e-2 if args.reader_op == "rms" else 0,
-    )
+    torch.testing.assert_close(returned, expected_returned, rtol=0, atol=0)
     status, senders, received_rows, returned_slices, dispatch_ready = (
         buffers.control_state()
     )
@@ -338,7 +310,6 @@ def run_pool(
             f"source-grouped-{POOL_SLICE_RETURN_GROUPS_PER_SOURCE}"
         ),
         "weighted_reduce": "fp32-ilp4",
-        "reader_op": args.reader_op,
         "data_group_limit": buffers.group_limit,
         "stream_queues_per_source": stream_queues_per_source,
         "stream_queue_metadata_bytes_per_pe": int(
@@ -397,13 +368,7 @@ def run_pool(
         "local_reader_copy_bytes_per_pe": (
             0
             if args.in_place_identity
-            else 2
-            * (
-                received_rows
-                if args.reader_op == "rms"
-                else args.experts_per_pe * expert_capacity_rows
-            )
-            * row_bytes
+            else 2 * args.experts_per_pe * expert_capacity_rows * row_bytes
         ),
         "received_rows": received_rows,
     }
@@ -506,7 +471,6 @@ def main() -> None:
                 f"{args.in_place_identity} source_preloaded="
                 f"{args.source_preloaded} weighted_return="
                 f"{args.weighted_return} "
-                f"reader_op={args.reader_op} "
                 f"data_group_limit="
                 f"{pool_result[1]['data_group_limit'] if pool_result else args.group_limit} "
                 f"queues/source="

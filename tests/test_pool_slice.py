@@ -352,6 +352,28 @@ def test_pool_program_is_only_vdcores_ops_and_uses_an_isolated_pool_block():
     assert "launcher.new_bar(0 if source_preloaded else 1)" in source
 
 
+def test_pool_program_has_no_model_specific_rms_operator():
+    sources = "\n".join(
+        (ROOT / relative).read_text()
+        for relative in (
+            "benchmarks/pool_slice_nccl_compare.py",
+            "include/dae/compute_dispatch.cuh",
+            "include/dae/opcode.cuh.inc",
+            "include/task/rms_norm.cuh",
+            "python/dae/instructions.py",
+            "python/dae/pool_slice.py",
+        )
+    )
+    for removed_name in (
+        "OP_POOL_RMS_NORM",
+        "POOL_RMS_NORM",
+        "task_pool_rms_norm",
+        "reader_rms",
+        "--reader-op",
+    ):
+        assert removed_name not in sources
+
+
 def test_pool_mailbox_scan_is_lane_parallel_and_uses_one_merged_word():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
     assert "__ballot_sync(0xffffffffU, metadata_ready)" in source
@@ -536,7 +558,7 @@ def test_pool_local_dependencies_reuse_normal_countdown_barriers():
         for relative in ("include/task/rms_norm.cuh", "include/task/silu.cuh")
     )
     assert "special_slot_completion" not in direct_output_tasks
-    assert direct_output_tasks.count("1U <<") >= 3
+    assert direct_output_tasks.count("1U <<") >= 2
 
     allocator = (
         ROOT / "include" / "dae" / "pipeline" / "allocwarp.cuh"

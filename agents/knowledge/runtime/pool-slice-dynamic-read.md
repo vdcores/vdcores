@@ -14,6 +14,8 @@ points are `include/dae/pool_slice_abi.cuh`, `include/dae/pool_slice.cuh`, and
   that metadata and owns all inter-PE movement.
 - Reader blocks only execute ordinary VDCores memory/compute operations behind
   pool-released barriers.
+- The checked-in benchmark helper uses either in-place identity or an ordinary
+  byte-copy reader. PoolInst has no model-specific RMSNorm opcode or task.
 
 The optimized implementation has one outstanding monotonic sequence per fixed
 buffer set. It does not retain the old expert-specific transport or its
@@ -225,6 +227,24 @@ latency there; the prior matched DeepEP sweep was
 0.156/0.243/0.407/0.742 ms. A fully spread 32-token correctness run measured
 0.164 ms. Process-to-process metadata/fabric jitter remains visible, so retain
 phase medians and paired controls rather than only the best total.
+
+### Pool RMS removal A/B (2026-07-29)
+
+The model-specific Pool RMS opcode was removed without changing the PoolInst
+hot path. A same-allocation, independently rebuilt two-PE A/B used BF16 hidden
+7168, eight experts/PE, top-k 8 clustered routing, weighted return,
+source-preloaded input, in-place identity readers, 24 PoolInst CTAs, 15
+warmups, and 50 samples at 32/128/256 tokens per PE. It used CTA-mapped QP4 at
+32/128 tokens and QP8 at 256. Pre-cleanup totals were
+0.169/0.302--0.309/0.439 ms; cleaned totals were
+0.142--0.169/0.225--0.378/0.417--0.453 ms. The old result lies inside the
+cleaned process-to-process range at every size. At 128 tokens, three-run
+medians were 0.303 ms old and 0.251 ms cleaned, while the much less
+fabric-sensitive `compute_ready -> scatter_done` interval remained 101.328 us
+old versus 100.704 us cleaned. Both builds used 190 registers, 16 barriers,
+14,628 bytes shared memory, and no entry spills for the PoolInst mixed entry.
+This rules out a measurable regression from the cleanup; metadata/fabric
+arrival jitter dominates the total-time spread.
 
 The retained return uses sixteen fine reduction shards per source at two PEs,
 coalesced into four contiguous put-with-signal groups by narrow GPU-scope

@@ -290,16 +290,6 @@ class RMS_NORM_F16_K_4096(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_4096, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
-class POOL_RMS_NORM_F16_K_4096(ComputeInstruction):
-    """RMS over a pool-published dynamic contiguous row count."""
-
-    def __init__(self, max_num_token: int, epsilon: float):
-        super().__init__(
-            opcode=opcode.OP_POOL_RMS_NORM_F16_K_4096,
-            args=[max_num_token, encode_bfloat16_u16(epsilon)],
-        )
-
-
 class RMS_NORM_F16_K_4096_SMEM(ComputeInstruction):
     def __init__(self, num_token: int, epsilon: float):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_4096_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
@@ -1308,7 +1298,6 @@ __all__ = [
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
-    "POOL_RMS_NORM_F16_K_4096",
     "RMS_NORM_F16_K_4096_SMEM",
     "RMS_NORM_F16_K_128_SMEM",
     "RMS_NORM_F16_K_2048_SMEM",

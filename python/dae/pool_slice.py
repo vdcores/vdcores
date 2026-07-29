@@ -899,8 +899,6 @@ def build_pool_slice_copy_program(
     benchmark_barrier=None,
     in_place_identity: bool = False,
     source_preloaded: bool = False,
-    reader_rms_weights: torch.Tensor | None = None,
-    reader_rms_epsilon: float = 1.0e-5,
     host_data_plane: bool = False,
 ) -> PoolSliceProgram:
     """Build writer, PoolInst, and reader VDCores operations."""
@@ -908,11 +906,9 @@ def build_pool_slice_copy_program(
     from .instructions import (
         Copy,
         IssueBarrier,
-        POOL_RMS_NORM_F16_K_4096,
         PoolSliceExchange,
         PoolSliceHostWeightedExchange,
         PoolSliceWeightedExchange,
-        RawAddress,
         TerminateC,
         TerminateM,
         TmaLoad1D,
@@ -932,24 +928,6 @@ def build_pool_slice_copy_program(
         raise ValueError(
             "in_place_identity requires expert_input and expert_output to alias"
         )
-    if in_place_identity and reader_rms_weights is not None:
-        raise ValueError("reader RMS requires a separate expert output buffer")
-    if reader_rms_weights is not None:
-        if buffers.expert_input.dtype != torch.bfloat16:
-            raise ValueError("reader RMS currently requires bfloat16 buffers")
-        if buffers.token_pool.shape[-1] != 4096:
-            raise ValueError("reader RMS currently requires hidden_size=4096")
-        if (
-            not isinstance(reader_rms_weights, torch.Tensor)
-            or not reader_rms_weights.is_cuda
-            or reader_rms_weights.dtype != torch.bfloat16
-            or not reader_rms_weights.is_contiguous()
-            or reader_rms_weights.numel() != 4096
-        ):
-            raise ValueError(
-                "reader_rms_weights must be a contiguous CUDA bfloat16 row "
-                "with 4096 elements"
-            )
     if source_preloaded and (
         buffers._source.data_ptr() != buffers.token_pool.data_ptr()
     ):
@@ -1049,33 +1027,6 @@ def build_pool_slice_copy_program(
         for local_reader in range(buffers.local_readers):
             builder = launcher.builder[reader_base + local_reader]
             builder.add_memory(IssueBarrier(dispatch_barriers[local_reader]))
-            if reader_rms_weights is not None:
-                builder.add_memory(RawAddress(reader_rms_weights, 26))
-                builder.add_memory(
-                    RawAddress(buffers.expert_input[local_reader], 24)
-                )
-                rms_output = RawAddress(
-                    buffers.expert_output[local_reader], 25
-                )
-                rms_output.writeback()
-                rms_output.bar(compute_barriers[local_reader])
-                builder.add_memory(rms_output)
-                builder.add_memory(
-                    RawAddress(
-                        buffers.control[
-                            POOL_SLICE_CONTROL_READER_ROW_COUNT + local_reader :
-                            POOL_SLICE_CONTROL_READER_ROW_COUNT + local_reader + 1
-                        ],
-                        27,
-                    )
-                )
-                builder.add_compute(
-                    POOL_RMS_NORM_F16_K_4096(
-                        buffers.expert_capacity_rows,
-                        reader_rms_epsilon,
-                    )
-                )
-                continue
             input_flat = buffers.expert_input[local_reader].view(-1)
             output_flat = buffers.expert_output[local_reader].view(-1)
             for chunk in range(reader_chunks):
@@ -1103,15 +1054,11 @@ def build_pool_slice_copy_program(
 
     max_memory = max(
         1 if source_preloaded else 2 * token_chunks + 1,
-        1
-        if in_place_identity
-        else (6 if reader_rms_weights is not None else 2 * reader_chunks + 2),
+        1 if in_place_identity else 2 * reader_chunks + 2,
     )
     max_compute = max(
         1 if source_preloaded else token_chunks + 1,
-        1
-        if in_place_identity
-        else (2 if reader_rms_weights is not None else reader_chunks + 1),
+        1 if in_place_identity else reader_chunks + 1,
     )
     if max_memory > launcher.max_insts or max_compute > launcher.max_insts:
         raise ValueError("pool capacity requires too many VDCores instructions")
