@@ -61,8 +61,9 @@ must combine ordinary VDCores blocks with pool blocks.
 PoolInst and ordinary VM blocks interact through named HBM/barrier objects,
 not implicit CTA-wide ordering:
 
-- `pool_signal_release/ready` provides device-scope release/acquire ordering
-  for local VDCores producer and reader barriers;
+- local VDCores producer and reader dependencies reuse ordinary countdown
+  barriers: initialize a pending single-producer edge to one, `atomicSub` on
+  completion, and poll until zero;
 - dependency counters use scoped atomic release/add and acquire/load;
 - remote descriptors use NVSHMEM put-with-signal;
 - remote NBI payload operations are completed by a matching quiet before the

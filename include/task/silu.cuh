@@ -119,7 +119,7 @@ __device__ __forceinline__ void task_silu_K_half2(
     // c2m.template push<31, true, false>(thread_id, gate_addr_slot);
     // c2m.template push<31, true, false>(thread_id, up_addr_slot);
     c2m.template push<31, true, false>(
-        thread_id, special_slot_completion(out_addr_slot));
+        thread_id, 1U << out_addr_slot);
 }
 
 template<int K, typename Layout,

@@ -425,6 +425,11 @@ The `bars` array is the externally visible dependency table.
 - write side:
   - writeback ops with `MEM_OP_FLAGS_BARRIER` decrement `bars[bar]` after the async store finishes
 
+PoolSlice local handoffs use this same table and the same operations. A pending
+single-producer edge starts at one, its producer decrements once, and every
+consumer waits for zero. Pre-satisfied edges start at zero. Cross-PE sequence
+signals and generic memory-pool dependency tickets remain separate objects.
+
 ### Memory-pool dependency tickets
 
 The optional NVSHMEM memory pool adds a separate HBM dependency table. A pool
@@ -454,6 +459,12 @@ Observed behavior from [python/dae/instructions.py](/home1/11362/depctg/vdcores/
 - `RawAddress(tensor, slot_id)` reserves a special slot id
 - the pointer is stored in `st_insts[slot_id].address`
 - compute kernels recover it with `slot_2_glob_ptr(...)`
+- a direct-output schedule may add `WRITEBACK | BARRIER`; compute converts the
+  special slot id to the ordinary one-hot `c2m` mask, and the store warp routes
+  it solely to decrement the normal barrier after compute finishes writing HBM
+- direct-output writeback slots are restricted to `24..30`; special slots
+  `31..32` may carry input pointers but cannot be represented as a nonnegative
+  one-hot value in the signed 32-bit `c2m` queue
 
 This is the path used for outputs that compute writes directly to global memory without a shared-memory writeback tile.
 

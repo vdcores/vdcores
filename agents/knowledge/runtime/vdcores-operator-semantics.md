@@ -306,6 +306,12 @@ Barrier behavior for writeback ops:
   - observed effect:
     - allocator bypasses normal slot allocation
     - the pointer becomes available through `st_insts[special_slot].address`
+    - when a schedule adds `WRITEBACK | BARRIER`, compute returns the special
+      slot as an ordinary one-hot `c2m` mask; the store warp performs no copy
+      and decrements the encoded normal barrier
+    - writeback is supported for special slots `24..30`; slots `31..32` are
+      input-only because their one-hot values are not positive signed `c2m`
+      payloads
   - practical meaning:
     - carry raw global pointers through the VM for compute kernels that write or read global memory directly
 

@@ -132,8 +132,9 @@ PoolInst executor.
 4. All dispatch RMAs are nonblocking and several PoolInst CTAs may keep
    independent QPs in flight. The current compact direct-put path uses the
    pinned block-cooperative quiet per issuing CTA.
-5. Reader completion barriers use GPU-scope release/acquire operations to
-   order ordinary VDCores stores before return workers read expert output.
+5. Reader completion uses an ordinary countdown barrier initialized to one.
+   The VDCores store warp waits for its writeback, decrements the barrier, and
+   return workers poll for zero before reading expert output.
 6. All return RMAs are nonblocking; a quiet precedes return-phase publication.
 7. Observing all return phases makes every source inbox range consumable before
    scatter.

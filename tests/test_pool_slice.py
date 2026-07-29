@@ -12,6 +12,7 @@ from dae.instructions import (
     PoolSliceExchange,
     PoolSliceHostWeightedExchange,
     PoolSliceWeightedExchange,
+    RawAddress,
 )
 from dae.pool_slice import (
     POOL_SLICE_CONFIG_BYTES,
@@ -340,8 +341,10 @@ def test_pool_program_is_only_vdcores_ops_and_uses_an_isolated_pool_block():
     assert "PoolSliceWeightedExchange" in source
     assert "pool_instruction = PoolSliceExchange" in source
     assert "writer_builder.add_memory(TmaLoad1D" in source
-    assert "PoolTmaStore1D(" in source
-    assert "PoolWaitSignal(" in source
+    assert "store = TmaStore1D(" in source
+    assert "builder.add_memory(IssueBarrier(" in source
+    assert "PoolTmaStore1D" not in source
+    assert "PoolWaitSignal" not in source
     assert "reader_base = 1 + buffers.pool_count" in source
     assert "torch.cuda.Stream" not in source
     assert "torch.cuda.Event" not in source
@@ -506,19 +509,52 @@ def test_pool_protocol_has_no_explicit_system_fence():
     assert "__threadfence_system" not in sources
 
 
-def test_pool_local_dependencies_use_isolated_release_acquire_signals():
-    helper = (ROOT / "include" / "dae" / "pool_signal.cuh").read_text()
-    assert "st.release.gpu.global.u32" in helper
-    assert "ld.acquire.gpu.global.u32" in helper
+def test_pool_local_dependencies_reuse_normal_countdown_barriers():
+    assert not (ROOT / "include" / "dae" / "pool_signal.cuh").exists()
+    opcodes = (ROOT / "include" / "dae" / "opcode.cuh.inc").read_text()
+    assert "OP_POOL_WAIT_SIGNAL" not in opcodes
+    assert "OP_ALLOC_WB_POOL_TMA_STORE_1D" not in opcodes
+    assert "OP_ALLOC_WB_POOL_RAW_ADDRESS" not in opcodes
+
+    pool = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
+    assert "pool_slice_barrier_ready(" in pool
+    assert "volatile const int*" in pool
+    assert "atomicSub(bars + dispatch_barrier_base + reader, 1);" in pool
+
     store = (ROOT / "include" / "dae" / "pipeline" / "stwarp.cuh").read_text()
-    assert "OP_ALLOC_WB_POOL_TMA_STORE_1D" in store
-    assert "pool_signal_release(" in store
+    assert "case op(OP_ALLOC_WB_RAW_ADDRESS):" in store
+    assert "atomicSub(&bars[inst.bar()], 1);" in store
+    assert "const auto slot = extract(slot_mask);" in store
+    assert "special_completion" not in store
+
+    virtual_core = (ROOT / "include" / "dae" / "virtualcore.cuh").read_text()
+    assert "SLOT_SPECIAL_COMPLETION" not in virtual_core
+    assert "special_slot_completion" not in virtual_core
+
+    direct_output_tasks = "\n".join(
+        (ROOT / relative).read_text()
+        for relative in ("include/task/rms_norm.cuh", "include/task/silu.cuh")
+    )
+    assert "special_slot_completion" not in direct_output_tasks
+    assert direct_output_tasks.count("1U <<") >= 3
+
     allocator = (
         ROOT / "include" / "dae" / "pipeline" / "allocwarp.cuh"
     ).read_text()
-    assert "OP_POOL_WAIT_SIGNAL" in allocator
-    assert "pool_signal_ready(" in allocator
-    assert "atomicSub(&bars[inst.bar()], 1);" in store
+    assert "case op(OP_ISSUE_BARRIER):" in allocator
+    assert "OP_POOL_WAIT_SIGNAL" not in allocator
+
+
+def test_raw_address_writeback_rejects_unrepresentable_c2m_slots():
+    tensor = SimpleNamespace(
+        device=SimpleNamespace(type="cuda"),
+        data_ptr=lambda: 0,
+    )
+    assert RawAddress(tensor, 30).writeback().opcode & 2
+    with pytest.raises(ValueError, match="slot_id <= 30"):
+        RawAddress(tensor, 31).writeback()
+    with pytest.raises(ValueError, match="slot_id <= 30"):
+        RawAddress(tensor, 32).bar(7).writeback()
 
 
 def test_pool_inst_has_its_own_compile_time_warp_type():

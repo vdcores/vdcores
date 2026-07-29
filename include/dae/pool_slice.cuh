@@ -2,7 +2,6 @@
 
 #include "context.cuh"
 #include "pool_host.cuh"
-#include "pool_signal.cuh"
 #include "pool_slice_abi.cuh"
 #include "scoped_atomic.cuh"
 
@@ -27,6 +26,14 @@ static __device__ __forceinline__ void pool_slice_quiet_block() {
 #ifdef __CUDA_ARCH__
   nvshmemi_quiet<NVSHMEMI_THREADGROUP_BLOCK>();
 #endif
+}
+
+// PoolInst consumes the same local countdown barriers as ordinary VDCores
+// memory operators. A pending single-producer dependency starts at one; an
+// already satisfied dependency starts at zero.
+static __device__ __forceinline__ bool pool_slice_barrier_ready(
+    const int* barrier) {
+  return *reinterpret_cast<volatile const int*>(barrier) == 0;
 }
 
 static __device__ __forceinline__ void pool_slice_set_status(
@@ -697,7 +704,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
         continue;
       }
       const uint32_t chunk = source_row / config.write_chunk_rows;
-      while (!pool_signal_ready(bars + write_barrier + chunk))
+      while (!pool_slice_barrier_ready(bars + write_barrier + chunk))
         __nanosleep(barrierPollSleepCycles);
     }
     __syncthreads();
@@ -784,7 +791,8 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
       uint32_t write_ready = 0;
       while (write_ready == 0) {
         if (lane == 0)
-          write_ready = pool_signal_ready(bars + write_barrier + chunk);
+          write_ready = pool_slice_barrier_ready(
+              bars + write_barrier + chunk);
         write_ready = __shfl_sync(0xffffffffU, write_ready, 0);
         if (write_ready == 0)
           __nanosleep(barrierPollSleepCycles);
@@ -1018,8 +1026,8 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
         uint32_t write_ready = 0;
         while (write_ready == 0) {
           if (lane == 0)
-            write_ready =
-                pool_signal_ready(bars + write_barrier + chunk);
+            write_ready = pool_slice_barrier_ready(
+                bars + write_barrier + chunk);
           write_ready =
               __shfl_sync(0xffffffffU, write_ready, 0);
           if (write_ready == 0)
@@ -1383,7 +1391,8 @@ static __device__ __noinline__ void pool_slice_return_weighted(
     bool ready = lane >= config.local_readers;
     while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
       if (!ready)
-        ready = pool_signal_ready(bars + compute_barrier_base + lane);
+        ready = pool_slice_barrier_ready(
+            bars + compute_barrier_base + lane);
       if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
         __nanosleep(barrierPollSleepCycles);
     }
@@ -2192,8 +2201,8 @@ static __device__ __noinline__ void pool_slice_return_unweighted(
       uint32_t compute_ready = 0;
       while (compute_ready == 0) {
         if (lane == 0)
-          compute_ready =
-              pool_signal_ready(bars + compute_barrier_base + reader);
+          compute_ready = pool_slice_barrier_ready(
+              bars + compute_barrier_base + reader);
         compute_ready = __shfl_sync(0xffffffffU, compute_ready, 0);
         if (compute_ready == 0)
           __nanosleep(barrierPollSleepCycles);
@@ -2234,7 +2243,8 @@ static __device__ __noinline__ void pool_slice_return_unweighted(
     bool ready = lane >= config.local_readers;
     while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
       if (!ready)
-        ready = pool_signal_ready(bars + compute_barrier_base + lane);
+        ready = pool_slice_barrier_ready(
+            bars + compute_barrier_base + lane);
       if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
         __nanosleep(barrierPollSleepCycles);
     }
@@ -2912,7 +2922,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
         const uint64_t rows = dae_atomic_load_relaxed_gpu(
             control + poolSliceControlReaderRowCount + reader);
         received_rows += rows;
-        pool_signal_release(bars + dispatch_barrier_base + reader);
+        atomicSub(bars + dispatch_barrier_base + reader, 1);
       }
       control[1] = config.num_pes;
       control[2] = received_rows;

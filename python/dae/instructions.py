@@ -914,6 +914,8 @@ class RepeatM(MemoryInstruction):
 
 
 class RawAddress(MemoryInstruction):
+    MAX_WRITEBACK_SLOT = 30
+
     def __init__(self, tensor: torch.Tensor, slot_id: int):
         assert tensor.device.type == "cuda"
         address = tensor.data_ptr()
@@ -931,33 +933,21 @@ class RawAddress(MemoryInstruction):
             address=address,
         )
 
-
-class PoolRawAddress(RawAddress):
-    """Direct-output address followed by a device-scope pool release."""
-
-    def __init__(self, tensor: torch.Tensor, slot_id: int):
-        super().__init__(tensor, slot_id)
-        self.opcode = opcode.OP_ALLOC_WB_POOL_RAW_ADDRESS
+    def writeback(self):
+        slot_id = self.arg
+        if slot_id > self.MAX_WRITEBACK_SLOT:
+            raise ValueError(
+                "RawAddress writeback requires a one-hot c2m mask and "
+                f"therefore supports slot_id <= {self.MAX_WRITEBACK_SLOT}; "
+                f"got {slot_id}"
+            )
+        return super().writeback()
 
 
 class IssueBarrier(MemoryInstruction):
     def __init__(self, bar: int):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
         self.bar(bar)
-
-
-class PoolWaitSignal(MemoryInstruction):
-    """Wait on a single-producer device-scope pool dependency flag."""
-
-    def __init__(self, signal: int):
-        super().__init__(
-            opcode=opcode.OP_POOL_WAIT_SIGNAL,
-            num_slots=0,
-            arg=0,
-            size=0,
-            address=0,
-        )
-        self.bar(signal)
 
 
 def _control_pointer(value: torch.Tensor | int, name: str) -> int:
@@ -1210,19 +1200,6 @@ class TmaStore1D(MemoryInstruction):
         return new_inst
 
 
-class PoolTmaStore1D(TmaStore1D):
-    """TMA store followed by a device-scope pool release signal."""
-
-    def __init__(
-        self,
-        dst: torch.Tensor,
-        bytes: int | None = None,
-        numSlots: int | None = None,
-    ):
-        super().__init__(dst, bytes=bytes, numSlots=numSlots)
-        self.opcode = opcode.OP_ALLOC_WB_POOL_TMA_STORE_1D
-
-
 class TmaTensor(MemoryInstruction):
     def __init__(self, launcher, mat: torch.Tensor):
         super().__init__(opcode=0, num_slots=0, arg=0, size=0, cords=[])
@@ -1357,9 +1334,7 @@ __all__ = [
     "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",
-    "PoolRawAddress",
     "IssueBarrier",
-    "PoolWaitSignal",
     "NvshmemPut",
     "NvshmemWait",
     "MemoryPoolSubmit",
@@ -1373,6 +1348,5 @@ __all__ = [
     "RegLoad",
     "TmaLoad1D",
     "TmaStore1D",
-    "PoolTmaStore1D",
     "TmaTensor",
 ]

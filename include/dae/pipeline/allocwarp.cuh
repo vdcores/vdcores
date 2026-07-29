@@ -1,7 +1,6 @@
 #pragma once
 
 #include "virtualcore.cuh"
-#include "pool_signal.cuh"
 
 static __device__ __forceinline__ void prefetch_inst_window(
     const int lane_id, const MInst* insts, uint32_t target_pc) {
@@ -198,14 +197,6 @@ __device__ __forceinline__ void allocwarp_execute(
               __nanosleep(barrierPollSleepCycles);
             }
             __mprint("Issue barrier %d passed", inst.bar());
-          }
-          break;
-        }
-        case op(OP_POOL_WAIT_SIGNAL): {
-          if (lane_id == 0) {
-            const int* signal = bars + inst.bar();
-            while (!pool_signal_ready(signal))
-              __nanosleep(barrierPollSleepCycles);
           }
           break;
         }

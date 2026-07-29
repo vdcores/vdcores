@@ -133,8 +133,9 @@ VDCores macro operation; no helper kernel or stream is introduced.
 - An empty relationship still executes its ordered route reservation and
   `END`. When all of that source's queue ends retire, the target may publish
   return completion immediately.
-- Ordinary VDCores writer/reader barriers use the separate GPU-scope
-  `pool_signal` release/acquire path.
+- Ordinary VDCores writer/reader dependencies reuse the normal countdown-barrier
+  path. Every pending local edge has one logical producer, starts at one, and
+  reaches zero through the same `atomicSub` used by existing store barriers.
 
 The implementation has no explicit system fence. The scoped atomic wrappers
 lower directly to PTX; bookkeeping-only sequence words use native CUDA

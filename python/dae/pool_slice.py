@@ -907,10 +907,8 @@ def build_pool_slice_copy_program(
 
     from .instructions import (
         Copy,
-        PoolRawAddress,
+        IssueBarrier,
         POOL_RMS_NORM_F16_K_4096,
-        PoolTmaStore1D,
-        PoolWaitSignal,
         PoolSliceExchange,
         PoolSliceHostWeightedExchange,
         PoolSliceWeightedExchange,
@@ -918,6 +916,7 @@ def build_pool_slice_copy_program(
         TerminateC,
         TerminateM,
         TmaLoad1D,
+        TmaStore1D,
     )
     from .launcher import Launcher
 
@@ -1040,7 +1039,7 @@ def build_pool_slice_copy_program(
             destination = token_pool_flat.narrow(0, offset, elements)
             nbytes = rows * row_bytes
             writer_builder.add_memory(TmaLoad1D(source, bytes=nbytes))
-            store = PoolTmaStore1D(destination, bytes=nbytes)
+            store = TmaStore1D(destination, bytes=nbytes)
             store.bar(write_barriers[chunk])
             writer_builder.add_memory(store)
             writer_builder.add_compute(Copy(1, nbytes))
@@ -1049,15 +1048,16 @@ def build_pool_slice_copy_program(
         reader_base = 1 + buffers.pool_count
         for local_reader in range(buffers.local_readers):
             builder = launcher.builder[reader_base + local_reader]
-            builder.add_memory(PoolWaitSignal(dispatch_barriers[local_reader]))
+            builder.add_memory(IssueBarrier(dispatch_barriers[local_reader]))
             if reader_rms_weights is not None:
                 builder.add_memory(RawAddress(reader_rms_weights, 26))
                 builder.add_memory(
                     RawAddress(buffers.expert_input[local_reader], 24)
                 )
-                rms_output = PoolRawAddress(
+                rms_output = RawAddress(
                     buffers.expert_output[local_reader], 25
                 )
+                rms_output.writeback()
                 rms_output.bar(compute_barriers[local_reader])
                 builder.add_memory(rms_output)
                 builder.add_memory(
@@ -1090,7 +1090,7 @@ def build_pool_slice_copy_program(
                 destination = output_flat.narrow(0, offset, elements)
                 nbytes = rows * row_bytes
                 builder.add_memory(TmaLoad1D(source, bytes=nbytes))
-                store = PoolTmaStore1D(destination, bytes=nbytes)
+                store = TmaStore1D(destination, bytes=nbytes)
                 if chunk + 1 == reader_chunks:
                     store.bar(compute_barriers[local_reader])
                 builder.add_memory(store)
