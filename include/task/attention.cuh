@@ -303,12 +303,7 @@ template <int HEAD_DIM,
           int MAX_SPLIT,
           bool NEED_NORM, bool NEED_ROPE,
           typename AtomQK, typename AtomPV, typename M2C_Type, typename C2M_Type>
-#ifdef DAE_ENABLE_NVSHMEM
-__device__ __noinline__
-#else
-__device__ __forceinline__
-#endif
-void task_attention_fwd_flash3_grouped(
+__device__ __forceinline__ void task_attention_fwd_flash3_grouped(
     const int num_kv_blocks,
     const int split_idx,
     const int num_active_q, // to avoid overwriting other split_kv metadata buffer

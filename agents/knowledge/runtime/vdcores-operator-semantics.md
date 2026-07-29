@@ -364,6 +364,12 @@ and `vdcores-communication-core.md`.
 
 The compute-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/depctg/vdcores/include/dae/opcode.cuh.inc) is larger than the checked-in handler set. The checked-in control-flow opcodes are:
 
+Task device functions under `include/task/` must never use `noinline`, including
+configuration-dependent aliases of it. Keep task entry points force-inlined so
+the selected operator specializes into its VDCores interpreter; isolate large
+runtime roles through compile-time core assembly rather than device calls.
+`tests/test_task_inlining.py` enforces this source contract.
+
 - `OP_TERMINATEC`
 - `OP_LOOPC`
 - `OP_DUMMY`

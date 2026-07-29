@@ -9,17 +9,11 @@
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
 #include <cute/algorithm/gemm.hpp>     // cute::gemm
 
-#ifdef DAE_ENABLE_NVSHMEM
-#define DAE_WGMMA_TASK_QUALIFIER __noinline__
-#else
-#define DAE_WGMMA_TASK_QUALIFIER __forceinline__
-#endif
-
 // TODO(zhiyuang): this is a gemv style wgmma, not tile overN but prefetch K tiles
 template<typename Atom, int M, int K,
          int b_load_interval, bool residual,
          typename M2C_Type, typename C2M_Type>
-__device__ DAE_WGMMA_TASK_QUALIFIER void task_gemv(
+__device__ __forceinline__ void task_gemv(
     const int nKTiles, 
     const int prefetch,
     const void *base, 
@@ -132,8 +126,6 @@ __device__ DAE_WGMMA_TASK_QUALIFIER void task_gemv(
     // TODO: do we need synchronize warpgroup before returning slot?
     c2m.template push<0, true>(thread_id, slot_c);
 }
-
-#undef DAE_WGMMA_TASK_QUALIFIER
 
 // This function uses mma instead of wgmma, so it works on sm >= 89
 template<int M, int N, int K, typename M2C_Type, typename C2M_Type>
