@@ -199,17 +199,6 @@ static __device__ __forceinline__ void pool_slice_copy_block(
     dst[index] = src[index];
 }
 
-// Route words are the sole 8-byte-aligned local-copy plane. Keeping their
-// copy separate lets every payload/descriptor call above remain branch-free.
-static __device__ __forceinline__ void pool_slice_copy_route_words_warp(
-    uint64_t* destination,
-    const uint64_t* source,
-    uint64_t words,
-    uint32_t lane) {
-  for (uint64_t index = lane; index < words; index += 32)
-    destination[index] = source[index];
-}
-
 static __device__ __forceinline__ void pool_slice_put_nbi_warp(
     void* destination,
     const void* source,
@@ -374,6 +363,13 @@ static __device__ __forceinline__ uint32_t pool_slice_stream_queue_index(
   return source_pe * poolSliceMaxStreamQueues + queue;
 }
 
+static __device__ __forceinline__ uint64_t
+pool_slice_stream_packet_capacity_bytes(uint32_t route_capacity) {
+  return (sizeof(PoolSliceMetadataEnvelope) +
+          static_cast<uint64_t>(route_capacity) * sizeof(uint32_t) + 15) &
+      ~15ULL;
+}
+
 static __device__ __forceinline__ uint64_t* pool_slice_stream_queue_head(
     uint64_t* control, uint32_t source_pe, uint32_t queue) {
   return control + poolSliceControlStreamQueueHead +
@@ -391,8 +387,8 @@ pool_slice_stream_envelope(
     PoolSlicePublishBatch* storage,
     uint32_t peer,
     uint32_t route_capacity) {
-  const uint64_t packet_bytes = sizeof(PoolSliceMetadataEnvelope) +
-      static_cast<uint64_t>(route_capacity) * sizeof(uint64_t);
+  const uint64_t packet_bytes =
+      pool_slice_stream_packet_capacity_bytes(route_capacity);
   return reinterpret_cast<PoolSliceMetadataEnvelope*>(
       reinterpret_cast<uint8_t*>(storage) + peer * packet_bytes);
 }
@@ -402,8 +398,8 @@ pool_slice_stream_envelope(
     const PoolSlicePublishBatch* storage,
     uint32_t peer,
     uint32_t route_capacity) {
-  const uint64_t packet_bytes = sizeof(PoolSliceMetadataEnvelope) +
-      static_cast<uint64_t>(route_capacity) * sizeof(uint64_t);
+  const uint64_t packet_bytes =
+      pool_slice_stream_packet_capacity_bytes(route_capacity);
   return reinterpret_cast<const PoolSliceMetadataEnvelope*>(
       reinterpret_cast<const uint8_t*>(storage) + peer * packet_bytes);
 }
@@ -446,21 +442,21 @@ pool_slice_stream_queue_entry(
               ->queues[slot][queue];
 }
 
-static __device__ __forceinline__ uint64_t* pool_slice_stream_route_words(
+static __device__ __forceinline__ uint32_t* pool_slice_stream_route_words(
     PoolSlicePublishBatch* storage,
     uint32_t peer,
     const PoolSliceConfig& config,
     const PoolSlicePublishBatch& batch) {
   auto* envelope = reinterpret_cast<uint8_t*>(
       pool_slice_stream_envelope(storage, peer, config.route_capacity));
-  return reinterpret_cast<uint64_t*>(
+  return reinterpret_cast<uint32_t*>(
       envelope + pool_slice_stream_envelope_bytes(
                      batch.active_rows,
                      config.row_bytes,
                      config.group_limit));
 }
 
-static __device__ __forceinline__ const uint64_t*
+static __device__ __forceinline__ const uint32_t*
 pool_slice_stream_route_words(
     const PoolSlicePublishBatch* storage,
     uint32_t peer,
@@ -468,7 +464,7 @@ pool_slice_stream_route_words(
     const PoolSlicePublishBatch& batch) {
   const auto* envelope = reinterpret_cast<const uint8_t*>(
       pool_slice_stream_envelope(storage, peer, config.route_capacity));
-  return reinterpret_cast<const uint64_t*>(
+  return reinterpret_cast<const uint32_t*>(
       envelope + pool_slice_stream_envelope_bytes(
                      batch.active_rows,
                      config.row_bytes,
@@ -482,7 +478,7 @@ pool_slice_stream_queue_retired_mask(uint32_t num_pes) {
 }
 
 static __device__ __forceinline__ uint32_t pool_slice_stream_route_lower_bound(
-    const uint64_t* rows,
+    const uint32_t* rows,
     uint32_t begin,
     uint32_t count,
     uint32_t compact_row) {
@@ -490,7 +486,7 @@ static __device__ __forceinline__ uint32_t pool_slice_stream_route_lower_bound(
   uint32_t high = count;
   while (low < high) {
     const uint32_t middle = low + (high - low) / 2;
-    const uint32_t value = static_cast<uint32_t>(rows[begin + middle]);
+    const uint32_t value = rows[begin + middle] & 0xffffU;
     if (value < compact_row)
       low = middle + 1;
     else
@@ -621,10 +617,6 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     uint32_t group,
     const PoolSliceConfig& config,
     const PoolSliceHostConfig* host_config,
-    const uint8_t* token_pool,
-    uint8_t* delivery_pool,
-    const uint32_t* send_token_rows,
-    const uint32_t* send_token_counts,
     int* bars,
     uint32_t write_barrier,
     uint64_t* control,
@@ -635,6 +627,14 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     uint32_t thread_id) {
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
+  const auto* token_pool =
+      reinterpret_cast<const uint8_t*>(config.token_pool_address);
+  auto* delivery_pool =
+      reinterpret_cast<uint8_t*>(config.delivery_pool_address);
+  const auto* send_token_rows =
+      reinterpret_cast<const uint32_t*>(config.send_token_rows_address);
+  const auto* send_token_counts =
+      reinterpret_cast<const uint32_t*>(config.send_token_counts_address);
   // Send-task decoding emits remote targets only. Keeping that invariant
   // explicit removes the local/raw transport matrix from the hot helper.
   if (target_pe >= config.num_pes || target_pe == config.my_pe) {
@@ -664,6 +664,16 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
   uint32_t row_end = 0;
   pool_slice_stream_group_range(
       token_count, group_count, group, &row_begin, &row_end);
+  if constexpr (HostDataPlane) {
+    if (thread_id == 0) {
+      const auto* generations = reinterpret_cast<const uint64_t*>(
+          host_config->producer_generations_address);
+      while (dae_atomic_load_acquire_gpu(
+                 generations + config.num_pes) < sequence)
+        __nanosleep(barrierPollSleepCycles);
+    }
+    __syncthreads();
+  }
   if (thread_id == 0 && atomicCAS(shared_first_payload, 0U, 1U) == 0U &&
       g_events != nullptr) {
     g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
@@ -732,14 +742,33 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     return;
   }
 
+  const uint32_t send_warps = blockDim.x / 32;
+  const uint32_t group_rows = row_end - row_begin;
+  const uint32_t warp_row_begin = row_begin + static_cast<uint32_t>(
+      static_cast<uint64_t>(group_rows) * warp / send_warps);
+  const uint32_t warp_row_end = row_begin + static_cast<uint32_t>(
+      static_cast<uint64_t>(group_rows) * (warp + 1) / send_warps);
   uint32_t waited_chunk = UINT32_MAX;
-  for (uint32_t packed_row = row_begin + warp;
-       packed_row < row_end;
-       packed_row += blockDim.x / 32) {
+  for (uint32_t packed_row = warp_row_begin;
+       packed_row < warp_row_end;) {
     uint32_t source_row = 0;
-    if (lane == 0)
+    uint32_t run_rows = 1;
+    if (lane == 0) {
       source_row = target_rows[packed_row];
+      if (source_row < config.token_capacity) {
+        const uint32_t source_chunk =
+            source_row / config.write_chunk_rows;
+        while (packed_row + run_rows < warp_row_end) {
+          const uint32_t candidate = target_rows[packed_row + run_rows];
+          if (candidate != source_row + run_rows ||
+              candidate / config.write_chunk_rows != source_chunk)
+            break;
+          ++run_rows;
+        }
+      }
+    }
     source_row = __shfl_sync(0xffffffffU, source_row, 0);
+    run_rows = __shfl_sync(0xffffffffU, run_rows, 0);
     if (source_row >= config.token_capacity) {
       if (lane == 0) {
         atomicCAS(
@@ -747,6 +776,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
             static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
             static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
       }
+      ++packed_row;
       continue;
     }
     const uint32_t chunk = source_row / config.write_chunk_rows;
@@ -768,8 +798,9 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
                 config.row_bytes,
         token_pool +
             static_cast<uint64_t>(source_row) * config.row_bytes,
-        static_cast<size_t>(config.row_bytes),
+        static_cast<size_t>(run_rows) * config.row_bytes,
         target_pe);
+    packed_row += run_rows;
   }
 
   __syncthreads();
@@ -834,7 +865,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
 
   const PoolSlicePublishBatch batch = *pool_slice_stream_batch(
       receive_batches, source_pe, config.route_capacity);
-  const uint64_t* source_routes = pool_slice_stream_route_words(
+  const uint32_t* source_routes = pool_slice_stream_route_words(
       receive_batches, source_pe, config, batch);
   if (thread_id == 0) {
     shared_route = receive_routes[
@@ -887,9 +918,9 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
     for (uint32_t relative = relative_begin + thread_id;
          relative < relative_end;
          relative += blockDim.x) {
-      const uint64_t route_word =
+      const uint32_t route_word =
           source_routes[packed_route_begin + relative];
-      const uint32_t compact_row = static_cast<uint32_t>(route_word);
+      const uint32_t compact_row = route_word & 0xffffU;
       const uint32_t expected_row =
           compact_begin + relative - relative_begin;
       dense_thread_valid &= compact_row == expected_row;
@@ -902,15 +933,15 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
       for (uint32_t relative = relative_begin + thread_id;
            relative < relative_end;
            relative += blockDim.x) {
-        const uint64_t route_word =
+        const uint32_t route_word =
             source_routes[packed_route_begin + relative];
-        const uint32_t compact_row = static_cast<uint32_t>(route_word);
+        const uint32_t compact_row = route_word & 0xffffU;
         combine_rows[
             (static_cast<uint64_t>(local_reader) * config.num_pes +
              source_pe) *
                     config.token_capacity +
                 compact_row] =
-            (route_word & 0xffffffff00000000ULL) |
+            (static_cast<uint64_t>(route_word & 0xffff0000U) << 16) |
             static_cast<uint32_t>(route.base_row + relative);
       }
     }
@@ -933,11 +964,11 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
     for (uint32_t relative = relative_begin + warp;
          relative < relative_end;
          relative += TotalWarps) {
-      uint64_t route_word = 0;
+      uint32_t route_word = 0;
       uint32_t compact_row = 0;
       if (lane == 0) {
         route_word = source_routes[packed_route_begin + relative];
-        compact_row = static_cast<uint32_t>(route_word);
+        compact_row = route_word & 0xffffU;
       }
       route_word = __shfl_sync(0xffffffffU, route_word, 0);
       compact_row = __shfl_sync(0xffffffffU, compact_row, 0);
@@ -958,7 +989,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
                source_pe) *
                       config.token_capacity +
                   compact_row] =
-              (route_word & 0xffffffff00000000ULL) |
+              (static_cast<uint64_t>(route_word & 0xffff0000U) << 16) |
               static_cast<uint32_t>(route.base_row + relative);
         }
       }
@@ -1633,62 +1664,83 @@ static __device__ __noinline__ void pool_slice_return_weighted(
   }
 }
 
+static __device__ __forceinline__ void
+pool_slice_stream_publish_metadata_target(
+    const PoolSliceConfig& config,
+    uint64_t sequence,
+    uint32_t index,
+    uint32_t lane) {
+  auto* send_batches = reinterpret_cast<PoolSlicePublishBatch*>(
+      config.send_batches_address);
+  auto* receive_batches = reinterpret_cast<PoolSlicePublishBatch*>(
+      config.receive_batches_address);
+  const auto* send_rows = reinterpret_cast<const uint32_t*>(
+      config.send_rows_address);
+  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
+
+  const uint32_t target_pe = pool_slice_remote_first_pe(
+      index, config.my_pe, config.num_pes);
+  PoolSliceMetadataEnvelope* destination =
+      pool_slice_stream_envelope(
+          receive_batches, config.my_pe, config.route_capacity);
+  PoolSliceMetadataEnvelope* source =
+      pool_slice_stream_envelope(
+          send_batches, target_pe, config.route_capacity);
+  const PoolSlicePublishBatch* source_batch = &source->batch;
+  const uint32_t envelope_bytes = pool_slice_stream_envelope_bytes(
+      source_batch->active_rows, config.row_bytes, config.group_limit);
+  const uint32_t route_count =
+      source_batch->route_end - source_batch->route_begin;
+  uint32_t* packed_routes = pool_slice_stream_route_words(
+      send_batches, target_pe, config, *source_batch);
+  for (uint32_t route = lane; route < route_count; route += 32) {
+    packed_routes[route] =
+        send_rows[source_batch->route_begin + route];
+  }
+  __syncwarp();
+
+  // The local fast path copies uint4 vectors, so include up to 12 bytes of
+  // packet-local padding after the live route words.  The fixed peer stride
+  // is 16-byte aligned and reserves the full route capacity, making this
+  // padding both in-bounds and invisible to the route parser.  Keeping the
+  // remote transaction at the same aligned size also avoids a special tail
+  // path in the metadata publisher.
+  const uint64_t packet_bytes =
+      (envelope_bytes +
+       static_cast<uint64_t>(route_count) * sizeof(uint32_t) + 15) &
+      ~15ULL;
+  uint64_t* transport_ready =
+      control + poolSliceControlStreamMetadataTransportReady + config.my_pe;
+  if (target_pe == config.my_pe) {
+    pool_slice_copy_warp(destination, source, packet_bytes, lane);
+    __syncwarp();
+    if (lane == 0)
+      pool_slice_signal_release_local(transport_ready, sequence);
+  } else {
+    nvshmemx_putmem_signal_nbi_warp(
+        destination,
+        source,
+        static_cast<size_t>(packet_bytes),
+        transport_ready,
+        sequence,
+        NVSHMEM_SIGNAL_SET,
+        target_pe);
+  }
+  __syncwarp();
+}
+
 template <uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_stream_publish_metadata(
     const PoolSliceConfig& config,
-    PoolSlicePublishBatch* send_batches,
-    PoolSlicePublishBatch* receive_batches,
-    const uint64_t* send_rows,
-    uint64_t* control,
     uint64_t sequence,
     uint32_t thread_id) {
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
-
   for (uint32_t index = warp;
        index < config.num_pes;
        index += TotalWarps) {
-    const uint32_t target_pe = pool_slice_remote_first_pe(
-        index, config.my_pe, config.num_pes);
-    PoolSliceMetadataEnvelope* destination =
-        pool_slice_stream_envelope(
-            receive_batches, config.my_pe, config.route_capacity);
-    PoolSliceMetadataEnvelope* source =
-        pool_slice_stream_envelope(
-            send_batches, target_pe, config.route_capacity);
-    const PoolSlicePublishBatch* source_batch = &source->batch;
-    const uint32_t envelope_bytes = pool_slice_stream_envelope_bytes(
-        source_batch->active_rows, config.row_bytes, config.group_limit);
-    const uint32_t route_count =
-        source_batch->route_end - source_batch->route_begin;
-    uint64_t* packed_routes = pool_slice_stream_route_words(
-        send_batches, target_pe, config, *source_batch);
-    for (uint32_t route = lane; route < route_count; route += 32) {
-      packed_routes[route] =
-          send_rows[source_batch->route_begin + route];
-    }
-    __syncwarp();
-
-    const uint64_t packet_bytes = envelope_bytes +
-        static_cast<uint64_t>(route_count) * sizeof(uint64_t);
-    uint64_t* transport_ready =
-        control + poolSliceControlStreamMetadataTransportReady + config.my_pe;
-    if (target_pe == config.my_pe) {
-      pool_slice_copy_warp(destination, source, packet_bytes, lane);
-      __syncwarp();
-      if (lane == 0)
-        pool_slice_signal_release_local(transport_ready, sequence);
-    } else {
-      nvshmemx_putmem_signal_nbi_warp(
-          destination,
-          source,
-          static_cast<size_t>(packet_bytes),
-          transport_ready,
-          sequence,
-          NVSHMEM_SIGNAL_SET,
-          target_pe);
-    }
-    __syncwarp();
+    pool_slice_stream_publish_metadata_target(
+        config, sequence, index, lane);
   }
 }
 
@@ -2337,8 +2389,6 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       config.receive_routes_address);
   const auto* send_offsets = reinterpret_cast<const uint32_t*>(
       config.send_offsets_address);
-  const auto* send_rows = reinterpret_cast<const uint64_t*>(
-      config.send_rows_address);
   const auto* send_token_rows = reinterpret_cast<const uint32_t*>(
       config.send_token_rows_address);
   const auto* send_token_counts = reinterpret_cast<const uint32_t*>(
@@ -2492,15 +2542,23 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   }
   __syncthreads();
 
+  // Metadata is one source-owned envelope per destination, independent of the
+  // number of payload CTAs.  Keep publication on the rank-zero control CTA;
+  // its warps cover the targets in parallel while the remaining CTAs can enter
+  // the direct data/gather loop without duplicating network traffic.
   if (config.pool_rank == 0) {
     pool_slice_stream_publish_metadata<TotalWarps>(
         config,
-        send_batches,
-        receive_batches,
-        send_rows,
-        control,
         sequence,
         thread_id);
+  }
+  __syncthreads();
+  if constexpr (HostDataPlane) {
+    if (config.pool_rank == 0 && thread_id == 0) {
+      auto* generations = reinterpret_cast<uint64_t*>(
+          host_config->producer_generations_address);
+      dae_atomic_store_release_gpu(generations + config.num_pes, sequence);
+    }
   }
   __syncthreads();
 
@@ -2644,10 +2702,6 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
               group,
               config,
               host_config,
-              token_pool,
-              delivery_pool,
-              send_token_rows,
-              send_token_counts,
               bars,
               write_barrier,
               control,

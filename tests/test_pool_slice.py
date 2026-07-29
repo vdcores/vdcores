@@ -425,7 +425,7 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "pool_slice_stream_claim_queue_head(" in source
     assert "pool_slice_stream_drain_queue_control(" in source
     metadata_publisher = source.split(
-        "pool_slice_stream_publish_metadata(", 1
+        "pool_slice_stream_publish_metadata_target(", 1
     )[1].split("pool_slice_stream_accept_metadata(", 1)[0]
     assert "nvshmemx_putmem_signal_nbi_warp(" in metadata_publisher
     assert "nvshmem_putmem_signal_nbi(" not in metadata_publisher
@@ -433,12 +433,23 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "NVSHMEM_SIGNAL_SET" in metadata_publisher
     assert "poolSliceControlStreamMetadataTransportReady" in metadata_publisher
     assert "pool_slice_stream_route_words(" in metadata_publisher
+    assert "sizeof(uint32_t)" in metadata_publisher
+    assert "sizeof(uint64_t)" not in metadata_publisher
+    assert "route_count) * sizeof(uint32_t) + 15" in metadata_publisher
+    assert "~15ULL" in metadata_publisher
     assert "poolSliceControlStreamMetadataParts" not in source
     assert "pool_slice_quiet_warp" not in source
     assert "nvshmemx_putmem_signal_warp(" not in metadata_publisher
     assert "nvshmem_putmem_signal(" not in metadata_publisher
     assert "index = warp" in metadata_publisher
     assert "index += TotalWarps" in metadata_publisher
+    metadata_call = source.index("pool_slice_stream_publish_metadata<TotalWarps>(")
+    assert "if (config.pool_rank == 0)" in source[metadata_call - 512 : metadata_call]
+    assert source.count("pool_slice_stream_publish_metadata<TotalWarps>(") == 1
+    assert "weight_bits << 16" in python
+    assert "send_rows = nvshmem.zeros(route_capacity, dtype=torch.uint32)" in python
+    assert "route_capacity * 4 + 15" in python
+    assert "token_capacity > 1 << 16" in python
     assert "POOL_SLICE_QUEUE_RESERVE_ROUTES" in abi
     assert "POOL_SLICE_QUEUE_COPY_ROWS" in abi
     assert "POOL_SLICE_QUEUE_END" in abi

@@ -571,8 +571,8 @@ class PoolSliceBuffers:
                     inverse.to(torch.uint32)
                 )
             weight_bits = weights.view(torch.uint16).to(torch.int64)
-            route_words = compact_rows.to(torch.int64) | (weight_bits << 32)
-            self.send_rows[: rows.numel()].copy_(route_words.to(torch.uint64))
+            route_words = compact_rows.to(torch.int64) | (weight_bits << 16)
+            self.send_rows[: rows.numel()].copy_(route_words.to(torch.uint32))
         self.active_rows = rows.numel()
         return (
             self.send_offsets,
@@ -672,7 +672,7 @@ class PoolSliceBuffers:
         local_lkey = _positive_uint("local_lkey", local_lkey, 32)
         self._host_peers = peer_routes
         self._host_generations = torch.zeros(
-            self.num_pes,
+            self.num_pes + 1,
             dtype=torch.uint64,
             device=peer_routes.device,
         )
@@ -1190,6 +1190,8 @@ def allocate_pool_slice(
             "the host data plane supports at most "
             f"{POOL_HOST_RING_MAX_ROWS} tokens per PE"
         )
+    if token_capacity > 1 << 16:
+        raise ValueError("pool route metadata supports at most 65536 token slots")
     if expert_capacity_rows < num_pes * token_capacity:
         raise ValueError(
             "slot-put expert capacity must provide one token-capacity "
@@ -1218,10 +1220,10 @@ def allocate_pool_slice(
 
     num_readers = num_pes * local_readers
     send_offsets = nvshmem.zeros(num_readers + 1, dtype=torch.uint32)
-    # One route metadata word carries the compact activation row in bits 0:31
-    # and the BF16 route weight in bits 32:47. Keeping them together preserves
+    # One route metadata word carries the compact activation row in bits 0:15
+    # and the BF16 route weight in bits 16:31. Keeping them together preserves
     # one metadata message and one visibility signal per source/target pair.
-    send_rows = nvshmem.zeros(route_capacity, dtype=torch.uint64)
+    send_rows = nvshmem.zeros(route_capacity, dtype=torch.uint32)
     send_origin_rows = nvshmem.zeros(route_capacity, dtype=torch.uint32)
     token_row_planes = num_pes * (2 if weighted_return else 1)
     send_token_rows = nvshmem.zeros(
@@ -1296,8 +1298,8 @@ def allocate_pool_slice(
     # includes only the live queue prefix followed immediately by route words,
     # so one put-with-signal protects the complete metadata plane.
     metadata_packet_bytes = (
-        POOL_SLICE_METADATA_ENVELOPE_BYTES + route_capacity * 8
-    )
+        POOL_SLICE_METADATA_ENVELOPE_BYTES + route_capacity * 4 + 15
+    ) // 16 * 16
     batch_storage_bytes = num_pes * metadata_packet_bytes
     send_batches = nvshmem.zeros(batch_storage_bytes, dtype=torch.uint8)
     receive_batches = nvshmem.zeros(batch_storage_bytes, dtype=torch.uint8)

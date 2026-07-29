@@ -334,7 +334,9 @@ def run_pool(
         "protocol": "pool-gather-streaming",
         "pool_blocks": buffers.pool_count,
         "weighted_return": args.weighted_return,
-        "weighted_return_sharding": "source-grouped-4",
+        "weighted_return_sharding": (
+            f"source-grouped-{POOL_SLICE_RETURN_GROUPS_PER_SOURCE}"
+        ),
         "weighted_reduce": "fp32-ilp4",
         "reader_op": args.reader_op,
         "data_group_limit": buffers.group_limit,
@@ -360,7 +362,7 @@ def run_pool(
         ),
         "descriptor_bytes_per_pe": remote_pes * POOL_SLICE_PUBLISH_BYTES,
         "offset_metadata_bytes_received_per_pe": 0,
-        "route_metadata_bytes_sent_remote_per_pe": remote_routes * 8,
+        "route_metadata_bytes_sent_remote_per_pe": remote_routes * 4,
         "dispatch_data_rmas_per_pe_current": dispatch_data_rmas,
         "return_data_rmas_per_pe": (
             _source_grouped_return_rmas(

@@ -381,8 +381,9 @@ reference and CUDA-event timing remain external under `benchmarks/`.
 ## Current fast-path constraints (2026-07-27)
 
 - Metadata queues are slot-major and publishers transfer only the used fixed
-  prefix. One/two data groups use a 256-byte descriptor-plus-queue envelope;
-  route words remain an independent protected transfer.
+  prefix. Compact route metadata uses one 32-bit word containing a 16-bit
+  compact row and one BF16 weight; it follows the live queue prefix in the
+  same put-with-signal packet.
 - Metadata and direct-source payloads are posted concurrently. Receiver queue
   heads execute in order and copy a group as soon as both its metadata and
   named payload generation are present. END is an ordered queue entry, not a
@@ -415,3 +416,100 @@ reference and CUDA-event timing remain external under `benchmarks/`.
   each active COPY queue. The generic scheduler and its cross-CTA claim state
   remain the only implementation; there is no small-token opcode or runtime
   compatibility branch.
+
+## Contiguous-run transport update (2026-07-28)
+
+The device sender now gives each warp a contiguous compact-row interval and
+merges consecutive source rows, bounded by the named writer-dependency chunk,
+into one NVSHMEM PUT. Random routes naturally remain one-row runs. This keeps
+eight sender warps active while reducing IBGDA request count for the common
+sorted-token case. Two-PE clustered samples at 32/128/256 tokens were
+0.141/0.250/0.377 ms (best 128 sample 0.238 ms), versus the existing DeepEP
+controls of 0.156/0.407/0.742 ms.
+
+Cross-CTA return profiling showed an approximately 55 us gap from the last
+fine reducer completion to the first grouped return PUT. Replacing the
+acq-rel counter with per-CTA release generations did not reduce it; ordering
+the staged HBM writes was still the cost. Giving each of four groups to one
+CTA removed the dependency but grew the return tail to about 0.202 ms by
+discarding multi-SM reduction parallelism. Both variants were removed. Future
+work should make expert/reducer output transport-ready in its final group tile
+rather than adding another synchronization scheme around partial staging.
+
+## Four-PE synchronization boundary (2026-07-28)
+
+For BF16 hidden-7168, eight experts/PE, top-8 clustered routing and 32
+PoolInst CTAs, CTA-mapped QP16 measured 0.206/0.273 ms at 32/128 tokens. QP8
+was the stable 256-token choice at 0.550 ms. Recorded DeepEP controls are
+0.192/0.551/1.025 ms, respectively. QP count is therefore shape-specific:
+more connections remove small-message metadata head-of-line delay, but can
+make large-message metadata closure less stable.
+
+The approximately 50 us reducer-to-return-PUT transition persisted after
+replacing four grouped returns with eight direct reducer-shard PUTs. That A/B
+also doubled remote return messages and introduced a 96-byte helper spill
+frame, so it was removed. Likewise, batching two or eight local readers under
+one queue claim reduced queue-scoped acq-rel operations but lost the HBM copy
+parallelism required by dense top-k gather. Keep reader-level CTA claims and
+the grouped return counter; neither synchronization is the isolated cause of
+the remaining transition delay.
+
+## Compact-metadata and 8-PE boundary (2026-07-28)
+
+Only PoolInst rank zero publishes the one metadata envelope per destination;
+payload CTAs enter the direct send/gather loop concurrently. A reverted
+CTA-sharding experiment briefly left all CTAs publishing duplicate envelopes.
+That raised the 8-PE/128-token result from 0.331--0.365 ms to 0.430 ms and was
+removed. `tests/test_pool_slice.py` now checks for the single rank-zero call.
+
+Route metadata was reduced from eight bytes to four bytes without changing
+reduction precision: the wire word is `compact_row16 | bf16_weight << 16`, and
+the destination expands it into the existing 64-bit combine record. Python
+rejects token capacities above 65,536, and peer packet strides are rounded to
+16 bytes. At 8 PEs this moved 32/128-token samples from 0.227/0.365 ms to
+0.195/0.344 ms; 256 tokens stayed bandwidth-bound at 0.664 ms.
+
+The live packet length must also be rounded to 16 bytes, not only its fixed
+peer stride. The same-PE publisher copies `uint4` vectors and otherwise drops
+the final one to three 32-bit routes when a target owns an odd/non-vector route
+count. A 13-token, top-2, two-reader test exposed this because the common power-
+of-two benchmark shapes had hidden it. The padding is inside the reserved peer
+packet and is ignored by the route parser; weighted and unweighted irregular
+tests now cover the boundary.
+
+Final exact-BF16 clustered samples and the recorded DeepEP V1 controls are:
+
+| PEs | tokens/PE | CTA-mapped RC QPs | PoolInst | DeepEP V1 | advantage |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 32 | 4 | 0.126 ms | 0.156 ms | 19% |
+| 2 | 128 | 4 | 0.220 ms | 0.407 ms | 46% |
+| 2 | 256 | 8 | 0.367 ms | 0.742 ms | 51% |
+| 4 | 32 | 32 | 0.150 ms | 0.192 ms | 22% |
+| 4 | 128 | 16 | 0.347 ms | 0.551 ms | 37% |
+| 4 | 256 | 8 | 0.490 ms | 1.025 ms | 52% |
+| 8 | 32 | 16 | 0.195 ms | 0.272 ms | 28% |
+| 8 | 128 | 24 | 0.344 ms | 1.040 ms | 67% |
+| 8 | 256 | 24 | 0.664 ms | 2.041 ms | 67% |
+
+QP choice is shape-specific. For example, 4-PE/32-token QP32 measured
+0.150 ms, but the same QP count made 128-token metadata closure unstable and
+measured 0.489 ms. These are internal `g_events` medians with source-preloaded
+input and in-place identity experts; the DeepEP values are separately recorded
+production-baseline runs.
+
+Two return groups per source halved 8-PE return RMAs from 28 to 14 but did not
+improve the measured return interval: about 111 us versus 108 us at 128 tokens
+and 198 us versus 196 us at 256. Four groups remain compiled. CTA-sharded
+metadata, a source-wide return group, reduced PoolInst CTA counts, CPU-affinity
+pinning, and one-in-flight host-QP pacing were also rejected after neutral or
+negative end-to-end A/Bs.
+
+Two further overlap A/Bs were rejected. A CTA-collective PUT for an already-
+ready contiguous dispatch group reduced submissions but removed useful
+warp/QP concurrency (8-PE/128-token total 0.356 to 0.371 ms). Token-scoped
+return-generation polling attempted to scatter early groups before global
+closure, but duplicated dependency polling across scatter warps and left the
+return tail unchanged at about 0.15 ms. The existing warp-run sender and one
+merged return-closure warp remain simpler and faster. RC32 versus RC24 samples
+also tracked allocation-local metadata drift rather than a stable transport
+gain, so RC24 remains the eight-PE 128-token starting point.

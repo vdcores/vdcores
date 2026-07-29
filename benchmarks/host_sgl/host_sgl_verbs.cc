@@ -112,6 +112,57 @@ void set_error(char* error, size_t error_bytes, const char* format, ...) {
   error[error_bytes - 1] = '\0';
 }
 
+uint32_t host_sgl_source_run_count(const HostSglRequest& request,
+                                   bool coalesce) {
+  if (!coalesce)
+    return request.row_count;
+  uint32_t runs = 0;
+  uint64_t previous_end = 0;
+  uint32_t run_bytes = 0;
+  for (uint32_t row = 0; row < request.row_count; ++row) {
+    const uint64_t address = request.source_base +
+        static_cast<uint64_t>(request.row_indices[row]) *
+            request.source_stride;
+    if (runs != 0 && address == previous_end &&
+        run_bytes <= UINT32_MAX - request.row_bytes) {
+      run_bytes += request.row_bytes;
+    } else {
+      ++runs;
+      run_bytes = request.row_bytes;
+    }
+    previous_end = address + request.row_bytes;
+  }
+  return runs;
+}
+
+uint32_t host_sgl_fill_source_runs(const HostSglRequest& request,
+                                   bool coalesce, ibv_sge* sges) {
+  uint32_t runs = 0;
+  for (uint32_t row = 0; row < request.row_count; ++row) {
+    const uint64_t address = request.source_base +
+        static_cast<uint64_t>(request.row_indices[row]) *
+            request.source_stride;
+    if (coalesce && runs != 0 &&
+        address == sges[runs - 1].addr + sges[runs - 1].length &&
+        sges[runs - 1].length <= UINT32_MAX - request.row_bytes) {
+      sges[runs - 1].length += request.row_bytes;
+      continue;
+    }
+    sges[runs++] = ibv_sge{
+        address, request.row_bytes, request.local_lkey};
+  }
+  return runs;
+}
+
+bool host_sgl_remote_data_adjacent(const HostSglRequest& first,
+                                   const HostSglRequest& second) {
+  const uint64_t bytes =
+      static_cast<uint64_t>(first.row_count) * first.row_bytes;
+  return first.remote_rkey == second.remote_rkey &&
+      first.remote_data <= UINT64_MAX - bytes &&
+      first.remote_data + bytes == second.remote_data;
+}
+
 uint32_t make_psn(const HostSglQueue* queue) {
   const auto value =
                      (static_cast<uint64_t>(::getpid()) << 12) ^
@@ -728,9 +779,10 @@ int host_sgl_post_indexed_batch(void* queue_pointer,
               queue->max_outstanding_batches);
     return -1;
   }
-  const uint32_t rows_per_wr = row_wr_mode != 0 ? 1 : queue->max_sge;
-  uint64_t total_rows = 0;
-  uint64_t data_wr_count = 0;
+  const bool coalesce = row_wr_mode == 0;
+  const uint32_t sges_per_wr = coalesce ? queue->max_sge : 1;
+  uint64_t total_sges = 0;
+  std::vector<uint32_t> request_runs(request_count, 0);
   for (uint32_t request_index = 0; request_index < request_count;
        ++request_index) {
     const HostSglRequest& request = requests[request_index];
@@ -743,9 +795,24 @@ int host_sgl_post_indexed_batch(void* queue_pointer,
                 request_index);
       return -1;
     }
-    total_rows += request.row_count;
+    const uint32_t source_runs =
+        host_sgl_source_run_count(request, coalesce);
+    request_runs[request_index] = source_runs;
+    total_sges += source_runs;
+  }
+  uint64_t data_wr_count = 0;
+  for (uint32_t chain_begin = 0; chain_begin < request_count;) {
+    uint32_t chain_end = chain_begin + 1;
+    uint64_t chain_sges = request_runs[chain_begin];
+    while (chain_end < request_count &&
+           host_sgl_remote_data_adjacent(
+               requests[chain_end - 1], requests[chain_end])) {
+      chain_sges += request_runs[chain_end];
+      ++chain_end;
+    }
     data_wr_count +=
-        (request.row_count + rows_per_wr - 1) / rows_per_wr;
+        (chain_sges + sges_per_wr - 1) / sges_per_wr;
+    chain_begin = chain_end;
   }
   const uint64_t total_wr_count = data_wr_count + request_count;
   if (total_wr_count >
@@ -758,7 +825,7 @@ int host_sgl_post_indexed_batch(void* queue_pointer,
               queue->max_send_wr, queue->outstanding_send_wrs);
     return -1;
   }
-  if (total_rows + request_count > SIZE_MAX ||
+  if (total_sges + request_count > SIZE_MAX ||
       total_wr_count > SIZE_MAX || data_wr_count > UINT32_MAX) {
     set_error(error, error_bytes, "request batch is too large");
     return -1;
@@ -769,57 +836,77 @@ int host_sgl_post_indexed_batch(void* queue_pointer,
   posted.completion_sequence = requests[request_count - 1].sequence;
   posted.send_wr_count = static_cast<uint32_t>(total_wr_count);
   posted.inline_signals.assign(request_count, 0);
-  posted.sges.assign(static_cast<size_t>(total_rows + request_count),
+  posted.sges.assign(static_cast<size_t>(total_sges + request_count),
                      ibv_sge{});
   posted.wrs.assign(static_cast<size_t>(total_wr_count), ibv_send_wr{});
 
+  std::vector<size_t> request_sge_offsets(request_count + 1, 0);
   size_t sge_cursor = 0;
-  size_t wr_cursor = 0;
   for (uint32_t request_index = 0; request_index < request_count;
        ++request_index) {
-    const HostSglRequest& request = requests[request_index];
-    const size_t row_sge_base = sge_cursor;
-    for (uint32_t row = 0; row < request.row_count; ++row) {
-      ibv_sge& sge = posted.sges[sge_cursor++];
-      sge.addr = request.source_base +
-                 static_cast<uint64_t>(request.row_indices[row]) *
-                     request.source_stride;
-      sge.length = request.row_bytes;
-      sge.lkey = request.local_lkey;
+    request_sge_offsets[request_index] = sge_cursor;
+    const uint32_t source_runs = host_sgl_fill_source_runs(
+        requests[request_index], coalesce, &posted.sges[sge_cursor]);
+    sge_cursor += source_runs;
+  }
+  request_sge_offsets[request_count] = sge_cursor;
+  size_t signal_sge_cursor = sge_cursor;
+  size_t wr_cursor = 0;
+  for (uint32_t chain_begin = 0; chain_begin < request_count;) {
+    uint32_t chain_end = chain_begin + 1;
+    while (chain_end < request_count &&
+           host_sgl_remote_data_adjacent(
+               requests[chain_end - 1], requests[chain_end])) {
+      ++chain_end;
     }
-
-    uint32_t first_row = 0;
+    size_t first_sge = request_sge_offsets[chain_begin];
+    const size_t chain_sge_end = request_sge_offsets[chain_end];
+    uint32_t signal_request = chain_begin;
     uint64_t remote_offset = 0;
-    while (first_row < request.row_count) {
-      const uint32_t rows =
-          std::min(rows_per_wr, request.row_count - first_row);
+    while (first_sge < chain_sge_end) {
+      const uint32_t num_sge = static_cast<uint32_t>(
+          std::min<size_t>(sges_per_wr, chain_sge_end - first_sge));
       ibv_send_wr& wr = posted.wrs[wr_cursor++];
-      wr.sg_list = &posted.sges[row_sge_base + first_row];
-      wr.num_sge = static_cast<int>(rows);
+      wr.sg_list = &posted.sges[first_sge];
+      wr.num_sge = static_cast<int>(num_sge);
       wr.opcode = IBV_WR_RDMA_WRITE;
-      wr.wr.rdma.remote_addr = request.remote_data + remote_offset;
-      wr.wr.rdma.rkey = request.remote_rkey;
-      first_row += rows;
-      remote_offset += static_cast<uint64_t>(rows) * request.row_bytes;
-    }
+      wr.wr.rdma.remote_addr =
+          requests[chain_begin].remote_data + remote_offset;
+      wr.wr.rdma.rkey = requests[chain_begin].remote_rkey;
+      for (uint32_t index = 0; index < num_sge; ++index)
+        remote_offset += posted.sges[first_sge + index].length;
+      first_sge += num_sge;
 
-    posted.inline_signals[request_index] = request.sequence;
-    ibv_sge& signal_sge = posted.sges[sge_cursor++];
-    signal_sge.addr =
-        reinterpret_cast<uint64_t>(&posted.inline_signals[request_index]);
-    signal_sge.length = sizeof(uint64_t);
-    signal_sge.lkey = 0;
-    ibv_send_wr& signal_wr = posted.wrs[wr_cursor++];
-    signal_wr.wr_id = request.sequence;
-    signal_wr.sg_list = &signal_sge;
-    signal_wr.num_sge = 1;
-    signal_wr.opcode = IBV_WR_RDMA_WRITE;
-    signal_wr.send_flags = IBV_SEND_INLINE;
-    if (request_index + 1 == request_count) {
-      signal_wr.send_flags |= IBV_SEND_SIGNALED;
+      // A data WR may cross request boundaries. Publish every readiness word
+      // whose complete byte interval is now ordered before this point.
+      while (signal_request < chain_end &&
+             request_sge_offsets[signal_request + 1] <= first_sge) {
+        const HostSglRequest& request = requests[signal_request];
+        posted.inline_signals[signal_request] = request.sequence;
+        ibv_sge& signal_sge = posted.sges[signal_sge_cursor++];
+        signal_sge.addr = reinterpret_cast<uint64_t>(
+            &posted.inline_signals[signal_request]);
+        signal_sge.length = sizeof(uint64_t);
+        signal_sge.lkey = 0;
+        ibv_send_wr& signal_wr = posted.wrs[wr_cursor++];
+        signal_wr.wr_id = request.sequence;
+        signal_wr.sg_list = &signal_sge;
+        signal_wr.num_sge = 1;
+        signal_wr.opcode = IBV_WR_RDMA_WRITE;
+        signal_wr.send_flags = IBV_SEND_INLINE;
+        if (signal_request + 1 == request_count)
+          signal_wr.send_flags |= IBV_SEND_SIGNALED;
+        signal_wr.wr.rdma.remote_addr = request.remote_signal;
+        signal_wr.wr.rdma.rkey = request.remote_rkey;
+        ++signal_request;
+      }
     }
-    signal_wr.wr.rdma.remote_addr = request.remote_signal;
-    signal_wr.wr.rdma.rkey = request.remote_rkey;
+    chain_begin = chain_end;
+  }
+  if (wr_cursor != posted.wrs.size() ||
+      signal_sge_cursor != posted.sges.size()) {
+    set_error(error, error_bytes, "internal merged-WR accounting mismatch");
+    return -1;
   }
   for (size_t wr_index = 0; wr_index + 1 < posted.wrs.size(); ++wr_index) {
     posted.wrs[wr_index].next = &posted.wrs[wr_index + 1];
@@ -1155,8 +1242,8 @@ static int host_sgl_post_dc_batch(
     set_error(error, error_bytes, "invalid DC indexed-row batch");
     return -1;
   }
-  uint64_t total_rows = 0;
-  uint64_t data_wr_count = 0;
+  uint64_t total_sges = 0;
+  std::vector<uint32_t> request_runs(request_count, 0);
   for (uint32_t index = 0; index < request_count; ++index) {
     const HostSglRequest& request = requests[index];
     if (request.row_indices == nullptr || request.row_count == 0 ||
@@ -1167,65 +1254,97 @@ static int host_sgl_post_dc_batch(
                 index);
       return -1;
     }
-    total_rows += request.row_count;
+    const uint32_t source_runs = host_sgl_source_run_count(request, true);
+    request_runs[index] = source_runs;
+    total_sges += source_runs;
+  }
+  uint64_t data_wr_count = 0;
+  for (uint32_t chain_begin = 0; chain_begin < request_count;) {
+    uint32_t chain_end = chain_begin + 1;
+    uint64_t chain_sges = request_runs[chain_begin];
+    while (chain_end < request_count &&
+           host_sgl_remote_data_adjacent(
+               requests[chain_end - 1], requests[chain_end])) {
+      chain_sges += request_runs[chain_end];
+      ++chain_end;
+    }
     data_wr_count +=
-        (request.row_count + queue->max_sge - 1) / queue->max_sge;
+        (chain_sges + queue->max_sge - 1) / queue->max_sge;
+    chain_begin = chain_end;
   }
   const uint64_t total_wr_count = data_wr_count + request_count;
   if (total_wr_count > queue->max_send_wr - queue->outstanding_send_wrs ||
       queue->outstanding_batches.size() >= 64 ||
-      total_rows > SIZE_MAX || total_wr_count > UINT32_MAX) {
+      total_sges > SIZE_MAX || total_wr_count > UINT32_MAX) {
     set_error(error, error_bytes, "DC send-queue credits are exhausted");
     return -1;
   }
 
-  std::vector<ibv_sge> sges(static_cast<size_t>(total_rows));
+  std::vector<ibv_sge> sges(static_cast<size_t>(total_sges));
+  std::vector<size_t> request_sge_offsets(request_count + 1, 0);
   size_t sge_cursor = 0;
+  for (uint32_t request_index = 0; request_index < request_count;
+       ++request_index) {
+    request_sge_offsets[request_index] = sge_cursor;
+    const uint32_t source_runs = host_sgl_fill_source_runs(
+        requests[request_index], true, &sges[sge_cursor]);
+    sge_cursor += source_runs;
+  }
+  request_sge_offsets[request_count] = sge_cursor;
   const uint64_t completion_id = queue->next_completion_id++;
   const HostSglDcPeer& peer = queue->peers[peer_index];
   ibv_wr_start(queue->dci_ex);
   uint64_t emitted_wrs = 0;
-  for (uint32_t request_index = 0; request_index < request_count;
-       ++request_index) {
-    const HostSglRequest& request = requests[request_index];
-    const size_t row_sge_base = sge_cursor;
-    for (uint32_t row = 0; row < request.row_count; ++row) {
-      ibv_sge& sge = sges[sge_cursor++];
-      sge.addr = request.source_base +
-          static_cast<uint64_t>(request.row_indices[row]) *
-              request.source_stride;
-      sge.length = request.row_bytes;
-      sge.lkey = request.local_lkey;
+  for (uint32_t chain_begin = 0; chain_begin < request_count;) {
+    uint32_t chain_end = chain_begin + 1;
+    while (chain_end < request_count &&
+           host_sgl_remote_data_adjacent(
+               requests[chain_end - 1], requests[chain_end])) {
+      ++chain_end;
     }
-    uint32_t first_row = 0;
+    size_t first_sge = request_sge_offsets[chain_begin];
+    const size_t chain_sge_end = request_sge_offsets[chain_end];
+    uint32_t signal_request = chain_begin;
     uint64_t remote_offset = 0;
-    while (first_row < request.row_count) {
-      const uint32_t rows =
-          std::min(queue->max_sge, request.row_count - first_row);
+    while (first_sge < chain_sge_end) {
+      const uint32_t num_sge = static_cast<uint32_t>(
+          std::min<size_t>(queue->max_sge, chain_sge_end - first_sge));
       queue->dci_ex->wr_id = 0;
       queue->dci_ex->wr_flags = 0;
       ibv_wr_rdma_write(
-          queue->dci_ex, request.remote_rkey,
-          request.remote_data + remote_offset);
+          queue->dci_ex, requests[chain_begin].remote_rkey,
+          requests[chain_begin].remote_data + remote_offset);
       mlx5dv_wr_set_dc_addr(
           queue->mlx5_dci_ex, peer.ah, peer.dctn, hostSglDcKey);
       ibv_wr_set_sge_list(
-          queue->dci_ex, rows, &sges[row_sge_base + first_row]);
-      first_row += rows;
-      remote_offset += static_cast<uint64_t>(rows) * request.row_bytes;
+          queue->dci_ex, num_sge, &sges[first_sge]);
+      for (uint32_t index = 0; index < num_sge; ++index)
+        remote_offset += sges[first_sge + index].length;
+      first_sge += num_sge;
       ++emitted_wrs;
+      while (signal_request < chain_end &&
+             request_sge_offsets[signal_request + 1] <= first_sge) {
+        const HostSglRequest& request = requests[signal_request];
+        uint64_t signal = request.sequence;
+        ++emitted_wrs;
+        queue->dci_ex->wr_id =
+            emitted_wrs == total_wr_count ? completion_id : 0;
+        queue->dci_ex->wr_flags = IBV_SEND_INLINE |
+            (emitted_wrs == total_wr_count ? IBV_SEND_SIGNALED : 0);
+        ibv_wr_rdma_write(
+            queue->dci_ex, request.remote_rkey, request.remote_signal);
+        mlx5dv_wr_set_dc_addr(
+            queue->mlx5_dci_ex, peer.ah, peer.dctn, hostSglDcKey);
+        ibv_wr_set_inline_data(queue->dci_ex, &signal, sizeof(signal));
+        ++signal_request;
+      }
     }
-    uint64_t signal = request.sequence;
-    ++emitted_wrs;
-    queue->dci_ex->wr_id =
-        emitted_wrs == total_wr_count ? completion_id : 0;
-    queue->dci_ex->wr_flags = IBV_SEND_INLINE |
-        (emitted_wrs == total_wr_count ? IBV_SEND_SIGNALED : 0);
-    ibv_wr_rdma_write(
-        queue->dci_ex, request.remote_rkey, request.remote_signal);
-    mlx5dv_wr_set_dc_addr(
-        queue->mlx5_dci_ex, peer.ah, peer.dctn, hostSglDcKey);
-    ibv_wr_set_inline_data(queue->dci_ex, &signal, sizeof(signal));
+    chain_begin = chain_end;
+  }
+  if (emitted_wrs != total_wr_count) {
+    ibv_wr_abort(queue->dci_ex);
+    set_error(error, error_bytes, "internal DC merged-WR accounting mismatch");
+    return -1;
   }
   const int result = ibv_wr_complete(queue->dci_ex);
   if (result != 0) {

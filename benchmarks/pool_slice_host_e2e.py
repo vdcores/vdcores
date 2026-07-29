@@ -56,10 +56,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=1)
     parser.add_argument("--gid-index", type=int, default=0)
     parser.add_argument("--requested-sge", type=int, default=64)
+    parser.add_argument(
+        "--requested-send-wr",
+        type=int,
+        default=128,
+        help="host verbs SQ depth; transport capacity only, not protocol state",
+    )
+    parser.add_argument(
+        "--paired-device",
+        action="store_true",
+        help=(
+            "alternate device and host PoolInst epochs with the same verbs "
+            "resources to suppress process- and time-local fabric drift"
+        ),
+    )
     parser.add_argument("--host-transport", choices=("dc", "rc"), default="dc")
     parser.add_argument("--ib-device")
     parser.add_argument(
-        "--registration", choices=("auto", "dmabuf", "legacy"), default="auto"
+        "--registration",
+        choices=("auto", "dmabuf", "legacy"),
+        default="auto",
+        help=(
+            "GPU HBM MR mechanism; auto tries DMA-BUF and then legacy "
+            "peer-memory, while explicit modes support allocation-local A/Bs"
+        ),
     )
     parser.add_argument("--pcie-bar1", action="store_true")
     parser.add_argument(
@@ -157,7 +177,7 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
                     pd=registration.pd,
                     port=args.port,
                     gid_index=args.gid_index,
-                    requested_send_wr=128,
+                    requested_send_wr=args.requested_send_wr,
                     requested_send_sge=args.requested_sge,
                 ),
             )
@@ -209,7 +229,7 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
                         pd=registration.pd,
                         port=args.port,
                         gid_index=args.gid_index,
-                        requested_send_wr=32,
+                        requested_send_wr=args.requested_send_wr,
                         requested_send_sge=args.requested_sge,
                     ),
                 )
@@ -271,6 +291,15 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
             source_preloaded=True,
             host_data_plane=True,
         )
+        device_program = None
+        if args.paired_device:
+            device_program = build_pool_slice_copy_program(
+                buffers,
+                benchmark_barrier=nvshmem.benchmark_barrier,
+                in_place_identity=True,
+                source_preloaded=True,
+                host_data_plane=False,
+            )
 
         if dc_queue is not None:
             ring_group = HostSglDcEpochRingGroup(dc_queue, rings)
@@ -278,6 +307,21 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
             ring_group = HostSglEpochRingGroup(queues, rings)
         rounds = args.warmup + args.iterations
         worker_error: list[BaseException] = []
+        paired_device: dict[str, float] = {}
+
+        device_gather: list[float] = []
+        device_tail: list[float] = []
+        device_total: list[float] = []
+        device_phases: dict[str, list[float]] = {
+            "first_data_published": [],
+            "metadata_closed": [],
+            "payload_done": [],
+            "first_gather": [],
+            "compute_ready": [],
+            "first_return_put": [],
+            "return_payload_done": [],
+            "scatter_done": [],
+        }
 
         def progress() -> None:
             try:
@@ -306,8 +350,31 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
             "return_payload_done": [],
             "scatter_done": [],
         }
-        for iteration in range(rounds):
-            buffers.set_sequence(iteration + 1)
+
+        def run_device_epoch(iteration: int, sequence: int) -> None:
+            assert device_program is not None
+            buffers.set_sequence(sequence)
+            torch.cuda.synchronize(runtime.device)
+            comm.Barrier()
+            device_program.launch()
+            torch.cuda.synchronize(runtime.device)
+            gather_ns, tail_ns, total_ns = device_program.timing_ns()
+            overlap = device_program.overlap_timing_ns()
+            overlap.update(device_program.weighted_return_timing_ns())
+            if iteration < args.warmup:
+                return
+            device_gather.append(rank_max(comm, gather_ns / 1.0e6))
+            device_tail.append(rank_max(comm, tail_ns / 1.0e6))
+            device_total.append(rank_max(comm, total_ns / 1.0e6))
+            for name in device_phases:
+                value = overlap.get(name)
+                if value is not None:
+                    device_phases[name].append(
+                        rank_max(comm, float(value) / 1.0e6)
+                    )
+
+        def run_host_epoch(iteration: int, sequence: int) -> None:
+            buffers.set_sequence(sequence)
             torch.cuda.synchronize(runtime.device)
             comm.Barrier()
             program.launch()
@@ -317,21 +384,47 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
             gather_ns, tail_ns, total_ns = program.timing_ns()
             overlap = program.overlap_timing_ns()
             overlap.update(program.weighted_return_timing_ns())
-            if iteration >= args.warmup:
-                gather_samples.append(rank_max(comm, gather_ns / 1.0e6))
-                tail_samples.append(rank_max(comm, tail_ns / 1.0e6))
-                total_samples.append(rank_max(comm, total_ns / 1.0e6))
-                for name in phase_samples:
-                    value = overlap.get(name)
-                    if value is not None:
-                        phase_samples[name].append(
-                            rank_max(comm, float(value) / 1.0e6)
-                        )
+            if iteration < args.warmup:
+                return
+            gather_samples.append(rank_max(comm, gather_ns / 1.0e6))
+            tail_samples.append(rank_max(comm, tail_ns / 1.0e6))
+            total_samples.append(rank_max(comm, total_ns / 1.0e6))
+            for name in phase_samples:
+                value = overlap.get(name)
+                if value is not None:
+                    phase_samples[name].append(
+                        rank_max(comm, float(value) / 1.0e6)
+                    )
+
+        # Alternate which path runs first so neither measurement inherits a
+        # fixed warm-cache or transport-order advantage. The host progress
+        # worker sees exactly one host epoch per iteration and remains idle
+        # during the ordinary device PoolInst epoch.
+        sequence = 0
+        for iteration in range(rounds):
+            if device_program is not None and iteration % 2 == 0:
+                sequence += 1
+                run_device_epoch(iteration, sequence)
+            sequence += 1
+            run_host_epoch(iteration, sequence)
+            if device_program is not None and iteration % 2 != 0:
+                sequence += 1
+                run_device_epoch(iteration, sequence)
 
         worker.join()
         worker = None
         if worker_error:
             raise RuntimeError(f"host progress failed: {worker_error[0]}")
+
+        if device_program is not None:
+            paired_device = {
+                "gather_ms": statistics.median(device_gather),
+                "tail_ms": statistics.median(device_tail),
+                "total_ms": statistics.median(device_total),
+            }
+            for name, samples in device_phases.items():
+                if samples:
+                    paired_device[f"{name}_ms"] = statistics.median(samples)
 
         torch.testing.assert_close(returned, buffers.token_pool, rtol=0, atol=0)
         status, senders, _, returned_slices, dispatch_ready = buffers.control_state()
@@ -339,7 +432,7 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
             raise RuntimeError(f"PoolInst status is {status.name}")
         if senders != runtime.num_pes or returned_slices != runtime.num_pes:
             raise RuntimeError("PoolInst sender/return retirement is incomplete")
-        if dispatch_ready != rounds:
+        if dispatch_ready != sequence:
             raise RuntimeError("PoolInst final generation is incomplete")
 
         model = {
@@ -358,6 +451,10 @@ def run_host_pool(args: argparse.Namespace, runtime, comm: MPI.Comm) -> tuple[Ti
             ),
             "registration": registration.registration_mode,
             "registration_export_error": export_error,
+            "paired_device": paired_device,
+            "paired_schedule": (
+                "alternating" if device_program is not None else None
+            ),
         }
         for name, samples in phase_samples.items():
             if samples:

@@ -21,18 +21,19 @@ HBM row indices, a contiguous remote interval, the remote ready word, and its
 monotonic generation. It never stages activation bytes in host memory.
 
 The Grace worker drives one mlx5 DCI per PE and one local DCT target. Each peer
-has an address handle, but does not consume a separate send QP. One RDMA write
-concatenates up to eight noncontiguous HBM rows into the destination interval;
-the eight-SGE cap keeps the DCI address-vector WQE within the provider-supported
-encoding. An inline eight-byte RDMA write publishes readiness after the data on
-the same ordered DCI. The 128-WR queue window permits several peer batches in
+has an address handle, but does not consume a separate send QP. One RDMA WQE
+concatenates up to eight noncontiguous HBM source runs into the destination
+interval; adjacent indexed rows first collapse into one run. The eight-SGE cap
+keeps the DCI address-vector WQE within the provider-supported encoding. An
+inline eight-byte RDMA write publishes readiness after the data on the same
+ordered DCI. The default 128-WR queue window permits several peer batches in
 flight while retaining one transport queue. A compile-time 512-row request
 bound covers the supported inference token capacity even when a low PoolInst
 group limit produces groups larger than 32 rows.
 
-RC remains available as a comparison/fallback under `--host-transport rc`.
-It uses one QP per peer and was measurably more intrusive to NVSHMEM IBGDA at
-eight PEs, even when idle.
+RC remains available under `--host-transport rc`. It uses one QP per peer and
+currently outperforms the single serialized DCI at four and eight PEs, at the
+cost of more QP state. DCI remains the low-resource/default experiment.
 
 ## Ordering
 
@@ -42,8 +43,10 @@ eight PEs, even when idle.
 - Data and its ready write share one ordered transport queue. Native GH200
   GPUDirect owner ordering lets PoolInst consume HBM after observing readiness.
 - Metadata and payload are independent planes and remain concurrently issued.
-  No host-specific metadata fence, completion phase, dependency, or retirement
-  branch is present.
+  A local GPU generation opens host descriptor publication after the metadata
+  publisher has submitted its packet. It adds no remote acknowledgement,
+  fence, completion phase, or retirement branch, so NIC delivery still
+  overlaps.
 - Ring entries execute in order. The zero-row entry retires one host transport
   epoch only after all earlier data and ready writes complete.
 
@@ -77,3 +80,56 @@ or a metadata-wide quiet. DCI streams added completion bookkeeping without a
 stable gain. A metadata quiet occasionally helped one short run but regressed
 longer samples and small messages, so it was removed. Future 8-PE tuning should
 target HCA arbitration/pacing without changing the PoolInst control protocol.
+
+### Profile/optimize update (2026-07-28)
+
+The Grace verbs engine now merges consecutive indexed source rows into one
+SGE. Arbitrary noncontiguous rows keep their original indexed semantics. At
+two PEs this reduced complete dispatch+return data WQEs from 16 to 12 for 128
+tokens and from 32 to 20 for 256 tokens; a clean 128-token end-to-end sample
+was 0.243 ms. `--requested-send-wr` exposes SQ capacity. `--paired-device`
+alternates ordinary device and host epochs, reversing their order every
+iteration, in the same process and with the same verbs resources.
+
+Same-process comparisons showed that host overhead is shape dependent and
+that process/QP placement can move metadata closure by hundreds of
+microseconds for both backends. Device remains preferable for the smallest
+shape; host SGL amortizes descriptor overhead at larger shapes. A CTA-scoped
+NVSHMEM quiet between metadata and host data was explicitly rejected after a
+256-token regression to 1.542 ms. Do not use that quiet as NIC arbitration.
+
+At four PEs, a single DC initiator serialized three destinations: one
+128-token run measured 1.034 ms and used 24 final data WRs. One RC QP per peer
+reduced this to 0.502 ms and 18 WRs, while the paired device path moved with
+the same metadata-closure noise. Thus host transport selection is
+scale-specific: retain one DCI as the low-resource/default experiment, but
+use per-peer RC for the current four-PE performance path. Alternating paired
+epochs are required before attributing an absolute delta to host submission.
+
+### Eight-PE consolidation (2026-07-28)
+
+RC and DC now coalesce adjacent source rows within each request. They also
+merge consecutive requests when their remote intervals are adjacent, while
+retaining one ordered readiness write per queue instruction. Arbitrary
+noncontiguous source lists keep true SGL behavior. At 8 PEs/128 tokens the RC
+path commonly finishes with two to five data WQEs per peer rather than six.
+
+The compact 32-bit PoolInst route format benefits host and device equally.
+One 8-PE/128-token paired run measured 0.620 ms for host RC and 0.629 ms for
+the device path in the same verbs process. At 256 tokens, representative
+paired runs were 1.100/1.050 ms and later 1.777/1.671 ms; nearly all movement
+was the shared metadata-closure boundary, not host descriptor or return time.
+
+Keeping one merged RC batch in flight per peer measured 0.832 ms versus
+0.835 ms for the unrestricted peer pipeline and was removed. Pinning the
+Grace progress thread likewise had no stable gain because every MPI rank had
+all 72 CPUs available. No timeout, delayed batching window, metadata quiet, or
+new device-side poll was added.
+
+DMA-BUF and legacy peer-memory registration both work on Vista GH200. Their
+sequential results drift with the same paired-device metadata phase, so
+`--registration auto` remains the portable default and explicit modes are for
+allocation-local A/Bs. Merely keeping the host MR/QPs alive can make standalone
+NVSHMEM metadata much slower; always report the alternating paired device
+control. Reusing NVSHMEM's already-registered MR keys would be the clean next
+system optimization if a supported API becomes available.

@@ -136,7 +136,8 @@ static_assert(
     "PoolSlicePublishBatch ABI changed");
 
 // Metadata is laid out per peer with the two queues interleaved by slot. The
-// runtime-sized route words follow the last live queue slot round in the same
+// runtime-sized 32-bit row16/BF16 route words follow the last live queue slot
+// round in the same
 // packet, so one payload-coupled generation protects the complete metadata
 // message without sending the unused queue tail.
 struct alignas(16) PoolSliceMetadataEnvelope {
