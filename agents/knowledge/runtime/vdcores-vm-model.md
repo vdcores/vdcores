@@ -22,8 +22,8 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
   - `4` memory-side warps, threads `128..255`
 - Enabling NVSHMEM does not change the default core. Compile-time variants
   provide a seven-warp one-load VM, an eight-warp mixed compute/pool envelope,
-  an executor-sized pool-only kernel, and a separately compiled nine-warp
-  compute+memory+communication envelope. See `configurable-vdcores.md`.
+  an executor-sized pool-only kernel, and a nine-warp
+  compute+memory+communication specialization. See `configurable-vdcores.md`.
 - Current fixed configuration from [include/dae/context.cuh](/home1/11362/depctg/vdcores/include/dae/context.cuh):
   - `24` normal shared-memory slots
   - `9` special slots
@@ -144,9 +144,9 @@ The alloc-warp interpreter also keeps three local control variables in [include/
 The optional ninth warp has an independent `CommInst` PC loop and no allocator
 state. It executes barriers/timestamps, NVSHMEM put/wait, and the generic
 mailbox-pool submit/wait/run proof path. These operators do not consume slots
-or enter `m2c`, `c2m`, or `m2ld`. This interpreter is built in a separate
-runtime object so its register ceiling and NVSHMEM code do not affect the
-default or PoolInst assemblies.
+or enter `m2c`, `c2m`, or `m2ld`. Its kernel specialization has its own
+register ceiling, so the default and PoolInst assemblies are unaffected even
+though they share `runtime.o`.
 
 ### PoolInst Executor
 

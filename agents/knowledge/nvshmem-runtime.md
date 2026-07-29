@@ -55,8 +55,8 @@ macro on both extensions. `make nvshmem-pyext` is the normal entry point;
   communication and PoolInst instruction arrays through `runtime.launch_dae`.
   These are statically assembled roles inside VDCores kernels, not auxiliary
   CUDA streams or helper kernels. A
-  separately compiled ninth warp executes `COMM_NVSHMEM_*` and the generic
-  `COMM_MEMORY_POOL_*` proof path. `POOL_SLICE_EXCHANGE` selects its own
+  compile-time ninth-warp specialization executes `COMM_NVSHMEM_*` and the
+  generic `COMM_MEMORY_POOL_*` proof path. `POOL_SLICE_EXCHANGE` selects its own
   eight-warp execute type and never enters that interpreter. Ordinary
   alloc/load/store paths still have no NVSHMEM device calls.
 - `dae.nvshmem.benchmark_barrier()` synchronizes the device and all PEs. Base

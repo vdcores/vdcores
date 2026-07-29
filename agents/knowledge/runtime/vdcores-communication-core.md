@@ -6,9 +6,9 @@ are not auxiliary kernels, host callbacks, or CUDA streams.
 ## VM Shape And Isolation
 
 The default NVSHMEM build remains four compute plus four memory warps (`256`
-threads). A separately compiled `288`-thread variant adds one ordinary
-communication warp. Existing compute dispatch, allocation, store, and
-load-warp ids and code paths are unchanged.
+threads). A `288`-thread specialization adds one ordinary communication warp.
+Existing compute dispatch, allocation, store, and load-warp ids and code paths
+are unchanged.
 
 `CommInst` is a 16-byte instruction containing four 16-bit fields and one
 64-bit address. It has no allocator flags, consumes no shared-memory slots, and
@@ -169,10 +169,10 @@ to reducing destination polling. Re-evaluate this if the NVSHMEM transport or
 QP type changes rather than treating the choice as architecture-independent.
 
 NVSHMEM device calls remain behind communication/pool-only function
-boundaries. The nine-warp ordinary communication object alone carries the
-lower register cap; default and PoolInst assemblies preserve their independent
-budgets. Always inspect the linked extension for WGMMA diagnostics, entry
-spills, and launch-resource growth.
+boundaries. The nine-warp ordinary communication kernel alone carries the
+lower per-kernel register cap; default and PoolInst assemblies preserve their
+independent budgets in the same runtime object. Always inspect the linked
+extension for WGMMA diagnostics, entry spills, and launch-resource growth.
 
 ## Entry Files
 

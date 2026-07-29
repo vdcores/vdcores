@@ -73,12 +73,6 @@ if nvshmem_home is not None:
     runtime_libraries.extend(["nvshmem_host", "nvshmem_device", "dl", "pthread"])
     runtime_objects.append(
         os.environ.get(
-            "DAE_COMM_RUNTIME_OBJECT",
-            str(ROOT / "build" / "nvshmem" / "runtime_comm.o"),
-        )
-    )
-    runtime_objects.append(
-        os.environ.get(
             "DAE_RUNTIME_DLINK_OBJECT",
             str(ROOT / "build" / "nvshmem" / "runtime_dlink.o"),
         )

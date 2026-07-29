@@ -14,12 +14,15 @@ or reassign resident warps but cannot reclaim their launch resources.
   a selected PoolInst, or inactive;
 - fixed pool: only the selected PoolInst executor is instantiated; its
   compile-time execute-warp type owns the CTA width and register budget;
-- runtime communication: a separately compiled `9`-warp envelope containing
-  the default compute+memory VM plus one ordinary `CommInst` warp.
+- runtime communication: a `9`-warp specialization containing the default
+  compute+memory VM plus one ordinary `CommInst` warp.
 
-The separate communication object is register-capped because a nine-warp CTA
-has a lower Hopper per-thread register residency limit. Default, mixed pool,
-and fixed-pool objects do not inherit that cap or the communication decoder.
+The communication specialization is capped with per-kernel `__maxnreg__`
+because a nine-warp CTA has a lower Hopper per-thread register residency
+limit. Default, mixed pool, and fixed-pool specializations do not inherit that
+cap or instantiate the communication decoder. All specializations live in one
+runtime object; the old duplicate `runtime_comm.o` translation unit became
+unnecessary once the cap was a kernel attribute.
 
 ## PoolInst Assembly
 
@@ -69,16 +72,33 @@ not implicit CTA-wide ordering:
 - remote NBI payload operations are completed by a matching quiet before the
   message-specific phase signal advances.
 
-No explicit system-wide fence appears in the pool protocol. A system-scoped
-atomic is used only when ordinary HBM stores are about to become an RDMA GET
-source; all other local dependencies remain GPU scoped.
+No explicit system-wide fence appears in the pool protocol. System-scoped
+release/acquire operations are confined to the explicit Grace-coherent host
+request-ring handoff; all device-only dependencies remain GPU scoped.
+
+`include/dae/scoped_atomic.cuh` is intentionally a small shared PTX primitive
+layer, not another runtime. Relaxed bookkeeping uses native CUDA atomics, while
+message publication uses exact `.release.gpu`, `.acquire.gpu`, or
+`.acq_rel.gpu` operations. A plain `atomicAdd` cannot replace those publication
+edges because CUDA native atomics are relaxed and do not order the payload;
+using a general fence or `cuda::atomic` would be broader or heavier than the
+named dependency requires.
+
+## Consolidation Verification
+
+On 2026-07-29, a same-allocation split-versus-single-object build on GH200
+kept the nine-warp entry at 168 registers, 16 barriers, and 14,612 bytes shared
+memory with no entry spills. The weighted PoolInst entry remained at 190
+registers, 16 barriers, and 14,628 bytes shared memory. A two-PE 128-token
+timing bracket measured 0.252 ms single object, 0.269 ms split control, and
+0.237 ms single object, so the consolidation introduced no measurable
+PoolInst regression.
 
 ## Entry Files
 
 - physical/logical configuration: `include/dae/core_config.cuh`,
   `python/dae/core.py`;
-- kernel assembly: `include/dae/dae2.cuh`, `src/runtime.cu`,
-  `src/runtime_comm.cu`;
+- kernel assembly: `include/dae/dae2.cuh`, `src/runtime.cu`;
 - PoolInst ABI/registry: `include/dae/context.cuh`,
   `include/dae/pool_opcode.cuh.inc`;
 - current executor: `include/dae/pipeline/poolinst.cuh`;

@@ -51,8 +51,7 @@ def test_inactive_runtime_core_launches_without_vm_instructions():
 @pytest.mark.skipif(
     not bool(config.nvshmem_enabled), reason="NVSHMEM runtime required"
 )
-def test_separate_nine_warp_communication_assembly_launches():
+def test_nine_warp_communication_assembly_launches():
     launcher = _terminated_launcher()
     launcher.i(TerminateComm())
     launcher.launch()
-
