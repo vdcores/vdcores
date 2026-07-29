@@ -51,6 +51,41 @@ NCCL 2.30.7, but cross-node Gin initialization stopped after topology probing
 and timed out before a timed iteration. Do not substitute V1 timings for V2 or
 claim a V2 comparison until that bootstrap issue is resolved.
 
+`uccl_ep_reference.py` adds the UCCL-EP low-latency path through UCCL's
+DeepEP-compatible wrapper. It supports BF16 for a byte-matched PoolInst
+comparison and FP8 for UCCL's inference-oriented wire format. UCCL's GPU
+kernels, registered HBM, CPU proxy threads, and RDMA transport remain in the
+external UCCL checkout; only a benchmark adapter lives here.
+
+`triton_distributed_ep_reference.py` adds Triton-distributed's optimized
+`EPLowLatencyAllToAllLayer`. That kernel always quantizes BF16 activations to
+FP8 online, so its numbers are labeled FP8 and must not be presented as a
+byte-matched BF16 comparison. One untimed operator pass checks received expert
+counts against globally gathered routes and checks the weighted identity return
+against local FP8 quantize/dequantize. Each measured iteration dequantizes that
+iteration's dynamically ordered receive buffer, but CUDA events exclude this
+identity-expert work from both dispatch and combine timing.
+
+Both adapters share the deterministic placement definitions in
+`ep_baseline_common.py`, report the rank-maximum median of CUDA-event samples,
+and emit an `ep-baseline-json:` line for result collection. These CUDA events
+are external-baseline measurements and never use or alter VDCores `g_events`.
+Pinned source/build and Vista launch instructions are in
+`agents/workflows/external-ep-baselines.md`; the measured 2/4/8-PE matrix is in
+`agents/knowledge/runtime/external-ep-baselines.md`.
+
+Typical one-GPU-per-node launches after installing each dependency externally:
+
+```bash
+UCCL_EP_ROOT=/home1/11362/depctg/projects/uccl \
+ibrun -n 2 python benchmarks/uccl_ep_reference.py \
+  --tokens-per-pe 128 --dispatch-dtype bfloat16
+
+TRITON_DISTRIBUTED_ROOT=/home1/11362/depctg/projects/Triton-distributed \
+ibrun -n 2 /path/to/triton-dist-env/bin/python \
+  benchmarks/triton_distributed_ep_reference.py --tokens-per-pe 128
+```
+
 `host_sgl_probe.py` is the registration capability gate for an experimental
 Grace-hosted scatter/gather transport. It attempts CUDA DMA-BUF registration
 first and legacy GPU peer-memory registration second on an actual NVSHMEM HBM

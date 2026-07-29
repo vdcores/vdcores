@@ -17,6 +17,7 @@ Then pull in narrower notes as needed:
 - [vdcores-communication-core.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-communication-core.md)
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md)
 - [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md)
+- [external-ep-baselines.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/external-ep-baselines.md)
 
 ## What Each Note Covers
 
@@ -37,3 +38,5 @@ Then pull in narrower notes as needed:
   measured optimization results
 - [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md):
   optional Grace coherent request ring and direct-HBM host-verbs transport
+- [external-ep-baselines.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/external-ep-baselines.md):
+  pinned UCCL/Triton EP adapters, comparison contract, and 2/4/8-PE results

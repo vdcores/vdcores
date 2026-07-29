@@ -1,0 +1,38 @@
+diff --git a/ep/src/uccl_proxy.cpp b/ep/src/uccl_proxy.cpp
+index b570d94..4452edc 100644
+--- a/ep/src/uccl_proxy.cpp
++++ b/ep/src/uccl_proxy.cpp
+@@ -69,10 +69,20 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
+     cudaMalloc(&atomic_buffer_ptr_, kAtomicBufferSize);
+     atomic_buffer_is_host_allocated_ = false;
+ #elif defined(USE_GRACE_HOPPER)
+-    cudaMallocManaged(&atomic_buffer_ptr_, kAtomicBufferSize);
+-    atomic_buffer_is_host_allocated_ =
+-        false;  // Uses unified memory when we are in Grace hopper (so Alps
+-                // clariden will use this)
++    // Some mlx5 stacks cannot register CUDA managed memory with ibv_reg_mr.
++    // Honor the existing host-memory override on Grace Hopper as well: mapped
++    // pinned memory remains CPU/GPU coherent while providing a normal verbs MR.
++    char* force_host = getenv("UCCL_ATOMICS_USE_HOST_MEMORY");
++    if (force_host &&
++        (force_host[0] == '1' || force_host[0] == 'y' ||
++         force_host[0] == 'Y')) {
++      cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
++                    cudaHostAllocMapped);
++      atomic_buffer_is_host_allocated_ = true;
++    } else {
++      cudaMallocManaged(&atomic_buffer_ptr_, kAtomicBufferSize);
++      atomic_buffer_is_host_allocated_ = false;
++    }
+ #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+     hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
+                           hipDeviceMallocUncached);
+@@ -107,7 +117,7 @@ UcclProxy::~UcclProxy() {
+   }
+
+   if (thread_idx_ == 0 && atomic_buffer_ptr_) {
+-#if defined(USE_LIBFABRIC_CXI) || defined(USE_GRACE_HOPPER)
++#if defined(USE_LIBFABRIC_CXI)
+     cudaFree(atomic_buffer_ptr_);
+ #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+     hipFree(atomic_buffer_ptr_);
