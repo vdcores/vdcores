@@ -39,6 +39,7 @@ class RuntimeInfo:
     nvshmem_name: str
     nvshmem_version: tuple[int, int, int]
     symmetric_size: str
+    transport: str
 
 
 @dataclass
@@ -148,14 +149,27 @@ def _device_index(device: torch.device | str | int | None) -> int | None:
     return parsed.index
 
 
-def _configure_environment(symmetric_size: str) -> None:
+def _configure_environment(symmetric_size: str, transport: str) -> None:
+    if transport not in {"auto", "nvlink", "ibgda"}:
+        raise ValueError("transport must be one of: auto, nvlink, ibgda")
     defaults = {
         "NVSHMEM_BOOTSTRAP": "MPI",
-        "NVSHMEM_REMOTE_TRANSPORT": "ibrc",
-        "NVSHMEM_IB_ENABLE_IBGDA": "1",
-        "NVSHMEM_IBGDA_NIC_HANDLER": "gpu",
         "NVSHMEM_SYMMETRIC_SIZE": "512M",
     }
+    if transport == "nvlink":
+        # NVSHMEM uses its direct P2P path for same-node peers. Disabling the
+        # remote transport and IBGDA makes an accidental NIC datapath fail
+        # during initialization instead of contaminating NVLink measurements.
+        defaults.update({
+            "NVSHMEM_REMOTE_TRANSPORT": "none",
+            "NVSHMEM_IB_ENABLE_IBGDA": "0",
+        })
+    elif transport == "ibgda":
+        defaults.update({
+            "NVSHMEM_REMOTE_TRANSPORT": "ibrc",
+            "NVSHMEM_IB_ENABLE_IBGDA": "1",
+            "NVSHMEM_IBGDA_NIC_HANDLER": "gpu",
+        })
     for name, value in defaults.items():
         os.environ.setdefault(name, value)
     if symmetric_size:
@@ -168,8 +182,13 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
     return values[0], values[1], values[2]
 
 
-def _host_is_initialized(host: ModuleType) -> bool:
-    status = int(host.init_status())
+def _host_is_initialized(
+    host: ModuleType, bindings: ModuleType | None = None
+) -> bool:
+    status_fn = getattr(host, "init_status", None)
+    if status_fn is None:
+        status_fn = getattr(bindings or _load_bindings(), "init_status")
+    status = int(status_fn())
     return 2 <= status <= 4
 
 
@@ -177,6 +196,7 @@ def init(
     *,
     symmetric_size: str | int | None = None,
     device: torch.device | str | int | None = None,
+    transport: str = "auto",
 ) -> RuntimeInfo:
     """Collectively initialize NVSHMEM4Py and the DAE CUDA module."""
 
@@ -193,7 +213,7 @@ def init(
             )
         return current
 
-    _configure_environment(requested_size)
+    _configure_environment(requested_size, transport)
     _load_allocator()
     dae_runtime = _load_runtime()
     host = _load_host()
@@ -234,7 +254,7 @@ def init(
         cuda_device = cuda_device_type(selected_device)
         cuda_device.set_current()
 
-        if not _host_is_initialized(host):
+        if not _host_is_initialized(host, bindings):
             host.init(
                 device=cuda_device,
                 mpi_comm=world,
@@ -263,6 +283,7 @@ def init(
             nvshmem_name="NVSHMEM4Py",
             nvshmem_version=_version_tuple(version.libnvshmem_version),
             symmetric_size=os.environ["NVSHMEM_SYMMETRIC_SIZE"],
+            transport=transport,
         )
 
         status = int(dae_runtime._nvshmem_module_init())
@@ -274,7 +295,7 @@ def init(
     except Exception:
         if module_initialized:
             dae_runtime._nvshmem_module_finalize()
-        if owns_nvshmem and _host_is_initialized(host):
+        if owns_nvshmem and _host_is_initialized(host, bindings):
             host.finalize()
         local_comm.Free()
         raise

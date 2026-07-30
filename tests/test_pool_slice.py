@@ -480,7 +480,9 @@ def test_device_dispatch_uses_exact_static_qp_scope_generations():
     public_put = source.split(
         "pool_slice_stream_put_rows_public(", 1
     )[1].split("#undef DAE_POOL_SLICE_PUBLIC_FALLBACK_QUALIFIER", 1)[0]
-    assert "nvshmemx_putmem_nbi_warp(" in public_put
+    assert "pool_slice_put_nbi_warp(" in public_put
+    assert "nvshmemx_putmem_nbi_warp(" in source
+    assert "pool_slice_peer_ptr(destination, target_pe)" in source
     assert "pool_slice_stream_put_rows_public(" in send_group
     assert "if constexpr (poolSliceWarpQpCompletion)" in send_group
     assert "if constexpr (!poolSliceWarpQpCompletion)" in send_group

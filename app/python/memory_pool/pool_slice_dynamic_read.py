@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--symmetric-size", default="512M")
     parser.add_argument(
+        "--transport",
+        choices=("auto", "nvlink", "ibgda"),
+        default="auto",
+        help="NVSHMEM data path; use nvlink for a single GB300 NVLink domain",
+    )
+    parser.add_argument(
         "--data-groups",
         dest="group_limit",
         type=int,
@@ -71,7 +77,9 @@ def main() -> None:
         raise ValueError("warmup must be non-negative")
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
-    runtime = nvshmem.init(symmetric_size=args.symmetric_size)
+    runtime = nvshmem.init(
+        symmetric_size=args.symmetric_size, transport=args.transport
+    )
     try:
         num_readers = runtime.num_pes * args.readers_per_pe
         if args.top_k > num_readers:

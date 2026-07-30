@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--symmetric-size", default="1G")
     parser.add_argument(
+        "--transport",
+        choices=("auto", "nvlink", "ibgda"),
+        default="auto",
+    )
+    parser.add_argument(
         "--data-groups",
         dest="group_limit",
         type=int,
@@ -441,18 +446,34 @@ def run_pool(
         "device_payload_submission": (
             f"raw-rc-sgl-{POOL_SLICE_RAW_SGL_WIDTH}"
             if POOL_SLICE_RAW_SGL
-            else "nvshmem-row-put"
+            else (
+                "direct-peer-store"
+                if args.transport == "nvlink"
+                else "nvshmem-row-put"
+            )
         ),
-        "metadata_transport_signal": "fused-add-sequence-delta",
+        "metadata_transport_signal": (
+            "system-atomic-add-sequence-delta"
+            if args.transport == "nvlink"
+            else "fused-add-sequence-delta"
+        ),
         "data_transport_signal": (
             "raw-sgl-inline-progress-generation"
             if POOL_SLICE_RAW_SGL
-            else "inline-generation-put"
+            else (
+                "system-release-generation"
+                if args.transport == "nvlink"
+                else "inline-generation-put"
+            )
         ),
         "return_transport_signal": (
             "raw-rc-contiguous-chain-generation"
             if POOL_SLICE_RAW_SGL
-            else "inline-generation-put"
+            else (
+                "system-release-generation"
+                if args.transport == "nvlink"
+                else "inline-generation-put"
+            )
         ),
         "reader_gather": (
             f"reader-cta-progress-{POOL_SLICE_RAW_SGL_WIDTH}"
@@ -526,7 +547,9 @@ def main() -> None:
         raise ValueError("sizes and iterations must be positive; warmup may be zero")
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     comm = MPI.COMM_WORLD
-    runtime = nvshmem.init(symmetric_size=args.symmetric_size)
+    runtime = nvshmem.init(
+        symmetric_size=args.symmetric_size, transport=args.transport
+    )
     nccl_initialized = False
     try:
         num_readers = runtime.num_pes * args.experts_per_pe

@@ -26,7 +26,9 @@
 // QP completion work without changing any base VDCores operator.
 static __device__ __forceinline__ void pool_slice_quiet_block() {
 #ifdef __CUDA_ARCH__
-#ifdef DAE_ENABLE_NVSHMEM
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+  asm volatile("fence.release.sys;" ::: "memory");
+#elif defined(DAE_ENABLE_NVSHMEM)
   nvshmemi_quiet<NVSHMEMI_THREADGROUP_BLOCK>();
 #else
   pool_gin_flush_block();
@@ -104,12 +106,74 @@ static __device__ __forceinline__ void pool_slice_signal_release_local(
 
 static __device__ __forceinline__ uint64_t pool_slice_signal_fetch(
     uint64_t* address, bool local) {
-#ifdef DAE_ENABLE_NVSHMEM
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+  (void)local;
+  uint64_t value;
+  asm volatile(
+      "ld.acquire.sys.global.u64 %0, [%1];"
+      : "=l"(value)
+      : "l"(address)
+      : "memory");
+  return value;
+#elif defined(DAE_ENABLE_NVSHMEM)
   return local ? dae_atomic_load_acquire_gpu(address)
                : nvshmem_signal_fetch(address);
 #else
   (void)local;
   return dae_atomic_load_acquire_gpu(address);
+#endif
+}
+
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+static __device__ __forceinline__ void* pool_slice_peer_ptr(
+    const void* address, uint32_t pe) {
+  void* peer = nvshmem_ptr(address, pe);
+  if (peer == nullptr)
+    asm volatile("trap;");
+  return peer;
+}
+#endif
+
+static __device__ __forceinline__ void pool_slice_fence_release_system() {
+  asm volatile("fence.release.sys;" ::: "memory");
+}
+
+static __device__ __forceinline__ void pool_slice_signal_release_remote(
+    uint64_t* address, uint64_t value, uint32_t target_pe) {
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+  auto* peer = reinterpret_cast<uint64_t*>(
+      pool_slice_peer_ptr(address, target_pe));
+  uint64_t previous;
+  asm volatile(
+      "atom.release.sys.global.exch.b64 %0, [%1], %2;"
+      : "=l"(previous)
+      : "l"(peer), "l"(value)
+      : "memory");
+  (void)previous;
+#elif defined(DAE_ENABLE_NVSHMEM)
+  nvshmemx_signal_op(address, value, NVSHMEM_SIGNAL_SET, target_pe);
+#else
+  pool_gin_set_thread(address, value, target_pe);
+#endif
+}
+
+static __device__ __forceinline__ void pool_slice_signal_add_remote(
+    uint64_t* address, uint64_t value, uint32_t target_pe) {
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+  auto* peer = reinterpret_cast<uint64_t*>(
+      pool_slice_peer_ptr(address, target_pe));
+  uint64_t previous;
+  asm volatile(
+      "atom.release.sys.global.add.u64 %0, [%1], %2;"
+      : "=l"(previous)
+      : "l"(peer), "l"(value)
+      : "memory");
+  (void)previous;
+#elif defined(DAE_ENABLE_NVSHMEM)
+  nvshmemx_signal_op(address, value, NVSHMEM_SIGNAL_ADD, target_pe);
+#else
+  // GIN add-signals are fused with their metadata payload at the call site.
+  pool_gin_set_thread(address, value, target_pe);
 #endif
 }
 
@@ -239,7 +303,10 @@ static __device__ __forceinline__ void pool_slice_put_nbi_warp(
     pool_slice_copy_warp(destination, source, bytes, lane);
     return;
   }
-#ifdef DAE_ENABLE_NVSHMEM
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+  pool_slice_copy_warp(
+      pool_slice_peer_ptr(destination, target_pe), source, bytes, lane);
+#elif defined(DAE_ENABLE_NVSHMEM)
   nvshmemx_putmem_nbi_warp(
       destination, source, static_cast<size_t>(bytes), target_pe);
 #else
@@ -249,18 +316,6 @@ static __device__ __forceinline__ void pool_slice_put_nbi_warp(
       static_cast<size_t>(bytes),
       target_pe,
       false);
-#endif
-}
-
-static __device__ __forceinline__ void pool_slice_signal_set_remote(
-    uint64_t* destination,
-    uint64_t value,
-    uint32_t target_pe) {
-#ifdef DAE_ENABLE_NVSHMEM
-  nvshmemx_signal_op(
-      destination, value, NVSHMEM_SIGNAL_SET, target_pe);
-#else
-  pool_gin_set_thread(destination, value, target_pe);
 #endif
 }
 
@@ -287,7 +342,7 @@ static __device__ __forceinline__ void pool_slice_publish_phase_parallel(
         if (target_pe == my_pe) {
           pool_slice_signal_release_local(signal_array + signal_id, value);
         } else {
-          pool_slice_signal_set_remote(
+          pool_slice_signal_release_remote(
               signal_array + signal_id, value, target_pe);
         }
       }
@@ -310,7 +365,7 @@ static __device__ __forceinline__ void pool_slice_publish_phase_parallel(
     } else if (target_pe == my_pe) {
       pool_slice_signal_release_local(signal_array + signal_id, value);
     } else {
-      pool_slice_signal_set_remote(
+      pool_slice_signal_release_remote(
           signal_array + signal_id, value, target_pe);
     }
   }
@@ -908,14 +963,15 @@ pool_slice_stream_put_rows_public(
     const uint8_t* source = token_pool +
         static_cast<uint64_t>(source_row) * config.row_bytes;
     const size_t bytes = static_cast<size_t>(run_rows) * config.row_bytes;
-#ifdef DAE_ENABLE_NVSHMEM
-    nvshmemx_putmem_nbi_warp(destination, source, bytes, target_pe);
-#else
+#ifdef DAE_ENABLE_NCCL_GIN
     // All row runs in this group share a GIN context. Defer its doorbell until
     // the exact readiness generation below, allowing noncontiguous source
     // regions to travel as one submitted request list.
     pool_gin_put_warp(
         destination, source, bytes, target_pe, true);
+#else
+    pool_slice_put_nbi_warp(
+        destination, source, bytes, target_pe, config.my_pe, lane);
 #endif
     packed_row += run_rows;
   }
@@ -1140,7 +1196,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
       shared_status,
       thread_id);
 
-#ifdef DAE_ENABLE_NVSHMEM
+#if defined(DAE_ENABLE_NVSHMEM) && !defined(DAE_POOL_DATA_PATH_NVLINK)
   if constexpr (poolSliceWarpQpCompletion) {
     // Each nonempty warp owns one statically mapped QP. Its inline generation
     // write follows every payload WQE on that QP, so a dynamic group can skip
@@ -1158,7 +1214,15 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
 
   __syncthreads();
   if (thread_id == 0) {
-#if !DAE_POOL_SLICE_RAW_SGL
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+    pool_slice_fence_release_system();
+    pool_slice_signal_release_remote(
+        pool_slice_stream_data_ready(
+            control, config.my_pe, group, 0),
+        sequence,
+        target_pe);
+#else
+#elif !DAE_POOL_SLICE_RAW_SGL
     if constexpr (!poolSliceWarpQpCompletion) {
       // The static CTA-QP policy maps every producer warp to one ordered RC
       // context. All payload WQEs have been posted before this thread reaches
@@ -2119,9 +2183,20 @@ static __device__ __noinline__ void pool_slice_dynamic_read_reduce_add_local(
               destination,
               source,
               static_cast<size_t>(bytes),
-              source_pe);
+              source_pe,
+              config.my_pe,
+              lane);
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+          __syncwarp();
+          pool_slice_fence_release_system();
+          __syncwarp();
+          if (lane == 0)
+            pool_slice_signal_release_remote(
+                ready, sequence, source_pe);
+#else
           if (lane == 0)
             nvshmem_uint64_p(ready, sequence, source_pe);
+#endif
 #else
           pool_gin_put_warp(
               destination,
@@ -2401,7 +2476,21 @@ pool_slice_stream_publish_metadata_target(
     if (lane == 0)
       pool_slice_signal_release_local(ready, sequence);
   } else {
-#ifdef DAE_ENABLE_NVSHMEM
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+    pool_slice_put_nbi_warp(
+        destination,
+        source,
+        static_cast<size_t>(packet_bytes),
+        target_pe,
+        config.my_pe,
+        lane);
+    __syncwarp();
+    pool_slice_fence_release_system();
+    __syncwarp();
+    if (lane == 0)
+      pool_slice_signal_add_remote(
+          ready, signal_delta, target_pe);
+#elif defined(DAE_ENABLE_NVSHMEM)
     nvshmemx_putmem_signal_nbi_warp(
         destination,
         source,
@@ -3010,7 +3099,7 @@ static __device__ __noinline__ void pool_slice_stream_execute_queue_control(
                 signal_array + config.signal_base + config.my_pe,
                 return_value);
           } else {
-            pool_slice_signal_set_remote(
+            pool_slice_signal_release_remote(
                 signal_array + config.signal_base + config.my_pe,
                 return_value,
                 source_pe);

@@ -92,3 +92,47 @@ def test_available_handles_a_missing_optional_package(monkeypatch):
 
     monkeypatch.setattr(nvshmem.importlib_util, "find_spec", missing)
     assert nvshmem.available() is False
+
+
+@pytest.mark.parametrize(
+    ("transport", "expected"),
+    [
+        ("auto", {}),
+        (
+            "nvlink",
+            {
+                "NVSHMEM_REMOTE_TRANSPORT": "none",
+                "NVSHMEM_IB_ENABLE_IBGDA": "0",
+            },
+        ),
+        (
+            "ibgda",
+            {
+                "NVSHMEM_REMOTE_TRANSPORT": "ibrc",
+                "NVSHMEM_IB_ENABLE_IBGDA": "1",
+                "NVSHMEM_IBGDA_NIC_HANDLER": "gpu",
+            },
+        ),
+    ],
+)
+def test_transport_environment_is_explicit(monkeypatch, transport, expected):
+    for name in (
+        "NVSHMEM_BOOTSTRAP",
+        "NVSHMEM_REMOTE_TRANSPORT",
+        "NVSHMEM_IB_ENABLE_IBGDA",
+        "NVSHMEM_IBGDA_NIC_HANDLER",
+        "NVSHMEM_SYMMETRIC_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    nvshmem._configure_environment("768M", transport)
+
+    assert nvshmem.os.environ["NVSHMEM_BOOTSTRAP"] == "MPI"
+    assert nvshmem.os.environ["NVSHMEM_SYMMETRIC_SIZE"] == "768M"
+    for name, value in expected.items():
+        assert nvshmem.os.environ[name] == value
+
+
+def test_transport_environment_rejects_unknown_policy():
+    with pytest.raises(ValueError, match="transport"):
+        nvshmem._configure_environment("512M", "ethernet")

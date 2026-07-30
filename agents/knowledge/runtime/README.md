@@ -48,3 +48,5 @@ Then pull in narrower notes as needed:
 - [external-ep-baselines.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/external-ep-baselines.md):
   pinned NVIDIA NCCL EP, UCCL, and Triton EP adapters, comparison contract,
   and 2/4/8-PE results
+- [gb300-nvlink-pool.md](gb300-nvlink-pool.md):
+  GB300 build profile, direct NVLink pool transport, and current verification boundary

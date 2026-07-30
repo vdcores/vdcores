@@ -25,6 +25,8 @@ DAE_POOL_SLICE_WARP_QP_COMPLETION ?= 0
 # than selected inside the runtime loop.
 DAE_POOL_SLICE_RAW_SGL ?= 0
 DAE_POOL_SLICE_RAW_SGL_WIDTH ?= 8
+DAE_BUILD_PROFILE ?= hopper
+DAE_POOL_DATA_PATH ?= $(if $(filter gb300,$(DAE_BUILD_PROFILE)),nvlink,nvshmem)
 # CUDA 13 diagnoses deprecated volatile syntax in NVSHMEM 3.4.5 collective
 # headers even though this runtime does not instantiate those collectives.
 NVSHMEM_HEADER_DIAGNOSTICS := -diag-suppress=3012,3013
@@ -34,7 +36,12 @@ NVSHMEM_HEADER_DIAGNOSTICS := -diag-suppress=3012,3013
 
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
-CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
+ifeq ($(DAE_BUILD_PROFILE),gb300)
+	CUDA_ARCH ?= -gencode arch=compute_100a,code=sm_100a
+	DAE_COMPUTE_OPS ?= OP_TERMINATEC
+else
+	CUDA_ARCH ?= -gencode arch=compute_90a,code=sm_90a
+endif
 
 GENERATED_INCLUDE_DIR := build/generated
 SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc
@@ -57,6 +64,9 @@ NVCC_FLAGS += -DDAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS)
 NVCC_FLAGS += -DDAE_POOL_SLICE_WARP_QP_COMPLETION=$(DAE_POOL_SLICE_WARP_QP_COMPLETION)
 NVCC_FLAGS += -DDAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL)
 NVCC_FLAGS += -DDAE_POOL_SLICE_RAW_SGL_WIDTH=$(DAE_POOL_SLICE_RAW_SGL_WIDTH)
+ifeq ($(DAE_POOL_DATA_PATH),nvlink)
+	NVCC_FLAGS += -DDAE_POOL_DATA_PATH_NVLINK=1
+endif
 
 # Directories
 ifeq ($(debug),)
@@ -139,6 +149,8 @@ pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLER
 # extension through the same setup.py. Host control remains in NVSHMEM4Py.
 nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(NVSHMEM_RUNTIME_OBJECT) $(NVSHMEM_DLINK_OBJECT)
 	DAE_ENABLE_NVSHMEM=1 \
+	DAE_CUDA_ARCH=$(if $(filter gb300,$(DAE_BUILD_PROFILE)),100a,90a) \
+	DAE_POOL_DATA_PATH=$(DAE_POOL_DATA_PATH) \
 	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
 	DAE_POOL_SLICE_WARP_QP_COMPLETION=$(DAE_POOL_SLICE_WARP_QP_COMPLETION) \
 	DAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL) \
@@ -161,6 +173,11 @@ gin-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HAN
 	DAE_RUNTIME_OBJECT=$(abspath $(GIN_RUNTIME_OBJECT)) \
 	$(PYTHON) -m pip install -e . --no-build-isolation
 
+# GB300/GB200 pool-only build. The single selected compute opcode is the VM
+# terminator; Hopper WGMMA/attention kernels are not instantiated.
+gb300-nvlink-pyext:
+	$(MAKE) nvshmem-pyext DAE_BUILD_PROFILE=gb300
+
 FORCE:
 
-.PHONY: all clean run FORCE nvshmem-pyext gin-pyext
+.PHONY: all clean run FORCE nvshmem-pyext gin-pyext gb300-nvlink-pyext

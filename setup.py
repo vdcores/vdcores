@@ -24,9 +24,17 @@ NCCL_GIN_ENABLED = os.environ.get("DAE_ENABLE_NCCL_GIN", "0").lower() in {
 }
 if NVSHMEM_ENABLED and NCCL_GIN_ENABLED:
     raise RuntimeError("NVSHMEM and NCCL GIN PoolInst backends are exclusive")
+CUDA_ARCH = os.environ.get("DAE_CUDA_ARCH", "90a")
+POOL_DATA_PATH = os.environ.get("DAE_POOL_DATA_PATH", "nvshmem")
 
 
-def find_nvshmem_home() -> Path:
+def cuda_gencode(arch: str) -> str:
+    if not arch.replace("a", "").isdigit() or arch.count("a") > 1:
+        raise RuntimeError(f"Invalid DAE_CUDA_ARCH={arch!r}; expected e.g. 90a or 100a")
+    return f"-gencode=arch=compute_{arch},code=sm_{arch}"
+
+
+def find_nvshmem_home() -> tuple[Path, Path]:
     candidates = []
     if configured := os.environ.get("NVSHMEM_HOME"):
         candidates.append(Path(configured))
@@ -42,10 +50,11 @@ def find_nvshmem_home() -> Path:
     for candidate in candidates:
         if (
             (candidate / "include" / "nvshmem.h").is_file()
-            and (candidate / "lib" / "libnvshmem_host.so").exists()
             and (candidate / "lib" / "libnvshmem_device.a").is_file()
         ):
-            return candidate.resolve()
+            host_candidates = sorted((candidate / "lib").glob("libnvshmem_host.so*"))
+            if host_candidates:
+                return candidate.resolve(), host_candidates[0].resolve()
 
     searched = ", ".join(str(candidate) for candidate in candidates)
     raise RuntimeError(
@@ -98,6 +107,10 @@ if NVSHMEM_ENABLED:
     runtime_macros.append(("DAE_ENABLE_NVSHMEM", "1"))
 if NCCL_GIN_ENABLED:
     runtime_macros.append(("DAE_ENABLE_NCCL_GIN", "1"))
+if POOL_DATA_PATH == "nvlink":
+    runtime_macros.append(("DAE_POOL_DATA_PATH_NVLINK", "1"))
+elif POOL_DATA_PATH != "nvshmem":
+    raise RuntimeError("DAE_POOL_DATA_PATH must be nvshmem or nvlink")
 runtime_include_dirs = [
     str(ROOT / "include"),
     str(ROOT / "include" / "dae"),
@@ -110,11 +123,14 @@ runtime_objects = [
     os.environ.get("DAE_RUNTIME_OBJECT", str(ROOT / "runtime.o")),
 ]
 
-nvshmem_home = find_nvshmem_home() if NVSHMEM_ENABLED else None
+nvshmem_location = find_nvshmem_home() if NVSHMEM_ENABLED else None
+nvshmem_home = nvshmem_location[0] if nvshmem_location is not None else None
+nvshmem_host_library = nvshmem_location[1] if nvshmem_location is not None else None
 if nvshmem_home is not None:
     runtime_include_dirs.append(str(nvshmem_home / "include"))
     runtime_library_dirs.append(str(nvshmem_home / "lib"))
-    runtime_libraries.extend(["nvshmem_host", "nvshmem_device", "dl", "pthread"])
+    runtime_libraries.extend(["nvshmem_device", "dl", "pthread"])
+    runtime_link_args.append(str(nvshmem_host_library))
     runtime_objects.append(
         os.environ.get(
             "DAE_RUNTIME_DLINK_OBJECT",
@@ -143,7 +159,7 @@ extensions = [
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20", "-DNDEBUG"],
             "nvcc": [
-                "-gencode=arch=compute_90a,code=sm_90a",
+                cuda_gencode(CUDA_ARCH),
                 "-O3",
                 "-std=c++20",
                 "-DNDEBUG",
@@ -164,18 +180,21 @@ if NVSHMEM_ENABLED:
             sources=[str(ROOT / "src" / "torch_nvshmem_runtime.cu")],
             include_dirs=[str(nvshmem_home / "include")],
             library_dirs=[str(nvshmem_home / "lib")],
-            libraries=["nvshmem_host", "dl", "pthread"],
+            libraries=["dl", "pthread"],
             define_macros=[("DAE_ENABLE_NVSHMEM", "1")],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++20", "-DNDEBUG"],
                 "nvcc": [
-                    "-gencode=arch=compute_90a,code=sm_90a",
+                    cuda_gencode(CUDA_ARCH),
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
                 ],
             },
-            extra_link_args=[f"-Wl,-rpath,{nvshmem_home / 'lib'}"],
+            extra_link_args=[
+                str(nvshmem_host_library),
+                f"-Wl,-rpath,{nvshmem_home / 'lib'}",
+            ],
         )
     )
 
