@@ -51,6 +51,15 @@ torch_lib = Path(torch.__file__).resolve().parent / "lib"
 generated_include_dir = ROOT / "build" / "generated"
 runtime_macros = [
     ("DAE_POOL_SLICE_WARPS", os.environ.get("DAE_POOL_SLICE_WARPS", "8")),
+    (
+        "DAE_POOL_SLICE_WARP_QP_COMPLETION",
+        os.environ.get("DAE_POOL_SLICE_WARP_QP_COMPLETION", "0"),
+    ),
+    ("DAE_POOL_SLICE_RAW_SGL", os.environ.get("DAE_POOL_SLICE_RAW_SGL", "0")),
+    (
+        "DAE_POOL_SLICE_RAW_SGL_WIDTH",
+        os.environ.get("DAE_POOL_SLICE_RAW_SGL_WIDTH", "8"),
+    ),
 ]
 if NVSHMEM_ENABLED:
     runtime_macros.append(("DAE_ENABLE_NVSHMEM", "1"))

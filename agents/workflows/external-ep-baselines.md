@@ -19,6 +19,10 @@ repository.
 
 ## Pinned sources
 
+- NVIDIA NCCL EP: official `NVIDIA/nccl` checkout at
+  `/scratch/11362/depctg/vdcores-baselines/nccl-ep-current`, commit
+  `5067397c2676d5aed50042fc39e5c8ee96eb0027`; `nccl4py==0.3.1`,
+  `libnccl_ep.so` version 0.1.0, and `nvidia-nccl-cu13==2.30.7`.
 - UCCL: `/home1/11362/depctg/projects/uccl`, commit
   `f071f2e31239cd7d673bf2c9369b5cebe1b98457`.
 - Triton-distributed:
@@ -29,6 +33,69 @@ repository.
 Record any local compatibility patch with the source pin and keep the external
 checkout's `git diff` in the task log. Do not silently compare a modified
 algorithm.
+
+## NVIDIA NCCL EP
+
+`benchmarks/nccl_ep_reference.py` is the real NCCL EP LL boundary. The
+similarly shaped dense ring control has been renamed
+`benchmarks/dense_nccl_ring_reference.py`; never report that control as NCCL
+EP.
+
+Use an external environment containing the official CUDA-13 `nccl4py` package
+and a matching NCCL runtime. A lean LL-only setup needs `nccl4py==0.3.1`,
+`cuda-core~=1.0`, `cuda-pathfinder>=1.5.4`, and
+`nvidia-nccl-cu13==2.30.7`; install all four into the same environment so
+CUDA Pathfinder does not select an older NCCL from the base environment. The
+official `nccl4py[cu13]` extra is also valid. Select that same NCCL library for
+both Torch and NCCL4Py before Python starts. On Vista:
+
+```bash
+python -m venv --system-site-packages \
+  /scratch/11362/depctg/vdcores-baselines/nccl-ep-env
+/scratch/11362/depctg/vdcores-baselines/nccl-ep-env/bin/python -m pip install \
+  nccl4py==0.3.1 cuda-core==1.1.0 cuda-pathfinder==1.6.0 \
+  nvidia-nccl-cu13==2.30.7
+
+export NCCL_EP_ROOT=/scratch/11362/depctg/vdcores-baselines/nccl-ep-current
+export NCCL_EP_ENV=/scratch/11362/depctg/vdcores-baselines/nccl-ep-env
+export LD_LIBRARY_PATH="$NCCL_EP_ENV/lib/python3.13/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH"
+export NCCL_GIN_TYPE=3
+export NCCL_SOCKET_IFNAME=ibP2s2
+```
+
+Then launch one rank/GPU/node:
+
+```bash
+ibrun -n 2 "$NCCL_EP_ENV/bin/python" \
+  benchmarks/nccl_ep_reference.py \
+  --nccl-ep-root "$NCCL_EP_ROOT" \
+  --tokens-per-pe 128 --hidden-size 7168 \
+  --experts-per-pe 8 --top-k 8 --route-placement clustered \
+  --warmup 10 --iterations 30
+```
+
+The adapter uses BF16 LL expert-major layout, real weighted combine, and an
+untimed identity expert. `--num-qps-per-rank 0` selects one QP per local expert,
+matching the official LL benchmark; `--max-num-sms 0` and `--num-channels 0`
+retain library auto-tuning. It reports the real de-duplicated dispatch payload
+count (one row per token/distinct destination rank), not route-count payload
+bytes. The packaged LL kernels support hidden sizes 2048, 2560, 4096, 5120,
+6144, 7168, and 8192. Record all three tuning choices with every result.
+
+The benchmark is a steady-state fixed-route measurement: handle creation and
+`Handle.update()` are outside the interval. This matches the repeated PoolInst
+benchmark, whose route tensor is also written before its timing loop. A study
+of per-step dynamic-router overhead must time `Handle.update()` separately or
+include it ahead of each dispatch and label that result distinctly.
+
+Expert-major is NCCL EP's LL benchmark default and is the comparable boundary
+when the dispatch result must already be expert-contiguous: dispatch transmits
+one token message per destination rank and fans it out locally, while combine
+returns one post-expert row per route and applies the weights. NCCL EP also has
+a rank-major layout that can return one row per source/destination rank, but it
+moves local expert scatter and weighted pre-reduction into the caller. Do not
+quote rank-major communication-only timing as an expert-ready end-to-end result
+unless that caller work is implemented and accounted for.
 
 ## UCCL-EP
 

@@ -34,9 +34,10 @@ Then pull in narrower notes as needed:
 - [vdcores-communication-core.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-communication-core.md):
   communication ISA, macro-core isolation, warp roles, and ordering rules
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md):
-  distributed slice ownership, merged signals, batched dynamic reads, and
-  measured optimization results
+  distributed slice ownership, strict raw-RC transport, launch-packet setup,
+  batched dynamic reads, and the current 2/4/8-PE performance matrix
 - [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md):
   optional Grace coherent request ring and direct-HBM host-verbs transport
 - [external-ep-baselines.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/external-ep-baselines.md):
-  pinned UCCL/Triton EP adapters, comparison contract, and 2/4/8-PE results
+  pinned NVIDIA NCCL EP, UCCL, and Triton EP adapters, comparison contract,
+  and 2/4/8-PE results

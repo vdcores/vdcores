@@ -5,10 +5,11 @@ protocol code remains under `include/` and `python/dae/`; NCCL, DeepEP, and
 verbs progress code is never linked into the main runtime.
 
 `pool_slice_nccl_compare.py` compares the unified pool-slice dynamic-read
-protocol with a dense two-ring NCCL reference implemented in
-`nccl_ep_reference.py`. The VDCores side is timed exclusively from `dae2`'s
-internal `g_events` profile space. CUDA events are used only around the
-external NCCL reference.
+protocol with a dense two-all-reduce NCCL ring surrogate implemented in
+`dense_nccl_ring_reference.py`. This is deliberately not called NCCL EP: it
+materializes dense expert-major and token-major tensors and supports top-k=1.
+The VDCores side is timed exclusively from `dae2`'s internal `g_events`
+profile space. CUDA events are used only around the external NCCL surrogate.
 
 The harness also reports protocol bytes, batches, and merged signal counts so
 transport decisions can be evaluated before low-level profiling.
@@ -30,6 +31,17 @@ all-reduce for dispatch and one token-major ring all-reduce for return. It is a
 stable NCCL comparison boundary, not a claim that production sparse EP must be
 implemented as all-reduce. Keep `NVSHMEM_IBGDA_NUM_RC_PER_PE` and mapping
 sweeps in the benchmark environment; they are not runtime operators.
+
+`nccl_ep_reference.py` is a separate adapter for NVIDIA's actual NCCL EP
+library. It invokes `ncclEpDispatch` and `ncclEpCombine` through an externally
+installed `nccl4py`/`libnccl_ep`, using BF16 low-latency expert-major dispatch
+and weighted identity combine. Its dispatch sends a token once per distinct
+destination rank and carries routing metadata for local expert fanout. The
+adapter validates both received expert counts and the weighted identity result,
+reports the loaded NCCL/NCCL-EP versions and library path, and emits the common
+`ep-baseline-json:` record. NCCL EP remains an external dependency and is never
+linked into VDCores. Its timing is the official steady-state fixed-route
+boundary: handle creation/update is outside the interval.
 
 `deepep_low_latency_reference.py` is the production sparse comparison
 boundary. It imports an externally built DeepEP V1 package and measures the
@@ -66,10 +78,11 @@ against local FP8 quantize/dequantize. Each measured iteration dequantizes that
 iteration's dynamically ordered receive buffer, but CUDA events exclude this
 identity-expert work from both dispatch and combine timing.
 
-Both adapters share the deterministic placement definitions in
-`ep_baseline_common.py`, report the rank-maximum median of CUDA-event samples,
-and emit an `ep-baseline-json:` line for result collection. These CUDA events
-are external-baseline measurements and never use or alter VDCores `g_events`.
+The NCCL EP, UCCL, and Triton adapters share the deterministic placement
+definitions in `ep_baseline_common.py`, report the rank-maximum median of
+CUDA-event samples, and emit an `ep-baseline-json:` line for result collection.
+These CUDA events are external-baseline measurements and never use or alter
+VDCores `g_events`.
 Pinned source/build and Vista launch instructions are in
 `agents/workflows/external-ep-baselines.md`; the measured 2/4/8-PE matrix is in
 `agents/knowledge/runtime/external-ep-baselines.md`.
@@ -77,6 +90,11 @@ Pinned source/build and Vista launch instructions are in
 Typical one-GPU-per-node launches after installing each dependency externally:
 
 ```bash
+NCCL_EP_ROOT=/scratch/11362/depctg/vdcores-baselines/nccl-ep-current \
+NCCL_GIN_TYPE=3 NCCL_SOCKET_IFNAME=ibP2s2 \
+ibrun -n 2 /path/to/nccl-ep-env/bin/python \
+  benchmarks/nccl_ep_reference.py --tokens-per-pe 128
+
 UCCL_EP_ROOT=/home1/11362/depctg/projects/uccl \
 ibrun -n 2 python benchmarks/uccl_ep_reference.py \
   --tokens-per-pe 128 --dispatch-dtype bfloat16

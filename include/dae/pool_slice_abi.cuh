@@ -4,36 +4,105 @@
 
 #include "pool_host_abi.h"
 
+#ifndef DAE_POOL_SLICE_WARPS
+#define DAE_POOL_SLICE_WARPS 8
+#endif
+#ifndef DAE_POOL_SLICE_WARP_QP_COMPLETION
+#define DAE_POOL_SLICE_WARP_QP_COMPLETION 0
+#endif
+#ifndef DAE_POOL_SLICE_RAW_SGL
+#define DAE_POOL_SLICE_RAW_SGL 0
+#endif
+#ifndef DAE_POOL_SLICE_RAW_SGL_WIDTH
+#define DAE_POOL_SLICE_RAW_SGL_WIDTH 8
+#endif
+
 static constexpr uint32_t poolSliceMaxPes = 32;
 static constexpr uint32_t poolSliceMaxLocalReaders = 8;
-static constexpr uint32_t poolSliceMaxPoolBlocks = 32;
-// Source-owned reduction/return shards per destination. Four matches the
-// production IBGDA RC-QP default and keeps the dependency set bounded.
+// A fixed all-PoolInst assembly may occupy every SM exposed by the VDCores
+// launcher. Mixed assemblies are checked against the device SM count after
+// adding their writer and reader cores.
+static constexpr uint32_t poolSliceMaxPoolBlocks = 132;
+// Dynamic grouping is a message-granularity choice, not a PoolInst-CTA limit.
+// Thirty-two groups cover the intended <= 1K-token inference fast path while
+// keeping the two ordered queues and their readiness state compact.
+static constexpr uint32_t poolSliceMaxDataGroups = 32;
+// A CTA-mapped-QP assembly needs one ordered generation per payload group.
+// A separately compiled warp-mapped-QP assembly names every sender warp so
+// the receiver can join the independent transport contexts exactly.
+static constexpr uint32_t poolSlicePayloadWarps = DAE_POOL_SLICE_WARPS;
+static_assert(
+    poolSlicePayloadWarps >= 3 && poolSlicePayloadWarps <= 32,
+    "PoolInst payload warp count is outside the supported range");
+static_assert(
+    DAE_POOL_SLICE_WARP_QP_COMPLETION == 0 ||
+        DAE_POOL_SLICE_WARP_QP_COMPLETION == 1,
+    "PoolInst QP completion scope must be CTA (0) or warp (1)");
+static constexpr bool poolSliceWarpQpCompletion =
+    DAE_POOL_SLICE_WARP_QP_COMPLETION != 0;
+static constexpr uint32_t poolSliceCompletionSlots =
+    poolSliceWarpQpCompletion ? poolSlicePayloadWarps : 1;
+static_assert(
+    DAE_POOL_SLICE_RAW_SGL == 0 || DAE_POOL_SLICE_RAW_SGL == 1,
+    "PoolInst raw SGL selection must be disabled (0) or enabled (1)");
+static constexpr bool poolSliceRawSgl = DAE_POOL_SLICE_RAW_SGL != 0;
+static constexpr uint32_t poolSliceRawSglWidth =
+    DAE_POOL_SLICE_RAW_SGL_WIDTH;
+// A raw-SGL payload word carries both the invocation generation and the
+// number of contiguous SGL segments already visible at the destination.  The
+// route encoding limits one source envelope to 2^16 rows, so a 17-bit stride
+// leaves every legal final value strictly below the next generation.
+static constexpr uint64_t poolSliceRawSglProgressStride = 1ULL << 17;
+static_assert(
+    !poolSliceRawSgl ||
+        (poolSliceRawSglWidth >= 1 && poolSliceRawSglWidth <= 30),
+    "PoolInst raw RC SGL width must be in [1, 30]");
+static_assert(poolSliceRawSglProgressStride > (1ULL << 16));
+static_assert(
+    !poolSliceRawSgl || !poolSliceWarpQpCompletion,
+    "PoolInst raw RC SGL requires the CTA-mapped completion build");
+// Dense LLM activations up through 8192 BF16 elements fit in one shared tile.
+// PoolInst uses the tile only when every compiled warp owns one local expert;
+// wider or sparse shapes retain the ordinary per-reader gather.
+// Maximum source-owned reduction/return transport groups per destination.
+// Runtime coalescing targets roughly 256 KiB while this bound keeps the
+// dependency set compact.
 static constexpr uint32_t poolSliceReturnGroupsPerSource = 4;
+static constexpr uint32_t poolSliceMaxReturnReady =
+    poolSliceMaxPes * poolSliceReturnGroupsPerSource;
 // Every source exposes exactly two ordered queues. Keeping this compile-time
 // shape small avoids a runtime queue-mode branch without recreating a
 // (source, group) scan.
 static constexpr uint32_t poolSliceMaxStreamQueues = 2;
 static constexpr uint32_t poolSliceStreamQueueDepth =
-    poolSliceMaxPoolBlocks + 2;
+    2 + (poolSliceMaxDataGroups + 1) / 2;
 static_assert(poolSliceMaxPes * poolSliceMaxStreamQueues <= 64);
 // The first five words are user-visible telemetry. The remaining words are
 // single-writer generations and narrowly scoped counters used to coordinate
 // independently scheduled PoolInst CTAs without a device-wide fence or reset
-// race. Streaming COPY_ROWS messages name producer-owned readiness slots, but
-// consumers inspect only the head of each small ordered queue.
+// race. Streaming COPY_ROWS messages name one statically scoped completion
+// set, but consumers inspect only the head of each small ordered queue.
 static constexpr uint32_t poolSliceControlDispatchGeneration = 5;
-static constexpr uint32_t poolSliceControlReturnGeneration = 37;
-static constexpr uint32_t poolSliceControlScatterGeneration = 69;
-static constexpr uint32_t poolSliceControlStart = 101;
-static constexpr uint32_t poolSliceControlDispatchReady = 102;
-static constexpr uint32_t poolSliceControlScatterStart = 103;
-static constexpr uint32_t poolSliceControlReaderRowCount = 104;
-static constexpr uint32_t poolSliceControlStreamSendTotal = 112;
-static constexpr uint32_t poolSliceControlStreamSendDone = 113;
-static constexpr uint32_t poolSliceControlStreamQueueRetiredMask = 114;
-// One put-with-signal publishes the runtime-sized route/queue metadata packet
-// into this monotonic per-source transport generation.
+static constexpr uint32_t poolSliceControlReturnGeneration =
+    poolSliceControlDispatchGeneration + poolSliceMaxPoolBlocks;
+static constexpr uint32_t poolSliceControlScatterGeneration =
+    poolSliceControlReturnGeneration + poolSliceMaxPoolBlocks;
+static constexpr uint32_t poolSliceControlStart =
+    poolSliceControlScatterGeneration + poolSliceMaxPoolBlocks;
+static constexpr uint32_t poolSliceControlDispatchReady =
+    poolSliceControlStart + 1;
+static constexpr uint32_t poolSliceControlScatterStart =
+    poolSliceControlDispatchReady + 1;
+static constexpr uint32_t poolSliceControlReaderRowCount =
+    poolSliceControlScatterStart + 1;
+static constexpr uint32_t poolSliceControlStreamSendTotal =
+    poolSliceControlReaderRowCount + poolSliceMaxLocalReaders;
+static constexpr uint32_t poolSliceControlStreamSendDone =
+    poolSliceControlStreamSendTotal + 1;
+static constexpr uint32_t poolSliceControlStreamQueueRetiredMask =
+    poolSliceControlStreamSendDone + 1;
+// One put-with-signal publishes a standalone runtime-sized route/queue
+// metadata packet into this monotonic per-source transport generation.
 static constexpr uint32_t poolSliceControlStreamMetadataTransportReady =
     poolSliceControlStreamQueueRetiredMask + 1;
 static constexpr uint32_t poolSliceControlStreamMetadataReady =
@@ -44,7 +113,8 @@ static constexpr uint32_t poolSliceControlStreamDataReady =
     poolSliceControlStreamRouteReady + poolSliceMaxPes;
 static constexpr uint32_t poolSliceControlStreamQueueHead =
     poolSliceControlStreamDataReady +
-    poolSliceMaxPes * poolSliceMaxPoolBlocks;
+    poolSliceMaxPes * poolSliceMaxDataGroups *
+        poolSliceCompletionSlots;
 static constexpr uint32_t poolSliceControlStreamQueueClaim =
     poolSliceControlStreamQueueHead +
     poolSliceMaxPes * poolSliceMaxStreamQueues;
@@ -53,10 +123,17 @@ static constexpr uint32_t poolSliceControlReturnReady =
     poolSliceMaxPes * poolSliceMaxStreamQueues;
 static constexpr uint32_t poolSliceControlReturnGroupCount =
     poolSliceControlReturnReady +
-    poolSliceMaxPes * poolSliceMaxPoolBlocks;
-static constexpr uint32_t poolSliceControlWords =
+    poolSliceMaxPes * poolSliceMaxReturnReady;
+// Every source publishes exactly one metadata envelope to every destination
+// per invocation, including an empty envelope. Remember the last source
+// sequence so its fused packet can advance one monotonic ADD generation.
+static constexpr uint32_t poolSliceControlStreamMetadataSourceSequence =
     poolSliceControlReturnGroupCount +
     poolSliceMaxPes * poolSliceReturnGroupsPerSource;
+static constexpr uint32_t poolSliceControlStreamMetadataSignalDelta =
+    poolSliceControlStreamMetadataSourceSequence + 1;
+static constexpr uint32_t poolSliceControlWords =
+    poolSliceControlStreamMetadataSignalDelta + 1;
 static constexpr uint32_t poolSliceProfileStart = 5;
 static constexpr uint32_t poolSliceProfileGatherReady = 6;
 static constexpr uint32_t poolSliceProfileDone = 7;
@@ -80,7 +157,6 @@ static constexpr uint32_t poolSliceProfileReturnReduceStart = 19;
 static constexpr uint32_t poolSliceProfileReturnReduceDone = 20;
 static constexpr uint32_t poolSliceProfileFirstReturnPut = 21;
 static constexpr uint32_t poolSliceProfileReturnCtaDone = 22;
-
 enum PoolSliceStatus : uint64_t {
   POOL_SLICE_STATUS_OK = 0,
   POOL_SLICE_STATUS_BATCH = 1,
@@ -95,8 +171,9 @@ enum PoolSliceBatchFlags : uint32_t {
 // Immutable instructions in each source-owned destination queue. Queue zero
 // starts with one RESERVE_ROUTES macro that consumes the 64-byte source
 // envelope. COPY_ROWS instructions are striped over exactly two queues; each
-// queue terminates with END. Data readiness lives in a separate named slot so
-// an early payload signal can never race a metadata write.
+// queue terminates with END. Data readiness lives in separate named static-QP
+// slots so an early payload signal can never race a metadata write or an
+// independently mapped transport context.
 enum PoolSliceQueueOpcode : uint32_t {
   POOL_SLICE_QUEUE_RESERVE_ROUTES = 1,
   POOL_SLICE_QUEUE_COPY_ROWS = 2,

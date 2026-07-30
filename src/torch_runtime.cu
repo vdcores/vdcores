@@ -447,6 +447,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("runtime_communication_core_warps") =
       daeRuntimeCommunicationCoreWarps;
   config.attr("pool_slice_warps") = daePoolSliceWarps;
+  config.attr("pool_slice_warp_qp_completion") =
+      daePoolSliceWarpQpCompletion;
+  config.attr("pool_slice_completion_slots") =
+      daePoolSliceCompletionSlots;
+  config.attr("pool_slice_raw_sgl") = daePoolSliceRawSgl;
+  config.attr("pool_slice_raw_sgl_width") = daePoolSliceRawSglWidth;
   config.attr("kernel_auto") = static_cast<int>(DAE_KERNEL_AUTO);
   config.attr("kernel_compute_memory") =
       static_cast<int>(DAE_KERNEL_COMPUTE_MEMORY);

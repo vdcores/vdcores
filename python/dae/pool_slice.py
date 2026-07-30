@@ -18,6 +18,8 @@ from typing import Sequence, TYPE_CHECKING
 
 import torch
 
+from .runtime import config as _runtime_config
+
 
 if TYPE_CHECKING:
     from .launcher import Launcher
@@ -25,12 +27,31 @@ if TYPE_CHECKING:
 
 POOL_SLICE_MAX_PES = 32
 POOL_SLICE_MAX_LOCAL_READERS = 8
-POOL_SLICE_MAX_POOL_BLOCKS = 32
+POOL_SLICE_MAX_POOL_BLOCKS = 132
+POOL_SLICE_MAX_DATA_GROUPS = 32
+POOL_SLICE_PAYLOAD_WARPS = int(_runtime_config.pool_slice_warps) or 8
+if not 3 <= POOL_SLICE_PAYLOAD_WARPS <= 32:
+    raise RuntimeError("compiled PoolInst payload warp count is invalid")
+POOL_SLICE_WARP_QP_COMPLETION = bool(
+    _runtime_config.pool_slice_warp_qp_completion
+)
+POOL_SLICE_COMPLETION_SLOTS = int(_runtime_config.pool_slice_completion_slots)
+if POOL_SLICE_COMPLETION_SLOTS != (
+    POOL_SLICE_PAYLOAD_WARPS if POOL_SLICE_WARP_QP_COMPLETION else 1
+):
+    raise RuntimeError("compiled PoolInst completion scope is inconsistent")
+POOL_SLICE_RAW_SGL = bool(_runtime_config.pool_slice_raw_sgl)
+POOL_SLICE_RAW_SGL_WIDTH = int(_runtime_config.pool_slice_raw_sgl_width)
+if POOL_SLICE_RAW_SGL and not 1 <= POOL_SLICE_RAW_SGL_WIDTH <= 30:
+    raise RuntimeError("compiled PoolInst raw SGL width is invalid")
 POOL_SLICE_RETURN_GROUPS_PER_SOURCE = 4
+POOL_SLICE_MAX_RETURN_READY = (
+    POOL_SLICE_MAX_PES * POOL_SLICE_RETURN_GROUPS_PER_SOURCE
+)
 POOL_SLICE_MAX_STREAM_QUEUES = 2
 POOL_HOST_RING_MAX_ROWS = 512
 POOL_SLICE_STREAM_QUEUE_DEPTH = (
-    POOL_SLICE_MAX_POOL_BLOCKS + 2
+    2 + (POOL_SLICE_MAX_DATA_GROUPS + 1) // 2
 )
 POOL_SLICE_QUEUE_ENTRY_BYTES = 32
 POOL_SLICE_PUBLISH_BYTES = 64
@@ -44,7 +65,29 @@ POOL_SLICE_RECEIVE_BYTES = 32
 POOL_SLICE_CONFIG_BYTES = 192
 POOL_SLICE_HOST_CONFIG_BYTES = 224
 POOL_SLICE_HOST_PEER_WORDS = 5
-POOL_SLICE_CONTROL_STREAM_METADATA_TRANSPORT_READY = 115
+POOL_SLICE_CONTROL_DISPATCH_GENERATION = 5
+POOL_SLICE_CONTROL_RETURN_GENERATION = (
+    POOL_SLICE_CONTROL_DISPATCH_GENERATION + POOL_SLICE_MAX_POOL_BLOCKS
+)
+POOL_SLICE_CONTROL_SCATTER_GENERATION = (
+    POOL_SLICE_CONTROL_RETURN_GENERATION + POOL_SLICE_MAX_POOL_BLOCKS
+)
+POOL_SLICE_CONTROL_START = (
+    POOL_SLICE_CONTROL_SCATTER_GENERATION + POOL_SLICE_MAX_POOL_BLOCKS
+)
+POOL_SLICE_CONTROL_DISPATCH_READY = POOL_SLICE_CONTROL_START + 1
+POOL_SLICE_CONTROL_SCATTER_START = POOL_SLICE_CONTROL_DISPATCH_READY + 1
+POOL_SLICE_CONTROL_READER_ROW_COUNT = POOL_SLICE_CONTROL_SCATTER_START + 1
+POOL_SLICE_CONTROL_STREAM_SEND_TOTAL = (
+    POOL_SLICE_CONTROL_READER_ROW_COUNT + POOL_SLICE_MAX_LOCAL_READERS
+)
+POOL_SLICE_CONTROL_STREAM_SEND_DONE = POOL_SLICE_CONTROL_STREAM_SEND_TOTAL + 1
+POOL_SLICE_CONTROL_STREAM_QUEUE_RETIRED_MASK = (
+    POOL_SLICE_CONTROL_STREAM_SEND_DONE + 1
+)
+POOL_SLICE_CONTROL_STREAM_METADATA_TRANSPORT_READY = (
+    POOL_SLICE_CONTROL_STREAM_QUEUE_RETIRED_MASK + 1
+)
 POOL_SLICE_CONTROL_STREAM_METADATA_READY = (
     POOL_SLICE_CONTROL_STREAM_METADATA_TRANSPORT_READY + POOL_SLICE_MAX_PES
 )
@@ -56,7 +99,9 @@ POOL_SLICE_CONTROL_STREAM_DATA_READY = (
 )
 POOL_SLICE_CONTROL_STREAM_QUEUE_HEAD = (
     POOL_SLICE_CONTROL_STREAM_DATA_READY
-    + POOL_SLICE_MAX_PES * POOL_SLICE_MAX_POOL_BLOCKS
+    + POOL_SLICE_MAX_PES
+    * POOL_SLICE_MAX_DATA_GROUPS
+    * POOL_SLICE_COMPLETION_SLOTS
 )
 POOL_SLICE_CONTROL_STREAM_QUEUE_CLAIM = (
     POOL_SLICE_CONTROL_STREAM_QUEUE_HEAD
@@ -68,14 +113,18 @@ POOL_SLICE_CONTROL_RETURN_READY = (
 )
 POOL_SLICE_CONTROL_RETURN_GROUP_COUNT = (
     POOL_SLICE_CONTROL_RETURN_READY
-    + POOL_SLICE_MAX_PES * POOL_SLICE_MAX_POOL_BLOCKS
+    + POOL_SLICE_MAX_PES * POOL_SLICE_MAX_RETURN_READY
 )
-POOL_SLICE_CONTROL_WORDS = (
+POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE = (
     POOL_SLICE_CONTROL_RETURN_GROUP_COUNT
     + POOL_SLICE_MAX_PES * POOL_SLICE_RETURN_GROUPS_PER_SOURCE
 )
-POOL_SLICE_CONTROL_READER_ROW_COUNT = 104
-POOL_SLICE_CONTROL_DISPATCH_READY = 102
+POOL_SLICE_CONTROL_STREAM_METADATA_SIGNAL_DELTA = (
+    POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE + 1
+)
+POOL_SLICE_CONTROL_WORDS = (
+    POOL_SLICE_CONTROL_STREAM_METADATA_SIGNAL_DELTA + 1
+)
 POOL_SLICE_MAX_TMA_BYTES = (1 << 16) - 1
 POOL_SLICE_PROFILE_START = 5
 POOL_SLICE_PROFILE_GATHER_READY = 6
@@ -346,7 +395,7 @@ class PoolSliceConfig:
             )
         if self.active_rows > self.route_capacity:
             raise ValueError("active_rows exceeds route_capacity")
-        if not 1 <= self.group_limit <= POOL_SLICE_MAX_POOL_BLOCKS:
+        if not 1 <= self.group_limit <= POOL_SLICE_MAX_DATA_GROUPS:
             raise ValueError("dispatch groups exceed the protocol limit")
         expected_chunks = (
             self.token_capacity + self.write_chunk_rows - 1
@@ -739,6 +788,7 @@ class PoolSliceProgram:
     chunk_rows: int
     communication_block: int = 1
     pool_blocks: tuple[int, ...] = (1,)
+    num_pes: int = 1
 
     def launch(self) -> None:
         self.launcher.launch()
@@ -934,11 +984,14 @@ def build_pool_slice_copy_program(
         raise ValueError(
             "source_preloaded requires source and token_pool to alias"
         )
+    writer_blocks = 0 if source_preloaded else 1
     reader_blocks = 0 if in_place_identity else buffers.local_readers
-    num_sms = 1 + buffers.pool_count + reader_blocks
+    pool_base = writer_blocks
+    reader_base = pool_base + buffers.pool_count
+    num_sms = writer_blocks + buffers.pool_count + reader_blocks
     if num_sms > properties.multi_processor_count:
         raise ValueError(
-            "pool writer, PoolInst blocks, and local readers exceed the GPU "
+            "active pool writer, PoolInst blocks, and local readers exceed the GPU "
             f"SM count ({properties.multi_processor_count})"
         )
 
@@ -961,6 +1014,9 @@ def build_pool_slice_copy_program(
         signal_array=buffers.signals,
         benchmark_barrier=benchmark_barrier,
     )
+    # PoolInst streams through activation/return buffers and does not benefit
+    # from the generic instruction-persistence window.
+    launcher.disable_cache_window()
     write_barriers = tuple(
         launcher.new_bar(0 if source_preloaded else 1)
         for _ in range(buffers.write_chunks)
@@ -984,9 +1040,9 @@ def build_pool_slice_copy_program(
     ):
         raise AssertionError("compute barriers must be contiguous")
 
-    writer_builder = launcher.builder[0]
+    writer_builder = launcher.builder[0] if writer_blocks else None
     for pool_rank in range(buffers.pool_count):
-        pool_builder = launcher.builder[1 + pool_rank]
+        pool_builder = launcher.builder[pool_base + pool_rank]
         pool_config_tensor = buffers.config_tensor
         if host_data_plane:
             pool_instruction = PoolSliceHostWeightedExchange
@@ -1006,6 +1062,7 @@ def build_pool_slice_copy_program(
 
     hidden_size = buffers.token_pool.shape[-1]
     if not source_preloaded:
+        assert writer_builder is not None
         source_flat = buffers._source.view(-1)
         token_pool_flat = buffers.token_pool.view(-1)
         for chunk in range(token_chunks):
@@ -1023,7 +1080,6 @@ def build_pool_slice_copy_program(
             writer_builder.add_compute(Copy(1, nbytes))
 
     if not in_place_identity:
-        reader_base = 1 + buffers.pool_count
         for local_reader in range(buffers.local_readers):
             builder = launcher.builder[reader_base + local_reader]
             builder.add_memory(IssueBarrier(dispatch_barriers[local_reader]))
@@ -1068,8 +1124,11 @@ def build_pool_slice_copy_program(
         dispatch_barriers=dispatch_barriers,
         compute_barriers=compute_barriers,
         chunk_rows=chunk_rows,
-        communication_block=1,
-        pool_blocks=tuple(range(1, 1 + buffers.pool_count)),
+        communication_block=pool_base,
+        pool_blocks=tuple(
+            range(pool_base, pool_base + buffers.pool_count)
+        ),
+        num_pes=buffers.num_pes,
     )
 
 
@@ -1155,11 +1214,25 @@ def allocate_pool_slice(
         remote_targets = max(1, num_pes - 1)
         group_limit = min(
             token_capacity,
-            POOL_SLICE_MAX_POOL_BLOCKS,
+            POOL_SLICE_MAX_DATA_GROUPS,
             max(1, payload_ctas // remote_targets),
         )
-    elif group_limit > POOL_SLICE_MAX_POOL_BLOCKS:
+        if POOL_SLICE_RAW_SGL:
+            # The compile-time raw RC transport intentionally omits its
+            # per-row validation/fallback matrix. One warp therefore owns at
+            # most 32 independently addressed source rows in each group.
+            raw_groups = (token_capacity + 31) // 32
+            if raw_groups > POOL_SLICE_MAX_DATA_GROUPS:
+                raise ValueError(
+                    "raw PoolInst supports at most 1024 token slots per PE"
+                )
+            group_limit = max(group_limit, raw_groups)
+    elif group_limit > POOL_SLICE_MAX_DATA_GROUPS:
         raise ValueError("dispatch groups exceed the protocol limit")
+    elif POOL_SLICE_RAW_SGL and group_limit < (token_capacity + 31) // 32:
+        raise ValueError(
+            "raw PoolInst group_limit must keep every group within 32 rows"
+        )
     if signal_base + num_pes > signals.numel():
         raise ValueError("pool-slice signal range exceeds the signal tensor")
     write_chunk_rows = POOL_SLICE_MAX_TMA_BYTES // row_bytes
@@ -1305,6 +1378,13 @@ __all__ = [
     "POOL_SLICE_MAX_PES",
     "POOL_SLICE_MAX_LOCAL_READERS",
     "POOL_SLICE_MAX_POOL_BLOCKS",
+    "POOL_SLICE_MAX_DATA_GROUPS",
+    "POOL_SLICE_PAYLOAD_WARPS",
+    "POOL_SLICE_WARP_QP_COMPLETION",
+    "POOL_SLICE_COMPLETION_SLOTS",
+    "POOL_SLICE_RAW_SGL",
+    "POOL_SLICE_RAW_SGL_WIDTH",
+    "POOL_SLICE_MAX_RETURN_READY",
     "POOL_SLICE_RETURN_GROUPS_PER_SOURCE",
     "POOL_SLICE_MAX_STREAM_QUEUES",
     "POOL_SLICE_STREAM_QUEUE_DEPTH",

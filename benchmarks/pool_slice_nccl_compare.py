@@ -1,4 +1,4 @@
-"""External pool-slice dynamic-read versus dense NCCL ring EP benchmark.
+"""Pool-slice dynamic-read versus a dense NCCL ring all-reduce surrogate.
 
 The pool samples come only from communication-warp global-timer events.  The
 NCCL helper uses CUDA events and lives in this benchmark directory so neither
@@ -15,6 +15,10 @@ from mpi4py import MPI
 import dae.nvshmem as nvshmem
 from dae.pool_slice import (
     POOL_SLICE_PUBLISH_BYTES,
+    POOL_SLICE_COMPLETION_SLOTS,
+    POOL_SLICE_PAYLOAD_WARPS,
+    POOL_SLICE_RAW_SGL,
+    POOL_SLICE_RAW_SGL_WIDTH,
     POOL_SLICE_QUEUE_ENTRY_BYTES,
     POOL_SLICE_STREAM_QUEUE_DEPTH,
     POOL_SLICE_RETURN_GROUPS_PER_SOURCE,
@@ -22,12 +26,12 @@ from dae.pool_slice import (
     allocate_pool_slice,
     build_pool_slice_copy_program,
 )
-from nccl_ep_reference import (
+from dense_nccl_ring_reference import (
     Timing,
-    initialize_nccl,
+    initialize_dense_nccl_ring,
     print_result,
     rank_max,
-    run_nccl,
+    run_dense_nccl_ring,
 )
 
 
@@ -52,7 +56,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--mode", choices=("pool", "nccl", "both"), default="both")
+    parser.add_argument(
+        "--mode",
+        choices=("pool", "dense-nccl", "both"),
+        default="both",
+        help="run PoolInst, the dense two-all-reduce NCCL surrogate, or both",
+    )
     parser.add_argument("--symmetric-size", default="1G")
     parser.add_argument(
         "--data-groups",
@@ -82,9 +91,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _source_grouped_return_rmas(
-    rows_per_source: list[int], local_pe: int, pool_blocks: int
+    rows_per_source: list[int], local_pe: int, pool_blocks: int, row_bytes: int
 ) -> int:
-    """Count source-owned return shards that carry a remote payload."""
+    """Count dynamic source-owned return groups carrying remote payload."""
 
     num_pes = len(rows_per_source)
     rmas = 0
@@ -92,26 +101,66 @@ def _source_grouped_return_rmas(
         if source_pe == local_pe or source_pe >= pool_blocks:
             continue
         available = 1 + (pool_blocks - 1 - source_pe) // num_pes
+        byte_groups = (int(rows) * row_bytes + 256 * 1024 - 1) // (
+            256 * 1024
+        )
         rmas += min(
-            int(rows), available, POOL_SLICE_RETURN_GROUPS_PER_SOURCE
+            byte_groups,
+            int(rows),
+            available,
+            POOL_SLICE_RETURN_GROUPS_PER_SOURCE,
         )
     return rmas
 
 
 def _stream_group_counts(
-    rows: torch.Tensor, *, row_bytes: int, group_limit: int
+    rows: torch.Tensor,
+    *,
+    row_bytes: int,
+    group_limit: int,
+    num_pes: int,
 ) -> torch.Tensor:
     """Mirror PoolInst's runtime-sized group policy for the cost model."""
 
+    target_group_bytes = 512 * 1024 if num_pes >= 8 else 256 * 1024
     byte_groups = (
-        rows * row_bytes + (512 * 1024 - 1)
-    ).div(512 * 1024, rounding_mode="floor")
+        rows * row_bytes + (target_group_bytes - 1)
+    ).div(target_group_bytes, rounding_mode="floor")
     row_groups = (rows + 31).div(32, rounding_mode="floor")
     desired = torch.maximum(byte_groups, row_groups)
-    return torch.minimum(
+    groups = torch.minimum(
         rows,
         torch.minimum(desired, torch.full_like(rows, group_limit)),
     )
+    return groups
+
+
+def _stream_ready_updates(
+    rows: torch.Tensor, groups: torch.Tensor, *, row_bytes: int
+) -> int:
+    """Count payload completion generations for the compiled QP scope."""
+
+    if POOL_SLICE_RAW_SGL:
+        updates = 0
+        for row_count, group_count in zip(rows.tolist(), groups.tolist()):
+            for group in range(group_count):
+                begin = row_count * group // group_count
+                end = row_count * (group + 1) // group_count
+                updates += (
+                    end - begin + POOL_SLICE_RAW_SGL_WIDTH - 1
+                ) // POOL_SLICE_RAW_SGL_WIDTH
+        return updates
+
+    if POOL_SLICE_COMPLETION_SLOTS == 1:
+        return int(groups.sum().item())
+
+    updates = 0
+    for row_count, group_count in zip(rows.tolist(), groups.tolist()):
+        for group in range(group_count):
+            begin = row_count * group // group_count
+            end = row_count * (group + 1) // group_count
+            updates += min(end - begin, POOL_SLICE_PAYLOAD_WARPS)
+    return updates
 
 
 def _balanced_expert_ids(
@@ -145,6 +194,35 @@ def _balanced_expert_ids(
         global_rows[:, None] * top_k + route[None, :]
     ).div(num_pes, rounding_mode="floor").remainder(experts_per_pe)
     return target_pe * experts_per_pe + local_expert
+
+
+def _weighted_identity_reference(
+    tokens: torch.Tensor,
+    expert_ids: torch.Tensor,
+    *,
+    num_pes: int,
+    experts_per_pe: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Mirror pool-local BF16 partials followed by the source FP32 sum."""
+
+    target_pes = expert_ids.view(tokens.shape[0], top_k).div(
+        experts_per_pe, rounding_mode="floor"
+    ).to(tokens.device)
+    values = tokens.float()
+    weight = torch.tensor(
+        1.0 / top_k, dtype=tokens.dtype, device=tokens.device
+    ).float()
+    total = torch.zeros_like(values)
+    for target_pe in range(num_pes):
+        partial = torch.zeros_like(values)
+        for route in range(top_k):
+            active = (target_pes[:, route] == target_pe).unsqueeze(1)
+            partial += torch.where(active, values * weight, 0.0)
+        # Pool slices publish BF16 partial rows; the source then accumulates
+        # those partials in FP32 and rounds the final token once more.
+        total += partial.to(tokens.dtype).float()
+    return total.to(tokens.dtype)
 
 
 def run_pool(
@@ -255,7 +333,13 @@ def run_pool(
                     )
 
     expected_returned = (
-        tokens
+        _weighted_identity_reference(
+            tokens,
+            expert_ids,
+            num_pes=runtime.num_pes,
+            experts_per_pe=args.experts_per_pe,
+            top_k=args.top_k,
+        )
         if args.weighted_return
         else tokens.index_select(0, source_rows.to(tokens.device))
     )
@@ -296,22 +380,33 @@ def run_pool(
         remote_target_rows,
         row_bytes=row_bytes,
         group_limit=buffers.group_limit,
+        num_pes=runtime.num_pes,
     )
     metadata_slot_rounds = 2 + (dynamic_groups + 1).div(
         2, rounding_mode="floor"
     )
-    dispatch_data_rmas = int(dynamic_groups.sum().item())
+    dispatch_group_ctas = int(dynamic_groups.sum().item())
+    data_ready_updates = _stream_ready_updates(
+        remote_target_rows, dynamic_groups, row_bytes=row_bytes
+    )
     stream_queues_per_source = 2
     model = {
         "protocol": "pool-gather-streaming",
         "pool_blocks": buffers.pool_count,
         "weighted_return": args.weighted_return,
         "weighted_return_sharding": (
-            f"source-grouped-{POOL_SLICE_RETURN_GROUPS_PER_SOURCE}"
+            f"source-dynamic-256KiB-max-{POOL_SLICE_RETURN_GROUPS_PER_SOURCE}"
         ),
+        "dispatch_grouping": "pe-adaptive-256KiB-low-512KiB-high",
         "weighted_reduce": "fp32-ilp4",
         "data_group_limit": buffers.group_limit,
         "stream_queues_per_source": stream_queues_per_source,
+        "queue_head_scan": "distributed-warp-ready-steal",
+        "target_submission": (
+            "independent-target-major-cta-qp"
+            if buffers.pool_count >= runtime.num_pes
+            else "rank0-warp-fallback"
+        ),
         "stream_queue_metadata_bytes_per_pe": int(
             (
                 metadata_slot_rounds
@@ -334,12 +429,40 @@ def run_pool(
         "descriptor_bytes_per_pe": remote_pes * POOL_SLICE_PUBLISH_BYTES,
         "offset_metadata_bytes_received_per_pe": 0,
         "route_metadata_bytes_sent_remote_per_pe": remote_routes * 4,
-        "dispatch_data_rmas_per_pe_current": dispatch_data_rmas,
+        "dispatch_group_ctas_per_pe": dispatch_group_ctas,
+        "payload_warps": POOL_SLICE_PAYLOAD_WARPS,
+        "completion_slots_per_group": POOL_SLICE_COMPLETION_SLOTS,
+        "completion_qp_scope": (
+            "warp" if POOL_SLICE_COMPLETION_SLOTS > 1 else "cta"
+        ),
+        "device_payload_submission": (
+            f"raw-rc-sgl-{POOL_SLICE_RAW_SGL_WIDTH}"
+            if POOL_SLICE_RAW_SGL
+            else "nvshmem-row-put"
+        ),
+        "metadata_transport_signal": "fused-add-sequence-delta",
+        "data_transport_signal": (
+            "raw-sgl-inline-progress-generation"
+            if POOL_SLICE_RAW_SGL
+            else "inline-generation-put"
+        ),
+        "return_transport_signal": (
+            "raw-rc-contiguous-chain-generation"
+            if POOL_SLICE_RAW_SGL
+            else "inline-generation-put"
+        ),
+        "reader_gather": (
+            f"reader-cta-progress-{POOL_SLICE_RAW_SGL_WIDTH}"
+            if POOL_SLICE_RAW_SGL
+            else "reader-cta"
+        ),
+        "data_ready_updates_per_pe": data_ready_updates,
         "return_data_rmas_per_pe": (
             _source_grouped_return_rmas(
                 unique_target_rows.tolist(),
                 runtime.pe,
                 buffers.pool_count,
+                row_bytes,
             )
             if args.weighted_return
             else remote_readers
@@ -351,12 +474,13 @@ def run_pool(
                 unique_target_rows.tolist(),
                 runtime.pe,
                 buffers.pool_count,
+                row_bytes,
             )
             if args.weighted_return
             else 0
         ),
+        "metadata_payload_coupled_per_pe": 0,
         "metadata_phase_updates_per_pe": remote_pes,
-        "data_phase_updates_per_pe": int(dynamic_groups.sum().item()),
         "return_phase_updates_per_pe": (
             0 if args.weighted_return else nonempty_remote_targets
         ),
@@ -437,14 +561,16 @@ def main() -> None:
         nccl_result = None
         if args.mode in {"pool", "both"}:
             pool_result = run_pool(args, runtime, comm, tokens, expert_ids)
-        if args.mode in {"nccl", "both"}:
+        if args.mode in {"dense-nccl", "both"}:
             if args.top_k != 1:
                 raise ValueError(
                     "the dense NCCL surrogate currently supports only top-k=1"
                 )
-            initialize_nccl(runtime, comm)
+            initialize_dense_nccl_ring(runtime, comm)
             nccl_initialized = True
-            nccl_result = run_nccl(args, runtime, comm, tokens, expert_ids)
+            nccl_result = run_dense_nccl_ring(
+                args, runtime, comm, tokens, expert_ids
+            )
 
         pool_cta_profiles = None
         if args.print_pool_ctas and pool_result is not None:
@@ -480,12 +606,12 @@ def main() -> None:
             if pool_result is not None:
                 print_result("pool-slice", *pool_result)
             if nccl_result is not None:
-                print_result("nccl-ring", *nccl_result)
+                print_result("dense-nccl-ring-allreduce-surrogate", *nccl_result)
             if pool_result is not None and nccl_result is not None:
                 pool_ms = pool_result[0].summary()["end_to_end_ms"]
                 nccl_ms = nccl_result[0].summary()["end_to_end_ms"]
                 print(
-                    "latency ratio pool-slice/nccl-ring: "
+                    "latency ratio pool-slice/dense-nccl-ring-surrogate: "
                     f"{pool_ms / nccl_ms:.3f}x"
                 )
     finally:

@@ -36,6 +36,10 @@ static __device__ __forceinline__ bool pool_slice_barrier_ready(
   return *reinterpret_cast<volatile const int*>(barrier) == 0;
 }
 
+#if DAE_POOL_SLICE_RAW_SGL
+#include "pool_ibgda_sgl.cuh"
+#endif
+
 static __device__ __forceinline__ void pool_slice_set_status(
     const PoolSliceConfig& config, PoolSliceStatus status) {
   auto* control = reinterpret_cast<uint64_t*>(config.control_address);
@@ -71,12 +75,15 @@ static __device__ __forceinline__ void pool_slice_wait_generation_warp(
     uint32_t count,
     uint64_t expected,
     uint32_t lane) {
-  bool ready = lane >= count;
-  while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
-    if (!ready)
-      ready = dae_atomic_load_acquire_gpu(generations + lane) >= expected;
-    if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
-      __nanosleep(barrierPollSleepCycles);
+  for (uint32_t base = 0; base < count; base += 32) {
+    const uint32_t index = base + lane;
+    bool ready = index >= count;
+    while (__ballot_sync(0xffffffffU, ready) != 0xffffffffU) {
+      if (!ready)
+        ready = dae_atomic_load_acquire_gpu(generations + index) >= expected;
+      if (__ballot_sync(0xffffffffU, ready) != 0xffffffffU)
+        __nanosleep(barrierPollSleepCycles);
+    }
   }
 }
 
@@ -307,16 +314,21 @@ static __device__ __forceinline__ void pool_slice_record_profile(
 // Streaming dispatch derives G from the current target's unique activation
 // output. Reader-sharded gathers expose one CTA task per local expert, so one
 // group already creates substantial destination parallelism. Aim for groups
-// near 512 KiB and no more than 32 rows: this amortizes IBGDA readiness and
-// ordered-head overhead while preserving payload/metadata overlap. Sparse
-// targets automatically use fewer groups.
+// near 256 KiB through four PEs and 512 KiB at eight or more PEs, with no
+// more than 32 rows.  The larger 8-PE group avoids doubling ordered queue-head
+// work after every source shard has already shrunk to about 32 rows.
 static __device__ __forceinline__ uint32_t pool_slice_stream_group_count(
     uint32_t active_rows,
     uint32_t row_bytes,
-    uint32_t max_groups) {
+    uint32_t max_groups,
+    uint32_t num_pes) {
   if (active_rows == 0)
     return 0;
-  constexpr uint64_t target_group_bytes = 512ULL * 1024;
+  constexpr uint64_t target_group_bytes_low_pe = 256ULL * 1024;
+  constexpr uint64_t target_group_bytes_high_pe = 512ULL * 1024;
+  const uint64_t target_group_bytes = num_pes >= 8
+      ? target_group_bytes_high_pe
+      : target_group_bytes_low_pe;
   constexpr uint32_t target_group_rows = 32;
   const uint64_t payload_bytes =
       static_cast<uint64_t>(active_rows) * row_bytes;
@@ -331,12 +343,36 @@ static __device__ __forceinline__ uint32_t pool_slice_stream_group_count(
   return static_cast<uint32_t>(groups);
 }
 
+static __device__ __forceinline__ uint32_t
+pool_slice_stream_dispatch_worker_count(
+    const PoolSliceConfig& config,
+    uint64_t* control) {
+  if (config.pool_count == 1)
+    return 1;
+  const uint64_t send_total = dae_atomic_load_relaxed_gpu(
+      control + poolSliceControlStreamSendTotal);
+  const uint64_t gather_work = control[4] *
+      static_cast<uint64_t>(config.num_pes) * config.local_readers;
+  uint64_t useful_workers = gather_work + send_total;
+  useful_workers = useful_workers == 0 ? 1 : useful_workers;
+  useful_workers = useful_workers < config.pool_count
+      ? useful_workers
+      : config.pool_count - 1;
+  return static_cast<uint32_t>(useful_workers);
+}
+
 static __device__ __forceinline__ void pool_slice_stream_group_range(
     uint32_t active_rows,
+    uint32_t row_bytes,
     uint32_t group_count,
     uint32_t group,
     uint32_t* row_begin,
     uint32_t* row_end) {
+  if (group_count == 1) {
+    *row_begin = 0;
+    *row_end = active_rows;
+    return;
+  }
   *row_begin = static_cast<uint32_t>(
       static_cast<uint64_t>(active_rows) * group / group_count);
   *row_end = static_cast<uint32_t>(
@@ -344,9 +380,47 @@ static __device__ __forceinline__ void pool_slice_stream_group_range(
 }
 
 static __device__ __forceinline__ uint64_t* pool_slice_stream_data_ready(
-    uint64_t* control, uint32_t source_pe, uint32_t group) {
+    uint64_t* control,
+    uint32_t source_pe,
+    uint32_t group,
+    uint32_t payload_warp) {
   return control + poolSliceControlStreamDataReady +
-      static_cast<uint64_t>(source_pe) * poolSliceMaxPoolBlocks + group;
+      (static_cast<uint64_t>(source_pe) * poolSliceMaxDataGroups + group) *
+          poolSliceCompletionSlots +
+      payload_warp;
+}
+
+static __device__ __forceinline__ uint64_t
+pool_slice_stream_data_progress(
+    uint64_t sequence, uint32_t completed_segments) {
+  return sequence * poolSliceRawSglProgressStride + completed_segments;
+}
+
+static __device__ __forceinline__ uint32_t
+pool_slice_stream_data_segments(uint32_t row_begin, uint32_t row_end) {
+  const uint32_t rows = row_end - row_begin;
+  return (rows + poolSliceRawSglWidth - 1) / poolSliceRawSglWidth;
+}
+
+static __device__ __forceinline__ void
+pool_slice_stream_wait_data_progress_warp(
+    uint64_t* control,
+    uint32_t source_pe,
+    uint32_t ready_slot,
+    uint64_t expected,
+    uint32_t lane) {
+  uint32_t ready = 0;
+  while (ready == 0) {
+    if (lane == 0) {
+      ready = pool_slice_signal_fetch(
+                  pool_slice_stream_data_ready(
+                      control, source_pe, ready_slot, 0),
+                  false) >= expected;
+    }
+    ready = __shfl_sync(0xffffffffU, ready, 0);
+    if (ready == 0)
+      __nanosleep(barrierPollSleepCycles);
+  }
 }
 
 // Queue entries are interleaved by slot. A producer therefore sends only the
@@ -356,9 +430,10 @@ static __device__ __forceinline__ uint32_t
 pool_slice_stream_envelope_bytes(
     uint32_t active_rows,
     uint32_t row_bytes,
-    uint32_t group_limit) {
+    uint32_t group_limit,
+    uint32_t num_pes) {
   const uint32_t groups = pool_slice_stream_group_count(
-      active_rows, row_bytes, group_limit);
+      active_rows, row_bytes, group_limit, num_pes);
   const uint32_t slot_rounds = 2 + (groups + 1) / 2;
   return sizeof(PoolSlicePublishBatch) +
       slot_rounds * poolSliceMaxStreamQueues *
@@ -460,7 +535,8 @@ static __device__ __forceinline__ uint32_t* pool_slice_stream_route_words(
       envelope + pool_slice_stream_envelope_bytes(
                      batch.active_rows,
                      config.row_bytes,
-                     config.group_limit));
+                     config.group_limit,
+                     config.num_pes));
 }
 
 static __device__ __forceinline__ const uint32_t*
@@ -475,7 +551,8 @@ pool_slice_stream_route_words(
       envelope + pool_slice_stream_envelope_bytes(
                      batch.active_rows,
                      config.row_bytes,
-                     config.group_limit));
+                     config.group_limit,
+                     config.num_pes));
 }
 
 static __device__ __forceinline__ uint64_t
@@ -531,7 +608,10 @@ static __device__ __noinline__ void pool_slice_stream_build_queues(
     PoolSlicePublishBatch* send_batches) {
   constexpr uint32_t queue_count = poolSliceMaxStreamQueues;
   const uint32_t groups = pool_slice_stream_group_count(
-      batch.active_rows, config.row_bytes, config.group_limit);
+      batch.active_rows,
+      config.row_bytes,
+      config.group_limit,
+      config.num_pes);
   for (uint32_t queue = 0; queue < queue_count; ++queue) {
     uint32_t slot = 0;
     if (queue == 0) {
@@ -555,7 +635,12 @@ static __device__ __noinline__ void pool_slice_stream_build_queues(
       uint32_t row_begin = 0;
       uint32_t row_end = 0;
       pool_slice_stream_group_range(
-          batch.active_rows, groups, group, &row_begin, &row_end);
+          batch.active_rows,
+          config.row_bytes,
+          groups,
+          group,
+          &row_begin,
+          &row_end);
       *pool_slice_stream_queue_entry(
           send_batches,
           target_pe,
@@ -598,26 +683,130 @@ static __device__ __forceinline__ bool pool_slice_stream_decode_send_task(
   uint32_t cursor = 0;
   // Send tasks are remote-only and remote-first. A self-source dynamic read
   // acquires its ordinary writer chunk inside gather, so it needs neither a
-  // synthetic send task nor a data-ready message.
+  // synthetic send task nor a data-ready message. Target-major enumeration
+  // preserves the independent metadata/data-plane placement while assigning
+  // every runtime-sized group exactly once.
   for (uint32_t index = 0; index + 1 < config.num_pes; ++index) {
     const uint32_t target = pool_slice_remote_first_pe(
         index, config.my_pe, config.num_pes);
     const uint32_t groups = pool_slice_stream_group_count(
-        send_token_counts[target], config.row_bytes, config.group_limit);
-    if (task < cursor + groups) {
-      *target_pe = target;
-      *group = task - cursor;
-      return true;
+        send_token_counts[target],
+        config.row_bytes,
+        config.group_limit,
+        config.num_pes);
+    for (uint32_t candidate_group = 0;
+         candidate_group < groups;
+         ++candidate_group) {
+      if (cursor == task) {
+        *target_pe = target;
+        *group = candidate_group;
+        return true;
+      }
+      ++cursor;
     }
-    cursor += groups;
   }
   return false;
 }
 
+#if DAE_POOL_SLICE_RAW_SGL
+#define DAE_POOL_SLICE_PUBLIC_FALLBACK_QUALIFIER __noinline__
+#else
+#define DAE_POOL_SLICE_PUBLIC_FALLBACK_QUALIFIER __forceinline__
+#endif
+
+// Keep the ordinary NVSHMEM row-PUT path inline in the default build. The raw
+// SGL specialization makes it a cold noinline fallback so its loop state does
+// not inflate the hot raw sender's live range or spill traffic.
+static __device__ DAE_POOL_SLICE_PUBLIC_FALLBACK_QUALIFIER void
+pool_slice_stream_put_rows_public(
+    uint32_t target_pe,
+    uint32_t row_begin,
+    uint32_t row_end,
+    const PoolSliceConfig& config,
+    int* bars,
+    uint32_t write_barrier,
+    uint32_t* shared_status,
+    uint32_t thread_id) {
+  const uint32_t lane = thread_id & 31U;
+  const uint32_t warp = thread_id >> 5;
+  const uint32_t send_warps = blockDim.x / 32;
+  const uint32_t group_rows = row_end - row_begin;
+  const uint32_t warp_row_begin = row_begin + static_cast<uint32_t>(
+      static_cast<uint64_t>(group_rows) * warp / send_warps);
+  const uint32_t warp_row_end = row_begin + static_cast<uint32_t>(
+      static_cast<uint64_t>(group_rows) * (warp + 1) / send_warps);
+  const auto* token_pool =
+      reinterpret_cast<const uint8_t*>(config.token_pool_address);
+  auto* delivery_pool =
+      reinterpret_cast<uint8_t*>(config.delivery_pool_address);
+  const auto* target_rows = reinterpret_cast<const uint32_t*>(
+      config.send_token_rows_address) +
+      static_cast<uint64_t>(target_pe) * config.token_capacity;
+
+  uint32_t waited_chunk = UINT32_MAX;
+  for (uint32_t packed_row = warp_row_begin;
+       packed_row < warp_row_end;) {
+    uint32_t source_row = 0;
+    uint32_t run_rows = 1;
+    if (lane == 0) {
+      source_row = target_rows[packed_row];
+      if (source_row < config.token_capacity) {
+        const uint32_t source_chunk =
+            source_row / config.write_chunk_rows;
+        while (packed_row + run_rows < warp_row_end) {
+          const uint32_t candidate = target_rows[packed_row + run_rows];
+          if (candidate != source_row + run_rows ||
+              candidate / config.write_chunk_rows != source_chunk)
+            break;
+          ++run_rows;
+        }
+      }
+    }
+    source_row = __shfl_sync(0xffffffffU, source_row, 0);
+    run_rows = __shfl_sync(0xffffffffU, run_rows, 0);
+    if (source_row >= config.token_capacity) {
+      if (lane == 0) {
+        atomicCAS(
+            shared_status,
+            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+      }
+      ++packed_row;
+      continue;
+    }
+    const uint32_t chunk = source_row / config.write_chunk_rows;
+    if (chunk != waited_chunk) {
+      uint32_t write_ready = 0;
+      while (write_ready == 0) {
+        if (lane == 0)
+          write_ready = pool_slice_barrier_ready(
+              bars + write_barrier + chunk);
+        write_ready = __shfl_sync(0xffffffffU, write_ready, 0);
+        if (write_ready == 0)
+          __nanosleep(barrierPollSleepCycles);
+      }
+      waited_chunk = chunk;
+    }
+    uint8_t* destination = delivery_pool +
+        (static_cast<uint64_t>(config.my_pe) * config.token_capacity +
+         packed_row) *
+            config.row_bytes;
+    const uint8_t* source = token_pool +
+        static_cast<uint64_t>(source_row) * config.row_bytes;
+    const size_t bytes = static_cast<size_t>(run_rows) * config.row_bytes;
+    nvshmemx_putmem_nbi_warp(destination, source, bytes, target_pe);
+    packed_row += run_rows;
+  }
+}
+
+#undef DAE_POOL_SLICE_PUBLIC_FALLBACK_QUALIFIER
+
 // One CTA owns one dynamic group. Every warp issues direct puts from the
 // authoritative source token slots; no source-side activation staging is
-// materialized. Public-NVSHMEM groups publish readiness after CTA-local quiet;
-// each readiness generation names exactly the compact rows it protects.
+// materialized. Completion scope is compile-time static: a CTA-mapped build
+// posts one same-QP generation after all warp WQEs, while a warp-mapped build
+// couples each active warp's final run to its own generation. Neither path
+// performs a transport-wide completion sweep.
 template <bool HostDataPlane>
 static __device__ __noinline__ void pool_slice_stream_send_group(
     uint32_t target_pe,
@@ -631,13 +820,9 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     uint64_t sequence,
     uint32_t* shared_status,
     uint32_t* shared_first_payload,
-    uint32_t thread_id) {
+  uint32_t thread_id) {
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
-  const auto* token_pool =
-      reinterpret_cast<const uint8_t*>(config.token_pool_address);
-  auto* delivery_pool =
-      reinterpret_cast<uint8_t*>(config.delivery_pool_address);
   const auto* send_token_rows =
       reinterpret_cast<const uint32_t*>(config.send_token_rows_address);
   const auto* send_token_counts =
@@ -655,7 +840,10 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
   }
   const uint32_t token_count = send_token_counts[target_pe];
   const uint32_t group_count = pool_slice_stream_group_count(
-      token_count, config.row_bytes, config.group_limit);
+      token_count,
+      config.row_bytes,
+      config.group_limit,
+      config.num_pes);
   if (group_count == 0 || group >= group_count ||
       token_count > config.token_capacity) {
     if (thread_id == 0) {
@@ -670,7 +858,12 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
   uint32_t row_begin = 0;
   uint32_t row_end = 0;
   pool_slice_stream_group_range(
-      token_count, group_count, group, &row_begin, &row_end);
+      token_count,
+      config.row_bytes,
+      group_count,
+      group,
+      &row_begin,
+      &row_end);
   if constexpr (HostDataPlane) {
     if (thread_id == 0) {
       const auto* generations = reinterpret_cast<const uint64_t*>(
@@ -717,7 +910,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
       const uint64_t generation = pool_host_reserve_generation_warp(
           generations + target_pe, lane);
       uint64_t* local_ready = pool_slice_stream_data_ready(
-          control, config.my_pe, group);
+          control, config.my_pe, group, 0);
       const uint64_t ready_offset =
           reinterpret_cast<uint64_t>(local_ready) - config.control_address;
       pool_host_publish_request_warp<true>(
@@ -735,7 +928,11 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
               (static_cast<uint64_t>(config.my_pe) * config.token_capacity +
                row_begin) * config.row_bytes,
           peer.remote_control_address + ready_offset,
-          sequence,
+          poolSliceRawSgl
+              ? pool_slice_stream_data_progress(
+                    sequence,
+                    pool_slice_stream_data_segments(row_begin, row_end))
+              : sequence,
           lane);
     }
     __syncthreads();
@@ -749,76 +946,80 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     return;
   }
 
+#if DAE_POOL_SLICE_RAW_SGL && defined(__CUDA_ARCH__)
+  const auto* token_pool =
+      reinterpret_cast<const uint8_t*>(config.token_pool_address);
+  auto* delivery_pool =
+      reinterpret_cast<uint8_t*>(config.delivery_pool_address);
+  if (warp == 0) {
+    pool_ibgda_sgl_put_rows_warp(
+        delivery_pool +
+            (static_cast<uint64_t>(config.my_pe) * config.token_capacity +
+             row_begin) * config.row_bytes,
+        pool_slice_stream_data_ready(
+            control, config.my_pe, group, 0),
+        token_pool,
+        target_rows,
+        row_begin,
+        row_end,
+        config.row_bytes,
+        config.write_chunk_rows,
+        target_pe,
+        bars,
+        write_barrier,
+        sequence,
+        lane);
+  }
+#else
   const uint32_t send_warps = blockDim.x / 32;
   const uint32_t group_rows = row_end - row_begin;
   const uint32_t warp_row_begin = row_begin + static_cast<uint32_t>(
       static_cast<uint64_t>(group_rows) * warp / send_warps);
   const uint32_t warp_row_end = row_begin + static_cast<uint32_t>(
       static_cast<uint64_t>(group_rows) * (warp + 1) / send_warps);
-  uint32_t waited_chunk = UINT32_MAX;
-  for (uint32_t packed_row = warp_row_begin;
-       packed_row < warp_row_end;) {
-    uint32_t source_row = 0;
-    uint32_t run_rows = 1;
-    if (lane == 0) {
-      source_row = target_rows[packed_row];
-      if (source_row < config.token_capacity) {
-        const uint32_t source_chunk =
-            source_row / config.write_chunk_rows;
-        while (packed_row + run_rows < warp_row_end) {
-          const uint32_t candidate = target_rows[packed_row + run_rows];
-          if (candidate != source_row + run_rows ||
-              candidate / config.write_chunk_rows != source_chunk)
-            break;
-          ++run_rows;
-        }
-      }
+  pool_slice_stream_put_rows_public(
+      target_pe,
+      row_begin,
+      row_end,
+      config,
+      bars,
+      write_barrier,
+      shared_status,
+      thread_id);
+
+  if constexpr (poolSliceWarpQpCompletion) {
+    // Each nonempty warp owns one statically mapped QP. Its inline generation
+    // write follows every payload WQE on that QP, so a dynamic group can skip
+    // arbitrary sequence values without an atomic RMW or source-side state.
+    if (lane == 0 && warp_row_begin < warp_row_end) {
+      nvshmem_uint64_p(
+          pool_slice_stream_data_ready(
+              control, config.my_pe, group, warp),
+          sequence,
+          target_pe);
     }
-    source_row = __shfl_sync(0xffffffffU, source_row, 0);
-    run_rows = __shfl_sync(0xffffffffU, run_rows, 0);
-    if (source_row >= config.token_capacity) {
-      if (lane == 0) {
-        atomicCAS(
-            shared_status,
-            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
-            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
-      }
-      ++packed_row;
-      continue;
-    }
-    const uint32_t chunk = source_row / config.write_chunk_rows;
-    if (chunk != waited_chunk) {
-      uint32_t write_ready = 0;
-      while (write_ready == 0) {
-        if (lane == 0)
-          write_ready = pool_slice_barrier_ready(
-              bars + write_barrier + chunk);
-        write_ready = __shfl_sync(0xffffffffU, write_ready, 0);
-        if (write_ready == 0)
-          __nanosleep(barrierPollSleepCycles);
-      }
-      waited_chunk = chunk;
-    }
-    nvshmemx_putmem_nbi_warp(
-        delivery_pool +
-            (static_cast<uint64_t>(config.my_pe) * config.token_capacity +
-             packed_row) *
-                config.row_bytes,
-        token_pool +
-            static_cast<uint64_t>(source_row) * config.row_bytes,
-        static_cast<size_t>(run_rows) * config.row_bytes,
-        target_pe);
-    packed_row += run_rows;
   }
+#endif
 
   __syncthreads();
-  pool_slice_quiet_block();
-  __syncthreads();
   if (thread_id == 0) {
-    uint64_t* ready = pool_slice_stream_data_ready(
-        control, config.my_pe, group);
-    nvshmemx_signal_op(
-        ready, sequence, NVSHMEM_SIGNAL_SET, target_pe);
+#if !(DAE_POOL_SLICE_RAW_SGL && defined(__CUDA_ARCH__))
+    if constexpr (!poolSliceWarpQpCompletion) {
+      // The static CTA-QP policy maps every producer warp to one ordered RC
+      // context. All payload WQEs have been posted before this thread reaches
+      // the CTA barrier, so the later same-QP generation names precisely this
+      // group without a transport-wide quiet or a system fence.
+      nvshmem_uint64_p(
+          pool_slice_stream_data_ready(
+              control, config.my_pe, group, 0),
+          poolSliceRawSgl
+              ? pool_slice_stream_data_progress(
+                    sequence,
+                    pool_slice_stream_data_segments(row_begin, row_end))
+              : sequence,
+          target_pe);
+    }
+#endif
     atomicAdd(
         reinterpret_cast<unsigned long long*>(
             control + poolSliceControlStreamSendDone),
@@ -832,12 +1033,12 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
 // local reader, and its lanes move that reader's matching activation rows.
 // Queue-zero metadata reserves the complete (reader, source) span once.  A
 // queue carries the exact compact interval, so the consumer never derives G.
-template <bool WeightedReturn, uint32_t TotalWarps>
+template <bool HostDataPlane, bool WeightedReturn, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_stream_gather_rows(
     uint32_t source_pe,
     uint32_t compact_begin,
     uint32_t compact_end,
-    uint32_t local_reader,
+    uint32_t ready_slot_and_reader,
     const PoolSliceConfig& config,
     const PoolSlicePublishBatch* receive_batches,
     const PoolSliceReceiveBatch* receive_routes,
@@ -858,9 +1059,13 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
 
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
+  const uint32_t ready_slot = ready_slot_and_reader & 0xffffU;
+  const uint32_t local_reader = ready_slot_and_reader >> 16;
+  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
   static_assert(TotalWarps > 0);
   if (source_pe >= config.num_pes || compact_begin >= compact_end ||
       compact_end > config.token_capacity ||
+      ready_slot >= poolSliceMaxDataGroups ||
       local_reader >= config.local_readers) {
     if (thread_id == 0) {
       atomicCAS(
@@ -953,19 +1158,59 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
             static_cast<uint32_t>(route.base_row + relative);
       }
     }
-    pool_slice_copy_block(
-        expert_input +
-            (static_cast<uint64_t>(local_reader) *
-                 config.expert_capacity_rows +
-             route.base_row + relative_begin) *
+    if constexpr (poolSliceRawSgl && !HostDataPlane) {
+      // The queue head becomes claimable after segment zero. Keep the same
+      // reader CTA and walk the remainder of the ordered progress word while
+      // later SGL writes are still crossing the fabric.
+      const uint32_t segment_count = pool_slice_stream_data_segments(
+          compact_begin, compact_end);
+      for (uint32_t segment = 0; segment < segment_count; ++segment) {
+        if (segment != 0 && thread_id == 0) {
+          const uint64_t expected = pool_slice_stream_data_progress(
+              sequence, segment + 1);
+          while (pool_slice_signal_fetch(
+                     pool_slice_stream_data_ready(
+                         control, source_pe, ready_slot, 0),
+                     false) < expected)
+            __nanosleep(barrierPollSleepCycles);
+        }
+        __syncthreads();
+        const uint32_t segment_begin =
+            compact_begin + segment * poolSliceRawSglWidth;
+        const uint32_t segment_end =
+            segment_begin + poolSliceRawSglWidth < compact_end
+            ? segment_begin + poolSliceRawSglWidth
+            : compact_end;
+        const uint32_t relative_offset = segment_begin - compact_begin;
+        pool_slice_copy_block(
+            expert_input +
+                (static_cast<uint64_t>(local_reader) *
+                     config.expert_capacity_rows +
+                 route.base_row + relative_begin + relative_offset) *
+                    config.row_bytes,
+            delivery_pool +
+                (static_cast<uint64_t>(source_pe) * config.token_capacity +
+                 segment_begin) *
+                    config.row_bytes,
+            static_cast<uint64_t>(segment_end - segment_begin) *
                 config.row_bytes,
-        delivery_pool +
-            (static_cast<uint64_t>(source_pe) * config.token_capacity +
-             compact_begin) *
-                config.row_bytes,
-        static_cast<uint64_t>(relative_end - relative_begin) *
-            config.row_bytes,
-        thread_id);
+            thread_id);
+      }
+    } else {
+      pool_slice_copy_block(
+          expert_input +
+              (static_cast<uint64_t>(local_reader) *
+                   config.expert_capacity_rows +
+               route.base_row + relative_begin) *
+                  config.row_bytes,
+          delivery_pool +
+              (static_cast<uint64_t>(source_pe) * config.token_capacity +
+               compact_begin) *
+                  config.row_bytes,
+          static_cast<uint64_t>(relative_end - relative_begin) *
+              config.row_bytes,
+          thread_id);
+    }
   } else {
     // Sparse and self-source gathers stripe rows across the compiled warps;
     // each warp keeps a full coalesced row copy and its precise writer wait.
@@ -1005,6 +1250,20 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
           (static_cast<uint64_t>(source_pe) * config.token_capacity +
            compact_row) *
               config.row_bytes;
+      if constexpr (poolSliceRawSgl && !HostDataPlane) {
+        if (source_pe != config.my_pe) {
+          const uint32_t segment =
+              (compact_row - compact_begin) / poolSliceRawSglWidth;
+          if (segment != 0) {
+            pool_slice_stream_wait_data_progress_warp(
+                control,
+                source_pe,
+                ready_slot,
+                pool_slice_stream_data_progress(sequence, segment + 1),
+                lane);
+          }
+        }
+      }
       if (source_pe == config.my_pe) {
         uint32_t token_row = 0;
         if (lane == 0) {
@@ -1321,6 +1580,22 @@ pool_slice_weighted_source_shards(
   return 1 + (config.pool_count - 1 - source_pe) / config.num_pes;
 }
 
+static __device__ __forceinline__ uint32_t
+pool_slice_weighted_return_groups(
+    uint32_t rows, uint32_t active_shards, uint32_t row_bytes) {
+  if (rows == 0 || active_shards == 0)
+    return 0;
+  constexpr uint64_t target_group_bytes = 256ULL * 1024;
+  uint64_t groups =
+      (static_cast<uint64_t>(rows) * row_bytes + target_group_bytes - 1) /
+      target_group_bytes;
+  groups = groups < active_shards ? groups : active_shards;
+  groups = groups < poolSliceReturnGroupsPerSource
+      ? groups
+      : poolSliceReturnGroupsPerSource;
+  return static_cast<uint32_t>(groups);
+}
+
 static __device__ __forceinline__ void pool_slice_weighted_shard_range(
     uint32_t rows,
     uint32_t shard,
@@ -1339,10 +1614,10 @@ static __device__ __forceinline__ void pool_slice_weighted_shard_range(
 }
 
 static __device__ __forceinline__ uint64_t* pool_slice_weighted_return_ready(
-    uint64_t* control, uint32_t destination_pe, uint32_t pool_rank) {
+    uint64_t* control, uint32_t destination_pe, uint32_t return_rank) {
   return control + poolSliceControlReturnReady +
-      static_cast<uint64_t>(destination_pe) * poolSliceMaxPoolBlocks +
-      pool_rank;
+      static_cast<uint64_t>(destination_pe) * poolSliceMaxReturnReady +
+      return_rank;
 }
 
 static __device__ __forceinline__ uint32_t*
@@ -1440,9 +1715,12 @@ static __device__ __noinline__ void pool_slice_return_weighted(
       partial_staging +
       static_cast<uint64_t>(source_pe) * config.token_capacity *
           config.row_bytes;
-  if (warp != 0 && active_shard) {
-    constexpr uint32_t worker_warps = TotalWarps - 1;
-    const uint32_t worker_slot = warp - 1;
+  // The coordinator warp is idle after the compute-barrier join. Reuse it
+  // for the local weighted reduction so every statically assembled PoolInst
+  // warp contributes during this bandwidth-bound phase.
+  if (active_shard) {
+    constexpr uint32_t worker_warps = TotalWarps;
+    const uint32_t worker_slot = warp;
     const uint32_t vector_shards = 4;
     const uint32_t reduce_tasks =
         (row_end - row_begin) * vector_shards;
@@ -1472,16 +1750,18 @@ static __device__ __noinline__ void pool_slice_return_weighted(
   }
 
   // Keep fine-grained reduction sharding, then coalesce adjacent shards into
-  // four transport groups. The last release/acquire counter contributor owns
-  // the group's one contiguous put-with-signal.
-  if (warp == 0 && active_shard) {
-    const uint32_t active_groups =
-        active_shards < poolSliceReturnGroupsPerSource
-        ? active_shards
-        : poolSliceReturnGroupsPerSource;
-    const uint32_t group = static_cast<uint32_t>(
+  // roughly 256-KiB transport groups. The last release/acquire counter
+  // contributor owns the group's one contiguous put plus exact generation.
+  const uint32_t active_groups = pool_slice_weighted_return_groups(
+      rows, active_shards, config.row_bytes);
+  uint32_t group = 0;
+  if (active_shard) {
+    group = static_cast<uint32_t>(
         (static_cast<uint64_t>(source_shard + 1) * active_groups - 1) /
         active_shards);
+  }
+  const uint32_t transport_warp = group % TotalWarps;
+  if (warp == transport_warp && active_shard) {
     uint32_t group_shard_begin = 0;
     uint32_t group_shard_end = 0;
     pool_slice_weighted_shard_range(
@@ -1555,14 +1835,24 @@ static __device__ __noinline__ void pool_slice_return_weighted(
               sequence,
               lane);
         } else {
-          nvshmemx_putmem_signal_nbi_warp(
+#if DAE_POOL_SLICE_RAW_SGL && defined(__CUDA_ARCH__)
+          pool_ibgda_put_contiguous_signal_warp(
+              destination,
+              ready,
+              source,
+              static_cast<uint32_t>(bytes),
+              source_pe,
+              sequence,
+              lane);
+#else
+          nvshmemx_putmem_nbi_warp(
               destination,
               source,
               static_cast<size_t>(bytes),
-              ready,
-              sequence,
-              NVSHMEM_SIGNAL_SET,
               source_pe);
+          if (lane == 0)
+            nvshmem_uint64_p(ready, sequence, source_pe);
+#endif
         }
       }
     }
@@ -1597,9 +1887,8 @@ static __device__ __noinline__ void pool_slice_return_weighted(
               ? destination_rows
               : source_shards;
       const uint32_t destination_groups =
-          destination_shards < poolSliceReturnGroupsPerSource
-          ? destination_shards
-          : poolSliceReturnGroupsPerSource;
+          pool_slice_weighted_return_groups(
+              destination_rows, destination_shards, config.row_bytes);
       if (group >= destination_groups)
         continue;
       const uint32_t destination_rank =
@@ -1677,18 +1966,17 @@ static __device__ __forceinline__ void
 pool_slice_stream_publish_metadata_target(
     const PoolSliceConfig& config,
     uint64_t sequence,
+    uint64_t signal_delta,
     uint32_t index,
     uint32_t lane) {
+  const uint32_t target_pe = pool_slice_remote_first_pe(
+      index, config.my_pe, config.num_pes);
   auto* send_batches = reinterpret_cast<PoolSlicePublishBatch*>(
       config.send_batches_address);
   auto* receive_batches = reinterpret_cast<PoolSlicePublishBatch*>(
       config.receive_batches_address);
   const auto* send_rows = reinterpret_cast<const uint32_t*>(
       config.send_rows_address);
-  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
-
-  const uint32_t target_pe = pool_slice_remote_first_pe(
-      index, config.my_pe, config.num_pes);
   PoolSliceMetadataEnvelope* destination =
       pool_slice_stream_envelope(
           receive_batches, config.my_pe, config.route_capacity);
@@ -1697,7 +1985,10 @@ pool_slice_stream_publish_metadata_target(
           send_batches, target_pe, config.route_capacity);
   const PoolSlicePublishBatch* source_batch = &source->batch;
   const uint32_t envelope_bytes = pool_slice_stream_envelope_bytes(
-      source_batch->active_rows, config.row_bytes, config.group_limit);
+      source_batch->active_rows,
+      config.row_bytes,
+      config.group_limit,
+      config.num_pes);
   const uint32_t route_count =
       source_batch->route_end - source_batch->route_begin;
   uint32_t* packed_routes = pool_slice_stream_route_words(
@@ -1708,48 +1999,63 @@ pool_slice_stream_publish_metadata_target(
   }
   __syncwarp();
 
-  // The local fast path copies uint4 vectors, so include up to 12 bytes of
-  // packet-local padding after the live route words.  The fixed peer stride
-  // is 16-byte aligned and reserves the full route capacity, making this
-  // padding both in-bounds and invisible to the route parser.  Keeping the
-  // remote transaction at the same aligned size also avoids a special tail
-  // path in the metadata publisher.
+  // The local fast path copies uint4 vectors, so include packet-local padding
+  // after the live route words. The fixed peer stride reserves this padding.
   const uint64_t packet_bytes =
       (envelope_bytes +
        static_cast<uint64_t>(route_count) * sizeof(uint32_t) + 15) &
       ~15ULL;
-  uint64_t* transport_ready =
+  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
+  uint64_t* ready =
       control + poolSliceControlStreamMetadataTransportReady + config.my_pe;
   if (target_pe == config.my_pe) {
     pool_slice_copy_warp(destination, source, packet_bytes, lane);
     __syncwarp();
     if (lane == 0)
-      pool_slice_signal_release_local(transport_ready, sequence);
+      pool_slice_signal_release_local(ready, sequence);
   } else {
     nvshmemx_putmem_signal_nbi_warp(
         destination,
         source,
         static_cast<size_t>(packet_bytes),
-        transport_ready,
-        sequence,
-        NVSHMEM_SIGNAL_SET,
+        ready,
+        signal_delta,
+        NVSHMEM_SIGNAL_ADD,
         target_pe);
   }
   __syncwarp();
 }
 
-template <uint32_t TotalWarps>
+template <bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_stream_publish_metadata(
     const PoolSliceConfig& config,
     uint64_t sequence,
+    uint64_t signal_delta,
     uint32_t thread_id) {
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
+  if (config.pool_count >= config.num_pes) {
+    // Every transport publishes one independent fused metadata message per
+    // target. Metadata and activation keep independent CTA/QP placement so
+    // the two planes can be submitted concurrently.
+    if (config.pool_rank < config.num_pes && warp == 0) {
+      pool_slice_stream_publish_metadata_target(
+          config,
+          sequence,
+          signal_delta,
+          config.pool_rank,
+          lane);
+    }
+    return;
+  }
+  // A smaller generic assembly falls back to the coordinator CTA's warps.
+  if (config.pool_rank != 0)
+    return;
   for (uint32_t index = warp;
        index < config.num_pes;
        index += TotalWarps) {
     pool_slice_stream_publish_metadata_target(
-        config, sequence, index, lane);
+        config, sequence, signal_delta, index, lane);
   }
 }
 
@@ -1794,6 +2100,7 @@ static __device__ __forceinline__ void pool_slice_stream_accept_metadata(
       control + poolSliceControlStreamMetadataReady + source_pe, sequence);
 }
 
+template <bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __forceinline__ bool pool_slice_stream_queue_message_ready(
     uint32_t source_pe,
     uint32_t queue,
@@ -1840,19 +2147,59 @@ static __device__ __forceinline__ bool pool_slice_stream_queue_message_ready(
   if (dae_atomic_load_acquire_gpu(
           control + poolSliceControlStreamRouteReady + source_pe) < sequence)
     return false;
-  if (message->ready_slot >= poolSliceMaxPoolBlocks)
+  if (message->ready_slot >= poolSliceMaxDataGroups)
     return true;
-  return source_pe == config.my_pe ||
-      pool_slice_signal_fetch(
-          pool_slice_stream_data_ready(
-              control, source_pe, message->ready_slot),
-          false) >= sequence;
+  if (source_pe == config.my_pe)
+    return true;
+  if constexpr (HostDataPlane || !poolSliceWarpQpCompletion) {
+    const uint64_t observed = pool_slice_signal_fetch(
+        pool_slice_stream_data_ready(
+            control, source_pe, message->ready_slot, 0),
+        false);
+    if constexpr (poolSliceRawSgl) {
+      return observed >= pool_slice_stream_data_progress(
+          sequence,
+          HostDataPlane
+              ? pool_slice_stream_data_segments(
+                    message->row_begin, message->row_end)
+              : 1);
+    }
+    return observed >= sequence;
+  } else {
+    static_assert(TotalWarps == poolSlicePayloadWarps);
+    static_assert(
+        !poolSliceWarpQpCompletion ||
+        poolSliceCompletionSlots == poolSlicePayloadWarps);
+    const uint32_t group_rows = message->row_end - message->row_begin;
+#pragma unroll
+    for (uint32_t payload_warp = 0;
+         payload_warp < TotalWarps;
+         ++payload_warp) {
+      const uint32_t warp_row_begin = message->row_begin +
+          static_cast<uint32_t>(
+              static_cast<uint64_t>(group_rows) * payload_warp / TotalWarps);
+      const uint32_t warp_row_end = message->row_begin +
+          static_cast<uint32_t>(
+              static_cast<uint64_t>(group_rows) * (payload_warp + 1) /
+              TotalWarps);
+      if (warp_row_begin < warp_row_end &&
+          pool_slice_signal_fetch(
+              pool_slice_stream_data_ready(
+                  control,
+                  source_pe,
+                  message->ready_slot,
+                  payload_warp),
+              false) < sequence)
+        return false;
+    }
+    return true;
+  }
 }
 
-// The scan is only over queue heads. There are at most sixteen heads (two per
-// PE), so warp zero tests all of them and elects the first ready head with one
-// ballot. Revalidation under the claim handles another PoolInst CTA advancing
-// the same queue between scan and CAS.
+// The scan is only over queue heads. Warp zero tests them in at most two
+// 32-lane waves and elects the first ready head. Revalidation under the claim
+// handles another PoolInst CTA advancing the same queue between scan and CAS.
+template <bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __noinline__ bool pool_slice_stream_claim_queue_head(
     uint32_t queue_index,
     const PoolSliceConfig& config,
@@ -1899,7 +2246,7 @@ static __device__ __noinline__ bool pool_slice_stream_claim_queue_head(
   if (dae_atomic_compare_exchange_acquire_gpu(
           reinterpret_cast<uint64_t*>(claim), 0, UINT64_MAX) != 0)
     return false;
-  if (!pool_slice_stream_queue_message_ready(
+  if (!pool_slice_stream_queue_message_ready<HostDataPlane, TotalWarps>(
           source_pe,
           queue,
           config,
@@ -1980,7 +2327,7 @@ static __device__ __forceinline__ bool pool_slice_stream_queue_copy_valid(
       message.flags == POOL_SLICE_BATCH_FLAGS_NONE &&
       message.row_begin < message.row_end &&
       message.row_end <= config.token_capacity &&
-      message.ready_slot < poolSliceMaxPoolBlocks;
+      message.ready_slot < poolSliceMaxDataGroups;
 }
 
 // Execute the metadata/control opcodes at a claimed queue head. COPY_ROWS is
@@ -2534,7 +2881,8 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
             pool_slice_stream_batch(
                 send_batches, target_pe, config.route_capacity)->active_rows,
             config.row_bytes,
-            config.group_limit);
+            config.group_limit,
+            config.num_pes);
         active_group_count = target_groups > active_group_count
             ? target_groups
             : active_group_count;
@@ -2543,6 +2891,12 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       }
       control[poolSliceControlStreamSendTotal] = send_total;
       control[4] = active_group_count;
+      const uint64_t previous_metadata_sequence =
+          dae_atomic_load_relaxed_gpu(
+              control + poolSliceControlStreamMetadataSourceSequence);
+      control[poolSliceControlStreamMetadataSignalDelta] =
+          sequence - previous_metadata_sequence;
+      control[poolSliceControlStreamMetadataSourceSequence] = sequence;
       dae_atomic_store_release_gpu(
           control + poolSliceControlStart, sequence);
     }
@@ -2552,16 +2906,18 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   }
   __syncthreads();
 
-  // Metadata is one source-owned envelope per destination, independent of the
-  // number of payload CTAs.  Keep publication on the rank-zero control CTA;
-  // its warps cover the targets in parallel while the remaining CTAs can enter
-  // the direct data/gather loop without duplicating network traffic.
-  if (config.pool_rank == 0) {
-    pool_slice_stream_publish_metadata<TotalWarps>(
-        config,
-        sequence,
-        thread_id);
-  }
+  // Metadata is one source-owned envelope per destination. It is always an
+  // independent fused message, so routing can be accepted while the selected
+  // host, public-NVSHMEM, or raw-SGL data plane remains in flight.
+  const uint64_t metadata_signal_delta = dae_atomic_load_relaxed_gpu(
+      control + poolSliceControlStreamMetadataSignalDelta);
+  const uint32_t dispatch_worker_count =
+      pool_slice_stream_dispatch_worker_count(config, control);
+  pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>(
+      config,
+      sequence,
+      metadata_signal_delta,
+      thread_id);
   __syncthreads();
   if constexpr (HostDataPlane) {
     if (config.pool_rank == 0 && thread_id == 0) {
@@ -2584,7 +2940,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     bool gather_done_recorded = false;
     while (true) {
       if (!metadata_ready) {
-        const uint64_t observed = pool_slice_signal_fetch(
+        uint64_t observed = pool_slice_signal_fetch(
             control + poolSliceControlStreamMetadataTransportReady + lane,
             lane == config.my_pe);
         if (observed >= sequence) {
@@ -2664,19 +3020,6 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   }
   __syncthreads();
 
-  uint32_t dispatch_worker_count = 1;
-  if (config.pool_count > 1) {
-    const uint64_t send_total = dae_atomic_load_relaxed_gpu(
-        control + poolSliceControlStreamSendTotal);
-    const uint64_t gather_work = control[4] *
-        static_cast<uint64_t>(config.num_pes) * config.local_readers;
-    uint64_t useful_workers = gather_work + send_total;
-    useful_workers = useful_workers == 0 ? 1 : useful_workers;
-    useful_workers = useful_workers < config.pool_count
-        ? useful_workers
-        : config.pool_count - 1;
-    dispatch_worker_count = static_cast<uint32_t>(useful_workers);
-  }
   const bool payload_executor = config.pool_count == 1 ||
       (config.pool_rank != 0 &&
        config.pool_rank <= dispatch_worker_count);
@@ -2702,11 +3045,11 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
         uint32_t target_pe = 0;
         uint32_t group = 0;
         if (pool_slice_stream_decode_send_task(
-                shared_send_task,
-                config,
-                send_token_counts,
-                &target_pe,
-                &group)) {
+              shared_send_task,
+              config,
+              send_token_counts,
+              &target_pe,
+              &group)) {
           pool_slice_stream_send_group<HostDataPlane>(
               target_pe,
               group,
@@ -2732,29 +3075,44 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       }
       __syncthreads();
       if (warp == 0) {
-        const uint32_t offset = lane;
-        bool ready = offset < total_queue_count;
-        const uint32_t queue_index =
-            (shared_probe + offset) % total_queue_count;
-        const uint32_t source_pe = queue_index / queue_count;
-        const uint32_t queue = queue_index % queue_count;
-        ready = ready && pool_slice_stream_queue_message_ready(
-                source_pe,
-                queue,
-                config,
-                receive_batches,
-                control,
-                sequence,
-                true);
-        const uint32_t ready_mask = __ballot_sync(0xffffffffU, ready);
-        if (lane == 0 && ready_mask != 0)
-          shared_queue_candidate = __ffs(ready_mask) - 1;
+        // Test every queue head warp-parallel, starting at this worker's
+        // round-robin probe. Claiming remains global, so ready CTAs can steal
+        // work from any source without a preferred-head branch or retry.
+        for (uint32_t base = 0;
+             shared_queue_candidate == UINT32_MAX &&
+             base < total_queue_count;
+             base += 32) {
+          const uint32_t offset = base + lane;
+          bool ready = offset < total_queue_count;
+          const uint32_t queue_index =
+              (shared_probe + offset) % total_queue_count;
+          const uint32_t source_pe = queue_index / queue_count;
+          const uint32_t queue = queue_index % queue_count;
+          ready = ready &&
+              pool_slice_stream_queue_message_ready<
+                  HostDataPlane, TotalWarps>(
+                      source_pe,
+                      queue,
+                      config,
+                      receive_batches,
+                      control,
+                      sequence,
+                      true);
+          const uint32_t ready_mask =
+              __ballot_sync(0xffffffffU, ready);
+          if (lane == 0 && shared_queue_candidate == UINT32_MAX &&
+              ready_mask != 0) {
+            shared_queue_candidate =
+                base + static_cast<uint32_t>(__ffs(ready_mask) - 1);
+          }
+          __syncwarp();
+        }
       }
       __syncthreads();
       if (thread_id == 0 && shared_queue_candidate != UINT32_MAX) {
         const uint32_t queue_index =
             (shared_probe + shared_queue_candidate) % total_queue_count;
-        if (pool_slice_stream_claim_queue_head(
+        if (pool_slice_stream_claim_queue_head<HostDataPlane, TotalWarps>(
                 queue_index,
                 config,
                 receive_batches,
@@ -2792,11 +3150,13 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
           }
           __syncthreads();
           if (shared_queue_valid) {
-            pool_slice_stream_gather_rows<WeightedReturn, TotalWarps>(
+            pool_slice_stream_gather_rows<
+                HostDataPlane, WeightedReturn, TotalWarps>(
                 source_pe,
                 shared_queue_message.row_begin,
                 shared_queue_message.row_end,
-                shared_queue_reader,
+                shared_queue_message.ready_slot |
+                    (shared_queue_reader << 16),
                 config,
                 receive_batches,
                 receive_routes,
@@ -2831,7 +3191,10 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
         if (thread_id == 0 &&
             shared_queue_message.opcode == POOL_SLICE_QUEUE_COPY_ROWS) {
           pool_slice_stream_finish_copy_queue_head(
-              control, source_pe, queue, config.local_readers);
+              control,
+              source_pe,
+              queue,
+              config.local_readers);
         }
         __syncthreads();
         did_work = true;

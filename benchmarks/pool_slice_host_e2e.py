@@ -33,7 +33,7 @@ from host_sgl_benchmark import (
     _gpudirect_write_ordering,
     _register_storage,
 )
-from nccl_ep_reference import Timing, print_result, rank_max
+from dense_nccl_ring_reference import Timing, print_result, rank_max
 from pool_slice_nccl_compare import _balanced_expert_ids
 
 

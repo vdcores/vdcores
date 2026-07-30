@@ -15,8 +15,10 @@ from dae.instructions import (
     RawAddress,
 )
 from dae.pool_slice import (
+    POOL_SLICE_COMPLETION_SLOTS,
     POOL_SLICE_CONFIG_BYTES,
     POOL_SLICE_HOST_CONFIG_BYTES,
+    POOL_SLICE_MAX_DATA_GROUPS,
     POOL_SLICE_MAX_LOCAL_READERS,
     POOL_SLICE_MAX_POOL_BLOCKS,
     POOL_SLICE_MAX_STREAM_QUEUES,
@@ -34,6 +36,8 @@ from dae.pool_slice import (
     POOL_SLICE_PROFILE_RETURN_SIGNALS_CLOSED,
     POOL_SLICE_PROFILE_SCATTER_DONE,
     POOL_SLICE_PROFILE_START,
+    POOL_SLICE_PAYLOAD_WARPS,
+    POOL_SLICE_WARP_QP_COMPLETION,
     POOL_SLICE_PUBLISH_BYTES,
     POOL_SLICE_RECEIVE_BYTES,
     PoolSliceBatchFlags,
@@ -169,14 +173,14 @@ def test_pool_slice_config_abi_and_ranges():
     assert len(_config(group_limit=8).pack()) == POOL_SLICE_CONFIG_BYTES
     assert len(
         _config(
-            group_limit=POOL_SLICE_MAX_POOL_BLOCKS,
+            group_limit=POOL_SLICE_MAX_DATA_GROUPS,
             pool_count=2,
             pool_rank=1,
         ).pack()
     ) == POOL_SLICE_CONFIG_BYTES
     with pytest.raises(ValueError, match="protocol limit"):
         _config(
-            group_limit=POOL_SLICE_MAX_POOL_BLOCKS + 1,
+            group_limit=POOL_SLICE_MAX_DATA_GROUPS + 1,
             pool_count=2,
             pool_rank=1,
         ).pack()
@@ -306,6 +310,7 @@ def test_pool_slice_timing_uses_only_vdcores_internal_events():
         compute_barriers=(),
         chunk_rows=1,
         communication_block=1,
+        num_pes=3,
     )
 
     assert program.timing_ns() == (70, 90, 160)
@@ -345,11 +350,14 @@ def test_pool_program_is_only_vdcores_ops_and_uses_an_isolated_pool_block():
     assert "builder.add_memory(IssueBarrier(" in source
     assert "PoolTmaStore1D" not in source
     assert "PoolWaitSignal" not in source
-    assert "reader_base = 1 + buffers.pool_count" in source
+    assert "writer_blocks = 0 if source_preloaded else 1" in source
+    assert "pool_base = writer_blocks" in source
+    assert "reader_base = pool_base + buffers.pool_count" in source
     assert "torch.cuda.Stream" not in source
     assert "torch.cuda.Event" not in source
     assert "source_preloaded" in source
     assert "launcher.new_bar(0 if source_preloaded else 1)" in source
+    assert "launcher.disable_cache_window()" in source
 
 
 def test_pool_program_has_no_model_specific_rms_operator():
@@ -374,18 +382,93 @@ def test_pool_program_has_no_model_specific_rms_operator():
         assert removed_name not in sources
 
 
-def test_pool_mailbox_scan_is_lane_parallel_and_uses_one_merged_word():
+def test_pool_mailbox_scan_is_lane_parallel_and_uses_one_source_word():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
     assert "__ballot_sync(0xffffffffU, metadata_ready)" in source
+    assert "base < total_queue_count" in source
+    assert "base + lane" in source
     assert "config.signal_base + lane" in source
     assert "poolSliceControlStreamMetadataTransportReady + lane" in source
+    metadata = source.split(
+        "pool_slice_stream_publish_metadata_target(", 1
+    )[1].split("pool_slice_stream_accept_metadata(", 1)[0]
+    assert "nvshmemx_putmem_signal_nbi_warp(" in metadata
+    assert "NVSHMEM_SIGNAL_ADD" in metadata
+    assert "signal_delta" in metadata
+    assert "payload_coupled" not in metadata
+    assert "inline_generation" not in metadata
+    assert "nvshmemx_putmem_nbi_warp(" not in metadata
+    assert "poolSliceControlStreamMetadataSourceSequence" in source
 
 
-def test_macro_operator_batches_payload_and_uses_cooperative_quiet_per_direction():
+def test_raw_sgl_progress_reuses_one_group_signal_and_one_reader_task():
+    abi = (ROOT / "include" / "dae" / "pool_slice_abi.cuh").read_text()
+    raw = (ROOT / "include" / "dae" / "pool_ibgda_sgl.cuh").read_text()
+    source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
+
+    assert "poolSliceRawSglProgressStride = 1ULL << 17" in abi
+    assert "total_wqebbs += pool_ibgda_sgl_wqebbs(count) + 1" in raw
+    assert "const uint32_t reserved_wqebbs = total_wqebbs" in raw
+    assert "pool_ibgda_put_contiguous_signal_warp(" in raw
+    assert (
+        "static __device__ __noinline__ void pool_ibgda_sgl_put_rows_warp("
+        in raw
+    )
+    assert (
+        "static __device__ __noinline__ void\n"
+        "pool_ibgda_put_contiguous_signal_warp(" in raw
+    )
+    assert "return false;" not in raw
+    assert "constexpr uint32_t wqebbs = 2" in raw
+    assert "sequence * poolSliceRawSglProgressStride + wqe + 1" in raw
+    assert "wqe + 1 == wqe_count ? MLX5_WQE_CTRL_CQ_UPDATE : 0" in raw
+    assert raw.count("ibgda_submit_requests<true>(") == 2
+    assert "base_wqe + total_wqebbs" not in raw
+    assert "shared_sgl_sent" not in source
+
+    assert "pool_slice_stream_data_progress(" in source
+    assert "pool_slice_stream_data_segments(" in source
+    assert "HostDataPlane, WeightedReturn, TotalWarps" in source
+    assert "shared_queue_message.ready_slot |" in source
+    assert "shared_queue_reader << 16" in source
+    assert "ready_slot_and_reader & 0xffffU" in source
+    assert "segment * poolSliceRawSglWidth" in source
+    assert "reader-cta-progress" not in source
+    # Progress changes only the meaning of the existing ready word: it does
+    # not create another queue, group, claim state, or destination task.
+    assert "poolSliceMaxStreamQueues = 2" in abi
+    assert "poolSliceCompletionSlots" in abi
+
+
+def test_device_dispatch_uses_exact_static_qp_scope_generations():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
     assert "config.delivery_pool_address" in source
     assert "route.row_count) * config.row_bytes" in source
-    assert source.count("pool_slice_quiet_block();") >= 2
+    send_group = source.split("pool_slice_stream_send_group(", 1)[1].split(
+        "pool_slice_stream_gather_rows(", 1
+    )[0]
+    public_put = source.split(
+        "pool_slice_stream_put_rows_public(", 1
+    )[1].split("#undef DAE_POOL_SLICE_PUBLIC_FALLBACK_QUALIFIER", 1)[0]
+    assert "nvshmemx_putmem_nbi_warp(" in public_put
+    assert "pool_slice_stream_put_rows_public(" in send_group
+    assert "if constexpr (poolSliceWarpQpCompletion)" in send_group
+    assert "if constexpr (!poolSliceWarpQpCompletion)" in send_group
+    assert "nvshmemx_putmem_signal_nbi_warp(" not in send_group
+    assert "nvshmemx_signal_op(" not in send_group
+    assert "nvshmem_uint64_p(" in send_group
+    assert "pool_slice_stream_reserve_data_signal_delta(" not in send_group
+    assert "NVSHMEM_SIGNAL_ADD" not in send_group
+    assert "NVSHMEM_SIGNAL_SET" not in send_group
+    assert "pool_slice_quiet_block();" not in send_group
+    assert "message->ready_slot" in source
+    assert "payload_warp < TotalWarps" in source
+    assert "poolSlicePayloadWarps" in source
+    assert "poolSliceCompletionSlots" in source
+    assert "poolSliceControlStreamDataSourceSequence" not in source
+    # The generic unweighted return still needs a cooperative completion;
+    # weighted EP return already uses payload-coupled generations.
+    assert source.count("pool_slice_quiet_block();") == 1
     assert "nvshmemi_quiet<NVSHMEMI_THREADGROUP_BLOCK>();" in source
 
 
@@ -399,7 +482,8 @@ def test_pool_gather_is_multi_poolinst_and_uses_generation_slots():
     assert "source_row >= config.token_capacity" in source
     assert "pool_slice_stream_gather_rows(" in source
     assert "pool_slice_return_scatter_pipelined(" not in source
-    assert "nvshmemx_putmem_signal_nbi_warp(" in source
+    assert "nvshmemx_putmem_nbi_warp(" in source
+    assert "nvshmem_uint64_p(" in source
     assert "poolSliceControlDispatchGeneration" in source
     assert "poolSliceControlReturnGeneration" in source
     assert "poolSliceControlReturnReady" in source
@@ -407,9 +491,15 @@ def test_pool_gather_is_multi_poolinst_and_uses_generation_slots():
     assert "poolSliceControlReaderRowCount" in source
     assert "dae_atomic_store_release_gpu(" in source
     assert "dae_atomic_load_acquire_gpu(" in source
-    assert "poolSliceMaxPoolBlocks = 32" in abi
+    assert "poolSliceMaxPoolBlocks = 132" in abi
+    assert "poolSliceMaxDataGroups = 32" in abi
+    assert "poolSlicePayloadWarps = DAE_POOL_SLICE_WARPS" in abi
+    assert "poolSliceCompletionSlots" in abi
     assert "for pool_rank in range(buffers.pool_count)" in python
-    assert "POOL_SLICE_CONTROL_DISPATCH_READY = 102" in python
+    assert (
+        "POOL_SLICE_CONTROL_DISPATCH_READY = POOL_SLICE_CONTROL_START + 1"
+        in python
+    )
 
 
 def test_weighted_scatter_bypasses_reduction_for_one_pool_contributor():
@@ -424,13 +514,22 @@ def test_weighted_scatter_bypasses_reduction_for_one_pool_contributor():
     assert "__hadd2(" in source
     assert "float2 sums[4][4]" not in scatter
     weighted_return = source.split("pool_slice_return_weighted(", 1)[1].split(
-        "pool_slice_stream_publish_metadata(", 1
+        "pool_slice_stream_publish_metadata_target(", 1
     )[0]
-    assert "if (warp == 0 && active_shard)" in weighted_return
+    weighted_grouping = source.split(
+        "pool_slice_weighted_return_groups(", 1
+    )[1].split("pool_slice_weighted_shard_range(", 1)[0]
+    assert "if (warp == transport_warp && active_shard)" in weighted_return
+    assert "transport_warp = group % TotalWarps" in weighted_return
     assert "pool_slice_quiet_block();" not in weighted_return
-    assert "nvshmemx_putmem_signal_nbi_warp(" in weighted_return
+    assert "nvshmemx_putmem_nbi_warp(" in weighted_return
+    assert "nvshmem_uint64_p(" in weighted_return
+    assert "nvshmemx_putmem_signal_nbi_warp(" not in weighted_return
+    assert "pool_ibgda_put_contiguous_signal_warp(" in weighted_return
     assert "pool_slice_weighted_source_shards(" in weighted_return
     assert "pool_slice_weighted_return_group_count(" in weighted_return
+    assert "pool_slice_weighted_return_groups(" in weighted_return
+    assert "target_group_bytes = 256ULL * 1024" in weighted_grouping
     assert "dae_atomic_fetch_add_acq_rel_gpu(" in weighted_return
 
 
@@ -439,23 +538,54 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     abi = (ROOT / "include" / "dae" / "pool_slice_abi.cuh").read_text()
     host_abi = (ROOT / "include" / "dae" / "pool_host_abi.h").read_text()
     python = (ROOT / "python" / "dae" / "pool_slice.py").read_text()
+    dispatch_grouping = source.split(
+        "pool_slice_stream_group_count(", 1
+    )[1].split("pool_slice_stream_dispatch_worker_count(", 1)[0]
     assert POOL_SLICE_MAX_STREAM_QUEUES == 2
+    assert POOL_SLICE_MAX_POOL_BLOCKS == 132
+    assert POOL_SLICE_MAX_DATA_GROUPS == 32
+    assert POOL_SLICE_PAYLOAD_WARPS == 8
+    assert POOL_SLICE_WARP_QP_COMPLETION is False
+    assert POOL_SLICE_COMPLETION_SLOTS == 1
     assert POOL_SLICE_QUEUE_ENTRY_BYTES == 32
-    assert POOL_SLICE_STREAM_QUEUE_DEPTH == POOL_SLICE_MAX_POOL_BLOCKS + 2
+    assert POOL_SLICE_STREAM_QUEUE_DEPTH == 2 + (
+        POOL_SLICE_MAX_DATA_GROUPS + 1
+    ) // 2
     assert "POOL_SLICE_FLAGS_STREAMING_DISPATCH" not in abi
     assert "pool_slice_stream_group_count(" in source
     assert "pool_slice_stream_send_group(" in source
     assert "pool_slice_stream_gather_rows(" in source
     assert "pool_slice_stream_build_queues(" in source
     assert "pool_slice_stream_claim_queue_head(" in source
+    assert "offset = base + lane" in source
+    assert "ready CTAs can steal" in source
+    assert "preferred-head branch" in source
+    assert "candidate_group < groups" in source
+    assert "signal_delta,\n          config.pool_rank," in source
+    assert "independent metadata/data-plane placement" in source
+    assert '"distributed-warp-ready-steal"' in (
+        ROOT / "benchmarks" / "pool_slice_nccl_compare.py"
+    ).read_text()
+    assert '"independent-target-major-cta-qp"' in (
+        ROOT / "benchmarks" / "pool_slice_nccl_compare.py"
+    ).read_text()
     assert "pool_slice_stream_drain_queue_control(" in source
+    assert "poolSliceControlStreamDataSourceSequence" not in abi
+    assert "POOL_SLICE_CONTROL_STREAM_DATA_SOURCE_SEQUENCE" not in python
     metadata_publisher = source.split(
         "pool_slice_stream_publish_metadata_target(", 1
     )[1].split("pool_slice_stream_accept_metadata(", 1)[0]
     assert "nvshmemx_putmem_signal_nbi_warp(" in metadata_publisher
+    assert "nvshmemx_putmem_nbi_warp(" not in metadata_publisher
     assert "nvshmem_putmem_signal_nbi(" not in metadata_publisher
     assert metadata_publisher.count("nvshmemx_putmem_signal_nbi_warp(") == 1
-    assert "NVSHMEM_SIGNAL_SET" in metadata_publisher
+    assert "NVSHMEM_SIGNAL_ADD" in metadata_publisher
+    assert "signal_delta" in metadata_publisher
+    assert "payload_coupled" not in metadata_publisher
+    assert "inline_generation" not in metadata_publisher
+    assert "nvshmem_uint64_p(transport_ready, sequence, target_pe)" not in (
+        metadata_publisher
+    )
     assert "poolSliceControlStreamMetadataTransportReady" in metadata_publisher
     assert "pool_slice_stream_route_words(" in metadata_publisher
     assert "sizeof(uint32_t)" in metadata_publisher
@@ -468,9 +598,22 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "nvshmem_putmem_signal(" not in metadata_publisher
     assert "index = warp" in metadata_publisher
     assert "index += TotalWarps" in metadata_publisher
-    metadata_call = source.index("pool_slice_stream_publish_metadata<TotalWarps>(")
-    assert "if (config.pool_rank == 0)" in source[metadata_call - 512 : metadata_call]
-    assert source.count("pool_slice_stream_publish_metadata<TotalWarps>(") == 1
+    metadata_call = source.index(
+        "pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>("
+    )
+    assert source.count(
+        "pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>("
+    ) == 1
+    assert "config.pool_count >= config.num_pes" in (
+        metadata_publisher
+    )
+    assert "config.pool_rank < config.num_pes && warp == 0" in metadata_publisher
+    assert "if (config.pool_rank != 0)" in metadata_publisher
+    assert "smaller generic assembly falls back" in metadata_publisher
+    coordinator = source[metadata_call:]
+    assert "poolSliceControlStreamMetadataTransportReady + lane" in coordinator
+    assert "pool_slice_stream_data_ready(control, lane, 0, 0)" not in coordinator
+    assert "poolSliceControlStreamMetadataSignalDelta" in source
     assert "weight_bits << 16" in python
     assert "send_rows = nvshmem.zeros(route_capacity, dtype=torch.uint32)" in python
     assert "route_capacity * 4 + 15" in python
@@ -485,18 +628,27 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "metadata_parts_expected" not in source
     assert "poolSliceControlStreamRouteReady" in source
     assert "poolSliceControlStreamMetadataIssued" not in source
-    assert "poolSliceControlStreamMetadataPosted" not in source
     assert "poolSliceControlStreamDataReady" in source
     assert "poolSliceControlStreamQueueHead" in source
     assert "poolSliceControlStreamQueueClaim" in source
     assert "retired & (1ULL << queue_index)" in source
     assert "poolSliceControlStreamExpectedGroups" not in source
-    assert "pool_slice_quiet_block();" in source
+    assert "pool_slice_stream_data_ready(" in source
+    assert "payload_warp" in source
+    assert "atomicCAS(copy_claim, state, desired)" in source
+    assert "gather_work = control[4] *" in source
+    assert "dae_atomic_add_release_gpu(" in source
     assert "pool_slice_remote_first_pe(" in source
     assert "nvshmemx_signal_op(" in source
     assert "pool_ibgda_sg_put_signal_warp(" not in source
-    assert "target_group_bytes = 512ULL * 1024" in source
+    assert "target_group_bytes_low_pe = 256ULL * 1024" in dispatch_grouping
+    assert "target_group_bytes_high_pe = 512ULL * 1024" in dispatch_grouping
+    assert "num_pes >= 8" in dispatch_grouping
+    assert "pilot_group_bytes" not in source
     assert "target_group_rows = 32" in source
+    assert "active_rows) * group / group_count" in source
+    assert "active_rows) * (group + 1) / group_count" in source
+    assert "#if DAE_POOL_SLICE_RAW_SGL" not in metadata_publisher
     assert "hostSglRingMaxRows = 512" in host_abi
     assert "POOL_HOST_RING_MAX_ROWS = 512" in python
     assert "token_capacity > POOL_HOST_RING_MAX_ROWS" in python
@@ -520,7 +672,8 @@ def test_payload_publication_separates_visibility_from_dependency_tracking():
     assert "pool_slice_publish_counter_ready(" not in source
     assert "__threadfence_system();" not in source
     assert "nvshmem_fence();" not in source
-    assert "nvshmemx_putmem_signal_nbi_warp(" in source
+    assert "nvshmemx_putmem_nbi_warp(" in source
+    assert "nvshmem_uint64_p(" in source
 
 
 def test_pool_protocol_has_no_explicit_system_fence():

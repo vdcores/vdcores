@@ -84,3 +84,16 @@ def test_launcher_rejects_multiple_pool_execute_warp_types():
     launcher.builder[1].built_poolinsts.append(PoolInstruction(2))
     with pytest.raises(ValueError, match="only one PoolInst execute-warp type"):
         launcher._resolve_pool_inst_opcode()
+
+
+def test_launcher_cache_window_can_be_disabled():
+    launcher = object.__new__(Launcher)
+    launcher._cache_window_disabled = True
+    assert launcher._select_launch_cache_window(
+        bars=None,
+        tma=None,
+        cinsts=None,
+        minsts=None,
+        comminsts=None,
+        poolinsts=None,
+    ) is None

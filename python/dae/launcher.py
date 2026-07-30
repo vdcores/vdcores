@@ -296,6 +296,7 @@ class Launcher:
 
         self.bars = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
         self.bars_src = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
+        self._bar_source_dirty = True
 
         self.resource_groups = {
             'default': ResourceGroup('default')
@@ -303,6 +304,10 @@ class Launcher:
 
         self._cache_window_override = None
         self._cache_window_requests = []
+        self._cache_window_disabled = False
+        # Immutable instruction/core/TMA state is materialized on the device
+        # once and reused across launches. Schedule edits invalidate it.
+        self._launch_packet = None
 
         runtime.set_smem_size(self.smem_size)
 
@@ -348,13 +353,16 @@ class Launcher:
         bar_id = self.num_bars
         self.bar_values[bar_id] = value
         self.num_bars += 1
+        self._bar_source_dirty = True
         return bar_id
     def set_bar(self, bar_id: int, value: int):
         assert bar_id in self.bar_values, f"bar_id {bar_id} does not exist"
         assert isinstance(value, int), "bar value must be an int"
         self.bar_values[bar_id] = value
+        self._bar_source_dirty = True
     def new_tma(self, desc: torch.Tensor) -> int:
         self.tmas.append(desc)
+        self._launch_packet = None
         return len(self.tmas) - 1
 
     # instruction management
@@ -391,9 +399,11 @@ class Launcher:
         if not isinstance(core, CoreConfig):
             raise TypeError("core must be a dae.core.CoreConfig")
         self.core_configs[sm_id] = core
+        self._launch_packet = None
 
     def build_instructions(self):
         if self.need_instruction_build:
+            self._launch_packet = None
             for i in range(self.num_sms):
                 self.builder[i].build(
                     self.cinsts[i,...],
@@ -434,6 +444,7 @@ class Launcher:
                 raise ValueError("tensor must be a torch.Tensor or a list/tuple of torch.Tensor")
 
     def set_cache_window(self, tensor, *, hit_ratio=1.0, hit_policy=2, miss_policy=0, num_bytes=None):
+        self._cache_window_disabled = False
         self._cache_window_override = self._cache_window_dict(
             tensor,
             hit_ratio=hit_ratio,
@@ -443,10 +454,17 @@ class Launcher:
         )
 
     def clear_cache_window(self):
+        self._cache_window_disabled = False
+        self._cache_window_override = None
+        self._cache_window_requests.clear()
+
+    def disable_cache_window(self):
+        self._cache_window_disabled = True
         self._cache_window_override = None
         self._cache_window_requests.clear()
 
     def set_persistent(self, *tensors, num_bytes=None, hit_ratio=1.0):
+        self._cache_window_disabled = False
         for tensor in self._flatten_cache_tensors(*tensors):
             self._cache_window_requests.append(
                 self._cache_window_dict(
@@ -459,6 +477,7 @@ class Launcher:
             )
 
     def set_streaming(self, *tensors, num_bytes=None):
+        self._cache_window_disabled = False
         for tensor in self._flatten_cache_tensors(*tensors):
             self._cache_window_requests.append(
                 self._cache_window_dict(
@@ -491,6 +510,8 @@ class Launcher:
     def _select_launch_cache_window(
         self, *, bars, tma, cinsts, minsts, comminsts, poolinsts
     ):
+        if self._cache_window_disabled:
+            return None
         requested = self._select_requested_cache_window()
         if requested is not None:
             return requested
@@ -533,6 +554,7 @@ class Launcher:
             for b in self.builder:
                 b.add(inst)
         self.need_instruction_build = True
+        self._launch_packet = None
 
     def collect_barrier_release_counts(self, *insts):
         counts = {}
@@ -719,13 +741,19 @@ class Launcher:
             self.num_sms, config.core_config_bytes
         ).to(self.device)
 
-    def launch(self):
+    def _prepare_launch_packet(self):
+        """Materialize immutable VDCores launch state once on the device."""
+
         self.build_instructions()
+        if self._launch_packet is not None:
+            return self._launch_packet
 
         core_configs = self._resolve_core_configs()
         kernel_variant = self._select_kernel_variant(core_configs)
         pool_inst_opcode = self._resolve_pool_inst_opcode()
-        core_config_tensor = self._pack_core_configs(core_configs, kernel_variant)
+        core_config_tensor = self._pack_core_configs(
+            core_configs, kernel_variant
+        )
 
         communication_instructions = [
             inst
@@ -742,65 +770,119 @@ class Launcher:
             for inst in communication_instructions
             if getattr(inst, "requires_signal_array", False)
         ]
-        if (communication_instructions or pool_instructions) and not bool(
-            config.nvshmem_enabled
-        ):
-            raise RuntimeError(
-                "communication and pool instructions require `make nvshmem-pyext`"
-            )
         signal_requiring_instructions += [
             inst
             for inst in pool_instructions
             if getattr(inst, "requires_signal_array", False)
         ]
+        if (communication_instructions or pool_instructions) and not bool(
+            config.nvshmem_enabled
+        ):
+            raise RuntimeError(
+                "communication and pool instructions require "
+                "`make nvshmem-pyext`"
+            )
         if signal_requiring_instructions and self.signal_array is None:
             raise ValueError(
-                "NVSHMEM and memory-pool instructions require Launcher(signal_array=...)"
+                "NVSHMEM and memory-pool instructions require "
+                "Launcher(signal_array=...)"
             )
 
-        supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
+        supported_compute_ops = getattr(
+            runtime, "supported_compute_ops", None
+        )
         if supported_compute_ops is not None:
             required_compute_ops = self.compute_operator_names()
             supported_compute_ops = set(supported_compute_ops)
-            missing_compute_ops = [name for name in required_compute_ops if name not in supported_compute_ops]
+            missing_compute_ops = [
+                name
+                for name in required_compute_ops
+                if name not in supported_compute_ops
+            ]
             if missing_compute_ops:
                 rebuild_list = ",".join(required_compute_ops)
                 raise ValueError(
-                    "Launcher requires compute operators that are not compiled into dae.runtime: "
-                    f"{missing_compute_ops}. Rebuild with DAE_COMPUTE_OPS={rebuild_list} or a superset."
+                    "Launcher requires compute operators that are not "
+                    "compiled into dae.runtime: "
+                    f"{missing_compute_ops}. Rebuild with "
+                    f"DAE_COMPUTE_OPS={rebuild_list} or a superset."
                 )
 
-        unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
-        if unbound_bar_ids:
-            raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
-
-        # Load the model using the runtime
-        cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
-        minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
+        cinsts = self.cinsts.to(self.device).view(
+            self.num_sms * self.max_insts, 8
+        )
+        minsts = self.minsts.to(self.device).view(
+            self.num_sms * self.max_insts, 16
+        )
         comminsts = self.comminsts.to(self.device).view(
             self.num_sms * self.max_comm_insts, 16
         )
         poolinsts = self.poolinsts.to(self.device).view(
             self.num_sms * self.max_pool_insts, 16
         )
-
-        stream = torch.cuda.current_stream().cuda_stream
-        # TODO(zhiyuang): check this?
-
-        # init the bars based on dict
-        bar_int_view = self.bars.view(torch.uint32)
-        bar_src_int_view = self.bars_src.view(torch.uint32)
-        for bar_id, value in self.bar_values.items():
-            bar_int_view[bar_id] = value
-            bar_src_int_view[bar_id] = value
-
-        # print("bars before launch:", self.bar_values)
-
         if len(self.tmas) == 0:
             tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
         else:
             tma = torch.stack(self.tmas).to(self.device)
-        profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
+        profile = self.profile.view(torch.uint8).view(
+            self.num_sms * config.num_profile_events, 8
+        )
+        self._launch_packet = {
+            "kernel_variant": kernel_variant,
+            "pool_inst_opcode": pool_inst_opcode,
+            "core_config_tensor": core_config_tensor,
+            "cinsts": cinsts,
+            "minsts": minsts,
+            "comminsts": comminsts,
+            "poolinsts": poolinsts,
+            "tma": tma,
+            "profile": profile,
+        }
+        return self._launch_packet
+
+    def _reset_barriers(self) -> None:
+        """Restore all VDCores counters with one device copy per launch."""
+
+        if self._bar_source_dirty:
+            source = torch.zeros(
+                (config.max_bars, 4), dtype=torch.uint8
+            )
+            source_values = source.view(torch.uint32)
+            for bar_id, value in self.bar_values.items():
+                source_values[bar_id] = value
+            self.bars_src.copy_(source)
+            self._bar_source_dirty = False
+        self.bars.copy_(self.bars_src)
+
+    def launch(self):
+        packet = self._prepare_launch_packet()
+        kernel_variant = packet["kernel_variant"]
+        pool_inst_opcode = packet["pool_inst_opcode"]
+        core_config_tensor = packet["core_config_tensor"]
+        cinsts = packet["cinsts"]
+        minsts = packet["minsts"]
+        comminsts = packet["comminsts"]
+        poolinsts = packet["poolinsts"]
+        tma = packet["tma"]
+        profile = packet["profile"]
+
+        unbound_bar_ids = [
+            bar_id
+            for bar_id, value in self.bar_values.items()
+            if value is None
+        ]
+        if unbound_bar_ids:
+            raise ValueError(
+                "Cannot launch with unbound barrier counts: "
+                f"{unbound_bar_ids}"
+            )
+
+        stream = torch.cuda.current_stream().cuda_stream
+        # TODO(zhiyuang): check this?
+
+        self._reset_barriers()
+
+        # print("bars before launch:", self.bar_values)
 
         runtime.reset_cache_policy(stream)
         cache_window = self._select_launch_cache_window(

@@ -47,6 +47,11 @@ runtime-sized metadata packet is sent from every source to every target,
 including zero-row targets. Its live prefix contains the 64-byte publish
 descriptor, used portions of both fixed queue spans, and that target's packed
 route-to-compact words. One put-with-signal protects the complete packet.
+Because that packet exists for every target on every invocation, its signal
+uses an atomic-ADD source-sequence delta. This supports arbitrary monotonic
+invocation numbers while using the RC transport's one-WQE ADD instead of its
+multi-WQE SET. Dynamically absent payload-group slots retain SET semantics;
+they cannot consume a shared unit delta without per-slot catch-up state.
 
 Streaming dispatch appends immutable 32-byte instructions behind the envelope.
 Queue zero contains `RESERVE_ROUTES`, dynamically many `COPY_ROWS`, then
@@ -62,10 +67,12 @@ uses one NBI put-with-signal while activations use independently signaled data
 groups. Activations move directly
 from authoritative source token slots into the destination's source-indexed
 `delivery_pool`; there is no source activation staging in streaming mode.
-Each completed remote data group publishes a separate named readiness slot.
-Keeping readiness outside immutable instructions permits data to arrive before
-metadata without an overwrite race. The source-indexed signal names return
-visibility; group payload visibility is not inferred from it.
+Each completed remote data group publishes the compile-time completion set:
+one generation for the default CTA-mapped QP policy, or one generation per
+nonempty payload warp in a warp-mapped-QP build. Keeping readiness outside
+immutable instructions permits data to arrive before metadata without an
+overwrite race. The source-indexed signal names return visibility; group
+payload visibility is not inferred from it.
 
 ## Macro Operation
 
@@ -79,13 +86,25 @@ macro. No helper stream or standalone CUDA kernel participates.
 1. Ordinary VDCores writer instructions copy source activations once into
    source-owned token slots and release one barrier per TMA-sized row chunk.
 2. PoolInst rank zero derives source-side group sizes from the actual unique
-   token list, builds envelopes and ordered queues, and starts metadata
-   publication. The current policy targets about 512 KiB and at most 32 rows
-   per group, capped by the configured producer limit.
+   token list and builds envelopes and ordered queues. In the production
+   assembly, the first `num_pes` PoolInst CTAs each publish one target packet,
+   exposing distinct CTA-mapped RC QPs; an undersized generic assembly falls
+   back to rank-zero warps. The current grouping policy targets about 256 KiB
+   through four PEs and 512 KiB at eight or more PEs, with at most 32 rows per
+   group and a producer cap.
 3. Other PoolInst CTAs issue direct row PUTs while metadata is in flight. A
-   CTA waits only for writer chunks containing its rows. Public NVSHMEM groups
-   quiet their own NBI writes before publishing readiness. Metadata and data
-   remain independent and may arrive in either order.
+   CTA waits only for writer chunks containing its rows. The default static
+   CTA-QP policy posts one generation after every warp has posted its payload
+   WQEs; same-QP ordering makes that generation exact. A separately compiled
+   warp-QP policy couples each warp's final run to its own generation. No
+   global-QP quiet is on weighted dispatch. Metadata and data remain
+   independent and may arrive in either order.
+   In the optional raw-SGL assembly, selecting the compile flag is itself a
+   static transport contract: one GPU-owned NIC, CTA-mapped RC QPs, registered
+   symmetric GPU buffers, and no more than 32 rows per message. The allocator
+   enforces the row bound; the device helper omits the public fallback and its
+   duplicate lkey/rkey validation. The raw=0 assembly retains the public
+   NVSHMEM implementation.
 4. Coordinator lanes accept source metadata independently and publish a local
    metadata-ready generation. Payload CTAs test all source queue heads in
    parallel, claim one ready head, and execute it. `RESERVE_ROUTES` atomically
@@ -104,17 +123,19 @@ macro. No helper stream or standalone CUDA kernel participates.
 7. Once descriptors are valid, a target immediately acknowledges return
    completion to zero-row sources. The route-major path waits each nonempty
    expert compute barrier and PUTs its contiguous `(reader, source)` return
-   batch. The compiled weighted executor instead
-   reduces local expert rows by route weight to one partial per compact token.
+   batch. After its coordinator warp finishes the compute-barrier join, the
+   compiled weighted executor uses all eight PoolInst warps to reduce local
+   expert rows by route weight to one partial per compact token.
    Fine source-owned reduction shards are coalesced into at most four
    contiguous payload-coupled return groups, matching the default four RC
    QPs. The source consumes its local partial in place, waits only the named
    remote group generations, and sums at most one partial per pool slice into
    token-major output.
 With multiple PoolInst CTAs, rank zero remains the metadata/signal coordinator
-while other statically assembled PoolInst CTAs alternate outbound groups and
-ready destination queue heads. Every PoolInst instruction is still one
-VDCores macro operation; no helper kernel or stream is introduced.
+and builds every packet, while the first `num_pes` CTAs each publish exactly
+one target packet. All other statically assembled PoolInst CTAs alternate
+outbound groups and ready destination queue heads. Every PoolInst instruction
+is still one VDCores macro operation; no helper kernel or stream is introduced.
 
 ## Scoped Ordering
 
@@ -122,16 +143,19 @@ VDCores macro operation; no helper kernel or stream is introduced.
   put-with-signal into a monotonic per-source transport generation. Observing
   that generation names exactly the protected metadata range without a
   public-path metadata quiet.
-- Public payload groups use CTA-local NVSHMEM quiet followed by an NVSHMEM
-  signal to their named readiness slot. No broad fence is used.
+- Device payload completion is compile-time scoped to the configured QP map.
+  CTA mapping uses one post-barrier same-QP signal; warp mapping uses a
+  put-with-signal on each nonempty warp's final run. Both avoid scanning
+  unrelated peer/QP state.
 - Metadata-ready, route-ready, queue-claim, and reader barriers are GPU-scope
   release/acquire dependencies. COPY reader completions use release reductions
   and one acquire-release CAS; queue head advancement is release-scoped. The
   acq-rel terminal mask chains completed queues before reader release.
 - Self-target signal words use GPU-scope release stores and acquire loads.
   Remote signal words use NVSHMEM signal operations and signal fetches.
-- Dispatch and return payloads remain NBI. A direction-level quiet completes
-  the named operations before its reader barrier or return signal advances.
+- Dispatch and weighted-return payloads remain NBI and carry completion on
+  their final payload WQEs. The generic unweighted return retains its one
+  cooperative quiet because it has a different fanout contract.
 - An empty relationship still executes its ordered route reservation and
   `END`. When all of that source's queue ends retire, the target may publish
   return completion immediately.
@@ -146,7 +170,8 @@ atomics without acquiring or publishing payload.
 ## Fixed Fast-Path Assumptions
 
 - at most 32 PEs and at most eight local readers per slice;
-- up to 32 statically assembled PoolInst blocks per PE;
+- up to 132 statically assembled PoolInst blocks per PE, independently of the
+  32-group-per-target protocol limit;
 - one outstanding sequence per buffer set;
 - fixed-capacity, separately allocated symmetric buffers;
 - contiguous rows of at least 1 KiB, 16-byte aligned, with no fragmented or
@@ -167,13 +192,13 @@ Target PoolInst workers resolve that map locally and gather rows into
 the network transfer; fanout costs destination HBM bandwidth rather than
 repeated RDMA messages. The compact list is source-row sorted.
 
-The static runtime may assemble up to 32 PoolInst CTAs. Rank zero owns metadata
+The static runtime may assemble up to 132 PoolInst CTAs. Rank zero owns metadata
 publication, signal polling, and final dependency release. Other ranks issue
 outbound data and consume inbound queue heads; each ready COPY exposes one
 claim per local reader. Up to two queues per source bound the arbitration
 footprint without limiting HBM gather parallelism. Remote visibility remains
-exclusively in NVSHMEM payload/quiet/signal operations; queue synchronization
-is GPU-local.
+exclusively in payload-coupled NVSHMEM signals; queue synchronization is
+GPU-local.
 
 The compiled `POOL_SLICE_WEIGHTED_EXCHANGE` path uses source-owned CTA
 sharding, FP32 ILP4 destination accumulation, one partial token row per
@@ -286,12 +311,14 @@ reported CTA mapping, one shared DCI QP, and two RC QPs. The implementation
 therefore expresses concurrency as independent NBI source batches; RC/DCI
 count and CTA/warp mapping are explored through NVSHMEM environment settings.
 
-NVSHMEM 3.4's public device `quiet` is thread-scoped. The pool uses the pinned
-block-cooperative internal quiet so QP completion polling is distributed
-across the PoolInst CTA. The dependency is isolated in
-`pool_slice_quiet_block`.
+NVSHMEM 3.4's cooperative `quiet` scans every configured RC QP for every
+remote peer. Weighted dispatch therefore does not use it. The default
+CTA-mapped build posts one generation after all group warps have posted to the
+same ordered QP; a warp-mapped build waits its exact per-warp generation set.
+This avoids an O(peers x QPs) completion walk per data group.
+`pool_slice_quiet_block` remains only for generic unweighted return.
 
-The reader-sharded compact profile uses up to 32 PoolInst CTAs. On the matched
+The historical reader-sharded compact profile used up to 32 PoolInst CTAs. On the matched
 two-PE BF16-7168 top-k-8 sweep it measured 0.278/0.471 ms at 128/256 tokens,
 versus DeepEP V1 at 0.407/0.742 ms (32%/37% faster). At 32/64 tokens, dispatch
 polling and return sharding prefer different CTA counts, so the runtime caps
@@ -349,13 +376,13 @@ to the ordered direct-source queue path until it has a matched 2/4/8-PE run.
 
 The predecessor issued one GET per routed row. At 128 tokens/PE and 4096 BF16
 elements/row on two GH200 PEs it took 0.903--1.098 ms versus 0.474--0.476 ms
-for the dense NCCL ring reference.
+for the dense two-all-reduce NCCL ring surrogate (not NVIDIA NCCL EP).
 
 The unified route-major macro replaces tens of row RMAs with one batch per
 nonempty `(source, reader)`. Representative 50-sample results for 4096 BF16
 elements/row and one reader/PE are:
 
-| PEs | tokens/PE | pool | NCCL ring | pool/ring |
+| PEs | tokens/PE | pool | dense NCCL ring surrogate | pool/ring |
 |---:|---:|---:|---:|---:|
 | 2 | 8 | 0.113--0.116 ms | 0.289--0.291 ms | 0.39--0.40x |
 | 2 | 32 | 0.144--0.151 ms | 0.530--0.552 ms | 0.26--0.29x |
@@ -385,9 +412,10 @@ to packed-data publication, 0.111 ms to all metadata, 0.236 ms to dispatch
 payload completion, 0.337 ms to reader completion, 0.375 ms to return-payload
 completion, 0.401 ms to all return phases, and 0.428 ms through scatter.
 
-For direct streaming, `group_limit=0` derives a producer-side group ceiling from
-PoolInst CTAs and remote targets. Actual groups target about 512 KiB and at
-most 32 rows. This policy is not visible to the queue consumer.
+For direct streaming, `group_limit=0` derives a producer-side group ceiling
+from PoolInst CTAs and remote targets. Actual groups target about 256 KiB
+through four PEs and 512 KiB at eight or more PEs, with at most 32 rows. This
+policy is not visible to the queue consumer.
 
 Rejected variants include rescanning all routes per writer chunk, two-stage
 route scans, BF16 accumulation, private return-inbox staging, dense chunk
@@ -477,11 +505,12 @@ the remaining transition delay.
 
 ## Compact-metadata and 8-PE boundary (2026-07-28)
 
-Only PoolInst rank zero publishes the one metadata envelope per destination;
-payload CTAs enter the direct send/gather loop concurrently. A reverted
-CTA-sharding experiment briefly left all CTAs publishing duplicate envelopes.
-That raised the 8-PE/128-token result from 0.331--0.365 ms to 0.430 ms and was
-removed. `tests/test_pool_slice.py` now checks for the single rank-zero call.
+An earlier CTA-sharding experiment left all CTAs publishing duplicate
+envelopes. That raised the 8-PE/128-token result from 0.331--0.365 ms to
+0.430 ms and was removed. The current target-sharded policy is different:
+rank zero builds all packets, and exactly one statically selected CTA publishes
+each target packet. `tests/test_pool_slice.py` checks both the one-publisher
+mapping and the rank-zero fallback used by undersized generic assemblies.
 
 Route metadata was reduced from eight bytes to four bytes without changing
 reduction precision: the wire word is `compact_row16 | bf16_weight << 16`, and
@@ -534,3 +563,44 @@ return tail unchanged at about 0.15 ms. The existing warp-run sender and one
 merged return-closure warp remain simpler and faster. RC32 versus RC24 samples
 also tracked allocation-local metadata drift rather than a stable transport
 gain, so RC24 remains the eight-PE 128-token starting point.
+
+## Authoritative PoolInst versus NCCL-EP matrix (2026-07-30)
+
+The current retained device assembly is raw RC SGL width 8, CTA-mapped RC8,
+request batch 32, two ordered queues per source, target-sharded metadata,
+progressive destination gather, all-warp FP32 weighted reduction, and the
+two-WQE contiguous return/generation chain. Immutable launch packets and one
+bulk same-stream barrier-image restore remove the former max-rank host setup
+tail. The raw build is now a strict compile-time transport contract; its
+send-group spill is 48 B versus 120 B with runtime fallback, weighted-return
+spill is 100 B versus 136 B, and the PoolInst entry remains 24 registers,
+one barrier, 32 B shared memory, and zero spill.
+
+Jobs 876732/876733 used BF16 hidden 7168, eight experts/PE, top-8 clustered
+routing, source-preloaded input, in-place identity experts, eight warmups, and
+24 measured iterations. Timings are PoolInst internal `g_events`; NVIDIA
+NCCL-EP is the independently built low-latency commit
+`5067397c2676d5aed50042fc39e5c8ee96eb0027` and its external CUDA-event total.
+Spread and source-local 13-token exact cases also passed at every PE count.
+
+| PEs | tokens/PE | PoolInst 32 CTAs | PoolInst 64 CTAs | NCCL-EP | 64-CTA advantage |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 32 | 0.102 ms | 0.102 ms | 0.127 ms | 20% |
+| 2 | 128 | 0.164 ms | 0.146 ms | 0.302 ms | 52% |
+| 2 | 256 | 0.304 ms | 0.258 ms | 0.555 ms | 54% |
+| 4 | 32 | 0.106 ms | 0.106 ms | 0.146 ms | 27% |
+| 4 | 128 | 0.182 ms | 0.154 ms | 0.352 ms | 56% |
+| 4 | 256 | 0.319 ms | 0.274 ms | 0.629 ms | 56% |
+| 8 | 32 | 0.124 ms | 0.113 ms | 0.161 ms | 30% |
+| 8 | 128 | 0.192 ms | 0.163 ms | 0.396 ms | 59% |
+| 8 | 256 | 0.324 ms | 0.265 ms | 0.704 ms | 62% |
+
+The resource-balanced 64-CTA 256-token progression is
+0.258/0.274/0.265 ms at 2/4/8 PEs. Thus the former four-to-eight-PE regression
+is gone; eight PEs are slightly faster than four and leave 68 of 132 GH200 SMs
+for an interleaved compute/memory runtime. The large gain came primarily from
+eliminating per-rank immutable launch repacking and scalar barrier restores,
+then reusing all PoolInst warps for reduction. Wider copy ILP, coarser return
+groups, a special metadata QP, and one-lkey-per-allocation assumptions were
+neutral or negative and are not retained. Older result tables above are
+historical optimization checkpoints, not the current comparison.

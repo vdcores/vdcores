@@ -35,6 +35,21 @@ def test_fixed_one_load_core_launches():
     launcher.launch()
 
 
+def test_launch_packet_is_reused_and_core_change_invalidates_it():
+    launcher = _terminated_launcher()
+    launcher.launch()
+    packet = launcher._launch_packet
+    assert packet is not None
+
+    launcher.launch()
+    assert launcher._launch_packet is packet
+
+    launcher.set_core(0, CoreConfig.compute_memory(load_warps=1))
+    assert launcher._launch_packet is None
+    launcher.launch()
+    assert launcher._launch_packet is not packet
+
+
 def test_runtime_envelope_accepts_different_per_block_load_counts():
     launcher = _terminated_launcher(num_sms=2)
     launcher.set_core(0, CoreConfig.compute_memory(load_warps=1))

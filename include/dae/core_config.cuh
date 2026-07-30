@@ -23,8 +23,31 @@ static constexpr uint8_t daeRuntimeCommunicationWarps = 1;
 #ifndef DAE_POOL_SLICE_WARPS
 #define DAE_POOL_SLICE_WARPS 8
 #endif
+#ifndef DAE_POOL_SLICE_WARP_QP_COMPLETION
+#define DAE_POOL_SLICE_WARP_QP_COMPLETION 0
+#endif
+#ifndef DAE_POOL_SLICE_RAW_SGL
+#define DAE_POOL_SLICE_RAW_SGL 0
+#endif
+#ifndef DAE_POOL_SLICE_RAW_SGL_WIDTH
+#define DAE_POOL_SLICE_RAW_SGL_WIDTH 8
+#endif
 static constexpr uint8_t daePoolSliceWarps = DAE_POOL_SLICE_WARPS;
 static_assert(daePoolSliceWarps >= 3 && daePoolSliceWarps <= 32);
+static constexpr bool daePoolSliceWarpQpCompletion =
+    DAE_POOL_SLICE_WARP_QP_COMPLETION != 0;
+static_assert(
+    DAE_POOL_SLICE_WARP_QP_COMPLETION == 0 ||
+    DAE_POOL_SLICE_WARP_QP_COMPLETION == 1);
+static constexpr uint8_t daePoolSliceCompletionSlots =
+    daePoolSliceWarpQpCompletion ? daePoolSliceWarps : 1;
+static constexpr bool daePoolSliceRawSgl = DAE_POOL_SLICE_RAW_SGL != 0;
+static constexpr uint8_t daePoolSliceRawSglWidth =
+    DAE_POOL_SLICE_RAW_SGL_WIDTH;
+static_assert(DAE_POOL_SLICE_RAW_SGL == 0 || DAE_POOL_SLICE_RAW_SGL == 1);
+static_assert(
+    !daePoolSliceRawSgl ||
+    (daePoolSliceRawSglWidth >= 1 && daePoolSliceRawSglWidth <= 30));
 // The common heterogeneous pool envelope deliberately excludes the ordinary
 // communication interpreter. At eight warps it can alternate per block between
 // compute+memory and the currently registered PoolInst without the nine-warp
@@ -38,6 +61,10 @@ static constexpr uint8_t daeRuntimeCommunicationCoreWarps =
 #else
 static constexpr uint8_t daeRuntimeCommunicationWarps = 0;
 static constexpr uint8_t daePoolSliceWarps = 0;
+static constexpr bool daePoolSliceWarpQpCompletion = false;
+static constexpr uint8_t daePoolSliceCompletionSlots = 0;
+static constexpr bool daePoolSliceRawSgl = false;
+static constexpr uint8_t daePoolSliceRawSglWidth = 0;
 static constexpr uint8_t daeRuntimeCoreWarps = daeDefaultCoreWarps;
 static constexpr uint8_t daeRuntimeCommunicationCoreWarps =
     daeRuntimeCoreWarps;
