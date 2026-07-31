@@ -91,6 +91,34 @@ int nvshmem_module_finalize() {
 }
 #endif
 
+#ifdef DAE_ENABLE_NCCL_GIN
+cudaError_t configure_pool_gin_transport(
+    const void* host_dev_comm,
+    uint64_t window_handle,
+    uint64_t arena_base,
+    uint64_t arena_bytes,
+    uint32_t* context_count) {
+  if (host_dev_comm == nullptr || window_handle == 0 || arena_base == 0 ||
+      arena_bytes == 0 || context_count == nullptr)
+    return cudaErrorInvalidValue;
+
+  PoolGinTransportState state{};
+  state.dev_comm = *reinterpret_cast<const ncclDevComm*>(host_dev_comm);
+  state.window = reinterpret_cast<ncclWindow_t>(window_handle);
+  state.arena_base = arena_base;
+  state.arena_bytes = arena_bytes;
+  if (state.dev_comm.ginContextCount == 0)
+    return cudaErrorNotSupported;
+  *context_count = state.dev_comm.ginContextCount;
+  return cudaMemcpyToSymbol(
+      dae_pool_gin_transport_state,
+      &state,
+      sizeof(state),
+      0,
+      cudaMemcpyHostToDevice);
+}
+#endif
+
 size_t set_smem_size(size_t smem_size) {
     cudaError_t err = cudaFuncSetAttribute(
         dae2<NoPoolInstExecuteWarp, 2, 0, false, true>,
@@ -108,7 +136,7 @@ size_t set_smem_size(size_t smem_size) {
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size);
     }
-#ifdef DAE_ENABLE_NVSHMEM
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
     // Every PoolInst registry entry owns two concrete assemblies: a mixed
     // runtime envelope and a pool-only envelope.  Adding an instruction does
     // not modify dae2 or the default compute/memory assembly.
@@ -128,8 +156,10 @@ size_t set_smem_size(size_t smem_size) {
     } while (0);
     #include "dae/pool_opcode.cuh.inc"
     #undef DAE_POOL_OP
+    #ifdef DAE_ENABLE_NVSHMEM
     if (err == cudaSuccess)
         err = set_runtime_communication_smem_size(smem_size);
+    #endif
 #endif
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
@@ -137,7 +167,7 @@ size_t set_smem_size(size_t smem_size) {
     return smem_size;
 }
 
-#ifdef DAE_ENABLE_NVSHMEM
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
 template <typename PoolInstExecuteWarp>
 static cudaError_t launch_runtime_pool_inst(
     int num_sms,
@@ -318,7 +348,7 @@ cudaError_t launch_dae(
                 profile,
                 core_configs);
       } else {
-#ifdef DAE_ENABLE_NVSHMEM
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
         const cudaError_t launch_status = launch_selected_pool_inst(
             pool_inst_opcode,
             false,
@@ -343,7 +373,7 @@ cudaError_t launch_dae(
       break;
 
     case DAE_KERNEL_POOL:
-#ifdef DAE_ENABLE_NVSHMEM
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
       {
       const cudaError_t launch_status = launch_selected_pool_inst(
           pool_inst_opcode,

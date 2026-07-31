@@ -21,6 +21,12 @@ The optimized implementation has one outstanding monotonic sequence per fixed
 buffer set. It does not retain the old expert-specific transport or its
 compatibility opcodes.
 
+The queue and DynamicRead protocol is transport-independent. The default
+assembly uses NVSHMEM IBGDA; a separate compile-time NCCL GIN/GDAKI assembly
+uses the same metadata ABI and typed executors, with a raw width-eight SGL WQE
+for noncontiguous dispatch rows. See `nccl-gin-poolinst.md` for that transport
+boundary and its measured comparison.
+
 The hot ABI assumes allocator-produced contiguous rows. `PoolSliceConfig` is
 192 bytes and carries one row width rather than five equivalent strides;
 `PoolSliceReceiveBatch` is 32 bytes because expert row indices are bounded to
@@ -54,13 +60,16 @@ multi-WQE SET. Dynamically absent payload-group slots retain SET semantics;
 they cannot consume a shared unit delta without per-slot catch-up state.
 
 Streaming dispatch appends immutable 32-byte instructions behind the envelope.
-Queue zero contains `RESERVE_ROUTES`, dynamically many `COPY_ROWS`, then
-`END`; queue one contains `COPY_ROWS` and `END`. Exactly two queues are
-compiled into the protocol, so the scheduler has no queue-mode branch. A
-`COPY_ROWS` instruction carries its exact compact interval and a readiness-slot
-id, so the destination neither knows nor reconstructs the producer's group
-count. It checks at most two heads per source in parallel and advances each
-queue in order. Consuming every ordered `END` bit retires the dynamic read.
+Queue zero contains `RESERVE_ROUTES`, dynamically many `DATA`, then `END`;
+queue one contains `DATA` and `END`. Exactly two queues are compiled into the
+protocol, so the scheduler has no queue-mode branch. The wire opcode is typed
+by its compiled consumer: dispatch executes `DATA` as `DynamicRead<Copy>`,
+while combine executes locally built plans as `DynamicRead<ReduceAdd>`. A
+dispatch `DATA` instruction carries its exact compact interval and a
+readiness-slot id, so the destination neither knows nor reconstructs the
+producer's group count. It checks at most two heads per source in parallel and
+advances each queue in order. Consuming every ordered `END` bit retires the
+dispatch dynamic read.
 
 Metadata and activation data are distinct planes. The packed metadata packet
 uses one NBI put-with-signal while activations use independently signaled data
@@ -108,29 +117,37 @@ macro. No helper stream or standalone CUDA kernel participates.
 4. Coordinator lanes accept source metadata independently and publish a local
    metadata-ready generation. Payload CTAs test all source queue heads in
    parallel, claim one ready head, and execute it. `RESERVE_ROUTES` atomically
-   reserves every reader span as one macro and publishes route-ready.
-5. `COPY_ROWS` becomes executable only when route-ready and its own data slot
+   reserves every reader span as one macro. The same CTA expands the weighted
+   reverse map and builds that source's immutable `DynamicRead<ReduceAdd>`
+   plans before publishing route-ready; no activation DATA dependency is
+   consulted.
+5. Dispatch `DATA` becomes executable only when route-ready and its own data slot
    are visible. Each payload CTA claims one local reader shard and uses all
    eight compiled warps for that expert. Dense remote rows use a 256-thread
    contiguous HBM copy; arbitrary sparse maps remain warp-striped gathered
    row copies. Self rows read the authoritative token pool and acquire only
    their writer chunk. The head advances after all reader shards complete.
-6. Per-reader release adds and the final acquire-release CAS publish the
-   completed gathered writes before the queue head advances. Each
-   `END` contributes to one GPU-scope acq-rel terminal mask; acquiring the full
-   mask publishes all expert-input writes. Rank zero then releases ordinary
-   VDCores reader barriers. No expected-group counter is part of completion.
-7. Once descriptors are valid, a target immediately acknowledges return
-   completion to zero-row sources. The route-major path waits each nonempty
-   expert compute barrier and PUTs its contiguous `(reader, source)` return
-   batch. After its coordinator warp finishes the compute-barrier join, the
-   compiled weighted executor uses all eight PoolInst warps to reduce local
-   expert rows by route weight to one partial per compact token.
-   Fine source-owned reduction shards are coalesced into at most four
-   contiguous payload-coupled return groups, matching the default four RC
-   QPs. The source consumes its local partial in place, waits only the named
-   remote group generations, and sums at most one partial per pool slice into
-   token-major output.
+6. Every nonempty `(source, group, reader)` gather release-adds one exact
+   per-reader completion counter. After all metadata is accepted, one
+   coordinator lane per reader derives its expected group count from the
+   compact route words and decrements that reader's ordinary dispatch barrier
+   as soon as the count is reached. Readers therefore start independently,
+   before unrelated DATA and ordered `END` messages retire. `END` still
+   contributes to the GPU-scope terminal mask used for invocation retirement.
+   The plan publication generation covers every source-built reverse map and
+   ReduceAdd plan and is normally ready while activation DATA remains in
+   flight. Dense readers take the count-only dependency shortcut; sparse
+   readers retain the exact fine-shard scan.
+7. Dispatch and combine call one compile-time `DynamicRead` executor with
+   `Copy` and `ReduceAdd` specializations; there is no runtime transform branch
+   or union context. Each reduction CTA waits only the ordinary
+   reader-compute barriers named by its plan, rather than joining every local
+   reader. The retained scheduler gives dispatch Copy exclusive HBM priority
+   through retirement: an attempted early ReduceAdd group delayed dispatch and
+   regressed total latency. ReduceAdd is split into a small per-CTA local
+   transform and source finalizer joined by the normal `ReturnGeneration`
+   array. All eight PoolInst warps reduce the source-row shard; at most four
+   contiguous payload-coupled return groups feed token-major source scatter.
 With multiple PoolInst CTAs, rank zero remains the metadata/signal coordinator
 and builds every packet, while the first `num_pes` CTAs each publish exactly
 one target packet. All other statically assembled PoolInst CTAs alternate
@@ -148,9 +165,11 @@ is still one VDCores macro operation; no helper kernel or stream is introduced.
   put-with-signal on each nonempty warp's final run. Both avoid scanning
   unrelated peer/QP state.
 - Metadata-ready, route-ready, queue-claim, and reader barriers are GPU-scope
-  release/acquire dependencies. COPY reader completions use release reductions
-  and one acquire-release CAS; queue head advancement is release-scoped. The
-  acq-rel terminal mask chains completed queues before reader release.
+  release/acquire dependencies. Copy groups release-add exact per-reader
+  counters; the coordinator's acquire load publishes those gathered stores
+  before it decrements that reader's ordinary barrier. Queue head advancement
+  remains release-scoped, and the acq-rel terminal mask retires ordered queues
+  independently of reader release.
 - Self-target signal words use GPU-scope release stores and acquire loads.
   Remote signal words use NVSHMEM signal operations and signal fetches.
 - Dispatch and weighted-return payloads remain NBI and carry completion on
@@ -159,9 +178,10 @@ is still one VDCores macro operation; no helper kernel or stream is introduced.
 - An empty relationship still executes its ordered route reservation and
   `END`. When all of that source's queue ends retire, the target may publish
   return completion immediately.
-- Ordinary VDCores writer/reader dependencies reuse the normal countdown-barrier
-  path. Every pending local edge has one logical producer, starts at one, and
-  reaches zero through the same `atomicSub` used by existing store barriers.
+- Ordinary VDCores writer/reader dependencies reuse the normal countdown
+  barrier path. A barrier starts at its producer count and reaches zero through
+  the same `atomicSub` used by existing store barriers. Combine plans store a
+  compact mask of those barrier ids; no special pool-signal primitive exists.
 
 The implementation has no explicit system fence. The scoped atomic wrappers
 lower directly to PTX; bookkeeping-only sequence words use native CUDA
@@ -604,3 +624,37 @@ then reusing all PoolInst warps for reduction. Wider copy ILP, coarser return
 groups, a special metadata QP, and one-lkey-per-allocation assumptions were
 neutral or negative and are not retained. Older result tables above are
 historical optimization checkpoints, not the current comparison.
+
+## Early metadata and typed executor (2026-07-30)
+
+`RESERVE_ROUTES` now materializes each source's reverse map and immutable
+`DynamicRead<ReduceAdd>` plans while activation DATA is independently in
+flight. Exact per-reader DATA counters replace the former post-dispatch reader
+join. At 128 tokens/PE, internal PoolInst timestamps placed metadata closure at
+0.053 ms, plan publication at 0.055 ms, first/all reader release at
+0.082/0.084 ms, and dispatch payload retirement at 0.092 ms. Thus plan
+generation is no longer on the tail and ordinary expert blocks can start as
+soon as their own gathered input is complete.
+
+Dispatch Copy and combine ReduceAdd now enter one compile-time
+`PoolSliceDynamicReadExecutor`; specialization preserves queue-driven Copy and
+static per-CTA ReduceAdd placement without adding a device branch. ReduceAdd's
+local transform and final scatter are separate helpers joined by the existing
+per-CTA return-generation array. The PoolInst entry remains 190 registers,
+14,628 bytes shared memory, and zero entry spills. Copy and early plan building
+remain zero-spill; the raw-device local ReduceAdd helper uses 52 bytes of spill
+and its finalizer 16 bytes, versus 100 bytes for the previous monolithic helper.
+
+An actual early-execution experiment was not retained. Starting a complete
+ReduceAdd shard group at reader readiness moved first reduction to 0.087 ms but
+contended with Copy for HBM, delayed dispatch retirement to 0.116 ms, and
+regressed 128-token total latency from about 0.142 to 0.150 ms. The retained
+scheduler therefore publishes combine metadata early but executes reduction
+after dispatch retirement until real expert compute creates a natural gap.
+
+Final two-node checks used BF16 H=7168, eight experts/PE, top-8 clustered,
+64 PoolInst CTAs, four warmups, and eight measured iterations. They measured
+0.143 ms at 128 tokens/PE and 0.260 ms at 256, versus the retained predecessor's
+0.143/0.261 ms. A 13-token top-2 spread case with ordinary VDCores reader
+blocks passed exact output at 0.081 ms. This focused two-PE gate does not
+replace the authoritative 2/4/8 matrix above.

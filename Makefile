@@ -10,6 +10,10 @@ NVSHMEM_LIBRARY_DIR := $(NVSHMEM_HOME)/lib
 NVSHMEM_BUILD_DIR := build/nvshmem
 NVSHMEM_RUNTIME_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime.o
 NVSHMEM_DLINK_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime_dlink.o
+NCCL_HOME ?= $(shell $(PYTHON) -c "import sys; from pathlib import Path; print(Path(sys.prefix) / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages' / 'nvidia' / 'nccl')")
+NCCL_INCLUDE_DIR := $(NCCL_HOME)/include
+GIN_BUILD_DIR := build/gin
+GIN_RUNTIME_OBJECT := $(GIN_BUILD_DIR)/runtime.o
 DAE_POOL_SLICE_WARPS ?= 8
 # CTA-mapped RC QPs permit one ordered completion generation per PoolInst
 # payload group. Set this to 1 only for a runtime configured with warp-mapped
@@ -81,7 +85,7 @@ all: pyext
 
 # Clean build artifacts
 clean:
-	rm -rf $(APPS) $(TARGETS) build/generated $(NVSHMEM_BUILD_DIR)
+	rm -rf $(APPS) $(TARGETS) build/generated $(NVSHMEM_BUILD_DIR) $(GIN_BUILD_DIR)
 
 # Build the executable, this is wildcard rule for multiple targets
 %: app/%.cu $(TARGETS) $(HEADERS)
@@ -113,6 +117,12 @@ $(NVSHMEM_DLINK_OBJECT): $(NVSHMEM_RUNTIME_OBJECT)
 		$(NVSHMEM_RUNTIME_OBJECT) \
 		-L$(NVSHMEM_LIBRARY_DIR) -lnvshmem_device -o $@
 
+$(GIN_RUNTIME_OBJECT): src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
+	@test -f $(NCCL_INCLUDE_DIR)/nccl_device.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NCCL_GIN=1 \
+		-I$(NCCL_INCLUDE_DIR) -Xcompiler -fPIC -c -o $@ $<
+
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
 
 run: $(BIN)
@@ -138,6 +148,19 @@ nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE
 	DAE_RUNTIME_DLINK_OBJECT=$(abspath $(NVSHMEM_DLINK_OBJECT)) \
 	$(PYTHON) -m pip install -e . --no-build-isolation
 
+# Compile a PoolInst-only NCCL GIN assembly. GIN and NVSHMEM are deliberately
+# exclusive in one extension so the pool transport is selected at compile
+# time and no transport branch enters the macro operator.
+gin-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(GIN_RUNTIME_OBJECT)
+	DAE_ENABLE_NCCL_GIN=1 \
+	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
+	DAE_POOL_SLICE_WARP_QP_COMPLETION=0 \
+	DAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL) \
+	DAE_POOL_SLICE_RAW_SGL_WIDTH=$(DAE_POOL_SLICE_RAW_SGL_WIDTH) \
+	NCCL_HOME=$(NCCL_HOME) \
+	DAE_RUNTIME_OBJECT=$(abspath $(GIN_RUNTIME_OBJECT)) \
+	$(PYTHON) -m pip install -e . --no-build-isolation
+
 FORCE:
 
-.PHONY: all clean run FORCE nvshmem-pyext
+.PHONY: all clean run FORCE nvshmem-pyext gin-pyext

@@ -1,7 +1,10 @@
 #pragma once
 
-#ifndef DAE_ENABLE_NVSHMEM
-#error "poolinst.cuh requires DAE_ENABLE_NVSHMEM"
+#if !defined(DAE_ENABLE_NVSHMEM) && !defined(DAE_ENABLE_NCCL_GIN)
+#error "poolinst.cuh requires a PoolInst transport backend"
+#endif
+#if defined(DAE_ENABLE_NVSHMEM) && defined(DAE_ENABLE_NCCL_GIN)
+#error "PoolInst transport backends are compile-time exclusive"
 #endif
 
 #include "context.cuh"
@@ -16,6 +19,7 @@ struct NoPoolInstExecuteWarp {
   static constexpr int max_registers = daeWideRegisterLimit;
 };
 
+#ifdef DAE_ENABLE_NVSHMEM
 struct PoolSliceExchangeExecuteWarp {
   static constexpr uint16_t opcode = POOL_SLICE_EXCHANGE;
   static constexpr uint32_t num_warps = daePoolSliceWarps;
@@ -92,3 +96,31 @@ struct PoolSliceHostWeightedExchangeExecuteWarp {
         thread_id);
   }
 };
+#endif
+
+#ifdef DAE_ENABLE_NCCL_GIN
+struct PoolSliceGinWeightedExchangeExecuteWarp {
+  static constexpr uint16_t opcode = POOL_SLICE_GIN_WEIGHTED_EXCHANGE;
+  static constexpr uint32_t num_warps = daePoolSliceWarps;
+  static constexpr int max_registers = daeWideRegisterLimit;
+
+  static __device__ __forceinline__ void execute(
+      const PoolInst& inst,
+      int* bars,
+      uint64_t* signal_array,
+      uint64_t* g_events,
+      uint32_t physical_warps,
+      uint32_t thread_id) {
+    (void)physical_warps;
+    pool_slice_exchange<true, num_warps>(
+        reinterpret_cast<const PoolSliceConfig*>(inst.address),
+        bars,
+        signal_array,
+        g_events,
+        inst.size,
+        inst.arg0,
+        inst.arg1,
+        thread_id);
+  }
+};
+#endif

@@ -775,16 +775,22 @@ class Launcher:
             for inst in pool_instructions
             if getattr(inst, "requires_signal_array", False)
         ]
-        if (communication_instructions or pool_instructions) and not bool(
-            config.nvshmem_enabled
+        if communication_instructions and not bool(config.nvshmem_enabled):
+            raise RuntimeError(
+                "ordinary communication instructions require "
+                "`make nvshmem-pyext`"
+            )
+        if pool_instructions and not (
+            bool(config.nvshmem_enabled)
+            or bool(getattr(config, "nccl_gin_enabled", False))
         ):
             raise RuntimeError(
-                "communication and pool instructions require "
-                "`make nvshmem-pyext`"
+                "pool instructions require a compiled NVSHMEM or NCCL GIN "
+                "PoolInst backend"
             )
         if signal_requiring_instructions and self.signal_array is None:
             raise ValueError(
-                "NVSHMEM and memory-pool instructions require "
+                "communication and memory-pool instructions require "
                 "Launcher(signal_array=...)"
             )
 

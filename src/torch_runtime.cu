@@ -20,6 +20,27 @@ size_t py_set_smem_size(size_t requested_size) {
   return set_smem_size(requested_size);
 }
 
+#ifdef DAE_ENABLE_NCCL_GIN
+uint32_t py_configure_pool_gin_transport(
+    uint64_t host_dev_comm,
+    uint64_t window_handle,
+    uint64_t arena_base,
+    uint64_t arena_bytes) {
+  uint32_t context_count = 0;
+  const cudaError_t status = configure_pool_gin_transport(
+      reinterpret_cast<const void*>(host_dev_comm),
+      window_handle,
+      arena_base,
+      arena_bytes,
+      &context_count);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "configure_pool_gin_transport failed: ",
+      cudaGetErrorString(status));
+  return context_count;
+}
+#endif
+
 template <typename T>
 static inline T* check_tensor_ptr(torch::Tensor t, const char* name) {
   TORCH_CHECK(t.defined(), name, " must be defined");
@@ -474,6 +495,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Finalize NVSHMEM device state for the DAE CUDA module");
 #else
   config.attr("nvshmem_enabled") = false;
+#endif
+#ifdef DAE_ENABLE_NCCL_GIN
+  config.attr("nccl_gin_enabled") = true;
+  m.def(
+      "_configure_pool_gin_transport",
+      &py_configure_pool_gin_transport,
+      py::arg("host_dev_comm"),
+      py::arg("window_handle"),
+      py::arg("arena_base"),
+      py::arg("arena_bytes"),
+      "Install the process-local NCCL GIN device communicator and pool window");
+#else
+  config.attr("nccl_gin_enabled") = false;
 #endif
 
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");

@@ -78,8 +78,11 @@ POOL_SLICE_CONTROL_START = (
 POOL_SLICE_CONTROL_DISPATCH_READY = POOL_SLICE_CONTROL_START + 1
 POOL_SLICE_CONTROL_SCATTER_START = POOL_SLICE_CONTROL_DISPATCH_READY + 1
 POOL_SLICE_CONTROL_READER_ROW_COUNT = POOL_SLICE_CONTROL_SCATTER_START + 1
-POOL_SLICE_CONTROL_STREAM_SEND_TOTAL = (
+POOL_SLICE_CONTROL_READER_DATA_DONE = (
     POOL_SLICE_CONTROL_READER_ROW_COUNT + POOL_SLICE_MAX_LOCAL_READERS
+)
+POOL_SLICE_CONTROL_STREAM_SEND_TOTAL = (
+    POOL_SLICE_CONTROL_READER_DATA_DONE + POOL_SLICE_MAX_LOCAL_READERS
 )
 POOL_SLICE_CONTROL_STREAM_SEND_DONE = POOL_SLICE_CONTROL_STREAM_SEND_TOTAL + 1
 POOL_SLICE_CONTROL_STREAM_QUEUE_RETIRED_MASK = (
@@ -115,9 +118,17 @@ POOL_SLICE_CONTROL_RETURN_GROUP_COUNT = (
     POOL_SLICE_CONTROL_RETURN_READY
     + POOL_SLICE_MAX_PES * POOL_SLICE_MAX_RETURN_READY
 )
-POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE = (
+POOL_SLICE_CONTROL_COMBINE_FIRST_READY = (
     POOL_SLICE_CONTROL_RETURN_GROUP_COUNT
     + POOL_SLICE_MAX_PES * POOL_SLICE_RETURN_GROUPS_PER_SOURCE
+)
+POOL_SLICE_DYNAMIC_READ_PLAN_WORDS = 4
+POOL_SLICE_CONTROL_COMBINE_PLAN = (
+    POOL_SLICE_CONTROL_COMBINE_FIRST_READY + 1
+)
+POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE = (
+    POOL_SLICE_CONTROL_COMBINE_PLAN
+    + POOL_SLICE_MAX_POOL_BLOCKS * POOL_SLICE_DYNAMIC_READ_PLAN_WORDS
 )
 POOL_SLICE_CONTROL_STREAM_METADATA_SIGNAL_DELTA = (
     POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE + 1
@@ -144,6 +155,9 @@ POOL_SLICE_PROFILE_RETURN_REDUCE_START = 19
 POOL_SLICE_PROFILE_RETURN_REDUCE_DONE = 20
 POOL_SLICE_PROFILE_FIRST_RETURN_PUT = 21
 POOL_SLICE_PROFILE_RETURN_CTA_DONE = 22
+POOL_SLICE_PROFILE_PLAN_READY = 23
+POOL_SLICE_PROFILE_FIRST_READER_READY = 24
+POOL_SLICE_PROFILE_ALL_READERS_READY = 25
 
 _PUBLISH_STRUCT = struct.Struct("<Q6I8I")
 _RECEIVE_STRUCT = struct.Struct("<Q6I")
@@ -528,6 +542,9 @@ class PoolSliceBuffers:
     write_chunk_rows: int
     pool_count: int
     weighted_return: bool
+    transport: str = "nvshmem"
+    transport_arena: torch.Tensor | None = None
+    transport_owner: object | None = None
     data_plane_arena: torch.Tensor | None = None
     active_rows: int = 0
     _source: torch.Tensor | None = None
@@ -636,8 +653,29 @@ class PoolSliceBuffers:
         *,
         pool_rank: int = 0,
     ) -> PoolSliceConfig:
-        source = _symmetric_tensor(source, "source")
-        returned = _symmetric_tensor(returned, "returned")
+        if self.transport == "nvshmem":
+            source = _symmetric_tensor(source, "source")
+            returned = _symmetric_tensor(returned, "returned")
+        elif self.transport == "nccl_gin":
+            if self.transport_arena is None:
+                raise RuntimeError("GIN buffers lost their registered arena")
+            arena_begin = self.transport_arena.data_ptr()
+            arena_end = arena_begin + self.transport_arena.numel()
+            for tensor, name in ((source, "source"), (returned, "returned")):
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or not tensor.is_cuda
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(f"{name} must be a contiguous CUDA tensor")
+                begin = tensor.data_ptr()
+                end = begin + tensor.numel() * tensor.element_size()
+                if begin < arena_begin or end > arena_end:
+                    raise ValueError(
+                        f"{name} must reside in the registered NCCL GIN arena"
+                    )
+        else:
+            raise RuntimeError(f"unknown pool transport {self.transport!r}")
         if source.ndim != 2 or returned.ndim != 2:
             raise ValueError("source and returned must be rank-2 row tensors")
         if source.dtype != self.token_pool.dtype or returned.dtype != source.dtype:
@@ -863,6 +901,14 @@ class PoolSliceProgram:
             "return_signals_closed": return_signals_closed - start,
             "scatter_done": scatter_done - start,
         }
+        for name, index in (
+            ("plan_ready", POOL_SLICE_PROFILE_PLAN_READY),
+            ("first_reader_ready", POOL_SLICE_PROFILE_FIRST_READER_READY),
+            ("all_readers_ready", POOL_SLICE_PROFILE_ALL_READERS_READY),
+        ):
+            value = int(profile[index].item())
+            if value >= start:
+                result[name] = value - start
         if self.pool_blocks:
             pool_profile = self.launcher.profile.cpu().to(torch.int64)
             gather_events = pool_profile[
@@ -957,6 +1003,7 @@ def build_pool_slice_copy_program(
         Copy,
         IssueBarrier,
         PoolSliceExchange,
+        PoolSliceGinWeightedExchange,
         PoolSliceHostWeightedExchange,
         PoolSliceWeightedExchange,
         TerminateC,
@@ -1044,7 +1091,13 @@ def build_pool_slice_copy_program(
     for pool_rank in range(buffers.pool_count):
         pool_builder = launcher.builder[pool_base + pool_rank]
         pool_config_tensor = buffers.config_tensor
-        if host_data_plane:
+        if bool(getattr(_runtime_config, "nccl_gin_enabled", False)):
+            if host_data_plane or not buffers.weighted_return:
+                raise ValueError(
+                    "the GIN PoolInst assembly supports weighted device EP only"
+                )
+            pool_instruction = PoolSliceGinWeightedExchange
+        elif host_data_plane:
             pool_instruction = PoolSliceHostWeightedExchange
             pool_config_tensor = buffers._host_config_tensor
         elif buffers.weighted_return:
@@ -1386,6 +1439,9 @@ __all__ = [
     "POOL_SLICE_RAW_SGL_WIDTH",
     "POOL_SLICE_MAX_RETURN_READY",
     "POOL_SLICE_RETURN_GROUPS_PER_SOURCE",
+    "POOL_SLICE_CONTROL_COMBINE_FIRST_READY",
+    "POOL_SLICE_DYNAMIC_READ_PLAN_WORDS",
+    "POOL_SLICE_CONTROL_COMBINE_PLAN",
     "POOL_SLICE_MAX_STREAM_QUEUES",
     "POOL_SLICE_STREAM_QUEUE_DEPTH",
     "POOL_SLICE_QUEUE_ENTRY_BYTES",
@@ -1411,6 +1467,9 @@ __all__ = [
     "POOL_SLICE_PROFILE_RETURN_REDUCE_DONE",
     "POOL_SLICE_PROFILE_FIRST_RETURN_PUT",
     "POOL_SLICE_PROFILE_RETURN_CTA_DONE",
+    "POOL_SLICE_PROFILE_PLAN_READY",
+    "POOL_SLICE_PROFILE_FIRST_READER_READY",
+    "POOL_SLICE_PROFILE_ALL_READERS_READY",
     "POOL_SLICE_PROFILE_FIRST_GATHER",
     "PoolSliceStatus",
     "PoolSliceBatchFlags",

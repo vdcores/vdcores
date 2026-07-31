@@ -16,6 +16,14 @@ NVSHMEM_ENABLED = os.environ.get("DAE_ENABLE_NVSHMEM", "0").lower() in {
     "yes",
     "on",
 }
+NCCL_GIN_ENABLED = os.environ.get("DAE_ENABLE_NCCL_GIN", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+if NVSHMEM_ENABLED and NCCL_GIN_ENABLED:
+    raise RuntimeError("NVSHMEM and NCCL GIN PoolInst backends are exclusive")
 
 
 def find_nvshmem_home() -> Path:
@@ -47,6 +55,31 @@ def find_nvshmem_home() -> Path:
     )
 
 
+def find_nccl_home() -> Path:
+    candidates = []
+    if configured := os.environ.get("NCCL_HOME"):
+        candidates.append(Path(configured))
+    candidates.append(
+        Path(sys.prefix)
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / "nvidia"
+        / "nccl"
+    )
+    for candidate in candidates:
+        if (
+            (candidate / "include" / "nccl_device.h").is_file()
+            and (candidate / "lib" / "libnccl.so.2").exists()
+        ):
+            return candidate.resolve()
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise RuntimeError(
+        "DAE_ENABLE_NCCL_GIN is set, but NCCL device headers or libnccl.so.2 "
+        f"were not found. Set NCCL_HOME; searched: {searched}"
+    )
+
+
 torch_lib = Path(torch.__file__).resolve().parent / "lib"
 generated_include_dir = ROOT / "build" / "generated"
 runtime_macros = [
@@ -63,6 +96,8 @@ runtime_macros = [
 ]
 if NVSHMEM_ENABLED:
     runtime_macros.append(("DAE_ENABLE_NVSHMEM", "1"))
+if NCCL_GIN_ENABLED:
+    runtime_macros.append(("DAE_ENABLE_NCCL_GIN", "1"))
 runtime_include_dirs = [
     str(ROOT / "include"),
     str(ROOT / "include" / "dae"),
@@ -87,6 +122,15 @@ if nvshmem_home is not None:
         )
     )
     runtime_link_args.append(f"-Wl,-rpath,{nvshmem_home / 'lib'}")
+
+nccl_home = find_nccl_home() if NCCL_GIN_ENABLED else None
+if nccl_home is not None:
+    runtime_include_dirs.append(str(nccl_home / "include"))
+    runtime_library_dirs.append(str(nccl_home / "lib"))
+    # GIN device operations are header-inlined. NCCL4Py owns all host API
+    # calls and loads the pinned versioned libnccl.so.2; the VDCores extension
+    # therefore has no unversioned -lnccl link dependency.
+    runtime_link_args.append(f"-Wl,-rpath,{nccl_home / 'lib'}")
 
 extensions = [
     CUDAExtension(

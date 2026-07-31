@@ -11,6 +11,15 @@ int nvshmem_module_init();
 int nvshmem_module_finalize();
 #endif
 
+#ifdef DAE_ENABLE_NCCL_GIN
+cudaError_t configure_pool_gin_transport(
+    const void* host_dev_comm,
+    uint64_t window_handle,
+    uint64_t arena_base,
+    uint64_t arena_bytes,
+    uint32_t* context_count);
+#endif
+
 cudaError_t launch_dae(
   int numSMs,
   size_t smem_size,

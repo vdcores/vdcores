@@ -80,7 +80,7 @@ static_assert(poolSliceMaxPes * poolSliceMaxStreamQueues <= 64);
 // The first five words are user-visible telemetry. The remaining words are
 // single-writer generations and narrowly scoped counters used to coordinate
 // independently scheduled PoolInst CTAs without a device-wide fence or reset
-// race. Streaming COPY_ROWS messages name one statically scoped completion
+// race. Streaming DATA messages name one statically scoped completion
 // set, but consumers inspect only the head of each small ordered queue.
 static constexpr uint32_t poolSliceControlDispatchGeneration = 5;
 static constexpr uint32_t poolSliceControlReturnGeneration =
@@ -95,8 +95,14 @@ static constexpr uint32_t poolSliceControlScatterStart =
     poolSliceControlDispatchReady + 1;
 static constexpr uint32_t poolSliceControlReaderRowCount =
     poolSliceControlScatterStart + 1;
-static constexpr uint32_t poolSliceControlStreamSendTotal =
+// One release counter per local reader. Metadata determines the exact number
+// of nonempty DATA shards for that reader, while completed gathers add to the
+// counter independently. This lets the pool release each ordinary expert
+// barrier without joining unrelated readers or waiting for queue END.
+static constexpr uint32_t poolSliceControlReaderDataDone =
     poolSliceControlReaderRowCount + poolSliceMaxLocalReaders;
+static constexpr uint32_t poolSliceControlStreamSendTotal =
+    poolSliceControlReaderDataDone + poolSliceMaxLocalReaders;
 static constexpr uint32_t poolSliceControlStreamSendDone =
     poolSliceControlStreamSendTotal + 1;
 static constexpr uint32_t poolSliceControlStreamQueueRetiredMask =
@@ -124,12 +130,24 @@ static constexpr uint32_t poolSliceControlReturnReady =
 static constexpr uint32_t poolSliceControlReturnGroupCount =
     poolSliceControlReturnReady +
     poolSliceMaxPes * poolSliceMaxReturnReady;
+// Dispatch and combine share the dynamic-read lifecycle.  Dispatch DATA
+// entries carry remotely published route metadata, while combine metadata is
+// already present on both endpoints. Destination RESERVE_ROUTES expands the
+// reverse map and builds one shard-scoped reader mask per statically sharded
+// ReduceAdd plan while activation DATA remains independently in flight.
+static constexpr uint32_t poolSliceControlCombineFirstReady =
+    poolSliceControlReturnGroupCount +
+    poolSliceMaxPes * poolSliceReturnGroupsPerSource;
+static constexpr uint32_t poolSliceDynamicReadPlanWords = 4;
+static constexpr uint32_t poolSliceControlCombinePlan =
+    poolSliceControlCombineFirstReady + 1;
+static_assert(poolSliceControlCombinePlan % 2 == 0);
 // Every source publishes exactly one metadata envelope to every destination
 // per invocation, including an empty envelope. Remember the last source
 // sequence so its fused packet can advance one monotonic ADD generation.
 static constexpr uint32_t poolSliceControlStreamMetadataSourceSequence =
-    poolSliceControlReturnGroupCount +
-    poolSliceMaxPes * poolSliceReturnGroupsPerSource;
+    poolSliceControlCombinePlan +
+    poolSliceMaxPoolBlocks * poolSliceDynamicReadPlanWords;
 static constexpr uint32_t poolSliceControlStreamMetadataSignalDelta =
     poolSliceControlStreamMetadataSourceSequence + 1;
 static constexpr uint32_t poolSliceControlWords =
@@ -157,6 +175,9 @@ static constexpr uint32_t poolSliceProfileReturnReduceStart = 19;
 static constexpr uint32_t poolSliceProfileReturnReduceDone = 20;
 static constexpr uint32_t poolSliceProfileFirstReturnPut = 21;
 static constexpr uint32_t poolSliceProfileReturnCtaDone = 22;
+static constexpr uint32_t poolSliceProfilePlanReady = 23;
+static constexpr uint32_t poolSliceProfileFirstReaderReady = 24;
+static constexpr uint32_t poolSliceProfileAllReadersReady = 25;
 enum PoolSliceStatus : uint64_t {
   POOL_SLICE_STATUS_OK = 0,
   POOL_SLICE_STATUS_BATCH = 1,
@@ -170,13 +191,16 @@ enum PoolSliceBatchFlags : uint32_t {
 
 // Immutable instructions in each source-owned destination queue. Queue zero
 // starts with one RESERVE_ROUTES macro that consumes the 64-byte source
-// envelope. COPY_ROWS instructions are striped over exactly two queues; each
+// envelope. DATA instructions are striped over exactly two queues; each
 // queue terminates with END. Data readiness lives in separate named static-QP
 // slots so an early payload signal can never race a metadata write or an
 // independently mapped transport context.
 enum PoolSliceQueueOpcode : uint32_t {
   POOL_SLICE_QUEUE_RESERVE_ROUTES = 1,
-  POOL_SLICE_QUEUE_COPY_ROWS = 2,
+  // The queue is typed by its compiled consumer.  Dispatch instantiates
+  // DATA as Copy; combine instantiates DATA as ReduceAdd.  The wire entry
+  // therefore does not carry a runtime transform branch.
+  POOL_SLICE_QUEUE_DATA = 2,
   POOL_SLICE_QUEUE_END = 3,
 };
 
@@ -192,6 +216,39 @@ struct alignas(16) PoolSliceQueueEntry {
 static_assert(
     sizeof(PoolSliceQueueEntry) == 32,
     "PoolSliceQueueEntry ABI changed");
+
+enum PoolSliceDynamicReadPlanFlags : uint32_t {
+  POOL_SLICE_DYNAMIC_READ_PLAN_EMPTY = 0,
+  POOL_SLICE_DYNAMIC_READ_PLAN_ACTIVE = 1U << 0,
+  POOL_SLICE_DYNAMIC_READ_PLAN_ERROR = 1U << 1,
+};
+
+// The operation is selected by the assembled PoolInst type, never decoded in
+// the hot loop. Dispatch and combine therefore enter one typed dynamic-read
+// executor without adding a runtime transform branch to either path.
+enum PoolSliceDynamicReadTransform : uint32_t {
+  POOL_SLICE_DYNAMIC_READ_COPY = 0,
+  POOL_SLICE_DYNAMIC_READ_REDUCE_ADD = 1,
+};
+
+// Local immutable work derived from the already delivered dispatch metadata.
+// `dependency_mask` names ordinary VDCores reader-completion barriers relative
+// to PoolInst's compute-barrier base.  `ready_slot` names the destination
+// partial/transport group.  One plan is assigned to each PoolInst CTA, so the
+// optimized fine reduction sharding needs no second queue arbitration pass.
+struct alignas(16) PoolSliceDynamicReadPlan {
+  uint64_t sequence;
+  uint32_t source_pe;
+  uint32_t row_begin;
+  uint32_t row_end;
+  uint32_t dependency_mask;
+  uint32_t ready_slot;
+  uint32_t flags;
+};
+static_assert(
+    sizeof(PoolSliceDynamicReadPlan) ==
+        poolSliceDynamicReadPlanWords * sizeof(uint64_t),
+    "PoolSliceDynamicReadPlan ABI changed");
 
 // One descriptor is published by every source pool core to every target pool
 // slice, including targets with zero rows. Reader counts reconstruct the

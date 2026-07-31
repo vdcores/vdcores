@@ -40,31 +40,37 @@ The source metadata is stable-grouped by destination PE and local reader.
 2. Router metadata contains a sorted unique source-row list per target and a
    route-to-compact-row index per expert route. PoolInst builds one contiguous
    descriptor-plus-queues envelope per target. Queue zero is
-   `RESERVE_ROUTES, COPY_ROWS*, END`; queue one is
-   `COPY_ROWS*, END`.
+   `RESERVE_ROUTES, DATA*, END`; queue one is `DATA*, END`. The compiled
+   dispatch consumer interprets `DATA` as `DynamicRead<Copy>`.
 3. Coordinator warp 0 starts metadata publication while payload PoolInst CTAs
    issue direct row PUTs from authoritative source slots. There is no source
    activation staging and no barrier between the data and metadata planes.
-   Every `COPY_ROWS` names its exact compact interval and separate readiness
+   Every `DATA` names its exact compact interval and separate readiness
    slot. The route plane and envelope each carry their own arrival update into
    a merged per-source counter. Public payloads remain independent of metadata.
 4. Target payload CTAs inspect only queue heads, using one warp ballot for at
    most sixteen heads. `RESERVE_ROUTES` creates all `(reader, source)` spans as one macro.
+   For weighted return it also expands that source's reverse map and builds
+   source-owned ReduceAdd plans before publishing route-ready.
    A copy head waits for route-ready and its own data-ready slot; later ready
    entries remain behind their queue head. A ready COPY exposes one CTA claim
    per local reader, so two queues/source bound arbitration without limiting
    destination HBM parallelism.
 5. Target workers fan ready intervals from their source-indexed receive table
-   into expert input. Ordered `END` instructions contribute to one terminal
-   mask. The full mask, rather than a reconstructed group count, releases
-   ordinary reader blocks.
-6. After reader compute barriers retire, workers issue one contiguous NBI PUT
-   for each nonempty `(reader, source)` return range and quiet once before its
-   named return signal.
-7. A target that validates a zero-row source acknowledges its return phase
-   immediately; nonempty slices publish the merged return phase after quiet.
-   Once the source observes all phases, all PoolInst warps scatter token-major
-   partial rows to saved origins.
+   into expert input. Each nonempty group release-adds an exact per-reader
+   counter; metadata supplies the expected count, so the coordinator releases
+   each ordinary reader independently. Ordered `END` instructions still
+   contribute to the separate terminal mask that retires the invocation.
+6. Dispatch Copy and combine ReduceAdd use one compile-time typed executor.
+   Each static reduction CTA consumes its already-published plan, waits only
+   the named reader-compute barriers, reduces one source-row shard, and
+   publishes its coalesced return group with payload-coupled generation
+   ordering. The retained schedule executes ReduceAdd after dispatch because
+   overlapping both HBM-bound transforms regressed the measured total.
+7. Once the source observes the required return-group generations, all
+   PoolInst warps scatter and reduce destination partials into token-major
+   output. Combine sends no router metadata because both endpoints retained
+   the dispatch-derived compact maps.
 
 This is a dependent gathered read, not a special EP transport. Route metadata
 names which source slots each dynamic reader consumes; the shared sender set
@@ -102,7 +108,7 @@ mailboxes or fragmented allocation.
 ## Warp Roles
 
 - warp 0 on rank zero: descriptor/signal publication, lane-parallel metadata
-  polling, reader release, compute-barrier polling, and phase timestamps;
+  polling, plan publication, reader release, and phase timestamps;
 - all warps on payload CTAs: direct source PUTs, parallel queue-head
   arbitration, target-side HBM gather, and contiguous return PUTs;
 - all eight warps: final source scatter.
@@ -132,14 +138,17 @@ PoolInst executor.
 4. All dispatch RMAs are nonblocking and several PoolInst CTAs may keep
    independent QPs in flight. The current compact direct-put path uses the
    pinned block-cooperative quiet per issuing CTA.
-5. Reader completion uses an ordinary countdown barrier initialized to one.
-   The VDCores store warp waits for its writeback, decrements the barrier, and
-   return workers poll for zero before reading expert output.
-6. All return RMAs are nonblocking; a quiet precedes return-phase publication.
-7. Observing all return phases makes every source inbox range consumable before
-   scatter.
-8. Queue claim release/acquire orders consecutive local instructions, and the
-   acq-rel terminal mask publishes all queue writes before reader release.
+5. Reader completion uses ordinary countdown barriers. The VDCores store warp
+   waits for its writeback and decrements its barrier; a ReduceAdd plan polls
+   only the subset named by its dependency mask before reading expert output.
+6. Weighted return groups carry completion on their payload WQE; there is no
+   destination-wide quiet or merged return phase in this executor.
+7. Observing all required return-group generations makes every source inbox
+   range consumable before scatter.
+8. Queue claim release/acquire orders consecutive local instructions. The
+   per-reader acquire/release counter chain publishes gathered rows before
+   reader release; the acq-rel terminal mask independently retires all ordered
+   queues.
 9. Signal comparisons use `>=` and sequence-derived values. Signal words and
    the metadata-parts counter are monotonic and are not cleared between phases.
 
@@ -153,6 +162,14 @@ named NVSHMEM messages. These mechanisms are deliberately not treated as
 interchangeable.
 
 ## Transport Boundary
+
+The weighted PoolInst also has a compile-time NCCL GIN/GDAKI backend. It uses
+the same queue and typed DynamicRead executors, one registered NCCL HBM window,
+and a raw width-eight multi-SGE dispatch WQE; no runtime transport branch is
+added. Data and metadata occupy disjoint NCCL context/QP partitions, and each
+readiness update follows its precise payload on the same RC QP. See
+`agents/knowledge/runtime/nccl-gin-poolinst.md` for its setup, version pin,
+resource shape, and 4/8-PE measurements.
 
 The installed Vista NVSHMEM 3.4.5 build exposes IBGDA environment mapping but
 not application-created QP handles. The macro keeps target shards independent

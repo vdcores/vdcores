@@ -17,6 +17,9 @@ from dae.instructions import (
 from dae.pool_slice import (
     POOL_SLICE_COMPLETION_SLOTS,
     POOL_SLICE_CONFIG_BYTES,
+    POOL_SLICE_CONTROL_COMBINE_FIRST_READY,
+    POOL_SLICE_CONTROL_COMBINE_PLAN,
+    POOL_SLICE_DYNAMIC_READ_PLAN_WORDS,
     POOL_SLICE_HOST_CONFIG_BYTES,
     POOL_SLICE_MAX_DATA_GROUPS,
     POOL_SLICE_MAX_LOCAL_READERS,
@@ -428,7 +431,7 @@ def test_raw_sgl_progress_reuses_one_group_signal_and_one_reader_task():
 
     assert "pool_slice_stream_data_progress(" in source
     assert "pool_slice_stream_data_segments(" in source
-    assert "HostDataPlane, WeightedReturn, TotalWarps" in source
+    assert "pool_slice_stream_gather_rows<HostDataPlane, TotalWarps>" in source
     assert "shared_queue_message.ready_slot |" in source
     assert "shared_queue_reader << 16" in source
     assert "ready_slot_and_reader & 0xffffU" in source
@@ -502,10 +505,10 @@ def test_pool_gather_is_multi_poolinst_and_uses_generation_slots():
     )
 
 
-def test_weighted_scatter_bypasses_reduction_for_one_pool_contributor():
+def test_reduce_add_scatter_bypasses_reduction_for_one_pool_contributor():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
     scatter = source.split("pool_slice_weighted_scatter_token(", 1)[1].split(
-        "pool_slice_weighted_source_shards(", 1
+        "pool_slice_reduce_add_source_shards(", 1
     )[0]
     assert "contributor_mask = __ballot_sync(" in scatter
     assert "__popc(contributor_mask) == 1" in scatter
@@ -513,24 +516,121 @@ def test_weighted_scatter_bypasses_reduction_for_one_pool_contributor():
     assert "pool_slice_add_bf16_warp_shard(" in scatter
     assert "__hadd2(" in source
     assert "float2 sums[4][4]" not in scatter
-    weighted_return = source.split("pool_slice_return_weighted(", 1)[1].split(
-        "pool_slice_stream_publish_metadata_target(", 1
+    reduce_add = source.split(
+        "pool_slice_dynamic_read_reduce_add_local(", 1
+    )[1].split(
+        "pool_slice_dynamic_read_reduce_add_finish(", 1
     )[0]
-    weighted_grouping = source.split(
-        "pool_slice_weighted_return_groups(", 1
-    )[1].split("pool_slice_weighted_shard_range(", 1)[0]
-    assert "if (warp == transport_warp && active_shard)" in weighted_return
-    assert "transport_warp = group % TotalWarps" in weighted_return
-    assert "pool_slice_quiet_block();" not in weighted_return
-    assert "nvshmemx_putmem_nbi_warp(" in weighted_return
-    assert "nvshmem_uint64_p(" in weighted_return
-    assert "nvshmemx_putmem_signal_nbi_warp(" not in weighted_return
-    assert "pool_ibgda_put_contiguous_signal_warp(" in weighted_return
-    assert "pool_slice_weighted_source_shards(" in weighted_return
-    assert "pool_slice_weighted_return_group_count(" in weighted_return
-    assert "pool_slice_weighted_return_groups(" in weighted_return
-    assert "target_group_bytes = 256ULL * 1024" in weighted_grouping
-    assert "dae_atomic_fetch_add_acq_rel_gpu(" in weighted_return
+    reduce_add_grouping = source.split(
+        "pool_slice_reduce_add_group_count(\n"
+        "    uint32_t rows, uint32_t active_shards, uint32_t row_bytes) {",
+        1,
+    )[1].split("pool_slice_reduce_add_shard_range(\n", 1)[0]
+    assert "if (warp == transport_warp && active_shard)" in reduce_add
+    assert "transport_warp = group % TotalWarps" in reduce_add
+    assert "pool_slice_quiet_block();" not in reduce_add
+    assert "nvshmemx_putmem_nbi_warp(" in reduce_add
+    assert "nvshmem_uint64_p(" in reduce_add
+    assert "nvshmemx_putmem_signal_nbi_warp(" not in reduce_add
+    assert "pool_ibgda_put_contiguous_signal_warp(" in reduce_add
+    assert "pool_slice_reduce_add_source_shards(" in reduce_add
+    assert "pool_slice_reduce_add_return_group_count(" in reduce_add
+    assert "pool_slice_reduce_add_group_count(" in reduce_add
+    assert "target_group_bytes = 256ULL * 1024" in reduce_add_grouping
+    assert "dae_atomic_fetch_add_acq_rel_gpu(" in reduce_add
+
+
+def test_combine_is_prebuilt_dynamic_read_with_named_dependencies():
+    source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
+    abi = (ROOT / "include" / "dae" / "pool_slice_abi.cuh").read_text()
+    python = (ROOT / "python" / "dae" / "pool_slice.py").read_text()
+
+    assert POOL_SLICE_DYNAMIC_READ_PLAN_WORDS == 4
+    assert POOL_SLICE_CONTROL_COMBINE_FIRST_READY < (
+        POOL_SLICE_CONTROL_COMBINE_PLAN
+    )
+    assert "struct alignas(16) PoolSliceDynamicReadPlan" in abi
+    assert "sizeof(PoolSliceDynamicReadPlan) ==" in abi
+    assert "POOL_SLICE_QUEUE_DATA = 2" in abi
+    assert "POOL_SLICE_QUEUE_COPY_ROWS" not in abi
+    assert "POOL_SLICE_DYNAMIC_READ_PLAN_WORDS = 4" in python
+    assert "enum PoolSliceDynamicReadTransform" in abi
+    assert "POOL_SLICE_DYNAMIC_READ_COPY" in abi
+    assert "POOL_SLICE_DYNAMIC_READ_REDUCE_ADD" in abi
+    assert "struct PoolSliceDynamicReadExecutor" in source
+    assert source.count("PoolSliceDynamicReadExecutor<") >= 5
+    assert "switch (transform)" not in source
+
+    builder = source.split(
+        "pool_slice_build_reduce_add_plans_source(", 1
+    )[1].split(
+        "pool_slice_reduce_add_return_ready(", 1
+    )[0]
+    assert "uint32_t source_pe" in builder
+    assert "plan.dependency_mask" in builder
+    assert "batch.reader_counts[reader] == rows" in builder
+    assert "reader_rows[row] != UINT64_MAX" in builder
+    assert "pool_slice_dynamic_read_plan(control, pool_rank) = plan" in builder
+    assert "nvshmem" not in builder
+
+    reserve = source.split(
+        "pool_slice_stream_execute_reserve_routes(", 1
+    )[1].split("pool_slice_stream_execute_queue_control(", 1)[0]
+    assert "combine_rows[" in reserve
+    assert "route.base_row + relative" in reserve
+    assert "pool_slice_build_reduce_add_plans_source(" in reserve
+    assert reserve.index("pool_slice_build_reduce_add_plans_source(") < (
+        reserve.index("poolSliceControlStreamRouteReady + source_pe")
+    )
+    gather = source.split("pool_slice_stream_gather_rows(", 1)[1].split(
+        "pool_slice_route_weight(", 1
+    )[0]
+    assert "combine_rows" not in gather
+    assert "poolSliceControlReaderDataDone + local_reader" in gather
+    assert "dae_atomic_add_release_gpu(" in gather
+    assert "atomicOr(" not in gather
+
+    completion = source.split(
+        "control + poolSliceControlDispatchGeneration + config.pool_rank",
+        1,
+    )[1]
+    assert "pool_slice_build_reduce_add_plans" not in completion
+    coordinator = source.split(
+        "bool metadata_ready = lane >= config.num_pes", 1
+    )[1].split("const bool payload_executor", 1)[0]
+    assert "pool_slice_stream_reader_data_groups(" in coordinator
+    assert "poolSliceControlReaderDataDone + lane" in coordinator
+    assert "atomicSub(bars + dispatch_barrier_base + lane, 1);" in coordinator
+    coordinator_start = source.index(
+        "bool metadata_ready = lane >= config.num_pes"
+    )
+    assert source.index(
+        "control + poolSliceControlDispatchReady", coordinator_start
+    ) < source.index(
+        "control + poolSliceControlDispatchGeneration + config.pool_rank"
+    )
+
+    reduce_add = source.split(
+        "pool_slice_dynamic_read_reduce_add_local(", 1
+    )[1].split("pool_slice_dynamic_read_reduce_add_finish(", 1)[0]
+    assert "const uint32_t dependencies = plan.dependency_mask" in reduce_add
+    assert "dependencies & (1U << lane)" in reduce_add
+    assert "bars + compute_barrier_base + lane" in reduce_add
+    assert "lane >= config.local_readers;" not in reduce_add
+    finish = source.split(
+        "pool_slice_dynamic_read_reduce_add_finish(", 1
+    )[1].split("pool_slice_stream_publish_metadata_target(", 1)[0]
+    assert "poolSliceControlReturnGeneration" in reduce_add
+    assert "pool_slice_wait_generation_warp(" in finish
+    assert "poolSliceControlReturnGeneration" in finish
+    scheduler = source.split("const bool payload_executor", 1)[1].split(
+        "pool_slice_return_unweighted", 1
+    )[0]
+    assert "if (!payload_executor)" in scheduler
+    assert "combine_local_done" not in scheduler
+    assert scheduler.index("poolSliceControlDispatchGeneration") < (
+        scheduler.index("POOL_SLICE_DYNAMIC_READ_REDUCE_ADD")
+    )
 
 
 def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
@@ -619,7 +719,7 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "route_capacity * 4 + 15" in python
     assert "token_capacity > 1 << 16" in python
     assert "POOL_SLICE_QUEUE_RESERVE_ROUTES" in abi
-    assert "POOL_SLICE_QUEUE_COPY_ROWS" in abi
+    assert "POOL_SLICE_QUEUE_DATA" in abi
     assert "POOL_SLICE_QUEUE_END" in abi
     assert "poolSliceMaxStreamQueues = 2" in abi
     assert "PoolSliceMetadataEnvelope" in abi
@@ -627,6 +727,8 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "poolSliceControlStreamMetadataReady" in source
     assert "metadata_parts_expected" not in source
     assert "poolSliceControlStreamRouteReady" in source
+    assert "poolSliceControlReaderDataDone" in abi
+    assert "POOL_SLICE_CONTROL_READER_DATA_DONE" in python
     assert "poolSliceControlStreamMetadataIssued" not in source
     assert "poolSliceControlStreamDataReady" in source
     assert "poolSliceControlStreamQueueHead" in source

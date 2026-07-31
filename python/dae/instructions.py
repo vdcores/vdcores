@@ -1068,7 +1068,7 @@ class PoolSliceExchange(PoolInstruction):
     """
 
     requires_signal_array = True
-    wire_opcode = pool_opcode.POOL_SLICE_EXCHANGE
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_EXCHANGE", 1)
 
     def __init__(
         self,
@@ -1096,13 +1096,19 @@ class PoolSliceExchange(PoolInstruction):
 class PoolSliceWeightedExchange(PoolSliceExchange):
     """Run the same gathered-read protocol with compiled inline EP combine."""
 
-    wire_opcode = pool_opcode.POOL_SLICE_WEIGHTED_EXCHANGE
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_WEIGHTED_EXCHANGE", 2)
 
 
 class PoolSliceHostWeightedExchange(PoolSliceExchange):
     """Run weighted PoolInst with Grace verbs payload delivery only."""
 
-    wire_opcode = pool_opcode.POOL_SLICE_HOST_WEIGHTED_EXCHANGE
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_HOST_WEIGHTED_EXCHANGE", 3)
+
+
+class PoolSliceGinWeightedExchange(PoolSliceExchange):
+    """Run weighted PoolInst with the compile-time NCCL GIN transport."""
+
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_GIN_WEIGHTED_EXCHANGE", 4)
 
 
 class CC0(MemoryInstruction):
@@ -1332,6 +1338,7 @@ __all__ = [
     "PoolSliceExchange",
     "PoolSliceWeightedExchange",
     "PoolSliceHostWeightedExchange",
+    "PoolSliceGinWeightedExchange",
     "CC0",
     "RegStore",
     "RegLoad",

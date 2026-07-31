@@ -16,6 +16,7 @@ Then pull in narrower notes as needed:
 - [memory-pool-protocol.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-pool-protocol.md)
 - [vdcores-communication-core.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-communication-core.md)
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md)
+- [nccl-gin-poolinst.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/nccl-gin-poolinst.md)
 - [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md)
 - [external-ep-baselines.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/external-ep-baselines.md)
 
@@ -36,6 +37,9 @@ Then pull in narrower notes as needed:
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md):
   distributed slice ownership, strict raw-RC transport, launch-packet setup,
   batched dynamic reads, and the current 2/4/8-PE performance matrix
+- [nccl-gin-poolinst.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/nccl-gin-poolinst.md):
+  compile-time NCCL GIN transport, raw GDAKI SGL WQEs, version constraints,
+  and final 4/8-PE comparison with NVSHMEM
 - [pool-host-sgl.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-host-sgl.md):
   optional Grace coherent request ring and direct-HBM host-verbs transport
 - [external-ep-baselines.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/external-ep-baselines.md):

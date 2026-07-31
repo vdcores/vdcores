@@ -356,11 +356,26 @@ their registered execute-warp type.
   - `arg1` is the first contiguous reader-compute barrier;
   - host dispatch instantiates the matching generic or weighted execute-warp
     type and every thread enters it before ordinary VM state is allocated;
-  - it publishes router metadata, directly PUTs source rows, executes ordered
-    gathered reads, releases ordinary reader blocks, performs batched return
-    PUTs, waits merged return signals, and source-scatters the result;
+  - dispatch queue `DATA` instructions execute as `DynamicRead<Copy>`;
+  - for weighted combine, dispatch-derived route metadata is converted locally
+    by `RESERVE_ROUTES` into immutable `DynamicRead<ReduceAdd>` plans while
+    activation DATA is still in flight; every plan names its ordinary
+    compute-barrier subset and static source-row shard, so combine sends no
+    second metadata packet;
+  - Copy and ReduceAdd enter one compile-time specialized dynamic-read
+    executor; there is no transform switch in the PoolInst hot loop;
+  - exact per-reader DATA counters release ordinary dispatch barriers before
+    unrelated queue `END` instructions retire;
+  - it directly PUTs source rows, executes the typed dynamic reads, publishes
+    payload-coupled return groups, and source-scatters/reduces the result;
   - a fixed pool assembly contains no compute/memory/communication
     interpreters; a mixed assembly may run them only on other blocks.
+- `POOL_SLICE_GIN_WEIGHTED_EXCHANGE` has the same instruction fields,
+  metadata ABI, `DynamicRead<Copy>`, and `DynamicRead<ReduceAdd>` semantics as
+  the weighted operator. Its execute-warp type is present only in the
+  compile-time NCCL GIN assembly; all remotely accessed objects must be views
+  of its registered HBM window. The raw build changes dispatch WQE formation,
+  not the PoolInst dependency semantics.
 
 Generic dependency semantics are in `memory-pool-protocol.md`. The batched gathered
 read ABI, warp roles, and ordering rules are in `pool-slice-dynamic-read.md`
