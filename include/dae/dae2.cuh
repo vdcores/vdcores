@@ -18,7 +18,8 @@
 #ifdef DAE_ENABLE_NVSHMEM
 #include "pipeline/commwarp.cuh"
 #endif
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
 #include "pipeline/poolinst.cuh"
 #else
 struct NoPoolInstExecuteWarp {
@@ -135,7 +136,8 @@ void dae2(
     return;
   }
 
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
   // PoolInst has its own compile-time execute-warp type and instruction array;
   // it is never decoded by the ordinary communication warp.
   if constexpr (PoolInstExecuteWarp::num_warps != 0) {

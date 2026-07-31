@@ -136,7 +136,8 @@ size_t set_smem_size(size_t smem_size) {
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size);
     }
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
     // Every PoolInst registry entry owns two concrete assemblies: a mixed
     // runtime envelope and a pool-only envelope.  Adding an instruction does
     // not modify dae2 or the default compute/memory assembly.
@@ -167,7 +168,8 @@ size_t set_smem_size(size_t smem_size) {
     return smem_size;
 }
 
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
 template <typename PoolInstExecuteWarp>
 static cudaError_t launch_runtime_pool_inst(
     int num_sms,
@@ -267,6 +269,37 @@ static cudaError_t launch_selected_pool_inst(
 }
 #endif
 
+#ifdef DAE_ENABLE_LOCAL_POOL
+cudaError_t configure_local_pool_runtime(
+    uint64_t arena_base,
+    const uint64_t* peer_arena_bases,
+    size_t peer_count,
+    uint64_t multicast_unicast_base,
+    uint64_t multicast_partial_base) {
+  if (peer_count == 0 || peer_count > poolSliceMaxPes)
+    return cudaErrorInvalidValue;
+  uint64_t peers[poolSliceMaxPes] = {};
+  for (size_t index = 0; index < peer_count; ++index)
+    peers[index] = peer_arena_bases[index];
+  cudaError_t status = cudaMemcpyToSymbol(
+      poolLocalArenaBase, &arena_base, sizeof(arena_base));
+  if (status == cudaSuccess)
+    status = cudaMemcpyToSymbol(
+        poolLocalMulticastUnicastBase,
+        &multicast_unicast_base,
+        sizeof(multicast_unicast_base));
+  if (status == cudaSuccess)
+    status = cudaMemcpyToSymbol(
+        poolLocalPeerArenaBases, peers, sizeof(peers));
+  if (status == cudaSuccess)
+    status = cudaMemcpyToSymbol(
+        poolLocalMulticastPartialBase,
+        &multicast_partial_base,
+        sizeof(multicast_partial_base));
+  return status;
+}
+#endif
+
 cudaError_t launch_dae(
   int numSMs,
   size_t smem_size,
@@ -283,8 +316,12 @@ cudaError_t launch_dae(
   DaeKernelVariant kernel_variant,
   uint16_t pool_inst_opcode
 ) {
-  // wait for all pre-launch meta-data copying
+  // Multi-process transports historically synchronize here. Local NVLink
+  // must enqueue every GPU before any peer can make progress; stream order
+  // already protects each GPU's metadata copies.
+#ifndef DAE_ENABLE_LOCAL_POOL
   cudaDeviceSynchronize();
+#endif
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
   if (kernel_variant == DAE_KERNEL_AUTO) {
     kernel_variant = core_configs == nullptr
@@ -348,7 +385,8 @@ cudaError_t launch_dae(
                 profile,
                 core_configs);
       } else {
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
         const cudaError_t launch_status = launch_selected_pool_inst(
             pool_inst_opcode,
             false,
@@ -373,7 +411,8 @@ cudaError_t launch_dae(
       break;
 
     case DAE_KERNEL_POOL:
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
       {
       const cudaError_t launch_status = launch_selected_pool_inst(
           pool_inst_opcode,
@@ -429,7 +468,9 @@ cudaError_t launch_dae(
   }
   // TODO(zhiyuang): check launch error here?
 
+#ifndef DAE_ENABLE_LOCAL_POOL
   cudaDeviceSynchronize();
+#endif
 
   return cudaGetLastError();
 }

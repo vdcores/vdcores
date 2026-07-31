@@ -563,6 +563,7 @@ class PoolSliceBuffers:
     transport: str = "nvshmem"
     transport_arena: torch.Tensor | None = None
     transport_owner: object | None = None
+    reduction_backend: str | None = None
     data_plane_arena: torch.Tensor | None = None
     active_rows: int = 0
     _source: torch.Tensor | None = None
@@ -572,6 +573,7 @@ class PoolSliceBuffers:
     _host_peers: torch.Tensor | None = None
     _host_generations: torch.Tensor | None = None
     _host_config_tensor: torch.Tensor | None = None
+    _local_reduction_output: torch.Tensor | None = None
 
     @property
     def num_readers(self) -> int:
@@ -580,6 +582,16 @@ class PoolSliceBuffers:
     @property
     def row_bytes(self) -> int:
         return self.token_pool.shape[-1] * self.token_pool.element_size()
+
+    @property
+    def local_reduction_output(self) -> torch.Tensor:
+        """Source-owned result view for the local GB300 multicast backend."""
+
+        if self._local_reduction_output is None:
+            raise RuntimeError(
+                "a pool-owned result is available only for local multimem"
+            )
+        return self._local_reduction_output
 
     def write_routes(
         self,
@@ -691,6 +703,17 @@ class PoolSliceBuffers:
                 if begin < arena_begin or end > arena_end:
                     raise ValueError(
                         f"{name} must reside in the registered NCCL GIN arena"
+                    )
+        elif self.transport == "local":
+            for tensor, name in ((source, "source"), (returned, "returned")):
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or not tensor.is_cuda
+                    or not tensor.is_contiguous()
+                    or tensor.device != self.token_pool.device
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous on {self.token_pool.device}"
                     )
         else:
             raise RuntimeError(f"unknown pool transport {self.transport!r}")
@@ -1025,6 +1048,7 @@ def build_pool_slice_copy_program(
         PoolSliceExchange,
         PoolSliceGinWeightedExchange,
         PoolSliceHostWeightedExchange,
+        PoolSliceMultimemExchange,
         PoolSliceWeightedExchange,
         TerminateC,
         TerminateM,
@@ -1121,7 +1145,11 @@ def build_pool_slice_copy_program(
             pool_instruction = PoolSliceHostWeightedExchange
             pool_config_tensor = buffers._host_config_tensor
         elif buffers.weighted_return:
-            pool_instruction = PoolSliceWeightedExchange
+            pool_instruction = (
+                PoolSliceMultimemExchange
+                if buffers.reduction_backend == "multimem"
+                else PoolSliceWeightedExchange
+            )
         else:
             pool_instruction = PoolSliceExchange
         pool_builder.add_pool(
@@ -1409,7 +1437,7 @@ def allocate_pool_slice(
     # includes only the live queue prefix followed immediately by route words,
     # so one put-with-signal protects the complete metadata plane.
     metadata_packet_bytes = (
-        POOL_SLICE_METADATA_ENVELOPE_BYTES + route_capacity * 4 + 15
+        POOL_SLICE_METADATA_ENVELOPE_BYTES + 2 * route_capacity * 4 + 15
     ) // 16 * 16
     batch_storage_bytes = num_pes * metadata_packet_bytes
     send_batches = nvshmem.zeros(batch_storage_bytes, dtype=torch.uint8)

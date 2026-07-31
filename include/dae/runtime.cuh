@@ -20,6 +20,15 @@ cudaError_t configure_pool_gin_transport(
     uint32_t* context_count);
 #endif
 
+#ifdef DAE_ENABLE_LOCAL_POOL
+cudaError_t configure_local_pool_runtime(
+    uint64_t arena_base,
+    const uint64_t* peer_arena_bases,
+    size_t peer_count,
+    uint64_t multicast_unicast_base,
+    uint64_t multicast_partial_base);
+#endif
+
 cudaError_t launch_dae(
   int numSMs,
   size_t smem_size,

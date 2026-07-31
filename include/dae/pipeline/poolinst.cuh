@@ -1,9 +1,11 @@
 #pragma once
 
-#if !defined(DAE_ENABLE_NVSHMEM) && !defined(DAE_ENABLE_NCCL_GIN)
-#error "poolinst.cuh requires a PoolInst transport backend"
+#if !defined(DAE_ENABLE_NVSHMEM) && !defined(DAE_ENABLE_NCCL_GIN) && \
+    !defined(DAE_ENABLE_LOCAL_POOL)
+#error "poolinst.cuh requires a pool transport"
 #endif
-#if defined(DAE_ENABLE_NVSHMEM) && defined(DAE_ENABLE_NCCL_GIN)
+#if (defined(DAE_ENABLE_NVSHMEM) + defined(DAE_ENABLE_NCCL_GIN) + \
+     defined(DAE_ENABLE_LOCAL_POOL)) > 1
 #error "PoolInst transport backends are compile-time exclusive"
 #endif
 
@@ -19,7 +21,7 @@ struct NoPoolInstExecuteWarp {
   static constexpr int max_registers = daeWideRegisterLimit;
 };
 
-#ifdef DAE_ENABLE_NVSHMEM
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_LOCAL_POOL)
 struct PoolSliceExchangeExecuteWarp {
   static constexpr uint16_t opcode = POOL_SLICE_EXCHANGE;
   static constexpr uint32_t num_warps = daePoolSliceWarps;
@@ -87,6 +89,33 @@ struct PoolSliceHostWeightedExchangeExecuteWarp {
         thread_id);
   }
 };
+
+#ifdef DAE_ENABLE_LOCAL_POOL
+// The scheduler, metadata protocol, and DynamicRead command stream are shared
+// with weighted forwarding. Only ReduceAdd's worker implementation and finish
+// boundary are specialized, so the hot worker contains no backend branch.
+struct PoolSliceMultimemExchangeExecuteWarp {
+  static constexpr uint16_t opcode = POOL_SLICE_MULTIMEM_EXCHANGE;
+  static constexpr uint32_t num_warps = daePoolSliceWarps;
+  static constexpr int max_registers = daeWideRegisterLimit;
+
+  static __device__ __forceinline__ void execute(
+      const PoolInst* instructions,
+      int* bars,
+      uint64_t* signal_array,
+      uint64_t* g_events,
+      uint32_t physical_warps,
+      uint32_t thread_id) {
+    (void)physical_warps;
+    pool_slice_exchange<true, num_warps, true>(
+        instructions,
+        bars,
+        signal_array,
+        g_events,
+        thread_id);
+  }
+};
+#endif
 #endif
 
 #ifdef DAE_ENABLE_NCCL_GIN

@@ -18,7 +18,8 @@ static constexpr uint8_t daeDefaultCoreWarps =
 static constexpr int daeWideRegisterLimit = 255;
 static constexpr int daeNineWarpRegisterLimit = 168;
 
-#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
 #ifdef DAE_ENABLE_NVSHMEM
 static constexpr uint8_t daeRuntimeCommunicationWarps = 1;
 #else

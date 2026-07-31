@@ -22,8 +22,11 @@ NCCL_GIN_ENABLED = os.environ.get("DAE_ENABLE_NCCL_GIN", "0").lower() in {
     "yes",
     "on",
 }
-if NVSHMEM_ENABLED and NCCL_GIN_ENABLED:
-    raise RuntimeError("NVSHMEM and NCCL GIN PoolInst backends are exclusive")
+LOCAL_POOL_ENABLED = os.environ.get("DAE_ENABLE_LOCAL_POOL", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+if sum((NVSHMEM_ENABLED, NCCL_GIN_ENABLED, LOCAL_POOL_ENABLED)) > 1:
+    raise RuntimeError("PoolInst transport backends are compile-time exclusive")
 CUDA_ARCH = os.environ.get("DAE_CUDA_ARCH", "90a")
 POOL_DATA_PATH = os.environ.get("DAE_POOL_DATA_PATH", "nvshmem")
 
@@ -102,15 +105,25 @@ runtime_macros = [
         "DAE_POOL_SLICE_RAW_SGL_WIDTH",
         os.environ.get("DAE_POOL_SLICE_RAW_SGL_WIDTH", "8"),
     ),
+    (
+        "DAE_POOL_LOCAL_DIRECT_SCATTER",
+        os.environ.get("DAE_POOL_LOCAL_DIRECT_SCATTER", "0"),
+    ),
+    (
+        "DAE_POOL_MULTIMEM_VECTOR_ILP",
+        os.environ.get("DAE_POOL_MULTIMEM_VECTOR_ILP", "4"),
+    ),
 ]
 if NVSHMEM_ENABLED:
     runtime_macros.append(("DAE_ENABLE_NVSHMEM", "1"))
 if NCCL_GIN_ENABLED:
     runtime_macros.append(("DAE_ENABLE_NCCL_GIN", "1"))
-if POOL_DATA_PATH == "nvlink":
+if LOCAL_POOL_ENABLED:
+    runtime_macros.append(("DAE_ENABLE_LOCAL_POOL", "1"))
+if POOL_DATA_PATH in {"nvlink", "local"}:
     runtime_macros.append(("DAE_POOL_DATA_PATH_NVLINK", "1"))
 elif POOL_DATA_PATH != "nvshmem":
-    raise RuntimeError("DAE_POOL_DATA_PATH must be nvshmem or nvlink")
+    raise RuntimeError("DAE_POOL_DATA_PATH must be nvshmem, nvlink, or local")
 runtime_include_dirs = [
     str(ROOT / "include"),
     str(ROOT / "include" / "dae"),
@@ -171,6 +184,19 @@ extensions = [
         extra_link_args=runtime_link_args,
     )
 ]
+
+if CUDA_ARCH == "100a" and LOCAL_POOL_ENABLED:
+    extensions.append(
+        CUDAExtension(
+            name="dae._local_pool_runtime",
+            sources=[str(ROOT / "src" / "torch_local_pool_runtime.cpp")],
+            libraries=["cuda"],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20", "-DNDEBUG"],
+                "nvcc": [cuda_gencode(CUDA_ARCH), "-O3", "-std=c++20"],
+            },
+        )
+    )
 
 if NVSHMEM_ENABLED:
     assert nvshmem_home is not None

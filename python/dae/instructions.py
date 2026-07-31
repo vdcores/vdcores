@@ -1108,6 +1108,12 @@ class PoolSliceHostWeightedExchange(PoolSliceExchange):
     wire_opcode = getattr(pool_opcode, "POOL_SLICE_HOST_WEIGHTED_EXCHANGE", 3)
 
 
+class PoolSliceMultimemExchange(PoolSliceExchange):
+    """Run the unified scheduler-worker protocol with GB300 multimem reduce."""
+
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_MULTIMEM_EXCHANGE", 5)
+
+
 class PoolSliceGinWeightedExchange(PoolSliceExchange):
     """Run weighted PoolInst with the compile-time NCCL GIN transport."""
 
@@ -1385,6 +1391,7 @@ __all__ = [
     "PoolSliceExchange",
     "PoolSliceWeightedExchange",
     "PoolSliceHostWeightedExchange",
+    "PoolSliceMultimemExchange",
     "PoolSliceGinWeightedExchange",
     "PoolSliceDynamicReadCopy",
     "PoolSliceDynamicReadReduceAdd",

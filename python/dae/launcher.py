@@ -805,13 +805,11 @@ class Launcher:
                 "ordinary communication instructions require "
                 "`make nvshmem-pyext`"
             )
-        if pool_instructions and not (
-            bool(config.nvshmem_enabled)
-            or bool(getattr(config, "nccl_gin_enabled", False))
+        if pool_instructions and not bool(
+            getattr(config, "pool_enabled", False)
         ):
             raise RuntimeError(
-                "pool instructions require a compiled NVSHMEM or NCCL GIN "
-                "PoolInst backend"
+                "pool instructions require a compiled PoolInst backend"
             )
         if signal_requiring_instructions and self.signal_array is None:
             raise ValueError(

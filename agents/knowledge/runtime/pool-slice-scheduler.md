@@ -84,6 +84,32 @@ issue/completion front end. If that front end becomes the limit, the safe
 extension is a small compile-time number of source-sharded schedulers, each
 with exclusive ownership of its queues.
 
+### GB300 local-NVLink placement
+
+The local backend specializes the same model for NVLink ordering and GB300
+multicast. In a sufficiently large assembly, rank zero is scheduler-only and
+the remaining CTAs have disjoint metadata-publish, route-expand, remote-SEND,
+and local-pack roles. This avoids serializing route expansion behind SEND and
+does not preserve the QP-pacing placement needed by the RDMA backend. Metadata
+is published remote-first and self-last, while source payload is packed only
+once into each destination delivery segment. Dynamic Copy commands move ready
+segments to expert input while later segments are still in flight.
+
+The scheduler preposts immutable per-source ReduceAdd commands immediately
+after that source's ordered END heads retire. It does not wait for global
+dispatch closure. The STOP suffix still follows every reduction ticket, but
+the executor reads only the opcode for STOP, skips the descriptor/queue path,
+retires its ring generation, and publishes its final dispatch generation.
+These changes preserve the metadata/data separation and command interface
+while reducing plan-ready and reduction-start latency.
+
+The local multimem executor writes one BF16 partial per destination into that
+destination's physical multicast backing. The source then executes
+`multimem.red` over the multicast alias, using four independent 16-byte
+vectors per loop iteration. The forwarding ReduceAdd executor remains the
+portable command implementation and the NVSHMEM/IBGDA build retains its
+original transport path.
+
 ## Model 2: Stateful DynamicRead Workers
 
 Each worker CTA owns one or more active DynamicReads and directly scans the

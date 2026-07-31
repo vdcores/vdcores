@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <optional>
 #include <cstdint>
@@ -14,6 +15,46 @@
 #include <vector>
 
 namespace py = pybind11;
+
+#ifdef DAE_ENABLE_LOCAL_POOL
+// A single-process local-NVLink assembly launches one kernel per device from
+// independent host threads. Rendezvous after argument validation, immediately
+// before cudaLaunchKernel, so an OS wake-up delay cannot turn into a peer-side
+// protocol stall. The barrier is optional and reusable across launches.
+static std::atomic<uint32_t> local_launch_parties{0};
+static std::atomic<uint32_t> local_launch_arrivals{0};
+static std::atomic<uint32_t> local_launch_generation{0};
+
+static void py_configure_local_launch_barrier(uint32_t parties) {
+  TORCH_CHECK(parties <= 32, "local launch barrier supports at most 32 peers");
+  TORCH_CHECK(
+      local_launch_arrivals.load(std::memory_order_acquire) == 0,
+      "cannot reconfigure an active local launch barrier");
+  local_launch_parties.store(parties, std::memory_order_release);
+}
+
+static inline void local_launch_barrier_wait() {
+  const uint32_t parties = local_launch_parties.load(std::memory_order_acquire);
+  if (parties <= 1)
+    return;
+  const uint32_t generation =
+      local_launch_generation.load(std::memory_order_acquire);
+  const uint32_t position =
+      local_launch_arrivals.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (position == parties) {
+    local_launch_arrivals.store(0, std::memory_order_relaxed);
+    local_launch_generation.fetch_add(1, std::memory_order_release);
+    return;
+  }
+  while (local_launch_generation.load(std::memory_order_acquire) == generation) {
+#if defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+    asm volatile("pause" ::: "memory");
+#endif
+  }
+}
+#endif
 
 // function 1: set smem size
 size_t py_set_smem_size(size_t requested_size) {
@@ -217,6 +258,10 @@ int py_launch_dae(
       pool_inst_opcode >= 0 && pool_inst_opcode <= UINT16_MAX,
       "pool_inst_opcode must fit in uint16");
 
+#ifdef DAE_ENABLE_LOCAL_POOL
+  local_launch_barrier_wait();
+#endif
+
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, comminst, poolinst, tma,
@@ -409,7 +454,40 @@ void py_tensor_set_cache_policy(
   TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute failed: ", cudaGetErrorString(err));
 }
 
+#ifdef DAE_ENABLE_LOCAL_POOL
+void py_configure_local_pool_runtime(
+    uint64_t arena_base,
+    const std::vector<uint64_t>& peer_arena_bases,
+    uint64_t multicast_unicast_base,
+    uint64_t multicast_partial_base) {
+  const cudaError_t status = configure_local_pool_runtime(
+      arena_base,
+      peer_arena_bases.data(),
+      peer_arena_bases.size(),
+      multicast_unicast_base,
+      multicast_partial_base);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "configure_local_pool_runtime failed: ",
+      cudaGetErrorString(status));
+}
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifdef DAE_ENABLE_LOCAL_POOL
+  m.def(
+      "configure_local_launch_barrier",
+      &py_configure_local_launch_barrier,
+      py::arg("parties"),
+      "Synchronize local multi-GPU host threads immediately before launch");
+  m.def(
+      "configure_local_pool_runtime",
+      &py_configure_local_pool_runtime,
+      py::arg("arena_base"),
+      py::arg("peer_arena_bases"),
+      py::arg("multicast_unicast_base"),
+      py::arg("multicast_partial_base"));
+#endif
   auto op = m.def_submodule("opcode", "DAE2 OpCodes");
   #define DAE_OP(name, value) op.attr(#name) = (int)name;
   #include "dae/opcode.cuh.inc"
@@ -484,6 +562,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("kernel_runtime_communication") =
       static_cast<int>(DAE_KERNEL_RUNTIME_COMMUNICATION);
 #ifdef DAE_ENABLE_NVSHMEM
+  config.attr("pool_enabled") = true;
   config.attr("nvshmem_enabled") = true;
   m.def(
       "_nvshmem_module_init",
@@ -495,6 +574,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Finalize NVSHMEM device state for the DAE CUDA module");
 #else
   config.attr("nvshmem_enabled") = false;
+#ifdef DAE_ENABLE_LOCAL_POOL
+  config.attr("pool_enabled") = true;
+#else
+  config.attr("pool_enabled") = false;
+#endif
 #endif
 #ifdef DAE_ENABLE_NCCL_GIN
   config.attr("nccl_gin_enabled") = true;
@@ -541,6 +625,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("core_configs_bytes") = std::nullopt,
       py::arg("kernel_variant") = static_cast<int>(DAE_KERNEL_AUTO),
       py::arg("pool_inst_opcode") = 0,
+      py::call_guard<py::gil_scoped_release>(),
       "Launch a fixed or runtime-configurable DAE2 core assembly");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");

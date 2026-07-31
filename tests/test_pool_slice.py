@@ -736,7 +736,10 @@ def test_dynamic_reads_are_prebuilt_poolinsts_with_shared_workers():
     assert "shared->instruction" in executor
     assert "POOL_SLICE_EXECUTOR_DYNAMIC_READ_STOP" not in source
     assert "pool_slice_scheduler_publish_reduce_warp" not in source
-    assert "config.local_readers + reduce_published" in scheduler
+    assert "pool_slice_scheduler_prepost_source_reductions(" in scheduler
+    assert "shared->reductions_preposted_mask" in scheduler
+    assert "config.local_readers + source_pe +" in source
+    assert "(base + lane) * config.num_pes" in source
     assert "ReduceAdd tickets precede all STOP tickets" in scheduler
     assert "WeightedReturn && config.pool_rank == 0" in source
     assert "config.pool_rank <= executor_count" in source
