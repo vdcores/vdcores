@@ -44,6 +44,23 @@ production shape, PoolInst totals are 0.4114/0.3580/0.5183 ms, or
 0.022--0.035 ms; metadata closure and ordered queue retirement, followed by
 the weighted return at larger shapes, are the primary optimization targets.
 
+### Current matched local-NVLink matrix (2026-07-31)
+
+For 128 tokens/PE, hidden 7168, eight experts/PE, top-k 8 clustered BF16,
+10 warmups, and 30 samples, the post-rebase multimem pool measures 0.122880 ms
+on two GPUs and 0.139792 ms on three. DeepEP V1.2.1 measures 0.1389 ms on two
+(0.0996 dispatch/0.0383 combine) and 0.2628 ms on three
+(0.1716/0.0885), making the pool 11.5% and 46.8% faster.
+
+The genuine NVIDIA NCCL-EP LL same-node direct path measures 0.125424 ms on
+two GPUs (0.0780 dispatch/0.048512 combine), so the pool is 2.0% faster.
+Provenance is nccl4py 0.3.1, NCCL-EP 0.1.0, NCCL 2.30.7, expert-major layout,
+QP8, and library-auto SM/channel selection. NCCL-EP LL does not support three
+ranks; its accepted world sizes are 2, 4, or multiples of 8. Four-GPU results
+remain pending because GPU 0 was busy/unavailable under an unrelated root-owned
+workflow. Do not substitute the older dense NCCL ring surrogate for that
+missing NCCL-EP point.
+
 ## Rebased `mempool-ep` checkpoint
 
 The GB300 work is rebased on `origin/mempool-ep` commit `c573d8e`. The remote
