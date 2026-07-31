@@ -26,24 +26,31 @@ unnecessary once the cap was a kernel attribute.
 
 ## PoolInst Assembly
 
-`PoolInst` is a distinct 16-byte instruction ABI. Each entry in
-`include/dae/pool_opcode.cuh.inc` binds a wire opcode to a concrete executor
-type with:
+`PoolInst` is a distinct 16-byte instruction ABI. Slot zero is a program
+header; each entry in `include/dae/pool_opcode.cuh.inc` binds that header's
+wire opcode to a concrete executor type with:
 
 - `num_warps`: the complete physical CTA owned by the instruction;
 - `max_registers`: the compile-time kernel budget;
 - `execute(...)`: the all-warp implementation.
 
 Host dispatch selects and instantiates that executor type. Device code enters
-it before allocating the ordinary VM state and performs no PoolInst opcode
-switch. A fixed pool kernel therefore contains no compute, allocator, load,
-store, or ordinary communication interpreter. The runtime mixed kernel may
-assign other blocks in the same grid to the default VM, but all blocks retain
-the common eight-warp physical envelope.
+it before allocating ordinary VM state. Following header slots form an
+immutable, schedule-generated operation queue; the pool worker decodes one
+CTA-uniform operation opcode per claimed work item, outside the row loops. A
+fixed pool kernel therefore contains no compute, allocator, load, store, or
+ordinary communication interpreter. The runtime mixed kernel may assign other
+blocks in the same grid to the default VM, but all blocks retain the common
+eight-warp physical envelope.
 
 `PoolSliceExchangeExecuteWarp` is the first registered executor. It currently
-owns eight warps: one coordinator, configurable pack workers, and the remaining
-dynamic receive/return workers.
+owns eight warps. Its per-block stream contains one header, one
+`DynamicRead<Copy>` per local expert, and, for weighted combine, one
+`DynamicRead<ReduceAdd>` per pool plan. Read-only descriptors are replicated
+per pool block and prefetched to shared memory during invocation setup. Their
+single GPU-scope claim cursor makes them one logical per-PE instruction queue.
+The fixed queue and worker cardinalities match, so weighted combine needs one
+claim per CTA and no terminal empty-queue probe.
 
 ## Per-Block Configuration
 

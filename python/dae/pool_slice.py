@@ -133,8 +133,26 @@ POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE = (
 POOL_SLICE_CONTROL_STREAM_METADATA_SIGNAL_DELTA = (
     POOL_SLICE_CONTROL_STREAM_METADATA_SOURCE_SEQUENCE + 1
 )
-POOL_SLICE_CONTROL_WORDS = (
+POOL_SLICE_EXECUTOR_RING_DEPTH = 512
+POOL_SLICE_EXECUTOR_SLOT_WORDS = 4
+POOL_SLICE_CONTROL_EXECUTOR_INITIALIZED = (
     POOL_SLICE_CONTROL_STREAM_METADATA_SIGNAL_DELTA + 1
+)
+POOL_SLICE_CONTROL_EXECUTOR_PRODUCER = (
+    POOL_SLICE_CONTROL_EXECUTOR_INITIALIZED + 1
+)
+POOL_SLICE_CONTROL_EXECUTOR_CONSUMER = (
+    POOL_SLICE_CONTROL_EXECUTOR_PRODUCER + 1
+)
+POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE = (
+    POOL_SLICE_CONTROL_EXECUTOR_CONSUMER + 1
+)
+POOL_SLICE_CONTROL_EXECUTOR_RING = (
+    POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE + 1
+)
+POOL_SLICE_CONTROL_WORDS = (
+    POOL_SLICE_CONTROL_EXECUTOR_RING
+    + POOL_SLICE_EXECUTOR_RING_DEPTH * POOL_SLICE_EXECUTOR_SLOT_WORDS
 )
 POOL_SLICE_MAX_TMA_BYTES = (1 << 16) - 1
 POOL_SLICE_PROFILE_START = 5
@@ -1002,6 +1020,8 @@ def build_pool_slice_copy_program(
     from .instructions import (
         Copy,
         IssueBarrier,
+        PoolSliceDynamicReadCopy,
+        PoolSliceDynamicReadReduceAdd,
         PoolSliceExchange,
         PoolSliceGinWeightedExchange,
         PoolSliceHostWeightedExchange,
@@ -1112,6 +1132,24 @@ def build_pool_slice_copy_program(
                 compute_barrier_base=compute_barrier_base,
             )
         )
+        for local_reader in range(buffers.local_readers):
+            pool_builder.add_pool(
+                PoolSliceDynamicReadCopy(
+                    pool_config_tensor[pool_rank],
+                    local_reader=local_reader,
+                    write_barrier=write_barrier,
+                    dispatch_barrier_base=dispatch_barrier_base,
+                )
+            )
+        if buffers.weighted_return:
+            for plan_rank in range(buffers.pool_count):
+                pool_builder.add_pool(
+                    PoolSliceDynamicReadReduceAdd(
+                        pool_config_tensor[pool_rank],
+                        plan_rank=plan_rank,
+                        compute_barrier_base=compute_barrier_base,
+                    )
+                )
 
     hidden_size = buffers.token_pool.shape[-1]
     if not source_preloaded:
@@ -1442,6 +1480,13 @@ __all__ = [
     "POOL_SLICE_CONTROL_COMBINE_FIRST_READY",
     "POOL_SLICE_DYNAMIC_READ_PLAN_WORDS",
     "POOL_SLICE_CONTROL_COMBINE_PLAN",
+    "POOL_SLICE_EXECUTOR_RING_DEPTH",
+    "POOL_SLICE_EXECUTOR_SLOT_WORDS",
+    "POOL_SLICE_CONTROL_EXECUTOR_INITIALIZED",
+    "POOL_SLICE_CONTROL_EXECUTOR_PRODUCER",
+    "POOL_SLICE_CONTROL_EXECUTOR_CONSUMER",
+    "POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE",
+    "POOL_SLICE_CONTROL_EXECUTOR_RING",
     "POOL_SLICE_MAX_STREAM_QUEUES",
     "POOL_SLICE_STREAM_QUEUE_DEPTH",
     "POOL_SLICE_QUEUE_ENTRY_BYTES",

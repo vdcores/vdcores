@@ -26,7 +26,7 @@ struct PoolSliceExchangeExecuteWarp {
   static constexpr int max_registers = daeWideRegisterLimit;
 
   static __device__ __forceinline__ void execute(
-      const PoolInst& inst,
+      const PoolInst* instructions,
       int* bars,
       uint64_t* signal_array,
       uint64_t* g_events,
@@ -36,13 +36,10 @@ struct PoolSliceExchangeExecuteWarp {
     // Host assembly selection guarantees the PoolInst type.  There is no
     // opcode check, switch, or defensive fallback in the specialized CTA.
     pool_slice_exchange<false, num_warps>(
-        reinterpret_cast<const PoolSliceConfig*>(inst.address),
+        instructions,
         bars,
         signal_array,
         g_events,
-        inst.size,
-        inst.arg0,
-        inst.arg1,
         thread_id);
   }
 };
@@ -53,7 +50,7 @@ struct PoolSliceWeightedExchangeExecuteWarp {
   static constexpr int max_registers = daeWideRegisterLimit;
 
   static __device__ __forceinline__ void execute(
-      const PoolInst& inst,
+      const PoolInst* instructions,
       int* bars,
       uint64_t* signal_array,
       uint64_t* g_events,
@@ -61,13 +58,10 @@ struct PoolSliceWeightedExchangeExecuteWarp {
       uint32_t thread_id) {
     (void)physical_warps;
     pool_slice_exchange<true, num_warps>(
-        reinterpret_cast<const PoolSliceConfig*>(inst.address),
+        instructions,
         bars,
         signal_array,
         g_events,
-        inst.size,
-        inst.arg0,
-        inst.arg1,
         thread_id);
   }
 };
@@ -78,7 +72,7 @@ struct PoolSliceHostWeightedExchangeExecuteWarp {
   static constexpr int max_registers = daeWideRegisterLimit;
 
   static __device__ __forceinline__ void execute(
-      const PoolInst& inst,
+      const PoolInst* instructions,
       int* bars,
       uint64_t* signal_array,
       uint64_t* g_events,
@@ -86,13 +80,10 @@ struct PoolSliceHostWeightedExchangeExecuteWarp {
       uint32_t thread_id) {
     (void)physical_warps;
     pool_slice_host_weighted_exchange<num_warps>(
-        reinterpret_cast<const PoolSliceHostConfig*>(inst.address),
+        instructions,
         bars,
         signal_array,
         g_events,
-        inst.size,
-        inst.arg0,
-        inst.arg1,
         thread_id);
   }
 };
@@ -105,7 +96,7 @@ struct PoolSliceGinWeightedExchangeExecuteWarp {
   static constexpr int max_registers = daeWideRegisterLimit;
 
   static __device__ __forceinline__ void execute(
-      const PoolInst& inst,
+      const PoolInst* instructions,
       int* bars,
       uint64_t* signal_array,
       uint64_t* g_events,
@@ -113,13 +104,10 @@ struct PoolSliceGinWeightedExchangeExecuteWarp {
       uint32_t thread_id) {
     (void)physical_warps;
     pool_slice_exchange<true, num_warps>(
-        reinterpret_cast<const PoolSliceConfig*>(inst.address),
+        instructions,
         bars,
         signal_array,
         g_events,
-        inst.size,
-        inst.arg0,
-        inst.arg1,
         thread_id);
   }
 };

@@ -349,21 +349,30 @@ The registry is `include/dae/pool_opcode.cuh.inc`. Pool operators are
 their registered execute-warp type.
 
 - `POOL_SLICE_EXCHANGE` and `POOL_SLICE_WEIGHTED_EXCHANGE` are eight-warp
-  `PoolInst` variants:
+  PoolInst program headers:
   - `address` is a `PoolSliceConfig` pointer;
   - `size` is the first source-writer chunk barrier;
   - `arg0` is the first contiguous reader-dispatch barrier;
   - `arg1` is the first contiguous reader-compute barrier;
   - host dispatch instantiates the matching generic or weighted execute-warp
     type and every thread enters it before ordinary VM state is allocated;
-  - dispatch queue `DATA` instructions execute as `DynamicRead<Copy>`;
+  - following PoolInst slots contain one `DynamicRead<Copy>` for each local
+    expert (`size=local_reader`, `arg0=write barrier`, `arg1=dispatch barrier
+    base`) and, in a weighted program, one `DynamicRead<ReduceAdd>` per static
+    combine plan (`size=plan rank`, `arg0=compute barrier base`);
+  - remote dispatch queue `DATA` metadata is unchanged; the central scheduler
+    maps each ready reader/message pair to its persistent
+    `DynamicRead<Copy>` PoolInst and publishes a stateless HBM-ring job;
   - for weighted combine, dispatch-derived route metadata is converted locally
     by `RESERVE_ROUTES` into immutable `DynamicRead<ReduceAdd>` plans while
     activation DATA is still in flight; every plan names its ordinary
     compute-barrier subset and static source-row shard, so combine sends no
     second metadata packet;
-  - Copy and ReduceAdd enter one compile-time specialized dynamic-read
-    executor; there is no transform switch in the PoolInst hot loop;
+  - Copy and ReduceAdd enter the same stateless pool worker implementation.
+    Copy uses runtime-sized ring batches; after dispatch retirement the central
+    scheduler appends every immutable ReduceAdd plan and a STOP suffix to that
+    same ring. The worker decodes one CTA-uniform PoolInst opcode and calls the
+    narrow copy/reducer helper, so no row loop contains a transform branch;
   - exact per-reader DATA counters release ordinary dispatch barriers before
     unrelated queue `END` instructions retire;
   - it directly PUTs source rows, executes the typed dynamic reads, publishes

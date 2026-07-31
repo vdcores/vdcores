@@ -37,6 +37,9 @@ Then pull in narrower notes as needed:
 - [pool-slice-dynamic-read.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-dynamic-read.md):
   distributed slice ownership, strict raw-RC transport, launch-packet setup,
   batched dynamic reads, and the current 2/4/8-PE performance matrix
+- [pool-slice-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/pool-slice-scheduler.md):
+  centralized scheduler/ring and stateful-worker alternatives, ownership,
+  synchronization, and scaling limits
 - [nccl-gin-poolinst.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/nccl-gin-poolinst.md):
   compile-time NCCL GIN transport, raw GDAKI SGL WQEs, version constraints,
   and final 4/8-PE comparison with NVSHMEM

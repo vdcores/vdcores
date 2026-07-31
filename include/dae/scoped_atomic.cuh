@@ -37,6 +37,15 @@ static __device__ __forceinline__ uint64_t dae_atomic_fetch_or_acq_rel_gpu(
   return previous;
 }
 
+static __device__ __forceinline__ void dae_atomic_or_release_gpu(
+    uint64_t* address, uint64_t value) {
+  asm volatile(
+      "red.release.gpu.global.or.b64 [%0], %1;"
+      :
+      : "l"(address), "l"(value)
+      : "memory");
+}
+
 static __device__ __forceinline__ uint64_t
 dae_atomic_compare_exchange_acquire_gpu(
     uint64_t* address, uint64_t expected, uint64_t desired) {

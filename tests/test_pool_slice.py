@@ -9,6 +9,8 @@ import torch
 
 from dae.instructions import (
     PoolInstruction,
+    PoolSliceDynamicReadCopy,
+    PoolSliceDynamicReadReduceAdd,
     PoolSliceExchange,
     PoolSliceHostWeightedExchange,
     PoolSliceWeightedExchange,
@@ -19,7 +21,14 @@ from dae.pool_slice import (
     POOL_SLICE_CONFIG_BYTES,
     POOL_SLICE_CONTROL_COMBINE_FIRST_READY,
     POOL_SLICE_CONTROL_COMBINE_PLAN,
+    POOL_SLICE_CONTROL_EXECUTOR_CONSUMER,
+    POOL_SLICE_CONTROL_EXECUTOR_INITIALIZED,
+    POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE,
+    POOL_SLICE_CONTROL_EXECUTOR_PRODUCER,
+    POOL_SLICE_CONTROL_EXECUTOR_RING,
     POOL_SLICE_DYNAMIC_READ_PLAN_WORDS,
+    POOL_SLICE_EXECUTOR_RING_DEPTH,
+    POOL_SLICE_EXECUTOR_SLOT_WORDS,
     POOL_SLICE_HOST_CONFIG_BYTES,
     POOL_SLICE_MAX_DATA_GROUPS,
     POOL_SLICE_MAX_LOCAL_READERS,
@@ -256,7 +265,7 @@ def test_group_routes_supports_topk_and_explicit_zero_route_readers():
     assert empty_weights.numel() == 0
 
 
-def test_pool_slice_exchange_is_a_separate_macro_pool_instruction():
+def test_pool_slice_dynamic_reads_are_pool_instructions():
     address = 0x123456789ABCDEF0
     exchange = PoolSliceExchange(
         address,
@@ -300,6 +309,24 @@ def test_pool_slice_exchange_is_a_separate_macro_pool_instruction():
     ]
     assert isinstance(host_weighted, PoolInstruction)
     assert host_weighted.requires_signal_array
+
+    copy = PoolSliceDynamicReadCopy(
+        address,
+        local_reader=3,
+        write_barrier=7,
+        dispatch_barrier_base=11,
+    )
+    assert _fields(copy)[:4] == [0x100, 3, 7, 11]
+    assert copy.selects_pool_execute_warp is False
+
+    reduce_add = PoolSliceDynamicReadReduceAdd(
+        address,
+        plan_rank=5,
+        compute_barrier_base=19,
+    )
+    assert _fields(reduce_add)[:4] == [0x101, 5, 19, 0]
+    assert reduce_add.selects_pool_execute_warp is False
+    assert exchange.selects_pool_execute_warp is True
 
 def test_pool_slice_timing_uses_only_vdcores_internal_events():
     profile = torch.zeros((3, 128), dtype=torch.uint64)
@@ -432,8 +459,8 @@ def test_raw_sgl_progress_reuses_one_group_signal_and_one_reader_task():
     assert "pool_slice_stream_data_progress(" in source
     assert "pool_slice_stream_data_segments(" in source
     assert "pool_slice_stream_gather_rows<HostDataPlane, TotalWarps>" in source
-    assert "shared_queue_message.ready_slot |" in source
-    assert "shared_queue_reader << 16" in source
+    assert "message.ready_slot |" in source
+    assert "static_cast<uint32_t>(instruction.size) << 16" in source
     assert "ready_slot_and_reader & 0xffffU" in source
     assert "segment * poolSliceRawSglWidth" in source
     assert "reader-cta-progress" not in source
@@ -540,7 +567,7 @@ def test_reduce_add_scatter_bypasses_reduction_for_one_pool_contributor():
     assert "dae_atomic_fetch_add_acq_rel_gpu(" in reduce_add
 
 
-def test_combine_is_prebuilt_dynamic_read_with_named_dependencies():
+def test_dynamic_reads_are_prebuilt_poolinsts_with_shared_workers():
     source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
     abi = (ROOT / "include" / "dae" / "pool_slice_abi.cuh").read_text()
     python = (ROOT / "python" / "dae" / "pool_slice.py").read_text()
@@ -554,12 +581,42 @@ def test_combine_is_prebuilt_dynamic_read_with_named_dependencies():
     assert "POOL_SLICE_QUEUE_DATA = 2" in abi
     assert "POOL_SLICE_QUEUE_COPY_ROWS" not in abi
     assert "POOL_SLICE_DYNAMIC_READ_PLAN_WORDS = 4" in python
-    assert "enum PoolSliceDynamicReadTransform" in abi
+    assert "enum PoolSliceDynamicReadOpcode" in abi
     assert "POOL_SLICE_DYNAMIC_READ_COPY" in abi
     assert "POOL_SLICE_DYNAMIC_READ_REDUCE_ADD" in abi
-    assert "struct PoolSliceDynamicReadExecutor" in source
-    assert source.count("PoolSliceDynamicReadExecutor<") >= 5
+    assert "POOL_SLICE_DYNAMIC_READ_COPY = 0x100" in abi
+    assert "POOL_SLICE_DYNAMIC_READ_REDUCE_ADD = 0x101" in abi
+    assert "struct PoolSliceDynamicReadWorker" in source
+    assert source.count("PoolSliceDynamicReadWorker::") >= 3
+    assert "PoolSliceDynamicReadExecutor" not in source
+    assert "switch (instruction.opcode)" in source
+    assert "PoolSliceDynamicReadCopy" in python
+    assert "PoolSliceDynamicReadReduceAdd" in python
     assert "switch (transform)" not in source
+    assert POOL_SLICE_CONTROL_EXECUTOR_INITIALIZED > (
+        POOL_SLICE_CONTROL_COMBINE_PLAN
+    )
+    assert POOL_SLICE_CONTROL_EXECUTOR_PRODUCER == (
+        POOL_SLICE_CONTROL_EXECUTOR_INITIALIZED + 1
+    )
+    assert POOL_SLICE_CONTROL_EXECUTOR_CONSUMER == (
+        POOL_SLICE_CONTROL_EXECUTOR_PRODUCER + 1
+    )
+    assert POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE == (
+        POOL_SLICE_CONTROL_EXECUTOR_CONSUMER + 1
+    )
+    assert POOL_SLICE_CONTROL_EXECUTOR_RING == (
+        POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE + 1
+    )
+    assert POOL_SLICE_CONTROL_EXECUTOR_RING % 2 == 0
+    assert POOL_SLICE_EXECUTOR_RING_DEPTH == 512
+    assert POOL_SLICE_EXECUTOR_RING_DEPTH & (
+        POOL_SLICE_EXECUTOR_RING_DEPTH - 1
+    ) == 0
+    assert POOL_SLICE_EXECUTOR_SLOT_WORDS == 4
+    assert "struct alignas(16) PoolSliceExecutorSlot" in abi
+    assert "sizeof(PoolSliceExecutorSlot) == 32" in abi
+    assert "uint32_t message_count" in abi
 
     builder = source.split(
         "pool_slice_build_reduce_add_plans_source(", 1
@@ -596,11 +653,11 @@ def test_combine_is_prebuilt_dynamic_read_with_named_dependencies():
     )[1]
     assert "pool_slice_build_reduce_add_plans" not in completion
     coordinator = source.split(
-        "bool metadata_ready = lane >= config.num_pes", 1
-    )[1].split("const bool payload_executor", 1)[0]
+        "pool_slice_scheduler_dispatch_warp(", 1
+    )[1].split("pool_slice_executor_loop(", 1)[0]
     assert "pool_slice_stream_reader_data_groups(" in coordinator
     assert "poolSliceControlReaderDataDone + lane" in coordinator
-    assert "atomicSub(bars + dispatch_barrier_base + lane, 1);" in coordinator
+    assert "shared->bars + shared->dispatch_barrier_base + lane" in coordinator
     coordinator_start = source.index(
         "bool metadata_ready = lane >= config.num_pes"
     )
@@ -616,6 +673,8 @@ def test_combine_is_prebuilt_dynamic_read_with_named_dependencies():
     assert "const uint32_t dependencies = plan.dependency_mask" in reduce_add
     assert "dependencies & (1U << lane)" in reduce_add
     assert "bars + compute_barrier_base + lane" in reduce_add
+    assert "pool_slice_dynamic_read_plan(control, plan_rank)" in reduce_add
+    assert "poolSliceControlReturnGeneration + plan_rank" in reduce_add
     assert "lane >= config.local_readers;" not in reduce_add
     finish = source.split(
         "pool_slice_dynamic_read_reduce_add_finish(", 1
@@ -623,14 +682,64 @@ def test_combine_is_prebuilt_dynamic_read_with_named_dependencies():
     assert "poolSliceControlReturnGeneration" in reduce_add
     assert "pool_slice_wait_generation_warp(" in finish
     assert "poolSliceControlReturnGeneration" in finish
-    scheduler = source.split("const bool payload_executor", 1)[1].split(
-        "pool_slice_return_unweighted", 1
+    scheduler = source.split(
+        "pool_slice_scheduler_dispatch_warp(", 1
+    )[1].split("pool_slice_executor_loop(", 1)[0]
+    executor = source.split("pool_slice_executor_loop(", 1)[1].split(
+        "pool_slice_return_unweighted(", 1
     )[0]
-    assert "if (!payload_executor)" in scheduler
-    assert "combine_local_done" not in scheduler
-    assert scheduler.index("poolSliceControlDispatchGeneration") < (
-        scheduler.index("POOL_SLICE_DYNAMIC_READ_REDUCE_ADD")
-    )
+    assert "shared_scheduler_heads" not in executor
+    assert "shared->heads[queue_index]" in scheduler
+    assert "shared->expected[queue_index]" in scheduler
+    assert "pool_slice_executor_publish_batch_warp(" in scheduler
+    assert "config.local_readers," in source
+    assert "POOL_SLICE_EXECUTOR_DYNAMIC_READ" in source
+    assert "POOL_SLICE_EXECUTOR_RESERVE_ROUTES" not in source
+    assert "shared_direct_route_source" in source
+    assert "POOL_SLICE_EXECUTOR_SEND" in scheduler
+    assert "direct_send_count" in source
+    assert "shared_direct_send_owns_metadata" not in source
+    assert "free_worker_count" not in source
+    assert "preferred_direct_count" not in source
+    assert "worker_index < direct_send_count" in source
+    assert "candidate_group < groups" in source
+    assert "POOL_SLICE_EXECUTOR_STOP" in scheduler
+    assert "pool_slice_stream_claim_queue_head(" not in scheduler
+    assert "pool_slice_dynamic_read_finish_data_head(" not in scheduler
+    assert "poolSliceControlExecutorConsumer" in executor
+    assert "atomicAdd(" in executor
+    assert "shared->ticket += shared->ticket_stride" not in executor
+    assert "shared->phase_start" in executor
+    assert "shared->ticket_index" not in executor
+    assert "poolSliceControlExecutorPhaseSequence" in executor
+    assert "poolSliceControlExecutorPhaseBase" not in executor
+    assert "shared->direct_send_count" in scheduler
+    assert "shared->send_count" in scheduler
+    assert "pool_slice_stream_decode_send_job(" not in source
+    assert "pool_slice_executor_send_task<" in source
+    assert "initial_send_published = shared->direct_send_count" in scheduler
+    assert "message_count + static_cast<uint32_t>(route_pending)" in source
+    assert "poolSliceControlStreamMetadataSubmittedMask" not in source
+    assert "PoolSliceDynamicReadWorker::" in executor
+    assert "dae_atomic_or_release_gpu(" in executor
+    assert "pool_slice_stream_queue_head(" not in executor
+    assert "shared_dynamic_read_instructions[" in source
+    assert "dynamic_read_instructions[instruction]" in source
+    assert "shared->batch_offset < shared->batch_count" in executor
+    assert "shared->task.message_index + shared->batch_offset" in executor
+    assert "while (!pool_slice_scheduler_queue_message_ready" in executor
+    assert "pool_slice_executor_publish_routes_warp(" not in scheduler
+    assert "pool_slice_scheduler_prepost_source_reads(" in scheduler
+    assert "route_mask & ~shared->reads_preposted_mask" in scheduler
+    assert "shared->instruction" in executor
+    assert "POOL_SLICE_EXECUTOR_DYNAMIC_READ_STOP" not in source
+    assert "pool_slice_scheduler_publish_reduce_warp" not in source
+    assert "config.local_readers + reduce_published" in scheduler
+    assert "ReduceAdd tickets precede all STOP tickets" in scheduler
+    assert "WeightedReturn && config.pool_rank == 0" in source
+    assert "config.pool_rank <= executor_count" in source
+    assert "if (config.pool_count == 1)" in source
+    assert "pool_slice_executor_loop<" in source
 
 
 def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
@@ -656,17 +765,20 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "pool_slice_stream_send_group(" in source
     assert "pool_slice_stream_gather_rows(" in source
     assert "pool_slice_stream_build_queues(" in source
-    assert "pool_slice_stream_claim_queue_head(" in source
+    assert "pool_slice_scheduler_queue_message_ready(" in source
+    assert "pool_slice_scheduler_dispatch_warp(" in source
+    assert "pool_slice_executor_publish_batch_warp(" in source
+    assert "pool_slice_executor_loop(" in source
     assert "offset = base + lane" in source
-    assert "ready CTAs can steal" in source
-    assert "preferred-head branch" in source
+    assert "One rank-zero warp owns every destination queue cursor" in source
+    assert "Persistent executor CTAs dynamically claim" in source
     assert "candidate_group < groups" in source
     assert "signal_delta,\n          config.pool_rank," in source
-    assert "independent metadata/data-plane placement" in source
-    assert '"distributed-warp-ready-steal"' in (
+    assert "neither submission gates the other" in source
+    assert '"central-shared-head-executor-ring"' in (
         ROOT / "benchmarks" / "pool_slice_nccl_compare.py"
     ).read_text()
-    assert '"independent-target-major-cta-qp"' in (
+    assert '"target-major-dynamic-group-cta-stripe"' in (
         ROOT / "benchmarks" / "pool_slice_nccl_compare.py"
     ).read_text()
     assert "pool_slice_stream_drain_queue_control(" in source
@@ -734,6 +846,12 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "poolSliceControlStreamQueueHead" in source
     assert "poolSliceControlStreamQueueClaim" in source
     assert "retired & (1ULL << queue_index)" in source
+    assert "poolSliceExecutorRingDepth" in source
+    assert "ticket & (poolSliceExecutorRingDepth - 1)" in source
+    assert "ticket + poolSliceExecutorRingDepth" in source
+    assert "ticket + 1" in source
+    assert "poolSliceControlExecutorInitialized" in source
+    assert "shared_executor_initialize" in source
     assert "poolSliceControlStreamExpectedGroups" not in source
     assert "pool_slice_stream_data_ready(" in source
     assert "payload_warp" in source
@@ -755,8 +873,11 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "POOL_HOST_RING_MAX_ROWS = 512" in python
     assert "token_capacity > POOL_HOST_RING_MAX_ROWS" in python
     assert "dae_atomic_fetch_or_acq_rel_gpu(" in source
-    assert "index < 3; index += blockDim.x" in source
-    assert "index < 4; index += blockDim.x" not in source
+    scratch_reset = source.split(
+        "Only these three words are invocation-local scratch", 1
+    )[1].split("if constexpr (WeightedReturn)", 1)[0]
+    assert "index < 3; index += blockDim.x" in scratch_reset
+    assert "index < 4; index += blockDim.x" not in scratch_reset
     assert "streaming_dispatch" not in python
 
 
@@ -767,6 +888,7 @@ def test_payload_publication_separates_visibility_from_dependency_tracking():
     assert "dae_atomic_load_acquire_sys(" not in source
     assert ".sys.global" not in atomics
     assert "atom.acq_rel.gpu.global.or.b64" in atomics
+    assert "red.release.gpu.global.or.b64" in atomics
     assert "atom.acq_rel.gpu.global.add.u32" in atomics
     assert "atom.acquire.gpu.global.cas.b64" in atomics
     assert "cuda::atomic" not in source
@@ -838,7 +960,7 @@ def test_pool_inst_has_its_own_compile_time_warp_type():
     source = (ROOT / "include" / "dae" / "dae2.cuh").read_text()
     assert "typename PoolInstExecuteWarp" in source
     assert "PoolInstExecuteWarp::execute(" in source
-    assert "pool_instructions[sm_id * numPoolInsts]" in source
+    assert "pool_instructions + sm_id * numPoolInsts" in source
     assert "communicationwarp_execute(" in source
     pool_inst = (ROOT / "include" / "dae" / "pipeline" / "poolinst.cuh").read_text()
     assert "struct PoolSliceExchangeExecuteWarp" in pool_inst
@@ -849,6 +971,7 @@ def test_pool_inst_has_its_own_compile_time_warp_type():
     assert "pool_slice_host_weighted_exchange<num_warps>(" in pool_inst
     assert "(void)physical_warps;" in pool_inst
     assert "switch (inst.opcode)" not in pool_inst
+    assert "const PoolInst* instructions" in pool_inst
     registry = (ROOT / "include" / "dae" / "pool_opcode.cuh.inc").read_text()
     assert "PoolSliceExchangeExecuteWarp" in registry
     assert "PoolSliceWeightedExchangeExecuteWarp" in registry
@@ -856,3 +979,4 @@ def test_pool_inst_has_its_own_compile_time_warp_type():
     context = (ROOT / "include" / "dae" / "context.cuh").read_text()
     assert "struct alignas(16) PoolInst" in context
     assert "struct alignas(16) CommInst" in context
+    assert "numPoolInsts = 1 + 8 + 132" in context

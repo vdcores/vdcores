@@ -277,9 +277,11 @@ class Launcher:
         self.comminsts = torch.zeros(
             (num_sms, self.max_comm_insts, 16), dtype=torch.uint8
         )
-        self.poolinsts = torch.zeros(
-            (num_sms, self.max_pool_insts, 16), dtype=torch.uint8
-        )
+        # Ordinary compute/memory programs keep one inert slot per block.
+        # Expand to the compile-time PoolInst stride only when a pool program
+        # is actually assembled, so the new queue has no allocation/copy cost
+        # for existing operators.
+        self.poolinsts = torch.zeros((num_sms, 1, 16), dtype=torch.uint8)
         self.cptrs = [0 for _ in range(num_sms)]
         self.mptrs = [0 for _ in range(num_sms)]
         self.commptrs = [0 for _ in range(num_sms)]
@@ -401,8 +403,22 @@ class Launcher:
         self.core_configs[sm_id] = core
         self._launch_packet = None
 
+    def _ensure_pool_instruction_storage(self) -> None:
+        has_pool_program = any(
+            builder.poolinsts or builder.built_poolinsts
+            for builder in self.builder
+        )
+        if not has_pool_program or self.poolinsts.shape[1] == self.max_pool_insts:
+            return
+        expanded = torch.zeros(
+            (self.num_sms, self.max_pool_insts, 16), dtype=torch.uint8
+        )
+        expanded[:, : self.poolinsts.shape[1], :] = self.poolinsts
+        self.poolinsts = expanded
+
     def build_instructions(self):
         if self.need_instruction_build:
+            self._ensure_pool_instruction_storage()
             self._launch_packet = None
             for i in range(self.num_sms):
                 self.builder[i].build(
@@ -604,8 +620,11 @@ class Launcher:
         for sm_id, builder in enumerate(self.builder):
             pool_insts = builder.built_poolinsts
             comm_insts = builder.built_comminsts
-            if len(pool_insts) > 1:
-                raise ValueError("a pool core currently accepts one macro PoolInst")
+            pool_headers = [
+                inst
+                for inst in pool_insts
+                if getattr(inst, "selects_pool_execute_warp", False)
+            ]
 
             core = self.core_configs[sm_id]
             if core is None:
@@ -619,6 +638,10 @@ class Launcher:
             if core.kind == CoreKind.POOL:
                 if not pool_insts:
                     raise ValueError(f"pool core {sm_id} has no PoolInst")
+                if len(pool_headers) != 1:
+                    raise ValueError(
+                        f"pool core {sm_id} requires one program header"
+                    )
                 if comm_insts:
                     raise ValueError(
                         f"pool core {sm_id} cannot execute an ordinary CommInst stream"
@@ -638,16 +661,18 @@ class Launcher:
         return resolved
 
     def _resolve_pool_inst_opcode(self) -> int:
-        """Select the one execute-warp type assembled into this launch.
+        """Select the one pool-program execute-warp type in this launch.
 
-        Different blocks may execute the same PoolInst type, but one CUDA grid
-        cannot contain different pool execute-warp types: blockDim, registers,
-        and static shared memory are properties of the compiled kernel.
+        Operation PoolInsts do not participate in assembly selection. Different
+        blocks may execute the same program type, but one CUDA grid cannot
+        contain different execute-warp types: blockDim, registers, and static
+        shared memory are properties of the compiled kernel.
         """
         opcodes = {
             int(inst.opcode)
             for builder in self.builder
             for inst in builder.built_poolinsts
+            if getattr(inst, "selects_pool_execute_warp", False)
         }
         if not opcodes:
             return 0
@@ -823,9 +848,7 @@ class Launcher:
         comminsts = self.comminsts.to(self.device).view(
             self.num_sms * self.max_comm_insts, 16
         )
-        poolinsts = self.poolinsts.to(self.device).view(
-            self.num_sms * self.max_pool_insts, 16
-        )
+        poolinsts = self.poolinsts.to(self.device).view(-1, 16)
         if len(self.tmas) == 0:
             tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
         else:

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from dae.core import CoreConfig, CoreKind, KernelVariant, parse_kernel_variant
-from dae.instructions import PoolInstruction, PoolSliceExchange
+from dae.instructions import (
+    PoolInstruction,
+    PoolSliceDynamicReadCopy,
+    PoolSliceExchange,
+)
 from dae.launcher import Launcher, SMInstructionBuilder
 
 
@@ -69,6 +74,14 @@ def test_launcher_selects_pool_inst_execute_warp_from_registry(monkeypatch):
         compute_barrier_base=2,
     )
     launcher.builder[0].built_poolinsts.append(pool_inst)
+    launcher.builder[0].built_poolinsts.append(
+        PoolSliceDynamicReadCopy(
+            1,
+            local_reader=0,
+            write_barrier=0,
+            dispatch_barrier_base=1,
+        )
+    )
     monkeypatch.setattr(
         "dae.launcher.runtime.pool_execute_warp_types",
         {pool_inst.opcode: "PoolSliceExchangeExecuteWarp"},
@@ -84,6 +97,28 @@ def test_launcher_rejects_multiple_pool_execute_warp_types():
     launcher.builder[1].built_poolinsts.append(PoolInstruction(2))
     with pytest.raises(ValueError, match="only one PoolInst execute-warp type"):
         launcher._resolve_pool_inst_opcode()
+
+
+def test_pool_instruction_storage_expands_only_for_pool_programs():
+    launcher = object.__new__(Launcher)
+    launcher.num_sms = 2
+    launcher.max_pool_insts = 141
+    launcher.poolinsts = torch.zeros((2, 1, 16), dtype=torch.uint8)
+    launcher.builder = [SMInstructionBuilder(0), SMInstructionBuilder(1)]
+
+    launcher._ensure_pool_instruction_storage()
+    assert launcher.poolinsts.shape == (2, 1, 16)
+
+    launcher.builder[1].poolinsts.append(
+        PoolSliceDynamicReadCopy(
+            1,
+            local_reader=0,
+            write_barrier=0,
+            dispatch_barrier_base=1,
+        )
+    )
+    launcher._ensure_pool_instruction_storage()
+    assert launcher.poolinsts.shape == (2, 141, 16)
 
 
 def test_launcher_cache_window_can_be_disabled():

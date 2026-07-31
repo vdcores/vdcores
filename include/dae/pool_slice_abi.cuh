@@ -77,6 +77,12 @@ static constexpr uint32_t poolSliceMaxStreamQueues = 2;
 static constexpr uint32_t poolSliceStreamQueueDepth =
     2 + (poolSliceMaxDataGroups + 1) / 2;
 static_assert(poolSliceMaxPes * poolSliceMaxStreamQueues <= 64);
+// One scheduler warp dynamically fills this bounded local-HBM ring. The
+// maximum simultaneously active dispatch fanout is 64 heads * 8 readers, so
+// 512 slots avoid artificial backpressure while keeping the index a mask.
+static constexpr uint32_t poolSliceExecutorRingDepth = 512;
+static_assert(
+    (poolSliceExecutorRingDepth & (poolSliceExecutorRingDepth - 1)) == 0);
 // The first five words are user-visible telemetry. The remaining words are
 // single-writer generations and narrowly scoped counters used to coordinate
 // independently scheduled PoolInst CTAs without a device-wide fence or reset
@@ -150,8 +156,19 @@ static constexpr uint32_t poolSliceControlStreamMetadataSourceSequence =
     poolSliceMaxPoolBlocks * poolSliceDynamicReadPlanWords;
 static constexpr uint32_t poolSliceControlStreamMetadataSignalDelta =
     poolSliceControlStreamMetadataSourceSequence + 1;
-static constexpr uint32_t poolSliceControlWords =
+// Scheduler/executor ring state. Appending it preserves every existing
+// wire/control offset.
+static constexpr uint32_t poolSliceControlExecutorInitialized =
     poolSliceControlStreamMetadataSignalDelta + 1;
+static constexpr uint32_t poolSliceControlExecutorProducer =
+    poolSliceControlExecutorInitialized + 1;
+static constexpr uint32_t poolSliceControlExecutorConsumer =
+    poolSliceControlExecutorProducer + 1;
+static constexpr uint32_t poolSliceControlExecutorPhaseSequence =
+    poolSliceControlExecutorConsumer + 1;
+static constexpr uint32_t poolSliceControlExecutorRing =
+    poolSliceControlExecutorPhaseSequence + 1;
+static_assert(poolSliceControlExecutorRing % 2 == 0);
 static constexpr uint32_t poolSliceProfileStart = 5;
 static constexpr uint32_t poolSliceProfileGatherReady = 6;
 static constexpr uint32_t poolSliceProfileDone = 7;
@@ -223,19 +240,54 @@ enum PoolSliceDynamicReadPlanFlags : uint32_t {
   POOL_SLICE_DYNAMIC_READ_PLAN_ERROR = 1U << 1,
 };
 
-// The operation is selected by the assembled PoolInst type, never decoded in
-// the hot loop. Dispatch and combine therefore enter one typed dynamic-read
-// executor without adding a runtime transform branch to either path.
-enum PoolSliceDynamicReadTransform : uint32_t {
-  POOL_SLICE_DYNAMIC_READ_COPY = 0,
-  POOL_SLICE_DYNAMIC_READ_REDUCE_ADD = 1,
+// These are operation opcodes in the immutable PoolInst queue, distinct from
+// the small assembly-selector opcodes in pool_opcode.cuh.inc. The queue shape
+// is fixed by the LLM schedule; runtime metadata supplies only addresses,
+// ranges, and readiness.
+enum PoolSliceDynamicReadOpcode : uint16_t {
+  POOL_SLICE_DYNAMIC_READ_COPY = 0x100,
+  POOL_SLICE_DYNAMIC_READ_REDUCE_ADD = 0x101,
 };
+
+// Resolved scheduler-to-executor jobs. Queue metadata is decoded only by the
+// scheduler; executor CTAs receive the exact operation, instruction index,
+// and completion bit. Fixed route expansion executes directly on one source
+// CTA; the ring carries only SEND, DynamicRead, and termination work.
+enum PoolSliceExecutorOpcode : uint32_t {
+  POOL_SLICE_EXECUTOR_SEND = 1,
+  POOL_SLICE_EXECUTOR_DYNAMIC_READ = 2,
+  POOL_SLICE_EXECUTOR_STOP = 3,
+};
+
+struct alignas(16) PoolSliceExecutorSlot {
+  uint32_t opcode;
+  uint32_t argument;
+  uint32_t queue_index;
+  uint32_t completion_bit;
+  // The scheduler owns the queue head until completion. Executors therefore
+  // need only its immutable message index and load the original packet once
+  // into CTA shared memory instead of duplicating it in every reader job.
+  uint32_t message_index;
+  // Consecutive ready DATA messages assigned to one reader CTA. Other jobs
+  // use zero or one; batching is resolved dynamically by the scheduler.
+  uint32_t message_count;
+  // A free slot contains its producer ticket. Publication stores ticket+1;
+  // the consumer releases it as ticket+ring_depth after execution.
+  uint64_t generation;
+};
+static_assert(sizeof(PoolSliceExecutorSlot) == 32,
+              "PoolSliceExecutorSlot ABI changed");
+static constexpr uint32_t poolSliceExecutorSlotWords =
+    sizeof(PoolSliceExecutorSlot) / sizeof(uint64_t);
+static constexpr uint32_t poolSliceControlWords =
+    poolSliceControlExecutorRing +
+    poolSliceExecutorRingDepth * poolSliceExecutorSlotWords;
 
 // Local immutable work derived from the already delivered dispatch metadata.
 // `dependency_mask` names ordinary VDCores reader-completion barriers relative
 // to PoolInst's compute-barrier base.  `ready_slot` names the destination
-// partial/transport group.  One plan is assigned to each PoolInst CTA, so the
-// optimized fine reduction sharding needs no second queue arbitration pass.
+// partial/transport group. One immutable DynamicRead<ReduceAdd> PoolInst names
+// each plan; the shared worker CTAs claim those instructions dynamically.
 struct alignas(16) PoolSliceDynamicReadPlan {
   uint64_t sequence;
   uint32_t source_pe;

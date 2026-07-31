@@ -23,7 +23,8 @@ compatibility opcodes.
 
 The queue and DynamicRead protocol is transport-independent. The default
 assembly uses NVSHMEM IBGDA; a separate compile-time NCCL GIN/GDAKI assembly
-uses the same metadata ABI and typed executors, with a raw width-eight SGL WQE
+uses the same metadata ABI and shared DynamicRead worker, with a raw
+width-eight SGL WQE
 for noncontiguous dispatch rows. See `nccl-gin-poolinst.md` for that transport
 boundary and its measured comparison.
 
@@ -83,14 +84,17 @@ immutable instructions permits data to arrive before metadata without an
 overwrite race. The source-indexed signal names return visibility; group
 payload visibility is not inferred from it.
 
-## Macro Operation
+## PoolInst Program
 
-The pool program carries one gathered-read PoolInst per statically assembled
-PoolInst CTA. Host dispatch selects either `PoolSliceExchangeExecuteWarp` or
-`PoolSliceWeightedExchangeExecuteWarp`; this compile-time choice removes the
-return-mode branch from device code and sizes reverse-map, delivery-staging,
-and return-inbox storage for only that policy. `dae2` executes one all-warp
-macro. No helper stream or standalone CUDA kernel participates.
+Each pool block receives a static PoolInst stream. Slot zero is the rank-local
+program header and selects `PoolSliceExchangeExecuteWarp` or
+`PoolSliceWeightedExchangeExecuteWarp`. It is followed by one
+`DynamicRead<Copy>` per local expert and, for weighted return, one
+`DynamicRead<ReduceAdd>` per combine plan. The operation descriptors are
+replicated read-only per block for direct indexing, but all blocks share claim
+state and therefore implement one logical PE-local instruction queue. `dae2`
+executes the all-warp program; no helper stream or standalone CUDA kernel
+participates.
 
 1. Ordinary VDCores writer instructions copy source activations once into
    source-owned token slots and release one barrier per TMA-sized row chunk.
@@ -101,32 +105,36 @@ macro. No helper stream or standalone CUDA kernel participates.
    back to rank-zero warps. The current grouping policy targets about 256 KiB
    through four PEs and 512 KiB at eight or more PEs, with at most 32 rows per
    group and a producer cap.
-3. Other PoolInst CTAs issue direct row PUTs while metadata is in flight. A
-   CTA waits only for writer chunks containing its rows. The default static
-   CTA-QP policy posts one generation after every warp has posted its payload
-   WQEs; same-QP ordering makes that generation exact. A separately compiled
-   warp-QP policy couples each warp's final run to its own generation. No
-   global-QP quiet is on weighted dispatch. Metadata and data remain
-   independent and may arrive in either order.
+3. PoolInst CTAs issue direct row PUTs while metadata is in flight. Dynamic
+   groups form a flat target-major task list. The common path uses the
+   predecessor's static CTA stripe, while only groups beyond the direct worker
+   count enter the HBM ring. Metadata CTAs naturally finish their independent
+   envelope publication before their own SEND task; there is no submission
+   flag or global gate. Metadata and payload have separate buffers and arrival
+   generations, and either may arrive first. A CTA otherwise waits only for
+   writer chunks containing its rows. No global-QP quiet is on weighted
+   dispatch.
    In the optional raw-SGL assembly, selecting the compile flag is itself a
    static transport contract: one GPU-owned NIC, CTA-mapped RC QPs, registered
    symmetric GPU buffers, and no more than 32 rows per message. The allocator
    enforces the row bound; the device helper omits the public fallback and its
    duplicate lkey/rkey validation. The raw=0 assembly retains the public
    NVSHMEM implementation.
-4. Coordinator lanes accept source metadata independently and publish a local
-   metadata-ready generation. Payload CTAs test all source queue heads in
-   parallel, claim one ready head, and execute it. `RESERVE_ROUTES` atomically
-   reserves every reader span as one macro. The same CTA expands the weighted
-   reverse map and builds that source's immutable `DynamicRead<ReduceAdd>`
-   plans before publishing route-ready; no activation DATA dependency is
-   consulted.
-5. Dispatch `DATA` becomes executable only when route-ready and its own data slot
-   are visible. Each payload CTA claims one local reader shard and uses all
-   eight compiled warps for that expert. Dense remote rows use a 256-thread
-   contiguous HBM copy; arbitrary sparse maps remain warp-striped gathered
-   row copies. Self rows read the authoritative token pool and acquire only
-   their writer chunk. The head advances after all reader shards complete.
+4. One rank-zero scheduler warp accepts source metadata independently and is
+   the only owner of all queue heads, dependency masks, and retirement. One
+   fixed CTA per source executes `RESERVE_ROUTES` directly, reserves every
+   reader span, expands the weighted reverse map, and builds that source's
+   immutable `DynamicRead<ReduceAdd>` plans before publishing route-ready; no
+   activation DATA dependency is consulted. As each source becomes ready, the
+   scheduler appends its runtime-sized Copy jobs to a bounded HBM ring.
+5. Persistent executor CTAs use one native 64-bit `atomicAdd` consumer ticket
+   to claim the next ring job. Dispatch `DATA` executes only after route-ready
+   and its exact data slot are visible. Each job indexes one reader's
+   persistent `DynamicRead<Copy>` PoolInst and uses all eight compiled warps.
+   Dense remote rows use a 256-thread contiguous HBM copy; arbitrary sparse
+   maps remain warp-striped gathered row copies. Self rows read the
+   authoritative token pool and acquire only their writer chunk. Executors
+   publish per-job completion bits; only the scheduler advances heads.
 6. Every nonempty `(source, group, reader)` gather release-adds one exact
    per-reader completion counter. After all metadata is accepted, one
    coordinator lane per reader derives its expected group count from the
@@ -138,21 +146,47 @@ macro. No helper stream or standalone CUDA kernel participates.
    ReduceAdd plan and is normally ready while activation DATA remains in
    flight. Dense readers take the count-only dependency shortcut; sparse
    readers retain the exact fine-shard scan.
-7. Dispatch and combine call one compile-time `DynamicRead` executor with
-   `Copy` and `ReduceAdd` specializations; there is no runtime transform branch
-   or union context. Each reduction CTA waits only the ordinary
-   reader-compute barriers named by its plan, rather than joining every local
-   reader. The retained scheduler gives dispatch Copy exclusive HBM priority
-   through retirement: an attempted early ReduceAdd group delayed dispatch and
-   regressed total latency. ReduceAdd is split into a small per-CTA local
-   transform and source finalizer joined by the normal `ReturnGeneration`
-   array. All eight PoolInst warps reduce the source-row shard; at most four
-   contiguous payload-coupled return groups feed token-major source scatter.
-With multiple PoolInst CTAs, rank zero remains the metadata/signal coordinator
-and builds every packet, while the first `num_pes` CTAs each publish exactly
-one target packet. All other statically assembled PoolInst CTAs alternate
-outbound groups and ready destination queue heads. Every PoolInst instruction
-is still one VDCores macro operation; no helper kernel or stream is introduced.
+7. Dispatch and combine call one `PoolSliceDynamicReadWorker`. It decodes the
+   PoolInst once per work item, outside all row loops. Copy jobs are dynamically
+   batched by `(source, queue, reader)`. After Copy retirement, the scheduler
+   appends every pre-generated ReduceAdd plan to the same ring, followed by one
+   STOP per executor; rank zero then joins the executor pool. Descriptors are
+   prefetched into shared memory during initialization. Each ReduceAdd names a
+   plan and its compute-barrier base, so no second metadata transfer is needed.
+   Copy keeps exclusive HBM priority because an attempted early ReduceAdd group
+   delayed dispatch and regressed total latency. ReduceAdd is split into a
+   local transform and source finalizer joined by `ReturnGeneration`. All eight
+   PoolInst warps reduce the source-row shard; at most four contiguous
+   payload-coupled return groups feed token-major source scatter.
+With multiple PoolInst CTAs, rank zero builds every packet and its scheduler
+warp owns all local queue state. The first `num_pes` CTAs each publish exactly
+one target packet; fixed source CTAs expand routes, and executor CTAs consume
+dynamically batched SEND/Copy jobs from the shared HBM ring. Every PoolInst
+instruction is still one VDCores macro operation; no helper kernel or stream
+is introduced. Both scheduler models and their scale limits are recorded in
+`pool-slice-scheduler.md`.
+
+### DynamicRead PoolInst validation
+
+On 2026-07-30, an exact-HEAD predecessor and the shared-worker runtime were
+built with raw IBGDA SGL width 8, CTA-mapped RC QPs, 8 QPs/PE, and request batch
+32. The two-PE test used hidden 7168 BF16, eight experts/PE, top-k 8 clustered
+placement, 64 PoolInst CTAs, source-preloaded weighted identity, six warmups,
+and 16 measured iterations. Each result below is the mean of an A/B order-pair
+from the same allocation, using the exact internal `scatter_done` median:
+
+| tokens/PE | predecessor | DynamicRead PoolInst | change |
+|---:|---:|---:|---:|
+| 32 | 0.103688 ms | 0.100848 ms | -2.74% |
+| 128 | 0.144864 ms | 0.144016 ms | -0.59% |
+| 256 | 0.258288 ms | 0.257992 ms | -0.11% |
+
+The same build passed 39 focused CPU/GPU tests and a sparse one-PE weighted
+exactness case. Its weighted entry uses 190 registers, 16 barriers, 14,612
+bytes shared memory, and no entry spills. The streaming helper spills 228 bytes
+versus 252 in the predecessor. This bracket is the regression gate for the
+PoolInst queue conversion; it is not directly comparable to the older
+multi-PE baseline table below, which used a different pool-block allocation.
 
 ## Scoped Ordering
 
@@ -212,13 +246,14 @@ Target PoolInst workers resolve that map locally and gather rows into
 the network transfer; fanout costs destination HBM bandwidth rather than
 repeated RDMA messages. The compact list is source-row sorted.
 
-The static runtime may assemble up to 132 PoolInst CTAs. Rank zero owns metadata
-publication, signal polling, and final dependency release. Other ranks issue
-outbound data and consume inbound queue heads; each ready COPY exposes one
-claim per local reader. Up to two queues per source bound the arbitration
-footprint without limiting HBM gather parallelism. Remote visibility remains
-exclusively in payload-coupled NVSHMEM signals; queue synchronization is
-GPU-local.
+The static runtime may assemble up to 132 PoolInst CTAs. Rank zero owns queue
+heads, metadata acceptance, and final dependency release. Other ranks publish
+metadata, issue outbound data, expand one source's routes, or dynamically
+consume stateless SEND/Copy jobs. Up to two queues per source bound the
+scheduler's shared-memory state without limiting HBM gather parallelism.
+Remote visibility remains exclusively in payload-coupled NVSHMEM signals;
+ring publication and queue synchronization are GPU-local release/acquire
+operations.
 
 The compiled `POOL_SLICE_WEIGHTED_EXCHANGE` path uses source-owned CTA
 sharding, FP32 ILP4 destination accumulation, one partial token row per
@@ -636,14 +671,12 @@ join. At 128 tokens/PE, internal PoolInst timestamps placed metadata closure at
 generation is no longer on the tail and ordinary expert blocks can start as
 soon as their own gathered input is complete.
 
-Dispatch Copy and combine ReduceAdd now enter one compile-time
-`PoolSliceDynamicReadExecutor`; specialization preserves queue-driven Copy and
-static per-CTA ReduceAdd placement without adding a device branch. ReduceAdd's
-local transform and final scatter are separate helpers joined by the existing
-per-CTA return-generation array. The PoolInst entry remains 190 registers,
-14,628 bytes shared memory, and zero entry spills. Copy and early plan building
-remain zero-spill; the raw-device local ReduceAdd helper uses 52 bytes of spill
-and its finalizer 16 bytes, versus 100 bytes for the previous monolithic helper.
+This section records the predecessor measured on that date. The current code
+replaces its compile-time specializations/static CTA placement with explicit
+PoolInst operations and a shared worker scheduler; use the newest validation
+section below for current resource and latency results. ReduceAdd's local
+transform and final scatter remain separate helpers joined by the existing
+per-plan return-generation array.
 
 An actual early-execution experiment was not retained. Starting a complete
 ReduceAdd shard group at reader readiness moved first reduction to 0.087 ms but

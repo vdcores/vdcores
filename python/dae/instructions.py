@@ -458,15 +458,17 @@ class CommunicationInstruction(Instruction):
 
 
 class PoolInstruction(Instruction):
-    """A 16-byte instruction consumed by its compiled execute-warp type.
+    """A 16-byte instruction consumed by a compiled multi-warp pool core.
 
-    Pool instructions share only a wire layout.  They are not a bytecode
-    stream: the launcher's opcode selects a precompiled VDCores assembly, and
-    that assembly calls the matching multi-warp executor directly.
+    Slot zero selects the precompiled VDCores assembly. The remaining
+    instructions form that assembly's immutable operation queue.
     """
 
     requires_pool_core = True
     requires_signal_array = True
+    # A bare PoolInstruction remains an assembly header. Operation subclasses
+    # opt out explicitly so existing custom pool executors keep their API.
+    selects_pool_execute_warp = True
 
     def __init__(
         self,
@@ -1060,14 +1062,15 @@ class MemoryPoolRun(CommunicationInstruction):
 
 
 class PoolSliceExchange(PoolInstruction):
-    """Run the batched dependent-read/return loop as one PoolInst.
+    """Configure a pool-slice PoolInst program.
 
-    The selected specialized runtime gives the complete pool CTA to
-    ``PoolSliceExchangeExecuteWarp`` until the write/read/return dependency
-    chain retires.  It never enters the ordinary communication interpreter.
+    This first stream entry selects the specialized runtime and carries its
+    rank-local configuration. DynamicRead operations follow it in the same
+    PoolInst stream.
     """
 
     requires_signal_array = True
+    selects_pool_execute_warp = True
     wire_opcode = getattr(pool_opcode, "POOL_SLICE_EXCHANGE", 1)
 
     def __init__(
@@ -1109,6 +1112,50 @@ class PoolSliceGinWeightedExchange(PoolSliceExchange):
     """Run weighted PoolInst with the compile-time NCCL GIN transport."""
 
     wire_opcode = getattr(pool_opcode, "POOL_SLICE_GIN_WEIGHTED_EXCHANGE", 4)
+
+
+class PoolSliceDynamicReadCopy(PoolInstruction):
+    """Persistent per-expert gathered read in a pool-slice instruction queue."""
+
+    wire_opcode = 0x100
+    selects_pool_execute_warp = False
+
+    def __init__(
+        self,
+        config_tensor: torch.Tensor | int,
+        *,
+        local_reader: int,
+        write_barrier: int,
+        dispatch_barrier_base: int,
+    ):
+        super().__init__(
+            self.wire_opcode,
+            size=local_reader,
+            arg0=write_barrier,
+            arg1=dispatch_barrier_base,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
+
+
+class PoolSliceDynamicReadReduceAdd(PoolInstruction):
+    """Persistent combine-plan read using the shared pool worker CTAs."""
+
+    wire_opcode = 0x101
+    selects_pool_execute_warp = False
+
+    def __init__(
+        self,
+        config_tensor: torch.Tensor | int,
+        *,
+        plan_rank: int,
+        compute_barrier_base: int,
+    ):
+        super().__init__(
+            self.wire_opcode,
+            size=plan_rank,
+            arg0=compute_barrier_base,
+            address=_control_pointer(config_tensor, "config_tensor"),
+        )
 
 
 class CC0(MemoryInstruction):
@@ -1339,6 +1386,8 @@ __all__ = [
     "PoolSliceWeightedExchange",
     "PoolSliceHostWeightedExchange",
     "PoolSliceGinWeightedExchange",
+    "PoolSliceDynamicReadCopy",
+    "PoolSliceDynamicReadReduceAdd",
     "CC0",
     "RegStore",
     "RegLoad",

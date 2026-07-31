@@ -140,12 +140,8 @@ void dae2(
   // it is never decoded by the ordinary communication warp.
   if constexpr (PoolInstExecuteWarp::num_warps != 0) {
     if (core.kind == DAE_CORE_POOL) {
-      __shared__ PoolInst pool_instruction;
-      if (thread_id == 0)
-        pool_instruction = pool_instructions[sm_id * numPoolInsts];
-      __syncthreads();
       PoolInstExecuteWarp::execute(
-          pool_instruction,
+          pool_instructions + sm_id * numPoolInsts,
           bars,
           signal_array,
           g_events,

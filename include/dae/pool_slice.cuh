@@ -383,6 +383,9 @@ pool_slice_stream_dispatch_worker_count(
       static_cast<uint64_t>(config.num_pes) * config.local_readers;
   uint64_t useful_workers = gather_work + send_total;
   useful_workers = useful_workers == 0 ? 1 : useful_workers;
+  useful_workers = useful_workers < config.num_pes
+      ? config.num_pes
+      : useful_workers;
   useful_workers = useful_workers < config.pool_count
       ? useful_workers
       : config.pool_count - 1;
@@ -589,6 +592,51 @@ pool_slice_stream_queue_retired_mask(uint32_t num_pes) {
   return queues == 64 ? ~0ULL : (1ULL << queues) - 1;
 }
 
+static __device__ __forceinline__ PoolSliceExecutorSlot*
+pool_slice_executor_ring(uint64_t* control) {
+  return reinterpret_cast<PoolSliceExecutorSlot*>(
+      control + poolSliceControlExecutorRing);
+}
+
+static __device__ __forceinline__ PoolSliceExecutorSlot*
+pool_slice_executor_slot(uint64_t* control, uint64_t ticket) {
+  return pool_slice_executor_ring(control) +
+      (ticket & (poolSliceExecutorRingDepth - 1));
+}
+
+// The scheduler is the ring's only producer. Active lanes publish one
+// variable-sized batch directly into consecutive slots; consumers may already
+// have reserved those tickets and wait on the per-slot generation. Keeping
+// the payload stores lane-local avoids a serial lane-zero descriptor loop.
+static __device__ __forceinline__ uint64_t
+pool_slice_executor_publish_batch_warp(
+    uint64_t* control,
+    uint64_t producer,
+    uint32_t count,
+    uint32_t opcode,
+    uint32_t argument_base,
+    uint32_t queue_index,
+    uint32_t completion_base,
+    uint32_t message_index,
+    uint32_t message_count,
+    uint32_t lane) {
+  if (lane < count) {
+    const uint64_t ticket = producer + lane;
+    PoolSliceExecutorSlot* slot = pool_slice_executor_slot(control, ticket);
+    while (dae_atomic_load_acquire_gpu(&slot->generation) != ticket)
+      __nanosleep(barrierPollSleepCycles);
+    slot->opcode = opcode;
+    slot->argument = argument_base + lane;
+    slot->queue_index = queue_index;
+    slot->completion_bit = completion_base + lane;
+    slot->message_index = message_index;
+    slot->message_count = message_count;
+    dae_atomic_store_release_gpu(&slot->generation, ticket + 1);
+  }
+  __syncwarp();
+  return producer + count;
+}
+
 static __device__ __forceinline__ uint32_t pool_slice_stream_route_lower_bound(
     const uint32_t* rows,
     uint32_t begin,
@@ -747,11 +795,11 @@ static __device__ __forceinline__ bool pool_slice_stream_decode_send_task(
     uint32_t* target_pe,
     uint32_t* group) {
   uint32_t cursor = 0;
-  // Send tasks are remote-only and remote-first. A self-source dynamic read
-  // acquires its ordinary writer chunk inside gather, so it needs neither a
-  // synthetic send task nor a data-ready message. Target-major enumeration
-  // preserves the independent metadata/data-plane placement while assigning
-  // every runtime-sized group exactly once.
+  // Send tasks are remote-only and target-major. The flat dynamic group list
+  // is identical to the predecessor data plane: CTA i executes task i, so
+  // metadata-owning CTAs naturally pace the first WQE wave while otherwise
+  // idle CTAs submit later groups. No extra cross-CTA readiness word is
+  // required; remote visibility is still carried only by DataReady.
   for (uint32_t index = 0; index + 1 < config.num_pes; ++index) {
     const uint32_t target = pool_slice_remote_first_pe(
         index, config.my_pe, config.num_pes);
@@ -1157,8 +1205,7 @@ static __device__ __forceinline__ void pool_slice_reduce_add_shard_range(
     uint32_t* row_begin,
     uint32_t* row_end);
 
-template <PoolSliceDynamicReadTransform Transform>
-struct PoolSliceDynamicReadExecutor;
+struct PoolSliceDynamicReadWorker;
 
 // A destination DATA instruction compiled as DynamicRead<Copy> is executed by
 // the whole PoolInst CTA:
@@ -1854,6 +1901,7 @@ template <bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_dynamic_read_reduce_add_local(
     const PoolSliceConfig& config,
     const PoolSliceHostConfig* host_config,
+    uint32_t plan_rank,
     int* bars,
     uint64_t* g_events,
     uint32_t compute_barrier_base,
@@ -1875,8 +1923,8 @@ static __device__ __noinline__ void pool_slice_dynamic_read_reduce_add_local(
   auto* return_inbox =
       reinterpret_cast<uint8_t*>(config.return_inbox_address);
   const PoolSliceDynamicReadPlan plan =
-      *pool_slice_dynamic_read_plan(control, config.pool_rank);
-  const uint32_t expected_source_pe = config.pool_rank % config.num_pes;
+      *pool_slice_dynamic_read_plan(control, plan_rank);
+  const uint32_t expected_source_pe = plan_rank % config.num_pes;
   const bool plan_valid = plan.sequence == sequence &&
       plan.source_pe == expected_source_pe &&
       (plan.flags & POOL_SLICE_DYNAMIC_READ_PLAN_ERROR) == 0;
@@ -2100,7 +2148,7 @@ static __device__ __noinline__ void pool_slice_dynamic_read_reduce_add_local(
       pool_slice_set_status(
           config, static_cast<PoolSliceStatus>(*shared_status));
     dae_atomic_store_release_gpu(
-        control + poolSliceControlReturnGeneration + config.pool_rank,
+        control + poolSliceControlReturnGeneration + plan_rank,
         sequence);
   }
   __syncthreads();
@@ -2224,76 +2272,66 @@ pool_slice_dynamic_read_reduce_add_finish(
   }
 }
 
-// Compile-time dynamic-read registry. Both dispatch and combine enter this
-// interface, while each specialization keeps only the state needed by its
-// transform. That preserves the queue-driven Copy scheduler and the static
-// per-PoolInst ReduceAdd placement without a runtime opcode branch, a union
-// context, or additional live registers in either hot path.
-template <>
-struct PoolSliceDynamicReadExecutor<POOL_SLICE_DYNAMIC_READ_COPY> {
-  template <bool HostDataPlane, uint32_t TotalWarps>
+// Copy and ReduceAdd use the same physical PoolInst worker CTAs and immutable
+// instruction stream. The scheduler decodes once per claimed work item, then
+// enters a narrow no-inline data mover or reducer; no row pays an opcode branch.
+struct PoolSliceDynamicReadWorker {
+  template <bool WeightedReturn, bool HostDataPlane, uint32_t TotalWarps>
   static __device__ __forceinline__ void execute(
+      const PoolInst& instruction,
+      const PoolSliceQueueEntry& message,
       uint32_t source_pe,
-      uint32_t compact_begin,
-      uint32_t compact_end,
-      uint32_t ready_slot_and_reader,
-      const PoolSliceConfig& config,
-      const PoolSlicePublishBatch* receive_batches,
-      const PoolSliceReceiveBatch* receive_routes,
-      const uint32_t* send_token_rows,
-      const uint8_t* token_pool,
-      const uint8_t* delivery_pool,
-      uint8_t* expert_input,
-      int* bars,
-      uint32_t write_barrier,
-      uint64_t sequence,
-      uint32_t* shared_status,
-      uint32_t thread_id) {
-    pool_slice_stream_gather_rows<HostDataPlane, TotalWarps>(
-        source_pe,
-        compact_begin,
-        compact_end,
-        ready_slot_and_reader,
-        config,
-        receive_batches,
-        receive_routes,
-        send_token_rows,
-        token_pool,
-        delivery_pool,
-        expert_input,
-        bars,
-        write_barrier,
-        sequence,
-        shared_status,
-        thread_id);
-  }
-};
-
-template <>
-struct PoolSliceDynamicReadExecutor<POOL_SLICE_DYNAMIC_READ_REDUCE_ADD> {
-  template <bool HostDataPlane, uint32_t TotalWarps>
-  static __device__ __forceinline__ void execute(
       const PoolSliceConfig& config,
       const PoolSliceHostConfig* host_config,
       int* bars,
       uint64_t* g_events,
-      uint32_t compute_barrier_base,
-      uint32_t thread_id,
       uint64_t sequence,
-      uint32_t* shared_status) {
-    pool_slice_dynamic_read_reduce_add_local<HostDataPlane, TotalWarps>(
-        config,
-        host_config,
-        bars,
-        g_events,
-        compute_barrier_base,
-        thread_id,
-        sequence,
-        shared_status);
+      uint32_t* shared_status,
+      uint32_t thread_id) {
+    switch (instruction.opcode) {
+      case POOL_SLICE_DYNAMIC_READ_COPY:
+        pool_slice_stream_gather_rows<HostDataPlane, TotalWarps>(
+            source_pe,
+            message.row_begin,
+            message.row_end,
+            message.ready_slot |
+                (static_cast<uint32_t>(instruction.size) << 16),
+            config,
+            reinterpret_cast<const PoolSlicePublishBatch*>(
+                config.receive_batches_address),
+            reinterpret_cast<const PoolSliceReceiveBatch*>(
+                config.receive_routes_address),
+            reinterpret_cast<const uint32_t*>(
+                config.send_token_rows_address),
+            reinterpret_cast<const uint8_t*>(config.token_pool_address),
+            reinterpret_cast<const uint8_t*>(config.delivery_pool_address),
+            reinterpret_cast<uint8_t*>(config.expert_input_address),
+            bars,
+            instruction.arg0,
+            sequence,
+            shared_status,
+            thread_id);
+        break;
+      case POOL_SLICE_DYNAMIC_READ_REDUCE_ADD:
+        if constexpr (WeightedReturn) {
+          pool_slice_dynamic_read_reduce_add_local<
+              HostDataPlane, TotalWarps>(
+              config,
+              host_config,
+              instruction.size,
+              bars,
+              g_events,
+              instruction.arg0,
+              thread_id,
+              sequence,
+              shared_status);
+        }
+        break;
+    }
   }
 
   template <uint32_t TotalWarps>
-  static __device__ __forceinline__ void finish(
+  static __device__ __forceinline__ void finish_reduce_add(
       const PoolSliceConfig& config,
       uint64_t* g_events,
       uint32_t thread_id,
@@ -2311,8 +2349,15 @@ pool_slice_stream_publish_metadata_target(
     uint64_t signal_delta,
     uint32_t index,
     uint32_t lane) {
-  const uint32_t target_pe = pool_slice_remote_first_pe(
-      index, config.my_pe, config.num_pes);
+  // In a centralized assembly rank zero becomes the scheduler immediately
+  // after this call. Give it the local packet; the remaining metadata CTAs
+  // submit remote packets concurrently. The one-CTA fallback retains the
+  // remote-first ordering used by its serial transport loop.
+  const uint32_t target_pe = config.pool_count > 1
+      ? (index + config.my_pe >= config.num_pes
+             ? index + config.my_pe - config.num_pes
+             : index + config.my_pe)
+      : pool_slice_remote_first_pe(index, config.my_pe, config.num_pes);
   auto* send_batches = reinterpret_cast<PoolSlicePublishBatch*>(
       config.send_batches_address);
   auto* receive_batches = reinterpret_cast<PoolSlicePublishBatch*>(
@@ -2388,8 +2433,8 @@ static __device__ __noinline__ void pool_slice_stream_publish_metadata(
   const uint32_t warp = thread_id >> 5;
   if (config.pool_count >= config.num_pes) {
     // Every transport publishes one independent fused metadata message per
-    // target. Metadata and activation keep independent CTA/QP placement so
-    // the two planes can be submitted concurrently.
+    // target. Metadata and activation remain distinct protocol planes and use
+    // independent CTA/QP placement, so neither submission gates the other.
     if (config.pool_rank < config.num_pes && warp == 0) {
       pool_slice_stream_publish_metadata_target(
           config,
@@ -2422,9 +2467,8 @@ static __device__ __forceinline__ void pool_slice_stream_accept_metadata(
     uint64_t* control,
     uint64_t sequence,
     uint32_t* shared_status) {
-  const PoolSlicePublishBatch batch =
-      *pool_slice_stream_batch(
-          receive_batches, source_pe, config.route_capacity);
+  const PoolSlicePublishBatch& batch = *pool_slice_stream_batch(
+      receive_batches, source_pe, config.route_capacity);
   bool valid = batch.sequence == sequence &&
       batch.source_pe == source_pe && batch.target_pe == config.my_pe &&
       batch.active_rows <= config.token_capacity &&
@@ -2530,6 +2574,90 @@ static __device__ __forceinline__ bool pool_slice_stream_queue_message_ready(
       const uint32_t warp_row_begin = message->row_begin +
           static_cast<uint32_t>(
               static_cast<uint64_t>(group_rows) * payload_warp / TotalWarps);
+      const uint32_t warp_row_end = message->row_begin +
+          static_cast<uint32_t>(
+              static_cast<uint64_t>(group_rows) * (payload_warp + 1) /
+              TotalWarps);
+      if (warp_row_begin < warp_row_end &&
+          pool_slice_signal_fetch(
+              pool_slice_stream_data_ready(
+                  control,
+                  source_pe,
+                  message->ready_slot,
+                  payload_warp),
+              false) < sequence)
+        return false;
+    }
+    return true;
+  }
+}
+
+// Scheduler-owned readiness uses its shared-memory cursor and never consults
+// the old cross-CTA claim word. Metadata and payload generations remain the
+// authoritative HBM/NVSHMEM dependencies; the shared cursor is only local
+// scheduling state.
+template <bool HostDataPlane, uint32_t TotalWarps>
+static __device__ __forceinline__ bool
+pool_slice_scheduler_queue_message_ready(
+    uint32_t source_pe,
+    uint32_t queue,
+    uint32_t head,
+    const PoolSliceConfig& config,
+    const PoolSlicePublishBatch* receive_batches,
+    uint64_t* control,
+    uint64_t sequence) {
+  if (dae_atomic_load_acquire_gpu(
+          control + poolSliceControlStreamMetadataReady + source_pe) <
+      sequence)
+    return false;
+  constexpr uint32_t queue_count = poolSliceMaxStreamQueues;
+  const uint32_t queue_index = source_pe * queue_count + queue;
+  const uint64_t retired = dae_atomic_load_acquire_gpu(
+      control + poolSliceControlStreamQueueRetiredMask);
+  if ((retired & (1ULL << queue_index)) != 0)
+    return false;
+  if (head >= poolSliceStreamQueueDepth)
+    return true;
+  const PoolSliceQueueEntry* message = pool_slice_stream_queue_entry(
+      receive_batches,
+      source_pe,
+      queue,
+      head,
+      config.route_capacity);
+  if (message->sequence != sequence || message->message_index != head ||
+      message->opcode != POOL_SLICE_QUEUE_DATA)
+    return true;
+  if (dae_atomic_load_acquire_gpu(
+          control + poolSliceControlStreamRouteReady + source_pe) < sequence)
+    return false;
+  if (message->ready_slot >= poolSliceMaxDataGroups ||
+      source_pe == config.my_pe)
+    return true;
+  if constexpr (HostDataPlane || !poolSliceWarpQpCompletion) {
+    const uint64_t observed = pool_slice_signal_fetch(
+        pool_slice_stream_data_ready(
+            control, source_pe, message->ready_slot, 0),
+        false);
+    if constexpr (poolSliceRawSgl) {
+      return observed >= pool_slice_stream_data_progress(
+          sequence,
+          HostDataPlane
+              ? pool_slice_stream_data_segments(
+                    message->row_begin, message->row_end)
+              : 1);
+    }
+    return observed >= sequence;
+  } else {
+    static_assert(TotalWarps == poolSlicePayloadWarps);
+    const uint32_t group_rows = message->row_end - message->row_begin;
+#pragma unroll
+    for (uint32_t payload_warp = 0;
+         payload_warp < TotalWarps;
+         ++payload_warp) {
+      const uint32_t warp_row_begin = message->row_begin +
+          static_cast<uint32_t>(
+              static_cast<uint64_t>(group_rows) * payload_warp /
+              TotalWarps);
       const uint32_t warp_row_end = message->row_begin +
           static_cast<uint32_t>(
               static_cast<uint64_t>(group_rows) * (payload_warp + 1) /
@@ -2686,7 +2814,7 @@ static __device__ __forceinline__ bool pool_slice_dynamic_read_data_valid(
 // the small destination-row allocation; all threads then expand the packed
 // route words and build this source's immutable ReduceAdd plans. No activation
 // DATA dependency is consulted, so this overlaps the direct payload path.
-template <bool WeightedReturn>
+template <bool WeightedReturn, bool SchedulerOwned = false>
 static __device__ __noinline__ void
 pool_slice_stream_execute_reserve_routes(
     const PoolSliceQueueEntry& message,
@@ -2826,10 +2954,12 @@ pool_slice_stream_execute_reserve_routes(
     // acquires the same publication without a later plan-build phase.
     dae_atomic_store_release_gpu(
         control + poolSliceControlStreamRouteReady + source_pe, sequence);
-    dae_atomic_add_release_gpu(
-        pool_slice_stream_queue_head(control, source_pe, queue), 1);
-    dae_atomic_store_release_gpu(
-        pool_slice_stream_queue_claim(control, source_pe, queue), 0);
+    if constexpr (!SchedulerOwned) {
+      dae_atomic_add_release_gpu(
+          pool_slice_stream_queue_head(control, source_pe, queue), 1);
+      dae_atomic_store_release_gpu(
+          pool_slice_stream_queue_claim(control, source_pe, queue), 0);
+    }
   }
   __syncthreads();
 }
@@ -2944,6 +3074,817 @@ static __device__ __noinline__ void pool_slice_stream_drain_queue_control(
         config.route_capacity);
   }
   dae_atomic_store_release_gpu(reinterpret_cast<uint64_t*>(claim), 0);
+}
+
+// Scheduler parameters and mutable queue cursors live in shared memory. The
+// persistent warp can therefore call route/control helpers without saving a
+// wide argument set or the 64-head active set in thread-local memory.
+struct PoolSliceSchedulerShared {
+  const PoolSliceConfig* config;
+  const PoolSlicePublishBatch* receive_batches;
+  int* bars;
+  uint64_t* signal_array;
+  uint64_t* events;
+  uint64_t* control;
+  uint32_t* status;
+  uint64_t sequence;
+  uint64_t return_value;
+  uint32_t dispatch_barrier_base;
+  uint32_t worker_count;
+  uint32_t send_count;
+  uint32_t direct_send_count;
+  uint64_t producer;
+  uint32_t reads_preposted_mask;
+  uint32_t profile_flags;
+  uint32_t metadata_mask;
+  uint32_t route_mask;
+  uint32_t reader_expected_mask;
+  uint32_t reader_released_mask;
+  uint32_t reader_expected[poolSliceMaxLocalReaders];
+  uint32_t heads[poolSliceMaxPes * poolSliceMaxStreamQueues];
+  uint32_t expected[poolSliceMaxPes * poolSliceMaxStreamQueues];
+  uint32_t advance[poolSliceMaxPes * poolSliceMaxStreamQueues];
+};
+
+// Fixed route CTAs and remaining SEND descriptors are already active before
+// this helper. As soon as one source's route expansion completes, append that
+// source's resolved DynamicRead programs. Executors wait on the exact data
+// generations, so sources overlap without global metadata closure or a rescan.
+static __device__ __noinline__ void
+pool_slice_scheduler_prepost_source_reads(
+    PoolSliceSchedulerShared* shared,
+    uint32_t source_pe,
+    uint32_t lane) {
+  const PoolSliceConfig& config = *shared->config;
+  uint64_t producer = shared->producer;
+  constexpr uint32_t queue_count = poolSliceMaxStreamQueues;
+  const uint32_t reader_mask =
+      (1U << config.local_readers) - 1U;
+  const PoolSlicePublishBatch& batch = *pool_slice_stream_batch(
+      shared->receive_batches, source_pe, config.route_capacity);
+  const uint32_t groups = pool_slice_stream_group_count(
+      batch.active_rows,
+      config.row_bytes,
+      config.group_limit,
+      config.num_pes);
+  for (uint32_t queue = 0; queue < queue_count; ++queue) {
+    const uint32_t message_count =
+        (groups + queue_count - 1 - queue) / queue_count;
+    if (message_count == 0)
+      continue;
+    const uint32_t queue_index = source_pe * queue_count + queue;
+    const uint32_t head = shared->heads[queue_index];
+    const bool route_pending = queue == 0 && head == 0;
+    const uint32_t completion_base = route_pending ? 1 : 0;
+    if (lane == 0) {
+      shared->expected[queue_index] = route_pending
+          ? 1U | (reader_mask << 1)
+          : reader_mask;
+      shared->advance[queue_index] =
+          message_count + static_cast<uint32_t>(route_pending);
+    }
+    __syncwarp();
+    producer = pool_slice_executor_publish_batch_warp(
+        shared->control,
+        producer,
+        config.local_readers,
+        POOL_SLICE_EXECUTOR_DYNAMIC_READ,
+        0,
+        queue_index,
+        completion_base,
+        queue == 0 ? 1 : 0,
+        message_count,
+        lane);
+  }
+  if (lane == 0) {
+    shared->producer = producer;
+    shared->reads_preposted_mask |= 1U << source_pe;
+  }
+  __syncwarp();
+}
+
+// One rank-zero warp owns every destination queue cursor and retirement. It
+// keeps the small active set in CTA shared memory and publishes only resolved
+// jobs to the executor ring. Fixed source CTAs expand routes directly, so
+// O(routes) work cannot block metadata acceptance or completion retirement.
+template <bool WeightedReturn, bool HostDataPlane, uint32_t TotalWarps>
+static __device__ __noinline__ uint64_t
+pool_slice_scheduler_dispatch_warp(
+    PoolSliceSchedulerShared* shared,
+    uint32_t lane) {
+  const PoolSliceConfig& config = *shared->config;
+  constexpr uint32_t queue_count = poolSliceMaxStreamQueues;
+  const uint32_t total_queue_count = config.num_pes * queue_count;
+  constexpr uint32_t profileFirstData = 1U << 0;
+  constexpr uint32_t profileDataDone = 1U << 1;
+  constexpr uint32_t profileMetadataClosed = 1U << 2;
+  constexpr uint32_t profileDispatchReady = 1U << 3;
+  constexpr uint32_t profileFirstReader = 1U << 4;
+  constexpr uint32_t profileAllReaders = 1U << 5;
+  constexpr uint32_t profileGatherDone = 1U << 6;
+
+  if (lane == 0) {
+    shared->producer = dae_atomic_load_relaxed_gpu(
+        shared->control + poolSliceControlExecutorProducer);
+    // The scheduler is the sole producer. Reset the native-atomic consumer to
+    // this phase's first ticket before releasing executors.
+    dae_atomic_store_relaxed_gpu(
+        shared->control + poolSliceControlExecutorConsumer,
+        shared->producer);
+    dae_atomic_store_release_gpu(
+        shared->control + poolSliceControlExecutorPhaseSequence,
+        shared->sequence * 2);
+    shared->reads_preposted_mask = 0;
+    shared->profile_flags = 0;
+    shared->metadata_mask = 0;
+    shared->route_mask = 0;
+    shared->reader_expected_mask = 0;
+    shared->reader_released_mask = 0;
+  }
+  if (lane < config.local_readers)
+    shared->reader_expected[lane] = 0;
+  __syncwarp();
+
+  // One fixed executor CTA per source performs route expansion directly.
+  // Empty sources still execute it so RouteReady and combine plans remain a
+  // uniform one-generation dependency. Queue-zero completion stays under the
+  // central scheduler's expected-mask ownership.
+  if (lane < config.num_pes) {
+    const uint32_t queue_index = lane * queue_count;
+    shared->expected[queue_index] = 1;
+    shared->advance[queue_index] = 1;
+  }
+  uint64_t initial_producer = shared->producer;
+
+  // Publish only flat SEND groups that overflow the fixed CTA stripe. The
+  // common LLM shapes execute every SEND directly, matching the predecessor
+  // transport path; unusually large dynamic group counts use the same HBM
+  // executor ring without imposing that handoff on the fast path.
+  uint32_t initial_send_published = shared->direct_send_count;
+  const uint32_t initial_send_total = shared->send_count;
+  while (initial_send_published < initial_send_total) {
+    const uint32_t remaining = initial_send_total - initial_send_published;
+    const uint32_t batch = remaining < 32 ? remaining : 32;
+    initial_producer = pool_slice_executor_publish_batch_warp(
+        shared->control,
+        initial_producer,
+        batch,
+        POOL_SLICE_EXECUTOR_SEND,
+        initial_send_published,
+        UINT32_MAX,
+        0,
+        UINT32_MAX,
+        0,
+        lane);
+    initial_send_published += batch;
+  }
+  if (lane == 0) {
+    shared->producer = initial_producer;
+  }
+  __syncwarp();
+
+  while (true) {
+    uint32_t made_progress = 0;
+    bool metadata_ready = lane >= config.num_pes ||
+        (shared->metadata_mask & (1U << lane)) != 0;
+    if (!metadata_ready) {
+      const uint64_t observed = pool_slice_signal_fetch(
+          shared->control +
+              poolSliceControlStreamMetadataTransportReady + lane,
+          lane == config.my_pe);
+      if (observed >= shared->sequence) {
+        pool_slice_stream_accept_metadata(
+            lane,
+            config,
+            shared->receive_batches,
+            shared->control,
+            shared->sequence,
+            shared->status);
+        metadata_ready = true;
+        made_progress = 1;
+      }
+    }
+    const uint32_t metadata_mask =
+        __ballot_sync(0xffffffffU, metadata_ready) &
+        pool_slice_pe_mask(config.num_pes);
+    if (lane == 0)
+      shared->metadata_mask = metadata_mask;
+    const bool metadata_complete =
+        metadata_mask == pool_slice_pe_mask(config.num_pes);
+    bool reader_expected_ready = lane >= config.local_readers ||
+        (shared->reader_expected_mask & (1U << lane)) != 0;
+    if (metadata_complete && !reader_expected_ready) {
+      uint32_t reader_expected = 0;
+      for (uint32_t source_pe = 0;
+           source_pe < config.num_pes;
+           ++source_pe) {
+        (void)dae_atomic_load_acquire_gpu(
+            shared->control +
+                poolSliceControlStreamMetadataReady + source_pe);
+        const PoolSlicePublishBatch& batch = *pool_slice_stream_batch(
+            shared->receive_batches, source_pe, config.route_capacity);
+        const uint32_t* source_routes = pool_slice_stream_route_words(
+            shared->receive_batches, source_pe, config, batch);
+        reader_expected += pool_slice_stream_reader_data_groups(
+            batch, source_routes, lane, config);
+      }
+      shared->reader_expected[lane] = reader_expected;
+      reader_expected_ready = true;
+      made_progress = 1;
+    }
+    const uint32_t reader_expected_mask =
+        __ballot_sync(0xffffffffU, reader_expected_ready) &
+        pool_slice_pe_mask(config.local_readers);
+    if (lane == 0)
+      shared->reader_expected_mask = reader_expected_mask;
+
+    bool route_ready = lane >= config.num_pes ||
+        (shared->route_mask & (1U << lane)) != 0;
+    if (metadata_ready && !route_ready) {
+      route_ready = dae_atomic_load_acquire_gpu(
+                        shared->control +
+                            poolSliceControlStreamRouteReady + lane) >=
+          shared->sequence;
+      made_progress |= route_ready;
+    }
+    const uint32_t route_mask =
+        __ballot_sync(0xffffffffU, route_ready) &
+        pool_slice_pe_mask(config.num_pes);
+    if (lane == 0)
+      shared->route_mask = route_mask;
+
+    // Route expansion is the only dependency that can pin a reader CTA while
+    // other sources are already executable. Append a source's complete
+    // DynamicRead program as soon as its route generation is ready, without
+    // waiting for global metadata closure. Payload generations remain inside
+    // the executor so data transfer and gather still overlap.
+    uint32_t unposted_sources =
+        route_mask & ~shared->reads_preposted_mask;
+    while (unposted_sources != 0) {
+      const uint32_t source_pe =
+          static_cast<uint32_t>(__ffs(unposted_sources) - 1);
+      pool_slice_scheduler_prepost_source_reads(
+          shared, source_pe, lane);
+      unposted_sources &= unposted_sources - 1;
+      made_progress = 1;
+    }
+
+    bool reader_released = lane >= config.local_readers ||
+        (shared->reader_released_mask & (1U << lane)) != 0;
+    if (reader_expected_ready && !reader_released) {
+      const uint64_t completed = dae_atomic_load_acquire_gpu(
+          shared->control + poolSliceControlReaderDataDone + lane);
+      if (completed >= shared->reader_expected[lane]) {
+        atomicSub(
+            shared->bars + shared->dispatch_barrier_base + lane, 1);
+        reader_released = true;
+        made_progress = 1;
+      }
+    }
+    const uint32_t reader_mask =
+        __ballot_sync(0xffffffffU, reader_released) &
+        pool_slice_pe_mask(config.local_readers);
+    if (lane == 0)
+      shared->reader_released_mask = reader_mask;
+
+    // Every lane owns disjoint queue indices. Completion acquire carries the
+    // executor's Copy/route stores before this unique scheduler advances the
+    // ordered head and frees the completion word for its next message.
+    for (uint32_t queue_index = lane;
+         queue_index < total_queue_count;
+         queue_index += 32) {
+      const uint32_t expected = shared->expected[queue_index];
+      if (expected == 0)
+        continue;
+      const uint32_t source_pe = queue_index / queue_count;
+      const uint32_t queue = queue_index % queue_count;
+      uint64_t* completion =
+          pool_slice_stream_queue_claim(
+              shared->control, source_pe, queue);
+      const uint64_t state = dae_atomic_load_acquire_gpu(completion);
+      const uint32_t done = static_cast<uint32_t>(state >> 32);
+      if ((done & expected) == expected) {
+        const uint32_t next =
+            shared->heads[queue_index] + shared->advance[queue_index];
+        shared->heads[queue_index] = next;
+        shared->expected[queue_index] = 0;
+        shared->advance[queue_index] = 0;
+        dae_atomic_store_release_gpu(
+            pool_slice_stream_queue_head(
+                shared->control, source_pe, queue),
+            next);
+        dae_atomic_store_relaxed_gpu(completion, 0);
+        made_progress = 1;
+      }
+    }
+    __syncwarp();
+
+    // END is the only control head left after fixed route completion and DATA
+    // assignment. Retire every ready head SIMT-parallel instead
+    // of serially electing one queue per scheduler iteration. One merged OR
+    // publishes up to 32 retirements, while each lane advances its disjoint
+    // queue head. This keeps one logical scheduler owner without an O(P)
+    // retirement tail at eight and more PEs.
+    for (uint32_t base = 0; base < total_queue_count; base += 32) {
+      const uint32_t queue_index = base + lane;
+      const bool in_range = queue_index < total_queue_count;
+      const uint32_t source_pe = in_range ? queue_index / queue_count : 0;
+      const uint32_t queue = in_range ? queue_index % queue_count : 0;
+      const uint32_t head = in_range ? shared->heads[queue_index] : 0;
+      const PoolSliceQueueEntry* candidate = in_range &&
+              head < poolSliceStreamQueueDepth
+          ? pool_slice_stream_queue_entry(
+                shared->receive_batches,
+                source_pe,
+                queue,
+                head,
+                config.route_capacity)
+          : nullptr;
+      const bool ready = candidate != nullptr &&
+          shared->expected[queue_index] == 0 &&
+          (shared->metadata_mask & (1U << source_pe)) != 0 &&
+          candidate->sequence == shared->sequence &&
+          candidate->message_index == head &&
+          candidate->opcode == POOL_SLICE_QUEUE_END;
+      const uint32_t ready_mask = __ballot_sync(0xffffffffU, ready);
+      const uint32_t invalid_mask = __ballot_sync(
+          0xffffffffU,
+          ready && candidate->flags != POOL_SLICE_BATCH_FLAGS_NONE);
+      if (ready_mask == 0)
+        continue;
+
+      const uint64_t retired_bits =
+          static_cast<uint64_t>(ready_mask) << base;
+      uint64_t previous = 0;
+      if (lane == 0) {
+        previous = dae_atomic_fetch_or_acq_rel_gpu(
+            shared->control + poolSliceControlStreamQueueRetiredMask,
+            retired_bits);
+        if ((previous & retired_bits) != 0 || invalid_mask != 0)
+          pool_slice_stream_queue_error(config, shared->status);
+      }
+      const uint32_t previous_low = __shfl_sync(
+          0xffffffffU, static_cast<uint32_t>(previous), 0);
+      const uint32_t previous_high = __shfl_sync(
+          0xffffffffU, static_cast<uint32_t>(previous >> 32), 0);
+      previous = static_cast<uint64_t>(previous_low) |
+          (static_cast<uint64_t>(previous_high) << 32);
+      const uint64_t retired = previous | retired_bits;
+
+      if (ready) {
+        const uint32_t next = head + 1;
+        shared->heads[queue_index] = next;
+        dae_atomic_store_release_gpu(
+            pool_slice_stream_queue_head(
+                shared->control, source_pe, queue),
+            next);
+        made_progress = 1;
+      }
+
+      // Queue pairs never cross a 32-lane wave. The even lane detects the
+      // single incomplete->complete transition and emits the empty-source
+      // return signal once, even if both ENDs retired in this batch.
+      if (in_range && queue == 0) {
+        const uint64_t source_mask =
+            ((1ULL << queue_count) - 1) << (source_pe * queue_count);
+        if ((previous & source_mask) != source_mask &&
+            (retired & source_mask) == source_mask) {
+          const PoolSlicePublishBatch& batch = *pool_slice_stream_batch(
+              shared->receive_batches,
+              source_pe,
+              config.route_capacity);
+          if (batch.route_begin == batch.route_end) {
+            if (source_pe == config.my_pe) {
+              pool_slice_signal_release_local(
+                  shared->signal_array +
+                      config.signal_base + config.my_pe,
+                  shared->return_value);
+            } else {
+              pool_slice_signal_set_remote(
+                  shared->signal_array +
+                      config.signal_base + config.my_pe,
+                  shared->return_value,
+                  source_pe);
+            }
+          }
+        }
+      }
+      __syncwarp();
+    }
+
+    // Every overflow SEND was placed ahead of dependent reads at phase
+    // initialization; only completion remains on the scheduler hot loop.
+    uint32_t send_total = 0;
+    if (lane == 0) {
+      send_total = static_cast<uint32_t>(
+          dae_atomic_load_relaxed_gpu(
+              shared->control + poolSliceControlStreamSendTotal));
+    }
+    send_total = __shfl_sync(0xffffffffU, send_total, 0);
+
+    uint32_t stop = 0;
+    if (lane == 0) {
+      const uint64_t completed_sends = dae_atomic_load_relaxed_gpu(
+          shared->control + poolSliceControlStreamSendDone);
+      uint32_t profile_flags = shared->profile_flags;
+      if ((profile_flags & profileFirstData) == 0 &&
+          (completed_sends != 0 || send_total == 0)) {
+        if (shared->events != nullptr) {
+          const uint64_t now = cuda::ptx::get_sreg_globaltimer();
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfileFirstPayload] = now;
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfileFirstDataPublished] = now;
+        }
+        profile_flags |= profileFirstData;
+      }
+      if ((profile_flags & profileDataDone) == 0 &&
+          completed_sends >= send_total) {
+        if (shared->events != nullptr) {
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfileDataPublished] =
+              cuda::ptx::get_sreg_globaltimer();
+        }
+        profile_flags |= profileDataDone;
+      }
+      if ((profile_flags & profileMetadataClosed) == 0 && metadata_complete) {
+        if (shared->events != nullptr) {
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfileMetadataClosed] =
+              cuda::ptx::get_sreg_globaltimer();
+        }
+        profile_flags |= profileMetadataClosed;
+      }
+      if ((profile_flags & profileDispatchReady) == 0 &&
+          route_mask == pool_slice_pe_mask(config.num_pes)) {
+        dae_atomic_store_release_gpu(
+            shared->control + poolSliceControlDispatchReady,
+            shared->sequence);
+        if (shared->events != nullptr) {
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfilePlanReady] =
+              cuda::ptx::get_sreg_globaltimer();
+        }
+        profile_flags |= profileDispatchReady;
+      }
+      if ((profile_flags & profileFirstReader) == 0 && reader_mask != 0) {
+        if (shared->events != nullptr) {
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfileFirstReaderReady] =
+              cuda::ptx::get_sreg_globaltimer();
+        }
+        profile_flags |= profileFirstReader;
+      }
+      if ((profile_flags & profileAllReaders) == 0 &&
+          reader_mask == pool_slice_pe_mask(config.local_readers)) {
+        if (shared->events != nullptr) {
+          shared->events[
+              static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+              poolSliceProfileAllReadersReady] =
+              cuda::ptx::get_sreg_globaltimer();
+        }
+        profile_flags |= profileAllReaders;
+      }
+      if (metadata_complete) {
+        const uint64_t retired = dae_atomic_load_acquire_gpu(
+            shared->control + poolSliceControlStreamQueueRetiredMask);
+        const uint64_t expected_retired =
+            pool_slice_stream_queue_retired_mask(config.num_pes);
+        if ((profile_flags & profileGatherDone) == 0 &&
+            retired == expected_retired) {
+          if (shared->events != nullptr) {
+            shared->events[
+                static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+                poolSliceProfileStreamGatherDone] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+          profile_flags |= profileGatherDone;
+        }
+        stop = completed_sends >= send_total &&
+            retired == expected_retired &&
+            route_mask == pool_slice_pe_mask(config.num_pes) &&
+            reader_mask == pool_slice_pe_mask(config.local_readers);
+      }
+      shared->profile_flags = profile_flags;
+    }
+    __syncwarp();
+    stop = __shfl_sync(0xffffffffU, stop, 0);
+    if (stop != 0)
+      break;
+    if (__ballot_sync(0xffffffffU, made_progress != 0) == 0)
+      __nanosleep(barrierPollSleepCycles);
+  }
+
+  // Dispatch and combine share the same instruction queue. Once every Copy
+  // head has retired, append the immutable ReduceAdd programs immediately;
+  // their named expert barriers keep execution data-dependent without a
+  // second metadata phase. Rank zero joins the executor pool after publishing
+  // this suffix, so the centralized scheduler does not cost one reduction CTA.
+  uint64_t producer = shared->producer;
+  if constexpr (WeightedReturn) {
+    uint32_t reduce_published = 0;
+    while (reduce_published < config.pool_count) {
+      const uint32_t remaining = config.pool_count - reduce_published;
+      const uint32_t batch = remaining < 32 ? remaining : 32;
+      producer = pool_slice_executor_publish_batch_warp(
+          shared->control,
+          producer,
+          batch,
+          POOL_SLICE_EXECUTOR_DYNAMIC_READ,
+          config.local_readers + reduce_published,
+          UINT32_MAX,
+          0,
+          UINT32_MAX,
+          0,
+          lane);
+      reduce_published += batch;
+    }
+  }
+
+  // Every participating executor consumes exactly one ordered STOP. All
+  // ReduceAdd tickets precede all STOP tickets; a fast CTA may take another
+  // reduction, but it exits on its first STOP and cannot steal termination
+  // from a slower worker.
+  uint32_t remaining = shared->worker_count +
+      static_cast<uint32_t>(WeightedReturn);
+  while (remaining != 0) {
+    const uint32_t batch = remaining < 32 ? remaining : 32;
+    producer = pool_slice_executor_publish_batch_warp(
+        shared->control,
+        producer,
+        batch,
+        POOL_SLICE_EXECUTOR_STOP,
+        0,
+        UINT32_MAX,
+        0,
+        UINT32_MAX,
+        0,
+        lane);
+    remaining -= batch;
+  }
+  if (lane == 0)
+    dae_atomic_store_relaxed_gpu(
+        shared->control + poolSliceControlExecutorProducer, producer);
+  __syncwarp();
+  return producer;
+}
+
+// Keep loop-invariant executor state in shared memory. In addition to making
+// the ring handoff explicit, this prevents the persistent call loop from
+// saving a wide argument set to thread-local memory around every operation.
+struct PoolSliceExecutorShared {
+  const PoolSliceConfig* config;
+  const PoolSliceHostConfig* host_config;
+  const PoolInst* dynamic_read_instructions;
+  int* bars;
+  uint64_t* events;
+  uint32_t* status;
+  uint32_t* first_payload;
+  uint32_t* first_gather;
+  uint64_t sequence;
+  uint64_t phase_sequence;
+  uint32_t write_barrier;
+  uint32_t phase_start;
+  PoolSliceExecutorSlot task;
+  PoolSliceQueueEntry message;
+  // Dynamic batch state is CTA-uniform. Keeping it here prevents every SIMT
+  // lane from preserving the instruction, queue coordinates, and loop cursor
+  // across the inlined Copy/ReduceAdd worker.
+  PoolInst instruction;
+  uint32_t source_pe;
+  uint32_t queue;
+  uint32_t batch_count;
+  uint32_t batch_offset;
+  uint64_t ticket;
+};
+
+// Decode one flat SEND descriptor into CTA-uniform shared state, then run the
+// same vectorized SIMT sender used by the direct predecessor-style stripe.
+// SEND is uncommon in the persistent loop (only group-count overflow), so the
+// noinline boundary keeps its state out of the DynamicRead hot loop.
+template <bool HostDataPlane, uint32_t TotalWarps>
+static __device__ __noinline__ void pool_slice_executor_send_task(
+    PoolSliceExecutorShared* shared,
+    uint32_t task,
+    uint32_t thread_id) {
+  if (thread_id == 0) {
+    const PoolSliceConfig& config = *shared->config;
+    const auto* send_token_counts = reinterpret_cast<const uint32_t*>(
+        config.send_token_counts_address);
+    shared->batch_offset = pool_slice_stream_decode_send_task(
+        task,
+        config,
+        send_token_counts,
+        &shared->source_pe,
+        &shared->queue);
+    if (shared->batch_offset == 0)
+      pool_slice_stream_queue_error(config, shared->status);
+  }
+  __syncthreads();
+  if (shared->batch_offset == 0)
+    return;
+  pool_slice_stream_send_group<HostDataPlane>(
+      shared->source_pe,
+      shared->queue,
+      *shared->config,
+      shared->host_config,
+      shared->bars,
+      shared->write_barrier,
+      reinterpret_cast<uint64_t*>(shared->config->control_address),
+      shared->events,
+      shared->sequence,
+      shared->status,
+      shared->first_payload,
+      thread_id);
+}
+
+// Persistent executor CTAs dynamically claim the next scheduler ticket with
+// native atomicAdd. A CTA that is busy publishing metadata or payload cannot
+// pin a ready job: any free executor may take it. Per-slot generations remain
+// the publication and bounded-ring reuse dependency. Executors stage the
+// 32-byte descriptor in shared memory and never read or retire metadata heads.
+template <bool WeightedReturn, bool HostDataPlane, uint32_t TotalWarps>
+static __device__ __noinline__ void pool_slice_executor_loop(
+    PoolSliceExecutorShared* shared,
+    uint32_t thread_id) {
+  while (true) {
+    if (thread_id == 0) {
+      auto* control = reinterpret_cast<uint64_t*>(
+          shared->config->control_address);
+      if (shared->phase_start != 0) {
+        while (dae_atomic_load_acquire_gpu(
+                   control + poolSliceControlExecutorPhaseSequence) <
+               shared->phase_sequence)
+          __nanosleep(barrierPollSleepCycles);
+        shared->phase_start = 0;
+      }
+      shared->ticket = atomicAdd(
+          reinterpret_cast<unsigned long long*>(
+              control + poolSliceControlExecutorConsumer),
+          1ULL);
+      PoolSliceExecutorSlot* slot =
+          pool_slice_executor_slot(control, shared->ticket);
+      while (dae_atomic_load_acquire_gpu(&slot->generation) !=
+             shared->ticket + 1)
+        __nanosleep(barrierPollSleepCycles);
+    }
+    __syncthreads();
+    if (thread_id < sizeof(PoolSliceExecutorSlot) / sizeof(uint4)) {
+      auto* control = reinterpret_cast<uint64_t*>(
+          shared->config->control_address);
+      reinterpret_cast<uint4*>(&shared->task)[thread_id] =
+          reinterpret_cast<const uint4*>(
+              pool_slice_executor_slot(control, shared->ticket))[thread_id];
+    }
+    __syncthreads();
+    if (shared->task.queue_index != UINT32_MAX && thread_id < 2) {
+      const PoolSliceConfig& config = *shared->config;
+      const uint32_t source_pe =
+          shared->task.queue_index / poolSliceMaxStreamQueues;
+      const uint32_t queue =
+          shared->task.queue_index % poolSliceMaxStreamQueues;
+      const auto* receive_batches =
+          reinterpret_cast<const PoolSlicePublishBatch*>(
+              config.receive_batches_address);
+      reinterpret_cast<uint4*>(&shared->message)[thread_id] =
+          reinterpret_cast<const uint4*>(pool_slice_stream_queue_entry(
+              receive_batches,
+              source_pe,
+              queue,
+              shared->task.message_index,
+              config.route_capacity))[thread_id];
+    }
+    __syncthreads();
+
+    const uint32_t opcode = shared->task.opcode;
+    if (opcode == POOL_SLICE_EXECUTOR_SEND) {
+      pool_slice_executor_send_task<HostDataPlane, TotalWarps>(
+          shared, shared->task.argument, thread_id);
+    } else if (opcode == POOL_SLICE_EXECUTOR_DYNAMIC_READ) {
+      if (thread_id == 0) {
+        shared->source_pe = shared->task.queue_index == UINT32_MAX
+            ? 0
+            : shared->task.queue_index / poolSliceMaxStreamQueues;
+        shared->queue = shared->task.queue_index == UINT32_MAX
+            ? 0
+            : shared->task.queue_index % poolSliceMaxStreamQueues;
+        shared->instruction =
+            shared->dynamic_read_instructions[shared->task.argument];
+        shared->batch_count = shared->task.message_count;
+        shared->batch_offset = 0;
+      }
+      __syncthreads();
+      if (shared->instruction.opcode ==
+          POOL_SLICE_DYNAMIC_READ_REDUCE_ADD) {
+        // ReduceAdd is already a macro instruction over one immutable shard
+        // plan. It consumes no queue message; its expert barriers are the
+        // exact data dependencies and let the same stateless CTA execute it.
+        PoolSliceDynamicReadWorker::
+            execute<WeightedReturn, HostDataPlane, TotalWarps>(
+                shared->instruction,
+                shared->message,
+                0,
+                *shared->config,
+                shared->host_config,
+                shared->bars,
+                shared->events,
+                shared->sequence,
+                shared->status,
+                thread_id);
+      } else if (shared->instruction.opcode ==
+                     POOL_SLICE_DYNAMIC_READ_COPY &&
+                 shared->batch_count != 0) {
+        while (shared->batch_offset < shared->batch_count) {
+          if (thread_id == 0) {
+            while (!pool_slice_scheduler_queue_message_ready<
+                       HostDataPlane, TotalWarps>(
+                       shared->source_pe,
+                       shared->queue,
+                       shared->task.message_index + shared->batch_offset,
+                       *shared->config,
+                       reinterpret_cast<const PoolSlicePublishBatch*>(
+                           shared->config->receive_batches_address),
+                       reinterpret_cast<uint64_t*>(
+                           shared->config->control_address),
+                       shared->sequence))
+              __nanosleep(barrierPollSleepCycles);
+          }
+          if (shared->batch_offset != 0 && thread_id < 2) {
+            const auto* receive_batches =
+                reinterpret_cast<const PoolSlicePublishBatch*>(
+                    shared->config->receive_batches_address);
+            reinterpret_cast<uint4*>(&shared->message)[thread_id] =
+                reinterpret_cast<const uint4*>(
+                    pool_slice_stream_queue_entry(
+                        receive_batches,
+                        shared->source_pe,
+                        shared->queue,
+                        shared->task.message_index + shared->batch_offset,
+                        shared->config->route_capacity))[thread_id];
+          }
+          __syncthreads();
+          if (shared->instruction.opcode ==
+                  POOL_SLICE_DYNAMIC_READ_COPY &&
+              thread_id == 0 &&
+              atomicCAS(shared->first_gather, 0U, 1U) == 0U &&
+              shared->events != nullptr) {
+            shared->events[
+                static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+                poolSliceProfileFirstGather] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+          __syncthreads();
+          PoolSliceDynamicReadWorker::
+              execute<WeightedReturn, HostDataPlane, TotalWarps>(
+                  shared->instruction,
+                  shared->message,
+                  shared->source_pe,
+                  *shared->config,
+                  shared->host_config,
+                  shared->bars,
+                  shared->events,
+                  shared->sequence,
+                  shared->status,
+                  thread_id);
+          __syncthreads();
+          if (thread_id == 0)
+            ++shared->batch_offset;
+          __syncthreads();
+        }
+      } else if (thread_id == 0) {
+        pool_slice_stream_queue_error(*shared->config, shared->status);
+      }
+    } else if (opcode != POOL_SLICE_EXECUTOR_STOP && thread_id == 0) {
+      pool_slice_stream_queue_error(*shared->config, shared->status);
+    }
+    __syncthreads();
+
+    if (thread_id == 0) {
+      auto* control = reinterpret_cast<uint64_t*>(
+          shared->config->control_address);
+      if (shared->task.queue_index != UINT32_MAX) {
+        const uint32_t source_pe =
+            shared->task.queue_index / poolSliceMaxStreamQueues;
+        const uint32_t queue =
+            shared->task.queue_index % poolSliceMaxStreamQueues;
+        dae_atomic_or_release_gpu(
+            pool_slice_stream_queue_claim(control, source_pe, queue),
+            1ULL << (32 + shared->task.completion_bit));
+      }
+      dae_atomic_store_release_gpu(
+          &pool_slice_executor_slot(control, shared->ticket)->generation,
+          shared->ticket + poolSliceExecutorRingDepth);
+    }
+    __syncthreads();
+    if (opcode == POOL_SLICE_EXECUTOR_STOP)
+      break;
+  }
 }
 
 template <uint32_t TotalWarps>
@@ -3146,6 +4087,7 @@ template <bool WeightedReturn, bool HostDataPlane, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_exchange_streaming(
     const PoolSliceConfig& config,
     const PoolSliceHostConfig* host_config,
+    const PoolInst* dynamic_read_instructions,
     int* bars,
     uint64_t* signal_array,
     uint64_t* g_events,
@@ -3167,6 +4109,17 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   __shared__ uint32_t shared_probe;
   __shared__ uint32_t shared_complete;
   __shared__ PoolSliceQueueEntry shared_queue_message;
+  __shared__ PoolSliceSchedulerShared shared_scheduler;
+  __shared__ PoolSliceExecutorShared shared_executor;
+  __shared__ uint32_t shared_executor_initialize;
+  __shared__ uint32_t shared_direct_send_task;
+  __shared__ uint32_t shared_direct_route_source;
+  // The DynamicRead program is immutable for an invocation. Prefetch it once
+  // while the pool is initializing so queue execution never brings a 16-byte
+  // descriptor through the DATA-message critical path. The largest program is
+  // only 2.2 KiB and does not change PoolInst occupancy on Hopper.
+  __shared__ PoolInst shared_dynamic_read_instructions[
+      poolSliceMaxLocalReaders + poolSliceMaxPoolBlocks];
 
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
@@ -3181,16 +4134,8 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       config.receive_routes_address);
   const auto* send_offsets = reinterpret_cast<const uint32_t*>(
       config.send_offsets_address);
-  const auto* send_token_rows = reinterpret_cast<const uint32_t*>(
-      config.send_token_rows_address);
   const auto* send_token_counts = reinterpret_cast<const uint32_t*>(
       config.send_token_counts_address);
-  const auto* token_pool = reinterpret_cast<const uint8_t*>(
-      config.token_pool_address);
-  auto* delivery_pool = reinterpret_cast<uint8_t*>(
-      config.delivery_pool_address);
-  auto* expert_input = reinterpret_cast<uint8_t*>(
-      config.expert_input_address);
 
   if (thread_id == 0) {
     shared_status = POOL_SLICE_STATUS_OK;
@@ -3201,6 +4146,41 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     shared_next_send_task = config.pool_count == 1
         ? 0
         : config.pool_rank - 1;
+    shared_executor_initialize = 0;
+    shared_direct_send_task = UINT32_MAX;
+    shared_direct_route_source = UINT32_MAX;
+    shared_executor.config = &config;
+    shared_executor.host_config = host_config;
+    shared_executor.dynamic_read_instructions =
+        shared_dynamic_read_instructions;
+    shared_executor.bars = bars;
+    shared_executor.events = g_events;
+    shared_executor.status = &shared_status;
+    shared_executor.first_payload = &shared_first_payload;
+    shared_executor.first_gather = &shared_first_gather;
+    shared_executor.sequence = sequence;
+    shared_executor.phase_sequence = sequence * 2;
+    shared_executor.write_barrier = write_barrier;
+    shared_executor.phase_start = 1;
+    shared_scheduler.config = &config;
+    shared_scheduler.receive_batches = receive_batches;
+    shared_scheduler.bars = bars;
+    shared_scheduler.signal_array = signal_array;
+    shared_scheduler.events = g_events;
+    shared_scheduler.control = control;
+    shared_scheduler.status = &shared_status;
+    shared_scheduler.sequence = sequence;
+    shared_scheduler.return_value = return_value;
+    shared_scheduler.dispatch_barrier_base = dispatch_barrier_base;
+    shared_scheduler.worker_count = 0;
+    shared_scheduler.send_count = 0;
+    shared_scheduler.direct_send_count = 0;
+  }
+  for (uint32_t instruction = thread_id;
+       instruction < config.local_readers + config.pool_count;
+       instruction += blockDim.x) {
+    shared_dynamic_read_instructions[instruction] =
+        dynamic_read_instructions[instruction];
   }
   if (g_events != nullptr) {
     constexpr uint32_t last_profile_event = poolSliceProfileAllReadersReady;
@@ -3214,6 +4194,12 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   __syncthreads();
 
   if (config.pool_rank == 0) {
+    if (thread_id == 0) {
+      shared_executor_initialize = config.pool_count > 1 &&
+          dae_atomic_load_acquire_gpu(
+              control + poolSliceControlExecutorInitialized) == 0;
+    }
+    __syncthreads();
     for (uint32_t index = thread_id; index < 5; index += blockDim.x)
       control[index] = 0;
     for (uint32_t reader = thread_id;
@@ -3232,6 +4218,23 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
          index += blockDim.x) {
       control[poolSliceControlStreamQueueHead + index] = 0;
       control[poolSliceControlStreamQueueClaim + index] = 0;
+      shared_scheduler.heads[index] = 0;
+      shared_scheduler.expected[index] = 0;
+      shared_scheduler.advance[index] = 0;
+    }
+    if (shared_executor_initialize != 0) {
+      for (uint32_t slot = thread_id;
+           slot < poolSliceExecutorRingDepth;
+           slot += blockDim.x)
+        pool_slice_executor_ring(control)[slot].generation = slot;
+      __syncthreads();
+      if (thread_id == 0) {
+        control[poolSliceControlExecutorProducer] = 0;
+        control[poolSliceControlExecutorConsumer] = 0;
+        control[poolSliceControlExecutorPhaseSequence] = 0;
+        dae_atomic_store_release_gpu(
+            control + poolSliceControlExecutorInitialized, 1);
+      }
     }
     if constexpr (WeightedReturn) {
       for (uint32_t index = thread_id;
@@ -3349,6 +4352,37 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       control + poolSliceControlStreamMetadataSignalDelta);
   const uint32_t dispatch_worker_count =
       pool_slice_stream_dispatch_worker_count(config, control);
+  // Weighted combine has one independently executable shard per PoolInst
+  // rank. Keep every assembled CTA available to the dynamic ring so moving
+  // ReduceAdd behind the scheduler never reduces the prior reduction width.
+  const uint32_t executor_count = WeightedReturn
+      ? config.pool_count - 1
+      : dispatch_worker_count;
+  if (thread_id == 0) {
+    const uint32_t send_count = static_cast<uint32_t>(
+        dae_atomic_load_relaxed_gpu(
+            control + poolSliceControlStreamSendTotal));
+    const uint32_t direct_send_count =
+        send_count < dispatch_worker_count
+        ? send_count
+        : dispatch_worker_count;
+    shared_scheduler.worker_count = executor_count;
+    shared_scheduler.send_count = send_count;
+    shared_scheduler.direct_send_count = direct_send_count;
+    if (config.pool_rank != 0 &&
+        config.pool_rank <= dispatch_worker_count) {
+      const uint32_t worker_index = config.pool_rank - 1;
+      if (worker_index < config.num_pes)
+        shared_direct_route_source = worker_index;
+      // Preserve the predecessor's flat CTA stripe exactly. The metadata
+      // CTAs execute their own publication first and then submit early SEND
+      // groups; free CTAs submit the rest. This naturally paces the NIC WQE
+      // wave without a global gate or an extra source-local signal.
+      if (worker_index < direct_send_count)
+        shared_direct_send_task = worker_index;
+      shared_executor.phase_start = 1;
+    }
+  }
   pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>(
       config,
       sequence,
@@ -3364,11 +4398,70 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   }
   __syncthreads();
 
-  // With multiple CTAs rank zero remains a control plane while all other
-  // CTAs alternate direct sends and ready destination gathers. A one-CTA
-  // correctness configuration first closes metadata, then runs the same
-  // payload loop with the full block.
-  if (config.pool_rank == 0 && warp == 0) {
+  // SEND has no queue-head dependency. Runtime-sized groups use the same flat
+  // target-major CTA stripe as the predecessor; only overflow enters the HBM
+  // ring. Metadata and data retain independent remote readiness generations.
+  if (shared_direct_send_task != UINT32_MAX) {
+    pool_slice_executor_send_task<HostDataPlane, TotalWarps>(
+        &shared_executor, shared_direct_send_task, thread_id);
+  }
+  __syncthreads();
+
+  // Source-route expansion is a fixed metadata operation, not a dynamic ring
+  // job. One executor CTA per source waits on that source's accepted envelope,
+  // expands the reverse map and ReduceAdd plans, then publishes the same
+  // queue-zero completion bit consumed by the central scheduler. Keeping this
+  // stage direct removes a ring handoff from every DynamicRead dependency.
+  if (shared_direct_route_source != UINT32_MAX) {
+    const uint32_t source_pe = shared_direct_route_source;
+    if (thread_id == 0) {
+      while (dae_atomic_load_acquire_gpu(
+                 control + poolSliceControlStreamMetadataReady + source_pe) <
+             sequence)
+        __nanosleep(barrierPollSleepCycles);
+    }
+    __syncthreads();
+    if (thread_id < 2) {
+      reinterpret_cast<uint4*>(&shared_queue_message)[thread_id] =
+          reinterpret_cast<const uint4*>(pool_slice_stream_queue_entry(
+              receive_batches,
+              source_pe,
+              0,
+              0,
+              config.route_capacity))[thread_id];
+    }
+    __syncthreads();
+    pool_slice_stream_execute_reserve_routes<WeightedReturn, true>(
+        shared_queue_message,
+        source_pe,
+        0,
+        config,
+        receive_batches,
+        receive_routes,
+        combine_rows,
+        control,
+        sequence,
+        &shared_status,
+        thread_id);
+    __syncthreads();
+    if (thread_id == 0) {
+      dae_atomic_or_release_gpu(
+          pool_slice_stream_queue_claim(control, source_pe, 0),
+          1ULL << 32);
+    }
+  }
+  __syncthreads();
+
+  // Production assemblies use one scheduler warp and stateless executor
+  // CTAs. The single-CTA correctness shape retains the direct loop below
+  // because no independent CTA exists to consume the ring.
+  if (config.pool_count > 1 && config.pool_rank == 0 && warp == 0) {
+    pool_slice_scheduler_dispatch_warp<
+        WeightedReturn, HostDataPlane, TotalWarps>(
+            &shared_scheduler,
+            lane);
+  }
+  if (config.pool_count == 1 && config.pool_rank == 0 && warp == 0) {
     bool metadata_ready = lane >= config.num_pes;
     bool route_ready = lane >= config.num_pes;
     bool reader_expected_ready = lane >= config.local_readers;
@@ -3534,13 +4627,17 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   }
   __syncthreads();
 
-  const bool payload_executor = config.pool_count == 1 ||
-      (config.pool_rank != 0 &&
-       config.pool_rank <= dispatch_worker_count);
-  if (payload_executor) {
-    const uint32_t send_stride = config.pool_count == 1
-        ? 1
-        : dispatch_worker_count;
+  const bool ring_executor = config.pool_count > 1 &&
+      ((config.pool_rank != 0 &&
+        config.pool_rank <= executor_count) ||
+       (WeightedReturn && config.pool_rank == 0));
+  if (ring_executor) {
+    pool_slice_executor_loop<WeightedReturn, HostDataPlane, TotalWarps>(
+        &shared_executor,
+        thread_id);
+  }
+  if (config.pool_count == 1) {
+    const uint32_t send_stride = 1;
     while (true) {
       if (thread_id == 0) {
         const uint64_t send_total = dae_atomic_load_relaxed_gpu(
@@ -3653,34 +4750,27 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
                 sequence);
             if (!shared_queue_valid) {
               pool_slice_stream_queue_error(config, &shared_status);
-            } else if (
-                atomicCAS(&shared_first_gather, 0U, 1U) == 0U &&
-                g_events != nullptr) {
-              g_events[
-                  static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
-                  poolSliceProfileFirstGather] =
-                  cuda::ptx::get_sreg_globaltimer();
+            } else {
+              if (atomicCAS(&shared_first_gather, 0U, 1U) == 0U &&
+                  g_events != nullptr) {
+                g_events[
+                    static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+                    poolSliceProfileFirstGather] =
+                    cuda::ptx::get_sreg_globaltimer();
+              }
             }
           }
           __syncthreads();
           if (shared_queue_valid) {
-            PoolSliceDynamicReadExecutor<
-                POOL_SLICE_DYNAMIC_READ_COPY>::
-                execute<HostDataPlane, TotalWarps>(
+            PoolSliceDynamicReadWorker::
+                execute<WeightedReturn, HostDataPlane, TotalWarps>(
+                shared_dynamic_read_instructions[shared_queue_reader],
+                shared_queue_message,
                 source_pe,
-                shared_queue_message.row_begin,
-                shared_queue_message.row_end,
-                shared_queue_message.ready_slot |
-                    (shared_queue_reader << 16),
                 config,
-                receive_batches,
-                receive_routes,
-                send_token_rows,
-                token_pool,
-                delivery_pool,
-                expert_input,
+                host_config,
                 bars,
-                write_barrier,
+                g_events,
                 sequence,
                 &shared_status,
                 thread_id);
@@ -3748,7 +4838,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       __syncthreads();
     }
   }
-  if (!payload_executor) {
+  if (config.pool_count > 1 && !ring_executor) {
     if (thread_id == 0) {
       const uint64_t expected_retired =
           pool_slice_stream_queue_retired_mask(config.num_pes);
@@ -3860,20 +4950,25 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   pool_slice_wait_value_warp(
       control + poolSliceControlDispatchReady, sequence, lane);
   if constexpr (WeightedReturn) {
-    PoolSliceDynamicReadExecutor<
-        POOL_SLICE_DYNAMIC_READ_REDUCE_ADD>::
-        execute<HostDataPlane, TotalWarps>(
-        config,
-        host_config,
-        bars,
-        g_events,
-        compute_barrier_base,
-        thread_id,
-        sequence,
-        &shared_status);
-    PoolSliceDynamicReadExecutor<
-        POOL_SLICE_DYNAMIC_READ_REDUCE_ADD>::
-        finish<TotalWarps>(
+    // A one-CTA correctness assembly has no independent ring consumer. The
+    // production assembly enqueued all ReduceAdd programs on the common ring
+    // before its STOP suffix, so only the fallback executes one directly.
+    if (config.pool_count == 1) {
+      PoolSliceDynamicReadWorker::
+          execute<WeightedReturn, HostDataPlane, TotalWarps>(
+              shared_dynamic_read_instructions[config.local_readers],
+              shared_queue_message,
+              0,
+              config,
+              host_config,
+              bars,
+              g_events,
+              sequence,
+              &shared_status,
+              thread_id);
+      __syncthreads();
+    }
+    PoolSliceDynamicReadWorker::finish_reduce_add<TotalWarps>(
         config, g_events, thread_id, sequence, &shared_status);
   } else {
     pool_slice_return_unweighted<TotalWarps>(
@@ -3890,24 +4985,25 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
 }
 
 
-// A PoolInst macro operation invoked by every PoolSliceExchangeExecuteWarp
-// thread. PoolInst is separate from CommInst, and this operator has one
-// dispatch implementation: direct-source streaming gathered read.
+// A PoolInst program invoked by every PoolSliceExchangeExecuteWarp thread.
+// Slot zero carries the rank-local program header; the remaining immutable
+// instructions are scheduled by the common pool worker.
 template <bool WeightedReturn, uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_exchange(
-    const PoolSliceConfig* config_pointer,
+    const PoolInst* instructions,
     int* bars,
     uint64_t* signal_array,
     uint64_t* g_events,
-    uint32_t write_barrier,
-    uint32_t dispatch_barrier_base,
-    uint32_t compute_barrier_base,
     uint32_t thread_id) {
   static_assert(TotalWarps >= 3, "PoolInst requires coordinator plus workers");
+  __shared__ PoolInst shared_program_header;
   __shared__ PoolSliceConfig shared_config;
 
-  if (thread_id == 0)
-    shared_config = *config_pointer;
+  if (thread_id == 0) {
+    shared_program_header = instructions[0];
+    shared_config = *reinterpret_cast<const PoolSliceConfig*>(
+        shared_program_header.address);
+  }
   __syncthreads();
 
   const PoolSliceConfig& config = shared_config;
@@ -3916,12 +5012,13 @@ static __device__ __noinline__ void pool_slice_exchange(
   pool_slice_exchange_streaming<WeightedReturn, false, TotalWarps>(
       config,
       nullptr,
+      instructions + 1,
       bars,
       signal_array,
       g_events,
-      write_barrier,
-      dispatch_barrier_base,
-      compute_barrier_base,
+      shared_program_header.size,
+      shared_program_header.arg0,
+      shared_program_header.arg1,
       thread_id,
       sequence,
       return_value);
@@ -3932,19 +5029,20 @@ static __device__ __noinline__ void pool_slice_exchange(
 // payload+ready publication sites above.
 template <uint32_t TotalWarps>
 static __device__ __noinline__ void pool_slice_host_weighted_exchange(
-    const PoolSliceHostConfig* config_pointer,
+    const PoolInst* instructions,
     int* bars,
     uint64_t* signal_array,
     uint64_t* g_events,
-    uint32_t write_barrier,
-    uint32_t dispatch_barrier_base,
-    uint32_t compute_barrier_base,
     uint32_t thread_id) {
   static_assert(TotalWarps >= 3, "PoolInst requires coordinator plus workers");
+  __shared__ PoolInst shared_program_header;
   __shared__ PoolSliceHostConfig shared_host_config;
 
-  if (thread_id == 0)
-    shared_host_config = *config_pointer;
+  if (thread_id == 0) {
+    shared_program_header = instructions[0];
+    shared_host_config = *reinterpret_cast<const PoolSliceHostConfig*>(
+        shared_program_header.address);
+  }
   __syncthreads();
 
   const PoolSliceConfig& config = shared_host_config.pool;
@@ -3952,12 +5050,13 @@ static __device__ __noinline__ void pool_slice_host_weighted_exchange(
   pool_slice_exchange_streaming<true, true, TotalWarps>(
       config,
       &shared_host_config,
+      instructions + 1,
       bars,
       signal_array,
       g_events,
-      write_barrier,
-      dispatch_barrier_base,
-      compute_barrier_base,
+      shared_program_header.size,
+      shared_program_header.arg0,
+      shared_program_header.arg1,
       thread_id,
       sequence,
       sequence);

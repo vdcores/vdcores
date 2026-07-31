@@ -404,9 +404,9 @@ def run_pool(
         "weighted_reduce": "fp32-ilp4",
         "data_group_limit": buffers.group_limit,
         "stream_queues_per_source": stream_queues_per_source,
-        "queue_head_scan": "distributed-warp-ready-steal",
+        "queue_head_scan": "central-shared-head-executor-ring",
         "target_submission": (
-            "independent-target-major-cta-qp"
+            "target-major-dynamic-group-cta-stripe"
             if buffers.pool_count >= runtime.num_pes
             else "rank0-warp-fallback"
         ),

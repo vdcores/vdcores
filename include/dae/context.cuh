@@ -17,7 +17,10 @@ static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
 static constexpr int numCommInsts = 32;
-static constexpr int numPoolInsts = 1;
+// One pool-program header, one DynamicRead<Copy> per local expert, and one
+// DynamicRead<ReduceAdd> per pool slice. The immutable stream stays in the
+// ordinary PoolInst array; executors fetch only the instruction they claim.
+static constexpr int numPoolInsts = 1 + 8 + 132;
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 
@@ -135,8 +138,8 @@ static_assert(sizeof(CommInst) == 16, "CommInst ABI changed");
 
 // PoolInst is a separate instruction ABI consumed by a compile-time selected,
 // generally multi-warp pool executor. It never enters the ordinary CommInst
-// interpreter. The common layout keeps launcher packing simple while allowing
-// each pool opcode to select its own warp type and kernel resources.
+// interpreter. Slot zero selects/configures the executor; following slots are
+// its immutable operation queue.
 struct alignas(16) PoolInst {
   uint16_t opcode;
   uint16_t size;

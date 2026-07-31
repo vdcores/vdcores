@@ -16,12 +16,13 @@ never enters the memory/compute queues. Opcode zero terminates, so an untouched
 communication stream is inert. The default and fixed-pool kernels do not
 instantiate this interpreter.
 
-The unified pool hot path is a distinct `PoolInst`. Its registry binds generic
-and weighted gathered-read opcodes to separate execute-warp types; host
-dispatch instantiates one type, and the device performs no opcode or
-return-mode switch. Its eight resident warps cooperate on the macro. A fixed
-pool kernel contains no ordinary VM; a mixed eight-warp kernel may assign
-other blocks to the unchanged compute/memory VM.
+The unified pool hot path is a distinct PoolInst program. Its registry binds
+generic and weighted header opcodes to separate execute-warp types; host
+dispatch instantiates one type. The following PoolInst queue contains Copy and
+ReduceAdd operations decoded once per CTA claim. Its eight resident warps
+cooperate on each operation. A fixed pool kernel contains no ordinary VM; a
+mixed eight-warp kernel may assign other blocks to the unchanged
+compute/memory VM.
 
 The single `Launcher.launch_dae` call carries compute, memory, ordinary
 communication, and pool instruction arrays plus optional per-block core
@@ -31,7 +32,10 @@ strictly under `benchmarks/`.
 
 ## Unified Compact Pool Protocol
 
-Each PE owns one logical pool slice and one communication-specialized block.
+Each PE owns one logical pool slice and one immutable local instruction queue.
+The descriptors are replicated in each pool block's instruction segment for
+cheap direct indexing, while shared claim state makes all blocks one executor
+pool.
 The source metadata is stable-grouped by destination PE and local reader.
 
 1. An ordinary VDCores writer block copies every active source row exactly
@@ -48,25 +52,25 @@ The source metadata is stable-grouped by destination PE and local reader.
    Every `DATA` names its exact compact interval and separate readiness
    slot. The route plane and envelope each carry their own arrival update into
    a merged per-source counter. Public payloads remain independent of metadata.
-4. Target payload CTAs inspect only queue heads, using one warp ballot for at
-   most sixteen heads. `RESERVE_ROUTES` creates all `(reader, source)` spans as one macro.
-   For weighted return it also expands that source's reverse map and builds
-   source-owned ReduceAdd plans before publishing route-ready.
-   A copy head waits for route-ready and its own data-ready slot; later ready
-   entries remain behind their queue head. A ready COPY exposes one CTA claim
-   per local reader, so two queues/source bound arbitration without limiting
-   destination HBM parallelism.
-5. Target workers fan ready intervals from their source-indexed receive table
-   into expert input. Each nonempty group release-adds an exact per-reader
-   counter; metadata supplies the expected count, so the coordinator releases
-   each ordinary reader independently. Ordered `END` instructions still
-   contribute to the separate terminal mask that retires the invocation.
-6. Dispatch Copy and combine ReduceAdd use one compile-time typed executor.
-   Each static reduction CTA consumes its already-published plan, waits only
-   the named reader-compute barriers, reduces one source-row shard, and
-   publishes its coalesced return group with payload-coupled generation
-   ordering. The retained schedule executes ReduceAdd after dispatch because
-   overlapping both HBM-bound transforms regressed the measured total.
+4. A single rank-zero scheduler warp owns all target queue heads and retirement.
+   One fixed CTA per source executes `RESERVE_ROUTES`, creates every
+   `(reader, source)` span, and for weighted return builds source-owned
+   ReduceAdd plans before publishing route-ready. As sources become ready, the
+   scheduler dynamically batches stateless Copy jobs into a bounded HBM ring.
+5. Executor CTAs claim ring tickets with native 64-bit `atomicAdd` and fan
+   ready intervals from their source-indexed receive table into expert input.
+   Each nonempty group release-adds an exact per-reader counter; metadata
+   supplies the expected count, so the scheduler releases each ordinary
+   reader independently. Executor completion bits let the sole scheduler
+   advance ordered heads; warp-parallel `END` retirement contributes to the
+   separate terminal mask.
+6. Dispatch Copy and combine ReduceAdd use the same pool worker CTAs. A DATA
+   claim selects the persistent Copy instruction for its local reader. After
+   dispatch retirement, workers use one local `atomicAdd` cursor to claim the
+   persistent ReduceAdd instructions, consume their already-published plans,
+   wait only the named reader-compute barriers, reduce one source-row shard,
+   and publish its coalesced return group. The retained phase priority avoids
+   the measured regression from overlapping both HBM-bound transforms.
 7. Once the source observes the required return-group generations, all
    PoolInst warps scatter and reduce destination partials into token-major
    output. Combine sends no router metadata because both endpoints retained
@@ -134,7 +138,8 @@ PoolInst executor.
    never shares bytes with metadata, so early payload completion is safe.
 3. Target queue copies start only after both source route-ready and the head
    instruction's data-ready slot are observed. Each reader shard release-adds
-   completion; the final acquire-release CAS advances the queue head.
+   its reader count and release-publishes a message-specific completion bit;
+   the single scheduler acquires that bit before advancing the queue head.
 4. All dispatch RMAs are nonblocking and several PoolInst CTAs may keep
    independent QPs in flight. The current compact direct-put path uses the
    pinned block-cooperative quiet per issuing CTA.
@@ -145,10 +150,11 @@ PoolInst executor.
    destination-wide quiet or merged return phase in this executor.
 7. Observing all required return-group generations makes every source inbox
    range consumable before scatter.
-8. Queue claim release/acquire orders consecutive local instructions. The
-   per-reader acquire/release counter chain publishes gathered rows before
-   reader release; the acq-rel terminal mask independently retires all ordered
-   queues.
+8. Per-slot ring generations order scheduler publication and dynamic executor
+   claims. Message-specific completion release/acquire orders consecutive
+   queue instructions. The per-reader counter chain publishes gathered rows
+   before reader release; the acq-rel terminal mask independently retires all
+   ordered queues.
 9. Signal comparisons use `>=` and sequence-derived values. Signal words and
    the metadata-parts counter are monotonic and are not cleared between phases.
 
