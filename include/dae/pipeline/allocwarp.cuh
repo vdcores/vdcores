@@ -15,12 +15,16 @@ static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
 static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
-template<typename M2C_Type, typename M2LD_Type>
+template<int NumLoadWarps = daeDefaultLoadWarps,
+         typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
-    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs,
+    int *bars, uint64_t *signal_array
 ) {
+  static_assert(NumLoadWarps >= 1 && NumLoadWarps <= daeMaxLoadWarps);
+  (void)signal_array;
   static_assert(numSlots < 32, "Too many slots for single warp");
 
   // register flags
@@ -52,7 +56,9 @@ __device__ __forceinline__ void allocwarp_execute(
     // end of async zone
 
     di.inst_decode(inst);
-    auto &curld = m2ld[di.port];
+    // The compact one-load core accepts the unchanged two-port instruction
+    // ABI and serializes both logical ports through its only physical loader.
+    auto &curld = m2ld[NumLoadWarps == 1 ? 0 : di.port];
 
     // ID.A: modification to the instruction
     // A1. shift the address field
@@ -133,8 +139,9 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_TERMINATE): {
           di.pred_continue = false;
           if (lane_id == 0) {
-            m2ld[0].push(SLOT_END);
-            m2ld[1].push(SLOT_END);
+            #pragma unroll
+            for (int port = 0; port < NumLoadWarps; ++port)
+              m2ld[port].push(SLOT_END);
           }
         }
         break;

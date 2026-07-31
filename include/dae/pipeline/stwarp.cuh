@@ -13,7 +13,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
   int slot_mask = c2m.pop();
   while (slot_mask) {
   
-    auto slot = extract(slot_mask);
+    const auto slot = extract(slot_mask);
     bool do_free = true;
 
     __stprint("Receive ST slot: slot=%d", slot);
@@ -34,6 +34,11 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
         );
         cuda::ptx::cp_async_bulk_commit_group();
       } 
+        break;
+      case op(OP_ALLOC_WB_RAW_ADDRESS):
+        // The compute operator wrote the global destination directly. The
+        // queued raw-address token exists only to arrive at its barrier.
+        do_free = false;
         break;
       case op(OP_ALLOC_WB_TMA_STORE_2D):
         {

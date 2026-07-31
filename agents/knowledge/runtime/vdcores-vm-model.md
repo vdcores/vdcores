@@ -16,15 +16,21 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
 
 ## Runtime Shape
 
-- One `dae2` block runs per SM.
-- Each block has `256` threads:
+- One `dae2` block runs per logical SM in the launch.
+- The default build has `256` threads:
   - `4` compute warps, threads `0..127`
   - `4` memory-side warps, threads `128..255`
+- Enabling NVSHMEM does not change the default core. Compile-time variants
+  provide a seven-warp one-load VM, an eight-warp mixed compute/pool envelope,
+  an executor-sized pool-only kernel, and a nine-warp
+  compute+memory+communication specialization. See `configurable-vdcores.md`.
 - Current fixed configuration from [include/dae/context.cuh](/home1/11362/depctg/vdcores/include/dae/context.cuh):
   - `24` normal shared-memory slots
   - `9` special slots
   - slot size `8 KiB`
   - `512` instructions per SM when `dae2LoadInstructions=true`
+  - `32` communication instructions per SM
+  - `1` PoolInst per SM
   - `1024` TMA descriptors max
   - `1024` global barrier ids max
 
@@ -33,6 +39,7 @@ This note distills the checked-in runtime into a VM-style model. It is based on:
 Each SM/block owns:
 
 - Shared copies of the compute and memory instruction streams
+- In the nine-warp communication build, a separate shared communication stream
 - `st_insts[numSlots + numSpecialSlots]`
   - the allocated-memory instruction table
   - entry `st_insts[slot]` is the metadata for that live slot
@@ -44,9 +51,15 @@ Each SM/block owns:
 - `scratch_space[32]`
   - shared scratch used by some compute ops such as argmax
 
+The kernel also accepts an optional process-wide symmetric `uint64_t*` signal
+array. Ordinary communication and PoolInst executors consume it for named
+request/phase messages. Base alloc/load/store behavior is unchanged.
+
 ## Virtual Cores
 
-The runtime is easiest to view as one compute VM plus one memory VM per SM.
+An ordinary block is one compute VM plus one memory VM, optionally with a
+third communication VM. A PoolInst block instead gives its complete CTA to one
+compile-time selected executor and does not enter those interpreters.
 
 ### Compute VM
 
@@ -125,6 +138,32 @@ The alloc-warp interpreter also keeps three local control variables in [include/
   - pc for the next fetch
 - `shift`
   - the packed resource-group increment later consumed by `GROUP`
+
+### Ordinary Communication VM
+
+The optional ninth warp has an independent `CommInst` PC loop and no allocator
+state. It executes barriers/timestamps, NVSHMEM put/wait, and the generic
+mailbox-pool submit/wait/run proof path. These operators do not consume slots
+or enter `m2c`, `c2m`, or `m2ld`. Its kernel specialization has its own
+register ceiling, so the default and PoolInst assemblies are unaffected even
+though they share `runtime.o`.
+
+### PoolInst Executor
+
+`PoolInst` has its own instruction array and registry. Host launch dispatch
+selects a concrete execute-warp type at compile time; device code performs no
+pool opcode switch. The executor may own multiple physical warps or the entire
+CTA. The generic and weighted pool-slice executors each own eight warps and
+instantiate the same dependent dynamic-read loop with a different compiled
+return policy.
+
+PoolInst synchronizes with ordinary blocks through named `bars[]` entries and
+with other PEs through monotonic NVSHMEM signals. See
+`configurable-vdcores.md` and `vdcores-communication-core.md`.
+
+Weighted pool return is compiled into `PoolSliceWeightedExchangeExecuteWarp`.
+Previously explored external-reducer modes were removed from the hot ABI; a
+future placement alternative must register another concrete PoolInst type.
 
 ## Queue Model
 
@@ -386,6 +425,20 @@ The `bars` array is the externally visible dependency table.
 - write side:
   - writeback ops with `MEM_OP_FLAGS_BARRIER` decrement `bars[bar]` after the async store finishes
 
+PoolSlice local handoffs use this same table and the same operations. A pending
+single-producer edge starts at one, its producer decrements once, and every
+consumer waits for zero. Pre-satisfied edges start at zero. Cross-PE sequence
+signals and generic memory-pool dependency tickets remain separate objects.
+
+### Memory-pool dependency tickets
+
+The optional NVSHMEM memory pool adds a separate HBM dependency table. A pool
+request can wait for `dependencies[slot] >= value` and can add a delta to a
+slot only after its data operation completes. These monotonic tickets are not
+the same object as the launcher's `bars[]`: `CommWaitBarrier` orders a local
+HBM producer before `MemoryPoolSubmit`, while pool tickets order remote pool
+operations against each other.
+
 ## Register-Like Facilities
 
 Two operator pairs act like VM-side pseudo-registers.
@@ -406,6 +459,12 @@ Observed behavior from [python/dae/instructions.py](/home1/11362/depctg/vdcores/
 - `RawAddress(tensor, slot_id)` reserves a special slot id
 - the pointer is stored in `st_insts[slot_id].address`
 - compute kernels recover it with `slot_2_glob_ptr(...)`
+- a direct-output schedule may add `WRITEBACK | BARRIER`; compute converts the
+  special slot id to the ordinary one-hot `c2m` mask, and the store warp routes
+  it solely to decrement the normal barrier after compute finishes writing HBM
+- direct-output writeback slots are restricted to `24..30`; special slots
+  `31..32` may carry input pointers but cannot be represented as a nonnegative
+  one-hot value in the signed 32-bit `c2m` queue
 
 This is the path used for outputs that compute writes directly to global memory without a shared-memory writeback tile.
 

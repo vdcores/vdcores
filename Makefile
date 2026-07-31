@@ -4,6 +4,34 @@
 NVCC = nvcc
 PYTHON ?= python
 
+NVSHMEM_HOME ?= $(shell $(PYTHON) -c "import sys; from pathlib import Path; print(Path(sys.prefix) / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages' / 'nvidia' / 'nvshmem')")
+NVSHMEM_INCLUDE_DIR := $(NVSHMEM_HOME)/include
+NVSHMEM_LIBRARY_DIR := $(NVSHMEM_HOME)/lib
+NVSHMEM_BUILD_DIR := build/nvshmem
+NVSHMEM_RUNTIME_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime.o
+NVSHMEM_DLINK_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime_dlink.o
+NCCL_HOME ?= $(shell $(PYTHON) -c "import sys; from pathlib import Path; print(Path(sys.prefix) / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages' / 'nvidia' / 'nccl')")
+NCCL_INCLUDE_DIR := $(NCCL_HOME)/include
+GIN_BUILD_DIR := build/gin
+GIN_RUNTIME_OBJECT := $(GIN_BUILD_DIR)/runtime.o
+DAE_POOL_SLICE_WARPS ?= 8
+# CTA-mapped RC QPs permit one ordered completion generation per PoolInst
+# payload group. Set this to 1 only for a runtime configured with warp-mapped
+# QPs; that build uses one exact completion generation per payload warp.
+DAE_POOL_SLICE_WARP_QP_COMPLETION ?= 0
+# Optional PoolInst-only IBGDA RC fast path. It concatenates noncontiguous HBM
+# rows into one remote contiguous write without source staging. Keep disabled
+# for the portable/default build; the performance variant is compiled rather
+# than selected inside the runtime loop.
+DAE_POOL_SLICE_RAW_SGL ?= 0
+DAE_POOL_SLICE_RAW_SGL_WIDTH ?= 8
+# CUDA 13 diagnoses deprecated volatile syntax in NVSHMEM 3.4.5 collective
+# headers even though this runtime does not instantiate those collectives.
+NVSHMEM_HEADER_DIAGNOSTICS := -diag-suppress=3012,3013
+# Register limits are per kernel specialization via CUDA 13's __maxnreg__:
+# eight-warp VM and PoolInst kernels may use 255 registers, while only the
+# optional nine-warp ordinary-communication assembly is capped at 168.
+
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
 CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
@@ -25,6 +53,10 @@ LDFLAGS = -lcuda -lcublas
 
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
+NVCC_FLAGS += -DDAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS)
+NVCC_FLAGS += -DDAE_POOL_SLICE_WARP_QP_COMPLETION=$(DAE_POOL_SLICE_WARP_QP_COMPLETION)
+NVCC_FLAGS += -DDAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL)
+NVCC_FLAGS += -DDAE_POOL_SLICE_RAW_SGL_WIDTH=$(DAE_POOL_SLICE_RAW_SGL_WIDTH)
 
 # Directories
 ifeq ($(debug),)
@@ -53,7 +85,7 @@ all: pyext
 
 # Clean build artifacts
 clean:
-	rm -rf $(APPS) $(TARGETS) build/generated
+	rm -rf $(APPS) $(TARGETS) build/generated $(NVSHMEM_BUILD_DIR) $(GIN_BUILD_DIR)
 
 # Build the executable, this is wildcard rule for multiple targets
 %: app/%.cu $(TARGETS) $(HEADERS)
@@ -72,14 +104,63 @@ $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS): $(C
 runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
 
+$(NVSHMEM_RUNTIME_OBJECT): src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
+	@test -f $(NVSHMEM_INCLUDE_DIR)/nvshmem.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NVSHMEM=1 \
+		$(NVSHMEM_HEADER_DIAGNOSTICS) -I$(NVSHMEM_INCLUDE_DIR) \
+		-rdc=true -dc -Xcompiler -fPIC -o $@ $<
+
+$(NVSHMEM_DLINK_OBJECT): $(NVSHMEM_RUNTIME_OBJECT)
+	@test -f $(NVSHMEM_LIBRARY_DIR)/libnvshmem_device.a
+	$(NVCC) $(CUDA_ARCH) -dlink -Xcompiler -fPIC \
+		$(NVSHMEM_RUNTIME_OBJECT) \
+		-L$(NVSHMEM_LIBRARY_DIR) -lnvshmem_device -o $@
+
+$(GIN_RUNTIME_OBJECT): src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
+	@test -f $(NCCL_INCLUDE_DIR)/nccl_device.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NCCL_GIN=1 \
+		-I$(NCCL_INCLUDE_DIR) -Xcompiler -fPIC -c -o $@ $<
+
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
 
 run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
-	pip install -e . --no-build-isolation
+	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
+	DAE_POOL_SLICE_WARP_QP_COMPLETION=$(DAE_POOL_SLICE_WARP_QP_COMPLETION) \
+	DAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL) \
+	DAE_POOL_SLICE_RAW_SGL_WIDTH=$(DAE_POOL_SLICE_RAW_SGL_WIDTH) \
+	$(PYTHON) -m pip install -e . --no-build-isolation
+
+# Build the device-linked DAE runtime and the small optional NVSHMEM allocation
+# extension through the same setup.py. Host control remains in NVSHMEM4Py.
+nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(NVSHMEM_RUNTIME_OBJECT) $(NVSHMEM_DLINK_OBJECT)
+	DAE_ENABLE_NVSHMEM=1 \
+	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
+	DAE_POOL_SLICE_WARP_QP_COMPLETION=$(DAE_POOL_SLICE_WARP_QP_COMPLETION) \
+	DAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL) \
+	DAE_POOL_SLICE_RAW_SGL_WIDTH=$(DAE_POOL_SLICE_RAW_SGL_WIDTH) \
+	NVSHMEM_HOME=$(NVSHMEM_HOME) \
+	DAE_RUNTIME_OBJECT=$(abspath $(NVSHMEM_RUNTIME_OBJECT)) \
+	DAE_RUNTIME_DLINK_OBJECT=$(abspath $(NVSHMEM_DLINK_OBJECT)) \
+	$(PYTHON) -m pip install -e . --no-build-isolation
+
+# Compile a PoolInst-only NCCL GIN assembly. GIN and NVSHMEM are deliberately
+# exclusive in one extension so the pool transport is selected at compile
+# time and no transport branch enters the macro operator.
+gin-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(GIN_RUNTIME_OBJECT)
+	DAE_ENABLE_NCCL_GIN=1 \
+	DAE_POOL_SLICE_WARPS=$(DAE_POOL_SLICE_WARPS) \
+	DAE_POOL_SLICE_WARP_QP_COMPLETION=0 \
+	DAE_POOL_SLICE_RAW_SGL=$(DAE_POOL_SLICE_RAW_SGL) \
+	DAE_POOL_SLICE_RAW_SGL_WIDTH=$(DAE_POOL_SLICE_RAW_SGL_WIDTH) \
+	NCCL_HOME=$(NCCL_HOME) \
+	DAE_RUNTIME_OBJECT=$(abspath $(GIN_RUNTIME_OBJECT)) \
+	$(PYTHON) -m pip install -e . --no-build-isolation
 
 FORCE:
 
-.PHONY: all clean run FORCE
+.PHONY: all clean run FORCE nvshmem-pyext gin-pyext

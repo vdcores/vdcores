@@ -1,0 +1,13 @@
+# Install the CUDA 13 PyTorch wheel separately as documented in setup.sh.
+accelerate
+numpy
+transformers
+
+# NVSHMEM 3.4.5 / NVSHMEM4Py 0.1.3 compatibility set.
+cuda-bindings==13.0.3
+cuda-python==13.0.3
+cuda.core==0.4.0
+cuda.pathfinder==1.2.3
+mpi4py==4.1.1
+nvidia-nvshmem-cu13==3.4.5
+nvshmem4py-cu13==0.1.3
