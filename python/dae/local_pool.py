@@ -37,7 +37,9 @@ def select_local_pool_blocks(
     On two PEs the four-vector GB300 reduction kernel favors about 3.5 source
     rows per aggregate pool CTA (37 CTAs at 128 tokens). Three peers create
     more independent work, where the retained 11-row source-shard policy is
-    better. Always leave room for the configured reader CTAs.
+    better. Four peers use one CTA beyond the 64-CTA symmetric boundary once
+    the row-derived policy saturates. Always leave room for the configured
+    reader CTAs.
     """
 
     if len(sm_counts) != num_pes or num_pes <= 0:
@@ -51,12 +53,25 @@ def select_local_pool_blocks(
         target = max(20, math.ceil(2 * token_capacity / 7))
     else:
         # Three peers create more independent send/gather work per source CTA,
-        # so fewer reduction shards are needed than on the two-peer path. Keep
-        # the previously validated fallback for larger topologies.
+        # so fewer reduction shards are needed than on the two-peer path.
+        # Across rank-per-GPU Fabric mappings, 128-token sweeps at 8 and 16
+        # PEs show that executor counts above 64 only lengthen ordered dispatch
+        # retirement.  Cap the larger-topology policy before the resident
+        # limit; smaller token shapes can still select fewer CTAs.
         rows_per_shard = 11 if num_pes == 3 else 8
         row_target = num_pes * math.ceil(token_capacity / rows_per_shard)
         target = max(20, row_target)
         target = math.ceil(target / num_pes) * num_pes
+        if num_pes >= 4:
+            target = min(target, 64)
+        # Four peers sit on a sharp scheduler/executor boundary at 64 CTAs:
+        # rank zero is scheduler-only, leaving 63 reduction executors.  One
+        # extra CTA removes the final uneven shard without changing the
+        # publisher/route/send role layout.  Keep smaller four-peer batches on
+        # their row-derived policy and retain the profiled 64-CTA cap above
+        # four peers.
+        if num_pes == 4 and target == 64 and resident_limit >= 65:
+            target = 65
     return min(target, resident_limit)
 
 

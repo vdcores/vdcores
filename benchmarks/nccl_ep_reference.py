@@ -27,6 +27,7 @@ from ep_baseline_common import (
     emit_result,
     rank_max,
     remote_route_count,
+    route_digest,
     validate_common_arguments,
 )
 
@@ -185,7 +186,9 @@ def main() -> None:
             placement=args.route_placement,
             device=device,
             dtype=torch.int64,
+            seed=args.route_seed,
         ).contiguous()
+        global_route_digest = route_digest(comm, topk_idx)
         topk_weights = torch.full(
             (args.tokens_per_pe, args.top_k),
             1.0 / args.top_k,
@@ -334,6 +337,7 @@ def main() -> None:
                 f"hidden={args.hidden_size} experts/pe={args.experts_per_pe} "
                 f"top_k={args.top_k} dispatch=bfloat16 "
                 f"layout=expert-major route_placement={args.route_placement} "
+                f"route_seed={args.route_seed} "
                 f"qps/rank={qps_per_rank} max_sms={args.max_num_sms or 'auto'} "
                 f"channels={args.num_channels or 'auto'} "
                 f"warmup={args.warmup} iterations={args.iterations}"
@@ -367,6 +371,8 @@ def main() -> None:
                     "experts_per_pe": args.experts_per_pe,
                     "top_k": args.top_k,
                     "route_placement": args.route_placement,
+                    "route_seed": args.route_seed,
+                    "route_digest": global_route_digest,
                     "layout": "expert-major",
                     "dispatch_dtype": "bfloat16",
                     "num_qps_per_rank": qps_per_rank,

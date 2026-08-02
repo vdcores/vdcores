@@ -672,7 +672,9 @@ def test_dynamic_reads_are_prebuilt_poolinsts_with_shared_workers():
     reduce_add = source.split(
         "pool_slice_dynamic_read_reduce_add_local(", 1
     )[1].split("pool_slice_dynamic_read_reduce_add_finish(", 1)[0]
-    assert "const uint32_t dependencies = plan.dependency_mask" in reduce_add
+    assert "const uint32_t dependencies = SourceGatherReduction" in reduce_add
+    assert "? pool_slice_pe_mask(config.local_readers)" in reduce_add
+    assert ": plan.dependency_mask" in reduce_add
     assert "dependencies & (1U << lane)" in reduce_add
     assert "bars + compute_barrier_base + lane" in reduce_add
     assert "pool_slice_dynamic_read_plan(control, plan_rank)" in reduce_add
@@ -736,12 +738,20 @@ def test_dynamic_reads_are_prebuilt_poolinsts_with_shared_workers():
     assert "shared->instruction" in executor
     assert "POOL_SLICE_EXECUTOR_DYNAMIC_READ_STOP" not in source
     assert "pool_slice_scheduler_publish_reduce_warp" not in source
-    assert "pool_slice_scheduler_prepost_source_reductions(" in scheduler
+    assert "pool_slice_scheduler_prepost_source_reductions(" in source
+    assert (
+        "pool_slice_scheduler_prepost_source_reductions<\n"
+        "            SourceGatherReduction>" in scheduler
+    )
+    assert "WeightedReturn && !SourceGatherReduction" in scheduler
     assert "shared->reductions_preposted_mask" in scheduler
     assert "config.local_readers + source_pe +" in source
     assert "(base + lane) * config.num_pes" in source
     assert "ReduceAdd tickets precede all STOP tickets" in scheduler
-    assert "WeightedReturn && config.pool_rank == 0" in source
+    assert (
+        "WeightedReturn && !SourceGatherReduction && config.pool_rank == 0"
+        in source
+    )
     assert "config.pool_rank <= executor_count" in source
     assert "if (config.pool_count == 1)" in source
     assert "pool_slice_executor_loop<" in source
@@ -867,8 +877,9 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "nvshmemx_signal_op(" in source
     assert "pool_ibgda_sg_put_signal_warp(" not in source
     assert "target_group_bytes_low_pe = 256ULL * 1024" in dispatch_grouping
+    assert "target_group_bytes_high_pe = 128ULL * 1024" in dispatch_grouping
     assert "target_group_bytes_high_pe = 512ULL * 1024" in dispatch_grouping
-    assert "num_pes >= 8" in dispatch_grouping
+    assert "num_pes >= 4" in dispatch_grouping
     assert "pilot_group_bytes" not in source
     assert "target_group_rows = 32" in source
     assert "active_rows) * group / group_count" in source

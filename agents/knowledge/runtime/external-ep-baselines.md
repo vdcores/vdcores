@@ -10,7 +10,8 @@ from the production-library table below.
 
 ## Comparison Contract
 
-- Shape: hidden 7168, 8 experts/PE, top-k 8, clustered routes.
+- Current NVL72 shape: hidden 7168, 128 tokens/PE, 8 experts/PE, top-k 8,
+  deterministic random global routing with seed `20260802`.
 - Timing: rank-maximum median, 10 warmup and 30 measured iterations.
 - Routing tensors are deterministic and fixed across iterations. Router
   generation and NCCL EP handle creation/update are outside the steady-state
@@ -20,8 +21,31 @@ from the production-library table below.
   work is a no-op or lies outside the CUDA-event intervals and is not timed.
 - NVIDIA NCCL EP and UCCL BF16 are byte-matched to PoolInst and DeepEP V1.
   UCCL FP8 and Triton FP8 are not byte-matched to the BF16 paths.
-- PoolInst and DeepEP V1 values below are the previously recorded matched
-  controls, not measurements from the external-baseline allocations.
+- Any clustered-routing matrix below is a historical platform record, not a
+  current production comparison. In particular, clustered peer-direct return
+  is invalid for global random top-8 and must not be quoted as VDCores.
+
+## Current NVL72 random-global-top-8 scan (2026-08-02)
+
+All values are communication totals in milliseconds. VDCores uses valid
+source-gather return; direct scatter is dispatch-only. Triton-distributed is
+online FP8 and the dense NCCL control is top-k 1, so neither is byte-matched
+to the BF16 sparse-EP rows.
+
+| Implementation | 2 GPUs | 4 GPUs | 8 GPUs | 12 GPUs | 16 GPUs |
+|---|---:|---:|---:|---:|---:|
+| VDCores BF16 source-gather | 0.100480 | 0.113088 | 0.115408 | 0.119296 | 0.127168 |
+| NCCL-EP BF16 | 0.126944 | 0.110144 | 0.154400 | unsupported | 0.159136 |
+| DeepEP V1 BF16 | 0.1442 | 0.1485 | unsupported | unsupported | unsupported |
+| UCCL BF16 | 0.256880 | 0.214112 | unsupported | unsupported | unsupported |
+| Triton-distributed online FP8 | 0.309664 | 0.341456 | 0.325376 | 0.347488 | 0.348208 |
+| Dense NCCL ring, BF16 top-k 1 | 0.560 | 0.829 | 2.740 | 6.033 | 10.698 |
+
+DeepEP V1's cross-host low-latency kernel requires IBGDA RC QPs, UCCL's
+cross-host branch launches RDMA proxies, and DeepEP V2 requires NCCL GIN.
+Those paths are reported unsupported rather than enabled inside the pure
+NVL72 all-NVLink scan. Full provenance and route digests are in
+`.agentlog/2026-08-02-random-global-top8.md`.
 
 ## Historical cross-library Vista GH200 matrix
 

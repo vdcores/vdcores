@@ -1114,6 +1114,42 @@ class PoolSliceMultimemExchange(PoolSliceExchange):
     wire_opcode = getattr(pool_opcode, "POOL_SLICE_MULTIMEM_EXCHANGE", 5)
 
 
+class PoolSlicePeerDirectExchange(PoolSliceExchange):
+    """Legacy wire opcode; peer-direct return is not a valid EP operation."""
+
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_PEER_DIRECT_EXCHANGE", 6)
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError(
+            "peer-direct return is invalid for general top-k routing: "
+            "multiple destination GPUs may contribute to one source token; "
+            "use PoolSliceSourceGatherExchange or another reduction-safe "
+            "return"
+        )
+
+
+class PoolSlicePeerDirectLowIlpExchange(PoolSliceExchange):
+    """Legacy low-ILP wire opcode; generation is intentionally disabled."""
+
+    wire_opcode = getattr(
+        pool_opcode, "POOL_SLICE_PEER_DIRECT_LOW_ILP_EXCHANGE", 7
+    )
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError(
+            "peer-direct return is invalid for general top-k routing: "
+            "multiple destination GPUs may contribute to one source token; "
+            "use PoolSliceSourceGatherExchange or another reduction-safe "
+            "return"
+        )
+
+
+class PoolSliceSourceGatherExchange(PoolSliceExchange):
+    """Run arbitrary-route EP with source-owned CUDA-Fabric reduction."""
+
+    wire_opcode = getattr(pool_opcode, "POOL_SLICE_SOURCE_GATHER_EXCHANGE", 8)
+
+
 class PoolSliceGinWeightedExchange(PoolSliceExchange):
     """Run weighted PoolInst with the compile-time NCCL GIN transport."""
 
@@ -1392,6 +1428,7 @@ __all__ = [
     "PoolSliceWeightedExchange",
     "PoolSliceHostWeightedExchange",
     "PoolSliceMultimemExchange",
+    "PoolSliceSourceGatherExchange",
     "PoolSliceGinWeightedExchange",
     "PoolSliceDynamicReadCopy",
     "PoolSliceDynamicReadReduceAdd",

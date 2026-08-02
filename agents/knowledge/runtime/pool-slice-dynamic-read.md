@@ -4,6 +4,15 @@ This is the unified pool-owned gathered-read protocol. Authoritative entry
 points are `include/dae/pool_slice_abi.cuh`, `include/dae/pool_slice.cuh`, and
 `python/dae/pool_slice.py`.
 
+> **Production-routing correction (2026-08-02):** benchmark sections below
+> that use clustered routing are historical transport-development records,
+> not the current production comparison contract. The current NVL72 scan uses
+> deterministic random global top-8 routing (seed `20260802`) and a
+> source-gather return. Peer-direct return is invalid because a source token's
+> experts can reside on several destination GPUs, whose ordinary stores would
+> race or overwrite. Direct scatter, where mentioned, applies to distinct
+> expert-input slots on dispatch only.
+
 ## Logical Ownership
 
 - The logical pool is split into one slice per PE.

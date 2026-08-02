@@ -58,7 +58,11 @@ def initialize_dense_nccl_ring(runtime, comm: MPI.Comm) -> None:
     single_node = local_comm.Get_size() == comm.Get_size()
     local_comm.Free()
     if runtime.rank == 0:
-        master_address = "127.0.0.1" if single_node else socket.gethostname()
+        master_address = (
+            "127.0.0.1"
+            if single_node
+            else (os.environ.get("MASTER_ADDR") or socket.gethostname())
+        )
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("", 0))
             master_port = listener.getsockname()[1]

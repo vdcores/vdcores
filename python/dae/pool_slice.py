@@ -150,10 +150,14 @@ POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE = (
 POOL_SLICE_CONTROL_EXECUTOR_RING = (
     POOL_SLICE_CONTROL_EXECUTOR_PHASE_SEQUENCE + 1
 )
-POOL_SLICE_CONTROL_WORDS = (
+POOL_SLICE_CONTROL_STATIC_ROUTES_ENABLED = (
     POOL_SLICE_CONTROL_EXECUTOR_RING
     + POOL_SLICE_EXECUTOR_RING_DEPTH * POOL_SLICE_EXECUTOR_SLOT_WORDS
 )
+POOL_SLICE_CONTROL_STATIC_ROUTES_INITIALIZED = (
+    POOL_SLICE_CONTROL_STATIC_ROUTES_ENABLED + 1
+)
+POOL_SLICE_CONTROL_WORDS = POOL_SLICE_CONTROL_STATIC_ROUTES_INITIALIZED + 1
 POOL_SLICE_MAX_TMA_BYTES = (1 << 16) - 1
 POOL_SLICE_PROFILE_START = 5
 POOL_SLICE_PROFILE_GATHER_READY = 6
@@ -564,6 +568,7 @@ class PoolSliceBuffers:
     transport_arena: torch.Tensor | None = None
     transport_owner: object | None = None
     reduction_backend: str | None = None
+    static_routes: bool = False
     data_plane_arena: torch.Tensor | None = None
     active_rows: int = 0
     _source: torch.Tensor | None = None
@@ -575,6 +580,15 @@ class PoolSliceBuffers:
     _host_config_tensor: torch.Tensor | None = None
     _local_reduction_output: torch.Tensor | None = None
 
+    def __post_init__(self) -> None:
+        if self.reduction_backend == "peer_direct":
+            raise ValueError(
+                "peer_direct return is invalid for general top-k routing: "
+                "multiple destination GPUs may contribute to one source token, "
+                "so ordinary peer stores can race or overwrite; use "
+                "source_gather, multimem, or forward"
+            )
+
     @property
     def num_readers(self) -> int:
         return self.num_pes * self.local_readers
@@ -585,13 +599,22 @@ class PoolSliceBuffers:
 
     @property
     def local_reduction_output(self) -> torch.Tensor:
-        """Source-owned result view for the local GB300 multicast backend."""
+        """Source-owned result view for a pool-owned local reduction backend."""
 
         if self._local_reduction_output is None:
             raise RuntimeError(
-                "a pool-owned result is available only for local multimem"
+                "a pool-owned result is unavailable for this reduction backend"
             )
         return self._local_reduction_output
+
+    def set_static_routes(self, enabled: bool) -> None:
+        """Select route-handle reuse and invalidate any resident metadata."""
+
+        self.static_routes = bool(enabled)
+        self.control[POOL_SLICE_CONTROL_STATIC_ROUTES_ENABLED].fill_(
+            int(self.static_routes)
+        )
+        self.control[POOL_SLICE_CONTROL_STATIC_ROUTES_INITIALIZED].zero_()
 
     def write_routes(
         self,
@@ -608,10 +631,92 @@ class PoolSliceBuffers:
             origin_rows=origin_rows,
             route_weights=route_weights,
         )
+        raw_readers = torch.as_tensor(
+            reader_ids, dtype=torch.int64, device="cpu"
+        ).view(-1)
+        raw_source_rows = (
+            torch.arange(raw_readers.numel(), dtype=torch.int64)
+            if source_rows is None
+            else torch.as_tensor(
+                source_rows, dtype=torch.int64, device="cpu"
+            ).view(-1)
+        )
+        raw_weights = (
+            torch.ones(raw_readers.numel(), dtype=torch.float32)
+            if route_weights is None
+            else torch.as_tensor(
+                route_weights, dtype=torch.float32, device="cpu"
+            ).view(-1)
+        )
         if rows.numel() > self.route_capacity:
             raise ValueError("active route count exceeds route_capacity")
         if rows.numel() and rows.to(torch.int64).max().item() >= self.token_capacity:
             raise ValueError("source row exceeds token_capacity")
+        if self.reduction_backend == "source_gather":
+            # Source-gather reads the real expert-output rows through their
+            # CUDA-Fabric peer mappings.  Keep a compact token-major route
+            # table in the otherwise-unused return inbox:
+            #
+            #   uint32 token_offsets[token_capacity + 1]
+            #   padding to 16 bytes
+            #   uint64 routes[active_rows]
+            #
+            # A route packs reader-relative row [31:0], global reader [47:32],
+            # and the BF16 weight [63:48].  The destination's source-specific
+            # base row is intentionally not predicted here: low-rank staged
+            # dispatch allocates it dynamically, so the device resolves it
+            # from that destination's published receive-route descriptor.
+            if raw_readers.numel() != rows.numel():
+                raise AssertionError("source-gather route count changed")
+            if raw_source_rows.numel() and (
+                raw_source_rows.min().item() < 0
+                or raw_source_rows.max().item() >= self.token_capacity
+            ):
+                raise ValueError(
+                    "source_gather requires source rows inside token_capacity"
+                )
+            route_key = raw_readers * (1 << 32) + raw_source_rows
+            reader_order = torch.argsort(route_key, stable=True)
+            grouped_readers = raw_readers.index_select(0, reader_order)
+            grouped_positions = torch.arange(rows.numel(), dtype=torch.int64)
+            reader_relative = grouped_positions - offsets.to(torch.int64).index_select(
+                0, grouped_readers
+            )
+            relative_by_route = torch.empty_like(reader_relative)
+            relative_by_route[reader_order] = reader_relative
+            weight_bits = raw_weights.to(torch.bfloat16).view(torch.uint16)
+            route_descriptors = (
+                relative_by_route
+                | (raw_readers << 32)
+                | (weight_bits.to(torch.int64) << 48)
+            )
+            source_order = torch.argsort(raw_source_rows, stable=True)
+            route_descriptors = route_descriptors.index_select(0, source_order)
+            source_counts = torch.bincount(
+                raw_source_rows, minlength=self.token_capacity
+            )
+            source_offsets = torch.zeros(
+                self.token_capacity + 1, dtype=torch.uint32
+            )
+            source_offsets[1:] = torch.cumsum(source_counts, dim=0).to(
+                torch.uint32
+            )
+            descriptor_offset = (
+                (source_offsets.numel() * source_offsets.element_size() + 15)
+                // 16
+                * 16
+            )
+            descriptor_bytes = route_descriptors.numel() * 8
+            if descriptor_offset + descriptor_bytes > self.return_inbox.numel() * 2:
+                raise ValueError("source-gather route table exceeds return inbox")
+            route_storage = self.return_inbox.view(torch.uint8).reshape(-1)
+            route_storage.narrow(
+                0, 0, source_offsets.numel() * source_offsets.element_size()
+            ).view(torch.uint32).copy_(source_offsets)
+            if route_descriptors.numel():
+                route_storage.narrow(
+                    0, descriptor_offset, descriptor_bytes
+                ).view(torch.int64).copy_(route_descriptors)
         if self.weighted_return:
             if origins.numel() and not torch.equal(origins, rows):
                 raise ValueError(
@@ -670,6 +775,10 @@ class PoolSliceBuffers:
             route_words = compact_rows.to(torch.int64) | (weight_bits << 16)
             self.send_rows[: rows.numel()].copy_(route_words.to(torch.uint32))
         self.active_rows = rows.numel()
+        # A route rewrite invalidates every destination's resident envelope.
+        # The next launch performs one ordinary metadata exchange before the
+        # explicit route-stable handle may reuse it.
+        self.control[POOL_SLICE_CONTROL_STATIC_ROUTES_INITIALIZED].zero_()
         return (
             self.send_offsets,
             self.send_rows[: self.active_rows],
@@ -1049,6 +1158,7 @@ def build_pool_slice_copy_program(
         PoolSliceGinWeightedExchange,
         PoolSliceHostWeightedExchange,
         PoolSliceMultimemExchange,
+        PoolSliceSourceGatherExchange,
         PoolSliceWeightedExchange,
         TerminateC,
         TerminateM,
@@ -1056,6 +1166,12 @@ def build_pool_slice_copy_program(
         TmaStore1D,
     )
     from .launcher import Launcher
+
+    if buffers.reduction_backend == "peer_direct":
+        raise ValueError(
+            "peer_direct return is invalid for general top-k routing; use a "
+            "reduction-safe return backend"
+        )
 
     if buffers._source is None or buffers._returned is None:
         raise RuntimeError("call buffers.prepare(source, returned) before building")
@@ -1145,11 +1261,12 @@ def build_pool_slice_copy_program(
             pool_instruction = PoolSliceHostWeightedExchange
             pool_config_tensor = buffers._host_config_tensor
         elif buffers.weighted_return:
-            pool_instruction = (
-                PoolSliceMultimemExchange
-                if buffers.reduction_backend == "multimem"
-                else PoolSliceWeightedExchange
-            )
+            if buffers.reduction_backend == "multimem":
+                pool_instruction = PoolSliceMultimemExchange
+            elif buffers.reduction_backend == "source_gather":
+                pool_instruction = PoolSliceSourceGatherExchange
+            else:
+                pool_instruction = PoolSliceWeightedExchange
         else:
             pool_instruction = PoolSliceExchange
         pool_builder.add_pool(

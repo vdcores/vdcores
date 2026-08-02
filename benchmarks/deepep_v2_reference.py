@@ -8,12 +8,15 @@ to ``PYTHONPATH`` plus its NCCL wheel ``lib`` directory to ``LD_LIBRARY_PATH``.
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import statistics
 
 from mpi4py import MPI
 import torch
 import torch.distributed as dist
+
+from ep_baseline_common import balanced_topk, route_digest
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=7168)
     parser.add_argument("--experts-per-pe", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--route-placement",
+        choices=("random", "clustered", "spread"),
+        default="random",
+    )
+    parser.add_argument("--route-seed", type=int, default=20260802)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--num-sms", type=int, default=0)
@@ -50,6 +59,8 @@ def main() -> None:
         args.iterations,
     ) <= 0 or args.warmup < 0:
         raise ValueError("sizes must be positive and warmup non-negative")
+    if args.route_seed < 0:
+        raise ValueError("route-seed must be non-negative")
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -60,7 +71,10 @@ def main() -> None:
         raise RuntimeError("one MPI rank requires one local CUDA device")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    master = comm.bcast(socket.gethostname() if rank == 0 else None, root=0)
+    master = comm.bcast(
+        (os.environ.get("MASTER_ADDR") or socket.gethostname()) if rank == 0 else None,
+        root=0,
+    )
     if rank == 0:
         print("deepep-v2 bootstrap: initializing torch NCCL communicator", flush=True)
     dist.init_process_group(
@@ -94,13 +108,18 @@ def main() -> None:
         device=device,
     ).view_as(tokens)
     tokens.copy_((values.remainder(97) - 48).to(torch.bfloat16))
-    global_rows = rank * args.tokens_per_pe + torch.arange(
-        args.tokens_per_pe, dtype=torch.int64, device=device
+    topk_idx = balanced_topk(
+        rank=rank,
+        tokens_per_pe=args.tokens_per_pe,
+        num_experts=num_experts,
+        experts_per_pe=args.experts_per_pe,
+        top_k=args.top_k,
+        placement=args.route_placement,
+        device=device,
+        dtype=deep_ep.topk_idx_t,
+        seed=args.route_seed,
     )
-    route = torch.arange(args.top_k, dtype=torch.int64, device=device)
-    topk_idx = (
-        global_rows[:, None] * args.top_k + route[None, :]
-    ).remainder(num_experts).to(deep_ep.topk_idx_t)
+    global_route_digest = route_digest(comm, topk_idx)
     topk_weights = torch.full(
         (args.tokens_per_pe, args.top_k),
         1.0 / args.top_k,
@@ -201,8 +220,11 @@ def main() -> None:
                 f"pes={world_size} tokens/pe={args.tokens_per_pe} "
                 f"hidden={args.hidden_size} experts/pe={args.experts_per_pe} "
                 f"top_k={args.top_k} sms={num_sms} qps={num_qps} "
+                f"route_placement={args.route_placement} "
+                f"route_seed={args.route_seed} "
                 f"prefer_overlap={args.prefer_overlap_with_compute}"
             )
+            print(f"deepep-v2 route-digest: {global_route_digest}")
             print(
                 "deepep-v2-cached timing: "
                 f"dispatch={statistics.median(dispatch_samples):.4f} ms "

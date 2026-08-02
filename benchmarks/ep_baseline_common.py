@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import random
 import socket
 from typing import Any
 
@@ -12,6 +14,7 @@ import torch
 
 
 ROUTE_PLACEMENTS = (
+    "random",
     "clustered",
     "source-local",
     "remote-clustered",
@@ -27,11 +30,18 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--route-placement",
         choices=ROUTE_PLACEMENTS,
-        default="clustered",
+        default="random",
         help=(
-            "cluster each token's routes on one balanced PE, force that PE "
-            "local/remote to the source, or spread routes across PEs"
+            "sample distinct global experts with a fixed seed, cluster each "
+            "token's routes on one balanced PE, force that PE local/remote "
+            "to the source, or spread routes across PEs"
         ),
+    )
+    parser.add_argument(
+        "--route-seed",
+        type=int,
+        default=20260802,
+        help="fixed seed for random global top-k expert selection",
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=50)
@@ -49,6 +59,8 @@ def validate_common_arguments(args: argparse.Namespace, world_size: int) -> None
             raise ValueError(f"{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         raise ValueError("warmup must be non-negative")
+    if args.route_seed < 0:
+        raise ValueError("route-seed must be non-negative")
 
     num_experts = world_size * args.experts_per_pe
     if args.top_k > num_experts:
@@ -74,7 +86,10 @@ def configure_torchrun_environment(
     local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
     local_rank = local_comm.Get_rank()
     local_world_size = local_comm.Get_size()
-    master_addr = comm.bcast(socket.gethostname() if rank == 0 else None, root=0)
+    master_addr = comm.bcast(
+        (os.environ.get("MASTER_ADDR") or socket.gethostname()) if rank == 0 else None,
+        root=0,
+    )
 
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
@@ -95,6 +110,7 @@ def balanced_topk(
     placement: str,
     device: torch.device,
     dtype: torch.dtype = torch.int64,
+    seed: int = 20260802,
 ) -> torch.Tensor:
     """Build distinct deterministic routes with balanced global ownership."""
 
@@ -102,7 +118,24 @@ def balanced_topk(
         tokens_per_pe, dtype=torch.int64, device=device
     )
     route = torch.arange(top_k, dtype=torch.int64, device=device)
-    if placement == "clustered":
+    if placement == "random":
+        # Generate each token's route independently so rank-local construction
+        # is identical across adapters and does not depend on call order or a
+        # process-global RNG state. random.sample is uniform without
+        # replacement, which prevents duplicate experts in one token's top-k.
+        rows: list[list[int]] = []
+        seed_mask = (1 << 64) - 1
+        for local_row in range(tokens_per_pe):
+            global_row = rank * tokens_per_pe + local_row
+            token_seed = (
+                int(seed)
+                + (global_row + 1) * 0x9E3779B97F4A7C15
+            ) & seed_mask
+            rows.append(
+                random.Random(token_seed).sample(range(num_experts), top_k)
+            )
+        result = torch.tensor(rows, dtype=torch.int64, device=device)
+    elif placement == "clustered":
         result = (global_rows[:, None] * top_k + route[None, :]).remainder(
             num_experts
         )
@@ -126,6 +159,20 @@ def balanced_topk(
             ).div(num_pes, rounding_mode="floor").remainder(experts_per_pe)
             result = target_pe * experts_per_pe + local_expert
     return result.to(dtype=dtype)
+
+
+def route_digest(comm: Any, topk_idx: torch.Tensor) -> str:
+    """Hash the global rank-major int64 route tensor for cross-backend proof."""
+
+    gathered = comm.allgather(
+        topk_idx.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    )
+    digest = hashlib.sha256()
+    for routes in gathered:
+        digest.update(int(routes.shape[0]).to_bytes(8, "little"))
+        digest.update(int(routes.shape[1]).to_bytes(8, "little"))
+        digest.update(routes.numpy().tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def remote_route_count(

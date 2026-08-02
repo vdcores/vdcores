@@ -15,6 +15,8 @@ import statistics
 from mpi4py import MPI
 import torch
 
+from ep_baseline_common import balanced_topk, route_digest
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -24,14 +26,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument(
         "--route-placement",
-        choices=("clustered", "source-local", "remote-clustered", "spread"),
-        default="clustered",
+        choices=(
+            "random",
+            "clustered",
+            "source-local",
+            "remote-clustered",
+            "spread",
+        ),
+        default="random",
         help=(
             "cluster each token's routes on one balanced PE, force that PE "
             "local/remote to the source, or spread routes round-robin "
             "across PEs"
         ),
     )
+    parser.add_argument("--route-seed", type=int, default=20260802)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument(
@@ -57,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="allow DeepEP's low-latency NVLink path (off for one-GPU nodes)",
     )
+    parser.add_argument(
+        "--allow-mnnvl",
+        action="store_true",
+        help="allow DeepEP's multi-node NVLink path on one MNNVL fabric",
+    )
     return parser.parse_args()
 
 
@@ -73,34 +87,18 @@ def _balanced_topk(
     top_k: int,
     placement: str,
     device: torch.device,
+    seed: int,
 ) -> torch.Tensor:
-    """Build distinct, deterministic, globally balanced expert selections."""
-
-    global_rows = rank * tokens_per_pe + torch.arange(
-        tokens_per_pe, dtype=torch.int64, device=device
+    return balanced_topk(
+        rank=rank,
+        tokens_per_pe=tokens_per_pe,
+        num_experts=num_experts,
+        experts_per_pe=experts_per_pe,
+        top_k=top_k,
+        placement=placement,
+        device=device,
+        seed=seed,
     )
-    route = torch.arange(top_k, dtype=torch.int64, device=device)
-    if placement == "clustered":
-        return (global_rows[:, None] * top_k + route[None, :]).remainder(
-            num_experts
-        )
-
-    num_pes = num_experts // experts_per_pe
-    source_pe = global_rows.div(tokens_per_pe, rounding_mode="floor")
-    if placement in {"source-local", "remote-clustered"}:
-        target_pe = source_pe
-        if placement == "remote-clustered":
-            target_pe = (target_pe + 1).remainder(num_pes)
-        local_expert = (
-            global_rows[:, None] * top_k + route[None, :]
-        ).remainder(experts_per_pe)
-        return target_pe[:, None] * experts_per_pe + local_expert
-
-    target_pe = (global_rows[:, None] + route[None, :]).remainder(num_pes)
-    local_expert = (
-        global_rows[:, None] * top_k + route[None, :]
-    ).div(num_pes, rounding_mode="floor").remainder(experts_per_pe)
-    return target_pe * experts_per_pe + local_expert
 
 
 def main() -> None:
@@ -124,6 +122,8 @@ def main() -> None:
         )
     if args.warmup < 0:
         raise ValueError("warmup must be non-negative")
+    if args.route_seed < 0:
+        raise ValueError("route-seed must be non-negative")
 
     comm = MPI.COMM_WORLD
     local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
@@ -181,7 +181,9 @@ def main() -> None:
         top_k=args.top_k,
         placement=args.route_placement,
         device=device,
+        seed=args.route_seed,
     )
+    global_route_digest = route_digest(comm, topk_idx)
     topk_weights = torch.full(
         (args.tokens_per_pe, args.top_k),
         1.0 / args.top_k,
@@ -202,6 +204,7 @@ def main() -> None:
         low_latency_mode=True,
         num_qps_per_rank=qps_per_rank,
         allow_nvlink_for_low_latency_mode=args.allow_nvlink,
+        allow_mnnvl=args.allow_mnnvl,
         explicitly_destroy=True,
     )
     buffer.clean_low_latency_buffer(
@@ -302,6 +305,7 @@ def main() -> None:
                 f"hidden={args.hidden_size} experts/pe={args.experts_per_pe} "
                 f"top_k={args.top_k} dispatch={args.dispatch_dtype} "
                 f"route_placement={args.route_placement} "
+                f"route_seed={args.route_seed} "
                 f"qps/rank={qps_per_rank} qp_depth={args.qp_depth} "
                 f"warmup={args.warmup} iterations={args.iterations}"
             )
@@ -321,6 +325,7 @@ def main() -> None:
                 f"{remote_routes * combine_row_bytes} "
                 f"rdma_buffer_B/pe={rdma_bytes}"
             )
+            print(f"deepep-v1 route-digest: {global_route_digest}")
     finally:
         buffer.destroy()
         comm.Barrier()

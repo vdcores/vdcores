@@ -279,10 +279,17 @@ static_assert(sizeof(PoolSliceExecutorSlot) == 32,
               "PoolSliceExecutorSlot ABI changed");
 static constexpr uint32_t poolSliceExecutorSlotWords =
     sizeof(PoolSliceExecutorSlot) / sizeof(uint64_t);
-static constexpr uint32_t poolSliceControlWords =
+// Route-stable handles keep the received route/queue packet resident across
+// launches. The first word is an explicit host-selected contract; the second
+// is set only after a complete ordinary metadata exchange. Per-launch payload
+// and executor generations remain dynamic.
+static constexpr uint32_t poolSliceControlStaticRoutesEnabled =
     poolSliceControlExecutorRing +
     poolSliceExecutorRingDepth * poolSliceExecutorSlotWords;
-
+static constexpr uint32_t poolSliceControlStaticRoutesInitialized =
+    poolSliceControlStaticRoutesEnabled + 1;
+static constexpr uint32_t poolSliceControlWords =
+    poolSliceControlStaticRoutesInitialized + 1;
 // Local immutable work derived from the already delivered dispatch metadata.
 // `dependency_mask` names ordinary VDCores reader-completion barriers relative
 // to PoolInst's compute-barrier base.  `ready_slot` names the destination

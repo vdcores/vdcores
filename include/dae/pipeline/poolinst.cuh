@@ -115,6 +115,31 @@ struct PoolSliceMultimemExchangeExecuteWarp {
         thread_id);
   }
 };
+
+// Arbitrary top-k routing may place a token's expert outputs on several GPUs.
+// Destinations therefore publish readiness only; the source GPU follows its
+// token-major route table through CUDA Fabric and performs the one final sum.
+struct PoolSliceSourceGatherExchangeExecuteWarp {
+  static constexpr uint16_t opcode = POOL_SLICE_SOURCE_GATHER_EXCHANGE;
+  static constexpr uint32_t num_warps = daePoolSliceWarps;
+  static constexpr int max_registers = daeWideRegisterLimit;
+
+  static __device__ __forceinline__ void execute(
+      const PoolInst* instructions,
+      int* bars,
+      uint64_t* signal_array,
+      uint64_t* g_events,
+      uint32_t physical_warps,
+      uint32_t thread_id) {
+    (void)physical_warps;
+    pool_slice_exchange<true, num_warps, false, false, true, 4>(
+        instructions,
+        bars,
+        signal_array,
+        g_events,
+        thread_id);
+  }
+};
 #endif
 #endif
 

@@ -19,6 +19,10 @@ DAE_POOL_OP(
     POOL_SLICE_MULTIMEM_EXCHANGE,
     5,
     PoolSliceMultimemExchangeExecuteWarp)
+DAE_POOL_OP(
+    POOL_SLICE_SOURCE_GATHER_EXCHANGE,
+    8,
+    PoolSliceSourceGatherExchangeExecuteWarp)
 #endif
 #endif
 #ifdef DAE_ENABLE_NCCL_GIN
