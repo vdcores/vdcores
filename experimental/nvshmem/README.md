@@ -22,20 +22,27 @@ Option meanings:
 
 For this example, `-N 2 -n 2 -tpn 1` is important because each Vista GH node has one GPU, so we want one MPI rank / NVSHMEM PE per GPU.
 
-## 3. Install NVSHMEM if it is not already available
+## 3. Install NVSHMEM and its official Python binding
 
-If anything is missing, install the CUDA 13 NVSHMEM package into the conda environment:
+Use the NVSHMEM4Py release matched to NVSHMEM 3.4.5. Keep CUDA Python at
+13.0.3 because that is also the exact version required by the CUDA 13 PyTorch
+wheel used by this project:
 
 ```bash
-python -m pip install nvidia-nvshmem-cu13
+OMPI_CC=gcc \
+MPICC=/opt/apps/nvidia24/openmpi/5.0.5/bin/mpicc \
+python -m pip install --no-binary=mpi4py -r requirements.txt
 ```
+
+Building `mpi4py` through the loaded TACC wrapper keeps it on the same OpenMPI
+5.0.5 ABI used by `ibrun`.
 
 ## 4. Create NVSHMEM shared-object symlinks if needed
 
 Some pip-installed NVSHMEM packages may include versioned `.so` files but not the unversioned linker names. Check:
 
 ```bash
-export NVSHMEM_HOME=$(CONDA_PATH)/lib/python3.13/site-packages/nvidia/nvshmem
+export NVSHMEM_HOME=$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/nvshmem
 ls -lh $NVSHMEM_HOME/lib/libnvshmem*
 ```
 
@@ -55,6 +62,8 @@ python -m pip install --force-reinstall nvidia-nvshmem-cu13
 
 ## 5. Build
 
+The standalone CUDA bandwidth example still uses its local Makefile:
+
 ```bash
 make clean
 make
@@ -65,6 +74,21 @@ This should produce:
 ```bash
 ./main
 ```
+
+Build the ordinary DAE runtime and optional symmetric-allocation extension from
+the repository root through the unified `setup.py`:
+
+```bash
+make nvshmem-pyext
+python -m pytest -q tests/test_nvshmem.py
+```
+
+This sets `DAE_ENABLE_NVSHMEM=1`, builds `dae.runtime` and
+`dae._nvshmem_runtime`, and verifies that the optional module imports without
+initializing a collective job. MPI bootstrap and host operations come from the
+official `nvshmem.core` / `nvshmem.bindings` packages; the DAE extension only
+allocates symmetric Torch tensors. Signals are ordinary zeroed `uint64`
+symmetric tensors managed by the Python layer.
 
 ## 6. Run with `ibrun`
 
@@ -83,6 +107,20 @@ Launch with TACC `ibrun`:
 ```bash
 ibrun ./main 128 50
 ```
+
+Run the Python binding smoke test from the repository root:
+
+```bash
+ibrun python app/python/nvshmem/example.py
+```
+
+The Python test performs a one-SM DAE TMA copy between symmetric Torch tensors
+and exchanges one stream-ordered NVSHMEM signal per PE.
+
+When the ordinary launcher is configured with
+`benchmark_barrier=nvshmem.benchmark_barrier`, `dae_app(..., -b)` performs a
+device synchronization followed by an all-PE barrier before every measured
+kernel launch.
 
 Arguments:
 
@@ -126,3 +164,47 @@ In that case, re-enter `idev` with:
 idev -p gh-dev -N 2 -n 2 -tpn 1 -t 01:00:00
 ```
 
+## 9. Python API
+
+Initialize NVSHMEM, then use the ordinary DAE launcher:
+
+```python
+import torch
+import dae.nvshmem as nvshmem
+from dae.launcher import Launcher
+
+runtime = nvshmem.init(symmetric_size="2G")
+signals = nvshmem.init_signal_space(runtime.num_pes)
+dae = Launcher(
+    num_sms=128,
+    device=torch.device("cuda", runtime.device),
+    signal_array=signals,
+    benchmark_barrier=nvshmem.benchmark_barrier,
+)
+weights = nvshmem.empty((4096, 4096), dtype=torch.bfloat16)
+output = nvshmem.zeros((8, 4096), dtype=torch.bfloat16)
+
+# Build and launch schedules exactly as with dae.launcher.Launcher.
+# `weights` and `output` are normal contiguous CUDA tensors locally.
+```
+
+Symmetric allocation and signal operations remain explicit module functions:
+
+```python
+import dae.nvshmem as nvshmem
+
+runtime = nvshmem.init(symmetric_size="2G")
+signals = nvshmem.init_signal_space(1024)
+tensor = nvshmem.empty(4096, dtype=torch.float32)
+```
+
+Allocation and finalization rules:
+
+- Call `init()` before creating CUDA tensors so local MPI rank to GPU mapping is established first.
+- Every PE must call `init_signal_space()`, `empty()`, and `zeros()` in the same order with identical sizes and dtypes.
+- Symmetric tensors are non-owning Torch views. The runtime tracks their allocations and frees them collectively, in reverse order, during `finalize()`.
+- Do not use a symmetric tensor after `finalize()`. Finalization itself must be called by every PE after all CUDA work completes.
+- `signal()` and `wait_signal()` enqueue operations on the current Torch CUDA stream unless another stream is supplied.
+- A `Launcher` configured with `benchmark_barrier=nvshmem.benchmark_barrier`
+  synchronizes all NVSHMEM PEs before every measured iteration.
+- The runtime defaults unset Vista variables to MPI bootstrap, `ibrc`, IBGDA, GPU NIC handling, and a `512M` symmetric heap. Explicit environment variables remain authoritative except for a `symmetric_size=` argument.

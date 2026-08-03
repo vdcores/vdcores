@@ -30,6 +30,7 @@ void dae2(
   const MInst* __restrict__ memory_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
+  uint64_t * __restrict__ signal_array,
   uint64_t *  __restrict__ g_events
 ) {
 
@@ -152,7 +153,7 @@ void dae2(
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
-        st_insts, smem_base, tma_descs, bars
+        st_insts, smem_base, tma_descs, bars, signal_array
       );
     } else if (warp_id == 1) {
       if (lane_id == 0) {

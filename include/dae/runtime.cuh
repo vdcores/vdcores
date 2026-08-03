@@ -6,6 +6,11 @@
 // runtime interface for DAE kernels
 size_t set_smem_size(size_t smem_size = (1024 * 212));
 
+#ifdef DAE_ENABLE_NVSHMEM
+int nvshmem_module_init();
+int nvshmem_module_finalize();
+#endif
+
 cudaError_t launch_dae(
   int numSMs,
   size_t smem_size,
@@ -13,6 +18,7 @@ cudaError_t launch_dae(
   MInst* memory_instructions,
   CUtensorMap* tma_descs,
   int * bars,
+  uint64_t * signal_array,
   uint64_t * profile,
   int64_t stream
 );
@@ -26,4 +32,3 @@ CUtensorMap create_tma_descriptor(
   CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
   std::array<uint64_t, 5> global_strides_opt = {0, 0, 0, 0, 0}
 );
-
