@@ -247,7 +247,7 @@ __device__ __forceinline__ void allocwarp_execute(
         }
         case op(OP_NVSHMEM_WAIT): {
           if (lane_id == 0) {
-            int signal_id = inst.arg & 0xFF;
+            int signal_id = (inst.arg >> 8) & 0xFF;
             uint64_t *signal = signal_array + signal_id;
             nvshmem_signal_wait_until(signal, NVSHMEM_CMP_GE, 1);
           }

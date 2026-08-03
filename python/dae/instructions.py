@@ -839,7 +839,7 @@ class NvshmemWait(MemoryInstruction):
         super().__init__(
             opcode=opcode.OP_NVSHMEM_WAIT,
             num_slots=0,
-            arg=signal_id,
+            arg=signal_id << 8,
             size=0,
             address=0,
         )
