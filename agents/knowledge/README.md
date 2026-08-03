@@ -12,6 +12,7 @@ Use this directory as the first stop when a task needs stable repo context.
   - [qwen3-attention.md](/home1/11362/depctg/vdcores/agents/knowledge/qwen3-attention.md)
 - Runtime mechanics:
   - [runtime/README.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/README.md)
+  - [nvshmem-runtime.md](/home1/11362/depctg/vdcores/agents/knowledge/nvshmem-runtime.md)
   - [runtime/vdcores-vm-model.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-vm-model.md)
   - [runtime/vdcores-operator-semantics.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-operator-semantics.md)
   - [runtime/vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md)
@@ -41,3 +42,6 @@ Use this directory as the first stop when a task needs stable repo context.
   - start with [project-map.md](/home1/11362/depctg/vdcores/agents/knowledge/project-map.md)
 - If the task asks for runtime internals or opcode semantics:
   - start with [runtime/README.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/README.md)
+- If the task touches multi-node symmetric memory or MPI bootstrap:
+  - read [nvshmem-runtime.md](/home1/11362/depctg/vdcores/agents/knowledge/nvshmem-runtime.md)
+  - then follow [../workflows/nvshmem-tacc.md](/home1/11362/depctg/vdcores/agents/workflows/nvshmem-tacc.md)

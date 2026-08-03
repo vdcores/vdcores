@@ -1,6 +1,8 @@
 #pragma once
 
 #include "virtualcore.cuh"
+#include <nvshmem.h>
+#include <nvshmemx.h>
 
 static __device__ __forceinline__ void prefetch_inst_window(
     const int lane_id, const MInst* insts, uint32_t target_pc) {
@@ -19,8 +21,10 @@ template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
-    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs,
+    int *bars, uint64_t *signal_array
 ) {
+  (void)signal_array;
   static_assert(numSlots < 32, "Too many slots for single warp");
 
   // register flags
@@ -212,6 +216,42 @@ __device__ __forceinline__ void allocwarp_execute(
           if (lane_id == 0) {
             di.gpr[1] = token * inst.size;
           }
+          break;
+        }
+        case op(OP_NVSHMEM_PUT): {
+          if (lane_id == 0) {
+            void *symm_addr = reinterpret_cast<void *>(inst.address);
+
+            uint32_t nbytes =
+              static_cast<uint32_t>(inst.size) |
+              (static_cast<uint32_t>(inst.num_slots) << 16);
+
+            int target_pe = inst.arg & 0xFF;
+            int signal_id = (inst.arg >> 8) & 0xFF;
+
+            uint64_t *signal = signal_array + signal_id;
+
+            nvshmem_putmem_signal_nbi(
+              symm_addr,
+              symm_addr,
+              nbytes,
+              signal,
+              1,
+              NVSHMEM_SIGNAL_SET,
+              target_pe);
+
+            nvshmem_quiet();
+          }
+          __syncwarp();
+          break;
+        }
+        case op(OP_NVSHMEM_WAIT): {
+          if (lane_id == 0) {
+            int signal_id = (inst.arg >> 8) & 0xFF;
+            uint64_t *signal = signal_array + signal_id;
+            nvshmem_signal_wait_until(signal, NVSHMEM_CMP_GE, 1);
+          }
+          __syncwarp();
           break;
         }
         default:
