@@ -1,10 +1,13 @@
 # NVSHMEM Runtime
 
-DAE's NVSHMEM support has two deliberately separate pieces:
+DAE's NVSHMEM support has three deliberately separate pieces:
 
 - `python/dae/nvshmem.py` uses NVIDIA's official `nvshmem.core` and
   `nvshmem.bindings` packages for MPI bootstrap, NVSHMEM lifecycle, PE queries,
   barriers, and stream-ordered signal operations.
+- The NVSHMEM build of `dae.runtime` links the NVSHMEM device library and
+  provides private hooks to register the CUDA module containing `dae2`.
+  `dae.nvshmem` calls those hooks as part of its host lifecycle.
 - `src/torch_nvshmem_runtime.cu` is a small DAE-specific extension that only
   allocates symmetric Torch tensors and releases tracked allocations
   collectively. It has no signal-specific allocation or address API.
@@ -27,6 +30,10 @@ macro on both extensions. `make nvshmem-pyext` is the normal entry point;
   `MPI.COMM_WORLD`.
 - MPI is owned by `mpi4py`; DAE finalization releases its symmetric allocations
   and owned NVSHMEM state, but does not finalize MPI itself.
+- NVSHMEM4Py host initialization does not initialize device state in the
+  separately linked DAE CUDA module. `dae.nvshmem.init()` therefore initializes
+  the module after host initialization, and `dae.nvshmem.finalize()` releases
+  allocations and finalizes the module before owned host state.
 
 ## Allocation And Signal Rules
 

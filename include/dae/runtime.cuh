@@ -6,6 +6,11 @@
 // runtime interface for DAE kernels
 size_t set_smem_size(size_t smem_size = (1024 * 212));
 
+#ifdef DAE_ENABLE_NVSHMEM
+int nvshmem_module_init();
+int nvshmem_module_finalize();
+#endif
+
 cudaError_t launch_dae(
   int numSMs,
   size_t smem_size,

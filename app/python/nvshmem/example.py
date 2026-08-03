@@ -47,7 +47,7 @@ def main() -> None:
             f"received_signal={signals[previous_pe].item()}"
         )
     finally:
-        # Collective finalization invalidates every symmetric tensor.
+        # Collective finalization releases module state and symmetric tensors.
         nvshmem.finalize()
 
 

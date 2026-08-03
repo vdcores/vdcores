@@ -396,6 +396,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("num_special_slots") = numSpecialSlots;
 #ifdef DAE_ENABLE_NVSHMEM
   config.attr("nvshmem_enabled") = true;
+  m.def(
+      "_nvshmem_module_init",
+      &nvshmem_module_init,
+      "Initialize NVSHMEM device state for the DAE CUDA module");
+  m.def(
+      "_nvshmem_module_finalize",
+      &nvshmem_module_finalize,
+      "Finalize NVSHMEM device state for the DAE CUDA module");
 #else
   config.attr("nvshmem_enabled") = false;
 #endif
