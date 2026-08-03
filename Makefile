@@ -4,6 +4,13 @@
 NVCC = nvcc
 PYTHON ?= python
 
+NVSHMEM_HOME ?= $(shell $(PYTHON) -c "import sys; from pathlib import Path; print(Path(sys.prefix) / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages' / 'nvidia' / 'nvshmem')")
+NVSHMEM_INCLUDE_DIR := $(NVSHMEM_HOME)/include
+NVSHMEM_LIBRARY_DIR := $(NVSHMEM_HOME)/lib
+NVSHMEM_BUILD_DIR := build/nvshmem
+NVSHMEM_RUNTIME_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime.o
+NVSHMEM_DLINK_OBJECT := $(NVSHMEM_BUILD_DIR)/runtime_dlink.o
+
 # CUDA architecture (adjust for your GPU)
 # SM80 for A100, SM89 for H100, SM90 for Hopper
 CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
@@ -53,7 +60,7 @@ all: pyext
 
 # Clean build artifacts
 clean:
-	rm -rf $(APPS) $(TARGETS) build/generated
+	rm -rf $(APPS) $(TARGETS) build/generated $(NVSHMEM_BUILD_DIR)
 
 # Build the executable, this is wildcard rule for multiple targets
 %: app/%.cu $(TARGETS) $(HEADERS)
@@ -72,14 +79,34 @@ $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS): $(C
 runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
 	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
 
+$(NVSHMEM_RUNTIME_OBJECT): src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
+	@test -f $(NVSHMEM_INCLUDE_DIR)/nvshmem.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -DDAE_ENABLE_NVSHMEM=1 \
+		-I$(NVSHMEM_INCLUDE_DIR) -rdc=true -dc -Xcompiler -fPIC -o $@ $<
+
+$(NVSHMEM_DLINK_OBJECT): $(NVSHMEM_RUNTIME_OBJECT)
+	@test -f $(NVSHMEM_LIBRARY_DIR)/libnvshmem_device.a
+	$(NVCC) $(CUDA_ARCH) -dlink -Xcompiler -fPIC $< \
+		-L$(NVSHMEM_LIBRARY_DIR) -lnvshmem_device -o $@
+
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
 
 run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
-	pip install -e . --no-build-isolation
+	$(PYTHON) -m pip install -e . --no-build-isolation
+
+# Build the device-linked DAE runtime and the small optional NVSHMEM allocation
+# extension through the same setup.py. Host control remains in NVSHMEM4Py.
+nvshmem-pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(NVSHMEM_RUNTIME_OBJECT) $(NVSHMEM_DLINK_OBJECT)
+	DAE_ENABLE_NVSHMEM=1 \
+	NVSHMEM_HOME=$(NVSHMEM_HOME) \
+	DAE_RUNTIME_OBJECT=$(abspath $(NVSHMEM_RUNTIME_OBJECT)) \
+	DAE_RUNTIME_DLINK_OBJECT=$(abspath $(NVSHMEM_DLINK_OBJECT)) \
+	$(PYTHON) -m pip install -e . --no-build-isolation
 
 FORCE:
 
-.PHONY: all clean run FORCE
+.PHONY: all clean run FORCE nvshmem-pyext

@@ -44,6 +44,10 @@ Each SM/block owns:
 - `scratch_space[32]`
   - shared scratch used by some compute ops such as argmax
 
+The kernel also accepts an optional process-wide `uint64_t*` signal array and
+forwards it unchanged to each alloc warp. No checked-in memory opcode consumes
+that pointer yet.
+
 ## Virtual Cores
 
 The runtime is easiest to view as one compute VM plus one memory VM per SM.

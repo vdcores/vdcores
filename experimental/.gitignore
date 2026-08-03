@@ -2,3 +2,5 @@
 !*.cu
 !Makefile
 !.gitignore
+!README.md
+!nvshmem
