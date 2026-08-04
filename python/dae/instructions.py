@@ -184,18 +184,25 @@ def _encode_attention_runtime_flags(
         flags |= num_kv_block_counter_reg << ATTENTION_BLOCK_COUNTER_SHIFT
     return flags
 
-def _encode_attention_qkv_workload_flag(num_active_q: int, last_kv_active_token_len: int) -> int:
-    return num_active_q | (last_kv_active_token_len << 8)
+def _encode_attention_qkv_workload_flag(
+    num_active_q: int,
+    last_kv_active_token_len: int,
+    kv_block_size: int = 64,
+) -> int:
+    assert 0 < num_active_q < 0x80, "num_active_q must fit below the KV-tile flag"
+    assert kv_block_size in {64, 128}, "kv_block_size must be 64 or 128"
+    kv_tile_flag = 0x80 if kv_block_size == 128 else 0
+    return num_active_q | kv_tile_flag | (last_kv_active_token_len << 8)
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64):
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
             args=[
                 num_kv_block, 
-                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
+                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len, kv_block_size),
                 _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg)
             ],
         )
@@ -245,11 +252,13 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
-    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True, kv_block_size: int = 64):
         assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
         # pack need_norm and need_rope into a uint16 arg
         arg0 = num_kv_block | (split_idx << 12)
-        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        arg1 = _encode_attention_qkv_workload_flag(
+            num_active_q, last_kv_active_token_len, kv_block_size
+        )
         arg2 = kv_start_idx # make this 16bit to support long seq
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 

@@ -396,10 +396,22 @@ class GemvLayerBase(Layer):
 
     @staticmethod
     def _tma_funcs(self, Atom, reduce):
+        if Atom.MNK[0] == 128 and Atom.MNK[1] == 8:
+            output_builder = lambda t: t._build(
+                "reduce" if reduce else "store",
+                Atom.MNK[0],
+                Atom.MNK[1],
+                build_tma_wgmma_mnmajor_m128n8,
+                cord_func_m128n8_output,
+            )
+        else:
+            output_builder = lambda t: t.wgmma(
+                "reduce" if reduce else "store", Atom.MNK[1], Atom.MNK[0], Major.MN
+            )
         return [
             lambda t: t.wgmma_load(Atom.MNK[0], Atom.MNK[2], Major.K),
             lambda t: t.wgmma_load(Atom.MNK[1], Atom.MNK[2] * Atom.n_batch, Major.K),
-            lambda t: t.wgmma("reduce" if reduce else "store", Atom.MNK[1], Atom.MNK[0], Major.MN)
+            output_builder,
         ]
 
     def description(self):

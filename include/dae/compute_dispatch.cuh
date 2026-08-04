@@ -19,6 +19,9 @@
   bool &finish, \
   const CInst &inst, \
   void *smem_base, \
+  uint32_t tmem_base_ptr, \
+  uint64_t *tmem_mma_barrier, \
+  uint32_t &tmem_mma_phase, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
   M2CQueue &m2c, \
@@ -187,16 +190,67 @@ static __device__ __forceinline__ void handle_attention_common(
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int encoded_active_q = inst.args[1] & 0xFF;
+  const int num_active_q = encoded_active_q & 0x7F;
+  const bool use_kv128 = encoded_active_q & 0x80;
+  int num_kv_blocks = inst.args[0];
+  int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  const bool need_norm = inst.args[2] & 0x1;
+  const bool need_rope = inst.args[2] & 0x2;
+  if (inst.args[2] & 0x8) {
+    const int counter_reg = (inst.args[2] >> 4) & 0xF;
+    num_kv_blocks += count[counter_reg];
+  }
+  if (inst.args[2] & 0x4) {
+    const int counter_reg = (inst.args[2] >> 8) & 0xFF;
+    last_kv_active_token_len += count[counter_reg];
+  }
+  if (use_kv128) {
+    task_attention_fwd_sm100_decode<128, 128>(
+      num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+      need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier,
+      tmem_mma_phase, smem_base, (float *)scratch_space, st_insts,
+      m2c, c2m);
+  } else {
+    task_attention_fwd_sm100_decode<128, 64>(
+      num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+      need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier,
+      tmem_mma_phase, smem_base, (float *)scratch_space, st_insts,
+      m2c, c2m);
+  }
+#else
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
   handle_attention_common<128, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
+#endif
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int num_kv_blocks = inst.args[0] & 0xFFF;
+  const int split_idx = (inst.args[0] >> 12) & 0xF;
+  const int encoded_active_q = inst.args[1] & 0xFF;
+  const int num_active_q = encoded_active_q & 0x7F;
+  const bool use_kv128 = encoded_active_q & 0x80;
+  const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  if (use_kv128) {
+    task_attention_fwd_sm100_decode<128, 128, true, 16>(
+      num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len,
+      false, false, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  } else {
+    task_attention_fwd_sm100_decode<128, 64, true, 16>(
+      num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len,
+      false, false, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  }
+#else
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
   handle_attention_common<128, true, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
+#endif
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
@@ -385,6 +439,9 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   bool &finish,
   const CInst &inst,
   void *smem_base,
+  uint32_t tmem_base_ptr,
+  uint64_t *tmem_mma_barrier,
+  uint32_t &tmem_mma_phase,
   uint64_t *scratch_space,
   MInst *st_insts,
   M2CQueue &m2c,
@@ -394,7 +451,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events); \
+        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space, st_insts, m2c, c2m, g_events); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP

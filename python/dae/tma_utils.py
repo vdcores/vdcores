@@ -258,6 +258,40 @@ def build_tma_wgmma_mnmajor(mat: torch.Tensor, tileM : int, tileK : int):
         0
     )
 
+
+def build_tma_wgmma_mnmajor_m128n8(mat: torch.Tensor, tileM: int, tileK: int):
+    """Build a reducible rank-3 descriptor for an SM100 M128xN8 output tile."""
+    assert mat.dim() == 2, "M128N8 output currently requires a 2D [N, M] tensor"
+    assert mat.element_size() == 2, "M128N8 output requires a 16-bit element type"
+    n, m = mat.shape
+    assert tileM == 128 and tileK == 8
+    assert n == 8 and m % 64 == 0
+
+    element_size = mat.element_size()
+    global_dims = [64, 8, m // 64]
+    global_strides = [m * element_size, 64 * element_size]
+    box_dims = [64, 8, 2]
+    rank = len(global_dims)
+    return rank, runtime.build_tma_desc(
+        mat,
+        global_dims,
+        global_strides,
+        box_dims,
+        [1] * rank,
+        128,
+        0,
+    )
+
+
+def cord_func_m128n8_output(mat: torch.Tensor, rank: int):
+    assert rank == 3
+    def cord_func(*cords):
+        assert len(cords) == 2, f"expected [N, M] coordinates, got {cords}"
+        n, m = cords
+        assert n == 0, "M128N8 output tiles cover the full N=8 dimension"
+        return [0, 0, m // 64]
+    return cord_func
+
 # pytorch-major cord functions
 def cord_func_2d_kmajor(mat: torch.Tensor, rank : int):
     def cord_func(*cords):

@@ -4,7 +4,10 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
+#include <cute/arch/mma_sm100.hpp>
+#include <cute/arch/copy_sm100.hpp>
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
+#include <cute/atom/copy_traits_sm100.hpp>
 #include <cute/algorithm/gemm.hpp>     // cute::gemm
 #include <cute/algorithm/tensor_reduce.hpp>     // cute::reduce
 #include <cute/algorithm/tensor_algorithms.hpp>     // cute::reduce
@@ -15,6 +18,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/arch/barrier.h>
 
 #include "context.cuh"
 #include "rms_norm.cuh"
@@ -83,21 +87,25 @@ __device__ __forceinline__ void rms_affine_rope_rows(
     const bool need_rope
 ) {
     constexpr int num_thread_per_token = (HEAD_DIM / 2 < N_COMPUTE_THREAD) ? HEAD_DIM / 2 : N_COMPUTE_THREAD;
-    constexpr int token_group_size = (N_COMPUTE_THREAD + num_thread_per_token - 1) / num_thread_per_token;
+    constexpr int token_group_size = N_COMPUTE_THREAD / num_thread_per_token;
     constexpr int num_warp_per_token = num_thread_per_token / 32;
     static_assert(num_thread_per_token % 32 == 0, "to simplify warp-level reduce");
+    static_assert(N_COMPUTE_THREAD % num_thread_per_token == 0, "token groups must be uniform");
 
-    const int warp_id = __compute_tid() / 32;
+    const int thread_id = __compute_tid();
+    const int warp_id = thread_id / 32;
     const int lane_id = __compute_tid() % 32;
-    const int ofst_in_token_group = __compute_tid() / num_thread_per_token;
-    const int lane_in_one_token = __compute_tid() % num_thread_per_token;
+    const int token_group = thread_id / num_thread_per_token;
+    const int lane_in_one_token = thread_id % num_thread_per_token;
 
-    #pragma unroll
-    for (int r = ofst_in_token_group; r < total_num_token; r += token_group_size) {
+    const int num_row_groups = (total_num_token + token_group_size - 1) / token_group_size;
+    for (int row_group = 0; row_group < num_row_groups; ++row_group) {
+        const int r = row_group * token_group_size + token_group;
+        const bool row_valid = r < total_num_token;
+        const int i = lane_in_one_token;
         float sum = 0.0f;
         if (need_norm) {
-            #pragma unroll
-            for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
+            if (row_valid) {
                 auto val = __bfloat1622float2(input(r, i));
                 sum += val.x * val.x + val.y * val.y;
             }
@@ -106,23 +114,22 @@ __device__ __forceinline__ void rms_affine_rope_rows(
                 sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
             if (lane_id == 0)
                 smem_reduce[warp_id] = sum;
-            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+            __sync_compute_group(N_COMPUTE_THREAD);
 
-            if (lane_in_one_token == 0) {
+            if (lane_in_one_token == 0 && row_valid) {
                 #pragma unroll
-                for (int i = 1; i < num_warp_per_token; ++i)
-                    sum += smem_reduce[i + ofst_in_token_group * num_warp_per_token];
-                smem_reduce[ofst_in_token_group] = sum;
+                for (int warp = 1; warp < num_warp_per_token; ++warp)
+                    sum += smem_reduce[warp + token_group * num_warp_per_token];
+                smem_reduce[N_COMPUTE_THREAD / 32 + token_group] = sum;
             }
-            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+            __sync_compute_group(N_COMPUTE_THREAD);
         }
 
         const float rms_rcp = need_norm
-            ? rsqrtf(smem_reduce[ofst_in_token_group] / float(HEAD_DIM) + epsilon)
+            ? rsqrtf(smem_reduce[N_COMPUTE_THREAD / 32 + token_group] / float(HEAD_DIM) + epsilon)
             : 1.0f;
 
-        #pragma unroll
-        for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
+        if (row_valid) {
             auto val = __bfloat1622float2(input(r, i));
             if (need_norm) {
                 val.x *= rms_rcp;
@@ -141,7 +148,7 @@ __device__ __forceinline__ void rms_affine_rope_rows(
             }
             input(r, i) = __float22bfloat162_rn(val);
         }
-        __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+        __sync_compute_group(N_COMPUTE_THREAD);
     }
 }
 
@@ -295,6 +302,370 @@ struct OnlineSoftmax {
 };
 
 }
+
+// SM100 decode attention keeps both the score and output accumulators in TMEM.
+// Scores are drained to registers for online softmax, packed back into TMEM as
+// BF16 probabilities, and consumed directly by the tensor-memory/shared-memory
+// PV UMMA.  This mirrors the Blackwell FA4/FlashInfer dataflow while preserving
+// VDCores' existing memory queues and shared-memory slot ABI.
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+template <int M, int N, typename TmemTensor, typename CoordTensor>
+__device__ __forceinline__ void sm100_attention_rescale_tmem_rows(
+    TmemTensor const& tmem_tensor,
+    CoordTensor const& coord_tensor,
+    const float scale,
+    const int num_active_rows) {
+    using namespace cute;
+    const int tid = __compute_tid();
+    const int active_warps = (num_active_rows + 15) / 16;
+    if (tid < 2 * M && tid / 32 < active_warps) {
+        using Load = SM100_TMEM_LOAD_16dp32b16x;
+        using Store = SM100_TMEM_STORE_16dp32b16x;
+        auto tiled_load = make_tmem_copy(Load{}, tmem_tensor);
+        auto tiled_store = make_tmem_copy(Store{}, tmem_tensor);
+        auto thr_load = tiled_load.get_slice(tid);
+        auto thr_store = tiled_store.get_slice(tid);
+        auto thread_tmem = thr_load.partition_S(tmem_tensor);
+        auto thread_coord = thr_load.partition_D(coord_tensor);
+        auto thread_tmem_store = thr_store.partition_D(tmem_tensor);
+        auto r_values = make_tensor<float>(shape(thread_coord));
+        copy(tiled_load, thread_tmem, r_values);
+        #pragma unroll
+        for (int i = 0; i < size(r_values); ++i) {
+            r_values(i) *= scale;
+        }
+        copy(tiled_store, r_values, thread_tmem_store);
+        cutlass::arch::fence_view_async_tmem_store();
+    }
+    __sync_compute_group(128);
+}
+
+template <int M, int N, typename TmemTensor, typename CoordTensor, typename SmemTensor>
+__device__ __forceinline__ void sm100_attention_store_tmem_rows(
+    TmemTensor const& tmem_tensor,
+    CoordTensor const& coord_tensor,
+    SmemTensor const& smem_tensor,
+    const float inv_sum,
+    const int num_active_rows) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    const int tid = __compute_tid();
+    const int active_warps = (num_active_rows + 15) / 16;
+    if (tid < 2 * M && tid / 32 < active_warps) {
+        using Load = SM100_TMEM_LOAD_16dp32b16x;
+        auto tiled_load = make_tmem_copy(Load{}, tmem_tensor);
+        auto thr_load = tiled_load.get_slice(tid);
+        auto thread_tmem = thr_load.partition_S(tmem_tensor);
+        auto thread_coord = thr_load.partition_D(coord_tensor);
+        auto thread_smem = thr_load.partition_D(smem_tensor);
+        auto r_values = make_tensor<float>(shape(thread_coord));
+        auto r_output = make_tensor<data_t>(shape(thread_smem));
+        copy(tiled_load, thread_tmem, r_values);
+        #pragma unroll
+        for (int i = 0; i < size(r_values); ++i) {
+            r_output(i) = data_t(r_values(i) * inv_sum);
+        }
+        copy(r_output, thread_smem);
+    }
+    __sync_compute_group(128);
+    cutlass::arch::fence_view_async_shared();
+}
+
+template <int HEAD_DIM, int KV_BLOCK_SIZE = 64,
+          bool SPLIT_KV = false, int MAX_SPLIT = 16,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_attention_fwd_sm100_decode(
+    const int num_kv_blocks,
+    const int split_idx,
+    const int num_active_q,
+    const int last_kv_active_token_len,
+    const bool runtime_need_norm,
+    const bool runtime_need_rope,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    void *base,
+    float *smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    using vec2_t = typename F16Traits<data_t>::vec2_t;
+
+    constexpr int M = 64;
+    constexpr int KV = KV_BLOCK_SIZE;
+    constexpr int O_N = HEAD_DIM;
+    constexpr uint32_t P_OFFSET = 0;
+    constexpr uint32_t O_OFFSET = 128;
+    static_assert(HEAD_DIM == 128, "The SM100 decode path is specialized for Llama head_dim=128");
+    static_assert(KV == 64 || KV == 128, "The SM100 decode path supports 64- or 128-token KV tiles");
+
+    using QKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, KV, UMMA::Major::K, UMMA::Major::K>;
+    using PVAtom = SM100_MMA_F16BF16_TS<
+        data_t, data_t, accum_t, M, O_N, UMMA::Major::K, UMMA::Major::MN>;
+
+    const int tid = __compute_tid();
+    auto tiled_qk = make_tiled_mma(QKAtom{});
+    auto cta_qk = tiled_qk.get_slice(0);
+    auto tiled_pv = make_tiled_mma(PVAtom{});
+    auto cta_pv = tiled_pv.get_slice(0);
+
+    auto q_shape = partition_shape_A(tiled_qk, make_shape(Int<M>{}, Int<HEAD_DIM>{}));
+    auto k_shape = partition_shape_B(tiled_qk, make_shape(Int<KV>{}, Int<HEAD_DIM>{}));
+    auto v_shape = partition_shape_B(tiled_pv, make_shape(Int<O_N>{}, Int<KV>{}));
+    auto p_shape = partition_shape_A(tiled_pv, make_shape(Int<M>{}, Int<KV>{}));
+    auto layout_q = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, q_shape);
+    auto layout_k = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, k_shape);
+    auto layout_v = UMMA::tile_to_mma_shape(UMMA::Layout_MN_SW128_Atom<data_t>{}, v_shape);
+    auto layout_p = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, p_shape);
+
+    auto logical_s = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<KV>{}), make_stride(Int<KV>{}, Int<1>{})));
+    auto coord_s = make_identity_tensor(make_shape(Int<M>{}, Int<KV>{}));
+    auto cta_s = cta_qk.partition_C(logical_s);
+    auto cta_coord_s = cta_qk.partition_C(coord_s);
+    auto tmem_s = cta_qk.make_fragment_C(cta_s);
+    tmem_s.data() = tmem_base_ptr;
+
+    auto logical_o = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<O_N>{}), make_stride(Int<O_N>{}, Int<1>{})));
+    auto coord_o = make_identity_tensor(make_shape(Int<M>{}, Int<O_N>{}));
+    auto cta_o = cta_pv.partition_C(logical_o);
+    auto cta_coord_o = cta_pv.partition_C(coord_o);
+    auto tmem_o = cta_pv.make_fragment_C(cta_o);
+    tmem_o.data() = tmem_base_ptr + O_OFFSET;
+
+    auto dummy_p = make_tensor(make_smem_ptr(static_cast<data_t *>(nullptr)), layout_p);
+    auto tmem_p = cta_pv.make_fragment_A(dummy_p);
+    tmem_p.data() = tmem_base_ptr + P_OFFSET;
+
+    // The PV A operand aliases the QK accumulator columns.  A packed 16-bit
+    // TMEM store writes two BF16 probabilities into each 32-bit score column.
+    auto tmem_p_view = tmem_s.compose(
+        make_layout(make_shape(Int<M>{}, Int<KV / 2>{})));
+    tmem_p_view.data() = tmem_base_ptr + P_OFFSET;
+    auto coord_p_view = cta_coord_s.compose(
+        make_layout(make_shape(Int<M>{}, Int<KV / 2>{})));
+
+    const bool use_fused_qk = runtime_need_norm || runtime_need_rope;
+    int side_slot = 0;
+    int k_store_slot = 0;
+    const vec2_t *q_norm_weight = nullptr;
+    const vec2_t *k_norm_weight = nullptr;
+    const vec2_t *rope_row = nullptr;
+    vec2_t *k_store_ptr = nullptr;
+    if (use_fused_qk) {
+        side_slot = m2c.template pop<0>();
+        const vec2_t *packed = static_cast<const vec2_t *>(
+            get_slot_address(base, extract(side_slot)));
+        q_norm_weight = packed;
+        k_norm_weight = packed + HEAD_DIM / 2;
+        rope_row = packed + HEAD_DIM;
+        k_store_slot = m2c.template pop<0>();
+        k_store_ptr = static_cast<vec2_t *>(get_slot_address(base, extract(k_store_slot)));
+    }
+
+    const int q_slot = m2c.template pop<0>();
+    data_t *q_ptr = static_cast<data_t *>(get_slot_address(base, extract(q_slot)));
+    auto sQ = make_tensor(make_smem_ptr(q_ptr), layout_q);
+    auto layout_q_vec = tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<vec2_t>{},
+        make_shape(Int<M>{}, Int<HEAD_DIM / 2>{}));
+    auto sQ_vec = make_tensor(make_smem_ptr(reinterpret_cast<vec2_t *>(q_ptr)), layout_q_vec);
+    if (use_fused_qk) {
+        rms_affine_rope_rows<HEAD_DIM, 128>(
+            sQ_vec, num_active_q, smem_reduce, 1.0e-6f,
+            q_norm_weight, rope_row, runtime_need_norm, runtime_need_rope);
+        // The two 64-thread row groups finish independently.  Join them before
+        // UMMA can consume the full Q tile, then publish generic shared stores
+        // to the asynchronous tensor-core proxy.
+        __sync_compute_group(128);
+        cutlass::arch::fence_view_async_shared();
+    }
+    auto frag_q = cta_qk.make_fragment_A(sQ);
+
+    int logical_row = tid;
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    constexpr float score_scale = M_LOG2E / 11.313708498984761f;
+
+    for (int block = 0; block < num_kv_blocks; ++block) {
+        const int k_slot = m2c.template pop<0>();
+        data_t *k_ptr = static_cast<data_t *>(get_slot_address(base, extract(k_slot)));
+        auto sK = make_tensor(make_smem_ptr(k_ptr), layout_k);
+        auto frag_k = cta_qk.make_fragment_B(sK);
+
+        if (use_fused_qk && block == num_kv_blocks - 1 && last_kv_active_token_len > 0) {
+            auto layout_k_vec = tile_to_shape(
+                GMMA::Layout_K_SW128_Atom<vec2_t>{},
+                make_shape(Int<KV>{}, Int<HEAD_DIM / 2>{}));
+            auto sK_vec = make_tensor(make_smem_ptr(reinterpret_cast<vec2_t *>(k_ptr)), layout_k_vec);
+            const int row = last_kv_active_token_len - 1;
+            rms_affine_rope_single_row<HEAD_DIM>(
+                sK_vec, row, smem_reduce, 1.0e-6f,
+                k_norm_weight, rope_row, runtime_need_norm, runtime_need_rope);
+            cutlass::arch::fence_view_async_shared();
+            if (tid < HEAD_DIM / 2) {
+                k_store_ptr[tid] = sK_vec(row, tid);
+            }
+            __sync_compute_group(128);
+        }
+
+        tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
+        if (tid < numThreadsPerWarp) {
+            #pragma unroll
+            for (int k_block = 0; k_block < size<2>(frag_q); ++k_block) {
+                gemm(tiled_qk, frag_q(_, _, k_block), frag_k(_, _, k_block), tmem_s);
+                tiled_qk.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+
+        float correction = 0.0f;
+        const int active_score_warps = (num_active_q + 15) / 16;
+        if (tid < 2 * M && tid / 32 < active_score_warps) {
+            using ScoreLoad = SM100_TMEM_LOAD_16dp32b16x;
+            auto tiled_s_load = make_tmem_copy(ScoreLoad{}, tmem_s);
+            auto thr_s_load = tiled_s_load.get_slice(tid);
+            auto thread_tmem_s = thr_s_load.partition_S(tmem_s);
+            auto thread_coord_s = thr_s_load.partition_D(cta_coord_s);
+            const int row = int(get<0>(thread_coord_s(0)));
+            logical_row = row;
+            auto r_s = make_tensor<accum_t>(shape(thread_coord_s));
+            copy(tiled_s_load, thread_tmem_s, r_s);
+
+            float block_max = -FLT_MAX;
+            #pragma unroll
+            for (int i = 0; i < size(r_s); ++i) {
+                const int col = int(get<1>(thread_coord_s(i)));
+                float score = r_s(i) * score_scale;
+                if (row >= num_active_q ||
+                    (block == num_kv_blocks - 1 && col >= last_kv_active_token_len)) {
+                    score = -FLT_MAX;
+                }
+                r_s(i) = score;
+                block_max = fmaxf(block_max, score);
+            }
+            block_max = fmaxf(
+                block_max,
+                __shfl_xor_sync(0xFFFFFFFFU, block_max, 16));
+            const float old_max = row_max;
+            row_max = fmaxf(row_max, block_max);
+            const bool row_valid = row < num_active_q && row_max != -FLT_MAX;
+            correction = old_max == -FLT_MAX ? 0.0f : exp2f(old_max - row_max);
+            float block_sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < size(r_s); ++i) {
+                const float probability = row_valid ? exp2f(r_s(i) - row_max) : 0.0f;
+                r_s(i) = probability;
+                block_sum += probability;
+            }
+            block_sum += __shfl_xor_sync(0xFFFFFFFFU, block_sum, 16);
+            row_sum = row_sum * correction + block_sum;
+
+            using ProbStore = SM100_TMEM_STORE_16dp32b16x;
+            auto tiled_p_store = make_tmem_copy(ProbStore{}, tmem_p_view);
+            auto thr_p_store = tiled_p_store.get_slice(tid);
+            auto thread_coord_p = thr_p_store.partition_S(coord_p_view);
+            auto thread_tmem_p = thr_p_store.partition_D(tmem_p_view);
+            auto r_packed = make_tensor<uint32_t>(shape(thread_coord_p));
+            auto r_packed_pairs = recast<cutlass::Array<data_t, 2>>(r_packed);
+            cutlass::NumericArrayConverter<data_t, accum_t, 2> convert;
+            const int lane_half = (tid >> 4) & 1;
+            #pragma unroll
+            for (int i = 0; i < size(r_packed_pairs); ++i) {
+                // A 16-DP TMEM load assigns score-column quarters to the two
+                // half-warps as [0,2] and [1,3], while the packed BF16 store
+                // assigns contiguous halves [0,1] and [2,3].  Exchange the
+                // alternate quarter within each warp before packing.
+                // The mapping repeats independently for each 64-column TMEM
+                // chunk; it does not widen its 16-column quarters for N=128.
+                const int chunk = i / 16;
+                const int pair_in_quarter = i & 7;
+                const int local_idx = chunk * 32 + 16 * lane_half + 2 * pair_in_quarter;
+                const int send_idx = chunk * 32 + 16 * (1 - lane_half) + 2 * pair_in_quarter;
+                const bool use_partner = ((i >> 3) & 1) != lane_half;
+                const accum_t partner_0 = __shfl_xor_sync(
+                    0xFFFFFFFFU, r_s(send_idx), 16);
+                const accum_t partner_1 = __shfl_xor_sync(
+                    0xFFFFFFFFU, r_s(send_idx + 1), 16);
+                cutlass::Array<accum_t, 2> pair;
+                pair[0] = use_partner ? partner_0 : r_s(local_idx);
+                pair[1] = use_partner ? partner_1 : r_s(local_idx + 1);
+                r_packed_pairs(i) = convert(pair);
+            }
+            copy(tiled_p_store, r_packed, thread_tmem_p);
+            cutlass::arch::fence_view_async_tmem_store();
+        }
+        __sync_compute_group(128);
+
+        if (block > 0) {
+            sm100_attention_rescale_tmem_rows<M, O_N>(
+                tmem_o, cta_coord_o, correction, num_active_q);
+        }
+
+        c2m.push(tid, k_slot);
+        const int v_slot = m2c.template pop<0>();
+        data_t *v_ptr = static_cast<data_t *>(get_slot_address(base, extract(v_slot)));
+        auto sV = make_tensor(make_smem_ptr(v_ptr), layout_v);
+        auto frag_v = cta_pv.make_fragment_B(sV);
+
+        tiled_pv.accumulate_ = block == 0 ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
+        if (tid < numThreadsPerWarp) {
+            #pragma unroll
+            for (int k_block = 0; k_block < size<2>(tmem_p); ++k_block) {
+                gemm(tiled_pv, tmem_p(_, _, k_block), frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        c2m.push(tid, v_slot);
+    }
+
+    c2m.push(tid, q_slot);
+    if (use_fused_qk) {
+        c2m.push(tid, side_slot);
+        c2m.template push<0, true>(tid, k_store_slot);
+    }
+
+    const int o_slot = m2c.template pop<0>();
+    data_t *o_ptr = static_cast<data_t *>(get_slot_address(base, extract(o_slot)));
+    auto sO = make_tensor(
+        make_smem_ptr(o_ptr),
+        make_layout(make_shape(Int<M>{}, Int<O_N>{}), make_stride(Int<O_N>{}, Int<1>{})));
+    auto cta_sO = cta_pv.partition_C(sO);
+    const float inv_sum = tid < 2 * M && logical_row < num_active_q && row_sum > 0.0f
+        ? 1.0f / row_sum : 0.0f;
+    sm100_attention_store_tmem_rows<M, O_N>(
+        tmem_o, cta_coord_o, cta_sO, inv_sum, num_active_q);
+    c2m.template push<0, true>(tid, o_slot);
+
+    if constexpr (SPLIT_KV) {
+        // The score accumulator is kept in the log2 domain, matching the
+        // exp2-based split reducer.  A 16-DP TMEM load assigns two threads to
+        // each row; both publish the same scalar, so duplicate stores are
+        // benign and avoid another synchronization/shuffle.
+        const int lse_slot = m2c.template pop<0>();
+        accum_t *lse_ptr = static_cast<accum_t *>(
+            slot_2_glob_ptr(st_insts, lse_slot));
+        if (tid < 2 * M && logical_row < num_active_q && row_sum > 0.0f) {
+            lse_ptr[logical_row * MAX_SPLIT + split_idx] =
+                row_max + log2f(row_sum);
+        }
+        __sync_compute_group(128);
+        c2m.template push<31, true, false>(tid, 1 << lse_slot);
+    }
+}
+#endif
 
 template <int HEAD_DIM,
           int Q_BLOCK_SIZE,

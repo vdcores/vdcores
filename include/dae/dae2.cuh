@@ -11,6 +11,9 @@
 #include <cuda/ptx>
 #include <bit>
 
+#include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/arch/barrier.h>
+
 // pipeline stages
 #include "pipeline/allocwarp.cuh"
 #include "pipeline/ldwarp.cuh"
@@ -106,6 +109,27 @@ void dae2(
   // argmax uses this
   __shared__ uint64_t scratch_space[32]; // 8-bytes aligned
 
+  // Blackwell UMMA accumulates in tensor memory.  VDCores keeps one resident
+  // block per SM, so acquire TMEM once for the lifetime of the megakernel and
+  // reuse it across sequential compute tasks.
+  __shared__ alignas(16) uint32_t tmem_base_ptr;
+  __shared__ alignas(16) uint64_t tmem_mma_barrier;
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  using TmemAllocator = cute::TMEM::Allocator1Sm;
+  TmemAllocator tmem_allocator{};
+  if (thread_id / numThreadsPerWarp == 0) {
+    tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
+  }
+  if (thread_id == 0) {
+    cute::initialize_barrier(tmem_mma_barrier, 1);
+  }
+#else
+  if (thread_id == 0) {
+    tmem_base_ptr = 0;
+    tmem_mma_barrier = 0;
+  }
+#endif
+
   if (threadIdx.x == 0) {
     int event_base = sm_id * numProfileEvents;
     g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
@@ -118,6 +142,7 @@ void dae2(
     CInst inst;
     uint32_t pc = 0;
     uint32_t count[numComputeLoopCounters] = {};
+    uint32_t tmem_mma_phase = 0;
     bool finish = false;
 
     while (!finish) {
@@ -132,6 +157,9 @@ void dae2(
         finish,
         inst,
         smem_base,
+        tmem_base_ptr,
+        &tmem_mma_barrier,
+        tmem_mma_phase,
         scratch_space,
         st_insts,
         m2c,
@@ -172,6 +200,14 @@ void dae2(
       }
     } // End of warps
   } // End of memory warp group
+
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  __syncthreads();
+  if (thread_id / numThreadsPerWarp == 0) {
+    tmem_allocator.release_allocation_lock();
+    tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+  }
+#endif
 
   // end of megakernel
 }
