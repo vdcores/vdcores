@@ -11,6 +11,7 @@ size_t set_smem_size(size_t smem_size) {
     );
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
+        return 0;
     }
     return smem_size;
 }

@@ -4,9 +4,12 @@
 NVCC = nvcc
 PYTHON ?= python
 
-# CUDA architecture (adjust for your GPU)
-# SM80 for A100, SM89 for H100, SM90 for Hopper
-CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
+# Datacenter Blackwell uses architecture-accelerated tensor-core instructions,
+# so both the virtual and real targets must carry the `a` suffix.  Keep this
+# overrideable for Hopper regression builds and for SM103/B300 validation.
+DAE_CUDA_ARCH ?= 100a
+export DAE_CUDA_ARCH
+CUDA_ARCH ?= -gencode arch=compute_$(DAE_CUDA_ARCH),code=sm_$(DAE_CUDA_ARCH)
 
 GENERATED_INCLUDE_DIR := build/generated
 SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc

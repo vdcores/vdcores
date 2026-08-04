@@ -15,9 +15,21 @@
 
 namespace py = pybind11;
 
+static cudaDeviceProp current_device_prop();
+
 // function 1: set smem size
 size_t py_set_smem_size(size_t requested_size) {
-  return set_smem_size(requested_size);
+  const cudaDeviceProp prop = current_device_prop();
+  const size_t max_optin = static_cast<size_t>(prop.sharedMemPerBlockOptin);
+  TORCH_CHECK(
+      requested_size <= max_optin,
+      "requested dynamic shared memory (", requested_size,
+      " bytes) exceeds this device's per-block opt-in limit (", max_optin, " bytes)");
+  const size_t configured_size = set_smem_size(requested_size);
+  TORCH_CHECK(
+      configured_size == requested_size,
+      "failed to configure dae2 dynamic shared memory to ", requested_size, " bytes");
+  return configured_size;
 }
 
 template <typename T>
@@ -143,8 +155,14 @@ int py_launch_dae(
 ) {
   set_persistent_cache();
 
-  // fixed for H100 for now
-  TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
+  const cudaDeviceProp prop = current_device_prop();
+  TORCH_CHECK(
+      num_sms > 0 && num_sms <= prop.multiProcessorCount,
+      "num_sms out of range for ", prop.name, ": requested ", num_sms,
+      ", device has ", prop.multiProcessorCount, " SMs");
+  TORCH_CHECK(
+      smem_size <= static_cast<size_t>(prop.sharedMemPerBlockOptin),
+      "smem_size exceeds this device's per-block opt-in shared-memory limit");
 
   // Make sure we run on the right device/stream
   auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");

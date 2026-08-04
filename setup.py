@@ -1,6 +1,7 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
+import re
 
 import torch
 torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
@@ -13,6 +14,15 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 generated_include_dir = os.path.join(this_dir, "build", "generated")
 sources = [os.path.join(this_dir, "src", "torch_runtime.cu")]
 runtime_obj = os.path.join(this_dir, "runtime.o")
+cuda_arch = os.environ.get("DAE_CUDA_ARCH", "100a").lower()
+for prefix in ("compute_", "sm_"):
+    if cuda_arch.startswith(prefix):
+        cuda_arch = cuda_arch[len(prefix):]
+if re.fullmatch(r"[0-9]{2,3}[af]?", cuda_arch) is None:
+    raise ValueError(
+        f"Invalid DAE_CUDA_ARCH={cuda_arch!r}; expected an architecture such as 90a, 100a, or 103a"
+    )
+cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
 include_dirs = [
     os.path.join(this_dir, "include"),
     os.path.join(this_dir, "include", "dae"),
@@ -34,7 +44,7 @@ setup(
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++20", "-DNDEBUG"],
                 "nvcc": [
-                    '-gencode=arch=compute_90a,code=sm_90a',
+                    cuda_gencode,
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
