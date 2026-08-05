@@ -207,9 +207,10 @@ __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_
 }
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-// Blackwell-native BF16 GEMV/GEMM tile.  UMMA reads A/B from shared memory,
-// accumulates F32 in TMEM, then pipelines the completed TMEM tile through
-// registers into the existing VDCores shared-memory writeback slot.
+// Generic Blackwell BF16 GEMV tile. Keep this path byte-for-byte equivalent
+// to the shared-slot implementation used by the fused projection schedules;
+// grouped direct output is isolated below so it cannot perturb RegStore or
+// TMA-reduction layouts.
 template<int M, int N, int K, int BLoadInterval, bool Residual,
          typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_gemv_sm100(
@@ -331,5 +332,131 @@ __device__ __forceinline__ void task_gemv_sm100(
         c2m.push(tid, residual_slot);
     }
     c2m.template push<0, true>(tid, output_slot);
+}
+
+// LM-head specialization: reuse each eight-token B tile across four disjoint
+// output tiles, retain the four F32 accumulators in TMEM, and drain them
+// directly through registers to global memory.
+template<int M, int N, int K, int BLoadInterval, int OutputGroups,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_sm100_direct_grouped(
+    const int n_k_tiles,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    const void *base,
+    M2C_Type &m2c,
+    C2M_Type &c2m,
+    MInst *st_insts,
+    const int output_stride,
+    const int output_group_stride) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    using Atom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, N, UMMA::Major::K, UMMA::Major::K>;
+
+    static_assert(M == 128 && N == 8,
+                  "Grouped direct GEMV is specialized for M128N8");
+    static_assert(K % 16 == 0, "SM100 BF16 UMMA requires K to be a multiple of 16");
+    static_assert(BLoadInterval > 0, "BLoadInterval must be positive");
+    static_assert(OutputGroups > 0, "SM100 GEMV needs at least one output group");
+
+    const int tid = __compute_tid();
+    auto tiled_mma = make_tiled_mma(Atom{});
+    auto cta_mma = tiled_mma.get_slice(0);
+
+    auto mma_shape_a = partition_shape_A(tiled_mma, make_shape(Int<M>{}, Int<K>{}));
+    auto mma_shape_b = partition_shape_B(tiled_mma, make_shape(Int<N>{}, Int<K>{}));
+    auto layout_sA = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, mma_shape_a);
+    auto layout_sB = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, mma_shape_b);
+
+    auto logical_c = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<N>{}, Int<1>{})));
+    auto cta_c = cta_mma.partition_C(logical_c);
+    auto tmem_acc = cta_mma.make_fragment_C(cta_c);
+    tmem_acc.data() = tmem_base_ptr;
+
+    int live_b_slot = 0;
+    constexpr int b_tile_elements = N * K;
+
+    for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
+        data_t *sB_ptr;
+        if (tile_idx % BLoadInterval == 0) {
+            live_b_slot = m2c.template pop<0>();
+            sB_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(live_b_slot)));
+        } else {
+            sB_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(live_b_slot)))
+                + (tile_idx % BLoadInterval) * b_tile_elements;
+        }
+
+        #pragma unroll
+        for (int output_group = 0; output_group < OutputGroups;
+             ++output_group) {
+            const int slot_a = m2c.template pop<0>();
+            data_t *sA_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(slot_a)));
+            auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
+            auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+            auto frag_a = cta_mma.make_fragment_A(sA);
+            auto frag_b = cta_mma.make_fragment_B(sB);
+            auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+            group_tmem_acc.data() = tmem_base_ptr + output_group * N;
+            tiled_mma.accumulate_ = tile_idx == 0
+                                  ? UMMA::ScaleOut::Zero
+                                  : UMMA::ScaleOut::One;
+
+            if (tid < numThreadsPerWarp) {
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
+                    gemm(tiled_mma, frag_a(_, _, k_block),
+                         frag_b(_, _, k_block), group_tmem_acc);
+                    tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+                }
+                cutlass::arch::umma_arrive(tmem_mma_barrier);
+            }
+            cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+            tmem_mma_phase ^= 1;
+
+            int release_mask = slot_a;
+            if (output_group + 1 == OutputGroups
+                && ((tile_idx + 1) % BLoadInterval == 0
+                    || tile_idx + 1 == n_k_tiles)) {
+                release_mask |= live_b_slot;
+            }
+            c2m.push(tid, release_mask);
+        }
+    }
+
+    const int output_slot = m2c.template pop<0>();
+    auto coord_c = make_identity_tensor(make_shape(Int<M>{}, Int<N>{}));
+    auto cta_coord_c = cta_mma.partition_C(coord_c);
+    using TmemLoad = SM100_TMEM_LOAD_32dp32b4x;
+    data_t *output_ptr = static_cast<data_t *>(
+        slot_2_glob_ptr(st_insts, output_slot));
+    #pragma unroll
+    for (int output_group = 0; output_group < OutputGroups; ++output_group) {
+        auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+        group_tmem_acc.data() = tmem_base_ptr + output_group * N;
+        TiledCopy tiled_t2r = make_tmem_copy(TmemLoad{}, group_tmem_acc);
+        ThrCopy thr_t2r = tiled_t2r.get_slice(tid);
+        auto thread_tmem = thr_t2r.partition_S(group_tmem_acc);
+        auto thread_coord = thr_t2r.partition_D(cta_coord_c);
+        auto r_acc = make_tensor<accum_t>(shape(thread_coord));
+        copy(tiled_t2r, thread_tmem, r_acc);
+
+        #pragma unroll
+        for (int i = 0; i < size(r_acc); ++i) {
+            const int row = int(get<0>(thread_coord(i)));
+            const int col = int(get<1>(thread_coord(i)));
+            output_ptr[col * output_stride
+                       + output_group * output_group_stride + row]
+                = data_t(r_acc(i));
+        }
+    }
+    c2m.template push<31, true, false>(tid, 1U << output_slot);
 }
 #endif

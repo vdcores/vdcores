@@ -615,6 +615,74 @@ class SchedGemv(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
+
+class SchedGemvMGroup(Schedule):
+    def __init__(self, Atom, MNK, tmas, direct_output,
+                 direct_output_slot: int = 24, group: bool = True):
+        super().__init__()
+        self.Atom = Atom
+        self.MNK = MNK
+        self.tmas = tmas
+        self.direct_output = direct_output
+        self.direct_output_slot = direct_output_slot
+        self.group = group
+
+    def _on_place(self):
+        TileM, TileN, TileK = self.Atom.MNK
+        M, N, K = self.MNK
+        assert M == self.num_sms * TileM * self.Atom.output_groups
+        assert N == TileN
+        assert K % (TileK * self.Atom.n_batch) == 0
+        assert tuple(self.direct_output.shape) == (N, M)
+        assert len(self.tmas) == 2
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        _, _, K = self.MNK
+        loadA, loadB = self.tmas
+        m = sm * TileM
+        output_group_stride = self.num_sms * TileM
+        n_repeat = K // (TileK * self.Atom.n_batch)
+        load_group = self.group and self._bar("load") is not None
+        store_group = self.group and self._bar("store") is not None
+
+        load_steps = [
+            (loadB.cord(0, 0).group(load_group),
+             loadB.cord2tma(0, TileK * self.Atom.n_batch)),
+        ]
+        for k_tile in range(self.Atom.n_batch):
+            for output_group in range(self.Atom.output_groups):
+                group_m = m + output_group * output_group_stride
+                load_a = loadA.cord(
+                    group_m, k_tile * TileK
+                ).group(load_group)
+                load_steps.append((
+                    load_a,
+                    loadA.cord2tma(0, TileK * self.Atom.n_batch),
+                ))
+
+        output = (
+            RawAddress(self.direct_output, self.direct_output_slot)
+            .delta(m * self.direct_output.element_size())
+            .bar(self._bar("store"))
+            .writeback()
+            .group(store_group)
+        )
+        return [
+            self.Atom(K // TileK, self.direct_output.shape[-1],
+                      output_group_stride),
+            RepeatM.onSync(0, self._bar("load"), n_repeat, *load_steps),
+            output,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
 class SchedGemm(Schedule):
     def __init__(self, Atom,
                  MNK: tuple[int, int, int],

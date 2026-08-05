@@ -49,9 +49,9 @@ removed. Long-context split reduction remains the attention bottleneck.
 ## GEMV
 
 SM100 GEMV uses native BF16 UMMA with F32 accumulation in TMEM and a
-TMEM-to-register-to-smem output path. M128 is the measured winner for regular
-Llama projections and is retained alongside M64 for layouts that require the
-smaller tile.
+TMEM-to-register-to-smem output path. The LM-head specialization reuses each
+eight-token B tile across four M128 output tiles, keeps four accumulators in
+separate TMEM column ranges, and drains BF16 directly to global memory.
 
 | Shape (M x N x K) | SMs | M64 (us) | M128 (us) | M128 gain |
 | --- | ---: | ---: | ---: | ---: |
@@ -59,6 +59,11 @@ smaller tile.
 | 4096 x 8 x 4096 | 128 | 7.200 | 6.560 | 8.9% |
 | 8192 x 8 x 4096 | 128 | 12.096 | 11.200 | 7.4% |
 | 4096 x 8 x 14336 | 128 | 22.464 | 20.960 | 6.7% |
+
+The exact two-epoch padded LM head (131072 x 8 x 4096 total) measures 147.840
+us with the grouped direct path and exact BF16 agreement with the isolated
+reference. The same framework comparison measures 149.703 us in vLLM and
+149.781 us in SGLang.
 
 Use `benchmarks/blackwell_gemv.py` to reproduce a shape and
 `tests/blackwell_gemv_smoke.py` for strict single-tile correctness.
@@ -97,16 +102,16 @@ split, fused, or overlapped and therefore has no equivalent standalone launch.
 | Gate or up component, 14336 x 8 x 4096 | - | **18.876** | 19.106 | VDCores uses 6144/8192 pipeline partitions |
 | Fused gate/up, 28672 x 8 x 4096 | - | 39.284 | **37.123** | Framework-selected fused scope |
 | Down, 4096 x 8 x 14336 | 22.768 | 19.264 | **18.893** | VDCores is 20% behind SGLang |
-| Padded LM head, 131072 x 8 x 4096 | 174.432 | **149.703** | 149.781 | Production M64 VDCores is 17% behind |
+| Padded LM head, 131072 x 8 x 4096 | **147.840** | 149.703 | 149.781 | VDCores leads by 1.2-1.3% |
 
-The full LM-head number is the exact production decomposition: two 65,536-row
-epochs with tile-packed weights, each split into eight 8,192-row schedules. An
-exploratory tile-packed M128 version measured 161.472 us, but it needs fold-2
-additive output and therefore a synchronized 2 MiB logits clear on every
-repeated decode step; the overwrite-safe M64 path remains the minimal
-production choice. The framework linear paths are the same PyTorch operation,
-so their small differences are independent-process measurement variation
-rather than different kernels.
+The production LM head is two 65,536-row epochs. Each of 128 SMs owns four
+disjoint M128 tiles and reuses every B tile across them, avoiding fold
+reduction, logits clearing, shared-memory output staging, and output TMA. The
+two raw output descriptors use dedicated special slots 30 and 31 so memory-VM
+lookahead cannot overwrite either pointer with the following argmax task. The
+framework linear paths are the same PyTorch operation, so their small
+differences are independent-process measurement variation rather than
+different kernels.
 
 | Non-projection task, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Scope note |
 | --- | ---: | ---: | ---: | --- |
@@ -123,8 +128,9 @@ residual adds occur in TMA reductions, the 8,192-row MLP tail forwards through
 registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 14% and SGLang by
-27%; the largest remaining task gaps are long-context B8/S512 attention (61%
-behind vLLM), and the Q/O and down projections.
+27%, and the grouped LM head leads both frameworks. The largest remaining task
+gaps are long-context B8/S512 attention (61% behind vLLM), and the Q/O and down
+projections.
 
 Reproduce the exact framework probes with
 `benchmarks/blackwell_framework_tasks.py`, the isolated VDCores non-GEMV tasks
@@ -151,6 +157,8 @@ The 152-SM schedule uses four measured choices:
 - the materialized 6,144-wide SwiGLU prefix uses three 2,048-element shards
   per token across all 24 auxiliary SMs, with aligned 128-bit shared-memory
   loads and stores;
+- the LM head assigns four M128 tiles to each of 128 SMs, reuses each input
+  tile four times, and drains four TMEM accumulators directly to logits;
 - output projection creates exactly 152 tasks with mixed K-folding, and the
   24 auxiliary SMs overlap one low-K down-projection task apiece with the
   register-forwarded MLP tail. Only the 12 affected M tiles cross an explicit
@@ -169,10 +177,11 @@ auxiliary-SM overlap is intentionally limited to one half-tile per SM.
 | One full down tile per auxiliary SM | 428.03 | 3.344 | no |
 | Two down half-tiles on eight auxiliary SMs | 436.11 | 3.407 | no |
 | 128-bit, three-way materialized SwiGLU | 393.86 | 3.077 | no |
-| Shared-P attention + unified multi-tile path | **383.26** | **2.994** | yes |
+| Shared-P attention + unified multi-tile path | 383.26 | 2.994 | no |
+| Four-output grouped LM head | **382.13** | **2.985** | yes |
 
-The framework comparison used `10.0.16.25:0`; the current VDCores result used
-the matching 152-SM GB200 on `10.0.16.24:0`. Both used the local
+The framework comparison and current VDCores result used the matching 152-SM
+GB200 on `10.0.16.25:0`. Both used the local
 Llama-3.1-8B-Instruct BF16 checkpoint, batch 8, input length 1, output length
 128, and each framework's default CUDA-graph path. VDCores reports the median
 wall time around all 128 one-token launches. vLLM's CLI reports total request
@@ -183,10 +192,10 @@ direct phase timer.
 
 | System | Version / measure | Median TBT (ms) | VDCores reduction |
 | --- | --- | ---: | ---: |
-| VDCores | 383.258 ms / 128 steps | **2.994** | - |
-| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 10.9% |
-| vLLM | cross-run decode estimate | 3.335 | 10.2% |
-| SGLang | 0.5.12.post1, reported decode median | 3.820 | 21.6% |
+| VDCores | 382.133 ms / 128 steps | **2.985** | - |
+| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 11.1% |
+| vLLM | cross-run decode estimate | 3.335 | 10.5% |
+| SGLang | 0.5.12.post1, reported decode median | 3.820 | 21.9% |
 
 Reproduce the retained path with:
 
@@ -198,8 +207,8 @@ python app/python/llama3/sched.py \
 
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
 match Hugging Face, and a 130-step launch crosses from one KV128 block to two
-with the unified online-softmax path. The exact 11-operator Llama image uses
-200 registers, 9 barriers, a 96-byte stack frame, and zero spills.
+with the unified online-softmax path. The exact 12-operator Llama image uses
+202 registers, 9 barriers, a 96-byte stack frame, and zero spills.
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
 bulk sequence launches on all 152 SMs.
 

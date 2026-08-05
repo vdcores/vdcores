@@ -94,6 +94,25 @@ class Gemv_M128N8(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=128, N=8, K=128, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
+
+class Gemv_M128N8Direct4(ComputeInstruction):
+    MNK = (128, 8, 128)
+    n_batch = 4
+    direct_output = True
+    output_groups = 4
+
+    def __init__(self, kTiles: int, output_stride: int, output_group_stride: int):
+        if output_stride % self.MNK[0] or output_group_stride % self.MNK[0]:
+            raise ValueError("direct M128 GEMV strides must be multiples of 128")
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M128N8_DIRECT4,
+            args=[
+                kTiles,
+                output_stride // self.MNK[0],
+                output_group_stride // self.MNK[0],
+            ],
+        )
+
 class Gemm_M64N64(ComputeInstruction):
     MNK = (64, 64, 128)
     n_batch = 1
@@ -1100,6 +1119,7 @@ __all__ = [
     "TerminateC",
     "Gemv_M64N8",
     "Gemv_M128N8",
+    "Gemv_M128N8Direct4",
     "Gemv_M64N8K64",
     "Gemv_M64N8K128",
     "Gemv_M64N8B2",

@@ -74,6 +74,16 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8_MMA) {
   task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_DIRECT4) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_direct_grouped<128, 8, 128, 4, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m, st_insts, inst.args[1] * 128,
+      inst.args[2] * 128);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_GEMM_M64N64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
   using gemm_atom = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;

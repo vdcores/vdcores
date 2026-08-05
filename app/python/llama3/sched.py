@@ -428,8 +428,10 @@ def seed_prefill_kv_cache():
 
 QKVAtom = Gemv_M64N8
 LinearAtom = Gemv_M64N8
+LogitsAtom = Gemv_M128N8Direct4
 QKVTileM, _, QKVTileK = QKVAtom.MNK
 LinearTileM, _, LinearTileK = LinearAtom.MNK
+LogitsTileM, _, LogitsTileK = LogitsAtom.MNK
 
 print(f"[weights] packing projections as contiguous M{LinearTileM}K{LinearTileK} tiles")
 matqWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matqWs]
@@ -440,7 +442,7 @@ matUps = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matUp
 matGates = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matGates]
 matDowns = [pack_weight_tile_major(weight, LinearTileM, LinearTileK) for weight in matDowns]
 matLogitsW = [
-  pack_weight_tile_major(weight.contiguous(), LinearTileM, LinearTileK)
+  pack_weight_tile_major(weight.contiguous(), LogitsTileM, LogitsTileK)
   for weight in matLogitsW
 ]
 dae.set_streaming(
@@ -466,18 +468,13 @@ def linear_output_tma(mode):
 defaultg.addTma(
   "loadLogitsB",
   [matRMSHidden],
-  lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K),
+  lambda t: t.wgmma_load(N, LogitsTileK * LogitsAtom.n_batch, Major.K),
 )
 for logits_idx in range(logits_epoch):
   defaultg.addTma(
     f"loadLogitsW{logits_idx}",
     [matLogitsW[logits_idx]],
-    lambda t: t.wgmma_load_tiled(LinearTileM, LinearTileK),
-  )
-  defaultg.addTma(
-    f"storeLogits{logits_idx}",
-    [matLogits[logits_idx]],
-    lambda t: t.wgmma_store(N, LinearTileM, Major.MN),
+    lambda t: t.wgmma_load_tiled(LogitsTileM, LogitsTileK),
   )
 
 
@@ -830,19 +827,22 @@ def schedule_single_token(
   # after all layers, logits projection
   LogitsProj = []
   for i in range(logits_epoch):
-    sched = SchedGemv(
-      LinearAtom,
+    sched = SchedGemvMGroup(
+      LogitsAtom,
       MNK=(logits_slice, N, HIDDEN),
       tmas=(
         defaultg[f"loadLogitsW{i}"],
         defaultg["loadLogitsB"],
-        defaultg[f"storeLogits{i}"],
       ),
+      direct_output=matLogits[i],
+      # Raw-address slots bypass the shared-slot allocator.  Keep concurrent
+      # logits epochs on descriptors distinct from each other and from the
+      # following argmax task (which uses slots 24--29).
+      direct_output_slot=30 + i,
       group=False,
-    ).split_M(8)
+    )
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
-      sched[0].no_prefetch()
     if i == logits_epoch - 1:
       sched.bar("store", systemg['bar_logits'])
     LogitsProj.append(sched.place(num_sms))

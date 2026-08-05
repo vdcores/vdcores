@@ -91,7 +91,9 @@ struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE>
   template<int ThrPush = 0, bool writeback = false, bool free_slot = true> 
   __device__ __forceinline__ void push(int tid, int val) {
     if constexpr (writeback) {
-      if (val < 0)
+      // -1 is the invalid-allocation sentinel.  Do not reject every negative
+      // int: bit 31 is a valid one-hot completion for special raw slot 31.
+      if (val == -1)
         return;
 
       if (tid == ThrPush)

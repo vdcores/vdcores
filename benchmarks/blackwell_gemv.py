@@ -5,10 +5,15 @@ from collections.abc import Sequence
 
 import torch
 
-from dae.instructions import Gemv_M64N8, Gemv_M128N8, TmaTensor
+from dae.instructions import (
+    Gemv_M64N8,
+    Gemv_M128N8,
+    Gemv_M128N8Direct4,
+    TmaTensor,
+)
 from dae.launcher import Launcher
 from dae.model import GemvLayer
-from dae.schedule import SchedGemv
+from dae.schedule import SchedGemv, SchedGemvMGroup
 from dae.tma_utils import (
     Major,
     build_tma_wgmma_mnmajor_m128n8,
@@ -38,8 +43,13 @@ def benchmark_torch(
 def main() -> None:
     device = torch.device("cuda")
     tile_m = int(os.environ.get("GEMV_TILE_M", "64"))
-    atom = {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
-    if atom is None:
+    grouped_output = os.environ.get("GEMV_GROUPED_OUTPUT", "0") == "1"
+    atom = (
+        Gemv_M128N8Direct4
+        if grouped_output
+        else {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
+    )
+    if atom is None or (grouped_output and tile_m != 128):
         raise ValueError("GEMV_TILE_M must be 64 or 128")
 
     m = int(os.environ.get("GEMV_M", "4096"))
@@ -57,9 +67,20 @@ def main() -> None:
     if m % split_m or (m // split_m) % tile_m:
         raise ValueError("each M split must contain a whole number of M tiles")
     m_tiles_per_split = (m // split_m) // tile_m
-    if sms % m_tiles_per_split:
-        raise ValueError("GEMV_SMS must be a multiple of the M tiles per split")
-    fold = sms // m_tiles_per_split
+    if grouped_output:
+        if not tile_packed or split_m != 1:
+            raise ValueError(
+                "GEMV_GROUPED_OUTPUT requires packed weights and GEMV_SPLIT_M=1"
+            )
+        if m != sms * tile_m * atom.output_groups:
+            raise ValueError(
+                "grouped output requires M = SMS * TILE_M * output_groups"
+            )
+        fold = 1
+    else:
+        if sms % m_tiles_per_split:
+            raise ValueError("GEMV_SMS must be a multiple of the M tiles per split")
+        fold = sms // m_tiles_per_split
 
     generator = torch.Generator(device=device).manual_seed(0)
     matrices = [
@@ -94,6 +115,17 @@ def main() -> None:
             load_matrix = TmaTensor(launcher, matrix).wgmma_load_tiled(
                 atom.MNK[0], atom.MNK[2]
             )
+            if grouped_output:
+                schedules.append(
+                    SchedGemvMGroup(
+                        atom,
+                        (m, vectors.shape[0], k),
+                        (load_matrix, load_vectors),
+                        output,
+                    ).place(sms)
+                )
+                continue
+
             output_mode = "reduce" if fold > 1 else "store"
             output_tensor = TmaTensor(launcher, output)
             if tile_m == 128:
@@ -156,8 +188,8 @@ def main() -> None:
     print(
         "GEMV_CONFIG "
         f"m={m * epochs} epoch_m={m} epochs={epochs} n=8 k={k} "
-        f"tile_m={tile_m} tile_packed={int(tile_packed)} sms={sms} split_m={split_m} "
-        f"fold={fold} "
+        f"tile_m={tile_m} tile_packed={int(tile_packed)} sms={sms} "
+        f"split_m={split_m} fold={fold} grouped_output={int(grouped_output)} "
         f"avg_diff_percent={avg_diff_percent:.6f} max_abs_error={max_abs_error:.6f}"
     )
     launcher.bench(iterations)

@@ -4,6 +4,7 @@ import torch
 from dae.instructions import (
     ATTENTION_M64N64K16_F16_F32_64_64_hdim,
     ATTENTION_SM100_BF16_HDIM128_DIRECT,
+    Gemv_M128N8Direct4,
     MemoryInstruction,
     RepeatM,
 )
@@ -75,6 +76,19 @@ def test_direct_attention_preserves_dynamic_decode_fields():
     assert instruction.args[0] == 0x0101
     assert instruction.args[1] == 0x0184
     assert instruction.args[2] == 0x213C
+
+
+def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():
+    instruction = Gemv_M128N8Direct4(
+        kTiles=32,
+        output_stride=65536,
+        output_group_stride=16384,
+    )
+
+    assert instruction.opcode == opcode.OP_GEMV_SM100_M128N8_DIRECT4
+    assert instruction.args == [32, 512, 128]
+    with pytest.raises(ValueError, match="multiples of 128"):
+        Gemv_M128N8Direct4(32, 65535, 16384)
 
 
 def test_launcher_loop_counter_validation_without_allocating_gpu_state():

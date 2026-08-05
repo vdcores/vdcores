@@ -55,10 +55,10 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
   shape-matched component probe.
 - VDCores M64 Q/O and down GEMVs are 7.216 and 22.768 us, 22-23% and 18-20%
   behind the framework component probes.
-- The exact tile-packed, two-epoch M64 LM head is 174.432 us versus about
-  149.7 us for either framework. M128 reaches 161.472 us in isolation but
-  requires fold-2 additive output plus a synchronized 2 MiB per-token clear,
-  so it is not the retained minimal repeated-decode path.
+- The retained two-epoch LM head assigns four disjoint M128 output tiles to
+  each of 128 SMs, reuses each B tile four times, and drains four F32 TMEM
+  accumulators directly to BF16 logits. It measures 147.840 us versus 149.703
+  us in vLLM and 149.781 us in SGLang, with exact isolated BF16 agreement.
 - Aligned 128-bit shared-memory packs and register reuse reduce VDCores
   RMSNorm to 2.496 us at B8, matching vLLM's 2.490 us but trailing SGLang's
   2.100 us. Three-way 2048-element sharding reduces the materialized
@@ -75,6 +75,20 @@ K/V cache writes, residual reductions, and the register-forwarded MLP tail and
 overlaps auxiliary-SM down-projection work inside one persistent megakernel.
 Use `benchmarks/blackwell_framework_tasks.py` and
 `benchmarks/blackwell_vdcores_tasks.py` for the exact comparison methodology.
+
+## Grouped LM-Head Pipeline
+
+- Raw-address descriptors bypass the shared-slot allocator and may be issued
+  ahead of compute. Consecutive direct-output tasks therefore need distinct
+  special slots, and those slots must also be distinct from following tasks.
+  The two logits epochs use slots 30/31; argmax uses slots 24--29.
+- C2M completion is a one-hot mask. Slot 31 sets the sign bit of the queue's
+  `int`, so only `-1` is an invalid-allocation sentinel; a generic `val < 0`
+  check incorrectly drops a valid slot-31 completion and deadlocks its barrier.
+- The final exact Llama image is spill-free at 202 registers, 9 barriers, and
+  a 96-byte stack. Four-token greedy output matches Hugging Face exactly.
+- Cooperative job `20260805T082334Z-4118216` measured 382.133 ms median for
+  128 decode steps, or 2.985 ms TBT and 334.96 token-steps/s.
 
 The elementwise task search rejected direct global-memory SwiGLU/RMS paths,
 port-1 weight or activation loads, and a two-SM RMS reduction because their
