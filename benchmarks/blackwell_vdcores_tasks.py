@@ -88,7 +88,7 @@ def benchmark_rms(args: argparse.Namespace, device: torch.device) -> None:
     ) + 0.5
     out = torch.empty_like(x)
 
-    rows_per_sm = args.rms_rows_per_sm or (2 if BATCH >= 8 else 1)
+    rows_per_sm = args.rms_rows_per_sm or 1
     if BATCH % rows_per_sm:
         raise ValueError("RMS batch must be divisible by --rms-rows-per-sm")
     launcher = Launcher(BATCH // rows_per_sm, device=device)
@@ -322,7 +322,7 @@ def main() -> None:
         type=int,
         choices=(0, 1, 2),
         default=0,
-        help="RMS rows per SM; 0 selects the measured B1-B8 optimum",
+        help="RMS rows per SM; 0 selects one 128-thread row per SM",
     )
     args = parser.parse_args()
     if args.iterations <= 0 or args.warmup < 0:

@@ -60,10 +60,13 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
   each of 128 SMs, reuses each B tile four times, and drains four F32 TMEM
   accumulators directly to BF16 logits. It measures 147.840 us versus 149.703
   us in vLLM and 149.781 us in SGLang, with exact isolated BF16 agreement.
-- A 64-thread RMS row keeps aligned input packs in registers and preloads
-  weights during the cross-warp reduction. Pairing two rows per SM at B8
-  reduces VDCores RMSNorm from 2.496 to 2.272 us, ahead of vLLM's 2.681 us but
-  behind SGLang's 2.069 us. Three-way 2048-element sharding reduces the materialized
+- A 128-thread RMS row uses all four compute warps, caches aligned 128-bit input
+  and weight packs, reduces four warp partials through shared memory once, and
+  broadcasts the final scalar within each warp. One row per SM measures
+  1.920/1.952/1.984/2.080 us at B1/B2/B4/B8, ahead of vLLM throughout and
+  ahead of SGLang at B2/B4; B8 is within 0.6% of SGLang. The task retains
+  TMA/shared-memory memory ops rather than raw global addressing. Three-way
+  2048-element sharding reduces the materialized
   6144-wide SwiGLU prefix from 3.904 to 2.560 us, ahead of vLLM's 2.682 us
   and SGLang's 2.919 us.
 - VDCores argmax is 7.360 us, 36-37% faster than vLLM/SGLang.
@@ -123,6 +126,14 @@ queue/global synchronization cost exceeded TMA staging. The retained exact
 Llama build remains spill-free. Its 24-SM sharded SwiGLU placement lowers the
 128-step median from 401.380 to 393.859 ms (3.077 ms TBT) while preserving
 four-token exact greedy correctness.
+
+The final 128-thread RMS follow-up keeps the memory-op path and assigns one row
+to each SM in the B1-B8 decode regime. In the minimal RMS+terminate image it
+uses 68 registers, 9 barriers, and no spills; repeated B1/B2/B4/B8 medians are
+1.920/1.952/1.984/2.080 us. The exact 12-op Llama image remains spill-free at
+128 registers, 9 barriers, and a 96-byte stack. Four greedy tokens match the
+Hugging Face reference, and job `20260805T145137Z-1748528` measures 377.306 ms
+for 128 steps, or 2.948 ms TBT and 339.25 token-steps/s.
 
 ## SM100 Decode Attention Pipeline
 

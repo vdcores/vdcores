@@ -22,13 +22,15 @@ __device__ __forceinline__ void _rms_helper_one_row(
   const vec2_t* weights2 = reinterpret_cast<const vec2_t*>(weights);
   vec2_t* output2 = reinterpret_cast<vec2_t*>(output);
 
-  vec2_t sum2 = make_bfloat162(0, 0);
+  vec2_t sum2_0 = make_bfloat162(0, 0);
+  vec2_t sum2_1 = make_bfloat162(0, 0);
   constexpr bool kCacheInput =
       HIDDIM_SIZE == 4096 &&
       (N_COMPUTE_THREAD == 64 || N_COMPUTE_THREAD == 128) &&
       std::is_same_v<T, __nv_bfloat16>;
   constexpr bool kCacheWeight =
-      HIDDIM_SIZE == 4096 && N_COMPUTE_THREAD == 64 &&
+      HIDDIM_SIZE == 4096 &&
+      (N_COMPUTE_THREAD == 64 || N_COMPUTE_THREAD == 128) &&
       std::is_same_v<T, __nv_bfloat16>;
   struct alignas(16) Pack128 {
     vec2_t values[4];
@@ -43,20 +45,23 @@ __device__ __forceinline__ void _rms_helper_one_row(
     for (int j = 0; j < kPacksPerThread; ++j) {
       const Pack128 pack = input_pack[thread_id + j * N_COMPUTE_THREAD];
       input_cache[j] = pack;
-      #pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        sum2 = __hfma2(pack.values[k], pack.values[k], sum2);
-      }
+      sum2_0 = __hfma2(pack.values[0], pack.values[0], sum2_0);
+      sum2_1 = __hfma2(pack.values[1], pack.values[1], sum2_1);
+      sum2_0 = __hfma2(pack.values[2], pack.values[2], sum2_0);
+      sum2_1 = __hfma2(pack.values[3], pack.values[3], sum2_1);
     }
   } else {
     #pragma unroll
     for (int i = thread_id; i < HIDDIM_SIZE / 2; i += N_COMPUTE_THREAD) {
       vec2_t val = input2[i];
-      sum2 = __hfma2(val, val, sum2);
+      sum2_0 = __hfma2(val, val, sum2_0);
     }
   }
 
-  float sum = __bfloat162float(sum2.x) + __bfloat162float(sum2.y);
+  float sum = __bfloat162float(sum2_0.x) + __bfloat162float(sum2_0.y);
+  if constexpr (kCacheInput) {
+    sum += __bfloat162float(sum2_1.x) + __bfloat162float(sum2_1.y);
+  }
 
   // reduce within warp
   for (int offset = 32 / 2; offset > 0; offset /= 2) {
@@ -71,27 +76,38 @@ __device__ __forceinline__ void _rms_helper_one_row(
     __sync_compute_group(N_COMPUTE_THREAD);
   }
 
-  // final reduce by first warp
-  if (thread_id == 0) {
-    #pragma unroll
-    for (int i = 1; i < N_COMPUTE_THREAD / 32; i++)
-      sum += smem_reduce[i];
-    smem_reduce[0] = sum;
-  }
+  float rms_rcp;
   if constexpr (kCacheWeight) {
+    if (lane_id == 0) {
+      sum = 0.0f;
+      #pragma unroll
+      for (int i = 0; i < N_COMPUTE_THREAD / 32; ++i) {
+        sum += smem_reduce[i];
+      }
+    }
     const Pack128* weights_pack = reinterpret_cast<const Pack128*>(weights);
     #pragma unroll
     for (int j = 0; j < kPacksPerThread; ++j) {
       weight_cache[j] = weights_pack[thread_id + j * N_COMPUTE_THREAD];
     }
-  }
-  if constexpr (N_COMPUTE_THREAD == 64) {
-    __sync_barrier<9, 64>();
+    if (lane_id == 0) {
+      rms_rcp = rsqrtf(
+          sum / float(HIDDIM_SIZE) + Tr::to_float(epsilon));
+    }
+    rms_rcp = __shfl_sync(0xFFFFFFFFU, rms_rcp, 0);
   } else {
+    // Generic widths publish one final shared result before normalization.
+    if (thread_id == 0) {
+      #pragma unroll
+      for (int i = 1; i < N_COMPUTE_THREAD / 32; i++)
+        sum += smem_reduce[i];
+      smem_reduce[0] = sum;
+    }
     __sync_compute_group(N_COMPUTE_THREAD);
+    sum = smem_reduce[0];
+    rms_rcp = rsqrtf(
+        sum / float(HIDDIM_SIZE) + Tr::to_float(epsilon));
   }
-
-  float rms_rcp = rsqrtf(smem_reduce[0] / float(HIDDIM_SIZE) + Tr::to_float(epsilon));
 
   // final scale
   vec2_t scale2 = make_bfloat162(rms_rcp, rms_rcp);
@@ -168,17 +184,18 @@ __device__ __forceinline__ void _rms_helper_two_rows_4096_bf16(
   }
   __sync_compute_group(128);
 
-  if (row_thread == 0) {
-    smem_reduce[row * 2] += smem_reduce[row * 2 + 1];
+  if (lane_id == 0) {
+    sum = smem_reduce[row * 2] + smem_reduce[row * 2 + 1];
   }
   #pragma unroll
   for (int j = 0; j < kPacksPerThread; ++j) {
     weight_cache[j] = weights_pack[row_thread + j * kThreadsPerRow];
   }
-  __sync_compute_group(128);
-
-  const float rms_rcp = rsqrtf(
-      smem_reduce[row * 2] / 4096.0f + __bfloat162float(epsilon));
+  float rms_rcp;
+  if (lane_id == 0) {
+    rms_rcp = rsqrtf(sum / 4096.0f + __bfloat162float(epsilon));
+  }
+  rms_rcp = __shfl_sync(0xFFFFFFFFU, rms_rcp, 0);
   const vec2_t scale2 = make_bfloat162(rms_rcp, rms_rcp);
   #pragma unroll
   for (int j = 0; j < kPacksPerThread; ++j) {
@@ -240,7 +257,7 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
   // TODO(zijian): this assume K major input
   static_assert(HIDDIM_SIZE % 2 == 0, "HIDDIM_SIZE must be even for half2 load");
 
-  constexpr int nThreads = HIDDIM_SIZE == 4096 ? 64 : 128;
+  constexpr int nThreads = 128;
   int thread_id = __compute_tid();
 
   // base address should be the start of the first token
@@ -265,7 +282,6 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
           _rms_helper_one_row<HIDDIM_SIZE, nThreads>(
               weights_ptr, input_ptr, output_ptr, smem_reduce, epsilon);
         }
-        __sync_compute_group(128);
       }
     }
   } else {

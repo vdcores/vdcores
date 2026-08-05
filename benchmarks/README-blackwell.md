@@ -149,7 +149,7 @@ different kernels.
 
 | Non-projection task, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Scope note |
 | --- | ---: | ---: | ---: | --- |
-| RMSNorm, 8 x 4096 | 2.272 | 2.681 | **2.069** | Two 64-thread rows per SM; VDCores leads vLLM by 15%, SGLang leads by 9.8% |
+| RMSNorm, 8 x 4096 | 2.080 | 2.681 | **2.069** | One 128-thread row per SM; VDCores leads vLLM by 22% and is within 0.6% of SGLang |
 | Fused add + RMSNorm, 8 x 4096 | - | 2.697 | **2.308** | VDCores folds residual add into the preceding projection reduction |
 | Materialized SwiGLU prefix, 8 x 6144 | **2.560** | 2.682 | 2.919 | Three 2048-wide shards; VDCores leads by 5%/12% |
 | Q+K RoPE | 2.304 (Q only) | 2.899 | **1.473** | VDCores Q-only probe is not scope-equivalent to joint Q+K |
@@ -164,8 +164,8 @@ That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 28% and SGLang by
 40%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
 remaining attention gap is B8/S512, where VDCores is 10% behind vLLM after
-reducing the prior 61% deficit; SGLang's standalone RMSNorm also remains faster
-than the VDCores stage.
+reducing the prior 61% deficit. Standalone RMSNorm is within 0.6% of SGLang at
+B8, ahead at B2/B4, and still trails SGLang at B1.
 
 Reproduce the exact framework probes with
 `benchmarks/blackwell_framework_tasks.py`, the isolated VDCores non-GEMV tasks
@@ -173,16 +173,28 @@ with `benchmarks/blackwell_vdcores_tasks.py`, and projection/LM-head epochs with
 `benchmarks/blackwell_gemv.py`. Every retained correctness result is below 1%
 mean-relative error.
 
-The RMS selector uses one 64-thread row at B1/B2/B4 and two concurrent rows at
-B8. Its selected B1/B2/B4/B8 medians are 2.144/2.144/2.208/2.272 us, versus
-vLLM's 2.463/2.689/2.680/2.681 us and SGLang's
-1.858/2.071/2.073/2.069 us. Each row keeps aligned BF16 input packs in
-registers, preloads its weight packs while the cross-warp reduction completes,
-and uses a row-local named barrier distinct from the runtime queue barrier.
-Rejected variants include 32 and 128 threads per row, input reload from shared
-memory, direct-global output, port-1 input TMA, and a prefetched global-weight
-path. Use `--rms-rows-per-sm 1` or `2` to reproduce either topology; the default
-`0` selects the measured B1-B8 optimum.
+The RMS selector uses one 128-thread row per SM at B1/B2/B4/B8. Its repeated
+selected medians are 1.920/1.952/1.984/2.080 us, versus vLLM's
+2.463/2.689/2.680/2.681 us and SGLang's 1.858/2.071/2.073/2.069 us. VDCores
+therefore leads vLLM by 22-27%, leads SGLang by 4-6% at B2/B4, is within 0.6%
+at B8, and trails by 3.3% at B1. All four compute warps cache aligned 128-bit
+BF16 input and weight packs. Four warp partials cross shared memory once; each
+warp leader computes the final reduction and inverse RMS, then broadcasts it
+within the warp. Two independent BF16 pair accumulators shorten the square-sum
+dependency chain without increasing the 68-register minimal image. The paired
+64-thread-row path remains available for two contiguous rows, but its roughly
+2.18 us B8 result loses to placing one row on each SM.
+
+These standalone RMS medians use the selective RMS+terminate image, matching
+the per-kernel scope of the framework probes. The 128-register production
+megakernel is qualified separately by the end-to-end result below.
+
+Rejected variants include 32-thread rows, separate row-local barriers,
+per-thread final scalar work, input reload from shared memory, direct-global
+output, port-1 input TMA, early global-weight prefetch, four square-sum
+accumulators, and 32-byte shared-memory packs. Use `--rms-rows-per-sm 1` or `2`
+to reproduce either topology; the default `0` selects one 128-thread row per
+SM. The selected task still uses TMA/shared-memory load and store memory ops.
 
 ## Llama-3.1-8B single-token schedule
 
@@ -225,7 +237,8 @@ auxiliary-SM overlap is intentionally limited to one half-tile per SM.
 | 128-bit, three-way materialized SwiGLU | 393.86 | 3.077 | no |
 | Shared-P attention + unified multi-tile path | 383.26 | 2.994 | no |
 | Four-output grouped LM head | 382.13 | 2.985 | no |
-| Swapped Q8 attention + 128-register image | **377.53** | **2.949** | yes |
+| Swapped Q8 attention + 128-register image | 377.53 | 2.949 | no |
+| One-row-per-SM 128-thread RMSNorm | **377.31** | **2.948** | yes |
 
 The framework comparison and current VDCores result used the matching 152-SM
 GB200 on `10.0.16.25:0`. Both used the local
@@ -239,7 +252,7 @@ direct phase timer.
 
 | System | Version / measure | Median TBT (ms) | VDCores reduction |
 | --- | --- | ---: | ---: |
-| VDCores | 377.529 ms / 128 steps | **2.949** | - |
+| VDCores | 377.306 ms / 128 steps | **2.948** | - |
 | vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 12.2% |
 | vLLM | cross-run decode estimate | 3.335 | 11.6% |
 | SGLang | 0.5.12.post1, reported decode median | 3.820 | 22.8% |
@@ -255,7 +268,7 @@ python app/python/llama3/sched.py \
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
 match Hugging Face, and a 130-step launch crosses from one KV128 block to two
 with the unified online-softmax path. The exact 12-operator Llama image uses
-128 registers, 10 barriers, a 96-byte stack frame, and zero spills. Removing
+128 registers, 9 barriers, a 96-byte stack frame, and zero spills. Removing
 the prior padded attention opcode from the selective image lowered the
 megakernel-wide register allocation from roughly 202 registers.
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
