@@ -15,18 +15,22 @@ preprocessing with the TMA load of partial output.
 
 The selector in `python/dae/attention_config.py` chooses from the measured
 KV64/KV128 and split-count variants. FlashInfer 0.6.15 is the best result among
-its available `auto` tensor-core and non-tensor-core decode variants.
+its available generic-wrapper variants. The vLLM and SGLang columns instead
+exercise the exact decode calls selected by those framework versions, which is
+why they can differ materially from the generic FlashInfer wrapper result.
 
-| Batch | Sequence | KV tile | Splits | SMs | VDCores (us) | FlashInfer (us) |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 64 | 64 | 1 | 8 | 4.064 | 4.397 |
-| 1 | 128 | 128 | 1 | 8 | 5.376 | 4.706 |
-| 1 | 512 | 64 | 8 | 64 | 6.912 | 6.856 |
-| 1 | 2048 | 128 | 16 | 128 | 8.672 | 8.187 |
-| 2 | 128 | 128 | 1 | 16 | 5.280 | 5.013 |
-| 2 | 512 | 64 | 8 | 128 | 7.136 | 7.470 |
-| 4 | 128 | 128 | 1 | 32 | 5.280 | 5.014 |
-| 4 | 512 | 128 | 4 | 128 | 7.904 | 8.085 |
+| Batch | Sequence | KV tile | Splits | SMs | VDCores (us) | FlashInfer 0.6.15 (us) | vLLM 0.23.0 (us) | SGLang 0.5.12 (us) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 64 | 64 | 1 | 8 | **4.064** | 4.397 | 4.510 | 5.681 |
+| 1 | 128 | 128 | 1 | 8 | 5.376 | 4.706 | **4.431** | 5.728 |
+| 1 | 512 | 64 | 8 | 64 | 6.912 | 6.856 | **5.360** | 5.773 |
+| 1 | 2048 | 128 | 16 | 128 | 8.672 | 8.187 | **5.782** | 6.833 |
+| 2 | 128 | 128 | 1 | 16 | 5.280 | 5.013 | **4.398** | 5.770 |
+| 2 | 512 | 64 | 8 | 128 | 7.136 | 7.470 | **5.360** | 5.978 |
+| 4 | 128 | 128 | 1 | 32 | 5.280 | 5.014 | **4.500** | 5.158 |
+| 4 | 512 | 128 | 4 | 128 | 7.904 | 8.085 | 5.365 | **5.155** |
+| 8 | 128 | 128 | 1 | 64 | 7.072 | - | **4.679** | 5.556 |
+| 8 | 512 | 128 | 2 | 128 | 11.008 | - | **5.579** | 5.656 |
 
 Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 `app/python/attention_split_kv.py` for split-KV. The comparison harness is
@@ -48,6 +52,75 @@ smaller tile.
 
 Use `benchmarks/blackwell_gemv.py` to reproduce a shape and
 `tests/blackwell_gemv_smoke.py` for strict single-tile correctness.
+
+## Per-operator comparison with vLLM and SGLang
+
+Llama-3.1-8B is dense, so "per expert" here means per task/operator rather
+than per MoE expert. These BF16 measurements target batch 8 with one new token
+per request. VDCores reports the span from the first participating SM start to
+the final participating SM completion after five warmups; the framework
+harness reports the median per operation inside a CUDA graph (7 samples, 20
+replays, 10 operations per replay). All values use warm data on a 152-SM GB200.
+
+The installed framework source selects the following exact paths:
+
+| Task | VDCores | vLLM 0.23.0 | SGLang 0.5.12.post1 |
+| --- | --- | --- | --- |
+| Token embedding | CC0 row selection feeds the first RMS task directly | Unquantized `F.embedding` | Unquantized `F.embedding` |
+| BF16 projections | Native M64/M128 UMMA, tiled weights, F32 TMEM accumulation | Unquantized `F.linear`; fused QKV and fused gate/up | Unquantized `F.linear`; fused QKV and fused gate/up |
+| Decode attention | Native KV64/KV128 UMMA with TMEM online softmax | FlashInfer 0.6.12 TRTLLM batch decode, page 16, actual maximum sequence | FlashInfer 0.6.11.post1 TRTLLM batch decode, page 64, model maximum sequence 131072 |
+| RMSNorm | `SchedRMSShared` | `vllm._custom_ops.rms_norm` | `sgl_kernel.rmsnorm` |
+| SwiGLU | Shared-memory prefix plus register-forwarded tail | `torch.ops._C.silu_and_mul` | `sgl_kernel.silu_and_mul` |
+| RoPE | Q/K consume projection registers; K writes its cache row | `vllm._custom_ops.rotary_embedding` | SGLang JIT in-place RoPE |
+| KV append | V projection and K RoPE stores | `reshape_and_cache_flash` | SGLang JIT `store_cache` |
+| Greedy select | 128-SM two-slice reduction | `torch.argmax` | `torch.argmax` |
+
+Shape-matched projection probes are useful even where the full frameworks fuse
+components. A dash means that the VDCores production stage is deliberately
+split, fused, or overlapped and therefore has no equivalent standalone launch.
+
+| Projection/task scope, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Result |
+| --- | ---: | ---: | ---: | --- |
+| KV component, 1024 x 8 x 4096 | **4.352** | 5.333 | 5.343 | VDCores is 18% faster |
+| Q/O component, 4096 x 8 x 4096 | 7.216 | **5.863** | 5.922 | M64 VDCores is 23% behind vLLM |
+| Fused QKV, 6144 x 8 x 4096 | - | **6.358** | 6.364 | Framework-selected fused scope |
+| Gate or up component, 14336 x 8 x 4096 | - | **18.876** | 19.106 | VDCores uses 6144/8192 pipeline partitions |
+| Fused gate/up, 28672 x 8 x 4096 | - | 39.284 | **37.123** | Framework-selected fused scope |
+| Down, 4096 x 8 x 14336 | 22.768 | 19.264 | **18.893** | VDCores is 20% behind SGLang |
+| Padded LM head, 131072 x 8 x 4096 | 174.432 | **149.703** | 149.781 | Production M64 VDCores is 17% behind |
+
+The full LM-head number is the exact production decomposition: two 65,536-row
+epochs with tile-packed weights, each split into eight 8,192-row schedules. An
+exploratory tile-packed M128 version measured 161.472 us, but it needs fold-2
+additive output and therefore a synchronized 2 MiB logits clear on every
+repeated decode step; the overwrite-safe M64 path remains the minimal
+production choice. The framework linear paths are the same PyTorch operation,
+so their small differences are independent-process measurement variation
+rather than different kernels.
+
+| Non-projection task, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Scope note |
+| --- | ---: | ---: | ---: | --- |
+| RMSNorm, 8 x 4096 | 2.752 | 2.490 | **2.100** | VDCores is 31% behind SGLang |
+| Fused add + RMSNorm, 8 x 4096 | - | 2.697 | **2.308** | VDCores folds residual add into the preceding projection reduction |
+| Materialized SwiGLU prefix, 8 x 6144 | 3.904 | **2.682** | 2.919 | VDCores is 46% behind vLLM |
+| Q+K RoPE | 2.304 (Q only) | 2.899 | **1.473** | VDCores Q-only probe is not scope-equivalent to joint Q+K |
+| K+V cache append | fused | 2.485 | **1.079** | No standalone VDCores launch |
+| Greedy argmax, 8 x 131072 | **7.360** | 11.521 | 11.749 | VDCores is 36-37% faster |
+
+These isolated times must not be summed to predict TBT. VDCores is one
+persistent megakernel: Q/K/V are separately placed, K/V stores are fused,
+residual adds occur in TMA reductions, the 8,192-row MLP tail forwards through
+registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
+That cross-task pipeline is why end-to-end VDCores can lead while several
+standalone probes trail. The largest remaining task gaps are B8 decode
+attention (51% at S128 and 97% at S512), the materialized MLP prefix, and the
+Q/O and down projections.
+
+Reproduce the exact framework probes with
+`benchmarks/blackwell_framework_tasks.py`, the isolated VDCores non-GEMV tasks
+with `benchmarks/blackwell_vdcores_tasks.py`, and projection/LM-head epochs with
+`benchmarks/blackwell_gemv.py`. Every retained correctness result is below 1%
+mean-relative error.
 
 ## Llama-3.1-8B single-token schedule
 

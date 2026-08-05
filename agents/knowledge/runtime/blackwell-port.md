@@ -38,3 +38,36 @@ Both the one-SM and all-152-SM cases passed exact comparison on GB200.
 
 - A full SM100 compile of the pre-port task set reaches `255` registers and spills.
 - Hopper `SM90_*` WGMMA atoms are not a Blackwell task implementation. Blackwell tensor-core tasks must use SM100 UMMA/tcgen05 with TMEM accumulation and an explicit TMEM-to-register/shared-memory epilogue.
+
+## Llama-8B Framework Task Baselines
+
+The Blackwell single-token comparison uses the exact installed framework paths,
+not generic stand-ins. vLLM 0.23.0 and SGLang 0.5.12.post1 both use
+unquantized `F.linear` with fused QKV and fused gate/up projections. Their
+default Llama MHA decode paths both call FlashInfer TRTLLM batch decode; vLLM
+uses FlashInfer 0.6.12 with page size 16 and the actual maximum sequence,
+whereas SGLang uses FlashInfer 0.6.11.post1 with page size 64 and the configured
+131072-token model maximum.
+
+At BF16 batch 8 on GB200, the production-shaped task measurements show:
+
+- VDCores KV GEMV is 4.352 us, about 18% faster than either framework's
+  shape-matched component probe.
+- VDCores M64 Q/O and down GEMVs are 7.216 and 22.768 us, 22-23% and 18-20%
+  behind the framework component probes.
+- The exact tile-packed, two-epoch M64 LM head is 174.432 us versus about
+  149.7 us for either framework. M128 reaches 161.472 us in isolation but
+  requires fold-2 additive output plus a synchronized 2 MiB per-token clear,
+  so it is not the retained minimal repeated-decode path.
+- VDCores RMSNorm and the materialized 6144-wide SwiGLU prefix are 2.752 and
+  3.904 us; SGLang RMSNorm is 2.100 us and vLLM's matching SwiGLU is 2.682 us.
+- VDCores argmax is 7.360 us, 36-37% faster than vLLM/SGLang.
+- VDCores B8 decode attention is 7.072 us at S128 and 11.008 us at S512,
+  versus 4.679/5.579 us for vLLM and 5.556/5.656 us for SGLang. These are the
+  largest isolated task gaps.
+
+Do not sum these isolated values to explain TBT. The VDCores Llama path fuses
+K/V cache writes, residual reductions, and the register-forwarded MLP tail and
+overlaps auxiliary-SM down-projection work inside one persistent megakernel.
+Use `benchmarks/blackwell_framework_tasks.py` and
+`benchmarks/blackwell_vdcores_tasks.py` for the exact comparison methodology.
