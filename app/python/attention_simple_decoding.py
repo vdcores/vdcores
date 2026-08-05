@@ -13,6 +13,7 @@ torch.manual_seed(0)
 ACTIVE_KV_SEQ_LEN = int(os.environ.get("ATTENTION_SEQ_LEN", "48"))
 if ACTIVE_KV_SEQ_LEN <= 0:
     raise ValueError("ATTENTION_SEQ_LEN must be positive")
+ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native_direct").lower()
 KVTile = int(os.environ.get("ATTENTION_KV_TILE", "64"))
 if KVTile not in {64, 128}:
     raise ValueError("ATTENTION_KV_TILE must be 64 or 128")
@@ -145,23 +146,29 @@ def cord_load_gqa_q(mat: torch.Tensor, rank: int):
 
 if ATTENTION_TOPOLOGY == "head":
     tQ = TmaTensor(dae, matQ_head_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
+    tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
+    tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 else:
     tQ = TmaTensor(dae, matQ_gqa_view)._build("load", HEAD_DIM, 64, tma_load_gqa_q, cord_load_gqa_q)
-tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
-tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
+    tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
+    tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 
 need_norm = env_flag("ATTENTION_NEED_NORM", False)
 need_rope = env_flag("ATTENTION_NEED_ROPE", False)
 if need_norm != need_rope:
     raise ValueError("attention_simple_decoding.py mirrors the fused Qwen decode path, so norm and rope must be enabled together")
 
-ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native").lower()
 if ATTENTION_IMPL == "mma":
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA
+elif ATTENTION_IMPL == "native_direct":
+    attention_inst = ATTENTION_SM100_BF16_HDIM128_DIRECT
 elif ATTENTION_IMPL in ("native", "hopper", "gmma", ""):
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim
 else:
-    raise ValueError(f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; expected 'native' or 'mma'")
+    raise ValueError(
+        f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; "
+        "expected 'native_direct', 'native', or 'mma'"
+    )
 
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
 last_active_kv_len = ACTIVE_KV_SEQ_LEN - (NUM_KV_BLOCK - 1) * KVTile
@@ -223,7 +230,9 @@ def sm_task(sm: int):
         tV.cord(req, kv_head, KVTile * (NUM_KV_BLOCK - 1), 0),
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(output, numSlots=2)
+        RawAddress(output, 24).writeback()
+        if ATTENTION_IMPL == "native_direct"
+        else TmaStore1D(output, numSlots=2)
     ]
     return insts
 
@@ -276,7 +285,7 @@ avg_diff_percent = (
 max_abs_diff = (refO - matO_attn_view).abs().float().max().item()
 print(
     "ATTENTION_RESULT "
-    f"impl=sm100-{ATTENTION_TOPOLOGY} batch={NUM_REQ} active_seq={ACTIVE_KV_SEQ_LEN} "
+    f"impl={ATTENTION_IMPL}-{ATTENTION_TOPOLOGY} batch={NUM_REQ} active_seq={ACTIVE_KV_SEQ_LEN} "
     f"kv_tile={KVTile} blocks={NUM_KV_BLOCK} "
     f"avg_diff_percent={avg_diff_percent:.6f} max_abs_diff={max_abs_diff:.6f}"
 )

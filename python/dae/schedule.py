@@ -279,8 +279,11 @@ class SchedAttentionDecoding(Schedule):
         self.outer_seq_len_counter_stride = outer_seq_len_counter_stride
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
-        self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
         self.use_qwen_fused_qk = side_input is not None
+        self.direct_output = matO.shape[-1] == 128 and not self.use_qwen_fused_qk
+        self.AttentionInst = select_attention_decode_instruction(
+            matO.shape[-1], direct_output=self.direct_output
+        )
         if self.use_qwen_fused_qk and not all(side is not None for side in (side_input, k_store, token_pos)):
             raise ValueError("SchedAttentionDecoding requires side_input, k_store, and token_pos together for the fused Qwen path")
 
@@ -346,7 +349,20 @@ class SchedAttentionDecoding(Schedule):
             last_k = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_k, tK.cord2tma(0, self.block_size, 0, 0))
             last_v = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_v, tV.cord2tma(0, self.block_size, 0, 0))
         insts += [last_k, last_v]
-        insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
+        if self.direct_output:
+            output = (
+                RawAddress(self.matO[req, head, ...], 24)
+                .bar(self._bar("o"))
+                .writeback()
+                .group()
+            )
+        else:
+            output = (
+                TmaStore1D(self.matO[req, head, ...], numSlots=2)
+                .bar(self._bar("o"))
+                .group()
+            )
+        insts.append(output)
         return insts
 
     def bar_release_count(self, role: str):

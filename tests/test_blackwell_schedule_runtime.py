@@ -3,6 +3,7 @@ import torch
 
 from dae.instructions import (
     ATTENTION_M64N64K16_F16_F32_64_64_hdim,
+    ATTENTION_SM100_BF16_HDIM128_DIRECT,
     MemoryInstruction,
     RepeatM,
 )
@@ -55,6 +56,25 @@ def test_attention_runtime_counter_fields_are_disjoint():
     assert instruction.args[0] == 0x0101
     assert instruction.args[1] == 0x0184
     assert instruction.args[2] == 0x213F
+
+
+def test_direct_attention_preserves_dynamic_decode_fields():
+    instruction = ATTENTION_SM100_BF16_HDIM128_DIRECT(
+        num_kv_block=1,
+        num_active_q=4,
+        last_kv_active_token_len=1,
+        need_norm=False,
+        need_rope=False,
+        seq_len_counter_reg=1,
+        num_kv_block_counter_reg=3,
+        kv_block_size=128,
+        outer_seq_len_counter_reg=2,
+        outer_seq_len_counter_stride=1,
+    )
+
+    assert instruction.args[0] == 0x0101
+    assert instruction.args[1] == 0x0184
+    assert instruction.args[2] == 0x213C
 
 
 def test_launcher_loop_counter_validation_without_allocating_gpu_state():

@@ -26,6 +26,9 @@ NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 16
+ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native_direct").strip().lower()
+if ATTENTION_IMPL not in {"native", "native_direct"}:
+    raise ValueError("ATTENTION_IMPL must be 'native' or 'native_direct'")
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
@@ -141,8 +144,22 @@ def sm_task(sm: int):
     kv_start_block = split_stage * num_block_per_split
     kv_start_idx = kv_start_block * KVTile
     split_last_active_kv_len = last_active_kv_len if split_stage == split_kv - 1 else KVTile
+    attention_inst = (
+        ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT
+        if ATTENTION_IMPL == "native_direct"
+        else ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
+    )
+    split_output = (
+        RawAddress(matO_split_attn_view[split_stage, req, head, ...], 24)
+        .writeback()
+        if ATTENTION_IMPL == "native_direct"
+        else TmaStore1D(
+            matO_split_attn_view[split_stage, req, head, ...], numSlots=2
+        )
+    )
+    lse_slot = 25 if ATTENTION_IMPL == "native_direct" else 24
     insts = [
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(
+        attention_inst(
             num_block_per_split, split_stage, HEAD_GROUP_SIZE,
             split_last_active_kv_len, kv_start_idx,
             need_norm=False, need_rope=False,
@@ -153,10 +170,9 @@ def sm_task(sm: int):
             [tK.cord(req, head, kv_start_idx, 0), tK.cord2tma(0, 0, KVTile, 0)],
             [tV.cord(req, head, kv_start_idx, 0), tV.cord2tma(0, 0, KVTile, 0)],
         ),
-        # here we override the allocator, to allocate enough space in the smem
-        # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(matO_split_attn_view[split_stage, req, head, ...], numSlots = 2),
-        RawAddress(matP[head, req * HEAD_GROUP_SIZE], 24).bar(attn_bar).writeback(),
+        split_output,
+        RawAddress(matP[head, req * HEAD_GROUP_SIZE], lse_slot)
+        .bar(attn_bar).writeback(),
     ]
 
     if sm >= NUM_KV_HEAD * NUM_REQ:
@@ -165,7 +181,10 @@ def sm_task(sm: int):
     reduce_req = sm // NUM_KV_HEAD
     insts += [
         ATTN_SPLIT_POST_REDUCE(split_kv),
-        RawAddress(matP[reduce_head, reduce_req * HEAD_GROUP_SIZE], 25).bar(attn_bar),
+        RawAddress(
+            matP[reduce_head, reduce_req * HEAD_GROUP_SIZE],
+            26 if ATTENTION_IMPL == "native_direct" else 25,
+        ).bar(attn_bar),
         tO_split.cord(reduce_head, reduce_req),
         TmaStore1D(matO_attn_view[reduce_req, reduce_head, ...]),
     ]
@@ -214,7 +233,7 @@ avg_diff_percent = (
 max_abs_diff = (refO - matO_attn_view).abs().float().max().item()
 print(
     "ATTENTION_RESULT "
-    f"impl=sm100-gqa-split batch={NUM_REQ} active_seq={ACTIVE_KV_SEQ_LEN} "
+    f"impl={ATTENTION_IMPL}-gqa-split batch={NUM_REQ} active_seq={ACTIVE_KV_SEQ_LEN} "
     f"kv_tile={KVTile} blocks={NUM_KV_BLOCK} split={split_kv} sms={num_sms} "
     f"avg_diff_percent={avg_diff_percent:.6f} max_abs_diff={max_abs_diff:.6f}"
 )

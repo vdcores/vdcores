@@ -65,9 +65,10 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
   6144-wide SwiGLU prefix from 3.904 to 2.560 us, ahead of vLLM's 2.682 us
   and SGLang's 2.919 us.
 - VDCores argmax is 7.360 us, 36-37% faster than vLLM/SGLang.
-- VDCores B8 decode attention is 7.072 us at S128 and 11.008 us at S512,
-  versus 4.679/5.579 us for vLLM and 5.556/5.656 us for SGLang. These are the
-  largest isolated task gaps.
+- VDCores B8 decode attention is 4.032 us at S128 and 8.960 us at S512,
+  versus 4.679/5.579 us for vLLM and 5.556/5.656 us for SGLang. The retained
+  short-context kernel leads both frameworks; split reduction remains the
+  long-context bottleneck.
 
 Do not sum these isolated values to explain TBT. The VDCores Llama path fuses
 K/V cache writes, residual reductions, and the register-forwarded MLP tail and
@@ -78,6 +79,31 @@ Use `benchmarks/blackwell_framework_tasks.py` and
 The elementwise task search rejected direct global-memory SwiGLU/RMS paths,
 port-1 weight or activation loads, and a two-SM RMS reduction because their
 queue/global synchronization cost exceeded TMA staging. The retained exact
-15-op Llama build remains spill-free at 243 registers. Its 24-SM sharded
-SwiGLU placement lowers the 128-step median from 401.380 to 393.859 ms
-(3.077 ms TBT) while preserving four-token exact greedy correctness.
+Llama build remains spill-free. Its 24-SM sharded SwiGLU placement lowers the
+128-step median from 401.380 to 393.859 ms (3.077 ms TBT) while preserving
+four-token exact greedy correctness.
+
+## SM100 Decode Attention Pipeline
+
+- The retained head-dim-128 path drains the four live GQA score rows from TMEM
+  into compact FP32 shared storage with one warp, uses all four compute warps
+  for row-parallel online softmax, overwrites the same special-slot region
+  with swizzled BF16 probabilities, and consumes them with shared/shared UMMA
+  PV. It supports both one and multiple KV tiles and rescales prior TMEM output
+  when the online maximum changes.
+- The direct epilogue converts TMEM output into aligned BF16x4 global stores.
+  Raw-address writeback must publish `1U << slot_id` to C2M because M2C carries
+  a special-slot index while the store queue consumes a one-hot slot mask.
+- The exact 11-operator Llama image compiles at 200 registers, 9 barriers, a
+  96-byte stack frame, and zero spills. Its 128-step median is 383.258 ms,
+  or 2.994 ms TBT, versus 3.335 ms for the stricter vLLM decode estimate and
+  3.820 ms reported by SGLang.
+- Final isolated attention medians are 3.424 us for B1/S64 and 3.904, 3.936,
+  3.936, and 4.032 us for B1/B2/B4/B8 at S128. All lead the exact installed
+  vLLM/SGLang paths. At S512 the retained split choices measure 6.112, 6.208,
+  6.688, and 8.960 us; they improve the prior VDCores path but still trail the
+  framework kernels.
+- Correct but rejected experiments include CUDA-core non-UMMA SDPA (7.488 us
+  at B1/S64), a cross-CTA atomic fused reducer (6.208 us at B1/S512), and a
+  direct-global reducer epilogue (no median gain). Keep these out of the final
+  task implementation unless the synchronization design changes materially.

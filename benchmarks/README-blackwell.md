@@ -7,11 +7,14 @@ the retained kernels stay below 1% mean-relative error.
 
 ## Decode attention
 
-The native SM100 path keeps the online-softmax accumulator in TMEM, drains only
-the four live GQA rows through one warp, converts probabilities back to TMEM,
-and feeds them directly to the tensor-memory/smem UMMA PV stage. Split-KV
-publishes normalized partial output plus log2 LSE; its reducer overlaps LSE
-preprocessing with the TMA load of partial output.
+The native SM100 path keeps QK and PV accumulators in TMEM. One warp drains the
+four live GQA score rows into a compact FP32 shared stage, all four compute
+warps perform row-parallel online softmax, and the same special-slot storage is
+overwritten with swizzled BF16 probabilities for shared/shared UMMA PV. The
+path supports one or multiple KV tiles, rescales the prior TMEM output online,
+and finishes with aligned BF16x4 TMEM-to-global stores. Split-KV publishes
+normalized partial output plus log2 LSE; its reducer overlaps warp-distributed
+LSE preprocessing with the TMA load of partial output.
 
 The selector in `python/dae/attention_config.py` chooses from the measured
 KV64/KV128 and split-count variants. FlashInfer 0.6.15 is the best result among
@@ -21,20 +24,27 @@ why they can differ materially from the generic FlashInfer wrapper result.
 
 | Batch | Sequence | KV tile | Splits | SMs | VDCores (us) | FlashInfer 0.6.15 (us) | vLLM 0.23.0 (us) | SGLang 0.5.12 (us) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 64 | 64 | 1 | 8 | **4.064** | 4.397 | 4.510 | 5.681 |
-| 1 | 128 | 128 | 1 | 8 | 5.376 | 4.706 | **4.431** | 5.728 |
-| 1 | 512 | 64 | 8 | 64 | 6.912 | 6.856 | **5.360** | 5.773 |
-| 1 | 2048 | 128 | 16 | 128 | 8.672 | 8.187 | **5.782** | 6.833 |
-| 2 | 128 | 128 | 1 | 16 | 5.280 | 5.013 | **4.398** | 5.770 |
-| 2 | 512 | 64 | 8 | 128 | 7.136 | 7.470 | **5.360** | 5.978 |
-| 4 | 128 | 128 | 1 | 32 | 5.280 | 5.014 | **4.500** | 5.158 |
-| 4 | 512 | 128 | 4 | 128 | 7.904 | 8.085 | 5.365 | **5.155** |
-| 8 | 128 | 128 | 1 | 64 | 7.072 | - | **4.679** | 5.556 |
-| 8 | 512 | 128 | 2 | 128 | 11.008 | - | **5.579** | 5.656 |
+| 1 | 64 | 64 | 1 | 8 | **3.424** | 4.397 | 4.510 | 5.681 |
+| 1 | 128 | 128 | 1 | 8 | **3.904** | 4.706 | 4.431 | 5.728 |
+| 1 | 512 | 64 | 8 | 64 | 6.112 | 6.856 | **5.360** | 5.773 |
+| 1 | 2048 | 128 | 16 | 128 | 7.040 | 8.187 | **5.782** | 6.833 |
+| 2 | 128 | 128 | 1 | 16 | **3.936** | 5.013 | 4.398 | 5.770 |
+| 2 | 512 | 64 | 8 | 128 | 6.208 | 7.470 | **5.360** | 5.978 |
+| 4 | 128 | 128 | 1 | 32 | **3.936** | 5.014 | 4.500 | 5.158 |
+| 4 | 512 | 128 | 4 | 128 | 6.688 | 8.085 | 5.365 | **5.155** |
+| 8 | 128 | 128 | 1 | 64 | **4.032** | - | 4.679 | 5.556 |
+| 8 | 512 | 128 | 2 | 128 | 8.960 | - | **5.579** | 5.656 |
 
 Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 `app/python/attention_split_kv.py` for split-KV. The comparison harness is
 `benchmarks/blackwell_flashinfer_decode.py`.
+
+The retained code is the minimum winner from a broader search. A CUDA-core,
+non-UMMA SDPA prototype was correct but measured 4.832 us at B1/S32 and 7.488
+us at B1/S64, so it was removed. A fused cross-CTA atomic rendezvous measured
+6.208 us at B1/S512 versus 6.080-6.112 us for the retained TMA reducer, and a
+direct-global reducer epilogue did not improve the median; both were also
+removed. Long-context split reduction remains the attention bottleneck.
 
 ## GEMV
 
@@ -68,7 +78,7 @@ The installed framework source selects the following exact paths:
 | --- | --- | --- | --- |
 | Token embedding | CC0 row selection feeds the first RMS task directly | Unquantized `F.embedding` | Unquantized `F.embedding` |
 | BF16 projections | Native M64/M128 UMMA, tiled weights, F32 TMEM accumulation | Unquantized `F.linear`; fused QKV and fused gate/up | Unquantized `F.linear`; fused QKV and fused gate/up |
-| Decode attention | Native KV64/KV128 UMMA with TMEM online softmax | FlashInfer 0.6.12 TRTLLM batch decode, page 16, actual maximum sequence | FlashInfer 0.6.11.post1 TRTLLM batch decode, page 64, model maximum sequence 131072 |
+| Decode attention | KV64/KV128 QK in TMEM, four-warp shared-P softmax, SS-UMMA PV | FlashInfer 0.6.12 TRTLLM batch decode, page 16, actual maximum sequence | FlashInfer 0.6.11.post1 TRTLLM batch decode, page 64, model maximum sequence 131072 |
 | RMSNorm | `SchedRMSShared` | `vllm._custom_ops.rms_norm` | `sgl_kernel.rmsnorm` |
 | SwiGLU | Shared-memory prefix plus register-forwarded tail | `torch.ops._C.silu_and_mul` | `sgl_kernel.silu_and_mul` |
 | RoPE | Q/K consume projection registers; K writes its cache row | `vllm._custom_ops.rotary_embedding` | SGLang JIT in-place RoPE |
@@ -112,9 +122,9 @@ persistent megakernel: Q/K/V are separately placed, K/V stores are fused,
 residual adds occur in TMA reductions, the 8,192-row MLP tail forwards through
 registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
-standalone probes trail. The largest remaining task gaps are B8 decode
-attention (51% at S128 and 97% at S512), the materialized MLP prefix, and the
-Q/O and down projections.
+standalone probes trail. B8/S128 attention now leads vLLM by 14% and SGLang by
+27%; the largest remaining task gaps are long-context B8/S512 attention (61%
+behind vLLM), and the Q/O and down projections.
 
 Reproduce the exact framework probes with
 `benchmarks/blackwell_framework_tasks.py`, the isolated VDCores non-GEMV tasks
@@ -134,6 +144,8 @@ The 152-SM schedule uses four measured choices:
 
 - all projection weights are packed as contiguous M64K256 UMMA/TMA tiles;
 - QKV uses four active GQA rows per KV head and KV128 decode tiles;
+- decode attention uses the four-warp shared-P/SS-UMMA path and writes its
+  BF16x4 epilogue directly, avoiding the prior output TMA staging pass;
 - the gate/up prefix is balanced over three waves across all 152 SMs, while
   the 8,192-row tail keeps gate, up, and SwiGLU values in registers;
 - the materialized 6,144-wide SwiGLU prefix uses three 2,048-element shards
@@ -156,7 +168,8 @@ auxiliary-SM overlap is intentionally limited to one half-tile per SM.
 | 152-task output + one auxiliary down half-tile | 402.82 | 3.147 | no |
 | One full down tile per auxiliary SM | 428.03 | 3.344 | no |
 | Two down half-tiles on eight auxiliary SMs | 436.11 | 3.407 | no |
-| 128-bit, three-way materialized SwiGLU | **393.86** | **3.077** | yes |
+| 128-bit, three-way materialized SwiGLU | 393.86 | 3.077 | no |
+| Shared-P attention + unified multi-tile path | **383.26** | **2.994** | yes |
 
 The framework comparison used `10.0.16.25:0`; the current VDCores result used
 the matching 152-SM GB200 on `10.0.16.24:0`. Both used the local
@@ -170,10 +183,10 @@ direct phase timer.
 
 | System | Version / measure | Median TBT (ms) | VDCores reduction |
 | --- | --- | ---: | ---: |
-| VDCores | 393.859 ms / 128 steps | **3.077** | - |
-| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 8.4% |
-| vLLM | cross-run decode estimate | 3.335 | 7.7% |
-| SGLang | 0.5.12.post1, reported decode median | 3.820 | 19.5% |
+| VDCores | 383.258 ms / 128 steps | **2.994** | - |
+| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 10.9% |
+| vLLM | cross-run decode estimate | 3.335 | 10.2% |
+| SGLang | 0.5.12.post1, reported decode median | 3.820 | 21.6% |
 
 Reproduce the retained path with:
 
@@ -184,10 +197,11 @@ python app/python/llama3/sched.py \
 ```
 
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
-match Hugging Face for 16 consecutive one-token launches, and an exact-token
-test starting with 127 prefetched prompt tokens passes across the KV128 block
-boundary. `tests/blackwell_runtime_smoke.py` also covers synchronous,
-asynchronous, and bulk sequence launches on all 152 SMs.
+match Hugging Face, and a 130-step launch crosses from one KV128 block to two
+with the unified online-softmax path. The exact 11-operator Llama image uses
+200 registers, 9 barriers, a 96-byte stack frame, and zero spills.
+`tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
+bulk sequence launches on all 152 SMs.
 
 ## Implementation references
 

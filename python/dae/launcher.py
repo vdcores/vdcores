@@ -217,7 +217,11 @@ class ResourceGroup:
 
 class Launcher:
     def __init__(self, num_sms : int = 1, device = 'cuda'):
-        self.smem_size = 202 * 1024 # 202 KB
+        # SM100 permits 227 KiB per block.  The FA4-style one-tile attention
+        # path reuses special-slot space through byte 208 KiB for its
+        # TMEM-to-shared probability pipeline, matching the C++ launcher's
+        # long-standing 212 KiB default while leaving room for static state.
+        self.smem_size = 212 * 1024
         self.num_sms = num_sms
         self.device = device
 

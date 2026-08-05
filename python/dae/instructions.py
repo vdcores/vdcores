@@ -230,13 +230,73 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64):
+        assert kv_block_size == 64, "MMA attention only supports KV64"
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA,
             args=[
                 num_kv_block,
                 _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len),
                 _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg),
+            ],
+        )
+
+
+class ATTENTION_SM100_BF16_HDIM128_DIRECT(ComputeInstruction):
+    HEAD_DIM = 128
+
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = False, need_rope: bool = False, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64, outer_seq_len_counter_reg: int | None = None, outer_seq_len_counter_stride: int = 0):
+        assert not need_norm and not need_rope, (
+            "direct SM100 attention expects Q/K normalization and RoPE to be "
+            "scheduled separately"
+        )
+        if outer_seq_len_counter_reg is None:
+            assert outer_seq_len_counter_stride == 0
+        else:
+            assert 0 < outer_seq_len_counter_stride < 256
+        assert 0 < num_kv_block < 256
+        encoded_num_kv_block = num_kv_block | (outer_seq_len_counter_stride << 8)
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_SM100_BF16_HDIM128_DIRECT,
+            args=[
+                encoded_num_kv_block,
+                _encode_attention_qkv_workload_flag(
+                    num_active_q, last_kv_active_token_len, kv_block_size
+                ),
+                _encode_attention_runtime_flags(
+                    need_norm,
+                    need_rope,
+                    seq_len_counter_reg,
+                    num_kv_block_counter_reg,
+                    outer_seq_len_counter_reg,
+                ),
+            ],
+        )
+
+
+class ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT(ComputeInstruction):
+    HEAD_DIM = 128
+
+    def __init__(
+        self,
+        num_kv_block: int,
+        split_idx: int,
+        num_active_q: int,
+        last_kv_active_token_len: int,
+        kv_start_idx: int,
+        *,
+        kv_block_size: int = 64,
+        **_unused,
+    ):
+        assert split_idx < 16
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT,
+            args=[
+                num_kv_block | (split_idx << 12),
+                _encode_attention_qkv_workload_flag(
+                    num_active_q, last_kv_active_token_len, kv_block_size
+                ),
+                kv_start_idx,
             ],
         )
 
@@ -303,6 +363,7 @@ class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
     def __init__(self, num_split: int):
         super().__init__(opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE, args=[num_split])
 
+
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):
         super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_4096_INTER, args=[num_token])
@@ -343,8 +404,10 @@ class RMS_NORM_F16_K_5120_SMEM(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_5120_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
-def select_attention_decode_instruction(head_dim: int):
+def select_attention_decode_instruction(head_dim: int, direct_output: bool = False):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
+        if direct_output:
+            return ATTENTION_SM100_BF16_HDIM128_DIRECT
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim64.HEAD_DIM:
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA
@@ -1051,6 +1114,8 @@ __all__ = [
     "ROPE_INTERLEAVE_512",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA",
+    "ATTENTION_SM100_BF16_HDIM128_DIRECT",
+    "ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
