@@ -36,7 +36,7 @@ why they can differ materially from the generic FlashInfer wrapper result.
 | 4 | 128 | 128 | 1 | 32 | **3.232** | 5.014 | 4.500 | 5.158 |
 | 4 | 512 | 128 | 4 | 128 | **4.560** | 8.085 | 5.365 | 5.155 |
 | 8 | 128 | 128 | 1 | 64 | **3.264** | - | 4.679 | 5.556 |
-| 8 | 512 | 128 | 2 | 128 | 6.176 | - | **5.579** | 5.656 |
+| 8 | 512 | 128 | 2 | 128 | 6.144 | - | **5.579** | 5.656 |
 
 Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 `app/python/attention_split_kv.py` for split-KV. The comparison harness is
@@ -61,8 +61,11 @@ Each lane reduces four tokens locally before a single warp reduction, removing
 the two CTA-wide max/sum exchanges and lowering the task image from 96 to 64
 registers. B8/S512 reaches 6.176 us. Splitting each four-row reducer over two
 SMs was correct but slower at 6.208 us because it duplicated task and TMA cost.
+Returning each K slot as soon as its QK scores reach shared memory lets the
+memory warps prefetch during softmax/PV, lowers the image to 63 registers, and
+brings B8/S512 to 6.144 us. Issuing QK(i+1) before PV(i) was slower at 6.336 us.
 The remaining long-context limitation is high-batch work per CTA: at S2048,
-B1/B2/B4/B8 measure 4.736/6.272/8.512/12.992 us as each task owns
+B1/B2/B4/B8 measure 4.736/6.304/8.448/12.672 us as each task owns
 1/2/4/8 KV128 blocks.
 
 ## GEMV
@@ -160,7 +163,7 @@ registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 28% and SGLang by
 40%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
-remaining attention gap is B8/S512, where VDCores is 11% behind vLLM after
+remaining attention gap is B8/S512, where VDCores is 10% behind vLLM after
 reducing the prior 61% deficit; SGLang's standalone RMSNorm also remains faster
 than the VDCores stage.
 

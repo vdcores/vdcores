@@ -47,6 +47,11 @@
   drops the selected image from 96 to 64 registers, and moves B8/S512 from
   6.400 to 6.176 us. A two-SM reducer duplicated TMA/task setup and regressed
   to 6.208 us, so retain one four-row reducer SM.
+- Return the current K slot immediately after the raw QK values have been staged
+  in shared memory. It reduces the selected image from 64 to 63 registers and
+  overlaps allocator/prefetch work with softmax and PV, moving B8/S512 from
+  6.176 to 6.144 us and B8/S2048 from 12.992 to 12.672 us. Reordering the MMA
+  stream to issue QK(i+1) before PV(i) instead regressed B8/S512 to 6.336 us.
 - A second tcgen05 completion barrier that issued the next QK before the current
   CUDA-core softmax increased registers from 96 to 128 and regressed B8/S256;
   retain the simpler sequential QK/softmax/PV loop unless a future tile changes

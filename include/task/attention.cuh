@@ -1131,6 +1131,7 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
                 ? r_scores(q) * kScoreScale : -FLT_MAX;
         }
         __sync_compute_group(128);
+        c2m.push(tid, k_slot);
 
         // Transpose the softmax work in shared memory: one warp owns one live
         // query column and each lane consumes four sequence positions.  This
@@ -1199,8 +1200,6 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
             cutlass::arch::fence_view_async_tmem_store();
             __sync_compute_group(128);
         }
-
-        c2m.push(tid, k_slot);
 
         tiled_pv.accumulate_ = block == 0
             ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
