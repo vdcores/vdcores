@@ -34,8 +34,8 @@ why they can differ materially from the generic FlashInfer wrapper result.
 | 2 | 512 | 128 | 4 | 64 | **4.512** | 7.470 | 5.360 | 5.978 |
 | 4 | 128 | 128 | 1 | 32 | **3.264** | 5.014 | 4.500 | 5.158 |
 | 4 | 512 | 128 | 4 | 128 | **4.704** | 8.085 | 5.365 | 5.155 |
-| 8 | 128 | 128 | 1 | 64 | **3.360** | - | 4.679 | 5.556 |
-| 8 | 512 | 128 | 2 | 128 | 6.464 | - | **5.579** | 5.656 |
+| 8 | 128 | 128 | 1 | 64 | **3.328** | - | 4.679 | 5.556 |
+| 8 | 512 | 128 | 2 | 128 | 6.400 | - | **5.579** | 5.656 |
 
 Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 `app/python/attention_split_kv.py` for split-KV. The comparison harness is
@@ -50,7 +50,11 @@ an atomic rendezvous, and normalized partial-output variants were also slower.
 The retained two-split reducer assigns one warp to each live query row and
 combines both BF16 partials with aligned 64-bit loads/stores. In a 500-epoch
 A/B run at B8/S512 it reduced the median from 6.560 to 6.464 us while masked
-S500 and S2048 cases retained less than 1% mean-relative error.
+S500 and S2048 cases retained less than 1% mean-relative error. Following the
+CUTLASS TGV BMM2 correction path, the output accumulator now bypasses CUTE
+partitioning and issues raw 32-DP `tcgen05.ld/st` for only the four live GQA
+columns. This halves each thread's output registers and further lowers B8/S512
+to 6.400 us.
 The remaining long-context limitation is high-batch work per CTA: at S2048,
 B1/B2/B4/B8 measure 4.768/6.560/9.216/13.776 us as each task owns
 1/2/4/8 KV128 blocks.
@@ -150,7 +154,7 @@ registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 28% and SGLang by
 40%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
-remaining attention gap is B8/S512, where VDCores is 16% behind vLLM after
+remaining attention gap is B8/S512, where VDCores is 15% behind vLLM after
 reducing the prior 61% deficit; SGLang's standalone RMSNorm also remains faster
 than the VDCores stage.
 

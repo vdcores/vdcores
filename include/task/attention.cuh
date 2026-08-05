@@ -309,6 +309,32 @@ struct OnlineSoftmax {
 // PV UMMA.  This mirrors the Blackwell FA4/FlashInfer dataflow while preserving
 // VDCores' existing memory queues and shared-memory slot ABI.
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+template <class CopyOp, class TD, class DLayout>
+__device__ __forceinline__ void sm100_attention_tmem_load_raw(
+    uint32_t tmem_addr,
+    Tensor<TD, DLayout>& dst) {
+    static_assert(is_rmem<TD>::value, "raw TMEM load expects register dst");
+    using reg_t = typename remove_extent<typename CopyOp::DRegisters>::type;
+    auto r_dst = recast<reg_t>(dst);
+    constexpr int kRegisters = extent<typename CopyOp::DRegisters>::value;
+    CUTE_STATIC_ASSERT_V(size(r_dst) == Int<kRegisters>{});
+    detail::explode(
+        CopyOp::copy, &tmem_addr, seq<0>{}, r_dst, make_seq<kRegisters>{});
+}
+
+template <class CopyOp, class TS, class SLayout>
+__device__ __forceinline__ void sm100_attention_tmem_store_raw(
+    Tensor<TS, SLayout>& src,
+    uint32_t tmem_addr) {
+    static_assert(is_rmem<TS>::value, "raw TMEM store expects register src");
+    using reg_t = typename remove_extent<typename CopyOp::SRegisters>::type;
+    auto r_src = recast<reg_t>(src);
+    constexpr int kRegisters = extent<typename CopyOp::SRegisters>::value;
+    CUTE_STATIC_ASSERT_V(size(r_src) == Int<kRegisters>{});
+    detail::explode(
+        CopyOp::copy, r_src, make_seq<kRegisters>{}, &tmem_addr, seq<0>{});
+}
+
 template <int M, int N, typename TmemTensor, typename CoordTensor>
 __device__ __forceinline__ void sm100_attention_rescale_tmem_rows(
     TmemTensor const& tmem_tensor,
@@ -969,8 +995,11 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     constexpr int Q = 8;
     constexpr int ACTIVE_Q = 4;
     constexpr uint32_t O_OFFSET = 32;
-    constexpr int kTmemColumnBits = Q * sizeof_bits_v<accum_t>;
-    static_assert(kTmemColumnBits == 256);
+    constexpr int kScoreTmemColumnBits = Q * sizeof_bits_v<accum_t>;
+    constexpr int kOutputTmemColumnBits =
+        ACTIVE_Q * sizeof_bits_v<accum_t>;
+    static_assert(kScoreTmemColumnBits == 256);
+    static_assert(kOutputTmemColumnBits == 128);
 
     using QKAtom = SM100_MMA_F16BF16_SS<
         data_t, data_t, accum_t, KV, Q,
@@ -1024,15 +1053,13 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     auto logical_o = make_tensor(
         make_smem_ptr(static_cast<accum_t *>(nullptr)),
         make_layout(make_shape(Int<D>{}, Int<Q>{})));
-    auto coord_o = make_identity_tensor(make_shape(Int<D>{}, Int<Q>{}));
     auto cta_o = cta_pv.partition_C(logical_o);
-    auto cta_coord_o = cta_pv.partition_C(coord_o);
     auto tmem_o = cta_pv.make_fragment_C(cta_o);
     tmem_o.data() = tmem_base_ptr + O_OFFSET;
 
     auto score_load_op =
         TMEM::op_repeater<SM100_TMEM_LOAD_32dp32b1x,
-                          kTmemColumnBits>();
+                          kScoreTmemColumnBits>();
     auto score_t2r = make_tmem_copy(score_load_op, tmem_s);
     auto score_thr = score_t2r.get_slice(tid);
     auto thread_tmem_s = score_thr.partition_S(tmem_s);
@@ -1044,20 +1071,12 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
 
     auto output_load_op =
         TMEM::op_repeater<SM100_TMEM_LOAD_32dp32b1x,
-                          kTmemColumnBits>();
+                          kOutputTmemColumnBits>();
     auto output_store_op =
         TMEM::op_repeater<SM100_TMEM_STORE_32dp32b1x,
-                          kTmemColumnBits>();
-    auto output_t2r = make_tmem_copy(output_load_op, tmem_o);
-    auto output_r2t = make_tmem_copy(output_store_op, tmem_o);
-    auto output_load_thr = output_t2r.get_slice(tid);
-    auto output_store_thr = output_r2t.get_slice(tid);
-    auto thread_tmem_o = output_load_thr.partition_S(tmem_o);
-    auto thread_coord_o = output_load_thr.partition_D(cta_coord_o);
-    auto thread_tmem_o_store = output_store_thr.partition_D(tmem_o);
-    auto r_output = make_tensor<accum_t>(shape(thread_coord_o));
-    static_assert(size(r_output) == Q,
-                  "each 32-DP thread must own all eight output columns");
+                          kOutputTmemColumnBits>();
+    const uint32_t output_tmem_addr = raw_pointer_cast(tmem_o.data());
+    auto r_output = make_tensor<accum_t>(Int<ACTIVE_Q>{});
 
     const int q_slot = m2c.template pop<0>();
     data_t *q_ptr = static_cast<data_t *>(
@@ -1185,13 +1204,15 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
         __sync_compute_group(128);
 
         if (block > 0) {
-            copy(output_t2r, thread_tmem_o, r_output);
+            sm100_attention_tmem_load_raw<decltype(output_load_op)>(
+                output_tmem_addr, r_output);
             cutlass::arch::fence_view_async_tmem_load();
             #pragma unroll
             for (int q = 0; q < ACTIVE_Q; ++q) {
                 r_output(q) *= correction[q];
             }
-            copy(output_r2t, r_output, thread_tmem_o_store);
+            sm100_attention_tmem_store_raw<decltype(output_store_op)>(
+                r_output, output_tmem_addr);
             cutlass::arch::fence_view_async_tmem_store();
             __sync_compute_group(128);
         }
@@ -1214,22 +1235,21 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
         tmem_mma_phase ^= 1;
 
         if (block + 1 == num_kv_blocks) {
-            copy(output_t2r, thread_tmem_o, r_output);
+            sm100_attention_tmem_load_raw<decltype(output_load_op)>(
+                output_tmem_addr, r_output);
             cutlass::arch::fence_view_async_tmem_load();
             data_t *o_ptr = static_cast<data_t *>(
                 slot_2_glob_ptr(st_insts, o_slot));
             #pragma unroll
-            for (int i = 0; i < size(r_output); ++i) {
-                const int row = int(get<0>(thread_coord_o(i)));
-                const int q = int(get<1>(thread_coord_o(i)));
+            for (int q = 0; q < ACTIVE_Q; ++q) {
                 if (q < num_active_q) {
                     accum_t output_scale = 1.0f;
                     if constexpr (!SPLIT_KV) {
                         output_scale = row_sum[q] > 0.0f
                             ? 1.0f / row_sum[q] : 0.0f;
                     }
-                    o_ptr[q * D + row] =
-                        data_t(r_output(i) * output_scale);
+                    o_ptr[q * D + tid] =
+                        data_t(r_output(q) * output_scale);
                 }
             }
             c2m.template push<31, true, false>(tid, 1U << o_slot);
