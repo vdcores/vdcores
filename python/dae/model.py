@@ -15,16 +15,18 @@ def get_other_dims(dim: int, i: int):
 def tma_gqa_load_q(mat: torch.Tensor, tileK: int, tileN: int):
     # [HEAD_DIM[0], HEAD_GROUP_SIZE, REP * HEAD_DIM[1] * NUM_KV_HEAD]
     assert mat.element_size() == 2, "Only support float16/bfloat16 output"
-    assert tileN == 64, "tileN must be 64"
+    assert tileN in {8, 64}, "tileN must be 8 or 64"
     # getting the mat size
     NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM = mat.shape
     assert tileK == HEAD_DIM, "tileK must match HEAD_DIM"
     assert HEAD_DIM % 64 == 0, "HEAD_DIM must be a multiple of 64"
-    assert 64 % HEAD_GROUP_SIZE == 0, "HEAD_GROUP_SIZE must divide the 64-row Q tile"
+    assert tileN % HEAD_GROUP_SIZE == 0, (
+        "HEAD_GROUP_SIZE must divide the requested Q tile"
+    )
 
-    # this will dup for 4 times, due to 0 in strides, do not know how tma engine will handle it
+    # A zero stride broadcasts each live GQA row into the UMMA padding rows.
     rope_tiles = HEAD_DIM // 64
-    q_tile_repeat = 64 // HEAD_GROUP_SIZE
+    q_tile_repeat = tileN // HEAD_GROUP_SIZE
     glob_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, rope_tiles, NUM_REQ * NUM_KV_HEAD]
     glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
     box_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, rope_tiles, 1]

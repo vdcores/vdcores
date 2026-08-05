@@ -522,7 +522,7 @@ matK_attn_views = [attnK.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnK i
 matV_attn_views = [attnV.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
 matO_attn_view = attnO.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
-layerg.addTma('loadQ', matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 64, tma_gqa_load_q, cord_gqa_load_q))
+layerg.addTma('loadQ', matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 8, tma_gqa_load_q, cord_gqa_load_q))
 layerg.addTma('loadK', matK_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_K, cord_func_K))
 layerg.addTma('loadV', matV_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_MN, cord_func_MN))
 
@@ -730,6 +730,7 @@ def schedule_single_token(
     outer_seq_len_counter_reg=TOKEN_BASE_REG if control_flow else None,
     outer_seq_len_counter_stride=base_counter_delta or 0,
     num_active_q=HEAD_GROUP_SIZE,
+    swapped_qk_pv=True,
     max_loop_count=min(
       control_flow_tokens or 1,
       KVBlockSize - (token_pos % KVBlockSize),

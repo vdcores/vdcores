@@ -179,8 +179,8 @@ The 152-SM schedule uses four measured choices:
 
 - all projection weights are packed as contiguous M64K256 UMMA/TMA tiles;
 - QKV uses four active GQA rows per KV head and KV128 decode tiles;
-- decode attention uses the four-warp shared-P/SS-UMMA path and writes its
-  BF16x4 epilogue directly, avoiding the prior output TMA staging pass;
+- decode attention uses the swapped-A/B Q8 path and writes its BF16 epilogue
+  directly, avoiding both the padded Q64 load and output TMA staging pass;
 - the gate/up prefix is balanced over three waves across all 152 SMs, while
   the 8,192-row tail keeps gate, up, and SwiGLU values in registers;
 - the materialized 6,144-wide SwiGLU prefix uses three 2,048-element shards
@@ -207,7 +207,8 @@ auxiliary-SM overlap is intentionally limited to one half-tile per SM.
 | Two down half-tiles on eight auxiliary SMs | 436.11 | 3.407 | no |
 | 128-bit, three-way materialized SwiGLU | 393.86 | 3.077 | no |
 | Shared-P attention + unified multi-tile path | 383.26 | 2.994 | no |
-| Four-output grouped LM head | **382.13** | **2.985** | yes |
+| Four-output grouped LM head | 382.13 | 2.985 | no |
+| Swapped Q8 attention + 128-register image | **377.53** | **2.949** | yes |
 
 The framework comparison and current VDCores result used the matching 152-SM
 GB200 on `10.0.16.25:0`. Both used the local
@@ -221,10 +222,10 @@ direct phase timer.
 
 | System | Version / measure | Median TBT (ms) | VDCores reduction |
 | --- | --- | ---: | ---: |
-| VDCores | 382.133 ms / 128 steps | **2.985** | - |
-| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 11.1% |
-| vLLM | cross-run decode estimate | 3.335 | 10.5% |
-| SGLang | 0.5.12.post1, reported decode median | 3.820 | 21.9% |
+| VDCores | 377.529 ms / 128 steps | **2.949** | - |
+| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 12.2% |
+| vLLM | cross-run decode estimate | 3.335 | 11.6% |
+| SGLang | 0.5.12.post1, reported decode median | 3.820 | 22.8% |
 
 Reproduce the retained path with:
 
@@ -237,7 +238,9 @@ python app/python/llama3/sched.py \
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
 match Hugging Face, and a 130-step launch crosses from one KV128 block to two
 with the unified online-softmax path. The exact 12-operator Llama image uses
-202 registers, 9 barriers, a 96-byte stack frame, and zero spills.
+128 registers, 10 barriers, a 96-byte stack frame, and zero spills. Removing
+the prior padded attention opcode from the selective image lowered the
+megakernel-wide register allocation from roughly 202 registers.
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
 bulk sequence launches on all 152 SMs.
 
@@ -249,6 +252,7 @@ the [CUDA PTX ISA tcgen05/TMEM synchronization model](https://docs.nvidia.com/cu
 and [CUTLASS Blackwell GEMM guidance](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html),
 including its TMEM-to-register epilogues and Blackwell-specific pipelines.
 Kernel organization and comparison regimes were cross-checked against the
+[CUTLASS SM100 low-latency GQA example](https://github.com/NVIDIA/cutlass/tree/main/examples/93_blackwell_low_latency_gqa),
 [Triton Blackwell persistent-matmul example](https://github.com/triton-lang/triton/blob/main/python/tutorials/09-persistent-matmul.py),
 [FlashInfer decode APIs and SM100 CuTe path](https://github.com/flashinfer-ai/flashinfer),
 [vLLM's CUDA-graph model runner](https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/model_runner.py),

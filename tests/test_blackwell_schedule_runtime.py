@@ -14,7 +14,7 @@ from dae.instructions import (
 )
 from dae.runtime import opcode
 from dae.launcher import Launcher
-from dae.schedule import SchedSmemSiLUInterleaved
+from dae.schedule import SchedAttentionDecoding, SchedSmemSiLUInterleaved
 from dae.tma_utils import (
     cords2addr,
     cord_func_2d_tile_major,
@@ -121,6 +121,43 @@ def test_swapped_split_attention_and_raw_reducer_flags():
     assert reducer.args == [4, 0x3]
     with pytest.raises(AssertionError):
         ATTN_SPLIT_POST_REDUCE(4, direct_output=True)
+
+
+def test_decode_schedule_selects_swapped_attention_without_changing_defaults():
+    output = torch.empty((8, 8, 4, 128), dtype=torch.bfloat16)
+    swapped = SchedAttentionDecoding(
+        reqs=8,
+        seq_len=128,
+        KV_BLOCK_SIZE=128,
+        NUM_KV_HEADS=8,
+        matO=output,
+        tmas=(None, None, None),
+        num_active_q=4,
+        swapped_qk_pv=True,
+    )
+    default = SchedAttentionDecoding(
+        reqs=8,
+        seq_len=128,
+        KV_BLOCK_SIZE=128,
+        NUM_KV_HEADS=8,
+        matO=output,
+        tmas=(None, None, None),
+        num_active_q=4,
+    )
+
+    assert swapped.AttentionInst is ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+    assert default.AttentionInst is ATTENTION_SM100_BF16_HDIM128_DIRECT
+    with pytest.raises(ValueError, match="requires direct HDIM128 output and KV128"):
+        SchedAttentionDecoding(
+            reqs=8,
+            seq_len=64,
+            KV_BLOCK_SIZE=64,
+            NUM_KV_HEADS=8,
+            matO=output,
+            tmas=(None, None, None),
+            num_active_q=4,
+            swapped_qk_pv=True,
+        )
 
 
 def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():

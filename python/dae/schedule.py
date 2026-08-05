@@ -261,7 +261,8 @@ class SchedAttentionDecoding(Schedule):
                  num_kv_block_counter_reg: int | None = None,
                  max_loop_count: int = 1,
                  outer_seq_len_counter_reg: int | None = None,
-                 outer_seq_len_counter_stride: int = 0):
+                 outer_seq_len_counter_stride: int = 0,
+                 swapped_qk_pv: bool = False):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -277,13 +278,25 @@ class SchedAttentionDecoding(Schedule):
         self.max_loop_count = max_loop_count
         self.outer_seq_len_counter_reg = outer_seq_len_counter_reg
         self.outer_seq_len_counter_stride = outer_seq_len_counter_stride
+        self.swapped_qk_pv = swapped_qk_pv
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.use_qwen_fused_qk = side_input is not None
         self.direct_output = matO.shape[-1] == 128 and not self.use_qwen_fused_qk
-        self.AttentionInst = select_attention_decode_instruction(
-            matO.shape[-1], direct_output=self.direct_output
-        )
+        if swapped_qk_pv:
+            if not self.direct_output or self.block_size != 128:
+                raise ValueError(
+                    "swapped SM100 decode requires direct HDIM128 output and KV128"
+                )
+            if self.num_active_q > 4:
+                raise ValueError(
+                    "swapped SM100 decode supports at most four active GQA heads"
+                )
+            self.AttentionInst = ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+        else:
+            self.AttentionInst = select_attention_decode_instruction(
+                matO.shape[-1], direct_output=self.direct_output
+            )
         if self.use_qwen_fused_qk and not all(side is not None for side in (side_input, k_store, token_pos)):
             raise ValueError("SchedAttentionDecoding requires side_input, k_store, and token_pos together for the fused Qwen path")
 
