@@ -345,3 +345,72 @@ def build_tma_wgmma_kmajor(mat: torch.Tensor, tileK : int, tileN : int):
         128,
         0
     )
+
+
+# Pack complete logical ``(M, K)`` weights so each SM100 UMMA tile is one
+# contiguous TMA allocation. The descriptor below interprets this rank-5 view
+# without copying it again at launch time.
+def pack_weight_tile_major(weight: torch.Tensor, tile_m: int, tile_k: int):
+    if not weight.is_contiguous():
+        raise ValueError("tile-major weight packing requires contiguous input")
+    output_rows, input_cols = weight.shape
+    if output_rows % tile_m or input_cols % tile_k or tile_k % 64:
+        raise ValueError(
+            f"weight {tuple(weight.shape)} is incompatible with M{tile_m}K{tile_k} packing"
+        )
+    return (
+        weight.view(
+            output_rows // tile_m,
+            tile_m,
+            input_cols // tile_k,
+            tile_k // 64,
+            64,
+        )
+        .permute(2, 0, 3, 1, 4)
+        .contiguous()
+    )
+
+
+def cord_func_2d_tile_major(mat: torch.Tensor, rank: int):
+    """Map logical ``(M, K)`` into [K-tile, M-tile, K-block, M-row, 64]."""
+    assert rank == 5, f"tile-major weights require a rank-5 TMA map, got {rank}"
+    _, _, subblocks, tile_rows, block_k = mat.shape
+    tile_k = subblocks * block_k
+
+    def cord_func(m: int, k: int):
+        assert m % tile_rows == 0, "tile-major M coordinates must be tile aligned"
+        assert k % tile_k == 0, "tile-major K coordinates must be tile aligned"
+        return [0, 0, m // tile_rows, k // tile_k]
+
+    return cord_func
+
+
+def build_tma_wgmma_tile_major(mat: torch.Tensor, tileK: int, tileN: int):
+    """Build one contiguous global-memory allocation per logical UMMA tile."""
+    assert mat.dim() == 5, (
+        "tile-major weights must have shape [K/tileK,M/tileM,tileK/64,tileM,64]"
+    )
+    k_tiles, m_tiles, subblocks, tile_rows, block_k = mat.shape
+    elsize = mat.element_size()
+    assert block_k == 128 // elsize == 64
+    assert tile_rows == tileN
+    assert subblocks * block_k == tileK
+
+    tile_bytes = tile_rows * tileK * elsize
+    global_dims = [block_k, tile_rows, subblocks, m_tiles, k_tiles]
+    global_strides = [
+        block_k * elsize,
+        tile_rows * block_k * elsize,
+        tile_bytes,
+        m_tiles * tile_bytes,
+    ]
+    box_dims = [block_k, tile_rows, subblocks, 1, 1]
+    return 5, runtime.build_tma_desc(
+        mat,
+        global_dims,
+        global_strides,
+        box_dims,
+        [1] * 5,
+        128,
+        0,
+    )

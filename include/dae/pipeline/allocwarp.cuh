@@ -13,13 +13,16 @@ static __device__ __forceinline__ void prefetch_inst_window(
 static constexpr uint16_t repeatCounterModeFlag = 0x8000U;
 static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
 static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
+static constexpr uint16_t repeatSkipCountMask = 0x1F00U;
+static constexpr int repeatSkipCountShift = 8;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
-    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    const LoopCounters &initial_loop_counts
 ) {
   static_assert(numSlots < 32, "Too many slots for single warp");
 
@@ -31,6 +34,9 @@ __device__ __forceinline__ void allocwarp_execute(
 
   MemoryVirtualCore di;
   di.init();
+  if (lane_id < numComputeLoopCounters) {
+    di.jmp_cnt = initial_loop_counts.values[lane_id];
+  }
   SharedMemoryAllocator<numSlots> alloc;
 
   __syncwarp();
@@ -145,11 +151,16 @@ __device__ __forceinline__ void allocwarp_execute(
           const bool accumulate_mode = inst.arg & repeatAccumulateModeFlag;
           const int counter_reg = inst.arg & repeatCounterRegMask;
           const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
+          const int repeat_count = inst.size + (count_counter_mode ? counter_value : 0);
+          const int skip_count = (inst.arg & repeatSkipCountMask) >> repeatSkipCountShift;
           // Accumulator repeats extend the active seed; they do not start a new
           // repeat window, so the final consumer keeps the original pc distance.
           if (!accumulate_mode) {
-            di.loop_counter = inst.size + (count_counter_mode ? counter_value : 0); // minus the current one
+            di.loop_counter = repeat_count; // minus the current one
             di.loop_start_pc = pc + 1;
+            if (repeat_count == 0 && skip_count > 0) {
+              next_pc = pc + 1 + skip_count;
+            }
           }
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;

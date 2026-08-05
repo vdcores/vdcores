@@ -19,9 +19,11 @@ from .tma_utils import (
     build_tma_1d,
     build_tma_wgmma_kmajor,
     build_tma_wgmma_mnmajor,
+    build_tma_wgmma_tile_major,
     bytes2slots,
     cord_func_2d_kmajor,
     cord_func_2d_mnmajor,
+    cord_func_2d_tile_major,
     cord_func_tma_1d,
     cords2addr,
     get_tensor_address,
@@ -83,6 +85,7 @@ class Gemv_M64N8B2(ComputeInstruction):
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=2, RESIDUAL=residual), args=[kTiles, nprefeth])
+
 
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
@@ -159,8 +162,8 @@ class ROPE_INTERLEAVE_512(ComputeInstruction):
 ATTENTION_DYNAMIC_LAST_KV_LEN_FLAG = 0x4
 ATTENTION_DYNAMIC_NUM_KV_BLOCKS_FLAG = 0x8
 ATTENTION_BLOCK_COUNTER_SHIFT = 4
-ATTENTION_BLOCK_COUNTER_MASK = 0xF
 ATTENTION_COUNTER_SHIFT = 8
+ATTENTION_OUTER_COUNTER_SHIFT = 12
 
 
 def _encode_attention_runtime_flags(
@@ -168,6 +171,7 @@ def _encode_attention_runtime_flags(
     need_rope: bool,
     seq_len_counter_reg: int | None = None,
     num_kv_block_counter_reg: int | None = None,
+    outer_seq_len_counter_reg: int | None = None,
 ) -> int:
     flags = 0
     if need_norm:
@@ -175,13 +179,16 @@ def _encode_attention_runtime_flags(
     if need_rope:
         flags |= 2
     if seq_len_counter_reg is not None:
-        assert 0 <= seq_len_counter_reg < 256, "seq_len_counter_reg must fit in 8 bits"
+        assert 0 <= seq_len_counter_reg < config.num_loop_counters
         flags |= ATTENTION_DYNAMIC_LAST_KV_LEN_FLAG
         flags |= seq_len_counter_reg << ATTENTION_COUNTER_SHIFT
     if num_kv_block_counter_reg is not None:
-        assert 0 <= num_kv_block_counter_reg <= ATTENTION_BLOCK_COUNTER_MASK, "num_kv_block_counter_reg must fit in 4 bits"
+        assert 0 <= num_kv_block_counter_reg < config.num_loop_counters
         flags |= ATTENTION_DYNAMIC_NUM_KV_BLOCKS_FLAG
         flags |= num_kv_block_counter_reg << ATTENTION_BLOCK_COUNTER_SHIFT
+    if outer_seq_len_counter_reg is not None:
+        assert 0 <= outer_seq_len_counter_reg < config.num_loop_counters
+        flags |= outer_seq_len_counter_reg << ATTENTION_OUTER_COUNTER_SHIFT
     return flags
 
 def _encode_attention_qkv_workload_flag(
@@ -197,13 +204,25 @@ def _encode_attention_qkv_workload_flag(
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64, outer_seq_len_counter_reg: int | None = None, outer_seq_len_counter_stride: int = 0):
+        if outer_seq_len_counter_reg is None:
+            assert outer_seq_len_counter_stride == 0
+        else:
+            assert 0 < outer_seq_len_counter_stride < 256
+        assert 0 < num_kv_block < 256
+        encoded_num_kv_block = num_kv_block | (outer_seq_len_counter_stride << 8)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
             args=[
-                num_kv_block, 
+                encoded_num_kv_block,
                 _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len, kv_block_size),
-                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg)
+                _encode_attention_runtime_flags(
+                    need_norm,
+                    need_rope,
+                    seq_len_counter_reg,
+                    num_kv_block_counter_reg,
+                    outer_seq_len_counter_reg,
+                ),
             ],
         )
 
@@ -639,6 +658,8 @@ class RepeatM(MemoryInstruction):
     COUNTER_MODE_FLAG = 0x8000
     COUNT_COUNTER_MODE_FLAG = 0x4000
     ACCUMULATE_MODE_FLAG = 0x2000
+    SKIP_COUNT_SHIFT = 8
+    SKIP_COUNT_MASK = 0x1F
     COUNTER_REG_MASK = 0x00FF
 
     def __init__(
@@ -795,6 +816,8 @@ class RepeatM(MemoryInstruction):
             for reg_start, reg_end, delta_cords in regcords:
                 insts += [cls(0, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords, count_counter_reg=count_counter_reg)]
             insts[-1].size = count
+            assert len(steps) <= cls.SKIP_COUNT_MASK, "dynamic repeat window is too large to encode"
+            insts[-1].arg |= len(steps) << cls.SKIP_COUNT_SHIFT
 
         for inst, _ in steps:
             insts.append(inst)
@@ -987,6 +1010,15 @@ class TmaTensor(MemoryInstruction):
 
     def wgmma_load(self, tileN: int, tileM: int, major: Major):
         return self.wgmma("load", tileN, tileM, major)
+
+    def wgmma_load_tiled(self, tileN: int, tileM: int):
+        return self._build(
+            "load",
+            tileM,
+            tileN,
+            build_tma_wgmma_tile_major,
+            cord_func_2d_tile_major,
+        )
 
     def wgmma_store(self, tileN: int, tileM: int, major: Major):
         return self.wgmma("store", tileN, tileM, major)

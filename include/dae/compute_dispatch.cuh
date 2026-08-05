@@ -143,7 +143,8 @@ static __device__ __forceinline__ void handle_attention_common(
   }
 
   const int num_active_q = inst.args[1] & 0xFF;
-  int num_kv_blocks = inst.args[0];
+  int num_kv_blocks = inst.args[0] & 0xFF;
+  const int outer_seq_stride = (inst.args[0] >> 8) & 0xFF;
   int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
   const bool need_norm = inst.args[2] & 0x1;
   const bool need_rope = inst.args[2] & 0x2;
@@ -151,8 +152,13 @@ static __device__ __forceinline__ void handle_attention_common(
     const int counter_reg = (inst.args[2] >> 4) & 0xF;
     num_kv_blocks += count[counter_reg];
   }
+  if (outer_seq_stride > 0) {
+    const int counter_reg = (inst.args[2] >> 12) & 0xF;
+    last_kv_active_token_len += count[counter_reg] * outer_seq_stride;
+    last_kv_active_token_len = (last_kv_active_token_len - 1) % 64 + 1;
+  }
   if (inst.args[2] & 0x4) {
-    const int counter_reg = (inst.args[2] >> 8) & 0xFF;
+    const int counter_reg = (inst.args[2] >> 8) & 0xF;
     last_kv_active_token_len += count[counter_reg];
   }
   if constexpr (std::is_same_v<KernelQK, cute::SM80_16x8x16_F32BF16BF16F32_TN>) {
@@ -194,7 +200,8 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim) {
   const int encoded_active_q = inst.args[1] & 0xFF;
   const int num_active_q = encoded_active_q & 0x7F;
   const bool use_kv128 = encoded_active_q & 0x80;
-  int num_kv_blocks = inst.args[0];
+  int num_kv_blocks = inst.args[0] & 0xFF;
+  const int outer_seq_stride = (inst.args[0] >> 8) & 0xFF;
   int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
   const bool need_norm = inst.args[2] & 0x1;
   const bool need_rope = inst.args[2] & 0x2;
@@ -202,8 +209,14 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim) {
     const int counter_reg = (inst.args[2] >> 4) & 0xF;
     num_kv_blocks += count[counter_reg];
   }
+  if (outer_seq_stride > 0) {
+    const int counter_reg = (inst.args[2] >> 12) & 0xF;
+    const int kv_block_size = use_kv128 ? 128 : 64;
+    last_kv_active_token_len += count[counter_reg] * outer_seq_stride;
+    last_kv_active_token_len = (last_kv_active_token_len - 1) % kv_block_size + 1;
+  }
   if (inst.args[2] & 0x4) {
-    const int counter_reg = (inst.args[2] >> 8) & 0xFF;
+    const int counter_reg = (inst.args[2] >> 8) & 0xF;
     last_kv_active_token_len += count[counter_reg];
   }
   if (use_kv128) {

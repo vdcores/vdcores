@@ -30,6 +30,10 @@ static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemo
 static constexpr int numProfileEvents = 128;
 static constexpr int numComputeLoopCounters = 4;
 
+struct alignas(16) LoopCounters {
+  uint32_t values[numComputeLoopCounters] = {};
+};
+
 // barrier configurations
 static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsC2MBarrier = numComputeWarps * numThreadsPerWarp + 1;

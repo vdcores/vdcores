@@ -33,7 +33,8 @@ void dae2(
   const MInst* __restrict__ memory_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
-  uint64_t *  __restrict__ g_events
+  uint64_t *  __restrict__ g_events,
+  LoopCounters initial_loop_counts
 ) {
 
   int sm_id = blockIdx.x;
@@ -141,7 +142,11 @@ void dae2(
   if (threadIdx.x < numComputeWarps * 32) {
     CInst inst;
     uint32_t pc = 0;
-    uint32_t count[numComputeLoopCounters] = {};
+    uint32_t count[numComputeLoopCounters];
+    #pragma unroll
+    for (int i = 0; i < numComputeLoopCounters; ++i) {
+      count[i] = initial_loop_counts.values[i];
+    }
     uint32_t tmem_mma_phase = 0;
     bool finish = false;
 
@@ -180,7 +185,8 @@ void dae2(
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
-        st_insts, smem_base, tma_descs, bars
+        st_insts, smem_base, tma_descs, bars,
+        initial_loop_counts
       );
     } else if (warp_id == 1) {
       if (lane_id == 0) {

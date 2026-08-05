@@ -2,6 +2,7 @@
 
 #include "context.cuh"
 #include <cuda.h>
+#include <vector>
 
 // runtime interface for DAE kernels
 size_t set_smem_size(size_t smem_size = (1024 * 212));
@@ -14,7 +15,22 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  LoopCounters initial_loop_counts = {},
+  int64_t stream = 0,
+  bool synchronize = true
+);
+
+cudaError_t launch_dae_sequence(
+  int numSMs,
+  size_t smem_size,
+  CInst* compute_instructions,
+  MInst* memory_instructions,
+  CUtensorMap* tma_descs,
+  int * bars,
+  uint64_t * profile,
+  const std::vector<LoopCounters>& initial_loop_counts,
+  int64_t stream = 0,
+  bool synchronize = true
 );
 
 CUtensorMap create_tma_descriptor(
@@ -26,4 +42,3 @@ CUtensorMap create_tma_descriptor(
   CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
   std::array<uint64_t, 5> global_strides_opt = {0, 0, 0, 0, 0}
 );
-

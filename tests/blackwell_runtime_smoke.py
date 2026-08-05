@@ -39,6 +39,20 @@ def main() -> None:
     launcher.launch()
     torch.testing.assert_close(destination, source, rtol=0, atol=0)
 
+    destination.zero_()
+    launcher.launch(synchronize=False, reset_bars=False)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(destination, source, rtol=0, atol=0)
+
+    destination.zero_()
+    launcher.launch_sequence(
+        [launcher.loop_counters.copy(), launcher.loop_counters.copy()],
+        synchronize=False,
+        reset_bars=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(destination, source, rtol=0, atol=0)
+
     props = torch.cuda.get_device_properties(device)
     print(
         "blackwell runtime smoke passed:",
@@ -47,6 +61,7 @@ def main() -> None:
         f"sms_launched={num_sms}",
         f"copies_per_sm={num_copies}",
         f"bytes_per_copy={copy_bytes}",
+        "sequence_launches=2",
     )
 
 

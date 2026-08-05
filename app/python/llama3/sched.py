@@ -14,14 +14,17 @@ except ImportError:
   from transformers.cache_utils import StaticCache as StaticKVCache
 from reference import input_batch1, reference_pass, check_tensor_threshold
 import os
-import math
+import statistics
+import time
 
 DEFAULT_MAX_DECODE_STEPS = 128
+CONTROL_FLOW_TOKENS_PER_LAUNCH = 1
 
 arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=None)
 arg_parser.add_argument("--max-decode-steps", type=int, default=DEFAULT_MAX_DECODE_STEPS)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
+arg_parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
 arg_parser.add_argument("--correctness", action="store_true")
 arg_parser.add_argument("--prompt", default=None)
 arg_parser.add_argument("--message", action="append", default=None)
@@ -62,6 +65,10 @@ if parsed_args.correctness and not dae_execution_requested(remaining_argv):
 elif has_user_prompt and not dae_work_requested(remaining_argv):
   remaining_argv = [*remaining_argv, "--launch"]
 will_execute = dae_execution_requested(remaining_argv)
+benchmark_mode = any(
+  arg in ("-b", "--bench") or arg.startswith("--bench=")
+  for arg in remaining_argv
+)
 sys.argv = [sys.argv[0], *remaining_argv]
 
 def dae_execution_iterations(argv):
@@ -80,17 +87,19 @@ def dae_execution_iterations(argv):
 # load model
 ###################################
 
-model_name = 'meta-llama/Llama-3.1-8B-Instruct'
+model_name = parsed_args.model
 cache_dir = parsed_args.hf_cache_dir
+hf_token = os.environ.get("HF_TOKEN")
+auth_kwargs = {"token": hf_token} if hf_token else {}
 
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     cache_dir=cache_dir,
     dtype=torch.bfloat16,
     device_map="auto",
-    token=os.environ['HF_TOKEN']
+    **auth_kwargs,
 )
-config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, token=os.environ['HF_TOKEN'])
+config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, **auth_kwargs)
 eps = config.rms_norm_eps # 1e-6
 rope_theta = config.rope_parameters["rope_theta"]
 
@@ -98,7 +107,7 @@ layers = model.model.layers
 tokenizer = AutoTokenizer.from_pretrained(
   model_name,
   cache_dir=cache_dir,
-  token=os.environ['HF_TOKEN'],
+  **auth_kwargs,
 )
 
 def normalize_token_ids(tokens, *, add_special_tokens=False):
@@ -168,12 +177,26 @@ gpu = torch.device("cuda")
 
 REQ, N = 8, 8
 MAX_SEQ_LEN = 512
-KVBlockSize = 64
+KVBlockSize = 128
 
 rms_sms = REQ
 num_sms = 128
-full_sms = 132
-dae = Launcher(132, device=gpu)
+blackwell_sms = 152
+blackwell_aux_sms = blackwell_sms - num_sms
+device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
+full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
+if full_sms > device_sms:
+  raise RuntimeError(f"Llama schedule requested {full_sms} SMs, but the device has {device_sms}")
+if full_sms != blackwell_sms:
+  raise RuntimeError(
+    f"the tuned Llama-3.1-8B schedule requires exactly {blackwell_sms} SMs, got {full_sms}"
+  )
+aux_sms = int(os.environ.get("VDCORES_LLAMA_AUX_SMS", str(blackwell_aux_sms)))
+if aux_sms != blackwell_aux_sms:
+  raise RuntimeError(
+    f"the tuned schedule requires {blackwell_aux_sms} auxiliary SMs, got {aux_sms}"
+  )
+dae = Launcher(full_sms, device=gpu)
 
 
 prompt_tokens = prompt_token_ids()
@@ -190,22 +213,17 @@ def decode_steps_up_to_limit(limit: int):
       f"prompt leaves no decode room: initial_decode_pos={initial_decode_pos}, MAX_SEQ_LEN={MAX_SEQ_LEN}"
     )
   target = min(limit, available_decode_tokens)
-  if target <= tokens_until_kv_block_end:
-    return target, target
-  remaining_after_initial_block = target - tokens_until_kv_block_end
-  full_block_tokens = (remaining_after_initial_block // KVBlockSize) * KVBlockSize
-  return tokens_until_kv_block_end + full_block_tokens, target
+  return target
 
-requested_decode_tokens = None
 if parsed_args.num_generates is not None:
   if parsed_args.control_flow:
-    total_decode_tokens, requested_decode_tokens = decode_steps_up_to_limit(parsed_args.num_generates)
+    total_decode_tokens = decode_steps_up_to_limit(parsed_args.num_generates)
   else:
     total_decode_tokens = parsed_args.num_generates
 elif parsed_args.correctness and not parsed_args.control_flow:
   total_decode_tokens = 1
 elif parsed_args.control_flow:
-  total_decode_tokens, requested_decode_tokens = decode_steps_up_to_limit(parsed_args.max_decode_steps)
+  total_decode_tokens = decode_steps_up_to_limit(parsed_args.max_decode_steps)
 else:
   total_decode_tokens = tokens_until_kv_block_end
 if total_decode_tokens <= 0:
@@ -216,25 +234,8 @@ if final_decode_pos >= MAX_SEQ_LEN:
   raise ValueError(
     f"decode position {final_decode_pos} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}"
   )
-if parsed_args.control_flow:
-  if len(input_token_id_and_pos) != 1:
-    raise ValueError("--control-flow currently supports exactly one initial token")
-  if total_decode_tokens <= 0:
-    raise ValueError("--control-flow requires at least one token")
-  remaining_after_initial_block = max(0, total_decode_tokens - tokens_until_kv_block_end)
-  if remaining_after_initial_block % KVBlockSize != 0:
-    raise ValueError(
-      "--control-flow full-block decode currently requires the appended region "
-      f"to be a multiple of KVBlockSize: initial_pos={initial_decode_pos}, "
-      f"total_tokens={total_decode_tokens}, KVBlockSize={KVBlockSize}"
-    )
-if requested_decode_tokens is not None and total_decode_tokens != requested_decode_tokens:
-  print(
-    "[decode] "
-    f"requested_steps={requested_decode_tokens}, "
-    f"scheduled_steps={total_decode_tokens}; "
-    f"rounded down to current-block remainder plus full {KVBlockSize}-token blocks"
-  )
+if parsed_args.control_flow and len(input_token_id_and_pos) != 1:
+  raise ValueError("--control-flow currently supports exactly one initial token")
 print(
   "[decode] "
   f"prefill_tokens={len(prefill_token_id_and_pos)}, "
@@ -273,11 +274,13 @@ layerg.addBarrier('bar_out_mlp')
 layerg.addBarrier('bar_q_proj')
 layerg.addBarrier('bar_qkv_attn')
 layerg.addBarrier('bar_attn_out')
+layerg.addBarrier('bar_q_clear')
 layerg.addBarrier('bar_rms_layer', REQ)
 layerg.addBarrier('bar_rms_mlp', REQ)
 layerg.addBarrier('bar_silu_in')
 layerg.addBarrier('bar_silu_out1')
 layerg.addBarrier('bar_silu_out2')
+layerg.addBarrier('bar_down_aux')
 layerg.addBarrier('bar_pre_attn_rms')
 layerg.addBarrier('bar_post_attn_rms')
 
@@ -285,7 +288,6 @@ layerg.addBarrier('bar_post_attn_rms')
 # Define tensors
 ###################################
 
-# TODO(zhiyuang: replace with a zero op
 matZero = torch.zeros(4096, dtype=dtype, device=gpu)
 
 _positions = torch.arange(MAX_SEQ_LEN).unsqueeze(0).to(gpu) # [1, seq]
@@ -294,7 +296,9 @@ matRope = torch.ones(MAX_SEQ_LEN, N, HEAD_DIM, dtype=torch.bfloat16, device=gpu)
 matRope[:, :, 0::2] = _cos[0, :, :HEAD_DIM//2].unsqueeze(1) # llama duplicate it to full dim
 matRope[:, :, 1::2] = _sin[0, :, :HEAD_DIM//2].unsqueeze(1)
 
-matTokens = torch.zeros(N, MAX_SEQ_LEN, dtype=torch.int64, device=gpu)
+# Keep one extra slot for the token produced after decoding position
+# MAX_SEQ_LEN - 1; KV/RoPE storage itself remains capped at MAX_SEQ_LEN.
+matTokens = torch.zeros(N, MAX_SEQ_LEN + 1, dtype=torch.int64, device=gpu)
 matHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 
@@ -358,8 +362,8 @@ matLogitsW = []
 matLmHeadW = model.lm_head.weight.detach()
 vocab_size = matLmHeadW.shape[0]
 
-# TODO(zhiyuang): tune for qwen
-matLmHeadW.resize_(logits_slice * logits_epoch, 4096) # pad to 64*full_sms*6, to simplify the scheduling
+# Pad to two 65,536-row epochs for the fixed 128-SM logits reduction.
+matLmHeadW.resize_(logits_slice * logits_epoch, 4096)
 matLmHeadW[vocab_size:,].zero_() # zero padding
 
 matArgmaxIdx = torch.zeros(N, 128, dtype=torch.long, device=gpu)
@@ -372,7 +376,6 @@ for i in range(logits_epoch):
 
 # tensor cache policy
 dae.set_persistent(matTokens)
-dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
 
 def seed_prefill_kv_cache():
   for layer_k, layer_v in zip(attnKs, attnVs):
@@ -423,29 +426,81 @@ def seed_prefill_kv_cache():
 # Register Tensor for TMA
 ###################################
 
-TileM, _, TileK = Gemv_M64N8.MNK
-defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", TileM, N, tma_load_tbl, cord_load_tbl))
+QKVAtom = Gemv_M64N8
+LinearAtom = Gemv_M64N8
+QKVTileM, _, QKVTileK = QKVAtom.MNK
+LinearTileM, _, LinearTileK = LinearAtom.MNK
+
+print(f"[weights] packing projections as contiguous M{LinearTileM}K{LinearTileK} tiles")
+matqWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matqWs]
+matkWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matkWs]
+matvWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matvWs]
+matOutWs = [pack_weight_tile_major(weight, LinearTileM, LinearTileK) for weight in matOutWs]
+matUps = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matUps]
+matGates = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matGates]
+matDowns = [pack_weight_tile_major(weight, LinearTileM, LinearTileK) for weight in matDowns]
+matLogitsW = [
+  pack_weight_tile_major(weight.contiguous(), LinearTileM, LinearTileK)
+  for weight in matLogitsW
+]
+dae.set_streaming(
+  matqWs,
+  matkWs,
+  matvWs,
+  matOutWs,
+  matUps,
+  matGates,
+  matDowns,
+  matLogitsW,
+)
+
+
+def weight_load_tma(tma_tensor, tile_m, tile_k):
+  return tma_tensor.wgmma_load_tiled(tile_m, tile_k)
+
+
+def linear_output_tma(mode):
+  return lambda t: t.wgmma(mode, N, LinearTileM, Major.MN)
+
+
+defaultg.addTma(
+  "loadLogitsB",
+  [matRMSHidden],
+  lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K),
+)
+for logits_idx in range(logits_epoch):
+  defaultg.addTma(
+    f"loadLogitsW{logits_idx}",
+    [matLogitsW[logits_idx]],
+    lambda t: t.wgmma_load_tiled(LinearTileM, LinearTileK),
+  )
+  defaultg.addTma(
+    f"storeLogits{logits_idx}",
+    [matLogits[logits_idx]],
+    lambda t: t.wgmma_store(N, LinearTileM, Major.MN),
+  )
+
+
+defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", QKVTileM, N, tma_load_tbl, cord_load_tbl))
 
 # load tmas for the same matrix for "grouped" instructions
-layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
-layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
-layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
-layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, QKVTileK * QKVAtom.n_batch, Major.K))
+layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, linear_output_tma("reduce"))
+layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K))
+layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
+layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K))
 
-layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
-layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
-layerg.addTma("reduceInterm", [matInterm] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("reduceGateOut", [matGateOut] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
+layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
+layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
 
 # RMS, skip the first one which is used for embedding fusion
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
 
-layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadOutWs", matOutWs, lambda t: weight_load_tma(t, LinearTileM, LinearTileK))
+layerg.addTma("loadDown", matDowns, lambda t: weight_load_tma(t, LinearTileM, LinearTileK))
+layerg.addTma("loadUp", matUps, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
+layerg.addTma("loadGate", matGates, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 
 tma_builder_MN = partial(build_tma_wgmma_mn, iK = -3)
 cord_func_MN = partial(cord_func_MN_major, iK=-3)
@@ -454,12 +509,11 @@ cord_func_MN_cord2 = partial(cord_func_MN_major_cord2, iK=-3)
 tma_builder_K = partial(build_tma_wgmma_k, iN = -3)
 cord_func_K = partial(cord_func_K_major, iN=-3)
 
-TileM, _, TileK = Gemv_M64N8_ROPE_128.MNK
-layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("storeQClear", attnQs, lambda t: t.wgmma_store(N, TileM, Major.MN))
+layerg.addTma("loadQW", matqWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
+layerg.addTma("loadKW", matkWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
+layerg.addTma("loadVW", matvWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
+layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, QKVTileM, Major.MN))
+layerg.addTma("storeQClear", attnQs, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
 layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
 
@@ -475,11 +529,6 @@ layerg.addTma('loadQ', matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 64,
 layerg.addTma('loadK', matK_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_K, cord_func_K))
 layerg.addTma('loadV', matV_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_MN, cord_func_MN))
 
-
-## testing matrix
-matTestHidden = [torch.zeros(N, HIDDEN, dtype=dtype, device=gpu) for _ in range(num_layers)]
-layerg.addTma("testReduce", matTestHidden, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-
 ###################################
 # Finish building resources
 ###################################
@@ -492,7 +541,8 @@ tma_shift, bar_shift = layerg.get_shift()
 ###################################
 
 TOKEN_LOOP_REG = 1
-KV_BLOCK_LOOP_REG = 2
+TOKEN_BASE_REG = 2
+KV_BLOCK_COUNT_REG = 3
 
 
 class CounterOffsetCordAdapter(CordAdapter):
@@ -507,29 +557,8 @@ class CounterOffsetCordAdapter(CordAdapter):
     return inst
 
 
-def _control_flow_offsets(token_delta, block_delta=None):
-  offsets = [(TOKEN_LOOP_REG, token_delta)]
-  if block_delta is not None:
-    offsets.append((KV_BLOCK_LOOP_REG, block_delta))
-  return offsets
-
-
-def maybe_counter_offset(inst, delta, enabled: bool, block_delta=None):
-  if not enabled:
-    return inst
-  for counter_reg, counter_delta in _control_flow_offsets(delta, block_delta):
-    inst = CounterOffsetMemoryInstruction(counter_reg, inst, counter_delta)
-  return inst
-
-
-def maybe_counter_adapter(adapter, delta, enabled: bool, block_delta=None):
-  if not enabled:
-    return adapter
-  return CounterOffsetCordAdapter(adapter, _control_flow_offsets(delta, block_delta))
-
-
 class SchedClearQ(Schedule):
-  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int, num_clear_sms: int, wait_bar: int | None = None):
+  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int, num_clear_sms: int, wait_bar: int):
     super().__init__()
     self.load_zero = load_zero
     self.store_q = store_q
@@ -544,18 +573,45 @@ class SchedClearQ(Schedule):
     count = (HIDDEN // self.tile_m + self.num_clear_sms - 1 - sm) // self.num_clear_sms
     if count <= 0:
       return []
-    insts = []
-    if self.wait_bar is not None:
-      insts.append(IssueBarrier(self.wait_bar).group())
-    insts += [
+    return [
+      IssueBarrier(self.wait_bar).group(),
       Copy(count, size=self.tile_bytes),
       RepeatM.on(
         count,
         (self.load_zero.cord(0), 0),
-        (self.store_q.cord(sm).group(), [self.num_clear_sms * self.tile_m, 0]),
+        (
+          self.store_q.cord(sm).bar(self._bar("store")).group(),
+          [self.num_clear_sms * self.tile_m, 0],
+        ),
       ),
+      IssueBarrier(self._bar("store")).group(),
     ]
-    return insts
+
+  def bar_release_count(self, role: str):
+    if role != "store":
+      return 0
+    return self._bar_release_if_present(role, HIDDEN // self.tile_m)
+
+
+def _control_flow_offsets(token_delta, base_delta=None):
+  offsets = [(TOKEN_LOOP_REG, token_delta)]
+  if base_delta is not None:
+    offsets.append((TOKEN_BASE_REG, base_delta))
+  return offsets
+
+
+def maybe_counter_offset(inst, delta, enabled: bool, base_delta=None):
+  if not enabled:
+    return inst
+  for counter_reg, counter_delta in _control_flow_offsets(delta, base_delta):
+    inst = CounterOffsetMemoryInstruction(counter_reg, inst, counter_delta)
+  return inst
+
+
+def maybe_counter_adapter(adapter, delta, enabled: bool, base_delta=None):
+  if not enabled:
+    return adapter
+  return CounterOffsetCordAdapter(adapter, _control_flow_offsets(delta, base_delta))
 
 
 def schedule_single_token(
@@ -564,11 +620,9 @@ def schedule_single_token(
     *,
     control_flow_tokens: int | None = None,
     token_loop_ptrs=None,
-    block_loop_tokens: int | None = None,
-    block_loop_ptrs=None,
 ):
   control_flow = control_flow_tokens is not None
-  block_control_flow = block_loop_tokens is not None
+  base_counter_delta = 1 if control_flow else None
   # RMS
   # group is not working on RMS tmas, as it uses TMA1D
   # TODO(zhiyuang): dup the matEmbed for now
@@ -584,7 +638,7 @@ def schedule_single_token(
       CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
       matTokens.element_size(),
       control_flow,
-      KVBlockSize * matTokens.element_size() if block_control_flow else None,
+      base_counter_delta * matTokens.element_size() if control_flow else None,
     )
   ).bar("output", layerg['bar_pre_attn_rms'])
   # copy the HIDDEN from embedding
@@ -598,23 +652,7 @@ def schedule_single_token(
       CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
       matTokens.element_size(),
       control_flow,
-      KVBlockSize * matTokens.element_size() if block_control_flow else None,
-    ),
-  )
-
-  # TODO(zhiyuang): finish a set of clear functions
-  clear_interm = SchedCopy(
-    size = 2048 * matInterm.element_size(),
-    tmas = wrap_static(
-      TmaLoad1D(matZero[:2048]),
-      TmaStore1D(matInterm[0,4096:4096+2048]),
-    ),
-  )
-  clear_gateout = SchedCopy(
-    size = 2048 * matGateOut.element_size(),
-    tmas = wrap_static(
-      TmaLoad1D(matZero[:2048]),
-      TmaStore1D(matGateOut[0, 4096:4096+2048]),
+      base_counter_delta * matTokens.element_size() if control_flow else None,
     ),
   )
 
@@ -629,9 +667,9 @@ def schedule_single_token(
 
   # QKV Projection
   # TODO(zhiyuang): add the ROPE for Q and K
-  regStoreQ = RegStore(0, size=N * TileM * matQ_attn_views[0].element_size())
+  regStoreQ = RegStore(0, size=N * QKVTileM * matQ_attn_views[0].element_size())
   regLoadQ = RegLoad(0)
-  QProj = SchedGemv(Gemv_M64N8,
+  QProj = SchedGemv(QKVAtom,
     MNK=(QW, N, HIDDEN),
     tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
   ).bar("load", layerg['bar_pre_attn_rms'])
@@ -641,15 +679,15 @@ def schedule_single_token(
         ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
         [0, 0, 0, 1],
         control_flow,
-        [0, 0, 0, KVBlockSize] if block_control_flow else None,
+        [0, 0, 0, base_counter_delta] if control_flow else None,
       ),
       regLoadQ,
-      ToSplitMCordAdapter(layerg['storeQ'], 128//2, TileM),
+      ToSplitMCordAdapter(layerg['storeQ'], 128//2, QKVTileM),
     ),
   ).bar("store", layerg['bar_q_proj'])
-  regStoreK = RegStore(0, size=N * TileM * matK_attn_views[0].element_size())
+  regStoreK = RegStore(0, size=N * QKVTileM * matK_attn_views[0].element_size())
   regLoadK = RegLoad(0)
-  KProj = SchedGemv(Gemv_M64N8,
+  KProj = SchedGemv(QKVAtom,
     MNK=(KW, N, HIDDEN),
     tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
   )
@@ -659,18 +697,18 @@ def schedule_single_token(
         ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
         [0, 0, 0, 1],
         control_flow,
-        [0, 0, 0, KVBlockSize] if block_control_flow else None,
+        [0, 0, 0, base_counter_delta] if control_flow else None,
       ),
       regLoadK,
       maybe_counter_adapter(
-        ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, TileM, token_pos),
+        ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, QKVTileM, token_pos),
         [0, 1, 0],
         control_flow,
-        [0, KVBlockSize, 0] if block_control_flow else None,
+        [0, base_counter_delta, 0] if control_flow else None,
       ),
     ),
   ).bar("store", layerg['bar_qkv_attn'])
-  VProj = SchedGemv(Gemv_M64N8,
+  VProj = SchedGemv(QKVAtom,
     MNK=(VW, N, HIDDEN),
     tmas=(
       layerg['loadVW'],
@@ -679,12 +717,11 @@ def schedule_single_token(
         ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
         [0, 1, 0],
         control_flow,
-        [0, KVBlockSize, 0] if block_control_flow else None,
+        [0, base_counter_delta, 0] if control_flow else None,
       ),
     ),
   ).bar("store", layerg['bar_qkv_attn'])
 
-  QWen8BGemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
   Gqa = SchedAttentionDecoding(
     reqs = N, seq_len = token_pos + 1,
     KV_BLOCK_SIZE = KVBlockSize,
@@ -692,36 +729,54 @@ def schedule_single_token(
     matO = matO_attn_view,
     tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
     seq_len_counter_reg=TOKEN_LOOP_REG if control_flow else None,
-    num_kv_block_counter_reg=KV_BLOCK_LOOP_REG if block_control_flow else None,
-    max_loop_count=control_flow_tokens or 1,
+    num_kv_block_counter_reg=KV_BLOCK_COUNT_REG if control_flow else None,
+    outer_seq_len_counter_reg=TOKEN_BASE_REG if control_flow else None,
+    outer_seq_len_counter_stride=base_counter_delta or 0,
+    num_active_q=HEAD_GROUP_SIZE,
+    max_loop_count=min(
+      control_flow_tokens or 1,
+      KVBlockSize - (token_pos % KVBlockSize),
+    ),
   ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
 
   # accumulate to matHidden, which auto applies the residual add
-  OutProj = SchedGemv(Gemv_M64N8,
-    MNK=(HIDDEN, N, HIDDEN),
+  # Twelve M tiles use four K folds and the other 52 use two folds: exactly
+  # 152 independent tasks, one for every Blackwell SM.
+  out_proj_fold4 = SchedGemv(LinearAtom,
+    MNK=((0, 768), N, HIDDEN),
+    fold=4,
+    tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])
+  ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
+  out_proj_fold2 = SchedGemv(LinearAtom,
+    MNK=((768, HIDDEN - 768), N, HIDDEN),
+    fold=2,
     tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])
   ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
 
   # Gate Up + SiLU
-  regGate, regUp = 0, 1
-  regStoreGate = RegStore(regGate, matGateOut[:,0:TileM])
-  regStoreUp = RegStore(regUp, matInterm[:,0:TileM])
+  reg_gate, reg_up = 0, 1
+  reg_store_gate = RegStore(reg_gate, matGateOut[:, :QKVTileM])
+  reg_store_up = RegStore(reg_up, matInterm[:, :QKVTileM])
 
-  gate_proj_low = SchedGemv(Gemv_M64N8,
-    MNK=(4096, N, HIDDEN),
+  gate_proj_prefix = SchedGemv(QKVAtom,
+    MNK=(6144, N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),
-  ).bar("load", layerg['bar_post_attn_rms'])
-  gate_proj_high = SchedGemv(Gemv_M64N8,
-    MNK=((4096, 2048), N, HIDDEN),
-    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['reduceGateOut']),
-  ).bar("store", layerg['bar_silu_in'])
-  up_proj_low = SchedGemv(Gemv_M64N8,
-    MNK=(4096, N, HIDDEN),
+  ).bar("load", layerg['bar_post_attn_rms']).bar("store", layerg['bar_silu_in'])
+  up_proj_main = SchedGemv(QKVAtom,
+    MNK=(2048, N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-  ).bar("load", layerg['bar_post_attn_rms'])
-  up_proj_high = SchedGemv(Gemv_M64N8,
-    MNK=((4096, 2048), N, HIDDEN),
-    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['reduceInterm']),
+  ).bar("load", layerg['bar_post_attn_rms']).bar("store", layerg['bar_silu_in'])
+  up_proj_aux0 = SchedGemv(QKVAtom,
+    MNK=((2048, 1536), N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
+  ).bar("load", layerg['bar_post_attn_rms']).bar("store", layerg['bar_silu_in'])
+  up_proj_aux1 = SchedGemv(QKVAtom,
+    MNK=((3584, 1536), N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
+  ).bar("store", layerg['bar_silu_in'])
+  up_proj_aux2 = SchedGemv(QKVAtom,
+    MNK=((5120, 1024), N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
   ).bar("store", layerg['bar_silu_in'])
 
   mlp_split = 6144
@@ -731,34 +786,59 @@ def schedule_single_token(
     up_glob=matInterm[:, :mlp_split],
     out_glob=matSiLUOut[:, :mlp_split],
   ).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
-  gate_proj_fused = SchedGemv(Gemv_M64N8,
-    MNK=((6144,8192), N, HIDDEN),
-    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], regStoreGate))
-  up_proj_fused = SchedGemv(Gemv_M64N8,
-    MNK=((6144,8192), N, HIDDEN),
-    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], regStoreUp))
-  silu_fused = SchedRegSiLUFused(
+  gate_proj_tail = SchedGemv(QKVAtom,
+    MNK=((mlp_split, INTERMIDIATE - mlp_split), N, HIDDEN),
+    tmas=(layerg['loadGate'], layerg['loadRMSLayer'], reg_store_gate),
+  )
+  up_proj_tail = SchedGemv(QKVAtom,
+    MNK=((mlp_split, INTERMIDIATE - mlp_split), N, HIDDEN),
+    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], reg_store_up),
+  )
+  silu_tail = SchedRegSiLUFused(
     num_token=N,
     store_tma=layerg['storeSiluLayer'],
-    reg_gate=regGate,
-    reg_up=regUp,
+    reg_gate=reg_gate,
+    reg_up=reg_up,
     base_offset=mlp_split,
-    stride=TileM,
+    stride=QKVTileM,
   ).bar("output", layerg['bar_silu_out2'])
-  down_proj_low = SchedGemv(Gemv_M64N8,
-    MNK=(HIDDEN, N, 6144),
-    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer']))
-  down_proj_high = SchedGemv(Gemv_M64N8,
-    MNK=(HIDDEN, N, (6144, 8192)),
+  # The 24 auxiliary SMs consume one low-K task while the 128 main SMs finish
+  # the register-forwarded gate/up/SwiGLU tail. The matching high-K rows run
+  # on the 24 main SMs left idle by the 104-task main partition.
+  down_proj_low_aux = SchedGemv(LinearAtom,
+    MNK=((0, 768), N, 6144),
+    fold=2,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
-  down_proj_low.bar("load", layerg['bar_silu_out1'])
+  ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_down_aux'])
+  down_proj_low_main = SchedGemv(LinearAtom,
+    MNK=((768, HIDDEN - 768), N, 6144),
+    fold=2,
+    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
+  ).bar("load", layerg['bar_silu_out1'])
+  down_proj_high_aux_rows = SchedGemv(LinearAtom,
+    MNK=((0, 768), N, (6144, 8192)),
+    fold=2,
+    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
+  ).bar("load", layerg['bar_down_aux']).bar("store", layerg['bar_layer'])
+  down_proj_high_main_rows = SchedGemv(LinearAtom,
+    MNK=((768, HIDDEN - 768), N, (6144, 8192)),
+    fold=2,
+    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
+  ).bar("store", layerg['bar_layer'])
 
   # after all layers, logits projection
   LogitsProj = []
   for i in range(logits_epoch):
-    proj = QWen8BGemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-    sched = proj.schedule_(group=False).split_M(logits_fold)
+    sched = SchedGemv(
+      LinearAtom,
+      MNK=(logits_slice, N, HIDDEN),
+      tmas=(
+        defaultg[f"loadLogitsW{i}"],
+        defaultg["loadLogitsB"],
+        defaultg[f"storeLogits{i}"],
+      ),
+      group=False,
+    ).split_M(8)
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
       sched[0].no_prefetch()
@@ -779,7 +859,7 @@ def schedule_single_token(
     matFinalOut=matTokens[:, token_offset+1],
     final_counter_offsets=_control_flow_offsets(
       matTokens.stride(1) * matTokens.element_size(),
-      KVBlockSize * matTokens.stride(1) * matTokens.element_size() if block_control_flow else None,
+      base_counter_delta * matTokens.stride(1) * matTokens.element_size() if control_flow else None,
     ) if control_flow else None,
   ).bar("load", systemg['bar_logits']).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
 
@@ -795,16 +875,6 @@ def schedule_single_token(
 
   embed_rms = embed_rms.place(rms_sms)
   copy_hidden = copy_hidden.place(N, base_sm=64)
-  clear_interm = clear_interm.place(1, base_sm=128)
-  clear_gateout = clear_gateout.place(1, base_sm=129)
-  clear_q = SchedClearQ(
-    TmaLoad1D(matZero[:N * TileM], bytes=N * TileM * matZero.element_size()),
-    ToSplitMCordAdapter(layerg['storeQClear'], 64, TileM),
-    N * TileM * matZero.element_size(),
-    TileM,
-    full_sms - num_sms,
-    wait_bar=layerg['bar_attn_out'],
-  ).place(full_sms - num_sms, base_sm=num_sms)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
   QProj = QProj.place(128)
@@ -813,28 +883,39 @@ def schedule_single_token(
   KRope = KRope.place(64, base_sm=64)
   VProj = VProj.place(64)
   Gqa = Gqa.place(N * NUM_KV_HEAD)
-  OutProj = OutProj.place(num_sms)
-  gate_proj_low = gate_proj_low.place(64)
-  gate_proj_high = gate_proj_high.place(64)
-  up_proj_low = up_proj_low.place(64, base_sm=64)
-  up_proj_high = up_proj_high.place(64, base_sm=64)
-  silu1 = silu1.place(4, base_sm=128)
-  gate_proj_fused = gate_proj_fused.place(128)
-  up_proj_fused = up_proj_fused.place(128)
-  silu_fused = silu_fused.place(128)
-  down_proj_low = down_proj_low.place(128)
-  down_proj_high = down_proj_high.place(128)
+  OutProj = [
+    out_proj_fold4.place(48),
+    out_proj_fold2.place(104, base_sm=48),
+  ]
+  gate_proj_prefix = gate_proj_prefix.place(96)
+  up_proj_main = up_proj_main.place(32, base_sm=96)
+  up_proj_aux0 = up_proj_aux0.place(24, base_sm=num_sms)
+  up_proj_aux1 = up_proj_aux1.place(24, base_sm=num_sms)
+  up_proj_aux2 = up_proj_aux2.place(16, base_sm=num_sms + 8)
+  silu1 = silu1.place(min(8, aux_sms), base_sm=num_sms)
+  gate_proj_tail = gate_proj_tail.place(128)
+  up_proj_tail = up_proj_tail.place(128)
+  silu_tail = silu_tail.place(128)
+  down_proj_low_aux = down_proj_low_aux.place(24, base_sm=num_sms)
+  down_proj_low_main = down_proj_low_main.place(104)
+  down_proj_high_aux_rows = down_proj_high_aux_rows.place(24, base_sm=104)
+  down_proj_high_main_rows = down_proj_high_main_rows.place(104)
   Argmax = Argmax.place(128)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
+  clear_q = SchedClearQ(
+    TmaLoad1D(matZero[:N * QKVTileM], bytes=N * QKVTileM * matZero.element_size()),
+    ToSplitMCordAdapter(layerg['storeQClear'], 64, QKVTileM),
+    N * QKVTileM * matZero.element_size(),
+    QKVTileM,
+    aux_sms,
+    layerg['bar_attn_out'],
+  ).bar("store", layerg['bar_q_clear']).place(aux_sms, base_sm=num_sms)
 
   dae.bind_late_barrier_counts(
     embed_rms,
     copy_hidden,
     restore_bars_high,
-    clear_interm,
-    clear_gateout,
-    clear_q if control_flow else [],
     QProj,
     QRope,
     KProj,
@@ -843,17 +924,21 @@ def schedule_single_token(
     Gqa,
     OutProj,
     post_attn_rms,
-    gate_proj_low,
-    gate_proj_high,
-    up_proj_low,
-    up_proj_high,
+    gate_proj_prefix,
+    up_proj_main,
+    up_proj_aux0,
+    up_proj_aux1,
+    up_proj_aux2,
     silu1,
-    gate_proj_fused,
-    up_proj_fused,
-    silu_fused,
-    down_proj_low,
-    down_proj_high,
+    gate_proj_tail,
+    up_proj_tail,
+    silu_tail,
+    down_proj_low_aux,
+    down_proj_low_main,
+    down_proj_high_aux_rows,
+    down_proj_high_main_rows,
     pre_attn_rms,
+    clear_q,
     LogitsProj,
     Argmax,
     restore_bars_low,
@@ -866,10 +951,8 @@ def schedule_single_token(
     restore_bars_high,
   )
 
-  # start a new scheudule to mark the loop target
+  # Start a new schedule to mark the loop target.
   dae.i(
-    clear_interm,
-    clear_gateout,
     QProj,
     QRope,
     KProj,
@@ -883,25 +966,27 @@ def schedule_single_token(
     post_attn_rms,
     
     # MLP
-    gate_proj_low,
-    gate_proj_high,
-    up_proj_low,
-    up_proj_high,
+    gate_proj_prefix,
+    up_proj_main,
+    up_proj_aux0,
+    up_proj_aux1,
+    up_proj_aux2,
     silu1,
-    gate_proj_fused,
-    up_proj_fused,
-    silu_fused,
-    down_proj_low,
-    down_proj_high,
+    gate_proj_tail,
+    up_proj_tail,
+    silu_tail,
+
+    down_proj_low_aux,
+    down_proj_low_main,
+    down_proj_high_aux_rows,
+    down_proj_high_main_rows,
 
     # rms for next layer
     pre_attn_rms,
 
-    # clear the per-layer Q buffer after its consumers are finished; the next
-    # token will not revisit this layer until the rest of the layers complete.
-    clear_q if control_flow else [],
+    clear_q,
 
-    # # all 132 SM need loop
+    # All 152 SMs need the layer loop.
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
     LoopC.toNext(dae.copy_cptrs(), num_layers),
 
@@ -920,17 +1005,17 @@ def schedule_single_token(
     token_cptrs, token_mptrs = token_loop_ptrs
     dae.i(
       IssueBarrier(systemg['bar_token_finish']),
-      LoopM.toNext(token_mptrs, control_flow_tokens, reg=TOKEN_LOOP_REG),
-      LoopC.toNext(token_cptrs, control_flow_tokens, reg=TOKEN_LOOP_REG),
+      LoopM.toNext(
+        token_mptrs,
+        control_flow_tokens,
+        reg=TOKEN_LOOP_REG,
+      ),
+      LoopC.toNext(
+        token_cptrs,
+        control_flow_tokens,
+        reg=TOKEN_LOOP_REG,
+      ),
     )
-    if block_control_flow:
-      if block_loop_ptrs is None:
-        raise ValueError("block control-flow scheduling requires block_loop_ptrs")
-      block_cptrs, block_mptrs = block_loop_ptrs
-      dae.i(
-        LoopM.toNext(block_mptrs, block_loop_tokens, reg=KV_BLOCK_LOOP_REG),
-        LoopC.toNext(block_cptrs, block_loop_tokens, reg=KV_BLOCK_LOOP_REG),
-      )
 
 ###################################
 # finish schedule and ready to run
@@ -945,38 +1030,14 @@ if parsed_args.control_flow:
   token, pos = input_token_id_and_pos[0]
   matTokens[0, decode_offset] = token
   token_loop_ptrs = (dae.copy_cptrs(), dae.copy_mptrs())
-  initial_block_tokens = min(total_decode_tokens, tokens_until_kv_block_end)
   schedule_single_token(
     decode_offset,
     pos,
-    control_flow_tokens=initial_block_tokens,
+    control_flow_tokens=CONTROL_FLOW_TOKENS_PER_LAUNCH,
     token_loop_ptrs=token_loop_ptrs,
   )
-  cur_offset = decode_offset + initial_block_tokens - 1
-  cur_pos = pos + initial_block_tokens - 1
-
-  remaining_full_block_tokens = total_decode_tokens - initial_block_tokens
-  if remaining_full_block_tokens:
-    if remaining_full_block_tokens % KVBlockSize != 0:
-      raise ValueError(
-        "control-flow full-block decode requires remaining tokens after the initial block "
-        f"to be a multiple of KVBlockSize: remaining={remaining_full_block_tokens}, KVBlockSize={KVBlockSize}"
-      )
-    block_loop_tokens = remaining_full_block_tokens // KVBlockSize
-    full_block_offset = decode_offset + initial_block_tokens
-    full_block_pos = pos + initial_block_tokens
-    block_loop_ptrs = (dae.copy_cptrs(), dae.copy_mptrs())
-    inner_loop_ptrs = block_loop_ptrs
-    schedule_single_token(
-      full_block_offset,
-      full_block_pos,
-      control_flow_tokens=KVBlockSize,
-      token_loop_ptrs=inner_loop_ptrs,
-      block_loop_tokens=block_loop_tokens,
-      block_loop_ptrs=block_loop_ptrs,
-    )
-    cur_offset += remaining_full_block_tokens
-    cur_pos += remaining_full_block_tokens
+  cur_offset = decode_offset + total_decode_tokens - 1
+  cur_pos = pos + total_decode_tokens - 1
 else:
   for token_offset, (token, pos) in enumerate(input_token_id_and_pos, start=decode_offset):
     matTokens[0, token_offset] = token
@@ -991,22 +1052,100 @@ else:
     dae.i(IssueBarrier(systemg['bar_token_finish']))
     schedule_single_token(cur_offset, cur_pos)
 
-print(f"run vdcors with {cur_offset+1} tokens...")
+print(f"run VDCores with {cur_offset+1} tokens...")
 dae.s()
-dae_app(dae)
 if will_execute:
-  profile_data = dae.profile[:, 0:2].cpu().numpy()
-  vdcores_time_ns = float(profile_data[:, 1].max() - profile_data[:, 0].min())
-  tbt_ns = vdcores_time_ns / total_decode_tokens
+  dae.prepare_launch()
+
+
+def control_flow_launch_plan():
+  base_seq_len = initial_decode_pos + 1
+  base_num_kv_blocks = (base_seq_len + KVBlockSize - 1) // KVBlockSize
+  plan = []
+  for token_offset in range(total_decode_tokens):
+    seq_len = base_seq_len + token_offset
+    num_kv_blocks = (seq_len + KVBlockSize - 1) // KVBlockSize
+    plan.append((token_offset, num_kv_blocks - base_num_kv_blocks))
+  return plan
+
+
+def reset_decode_state():
+  for attn_q in attnQs:
+    attn_q.zero_()
+  for attn_k, attn_v in zip(attnKs, attnVs):
+    attn_k[:, initial_decode_pos:final_decode_pos + 1].zero_()
+    attn_v[:, initial_decode_pos:final_decode_pos + 1].zero_()
+  torch.cuda.synchronize()
+
+
+def launch_control_flow_sequence(launch_plan):
+  reset_decode_state()
+  loop_counter_values = []
+  for token_base, kv_block_delta in launch_plan:
+    counters = dae.loop_counters.copy()
+    counters[TOKEN_BASE_REG] = token_base
+    counters[KV_BLOCK_COUNT_REG] = kv_block_delta
+    loop_counter_values.append(counters)
+  start_event = torch.cuda.Event(enable_timing=True)
+  end_event = torch.cuda.Event(enable_timing=True)
+  wall_start_ns = time.perf_counter_ns()
+  start_event.record()
+  dae.launch_sequence(loop_counter_values, synchronize=False, reset_bars=True)
+  end_event.record()
+  end_event.synchronize()
+  wall_time_ns = float(time.perf_counter_ns() - wall_start_ns)
+  sequence_time_ns = float(start_event.elapsed_time(end_event) * 1e6)
+  return sequence_time_ns, wall_time_ns
+
+
+perf_summary = None
+if will_execute and parsed_args.control_flow:
+  launch_plan = control_flow_launch_plan()
+  iterations = dae_execution_iterations(remaining_argv)
+  warmup_sequences = int(os.environ.get("DAE_BENCH_WARMUP", "3")) if benchmark_mode else 0
+  for _ in range(max(0, warmup_sequences)):
+    launch_control_flow_sequence(launch_plan)
+
+  print(
+    f"[{'bench' if benchmark_mode else 'launch'}] "
+    f"VDCores with {dae.num_sms} SMs, chunks={len(launch_plan)}..."
+  )
+  measurements = [launch_control_flow_sequence(launch_plan) for _ in range(iterations)]
+  kernel_times = [measurement[0] for measurement in measurements]
+  wall_times = [measurement[1] for measurement in measurements]
+  kernel_time_ns = statistics.median(kernel_times)
+  wall_time_ns = statistics.median(wall_times)
+  if benchmark_mode:
+    print(
+      f"Benchmark Results on {dae.num_sms} SMs and {iterations} iterations:\n"
+      f"Min end-to-end time (ns): {min(wall_times):.2f}\n"
+      f"Median end-to-end time (ns): {wall_time_ns:.2f}\n"
+      f"Average end-to-end time (ns): {statistics.mean(wall_times):.2f}\n"
+      f"Max end-to-end time (ns): {max(wall_times):.2f}"
+    )
+  tbt_ns = wall_time_ns / total_decode_tokens
   perf_summary = (
     "[perf] "
-    f"vdcores_time_ms={vdcores_time_ns / 1e6:.3f}, "
+    f"kernel_time_ms={kernel_time_ns / 1e6:.3f}, "
+    f"end_to_end_ms={wall_time_ns / 1e6:.3f}, "
+    f"decode_tokens={total_decode_tokens}, "
+    f"TBT_ms={tbt_ns / 1e6:.3f}, "
+    f"tokens_per_s={1e9 / tbt_ns:.2f}"
+  )
+elif will_execute:
+  dae_app(dae)
+  profile_data = dae.profile[:, 0:2].cpu().numpy()
+  kernel_time_ns = float(profile_data[:, 1].max() - profile_data[:, 0].min())
+  tbt_ns = kernel_time_ns / total_decode_tokens
+  perf_summary = (
+    "[perf] "
+    f"kernel_time_ms={kernel_time_ns / 1e6:.3f}, "
     f"decode_tokens={total_decode_tokens}, "
     f"TBT_ms={tbt_ns / 1e6:.3f}, "
     f"tokens_per_s={1e9 / tbt_ns:.2f}"
   )
 else:
-  perf_summary = None
+  dae_app(dae)
 
 def print_generated_text():
   generated_token_ids = matTokens[
@@ -1018,6 +1157,35 @@ def print_generated_text():
 
   print(f"[output] generated_tokens={len(generated_token_ids)}")
   print(f"[output] generated_text: {generated_text}")
+
+
+def check_logits_against_reference(reference_logits):
+  checks = []
+  for slice_idx, logits in enumerate(matLogits):
+    start = slice_idx * logits_slice
+    end = min(start + logits_slice, vocab_size)
+    if start >= end:
+      break
+    checks.append(
+      check_tensor_threshold(
+        f"logits_{slice_idx}",
+        reference_logits[start:end],
+        logits[0, :end - start],
+        10.0,
+      )
+    )
+  return checks
+
+
+def assembled_vocab_logits():
+  slices = []
+  for slice_idx, logits in enumerate(matLogits):
+    start = slice_idx * logits_slice
+    end = min(start + logits_slice, vocab_size)
+    if start >= end:
+      break
+    slices.append(logits[0, :end - start])
+  return torch.cat(slices)
 
 
 def run_correctness_check():
@@ -1077,15 +1245,9 @@ def run_correctness_check():
         check_tensor_threshold("k_rope", k_ref, attnKs[i][0, final_pos], 5.0)
       check_tensor_threshold("final_hidden", captured[num_layers-1]['hidden_state_out'][0, final_idx], matHidden[0], 5.0)
       check_tensor_threshold("final_rms", captured['final']['final_rms'][0, final_idx], matRMSHidden[0], 5.0)
-      check_tensor_threshold("logits_low", captured['final']['lm_head'][0, final_idx, :logits_slice], matLogits[0][0, :logits_slice], 10.0)
-      check_tensor_threshold("logits_high", captured['final']['lm_head'][0, final_idx, logits_slice:vocab_size], matLogits[1][0, :vocab_size - logits_slice], 10.0)
+      check_logits_against_reference(captured['final']['lm_head'][0, final_idx])
       ref_logits = captured['final']['lm_head'][0, final_idx].float()
-      dae_logits = torch.cat(
-        (
-          matLogits[0][0, :logits_slice],
-          matLogits[1][0, :vocab_size - logits_slice],
-        )
-      ).float()
+      dae_logits = assembled_vocab_logits().float()
       ref_top_vals, ref_top_idx = torch.topk(ref_logits, 5)
       dae_top_vals, dae_top_idx = torch.topk(dae_logits, 5)
       print(
@@ -1116,11 +1278,6 @@ def run_correctness_check():
 
   for i in range(min(2, num_layers)):
     layer = captured[i]
-    q_ref = apply_interleaved_rope_activation(
-      permute_rope_activation(layer['q_proj'][0, decode_index], QW // HEAD_DIM),
-      QW // HEAD_DIM,
-      decode_rope_row,
-    )
     k_ref = apply_interleaved_rope_activation(
       permute_rope_activation(layer['k_proj'][0, decode_index], KW // HEAD_DIM),
       KW // HEAD_DIM,
@@ -1129,9 +1286,9 @@ def run_correctness_check():
     print(f"[correctness] Layer {i}:")
     checks = [
       check_tensor_threshold("v_proj", layer['v_proj'][0, decode_index], attnVs[i][0, decode_pos], 5.0),
-      check_tensor_threshold("q_rope", q_ref, attnQs[i][0], 5.0),
       check_tensor_threshold("k_rope", k_ref, attnKs[i][0, decode_pos], 5.0),
     ]
+    print("[correctness] skip q_rope snapshot: clear_q zeros the reusable Q buffer after attention consumes it")
     all_ok = all_ok and all(passed for passed, _ in checks)
 
   print(f"[correctness] Checking Layer {num_layers-1}:")
@@ -1143,8 +1300,7 @@ def run_correctness_check():
     check_tensor_threshold("silu", silu_ref, matSiLUOut[0, :], 5.0),
     check_tensor_threshold("final_hidden", layer['hidden_state_out'][0, decode_index], matHidden[0], 5.0),
     check_tensor_threshold("final_rms", captured['final']['final_rms'][0, decode_index], matRMSHidden[0], 5.0),
-    check_tensor_threshold("logits_low", captured['final']['lm_head'][0, decode_index, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
-    check_tensor_threshold("logits_high", captured['final']['lm_head'][0, decode_index, logits_slice:vocab_size], matLogits[1][0, :vocab_size - logits_slice], 10.0),
+    *check_logits_against_reference(captured['final']['lm_head'][0, decode_index]),
   ]
   all_ok = all_ok and all(passed for passed, _ in final_checks)
 

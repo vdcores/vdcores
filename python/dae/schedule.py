@@ -259,7 +259,9 @@ class SchedAttentionDecoding(Schedule):
                  num_active_q=64,
                  seq_len_counter_reg: int | None = None,
                  num_kv_block_counter_reg: int | None = None,
-                 max_loop_count: int = 1):
+                 max_loop_count: int = 1,
+                 outer_seq_len_counter_reg: int | None = None,
+                 outer_seq_len_counter_stride: int = 0):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -273,6 +275,8 @@ class SchedAttentionDecoding(Schedule):
         self.seq_len_counter_reg = seq_len_counter_reg
         self.num_kv_block_counter_reg = num_kv_block_counter_reg
         self.max_loop_count = max_loop_count
+        self.outer_seq_len_counter_reg = outer_seq_len_counter_reg
+        self.outer_seq_len_counter_stride = outer_seq_len_counter_stride
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
@@ -315,6 +319,9 @@ class SchedAttentionDecoding(Schedule):
                 need_rope=self.use_qwen_fused_qk,
                 seq_len_counter_reg=self.seq_len_counter_reg,
                 num_kv_block_counter_reg=self.num_kv_block_counter_reg,
+                kv_block_size=self.block_size,
+                outer_seq_len_counter_reg=self.outer_seq_len_counter_reg,
+                outer_seq_len_counter_stride=self.outer_seq_len_counter_stride,
             ),
         ]
         if self.use_qwen_fused_qk:
@@ -1093,6 +1100,7 @@ class SchedSmemSiLUInterleaved(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_token)
 
+
 class SchedRegSiLUFused(Schedule):
     def __init__(self,
                  num_token: int,
@@ -1124,6 +1132,7 @@ class SchedRegSiLUFused(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
 
 class SchedSmemSiLU_K_4096_N_1(Schedule):
     def __init__(self,
