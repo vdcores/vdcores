@@ -2,8 +2,11 @@ import pytest
 import torch
 
 from dae.instructions import (
+    ATTN_SPLIT_POST_REDUCE,
     ATTENTION_M64N64K16_F16_F32_64_64_hdim,
     ATTENTION_SM100_BF16_HDIM128_DIRECT,
+    ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT,
+    ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT,
     Gemv_M128N8Direct4,
     MemoryInstruction,
     RepeatM,
@@ -82,6 +85,42 @@ def test_direct_attention_preserves_dynamic_decode_fields():
     assert instruction.args[0] == 0x0101
     assert instruction.args[1] == 0x0184
     assert instruction.args[2] == 0x213C
+
+
+def test_swapped_attention_preserves_runtime_fields_and_requires_kv128():
+    instruction = ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT(
+        num_kv_block=1,
+        num_active_q=4,
+        last_kv_active_token_len=1,
+        seq_len_counter_reg=1,
+        num_kv_block_counter_reg=3,
+        outer_seq_len_counter_reg=2,
+        outer_seq_len_counter_stride=1,
+    )
+
+    assert instruction.opcode == opcode.OP_ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+    assert instruction.args == [0x0101, 0x0184, 0x213C]
+    with pytest.raises(AssertionError, match="requires KV128"):
+        ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT(1, 4, 1, kv_block_size=64)
+
+
+def test_swapped_split_attention_and_raw_reducer_flags():
+    instruction = ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT(
+        num_kv_block=2,
+        split_idx=3,
+        num_active_q=4,
+        last_kv_active_token_len=117,
+        kv_start_idx=768,
+    )
+    reducer = ATTN_SPLIT_POST_REDUCE(
+        4, raw_partial=True, direct_output=True
+    )
+
+    assert instruction.opcode == opcode.OP_ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
+    assert instruction.args == [0x3002, 0x7584, 768]
+    assert reducer.args == [4, 0x3]
+    with pytest.raises(AssertionError):
+        ATTN_SPLIT_POST_REDUCE(4, direct_output=True)
 
 
 def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():

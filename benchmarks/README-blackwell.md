@@ -7,14 +7,16 @@ the retained kernels stay below 1% mean-relative error.
 
 ## Decode attention
 
-The native SM100 path keeps QK and PV accumulators in TMEM. One warp drains the
-four live GQA score rows into a compact FP32 shared stage, all four compute
-warps perform row-parallel online softmax, and the same special-slot storage is
-overwritten with swizzled BF16 probabilities for shared/shared UMMA PV. The
-path supports one or multiple KV tiles, rescales the prior TMEM output online,
-and finishes with aligned BF16x4 TMEM-to-global stores. Split-KV publishes
-normalized partial output plus log2 LSE; its reducer overlaps warp-distributed
-LSE preprocessing with the TMA load of partial output.
+The native SM100 winner swaps the two UMMA operands following CUTLASS' low-
+latency TGV GQA formulation: QK is `K[128,128] * Q[8,128]` and PV is
+`V[128,128] * P[8,128]`. Q therefore occupies only an eight-row, 2 KiB TMA
+tile instead of a padded 64-row tile. A 32-DP TMEM load assigns one sequence or
+output row to each compute thread, so all four compute warps perform the four
+live GQA softmax rows and online output correction in parallel. Split-KV emits
+unnormalized partial output plus local `(max, sum)` metadata. The reducer reads
+the final-output pointer from the same barriered metadata record, applies the
+global softmax correction, and stores directly to the output without a second
+raw-address instruction or output TMA stage.
 
 The selector in `python/dae/attention_config.py` chooses from the measured
 KV64/KV128 and split-count variants. FlashInfer 0.6.15 is the best result among
@@ -24,16 +26,16 @@ why they can differ materially from the generic FlashInfer wrapper result.
 
 | Batch | Sequence | KV tile | Splits | SMs | VDCores (us) | FlashInfer 0.6.15 (us) | vLLM 0.23.0 (us) | SGLang 0.5.12 (us) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 64 | 64 | 1 | 8 | **3.424** | 4.397 | 4.510 | 5.681 |
-| 1 | 128 | 128 | 1 | 8 | **3.904** | 4.706 | 4.431 | 5.728 |
-| 1 | 512 | 64 | 8 | 64 | 6.112 | 6.856 | **5.360** | 5.773 |
-| 1 | 2048 | 128 | 16 | 128 | 7.040 | 8.187 | **5.782** | 6.833 |
-| 2 | 128 | 128 | 1 | 16 | **3.936** | 5.013 | 4.398 | 5.770 |
-| 2 | 512 | 64 | 8 | 128 | 6.208 | 7.470 | **5.360** | 5.978 |
-| 4 | 128 | 128 | 1 | 32 | **3.936** | 5.014 | 4.500 | 5.158 |
-| 4 | 512 | 128 | 4 | 128 | 6.688 | 8.085 | 5.365 | **5.155** |
-| 8 | 128 | 128 | 1 | 64 | **4.032** | - | 4.679 | 5.556 |
-| 8 | 512 | 128 | 2 | 128 | 8.960 | - | **5.579** | 5.656 |
+| 1 | 64 | 128 | 1 | 8 | **3.072** | 4.397 | 4.510 | 5.681 |
+| 1 | 128 | 128 | 1 | 8 | **3.264** | 4.706 | 4.431 | 5.728 |
+| 1 | 512 | 128 | 4 | 32 | **4.384** | 6.856 | 5.360 | 5.773 |
+| 1 | 2048 | 128 | 16 | 128 | **4.768** | 8.187 | 5.782 | 6.833 |
+| 2 | 128 | 128 | 1 | 16 | **3.264** | 5.013 | 4.398 | 5.770 |
+| 2 | 512 | 128 | 4 | 64 | **4.512** | 7.470 | 5.360 | 5.978 |
+| 4 | 128 | 128 | 1 | 32 | **3.264** | 5.014 | 4.500 | 5.158 |
+| 4 | 512 | 128 | 4 | 128 | **4.704** | 8.085 | 5.365 | 5.155 |
+| 8 | 128 | 128 | 1 | 64 | **3.360** | - | 4.679 | 5.556 |
+| 8 | 512 | 128 | 2 | 128 | 6.592 | - | **5.579** | 5.656 |
 
 Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 `app/python/attention_split_kv.py` for split-KV. The comparison harness is
@@ -41,10 +43,13 @@ Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 
 The retained code is the minimum winner from a broader search. A CUDA-core,
 non-UMMA SDPA prototype was correct but measured 4.832 us at B1/S32 and 7.488
-us at B1/S64, so it was removed. A fused cross-CTA atomic rendezvous measured
-6.208 us at B1/S512 versus 6.080-6.112 us for the retained TMA reducer, and a
-direct-global reducer epilogue did not improve the median; both were also
-removed. Long-context split reduction remains the attention bottleneck.
+us at B1/S64, so it was removed. A FA4-style second barrier that launched the
+next QK before the current softmax raised the task image from 96 to 128
+registers and regressed B8/S256 from 4.640 to 4.928 us. Dedicated reducer SMs,
+an atomic rendezvous, and normalized partial-output variants were also slower.
+The remaining long-context limitation is high-batch work per CTA: at S2048,
+B1/B2/B4/B8 measure 4.768/6.560/9.216/13.776 us as each task owns
+1/2/4/8 KV128 blocks.
 
 ## GEMV
 
@@ -88,7 +93,7 @@ The installed framework source selects the following exact paths:
 | --- | --- | --- | --- |
 | Token embedding | CC0 row selection feeds the first RMS task directly | Unquantized `F.embedding` | Unquantized `F.embedding` |
 | BF16 projections | Native M64/M128 UMMA, tiled weights, F32 TMEM accumulation | Unquantized `F.linear`; fused QKV and fused gate/up | Unquantized `F.linear`; fused QKV and fused gate/up |
-| Decode attention | KV64/KV128 QK in TMEM, four-warp shared-P softmax, SS-UMMA PV | FlashInfer 0.6.12 TRTLLM batch decode, page 16, actual maximum sequence | FlashInfer 0.6.11.post1 TRTLLM batch decode, page 64, model maximum sequence 131072 |
+| Decode attention | Swapped-A/B KV128 QK/PV in TMEM, Q8 TMA, four-warp softmax, raw split reduction | FlashInfer 0.6.12 TRTLLM batch decode, page 16, actual maximum sequence | FlashInfer 0.6.11.post1 TRTLLM batch decode, page 64, model maximum sequence 131072 |
 | RMSNorm | `SchedRMSShared` | `vllm._custom_ops.rms_norm` | `sgl_kernel.rmsnorm` |
 | SwiGLU | Shared-memory prefix plus register-forwarded tail | `torch.ops._C.silu_and_mul` | `sgl_kernel.silu_and_mul` |
 | RoPE | Q/K consume projection registers; K writes its cache row | `vllm._custom_ops.rotary_embedding` | SGLang JIT in-place RoPE |
@@ -139,10 +144,11 @@ persistent megakernel: Q/K/V are separately placed, K/V stores are fused,
 residual adds occur in TMA reductions, the 8,192-row MLP tail forwards through
 registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
-standalone probes trail. B8/S128 attention now leads vLLM by 14% and SGLang by
-27%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
-largest remaining isolated gap is long-context B8/S512 attention (61% behind
-vLLM); SGLang's standalone RMSNorm also remains faster than the VDCores stage.
+standalone probes trail. B8/S128 attention now leads vLLM by 28% and SGLang by
+40%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
+remaining attention gap is B8/S512, where VDCores is 18% behind vLLM after
+reducing the prior 61% deficit; SGLang's standalone RMSNorm also remains faster
+than the VDCores stage.
 
 Reproduce the exact framework probes with
 `benchmarks/blackwell_framework_tasks.py`, the isolated VDCores non-GEMV tasks

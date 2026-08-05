@@ -345,6 +345,55 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT) {
+  DAE_UNUSED(sm_id, thread_id, pc, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int encoded_active_q = inst.args[1] & 0xFF;
+  const int num_active_q = encoded_active_q & 0x7F;
+  const bool use_kv128 = encoded_active_q & 0x80;
+  int num_kv_blocks = inst.args[0] & 0xFF;
+  const int outer_seq_stride = (inst.args[0] >> 8) & 0xFF;
+  int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  if (inst.args[2] & 0x8) {
+    const int counter_reg = (inst.args[2] >> 4) & 0xF;
+    num_kv_blocks += count[counter_reg];
+  }
+  if (outer_seq_stride > 0) {
+    const int counter_reg = (inst.args[2] >> 12) & 0xF;
+    last_kv_active_token_len += count[counter_reg] * outer_seq_stride;
+    last_kv_active_token_len =
+        (last_kv_active_token_len - 1) % 128 + 1;
+  }
+  if (inst.args[2] & 0x4) {
+    const int counter_reg = (inst.args[2] >> 8) & 0xF;
+    last_kv_active_token_len += count[counter_reg];
+  }
+  if (use_kv128) {
+    task_attention_fwd_sm100_decode_swap<false, 16>(
+      num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  }
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int num_kv_blocks = inst.args[0] & 0xFFF;
+  const int split_idx = (inst.args[0] >> 12) & 0xF;
+  const int num_active_q = inst.args[1] & 0x7F;
+  const bool use_kv128 = inst.args[1] & 0x80;
+  const int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  if (use_kv128) {
+    task_attention_fwd_sm100_decode_swap<true, 16>(
+      num_kv_blocks, split_idx, num_active_q, last_kv_active_token_len,
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  }
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
@@ -374,7 +423,19 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  task_split_post_reduce<128, 4, 64, 16, 32>(inst.args[0], smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+  if (inst.args[1] & 0x2) {
+    task_split_post_reduce<128, 4, 64, 16, 32, true, true>(
+      inst.args[0], smem_base, (float *)scratch_space,
+      st_insts, m2c, c2m);
+  } else if (inst.args[1] & 0x1) {
+    task_split_post_reduce<128, 4, 64, 16, 32, true, false>(
+      inst.args[0], smem_base, (float *)scratch_space,
+      st_insts, m2c, c2m);
+  } else {
+    task_split_post_reduce<128, 4, 64, 16, 32, false, false>(
+      inst.args[0], smem_base, (float *)scratch_space,
+      st_insts, m2c, c2m);
+  }
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {

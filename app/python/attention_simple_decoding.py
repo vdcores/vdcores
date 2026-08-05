@@ -4,6 +4,7 @@ from math import sqrt
 from functools import partial
 from dae import runtime
 from dae.launcher import *
+from dae.instructions import ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
 from dae.util import *
 from qwen3.utils import *
 
@@ -17,6 +18,8 @@ ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native_direct").lower()
 KVTile = int(os.environ.get("ATTENTION_KV_TILE", "64"))
 if KVTile not in {64, 128}:
     raise ValueError("ATTENTION_KV_TILE must be 64 or 128")
+if ATTENTION_IMPL == "native_swap" and KVTile != 128:
+    raise ValueError("native_swap requires ATTENTION_KV_TILE=128")
 KV_SEQ_LEN = ((ACTIVE_KV_SEQ_LEN + KVTile - 1) // KVTile) * KVTile
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
@@ -144,12 +147,31 @@ def cord_load_gqa_q(mat: torch.Tensor, rank: int):
     return cfunc
 
 
+def tma_load_gqa_q8(mat: torch.Tensor, tileK: int, tileN: int):
+    assert mat.element_size() == 2, "Only support float16/bfloat16 Q"
+    assert tileK == HEAD_DIM and tileN == 8
+    assert 8 % HEAD_GROUP_SIZE == 0
+    q_tile_repeat = 8 // HEAD_GROUP_SIZE
+    glob_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, NUM_REQ * NUM_KV_HEAD]
+    glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    box_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat, glob_dims, glob_strides, box_dims, [1] * rank, 128, 0
+    )
+
+
 if ATTENTION_TOPOLOGY == "head":
     tQ = TmaTensor(dae, matQ_head_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
     tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
     tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 else:
-    tQ = TmaTensor(dae, matQ_gqa_view)._build("load", HEAD_DIM, 64, tma_load_gqa_q, cord_load_gqa_q)
+    if ATTENTION_IMPL == "native_swap":
+        tQ = TmaTensor(dae, matQ_gqa_view)._build(
+            "load", HEAD_DIM, 8, tma_load_gqa_q8, cord_load_gqa_q
+        )
+    else:
+        tQ = TmaTensor(dae, matQ_gqa_view)._build("load", HEAD_DIM, 64, tma_load_gqa_q, cord_load_gqa_q)
     tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
     tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 
@@ -157,17 +179,21 @@ need_norm = env_flag("ATTENTION_NEED_NORM", False)
 need_rope = env_flag("ATTENTION_NEED_ROPE", False)
 if need_norm != need_rope:
     raise ValueError("attention_simple_decoding.py mirrors the fused Qwen decode path, so norm and rope must be enabled together")
+if ATTENTION_IMPL == "native_swap" and (ATTENTION_TOPOLOGY != "gqa" or need_norm or need_rope):
+    raise ValueError("native_swap currently requires gqa topology with separate norm/rope")
 
 if ATTENTION_IMPL == "mma":
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA
 elif ATTENTION_IMPL == "native_direct":
     attention_inst = ATTENTION_SM100_BF16_HDIM128_DIRECT
+elif ATTENTION_IMPL == "native_swap":
+    attention_inst = ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
 elif ATTENTION_IMPL in ("native", "hopper", "gmma", ""):
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim
 else:
     raise ValueError(
         f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; "
-        "expected 'native_direct', 'native', or 'mma'"
+        "expected 'native_swap', 'native_direct', 'native', or 'mma'"
     )
 
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
@@ -231,7 +257,7 @@ def sm_task(sm: int):
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
         RawAddress(output, 24).writeback()
-        if ATTENTION_IMPL == "native_direct"
+        if ATTENTION_IMPL in {"native_direct", "native_swap"}
         else TmaStore1D(output, numSlots=2)
     ]
     return insts

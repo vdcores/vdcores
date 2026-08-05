@@ -4,6 +4,7 @@ from math import sqrt
 from functools import partial
 from dae import runtime
 from dae.launcher import *
+from dae.instructions import ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
 from dae.util import *
 from qwen3.utils import *
 
@@ -27,8 +28,10 @@ NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 16
 ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native_direct").strip().lower()
-if ATTENTION_IMPL not in {"native", "native_direct"}:
-    raise ValueError("ATTENTION_IMPL must be 'native' or 'native_direct'")
+if ATTENTION_IMPL not in {"native", "native_direct", "native_swap"}:
+    raise ValueError("ATTENTION_IMPL must be 'native', 'native_direct', or 'native_swap'")
+if ATTENTION_IMPL == "native_swap" and KVTile != 128:
+    raise ValueError("native_swap requires ATTENTION_KV_TILE=128")
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
@@ -47,7 +50,32 @@ matK = torch.rand(NUM_REQ, NUM_KV_HEAD, KV_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat
 matV = torch.rand(NUM_REQ, NUM_KV_HEAD, KV_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(split_kv, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, MAX_SPLIT, dtype=torch.float, device=gpu)
+if ATTENTION_IMPL == "native_swap":
+    metadata_record_words = 1 + (
+        HEAD_GROUP_SIZE * 2 * MAX_SPLIT * torch.float32.itemsize
+    ) // torch.int64.itemsize
+    metadata_records_host = torch.zeros(
+        NUM_KV_HEAD, NUM_REQ, metadata_record_words, dtype=torch.int64
+    )
+    output_heads = matO.view(
+        NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM
+    )
+    for head in range(NUM_KV_HEAD):
+        for req in range(NUM_REQ):
+            metadata_records_host[head, req, 0] = output_heads[
+                req, head
+            ].data_ptr()
+    matMetadataRecords = metadata_records_host.to(device=gpu)
+    matP = None
+else:
+    matMetadataRecords = None
+    matP = torch.zeros(
+        NUM_KV_HEAD,
+        NUM_REQ * HEAD_GROUP_SIZE,
+        MAX_SPLIT,
+        dtype=torch.float,
+        device=gpu,
+    )
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
@@ -92,6 +120,19 @@ def cord_load_o(mat: torch.Tensor, rank: int):
         return [0, 0, 0, cords[0] * NUM_KV_HEAD + cords[1]]
     return cfunc
 
+
+def tma_load_gqa_q8(mat: torch.Tensor, tileK: int, tileN: int):
+    assert mat.element_size() == 2, "Only support float16/bfloat16 Q"
+    assert tileK == HEAD_DIM and tileN == 8
+    q_tile_repeat = 8 // HEAD_GROUP_SIZE
+    glob_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, NUM_REQ * NUM_KV_HEAD]
+    glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    box_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat, glob_dims, glob_strides, box_dims, [1] * rank, 128, 0
+    )
+
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
     assert tileS == split_kv
     assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
@@ -119,7 +160,15 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
         return [0, 0, cords[0], cords[1]]
     return cfunc
 
-tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
+tQ = (
+    TmaTensor(dae, matQ_attn_view)._build(
+        "load", HEAD_DIM, 8, tma_load_gqa_q8, cord_load_o
+    )
+    if ATTENTION_IMPL == "native_swap"
+    else TmaTensor(dae, matQ_attn_view)._build(
+        "load", HEAD_DIM, 64, tma_load_o, cord_load_o
+    )
+)
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
@@ -133,6 +182,16 @@ assert NUM_KV_BLOCK % split_kv == 0, (
 
 attn_bar = dae.new_bar(num_sms)
 
+def metadata_address(head: int, req: int, slot: int, *, reducer: bool):
+    if ATTENTION_IMPL == "native_swap":
+        inst = RawAddress(matMetadataRecords[head, req], slot)
+        if not reducer:
+            inst.delta(torch.int64.itemsize)
+        elif reducer:
+            inst.writeback()
+        return inst
+    return RawAddress(matP[head, req * HEAD_GROUP_SIZE], slot)
+
 def sm_task(sm: int):
     if sm >= num_sms:
         return []
@@ -145,19 +204,21 @@ def sm_task(sm: int):
     kv_start_idx = kv_start_block * KVTile
     split_last_active_kv_len = last_active_kv_len if split_stage == split_kv - 1 else KVTile
     attention_inst = (
-        ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT
+        ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
+        if ATTENTION_IMPL == "native_swap"
+        else ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT
         if ATTENTION_IMPL == "native_direct"
         else ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
     )
     split_output = (
         RawAddress(matO_split_attn_view[split_stage, req, head, ...], 24)
         .writeback()
-        if ATTENTION_IMPL == "native_direct"
+        if ATTENTION_IMPL in {"native_direct", "native_swap"}
         else TmaStore1D(
             matO_split_attn_view[split_stage, req, head, ...], numSlots=2
         )
     )
-    lse_slot = 25 if ATTENTION_IMPL == "native_direct" else 24
+    lse_slot = 25 if ATTENTION_IMPL in {"native_direct", "native_swap"} else 24
     insts = [
         attention_inst(
             num_block_per_split, split_stage, HEAD_GROUP_SIZE,
@@ -171,7 +232,7 @@ def sm_task(sm: int):
             [tV.cord(req, head, kv_start_idx, 0), tV.cord2tma(0, 0, KVTile, 0)],
         ),
         split_output,
-        RawAddress(matP[head, req * HEAD_GROUP_SIZE], lse_slot)
+        metadata_address(head, req, lse_slot, reducer=False)
         .bar(attn_bar).writeback(),
     ]
 
@@ -180,13 +241,21 @@ def sm_task(sm: int):
     reduce_head = sm % NUM_KV_HEAD
     reduce_req = sm // NUM_KV_HEAD
     insts += [
-        ATTN_SPLIT_POST_REDUCE(split_kv),
-        RawAddress(
-            matP[reduce_head, reduce_req * HEAD_GROUP_SIZE],
-            26 if ATTENTION_IMPL == "native_direct" else 25,
+        ATTN_SPLIT_POST_REDUCE(
+            split_kv,
+            raw_partial=ATTENTION_IMPL == "native_swap",
+            direct_output=ATTENTION_IMPL == "native_swap",
+        ),
+        metadata_address(
+            reduce_head,
+            reduce_req,
+            26 if ATTENTION_IMPL in {"native_direct", "native_swap"} else 25,
+            reducer=True,
         ).bar(attn_bar),
         tO_split.cord(reduce_head, reduce_req),
-        TmaStore1D(matO_attn_view[reduce_req, reduce_head, ...]),
+        []
+        if ATTENTION_IMPL == "native_swap"
+        else TmaStore1D(matO_attn_view[reduce_req, reduce_head, ...]),
     ]
     return insts
 

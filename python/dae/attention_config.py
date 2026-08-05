@@ -22,42 +22,41 @@ def select_blackwell_attention_config(
     device_sms: int = 152,
     max_split: int = 16,
 ) -> BlackwellAttentionConfig:
-    """Select the measured SM100 GQA decode tile and split count.
+    """Select the measured swapped-A/B SM100 GQA decode configuration.
 
-    Short contexts avoid the split-reduction fixed cost.  For longer contexts,
-    KV64 is retained only when its smaller tile exposes more parallel CTAs;
-    when occupancy ties, KV128 wins by halving QK issues and online-softmax
-    rescale stages.
+    KV128 wins across the measured short- and long-context regimes.  One-block
+    contexts avoid the split-reduction fixed cost.  Longer contexts use the
+    largest equal-sized split that fits the SM budget; requiring a divisor of
+    the padded block count prevents a split from dropping a KV block.
     """
-    if batch_size <= 0 or seq_len <= 0 or num_kv_heads <= 0:
-        raise ValueError("batch_size, seq_len, and num_kv_heads must be positive")
+    if batch_size <= 0 or seq_len <= 0 or num_kv_heads <= 0 or device_sms <= 0:
+        raise ValueError(
+            "batch_size, seq_len, num_kv_heads, and device_sms must be positive"
+        )
+    if not 1 <= max_split <= 16:
+        raise ValueError("max_split must be in [1, 16]")
     base_ctas = batch_size * num_kv_heads
     if base_ctas > device_sms:
         raise ValueError(
             f"one GQA CTA per request/KV head needs {base_ctas} SMs, but only {device_sms} are available"
         )
 
-    if seq_len <= 64:
-        return BlackwellAttentionConfig(kv_tile=64, split_kv=1, num_sms=base_ctas)
-    if seq_len <= 128:
+    kv_tile = 128
+    blocks = (seq_len + kv_tile - 1) // kv_tile
+    if blocks == 1:
         return BlackwellAttentionConfig(kv_tile=128, split_kv=1, num_sms=base_ctas)
 
     split_budget = max(1, min(max_split, device_sms // base_ctas))
-
-    def candidate(kv_tile: int) -> BlackwellAttentionConfig:
-        blocks = (seq_len + kv_tile - 1) // kv_tile
-        split = min(blocks, split_budget)
-        return BlackwellAttentionConfig(
-            kv_tile=kv_tile,
-            split_kv=split,
-            num_sms=base_ctas * split,
-        )
-
-    kv64 = candidate(64)
-    kv128 = candidate(128)
-    if kv64.num_sms > kv128.num_sms:
-        return kv64
-    return kv128
+    split = max(
+        candidate
+        for candidate in range(1, min(blocks, split_budget) + 1)
+        if blocks % candidate == 0
+    )
+    return BlackwellAttentionConfig(
+        kv_tile=kv_tile,
+        split_kv=split,
+        num_sms=base_ctas * split,
+    )
 
 
 __all__ = ["BlackwellAttentionConfig", "select_blackwell_attention_config"]

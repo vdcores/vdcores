@@ -351,6 +351,24 @@ class ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT(ComputeInstruction):
         )
 
 
+class ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT(
+    ATTENTION_SM100_BF16_HDIM128_DIRECT
+):
+    def __init__(self, *args, kv_block_size: int = 128, **kwargs):
+        assert kv_block_size == 128, "swapped SM100 attention requires KV128"
+        super().__init__(*args, kv_block_size=kv_block_size, **kwargs)
+        self.opcode = opcode.OP_ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+
+
+class ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT(
+    ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT
+):
+    def __init__(self, *args, kv_block_size: int = 128, **kwargs):
+        assert kv_block_size == 128, "swapped SM100 attention requires KV128"
+        super().__init__(*args, kv_block_size=kv_block_size, **kwargs)
+        self.opcode = opcode.OP_ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
+
+
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
@@ -410,8 +428,17 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA(ComputeInstruction):
 class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
     HEAD_DIM = 128
     Q_TILE = 4
-    def __init__(self, num_split: int):
-        super().__init__(opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE, args=[num_split])
+    def __init__(
+        self,
+        num_split: int,
+        raw_partial: bool = False,
+        direct_output: bool = False,
+    ):
+        assert not direct_output or raw_partial
+        super().__init__(
+            opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE,
+            args=[num_split, int(raw_partial) | (int(direct_output) << 1)],
+        )
 
 
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
@@ -1172,6 +1199,8 @@ __all__ = [
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA",
     "ATTENTION_SM100_BF16_HDIM128_DIRECT",
     "ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT",
+    "ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT",
+    "ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
