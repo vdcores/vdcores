@@ -220,6 +220,13 @@ These standalone RMS medians use the selective RMS+terminate image, matching
 the per-kernel scope of the framework probes. The 128-register production
 megakernel is qualified separately by the end-to-end result below.
 
+The embedding stage also keeps its separate residual-copy operator. RMSNorm
+on eight SMs and the 8 KiB copy on eight other SMs overlap at batch eight. A
+dual-output RMS prototype reused the cached input but measured 2.688 us versus
+2.464 us for the existing pair in a 500-iteration same-process A/B. Since both
+outputs were correct and fusion regressed the stage by 9.1%, the prototype was
+removed.
+
 Rejected variants include 32-thread rows, separate row-local barriers,
 per-thread final scalar work, input reload from shared memory, direct-global
 output, port-1 input TMA, early global-weight prefetch, four square-sum

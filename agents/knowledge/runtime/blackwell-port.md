@@ -135,6 +135,14 @@ uses 68 registers, 9 barriers, and no spills; repeated B1/B2/B4/B8 medians are
 Hugging Face reference, and job `20260805T145137Z-1748528` measures 377.306 ms
 for 128 steps, or 2.948 ms TBT and 339.25 token-steps/s.
 
+The embedding RMS stage deliberately remains two operators. RMSNorm on SMs
+0-7 overlaps an 8 KiB residual copy on SMs 64-71. A dual-output RMS prototype
+reused its cached BF16 input and removed the duplicate load, but serialized a
+second shared-memory write and writeback. In a same-process alternating B8
+test, the overlapped pair measured 2.464 us versus 2.688 us for dual output;
+both outputs were correct. The 9.1% regression means the prototype should not
+be restored unless the writeback pipeline changes materially.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
