@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Measure launch-inclusive framework decode at a fixed KV context length.
 
-Each request has ``context - 1`` prompt tokens and produces exactly two output
-tokens.  The interval between the framework's first- and second-token engine
-timestamps is therefore one decode step whose attention sees ``context`` KV
-tokens.  Prefill and the first-token latency are not part of the reported
-interval.
+Each invocation configures one engine for one context length.  Every request
+has ``context - 1`` prompt tokens and produces exactly two output tokens.  The
+interval between the framework's first- and second-token engine timestamps is
+therefore one decode step whose attention sees ``context`` KV tokens.  Prefill
+and the first-token latency are not part of the reported interval.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 
 
@@ -53,11 +54,30 @@ def run_vllm(args: argparse.Namespace) -> None:
     import vllm
     from vllm import LLM, SamplingParams
 
+    profiler_config = None
+    if args.profile_context is not None:
+        profiler_config = {"profiler": args.profile_kind}
+        if args.profile_kind == "torch":
+            profiler_config.update(
+                torch_profiler_dir=args.profile_dir,
+                torch_profiler_with_stack=False,
+                torch_profiler_use_gzip=False,
+            )
+
+    context = args.contexts[0]
+    engine_max_model_len = context + 1
+    print(
+        "FIXED_CONTEXT_CONFIG "
+        f"framework=vllm batch={args.batch} context={context} "
+        f"engine_max_model_len={engine_max_model_len} dtype=bfloat16 "
+        "strict_batch=1",
+        flush=True,
+    )
     engine = LLM(
         model=args.model,
         tokenizer=args.model,
         dtype="bfloat16",
-        max_model_len=max(args.contexts) + 1,
+        max_model_len=engine_max_model_len,
         max_num_seqs=args.batch,
         enable_prefix_caching=False,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -65,6 +85,7 @@ def run_vllm(args: argparse.Namespace) -> None:
         skip_tokenizer_init=True,
         trust_remote_code=False,
         disable_log_stats=False,
+        profiler_config=profiler_config,
     )
     sampling = SamplingParams(
         temperature=0.0,
@@ -72,6 +93,24 @@ def run_vllm(args: argparse.Namespace) -> None:
         max_tokens=2,
         detokenize=False,
     )
+
+    def enqueue_full_batch(prompts):
+        # With vLLM's default async scheduling, LLM.generate() can start the
+        # engine while it is still enqueueing a Python list of requests.  Pause
+        # scheduling at level 0 so every measured decode step is truly the
+        # requested batch size, while keeping async scheduling enabled for the
+        # execution itself.
+        engine.sleep(level=0, mode="wait")
+        try:
+            engine.enqueue(prompts, sampling, use_tqdm=False)
+        except BaseException:
+            engine.wake_up(tags=["scheduling"])
+            raise
+
+    def generate_full_batch(prompts):
+        enqueue_full_batch(prompts)
+        engine.wake_up(tags=["scheduling"])
+        return engine.wait_for_completion(use_tqdm=False)
 
     for context in args.contexts:
         # The second generated token consumes the first generated token at
@@ -81,11 +120,11 @@ def run_vllm(args: argparse.Namespace) -> None:
             for _ in range(args.batch)
         ]
         for _ in range(args.warmups):
-            engine.generate(prompts, sampling, use_tqdm=False)
+            generate_full_batch(prompts)
 
         samples_ms = []
         for _ in range(args.samples):
-            outputs = engine.generate(prompts, sampling, use_tqdm=False)
+            outputs = generate_full_batch(prompts)
             request_ms = []
             for output in outputs:
                 metrics = output.metrics
@@ -106,16 +145,48 @@ def run_vllm(args: argparse.Namespace) -> None:
 
         emit_result("vllm", vllm.__version__, context, args.batch, samples_ms)
 
+        if context == args.profile_context:
+            # Async scheduling can dispatch the next GPU graph before the
+            # frontend receives the prior step's output, so starting a profiler
+            # between calls to llm_engine.step() is too late.  Bracket request
+            # submission instead; the resulting trace has one prefill range and
+            # one decode range, whose second-token attention length is exactly
+            # ``context``.
+            enqueue_full_batch(prompts)
+            try:
+                engine.start_profile(f"fixed_context_{context}")
+                engine.wake_up(tags=["scheduling"])
+                engine.wait_for_completion(use_tqdm=False)
+                engine.stop_profile()
+            except BaseException:
+                engine.wake_up(tags=["scheduling"])
+                raise
+            print(
+                "FIXED_CONTEXT_PROFILE "
+                f"framework=vllm context={context} kind={args.profile_kind} "
+                f"scope=prefill_plus_one_decode directory={args.profile_dir or '-'}",
+                flush=True,
+            )
+
 
 def run_sglang(args: argparse.Namespace) -> None:
     import sglang
 
+    context = args.contexts[0]
+    engine_context_length = context + 16
+    print(
+        "FIXED_CONTEXT_CONFIG "
+        f"framework=sglang batch={args.batch} context={context} "
+        f"engine_context_length={engine_context_length} dtype=bfloat16 "
+        "strict_batch=1",
+        flush=True,
+    )
     engine = sglang.Engine(
         model_path=args.model,
         dtype="bfloat16",
         # SGLang keeps a small output/scheduler guard below context_length.
         # This capacity margin does not change the per-request KV length.
-        context_length=max(args.contexts) + 16,
+        context_length=engine_context_length,
         max_running_requests=args.batch,
         mem_fraction_static=args.gpu_memory_utilization,
         disable_radix_cache=True,
@@ -192,17 +263,52 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--framework", choices=("vllm", "sglang"), required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--contexts", type=parse_ints, default=parse_ints("64,128,512"))
+    parser.add_argument("--contexts", type=parse_ints, default=parse_ints("128"))
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--token-id", type=int, default=DEFAULT_TOKEN_ID)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--profile-context",
+        type=int,
+        help="vLLM context to capture as a one-step torch-profiler trace",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        help="absolute worker-local output directory for --profile-context",
+    )
+    parser.add_argument(
+        "--profile-kind",
+        choices=("torch", "cuda"),
+        default="torch",
+        help="profiler used for the selected vLLM decode step",
+    )
     args = parser.parse_args()
 
     if args.batch <= 0 or args.warmups < 0 or args.samples <= 0:
         parser.error("batch and samples must be positive; warmups must be non-negative")
+    if len(args.contexts) != 1:
+        parser.error(
+            "fixed-context results require exactly one --contexts value per process "
+            "so engine capacity is identical to the measured row"
+        )
+    if args.profile_context is not None:
+        if args.framework != "vllm":
+            parser.error("--profile-context currently supports only vLLM")
+        if args.profile_context not in args.contexts:
+            parser.error("--profile-context must be present in --contexts")
+        if args.profile_kind == "torch" and (
+            not args.profile_dir or not os.path.isabs(args.profile_dir)
+        ):
+            parser.error(
+                "--profile-dir must be an absolute worker-local path for torch profiling"
+            )
+        if args.profile_kind == "cuda" and args.profile_dir:
+            parser.error("--profile-dir is not used with --profile-kind cuda")
+    elif args.profile_dir:
+        parser.error("--profile-dir requires --profile-context")
 
     if args.framework == "vllm":
         run_vllm(args)

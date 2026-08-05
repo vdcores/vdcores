@@ -290,15 +290,19 @@ The fixed-context comparison uses the same local Llama-3.1-8B-Instruct BF16
 checkpoint, batch 8, and `10.0.16.24:2`. For a requested context `C`, each
 framework receives `C - 1` prompt tokens and produces exactly two tokens. The
 interval from the first to the second output is therefore one decode step
-whose attention sees exactly `C` KV tokens; prefill is excluded. Each framework
-result is the median of 30 samples after five warmups, taking the maximum
-request interval in the eight-request batch. There is no HTTP transport.
+whose attention sees exactly `C` KV tokens; prefill is excluded. Each row uses
+a separate framework process and an engine configured only for that context
+(`max_model_len=C+1` in vLLM and `context_length=C+16` in SGLang). This avoids
+silently giving the S64/S128 rows the scheduler and graph capacity of the S512
+engine. Each framework result is the median of 30 samples after five warmups,
+taking the maximum request interval in the strict eight-request batch. There
+is no HTTP transport.
 
 | Fixed context | VDCores internal (ms) | vLLM 0.23.0 launch-inclusive (ms) | SGLang 0.5.12.post1 launch-inclusive (ms) | Fastest | VDCores vs vLLM | VDCores vs SGLang |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| 64 | 2.914 | **2.760** | 3.340 | vLLM | 5.6% slower | 12.8% faster |
-| 128 | 2.907 | **2.769** | 3.356 | vLLM | 5.0% slower | 13.4% faster |
-| 512 | **2.945** | 3.513 | 3.645 | VDCores | 16.2% faster | 19.2% faster |
+| 64 | 2.914 | **2.842** | 3.381 | vLLM | 2.5% slower | 13.8% faster |
+| 128 | 2.907 | **2.816** | 3.312 | vLLM | 3.2% slower | 12.2% faster |
+| 512 | **2.945** | 3.499 | 3.683 | VDCores | 15.8% faster | 20.0% faster |
 
 vLLM uses its engine-core first/last-token timestamps and automatically selects
 the FlashInfer HND backend. SGLang uses its streaming engine metric with the
@@ -310,9 +314,58 @@ resident-megakernel internal span.
 
 Internal-timer jobs are `20260805T190254Z-3476561` (S64),
 `20260805T181024Z-3106086` (S128), and
-`20260805T181102Z-3110497` (S512). Fixed-context framework jobs are
-`20260805T184040Z-3312558` (vLLM) and
-`20260805T190110Z-3464127` (SGLang).
+`20260805T181102Z-3110497` (S512). Strict vLLM jobs are
+`20260805T205321Z-66365` (S64), `20260805T205112Z-50840` (S128), and
+`20260805T205544Z-83058` (S512). Strict SGLang jobs are
+`20260805T213318Z-356270` (S64), `20260805T213450Z-368285` (S128), and
+`20260805T213620Z-380084` (S512).
+
+### S128 kernel versus schedule audit
+
+The S128 short-context deficit was split into identical-shape projection
+probes, VDCores stage-frontier timestamps, and a vLLM CUDA-graph trace. The
+framework task probes use CUDA events around repeated graph replays; VDCores
+uses the resident kernel's cross-SM `globaltimer`. These are device-side task
+scopes and deliberately exclude the launch-inclusive system comparison above.
+
+| BF16 B8 projection, shape M x N x K | Production M64 VDCores (us) | M128 VDCores (us) | Group-4 M128 diagnostic (us) | vLLM (us) | SGLang (us) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Output, 4096 x 8 x 4096 | 7.456 | 6.688 | 6.112 | **5.949** | **5.949** |
+| Down, 4096 x 8 x 14336 | 21.760 | 20.480 | 20.864 | 19.367 | **18.405** |
+
+The group-4 path is diagnostic only: its fold-16 BF16 reduction ordering does
+not satisfy the qualified 32-layer schedule. The production M64 task is 12.4%
+slower than vLLM and 18.2% slower than SGLang for the exact down shape. M128
+recovers 1.28 us, but is still 5.7%/11.3% behind.
+
+Temporary compute-stream markers then split the production S128 critical path:
+
+| VDCores stage | Median (us) | Matching vLLM task sum (us) | Matching SGLang task sum (us) |
+| --- | ---: | ---: | ---: |
+| QKV + RoPE + KV append | 11.500 | 11.646 | **8.837** |
+| Decode attention | **4.000** | 4.527 | 5.533 |
+| Output projection + post-attention RMS | 9.500 | 8.384 | **8.204** |
+| Gate/up + SwiGLU | **36.750** | 41.937 | 42.382 |
+| Down projection + reduction completion + next RMS | 23.000 | 21.803 | **20.660** |
+| Q-buffer clear | 0.250 | - | - |
+
+Within the final row, the VDCores split is 21.000 us for down compute and
+2.000 us for reduction completion plus the next RMS. The reduction is already
+hidden behind the persistent memory/compute pipeline, and Q clear is already
+placed on auxiliary SMs. The two projection/RMS stages trail the matching
+vLLM sums by about 2.31 us/layer, or 74 us across 32 layers. That is the main
+actionable kernel-level deficit; moving clear or adding another RMS fusion is
+not.
+
+The vLLM Nsight trace independently verifies a schedule-level contribution.
+Its strict-B8 decode consists of 385 CUDA-graph nodes followed by 11 sampler
+nodes. Under tracing, their summed kernel duration is 3437.791 us while the
+critical-path span is 3332.255 us, exposing 105.536 us (3.07%) of graph-node
+concurrency. Nsight instrumentation inflates absolute durations, so that value
+is topology evidence rather than an untraced latency estimate. It nevertheless
+shows why standalone task sums cannot predict the 91 us launch-inclusive S128
+lead. The practical conclusion is: projection kernels are the VDCores-side
+bottleneck, while vLLM also benefits from graph-level overlap.
 
 Reproduce the retained path with:
 
@@ -324,15 +377,17 @@ python app/python/llama3/sched.py \
   --prompt '<fixed-length prompt>' \
   -N 1 --no-control-flow --bench 100
 
-# Run once from each framework's qualified environment.
+# Run each context in a separate process from each framework's qualified
+# environment. The benchmark rejects comma-separated multi-context runs so
+# engine capacity cannot leak across rows.
 python benchmarks/blackwell_fixed_context_decode.py \
   --framework vllm \
   --model /path/to/Meta-Llama-3.1-8B-Instruct \
-  --contexts 64,128,512 --batch 8 --warmups 5 --samples 30
+  --contexts 128 --batch 8 --warmups 5 --samples 30
 python benchmarks/blackwell_fixed_context_decode.py \
   --framework sglang \
   --model /path/to/Meta-Llama-3.1-8B-Instruct \
-  --contexts 64,128,512 --batch 8 --warmups 5 --samples 30
+  --contexts 128 --batch 8 --warmups 5 --samples 30
 ```
 
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens

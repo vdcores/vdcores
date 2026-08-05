@@ -137,15 +137,28 @@ for 128 steps, or 2.948 ms TBT and 339.25 token-steps/s.
 
 For the streaming deployment comparison, charge VDCores only for its internal
 cross-SM megakernel span and retain launch/scheduler overhead for vLLM/SGLang,
-which dispatch each decode step. A direct fixed-context B8 sweep measures
-VDCores/vLLM/SGLang medians of 2.914/2.760/3.340 ms at S64,
-2.907/2.769/3.356 ms at S128, and 2.945/3.513/3.645 ms at S512. The frameworks
+which dispatch each decode step. Configure one framework engine per context;
+sharing an S512-capacity engine changes the S64/S128 result. The strict B8
+VDCores/vLLM/SGLang medians are 2.914/2.842/3.381 ms at S64,
+2.907/2.816/3.312 ms at S128, and 2.945/3.499/3.683 ms at S512. The frameworks
 use `C - 1` input tokens and the first-to-second output interval, so the timed
 decode sees exactly `C` KV tokens without prefill. VDCores trails vLLM by
-5.6%/5.0% at S64/S128, then leads it by 16.2% at S512; it leads SGLang by
-12.8-19.2% throughout. Keep the timing-scope difference explicit rather than
-relabeling framework token intervals as kernel-internal counters. Reproduce
-the framework sweep with `benchmarks/blackwell_fixed_context_decode.py`.
+2.5%/3.2% at S64/S128, then leads it by 15.8% at S512; it leads SGLang by
+12.2-20.0% throughout. Keep the timing-scope difference explicit rather than
+relabeling framework token intervals as kernel-internal counters. The benchmark
+rejects multi-context invocations so engine capacity cannot leak across rows.
+
+The S128 bottleneck audit separates kernel and schedule effects. Production
+M64 output/down GEMVs measure 7.456/21.760 us for exact BF16 B8 shapes, versus
+5.949/19.367 us in vLLM and 5.949/18.405 us in SGLang. M128 improves them to
+6.688/20.480 us but does not close the gap. In the full VDCores layer, down
+compute is 21.000 us, reduction completion plus the next RMS is 2.000 us, and
+Q clear is 0.250 us. Thus reduction/RMS pipelining is already effective and
+clear is already negligible on auxiliary SMs; projection execution is the
+actionable task bottleneck. A strict vLLM Nsight trace contains 385 graph nodes
+plus 11 sampler nodes, with 3437.791 us summed kernel work in a 3332.255 us
+span. Treat the 105.536 us overlap as graph-topology evidence, not an absolute
+untraced timing, because Nsight inflates kernel durations.
 
 The embedding RMS stage deliberately remains two operators. RMSNorm on SMs
 0-7 overlaps an 8 KiB residual copy on SMs 64-71. A dual-output RMS prototype
