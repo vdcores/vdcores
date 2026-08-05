@@ -278,26 +278,44 @@ auxiliary-SM overlap is intentionally limited to one half-tile per SM.
 | Swapped Q8 attention + 128-register image | 377.53 | 2.949 | no |
 | One-row-per-SM 128-thread RMSNorm | **377.31** | **2.948** | yes |
 
-The framework comparison and current VDCores result used the matching 152-SM
-GB200 on `10.0.16.25:0`. Both used the local
-Llama-3.1-8B-Instruct BF16 checkpoint, batch 8, input length 1, output length
-128, and each framework's default CUDA-graph path. VDCores reports the median
-wall time around all 128 one-token launches. vLLM's CLI reports total request
-latency, so both its raw total/output value and a stricter cross-run decode
-estimate are shown. The latter subtracts the separately measured one-output
-p50 (6.496 ms) and divides the remainder by 127; it is an estimate, not a
-direct phase timer.
+The system comparison intentionally follows each deployment model instead of
+forcing the same launch stopwatch on both. VDCores reports the internal
+cross-SM `globaltimer` span, from the first participating SM entering the
+resident megakernel schedule to the last participating SM reaching
+`TerminateC`. A new streamed batch does not pay another host launch on this
+critical path. vLLM and SGLang retain their launch-inclusive CUDA-graph decode
+times because they dispatch work for each decode step.
 
-| System | Version / measure | Median TBT (ms) | VDCores reduction |
-| --- | --- | ---: | ---: |
-| VDCores | 377.306 ms / 128 steps | **2.948** | - |
-| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 12.2% |
-| vLLM | cross-run decode estimate | 3.335 | 11.6% |
-| SGLang | 0.5.12.post1, reported decode median | 3.820 | 22.8% |
+The fresh VDCores rows are 100-run medians on `10.0.16.24:2`, using the local
+Llama-3.1-8B-Instruct BF16 checkpoint and batch 8. The framework rows are the
+qualified results from the matching 152-SM GB200 on `10.0.16.25:0`, with input
+length 1 and output length 128. vLLM's stricter estimate subtracts the
+separately measured one-output p50 (6.496 ms) and divides the remainder by
+127; it remains an estimate rather than a direct phase timer.
+
+| System | Timing scope | Context | Median TBT (ms) | VDCores S128 reduction |
+| --- | --- | ---: | ---: | ---: |
+| VDCores | internal megakernel timer | 1 | **2.915** | - |
+| VDCores | internal megakernel timer | 128 | **2.907** | - |
+| VDCores | internal megakernel timer | 512 | **2.945** | - |
+| vLLM 0.23.0 | launch-inclusive, 429.979 ms / 128 outputs | 1-128 | 3.359 | 13.5% |
+| vLLM 0.23.0 | launch-inclusive cross-run estimate | 1-128 | 3.335 | 12.8% |
+| SGLang 0.5.12.post1 | launch-inclusive reported decode median | 1-128 | 3.820 | 23.9% |
+
+Internal-timer jobs are `20260805T180824Z-3091687` (S1),
+`20260805T181024Z-3106086` (S128), and
+`20260805T181102Z-3110497` (S512). The S128 row is the primary comparison;
+the other two show context sensitivity without adding launch overhead.
 
 Reproduce the retained path with:
 
 ```bash
+# Internal resident-megakernel span at context length 1.
+python app/python/llama3/sched.py \
+  --model /path/to/Meta-Llama-3.1-8B-Instruct \
+  -N 1 --no-control-flow --bench 100
+
+# Launch-inclusive 128-step control-flow qualification.
 python app/python/llama3/sched.py \
   --model /path/to/Meta-Llama-3.1-8B-Instruct \
   -N 128 --control-flow --bench 9
