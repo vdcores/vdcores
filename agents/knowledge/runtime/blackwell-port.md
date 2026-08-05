@@ -105,6 +105,16 @@ Use `benchmarks/blackwell_framework_tasks.py` and
 - Two-output reduction (5.792/19.968 us), four separate output stores
   (6.896/18.656 us), 112-SM fold-14 (19.840 us), and 64-SM fold-8 (28.672 us)
   were explored and removed or superseded.
+- Keep the grouped down GEMV as a standalone task, not in the production Llama
+  schedule. Two fold-16 BF16 reduction epochs accumulated 47.5% hidden-state
+  drift over 32 layers. A single B7 task avoided the second reduction but its
+  29-load window deadlocked after the existing MLP pipeline. A phased B3/B4
+  TMEM accumulator removed that window; group-4 still drifted 14.3%, while
+  group-2 reduced drift to 3.32% but measured 21.888 us and changed a
+  control-flow argmax. All phased variants were removed.
+- After restoring the overlapped M64 down schedule, four-token greedy output
+  again matches Hugging Face exactly. Cooperative job
+  `20260805T094633Z-354598` measured 382.217 ms / 128 steps, or 2.986 ms TBT.
 
 The elementwise task search rejected direct global-memory SwiGLU/RMS paths,
 port-1 weight or activation loads, and a two-SM RMS reduction because their

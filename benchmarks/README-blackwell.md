@@ -109,6 +109,13 @@ split, fused, or overlapped and therefore has no equivalent standalone launch.
 | Down, 4096 x 8 x 14336 | **18.704** | 19.264 | 18.893 | VDCores leads by 1.0-2.9% |
 | Padded LM head, 131072 x 8 x 4096 | **147.840** | 149.703 | 149.781 | VDCores leads by 1.2-1.3% |
 
+The grouped down row is an isolated task result. Production keeps the existing
+split/overlapped M64 schedule: integrating the fold-16 grouped result caused
+32-layer BF16 reduction drift, while a lower-drift fold-8 phased variant was
+slower at 21.888 us and changed a control-flow argmax. The retained schedule
+still passes four-token greedy correctness and measures 2.986 ms TBT over 128
+steps (job `20260805T094633Z-354598`).
+
 The production LM head is two 65,536-row epochs. Each of 128 SMs owns four
 disjoint M128 tiles and reuses every B tile across them, avoiding fold
 reduction, logits clearing, shared-memory output staging, and output TMA. The
