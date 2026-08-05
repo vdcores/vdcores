@@ -74,6 +74,15 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8_MMA) {
   task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8_ROPE_128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_rope<64, 8, 256, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m, st_insts, inst.args[2]);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_DIRECT4) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)

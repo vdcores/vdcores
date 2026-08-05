@@ -135,6 +135,39 @@ uses 68 registers, 9 barriers, and no spills; repeated B1/B2/B4/B8 medians are
 Hugging Face reference, and job `20260805T145137Z-1748528` measures 377.306 ms
 for 128 steps, or 2.948 ms TBT and 339.25 token-steps/s.
 
+## Projection-to-RoPE Handoff
+
+- `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
+  global-memory round trip. GEMV publishes its swizzled M64N8 epilogue slot,
+  RoPE consumes that exact slot, and only RoPE requests the final TMA
+  reduction/store.
+- A fused SM100 M64N8 alternative rotates the GEMV epilogue after TMEM drains
+  to shared memory and before the final TMA. Its raw table address uses special
+  slot 32; `SchedGemvRope` applies the fixed-position byte offset to that raw
+  address and the compute instruction selects the M64 half of the 128-element
+  rotary row.
+- At batch eight, the production Q fold-2 and K fold-4 shapes total 12.544 us
+  with the two-operator handoff and 12.352 us fused. The 1.5% fusion gain is
+  not large enough to displace the simpler, already-qualified two-operator
+  schedule, so both tasks remain available and the two-operator path stays the
+  default.
+- The two-operator total is below component-matched vLLM/SGLang sums
+  (14.095/12.738 us). These sums use separate Q/K projection probes plus the
+  joint Q+K RoPE probe and must not be confused with the frameworks' fused-QKV
+  scope.
+- Keep the output tensor-map coordinates in `(N, M)` order. For M64 workers,
+  `storeC.cord(0, m)` is correct; `storeC.cord(m, 0)` silently leaves every
+  nonzero M tile unwritten.
+- Computing the position-dependent table offset inside the fused task lowered
+  its selective register count from 40 to 32 but regressed the measured Q/K
+  spans by 3-4%. Keep fixed-position offsetting in the memory instruction;
+  a future dynamic fused schedule should use the memory VM's counter-offset
+  mechanism rather than adding scalar address work to every compute task.
+- Adding the optional fused handler does not perturb the selected production
+  image: it remains spill-free at 128 registers, nine barriers, and a 96-byte
+  stack. Four-token greedy output stays exact and the qualified 128-step
+  median remains 377.288 ms (2.948 ms TBT).
+
 ## SM100 Decode Attention Pipeline
 
 - The retained head-dim-128 path drains the four live GQA score rows from TMEM

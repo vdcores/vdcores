@@ -211,16 +211,18 @@ __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_
 // to the shared-slot implementation used by the fused projection schedules;
 // grouped direct output is isolated below so it cannot perturb RegStore or
 // TMA-reduction layouts.
-template<int M, int N, int K, int BLoadInterval, bool Residual,
+template<int M, int N, int K, int BLoadInterval, bool Residual, bool ApplyRope,
          typename M2C_Type, typename C2M_Type>
-__device__ __forceinline__ void task_gemv_sm100(
+__device__ __forceinline__ void task_gemv_sm100_impl(
     const int n_k_tiles,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t &tmem_mma_phase,
     const void *base,
     M2C_Type &m2c,
-    C2M_Type &c2m) {
+    C2M_Type &c2m,
+    const MInst *st_insts,
+    const int rope_head_offset) {
     using namespace cute;
     using data_t = cutlass::bfloat16_t;
     using accum_t = float;
@@ -231,8 +233,18 @@ __device__ __forceinline__ void task_gemv_sm100(
     static_assert(N % 8 == 0 && N >= 8 && N <= 256, "Unsupported SM100 UMMA N tile");
     static_assert(K % 16 == 0, "SM100 BF16 UMMA requires K to be a multiple of 16");
     static_assert(BLoadInterval > 0, "BLoadInterval must be positive");
+    static_assert(!ApplyRope || (M == 64 && N == 8 && !Residual),
+                  "The fused RoPE epilogue requires non-residual M64N8 output");
 
     const int tid = __compute_tid();
+    const data_t *rope_row = nullptr;
+    if constexpr (ApplyRope) {
+        const int rope_slot = m2c.template pop<0>();
+        const auto *volatile_st_insts =
+            reinterpret_cast<const volatile MInst *>(st_insts);
+        const uint64_t rope_address = volatile_st_insts[rope_slot].address;
+        rope_row = reinterpret_cast<const data_t *>(rope_address);
+    }
     auto tiled_mma = make_tiled_mma(Atom{});
     auto cta_mma = tiled_mma.get_slice(0);
 
@@ -328,10 +340,64 @@ __device__ __forceinline__ void task_gemv_sm100(
     }
     copy(r_output, thread_output);
 
+    if constexpr (ApplyRope) {
+        // RoPE is linear, so rotate each K-fold partial before the output TMA
+        // reduction. Keep the UMMA result on-SM: TMEM -> shared epilogue ->
+        // one final reduction/store, with no materialized projection round-trip.
+        __sync_compute_group(128);
+        #pragma unroll
+        for (int pair_idx = tid; pair_idx < M * N / 2; pair_idx += 128) {
+            const int batch = pair_idx / (M / 2);
+            const int pair = pair_idx % (M / 2);
+            const int even_row = pair * 2;
+            const float even = static_cast<float>(s_output(even_row, batch));
+            const float odd = static_cast<float>(s_output(even_row + 1, batch));
+            const float cosine = static_cast<float>(
+                rope_row[rope_head_offset + even_row]);
+            const float sine = static_cast<float>(
+                rope_row[rope_head_offset + even_row + 1]);
+            s_output(even_row, batch) = data_t(even * cosine - odd * sine);
+            s_output(even_row + 1, batch) = data_t(even * sine + odd * cosine);
+        }
+        __sync_compute_group(128);
+    }
+
     if constexpr (Residual) {
         c2m.push(tid, residual_slot);
     }
     c2m.template push<0, true>(tid, output_slot);
+}
+
+template<int M, int N, int K, int BLoadInterval, bool Residual,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_sm100(
+    const int n_k_tiles,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    const void *base,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+    task_gemv_sm100_impl<M, N, K, BLoadInterval, Residual, false>(
+        n_k_tiles, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        base, m2c, c2m, nullptr, 0);
+}
+
+template<int M, int N, int K, int BLoadInterval,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_sm100_rope(
+    const int n_k_tiles,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    const void *base,
+    M2C_Type &m2c,
+    C2M_Type &c2m,
+    const MInst *st_insts,
+    const int rope_head_offset) {
+    task_gemv_sm100_impl<M, N, K, BLoadInterval, false, true>(
+        n_k_tiles, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        base, m2c, c2m, st_insts, rope_head_offset);
 }
 
 // LM-head specialization: reuse each eight-token B tile across four disjoint

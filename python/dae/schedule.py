@@ -1003,7 +1003,7 @@ class SchedGemvRope(Schedule):
 
         insts = [
             self.Atom(self.k_per_fold // TileK, self.hist_seq_len, m % 128),
-            self.rope_table,
+            self.rope_table.copy().delta(self.hist_seq_len * 128 * 2),
             RepeatM.onSync(0, self._bar("load"), n_repeat,
                 (loadB.cord(0, k).group(), loadB.cord2tma(0, TileK * n_batch)),
                 *[
@@ -1012,7 +1012,7 @@ class SchedGemvRope(Schedule):
                 ],
                 asyncPort=self.prefetch,
             ),
-            storeC.cord(0, self.hist_seq_len, m).bar(self._bar("store")).group(),
+            storeC.cord(0, m).bar(self._bar("store")).group(),
         ]
         return insts
 

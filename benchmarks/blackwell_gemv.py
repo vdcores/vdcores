@@ -8,24 +8,39 @@ import torch
 
 from dae.instructions import (
     Gemv_M64N8,
+    Gemv_M64N8_ROPE_128,
     Gemv_M128N8,
     Gemv_M128N8Direct4,
     Gemv_M128N8Group4B2,
     Gemv_M128N8Group4B3,
     Gemv_M128N8Group4B4,
     Gemv_M128N8Group4B7,
+    RawAddress,
+    RegLoad,
+    RegStore,
+    ROPE_INTERLEAVE_512,
     TmaTensor,
 )
 from dae.launcher import Launcher
 from dae.model import GemvLayer
-from dae.schedule import SchedGemv, SchedGemvMGroup, SchedGemvMGroupReduce
+from dae.schedule import (
+    SchedGemv,
+    SchedGemvMGroup,
+    SchedGemvMGroupReduce,
+    SchedGemvRope,
+    SchedRope,
+)
 from dae.tma_utils import (
     Major,
+    ToRopeTableCordAdapter,
+    ToSplitMCordAdapter,
     build_tma_wgmma_mnmajor_m128n8,
     build_tma_wgmma_mnmajor_m128n8_grouped,
-    cord_func_m128n8_output,
     cord_func_m128n8_grouped_output,
+    cord_func_m128n8_output,
+    cord_load_tbl,
     pack_weight_tile_major,
+    tma_load_tbl,
 )
 
 
@@ -52,16 +67,27 @@ def main() -> None:
     tile_m = int(os.environ.get("GEMV_TILE_M", "64"))
     grouped_output = os.environ.get("GEMV_GROUPED_OUTPUT", "0") == "1"
     grouped_reduce = int(os.environ.get("GEMV_GROUPED_REDUCE", "0"))
+    fused_rope = os.environ.get("GEMV_FUSED_ROPE", "0") == "1"
+    two_op_rope = os.environ.get("GEMV_TWO_OP_ROPE", "0") == "1"
     m = int(os.environ.get("GEMV_M", "4096"))
     k = int(os.environ.get("GEMV_K", "4096"))
     sms = int(os.environ.get("GEMV_SMS", "128"))
     split_m = int(os.environ.get("GEMV_SPLIT_M", "1"))
     epochs = int(os.environ.get("GEMV_EPOCHS", "1"))
+    rope_position = int(os.environ.get("GEMV_ROPE_POSITION", "0"))
     tile_packed = os.environ.get("GEMV_TILE_PACKED", "0") == "1"
     iterations = int(os.environ.get("GEMV_ITERS", "50"))
-    if grouped_output and grouped_reduce:
-        raise ValueError("direct grouped output and grouped reduction are exclusive")
-    if grouped_output:
+    if (
+        sum((bool(grouped_output), bool(grouped_reduce), fused_rope, two_op_rope))
+        > 1
+    ):
+        raise ValueError(
+            "direct grouped output, grouped reduction, fused RoPE, and "
+            "two-op RoPE are exclusive"
+        )
+    if fused_rope:
+        atom = Gemv_M64N8_ROPE_128
+    elif grouped_output:
         atom = Gemv_M128N8Direct4
     elif grouped_reduce:
         atom = {
@@ -74,10 +100,22 @@ def main() -> None:
         atom = {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
     if atom is None or ((grouped_output or grouped_reduce) and tile_m != 128):
         raise ValueError("unsupported GEMV tile/group/K configuration")
-    if min(m, k, sms, split_m, epochs, iterations) <= 0:
+    if fused_rope and (tile_m != 64 or not tile_packed or split_m != 1):
+        raise ValueError(
+            "GEMV_FUSED_ROPE requires GEMV_TILE_M=64, packed weights, and "
+            "GEMV_SPLIT_M=1"
+        )
+    if two_op_rope and (tile_m != 64 or not tile_packed or split_m != 1):
+        raise ValueError(
+            "GEMV_TWO_OP_ROPE requires GEMV_TILE_M=64, packed weights, and "
+            "GEMV_SPLIT_M=1"
+        )
+    if (fused_rope or two_op_rope) and m % 128:
+        raise ValueError("projection + RoPE requires M to contain whole D128 heads")
+    if min(m, k, sms, split_m, epochs, iterations) <= 0 or rope_position < 0:
         raise ValueError(
             "GEMV_M, GEMV_K, GEMV_SMS, GEMV_SPLIT_M, GEMV_EPOCHS, and "
-            "GEMV_ITERS must be positive"
+            "GEMV_ITERS must be positive; GEMV_ROPE_POSITION must be nonnegative"
         )
     if m % split_m or (m // split_m) % tile_m:
         raise ValueError("each M split must contain a whole number of M tiles")
@@ -128,9 +166,28 @@ def main() -> None:
         torch.zeros((8, m), dtype=torch.bfloat16, device=device)
         for _ in range(epochs)
     ]
+    rope_rows = (
+        torch.rand(
+            (rope_position + 1, 128),
+            generator=generator,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        - 0.5
+    )
+    if os.environ.get("GEMV_ROPE_IDENTITY", "0") == "1":
+        rope_rows.zero_()
+        rope_rows[:, 0::2] = 1
+    rope_row = rope_rows[rope_position]
+    rope_table = rope_rows[:, None, :].expand(-1, 8, -1).contiguous()
 
     launcher = Launcher(sms, device=device)
     schedules = []
+    rope_table_tma = None
+    if two_op_rope:
+        rope_table_tma = TmaTensor(launcher, rope_table)._build(
+            "load", 64, 8, tma_load_tbl, cord_load_tbl
+        )
     if tile_packed:
         load_vectors = TmaTensor(launcher, vectors).wgmma_load(
             atom.MNK[1], atom.MNK[2] * atom.n_batch, Major.K
@@ -192,11 +249,43 @@ def main() -> None:
                     ).place(sms)
                 )
                 continue
-            schedule = SchedGemv(
-                atom,
-                (m, vectors.shape[0], k),
-                (load_matrix, load_vectors, store_output),
-            )
+            if fused_rope:
+                schedule = SchedGemvRope(
+                    (m, vectors.shape[0], k),
+                    (load_matrix, load_vectors, store_output),
+                    RawAddress(rope_rows, 32),
+                    hist_seq_len=rope_position,
+                )
+            elif two_op_rope:
+                reg_store = RegStore(
+                    0, size=atom.MNK[0] * atom.MNK[1] * output.element_size()
+                )
+                schedules.append(
+                    SchedGemv(
+                        atom,
+                        (m, vectors.shape[0], k),
+                        (load_matrix, load_vectors, reg_store),
+                    ).place(sms)
+                )
+                schedules.append(
+                    SchedRope(
+                        ROPE_INTERLEAVE_512,
+                        (
+                            ToRopeTableCordAdapter(rope_table_tma, rope_position),
+                            RegLoad(0),
+                            ToSplitMCordAdapter(
+                                store_output, m // atom.MNK[0], atom.MNK[0]
+                            ),
+                        ),
+                    ).place(sms)
+                )
+                continue
+            else:
+                schedule = SchedGemv(
+                    atom,
+                    (m, vectors.shape[0], k),
+                    (load_matrix, load_vectors, store_output),
+                )
             if split_m > 1:
                 schedule = schedule.split_M(split_m)
             schedules.append(schedule.place(sms))
@@ -217,6 +306,19 @@ def main() -> None:
     launcher.launch()
     torch.cuda.synchronize()
     expected = [matrix @ vectors.t() for matrix in matrices]
+    if fused_rope or two_op_rope:
+        cosine = rope_row[0::2].float()[None, :, None]
+        sine = rope_row[1::2].float()[None, :, None]
+        rotated = []
+        for reference in expected:
+            heads = reference.view(m // 128, 128, vectors.shape[0]).float()
+            even = heads[:, 0::2]
+            odd = heads[:, 1::2]
+            result = torch.empty_like(heads)
+            result[:, 0::2] = even * cosine - odd * sine
+            result[:, 1::2] = even * sine + odd * cosine
+            rotated.append(result.to(torch.bfloat16).view(m, vectors.shape[0]))
+        expected = rotated
     avg_diff_percent = max(
         (
             (output.t() - reference).abs().float().mean()
@@ -242,7 +344,8 @@ def main() -> None:
         f"m={m * epochs} epoch_m={m} epochs={epochs} n=8 k={k} "
         f"tile_m={tile_m} tile_packed={int(tile_packed)} sms={sms} "
         f"split_m={split_m} fold={fold} grouped_output={int(grouped_output)} "
-        f"grouped_reduce={grouped_reduce} "
+        f"grouped_reduce={grouped_reduce} fused_rope={int(fused_rope)} "
+        f"two_op_rope={int(two_op_rope)} rope_position={rope_position} "
         f"avg_diff_percent={avg_diff_percent:.6f} max_abs_error={max_abs_error:.6f}"
     )
     launcher.bench(iterations)
