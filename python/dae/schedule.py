@@ -994,6 +994,7 @@ class SchedRMS(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
+
 class SchedSiLU(Schedule):
     def __init__(self,
                  base_raw_slot: int,
@@ -1064,20 +1065,48 @@ class SchedSmemSiLUInterleaved(Schedule):
                  num_token: int,
                  gate_glob: torch.Tensor,
                  up_glob: torch.Tensor,
-                 out_glob: torch.Tensor):
+                 out_glob: torch.Tensor,
+                 shards_per_token: int = 1):
         super().__init__()
         self.num_token = num_token
         self.gate_glob = gate_glob
         self.up_glob = up_glob
         self.out_glob = out_glob
+        self.shards_per_token = shards_per_token
 
     def _on_place(self):
+        if self.shards_per_token == 3:
+            assert self.gate_glob.shape == self.up_glob.shape == self.out_glob.shape
+            assert self.gate_glob.shape[-1] == 6144, (
+                "Three-way SwiGLU sharding requires a 6144-element prefix"
+            )
+            assert self.num_sms == self.num_token * self.shards_per_token, (
+                "Three-way SwiGLU sharding requires one SM per token shard"
+            )
+            self.tokens_per_sm = 1
+            return
+        assert self.shards_per_token == 1, "Supported SwiGLU shard counts are 1 and 3"
         assert self.num_token % self.num_sms == 0, "Number of tokens must be divisible by number of SMs"
         self.tokens_per_sm = self.num_token // self.num_sms
 
     def schedule(self, sm):
         if sm < 0:
             return []
+
+        if self.shards_per_token == 3:
+            token_id = sm // self.shards_per_token
+            shard_id = sm % self.shards_per_token
+            shard_width = self.gate_glob.shape[-1] // self.shards_per_token
+            shard_start = shard_id * shard_width
+            shard_end = shard_start + shard_width
+            return [
+                SILU_MUL_SHARED_BF16_K_2048_INTER(1),
+                TmaStore1D(self.out_glob[token_id, shard_start:shard_end])
+                    .bar(self._bar("output")).group(),
+                TmaLoad1D(self.gate_glob[token_id, shard_start:shard_end])
+                    .bar(self._bar("input")).group(),
+                TmaLoad1D(self.up_glob[token_id, shard_start:shard_end]),
+            ]
 
         start_token_id = sm * self.tokens_per_sm
         end_token_id = (sm + 1) * self.tokens_per_sm
@@ -1098,7 +1127,8 @@ class SchedSmemSiLUInterleaved(Schedule):
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, self.num_token)
+        return self._bar_release_if_present(role, self.num_token * self.shards_per_token)
+
 
 
 class SchedRegSiLUFused(Schedule):

@@ -100,9 +100,9 @@ rather than different kernels.
 
 | Non-projection task, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Scope note |
 | --- | ---: | ---: | ---: | --- |
-| RMSNorm, 8 x 4096 | 2.752 | 2.490 | **2.100** | VDCores is 31% behind SGLang |
+| RMSNorm, 8 x 4096 | 2.496 | 2.490 | **2.100** | VDCores matches vLLM within 0.3%; SGLang leads by 19% |
 | Fused add + RMSNorm, 8 x 4096 | - | 2.697 | **2.308** | VDCores folds residual add into the preceding projection reduction |
-| Materialized SwiGLU prefix, 8 x 6144 | 3.904 | **2.682** | 2.919 | VDCores is 46% behind vLLM |
+| Materialized SwiGLU prefix, 8 x 6144 | **2.560** | 2.682 | 2.919 | Three 2048-wide shards; VDCores leads by 5%/12% |
 | Q+K RoPE | 2.304 (Q only) | 2.899 | **1.473** | VDCores Q-only probe is not scope-equivalent to joint Q+K |
 | K+V cache append | fused | 2.485 | **1.079** | No standalone VDCores launch |
 | Greedy argmax, 8 x 131072 | **7.360** | 11.521 | 11.749 | VDCores is 36-37% faster |
@@ -136,6 +136,9 @@ The 152-SM schedule uses four measured choices:
 - QKV uses four active GQA rows per KV head and KV128 decode tiles;
 - the gate/up prefix is balanced over three waves across all 152 SMs, while
   the 8,192-row tail keeps gate, up, and SwiGLU values in registers;
+- the materialized 6,144-wide SwiGLU prefix uses three 2,048-element shards
+  per token across all 24 auxiliary SMs, with aligned 128-bit shared-memory
+  loads and stores;
 - output projection creates exactly 152 tasks with mixed K-folding, and the
   24 auxiliary SMs overlap one low-K down-projection task apiece with the
   register-forwarded MLP tail. Only the 12 affected M tiles cross an explicit
@@ -150,11 +153,13 @@ auxiliary-SM overlap is intentionally limited to one half-tile per SM.
 | Earlier 128-main/24-aux placement | 470.86 | 3.679 | no |
 | Three-wave MLP prefix, uniform output/down | 431.49 | 3.371 | no |
 | 152-task output, uniform down | 429.78 | 3.358 | no |
-| 152-task output + one auxiliary down half-tile | 402.82 | 3.147 | yes |
+| 152-task output + one auxiliary down half-tile | 402.82 | 3.147 | no |
 | One full down tile per auxiliary SM | 428.03 | 3.344 | no |
 | Two down half-tiles on eight auxiliary SMs | 436.11 | 3.407 | no |
+| 128-bit, three-way materialized SwiGLU | **393.86** | **3.077** | yes |
 
-The final same-node comparison used `10.0.16.25:0`, the local
+The framework comparison used `10.0.16.25:0`; the current VDCores result used
+the matching 152-SM GB200 on `10.0.16.24:0`. Both used the local
 Llama-3.1-8B-Instruct BF16 checkpoint, batch 8, input length 1, output length
 128, and each framework's default CUDA-graph path. VDCores reports the median
 wall time around all 128 one-token launches. vLLM's CLI reports total request
@@ -165,10 +170,10 @@ direct phase timer.
 
 | System | Version / measure | Median TBT (ms) | VDCores reduction |
 | --- | --- | ---: | ---: |
-| VDCores | 401.380 ms / 128 steps | **3.136** | - |
-| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 6.7% |
-| vLLM | cross-run decode estimate | 3.335 | 6.0% |
-| SGLang | 0.5.12.post1, reported decode median | 3.820 | 17.9% |
+| VDCores | 393.859 ms / 128 steps | **3.077** | - |
+| vLLM | 0.23.0, 429.979 ms / 128 outputs | 3.359 | 8.4% |
+| vLLM | cross-run decode estimate | 3.335 | 7.7% |
+| SGLang | 0.5.12.post1, reported decode median | 3.820 | 19.5% |
 
 Reproduce the retained path with:
 

@@ -3,6 +3,8 @@
 #include "context.cuh"
 #include "type.cuh"
 
+#include <type_traits>
+
 template<int HIDDIM_SIZE, int N_COMPUTE_THREAD, typename T>
 __device__ __forceinline__ void _rms_helper_one_row(
     const T* weights,
@@ -21,10 +23,32 @@ __device__ __forceinline__ void _rms_helper_one_row(
   vec2_t* output2 = reinterpret_cast<vec2_t*>(output);
 
   vec2_t sum2 = make_bfloat162(0, 0);
-  #pragma unroll
-  for (int i = thread_id; i < HIDDIM_SIZE / 2; i += N_COMPUTE_THREAD) {
-    vec2_t val = input2[i];
-    sum2 = __hfma2(val, val, sum2);
+  constexpr bool kCacheInput =
+      HIDDIM_SIZE == 4096 && N_COMPUTE_THREAD == 128 &&
+      std::is_same_v<T, __nv_bfloat16>;
+  struct alignas(16) Pack128 {
+    vec2_t values[4];
+  };
+  constexpr int kPacksPerThread =
+      kCacheInput ? HIDDIM_SIZE / 8 / N_COMPUTE_THREAD : 1;
+  Pack128 input_cache[kPacksPerThread];
+  if constexpr (kCacheInput) {
+    const Pack128* input_pack = reinterpret_cast<const Pack128*>(input);
+    #pragma unroll
+    for (int j = 0; j < kPacksPerThread; ++j) {
+      const Pack128 pack = input_pack[thread_id + j * N_COMPUTE_THREAD];
+      input_cache[j] = pack;
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        sum2 = __hfma2(pack.values[k], pack.values[k], sum2);
+      }
+    }
+  } else {
+    #pragma unroll
+    for (int i = thread_id; i < HIDDIM_SIZE / 2; i += N_COMPUTE_THREAD) {
+      vec2_t val = input2[i];
+      sum2 = __hfma2(val, val, sum2);
+    }
   }
 
   float sum = __bfloat162float(sum2.x) + __bfloat162float(sum2.y);
@@ -51,10 +75,27 @@ __device__ __forceinline__ void _rms_helper_one_row(
 
   // final scale
   vec2_t scale2 = make_bfloat162(rms_rcp, rms_rcp);
-  #pragma unroll
-  for (int i = thread_id; i < HIDDIM_SIZE / 2; i += N_COMPUTE_THREAD) {
-    vec2_t o = __hmul2(input2[i], scale2);
-    output2[i] = __hmul2(o, weights2[i]);
+  if constexpr (kCacheInput) {
+    const Pack128* weights_pack = reinterpret_cast<const Pack128*>(weights);
+    Pack128* output_pack = reinterpret_cast<Pack128*>(output);
+    #pragma unroll
+    for (int j = 0; j < kPacksPerThread; ++j) {
+      const int i = thread_id + j * N_COMPUTE_THREAD;
+      const Pack128 weight = weights_pack[i];
+      Pack128 out;
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const vec2_t o = __hmul2(input_cache[j].values[k], scale2);
+        out.values[k] = __hmul2(o, weight.values[k]);
+      }
+      output_pack[i] = out;
+    }
+  } else {
+    #pragma unroll
+    for (int i = thread_id; i < HIDDIM_SIZE / 2; i += N_COMPUTE_THREAD) {
+      vec2_t o = __hmul2(input2[i], scale2);
+      output2[i] = __hmul2(o, weights2[i]);
+    }
   }
 }
 
@@ -131,4 +172,3 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
   c2m.template push<0, true>(thread_id, out_addr_slot);
   c2m.push(thread_id, in_addr_slot | weights_slot);
 }
-

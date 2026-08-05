@@ -8,7 +8,8 @@ from dae.instructions import (
 )
 from dae.runtime import opcode
 from dae.launcher import Launcher
-from dae.tma_utils import cord_func_2d_tile_major, pack_weight_tile_major
+from dae.schedule import SchedSmemSiLUInterleaved
+from dae.tma_utils import cords2addr, cord_func_2d_tile_major, pack_weight_tile_major
 
 
 def test_tile_major_weight_pack_round_trip_and_coordinates():
@@ -68,6 +69,32 @@ def test_launcher_loop_counter_validation_without_allocating_gpu_state():
         launcher.set_loop_counter(0, -1)
     with pytest.raises(ValueError, match="uint32"):
         launcher.set_loop_counter(0, 1 << 32)
+
+
+def test_three_way_silu_schedule_maps_one_2048_shard_per_aux_sm(monkeypatch):
+    monkeypatch.setattr("dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr())
+    gate = torch.empty((8, 6144), dtype=torch.bfloat16)
+    up = torch.empty_like(gate)
+    out = torch.empty_like(gate)
+    schedule = (
+        SchedSmemSiLUInterleaved(8, gate, up, out, shards_per_token=3)
+        .bar("input", 4)
+        .bar("output", 5)
+        .place(24, base_sm=128)
+    )
+
+    first = schedule.schedule(0)
+    last = schedule.schedule(23)
+    assert first[0].opcode == opcode.OP_SILU_MUL_SHARED_BF16_K_2048_INTER
+    assert first[1].size == last[1].size == 2048 * gate.element_size()
+    assert cords2addr(first[2].cords) == gate[0, :2048].data_ptr()
+    assert cords2addr(last[2].cords) == gate[7, 4096:].data_ptr()
+    assert schedule.bar_release_count("output") == 24
+
+    with pytest.raises(AssertionError, match="Three-way"):
+        SchedSmemSiLUInterleaved(
+            8, gate, up, out, shards_per_token=3
+        ).place(8)
 
 
 def test_launch_sequence_forwards_all_counter_snapshots(monkeypatch):

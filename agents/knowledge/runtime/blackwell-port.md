@@ -59,8 +59,11 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
   149.7 us for either framework. M128 reaches 161.472 us in isolation but
   requires fold-2 additive output plus a synchronized 2 MiB per-token clear,
   so it is not the retained minimal repeated-decode path.
-- VDCores RMSNorm and the materialized 6144-wide SwiGLU prefix are 2.752 and
-  3.904 us; SGLang RMSNorm is 2.100 us and vLLM's matching SwiGLU is 2.682 us.
+- Aligned 128-bit shared-memory packs and register reuse reduce VDCores
+  RMSNorm to 2.496 us at B8, matching vLLM's 2.490 us but trailing SGLang's
+  2.100 us. Three-way 2048-element sharding reduces the materialized
+  6144-wide SwiGLU prefix from 3.904 to 2.560 us, ahead of vLLM's 2.682 us
+  and SGLang's 2.919 us.
 - VDCores argmax is 7.360 us, 36-37% faster than vLLM/SGLang.
 - VDCores B8 decode attention is 7.072 us at S128 and 11.008 us at S512,
   versus 4.679/5.579 us for vLLM and 5.556/5.656 us for SGLang. These are the
@@ -71,3 +74,10 @@ K/V cache writes, residual reductions, and the register-forwarded MLP tail and
 overlaps auxiliary-SM down-projection work inside one persistent megakernel.
 Use `benchmarks/blackwell_framework_tasks.py` and
 `benchmarks/blackwell_vdcores_tasks.py` for the exact comparison methodology.
+
+The elementwise task search rejected direct global-memory SwiGLU/RMS paths,
+port-1 weight or activation loads, and a two-SM RMS reduction because their
+queue/global synchronization cost exceeded TMA staging. The retained exact
+15-op Llama build remains spill-free at 243 registers. Its 24-SM sharded
+SwiGLU placement lowers the 128-step median from 401.380 to 393.859 ms
+(3.077 ms TBT) while preserving four-token exact greedy correctness.

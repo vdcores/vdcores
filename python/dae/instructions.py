@@ -308,6 +308,11 @@ class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
         super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_4096_INTER, args=[num_token])
 
 
+class SILU_MUL_SHARED_BF16_K_2048_INTER(ComputeInstruction):
+    def __init__(self, num_token):
+        super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_2048_INTER, args=[num_token])
+
+
 class SILU_MUL_SHARED_BF16_K_64_SW128(ComputeInstruction):
     def __init__(self, num_token):
         super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_64_SW128, args=[num_token])
@@ -1052,6 +1057,7 @@ __all__ = [
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA",
     "ATTN_SPLIT_POST_REDUCE",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
+    "SILU_MUL_SHARED_BF16_K_2048_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
     "RMS_NORM_F16_K_4096_SMEM",

@@ -785,6 +785,7 @@ def schedule_single_token(
     gate_glob=matGateOut[:, :mlp_split],
     up_glob=matInterm[:, :mlp_split],
     out_glob=matSiLUOut[:, :mlp_split],
+    shards_per_token=3,
   ).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
   gate_proj_tail = SchedGemv(QKVAtom,
     MNK=((mlp_split, INTERMIDIATE - mlp_split), N, HIDDEN),
@@ -892,7 +893,7 @@ def schedule_single_token(
   up_proj_aux0 = up_proj_aux0.place(24, base_sm=num_sms)
   up_proj_aux1 = up_proj_aux1.place(24, base_sm=num_sms)
   up_proj_aux2 = up_proj_aux2.place(16, base_sm=num_sms + 8)
-  silu1 = silu1.place(min(8, aux_sms), base_sm=num_sms)
+  silu1 = silu1.place(N * 3, base_sm=num_sms)
   gate_proj_tail = gate_proj_tail.place(128)
   up_proj_tail = up_proj_tail.place(128)
   silu_tail = silu_tail.place(128)

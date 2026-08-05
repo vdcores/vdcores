@@ -116,7 +116,6 @@ def benchmark_rms(args: argparse.Namespace, device: torch.device) -> None:
         error_percent=relative_error(out, expected),
     )
 
-
 def benchmark_silu(args: argparse.Namespace, device: torch.device) -> None:
     generator = torch.Generator(device=device).manual_seed(12)
     gate = torch.rand(
@@ -147,6 +146,39 @@ def benchmark_silu(args: argparse.Namespace, device: torch.device) -> None:
     benchmark_launcher(
         launcher,
         op="silu_mul_smem_prefix",
+        shape=f"{BATCH}x{MLP_PREFIX}",
+        iterations=args.iterations,
+        warmup=args.warmup,
+        error_percent=relative_error(out, expected),
+    )
+
+
+def benchmark_silu_sharded(args: argparse.Namespace, device: torch.device) -> None:
+    generator = torch.Generator(device=device).manual_seed(12)
+    gate = torch.rand(
+        (BATCH, MLP_PREFIX), generator=generator, dtype=torch.bfloat16, device=device
+    ) - 0.5
+    up = torch.rand(
+        (BATCH, MLP_PREFIX), generator=generator, dtype=torch.bfloat16, device=device
+    ) - 0.5
+    out = torch.empty_like(gate)
+    num_sms = BATCH * 3
+
+    launcher = Launcher(num_sms, device=device)
+    schedule = SchedSmemSiLUInterleaved(
+        num_token=BATCH,
+        gate_glob=gate,
+        up_glob=up,
+        out_glob=out,
+        shards_per_token=3,
+    ).place(num_sms)
+    launcher.s(schedule)
+    launcher.launch()
+    torch.cuda.synchronize()
+    expected = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+    benchmark_launcher(
+        launcher,
+        op="silu_mul_smem_prefix_shard3",
         shape=f"{BATCH}x{MLP_PREFIX}",
         iterations=args.iterations,
         warmup=args.warmup,
@@ -272,12 +304,16 @@ def benchmark_argmax(args: argparse.Namespace, device: torch.device) -> None:
 
 
 def main() -> None:
+    global BATCH
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ops", default="rms,silu,rope,argmax", help="comma-separated task names"
     )
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument(
+        "--batches", default="8", help="comma-separated decode batch sizes"
+    )
     args = parser.parse_args()
     if args.iterations <= 0 or args.warmup < 0:
         raise ValueError("iterations must be positive and warmup non-negative")
@@ -286,12 +322,16 @@ def main() -> None:
     runners = {
         "rms": benchmark_rms,
         "silu": benchmark_silu,
+        "silu_shard3": benchmark_silu_sharded,
         "rope": benchmark_rope,
         "argmax": benchmark_argmax,
     }
     unknown = sorted(set(requested) - set(runners))
     if unknown:
         raise ValueError(f"unknown ops: {unknown}")
+    batches = [int(value) for value in args.batches.split(",") if value]
+    if not batches or any(batch <= 0 for batch in batches):
+        raise ValueError("--batches must contain positive integers")
 
     device = torch.device("cuda")
     print(
@@ -300,8 +340,10 @@ def main() -> None:
         f"torch={torch.__version__}",
         flush=True,
     )
-    for name in requested:
-        runners[name](args, device)
+    for BATCH in batches:
+        print(f"VDCORES_TASK_BATCH batch={BATCH}", flush=True)
+        for name in requested:
+            runners[name](args, device)
 
 
 if __name__ == "__main__":
