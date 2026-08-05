@@ -1892,6 +1892,96 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
     }
 }
 
+template <int HEAD_DIM, int NUM_Q, int MAX_SPLIT,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_split_post_reduce2_raw_direct(
+    void *base,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m) {
+    static_assert(NUM_Q == 4);
+    static_assert(HEAD_DIM == 128);
+
+    using namespace cute;
+    using data_t = __nv_bfloat16;
+    using accum_t = float;
+    using Tr = F16Traits<data_t>;
+    using vec2_t = typename Tr::vec2_t;
+    struct alignas(8) vec4_t {
+        vec2_t lo;
+        vec2_t hi;
+    };
+
+    constexpr int THREADS_PER_Q = 32;
+    constexpr int ELEMS_PER_THREAD = (HEAD_DIM / 2) / THREADS_PER_Q;
+    const int thread_id = threadIdx.x;
+    const int lane_id = thread_id % THREADS_PER_Q;
+    const int my_q = thread_id / THREADS_PER_Q;
+    const int my_i_base = lane_id * ELEMS_PER_THREAD;
+
+    const int slot_meta = m2c.template pop<0>();
+    const uint8_t* record = static_cast<const uint8_t *>(
+        slot_2_glob_ptr(st_insts, slot_meta));
+    vec2_t* output = reinterpret_cast<vec2_t *>(
+        *reinterpret_cast<const uint64_t *>(record));
+    const accum_t* metadata = reinterpret_cast<const accum_t *>(
+        record + sizeof(uint64_t));
+
+    accum_t lane_max = -FLT_MAX;
+    accum_t lane_mass = 0.0f;
+    if (lane_id < 2) {
+        lane_max = metadata[(my_q * 2 + 0) * MAX_SPLIT + lane_id];
+        lane_mass = metadata[(my_q * 2 + 1) * MAX_SPLIT + lane_id];
+    }
+    const accum_t peer_max = __shfl_xor_sync(
+        0xFFFFFFFFU, lane_max, 1);
+    accum_t lane_scale = 0.0f;
+    accum_t lane_weighted_mass = 0.0f;
+    if (lane_id < 2) {
+        lane_scale = exp2f(lane_max - fmaxf(lane_max, peer_max));
+        lane_weighted_mass = lane_scale * lane_mass;
+    }
+    const accum_t peer_weighted_mass = __shfl_xor_sync(
+        0xFFFFFFFFU, lane_weighted_mass, 1);
+    const accum_t lane_weight = lane_id < 2
+        ? lane_scale / (lane_weighted_mass + peer_weighted_mass)
+        : 0.0f;
+    const accum_t weight0 = __shfl_sync(
+        0xFFFFFFFFU, lane_weight, 0);
+    const accum_t weight1 = __shfl_sync(
+        0xFFFFFFFFU, lane_weight, 1);
+
+    const int slot_split = m2c.template pop<0>();
+    const vec2_t* split_ptr = static_cast<const vec2_t *>(
+        get_slot_address(base, extract(slot_split)));
+    constexpr int VEC2_PER_SPLIT = NUM_Q * (HEAD_DIM / 2);
+    const int output_idx = my_q * (HEAD_DIM / 2) + my_i_base;
+    const vec4_t packed0 = *reinterpret_cast<const vec4_t *>(
+        split_ptr + output_idx);
+    const vec4_t packed1 = *reinterpret_cast<const vec4_t *>(
+        split_ptr + VEC2_PER_SPLIT + output_idx);
+    const float2 partial0_lo = Tr::to_float2(packed0.lo);
+    const float2 partial0_hi = Tr::to_float2(packed0.hi);
+    const float2 partial1_lo = Tr::to_float2(packed1.lo);
+    const float2 partial1_hi = Tr::to_float2(packed1.hi);
+    const vec4_t packed_output = {
+        Tr::from_float2({
+            partial0_lo.x * weight0 + partial1_lo.x * weight1,
+            partial0_lo.y * weight0 + partial1_lo.y * weight1,
+        }),
+        Tr::from_float2({
+            partial0_hi.x * weight0 + partial1_hi.x * weight1,
+            partial0_hi.y * weight0 + partial1_hi.y * weight1,
+        }),
+    };
+    *reinterpret_cast<vec4_t *>(output + output_idx) = packed_output;
+
+    __sync_compute_group(128);
+    c2m.push(thread_id, slot_split);
+    c2m.template push<31, true, false>(
+        thread_id, 1U << slot_meta);
+}
+
 template <int HEAD_DIM,
           int NUM_Q,
           int KV_BLOCK_SIZE,

@@ -28,6 +28,12 @@
 - Split-KV should publish unnormalized partial output plus local `(max, sum)`.
   Keeping the final-output pointer in the same barriered metadata record removes
   a pointer-only memory instruction and lets the reducer store directly.
+- For the B8/S512 two-split case, a fixed reducer with one warp per live query
+  row is slightly faster than the generic split loop. Have lanes 0 and 1 form
+  the two normalized weights, broadcast them within the warp, and have every
+  lane combine two adjacent BF16x2 values using aligned 64-bit loads/stores.
+  A same-image 500-epoch A/B measured 6.464 us versus 6.560 us; 16-thread row
+  mappings and direct-L2 partial reads were slower.
 - A second tcgen05 completion barrier that issued the next QK before the current
   CUDA-core softmax increased registers from 96 to 128 and regressed B8/S256;
   retain the simpler sequential QK/softmax/PV loop unless a future tile changes

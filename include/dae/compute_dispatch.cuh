@@ -423,7 +423,10 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split) {
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  if (inst.args[1] & 0x2) {
+  if ((inst.args[1] & 0x3) == 0x3 && inst.args[0] == 2) {
+    task_split_post_reduce2_raw_direct<128, 4, 16>(
+      smem_base, st_insts, m2c, c2m);
+  } else if (inst.args[1] & 0x2) {
     task_split_post_reduce<128, 4, 64, 16, 32, true, true>(
       inst.args[0], smem_base, (float *)scratch_space,
       st_insts, m2c, c2m);
