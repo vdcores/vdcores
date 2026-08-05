@@ -60,9 +60,10 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
   each of 128 SMs, reuses each B tile four times, and drains four F32 TMEM
   accumulators directly to BF16 logits. It measures 147.840 us versus 149.703
   us in vLLM and 149.781 us in SGLang, with exact isolated BF16 agreement.
-- Aligned 128-bit shared-memory packs and register reuse reduce VDCores
-  RMSNorm to 2.496 us at B8, matching vLLM's 2.490 us but trailing SGLang's
-  2.100 us. Three-way 2048-element sharding reduces the materialized
+- A 64-thread RMS row keeps aligned input packs in registers and preloads
+  weights during the cross-warp reduction. Pairing two rows per SM at B8
+  reduces VDCores RMSNorm from 2.496 to 2.272 us, ahead of vLLM's 2.681 us but
+  behind SGLang's 2.069 us. Three-way 2048-element sharding reduces the materialized
   6144-wide SwiGLU prefix from 3.904 to 2.560 us, ahead of vLLM's 2.682 us
   and SGLang's 2.919 us.
 - VDCores argmax is 7.360 us, 36-37% faster than vLLM/SGLang.

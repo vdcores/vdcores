@@ -88,17 +88,20 @@ def benchmark_rms(args: argparse.Namespace, device: torch.device) -> None:
     ) + 0.5
     out = torch.empty_like(x)
 
-    launcher = Launcher(BATCH, device=device)
+    rows_per_sm = args.rms_rows_per_sm or (2 if BATCH >= 8 else 1)
+    if BATCH % rows_per_sm:
+        raise ValueError("RMS batch must be divisible by --rms-rows-per-sm")
+    launcher = Launcher(BATCH // rows_per_sm, device=device)
     weight_tma = TmaTensor(launcher, weight).tensor1d("load", HIDDEN)
     schedule = SchedRMSShared(
         num_token=BATCH,
         epsilon=EPS,
         tmas=(
             weight_tma.cord(0),
-            TmaLoad1D(x, bytes=HIDDEN * 2),
-            TmaStore1D(out, bytes=HIDDEN * 2),
+            TmaLoad1D(x, bytes=rows_per_sm * HIDDEN * 2),
+            TmaStore1D(out, bytes=rows_per_sm * HIDDEN * 2),
         ),
-    ).place(BATCH)
+    ).place(BATCH // rows_per_sm)
     launcher.s(schedule)
     launcher.launch()
     torch.cuda.synchronize()
@@ -313,6 +316,13 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
         "--batches", default="8", help="comma-separated decode batch sizes"
+    )
+    parser.add_argument(
+        "--rms-rows-per-sm",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="RMS rows per SM; 0 selects the measured B1-B8 optimum",
     )
     args = parser.parse_args()
     if args.iterations <= 0 or args.warmup < 0:

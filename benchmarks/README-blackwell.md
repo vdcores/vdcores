@@ -127,7 +127,7 @@ different kernels.
 
 | Non-projection task, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Scope note |
 | --- | ---: | ---: | ---: | --- |
-| RMSNorm, 8 x 4096 | 2.496 | 2.490 | **2.100** | VDCores matches vLLM within 0.3%; SGLang leads by 19% |
+| RMSNorm, 8 x 4096 | 2.272 | 2.681 | **2.069** | Two 64-thread rows per SM; VDCores leads vLLM by 15%, SGLang leads by 9.8% |
 | Fused add + RMSNorm, 8 x 4096 | - | 2.697 | **2.308** | VDCores folds residual add into the preceding projection reduction |
 | Materialized SwiGLU prefix, 8 x 6144 | **2.560** | 2.682 | 2.919 | Three 2048-wide shards; VDCores leads by 5%/12% |
 | Q+K RoPE | 2.304 (Q only) | 2.899 | **1.473** | VDCores Q-only probe is not scope-equivalent to joint Q+K |
@@ -149,6 +149,17 @@ Reproduce the exact framework probes with
 with `benchmarks/blackwell_vdcores_tasks.py`, and projection/LM-head epochs with
 `benchmarks/blackwell_gemv.py`. Every retained correctness result is below 1%
 mean-relative error.
+
+The RMS selector uses one 64-thread row at B1/B2/B4 and two concurrent rows at
+B8. Its selected B1/B2/B4/B8 medians are 2.144/2.144/2.208/2.272 us, versus
+vLLM's 2.463/2.689/2.680/2.681 us and SGLang's
+1.858/2.071/2.073/2.069 us. Each row keeps aligned BF16 input packs in
+registers, preloads its weight packs while the cross-warp reduction completes,
+and uses a row-local named barrier distinct from the runtime queue barrier.
+Rejected variants include 32 and 128 threads per row, input reload from shared
+memory, direct-global output, port-1 input TMA, and a prefetched global-weight
+path. Use `--rms-rows-per-sm 1` or `2` to reproduce either topology; the default
+`0` selects the measured B1-B8 optimum.
 
 ## Llama-3.1-8B single-token schedule
 
