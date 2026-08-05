@@ -136,13 +136,16 @@ Hugging Face reference, and job `20260805T145137Z-1748528` measures 377.306 ms
 for 128 steps, or 2.948 ms TBT and 339.25 token-steps/s.
 
 For the streaming deployment comparison, charge VDCores only for its internal
-cross-SM megakernel span and retain launch overhead for vLLM/SGLang, which
-dispatch each decode step. Fresh 100-run VDCores medians are 2.915/2.907/2.945
-ms at context lengths 1/128/512. Against the S128 value, vLLM's launch-inclusive
-3.359 ms result is 13.5% slower, its stricter 3.335 ms cross-run estimate is
-12.8% slower, and SGLang's launch-inclusive 3.820 ms median is 23.9% slower.
-Keep the timing-scope difference explicit rather than relabeling framework
-CUDA-graph times as kernel-internal counters.
+cross-SM megakernel span and retain launch/scheduler overhead for vLLM/SGLang,
+which dispatch each decode step. A direct fixed-context B8 sweep measures
+VDCores/vLLM/SGLang medians of 2.914/2.760/3.340 ms at S64,
+2.907/2.769/3.356 ms at S128, and 2.945/3.513/3.645 ms at S512. The frameworks
+use `C - 1` input tokens and the first-to-second output interval, so the timed
+decode sees exactly `C` KV tokens without prefill. VDCores trails vLLM by
+5.6%/5.0% at S64/S128, then leads it by 16.2% at S512; it leads SGLang by
+12.8-19.2% throughout. Keep the timing-scope difference explicit rather than
+relabeling framework token intervals as kernel-internal counters. Reproduce
+the framework sweep with `benchmarks/blackwell_fixed_context_decode.py`.
 
 The embedding RMS stage deliberately remains two operators. RMSNorm on SMs
 0-7 overlaps an 8 KiB residual copy on SMs 64-71. A dual-output RMS prototype

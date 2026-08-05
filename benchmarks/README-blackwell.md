@@ -286,39 +286,53 @@ resident megakernel schedule to the last participating SM reaching
 critical path. vLLM and SGLang retain their launch-inclusive CUDA-graph decode
 times because they dispatch work for each decode step.
 
-The fresh VDCores rows are 100-run medians on `10.0.16.24:2`, using the local
-Llama-3.1-8B-Instruct BF16 checkpoint and batch 8. The framework rows are the
-qualified results from the matching 152-SM GB200 on `10.0.16.25:0`, with input
-length 1 and output length 128. vLLM's stricter estimate subtracts the
-separately measured one-output p50 (6.496 ms) and divides the remainder by
-127; it remains an estimate rather than a direct phase timer.
+The fixed-context comparison uses the same local Llama-3.1-8B-Instruct BF16
+checkpoint, batch 8, and `10.0.16.24:2`. For a requested context `C`, each
+framework receives `C - 1` prompt tokens and produces exactly two tokens. The
+interval from the first to the second output is therefore one decode step
+whose attention sees exactly `C` KV tokens; prefill is excluded. Each framework
+result is the median of 30 samples after five warmups, taking the maximum
+request interval in the eight-request batch. There is no HTTP transport.
 
-| System | Timing scope | Context | Median TBT (ms) | VDCores S128 reduction |
-| --- | --- | ---: | ---: | ---: |
-| VDCores | internal megakernel timer | 1 | **2.915** | - |
-| VDCores | internal megakernel timer | 128 | **2.907** | - |
-| VDCores | internal megakernel timer | 512 | **2.945** | - |
-| vLLM 0.23.0 | launch-inclusive, 429.979 ms / 128 outputs | 1-128 | 3.359 | 13.5% |
-| vLLM 0.23.0 | launch-inclusive cross-run estimate | 1-128 | 3.335 | 12.8% |
-| SGLang 0.5.12.post1 | launch-inclusive reported decode median | 1-128 | 3.820 | 23.9% |
+| Fixed context | VDCores internal (ms) | vLLM 0.23.0 launch-inclusive (ms) | SGLang 0.5.12.post1 launch-inclusive (ms) | Fastest | VDCores vs vLLM | VDCores vs SGLang |
+| ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 64 | 2.914 | **2.760** | 3.340 | vLLM | 5.6% slower | 12.8% faster |
+| 128 | 2.907 | **2.769** | 3.356 | vLLM | 5.0% slower | 13.4% faster |
+| 512 | **2.945** | 3.513 | 3.645 | VDCores | 16.2% faster | 19.2% faster |
 
-Internal-timer jobs are `20260805T180824Z-3091687` (S1),
+vLLM uses its engine-core first/last-token timestamps and automatically selects
+the FlashInfer HND backend. SGLang uses its streaming engine metric with the
+FlashInfer backend and page size 64. Its experimental piecewise-prefill graph
+is disabled after its own 16K-token compiler warmup failed on this stack; the
+full decode CUDA graph remains enabled. Thus both framework columns retain
+decode scheduling and launch overhead, while the VDCores column remains the
+resident-megakernel internal span.
+
+Internal-timer jobs are `20260805T190254Z-3476561` (S64),
 `20260805T181024Z-3106086` (S128), and
-`20260805T181102Z-3110497` (S512). The S128 row is the primary comparison;
-the other two show context sensitivity without adding launch overhead.
+`20260805T181102Z-3110497` (S512). Fixed-context framework jobs are
+`20260805T184040Z-3312558` (vLLM) and
+`20260805T190110Z-3464127` (SGLang).
 
 Reproduce the retained path with:
 
 ```bash
-# Internal resident-megakernel span at context length 1.
+# Internal resident-megakernel span. Supply a prompt with the requested token
+# count; the Llama tokenizer adds its BOS token.
 python app/python/llama3/sched.py \
   --model /path/to/Meta-Llama-3.1-8B-Instruct \
+  --prompt '<fixed-length prompt>' \
   -N 1 --no-control-flow --bench 100
 
-# Launch-inclusive 128-step control-flow qualification.
-python app/python/llama3/sched.py \
+# Run once from each framework's qualified environment.
+python benchmarks/blackwell_fixed_context_decode.py \
+  --framework vllm \
   --model /path/to/Meta-Llama-3.1-8B-Instruct \
-  -N 128 --control-flow --bench 9
+  --contexts 64,128,512 --batch 8 --warmups 5 --samples 30
+python benchmarks/blackwell_fixed_context_decode.py \
+  --framework sglang \
+  --model /path/to/Meta-Llama-3.1-8B-Instruct \
+  --contexts 64,128,512 --batch 8 --warmups 5 --samples 30
 ```
 
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
