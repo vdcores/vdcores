@@ -10,9 +10,10 @@ the retained kernels stay below 1% mean-relative error.
 The native SM100 winner swaps the two UMMA operands following CUTLASS' low-
 latency TGV GQA formulation: QK is `K[128,128] * Q[8,128]` and PV is
 `V[128,128] * P[8,128]`. Q therefore occupies only an eight-row, 2 KiB TMA
-tile instead of a padded 64-row tile. A 32-DP TMEM load assigns one sequence or
-output row to each compute thread, so all four compute warps perform the four
-live GQA softmax rows and online output correction in parallel. Split-KV emits
+tile instead of a padded 64-row tile. A raw 32-DP TMEM load assigns one sequence
+row to each compute thread; scores are transposed through shared memory so each
+compute warp owns one live GQA query and each lane reduces four tokens. Split-KV
+emits
 unnormalized partial output plus local `(max, sum)` metadata. The reducer reads
 the final-output pointer from the same barriered metadata record, applies the
 global softmax correction, and stores directly to the output without a second
@@ -26,16 +27,16 @@ why they can differ materially from the generic FlashInfer wrapper result.
 
 | Batch | Sequence | KV tile | Splits | SMs | VDCores (us) | FlashInfer 0.6.15 (us) | vLLM 0.23.0 (us) | SGLang 0.5.12 (us) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 64 | 128 | 1 | 8 | **3.072** | 4.397 | 4.510 | 5.681 |
-| 1 | 128 | 128 | 1 | 8 | **3.264** | 4.706 | 4.431 | 5.728 |
-| 1 | 512 | 128 | 4 | 32 | **4.384** | 6.856 | 5.360 | 5.773 |
-| 1 | 2048 | 128 | 16 | 128 | **4.768** | 8.187 | 5.782 | 6.833 |
-| 2 | 128 | 128 | 1 | 16 | **3.264** | 5.013 | 4.398 | 5.770 |
-| 2 | 512 | 128 | 4 | 64 | **4.512** | 7.470 | 5.360 | 5.978 |
-| 4 | 128 | 128 | 1 | 32 | **3.264** | 5.014 | 4.500 | 5.158 |
-| 4 | 512 | 128 | 4 | 128 | **4.704** | 8.085 | 5.365 | 5.155 |
-| 8 | 128 | 128 | 1 | 64 | **3.328** | - | 4.679 | 5.556 |
-| 8 | 512 | 128 | 2 | 128 | 6.400 | - | **5.579** | 5.656 |
+| 1 | 64 | 128 | 1 | 8 | **3.008** | 4.397 | 4.510 | 5.681 |
+| 1 | 128 | 128 | 1 | 8 | **3.040** | 4.706 | 4.431 | 5.728 |
+| 1 | 512 | 128 | 4 | 32 | **4.320** | 6.856 | 5.360 | 5.773 |
+| 1 | 2048 | 128 | 16 | 128 | **4.736** | 8.187 | 5.782 | 6.833 |
+| 2 | 128 | 128 | 1 | 16 | **3.232** | 5.013 | 4.398 | 5.770 |
+| 2 | 512 | 128 | 4 | 64 | **4.400** | 7.470 | 5.360 | 5.978 |
+| 4 | 128 | 128 | 1 | 32 | **3.232** | 5.014 | 4.500 | 5.158 |
+| 4 | 512 | 128 | 4 | 128 | **4.560** | 8.085 | 5.365 | 5.155 |
+| 8 | 128 | 128 | 1 | 64 | **3.264** | - | 4.679 | 5.556 |
+| 8 | 512 | 128 | 2 | 128 | 6.176 | - | **5.579** | 5.656 |
 
 Run `app/python/attention_simple_decoding.py` for the unsplit cases and
 `app/python/attention_split_kv.py` for split-KV. The comparison harness is
@@ -54,9 +55,14 @@ S500 and S2048 cases retained less than 1% mean-relative error. Following the
 CUTLASS TGV BMM2 correction path, the output accumulator now bypasses CUTE
 partitioning and issues raw 32-DP `tcgen05.ld/st` for only the four live GQA
 columns. This halves each thread's output registers and further lowers B8/S512
-to 6.400 us.
+to 6.400 us. The retained score path applies the same four-column raw load,
+stages the scores in unused scratch space, and assigns one warp to each query.
+Each lane reduces four tokens locally before a single warp reduction, removing
+the two CTA-wide max/sum exchanges and lowering the task image from 96 to 64
+registers. B8/S512 reaches 6.176 us. Splitting each four-row reducer over two
+SMs was correct but slower at 6.208 us because it duplicated task and TMA cost.
 The remaining long-context limitation is high-batch work per CTA: at S2048,
-B1/B2/B4/B8 measure 4.768/6.560/9.216/13.776 us as each task owns
+B1/B2/B4/B8 measure 4.736/6.272/8.512/12.992 us as each task owns
 1/2/4/8 KV128 blocks.
 
 ## GEMV
@@ -154,7 +160,7 @@ registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 28% and SGLang by
 40%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
-remaining attention gap is B8/S512, where VDCores is 15% behind vLLM after
+remaining attention gap is B8/S512, where VDCores is 11% behind vLLM after
 reducing the prior 61% deficit; SGLang's standalone RMSNorm also remains faster
 than the VDCores stage.
 

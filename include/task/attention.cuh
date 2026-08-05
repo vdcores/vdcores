@@ -995,10 +995,11 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     constexpr int Q = 8;
     constexpr int ACTIVE_Q = 4;
     constexpr uint32_t O_OFFSET = 32;
-    constexpr int kScoreTmemColumnBits = Q * sizeof_bits_v<accum_t>;
+    constexpr int kScoreTmemColumnBits =
+        ACTIVE_Q * sizeof_bits_v<accum_t>;
     constexpr int kOutputTmemColumnBits =
         ACTIVE_Q * sizeof_bits_v<accum_t>;
-    static_assert(kScoreTmemColumnBits == 256);
+    static_assert(kScoreTmemColumnBits == 128);
     static_assert(kOutputTmemColumnBits == 128);
 
     using QKAtom = SM100_MMA_F16BF16_SS<
@@ -1042,6 +1043,8 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     // layouts are transposed views with identical physical swizzle stacking.
     data_t *prob_ptr = static_cast<data_t *>(
         get_slot_address(base, numSlots));
+    accum_t *score_stage = reinterpret_cast<accum_t *>(
+        prob_ptr + cosize(layout_s));
     auto sS = make_tensor(make_smem_ptr(prob_ptr), layout_s);
     auto sP = make_tensor(make_smem_ptr(prob_ptr), layout_p);
     auto cta_s = cta_qk.partition_C(sS);
@@ -1060,14 +1063,8 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     auto score_load_op =
         TMEM::op_repeater<SM100_TMEM_LOAD_32dp32b1x,
                           kScoreTmemColumnBits>();
-    auto score_t2r = make_tmem_copy(score_load_op, tmem_s);
-    auto score_thr = score_t2r.get_slice(tid);
-    auto thread_tmem_s = score_thr.partition_S(tmem_s);
-    auto thread_s = score_thr.partition_D(cta_s);
-    auto r_scores = make_tensor<accum_t>(shape(thread_s));
-    auto r_probs = make_tensor<data_t>(shape(thread_s));
-    static_assert(size(r_scores) == Q,
-                  "each 32-DP thread must own all eight query columns");
+    const uint32_t score_tmem_addr = raw_pointer_cast(tmem_s.data());
+    auto r_scores = make_tensor<accum_t>(Int<ACTIVE_Q>{});
 
     auto output_load_op =
         TMEM::op_repeater<SM100_TMEM_LOAD_32dp32b1x,
@@ -1084,13 +1081,8 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     auto sQ = make_tensor(make_smem_ptr(q_ptr), layout_q);
     auto frag_q = cta_qk.make_fragment_B(sQ);
 
-    accum_t row_max[ACTIVE_Q];
-    accum_t row_sum[ACTIVE_Q];
-    #pragma unroll
-    for (int q = 0; q < ACTIVE_Q; ++q) {
-        row_max[q] = -FLT_MAX;
-        row_sum[q] = 0.0f;
-    }
+    accum_t row_max = -FLT_MAX;
+    accum_t row_sum = 0.0f;
 
     int k_slot = m2c.template pop<0>();
     int o_slot = 0;
@@ -1128,78 +1120,69 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
         cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
         tmem_mma_phase ^= 1;
 
-        copy(score_t2r, thread_tmem_s, r_scores);
+        sm100_attention_tmem_load_raw<decltype(score_load_op)>(
+            score_tmem_addr, r_scores);
         cutlass::arch::fence_view_async_tmem_load();
-        __sync_compute_group(128);
-
-        accum_t correction[ACTIVE_Q];
         const bool token_valid =
             block + 1 < num_kv_blocks || tid < last_kv_active_token_len;
         #pragma unroll
         for (int q = 0; q < ACTIVE_Q; ++q) {
-            accum_t score = token_valid && q < num_active_q
+            score_stage[q * KV + tid] = token_valid && q < num_active_q
                 ? r_scores(q) * kScoreScale : -FLT_MAX;
-            r_scores(q) = score;
-            accum_t warp_max;
-            asm volatile(
-                "redux.sync.max.NaN.f32 %0, %1, 0xffffffff;\n"
-                : "=f"(warp_max) : "f"(score));
-            if (lane_id == 0) {
-                smem_reduce[warp_id * ACTIVE_Q + q] = warp_max;
-            }
         }
         __sync_compute_group(128);
 
+        // Transpose the softmax work in shared memory: one warp owns one live
+        // query column and each lane consumes four sequence positions.  This
+        // replaces four CTA-wide reductions with one warp reduction per query.
+        accum_t scores[KV / numThreadsPerWarp];
+        accum_t block_max = -FLT_MAX;
         #pragma unroll
-        for (int q = 0; q < ACTIVE_Q; ++q) {
-            accum_t value = smem_reduce[q];
-            #pragma unroll
-            for (int warp = 1; warp < 4; ++warp) {
-                value = fmaxf(
-                    value, smem_reduce[warp * ACTIVE_Q + q]);
-            }
-            const accum_t new_max = fmaxf(row_max[q], value);
-            correction[q] = row_max[q] == -FLT_MAX
-                ? 0.0f : exp2f(row_max[q] - new_max);
-            row_max[q] = new_max;
-            r_scores(q) = q < num_active_q
-                ? exp2f(r_scores(q) - new_max) : 0.0f;
+        for (int i = 0; i < KV / numThreadsPerWarp; ++i) {
+            const int token = lane_id + i * numThreadsPerWarp;
+            scores[i] = score_stage[warp_id * KV + token];
+            block_max = fmaxf(block_max, scores[i]);
+        }
+        accum_t warp_max;
+        asm volatile(
+            "redux.sync.max.NaN.f32 %0, %1, 0xffffffff;\n"
+            : "=f"(warp_max) : "f"(block_max));
+        const bool query_valid =
+            warp_id < num_active_q && warp_max != -FLT_MAX;
+        const accum_t new_max = query_valid
+            ? fmaxf(row_max, warp_max) : -FLT_MAX;
+        const accum_t correction = row_max == -FLT_MAX
+            ? 0.0f : exp2f(row_max - new_max);
+        row_max = new_max;
+
+        accum_t block_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < KV / numThreadsPerWarp; ++i) {
+            scores[i] = query_valid
+                ? exp2f(scores[i] - new_max) : 0.0f;
+            block_sum += scores[i];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            block_sum += __shfl_xor_sync(
+                0xFFFFFFFFU, block_sum, offset);
+        }
+        row_sum = row_sum * correction + block_sum;
+
+        // The live and padded P columns are disjoint across warps.  Keep the
+        // padded UMMA columns zero while publishing the four live columns.
+        #pragma unroll
+        for (int i = 0; i < KV / numThreadsPerWarp; ++i) {
+            const int token = lane_id + i * numThreadsPerWarp;
+            sS(token, warp_id) = data_t(scores[i]);
+            sS(token, warp_id + ACTIVE_Q) = data_t(0.0f);
+        }
+        if (lane_id == 0) {
+            smem_reduce[warp_id] = row_max;
+            smem_reduce[ACTIVE_Q + warp_id] = row_sum;
+            smem_reduce[2 * ACTIVE_Q + warp_id] = correction;
         }
 
-        #pragma unroll
-        for (int q = 0; q < ACTIVE_Q; ++q) {
-            accum_t warp_sum = r_scores(q);
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                warp_sum += __shfl_xor_sync(
-                    0xFFFFFFFFU, warp_sum, offset);
-            }
-            if (lane_id == 0) {
-                smem_reduce[warp_id * ACTIVE_Q + q] = warp_sum;
-            }
-        }
-        __sync_compute_group(128);
-
-        #pragma unroll
-        for (int q = 0; q < ACTIVE_Q; ++q) {
-            accum_t block_sum = smem_reduce[q];
-            #pragma unroll
-            for (int warp = 1; warp < 4; ++warp) {
-                block_sum += smem_reduce[warp * ACTIVE_Q + q];
-            }
-            row_sum[q] = row_sum[q] * correction[q] + block_sum;
-        }
-        #pragma unroll
-        for (int q = 0; q < Q; ++q) {
-            r_probs(q) = data_t(r_scores(q));
-            if (q >= ACTIVE_Q) {
-                r_probs(q) = data_t(0.0f);
-            }
-        }
-
-        // Store P through the S view.  The transposed P view aliases the same
-        // bytes and is immediately consumable as the B operand of PV.
-        copy(r_probs, thread_s);
         cutlass::arch::fence_view_async_shared();
         __sync_compute_group(128);
 
@@ -1209,7 +1192,7 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
             cutlass::arch::fence_view_async_tmem_load();
             #pragma unroll
             for (int q = 0; q < ACTIVE_Q; ++q) {
-                r_output(q) *= correction[q];
+                r_output(q) *= smem_reduce[2 * ACTIVE_Q + q];
             }
             sm100_attention_tmem_store_raw<decltype(output_store_op)>(
                 r_output, output_tmem_addr);
@@ -1245,8 +1228,10 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
                 if (q < num_active_q) {
                     accum_t output_scale = 1.0f;
                     if constexpr (!SPLIT_KV) {
-                        output_scale = row_sum[q] > 0.0f
-                            ? 1.0f / row_sum[q] : 0.0f;
+                        const accum_t total_mass =
+                            smem_reduce[ACTIVE_Q + q];
+                        output_scale = total_mass > 0.0f
+                            ? 1.0f / total_mass : 0.0f;
                     }
                     o_ptr[q * D + tid] =
                         data_t(r_output(q) * output_scale);
@@ -1264,11 +1249,12 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
         const int lse_slot = m2c.template pop<0>();
         accum_t *lse_ptr = static_cast<accum_t *>(
             slot_2_glob_ptr(st_insts, lse_slot));
-        if (tid < num_active_q && row_sum[tid] > 0.0f) {
+        if (tid < num_active_q &&
+            smem_reduce[ACTIVE_Q + tid] > 0.0f) {
             lse_ptr[(tid * 2 + 0) * MAX_SPLIT + split_idx] =
-                row_max[tid];
+                smem_reduce[tid];
             lse_ptr[(tid * 2 + 1) * MAX_SPLIT + split_idx] =
-                row_sum[tid];
+                smem_reduce[ACTIVE_Q + tid];
         }
         __sync_compute_group(128);
         c2m.template push<31, true, false>(tid, 1U << lse_slot);

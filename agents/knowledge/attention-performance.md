@@ -40,6 +40,13 @@
   thread, and address the TMEM fragment directly. This retained 96 registers
   for the task image but improved B8/S128 from 3.360 to 3.328 us and B8/S512
   from 6.464 to 6.400 us.
+- Apply the same raw four-column load to QK, then transpose the 128x4 F32 score
+  tile through the unused half of the 8 KiB scratch slot. Assign one warp to
+  each query and four sequence positions to each lane. The local four-value
+  reduction plus one warp reduction replaces the CTA-wide max and sum exchange,
+  drops the selected image from 96 to 64 registers, and moves B8/S512 from
+  6.400 to 6.176 us. A two-SM reducer duplicated TMA/task setup and regressed
+  to 6.208 us, so retain one four-row reducer SM.
 - A second tcgen05 completion barrier that issued the next QK before the current
   CUDA-core softmax increased registers from 96 to 128 and regressed B8/S256;
   retain the simpler sequential QK/softmax/PV loop unless a future tile changes
