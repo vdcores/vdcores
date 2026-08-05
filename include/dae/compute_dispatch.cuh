@@ -84,6 +84,42 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_DIRECT4) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_GROUP4_B2) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_grouped_reduce<128, 8, 128, 2, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_GROUP4_B3) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_grouped_reduce<128, 8, 128, 3, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_GROUP4_B4) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_grouped_reduce<128, 8, 128, 4, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_GROUP4_B7) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_grouped_reduce<128, 8, 128, 7, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_GEMM_M64N64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
   using gemm_atom = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;

@@ -459,4 +459,128 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
     }
     c2m.template push<31, true, false>(tid, 1U << output_slot);
 }
+
+// Projection specialization. Each task reuses B across four M128 output tiles
+// and packs all four epilogues into one 8 KiB shared slot for a single
+// strided rank-4 TMA reduction.
+template<int M, int N, int K, int BLoadInterval, int OutputGroups,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_sm100_grouped_reduce(
+    const int n_k_tiles,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    const void *base,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    using Atom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, N, UMMA::Major::K, UMMA::Major::K>;
+
+    static_assert(M == 128 && N == 8,
+                  "Grouped reduction GEMV is specialized for M128N8");
+    static_assert(OutputGroups == 4,
+                  "Grouped reduction GEMV is specialized for four outputs");
+
+    const int tid = __compute_tid();
+    auto tiled_mma = make_tiled_mma(Atom{});
+    auto cta_mma = tiled_mma.get_slice(0);
+    auto mma_shape_a = partition_shape_A(
+        tiled_mma, make_shape(Int<M>{}, Int<K>{}));
+    auto mma_shape_b = partition_shape_B(
+        tiled_mma, make_shape(Int<N>{}, Int<K>{}));
+    auto layout_sA = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, mma_shape_a);
+    auto layout_sB = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, mma_shape_b);
+
+    auto logical_c = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<N>{}),
+                    make_stride(Int<N>{}, Int<1>{})));
+    auto cta_c = cta_mma.partition_C(logical_c);
+
+    int live_b_slot = 0;
+    constexpr int b_tile_elements = N * K;
+    for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
+        data_t *sB_ptr;
+        if (tile_idx % BLoadInterval == 0) {
+            live_b_slot = m2c.template pop<0>();
+            sB_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(live_b_slot)));
+        } else {
+            sB_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(live_b_slot)))
+                + (tile_idx % BLoadInterval) * b_tile_elements;
+        }
+
+        #pragma unroll
+        for (int output_group = 0; output_group < OutputGroups;
+             ++output_group) {
+            const int slot_a = m2c.template pop<0>();
+            data_t *sA_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(slot_a)));
+            auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
+            auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+            auto frag_a = cta_mma.make_fragment_A(sA);
+            auto frag_b = cta_mma.make_fragment_B(sB);
+            auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+            group_tmem_acc.data() = tmem_base_ptr + output_group * N;
+            tiled_mma.accumulate_ = tile_idx == 0
+                                  ? UMMA::ScaleOut::Zero
+                                  : UMMA::ScaleOut::One;
+
+            if (tid < numThreadsPerWarp) {
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
+                    gemm(tiled_mma, frag_a(_, _, k_block),
+                         frag_b(_, _, k_block), group_tmem_acc);
+                    tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+                }
+                cutlass::arch::umma_arrive(tmem_mma_barrier);
+            }
+            cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+            tmem_mma_phase ^= 1;
+
+            int release_mask = slot_a;
+            if (output_group + 1 == OutputGroups
+                && ((tile_idx + 1) % BLoadInterval == 0
+                    || tile_idx + 1 == n_k_tiles)) {
+                release_mask |= live_b_slot;
+            }
+            c2m.push(tid, release_mask);
+        }
+    }
+
+    auto layout_output = tile_to_shape(
+        GMMA::Layout_MN_SW128_Atom<data_t>{},
+        make_shape(Int<M>{}, Int<N>{}));
+    using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
+    const int output_slot = m2c.template pop<0>();
+    data_t *output_base = static_cast<data_t *>(
+        get_slot_address(base, extract(output_slot)));
+    #pragma unroll
+    for (int output_group = 0; output_group < OutputGroups; ++output_group) {
+        data_t *output_ptr = output_base + output_group * M * N;
+        auto s_output = make_tensor(make_smem_ptr(output_ptr), layout_output);
+        auto cta_output = cta_mma.partition_C(s_output);
+        auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+        group_tmem_acc.data() = tmem_base_ptr + output_group * N;
+        TiledCopy tiled_t2r = make_tmem_copy(TmemLoad{}, group_tmem_acc);
+        ThrCopy thr_t2r = tiled_t2r.get_slice(tid);
+        auto thread_tmem = thr_t2r.partition_S(group_tmem_acc);
+        auto thread_output = thr_t2r.partition_D(cta_output);
+        auto r_acc = make_tensor<accum_t>(shape(thread_output));
+        copy(tiled_t2r, thread_tmem, r_acc);
+        auto r_output = make_fragment_like(thread_output);
+        #pragma unroll
+        for (int i = 0; i < size(r_output); ++i) {
+            r_output(i) = data_t(r_acc(i));
+        }
+        copy(r_output, thread_output);
+    }
+    c2m.template push<0, true>(tid, output_slot);
+}
 #endif

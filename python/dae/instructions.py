@@ -113,6 +113,37 @@ class Gemv_M128N8Direct4(ComputeInstruction):
             ],
         )
 
+
+class _GemvM128N8GroupedReduce(ComputeInstruction):
+    MNK = (128, 8, 128)
+
+    def __init__(self, kTiles: int):
+        super().__init__(opcode=self.opcode, args=[kTiles])
+
+
+class Gemv_M128N8Group4B2(_GemvM128N8GroupedReduce):
+    n_batch = 2
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B2
+
+
+class Gemv_M128N8Group4B3(_GemvM128N8GroupedReduce):
+    n_batch = 3
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B3
+
+
+class Gemv_M128N8Group4B4(_GemvM128N8GroupedReduce):
+    n_batch = 4
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B4
+
+
+class Gemv_M128N8Group4B7(_GemvM128N8GroupedReduce):
+    n_batch = 7
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B7
+
 class Gemm_M64N64(ComputeInstruction):
     MNK = (64, 64, 128)
     n_batch = 1
@@ -1036,6 +1067,7 @@ class TmaTensor(MemoryInstruction):
             "reduce": {
                 2: opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D,
                 3: opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_3D,
+                4: opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_4D,
             },
             "load": {
                 1: opcode.OP_ALLOC_TMA_LOAD_TENSOR_1D,
@@ -1120,6 +1152,10 @@ __all__ = [
     "Gemv_M64N8",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",
+    "Gemv_M128N8Group4B2",
+    "Gemv_M128N8Group4B3",
+    "Gemv_M128N8Group4B4",
+    "Gemv_M128N8Group4B7",
     "Gemv_M64N8K64",
     "Gemv_M64N8K128",
     "Gemv_M64N8B2",

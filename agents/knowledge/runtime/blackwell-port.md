@@ -53,8 +53,9 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
 
 - VDCores KV GEMV is 4.352 us, about 18% faster than either framework's
   shape-matched component probe.
-- VDCores M64 Q/O and down GEMVs are 7.216 and 22.768 us, 22-23% and 18-20%
-  behind the framework component probes.
+- Four-output M128 Q/O and down GEMVs are 5.792 and 18.704 us. Their packed
+  rank-4 reduction epilogue puts them 1.2-2.2% and 1.0-2.9% ahead of the
+  vLLM/SGLang component probes.
 - The retained two-epoch LM head assigns four disjoint M128 output tiles to
   each of 128 SMs, reuses each B tile four times, and drains four F32 TMEM
   accumulators directly to BF16 logits. It measures 147.840 us versus 149.703
@@ -89,6 +90,21 @@ Use `benchmarks/blackwell_framework_tasks.py` and
   a 96-byte stack. Four-token greedy output matches Hugging Face exactly.
 - Cooperative job `20260805T082334Z-4118216` measured 382.133 ms median for
   128 decode steps, or 2.985 ms TBT and 334.96 token-steps/s.
+
+## Grouped Projection Reduction
+
+- Four M128 output tiles reuse each staged B tile and accumulate in separate
+  TMEM column ranges. The four BF16 epilogues total exactly 8 KiB, so one
+  shared slot carries all of them.
+- A rank-4 tensor map represents the four non-contiguous output quarters and
+  one `cp.reduce.async.bulk.tensor.4d` publishes the complete slot. This avoids
+  four allocator/store-queue transactions per worker task.
+- At BF16 B8, the retained K4096 path is 5.792 us with 0.46% mean-relative
+  error, versus 5.863/5.922 us for vLLM/SGLang. K14336 is 18.704 us with 0.46%
+  error, versus 19.264/18.893 us.
+- Two-output reduction (5.792/19.968 us), four separate output stores
+  (6.896/18.656 us), 112-SM fold-14 (19.840 us), and 64-SM fold-8 (28.672 us)
+  were explored and removed or superseded.
 
 The elementwise task search rejected direct global-memory SwiGLU/RMS paths,
 port-1 weight or activation loads, and a two-SM RMS reduction because their

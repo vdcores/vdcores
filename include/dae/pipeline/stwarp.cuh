@@ -144,6 +144,25 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
           cuda::ptx::cp_async_bulk_commit_group();
         }
         break;
+      case op(OP_ALLOC_WB_TMA_REDUCE_ADD_4D):
+        {
+          const uint16_t *cord = inst.coords;
+          __stprint("TMA 4D Reduce-Add: desc_idx=%d size=%d cord=(%d,%d,%d,%d)",
+                    inst.arg, inst.size, cord[0], cord[1], cord[2], cord[3]);
+          asm volatile(
+            "cp.reduce.async.bulk.tensor.4d.global.shared::cta.add.bulk_group "
+            "[%0, {%1, %2, %3, %4}], [%5];\n"
+            :
+            : "l"((void *)(tma_descs + inst.arg)),
+              "r"((int)cord[0]),
+              "r"((int)cord[1]),
+              "r"((int)cord[2]),
+              "r"((int)cord[3]),
+              "r"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))
+              : "memory");
+          cuda::ptx::cp_async_bulk_commit_group();
+        }
+        break;
       default:
         // unknown opcode
         __stprint("Unknown mem wb opcode: slot_mask=%x slot=%d op=%d opcode=%04x\n", slot_mask, slot, op(inst.opcode), inst.opcode);

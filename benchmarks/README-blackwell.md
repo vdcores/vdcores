@@ -65,6 +65,11 @@ us with the grouped direct path and exact BF16 agreement with the isolated
 reference. The same framework comparison measures 149.703 us in vLLM and
 149.781 us in SGLang.
 
+For 4096-row projections, four disjoint M128 accumulators share every B tile.
+Their epilogues occupy one 8 KiB shared slot and one strided rank-4 TMA
+reduction. This measures 5.792 us for K4096 and 18.704 us for K14336, both
+below the exact framework component probes.
+
 Use `benchmarks/blackwell_gemv.py` to reproduce a shape and
 `tests/blackwell_gemv_smoke.py` for strict single-tile correctness.
 
@@ -97,11 +102,11 @@ split, fused, or overlapped and therefore has no equivalent standalone launch.
 | Projection/task scope, BF16 B8 | VDCores (us) | vLLM (us) | SGLang (us) | Result |
 | --- | ---: | ---: | ---: | --- |
 | KV component, 1024 x 8 x 4096 | **4.352** | 5.333 | 5.343 | VDCores is 18% faster |
-| Q/O component, 4096 x 8 x 4096 | 7.216 | **5.863** | 5.922 | M64 VDCores is 23% behind vLLM |
+| Q/O component, 4096 x 8 x 4096 | **5.792** | 5.863 | 5.922 | VDCores leads by 1.2-2.2% |
 | Fused QKV, 6144 x 8 x 4096 | - | **6.358** | 6.364 | Framework-selected fused scope |
 | Gate or up component, 14336 x 8 x 4096 | - | **18.876** | 19.106 | VDCores uses 6144/8192 pipeline partitions |
 | Fused gate/up, 28672 x 8 x 4096 | - | 39.284 | **37.123** | Framework-selected fused scope |
-| Down, 4096 x 8 x 14336 | 22.768 | 19.264 | **18.893** | VDCores is 20% behind SGLang |
+| Down, 4096 x 8 x 14336 | **18.704** | 19.264 | 18.893 | VDCores leads by 1.0-2.9% |
 | Padded LM head, 131072 x 8 x 4096 | **147.840** | 149.703 | 149.781 | VDCores leads by 1.2-1.3% |
 
 The production LM head is two 65,536-row epochs. Each of 128 SMs owns four
@@ -128,9 +133,9 @@ residual adds occur in TMA reductions, the 8,192-row MLP tail forwards through
 registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 14% and SGLang by
-27%, and the grouped LM head leads both frameworks. The largest remaining task
-gaps are long-context B8/S512 attention (61% behind vLLM), and the Q/O and down
-projections.
+27%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
+largest remaining isolated gap is long-context B8/S512 attention (61% behind
+vLLM); SGLang's standalone RMSNorm also remains faster than the VDCores stage.
 
 Reproduce the exact framework probes with
 `benchmarks/blackwell_framework_tasks.py`, the isolated VDCores non-GEMV tasks

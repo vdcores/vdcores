@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import Sequence
+from functools import partial
 
 import torch
 
@@ -9,15 +10,21 @@ from dae.instructions import (
     Gemv_M64N8,
     Gemv_M128N8,
     Gemv_M128N8Direct4,
+    Gemv_M128N8Group4B2,
+    Gemv_M128N8Group4B3,
+    Gemv_M128N8Group4B4,
+    Gemv_M128N8Group4B7,
     TmaTensor,
 )
 from dae.launcher import Launcher
 from dae.model import GemvLayer
-from dae.schedule import SchedGemv, SchedGemvMGroup
+from dae.schedule import SchedGemv, SchedGemvMGroup, SchedGemvMGroupReduce
 from dae.tma_utils import (
     Major,
     build_tma_wgmma_mnmajor_m128n8,
+    build_tma_wgmma_mnmajor_m128n8_grouped,
     cord_func_m128n8_output,
+    cord_func_m128n8_grouped_output,
     pack_weight_tile_major,
 )
 
@@ -44,14 +51,7 @@ def main() -> None:
     device = torch.device("cuda")
     tile_m = int(os.environ.get("GEMV_TILE_M", "64"))
     grouped_output = os.environ.get("GEMV_GROUPED_OUTPUT", "0") == "1"
-    atom = (
-        Gemv_M128N8Direct4
-        if grouped_output
-        else {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
-    )
-    if atom is None or (grouped_output and tile_m != 128):
-        raise ValueError("GEMV_TILE_M must be 64 or 128")
-
+    grouped_reduce = int(os.environ.get("GEMV_GROUPED_REDUCE", "0"))
     m = int(os.environ.get("GEMV_M", "4096"))
     k = int(os.environ.get("GEMV_K", "4096"))
     sms = int(os.environ.get("GEMV_SMS", "128"))
@@ -59,6 +59,21 @@ def main() -> None:
     epochs = int(os.environ.get("GEMV_EPOCHS", "1"))
     tile_packed = os.environ.get("GEMV_TILE_PACKED", "0") == "1"
     iterations = int(os.environ.get("GEMV_ITERS", "50"))
+    if grouped_output and grouped_reduce:
+        raise ValueError("direct grouped output and grouped reduction are exclusive")
+    if grouped_output:
+        atom = Gemv_M128N8Direct4
+    elif grouped_reduce:
+        atom = {
+            (4, 4096, 128): Gemv_M128N8Group4B2,
+            (4, 6144, 128): Gemv_M128N8Group4B3,
+            (4, 8192, 128): Gemv_M128N8Group4B4,
+            (4, 14336, 128): Gemv_M128N8Group4B7,
+        }.get((grouped_reduce, k, sms))
+    else:
+        atom = {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
+    if atom is None or ((grouped_output or grouped_reduce) and tile_m != 128):
+        raise ValueError("unsupported GEMV tile/group/K configuration")
     if min(m, k, sms, split_m, epochs, iterations) <= 0:
         raise ValueError(
             "GEMV_M, GEMV_K, GEMV_SMS, GEMV_SPLIT_M, GEMV_EPOCHS, and "
@@ -77,6 +92,19 @@ def main() -> None:
                 "grouped output requires M = SMS * TILE_M * output_groups"
             )
         fold = 1
+    elif grouped_reduce:
+        if not tile_packed or split_m != 1:
+            raise ValueError(
+                "GEMV_GROUPED_REDUCE requires packed weights and GEMV_SPLIT_M=1"
+            )
+        if m % (tile_m * atom.output_groups):
+            raise ValueError("M must contain complete grouped M128 outputs")
+        m_groups = m // (tile_m * atom.output_groups)
+        if sms % m_groups:
+            raise ValueError("GEMV_SMS must be divisible by grouped M tiles")
+        fold = sms // m_groups
+        if k % fold or (k // fold) % (atom.MNK[2] * atom.n_batch):
+            raise ValueError("K fold is incompatible with grouped B-load interval")
     else:
         if sms % m_tiles_per_split:
             raise ValueError("GEMV_SMS must be a multiple of the M tiles per split")
@@ -128,7 +156,21 @@ def main() -> None:
 
             output_mode = "reduce" if fold > 1 else "store"
             output_tensor = TmaTensor(launcher, output)
-            if tile_m == 128:
+            if grouped_reduce:
+                store_output = output_tensor._build(
+                    output_mode,
+                    atom.MNK[0] * atom.output_groups,
+                    atom.MNK[1],
+                    partial(
+                        build_tma_wgmma_mnmajor_m128n8_grouped,
+                        output_groups=atom.output_groups,
+                    ),
+                    partial(
+                        cord_func_m128n8_grouped_output,
+                        output_groups=atom.output_groups,
+                    ),
+                )
+            elif tile_m == 128:
                 store_output = output_tensor._build(
                     output_mode,
                     atom.MNK[0],
@@ -140,6 +182,16 @@ def main() -> None:
                 store_output = output_tensor.wgmma(
                     output_mode, atom.MNK[1], atom.MNK[0], Major.MN
                 )
+            if grouped_reduce:
+                schedules.append(
+                    SchedGemvMGroupReduce(
+                        atom,
+                        (m, vectors.shape[0], k),
+                        (load_matrix, load_vectors, store_output),
+                        group=False,
+                    ).place(sms)
+                )
+                continue
             schedule = SchedGemv(
                 atom,
                 (m, vectors.shape[0], k),
@@ -190,6 +242,7 @@ def main() -> None:
         f"m={m * epochs} epoch_m={m} epochs={epochs} n=8 k={k} "
         f"tile_m={tile_m} tile_packed={int(tile_packed)} sms={sms} "
         f"split_m={split_m} fold={fold} grouped_output={int(grouped_output)} "
+        f"grouped_reduce={grouped_reduce} "
         f"avg_diff_percent={avg_diff_percent:.6f} max_abs_error={max_abs_error:.6f}"
     )
     launcher.bench(iterations)

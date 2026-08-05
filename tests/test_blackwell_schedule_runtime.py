@@ -7,11 +7,17 @@ from dae.instructions import (
     Gemv_M128N8Direct4,
     MemoryInstruction,
     RepeatM,
+    TmaTensor,
 )
 from dae.runtime import opcode
 from dae.launcher import Launcher
 from dae.schedule import SchedSmemSiLUInterleaved
-from dae.tma_utils import cords2addr, cord_func_2d_tile_major, pack_weight_tile_major
+from dae.tma_utils import (
+    cords2addr,
+    cord_func_2d_tile_major,
+    cord_func_m128n8_grouped_output,
+    pack_weight_tile_major,
+)
 
 
 def test_tile_major_weight_pack_round_trip_and_coordinates():
@@ -89,6 +95,18 @@ def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():
     assert instruction.args == [32, 512, 128]
     with pytest.raises(ValueError, match="multiples of 128"):
         Gemv_M128N8Direct4(32, 65535, 16384)
+
+
+def test_grouped_m128_output_uses_one_rank4_reduction_tile():
+    output = torch.empty((8, 4096), dtype=torch.bfloat16)
+    cord = cord_func_m128n8_grouped_output(
+        output, 4, output_groups=4
+    )
+
+    assert cord(0, 0) == [0, 0, 0, 0]
+    assert cord(0, 896) == [0, 0, 14, 0]
+    tma = TmaTensor.__new__(TmaTensor)
+    assert tma._rank2opcode(4, "reduce") == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_4D
 
 
 def test_launcher_loop_counter_validation_without_allocating_gpu_state():

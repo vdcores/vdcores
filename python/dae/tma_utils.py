@@ -292,6 +292,54 @@ def cord_func_m128n8_output(mat: torch.Tensor, rank: int):
         return [0, 0, m // 64]
     return cord_func
 
+
+def build_tma_wgmma_mnmajor_m128n8_grouped(
+    mat: torch.Tensor, tileM: int, tileK: int, *, output_groups: int
+):
+    """Pack strided M128xN8 outputs into one 8 KiB reduction transaction."""
+    assert mat.dim() == 2
+    assert mat.element_size() == 2
+    n, m = mat.shape
+    assert n == 8 and tileK == 8
+    assert output_groups == 4
+    assert tileM == 128 * output_groups
+    assert m % tileM == 0
+
+    m_groups = m // tileM
+    output_group_stride = m_groups * 128
+    element_size = mat.element_size()
+    global_dims = [64, 8, 2 * m_groups, output_groups]
+    global_strides = [
+        m * element_size,
+        64 * element_size,
+        output_group_stride * element_size,
+    ]
+    box_dims = [64, 8, 2, output_groups]
+    return 4, runtime.build_tma_desc(
+        mat,
+        global_dims,
+        global_strides,
+        box_dims,
+        [1] * 4,
+        128,
+        0,
+    )
+
+
+def cord_func_m128n8_grouped_output(
+    mat: torch.Tensor, rank: int, *, output_groups: int
+):
+    assert rank == 4
+    assert mat.shape[1] % (128 * output_groups) == 0
+
+    def cord_func(*cords):
+        assert len(cords) == 2
+        n, m = cords
+        assert n == 0 and m % 128 == 0
+        return [0, 0, 2 * (m // 128), 0]
+
+    return cord_func
+
 # pytorch-major cord functions
 def cord_func_2d_kmajor(mat: torch.Tensor, rank : int):
     def cord_func(*cords):
