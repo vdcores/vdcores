@@ -251,3 +251,85 @@ be restored unless the writeback pipeline changes materially.
   at B1/S64), a cross-CTA atomic fused reducer (6.208 us at B1/S512), and a
   direct-global reducer epilogue (no median gain). Keep these out of the final
   task implementation unless the synchronization design changes materially.
+
+## TMEM Overlap Feasibility
+
+The 2026-08-06 idea-verification round tested whether an outer,
+memory-VCore-like warp can own explicit TMEM copy/drain work while the four
+compute warps continue independently. The low-level mechanism is viable. In a
+correctness-checked UTCCP/TMEM drain probe, a disjoint helper reduced the
+internal-counter span by 6-10%; making the producer warp drain its own pipeline
+did not overlap and regressed the 4 KiB case.
+
+| TMEM payload | Serial dedicated | One helper | Two helpers |
+| ---: | ---: | ---: | ---: |
+| 4 KiB | 468.813 ns | 429.750 ns (-8.34%) | 428.750 ns (-8.53%) |
+| 8 KiB | 820.812 ns | 745.500 ns (-9.29%) | 752.562 ns (-8.31%) |
+| 16 KiB | 1426.125 ns | 1303.687 ns (-8.60%) | 1276.625 ns (-10.41%) |
+| 32 KiB | 2820.937 ns | 2636.812 ns (-6.56%) | 2542.813 ns (-9.88%) |
+
+All 24 size/schedule cases had zero hash and final-output mismatches in job
+`20260806T172836Z-1324881`. Use one helper for payloads through 8 KiB and only
+consider two for 16 KiB or larger. This is a mechanism result, not permission
+to add a helper to every task: the helper must be disjoint from the producer
+and there must be independent work covering its synchronization cost.
+
+Reducing GEMV UMMA completion waits was beneficial inside an isolated compute
+window but harmful to the real VDCores load/slot pipeline. For M4096/N8,
+batching two or four K256 commits improved representative K2048/K4096/K8192
+probes by roughly 2-4%, but commit-4 regressed K14336 from 22.336 to 26.048 us.
+On production-shaped tasks, commit-2 changed down projection from 22.304 to
+22.912 us, a wide projection from 24.992 to 25.696 us, and a three-epoch
+prefix from 20.064 to 20.320 us. A two-completion-barrier pipeline changed
+7.552 to 7.936 us. Holding shared-memory operand slots across extra K tiles
+prevents the memory VM from refilling them; early slot release is more valuable
+than removing these local waits. All GEMV variants were removed.
+
+Attention exposed the same boundary. An isolated split-P probe, modeled after
+FlashAttention-4's early publication of the first three quarters of P, reduced
+1.362400 to 1.306675 us (-4.09%) with identical output in job
+`20260806T172903Z-1327697`. On the actual four-warp attention task, however,
+the same-warp variant raised B8 latency from 3.328/4.672/7.136 us to
+3.424/4.768/7.424 us at S128/S256/S512. A real fifth tensor sidecar warp was
+then added experimentally, with a double-buffered command mailbox, named
+barrier, UMMA mbarrier, and TMEM proxy fences. It was exact and spill-free, but
+the repeated internal-counter results were:
+
+| B8 context | Four-warp baseline | Command sidecar | Delta |
+| ---: | ---: | ---: | ---: |
+| 128 | 3.360 us | 3.488 us | +0.128 us |
+| 256 | 4.640 us | 4.768 us | +0.128 us |
+| 512 | 7.104 us | 7.328 us | +0.224 us |
+| 1024 | 11.360 us | 11.712 us | +0.352 us |
+| 2048 | 19.872 us | 20.544 us | +0.672 us |
+
+The approximately 42 ns per-KV-block command transition is on the critical
+path. The retained attention kernel therefore remains unchanged. A worthwhile
+next prototype is a persistent, coarse staged state machine: give the outer
+tensor VCore ownership of a stage ring and let softmax/correction warps signal
+stage readiness directly, rather than submitting QK, PV-head, and PV-tail as
+three commands per block. It should preserve the split-P dependency cut and
+use separate TMEM accumulator regions so a helper can drain one stage while
+UMMA fills another.
+
+After removing every experimental opcode/runtime hook, the selective
+production image returned to 63 registers, 9 barriers, a 96-byte stack, and no
+spills. Fresh B8 internal medians were 3.264/4.672/7.200 us for unsplit
+S128/S256/S512 and 6.080 us for S512 split-2; mean-relative error remained at
+or below 0.277%. The corresponding cooperative jobs are
+`20260806T181310Z-1514927`, `20260806T181341Z-1516257`,
+`20260806T181415Z-1518677`, and `20260806T181443Z-1520101`.
+
+TMEM synchronization must follow the tcgen05 proxy protocol. `wait::ld` and
+`wait::st` complete accesses for their issuing thread; a cross-warp ownership
+handoff additionally needs `tcgen05.fence::before_thread_sync`, a real named
+barrier or mbarrier transition, then `tcgen05.fence::after_thread_sync` in the
+consumer. Do not substitute `threadfence` or a full-CTA barrier that the memory
+warps do not join. This follows the NVIDIA PTX
+[fifth-generation TensorCore memory model](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model-for-5th-generation-of-tensorcore-operations)
+and CUTLASS's staged
+[`PipelineUmmaAsync`](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/pipeline.html)
+model. FlashAttention-4's current SM100 implementation is the reference for
+the persistent role split and early-P publication; see its
+[SM100 forward kernel](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm100.py).
+It is not evidence that a per-phase VDCores mailbox is free.
