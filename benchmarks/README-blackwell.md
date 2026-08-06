@@ -311,6 +311,7 @@ interval in the strict eight-request batch. There is no HTTP transport.
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 | 64 | **2.812** | 2.842 | 3.381 | VDCores | 1.1% faster | 16.8% faster |
 | 128 | **2.811** | 2.816 | 3.312 | VDCores | 0.2% faster | 15.1% faster |
+| 256 | **2.802** | 3.448 | 3.410 | VDCores | 18.7% faster | 17.8% faster |
 | 512 | **2.851** | 3.499 | 3.683 | VDCores | 18.5% faster | 22.6% faster |
 | 1,024 | **3.006** | 3.584 | 3.691 | VDCores | 16.1% faster | 18.6% faster |
 | 2,048 | **3.326** | 3.848 | 3.918 | VDCores | 13.6% faster | 15.1% faster |
@@ -347,6 +348,38 @@ VDCores probe measured 3.005920/3.325632 ms at S1K/S2K (501 samples) in job
 `20260805T213318Z-356270` (S64), `20260805T213450Z-368285` (S128), and
 `20260805T213620Z-380084` (S512). The corrected S1K-S32K sweeps are
 `20260806T150649Z-613023` for vLLM and `20260806T152302Z-698299` for SGLang.
+The S256 jobs are `20260806T154512Z-812206` for VDCores,
+`20260806T154029Z-788615` for vLLM, and `20260806T154257Z-801610` for
+SGLang.
+
+### Why vLLM steps up between S128 and S256
+
+The 0.632 ms increase from S128 to S256 is not an attention-kernel threshold.
+The exact vLLM FlashInfer call measures 4.414/4.507/5.440 us at
+S128/S256/S512. Thus S128 to S256 adds only 0.093 us per layer, or about 3 us
+over all 32 layers; S256 to S512 adds about 30 us. The complete S128 and S256
+Nsight traces both contain 396 decode-plus-sampling kernels. Under identical
+node tracing, their GPU spans are 3,332.576 and 3,288.799 us and their CPU
+decode execution ranges are 1,168.608 and 1,161.024 us, respectively. Nsight
+perturbs absolute latency, but neither topology nor device critical path has a
+corresponding 0.632 ms jump.
+
+The step comes from vLLM's asynchronous scheduling pipeline. A diagnostic
+sweep inside one S256-capacity engine measures 2.856/2.847/3.122/3.452/3.456
+ms at S128/S160/S192/S224/S256: S192 is the crossover and is visibly between
+the two latency regimes. With asynchronous scheduling disabled, the same
+contexts measure 4.257/4.241/4.257/4.254/4.267 ms, eliminating the step. The
+short-context engine overlaps more of sampling, bookkeeping, and next-step
+dispatch; around S192-S224 that overlap loses a pipeline phase and exposes a
+roughly 0.6 ms bubble. Once in the slower phase, extending attention from S256
+to S512 adds only its small kernel cost, explaining the nearly flat vLLM
+S256-S512 result. The main table intentionally retains vLLM's production
+launch-inclusive asynchronous behavior.
+
+The exact-attention audit is job `20260806T160029Z-889385`; the paired async
+and non-async sweeps are `20260806T160652Z-920346` and
+`20260806T161311Z-957601`. S128/S256 node traces are
+`20260806T161002Z-940301` and `20260806T155738Z-878196`.
 
 ### S128 kernel versus schedule audit
 
