@@ -114,6 +114,25 @@ class Gemv_M128N8Direct4(ComputeInstruction):
         )
 
 
+class Gemv_M128N8Argmax4(ComputeInstruction):
+    MNK = (128, 8, 128)
+    n_batch = 4
+    output_groups = 4
+
+    def __init__(self, kTiles: int, output_group_stride: int,
+                 vocabulary_base: int):
+        if output_group_stride % self.MNK[0] or vocabulary_base % self.MNK[0]:
+            raise ValueError("fused M128 GEMV offsets must be multiples of 128")
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M128N8_ARGMAX4,
+            args=[
+                kTiles,
+                output_group_stride // self.MNK[0],
+                vocabulary_base // self.MNK[0],
+            ],
+        )
+
+
 class _GemvM128N8GroupedReduce(ComputeInstruction):
     MNK = (128, 8, 128)
 
@@ -554,6 +573,16 @@ class ARGMAX_REDUCE_bf16_1024_128(ComputeInstruction):
 
     def __init__(self, num_active_token: int):
         super().__init__(opcode=opcode.OP_ARGMAX_REDUCE_bf16_1024_128, args=[num_active_token])
+
+
+class ARGMAX_REDUCE_GLOBAL_bf16_256(ComputeInstruction):
+    PARTIAL_TASKS = 256
+
+    def __init__(self, num_active_token: int):
+        super().__init__(
+            opcode=opcode.OP_ARGMAX_REDUCE_GLOBAL_bf16_256,
+            args=[num_active_token],
+        )
 
 
 class Dummy(ComputeInstruction):
@@ -1179,6 +1208,7 @@ __all__ = [
     "Gemv_M64N8",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",
+    "Gemv_M128N8Argmax4",
     "Gemv_M128N8Group4B2",
     "Gemv_M128N8Group4B3",
     "Gemv_M128N8Group4B4",
@@ -1221,6 +1251,7 @@ __all__ = [
     "ARGMAX_REDUCE_bf16_1152_132",
     "ARGMAX_PARTIAL_bf16_1024_65536_128",
     "ARGMAX_REDUCE_bf16_1024_128",
+    "ARGMAX_REDUCE_GLOBAL_bf16_256",
     "Dummy",
     "Copy",
     "LoopC",

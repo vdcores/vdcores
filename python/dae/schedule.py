@@ -697,6 +697,80 @@ class SchedGemvMGroup(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedGemvMGroupArgmax(Schedule):
+    """Grouped LM-head GEMV that emits one argmax record per task/token."""
+
+    def __init__(self, Atom, MNK, tmas, mat_out_partial,
+                 vocabulary_base: int, partial_base: int,
+                 partial_slot: int = 30, group: bool = False):
+        super().__init__()
+        self.Atom = Atom
+        self.MNK = MNK
+        self.tmas = tmas
+        self.mat_out_partial = mat_out_partial
+        self.vocabulary_base = vocabulary_base
+        self.partial_base = partial_base
+        self.partial_slot = partial_slot
+        self.group = group
+
+    def _on_place(self):
+        tile_m, tile_n, tile_k = self.Atom.MNK
+        m, n, k = self.MNK
+        assert m == self.num_sms * tile_m * self.Atom.output_groups
+        assert n == tile_n
+        assert k % (tile_k * self.Atom.n_batch) == 0
+        assert self.mat_out_partial.shape[0] == n
+        assert self.mat_out_partial.shape[2] == 16
+        assert self.partial_base + self.num_sms <= self.mat_out_partial.shape[1]
+        assert self.vocabulary_base % tile_m == 0
+        assert len(self.tmas) == 2
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        tile_m, _, tile_k = self.Atom.MNK
+        _, _, k = self.MNK
+        load_a, load_b = self.tmas
+        m = sm * tile_m
+        output_group_stride = self.num_sms * tile_m
+        n_repeat = k // (tile_k * self.Atom.n_batch)
+        load_group = self.group and self._bar("load") is not None
+
+        load_steps = [
+            (load_b.cord(0, 0).group(load_group),
+             load_b.cord2tma(0, tile_k * self.Atom.n_batch)),
+        ]
+        for k_tile in range(self.Atom.n_batch):
+            for output_group in range(self.Atom.output_groups):
+                group_m = m + output_group * output_group_stride
+                load_steps.append((
+                    load_a.cord(group_m, k_tile * tile_k).group(load_group),
+                    load_a.cord2tma(0, tile_k * self.Atom.n_batch),
+                ))
+
+        partial = self.partial_base + sm
+        partial_out = (
+            RawAddress(self.mat_out_partial[0, partial], self.partial_slot)
+            .bar(self._bar("partial"))
+            .writeback()
+        )
+        return [
+            self.Atom(
+                k // tile_k,
+                output_group_stride,
+                self.vocabulary_base + m,
+            ),
+            RepeatM.onSync(0, self._bar("load"), n_repeat, *load_steps),
+            partial_out,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "partial":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedGemvMGroupReduce(Schedule):
     def __init__(self, Atom, MNK, tmas, group: bool = True):
         super().__init__()
@@ -1446,6 +1520,50 @@ class SchedArgmax(Schedule):
         if role == "final":
             return self._bar_release_if_present(role, min(self.num_token, self.num_sms))
         return 0
+
+
+class SchedArgmaxReduceGlobal(Schedule):
+    """Reduce absolute-index argmax records produced by fused LM-head tasks."""
+
+    def __init__(self, num_token: int, AtomReduce,
+                 mat_out_partial: torch.Tensor,
+                 mat_final_out: torch.Tensor,
+                 final_counter_offsets: list[tuple[int, int]] | None = None):
+        super().__init__()
+        self.num_token = num_token
+        self.AtomReduce = AtomReduce
+        self.mat_out_partial = mat_out_partial
+        self.mat_final_out = mat_final_out
+        self.final_counter_offsets = final_counter_offsets
+
+    def _on_place(self):
+        assert self.num_sms == self.num_token
+        assert self.mat_out_partial.shape == (
+            self.num_token, self.AtomReduce.PARTIAL_TASKS, 16)
+        assert self.mat_final_out.shape == (self.num_token,)
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        final_out = (
+            RawAddress(self.mat_final_out[sm], 29)
+            .bar(self._bar("final"))
+            .writeback()
+        )
+        if self.final_counter_offsets:
+            final_out = RepeatM.offsetByCounters(
+                self.final_counter_offsets, final_out)
+        return [
+            self.AtomReduce(1),
+            RawAddress(self.mat_out_partial[sm], 27)
+            .bar(self._bar("partial")),
+            final_out,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "final":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 def interleave(*schedules):

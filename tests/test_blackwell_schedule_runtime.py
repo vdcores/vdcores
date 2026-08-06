@@ -7,6 +7,8 @@ from dae.instructions import (
     ATTENTION_SM100_BF16_HDIM128_DIRECT,
     ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT,
     ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT,
+    ARGMAX_REDUCE_GLOBAL_bf16_256,
+    Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     MemoryInstruction,
     RepeatM,
@@ -171,6 +173,22 @@ def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():
     assert instruction.args == [32, 512, 128]
     with pytest.raises(ValueError, match="multiples of 128"):
         Gemv_M128N8Direct4(32, 65535, 16384)
+
+
+def test_fused_lm_head_argmax_encodes_absolute_vocab_offsets():
+    instruction = Gemv_M128N8Argmax4(
+        kTiles=32,
+        output_group_stride=16384,
+        vocabulary_base=65536,
+    )
+    reducer = ARGMAX_REDUCE_GLOBAL_bf16_256(num_active_token=1)
+
+    assert instruction.opcode == opcode.OP_GEMV_SM100_M128N8_ARGMAX4
+    assert instruction.args == [32, 128, 512]
+    assert reducer.opcode == opcode.OP_ARGMAX_REDUCE_GLOBAL_bf16_256
+    assert reducer.args == [1]
+    with pytest.raises(ValueError, match="multiples of 128"):
+        Gemv_M128N8Argmax4(32, 16384, 1)
 
 
 def test_grouped_m128_output_uses_one_rank4_reduction_tile():

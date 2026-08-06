@@ -264,9 +264,7 @@ systemg = dae.add_group("system", 1)
 
 defaultg.addBarrier('bar_embedding', N)
 
-systemg.addBarrier('bar_logits')
-systemg.addBarrier('bar_argmax_idx')
-systemg.addBarrier('bar_argmax_val')
+systemg.addBarrier('bar_argmax_partial')
 systemg.addBarrier('bar_token_finish') # argmax plus restore-barrier copy after placement
 
 layerg.addBarrier('bar_layer')
@@ -357,7 +355,6 @@ logits_fold = 8
 logits_slice = 8192 * logits_fold
 logits_epoch = 2
 
-matLogits = []
 matLogitsW = []
 matLmHeadW = model.lm_head.weight.detach()
 vocab_size = matLmHeadW.shape[0]
@@ -366,13 +363,10 @@ vocab_size = matLmHeadW.shape[0]
 matLmHeadW.resize_(logits_slice * logits_epoch, 4096)
 matLmHeadW[vocab_size:,].zero_() # zero padding
 
-matArgmaxIdx = torch.zeros(N, 128, dtype=torch.long, device=gpu)
-matArgmaxVal = torch.zeros(N, 128, dtype=dtype, device=gpu)
-matArgmaxOut = torch.zeros(N, dtype=torch.long, device=gpu)
+matArgmaxPartial = torch.empty(N, 256, 16, dtype=torch.uint8, device=gpu)
 
 for i in range(logits_epoch):
   matLogitsW.append(matLmHeadW[i * logits_slice: (i+1) * logits_slice])
-  matLogits.append(torch.zeros(N, logits_slice, dtype=dtype, device=gpu))
 
 # tensor cache policy
 dae.set_persistent(matTokens)
@@ -428,7 +422,7 @@ def seed_prefill_kv_cache():
 
 QKVAtom = Gemv_M64N8
 LinearAtom = Gemv_M64N8
-LogitsAtom = Gemv_M128N8Direct4
+LogitsAtom = Gemv_M128N8Argmax4
 QKVTileM, _, QKVTileK = QKVAtom.MNK
 LinearTileM, _, LinearTileK = LinearAtom.MNK
 LogitsTileM, _, LogitsTileK = LogitsAtom.MNK
@@ -828,42 +822,34 @@ def schedule_single_token(
   # after all layers, logits projection
   LogitsProj = []
   for i in range(logits_epoch):
-    sched = SchedGemvMGroup(
+    sched = SchedGemvMGroupArgmax(
       LogitsAtom,
       MNK=(logits_slice, N, HIDDEN),
       tmas=(
         defaultg[f"loadLogitsW{i}"],
         defaultg["loadLogitsB"],
       ),
-      direct_output=matLogits[i],
-      # Raw-address slots bypass the shared-slot allocator.  Keep concurrent
-      # logits epochs on descriptors distinct from each other and from the
-      # following argmax task (which uses slots 24--29).
-      direct_output_slot=30 + i,
-      group=False,
+      mat_out_partial=matArgmaxPartial,
+      vocabulary_base=i * logits_slice,
+      partial_base=i * num_sms,
     )
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
-    if i == logits_epoch - 1:
-      sched.bar("store", systemg['bar_logits'])
+    sched.bar("partial", systemg['bar_argmax_partial'])
     LogitsProj.append(sched.place(num_sms))
 
-  # argmax
-  Argmax = SchedArgmax(
+  # The LM-head epilogue keeps logits in TMEM/registers and emits only one
+  # compact maximum per task/token.  Eight reducer SMs consume the 256 records.
+  Argmax = SchedArgmaxReduceGlobal(
     num_token=N,
-    logits_slice=logits_slice,
-    num_slice=logits_epoch,
-    AtomPartial=ARGMAX_PARTIAL_bf16_1024_65536_128,
-    AtomReduce=ARGMAX_REDUCE_bf16_1024_128,
-    matLogits=matLogits,
-    matOutVal=matArgmaxVal,
-    matOutIdx=matArgmaxIdx,
-    matFinalOut=matTokens[:, token_offset+1],
+    AtomReduce=ARGMAX_REDUCE_GLOBAL_bf16_256,
+    mat_out_partial=matArgmaxPartial,
+    mat_final_out=matTokens[:, token_offset+1],
     final_counter_offsets=_control_flow_offsets(
       matTokens.stride(1) * matTokens.element_size(),
       base_counter_delta * matTokens.stride(1) * matTokens.element_size() if control_flow else None,
     ) if control_flow else None,
-  ).bar("load", systemg['bar_logits']).bar("val", systemg['bar_argmax_val']).bar("idx", systemg['bar_argmax_idx']).bar("final", systemg['bar_token_finish'])
+  ).bar("partial", systemg['bar_argmax_partial']).bar("final", systemg['bar_token_finish'])
 
   sstart, send = systemg.range_bars()
 
@@ -902,7 +888,7 @@ def schedule_single_token(
   down_proj_low_main = down_proj_low_main.place(104)
   down_proj_high_aux_rows = down_proj_high_aux_rows.place(24, base_sm=104)
   down_proj_high_main_rows = down_proj_high_main_rows.place(104)
-  Argmax = Argmax.place(128)
+  Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
   clear_q = SchedClearQ(
@@ -1161,33 +1147,9 @@ def print_generated_text():
   print(f"[output] generated_text: {generated_text}")
 
 
-def check_logits_against_reference(reference_logits):
-  checks = []
-  for slice_idx, logits in enumerate(matLogits):
-    start = slice_idx * logits_slice
-    end = min(start + logits_slice, vocab_size)
-    if start >= end:
-      break
-    checks.append(
-      check_tensor_threshold(
-        f"logits_{slice_idx}",
-        reference_logits[start:end],
-        logits[0, :end - start],
-        10.0,
-      )
-    )
-  return checks
-
-
-def assembled_vocab_logits():
-  slices = []
-  for slice_idx, logits in enumerate(matLogits):
-    start = slice_idx * logits_slice
-    end = min(start + logits_slice, vocab_size)
-    if start >= end:
-      break
-    slices.append(logits[0, :end - start])
-  return torch.cat(slices)
+def check_logits_against_reference(_reference_logits):
+  print("[correctness] logits materialization skipped by fused LM-head argmax")
+  return []
 
 
 def run_correctness_check():
@@ -1248,15 +1210,6 @@ def run_correctness_check():
       check_tensor_threshold("final_hidden", captured[num_layers-1]['hidden_state_out'][0, final_idx], matHidden[0], 5.0)
       check_tensor_threshold("final_rms", captured['final']['final_rms'][0, final_idx], matRMSHidden[0], 5.0)
       check_logits_against_reference(captured['final']['lm_head'][0, final_idx])
-      ref_logits = captured['final']['lm_head'][0, final_idx].float()
-      dae_logits = assembled_vocab_logits().float()
-      ref_top_vals, ref_top_idx = torch.topk(ref_logits, 5)
-      dae_top_vals, dae_top_idx = torch.topk(dae_logits, 5)
-      print(
-        "[correctness] final logits top5: "
-        f"ref={list(zip(ref_top_idx.detach().cpu().tolist(), ref_top_vals.detach().cpu().tolist()))}, "
-        f"dae={list(zip(dae_top_idx.detach().cpu().tolist(), dae_top_vals.detach().cpu().tolist()))}"
-      )
       raise RuntimeError("Control-flow correctness check failed")
     print("[correctness] control-flow token check passed")
     return

@@ -56,10 +56,12 @@ At BF16 batch 8 on GB200, the production-shaped task measurements show:
 - Four-output M128 Q/O and down GEMVs are 5.792 and 18.704 us. Their packed
   rank-4 reduction epilogue puts them 1.2-2.2% and 1.0-2.9% ahead of the
   vLLM/SGLang component probes.
-- The retained two-epoch LM head assigns four disjoint M128 output tiles to
-  each of 128 SMs, reuses each B tile four times, and drains four F32 TMEM
-  accumulators directly to BF16 logits. It measures 147.840 us versus 149.703
-  us in vLLM and 149.781 us in SGLang, with exact isolated BF16 agreement.
+- The two-epoch LM-head projection assigns four disjoint M128 output tiles to
+  each of 128 SMs and reuses each B tile four times. Its diagnostic
+  materialized-output path measures 147.840 us versus 149.703 us in vLLM and
+  149.781 us in SGLang, with exact isolated BF16 agreement. Production keeps
+  the same TMEM accumulation but reduces the epilogue directly to compact
+  argmax records.
 - A 128-thread RMS row uses all four compute warps, caches aligned 128-bit input
   and weight packs, reduces four warp partials through shared memory once, and
   broadcasts the final scalar within each warp. One row per SM measures
@@ -83,17 +85,23 @@ Use `benchmarks/blackwell_framework_tasks.py` and
 
 ## Grouped LM-Head Pipeline
 
-- Raw-address descriptors bypass the shared-slot allocator and may be issued
-  ahead of compute. Consecutive direct-output tasks therefore need distinct
-  special slots, and those slots must also be distinct from following tasks.
-  The two logits epochs use slots 30/31; argmax uses slots 24--29.
+- The earlier materialized-output diagnostic uses raw-address descriptors,
+  which bypass the shared-slot allocator and may be issued ahead of compute.
+  Consecutive direct-output tasks therefore need distinct special slots, and
+  those slots must also be distinct from following tasks.
 - C2M completion is a one-hot mask. Slot 31 sets the sign bit of the queue's
   `int`, so only `-1` is an invalid-allocation sentinel; a generic `val < 0`
   check incorrectly drops a valid slot-31 completion and deadlocks its barrier.
-- The final exact Llama image is spill-free at 202 registers, 9 barriers, and
-  a 96-byte stack. Four-token greedy output matches Hugging Face exactly.
-- Cooperative job `20260805T082334Z-4118216` measured 382.133 ms median for
-  128 decode steps, or 2.985 ms TBT and 334.96 token-steps/s.
+- Production emits one 16-byte value/absolute-index record per LM-head
+  task/token, joins only the 128 compute threads before C2M publication, and
+  reduces all 256 records on one SM per token. It no longer allocates or
+  rereads the 2 MiB padded logits tensor.
+- The exact 11-op fused Llama image is spill-free at 128 registers, 9 barriers,
+  and a 96-byte stack. Build it with
+  `benchmarks/blackwell_llama8b_fused_argmax.ops`; four-token greedy output
+  matches Hugging Face exactly.
+- A fused/materialized/fused 500-step S128 sandwich averages 2.899672 ms fused
+  versus 2.911456 ms materialized, an 11.784 us reduction.
 
 ## Grouped Projection Reduction
 
@@ -139,12 +147,12 @@ For the streaming deployment comparison, charge VDCores only for its internal
 cross-SM megakernel span and retain launch/scheduler overhead for vLLM/SGLang,
 which dispatch each decode step. Configure one framework engine per context;
 sharing an S512-capacity engine changes the S64/S128 result. The strict B8
-VDCores/vLLM/SGLang medians are 2.914/2.842/3.381 ms at S64,
-2.907/2.816/3.312 ms at S128, and 2.945/3.499/3.683 ms at S512. The frameworks
+VDCores/vLLM/SGLang medians are 2.906/2.842/3.381 ms at S64,
+2.900/2.816/3.312 ms at S128, and 2.931/3.499/3.683 ms at S512. The frameworks
 use `C - 1` input tokens and the first-to-second output interval, so the timed
 decode sees exactly `C` KV tokens without prefill. VDCores trails vLLM by
-2.5%/3.2% at S64/S128, then leads it by 15.8% at S512; it leads SGLang by
-12.2-20.0% throughout. Keep the timing-scope difference explicit rather than
+2.2%/3.0% at S64/S128, then leads it by 16.2% at S512; it leads SGLang by
+12.5-20.4% throughout. Keep the timing-scope difference explicit rather than
 relabeling framework token intervals as kernel-internal counters. The benchmark
 rejects multi-context invocations so engine capacity cannot leak across rows.
 
@@ -159,6 +167,24 @@ actionable task bottleneck. A strict vLLM Nsight trace contains 385 graph nodes
 plus 11 sampler nodes, with 3437.791 us summed kernel work in a 3332.255 us
 span. Treat the 105.536 us overlap as graph-topology evidence, not an absolute
 untraced timing, because Nsight inflates kernel durations.
+
+The spare-SM follow-up tested schedule changes with both task timers and the
+full internal counter. "Group2 M64" is a two-output M64 CTA: 32 output-row
+pairs times four K partitions form 128 projection tasks. The count is a clean
+factorization, not a hardware limit; the remaining 24 of 152 SMs are available
+for auxiliary work. Group2 improves isolated K4096 from 7.552 to 6.752 us but
+is neutral in a prefix and either violates the 32-layer logits threshold or
+regresses the passing 1536-row subset to about 2.951 ms, so its new opcode was
+removed. An all-152-SM LM head also measures about 2.951 ms, balanced MLP
+placement measures 3.230 ms, and early Q clear loses in a paired A/B. Only the
+fused LM-head argmax produces a repeatable end-to-end win.
+
+Profiling has four complementary scopes: resident cross-SM `globaltimer` for
+VDCores task probes, CUDA-event graph replay for like-shaped framework tasks,
+temporary megakernel frontier/per-SM markers for critical-path overlap, and
+Nsight for framework graph topology. Parameter changes must be justified by
+the first three and then qualified by exact-token end-to-end inference; Nsight
+durations are not substituted for uninstrumented latency.
 
 The embedding RMS stage deliberately remains two operators. RMSNorm on SMs
 0-7 overlaps an 8 KiB residual copy on SMs 64-71. A dual-output RMS prototype

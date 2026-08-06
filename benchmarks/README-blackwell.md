@@ -73,7 +73,8 @@ B1/B2/B4/B8 measure 4.736/6.304/8.448/12.672 us as each task owns
 SM100 GEMV uses native BF16 UMMA with F32 accumulation in TMEM and a
 TMEM-to-register-to-smem output path. The LM-head specialization reuses each
 eight-token B tile across four M128 output tiles, keeps four accumulators in
-separate TMEM column ranges, and drains BF16 directly to global memory.
+separate TMEM column ranges, and can reduce the BF16 epilogue directly to
+compact argmax records without materializing the padded logits tensor.
 
 | Shape (M x N x K) | SMs | M64 (us) | M128 (us) | M128 gain |
 | --- | ---: | ---: | ---: | ---: |
@@ -83,9 +84,10 @@ separate TMEM column ranges, and drains BF16 directly to global memory.
 | 4096 x 8 x 14336 | 128 | 22.464 | 20.960 | 6.7% |
 
 The exact two-epoch padded LM head (131072 x 8 x 4096 total) measures 147.840
-us with the grouped direct path and exact BF16 agreement with the isolated
-reference. The same framework comparison measures 149.703 us in vLLM and
-149.781 us in SGLang.
+us with the diagnostic grouped direct-output path and exact BF16 agreement
+with the isolated reference. The same materialized projection comparison
+measures 149.703 us in vLLM and 149.781 us in SGLang. Production retains the
+same four-output TMEM accumulation but folds argmax into its epilogue.
 
 For 4096-row projections, four disjoint M128 accumulators share every B tile.
 Their epilogues occupy one 8 KiB shared slot and one strided rank-4 TMA
@@ -254,7 +256,8 @@ The 152-SM schedule uses four measured choices:
   per token across all 24 auxiliary SMs, with aligned 128-bit shared-memory
   loads and stores;
 - the LM head assigns four M128 tiles to each of 128 SMs, reuses each input
-  tile four times, and drains four TMEM accumulators directly to logits;
+  tile four times, and reduces each TMEM epilogue to one compact maximum per
+  task/token instead of writing and rereading 2 MiB of padded logits;
 - output projection creates exactly 152 tasks with mixed K-folding, and the
   24 auxiliary SMs overlap one low-K down-projection task apiece with the
   register-forwarded MLP tail. Only the 12 affected M tiles cross an explicit
@@ -300,9 +303,9 @@ is no HTTP transport.
 
 | Fixed context | VDCores internal (ms) | vLLM 0.23.0 launch-inclusive (ms) | SGLang 0.5.12.post1 launch-inclusive (ms) | Fastest | VDCores vs vLLM | VDCores vs SGLang |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| 64 | 2.914 | **2.842** | 3.381 | vLLM | 2.5% slower | 13.8% faster |
-| 128 | 2.907 | **2.816** | 3.312 | vLLM | 3.2% slower | 12.2% faster |
-| 512 | **2.945** | 3.499 | 3.683 | VDCores | 15.8% faster | 20.0% faster |
+| 64 | 2.906 | **2.842** | 3.381 | vLLM | 2.2% slower | 14.0% faster |
+| 128 | 2.900 | **2.816** | 3.312 | vLLM | 3.0% slower | 12.5% faster |
+| 512 | **2.931** | 3.499 | 3.683 | VDCores | 16.2% faster | 20.4% faster |
 
 vLLM uses its engine-core first/last-token timestamps and automatically selects
 the FlashInfer HND backend. SGLang uses its streaming engine metric with the
@@ -312,9 +315,9 @@ full decode CUDA graph remains enabled. Thus both framework columns retain
 decode scheduling and launch overhead, while the VDCores column remains the
 resident-megakernel internal span.
 
-Internal-timer jobs are `20260805T190254Z-3476561` (S64),
-`20260805T181024Z-3106086` (S128), and
-`20260805T181102Z-3110497` (S512). Strict vLLM jobs are
+Final fused-path 500-sample medians are 2.905936/2.899536/2.931248 ms at
+S64/S128/S512. S64/S512 use job `20260806T000216Z-1499618`; S128 uses
+`20260805T235912Z-1475454`. Strict vLLM jobs are
 `20260805T205321Z-66365` (S64), `20260805T205112Z-50840` (S128), and
 `20260805T205544Z-83058` (S512). Strict SGLang jobs are
 `20260805T213318Z-356270` (S64), `20260805T213450Z-368285` (S128), and
@@ -367,9 +370,52 @@ shows why standalone task sums cannot predict the 91 us launch-inclusive S128
 lead. The practical conclusion is: projection kernels are the VDCores-side
 bottleneck, while vLLM also benefits from graph-level overlap.
 
+The tuning is backed by three profiling scopes. Standalone VDCores task probes
+use the resident runtime's cross-SM `globaltimer`; matching vLLM/SGLang task
+probes use CUDA events around warmed CUDA-graph replays. Temporary megakernel
+frontier markers split an S128 layer into QKV/RoPE/cache (11.500 us), attention
+(4.000 us), output/RMS (9.500 us), MLP (36.750 us), down/reduction/RMS
+(23.000 us), and clear (0.250 us). Per-SM event timelines expose which work is
+actually concurrent, while Nsight is used only to verify framework graph
+topology because its instrumentation changes absolute latency.
+
+### Spare-SM and fusion follow-up
+
+The 24 SMs outside the 128-SM rectangular projection grid were explicitly
+tested rather than assumed idle. An all-152-SM LM-head partition measured
+about 2.951 ms at S128 and lost to the 128-SM schedule because the extra,
+uneven tasks increased queue and HBM traffic. A balanced all-SM MLP prefix
+measured 3.230 ms because it disturbed the register-forwarded tail. Moving Q
+clear earlier measured 2.917 ms versus 2.911 ms paired; the retained late clear
+is already hidden on auxiliary SMs.
+
+The "Group2 M64" probe means one CTA computes two independent M64N8 output
+tiles for the same K slice and reuses the staged B tile. Its clean output
+projection grid has 32 row pairs x 4 K partitions = 128 tasks. That is a task
+factorization, not a 128-SM hardware limit; the other 24 SMs can run auxiliary
+work. It required a separate compute opcode because the existing M64 opcode
+owns one accumulator/output tile, while the M128 group-4 opcode has a different
+TMEM layout and BF16 reduction order. Group2 improved the isolated K4096 probe
+from 7.552 to 6.752 us, but was neutral in a projection prefix and either
+failed the qualified 32-layer logits threshold or, for the passing 1536-row
+subset, regressed S128 to about 2.951 ms. The experiment was therefore removed.
+
+The retained fusion is instead LM-head epilogue argmax. Each of the 256
+projection tasks emits one 16-byte `{value, absolute_index}` record per token;
+eight reducer SMs consume those records. It avoids the padded logits
+write/read and separate materialized argmax. In a fused/materialized/fused
+500-step S128 sandwich, the two fused medians average 2.899672 ms versus
+2.911456 ms materialized, a repeatable 11.784 us reduction. Splitting a
+materialized early-argmax stage over 64 tasks regressed by about 32 us, and an
+auxiliary-only 16-task version was neutral, so neither pipeline was retained.
+
 Reproduce the retained path with:
 
 ```bash
+# Rebuild the exact spill-free 11-operator image used below.
+DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops \
+  make -B pyext
+
 # Internal resident-megakernel span. Supply a prompt with the requested token
 # count; the Llama tokenizer adds its BOS token.
 python app/python/llama3/sched.py \
@@ -392,10 +438,13 @@ python benchmarks/blackwell_fixed_context_decode.py \
 
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
 match Hugging Face, and a 130-step launch crosses from one KV128 block to two
-with the unified online-softmax path. The exact 12-operator Llama image uses
+with the unified online-softmax path. The exact 11-operator Llama image uses
 128 registers, 9 barriers, a 96-byte stack frame, and zero spills. Removing
 the prior padded attention opcode from the selective image lowered the
 megakernel-wide register allocation from roughly 202 registers.
+Clean fused-path checks pass at S1 (`20260806T000015Z-1484701`) and S128
+(`20260806T000808Z-1544456`); four-token control flow exactly matches
+`[75987, 57918, 706, 264]` in `20260806T000126Z-1492600`.
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
 bulk sequence launches on all 152 SMs.
 

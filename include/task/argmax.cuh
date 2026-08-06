@@ -3,6 +3,19 @@
 #include "virtualcore.cuh"
 #include "type.cuh"
 
+struct alignas(16) FusedArgmaxRecord {
+  __nv_bfloat16 value;
+  uint16_t padding[3];
+  long long index;
+};
+static_assert(sizeof(FusedArgmaxRecord) == 16);
+
+struct alignas(8) WarpArgmaxRecord {
+  float value;
+  int index;
+};
+static_assert(sizeof(WarpArgmaxRecord) == 8);
+
 template <typename T>
 __device__ __forceinline__ void warp_reduce_max_idx(T &val, long long &idx) {
   #pragma unroll
@@ -173,4 +186,49 @@ __device__ __forceinline__ void task_argmax_reduce_kernel(int num_active_tokens,
 
   __threadfence();
   c2m.template push<31, true, false>(tid, 1 << output_slot);
+}
+
+// Reduce absolute-index records emitted directly by the LM-head epilogue.
+// The producer joins its compute warps before C2M publishes each record; this
+// fence only makes the final token store visible and is not a warp-group join.
+template <int NUM_PARTIAL_TASKS, typename data_t,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_argmax_reduce_global_kernel(
+    int num_active_tokens,
+    void *smem_base,
+    const MInst *st_insts,
+    void *scratchpad,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+  auto partial_slot = m2c.template pop<0>();
+  FusedArgmaxRecord const *__restrict__ partials =
+      (FusedArgmaxRecord const *)slot_2_glob_ptr(st_insts, partial_slot);
+  auto output_slot = m2c.template pop<0>();
+  long long *__restrict__ output_final =
+      (long long *)slot_2_glob_ptr(st_insts, output_slot);
+
+  const int tid = threadIdx.x;
+  constexpr int nThreads = 128;
+  #pragma unroll
+  for (int batch_idx = 0; batch_idx < num_active_tokens; ++batch_idx) {
+    data_t local_max = data_t(-FLT_MAX);
+    long long local_idx = -1;
+    #pragma unroll
+    for (int i = tid; i < NUM_PARTIAL_TASKS; i += nThreads) {
+      const FusedArgmaxRecord &record =
+          partials[i + batch_idx * NUM_PARTIAL_TASKS];
+      data_t candidate = record.value;
+      if (candidate > local_max) {
+        local_max = candidate;
+        local_idx = record.index;
+      }
+    }
+    block_reduce_max_idx(scratchpad, local_max, local_idx);
+    if (tid == 0) {
+      output_final[batch_idx] = local_idx;
+    }
+  }
+
+  __threadfence();
+  c2m.template push<31, true, false>(tid, 1U << output_slot);
 }

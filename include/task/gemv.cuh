@@ -401,9 +401,11 @@ __device__ __forceinline__ void task_gemv_sm100_rope(
 }
 
 // LM-head specialization: reuse each eight-token B tile across four disjoint
-// output tiles, retain the four F32 accumulators in TMEM, and drain them
-// directly through registers to global memory.
+// output tiles and retain the four F32 accumulators in TMEM.  The epilogue
+// either drains BF16 logits directly to global memory or emits compact argmax
+// records without materializing logits.
 template<int M, int N, int K, int BLoadInterval, int OutputGroups,
+         bool FuseArgmax,
          typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
     const int n_k_tiles,
@@ -415,7 +417,10 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
     C2M_Type &c2m,
     MInst *st_insts,
     const int output_stride,
-    const int output_group_stride) {
+    const int output_group_stride,
+    void *reduction_scratch = nullptr,
+    const int vocabulary_base = 0,
+    const int partial_stride = 0) {
     using namespace cute;
     using data_t = cutlass::bfloat16_t;
     using accum_t = float;
@@ -497,12 +502,27 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
         }
     }
 
-    const int output_slot = m2c.template pop<0>();
     auto coord_c = make_identity_tensor(make_shape(Int<M>{}, Int<N>{}));
     auto cta_coord_c = cta_mma.partition_C(coord_c);
     using TmemLoad = SM100_TMEM_LOAD_32dp32b4x;
-    data_t *output_ptr = static_cast<data_t *>(
-        slot_2_glob_ptr(st_insts, output_slot));
+    data_t local_max[N];
+    long long local_idx[N];
+    if constexpr (FuseArgmax) {
+        static_assert(N == 8, "fused argmax expects the eight-token decode tile");
+        #pragma unroll
+        for (int col = 0; col < N; ++col) {
+            local_max[col] = data_t(-FLT_MAX);
+            local_idx[col] = -1;
+        }
+    }
+
+    int output_slot = -1;
+    data_t *output_ptr = nullptr;
+    if constexpr (!FuseArgmax) {
+        output_slot = m2c.template pop<0>();
+        output_ptr = static_cast<data_t *>(
+            slot_2_glob_ptr(st_insts, output_slot));
+    }
     #pragma unroll
     for (int output_group = 0; output_group < OutputGroups; ++output_group) {
         auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
@@ -518,12 +538,70 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
         for (int i = 0; i < size(r_acc); ++i) {
             const int row = int(get<0>(thread_coord(i)));
             const int col = int(get<1>(thread_coord(i)));
-            output_ptr[col * output_stride
-                       + output_group * output_group_stride + row]
-                = data_t(r_acc(i));
+            const data_t candidate = data_t(r_acc(i));
+            if constexpr (FuseArgmax) {
+                if (candidate > local_max[col]) {
+                    local_max[col] = candidate;
+                    local_idx[col] = vocabulary_base
+                                   + output_group * output_group_stride + row;
+                }
+            } else {
+                output_ptr[col * output_stride
+                           + output_group * output_group_stride + row]
+                    = candidate;
+            }
         }
     }
-    c2m.template push<31, true, false>(tid, 1U << output_slot);
+
+    if constexpr (FuseArgmax) {
+        const int partial_slot = m2c.template pop<0>();
+        FusedArgmaxRecord *partials = static_cast<FusedArgmaxRecord *>(
+            slot_2_glob_ptr(st_insts, partial_slot));
+        WarpArgmaxRecord *warp_partials =
+            static_cast<WarpArgmaxRecord *>(reduction_scratch);
+        constexpr int n_warps = 4;
+        const int lane_id = tid % numThreadsPerWarp;
+        const int warp_id = tid / numThreadsPerWarp;
+
+        // Fill the complete 4-warp x 8-token scratch tile before any warp
+        // reuses it.  At 8 bytes/record this exactly fits the 256-byte runtime
+        // scratch allocation.
+        #pragma unroll
+        for (int col = 0; col < N; ++col) {
+            warp_reduce_max_idx(local_max[col], local_idx[col]);
+            if (lane_id == 0) {
+                warp_partials[col * n_warps + warp_id] = {
+                    float(local_max[col]), int(local_idx[col])};
+            }
+        }
+        __sync_compute_group(128);
+
+        if (tid == 0) {
+            #pragma unroll
+            for (int col = 0; col < N; ++col) {
+                data_t block_max = data_t(-FLT_MAX);
+                long long block_idx = -1;
+                #pragma unroll
+                for (int warp = 0; warp < n_warps; ++warp) {
+                    const WarpArgmaxRecord candidate =
+                        warp_partials[col * n_warps + warp];
+                    if (data_t(candidate.value) > block_max) {
+                        block_max = data_t(candidate.value);
+                        block_idx = candidate.index;
+                    }
+                }
+                partials[col * partial_stride].value = block_max;
+                partials[col * partial_stride].index = block_idx;
+            }
+        }
+
+        // Join only the compute threads.  The memory warp observes completion
+        // through C2M after all records are globally stored.
+        __sync_compute_group(128);
+        c2m.template push<31, true, false>(tid, 1U << partial_slot);
+    } else {
+        c2m.template push<31, true, false>(tid, 1U << output_slot);
+    }
 }
 
 // Projection specialization. Each task reuses B across four M128 output tiles
