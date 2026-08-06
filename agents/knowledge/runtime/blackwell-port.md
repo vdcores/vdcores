@@ -422,3 +422,83 @@ model. FlashAttention-4's current SM100 implementation is the reference for
 the persistent role split and early-P publication; see its
 [SM100 forward kernel](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm100.py).
 It is not evidence that a per-phase VDCores mailbox is free.
+
+### Second compute role for LM-head epilogues
+
+The follow-up tested compute-compute overlap separately from the retained
+fine-grained schedule barriers. Two consecutive 128-SM LM-head epochs used
+TMEM columns 0--31 and 32--63 as a ping-pong pair. The original four compute
+warps accumulated epoch `n+1` while a persistent sidecar drained epoch `n`,
+performed the BF16 argmax epilogue, and published the normal C2M completion.
+The memory warps never joined the handoff. Ownership used
+`tcgen05.fence::before_thread_sync`, compute-only named barriers, and
+`tcgen05.fence::after_thread_sync`; no thread fence or whole-CTA task barrier
+was substituted.
+
+A single 32-thread "light compute" warp is not a valid replacement for the
+four-warp epilogue role. Replaying the four logical CUTE TMEM slices from one
+physical warp produced 1,534 wrong partial indices out of 2,048 at K512 in job
+`20260806T215320Z-2302814`. The physical warp cannot impersonate the other
+three TMEM datapath owners. The correct form therefore needs one complete
+additional warpgroup, making the experimental CTA 384 threads.
+
+The viable prototype kept its two-command mailbox after the 16 KiB attention
+scratch region in the tail of the existing 212 KiB dynamic allocation. Its
+sidecar device function was no-inline so the main interpreter did not inherit
+the epilogue instruction footprint. Following the PTX `setmaxnreg` contract,
+all four sidecar warps released their register tail to 64 registers while
+dormant and reacquired 128 only after the first bank became ready. The exact
+11-op images were spill-free: the retained 256-thread entry remained at 128
+registers, 9 barriers, and a 96-byte stack; the 384-thread entry used 128
+registers, 16 barriers, and the same stack.
+
+The isolated two-epoch task did overlap successfully:
+
+| Two LM-head epochs, 128 SMs | Retained epilogue | Four-warp sidecar | Delta |
+| --- | ---: | ---: | ---: |
+| K512 | 24.480 us | **23.584 us** | -0.896 us (-3.66%) |
+| K4096 | 148.864 us | **148.352 us** | -0.512 us (-0.34%) |
+
+Both variants produced identical partial indices. The 501-iteration jobs are
+`20260806T224419Z-2428936` and `20260806T224447Z-2430036`. A fresh full-model
+run also passed all tensor thresholds and the exact Hugging Face token in job
+`20260806T222502Z-2378848`.
+
+The full unprofiled S128 schedule did not retain that task-level gain. A
+same-process A/B/A compared each sidecar pass with the mean of its two retained
+neighbors:
+
+| Sidecar pacing before LM head/reducer | Retained mean | Sidecar | Delta |
+| ---: | ---: | ---: | ---: |
+| 0 cycles | **2.768432 ms** | 2.799520 ms | +31.088 us (+1.12%) |
+| 32 cycles | **2.755728 ms** | 2.761792 ms | +6.064 us (+0.22%) |
+| 64 cycles | **2.757760 ms** | 2.761568 ms | +3.808 us (+0.14%) |
+| 128 cycles | **2.768112 ms** | 2.791744 ms | +23.632 us (+0.85%) |
+
+These are jobs `20260806T224531Z-2431915`,
+`20260806T224902Z-2439720`, `20260806T225113Z-2442944`, and
+`20260806T225326Z-2448617`. Small producer delays reduce the regression by
+letting the already-running memory core lead the next M2C join, but no
+unprofiled setting wins.
+
+Temporary LM-head frontier stores selected a faster timing phase and made the
+instrumented sidecar appear 7.776 us faster end to end. That result is not a
+qualification measurement because the profiling writes change the schedule.
+Its useful breakdown is diagnostic: pre-LM work changed from 2604.512 to
+2592.256 us, the paired LM head from 148.800 to 147.200 us, and the reducer/
+termination tail from 10.672 to 17.376 us in job
+`20260806T224146Z-2422398`. The longer tail and the phase sensitivity explain
+why the isolated drain saving does not transfer reliably.
+
+The sidecar entries, mailbox, pacing hooks, and temporary benchmarks were
+removed. The retained lesson is narrower: coarse two-bank TMEM overlap is
+real, but adding a dormant warpgroup to the whole resident VDCores CTA is not
+free. A future compute-compute role split must amortize that CTA-shape cost
+across multiple stages, or repurpose an existing resident role, rather than
+attach four warps only for the final LM-head epilogue. This also follows the
+[PTX `setmaxnreg` warpgroup rules](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg)
+and the coarse specialized roles in
+[FlashAttention-4 SM100](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm100.py).
+The restored unprofiled image passed the runtime smoke test in job
+`20260806T225825Z-2457622` and measured a 2.765856 ms S128 median over 501
+iterations in job `20260806T225857Z-2458535`.
