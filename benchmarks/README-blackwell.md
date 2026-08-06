@@ -297,15 +297,36 @@ whose attention sees exactly `C` KV tokens; prefill is excluded. Each row uses
 a separate framework process and an engine configured only for that context
 (`max_model_len=C+1` in vLLM and `context_length=C+16` in SGLang). This avoids
 silently giving the S64/S128 rows the scheduler and graph capacity of the S512
-engine. Each framework result is the median of 30 samples after five warmups,
-taking the maximum request interval in the strict eight-request batch. There
-is no HTTP transport.
+engine. vLLM's batch-token budget is `8 * (C - 1)`; SGLang disables chunked
+prefill and uses the same full-batch prefill budget. These settings are
+required at long context: with either framework's smaller default prefill
+budget, the first-to-second-token interval can include unfinished prefill from
+other requests and is not a decode-only result. The S64-S512 framework rows
+are medians of 30 samples after five warmups. The S1K-S32K framework rows are
+medians of three samples after one warmup because every isolated sample first
+constructs all eight full contexts. Each sample takes the maximum request
+interval in the strict eight-request batch. There is no HTTP transport.
 
 | Fixed context | VDCores internal (ms) | vLLM 0.23.0 launch-inclusive (ms) | SGLang 0.5.12.post1 launch-inclusive (ms) | Fastest | VDCores vs vLLM | VDCores vs SGLang |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 | 64 | **2.812** | 2.842 | 3.381 | VDCores | 1.1% faster | 16.8% faster |
 | 128 | **2.811** | 2.816 | 3.312 | VDCores | 0.2% faster | 15.1% faster |
 | 512 | **2.851** | 3.499 | 3.683 | VDCores | 18.5% faster | 22.6% faster |
+| 1,024 | **3.006** | 3.584 | 3.691 | VDCores | 16.1% faster | 18.6% faster |
+| 2,048 | **3.326** | 3.848 | 3.918 | VDCores | 13.6% faster | 15.1% faster |
+| 4,096 | 4.358[^s4k] | **4.164** | 4.281 | vLLM | 4.7% slower | 1.8% slower |
+| 8,192 | --[^long-vdc] | 4.877 | **4.862** | SGLang | -- | -- |
+| 16,384 | --[^long-vdc] | 6.285 | **6.125** | SGLang | -- | -- |
+| 32,768 | --[^long-vdc] | 8.999 | **8.540** | SGLang | -- | -- |
+
+[^s4k]: The S4K VDCores number is a 30-sample diagnostic median after five
+  warmups. A subsequent 501-iteration stress run hit the long-context fault
+  described below, so this row is not marked as a qualified VDCores result.
+[^long-vdc]: No VDCores timing is reported. The temporary synthetic-context
+  probe encountered an illegal memory access during the 32-layer resident
+  schedule's K/V TMA layer transition from S6K onward and was reverted. The
+  standalone attention task still passes at S8K, localizing this boundary to
+  repeated layer scheduling rather than the single attention task.
 
 vLLM uses its engine-core first/last-token timestamps and automatically selects
 the FlashInfer HND backend. SGLang uses its streaming engine metric with the
@@ -316,11 +337,16 @@ decode scheduling and launch overhead, while the VDCores column remains the
 resident-megakernel internal span.
 
 Final balanced-down 501-sample medians are 2.811616/2.810784/2.851328 ms at
-S64/S128/S512 in job `20260806T011823Z-2068499`. Strict vLLM jobs are
+S64/S128/S512 in job `20260806T011823Z-2068499`. The temporary long-context
+VDCores probe measured 3.005920/3.325632 ms at S1K/S2K (501 samples) in job
+`20260806T153156Z-745260` and 4.358496 ms at S4K (30 samples) in job
+`20260806T153352Z-753912`; its S6K reproducer is
+`20260806T153049Z-738092`. Strict short-context vLLM jobs are
 `20260805T205321Z-66365` (S64), `20260805T205112Z-50840` (S128), and
 `20260805T205544Z-83058` (S512). Strict SGLang jobs are
 `20260805T213318Z-356270` (S64), `20260805T213450Z-368285` (S128), and
-`20260805T213620Z-380084` (S512).
+`20260805T213620Z-380084` (S512). The corrected S1K-S32K sweeps are
+`20260806T150649Z-613023` for vLLM and `20260806T152302Z-698299` for SGLang.
 
 ### S128 kernel versus schedule audit
 
