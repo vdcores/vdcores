@@ -542,3 +542,59 @@ barrier reports a long local duration while waiting, but is not the tail that
 releases the stage. Prefer static dependency and placement changes while the
 tail is repeatable; prototype dynamic task dispatch only if a material,
 run-varying straggler remains after those changes.
+
+### Cross-stage down-projection interleave
+
+The retained whole-token optimization uses the existing shard-local MLP
+barriers to schedule independent work across a stage boundary. After down
+shards 0 and 1 have started, 48 SMs that would otherwise wait for shard 2
+compute the first 768 output rows of the high-K `(6144, 8192)` slice. Shard-2
+low-K work then runs, followed by the remaining disjoint high-K output rows.
+The factorization still contains exactly 152 high-K reduction tasks and emits
+the same `bar_layer` count; it changes only task order and physical placement,
+not a compute or memory opcode. `VDCORES_INTERLEAVE_DOWN_HIGH=0` retains the
+old ordering for A/B measurement.
+
+The final-layer profile moved the next-RMS frontier from about 82.4 us to
+81.3 us. The exact, profiling-free 11-op image measured:
+
+| Fixed context | Shard-first order | Interleaved order | Delta |
+| ---: | ---: | ---: | ---: |
+| 64 | 2.767072 ms | **2.741056 ms** | -26.016 us (-0.94%) |
+| 128 | 2.769824 ms | **2.742272 ms** | -27.552 us (-0.99%) |
+| 256 | 2.764256 ms | **2.738432 ms** | -25.824 us (-0.93%) |
+| 512 | 2.810528 ms | **2.781408 ms** | -29.120 us (-1.04%) |
+
+S128 uses 1,001 internal-counter samples; the other rows use 501, all after
+five warmups. Baseline/retained jobs are respectively
+`20260806T235208Z-2574218`/`20260806T235246Z-2575347` (S64),
+`20260806T235038Z-2571740`/`20260806T235115Z-2572444` (S128),
+`20260806T235323Z-2576419`/`20260806T235401Z-2577975` (S256), and
+`20260806T235438Z-2579290`/`20260806T235516Z-2580502` (S512).
+
+A width sweep showed that 48 early tasks is a schedule boundary rather than a
+generic "more is better" knob. In the diagnostic image, 40/44/48/52/56 early
+tasks measured 2.773088/2.768896/2.751040/2.758592/2.758560 ms at S128. The
+48-task range maps exactly to the large shard-2 placement on SMs 96--143;
+other widths either leave part of that range idle or reorder the auxiliary
+small-row tasks.
+
+A separate attention-to-output proof of concept split eight KV heads into two
+four-head barriers and factorized output projection into two K2048 halves,
+without changing its 152-task total. It passed full correctness, but the
+profiled output frontier remained 29.6 us versus about 29.8 us for the coarse
+barrier. With the retained down interleave it improved S128 by only 2.208 us
+(2.751680 to 2.749472 ms) in the diagnostic image, within the schedule's phase
+sensitivity. The extra barriers, head-offset adapters, and split placements
+were removed.
+
+The production image remains at 128 registers, nine barriers, a 96-byte
+stack, and zero spills. Runtime smoke job `20260806T234925Z-2569187` passed;
+full-model job `20260806T234956Z-2570323` passed every tensor threshold and
+matched reference token 24748 exactly. A two-step control-flow regression also
+matched `[24748, 24748]` exactly in job `20260806T235703Z-2583774`. Dynamic
+dispatch was not prototyped: the only run-varying tail was the roughly 2--3 us
+LM-head spread, while the
+material tail responded to deterministic static ordering. A queue would add
+atomics and VM dispatch to a problem that did not exhibit queue-worthy
+stochastic imbalance.

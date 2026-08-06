@@ -188,6 +188,10 @@ blackwell_aux_sms = blackwell_sms - num_sms
 # coarse frontier as an A/B fallback without changing any compute opcode.
 fine_mlp_barriers = os.environ.get("VDCORES_FINE_MLP_BARRIERS", "1") == "1"
 stage_profile = os.environ.get("VDCORES_STAGE_PROFILE", "0") == "1"
+interleave_down_high = (
+  fine_mlp_barriers
+  and os.environ.get("VDCORES_INTERLEAVE_DOWN_HIGH", "1") == "1"
+)
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -849,16 +853,14 @@ def schedule_single_token(
     fold=3,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
   ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_layer'])
-  down_proj_high0 = SchedGemv(LinearAtom,
-    MNK=((0, 2432), N, (6144, 8192)),
-    fold=4,
-    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
-  down_proj_high1 = SchedGemv(LinearAtom,
-    MNK=((2432, 1664), N, (6144, 8192)),
-    fold=4,
-    tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
+  def make_down_proj_high(m_range):
+    return SchedGemv(LinearAtom,
+      MNK=(m_range, N, (6144, 8192)),
+      fold=4,
+      tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
+    ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
+
+  down_proj_high1 = make_down_proj_high((2432, 1664))
 
   if fine_mlp_barriers:
     silu_in_bars = [layerg[f'bar_silu_in{i}'] for i in range(3)]
@@ -1025,7 +1027,24 @@ def schedule_single_token(
     down_proj_low0 = down_proj_low0.place(144)
     down_proj_low1 = down_proj_low1.place(48, base_sm=104)
     down_low_schedules = [down_proj_low0, down_proj_low1]
-  down_proj_high0 = down_proj_high0.place(152)
+  if interleave_down_high:
+    # Run a disjoint high-K output range on the SMs that would otherwise wait
+    # for MLP shard 2.  Together these ranges retain exactly the original 152
+    # reduction tasks and the same output-barrier release count.
+    down_proj_high_early = [
+      make_down_proj_high((0, 768)).place(48, base_sm=96),
+    ]
+    down_proj_high_rest = [
+      make_down_proj_high((768, 1536)).place(96),
+      make_down_proj_high((2304, 128)).place(8, base_sm=144),
+    ]
+    down_low_early_schedules = down_low_schedules[:4]
+    down_low_late_schedules = down_low_schedules[4:]
+  else:
+    down_proj_high_early = []
+    down_proj_high_rest = [make_down_proj_high((0, 2432)).place(152)]
+    down_low_early_schedules = down_low_schedules
+    down_low_late_schedules = []
   down_proj_high1 = down_proj_high1.place(104)
   Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
@@ -1056,8 +1075,10 @@ def schedule_single_token(
     gate_proj_tail,
     up_proj_tail,
     silu_tail,
-    down_low_schedules,
-    down_proj_high0,
+    down_low_early_schedules,
+    down_proj_high_early,
+    down_low_late_schedules,
+    down_proj_high_rest,
     down_proj_high1,
     pre_attn_rms,
     clear_q,
@@ -1108,9 +1129,10 @@ def schedule_single_token(
     silu_tail,
     stage_profile_marker("silu_tail", range(128)),
 
-    stage_profile_schedule_parts("down_low_part", down_low_schedules),
-    stage_profile_marker("down_low", range(full_sms)),
-    down_proj_high0,
+    stage_profile_schedule_parts("down_low_early_part", down_low_early_schedules),
+    stage_profile_schedule_parts("down_high_early_part", down_proj_high_early),
+    stage_profile_schedule_parts("down_low_late_part", down_low_late_schedules),
+    stage_profile_schedule_parts("down_high_rest_part", down_proj_high_rest),
     stage_profile_marker("down_high0", range(full_sms)),
     down_proj_high1,
     stage_profile_marker("down_high1", range(104)),
@@ -1195,6 +1217,7 @@ else:
 print(
   f"run VDCores with {cur_offset+1} tokens... "
   f"fine_mlp_barriers={int(fine_mlp_barriers)}, "
+  f"interleave_down_high={int(interleave_down_high)}, "
   f"stage_profile={int(stage_profile)}"
 )
 dae.s()
