@@ -243,6 +243,27 @@ def test_three_way_silu_schedule_maps_one_2048_shard_per_aux_sm(monkeypatch):
         ).place(8)
 
 
+def test_three_way_silu_schedule_accepts_shard_local_barriers(monkeypatch):
+    monkeypatch.setattr("dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr())
+    gate = torch.empty((8, 6144), dtype=torch.bfloat16)
+    up = torch.empty_like(gate)
+    out = torch.empty_like(gate)
+    schedule = SchedSmemSiLUInterleaved(
+        8, gate, up, out, shards_per_token=3
+    )
+    for shard_id in range(3):
+        schedule.bar(f"input{shard_id}", 10 + shard_id)
+        schedule.bar(f"output{shard_id}", 20 + shard_id)
+    schedule = schedule.place(24, base_sm=128)
+
+    for shard_id in range(3):
+        insts = schedule.schedule(shard_id)
+        assert insts[1].num_slots >> 6 == 20 + shard_id
+        assert insts[2].num_slots >> 6 == 10 + shard_id
+        assert schedule.bar_release_count(f"output{shard_id}") == 8
+    assert schedule.bar_release_count("output") == 0
+
+
 def test_launch_sequence_forwards_all_counter_snapshots(monkeypatch):
     launcher = Launcher.__new__(Launcher)
     launcher.num_sms = 152

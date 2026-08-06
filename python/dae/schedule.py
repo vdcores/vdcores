@@ -1339,12 +1339,16 @@ class SchedSmemSiLUInterleaved(Schedule):
             shard_width = self.gate_glob.shape[-1] // self.shards_per_token
             shard_start = shard_id * shard_width
             shard_end = shard_start + shard_width
+            fine_input = self._bar(f"input{shard_id}")
+            fine_output = self._bar(f"output{shard_id}")
+            input_bar = fine_input if fine_input is not None else self._bar("input")
+            output_bar = fine_output if fine_output is not None else self._bar("output")
             return [
                 SILU_MUL_SHARED_BF16_K_2048_INTER(1),
                 TmaStore1D(self.out_glob[token_id, shard_start:shard_end])
-                    .bar(self._bar("output")).group(),
+                    .bar(output_bar).group(),
                 TmaLoad1D(self.gate_glob[token_id, shard_start:shard_end])
-                    .bar(self._bar("input")).group(),
+                    .bar(input_bar).group(),
                 TmaLoad1D(self.up_glob[token_id, shard_start:shard_end]),
             ]
 
@@ -1365,9 +1369,15 @@ class SchedSmemSiLUInterleaved(Schedule):
         return insts
 
     def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, self.num_token * self.shards_per_token)
+        if role == "output":
+            return self._bar_release_if_present(
+                role, self.num_token * self.shards_per_token
+            )
+        if role.startswith("output") and role[6:].isdigit():
+            shard_id = int(role[6:])
+            if 0 <= shard_id < self.shards_per_token:
+                return self._bar_release_if_present(role, self.num_token)
+        return 0
 
 
 

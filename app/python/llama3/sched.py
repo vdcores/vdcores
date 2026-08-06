@@ -183,6 +183,9 @@ rms_sms = REQ
 num_sms = 128
 blackwell_sms = 152
 blackwell_aux_sms = blackwell_sms - num_sms
+# Shard-local MLP readiness is the qualified Blackwell default.  Keep the
+# coarse frontier as an A/B fallback without changing any compute opcode.
+fine_mlp_barriers = os.environ.get("VDCORES_FINE_MLP_BARRIERS", "1") == "1"
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -275,11 +278,15 @@ layerg.addBarrier('bar_attn_out')
 layerg.addBarrier('bar_q_clear')
 layerg.addBarrier('bar_rms_layer', REQ)
 layerg.addBarrier('bar_rms_mlp', REQ)
-layerg.addBarrier('bar_silu_in')
-layerg.addBarrier('bar_silu_out1')
+layerg.addBarrier('bar_silu_in', 0 if fine_mlp_barriers else None)
+layerg.addBarrier('bar_silu_out1', 0 if fine_mlp_barriers else None)
 layerg.addBarrier('bar_silu_out2')
 layerg.addBarrier('bar_pre_attn_rms')
 layerg.addBarrier('bar_post_attn_rms')
+if fine_mlp_barriers:
+  for shard_id in range(3):
+    layerg.addBarrier(f'bar_silu_in{shard_id}')
+    layerg.addBarrier(f'bar_silu_out1_{shard_id}')
 
 ###################################
 # Define tensors
@@ -819,6 +826,70 @@ def schedule_single_token(
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
   ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
 
+  if fine_mlp_barriers:
+    silu_in_bars = [layerg[f'bar_silu_in{i}'] for i in range(3)]
+    silu_out_bars = [layerg[f'bar_silu_out1_{i}'] for i in range(3)]
+
+    gate_prefix_parts = [
+      SchedGemv(
+        QKVAtom,
+        MNK=((i * 2048, 2048), N, HIDDEN),
+        tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),
+      ).bar("load", layerg['bar_post_attn_rms']).bar("store", silu_in_bars[i])
+      for i in range(3)
+    ]
+    up_prefix_parts = [
+      SchedGemv(
+        QKVAtom,
+        MNK=(m_range, N, HIDDEN),
+        tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
+      ).bar("load", layerg['bar_post_attn_rms']).bar("store", silu_in_bars[shard])
+      for m_range, shard in (
+        ((0, 2048), 0),
+        ((2048, 1536), 1),
+        ((3584, 512), 1),
+        ((4096, 1024), 2),
+        ((5120, 1024), 2),
+      )
+    ]
+
+    silu1 = SchedSmemSiLUInterleaved(
+      num_token=N,
+      gate_glob=matGateOut[:, :mlp_split],
+      up_glob=matInterm[:, :mlp_split],
+      out_glob=matSiLUOut[:, :mlp_split],
+      shards_per_token=3,
+    )
+    for shard_id in range(3):
+      silu1.bar(f"input{shard_id}", silu_in_bars[shard_id])
+      silu1.bar(f"output{shard_id}", silu_out_bars[shard_id])
+
+    down_low_parts = []
+    for shard_id in range(3):
+      k_range = (shard_id * 2048, 2048)
+      down_low_parts.extend([
+        SchedGemv(
+          LinearAtom,
+          MNK=((0, 3072), N, k_range),
+          fold=1,
+          tmas=(
+            layerg['loadDown'],
+            layerg['loadSiluLayer'],
+            layerg['reduceHiddenLayer'],
+          ),
+        ).bar("load", silu_out_bars[shard_id]).bar("store", layerg['bar_layer']),
+        SchedGemv(
+          LinearAtom,
+          MNK=((3072, 1024), N, k_range),
+          fold=1,
+          tmas=(
+            layerg['loadDown'],
+            layerg['loadSiluLayer'],
+            layerg['reduceHiddenLayer'],
+          ),
+        ).bar("load", silu_out_bars[shard_id]).bar("store", layerg['bar_layer']),
+      ])
+
   # after all layers, logits projection
   LogitsProj = []
   for i in range(logits_epoch):
@@ -875,17 +946,51 @@ def schedule_single_token(
     out_proj_fold4.place(48),
     out_proj_fold2.place(104, base_sm=48),
   ]
-  gate_proj_prefix = gate_proj_prefix.place(96)
-  up_proj_main = up_proj_main.place(32, base_sm=96)
-  up_proj_aux0 = up_proj_aux0.place(24, base_sm=num_sms)
-  up_proj_aux1 = up_proj_aux1.place(24, base_sm=num_sms)
-  up_proj_aux2 = up_proj_aux2.place(16, base_sm=num_sms + 8)
-  silu1 = silu1.place(N * 3, base_sm=num_sms)
+  if fine_mlp_barriers:
+    gate_prefix_parts = [
+      part.place(32, base_sm=shard_id * 32)
+      for shard_id, part in enumerate(gate_prefix_parts)
+    ]
+    up_prefix_parts = [
+      part.place(part_sms, base_sm=base_sm)
+      for part, (part_sms, base_sm) in zip(
+        up_prefix_parts,
+        ((32, 96), (24, 128), (8, 128), (16, 136), (16, 136)),
+      )
+    ]
+    mlp_prefix_schedules = [*gate_prefix_parts, *up_prefix_parts]
+    silu1 = silu1.place(N * 3, base_sm=num_sms)
+    down_low_parts = [
+      part.place(part_sms, base_sm=base_sm)
+      for part, (part_sms, base_sm) in zip(
+        down_low_parts,
+        ((48, 0), (16, 104), (48, 48),
+         (16, 120), (48, 96), (16, 136)),
+      )
+    ]
+    down_low_schedules = down_low_parts
+  else:
+    gate_proj_prefix = gate_proj_prefix.place(96)
+    up_proj_main = up_proj_main.place(32, base_sm=96)
+    up_proj_aux0 = up_proj_aux0.place(24, base_sm=num_sms)
+    up_proj_aux1 = up_proj_aux1.place(24, base_sm=num_sms)
+    up_proj_aux2 = up_proj_aux2.place(16, base_sm=num_sms + 8)
+    mlp_prefix_schedules = [
+      gate_proj_prefix,
+      up_proj_main,
+      up_proj_aux0,
+      up_proj_aux1,
+      up_proj_aux2,
+    ]
+    silu1 = silu1.place(N * 3, base_sm=num_sms)
+    down_low_schedules = [down_proj_low0, down_proj_low1]
   gate_proj_tail = gate_proj_tail.place(128)
   up_proj_tail = up_proj_tail.place(128)
   silu_tail = silu_tail.place(128)
-  down_proj_low0 = down_proj_low0.place(144)
-  down_proj_low1 = down_proj_low1.place(48, base_sm=104)
+  if not fine_mlp_barriers:
+    down_proj_low0 = down_proj_low0.place(144)
+    down_proj_low1 = down_proj_low1.place(48, base_sm=104)
+    down_low_schedules = [down_proj_low0, down_proj_low1]
   down_proj_high0 = down_proj_high0.place(152)
   down_proj_high1 = down_proj_high1.place(104)
   Argmax = Argmax.place(N)
@@ -912,17 +1017,12 @@ def schedule_single_token(
     Gqa,
     OutProj,
     post_attn_rms,
-    gate_proj_prefix,
-    up_proj_main,
-    up_proj_aux0,
-    up_proj_aux1,
-    up_proj_aux2,
+    mlp_prefix_schedules,
     silu1,
     gate_proj_tail,
     up_proj_tail,
     silu_tail,
-    down_proj_low0,
-    down_proj_low1,
+    down_low_schedules,
     down_proj_high0,
     down_proj_high1,
     pre_attn_rms,
@@ -954,18 +1054,13 @@ def schedule_single_token(
     post_attn_rms,
     
     # MLP
-    gate_proj_prefix,
-    up_proj_main,
-    up_proj_aux0,
-    up_proj_aux1,
-    up_proj_aux2,
+    mlp_prefix_schedules,
     silu1,
     gate_proj_tail,
     up_proj_tail,
     silu_tail,
 
-    down_proj_low0,
-    down_proj_low1,
+    down_low_schedules,
     down_proj_high0,
     down_proj_high1,
 
@@ -1040,7 +1135,10 @@ else:
     dae.i(IssueBarrier(systemg['bar_token_finish']))
     schedule_single_token(cur_offset, cur_pos)
 
-print(f"run VDCores with {cur_offset+1} tokens...")
+print(
+  f"run VDCores with {cur_offset+1} tokens... "
+  f"fine_mlp_barriers={int(fine_mlp_barriers)}"
+)
 dae.s()
 if will_execute:
   dae.prepare_launch()

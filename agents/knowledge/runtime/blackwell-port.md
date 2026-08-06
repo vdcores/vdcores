@@ -194,6 +194,35 @@ test, the overlapped pair measured 2.464 us versus 2.688 us for dual output;
 both outputs were correct. The 9.1% regression means the prototype should not
 be restored unless the writeback pipeline changes materially.
 
+## Fine-Grained MLP Readiness
+
+The retained Blackwell Llama schedule no longer puts the entire 6144-wide MLP
+prefix behind one producer barrier. Gate/up output, SwiGLU, and the low-K down
+projection use three 2048-wide readiness chains. Each chain releases after its
+32 gate and 32 up tiles, lets eight token-local SwiGLU tasks run, and then
+releases the matching K2048 down-projection folds. The output tiles, K folds,
+SM placement, compute opcodes, and BF16 reduction work are unchanged; only the
+frontier granularity and ready-shard issue order differ. The coarse schedule
+remains available with `VDCORES_FINE_MLP_BARRIERS=0` for paired comparisons.
+
+Internal-counter medians on the same exact 11-op image were:
+
+| B8 context | Coarse MLP barriers | Three shard barriers | Delta |
+| ---: | ---: | ---: | ---: |
+| 64 | 2.808928 ms | 2.766432 ms | -42.496 us (-1.51%) |
+| 128 | 2.811984 ms | 2.769376 ms | -42.608 us (-1.52%) |
+| 512 | 2.844864 ms | 2.797472 ms | -47.392 us (-1.67%) |
+
+The 501-iteration S128 A/B/A sandwich is job
+`20260806T212444Z-2221138`; the S64/S512 sweep is job
+`20260806T212616Z-2225221`. A detailed single-token tensor comparison passed
+all thresholds in `20260806T212343Z-2218735`, and four control-flow greedy
+tokens exactly matched Hugging Face in `20260806T212301Z-2216505`. Because
+this is a Python schedule change, the selective runtime remains at 128
+registers, nine barriers, a 96-byte stack, and zero spills. This is the useful
+VDCores analogue of dependent-kernel overlap: publish a coarse-enough shard to
+another compute group without paying a command transition for each epilogue.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
