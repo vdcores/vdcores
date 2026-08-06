@@ -312,6 +312,66 @@ three commands per block. It should preserve the split-P dependency cut and
 use separate TMEM accumulator regions so a helper can drain one stage while
 UMMA fills another.
 
+### Two-bank UMMA/TMEM pipeline
+
+Multiple UMMA groups can be in flight inside one compute task when they target
+disjoint TMEM columns and have independent completion barriers. An exact
+M128N8K64 probe seeded banks 0 and 1, waited for bank `n`, started its 4 KiB
+TMEM-to-register drain, and submitted group `n+2` into the freed stage. The
+drain therefore overlaps UMMA filling the other bank; it does not try to read
+the bank still owned by UMMA. Job `20260806T183731Z-1618074` measured:
+
+| UMMA operations per group | Serial | Two-bank overlap | Delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 444.719 ns | 385.688 ns | -13.27% |
+| 2 | 529.625 ns | 385.563 ns | -27.20% |
+| 4 | 733.687 ns | 540.937 ns | -26.27% |
+| 8 | 1154.313 ns | 938.781 ns | -18.67% |
+
+All final values, pair ordering checks, and repeat checks were exact over
+10,001 iterations. A phase-accurate LM-head probe covering 1,002 M128 output
+tiles and nine rounds reduced the internal span from 91.216 to 69.869 us
+(-23.4%) with exact CPU and 1,001-repeat checks in job
+`20260806T184153Z-1636614`. Paired projection probes also confirmed a smaller
+but real opportunity when the whole schedule exposes independent work: with
+384 threads, gate/up improved from 4.984 to 4.657 us (-6.55%) and down from
+5.713 to 5.298 us (-7.26%) in job `20260806T183835Z-1621647`. A 352-thread
+form remained exact but reduced those gains to 4.26% and 3.86%; extra sidecar
+warps are not automatically better.
+
+The fine-grained integration into the retained grouped M128 GEMV did not win.
+That task can only drain an output bank after all of its K tiles have
+accumulated, so the prototype overlapped only the four final epilogues while
+adding two completion stages and compute-group transitions to every task. A
+same-image internal-counter sweep in job `20260806T185434Z-1686708` was:
+
+| K | Retained grouped task | Final-epilogue pipeline | Delta |
+| ---: | ---: | ---: | ---: |
+| 512 | 9.344 us | 9.568 us | +2.40% |
+| 1024 | 22.272 us | 22.528 us | +1.15% |
+| 2048 | 40.384 us | 40.448 us | +0.16% |
+| 4096 | 75.968 us | 76.128 us | +0.21% |
+
+Moving the two stage barriers to persistent runtime state, removing task-local
+initialization, and skipping the two producer-free tail barriers lowered the
+selective image from 48 to 45 registers with no spills. It still measured
+9.600 versus 9.376 us at K512 and 76.128 versus 75.968 us at K4096 in job
+`20260806T190102Z-1708233`. The experimental opcode, schedule reorder, and
+extra runtime barriers were therefore removed.
+
+The restored direct4+terminate image uses 32 registers, one barrier, an
+80-byte stack, and no spills. Its exact K4096 validation in job
+`20260806T190514Z-1726220` measured a 76.000 us median over 501 iterations.
+
+The useful design boundary is coarse ping-pong, not a final-epilogue patch:
+assign a persistent CTA successive independent output tiles, let UMMA reduce
+tile `n+1` into one TMEM bank while a disjoint role drains and writes tile `n`,
+and amortize each stage transition over a complete K reduction. This best fits
+LM head or another output-tile-parallel phase with spare SMs. It must be
+compared against the retained grouped task's B-tile reuse, because duplicating
+or retaining B traffic can erase the 4-7% task-level opportunity even though
+the underlying overlap is valid.
+
 After removing every experimental opcode/runtime hook, the selective
 production image returned to 63 registers, 9 barriers, a 96-byte stack, and no
 spills. Fresh B8 internal medians were 3.264/4.672/7.200 us for unsplit
