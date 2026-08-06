@@ -313,8 +313,12 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
     auto s_output = make_tensor(make_smem_ptr(output_ptr), layout_output);
     auto cta_output = cta_mma.partition_C(s_output);
 
+    // CUTLASS's SM100 epilogue policy uses the wide 16-datapath ownership
+    // pattern for FP32 accumulators narrowed to 16-bit output.  It aligns the
+    // M64 fragment with an stmatrix transpose store instead of scalar shared
+    // writes; M128 retains its native 32-datapath mapping.
     using TmemLoad = std::conditional_t<
-        M == 64, SM100_TMEM_LOAD_16dp32b1x, SM100_TMEM_LOAD_32dp32b1x>;
+        M == 64, SM100_TMEM_LOAD_16dp256b1x, SM100_TMEM_LOAD_32dp32b1x>;
     TiledCopy tiled_t2r = make_tmem_copy(TmemLoad{}, tmem_acc);
     ThrCopy thr_t2r = tiled_t2r.get_slice(tid);
     auto thread_tmem = thr_t2r.partition_S(tmem_acc);
@@ -322,7 +326,7 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
     auto r_acc = make_tensor<accum_t>(shape(thread_output));
     copy(tiled_t2r, thread_tmem, r_acc);
 
-    auto r_output = make_fragment_like(thread_output);
+    auto r_output = make_tensor<data_t>(shape(thread_output));
     if constexpr (Residual) {
         auto s_residual = make_tensor(make_smem_ptr(residual_ptr), layout_output);
         auto thread_residual = thr_t2r.partition_D(cta_mma.partition_C(s_residual));
@@ -338,7 +342,16 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
             r_output(i) = data_t(r_acc(i));
         }
     }
-    copy(r_output, thread_output);
+    if constexpr (M == 64) {
+        TiledCopy tiled_r2s = make_tiled_copy_D(
+            Copy_Atom<SM90_U16x4_STSM_T, data_t>{}, tiled_t2r);
+        ThrCopy thr_r2s = tiled_r2s.get_slice(tid);
+        auto thread_r2s_output = thr_r2s.partition_D(cta_output);
+        auto r2s_output = thr_r2s.retile_S(r_output);
+        copy(tiled_r2s, r2s_output, thread_r2s_output);
+    } else {
+        copy(r_output, thread_output);
+    }
 
     if constexpr (ApplyRope) {
         // RoPE is linear, so rotate each K-fold partial before the output TMA
@@ -701,7 +714,9 @@ __device__ __forceinline__ void task_gemv_sm100_grouped_reduce(
     auto layout_output = tile_to_shape(
         GMMA::Layout_MN_SW128_Atom<data_t>{},
         make_shape(Int<M>{}, Int<N>{}));
-    using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
+    // Drain a complete M128N8 fragment per pass.  The narrower x1 form needs
+    // four times as many TMEM load instructions for every grouped epilogue.
+    using TmemLoad = SM100_TMEM_LOAD_32dp32b4x;
     const int output_slot = m2c.template pop<0>();
     data_t *output_base = static_cast<data_t *>(
         get_slot_address(base, extract(output_slot)));
