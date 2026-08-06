@@ -11,6 +11,7 @@ from dae.instructions import (
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     MemoryInstruction,
+    ProfileEvent,
     RepeatM,
     TmaTensor,
 )
@@ -51,6 +52,15 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert repeat.arg & RepeatM.COUNT_COUNTER_MODE_FLAG
     assert repeat.arg & RepeatM.COUNTER_REG_MASK == 3
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
+
+
+def test_profile_event_reserves_kernel_start_and_end_slots():
+    instruction = ProfileEvent(17)
+
+    assert instruction.opcode == opcode.OP_PROFILE_EVENT
+    assert instruction.args == [17]
+    with pytest.raises(ValueError, match="slots 0/1"):
+        ProfileEvent(1)
 
 
 def test_attention_runtime_counter_fields_are_disjoint():

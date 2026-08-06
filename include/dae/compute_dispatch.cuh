@@ -613,6 +613,23 @@ DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
   task_rope_interleaved<512>(smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
+  DAE_UNUSED(pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, st_insts, m2c,
+             c2m);
+  // Diagnostic-only schedule marker.  Synchronize only the four compute
+  // warps: the memory warps are independent VM roles and never join this
+  // barrier.  Production images do not select this opcode.
+  __sync_compute_group(128);
+  if (thread_id == 0) {
+    const int event_id = inst.args[0];
+    if (event_id >= 2 && event_id < numProfileEvents) {
+      g_events[sm_id * numProfileEvents + event_id] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+  }
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
   DAE_UNUSED(sm_id, thread_id, finish, smem_base, scratch_space, st_insts, m2c, c2m, g_events);
   const int counter_reg = inst.args[2];

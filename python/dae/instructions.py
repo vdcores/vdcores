@@ -596,6 +596,18 @@ class Copy(ComputeInstruction):
         super().__init__(opcode=opcode.OP_COPY, args=[iters, size // 4])
 
 
+class ProfileEvent(ComputeInstruction):
+    """Record a compute-warpgroup arrival timestamp in the per-SM profile."""
+
+    def __init__(self, event_id: int):
+        if not 2 <= event_id < config.num_profile_events:
+            raise ValueError(
+                "profile event id must leave slots 0/1 for kernel start/end "
+                f"and be below {config.num_profile_events}, got {event_id}"
+            )
+        super().__init__(opcode=opcode.OP_PROFILE_EVENT, args=[event_id])
+
+
 class LoopC(ComputeInstruction):
     def __init__(self, count: int, pc: int, reg: int = 0):
         assert 0 <= reg < 2**16, "reg must fit in uint16"
@@ -1254,6 +1266,7 @@ __all__ = [
     "ARGMAX_REDUCE_GLOBAL_bf16_256",
     "Dummy",
     "Copy",
+    "ProfileEvent",
     "LoopC",
     "MemoryInstruction",
     "TerminateM",

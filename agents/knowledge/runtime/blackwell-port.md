@@ -502,3 +502,43 @@ and the coarse specialized roles in
 The restored unprofiled image passed the runtime smoke test in job
 `20260806T225825Z-2457622` and measured a 2.765856 ms S128 median over 501
 iterations in job `20260806T225857Z-2458535`.
+
+### Whole-token compute-frontier profiling
+
+An opt-in `VDCORES_STAGE_PROFILE=1` mode records compute-warpgroup arrival
+times in the runtime's existing per-SM event buffer. `OP_PROFILE_EVENT`
+synchronizes only the four compute warps before thread 0 reads `globaltimer`;
+the independent memory warps never join that barrier. The marker opcode is
+included only by `benchmarks/blackwell_llama8b_stage_profile.ops`, so the
+11-op production image and its dispatch path are unchanged. Marker runs are
+diagnostic rather than qualification measurements: detailed markers changed
+the S128 median from 2.765440 ms unprofiled to 2.793120 ms.
+
+S64, S128, and S512 traces showed the same final-layer topology. The main
+tail is deterministic placement, not a random slow block:
+
+- Gate/up prefix work on SMs 0--135 reaches a 40--50 us frontier, while the
+  second shard-2 up-projection chunk serializes on SMs 136--151 and reaches
+  66.7 us. Shard-local barriers let useful down-projection work overlap this
+  tail, so the spread is not itself the full critical-path cost.
+- The six low-K down-projection placements reach 77.0 us. The following
+  high-K ranges converge at about 83 us; the late physical SM IDs reflect the
+  deliberate balance between early shard work and later output ranges.
+- The two LM-head epochs reach about 234 us. Their max-minus-median frontier
+  spread is only about 2--3 us and the tail SM IDs move between runs, so there
+  is no evidence yet that a dynamic work queue would repay its atomic and
+  interpreter costs.
+
+The profiling jobs are `20260806T231633Z-2498393` (S128 stage),
+`20260806T231820Z-2501831` (S64), `20260806T231859Z-2503092` (S512), and
+`20260806T232129Z-2507589` (detailed S128 task parts). The profiling image
+remained spill-free at 128 registers, nine barriers, and a 96-byte stack, and
+the full-model correctness run `20260806T231739Z-2500732` matched every
+existing tensor threshold and the exact reference token.
+
+Use frontier timestamps, not per-SM marker-to-marker duration alone, to find
+the critical block. A compute warpgroup that arrives early at a downstream
+barrier reports a long local duration while waiting, but is not the tail that
+releases the stage. Prefer static dependency and placement changes while the
+tail is repeatable; prototype dynamic task dispatch only if a material,
+run-varying straggler remains after those changes.

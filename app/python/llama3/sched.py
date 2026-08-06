@@ -7,6 +7,7 @@ from dae.launcher import *
 from dae.schedule import *
 from dae.model import *
 from dae.util import dae_app
+from dae import runtime as dae_runtime
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 try:
   from transformers.cache_utils import StaticKVCache
@@ -186,6 +187,7 @@ blackwell_aux_sms = blackwell_sms - num_sms
 # Shard-local MLP readiness is the qualified Blackwell default.  Keep the
 # coarse frontier as an A/B fallback without changing any compute opcode.
 fine_mlp_barriers = os.environ.get("VDCORES_FINE_MLP_BARRIERS", "1") == "1"
+stage_profile = os.environ.get("VDCORES_STAGE_PROFILE", "0") == "1"
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -540,6 +542,38 @@ tma_shift, bar_shift = layerg.get_shift()
 TOKEN_LOOP_REG = 1
 TOKEN_BASE_REG = 2
 KV_BLOCK_COUNT_REG = 3
+
+stage_profile_events = {}
+
+
+def stage_profile_marker(name: str, active_sms=None):
+  if not stage_profile:
+    return None
+  if name not in stage_profile_events:
+    event_id = 2 + len(stage_profile_events)
+    if event_id >= dae_runtime.config.num_profile_events:
+      raise RuntimeError("Llama stage profile exhausted the runtime event buffer")
+    if active_sms is None:
+      active_sms = tuple(range(full_sms))
+    else:
+      active_sms = tuple(active_sms)
+    stage_profile_events[name] = (event_id, active_sms)
+  return ProfileEvent(stage_profile_events[name][0])
+
+
+def stage_profile_schedule_parts(prefix: str, schedules):
+  if not stage_profile:
+    return schedules
+  profiled = []
+  for part_id, schedule in enumerate(schedules):
+    profiled.extend([
+      schedule,
+      stage_profile_marker(
+        f"{prefix}{part_id}",
+        range(schedule.base_sm, schedule.base_sm + schedule.num_sms),
+      ),
+    ])
+  return profiled
 
 
 class CounterOffsetCordAdapter(CordAdapter):
@@ -1041,45 +1075,68 @@ def schedule_single_token(
 
   # Start a new schedule to mark the loop target.
   dae.i(
+    stage_profile_marker("layer_start"),
     QProj,
+    stage_profile_marker("q_proj", range(128)),
     QRope,
+    stage_profile_marker("q_rope", range(128)),
     KProj,
+    stage_profile_marker("k_proj", range(64, 128)),
     KRope,
+    stage_profile_marker("k_rope", range(64, 128)),
     VProj,
+    stage_profile_marker("v_proj", range(64)),
 
     Gqa,
-    OutProj,
+    stage_profile_marker("attention", range(N * NUM_KV_HEAD)),
+    stage_profile_schedule_parts("out_proj_part", OutProj),
+    stage_profile_marker("out_proj", range(full_sms)),
 
     # RMS
     post_attn_rms,
+    stage_profile_marker("post_attn_rms", range(rms_sms)),
     
     # MLP
-    mlp_prefix_schedules,
+    stage_profile_schedule_parts("mlp_prefix_part", mlp_prefix_schedules),
+    stage_profile_marker("mlp_prefix", range(full_sms)),
     silu1,
+    stage_profile_marker("silu_prefix", range(num_sms, full_sms)),
     gate_proj_tail,
+    stage_profile_marker("gate_tail", range(128)),
     up_proj_tail,
+    stage_profile_marker("up_tail", range(128)),
     silu_tail,
+    stage_profile_marker("silu_tail", range(128)),
 
-    down_low_schedules,
+    stage_profile_schedule_parts("down_low_part", down_low_schedules),
+    stage_profile_marker("down_low", range(full_sms)),
     down_proj_high0,
+    stage_profile_marker("down_high0", range(full_sms)),
     down_proj_high1,
+    stage_profile_marker("down_high1", range(104)),
 
     # rms for next layer
     pre_attn_rms,
+    stage_profile_marker("next_rms", range(rms_sms)),
 
     clear_q,
+    stage_profile_marker("clear_q", range(num_sms, full_sms)),
 
     # All 152 SMs need the layer loop.
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
     LoopC.toNext(dae.copy_cptrs(), num_layers),
+    stage_profile_marker("layers_done"),
 
     # # logits
-    LogitsProj,
+    stage_profile_schedule_parts("lm_head_epoch", LogitsProj),
+    stage_profile_marker("lm_head", range(num_sms)),
 
     # argmax and cleanup
     Argmax,
+    stage_profile_marker("argmax", range(N)),
 
     restore_bars_low,
+    stage_profile_marker("restore", range(128, 129)),
   )
 
   if control_flow:
@@ -1137,7 +1194,8 @@ else:
 
 print(
   f"run VDCores with {cur_offset+1} tokens... "
-  f"fine_mlp_barriers={int(fine_mlp_barriers)}"
+  f"fine_mlp_barriers={int(fine_mlp_barriers)}, "
+  f"stage_profile={int(stage_profile)}"
 )
 dae.s()
 if will_execute:
@@ -1232,6 +1290,51 @@ elif will_execute:
   )
 else:
   dae_app(dae)
+
+if will_execute and stage_profile:
+  profile = dae.profile.cpu().numpy()
+  ordered_profile_events = sorted(
+    stage_profile_events.items(), key=lambda item: item[1][0]
+  )
+  previous_name = None
+  previous_event_id = None
+  layer_start_event = stage_profile_events["layer_start"][0]
+  for name, (event_id, active_sms) in ordered_profile_events:
+    if previous_event_id is None:
+      previous_name = name
+      previous_event_id = event_id
+      continue
+    active = list(active_sms)
+    duration_us = (
+      profile[active, event_id].astype("int64")
+      - profile[active, previous_event_id].astype("int64")
+    ) / 1.0e3
+    frontier_us = (
+      profile[active, event_id].astype("int64")
+      - profile[active, layer_start_event].astype("int64")
+    ) / 1.0e3
+    slow_order = duration_us.argsort()[-min(6, len(active)):][::-1]
+    slow_sms = ",".join(
+      f"{active[idx]}:{duration_us[idx]:.3f}" for idx in slow_order
+    )
+    frontier_order = frontier_us.argsort()[-min(6, len(active)):][::-1]
+    tail_sms = ",".join(
+      f"{active[idx]}:{frontier_us[idx]:.3f}" for idx in frontier_order
+    )
+    print(
+      "[stage-profile] "
+      f"{previous_name}->{name} active={len(active)} "
+      f"duration_us[p10={float(torch.quantile(torch.tensor(duration_us), 0.1)):.3f},"
+      f"p50={float(torch.median(torch.tensor(duration_us))):.3f},"
+      f"p90={float(torch.quantile(torch.tensor(duration_us), 0.9)):.3f},"
+      f"max={duration_us.max():.3f}] "
+      f"frontier_us[p10={float(torch.quantile(torch.tensor(frontier_us), 0.1)):.3f},"
+      f"p50={float(torch.median(torch.tensor(frontier_us))):.3f},"
+      f"p90={float(torch.quantile(torch.tensor(frontier_us), 0.9)):.3f},"
+      f"max={frontier_us.max():.3f}] slow_sms={slow_sms} tail_sms={tail_sms}"
+    )
+    previous_name = name
+    previous_event_id = event_id
 
 def print_generated_text():
   generated_token_ids = matTokens[
