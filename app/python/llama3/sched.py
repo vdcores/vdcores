@@ -278,7 +278,6 @@ layerg.addBarrier('bar_rms_mlp', REQ)
 layerg.addBarrier('bar_silu_in')
 layerg.addBarrier('bar_silu_out1')
 layerg.addBarrier('bar_silu_out2')
-layerg.addBarrier('bar_down_aux')
 layerg.addBarrier('bar_pre_attn_rms')
 layerg.addBarrier('bar_post_attn_rms')
 
@@ -795,29 +794,30 @@ def schedule_single_token(
     base_offset=mlp_split,
     stride=QKVTileM,
   ).bar("output", layerg['bar_silu_out2'])
-  # The 24 auxiliary SMs consume one low-K task while the 128 main SMs finish
-  # the register-forwarded gate/up/SwiGLU tail. The matching high-K rows run
-  # on the 24 main SMs left idle by the 104-task main partition.
-  down_proj_low_aux = SchedGemv(LinearAtom,
-    MNK=((0, 768), N, 6144),
-    fold=2,
+  # Balance the down projection over all 152 SMs.  The two low-K schedules
+  # contribute 192 fold-3 tasks and the two high-K schedules contribute 256
+  # fold-4 tasks.  Placement gives 144 SMs three K2048 tasks and eight SMs two
+  # tasks, instead of leaving the 104-SM rectangular core with a 28-tile tail.
+  down_proj_low0 = SchedGemv(LinearAtom,
+    MNK=((0, 3072), N, 6144),
+    fold=3,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_down_aux'])
-  down_proj_low_main = SchedGemv(LinearAtom,
-    MNK=((768, HIDDEN - 768), N, 6144),
-    fold=2,
+  ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_layer'])
+  down_proj_low1 = SchedGemv(LinearAtom,
+    MNK=((3072, 1024), N, 6144),
+    fold=3,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out1'])
-  down_proj_high_aux_rows = SchedGemv(LinearAtom,
-    MNK=((0, 768), N, (6144, 8192)),
-    fold=2,
+  ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_layer'])
+  down_proj_high0 = SchedGemv(LinearAtom,
+    MNK=((0, 2432), N, (6144, 8192)),
+    fold=4,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_down_aux']).bar("store", layerg['bar_layer'])
-  down_proj_high_main_rows = SchedGemv(LinearAtom,
-    MNK=((768, HIDDEN - 768), N, (6144, 8192)),
-    fold=2,
+  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
+  down_proj_high1 = SchedGemv(LinearAtom,
+    MNK=((2432, 1664), N, (6144, 8192)),
+    fold=4,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("store", layerg['bar_layer'])
+  ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
 
   # after all layers, logits projection
   LogitsProj = []
@@ -884,10 +884,10 @@ def schedule_single_token(
   gate_proj_tail = gate_proj_tail.place(128)
   up_proj_tail = up_proj_tail.place(128)
   silu_tail = silu_tail.place(128)
-  down_proj_low_aux = down_proj_low_aux.place(24, base_sm=num_sms)
-  down_proj_low_main = down_proj_low_main.place(104)
-  down_proj_high_aux_rows = down_proj_high_aux_rows.place(24, base_sm=104)
-  down_proj_high_main_rows = down_proj_high_main_rows.place(104)
+  down_proj_low0 = down_proj_low0.place(144)
+  down_proj_low1 = down_proj_low1.place(48, base_sm=104)
+  down_proj_high0 = down_proj_high0.place(152)
+  down_proj_high1 = down_proj_high1.place(104)
   Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
@@ -921,10 +921,10 @@ def schedule_single_token(
     gate_proj_tail,
     up_proj_tail,
     silu_tail,
-    down_proj_low_aux,
-    down_proj_low_main,
-    down_proj_high_aux_rows,
-    down_proj_high_main_rows,
+    down_proj_low0,
+    down_proj_low1,
+    down_proj_high0,
+    down_proj_high1,
     pre_attn_rms,
     clear_q,
     LogitsProj,
@@ -964,10 +964,10 @@ def schedule_single_token(
     up_proj_tail,
     silu_tail,
 
-    down_proj_low_aux,
-    down_proj_low_main,
-    down_proj_high_aux_rows,
-    down_proj_high_main_rows,
+    down_proj_low0,
+    down_proj_low1,
+    down_proj_high0,
+    down_proj_high1,
 
     # rms for next layer
     pre_attn_rms,

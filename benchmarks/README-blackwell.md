@@ -303,9 +303,9 @@ is no HTTP transport.
 
 | Fixed context | VDCores internal (ms) | vLLM 0.23.0 launch-inclusive (ms) | SGLang 0.5.12.post1 launch-inclusive (ms) | Fastest | VDCores vs vLLM | VDCores vs SGLang |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| 64 | 2.906 | **2.842** | 3.381 | vLLM | 2.2% slower | 14.0% faster |
-| 128 | 2.900 | **2.816** | 3.312 | vLLM | 3.0% slower | 12.5% faster |
-| 512 | **2.931** | 3.499 | 3.683 | VDCores | 16.2% faster | 20.4% faster |
+| 64 | **2.812** | 2.842 | 3.381 | VDCores | 1.1% faster | 16.8% faster |
+| 128 | **2.811** | 2.816 | 3.312 | VDCores | 0.2% faster | 15.1% faster |
+| 512 | **2.851** | 3.499 | 3.683 | VDCores | 18.5% faster | 22.6% faster |
 
 vLLM uses its engine-core first/last-token timestamps and automatically selects
 the FlashInfer HND backend. SGLang uses its streaming engine metric with the
@@ -315,9 +315,8 @@ full decode CUDA graph remains enabled. Thus both framework columns retain
 decode scheduling and launch overhead, while the VDCores column remains the
 resident-megakernel internal span.
 
-Final fused-path 500-sample medians are 2.905936/2.899536/2.931248 ms at
-S64/S128/S512. S64/S512 use job `20260806T000216Z-1499618`; S128 uses
-`20260805T235912Z-1475454`. Strict vLLM jobs are
+Final balanced-down 501-sample medians are 2.811616/2.810784/2.851328 ms at
+S64/S128/S512 in job `20260806T011823Z-2068499`. Strict vLLM jobs are
 `20260805T205321Z-66365` (S64), `20260805T205112Z-50840` (S128), and
 `20260805T205544Z-83058` (S512). Strict SGLang jobs are
 `20260805T213318Z-356270` (S64), `20260805T213450Z-368285` (S128), and
@@ -333,13 +332,15 @@ scopes and deliberately exclude the launch-inclusive system comparison above.
 
 | BF16 B8 projection, shape M x N x K | Production M64 VDCores (us) | M128 VDCores (us) | Group-4 M128 diagnostic (us) | vLLM (us) | SGLang (us) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Output, 4096 x 8 x 4096 | 7.456 | 6.688 | 6.112 | **5.949** | **5.949** |
-| Down, 4096 x 8 x 14336 | 21.760 | 20.480 | 20.864 | 19.367 | **18.405** |
+| Output, 4096 x 8 x 4096 | 7.328 | 6.560 | 6.112 | **5.949** | **5.949** |
+| Down, 4096 x 8 x 14336 | 21.888 | 20.480 | 19.296 | 19.367 | **18.405** |
 
 The group-4 path is diagnostic only: its fold-16 BF16 reduction ordering does
-not satisfy the qualified 32-layer schedule. The production M64 task is 12.4%
-slower than vLLM and 18.2% slower than SGLang for the exact down shape. M128
-recovers 1.28 us, but is still 5.7%/11.3% behind.
+not satisfy the qualified 32-layer schedule. Its wider x4 TMEM drain now edges
+the vLLM down probe by 0.4%, but remains 4.8% behind SGLang. The production
+M64 path intentionally retains the qualified arithmetic order; its gain comes
+from balancing and overlapping the complete layer schedule rather than using
+the numerically rejected M128 reduction.
 
 Temporary compute-stream markers then split the production S128 critical path:
 
@@ -378,6 +379,47 @@ frontier markers split an S128 layer into QKV/RoPE/cache (11.500 us), attention
 (23.000 us), and clear (0.250 us). Per-SM event timelines expose which work is
 actually concurrent, while Nsight is used only to verify framework graph
 topology because its instrumentation changes absolute latency.
+
+### Current S128 Blackwell projection follow-up
+
+The retained M64 epilogue now follows CUTLASS's SM100 FP32-to-16-bit policy:
+`16dp256b1x` drains TMEM to registers and `stmatrix` writes the converted
+fragment to the existing shared TMA-reduction slot. It preserves the M64 UMMA
+and reduction order. A wider x4 drain also reduces the existing diagnostic
+M128 group-4 down probe from 19.680 to 19.296 us; x8 regressed to 19.776 us.
+
+The larger end-to-end gain is scheduling. The old down projection mapped 104
+SMs to a 28-K256-tile serial tail while the other 48 SMs carried only 12--16
+tiles. The retained split uses 192 low-K fold-3 tasks and 256 high-K fold-4
+tasks, all with K2048. Its placement gives 144 SMs three tasks and eight SMs
+two tasks, reducing the critical load to 24 tiles. High-K waits directly on
+the runtime barrier released by the register-forwarded SwiGLU tail; the next
+RMS barrier counts every one of the 448 down contributors. No thread fence or
+implicit memory-warp join is used.
+
+| S128 measurement | Previous | Retained | Change |
+| --- | ---: | ---: | ---: |
+| Down schedule, resident `globaltimer` (us) | 22.816 | **21.888** | -4.1% |
+| Full single-token decode, resident `globaltimer` (ms) | 2.900 | **2.811** | -3.1% |
+| Fixed-context vLLM decode (ms) | 2.816 | 2.816 | VDCores now 0.2% faster |
+| Fixed-context SGLang decode (ms) | 3.312 | 3.312 | VDCores now 15.1% faster |
+
+The down schedule comparison is a paired 501-iteration standalone probe from
+job `20260806T005532Z-1899332`; mean-relative BF16 error is 0.245% for the old
+layout and 0.319% for the balanced layout. The final S128 confirmation is job
+`20260806T011823Z-2068499`; an independent 501-iteration run reached 2.802048
+ms in job `20260806T005129Z-1869027`.
+
+Reproduce the down-stage comparison with the exact Llama compute image:
+
+```bash
+GEMV_M=4096 GEMV_K=14336 GEMV_SMS=152 GEMV_TILE_M=64 \
+GEMV_TILE_PACKED=1 GEMV_DOWN_SCHEDULE=legacy GEMV_ITERS=501 \
+  python benchmarks/blackwell_gemv.py
+GEMV_M=4096 GEMV_K=14336 GEMV_SMS=152 GEMV_TILE_M=64 \
+GEMV_TILE_PACKED=1 GEMV_DOWN_SCHEDULE=balanced GEMV_ITERS=501 \
+  python benchmarks/blackwell_gemv.py
+```
 
 ### Spare-SM and fusion follow-up
 
@@ -442,9 +484,10 @@ with the unified online-softmax path. The exact 11-operator Llama image uses
 128 registers, 9 barriers, a 96-byte stack frame, and zero spills. Removing
 the prior padded attention opcode from the selective image lowered the
 megakernel-wide register allocation from roughly 202 registers.
-Clean fused-path checks pass at S1 (`20260806T000015Z-1484701`) and S128
-(`20260806T000808Z-1544456`); four-token control flow exactly matches
-`[75987, 57918, 706, 264]` in `20260806T000126Z-1492600`.
+Clean balanced-path checks pass at S1 and four-token control flow in
+`20260806T005328Z-1885899`; the latter exactly matches
+`[75987, 57918, 706, 264]`. The S128 tensor check and exact final token pass in
+`20260806T005041Z-1862547`.
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
 bulk sequence launches on all 152 SMs.
 
@@ -455,10 +498,12 @@ layouts described by the [CUDA Blackwell tuning guide](https://docs.nvidia.com/c
 the [CUDA PTX ISA tcgen05/TMEM synchronization model](https://docs.nvidia.com/cuda/parallel-thread-execution/contents.html),
 and [CUTLASS Blackwell GEMM guidance](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html),
 including its TMEM-to-register epilogues and Blackwell-specific pipelines.
+The exact wide-load and shared-store selection follows the official
+[CUTLASS SM100 epilogue builder](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/epilogue/collective/builders/sm100_builder.inl).
 Kernel organization and comparison regimes were cross-checked against the
 [CUTLASS SM100 low-latency GQA example](https://github.com/NVIDIA/cutlass/tree/main/examples/93_blackwell_low_latency_gqa),
 [Triton Blackwell persistent-matmul example](https://github.com/triton-lang/triton/blob/main/python/tutorials/09-persistent-matmul.py),
 [FlashInfer decode APIs and SM100 CuTe path](https://github.com/flashinfer-ai/flashinfer),
 [vLLM's CUDA-graph model runner](https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/model_runner.py),
 [SGLang's decode runner and attention backends](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py),
-and the [FlashAttention-4 CuTeDSL implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd.py).
+and the [FlashAttention-4 SM100 CuTeDSL implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm100.py).

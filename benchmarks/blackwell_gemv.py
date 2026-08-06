@@ -67,6 +67,7 @@ def main() -> None:
     tile_m = int(os.environ.get("GEMV_TILE_M", "64"))
     grouped_output = os.environ.get("GEMV_GROUPED_OUTPUT", "0") == "1"
     grouped_reduce = int(os.environ.get("GEMV_GROUPED_REDUCE", "0"))
+    down_schedule = os.environ.get("GEMV_DOWN_SCHEDULE", "none").strip().lower()
     fused_rope = os.environ.get("GEMV_FUSED_ROPE", "0") == "1"
     two_op_rope = os.environ.get("GEMV_TWO_OP_ROPE", "0") == "1"
     m = int(os.environ.get("GEMV_M", "4096"))
@@ -77,13 +78,20 @@ def main() -> None:
     rope_position = int(os.environ.get("GEMV_ROPE_POSITION", "0"))
     tile_packed = os.environ.get("GEMV_TILE_PACKED", "0") == "1"
     iterations = int(os.environ.get("GEMV_ITERS", "50"))
-    if (
-        sum((bool(grouped_output), bool(grouped_reduce), fused_rope, two_op_rope))
-        > 1
-    ):
+    if down_schedule not in ("none", "legacy", "balanced"):
+        raise ValueError("GEMV_DOWN_SCHEDULE must be none, legacy, or balanced")
+    if sum(
+        (
+            bool(grouped_output),
+            bool(grouped_reduce),
+            down_schedule != "none",
+            fused_rope,
+            two_op_rope,
+        )
+    ) > 1:
         raise ValueError(
-            "direct grouped output, grouped reduction, fused RoPE, and "
-            "two-op RoPE are exclusive"
+            "direct grouped output, grouped reduction, down scheduling, "
+            "fused RoPE, and two-op RoPE are exclusive"
         )
     if fused_rope:
         atom = Gemv_M64N8_ROPE_128
@@ -112,6 +120,14 @@ def main() -> None:
         )
     if (fused_rope or two_op_rope) and m % 128:
         raise ValueError("projection + RoPE requires M to contain whole D128 heads")
+    if down_schedule != "none" and (
+        (m, k, sms, tile_m, split_m, epochs) != (4096, 14336, 152, 64, 1, 1)
+        or not tile_packed
+    ):
+        raise ValueError(
+            "GEMV_DOWN_SCHEDULE requires packed M4096xN8xK14336, "
+            "152 SMs, M64, one M split, and one epoch"
+        )
     if min(m, k, sms, split_m, epochs, iterations) <= 0 or rope_position < 0:
         raise ValueError(
             "GEMV_M, GEMV_K, GEMV_SMS, GEMV_SPLIT_M, GEMV_EPOCHS, and "
@@ -120,7 +136,9 @@ def main() -> None:
     if m % split_m or (m // split_m) % tile_m:
         raise ValueError("each M split must contain a whole number of M tiles")
     m_tiles_per_split = (m // split_m) // tile_m
-    if grouped_output:
+    if down_schedule != "none":
+        fold = "2+2" if down_schedule == "legacy" else "3+4"
+    elif grouped_output:
         if not tile_packed or split_m != 1:
             raise ValueError(
                 "GEMV_GROUPED_OUTPUT requires packed weights and GEMV_SPLIT_M=1"
@@ -200,6 +218,35 @@ def main() -> None:
             load_matrix = TmaTensor(launcher, matrix).wgmma_load_tiled(
                 atom.MNK[0], atom.MNK[2]
             )
+            if down_schedule != "none":
+                store_output = TmaTensor(launcher, output).wgmma(
+                    "reduce", atom.MNK[1], atom.MNK[0], Major.MN
+                )
+                if down_schedule == "legacy":
+                    partitions = (
+                        (((0, 768), vectors.shape[0], 6144), 2, 24, 128),
+                        (((768, 3328), vectors.shape[0], 6144), 2, 104, 0),
+                        (((0, 768), vectors.shape[0], (6144, 8192)), 2, 24, 104),
+                        (((768, 3328), vectors.shape[0], (6144, 8192)), 2, 104, 0),
+                    )
+                else:
+                    partitions = (
+                        (((0, 3072), vectors.shape[0], 6144), 3, 144, 0),
+                        (((3072, 1024), vectors.shape[0], 6144), 3, 48, 104),
+                        (((0, 2432), vectors.shape[0], (6144, 8192)), 4, 152, 0),
+                        (((2432, 1664), vectors.shape[0], (6144, 8192)), 4, 104, 0),
+                    )
+                schedules.extend(
+                    SchedGemv(
+                        atom,
+                        partition_mnk,
+                        (load_matrix, load_vectors, store_output),
+                        fold=partition_fold,
+                    ).place(partition_sms, base_sm=base_sm)
+                    for partition_mnk, partition_fold, partition_sms, base_sm
+                    in partitions
+                )
+                continue
             if grouped_output:
                 schedules.append(
                     SchedGemvMGroup(
@@ -344,7 +391,8 @@ def main() -> None:
         f"m={m * epochs} epoch_m={m} epochs={epochs} n=8 k={k} "
         f"tile_m={tile_m} tile_packed={int(tile_packed)} sms={sms} "
         f"split_m={split_m} fold={fold} grouped_output={int(grouped_output)} "
-        f"grouped_reduce={grouped_reduce} fused_rope={int(fused_rope)} "
+        f"grouped_reduce={grouped_reduce} down_schedule={down_schedule} "
+        f"fused_rope={int(fused_rope)} "
         f"two_op_rope={int(two_op_rope)} rope_position={rope_position} "
         f"avg_diff_percent={avg_diff_percent:.6f} max_abs_error={max_abs_error:.6f}"
     )
