@@ -66,11 +66,18 @@ def run_vllm(args: argparse.Namespace) -> None:
 
     context = args.contexts[0]
     engine_max_model_len = context + 1
+    # The measured first->second-token interval is decode-only only if every
+    # request completes prefill before the first token is emitted.  Size the
+    # scheduler's token budget for the complete strict batch; otherwise vLLM
+    # can interleave residual chunked prefill with the nominal decode interval
+    # once batch * context exceeds its default 16K-token budget.
+    engine_max_num_batched_tokens = args.batch * (context - 1)
     print(
         "FIXED_CONTEXT_CONFIG "
         f"framework=vllm batch={args.batch} context={context} "
         f"engine_max_model_len={engine_max_model_len} dtype=bfloat16 "
-        "strict_batch=1",
+        f"max_num_batched_tokens={engine_max_num_batched_tokens} "
+        "strict_batch=1 unchunked_strict_prefill=1",
         flush=True,
     )
     engine = LLM(
@@ -79,6 +86,7 @@ def run_vllm(args: argparse.Namespace) -> None:
         dtype="bfloat16",
         max_model_len=engine_max_model_len,
         max_num_seqs=args.batch,
+        max_num_batched_tokens=engine_max_num_batched_tokens,
         enable_prefix_caching=False,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
@@ -174,11 +182,13 @@ def run_sglang(args: argparse.Namespace) -> None:
 
     context = args.contexts[0]
     engine_context_length = context + 16
+    engine_max_prefill_tokens = args.batch * (context - 1)
     print(
         "FIXED_CONTEXT_CONFIG "
         f"framework=sglang batch={args.batch} context={context} "
         f"engine_context_length={engine_context_length} dtype=bfloat16 "
-        "strict_batch=1",
+        f"max_prefill_tokens={engine_max_prefill_tokens} "
+        "strict_batch=1 unchunked_strict_prefill=1",
         flush=True,
     )
     engine = sglang.Engine(
@@ -189,6 +199,11 @@ def run_sglang(args: argparse.Namespace) -> None:
         context_length=engine_context_length,
         max_running_requests=args.batch,
         mem_fraction_static=args.gpu_memory_utilization,
+        # A chunked prefill can overlap the first request's nominal decode
+        # interval with the remaining requests' prefill.  Keep every request
+        # whole so the first->second-token metric is a strict decode batch.
+        chunked_prefill_size=-1,
+        max_prefill_tokens=engine_max_prefill_tokens,
         disable_radix_cache=True,
         cuda_graph_max_bs=args.batch,
         disable_piecewise_cuda_graph=True,
