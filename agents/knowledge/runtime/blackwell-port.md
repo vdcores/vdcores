@@ -893,3 +893,24 @@ All 33 host schedule tests pass. The exact 11-op image remains at 96
 registers, nine barriers, a 96-byte stack, and zero spills. Its final S128
 median is 2.620128 ms in `20260807T113402Z-3461684`, 6.96% below the strict
 2.816003 ms vLLM result and 85.725 us above the requested 10%-lead target.
+
+## Rejected independent-accumulator output GEMV pipeline
+
+An output-projection proof of concept alternated K256 groups between two
+independent TMEM accumulators and two persistent UMMA completion events. It
+submitted group n+1 before waiting for group n, retained the early operand
+release, and drained both banks only after all K groups before adding the two
+FP32 partials. This directly tested whether UMMA filling bank n+1 could hide
+the TMEM/completion tail of bank n without changing the M64 tile or projection
+factorization.
+
+Full S128 correctness and token 24748 passed in
+`20260807T114015Z-3467590`. The selectable 12-op image used 126 registers,
+nine barriers, a 112-byte stack, and zero spills. In the same image, a
+control/dual-bank/control sandwich measured 2.619648/2.664224/2.620416 ms over
+501 internal-timer samples in jobs `20260807T114056Z-3468155`,
+`20260807T114127Z-3468635`, and `20260807T114157Z-3468970`. The dual-bank path
+therefore regressed by 44.192 us against the control mean. A second live
+accumulator, two TMEM drains, and the FP32 merge cost substantially more than
+the completion wait they could hide, so the opcode, second completion event,
+schedule selector, and tests were removed.
