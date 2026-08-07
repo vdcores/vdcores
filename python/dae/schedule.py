@@ -1027,6 +1027,7 @@ class SchedGemvRope(Schedule):
                  tmas: tuple[TmaTensor],
                  rope_table: RawAddress,
                  hist_seq_len: int,
+                 rope_counter_offsets=None,
                  ):
         super().__init__()
         self.Atom = Gemv_M64N8_ROPE_128
@@ -1051,6 +1052,7 @@ class SchedGemvRope(Schedule):
         self.MNK_base = MNK_base
         self.rope_table = rope_table
         self.hist_seq_len = hist_seq_len
+        self.rope_counter_offsets = rope_counter_offsets or []
 
         self.fold = None
         self.prefetch = True
@@ -1090,9 +1092,14 @@ class SchedGemvRope(Schedule):
 
         n_repeat = self.k_per_fold // (TileK * n_batch)
 
+        rope_table = self.rope_table.copy().delta(self.hist_seq_len * 128 * 2)
+        for counter_reg, delta in self.rope_counter_offsets:
+            rope_table = CounterOffsetMemoryInstruction(
+                counter_reg, rope_table, delta)
+
         insts = [
             self.Atom(self.k_per_fold // TileK, self.hist_seq_len, m % 128),
-            self.rope_table.copy().delta(self.hist_seq_len * 128 * 2),
+            rope_table,
             RepeatM.onSync(0, self._bar("load"), n_repeat,
                 (loadB.cord(0, k).group(), loadB.cord2tma(0, TileK * n_batch)),
                 *[

@@ -10,6 +10,7 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
+    Gemv_M64N8_ROPE_128,
     Gemv_M64N8UpSiLU,
     MemoryInstruction,
     ProfileEvent,
@@ -191,6 +192,17 @@ def test_up_silu_gemv_selects_the_sm100_overlap_opcode():
 
     assert instruction.opcode == opcode.OP_GEMV_SM100_M64N8_UP_SILU
     assert instruction.args == [16]
+
+
+def test_fused_rope_gemv_encodes_position_and_head_half():
+    instruction = Gemv_M64N8_ROPE_128(
+        kTiles=8,
+        hist_len=127,
+        head_dim_ofst=64,
+    )
+
+    assert instruction.opcode == opcode.OP_GEMV_M64N8_ROPE_128
+    assert instruction.args == [8, 127, 64]
 
 
 def test_fused_lm_head_argmax_encodes_absolute_vocab_offsets():

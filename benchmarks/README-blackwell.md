@@ -99,15 +99,15 @@ Use `benchmarks/blackwell_gemv.py` to reproduce a shape and
 
 ### Projection-to-RoPE shared-memory handoff
 
-Two M64 projection/RoPE paths remain available.  The selected two-operator
+Two M64 projection/RoPE paths remain available.  The two-operator diagnostic
 path ends GEMV with `RegStore`, keeps that slot in shared memory, and passes it
 to the existing RoPE task with `RegLoad`; only RoPE performs the final TMA
-reduction/store.  The fused alternative rotates the TMEM-to-shared GEMV
+reduction/store.  The selected fused path rotates the TMEM-to-shared GEMV
 epilogue in the projection task before the same final store.  Neither path
 materializes the projection intermediate in global memory or reloads it with
 TMA.
 
-The table below uses 501 iterations at the production batch-eight Q and K
+The table below uses 5,001 iterations at the production batch-eight Q and K
 shapes.  Q uses 128 SMs/fold two and K uses 64 SMs/fold four.  Both paths stay
 below 0.35% mean-relative error.  The framework total is a component sum of
 the separate Q projection, separate K projection, and joint Q+K RoPE probes;
@@ -115,18 +115,28 @@ it is intentionally not the frameworks' fused-QKV scope.
 
 | Projection + RoPE scope | Two operators (us) | Fused epilogue (us) | vLLM component sum (us) | SGLang component sum (us) |
 | --- | ---: | ---: | ---: | ---: |
-| Q, 4096 x 8 x 4096, fold 2 | 7.776 | **7.648** | - | - |
-| K, 1024 x 8 x 4096, fold 4 | 4.768 | **4.704** | - | - |
-| Q + K + RoPE component sum | 12.544 | **12.352** | 14.095 | 12.738 |
+| Q, 4096 x 8 x 4096, fold 2 | 7.616 | **7.328** | - | - |
+| K, 1024 x 8 x 4096, fold 4 | 4.736 | **4.544** | - | - |
+| Q + K + RoPE component sum | 12.352 | **11.872** | 14.095 | 12.738 |
 
-Fusion gains only 1.5% over the shared-register handoff.  The two-operator
-path is therefore selected: it reaches the component-matched framework goal,
-uses the already-qualified table TMA and RoPE task, and avoids adding a raw
-table address to the production schedule.  The exact selective images use 32
-registers/one barrier for the two-operator path and 40 registers/nine barriers
-for the fused path, with no spills in either image.  Set
+The fused task loads one head-local cosine/sine pair per compute thread after
+submitting the final UMMA group and keeps it live across the completion wait.
+Replaying the same task with those loads after the wait measured 7.392/4.672
+us for Q/K, so final-group prefetch contributes 0.192 us of the 0.480 us
+per-layer fused advantage.  A 1,001-sample S128 same-image
+two-op/fused/two-op sandwich measured 2.684960/2.643360/2.686016 ms; fusion
+saves 42.128 us (1.57%) against the control mean after 32 layers.  The larger
+end-to-end gain shows that deleting the task boundary also shortens the layer
+critical path.
+
+Llama therefore selects fusion by default while retaining the two-operator
+path for diagnostics with `VDCORES_FUSED_QK_ROPE=0`.  The minimal production
+operator manifest omits the unused standalone RoPE opcode; the stage-profile
+manifest contains both paths for same-image comparisons.  Set
 `GEMV_TWO_OP_ROPE=1` or `GEMV_FUSED_ROPE=1` in
-`benchmarks/blackwell_gemv.py` to reproduce the alternatives.
+`benchmarks/blackwell_gemv.py` to reproduce the isolated alternatives.
+The exact 11-op production image uses 96 registers, nine barriers, a 96-byte
+stack, and zero spills; its final 1,001-sample S128 median is 2.642304 ms.
 
 ## Per-operator comparison with vLLM and SGLang
 

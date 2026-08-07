@@ -238,6 +238,8 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
 
     const int tid = __compute_tid();
     const data_t *rope_row = nullptr;
+    data_t rope_cosine{};
+    data_t rope_sine{};
     if constexpr (ApplyRope) {
         const int rope_slot = m2c.template pop<0>();
         const auto *volatile_st_insts =
@@ -295,6 +297,17 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
                 tiled_mma.accumulate_ = UMMA::ScaleOut::One;
             }
             cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        if constexpr (ApplyRope) {
+            if (tile_idx + 1 == n_k_tiles) {
+                // The coefficient loads are independent of the final
+                // accumulator. Submit UMMA first, then keep one pair per
+                // thread live across its completion wait. Each thread rotates
+                // two batches with the same head-local pair below.
+                const int pair = tid % (M / 2);
+                rope_cosine = rope_row[rope_head_offset + pair * 2];
+                rope_sine = rope_row[rope_head_offset + pair * 2 + 1];
+            }
         }
         cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
         tmem_mma_phase ^= 1;
@@ -365,10 +378,8 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
             const int even_row = pair * 2;
             const float even = static_cast<float>(s_output(even_row, batch));
             const float odd = static_cast<float>(s_output(even_row + 1, batch));
-            const float cosine = static_cast<float>(
-                rope_row[rope_head_offset + even_row]);
-            const float sine = static_cast<float>(
-                rope_row[rope_head_offset + even_row + 1]);
+            const float cosine = static_cast<float>(rope_cosine);
+            const float sine = static_cast<float>(rope_sine);
             s_output(even_row, batch) = data_t(even * cosine - odd * sine);
             s_output(even_row + 1, batch) = data_t(even * sine + odd * cosine);
         }

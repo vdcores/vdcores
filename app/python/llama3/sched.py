@@ -192,6 +192,7 @@ interleave_down_high = (
   fine_mlp_barriers
   and os.environ.get("VDCORES_INTERLEAVE_DOWN_HIGH", "1") == "1"
 )
+fused_qk_rope = os.environ.get("VDCORES_FUSED_QK_ROPE", "1") == "1"
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -305,6 +306,7 @@ _cos, _sin = model.model.rotary_emb(torch.zeros(1, device=gpu), _positions) # te
 matRope = torch.ones(MAX_SEQ_LEN, N, HEAD_DIM, dtype=torch.bfloat16, device=gpu)
 matRope[:, :, 0::2] = _cos[0, :, :HEAD_DIM//2].unsqueeze(1) # llama duplicate it to full dim
 matRope[:, :, 1::2] = _sin[0, :, :HEAD_DIM//2].unsqueeze(1)
+matRopeFused = matRope[:, 0, :].contiguous()
 
 # Keep one extra slot for the token produced after decoding position
 # MAX_SEQ_LEN - 1; KV/RoPE storage itself remains capped at MAX_SEQ_LEN.
@@ -700,49 +702,79 @@ def schedule_single_token(
     tmas=(layerg['loadRMSPostAttnW'].cord(0), loadHidden1D, storeRMSHidden1D)
   ).bar("input", layerg['bar_out_mlp']).bar("output", layerg['bar_post_attn_rms'])
 
-  # QKV Projection
-  # TODO(zhiyuang): add the ROPE for Q and K
-  regStoreQ = RegStore(0, size=N * QKVTileM * matQ_attn_views[0].element_size())
-  regLoadQ = RegLoad(0)
-  QProj = SchedGemv(QKVAtom,
-    MNK=(QW, N, HIDDEN),
-    tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
-  ).bar("load", layerg['bar_pre_attn_rms'])
-  QRope = SchedRope(ROPE_INTERLEAVE_512,
-    tmas=(
-      maybe_counter_adapter(
-        ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
-        [0, 0, 0, 1],
-        control_flow,
-        [0, 0, 0, base_counter_delta] if control_flow else None,
+  # QKV projection and rotary handoff
+  if fused_qk_rope:
+    rope_counter_offsets = (
+      [(TOKEN_BASE_REG, base_counter_delta * HEAD_DIM * matRopeFused.element_size())]
+      if control_flow else []
+    )
+    QProj = SchedGemvRope(
+      MNK=(QW, N, HIDDEN),
+      tmas=(layerg['loadQW'], layerg['loadRMSLayer'], layerg['storeQ']),
+      rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
+      hist_seq_len=token_pos,
+      rope_counter_offsets=rope_counter_offsets,
+    ).bar("load", layerg['bar_pre_attn_rms']).bar("store", layerg['bar_q_proj'])
+    QRope = []
+    KProj = SchedGemvRope(
+      MNK=(KW, N, HIDDEN),
+      tmas=(
+        layerg['loadKW'],
+        layerg['loadRMSLayer'],
+        maybe_counter_adapter(
+          ToAttnVStoreCordAdapter(layerg['storeK'], token_pos),
+          [0, 1, 0],
+          control_flow,
+          [0, base_counter_delta, 0] if control_flow else None,
+        ),
       ),
-      regLoadQ,
-      ToSplitMCordAdapter(layerg['storeQ'], 128//2, QKVTileM),
-    ),
-  ).bar("store", layerg['bar_q_proj'])
-  regStoreK = RegStore(0, size=N * QKVTileM * matK_attn_views[0].element_size())
-  regLoadK = RegLoad(0)
-  KProj = SchedGemv(QKVAtom,
-    MNK=(KW, N, HIDDEN),
-    tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
-  )
-  KRope = SchedRope(ROPE_INTERLEAVE_512,
-    tmas=(
-      maybe_counter_adapter(
-        ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
-        [0, 0, 0, 1],
-        control_flow,
-        [0, 0, 0, base_counter_delta] if control_flow else None,
+      rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
+      hist_seq_len=token_pos,
+      rope_counter_offsets=rope_counter_offsets,
+    ).bar("store", layerg['bar_qkv_attn'])
+    KRope = []
+  else:
+    regStoreQ = RegStore(0, size=N * QKVTileM * matQ_attn_views[0].element_size())
+    regLoadQ = RegLoad(0)
+    QProj = SchedGemv(QKVAtom,
+      MNK=(QW, N, HIDDEN),
+      tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
+    ).bar("load", layerg['bar_pre_attn_rms'])
+    QRope = SchedRope(ROPE_INTERLEAVE_512,
+      tmas=(
+        maybe_counter_adapter(
+          ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+          [0, 0, 0, 1],
+          control_flow,
+          [0, 0, 0, base_counter_delta] if control_flow else None,
+        ),
+        regLoadQ,
+        ToSplitMCordAdapter(layerg['storeQ'], 128//2, QKVTileM),
       ),
-      regLoadK,
-      maybe_counter_adapter(
-        ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, QKVTileM, token_pos),
-        [0, 1, 0],
-        control_flow,
-        [0, base_counter_delta, 0] if control_flow else None,
+    ).bar("store", layerg['bar_q_proj'])
+    regStoreK = RegStore(0, size=N * QKVTileM * matK_attn_views[0].element_size())
+    regLoadK = RegLoad(0)
+    KProj = SchedGemv(QKVAtom,
+      MNK=(KW, N, HIDDEN),
+      tmas=(layerg['loadKW'], layerg['loadRMSLayer'], regStoreK),
+    )
+    KRope = SchedRope(ROPE_INTERLEAVE_512,
+      tmas=(
+        maybe_counter_adapter(
+          ToRopeTableCordAdapter(defaultg['loadRope'], token_pos),
+          [0, 0, 0, 1],
+          control_flow,
+          [0, 0, 0, base_counter_delta] if control_flow else None,
+        ),
+        regLoadK,
+        maybe_counter_adapter(
+          ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, QKVTileM, token_pos),
+          [0, 1, 0],
+          control_flow,
+          [0, base_counter_delta, 0] if control_flow else None,
+        ),
       ),
-    ),
-  ).bar("store", layerg['bar_qkv_attn'])
+    ).bar("store", layerg['bar_qkv_attn'])
   VProj = SchedGemv(QKVAtom,
     MNK=(VW, N, HIDDEN),
     tmas=(
@@ -969,9 +1001,9 @@ def schedule_single_token(
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
   QProj = QProj.place(128)
-  QRope = QRope.place(128)
+  QRope = [] if fused_qk_rope else QRope.place(128)
   KProj = KProj.place(64, base_sm=64)
-  KRope = KRope.place(64, base_sm=64)
+  KRope = [] if fused_qk_rope else KRope.place(64, base_sm=64)
   VProj = VProj.place(64)
   Gqa = Gqa.place(N * NUM_KV_HEAD)
   OutProj = [
@@ -1210,6 +1242,7 @@ print(
   f"run VDCores with {cur_offset+1} tokens... "
   f"fine_mlp_barriers={int(fine_mlp_barriers)}, "
   f"interleave_down_high={int(interleave_down_high)}, "
+  f"fused_qk_rope={int(fused_qk_rope)}, "
   f"stage_profile={int(stage_profile)}"
 )
 dae.s()

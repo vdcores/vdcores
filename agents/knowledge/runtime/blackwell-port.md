@@ -234,11 +234,10 @@ another compute group without paying a command transition for each epilogue.
   slot 32; `SchedGemvRope` applies the fixed-position byte offset to that raw
   address and the compute instruction selects the M64 half of the 128-element
   rotary row.
-- At batch eight, the production Q fold-2 and K fold-4 shapes total 12.544 us
-  with the two-operator handoff and 12.352 us fused. The 1.5% fusion gain is
-  not large enough to displace the simpler, already-qualified two-operator
-  schedule, so both tasks remain available and the two-operator path stays the
-  default.
+- At batch eight, current 5,001-iteration Q fold-2 and K fold-4 probes total
+  12.352 us with the two-operator handoff and 11.872 us fused. The fused
+  epilogue is the Llama default; the two-operator schedule remains available
+  with `VDCORES_FUSED_QK_ROPE=0` for diagnostics.
 - The two-operator total is below component-matched vLLM/SGLang sums
   (14.095/12.738 us). These sums use separate Q/K projection probes plus the
   joint Q+K RoPE probe and must not be confused with the frameworks' fused-QKV
@@ -251,10 +250,22 @@ another compute group without paying a command transition for each epilogue.
   spans by 3-4%. Keep fixed-position offsetting in the memory instruction;
   a future dynamic fused schedule should use the memory VM's counter-offset
   mechanism rather than adding scalar address work to every compute task.
-- Adding the optional fused handler does not perturb the selected production
-  image: it remains spill-free at 128 registers, nine barriers, and a 96-byte
-  stack. Four-token greedy output stays exact and the qualified 128-step
-  median remains 377.288 ms (2.948 ms TBT).
+- The fused handler submits the final UMMA group before loading one RoPE
+  coefficient pair per compute thread. The independent loads execute while
+  UMMA owns the accumulator, and the pair stays live for both batch groups in
+  the shared-memory epilogue. Moving those loads back after the completion
+  wait changed isolated Q/K medians from 7.328/4.544 to 7.392/4.672 us, so
+  this final-group overlap contributes 0.192 us/layer.
+- A same-image 1,001-sample S128 two-op/fused/two-op sandwich measured
+  2.684960/2.643360/2.686016 ms. The retained path saves 42.128 us (1.57%)
+  against the control mean, materially more than the 15.36 us/token implied
+  by isolated spans; removing the compute-task boundary also shortens the
+  cross-layer critical path. Full S128 tensor validation matched token 24748,
+  and four resident tokens produced `hello` four times across the KV128
+  boundary.
+- The final minimal 11-op image omits standalone RoPE, uses 96 registers,
+  nine barriers, a 96-byte stack, and zero spills. Its 1,001-sample S128
+  internal median is 2.642304 ms.
 
 ## SM100 Decode Attention Pipeline
 
