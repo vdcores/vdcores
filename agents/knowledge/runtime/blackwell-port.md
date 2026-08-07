@@ -797,3 +797,23 @@ the 5.6 us producer stagger. The prototype was removed. If tail K-shard
 readiness is revisited, one grouped down command must retain its existing
 operand pipeline and consume staged phases internally; Python-level task
 factorization is the wrong boundary.
+
+## Rejected direct8 LM-head epoch fusion
+
+The two 65,536-row LM-head epochs were merged into one 131,072-row epoch so
+each of 128 SMs held eight independent M128 output groups. The prototype used
+a two-tile B-load interval to stay within the 32-step memory-program mask,
+loaded the activation only once, removed one epoch frontier, and reduced 128
+local argmax records instead of 256. Full S128 correctness passed in job
+`20260807T100617Z-3388663`, and the selectable image remained spill-free at
+100 registers, nine barriers, and a 96-byte stack.
+
+The larger live TMEM/output state outweighed those savings. In one selectable
+image, neighboring direct4 controls measured 2.641696 and 2.634016 ms while
+direct8 measured 2.671424 ms over 1,001 internal-timer samples (jobs
+`20260807T100655Z-3389198`, `20260807T100843Z-3390920`, and
+`20260807T100734Z-3389738`). Direct8 therefore regressed by 33.568 us against
+the control mean. The opcode, reducer, schedule switch, and manifest entries
+were removed. Cross-task fusion should not increase the number of independent
+TMEM accumulators held by one compute warpgroup unless a measured consumer is
+available to overlap with them.
