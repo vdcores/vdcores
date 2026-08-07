@@ -138,6 +138,24 @@ manifest contains both paths for same-image comparisons.  Set
 The exact 11-op production image uses 96 registers, nine barriers, a 96-byte
 stack, and zero spills; its final 1,001-sample S128 median is 2.642304 ms.
 
+### Per-head QKV-to-attention readiness
+
+The production schedule no longer holds all eight KV heads behind one Q
+barrier and one combined K/V barrier. Each head has independent Q and K/V
+readiness, and attention is placed head-major on the same low eight-SM group
+that produces that head's V slice. The high group produces the matching Q
+fold and K slice concurrently. This changes neither projection task count nor
+tensor coordinates; it lets attention for a ready head overlap the tail of
+the other heads.
+
+A 1,001-sample coarse/per-head/coarse S128 sandwich measured
+2.635520/2.625248/2.636096 ms with the resident internal timer, a 10.560 us
+(0.40%) gain against the control mean. Two-head readiness groups measured
+2.639360 ms and were not retained. The exact 11-op image remains at 96
+registers, nine hardware barriers, a 96-byte stack, and zero spills; its final
+production median is 2.626368 ms. Full S128 tensor validation and exact
+four-token resident reuse pass.
+
 ## Per-operator comparison with vLLM and SGLang
 
 Llama-3.1-8B is dense, so "per expert" here means per task/operator rather

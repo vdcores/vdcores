@@ -262,7 +262,10 @@ class SchedAttentionDecoding(Schedule):
                  max_loop_count: int = 1,
                  outer_seq_len_counter_reg: int | None = None,
                  outer_seq_len_counter_stride: int = 0,
-                 swapped_qk_pv: bool = False):
+                 swapped_qk_pv: bool = False,
+                 q_head_bars=None,
+                 kv_head_bars=None,
+                 head_major: bool = False):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -279,6 +282,14 @@ class SchedAttentionDecoding(Schedule):
         self.outer_seq_len_counter_reg = outer_seq_len_counter_reg
         self.outer_seq_len_counter_stride = outer_seq_len_counter_stride
         self.swapped_qk_pv = swapped_qk_pv
+        self.q_head_bars = q_head_bars
+        self.kv_head_bars = kv_head_bars
+        self.head_major = head_major
+        if (q_head_bars is None) != (kv_head_bars is None):
+            raise ValueError("q_head_bars and kv_head_bars must be provided together")
+        if q_head_bars is not None:
+            if len(q_head_bars) != NUM_KV_HEADS or len(kv_head_bars) != NUM_KV_HEADS:
+                raise ValueError("head-barrier arrays must match NUM_KV_HEADS")
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.use_qwen_fused_qk = side_input is not None
@@ -303,13 +314,19 @@ class SchedAttentionDecoding(Schedule):
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
 
+    def _map_req_head(self, sm: int):
+        if self.head_major:
+            return sm % self.reqs, sm // self.reqs
+        return sm // self.num_heads, sm % self.num_heads
+
     def schedule(self, sm: int):
         if sm < 0:
             return []
 
-        req = sm // self.num_heads
-        head = sm % self.num_heads
+        req, head = self._map_req_head(sm)
         head_dim = self.matO.shape[-1]
+        q_bar = self.q_head_bars[head] if self.q_head_bars is not None else self._bar("q")
+        kv_bar = self.kv_head_bars[head] if self.kv_head_bars is not None else self._bar("k")
 
         tQ, tK, tV = self.tmas
 
@@ -346,7 +363,7 @@ class SchedAttentionDecoding(Schedule):
                 self.k_store[req].cord((self.token_pos * self.num_heads + head) * head_dim).group(),
             ]
         insts += [
-            tQ.cord(req, head).bar(self._bar("q")).group(),
+            tQ.cord(req, head).bar(q_bar).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
                 [tK.cord(req, 0, head, 0).port(1).group(), tK.cord2tma(0, self.block_size, 0, 0)],
@@ -356,7 +373,7 @@ class SchedAttentionDecoding(Schedule):
             # TODO(zhiyuang): reuse the accumulator register
             # only the last block has new generated KV cache
         ]
-        last_k = tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group().port(1)
+        last_k = tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(kv_bar).group().port(1)
         last_v = tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group().port(1)
         if self.num_kv_block_counter_reg is not None:
             last_k = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_k, tK.cord2tma(0, self.block_size, 0, 0))

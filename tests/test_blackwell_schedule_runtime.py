@@ -174,6 +174,50 @@ def test_decode_schedule_selects_swapped_attention_without_changing_defaults():
         )
 
 
+def test_decode_schedule_maps_head_major_workers_to_per_head_barriers():
+    output = torch.empty((8, 8, 4, 128), dtype=torch.bfloat16)
+    q_bars = list(range(10, 18))
+    kv_bars = list(range(20, 28))
+    sharded = SchedAttentionDecoding(
+        reqs=8,
+        seq_len=128,
+        KV_BLOCK_SIZE=128,
+        NUM_KV_HEADS=8,
+        matO=output,
+        tmas=(None, None, None),
+        num_active_q=4,
+        swapped_qk_pv=True,
+        q_head_bars=q_bars,
+        kv_head_bars=kv_bars,
+        head_major=True,
+    )
+    default = SchedAttentionDecoding(
+        reqs=8,
+        seq_len=128,
+        KV_BLOCK_SIZE=128,
+        NUM_KV_HEADS=8,
+        matO=output,
+        tmas=(None, None, None),
+        num_active_q=4,
+        swapped_qk_pv=True,
+    )
+
+    assert sharded._map_req_head(8) == (0, 1)
+    assert default._map_req_head(8) == (1, 0)
+    assert sharded.q_head_bars[1] == 11
+    assert sharded.kv_head_bars[1] == 21
+    with pytest.raises(ValueError, match="provided together"):
+        SchedAttentionDecoding(
+            reqs=8,
+            seq_len=128,
+            KV_BLOCK_SIZE=128,
+            NUM_KV_HEADS=8,
+            matO=output,
+            tmas=(None, None, None),
+            q_head_bars=q_bars,
+        )
+
+
 def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():
     instruction = Gemv_M128N8Direct4(
         kTiles=32,

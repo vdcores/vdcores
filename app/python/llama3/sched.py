@@ -193,6 +193,9 @@ interleave_down_high = (
   and os.environ.get("VDCORES_INTERLEAVE_DOWN_HIGH", "1") == "1"
 )
 fused_qk_rope = os.environ.get("VDCORES_FUSED_QK_ROPE", "1") == "1"
+qkv_head_barriers = os.environ.get("VDCORES_QKV_HEAD_BARRIERS", "1") == "1"
+if qkv_head_barriers and not fused_qk_rope:
+  raise ValueError("per-head QKV barriers require fused Q/K RoPE tasks")
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -279,17 +282,21 @@ systemg.addBarrier('bar_token_finish') # argmax plus restore-barrier copy after 
 
 layerg.addBarrier('bar_layer')
 layerg.addBarrier('bar_out_mlp')
-layerg.addBarrier('bar_q_proj')
-layerg.addBarrier('bar_qkv_attn')
+if not qkv_head_barriers:
+  layerg.addBarrier('bar_q_proj')
+  layerg.addBarrier('bar_qkv_attn')
 layerg.addBarrier('bar_attn_out')
 layerg.addBarrier('bar_q_clear')
-layerg.addBarrier('bar_rms_layer', REQ)
-layerg.addBarrier('bar_rms_mlp', REQ)
-layerg.addBarrier('bar_silu_in', 0 if fine_mlp_barriers else None)
-layerg.addBarrier('bar_silu_out1', 0 if fine_mlp_barriers else None)
+if not fine_mlp_barriers:
+  layerg.addBarrier('bar_silu_in')
+  layerg.addBarrier('bar_silu_out1')
 layerg.addBarrier('bar_silu_out2')
 layerg.addBarrier('bar_pre_attn_rms')
 layerg.addBarrier('bar_post_attn_rms')
+if qkv_head_barriers:
+  for head in range(8):
+    layerg.addBarrier(f'bar_q_proj_head{head}')
+    layerg.addBarrier(f'bar_qkv_attn_head{head}')
 if fine_mlp_barriers:
   for shard_id in range(3):
     layerg.addBarrier(f'bar_silu_in{shard_id}')
@@ -708,30 +715,56 @@ def schedule_single_token(
       [(TOKEN_BASE_REG, base_counter_delta * HEAD_DIM * matRopeFused.element_size())]
       if control_flow else []
     )
-    QProj = SchedGemvRope(
-      MNK=(QW, N, HIDDEN),
-      tmas=(layerg['loadQW'], layerg['loadRMSLayer'], layerg['storeQ']),
-      rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
-      hist_seq_len=token_pos,
-      rope_counter_offsets=rope_counter_offsets,
-    ).bar("load", layerg['bar_pre_attn_rms']).bar("store", layerg['bar_q_proj'])
+    if qkv_head_barriers:
+      QProj = [
+        SchedGemvRope(
+          MNK=((head * 512, 512), N, (fold * 2048, 2048)),
+          tmas=(layerg['loadQW'], layerg['loadRMSLayer'], layerg['storeQ']),
+          rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
+          hist_seq_len=token_pos,
+          rope_counter_offsets=rope_counter_offsets,
+        ).bar("load", layerg['bar_pre_attn_rms']).bar(
+          "store", layerg[f'bar_q_proj_head{head}']
+        ).place(8, base_sm=fold * 64 + head * 8)
+        for fold in range(2)
+        for head in range(NUM_KV_HEAD)
+      ]
+    else:
+      QProj = SchedGemvRope(
+        MNK=(QW, N, HIDDEN),
+        tmas=(layerg['loadQW'], layerg['loadRMSLayer'], layerg['storeQ']),
+        rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
+        hist_seq_len=token_pos,
+        rope_counter_offsets=rope_counter_offsets,
+      ).bar("load", layerg['bar_pre_attn_rms']).bar("store", layerg['bar_q_proj'])
     QRope = []
-    KProj = SchedGemvRope(
-      MNK=(KW, N, HIDDEN),
-      tmas=(
-        layerg['loadKW'],
-        layerg['loadRMSLayer'],
-        maybe_counter_adapter(
-          ToAttnVStoreCordAdapter(layerg['storeK'], token_pos),
-          [0, 1, 0],
-          control_flow,
-          [0, base_counter_delta, 0] if control_flow else None,
-        ),
-      ),
-      rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
-      hist_seq_len=token_pos,
-      rope_counter_offsets=rope_counter_offsets,
-    ).bar("store", layerg['bar_qkv_attn'])
+    k_store = maybe_counter_adapter(
+      ToAttnVStoreCordAdapter(layerg['storeK'], token_pos),
+      [0, 1, 0],
+      control_flow,
+      [0, base_counter_delta, 0] if control_flow else None,
+    )
+    if qkv_head_barriers:
+      KProj = [
+        SchedGemvRope(
+          MNK=((head * HEAD_DIM, HEAD_DIM), N, HIDDEN),
+          tmas=(layerg['loadKW'], layerg['loadRMSLayer'], k_store),
+          rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
+          hist_seq_len=token_pos,
+          rope_counter_offsets=rope_counter_offsets,
+        ).bar("store", layerg[f'bar_qkv_attn_head{head}']).place(
+          8, base_sm=64 + head * 8
+        )
+        for head in range(NUM_KV_HEAD)
+      ]
+    else:
+      KProj = SchedGemvRope(
+        MNK=(KW, N, HIDDEN),
+        tmas=(layerg['loadKW'], layerg['loadRMSLayer'], k_store),
+        rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
+        hist_seq_len=token_pos,
+        rope_counter_offsets=rope_counter_offsets,
+      ).bar("store", layerg['bar_qkv_attn'])
     KRope = []
   else:
     regStoreQ = RegStore(0, size=N * QKVTileM * matQ_attn_views[0].element_size())
@@ -775,19 +808,28 @@ def schedule_single_token(
         ),
       ),
     ).bar("store", layerg['bar_qkv_attn'])
-  VProj = SchedGemv(QKVAtom,
-    MNK=(VW, N, HIDDEN),
-    tmas=(
-      layerg['loadVW'],
-      layerg['loadRMSLayer'],
-      maybe_counter_adapter(
-        ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
-        [0, 1, 0],
-        control_flow,
-        [0, base_counter_delta, 0] if control_flow else None,
-      ),
-    ),
-  ).bar("store", layerg['bar_qkv_attn'])
+  v_store = maybe_counter_adapter(
+    ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
+    [0, 1, 0],
+    control_flow,
+    [0, base_counter_delta, 0] if control_flow else None,
+  )
+  if qkv_head_barriers:
+    VProj = [
+      SchedGemv(
+        QKVAtom,
+        MNK=((head * HEAD_DIM, HEAD_DIM), N, HIDDEN),
+        tmas=(layerg['loadVW'], layerg['loadRMSLayer'], v_store),
+      ).bar("store", layerg[f'bar_qkv_attn_head{head}']).place(
+        8, base_sm=head * 8
+      )
+      for head in range(NUM_KV_HEAD)
+    ]
+  else:
+    VProj = SchedGemv(QKVAtom,
+      MNK=(VW, N, HIDDEN),
+      tmas=(layerg['loadVW'], layerg['loadRMSLayer'], v_store),
+    ).bar("store", layerg['bar_qkv_attn'])
 
   Gqa = SchedAttentionDecoding(
     reqs = N, seq_len = token_pos + 1,
@@ -801,11 +843,22 @@ def schedule_single_token(
     outer_seq_len_counter_stride=base_counter_delta or 0,
     num_active_q=HEAD_GROUP_SIZE,
     swapped_qk_pv=True,
+    q_head_bars=(
+      [layerg[f'bar_q_proj_head{head}'] for head in range(NUM_KV_HEAD)]
+      if qkv_head_barriers else None
+    ),
+    kv_head_bars=(
+      [layerg[f'bar_qkv_attn_head{head}'] for head in range(NUM_KV_HEAD)]
+      if qkv_head_barriers else None
+    ),
+    head_major=qkv_head_barriers,
     max_loop_count=min(
       control_flow_tokens or 1,
       KVBlockSize - (token_pos % KVBlockSize),
     ),
-  ).bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn']).bar("o", layerg['bar_attn_out'])
+  ).bar("o", layerg['bar_attn_out'])
+  if not qkv_head_barriers:
+    Gqa.bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn'])
 
   # accumulate to matHidden, which auto applies the residual add
   # Twelve M tiles use four K folds and the other 52 use two folds: exactly
@@ -824,27 +877,29 @@ def schedule_single_token(
   # Gate Up + SiLU
   reg_gate = 0
   reg_store_gate = RegStore(reg_gate, matGateOut[:, :QKVTileM])
+  legacy_silu_in = layerg['bar_silu_in'] if not fine_mlp_barriers else None
+  legacy_silu_out1 = layerg['bar_silu_out1'] if not fine_mlp_barriers else None
 
   gate_proj_prefix = SchedGemv(QKVAtom,
     MNK=(6144, N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], layerg['storeGateOut']),
-  ).bar("load", layerg['bar_post_attn_rms']).bar("store", layerg['bar_silu_in'])
+  ).bar("load", layerg['bar_post_attn_rms']).bar("store", legacy_silu_in)
   up_proj_main = SchedGemv(QKVAtom,
     MNK=(2048, N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-  ).bar("load", layerg['bar_post_attn_rms']).bar("store", layerg['bar_silu_in'])
+  ).bar("load", layerg['bar_post_attn_rms']).bar("store", legacy_silu_in)
   up_proj_aux0 = SchedGemv(QKVAtom,
     MNK=((2048, 1536), N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-  ).bar("load", layerg['bar_post_attn_rms']).bar("store", layerg['bar_silu_in'])
+  ).bar("load", layerg['bar_post_attn_rms']).bar("store", legacy_silu_in)
   up_proj_aux1 = SchedGemv(QKVAtom,
     MNK=((3584, 1536), N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-  ).bar("store", layerg['bar_silu_in'])
+  ).bar("store", legacy_silu_in)
   up_proj_aux2 = SchedGemv(QKVAtom,
     MNK=((5120, 1024), N, HIDDEN),
     tmas=(layerg['loadUp'], layerg['loadRMSLayer'], layerg['storeInterm']),
-  ).bar("store", layerg['bar_silu_in'])
+  ).bar("store", legacy_silu_in)
 
   mlp_split = 6144
   silu1 = SchedSmemSiLUInterleaved(
@@ -853,7 +908,7 @@ def schedule_single_token(
     up_glob=matInterm[:, :mlp_split],
     out_glob=matSiLUOut[:, :mlp_split],
     shards_per_token=3,
-  ).bar("input", layerg['bar_silu_in']).bar("output", layerg['bar_silu_out1'])
+  ).bar("input", legacy_silu_in).bar("output", legacy_silu_out1)
   gate_proj_tail = SchedGemv(QKVAtom,
     MNK=((mlp_split, INTERMIDIATE - mlp_split), N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], reg_store_gate),
@@ -875,12 +930,12 @@ def schedule_single_token(
     MNK=((0, 3072), N, 6144),
     fold=3,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_layer'])
+  ).bar("load", legacy_silu_out1).bar("store", layerg['bar_layer'])
   down_proj_low1 = SchedGemv(LinearAtom,
     MNK=((3072, 1024), N, 6144),
     fold=3,
     tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_silu_out1']).bar("store", layerg['bar_layer'])
+  ).bar("load", legacy_silu_out1).bar("store", layerg['bar_layer'])
   def make_down_proj_high(m_range):
     return SchedGemv(LinearAtom,
       MNK=(m_range, N, (6144, 8192)),
@@ -1000,11 +1055,11 @@ def schedule_single_token(
   copy_hidden = copy_hidden.place(N, base_sm=64)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
-  QProj = QProj.place(128)
+  QProj = QProj if qkv_head_barriers else QProj.place(128)
   QRope = [] if fused_qk_rope else QRope.place(128)
-  KProj = KProj.place(64, base_sm=64)
+  KProj = KProj if qkv_head_barriers else KProj.place(64, base_sm=64)
   KRope = [] if fused_qk_rope else KRope.place(64, base_sm=64)
-  VProj = VProj.place(64)
+  VProj = VProj if qkv_head_barriers else VProj.place(64)
   Gqa = Gqa.place(N * NUM_KV_HEAD)
   OutProj = [
     out_proj_fold4.place(48),
@@ -1243,6 +1298,7 @@ print(
   f"fine_mlp_barriers={int(fine_mlp_barriers)}, "
   f"interleave_down_high={int(interleave_down_high)}, "
   f"fused_qk_rope={int(fused_qk_rope)}, "
+  f"qkv_head_barriers={int(qkv_head_barriers)}, "
   f"stage_profile={int(stage_profile)}"
 )
 dae.s()

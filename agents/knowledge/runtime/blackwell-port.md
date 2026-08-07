@@ -627,20 +627,34 @@ barrier. With the retained down interleave it improved S128 by only 2.208 us
 sensitivity. The extra barriers, head-offset adapters, and split placements
 were removed.
 
-The complementary Q/K/V-to-attention experiment kept every compute task and
-tensor coordinate unchanged while replacing the all-head dependency with
-2-way, 4-way, and per-head readiness. Profiling-free S128 internal medians
-were 2.737056 ms for the coarse production barrier, 2.738272 ms for two head
-groups, 2.736576 ms for four groups, and 2.741216 ms for a correct per-head
-variant. Separate Q and KV counters per head overflow the VM's 10-bit encoded
-barrier-ID space after 32-layer resource expansion, so the legal per-head
-probe used one combined Q+K+V counter per head. Both independent TMA load
-ports must wait on that counter; waiting only on Q produced an invalid
-2.721760 ms result because K/V raced their stores, which full tensor
-correctness caught even though the final token happened to match. The valid
-four-way delta was only 0.480 us and the other granularities regressed, so all
-prototype code was removed. Jobs are recorded in
-`.agentlog/2026-08-07-shared-barrier-candidates.md`.
+The Q/K/V-to-attention frontier was later revisited after a resource-lifetime
+audit found four barriers that are dead in the retained configuration: two
+legacy RMS barriers and the two coarse SwiGLU barriers superseded by the three
+shard-local pairs. Removing those allocations keeps separate Q and KV
+counters for every KV head inside the VM's 10-bit encoded barrier-ID space
+after 32-layer expansion. This fixes the main limitation of the earlier
+prototype, which had to combine Q+K+V readiness into one counter per head and
+therefore could not expose useful overlap.
+
+The retained schedule preserves every projection tile and tensor coordinate.
+For each KV head, its 16 Q contributors are split across matching low/high
+eight-SM groups, while its eight V contributors run on the low group and its
+eight K contributors run on the high group. Attention uses a head-major
+placement, so the low group can consume that head as soon as its independent
+16-count Q and 16-count K+V barriers reach zero; it no longer waits for the
+other seven heads. Weight and activation loads remain on the existing
+independent VCore ports, and both K and V are covered by the KV counter.
+
+A same-image 1,001-sample coarse/per-head/coarse sandwich measured
+2.635520/2.625248/2.636096 ms in jobs `20260807T102605Z-3405400`,
+`20260807T102644Z-3406015`, and `20260807T102723Z-3406616`. Per-head readiness
+saves 10.560 us / 0.40% against the control mean. Grouping two adjacent heads
+measured 2.639360 ms (`20260807T102837Z-3407381`) and was rejected. Full S128
+tensor correctness and token 24748 passed in `20260807T103049Z-3409224`; four
+resident tokens crossed the KV128 boundary and produced `hello` four times in
+`20260807T103132Z-3410039`. The exact 11-op image remains spill-free at 96
+registers, nine barriers, and a 96-byte stack, and its final S128 median is
+2.626368 ms (`20260807T103337Z-3411736`).
 
 Projection-to-RMS shard readiness was also rejected. The proof of concept
 used eight 512-row counters, 64 shard sum-of-squares tasks, and eight RMS
