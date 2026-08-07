@@ -831,3 +831,32 @@ the control mean. The opcode, reducer, schedule switch, and manifest entries
 were removed. Cross-task fusion should not increase the number of independent
 TMEM accumulators held by one compute warpgroup unless a measured consumer is
 available to overlap with them.
+
+## Rejected LM-head epoch handoffs
+
+Three two-operator handoffs attempted to compact epoch zero's four local
+maxima and merge them with epoch one, replacing 256 global records with 128.
+All kept the existing direct4 computation shape, unlike the rejected direct8
+fusion.
+
+The first version passed a 128-byte record through the dynamic register queue.
+It was correct in job `20260807T104336Z-3420100`, but occupied one complete
+dynamic slot throughout epoch one. Same-image control/handoff/control medians
+were 2.628736/2.648256/2.624128 ms in jobs
+`20260807T104413Z-3420430`, `20260807T104453Z-3421145`, and
+`20260807T104532Z-3421723`, a 21.824 us regression. A static shared scratch
+record removed that queue pressure but held four maxima in registers across
+the boundary, raised the image to 100 registers, and measured 2.673952 ms
+against a 2.626848 ms control (+47.104 us). Correctness passed in
+`20260807T104932Z-3424780`; timing jobs were
+`20260807T105015Z-3425122` and `20260807T105055Z-3425633`.
+
+The final version left epoch zero in TMEM groups 0--3, filled epoch one into
+groups 4--7, and drained all eight groups once. Full S128 correctness passed
+in `20260807T105405Z-3428344`. Same-image control/TMEM/control medians were
+2.622400/2.630944/2.624288 ms in jobs `20260807T105613Z-3430142`,
+`20260807T105645Z-3430793`, and `20260807T105718Z-3431358`, a 7.600 us
+regression. All three variants were removed. Extending resource lifetime
+across a vocabulary epoch costs more than one compact publication and the
+256-way reducer traffic, even when the handoff avoids both registers and a
+dynamic queue slot.
