@@ -413,6 +413,152 @@ __device__ __forceinline__ void task_gemv_sm100_rope(
         base, m2c, c2m, st_insts, rope_head_offset);
 }
 
+// Consume a gate tile retained by RegStore, overlap its CUDA sigmoid with the
+// final independent up-projection UMMA group, then fold the multiplication
+// into the up epilogue.  This preserves the two projection streams and avoids
+// both a TMA round trip and a separate compute-task boundary.
+template<int M, int N, int K, int BLoadInterval,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_up_silu_sm100(
+    const int n_k_tiles,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    const void *base,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    using Atom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, N, UMMA::Major::K, UMMA::Major::K>;
+
+    static_assert(M == 64 && N == 8 && K == 256 && BLoadInterval == 4,
+                  "up/SwiGLU overlap is specialized for M64N8K256 B4");
+
+    const int tid = __compute_tid();
+    auto tiled_mma = make_tiled_mma(Atom{});
+    auto cta_mma = tiled_mma.get_slice(0);
+    auto mma_shape_a = partition_shape_A(
+        tiled_mma, make_shape(Int<M>{}, Int<K>{}));
+    auto mma_shape_b = partition_shape_B(
+        tiled_mma, make_shape(Int<N>{}, Int<K>{}));
+    auto layout_sA = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, mma_shape_a);
+    auto layout_sB = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, mma_shape_b);
+    auto logical_c = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<N>{}),
+                    make_stride(Int<N>{}, Int<1>{})));
+    auto cta_c = cta_mma.partition_C(logical_c);
+    auto tmem_acc = cta_mma.make_fragment_C(cta_c);
+    tmem_acc.data() = tmem_base_ptr;
+
+    auto layout_output = tile_to_shape(
+        GMMA::Layout_MN_SW128_Atom<data_t>{},
+        make_shape(Int<M>{}, Int<N>{}));
+    using TmemLoad = SM100_TMEM_LOAD_16dp256b1x;
+    TiledCopy tiled_t2r = make_tmem_copy(TmemLoad{}, tmem_acc);
+    ThrCopy thr_t2r = tiled_t2r.get_slice(tid);
+    auto thread_tmem = thr_t2r.partition_S(tmem_acc);
+    auto r_gate = make_tensor<data_t>(shape(thread_tmem));
+    auto r_gate_silu = make_tensor<accum_t>(shape(thread_tmem));
+
+    tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
+    int live_b_slot = 0;
+    int gate_slot = 0;
+    constexpr int b_tile_elements = N * K;
+    for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
+        data_t *sB_ptr;
+        if (tile_idx % BLoadInterval == 0) {
+            live_b_slot = m2c.template pop<0>();
+            sB_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(live_b_slot)));
+        } else {
+            sB_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(live_b_slot)))
+                + (tile_idx % BLoadInterval) * b_tile_elements;
+        }
+
+        const int slot_a = m2c.template pop<0>();
+        auto sA = make_tensor(
+            make_smem_ptr(static_cast<data_t *>(
+                get_slot_address(base, extract(slot_a)))),
+            layout_sA);
+        auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+        auto frag_a = cta_mma.make_fragment_A(sA);
+        auto frag_b = cta_mma.make_fragment_B(sB);
+
+        if (tid < numThreadsPerWarp) {
+            #pragma unroll
+            for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
+                gemm(tiled_mma, frag_a(_, _, k_block),
+                     frag_b(_, _, k_block), tmem_acc);
+                tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+
+        if (tile_idx + 1 == n_k_tiles) {
+            // Publish the RegLoad after the operand repeat. Its queue handoff,
+            // shared load, and SFU operations are independent of the up
+            // accumulator and overlap only the final completion phase, so they
+            // cannot delay earlier slot release or weight prefetch.
+            gate_slot = m2c.template pop<0>();
+            auto s_gate = make_tensor(
+                make_smem_ptr(static_cast<data_t *>(
+                    get_slot_address(base, extract(gate_slot)))),
+                layout_output);
+            auto thread_gate = thr_t2r.partition_D(
+                cta_mma.partition_C(s_gate));
+            copy(thread_gate, r_gate);
+            #pragma unroll
+            for (int i = 0; i < size(r_gate_silu); ++i) {
+                const float gate = static_cast<float>(r_gate(i));
+                r_gate_silu(i) = gate / (1.0f + expf(-gate));
+            }
+        }
+
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        int release_mask = slot_a;
+        if ((tile_idx + 1) % BLoadInterval == 0
+            || tile_idx + 1 == n_k_tiles) {
+            release_mask |= live_b_slot;
+        }
+        c2m.push(tid, release_mask);
+    }
+
+    const int output_slot = m2c.template pop<0>();
+    auto s_output = make_tensor(
+        make_smem_ptr(static_cast<data_t *>(
+            get_slot_address(base, extract(output_slot)))),
+        layout_output);
+    auto cta_output = cta_mma.partition_C(s_output);
+    auto thread_output = thr_t2r.partition_D(cta_output);
+    auto r_acc = make_tensor<accum_t>(shape(thread_output));
+    copy(tiled_t2r, thread_tmem, r_acc);
+
+    auto r_output = make_tensor<data_t>(shape(thread_output));
+    #pragma unroll
+    for (int i = 0; i < size(r_output); ++i) {
+        // Match the existing RegStore -> RegLoad path: both projection
+        // outputs are rounded to BF16 before the FP32 SwiGLU multiplication.
+        const float up = static_cast<float>(data_t(r_acc(i)));
+        r_output(i) = data_t(r_gate_silu(i) * up);
+    }
+    TiledCopy tiled_r2s = make_tiled_copy_D(
+        Copy_Atom<SM90_U16x4_STSM_T, data_t>{}, tiled_t2r);
+    ThrCopy thr_r2s = tiled_r2s.get_slice(tid);
+    auto thread_r2s_output = thr_r2s.partition_D(cta_output);
+    auto r2s_output = thr_r2s.retile_S(r_output);
+    copy(tiled_r2s, r2s_output, thread_r2s_output);
+
+    c2m.template push<0, true>(tid, output_slot);
+    c2m.push(tid, gate_slot);
+}
+
 // LM-head specialization: reuse each eight-token B tile across four disjoint
 // output tiles and retain the four F32 accumulators in TMEM.  The epilogue
 // either drains BF16 logits directly to global memory or emits compact argmax

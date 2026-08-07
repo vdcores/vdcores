@@ -10,6 +10,7 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
+    Gemv_M64N8UpSiLU,
     MemoryInstruction,
     ProfileEvent,
     RepeatM,
@@ -183,6 +184,13 @@ def test_grouped_direct_gemv_encodes_element_strides_in_m128_units():
     assert instruction.args == [32, 512, 128]
     with pytest.raises(ValueError, match="multiples of 128"):
         Gemv_M128N8Direct4(32, 65535, 16384)
+
+
+def test_up_silu_gemv_selects_the_sm100_overlap_opcode():
+    instruction = Gemv_M64N8UpSiLU(kTiles=16)
+
+    assert instruction.opcode == opcode.OP_GEMV_SM100_M64N8_UP_SILU
+    assert instruction.args == [16]
 
 
 def test_fused_lm_head_argmax_encodes_absolute_vocab_offsets():

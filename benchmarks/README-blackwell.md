@@ -192,7 +192,8 @@ different kernels.
 These isolated times must not be summed to predict TBT. VDCores is one
 persistent megakernel: Q/K/V are separately placed, K/V stores are fused,
 residual adds occur in TMA reductions, the 8,192-row MLP tail forwards through
-registers, and 24 auxiliary SMs overlap low-K down projection with that tail.
+an on-SM slot into an overlapped up/SwiGLU epilogue, and 24 auxiliary SMs
+overlap low-K down projection with that tail.
 That cross-task pipeline is why end-to-end VDCores can lead while several
 standalone probes trail. B8/S128 attention now leads vLLM by 28% and SGLang by
 40%, and grouped Q/O, down, and LM-head projections lead both frameworks. The
@@ -251,7 +252,8 @@ The 152-SM schedule uses four measured choices:
 - decode attention uses the swapped-A/B Q8 path and writes its BF16 epilogue
   directly, avoiding both the padded Q64 load and output TMA staging pass;
 - the gate/up prefix is balanced over three waves across all 152 SMs, while
-  the 8,192-row tail keeps gate, up, and SwiGLU values in registers;
+  the 8,192-row tail retains each gate tile on-SM and computes its sigmoid
+  under the final up-projection UMMA group before direct SwiGLU writeback;
 - the materialized 6,144-wide SwiGLU prefix uses three 2,048-element shards
   per token across all 24 auxiliary SMs, with aligned 128-bit shared-memory
   loads and stores;

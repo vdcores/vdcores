@@ -65,6 +65,17 @@ class Gemv_M64N8(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
+
+class Gemv_M64N8UpSiLU(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 4
+
+    def __init__(self, kTiles: int):
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M64N8_UP_SILU,
+            args=[kTiles],
+        )
+
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
@@ -1218,6 +1229,7 @@ __all__ = [
     "ComputeInstruction",
     "TerminateC",
     "Gemv_M64N8",
+    "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",
     "Gemv_M128N8Argmax4",

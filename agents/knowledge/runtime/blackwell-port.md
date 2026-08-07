@@ -711,3 +711,29 @@ byte stack, corrupting even runs that did not dispatch the new opcode.
 Force-inlining restored the spill-free control image. Future experimental
 task handlers must check entry-function resources and disabled-path
 correctness, not only the new handler's local resource report.
+
+## Retained up-UMMA/SwiGLU overlap
+
+The production MLP tail keeps gate and up as independent projections. Gate
+ends in the existing `RegStore` special slot; the following up task queues all
+of its operand loads before requesting that gate slot. After submitting the
+final up UMMA group, all four compute warps consume the gate tile from shared
+memory and evaluate its FP32 sigmoid while the tensor core owns the independent
+up accumulator. The epilogue rounds up to BF16, multiplies by the retained
+FP32 gate activation, and writes SwiGLU directly. There is no intermediate TMA
+round trip, extra compute warp, or cross-SM dependency.
+
+Placing the CUDA work under the final group is material. An initial first-group
+form measured 25.088 us for the isolated 128-SM tail versus 25.024 us for the
+three-task control because it delayed early A/B slot release and prefetch. The
+late gate handoff measured 24.736 versus 24.896 us. In a 1,001-sample S128
+sandwich, late-overlap runs measured 2.673408 and 2.674592 ms around a
+2.679456 ms control, a 5.456 us / 0.20% gain. The exact 11-op production image
+then measured 2.678304 ms and remains spill-free at 128 registers, nine
+barriers, and a 96-byte stack.
+
+Full S128 tensor validation passed all thresholds and token 24748 exactly in
+job `20260807T084358Z-3316527`. Four resident tokens reused the late handoff
+correctly in `20260807T084435Z-3317529`, and the minimal final image repeated
+that result in `20260807T084806Z-3321002`. The retained schedule has exactly
+two tail compute tasks: gate GEMV and up GEMV with overlapped SwiGLU.

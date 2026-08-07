@@ -790,9 +790,8 @@ def schedule_single_token(
   ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
 
   # Gate Up + SiLU
-  reg_gate, reg_up = 0, 1
+  reg_gate = 0
   reg_store_gate = RegStore(reg_gate, matGateOut[:, :QKVTileM])
-  reg_store_up = RegStore(reg_up, matInterm[:, :QKVTileM])
 
   gate_proj_prefix = SchedGemv(QKVAtom,
     MNK=(6144, N, HIDDEN),
@@ -827,18 +826,15 @@ def schedule_single_token(
     MNK=((mlp_split, INTERMIDIATE - mlp_split), N, HIDDEN),
     tmas=(layerg['loadGate'], layerg['loadRMSLayer'], reg_store_gate),
   )
-  up_proj_tail = SchedGemv(QKVAtom,
+  up_silu_tail = SchedGemvUpSiLU(
     MNK=((mlp_split, INTERMIDIATE - mlp_split), N, HIDDEN),
-    tmas=(layerg['loadUp'], layerg['loadRMSLayer'], reg_store_up),
-  )
-  silu_tail = SchedRegSiLUFused(
-    num_token=N,
-    store_tma=layerg['storeSiluLayer'],
-    reg_gate=reg_gate,
-    reg_up=reg_up,
-    base_offset=mlp_split,
-    stride=QKVTileM,
-  ).bar("output", layerg['bar_silu_out2'])
+    tmas=(
+      layerg['loadUp'],
+      layerg['loadRMSLayer'],
+      layerg['storeSiluLayer'],
+    ),
+    gate_reg=reg_gate,
+  ).bar("store", layerg['bar_silu_out2'])
   # Balance the down projection over all 152 SMs.  The two low-K schedules
   # contribute 192 fold-3 tasks and the two high-K schedules contribute 256
   # fold-4 tasks.  Placement gives 144 SMs three K2048 tasks and eight SMs two
@@ -1021,8 +1017,7 @@ def schedule_single_token(
     silu1 = silu1.place(N * 3, base_sm=num_sms)
     down_low_schedules = [down_proj_low0, down_proj_low1]
   gate_proj_tail = gate_proj_tail.place(128)
-  up_proj_tail = up_proj_tail.place(128)
-  silu_tail = silu_tail.place(128)
+  up_silu_tail = up_silu_tail.place(128)
   if not fine_mlp_barriers:
     down_proj_low0 = down_proj_low0.place(144)
     down_proj_low1 = down_proj_low1.place(48, base_sm=104)
@@ -1073,8 +1068,7 @@ def schedule_single_token(
     mlp_prefix_schedules,
     silu1,
     gate_proj_tail,
-    up_proj_tail,
-    silu_tail,
+    up_silu_tail,
     down_low_early_schedules,
     down_proj_high_early,
     down_low_late_schedules,
@@ -1124,9 +1118,7 @@ def schedule_single_token(
     stage_profile_marker("silu_prefix", range(num_sms, full_sms)),
     gate_proj_tail,
     stage_profile_marker("gate_tail", range(128)),
-    up_proj_tail,
-    stage_profile_marker("up_tail", range(128)),
-    silu_tail,
+    up_silu_tail,
     stage_profile_marker("silu_tail", range(128)),
 
     stage_profile_schedule_parts("down_low_early_part", down_low_early_schedules),

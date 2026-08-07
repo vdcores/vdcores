@@ -629,6 +629,21 @@ class SchedGemv(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedGemvUpSiLU(SchedGemv):
+    """Up projection whose final UMMA group overlaps gate SiLU work."""
+
+    def __init__(self, MNK, tmas, gate_reg: int):
+        super().__init__(Gemv_M64N8UpSiLU, MNK, tmas)
+        self.gate_reg = gate_reg
+
+    def schedule(self, sm: int):
+        insts = super().schedule(sm)
+        if not insts:
+            return insts
+        insts.insert(len(insts) - 1, RegLoad(self.gate_reg))
+        return insts
+
+
 class SchedGemvMGroup(Schedule):
     def __init__(self, Atom, MNK, tmas, direct_output,
                  direct_output_slot: int = 24, group: bool = True):
