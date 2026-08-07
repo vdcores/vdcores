@@ -1191,3 +1191,39 @@ form also fails the repeated-launch lifetime requirement. All paired weights,
 TMA descriptors, opcode/task/schedule code, benchmark switches, and manifests
 were removed. The rebuilt 11-op production image measured 2.627648 ms over
 501 internal-timer samples in `20260807T154150Z-3669016`.
+
+## Rejected balanced two-wave 152-SM LM head
+
+A schedule audit first ruled out a memory-only wrapper around the staged down
+tasks. `Launcher` already flattens every schedule into independent continuous
+compute and memory instruction streams; the allocator and load VCore can run
+past a compute-task boundary without an added handoff. The remaining down
+waits are the actual shard-readiness dependencies. A new wrapper with the same
+instructions would therefore add representation without exposing work.
+
+The next experiment used the 24 SMs left idle by the 128-SM LM head without
+repeating the rejected six/seven-accumulator owner. Each of two waves contained
+56 four-output tasks and 96 three-output tasks. The long rectangles swapped
+physical ranges between waves, so 112 SMs processed seven M128 vocabulary
+tiles and 40 processed six; every task retained at most the production four
+live FP32 TMEM accumulators. The complete vocabulary still covered 1,024
+tiles, but the partial frontier grew from 256 to 304 records.
+
+Full S128 tensor validation and exact token 24748 passed in
+`20260807T155923Z-3683419`. The selectable unprofiled image used 100 registers,
+nine barriers, a 96-byte stack, and zero spills. A same-image
+control/experiment/control sandwich measured 2.618720/2.621888/2.620384 ms in
+jobs `20260807T160006Z-3683960`, `20260807T160046Z-3684652`, and
+`20260807T160128Z-3685457`. The balanced form was 2.336 us slower than the
+2.619552 ms control mean.
+
+Diagnostic frontier jobs `20260807T160525Z-3688685` and
+`20260807T160605Z-3689079` showed why. The last LM compute marker moved from
+230.624 us to 234.624 us relative to the final-layer start. The main reducer
+SMs spent less visible time waiting at their local LM marker, but the extra 48
+activation/task/partial streams extended the distributed projection tail.
+Using more SMs did not increase the bandwidth-bound LM throughput. The
+group-three opcode, 304-record reducer, weight partitions, selector, and both
+manifest additions were removed. The rebuilt 11-op production image returned
+to 96 registers with no spills and measured 2.619680 ms over 501 internal
+samples in `20260807T161018Z-3692811`.
