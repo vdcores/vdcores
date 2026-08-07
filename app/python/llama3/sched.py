@@ -196,6 +196,8 @@ fused_qk_rope = os.environ.get("VDCORES_FUSED_QK_ROPE", "1") == "1"
 qkv_head_barriers = os.environ.get("VDCORES_QKV_HEAD_BARRIERS", "1") == "1"
 if qkv_head_barriers and not fused_qk_rope:
   raise ValueError("per-head QKV barriers require fused Q/K RoPE tasks")
+phased_attn_out = os.environ.get("VDCORES_PHASED_ATTN_OUT", "1") == "1"
+attn_out_head_groups = ((0,), (1,), tuple(range(2, 8)))
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -285,8 +287,12 @@ layerg.addBarrier('bar_out_mlp')
 if not qkv_head_barriers:
   layerg.addBarrier('bar_q_proj')
   layerg.addBarrier('bar_qkv_attn')
-layerg.addBarrier('bar_attn_out')
-layerg.addBarrier('bar_q_clear')
+if phased_attn_out:
+  for group_id, heads in enumerate(attn_out_head_groups):
+    layerg.addBarrier(f'bar_attn_out_group{group_id}', N * len(heads))
+else:
+  layerg.addBarrier('bar_attn_out')
+  layerg.addBarrier('bar_q_clear')
 if not fine_mlp_barriers:
   layerg.addBarrier('bar_silu_in')
   layerg.addBarrier('bar_silu_out1')
@@ -602,14 +608,18 @@ class CounterOffsetCordAdapter(CordAdapter):
 
 
 class SchedClearQ(Schedule):
-  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int, num_clear_sms: int, wait_bar: int):
+  def __init__(self, load_zero, store_q, tile_bytes: int, tile_m: int,
+               num_clear_sms: int, wait_bars):
     super().__init__()
     self.load_zero = load_zero
     self.store_q = store_q
     self.tile_bytes = tile_bytes
     self.tile_m = tile_m
     self.num_clear_sms = num_clear_sms
-    self.wait_bar = wait_bar
+    self.wait_bars = (
+      list(wait_bars) if isinstance(wait_bars, (list, tuple))
+      else [wait_bars]
+    )
 
   def schedule(self, sm: int):
     if sm < 0:
@@ -617,18 +627,25 @@ class SchedClearQ(Schedule):
     count = (HIDDEN // self.tile_m + self.num_clear_sms - 1 - sm) // self.num_clear_sms
     if count <= 0:
       return []
+    store = self.store_q.cord(sm)
+    if self._bar("store") is not None:
+      store = store.bar(self._bar("store")).group()
+    finish = (
+      IssueBarrier(self._bar("store")).group()
+      if self._bar("store") is not None else None
+    )
     return [
-      IssueBarrier(self.wait_bar).group(),
+      [IssueBarrier(wait_bar).group() for wait_bar in self.wait_bars],
       Copy(count, size=self.tile_bytes),
       RepeatM.on(
         count,
         (self.load_zero.cord(0), 0),
         (
-          self.store_q.cord(sm).bar(self._bar("store")).group(),
+          store,
           [self.num_clear_sms * self.tile_m, 0],
         ),
       ),
-      IssueBarrier(self._bar("store")).group(),
+      finish,
     ]
 
   def bar_release_count(self, role: str):
@@ -851,28 +868,64 @@ def schedule_single_token(
       [layerg[f'bar_qkv_attn_head{head}'] for head in range(NUM_KV_HEAD)]
       if qkv_head_barriers else None
     ),
+    o_head_bars=(
+      [
+        layerg[f'bar_attn_out_group{group_id}']
+        for head in range(NUM_KV_HEAD)
+        for group_id, heads in enumerate(attn_out_head_groups)
+        if head in heads
+      ]
+      if phased_attn_out else None
+    ),
     head_major=qkv_head_barriers,
     max_loop_count=min(
       control_flow_tokens or 1,
       KVBlockSize - (token_pos % KVBlockSize),
     ),
-  ).bar("o", layerg['bar_attn_out'])
+  )
+  if not phased_attn_out:
+    Gqa.bar("o", layerg['bar_attn_out'])
   if not qkv_head_barriers:
     Gqa.bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn'])
 
   # accumulate to matHidden, which auto applies the residual add
   # Twelve M tiles use four K folds and the other 52 use two folds: exactly
   # 152 independent tasks, one for every Blackwell SM.
-  out_proj_fold4 = SchedGemv(LinearAtom,
-    MNK=((0, 768), N, HIDDEN),
-    fold=4,
-    tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
-  out_proj_fold2 = SchedGemv(LinearAtom,
-    MNK=((768, HIDDEN - 768), N, HIDDEN),
-    fold=2,
-    tmas=(layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer'])
-  ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
+  out_tmas = (
+    layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer']
+  )
+  if phased_attn_out:
+    activation_bars = [
+      layerg[f'bar_attn_out_group{group_id}']
+      for head in range(NUM_KV_HEAD)
+      for group_id, heads in enumerate(attn_out_head_groups)
+      if head in heads
+    ]
+    def make_phased_out(mnk):
+      return SchedGemvPhasedActivation(
+        LinearAtom, MNK=mnk, fold=1,
+        tmas=out_tmas, activation_bars=activation_bars,
+      ).bar("store", layerg['bar_out_mlp'])
+
+    # Put every K<2048 consumer on the 88 SMs outside attention. Late-K
+    # contributors take the complementary physical SM set after attention.
+    out_proj_placement_specs = [
+      (make_phased_out(((0, 768), N, (0, 1024))), 12, 64),
+      (make_phased_out(((0, 768), N, (1024, 1024))), 12, 76),
+      (make_phased_out(((768, HIDDEN - 768), N, (0, 2048))), 52, 88),
+      (make_phased_out(((0, 768), N, (2048, 1024))), 12, 0),
+      (make_phased_out(((0, 768), N, (3072, 1024))), 12, 12),
+      (make_phased_out(((768, 2560), N, (2048, 2048))), 40, 24),
+      (make_phased_out(((3328, 768), N, (2048, 2048))), 12, 140),
+    ]
+  else:
+    out_proj_fold4 = SchedGemv(
+      LinearAtom, MNK=((0, 768), N, HIDDEN), fold=4, tmas=out_tmas,
+    ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
+    out_proj_fold2 = SchedGemv(
+      LinearAtom, MNK=((768, HIDDEN - 768), N, HIDDEN), fold=2, tmas=out_tmas,
+    ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
+    out_proj_placement_specs = None
 
   # Gate Up + SiLU
   reg_gate = 0
@@ -1061,10 +1114,16 @@ def schedule_single_token(
   KRope = [] if fused_qk_rope else KRope.place(64, base_sm=64)
   VProj = VProj if qkv_head_barriers else VProj.place(64)
   Gqa = Gqa.place(N * NUM_KV_HEAD)
-  OutProj = [
-    out_proj_fold4.place(48),
-    out_proj_fold2.place(104, base_sm=48),
-  ]
+  if out_proj_placement_specs is not None:
+    OutProj = [
+      part.place(part_sms, base_sm=base_sm)
+      for part, part_sms, base_sm in out_proj_placement_specs
+    ]
+  else:
+    OutProj = [
+      out_proj_fold4.place(48),
+      out_proj_fold2.place(104, base_sm=48),
+    ]
   if fine_mlp_barriers:
     gate_prefix_parts = [
       part.place(32, base_sm=shard_id * 32)
@@ -1131,14 +1190,22 @@ def schedule_single_token(
   Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
+  clear_wait_bars = (
+    [layerg[f'bar_attn_out_group{group_id}']
+     for group_id in range(len(attn_out_head_groups))]
+    if phased_attn_out else layerg['bar_attn_out']
+  )
   clear_q = SchedClearQ(
     TmaLoad1D(matZero[:N * QKVTileM], bytes=N * QKVTileM * matZero.element_size()),
     ToSplitMCordAdapter(layerg['storeQClear'], 64, QKVTileM),
     N * QKVTileM * matZero.element_size(),
     QKVTileM,
     aux_sms,
-    layerg['bar_attn_out'],
-  ).bar("store", layerg['bar_q_clear']).place(aux_sms, base_sm=num_sms)
+    clear_wait_bars,
+  )
+  if not phased_attn_out:
+    clear_q.bar("store", layerg['bar_q_clear'])
+  clear_q = clear_q.place(aux_sms, base_sm=num_sms)
 
   dae.bind_late_barrier_counts(
     embed_rms,
@@ -1299,6 +1366,7 @@ print(
   f"interleave_down_high={int(interleave_down_high)}, "
   f"fused_qk_rope={int(fused_qk_rope)}, "
   f"qkv_head_barriers={int(qkv_head_barriers)}, "
+  f"phased_attn_out={int(phased_attn_out)}, "
   f"stage_profile={int(stage_profile)}"
 )
 dae.s()

@@ -860,3 +860,36 @@ regression. All three variants were removed. Extending resource lifetime
 across a vocabulary epoch costs more than one compact publication and the
 256-way reducer traffic, even when the handoff avoids both registers and a
 dynamic queue slot.
+
+## Retained phased attention-output consumption
+
+The output projection now consumes attention output through three shared
+frontiers: KV head 0, KV head 1, and heads 2--7. Its existing K512 activation
+repeat is exactly one KV head, so each projection remains one compute task
+while its memory program gates only the corresponding activation segment.
+Independent weight loads continue on the other memory port. No attention or
+GEMV compute opcode, tile, or thread count changed.
+
+Physical ownership is part of the dependency cut. All K<2048 contributors are
+mapped to SMs 64--139, outside the 64-SM attention placement, while late-K
+contributors use the complementary SM set after attention. The factorization
+still contains exactly 152 reduction tasks. Screening 4/4, 2/2/4, 1/1/6, and
+1/3/4 barriers showed that releasing the first two heads individually and
+then staying coarse best amortizes memory-program waits; all other grouping
+selectors were removed.
+
+A production-image coarse/phased/coarse sandwich measured
+2.627072/2.620544/2.627168 ms over 1,001 internal-timer samples in jobs
+`20260807T112850Z-3457366`, `20260807T112922Z-3457657`, and
+`20260807T112954Z-3457967`. The retained schedule saves 6.576 us / 0.25%
+against the control mean. Full S128 tensor correctness and token 24748 passed
+in `20260807T113120Z-3459483`; two resident tokens crossed KV128 and produced
+`hello hello` in `20260807T113322Z-3461205`. Four Python-unrolled tokens now
+exceed the fixed 4,096 memory-instruction buffer, so that larger unrolled
+qualification remains deferred with the multi-token milestone rather than
+expanding the runtime in this task-focused change.
+
+All 33 host schedule tests pass. The exact 11-op image remains at 96
+registers, nine barriers, a 96-byte stack, and zero spills. Its final S128
+median is 2.620128 ms in `20260807T113402Z-3461684`, 6.96% below the strict
+2.816003 ms vLLM result and 85.725 us above the requested 10%-lead target.

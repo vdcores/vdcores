@@ -156,6 +156,21 @@ registers, nine hardware barriers, a 96-byte stack, and zero spills; its final
 production median is 2.626368 ms. Full S128 tensor validation and exact
 four-token resident reuse pass.
 
+### Phased attention-to-output schedule
+
+Output projection now observes separate shared frontiers for KV head 0, head
+1, and heads 2--7. Its K512 activation repeat already matches one KV head, so
+weights can issue independently while only the not-yet-ready activation
+segment waits. Early-K contributors run on SMs 64--139 outside the attention
+placement; late-K contributors use the complementary SMs. The schedule still
+has exactly 152 output-reduction tasks and uses the unchanged M64 compute op.
+
+The profiling-free coarse/phased/coarse S128 medians are
+2.627072/2.620544/2.627168 ms, a 6.576 us (0.25%) gain. Full S128 tensor and
+exact-token correctness pass, as does two-token resident barrier reuse. The
+final exact-image median is 2.620128 ms; the image remains spill-free at 96
+registers, nine hardware barriers, and a 96-byte stack.
+
 ## Per-operator comparison with vLLM and SGLang
 
 Llama-3.1-8B is dense, so "per expert" here means per task/operator rather

@@ -265,6 +265,7 @@ class SchedAttentionDecoding(Schedule):
                  swapped_qk_pv: bool = False,
                  q_head_bars=None,
                  kv_head_bars=None,
+                 o_head_bars=None,
                  head_major: bool = False):
         super().__init__()
         self.reqs = reqs
@@ -284,12 +285,15 @@ class SchedAttentionDecoding(Schedule):
         self.swapped_qk_pv = swapped_qk_pv
         self.q_head_bars = q_head_bars
         self.kv_head_bars = kv_head_bars
+        self.o_head_bars = o_head_bars
         self.head_major = head_major
         if (q_head_bars is None) != (kv_head_bars is None):
             raise ValueError("q_head_bars and kv_head_bars must be provided together")
         if q_head_bars is not None:
             if len(q_head_bars) != NUM_KV_HEADS or len(kv_head_bars) != NUM_KV_HEADS:
                 raise ValueError("head-barrier arrays must match NUM_KV_HEADS")
+        if o_head_bars is not None and len(o_head_bars) != NUM_KV_HEADS:
+            raise ValueError("output head-barrier array must match NUM_KV_HEADS")
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.use_qwen_fused_qk = side_input is not None
@@ -327,6 +331,7 @@ class SchedAttentionDecoding(Schedule):
         head_dim = self.matO.shape[-1]
         q_bar = self.q_head_bars[head] if self.q_head_bars is not None else self._bar("q")
         kv_bar = self.kv_head_bars[head] if self.kv_head_bars is not None else self._bar("k")
+        o_bar = self.o_head_bars[head] if self.o_head_bars is not None else self._bar("o")
 
         tQ, tK, tV = self.tmas
 
@@ -382,14 +387,14 @@ class SchedAttentionDecoding(Schedule):
         if self.direct_output:
             output = (
                 RawAddress(self.matO[req, head, ...], 24)
-                .bar(self._bar("o"))
+                .bar(o_bar)
                 .writeback()
                 .group()
             )
         else:
             output = (
                 TmaStore1D(self.matO[req, head, ...], numSlots=2)
-                .bar(self._bar("o"))
+                .bar(o_bar)
                 .group()
             )
         insts.append(output)
@@ -644,6 +649,86 @@ class SchedGemv(Schedule):
         if role != "store":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedGemvPhasedActivation(SchedGemv):
+    """One GEMV task whose activation repeats observe staged producer bars.
+
+    Consecutive repeats with the same barrier stay in one RepeatM program, so
+    the compute opcode, tile shape, and normal weight/activation pipeline are
+    unchanged. Only genuine producer boundaries add another memory segment.
+    """
+
+    def __init__(self, Atom, MNK, tmas, activation_bars,
+                 fold: int | None = None, prefetch=True, group=True):
+        super().__init__(
+            Atom, MNK, tmas, fold=fold, prefetch=prefetch, group=group
+        )
+        self.activation_bars = list(activation_bars)
+
+    def validate(self):
+        super().validate()
+        TileK = self.Atom.MNK[2]
+        repeat_k = TileK * self.Atom.n_batch
+        base_k = self.MNK_base[2]
+        total_k = base_k + self.MNK[2]
+        assert base_k % repeat_k == 0
+        assert total_k % repeat_k == 0
+        assert len(self.activation_bars) >= total_k // repeat_k
+        assert self._bar("load") is None, (
+            "phased activation GEMV takes its load barriers explicitly"
+        )
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        baseM, _, baseK = self.MNK_base
+        n_batch = self.Atom.n_batch
+        loadA, loadB, storeC = self.tmas
+
+        m = baseM + (sm % self.sm_per_fold) * TileM
+        k = baseK + (sm // self.sm_per_fold) * self.k_per_fold
+        repeat_k = TileK * n_batch
+        n_repeat = self.k_per_fold // repeat_k
+        store_group = self.group and self._bar("store") is not None
+
+        phased_loads = []
+        local_repeat = 0
+        while local_repeat < n_repeat:
+            global_repeat = k // repeat_k + local_repeat
+            bar_id = self.activation_bars[global_repeat]
+            run_length = 1
+            while (
+                local_repeat + run_length < n_repeat
+                and self.activation_bars[global_repeat + run_length] == bar_id
+            ):
+                run_length += 1
+
+            segment_k = k + local_repeat * repeat_k
+            load_steps = [
+                (loadB.cord(0, segment_k).group(),
+                 loadB.cord2tma(0, repeat_k)),
+                *[
+                    (loadA.cord(m, segment_k + TileK * i).group(),
+                     loadA.cord2tma(0, repeat_k))
+                    for i in range(n_batch)
+                ],
+            ]
+            phased_loads.extend(
+                RepeatM.onSync(
+                    0, bar_id, run_length, *load_steps,
+                    asyncPort=self.prefetch,
+                )
+            )
+            local_repeat += run_length
+
+        return [
+            self.Atom(self.k_per_fold // TileK),
+            phased_loads,
+            storeC.cord(0, m).bar(self._bar("store")).group(store_group),
+        ]
 
 
 class SchedGemvUpSiLU(SchedGemv):

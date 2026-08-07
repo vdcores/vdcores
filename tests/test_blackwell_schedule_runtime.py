@@ -178,6 +178,7 @@ def test_decode_schedule_maps_head_major_workers_to_per_head_barriers():
     output = torch.empty((8, 8, 4, 128), dtype=torch.bfloat16)
     q_bars = list(range(10, 18))
     kv_bars = list(range(20, 28))
+    o_bars = [30, 30, 31, 31, 32, 32, 32, 32]
     sharded = SchedAttentionDecoding(
         reqs=8,
         seq_len=128,
@@ -189,6 +190,7 @@ def test_decode_schedule_maps_head_major_workers_to_per_head_barriers():
         swapped_qk_pv=True,
         q_head_bars=q_bars,
         kv_head_bars=kv_bars,
+        o_head_bars=o_bars,
         head_major=True,
     )
     default = SchedAttentionDecoding(
@@ -206,6 +208,7 @@ def test_decode_schedule_maps_head_major_workers_to_per_head_barriers():
     assert default._map_req_head(8) == (1, 0)
     assert sharded.q_head_bars[1] == 11
     assert sharded.kv_head_bars[1] == 21
+    assert sharded.o_head_bars[5] == 32
     with pytest.raises(ValueError, match="provided together"):
         SchedAttentionDecoding(
             reqs=8,
@@ -215,6 +218,16 @@ def test_decode_schedule_maps_head_major_workers_to_per_head_barriers():
             matO=output,
             tmas=(None, None, None),
             q_head_bars=q_bars,
+        )
+    with pytest.raises(ValueError, match="output head-barrier"):
+        SchedAttentionDecoding(
+            reqs=8,
+            seq_len=128,
+            KV_BLOCK_SIZE=128,
+            NUM_KV_HEADS=8,
+            matO=output,
+            tmas=(None, None, None),
+            o_head_bars=o_bars[:-1],
         )
 
 
