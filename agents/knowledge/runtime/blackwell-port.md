@@ -946,3 +946,28 @@ runtime cases, selectors, and manifest entries were removed. Q cleanup is not
 a profitable boundary to move while every form still consumes the global
 store and queue ordering; future cleanup work needs deletion or safe lifetime
 reuse rather than a cheaper copy mechanism.
+
+## Rejected full-K Q ownership and Q/K/V repartition
+
+A no-clear projection topology gave every Q M64 tile one full-K task, applied
+fused RoPE once, and used a normal store instead of two BF16 reduction
+contributors. Q occupied SMs 64--127 while K then V occupied SMs 0--63, with
+the intent to overlap Q with the combined KV path and delete all 64 Q-clear
+stores per layer.
+
+The experiment exposed two schedule dependencies that had previously been
+implicit in physical placement. V did not carry its own pre-attention-RMS
+wait because the low-half Q fold always waited first; moving K to that half
+had the same issue. K RoPE and attention also both used raw descriptor slot 24
+only because they formerly ran on disjoint CTAs. Explicit RMS waits and a
+separate K raw slot made the new topology correct. Full S128 validation passed
+all thresholds and token 24748 in `20260807T123155Z-3510844`.
+
+The topology was nevertheless slower. Same-image split-Q/full-Q/split-Q
+medians were 2.620864/2.639040/2.620960 ms in jobs
+`20260807T123233Z-3511607`, `20260807T123311Z-3512003`, and
+`20260807T123353Z-3512451`, a 18.128 us regression against the control mean.
+The longer full-K Q task plus serialized K and V work cost more than removing
+the Q reduction contributors and clear. The selector and all schedule changes
+were removed. Future placement changes must audit both explicit counters and
+same-CTA ordering/raw-slot assumptions before performance screening.
