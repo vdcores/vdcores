@@ -412,6 +412,34 @@ compared against the retained grouped task's B-tile reuse, because duplicating
 or retaining B traffic can erase the 4-7% task-level opportunity even though
 the underlying overlap is valid.
 
+### Rejected same-accumulator K pipelines
+
+A follow-up tested whether ordinary M64 GEMVs could hide their per-K256 UMMA
+wait without introducing a second output tile. Combining two ordered K tiles
+under one completion event improved an isolated M4096/K4096 fold-2 projection
+from 6.944 to 6.688 us, but extended the lifetime of both shared operands.
+That ownership cost reversed at K14336 (21.568 to 22.240 us) and at real
+producer/consumer boundaries. Against a 2.646720 ms same-image S128 control,
+V-only was neutral at 2.647520 ms, output projection regressed to 2.662080 ms,
+MLP projections regressed to 2.693760 ms, and all K4096 scopes reached
+2.711360 ms. Full tensor correctness still passed in
+`20260807T094538Z-3372345`.
+
+A true depth-two version attached alternating K tiles to two persistent UMMA
+completion barriers, submitted tile `n+1` before waiting for tile `n`, and
+released `n`'s operands while `n+1` remained in flight. It was also exact but
+regressed the isolated K4096 projection from 7.008 to 7.456 us and raised the
+selective image from 96 to 128 registers. Jobs were
+`20260807T095448Z-3379841` and `20260807T095417Z-3379361`.
+
+The ordinary GEMV critical path is producer/slot paced, not a bare UMMA wait.
+Same-accumulator depth either holds operands too long or pays an extra phase
+and live-state cost. Multiple-inflight integration should therefore use
+disjoint TMEM/output work whose operands can retire independently, consistent
+with the successful two-bank microprobe above. Both prototypes and the second
+persistent barrier were removed. The restored 11-op image returned to 96
+registers with zero spills and measured 2.634560 ms at S128.
+
 After removing every experimental opcode/runtime hook, the selective
 production image returned to 63 registers, 9 barriers, a 96-byte stack, and no
 spills. Fresh B8 internal medians were 3.264/4.672/7.200 us for unsplit
