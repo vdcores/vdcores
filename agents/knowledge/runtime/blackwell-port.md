@@ -914,3 +914,35 @@ therefore regressed by 44.192 us against the control mean. A second live
 accumulator, two TMEM drains, and the FP32 merge cost substantially more than
 the completion wait they could hide, so the opcode, second completion event,
 schedule selector, and tests were removed.
+
+## Rejected early and static-zero Q cleanup
+
+The updated final-layer frontier showed Q-buffer clearing on auxiliary SM 147
+ending at 79.392 us, after next-layer RMS had reached 77.760 us. Moving the
+existing load/copy/store task immediately behind attention output and placing
+it on main SMs tested whether that cleanup could fit under their MLP slack.
+Instead, a same-image control/early/control sandwich measured
+2.618752/2.630464/2.619168 ms in jobs `20260807T115559Z-3480216`,
+`20260807T115644Z-3480904`, and `20260807T115723Z-3481264`: +11.504 us. The
+cleanup left the final frontier but displaced useful MLP/down work.
+
+A stronger VCore prototype reserved a read-only zero tile outside attention
+scratch. A direct allocator-warp TMA store was not a valid SM100 execution
+path and trapped, so the safe form kept normal ownership: the load VCore
+published only a dynamically allocated store descriptor, a lightweight
+compute task forwarded that descriptor without touching payload bytes, and
+the store VCore sourced the fixed zero tile. This removed the zero TMA load
+and 1 KiB CUDA copy. Full S128 correctness passed in
+`20260807T121649Z-3497984`, and two tokens crossed KV128 with `hello hello` in
+`20260807T121729Z-3498441`.
+
+The reduced handoff still did not shorten the critical path. Same-image
+control/static/control medians were 2.624384/2.623712/2.621824 ms in jobs
+`20260807T121809Z-3498880`, `20260807T121850Z-3499564`, and
+`20260807T121931Z-3500282`, making the late static path 0.608 us slower than
+the control mean. Moving that lighter form early measured 2.631008 ms in
+`20260807T122014Z-3500679`, a 7.904 us regression. The zero tile, opcodes,
+runtime cases, selectors, and manifest entries were removed. Q cleanup is not
+a profitable boundary to move while every form still consumes the global
+store and queue ordering; future cleanup work needs deletion or safe lifetime
+reuse rather than a cheaper copy mechanism.
