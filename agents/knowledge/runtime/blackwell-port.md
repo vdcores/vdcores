@@ -683,3 +683,31 @@ port-1 activation load and a port-0 weight load into one transaction phase was
 also correct but 115.904 us slower than its paired observer-owned control.
 The load warps therefore continue to own TMA transaction setup and completion;
 only the compute warpgroup changed from participant to observer.
+
+## Cross-task gate/up UMMA fusion
+
+A paired M64 gate/up task tested whether sharing the activation load and
+eliminating the register-slot SwiGLU handoff could expose useful cross-task
+overlap. Gate and up accumulated in disjoint TMEM columns and the task emitted
+the BF16-rounded SwiGLU result directly. Reusing one UMMA completion phase for
+both accumulators requires all participating compute threads to observe each
+phase before it can be reused; omitting that rendezvous deadlocked repeated
+96/128-SM probes.
+
+A warp-specialized follow-up made compute warp 0 the sole UMMA issuer and
+parked the other three compute warps for the reduction. The parked warps
+advanced their private M2C cursors over the 36 consumed operand messages and
+joined only for the four-warp TMEM epilogue. This replaced 32 per-tile
+rendezvous with three task-level compute barriers and passed repeated 128-SM
+correctness. It still regressed the profiling-free S128 median from the
+2.687360 ms mean of neighboring controls to 2.697600 ms (+10.240 us, +0.38%).
+Sharing the activation was less valuable than preserving independent gate/up
+projection progress, so the prototype was removed.
+
+This experiment also exposed a compiler boundary constraint. Marking the
+large task no-inline made the resident interpreter non-leaf and changed the
+whole selective image from 126 registers/96-byte stack to 74 registers/176-
+byte stack, corrupting even runs that did not dispatch the new opcode.
+Force-inlining restored the spill-free control image. Future experimental
+task handlers must check entry-function resources and disabled-path
+correctness, not only the new handler's local resource report.
