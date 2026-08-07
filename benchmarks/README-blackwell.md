@@ -642,6 +642,26 @@ first epoch worsened 80.576 to 83.136 us; handler/barrier footprint exceeded
 the 0.512 us steady overlap.  The extra opcode, barriers, and selector were
 therefore removed rather than retaining a complex sub-microsecond path.
 
+The next experiment split fused LM-head argmax into a hierarchical pipeline.
+After the first 128-task logits epoch, eight auxiliary SMs each reduced one
+token's 128 compact records while the main 128 SMs ran the second epoch.  The
+summary replaced the last epoch-0 record, so the final reducer consumed one
+contiguous 129-record range instead of 256 records.  The path used explicit
+128-thread compute barriers before its C2M publications; it did not rely on a
+thread fence to join a memory warp that never entered the compute task.
+
+The pipeline passed full S128 tensor checks and produced the exact token 24748
+(job `20260807T211437Z-3968085`).  Its unprofiled 501-run control/variant/control
+medians were 2.614976/2.614464/2.619616 ms (jobs
+`20260807T211526Z-3968535`, `20260807T211603Z-3969081`, and
+`20260807T211643Z-3969665`).  The apparent 2.832 us advantage over the control
+mean was smaller than run-to-run drift.  Stage traces showed why the design did
+not provide a robust tail reduction: the auxiliary reduction itself remained
+about 15--16 us after epoch 0 became ready, and the measured LM-head/argmax
+frontier increased from about 231.2 to 233.4 us (jobs
+`20260807T211858Z-3971545` and `20260807T211937Z-3971892`).  The extra opcodes,
+barriers, and schedule were removed.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
