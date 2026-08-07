@@ -1227,3 +1227,56 @@ group-three opcode, 304-record reducer, weight partitions, selector, and both
 manifest additions were removed. The rebuilt 11-op production image returned
 to 96 registers with no spills and measured 2.619680 ms over 501 internal
 samples in `20260807T161018Z-3692811`.
+
+## Rejected CTA-cluster activation multicast
+
+A cluster-size-two prototype tested whether paired projection CTAs should
+replace their duplicate activation TMA loads with one
+`cp.async.bulk.shared::cluster.global...multicast::cluster` transaction. It
+kept weight ownership and UMMA execution local to each CTA. Explicit cluster
+launch was correct through the full S128 model and exact token 24748 in
+`20260807T161726Z-3698409`, but the otherwise unchanged kernel measured
+2.626912 ms in `20260807T161804Z-3699272`, 7.232 us slower than the neighboring
+2.619680 ms non-cluster production result. This is an internal-timer delta,
+so it reflects cluster placement/lifecycle constraints rather than host launch
+latency.
+
+A 152-CTA standalone probe separated transfer savings from synchronization.
+At 8 KiB for 256 waves, independent unicast measured 104.192 us
+(`20260807T162408Z-3704310`). Adding one complete `cluster.sync()` per wave
+raised matched unicast to 242.464 us (`20260807T162432Z-3704580`); multicast
+reduced that to 236.640 us (`20260807T162456Z-3704761`). Halving the activation
+transactions therefore saved 5.824 us, but the full-CTA lifecycle rendezvous
+cost over 130 us and could not be placed on the production path.
+
+An observer-style replacement used two shared-memory stages. Only the load
+leader recycled a stage after one remote arrival from each CTA's completed
+consumer; the load VCore, not the compute leader, rearmed the TMA mbarrier.
+This was repeat-correct. Against independent unicast over 256 waves, the
+leader-owned multicast form was still slower at every tested operand size:
+122.944 versus 128.544 us for 4 KiB, 127.744 versus 132.704 us for 8 KiB, and
+135.872 versus 140.960 us for 16 KiB. The jobs were
+`20260807T163033Z-3710233`/`20260807T163058Z-3710742`,
+`20260807T162845Z-3708478`/`20260807T162910Z-3708884`, and
+`20260807T163120Z-3711128`/`20260807T163143Z-3711549` respectively.
+
+A final producer/consumer probe split the load leader from a 128-thread
+compute VCore and let the two TMA stages run ahead. With no synthetic compute,
+pipelined unicast/multicast measured 60.576/68.768 us. A 200 ns compute window
+hid part of the lifecycle cost but still measured 92.864/96.160 us. At 500 ns
+the paths tied at 166.880/167.008 us; multicast never became faster. Adding a
+unique 8 KiB weight stream per CTA, which models the projection's simultaneous
+non-shareable operand traffic, exposed the cost again at 190.080/198.208 us in
+`20260807T164416Z-3722263` and `20260807T164439Z-3722734`.
+
+The shared activation is already cache-resident enough that removing one TMA
+request does not repay remote stage ownership. Compute can hide the extra
+barrier, but then there is no positive transfer delta to offset the measured
+7.232 us production cluster penalty. Cluster launch support, multicast
+instructions, the standalone probe, and all selectors were removed. A future
+cluster design needs an operation that intrinsically requires two-CTA UMMA or
+shares substantially more than one cached activation tile; it should not be
+introduced only to deduplicate projection B loads. The restored non-cluster
+11-op image compiled with 96 registers, nine barriers, a 96-byte stack, and no
+spills; fresh 501-sample medians were 2.627904 and 2.624640 ms in
+`20260807T164758Z-3725282` and `20260807T164840Z-3725741`.
