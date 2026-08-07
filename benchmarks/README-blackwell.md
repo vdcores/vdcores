@@ -178,6 +178,17 @@ manifest contains both paths for same-image comparisons.  Set
 The exact 11-op production image uses 96 registers, nine barriers, a 96-byte
 stack, and zero spills; its final 1,001-sample S128 median is 2.642304 ms.
 
+An issuer-owned fused-RoPE variant was also evaluated and removed.  Warp 0
+owned the per-tile M2C waits, UMMA issue/completion, and releases while the
+other compute warps advanced their private cursors and prefetched their final
+cosine/sine pairs before the shared TMEM epilogue.  In 501-iteration probes it
+improved Q from 7.296 to 7.104 us and K from 4.512 to 4.416 us, and exact S128
+validation passed.  The full-model control/variant/control medians were
+2.609888/2.608224/2.607232 ms, however: only 0.336 us (0.013%) against the
+control mean.  The extra opcode and selector were therefore not retained
+(jobs `20260807T201641Z-3913839`, `20260807T201719Z-3914435`, and
+`20260807T201802Z-3915123`).
+
 ### Per-head QKV-to-attention readiness
 
 The production schedule no longer holds all eight KV heads behind one Q
