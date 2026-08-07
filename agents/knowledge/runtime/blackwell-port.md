@@ -603,6 +603,20 @@ four-way delta was only 0.480 us and the other granularities regressed, so all
 prototype code was removed. Jobs are recorded in
 `.agentlog/2026-08-07-shared-barrier-candidates.md`.
 
+Projection-to-RMS shard readiness was also rejected. The proof of concept
+used eight 512-row counters, 64 shard sum-of-squares tasks, and eight RMS
+finalizers per layer. A diagnostic caught an important dependency rule: both
+the partial-vector load and the independently issued full hidden-row load must
+wait for producer completion; gating only the partial vector lets the row load
+capture a mixture of new and stale projection output. After correcting that
+race, the 13-op image still regressed the profiling-free S128 internal median
+from 2.743520 ms to 2.846784 ms at the output boundary and 2.855040 ms at the
+down boundary. The added work cost 103.264/111.520 us per token, so a finer
+eight-load finalizer could not plausibly recover the deficit. The full-model
+output-boundary run also narrowly missed the existing tensor thresholds even
+though its final token matched. All prototype code was removed; exact jobs and
+errors are recorded in `.agentlog/2026-08-07-shared-barrier-candidates.md`.
+
 The production image remains at 128 registers, nine barriers, a 96-byte
 stack, and zero spills. Runtime smoke job `20260806T234925Z-2569187` passed;
 full-model job `20260806T234956Z-2570323` passed every tensor threshold and
