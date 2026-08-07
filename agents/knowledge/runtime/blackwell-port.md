@@ -971,3 +971,23 @@ The longer full-K Q task plus serialized K and V work cost more than removing
 the Q reduction contributors and clear. The selector and all schedule changes
 were removed. Future placement changes must audit both explicit counters and
 same-CTA ordering/raw-slot assumptions before performance screening.
+
+## Rejected one-wave heterogeneous LM head
+
+A one-wave LM-head topology used every physical SM and removed the boundary
+between the two 128-task vocabulary epochs. SMs 0--111 each owned seven M128
+tiles and SMs 112--151 each owned six, covering all 1,024 padded vocabulary
+tiles exactly. Both rectangles waited directly on final RMS and jointly
+released one 152-record global-argmax frontier, so no dynamic dispatch or
+intermediate logits were introduced.
+
+Full S128 correctness and token 24748 passed in
+`20260807T124111Z-3518668`. The selectable image grew from 96 to 100 registers
+without spills. Same-image two-epoch/one-wave/two-epoch medians were
+2.626144/2.666912/2.631136 ms in jobs `20260807T124153Z-3519030`,
+`20260807T124230Z-3519650`, and `20260807T124312Z-3520327`. The one-wave path
+therefore regressed by 38.272 us against the control mean. Removing an epoch
+frontier does not compensate for extending each SM's critical path from four
+live output groups to six or seven. The grouped opcodes, 152-way reducer,
+selector, and manifest entries were removed, restoring the minimal
+96-register production image.
