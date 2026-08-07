@@ -241,6 +241,12 @@ does not add useful overlap.  Post-attention RMS at bases 64/128 measured
 1.632 us best delta is noise-sized and the auxiliary placement can regress by
 8.096 us, so RMS remains on SMs 0--7 and no placement selector is retained.
 
+Likewise, separating packed SwiGLU shard 0 from shard 1 onto SMs 136--143
+measured 2.588480 versus 2.589312 ms in a 501-sample pair, only 0.832 us.  A
+main-path SM120--127 placement regressed by 80.384 us.  The current auxiliary
+serialization is hidden behind the gate/up tail; no shard-0 placement selector
+is retained.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a

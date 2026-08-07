@@ -629,6 +629,18 @@ post-attention RMS to bases 64 and 128 measured 2.587264 and 2.594400 ms over
 below run-phase variance, while auxiliary ownership could be worse by 8.096
 us.  Fixed SM0--7 placement and the minimal schedule were restored.
 
+Separating packed SwiGLU shard 0 from shard 1 was also screened after the new
+frontier trace showed a 3.424 us maximum local SiLU interval (job
+`20260807T234426Z-4090696`).  Moving shard 0
+onto main-path SMs 120--127 regressed from 2.590240 to 2.670624 ms because it
+extended the gate/up-tail owners (jobs `20260807T234544Z-4091879` and
+`20260807T234627Z-4092575`).  Moving it to the remaining auxiliary subgroup,
+SMs 136--143, initially appeared 3.504 us faster, but a 501-sample pair was
+2.588480 versus 2.589312 ms (jobs `20260807T234848Z-4094941` and
+`20260807T234928Z-4095458`).  The 0.832 us delta is below run variance: the
+existing paired shard-0/1 work is already hidden behind the main gate/up tail,
+so no selector or extra placement remains.
+
 ### Spare-SM and fusion follow-up
 
 The 24 SMs outside the 128-SM rectangular projection grid were explicitly
