@@ -447,8 +447,8 @@ def seed_prefill_kv_cache():
 # Register Tensor for TMA
 ###################################
 
-QKVAtom = Gemv_M64N8
-LinearAtom = Gemv_M64N8
+QKVAtom = Gemv_M64N8IssuerOnly
+LinearAtom = Gemv_M64N8IssuerOnly
 LogitsAtom = Gemv_M128N8Argmax4
 QKVTileM, _, QKVTileK = QKVAtom.MNK
 LinearTileM, _, LinearTileK = LinearAtom.MNK

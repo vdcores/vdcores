@@ -207,11 +207,12 @@ __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_
 }
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-// Generic Blackwell BF16 GEMV tile. Keep this path byte-for-byte equivalent
-// to the shared-slot implementation used by the fused projection schedules;
-// grouped direct output is isolated below so it cannot perturb RegStore or
-// TMA-reduction layouts.
+// Generic Blackwell BF16 GEMV tile. IssuerOnly is a separately compiled M64N8
+// specialization; the original all-warp path remains available to the other
+// GEMV variants. Grouped direct output is isolated below so it cannot perturb
+// RegStore or TMA-reduction layouts.
 template<int M, int N, int K, int BLoadInterval, bool Residual, bool ApplyRope,
+         bool IssuerOnly,
          typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_gemv_sm100_impl(
     const int n_k_tiles,
@@ -235,6 +236,8 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
     static_assert(BLoadInterval > 0, "BLoadInterval must be positive");
     static_assert(!ApplyRope || (M == 64 && N == 8 && !Residual),
                   "The fused RoPE epilogue requires non-residual M64N8 output");
+    static_assert(!IssuerOnly || (!Residual && !ApplyRope && M == 64 && N == 8),
+                  "issuer-only proof is isolated to ordinary M64N8 GEMV");
 
     const int tid = __compute_tid();
     const data_t *rope_row = nullptr;
@@ -274,49 +277,105 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
     constexpr int b_tile_elements = N * K;
 
     for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
-        data_t *sB_ptr;
-        if (tile_idx % BLoadInterval == 0) {
-            live_b_slot = m2c.template pop<0>();
-            sB_ptr = static_cast<data_t *>(get_slot_address(base, extract(live_b_slot)));
+        if constexpr (IssuerOnly) {
+            if (tid < numThreadsPerWarp) {
+                data_t *sB_ptr;
+                if (tile_idx % BLoadInterval == 0) {
+                    live_b_slot = m2c.template pop<0>();
+                    sB_ptr = static_cast<data_t *>(
+                        get_slot_address(base, extract(live_b_slot)));
+                } else {
+                    sB_ptr = static_cast<data_t *>(
+                        get_slot_address(base, extract(live_b_slot)))
+                        + (tile_idx % BLoadInterval) * b_tile_elements;
+                }
+                const int slot_a = m2c.template pop<0>();
+
+                auto sA = make_tensor(
+                    make_smem_ptr(static_cast<data_t *>(
+                        get_slot_address(base, extract(slot_a)))),
+                    layout_sA);
+                auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+                auto frag_a = cta_mma.make_fragment_A(sA);
+                auto frag_b = cta_mma.make_fragment_B(sB);
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
+                    gemm(tiled_mma, frag_a(_, _, k_block),
+                         frag_b(_, _, k_block), tmem_acc);
+                    tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+                }
+                cutlass::arch::umma_arrive(tmem_mma_barrier);
+                cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+                tmem_mma_phase ^= 1;
+                int release_mask = slot_a;
+                if ((tile_idx + 1) % BLoadInterval == 0
+                    || tile_idx + 1 == n_k_tiles) {
+                    release_mask |= live_b_slot;
+                }
+                c2m.push(tid, release_mask);
+            } else {
+                if (tile_idx % BLoadInterval == 0) m2c.advance();
+                m2c.advance();
+                tmem_mma_phase ^= 1;
+            }
         } else {
-            sB_ptr = static_cast<data_t *>(get_slot_address(base, extract(live_b_slot)))
-                     + (tile_idx % BLoadInterval) * b_tile_elements;
+            data_t *sB_ptr;
+            if (tile_idx % BLoadInterval == 0) {
+                live_b_slot = m2c.template pop<0>();
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)));
+            } else {
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)))
+                    + (tile_idx % BLoadInterval) * b_tile_elements;
+            }
+
+            const int slot_a = m2c.template pop<0>();
+            data_t *sA_ptr = static_cast<data_t *>(
+                get_slot_address(base, extract(slot_a)));
+            auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
+            auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+            auto frag_a = cta_mma.make_fragment_A(sA);
+            auto frag_b = cta_mma.make_fragment_B(sB);
+
+            if (tid < numThreadsPerWarp) {
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
+                    gemm(tiled_mma, frag_a(_, _, k_block),
+                         frag_b(_, _, k_block), tmem_acc);
+                    tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+                }
+                cutlass::arch::umma_arrive(tmem_mma_barrier);
+            }
+            if constexpr (ApplyRope) {
+                if (tile_idx + 1 == n_k_tiles) {
+                    // The coefficient loads are independent of the final
+                    // accumulator. Submit UMMA first, then keep one pair per
+                    // thread live across its completion wait. Each thread rotates
+                    // two batches with the same head-local pair below.
+                    const int pair = tid % (M / 2);
+                    rope_cosine = rope_row[rope_head_offset + pair * 2];
+                    rope_sine = rope_row[rope_head_offset + pair * 2 + 1];
+                }
+            }
+            cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+            tmem_mma_phase ^= 1;
+
+            int release_mask = slot_a;
+            if ((tile_idx + 1) % BLoadInterval == 0
+                || tile_idx + 1 == n_k_tiles) {
+                release_mask |= live_b_slot;
+            }
+            c2m.push(tid, release_mask);
         }
+    }
 
-        const int slot_a = m2c.template pop<0>();
-        data_t *sA_ptr = static_cast<data_t *>(get_slot_address(base, extract(slot_a)));
-        auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
-        auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
-        auto frag_a = cta_mma.make_fragment_A(sA);
-        auto frag_b = cta_mma.make_fragment_B(sB);
-
+    if constexpr (IssuerOnly) {
         if (tid < numThreadsPerWarp) {
-            #pragma unroll
-            for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
-                gemm(tiled_mma, frag_a(_, _, k_block), frag_b(_, _, k_block), tmem_acc);
-                tiled_mma.accumulate_ = UMMA::ScaleOut::One;
-            }
-            cutlass::arch::umma_arrive(tmem_mma_barrier);
+            asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
         }
-        if constexpr (ApplyRope) {
-            if (tile_idx + 1 == n_k_tiles) {
-                // The coefficient loads are independent of the final
-                // accumulator. Submit UMMA first, then keep one pair per
-                // thread live across its completion wait. Each thread rotates
-                // two batches with the same head-local pair below.
-                const int pair = tid % (M / 2);
-                rope_cosine = rope_row[rope_head_offset + pair * 2];
-                rope_sine = rope_row[rope_head_offset + pair * 2 + 1];
-            }
-        }
-        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
-        tmem_mma_phase ^= 1;
-
-        int release_mask = slot_a;
-        if ((tile_idx + 1) % BLoadInterval == 0 || tile_idx + 1 == n_k_tiles) {
-            release_mask |= live_b_slot;
-        }
-        c2m.push(tid, release_mask);
+        __sync_compute_group(128);
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     }
 
     const int output_slot = m2c.template pop<0>();
@@ -402,7 +461,22 @@ __device__ __forceinline__ void task_gemv_sm100(
     const void *base,
     M2C_Type &m2c,
     C2M_Type &c2m) {
-    task_gemv_sm100_impl<M, N, K, BLoadInterval, Residual, false>(
+    task_gemv_sm100_impl<M, N, K, BLoadInterval, Residual, false, false>(
+        n_k_tiles, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        base, m2c, c2m, nullptr, 0);
+}
+
+template<int M, int N, int K, int BLoadInterval,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_gemv_sm100_issuer_only(
+    const int n_k_tiles,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    const void *base,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+    task_gemv_sm100_impl<M, N, K, BLoadInterval, false, false, true>(
         n_k_tiles, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
         base, m2c, c2m, nullptr, 0);
 }
@@ -419,7 +493,7 @@ __device__ __forceinline__ void task_gemv_sm100_rope(
     C2M_Type &c2m,
     const MInst *st_insts,
     const int rope_head_offset) {
-    task_gemv_sm100_impl<M, N, K, BLoadInterval, false, true>(
+    task_gemv_sm100_impl<M, N, K, BLoadInterval, false, true, false>(
         n_k_tiles, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
         base, m2c, c2m, st_insts, rope_head_offset);
 }

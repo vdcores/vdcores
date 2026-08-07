@@ -8,6 +8,7 @@ import torch
 
 from dae.instructions import (
     Gemv_M64N8,
+    Gemv_M64N8IssuerOnly,
     Gemv_M64N8_ROPE_128,
     Gemv_M128N8,
     Gemv_M128N8Direct4,
@@ -65,6 +66,7 @@ def benchmark_torch(
 def main() -> None:
     device = torch.device("cuda")
     tile_m = int(os.environ.get("GEMV_TILE_M", "64"))
+    issuer_only = os.environ.get("GEMV_ISSUER_ONLY", "0") == "1"
     grouped_output = os.environ.get("GEMV_GROUPED_OUTPUT", "0") == "1"
     grouped_reduce = int(os.environ.get("GEMV_GROUPED_REDUCE", "0"))
     down_schedule = os.environ.get("GEMV_DOWN_SCHEDULE", "none").strip().lower()
@@ -105,7 +107,10 @@ def main() -> None:
             (4, 14336, 128): Gemv_M128N8Group4B7,
         }.get((grouped_reduce, k, sms))
     else:
-        atom = {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
+        if tile_m == 64 and issuer_only:
+            atom = Gemv_M64N8IssuerOnly
+        else:
+            atom = {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
     if atom is None or ((grouped_output or grouped_reduce) and tile_m != 128):
         raise ValueError("unsupported GEMV tile/group/K configuration")
     if fused_rope and (tile_m != 64 or not tile_packed or split_m != 1):
@@ -390,6 +395,7 @@ def main() -> None:
         "GEMV_CONFIG "
         f"m={m * epochs} epoch_m={m} epochs={epochs} n=8 k={k} "
         f"tile_m={tile_m} tile_packed={int(tile_packed)} sms={sms} "
+        f"issuer_only={int(issuer_only)} "
         f"split_m={split_m} fold={fold} grouped_output={int(grouped_output)} "
         f"grouped_reduce={grouped_reduce} down_schedule={down_schedule} "
         f"fused_rope={int(fused_rope)} "

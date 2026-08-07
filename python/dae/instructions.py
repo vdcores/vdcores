@@ -76,6 +76,20 @@ class Gemv_M64N8UpSiLU(ComputeInstruction):
             args=[kTiles],
         )
 
+
+class Gemv_M64N8IssuerOnly(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 4
+
+    def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
+        if residual:
+            raise ValueError("issuer-only M64N8 does not support residual input")
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M64N8_ISSUER_ONLY,
+            args=[kTiles, nprefeth],
+        )
+
+
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
@@ -1229,6 +1243,7 @@ __all__ = [
     "ComputeInstruction",
     "TerminateC",
     "Gemv_M64N8",
+    "Gemv_M64N8IssuerOnly",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",

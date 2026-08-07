@@ -92,6 +92,15 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M64N8_UP_SILU) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M64N8_ISSUER_ONLY) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_gemv_sm100_issuer_only<64, 8, 256, 4>(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_DIRECT4) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)

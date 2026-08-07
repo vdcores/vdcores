@@ -97,6 +97,38 @@ below the exact framework component probes.
 Use `benchmarks/blackwell_gemv.py` to reproduce a shape and
 `tests/blackwell_gemv_smoke.py` for strict single-tile correctness.
 
+### Issuer-owned UMMA/TMEM pipeline
+
+Ordinary M64N8 projection tasks now keep the per-tile M2C dequeue, UMMA issue,
+UMMA completion wait, and slot release on the issuing compute warp. The other
+three compute warps advance their private queue cursors without repeating the
+acquire waits, then join once for the four-warp TMEM epilogue. The handoff uses
+`tcgen05.fence::before_thread_sync`, the existing 128-thread compute barrier,
+and `tcgen05.fence::after_thread_sync`; it does not add a memory-warp join or a
+thread fence.
+
+A temporary internal task probe on the M4096/K4096 fold-two shape attributed
+2.624 us (39.2%) to operand arrival, 2.784 us (41.6%) to UMMA issue, and only
+0.320 us (4.8%) to UMMA completion. The probe was removed after directing the
+optimization. Paired 501-iteration standalone medians on the same selective
+image were:
+
+| Projection schedule | Compute tiles/task | Previous (us) | Issuer-owned (us) | Gain |
+| --- | ---: | ---: | ---: | ---: |
+| M2048 x N8 x K4096, 128 SMs/fold 4 | 4 | 4.160 | **4.128** | 0.8% |
+| M4096 x N8 x K4096, 128 SMs/fold 2 | 8 | 6.816 | **6.688** | 1.9% |
+| M6144 x N8 x K4096, 96 SMs/fold 1 | 16 | 11.296 | **11.200** | 0.8% |
+| Balanced M4096 x N8 x K14336, 152 SMs | 12/16 | 21.664 | **21.504** | 0.7% |
+
+An S128 control/issuer/control sandwich measured
+2.623840/2.608672/2.624512 ms with the resident internal timer, a 15.504 us
+(0.59%) gain against the control mean. The final minimal 11-operator image
+measures 2.610624 ms over 501 iterations, 7.29% faster than the strict vLLM
+2.816003 ms baseline. It uses 96 registers, nine barriers, a 96-byte stack,
+and no spills. Full S128 tensor validation, exact token 24748, and exact
+four-token resident reuse all pass (jobs `20260807T195543Z-3887464`,
+`20260807T195611Z-3888026`, and `20260807T195656Z-3888515`).
+
 ### Projection-to-RoPE shared-memory handoff
 
 Two M64 projection/RoPE paths remain available.  The two-operator diagnostic
