@@ -658,3 +658,28 @@ LM-head spread, while the
 material tail responded to deterministic static ordering. A queue would add
 atomics and VM dispatch to a problem that did not exhibit queue-worthy
 stochastic imbalance.
+
+## Observer-owned memory-to-compute handoffs
+
+Blackwell M2C handoffs no longer require all 128 compute threads to arrive on
+every loaded-operand mbarrier. The load VCore is the sole participant and
+publishes the phase after its TMA transaction completes; compute threads use
+an acquire `mbarrier.try_wait.parity` to observe that phase. Queue-local parity
+flips when the 32-entry ring wraps. This preserves the asynchronous-proxy
+visibility guarantee without adding a compute-side arrival or named-barrier
+broadcast.
+
+The change matters because one Llama token executes about 4,530 M2C handoffs.
+A same-source profiling-free S128 comparison improved from 2.734976 to
+2.683328 ms, or 51.648 us / 1.89%. Full tensor correctness and exact
+four-token resident-loop correctness passed, and the exact selective image
+remains spill-free at 126 registers, nine barriers, and a 96-byte stack. A
+legacy build remains available with `make m2c_legacy=1` for regression tests.
+
+This optimization is deliberately limited to the 128-thread consumer. The
+same parity polling on the single-lane allocator-to-load queues regressed, as
+did moving TMA transaction publication into the allocator. Combining a
+port-1 activation load and a port-0 weight load into one transaction phase was
+also correct but 115.904 us slower than its paired observer-owned control.
+The load warps therefore continue to own TMA transaction setup and completion;
+only the compute warpgroup changed from participant to observer.

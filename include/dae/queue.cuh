@@ -6,7 +6,7 @@
 // each element is associated with one or more slot
 // So if the number of slots > QSIZE, both enqueue and dequeue will be safe,
 // reads as the slots are guaranteed to be unique per element
-template<typename T, unsigned QSIZE = 32>
+template<typename T, unsigned QSIZE = 32, bool ObserverWait = false>
 struct SizeBoundedBarrierQueue {
   static_assert(QSIZE > numSlots, "QSIZE must be larger than numSlots");
 
@@ -16,20 +16,37 @@ struct SizeBoundedBarrierQueue {
   T *data;
   // register data
   unsigned ptr;
+  uint32_t phase_parity = 0;
 
   __device__ __forceinline__ uint64_t *native_bar(unsigned slot_id) {
     return cuda::device::barrier_native_handle(barriers[slot_id]);
   }
 
   __device__ __forceinline__ void wait() {
-    barriers[ptr].arrive_and_wait();
+    if constexpr (ObserverWait) {
+      // The load VCore is the barrier's sole participant.  Compute threads
+      // observe, rather than mutate, its phase transition.  The acquire wait
+      // makes the completed TMA writes visible before the shared-memory read.
+      while (!cuda::ptx::mbarrier_try_wait_parity(
+          cuda::ptx::sem_acquire,
+          cuda::ptx::scope_cta,
+          native_bar(ptr),
+          phase_parity)) {
+      }
+    } else {
+      barriers[ptr].arrive_and_wait();
+    }
   }
 
   template<int PH = 0>
   __device__ __forceinline__ T pop() {
-    barriers[ptr].arrive_and_wait();
+    wait();
     T val = data[ptr];
     ptr = (ptr + 1) % QSIZE;
+    if constexpr (ObserverWait) {
+      if (ptr == 0)
+        phase_parity ^= 1;
+    }
     return val;
   }
 
@@ -53,6 +70,10 @@ struct SizeBoundedBarrierQueue {
   }
   __device__ __forceinline__ void advance() {
     ptr = (ptr + 1) % QSIZE;
+    if constexpr (ObserverWait) {
+      if (ptr == 0)
+        phase_parity ^= 1;
+    }
   }
   __device__ __forceinline__ void commit() {
     static_cast<void>(barriers[ptr].arrive());
@@ -65,8 +86,8 @@ static __device__ __forceinline__ uint16_t extract(const int s) {
 }
 
 template<unsigned QSIZE = 32>
-struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE> {
-  using Base = SizeBoundedBarrierQueue<int, QSIZE>;
+struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE, false> {
+  using Base = SizeBoundedBarrierQueue<int, QSIZE, false>;
 
   uint32_t shared_avail;
 

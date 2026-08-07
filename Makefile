@@ -29,6 +29,10 @@ LDFLAGS = -lcuda -lcublas
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
 
+ifneq ($(m2c_legacy),)
+	NVCC_FLAGS += -DDAE_M2C_OBSERVER_WAIT=0
+endif
+
 # Directories
 ifeq ($(debug),)
 	NVCC_FLAGS += -DNDEBUG

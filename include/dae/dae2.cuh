@@ -91,7 +91,7 @@ void dae2(
   __shared__ int c2m_data[numQueueElements];
   __shared__ int m2ld_data[2][numQueueElements];
 
-  SizeBoundedBarrierQueue<int, numQueueElements> m2c {
+  SizeBoundedBarrierQueue<int, numQueueElements, dae2M2CObserverWait> m2c {
     .barriers = barriers[0], .data = m2c_data, .ptr = 0
   };
   SizeBoundedBarrierAllocQueue<numQueueElements> c2m {

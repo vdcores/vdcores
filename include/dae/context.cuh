@@ -11,6 +11,13 @@ constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
 constexpr bool dae2LoadInstructions = true;
 
+#ifndef DAE_M2C_OBSERVER_WAIT
+#define DAE_M2C_OBSERVER_WAIT 1
+#endif
+// The load VCore owns each M2C barrier phase. Compute threads only observe the
+// phase transition, avoiding 128 redundant arrivals per loaded operand.
+constexpr bool dae2M2CObserverWait = DAE_M2C_OBSERVER_WAIT != 0;
+
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
@@ -35,7 +42,8 @@ struct alignas(16) LoopCounters {
 };
 
 // barrier configurations
-static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
+static constexpr int numThreadsM2CBarrier =
+    dae2M2CObserverWait ? 1 : numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsC2MBarrier = numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsLDBarrier = 2;
 

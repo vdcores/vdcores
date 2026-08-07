@@ -510,6 +510,21 @@ write/read and separate materialized argmax. In a fused/materialized/fused
 materialized early-argmax stage over 64 tasks regressed by about 32 us, and an
 auxiliary-only 16-task version was neutral, so neither pipeline was retained.
 
+### Observer-owned M2C readiness
+
+The resident runtime now treats loaded-operand readiness as a producer-owned
+phase. The load VCore is the only mbarrier participant, and all 128 compute
+threads observe completion with an acquire parity wait. This removes 128
+compute arrivals from each of roughly 4,530 handoffs per token while retaining
+the existing memory-op path and TMA visibility rules.
+
+At B8/S128, a same-source 501-sample internal-timer comparison improved from
+2.734976 to 2.683328 ms (-51.648 us, -1.89%). The default observer build
+passed full tensor validation and exact four-token resident control flow. The
+selective image uses 126 registers, nine barriers, a 96-byte stack, and no
+spills. `make m2c_legacy=1` restores the all-compute-thread arrival path for
+A/B diagnostics.
+
 Reproduce the retained path with:
 
 ```bash
