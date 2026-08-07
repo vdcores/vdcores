@@ -617,6 +617,23 @@ output-boundary run also narrowly missed the existing tensor thresholds even
 though its final token matched. All prototype code was removed; exact jobs and
 errors are recorded in `.agentlog/2026-08-07-shared-barrier-candidates.md`.
 
+RMS-to-projection K streaming was rejected after a two- and four-shard study.
+Splitting the normalized row into two K2048 stores cost 0.352 us in the
+standalone B8 RMS task, while four K1024 stores cost 1.184 us. A non-blocking
+post-attention consumer schedule appeared 11.760 us faster at S128 and about
+18 us faster at S64/S256, but that result was invalid: single-step tensor
+correctness passed, whereas the second token diverged after layer 0. The RMS
+operator remained correct across repeated standalone launches, barrier values
+restored correctly, and stock coarse consumers passed with the same two-store
+producer. The unsafe part was the split per-K consumer wait encoding. Replacing
+it with allocator-side shard waits restored repeated-token correctness but
+regressed S128 by about 189.5 us because it blocked memory issuance. Async
+proxy fencing and gating both load ports did not rescue the fast path. All PoC
+code was removed. The durable qualification rule is that a new resident shared
+frontier must pass repeated-token correctness; one clean decode step can hide
+a reuse race. Exact jobs are in
+`.agentlog/2026-08-07-shared-barrier-candidates.md`.
+
 The production image remains at 128 registers, nine barriers, a 96-byte
 stack, and zero spills. Runtime smoke job `20260806T234925Z-2569187` passed;
 full-model job `20260806T234956Z-2570323` passed every tensor threshold and
