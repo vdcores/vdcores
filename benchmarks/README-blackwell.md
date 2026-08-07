@@ -620,6 +620,28 @@ write/read and separate materialized argmax. In a fused/materialized/fused
 materialized early-argmax stage over 64 tasks regressed by about 32 us, and an
 auxiliary-only 16-task version was neutral, so neither pipeline was retained.
 
+Two completion-preserving LM-head ownership variants were subsequently tested
+and removed.  Unlike the earlier unsafe completion grouping, both retained one
+UMMA completion and immediate operand release per output group.  The first
+parked three compute warps during the mainloop and rejoined once for the
+four-accumulator epilogue.  It passed exact S128 correctness (job
+`20260807T204635Z-3944856`) but measured
+2.610976/2.617600/2.616448 ms in a control/variant/control sandwich, a 3.888 us
+regression.  Stage profiling localized 3.488 us of that cost to the first LM
+epoch; the warm second epoch was unchanged.
+
+The stronger version used four one-way named barriers.  After each final
+output-group completion, warp 0 published that disjoint TMEM range and
+continued issuing, while warps 1--3 drained and compared their native argmax
+fragments.  It was exact and repeat-safe for 501 resident runs (jobs
+`20260807T205651Z-3953651` and `20260807T205810Z-3954445`), but increased the
+image from 96 registers/nine barriers to 106 registers/13 barriers.  Its
+control/variant/control medians were 2.615520/2.617312/2.615296 ms, a 1.904 us
+regression.  The warm second LM epoch improved 70.176 to 69.664 us, but the
+first epoch worsened 80.576 to 83.136 us; handler/barrier footprint exceeded
+the 0.512 us steady overlap.  The extra opcode, barriers, and selector were
+therefore removed rather than retaining a complex sub-microsecond path.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
