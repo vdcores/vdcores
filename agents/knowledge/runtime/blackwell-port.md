@@ -1083,3 +1083,16 @@ retirement and makes the producer stream burstier; at depth four that can form
 a liveness cycle, and at depth two its cost exceeds the removed completion
 wait. Both opcodes, instruction classes, selectors, manifest entries, and
 template branches were removed.
+
+## Rejected explicit M2C suspension window
+
+The observer-owned M2C wait was rebuilt with the PTX
+`mbarrier.try_wait.parity` suspension-time operand set to 128 ns. This tested
+whether the hardware profile's 20.63% fixed-latency wait component came from
+hot polling that displaced useful memory/UMMA issue. The exact image remained
+at 96 registers, nine barriers, a 96-byte stack, and zero spills, but its
+501-sample S128 median was 2.627360 ms in
+`20260807T141517Z-3595917`, about 3.4 us slower than the neighboring default
+controls. The default implementation-defined suspension policy is already
+better; the compile selector and alternate wait path were removed without a
+hint sweep.
