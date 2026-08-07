@@ -796,6 +796,33 @@ measured a 2.614752 ms internal median and 2.597792 ms minimum in job
 `20260807T231129Z-4062821`, consistent with the retained 2.608576--2.609728 ms
 production medians.
 
+### Rejected compact register-to-TMEM projection path
+
+A native-M64 tensor/shared proof removed the padded M128 UTCCP source by
+loading the compact M64 weight tile into registers and storing it into the
+four native TMEM datapath bands.  It compared serialized staging, ping-pong
+staging, staging plus disjoint epilogue drain, reuse of the drain group, and
+an eight-compute-warp form.  The compact mapping itself is valid: a separate
+M64K16 test passed 10,001 bit-exact repetitions with zero mismatches in job
+`20260807T231714Z-4068128`.
+
+The 132-CTA timing suite nevertheless rejected the mechanism:
+
+| K | Production SS | Best compact R2T | Eight-warp SS control | Result |
+| ---: | ---: | ---: | ---: | --- |
+| 256 | **0.897130 us** | 1.921630 us | 0.960740 us | R2T +114.2%; eight warps +7.1% |
+| 1024 | **7.173560 us** | 8.453400 us | 7.894200 us | R2T +17.8%; eight warps +10.0% |
+
+Ping-pong plus disjoint drain did overlap real work: it reduced the compact
+path from 2.305440 to 1.921630 us at K256 and from 9.482040 to 8.453400 us at
+K1024.  Register-mediated shared-to-TMEM movement itself still costs more than
+the overlap removes, and the production K256 stage is the worst case.  The
+eight-warp R2T form measured 2.049740/8.751720 us and did not reverse the
+result.  Every timed form passed 101 exact checks with zero errors in job
+`20260807T231739Z-4068687`; no runtime integration was warranted.  The proof
+binaries had no recoverable source in the canonical tree or worker-local
+paths, so they remain diagnostic artifacts rather than retained code.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
