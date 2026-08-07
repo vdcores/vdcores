@@ -129,6 +129,14 @@ and no spills. Full S128 tensor validation, exact token 24748, and exact
 four-token resident reuse all pass (jobs `20260807T195543Z-3887464`,
 `20260807T195611Z-3888026`, and `20260807T195656Z-3888515`).
 
+Two follow-up pipeline-depth ideas were rejected and removed. Sending B to the
+otherwise-idle second load warp on an unbarriered task regressed M4096/K4096
+from 6.688 to 7.040 us; the second port is useful for bypassing a blocked
+activation load, not for increasing steady-state TMA throughput. Halving the K
+tile to 128 while retaining a four-tile B cadence reduced a TMA stage from 18
+slots to nine, but doubled UMMA issue/completion points and regressed the same
+shape to 10.432 us (job `20260807T200451Z-3899356`).
+
 ### Projection-to-RoPE shared-memory handoff
 
 Two M64 projection/RoPE paths remain available.  The two-operator diagnostic
