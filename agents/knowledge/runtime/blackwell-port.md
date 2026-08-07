@@ -634,6 +634,20 @@ frontier must pass repeated-token correctness; one clean decode step can hide
 a reuse race. Exact jobs are in
 `.agentlog/2026-08-07-shared-barrier-candidates.md`.
 
+LM-head epoch-to-reducer streaming was also rejected.  A spill-free prototype
+gave the two 128-task projection epochs separate counters and let one reducer
+task retain epoch-0 records in registers while its memory core waited for
+epoch 1; it added neither reducer tasks nor a second block reduction.  Both
+single-step tensor checks and four-token resident-loop correctness passed.
+However, three same-image S128 coarse controls averaged 2.746752 ms, while two
+staged runs on the original reducer SMs averaged 2.750416 ms (+3.664 us).
+Spare-SM placements were slower even after moving them away from the SM128
+barrier-restore task.  The LM-head tail available to hide was only 2--3 us,
+less than the added pointer handoff and scheduling cost.  The prototype was
+removed; exact jobs are in the shared-barrier agent log.  The restored exact
+11-op production image passed four-token resident correctness and measured a
+fresh 2.740256 ms S128 median over 501 profiling-free internal samples.
+
 The production image remains at 128 registers, nine barriers, a 96-byte
 stack, and zero spills. Runtime smoke job `20260806T234925Z-2569187` passed;
 full-model job `20260806T234956Z-2570323` passed every tensor threshold and
