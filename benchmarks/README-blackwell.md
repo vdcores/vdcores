@@ -684,6 +684,31 @@ work indivisible and delay useful producer/consumer interleaving in every
 layer.  The M128 opcode, duplicate packing, selector, and schedule were
 removed; the retained down projection remains uniformly M64.
 
+A deferred Q-cleanup proof then moved the unchanged 2 MiB zero stream out of
+the 32 layer bodies.  All layer Q rows were temporarily made contiguous, and
+24 auxiliary SMs cleared the complete range while the 128 primary SMs ran the
+LM head.  The final layer's three attention-output barriers protected Q
+lifetime, and the token-completion barrier joined cleanup before resident
+reuse.  The first implementation incorrectly waited on that token barrier
+inside the auxiliary stream before SM128 could execute the barrier-restore
+task; job `20260807T215928Z-4010850` exposed the cycle and was stopped after
+its exact worker PID was verified.  Publishing completion without the early
+wait fixed the protocol, passed every S128 tensor check, and produced exact
+token 24748 in job `20260807T220350Z-4014844`.
+
+The safe batched form still lost.  Releasing the token barrier from every
+1 KiB store measured 2.621248 ms against 2.612832/2.609920 ms controls, a
+9.872 us regression (jobs `20260807T220431Z-4015238`,
+`20260807T220515Z-4016024`, and `20260807T220558Z-4016515`).  A second form
+used ordered per-CTA streams and published only each CTA's final store,
+reducing 2,048 barrier updates to 24.  It measured 2.625568 ms against the
+bracketing 2.609920/2.613856 ms controls, a 13.680 us regression (jobs
+`20260807T220759Z-4018311` and `20260807T220838Z-4018991`).  The original
+per-layer clears were already mostly hidden; concentrating the same traffic
+in the bandwidth-bound LM window costs more than removing their small visible
+tail.  Contiguous Q storage, batch scheduling, selector, and completion
+changes were removed.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
