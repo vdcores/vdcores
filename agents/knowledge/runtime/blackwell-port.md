@@ -1399,3 +1399,47 @@ nine barriers, a 96-byte stack, and zero spills. Full S128 validation passed
 every tensor threshold and exact token 24748 in `20260807T190549Z-3844602`;
 its fresh 501-sample internal median was 2.621760 ms (2.608160 ms minimum) in
 `20260807T190630Z-3845286`.
+
+## Refreshed stage frontier and rejected auxiliary QKV overlap
+
+The post-RMS production schedule was reprofiled with the isolated 13-op marker
+image in `20260807T190928Z-3847568`. Markers raised the launch to 2.677 ms and
+remain diagnostic only. In the final layer, Q reached a 9.536 us frontier,
+attention reached 16.448 us, post-attention RMS reached 22.080 us, the MLP
+prefix tail reached 62.976 us, next-layer RMS reached 77.824 us, and the
+slowest layer-loop arrival reached 80.032 us. The two LM-head epochs then took
+about 81.8 and 72.9 us, followed by a roughly 6 us reducer. The remaining
+repeatable gap is distributed across each layer; it is not a single random
+straggler or launch tail.
+
+A first schedule-only proof expressed Q as four K1024 folds and balanced the
+combined Q/K/V work over all 152 SMs. Layer 0 was numerically sound, but the
+shortened Q producers exposed that Q clear is an independent store-VCore
+operation: layer 1 could be overwritten after the compute stream had advanced.
+Adding a separate carried clear frontier exceeded the memory instruction's
+10-bit barrier-ID range. Folding clear into the existing next-RMS barrier did
+not produce a live phase protocol and was stopped after only the owned job was
+verified. The topology was removed without timing an invalid path.
+
+A narrower proof retained the K2048 Q tasks and moved both Q folds for head 0
+to auxiliary SMs, allowing its original K/V owners to overlap with Q. Keeping
+the new Q owners away from the CTAs that clear head 0 fixed the immediate reuse
+failure: layer-1 V and K returned to 0.69% and 0.40% relative error. The early
+head frontier nevertheless changed the phased output reduction order enough
+to compound to about 37% hidden/RMS error by layer 31. A 101-sample mechanism
+screen measured 2.603456 ms versus a 2.616256 ms same-image control in
+`20260807T192422Z-3860709` and `20260807T192458Z-3861296`, only a 12.800 us
+gain. Moving only head-0 K/V to auxiliary SMs left Q ownership unchanged but
+reproduced the same late-layer drift in `20260807T192615Z-3862139`, isolating
+the problem to the materially earlier head/output reduction order rather than
+Q clear alone.
+
+The potential gain is too small to justify another barrier or a change in the
+32-layer BF16 reduction semantics. All Q-fold, placement, explicit-wait, and
+selector code was removed. Spare-SM QKV work should next be considered only
+with a numerically stable accumulation boundary; merely advancing one phased
+attention head is not a valid production optimization. The restored 11-op
+image remained at 96 registers, nine barriers, a 96-byte stack, and zero
+spills. Full S128 validation passed every tensor threshold and exact token
+24748 in `20260807T192906Z-3864350`; its fresh 501-sample internal median was
+2.620640 ms in `20260807T192944Z-3865232`.
