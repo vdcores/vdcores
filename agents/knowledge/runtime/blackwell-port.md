@@ -1316,3 +1316,43 @@ than expose a new overlap window. The tensor-prefetch opcode, scheduler hooks,
 standalone probe, B2 selector, and all Llama selectors were removed. Future
 operand work should pipeline completion and slot retirement of existing
 traffic, not inject duplicate weight reads.
+
+## Rejected store-VCore completion pipeline
+
+The store VCore currently commits one asynchronous TMA writeback and waits for
+that group before releasing its shared slot or publishing a global counter.
+A depth-two prototype tested whether a ready successor could be issued before
+retiring the older group. The safe form preserved the existing 129-party C2M
+barrier, probed a copy of the store warp's arrival token, and retained at most
+one older slot. If the successor was not already published, it completed and
+released the current store before blocking, so a dependent compute task could
+not form a store/barrier cycle.
+
+The mechanism works for a homogeneous projection stream. Eight consecutive
+M4096/N8/K4096 fold-2 reductions measured 48.992 us over 501 internal samples
+in `20260807T175637Z-3781446`, versus the neighboring 49.952 us serial control
+in `20260807T170809Z-3741087`: a 0.960 us / 1.92% reduction. Merely arriving
+at the next C2M phase during the current store, without issuing another store,
+was repeat-safe and spill-free but regressed full S128 from 2.616352 ms
+(`20260807T173115Z-3760343`) to 2.624000 ms
+(`20260807T175100Z-3776579`).
+
+Applying depth two to every writeback exposed invalid queue assumptions and
+hung full-model launches. In particular, making the store an observer by
+changing the global C2M participation count lets special-slot producers lap
+the 32-entry ring; C2M cannot adopt the M2C producer-owned protocol wholesale.
+The exact failed jobs were stopped only after verifying their owned worker
+PIDs. Restricting depth two to consecutive rank-2 projection reductions made
+the full model repeat-live (`20260807T175937Z-3784305`) while leaving all
+attention, raw-address, and ordinary stores on the original path.
+
+The restricted production test still lost: its 501-sample S128 median was
+2.631552 ms in `20260807T180110Z-3786923`, 15.200 us slower than the matched
+serial build. The valid 0.960 us micro gain is outweighed by C2M readiness
+probing, an extra live output slot, and burstier global reduction publication.
+All queue, runtime, and build selectors were removed. The next overlap design
+should eliminate a materialized stage or handoff rather than retain more
+writebacks in the already slot-paced pipeline. The rebuilt production image
+returned to 96 registers, nine barriers, a 96-byte stack, and zero spills; its
+fresh 501-sample S128 median was 2.623648 ms in
+`20260807T180747Z-3793689`.
