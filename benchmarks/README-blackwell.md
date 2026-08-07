@@ -709,6 +709,27 @@ in the bandwidth-bound LM window costs more than removing their small visible
 tail.  Contiguous Q storage, batch scheduling, selector, and completion
 changes were removed.
 
+A producer-aggregated C2M experiment kept the store VCore as the final
+participant in the existing 129-count phase, so the 32-entry queue retained
+its backpressure.  Ordinary issuer-owned GEMV epilogues first joined their
+four compute warps, then lane 0 contributed an update count of 128 instead of
+executing 128 separate nonblocking arrivals.  The 11-op image remained at 96
+registers, nine barriers, a 96-byte stack, and zero spills.  Full S128 tensor
+validation and exact token 24748 passed in job
+`20260807T221619Z-4025434`.
+
+The full compute join measured 2.614208 ms versus bracketing production
+controls of 2.610880 and 2.608576 ms, a 4.480 us regression (jobs
+`20260807T221658Z-4025874` and `20260807T222512Z-4032749`).  A split-phase
+named-barrier form let warps 1--3 arrive and continue while issuer warp 0
+waited before C2M publication.  It measured 2.616544 ms against
+2.610688/2.608576 ms controls, a 6.912 us regression (jobs
+`20260807T221904Z-4027728`, `20260807T222236Z-4030879`, and
+`20260807T222512Z-4032749`).  The original per-thread C2M arrivals are
+nonblocking and cheaper than adding a recurring compute rendezvous.  The
+aggregate queue method, split barrier, build selector, and GEMV branch were
+removed.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
