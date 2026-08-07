@@ -1020,3 +1020,34 @@ control mean. One hidden first UMMA does not amortize the extra live state,
 control path, and burstier memory demand. The task, opcode, schedule wrappers,
 selectors, and manifest entries were removed, returning to the 96-register
 image.
+
+## Rejected full-K direct down ownership
+
+Eight persistent output owners replaced the 448 K-sharded down-projection
+tasks and their cross-CTA TMA reductions. Each owner computed four M128 output
+groups across the complete K14336 dimension in FP32 TMEM, consumed the three
+early SwiGLU shards and the final tail through phase-specific readiness
+barriers, and wrote the residual result directly to the hidden-state buffer.
+This tested whether deleting all reduction traffic and global shard frontiers
+could outweigh the much longer owner lifetime.
+
+The exact selectable image still used 96 registers, nine barriers, a 96-byte
+stack, and no spills. One diagnostic S128 launch completed with token 24748 in
+`20260807T131411Z-3545913`, but changing seven independently rounded BF16
+partials into one FP32 accumulation exceeded tensor-equivalence thresholds:
+layer-31 gate/up errors were 9.19/7.95%, SwiGLU was 14.43%, and final hidden
+and RMS errors were 14.54/14.60%. More importantly, the four-output form hung
+nondeterministically in jobs `20260807T131551Z-3547354`,
+`20260807T131910Z-3550152`, and `20260807T132550Z-3556147`. Reducing the task
+to two output groups and only nine memory messages still hung in
+`20260807T132928Z-3558768`, confirming that long phased owners can exhaust the
+31-slot live descriptor window or form a producer/consumer cycle. Only the
+verified orphan processes from these launches were terminated.
+
+The 2.627168 ms control from `20260807T131509Z-3546665` is recorded only as a
+health check; the unsafe variant never produced a valid timing. All opcodes,
+packing, TMA descriptors, schedule classes, selectors, and manifest entries
+were removed. Full-K output ownership is incompatible with the current
+bounded VCore queue and also changes the intended BF16 reduction arithmetic;
+future work should shorten live ranges rather than aggregate more K work into
+one owner.
