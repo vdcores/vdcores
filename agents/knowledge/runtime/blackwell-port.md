@@ -991,3 +991,32 @@ frontier does not compensate for extending each SM's critical path from four
 live output groups to six or seven. The grouped opcodes, 152-way reducer,
 selector, and manifest entries were removed, restoring the minimal
 96-register production image.
+
+## Rejected cross-task down-projection TMEM pipeline
+
+A combined compute instruction preserved every existing K2048 down-projection
+memory program, readiness barrier, TMA reduction, and per-UMMA operand release,
+but joined each CTA's two or three tasks into one ping-pong pipeline. After
+task n completed in one TMEM bank, task n+1 submitted its first independent
+UMMA group into the other bank before the same four compute warps drained and
+published task n. This tested compute/compute overlap without another warp,
+an accumulator merge, or a global handoff.
+
+Full S128 correctness and token 24748 passed in
+`20260807T125547Z-3530042`. The selectable image used 126 registers, nine
+barriers, a 96-byte stack, and no spills. Same-image control/all-CTA/control
+medians were 2.632672/2.644128/2.626944 ms in jobs
+`20260807T125626Z-3530468`, `20260807T125708Z-3531167`, and
+`20260807T125749Z-3531674`, a 14.320 us regression. Per-SM profiling in jobs
+`20260807T130000Z-3533457` and `20260807T130044Z-3534406` showed that the
+final-layer down frontier could appear about 1 us earlier, but the following
+RMS frontier was identical at 77.984 us and the gain did not survive 32
+layers.
+
+Restricting the pipeline to the 104 main CTAs retained correctness in
+`20260807T130218Z-3535452` and reduced the damage, but its 2.638784 ms median
+in `20260807T130259Z-3536135` was still 8.976 us slower than the same-image
+control mean. One hidden first UMMA does not amortize the extra live state,
+control path, and burstier memory demand. The task, opcode, schedule wrappers,
+selectors, and manifest entries were removed, returning to the 96-register
+image.
