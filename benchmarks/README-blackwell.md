@@ -137,6 +137,20 @@ tile to 128 while retaining a four-tile B cadence reduced a TMA stage from 18
 slots to nine, but doubled UMMA issue/completion points and regressed the same
 shape to 10.432 us (job `20260807T200451Z-3899356`).
 
+Issuer ownership was also tested in the fused tail up-projection/SwiGLU task
+and removed.  Merely letting the three non-issuer warps advance to the retained
+gate `RegLoad` early was neutral: the control/variant/control medians were
+2.608224/2.613344/2.618912 ms, or 0.224 us faster than the control mean.  Warp
+0 still evaluated its own sigmoid fragment and remained the join's critical
+warp.  A stronger sidecar version used warps 1--3 to transform all 512 gate
+elements in place while warp 0 owned UMMA, then reloaded each native fragment
+after the legal TMEM handoff.  Exact-token and tensor validation passed (job
+`20260807T203352Z-3930180`), but its control/variant/control medians were
+2.614720/2.613888/2.615136 ms, only a 1.040 us (0.040%) gain.  Stage profiling
+showed why: the local `gate_tail` to `silu_tail` maximum increased from 11.360
+to 12.256 us because the 96-thread shared rewrite and reload cost more than the
+hidden SFU work.  The experimental opcode, selector, and task were removed.
+
 ### Projection-to-RoPE shared-memory handoff
 
 Two M64 projection/RoPE paths remain available.  The two-operator diagnostic
