@@ -730,6 +730,28 @@ nonblocking and cheaper than adding a recurring compute rendezvous.  The
 aggregate queue method, split barrier, build selector, and GEMV branch were
 removed.
 
+A warp-coalesced M2C-wait experiment tested whether issuer warp lane 0 could
+absorb the variable-duration observer spin before the other 31 lanes consumed
+the loaded operand.  The conservative implementation made lane 0 complete the
+wait, executed `__syncwarp()`, and then made every other consuming lane execute
+one already-ready acquire wait.  This follows the PTX mbarrier visibility rule,
+which guarantees producer writes to the thread that executes a successful
+`mbarrier.test_wait`/`mbarrier.try_wait`; `__syncwarp()` orders memory among its
+participants but does not document transitive propagation of that async-proxy
+acquire.  See the official [PTX mbarrier
+semantics](https://docs.nvidia.com/cuda/archive/11.8.0/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait)
+and [CUDA warp synchronization
+semantics](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#synchronization-functions).
+
+The extra warp synchronization failed the standalone gate.  K4096 M64 rose
+from 6.912 to 7.680 us, and the balanced K14336/down shape rose from 21.600 to
+28.064 us (controls `20260807T222804Z-4035435` and
+`20260807T222831Z-4035802`; variants `20260807T223059Z-4037035` and
+`20260807T223128Z-4037257`).  A leader-only acquire was not retained because
+the documented visibility guarantee applies to the executing thread.  No
+end-to-end run was warranted after both task shapes regressed; the helper,
+selector, and GEMV branches were removed.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
