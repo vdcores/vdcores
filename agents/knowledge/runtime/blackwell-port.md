@@ -1051,3 +1051,35 @@ were removed. Full-K output ownership is incompatible with the current
 bounded VCore queue and also changes the intended BF16 reduction arithmetic;
 future work should shorten live ranges rather than aggregate more K work into
 one owner.
+
+## Production hardware-stall profile and rejected LM UMMA grouping
+
+Nsight Compute profiled the unchanged 96-register S128 production
+megakernel in `20260807T135224Z-3577336`. Four replay passes reported only
+0.38% CTA-barrier stalls and 0.00% memory-barrier stalls. The dominant sampled
+reasons were long scoreboard at 37.77%, fixed-latency wait at 20.63%, short
+scoreboard at 5.30%, and no-instruction at 3.70%. The profiler replay time is
+not a TBT measurement, but the stall mix rules out whole-CTA barriers as the
+primary remaining bubble and points instead to operand delivery and
+completion pacing.
+
+Following the SM100 canonical pattern of issuing several `tcgen05` operations
+before one `umma_arrive`, a selectable LM-head task grouped the four disjoint
+M128 output UMMAs for each K128 step under one completion event and retired
+their shared-memory slots together. It preserved the direct4 weight/activation
+reuse, TMEM layout, and fused argmax, and the combined image remained at 96
+registers, nine barriers, a 96-byte stack, and zero spills. Full S128
+correctness and token 24748 passed in `20260807T140103Z-3584460`, but repeated
+benchmark execution hung in `20260807T140223Z-3585633`; the verified orphan
+PID from only that job was terminated.
+
+A bounded two-UMMA completion group was repeat-safe and passed full S128
+correctness/token 24748 in `20260807T140643Z-3589031`. Five launches completed
+in `20260807T140723Z-3589937`, but the 501-sample median was 2.634240 ms in
+`20260807T140801Z-3590358`, versus 2.623968/2.623936 ms same-image controls in
+`20260807T140143Z-3585196` and `20260807T140838Z-3590935`: a 10.288 us
+regression against the control mean. Coalescing completion delays operand
+retirement and makes the producer stream burstier; at depth four that can form
+a liveness cycle, and at depth two its cost exceeds the removed completion
+wait. Both opcodes, instruction classes, selectors, manifest entries, and
+template branches were removed.
