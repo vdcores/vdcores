@@ -588,6 +588,21 @@ barrier. With the retained down interleave it improved S128 by only 2.208 us
 sensitivity. The extra barriers, head-offset adapters, and split placements
 were removed.
 
+The complementary Q/K/V-to-attention experiment kept every compute task and
+tensor coordinate unchanged while replacing the all-head dependency with
+2-way, 4-way, and per-head readiness. Profiling-free S128 internal medians
+were 2.737056 ms for the coarse production barrier, 2.738272 ms for two head
+groups, 2.736576 ms for four groups, and 2.741216 ms for a correct per-head
+variant. Separate Q and KV counters per head overflow the VM's 10-bit encoded
+barrier-ID space after 32-layer resource expansion, so the legal per-head
+probe used one combined Q+K+V counter per head. Both independent TMA load
+ports must wait on that counter; waiting only on Q produced an invalid
+2.721760 ms result because K/V raced their stores, which full tensor
+correctness caught even though the final token happened to match. The valid
+four-way delta was only 0.480 us and the other granularities regressed, so all
+prototype code was removed. Jobs are recorded in
+`.agentlog/2026-08-07-shared-barrier-candidates.md`.
+
 The production image remains at 128 registers, nine barriers, a 96-byte
 stack, and zero spills. Runtime smoke job `20260806T234925Z-2569187` passed;
 full-model job `20260806T234956Z-2570323` passed every tensor threshold and
