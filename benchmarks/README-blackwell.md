@@ -616,6 +616,19 @@ resident reuses across KV128 exactly match `[24748, 24748, 24748, 24748]` in
 `20260807T233102Z-4079837`.  `VDCORES_PACKED_SILU_SHARDS=0` restores the old
 round-robin placement for diagnostics.
 
+### Rejected RMS physical-ownership move
+
+Moving the unchanged eight-token RMS tasks away from SMs 0--7 did not expose
+useful operand pre-staging.  With packed SwiGLU ownership enabled, moving the
+post-attention RMS to bases 64 and 128 measured 2.587264 and 2.594400 ms over
+201 internal-timer samples (jobs `20260807T233726Z-4084994` and
+`20260807T233807Z-4085619`).  Moving the next-layer pre-attention RMS to bases
+64 and 128 measured 2.584672 and 2.589696 ms (jobs
+`20260807T233850Z-4086100` and `20260807T234038Z-4087542`) versus the fresh
+2.586304 ms production median.  The only apparent improvement was 1.632 us,
+below run-phase variance, while auxiliary ownership could be worse by 8.096
+us.  Fixed SM0--7 placement and the minimal schedule were restored.
+
 ### Spare-SM and fusion follow-up
 
 The 24 SMs outside the 128-SM rectangular projection grid were explicitly

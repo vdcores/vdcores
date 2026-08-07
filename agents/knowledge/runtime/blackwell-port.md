@@ -234,6 +234,13 @@ shard-0/1 work.  A same-image control/packed/control sandwich measured
 validation and four resident-token reuse both pass exactly.  The change adds
 no opcode, hardware barrier, register, stack, or spill cost.
 
+Moving either eight-token RMS stage to otherwise different physical owners
+does not add useful overlap.  Post-attention RMS at bases 64/128 measured
+2.587264/2.594400 ms, and next-layer RMS at bases 64/128 measured
+2.584672/2.589696 ms, versus the fresh 2.586304 ms production result.  The
+1.632 us best delta is noise-sized and the auxiliary placement can regress by
+8.096 us, so RMS remains on SMs 0--7 and no placement selector is retained.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
