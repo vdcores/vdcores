@@ -1356,3 +1356,46 @@ writebacks in the already slot-paced pipeline. The rebuilt production image
 returned to 96 registers, nine barriers, a 96-byte stack, and zero spills; its
 fresh 501-sample S128 median was 2.623648 ms in
 `20260807T180747Z-3793689`.
+
+## Rejected post-attention RMS gamma folding
+
+Folding each post-attention RMS gamma vector into the gate and up weights
+removes the gamma TMA load and elementwise multiply from the RMS task, but the
+resulting per-token inverse RMS must then reach every projection owner. An
+isolated B8/K4096 task confirmed that the local opportunity is real: ordinary
+shared RMS measured 2.144 us while scale-only RMS measured 1.664 us in
+`20260807T181228Z-3798360`, a 0.480 us / 22.4% saving. Folding the actual model
+weights produced only BF16 rounding differences (roughly 0.30--0.32% mean
+relative error across q, gate, up, and LM projections) in
+`20260807T181532Z-3801038`.
+
+The first delivery design co-loaded the dynamic scale beside every repeated B
+activation tile. Full-model validation passed every tensor threshold and exact
+token 24748, but its 501-sample internal median was 2.658848 ms in
+`20260807T184023Z-3823696`, 35.200 us slower than the retained 2.623648 ms
+production result. A second design materialized the scale once and published
+it through a separate stage-wide shared-scratch M2C handoff to all 152 CTAs.
+It was exact-token correct but measured 2.795936 ms in
+`20260807T184514Z-3827034`; the extra 152-way handoff and rendezvous cost about
+4.3 us per layer.
+
+The final design let each SM's first projection seed a local scale scratch and
+reused it in later projection epilogues, avoiding the stage-wide handoff. Its
+best full-model median was still 2.647488 ms in
+`20260807T185947Z-3839451`, 23.840 us slower than production, and accumulated
+roughly 5% gate/SiLU relative error in later layers. Isolated scaled projection
+tests likewise showed no hidden epilogue win: M4096/K4096 measured 6.944 us
+versus 6.880 us, M2048 measured 4.256 versus 4.192 us, and M6144 measured
+11.456 versus 11.424 us.
+
+The scale-only RMS task therefore saves work, but distributing one dynamic
+scalar through the persistent CTA graph costs more in load-program traffic,
+queue state, and synchronization than it removes. All folded weights, scale
+scratch, opcodes, task variants, schedule paths, and benchmark switches were
+removed. Revisit this only if the scale can remain inside the same physical
+owner across RMS and both MLP projections; another broadcast representation
+is not promising. The rebuilt 11-op production image retained 96 registers,
+nine barriers, a 96-byte stack, and zero spills. Full S128 validation passed
+every tensor threshold and exact token 24748 in `20260807T190549Z-3844602`;
+its fresh 501-sample internal median was 2.621760 ms (2.608160 ms minimum) in
+`20260807T190630Z-3845286`.
