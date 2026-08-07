@@ -1152,3 +1152,42 @@ pays a producer pause. A future light-compute role must be persistent across
 multiple stages or operate on work that does not depend on the borrowed
 memory producer. The helper opcodes, mailbox, command, schedule fusion, and
 experimental manifests were removed.
+
+## Rejected paired-M128 gate/up ownership
+
+A mixed M128 task packed one M64 gate tile and the matching M64 up tile into a
+single UMMA A tile, loaded the normalized activation once, rounded both FP32
+TMEM halves to BF16, and emitted SwiGLU directly. This differed from the
+earlier paired-M64 experiment: one native M128 UMMA owned both projections,
+so 96 tasks covered the 6,144-row prefix instead of distributing 192 M64 tasks
+over a three-wave auxiliary-SM tail. The selectable Llama image remained at
+96 registers, nine barriers, a 96-byte stack, and zero spills.
+
+The task mechanism was exact in isolation. A 96-SM M6144-pair/K4096 probe
+measured 20.928 us and zero error over 101 launches in
+`20260807T152036Z-3651364`; four back-to-back epochs split over three physical
+shards also remained exact in `20260807T152736Z-3656540`. Full-model
+integration exposed another implicit placement dependency: the retained gate
+tail on SM96--127 had inherited its post-attention RMS wait from the old
+prefix. Once the paired prefix occupied only SM0--95, those CTAs could read a
+stale normalized row. Adding the explicit wait restored layer-1 and final
+tensor agreement (0.68% V, 2.19% SwiGLU, 2.10% hidden, 2.04% RMS) and token
+24748 in `20260807T153007Z-3658676`.
+
+The topology still did not qualify. The fine prefix faulted nondeterministically
+after several complete kernel replays in `20260807T153153Z-3660498` and
+`20260807T153447Z-3663175`, despite isolated repeat safety. Collapsing it to
+the exact standalone 96-SM command plus one coarse publication frontier was
+live for ten launches, but its best sample was 3.251232 ms and its median was
+3.800304 ms in `20260807T153605Z-3664068`, far above the 2.619488 ms control
+in `20260807T153121Z-3660036`. Tail-only fusion passed every 32-layer tensor
+check and token 24748 in `20260807T152634Z-3655865`, but measured 2.683424 ms
+in `20260807T153250Z-3661481`, a 63.936 us regression.
+
+Native M128 ownership reduces command count and activation traffic but
+serializes gate/up progress that the resident M64 placement already overlaps.
+Its shorter schedule is therefore not a shorter critical path, and the fine
+form also fails the repeated-launch lifetime requirement. All paired weights,
+TMA descriptors, opcode/task/schedule code, benchmark switches, and manifests
+were removed. The rebuilt 11-op production image measured 2.627648 ms over
+501 internal-timer samples in `20260807T154150Z-3669016`.
