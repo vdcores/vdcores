@@ -1096,3 +1096,59 @@ at 96 registers, nine barriers, a 96-byte stack, and zero spills, but its
 controls. The default implementation-defined suspension policy is already
 better; the compile selector and alternate wait path were removed without a
 hint sweep.
+
+## Rejected light-warp gate/up TMEM handoff
+
+A combined gate/up instruction tested true cross-task compute overlap rather
+than another same-accumulator completion variant. Gate accumulated in TMEM
+bank 0 while up used bank 1. At the boundary, a disjoint physical warp drained
+one gate epilogue slice while compute warp 0 began the up UMMA stream; the
+other three compute warps retained their original logical slices. Ownership
+used `tcgen05.fence::before_thread_sync`, compute-role named barriers, and
+`tcgen05.fence::after_thread_sync`. The existing RegStore/RegLoad and C2M slot
+protocol remained in place.
+
+A ninth physical warp proved the mechanism valid. The 288-thread selectable
+image used 96 registers, 12 barriers, a 96-byte stack, and no spills. Full
+S128 correctness and token 24748 passed in `20260807T142924Z-3607769`.
+Same-image control/helper medians were 2.643232/2.643584 ms in jobs
+`20260807T143212Z-3610100` and `20260807T143253Z-3610627`. The overlap paid
+back essentially all of the added CTA-shape cost, but did not improve TBT and
+remained slower than the 256-thread production image.
+
+Borrowing an existing memory VCore exposed physical TMEM datapath constraints.
+Store warp 5 cannot replace logical slice 0; that form corrupted the next
+layer in `20260807T143705Z-3613663`. Matching it to slice 1 while moving UMMA
+issue to compute warp 1 reduced the damage but still failed layer-1 tensor
+correctness in `20260807T144053Z-3616436`. The unchanged schedule on the same
+nonblocking C2M runtime was correct in `20260807T143752Z-3614353`, isolating
+the failure to the TMEM/issuer role substitution rather than queue polling.
+
+Allocator warp 4 has the required datapath rank 0 and produced exact results.
+Generic mailbox polling was too expensive: polling on every memory instruction
+made an unused-helper control 2.920096 ms in `20260807T144532Z-3620653`, and
+polling only during allocation retry still measured 2.716096 ms in
+`20260807T144827Z-3624515`. An explicit zero-slot memory command removed that
+hot-path tax. Stopping after a complete B4 operand seed could exhaust the
+24-slot pool and hung job `20260807T145210Z-3628562`; only its verified orphan
+process was terminated. Seeds of one through three individual A tiles were
+repeat-safe, and seed 1 passed full correctness/token 24748 in
+`20260807T145411Z-3630116`.
+
+The bounded seed sweep still did not win. Against the 2.635040 ms same-image
+control in `20260807T145453Z-3630838`, seed 1 measured 2.647360 ms over 501
+samples in `20260807T145531Z-3631515`, seed 2 screened at 2.644416 ms over 101
+samples in `20260807T145614Z-3632098`, and the best seed-3 form measured
+2.638720 ms over 501 samples in `20260807T145730Z-3633124`. More seeded UMMA
+work amortizes the rendezvous, but the largest safe seed remains 3.680 us
+slower than its matched control and 18.592 us slower than the retained
+2.620128 ms production median.
+
+The architectural boundary is now explicit: a light warp can overlap a legal
+TMEM slice only when its physical warpgroup rank matches that slice, but
+borrowing the allocator also removes the producer needed to sustain the next
+UMMA stream. Adding a ninth warp pays a resident-CTA cost; borrowing warp 4
+pays a producer pause. A future light-compute role must be persistent across
+multiple stages or operate on work that does not depend on the borrowed
+memory producer. The helper opcodes, mailbox, command, schedule fusion, and
+experimental manifests were removed.
