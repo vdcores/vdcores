@@ -662,6 +662,28 @@ frontier increased from about 231.2 to 233.4 us (jobs
 `20260807T211858Z-3971545` and `20260807T211937Z-3971892`).  The extra opcodes,
 barriers, and schedule were removed.
 
+The following down-projection experiment tested whether wider M tiles could
+use the otherwise idle Blackwell SMs more effectively.  The first three
+K2048 shards retained 192 M64 tasks, while the K6144--14336 tail changed from
+256 M64 tasks to 128 M128 tasks.  The placement kept the critical issue load
+balanced at 24 UMMA instructions on both the 128 primary and 24 auxiliary
+SMs, preserved all seven BF16 reduction contributors, and preserved the
+existing SiLU readiness boundaries.  A generic M128 implementation passed
+full S128 correctness but regressed the 501-sample median by 47.040 us.
+
+To separate tile width from runtime synchronization, a temporary M128
+issuer-owned opcode then gave warp 0 the same M2C/UMMA/release protocol as the
+retained M64 path.  It compiled at the unchanged 96 registers, nine barriers,
+96-byte stack, and zero spills, and passed every S128 tensor check plus exact
+token 24748 in job `20260807T214340Z-3996557`.  Its unprofiled
+control/variant/control medians were 2.608928/2.656864/2.615712 ms (jobs
+`20260807T214438Z-3997646`, `20260807T214518Z-3998427`, and
+`20260807T214555Z-3998985`), a 44.544 us regression versus the bracketing
+control mean.  The wider tasks reduce command count but make twice as much
+work indivisible and delay useful producer/consumer interleaving in every
+layer.  The M128 opcode, duplicate packing, selector, and schedule were
+removed; the retained down projection remains uniformly M64.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
