@@ -737,3 +737,24 @@ job `20260807T084358Z-3316527`. Four resident tokens reused the late handoff
 correctly in `20260807T084435Z-3317529`, and the minimal final image repeated
 that result in `20260807T084806Z-3321002`. The retained schedule has exactly
 two tail compute tasks: gate GEMV and up GEMV with overlapped SwiGLU.
+
+## Rejected stagger-aware tail/down pipeline
+
+The post-overlap profile exposed a deterministic imbalance worth testing:
+auxiliary SMs 136--151 finished the third MLP-prefix wave at about 65.0 us and
+prefix SwiGLU at 67.9 us, while the main register-forwarded tail finished at
+62.3 us. A proof of concept moved half of the final prefix-up wave to eight
+main SMs and gave the four 2,048-element tail ranges separate counters. Every
+high-K down fold was then represented as four K2048 schedules so unaffected
+shards could start before the delayed main range. The tile set and all 448
+down contributors were unchanged.
+
+The arithmetic was correct, but the dependency representation was not cheap.
+A same-image S128 comparison regressed from 2.675520 to 2.902272 ms (+226.752
+us, +8.47%), and the profiled per-layer frontier moved from 81.376 to 89.824
+us. Each factored K2048 schedule made the memory VM perform a separate
+barrier-gated readiness acquisition; that repeated queue/issue cost dwarfed
+the 5.6 us producer stagger. The prototype was removed. If tail K-shard
+readiness is revisited, one grouped down command must retain its existing
+operand pipeline and consume staged phases internally; Python-level task
+factorization is the wrong boundary.
