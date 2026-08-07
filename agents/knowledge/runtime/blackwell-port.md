@@ -1280,3 +1280,39 @@ introduced only to deduplicate projection B loads. The restored non-cluster
 11-op image compiled with 96 registers, nine barriers, a 96-byte stack, and no
 spills; fresh 501-sample medians were 2.627904 and 2.624640 ms in
 `20260807T164758Z-3725282` and `20260807T164840Z-3725741`.
+
+## Rejected projection weight prefetch and narrower B cadence
+
+The next operand-delivery audit separated tile shape, activation cadence, and
+cache lead. An exact fold-2 M4096/N8/K4096 projection measured 6.784 us with
+the retained M64 tile on 128 SMs (`20260807T165550Z-3731265`). A native M128
+tile must use only 64 SMs for the same K fold and measured 10.688 us
+(`20260807T165621Z-3731593`). The earlier M128 wins came from changing the K
+factorization, not from a faster like-for-like tile. Loading B every two A
+tiles instead of every four reduced the live input footprint but raised the
+same M64 probe to 7.488 us (`20260807T165854Z-3733994`); the extra activation
+commands cost more than the shorter slot lifetime.
+
+A raw 152-CTA stream then established that Blackwell's non-allocating
+`cp.async.bulk.prefetch.L2.global` mechanism can hide a genuinely cold next
+tile. Across 64 unique 32 KiB tiles per CTA, no hint measured 59.904 us and a
+one-tile lead measured 46.176 us in `20260807T170244Z-3736883` and
+`20260807T170308Z-3737355`. Two tiles were neutral to one at 46.208 us, while
+four regressed to 50.560 us. A rank-5 tensor-map form was therefore added
+temporarily to the allocator VCore so it consumed neither a shared slot nor an
+M2C handoff. Prefetching the current group was harmful. Moving the hint between
+the first and second K2048 groups did improve an eight-epoch isolated
+projection from 49.952 to 47.904 us (`20260807T171614Z-3747317`).
+
+That isolated cache gain did not survive the full model's concurrent weight
+stream. Against the same selectable-image 2.631680 ms control
+(`20260807T171248Z-3744678`), one-group-ahead output prefetch measured 2.637248
+ms (`20260807T171913Z-3749752`), down prefetch measured 2.665120 ms
+(`20260807T171952Z-3750322`), and enabling both measured 2.673120 ms
+(`20260807T172029Z-3750678`). These 201-sample internal medians regress by
+5.568, 33.440, and 41.440 us respectively. The model is already issuing useful
+TMA traffic during compute; speculative hints add request/cache pressure rather
+than expose a new overlap window. The tensor-prefetch opcode, scheduler hooks,
+standalone probe, B2 selector, and all Llama selectors were removed. Future
+operand work should pipeline completion and slot retirement of existing
+traffic, not inject duplicate weight reads.
