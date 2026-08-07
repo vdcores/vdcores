@@ -752,6 +752,50 @@ the documented visibility guarantee applies to the executing thread.  No
 end-to-end run was warranted after both task shapes regressed; the helper,
 selector, and GEMV branches were removed.
 
+### Rejected K512 projection stage
+
+A wider ordinary-projection stage tested whether halving the number of
+memory-to-compute handoffs and UMMA groups could expose more useful overlap.
+The proof changed M64N8K256/B4 into M64N8K512/B2 while preserving each
+activation group's K1024 cadence.  It also added a fixed 64 KiB rank-5 TMA
+load because the memory instruction's 16-bit byte-count field cannot encode
+65536.  The experimental image was spill-free and the all-scope Llama run
+passed every S128 tensor check with exact token 24748.
+
+The isolated, repeatedly reused matrices favored the wider stage:
+
+| Shape | K256 | K512 | Change |
+| --- | ---: | ---: | ---: |
+| M1024 K4096 / 64 SMs | 4.096 us | 3.744 us | -8.6% |
+| M4096 K4096 / 128 SMs | 6.944 us | 6.240 us | -10.1% |
+| M6144 K4096 / 96 SMs | 11.488 us | 9.760 us | -15.0% |
+| M8192 K4096 / 128 SMs | 11.648 us | 9.952 us | -14.6% |
+| M4096 K14336 / 152 SMs | 21.792 us | 21.856 us | +0.3% |
+
+The result did not transfer to the resident inference schedule.  Against a
+2.618624 ms same-image control, V-only measured 2.637216 ms (+18.592 us),
+output-only measured 2.687488 ms (+68.864 us), MLP-only measured 2.821312 ms
+(+202.688 us), and all eligible projections measured 2.852544 ms
+(+233.920 us).  Those runs are `20260807T230222Z-4055721`,
+`20260807T230301Z-4056062`, `20260807T230342Z-4056490`, and
+`20260807T230031Z-4054735`; the control is
+`20260807T225950Z-4054291`.
+
+An eight-epoch M6144/K4096 probe using eight distinct matrices reduced the
+apparent gain to 84.128 versus 83.168 us (-1.1%; jobs
+`20260807T230426Z-4056780` and `20260807T230459Z-4057166`).  The hot-matrix
+microbenchmark therefore overstated the benefit, while the full resident
+schedule exposed the dominant cost: each K512 operand consumes eight
+contiguous 8 KiB slots and retires at twice the granularity, reducing memory
+VCore allocator/load runahead and delaying cross-task interleaving.  The
+K512 opcodes, fixed-size memory operation, scheduler selectors, and benchmark
+variant were removed; production retains the finer K256 stage.
+After removal, the exact 11-op production image rebuilt at 96 registers, nine
+barriers, a 96-byte stack, and zero spills.  A fresh 501-sample S128 run
+measured a 2.614752 ms internal median and 2.597792 ms minimum in job
+`20260807T231129Z-4062821`, consistent with the retained 2.608576--2.609728 ms
+production medians.
+
 ### Observer-owned M2C readiness
 
 The resident runtime now treats loaded-operand readiness as a producer-owned
