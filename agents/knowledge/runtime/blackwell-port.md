@@ -223,6 +223,17 @@ registers, nine barriers, a 96-byte stack, and zero spills. This is the useful
 VDCores analogue of dependent-kernel overlap: publish a coarse-enough shard to
 another compute group without paying a command transition for each epilogue.
 
+The later packed-ownership follow-up keeps those exact three counters and 24
+tasks but removes a physical-placement hazard in the round-robin consumer
+mapping.  SMs 128--135 now execute all shard-0 and shard-1 token tasks after
+their shard-1 projection tail; SMs 144--151 execute shard 2.  Early
+down-projection owners no longer encounter a local shard-2 wait before their
+shard-0/1 work.  A same-image control/packed/control sandwich measured
+2.617888/2.594016/2.618592 ms, a 24.224 us gain, while the restored exact
+11-op production image measured 2.586304 ms at S128.  Single-step tensor
+validation and four resident-token reuse both pass exactly.  The change adds
+no opcode, hardware barrier, register, stack, or spill cost.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a

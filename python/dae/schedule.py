@@ -1430,13 +1430,15 @@ class SchedSmemSiLUInterleaved(Schedule):
                  gate_glob: torch.Tensor,
                  up_glob: torch.Tensor,
                  out_glob: torch.Tensor,
-                 shards_per_token: int = 1):
+                 shards_per_token: int = 1,
+                 fixed_shard_id: int | None = None):
         super().__init__()
         self.num_token = num_token
         self.gate_glob = gate_glob
         self.up_glob = up_glob
         self.out_glob = out_glob
         self.shards_per_token = shards_per_token
+        self.fixed_shard_id = fixed_shard_id
 
     def _on_place(self):
         if self.shards_per_token == 3:
@@ -1444,9 +1446,15 @@ class SchedSmemSiLUInterleaved(Schedule):
             assert self.gate_glob.shape[-1] == 6144, (
                 "Three-way SwiGLU sharding requires a 6144-element prefix"
             )
-            assert self.num_sms == self.num_token * self.shards_per_token, (
-                "Three-way SwiGLU sharding requires one SM per token shard"
-            )
+            if self.fixed_shard_id is None:
+                assert self.num_sms == self.num_token * self.shards_per_token, (
+                    "Three-way SwiGLU sharding requires one SM per token shard"
+                )
+            else:
+                assert 0 <= self.fixed_shard_id < self.shards_per_token
+                assert self.num_sms == self.num_token, (
+                    "A fixed SwiGLU shard requires one SM per token"
+                )
             self.tokens_per_sm = 1
             return
         assert self.shards_per_token == 1, "Supported SwiGLU shard counts are 1 and 3"
@@ -1458,8 +1466,12 @@ class SchedSmemSiLUInterleaved(Schedule):
             return []
 
         if self.shards_per_token == 3:
-            token_id = sm // self.shards_per_token
-            shard_id = sm % self.shards_per_token
+            if self.fixed_shard_id is None:
+                token_id = sm // self.shards_per_token
+                shard_id = sm % self.shards_per_token
+            else:
+                token_id = sm
+                shard_id = self.fixed_shard_id
             shard_width = self.gate_glob.shape[-1] // self.shards_per_token
             shard_start = shard_id * shard_width
             shard_end = shard_start + shard_width

@@ -590,6 +590,32 @@ GEMV_TILE_PACKED=1 GEMV_DOWN_SCHEDULE=balanced GEMV_ITERS=501 \
   python benchmarks/blackwell_gemv.py
 ```
 
+### Packed SwiGLU shard ownership
+
+The three materialized 2,048-element SwiGLU shards retain their independent
+readiness barriers and all 24 token-shard tasks, but no longer round-robin
+unrelated shards over the 24 auxiliary SMs.  Shards 0 and 1 are both placed
+on SMs 128--135 after those CTAs finish the shard-1 up-projection tail.  Shard
+2 stays on SMs 144--151, which are also its late producer/consumer group.
+Early down-projection owners therefore cannot be parked behind an unrelated
+shard-2 input frontier.
+
+A profiling-disabled control/packed/control sandwich on the same 13-op image
+measured 2.617888/2.594016/2.618592 ms, a 24.224 us gain against the control
+mean (jobs `20260807T232617Z-4075840`, `20260807T232655Z-4076228`, and
+`20260807T232733Z-4076690`).  Moving shard 2 to bases 136 or 140 measured
+2.598976/2.599520 ms in 201-sample screens; the retained base 144 measured
+2.592256 ms (jobs `20260807T232855Z-4077926`,
+`20260807T232935Z-4078389`, and `20260807T233014Z-4078979`).
+
+The exact 11-op production image reaches a fresh 2.586304 ms S128 median over
+501 internal-timer samples in `20260807T233431Z-4082641`.  It remains at 96
+registers, nine barriers, a 96-byte stack, and zero spills.  Full S128 tensor
+validation and exact token 24748 pass in `20260807T232532Z-4075060`; four
+resident reuses across KV128 exactly match `[24748, 24748, 24748, 24748]` in
+`20260807T233102Z-4079837`.  `VDCORES_PACKED_SILU_SHARDS=0` restores the old
+round-robin placement for diagnostics.
+
 ### Spare-SM and fusion follow-up
 
 The 24 SMs outside the 128-SM rectangular projection grid were explicitly

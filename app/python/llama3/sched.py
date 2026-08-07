@@ -187,6 +187,10 @@ blackwell_aux_sms = blackwell_sms - num_sms
 # Shard-local MLP readiness is the qualified Blackwell default.  Keep the
 # coarse frontier as an A/B fallback without changing any compute opcode.
 fine_mlp_barriers = os.environ.get("VDCORES_FINE_MLP_BARRIERS", "1") == "1"
+packed_silu_shards = (
+  fine_mlp_barriers
+  and os.environ.get("VDCORES_PACKED_SILU_SHARDS", "1") == "1"
+)
 stage_profile = os.environ.get("VDCORES_STAGE_PROFILE", "0") == "1"
 interleave_down_high = (
   fine_mlp_barriers
@@ -1025,16 +1029,31 @@ def schedule_single_token(
       )
     ]
 
-    silu1 = SchedSmemSiLUInterleaved(
-      num_token=N,
-      gate_glob=matGateOut[:, :mlp_split],
-      up_glob=matInterm[:, :mlp_split],
-      out_glob=matSiLUOut[:, :mlp_split],
-      shards_per_token=3,
-    )
-    for shard_id in range(3):
-      silu1.bar(f"input{shard_id}", silu_in_bars[shard_id])
-      silu1.bar(f"output{shard_id}", silu_out_bars[shard_id])
+    if packed_silu_shards:
+      silu1 = []
+      for shard_id in range(3):
+        shard = SchedSmemSiLUInterleaved(
+          num_token=N,
+          gate_glob=matGateOut[:, :mlp_split],
+          up_glob=matInterm[:, :mlp_split],
+          out_glob=matSiLUOut[:, :mlp_split],
+          shards_per_token=3,
+          fixed_shard_id=shard_id,
+        ).bar(f"input{shard_id}", silu_in_bars[shard_id]).bar(
+          f"output{shard_id}", silu_out_bars[shard_id]
+        )
+        silu1.append(shard)
+    else:
+      silu1 = SchedSmemSiLUInterleaved(
+        num_token=N,
+        gate_glob=matGateOut[:, :mlp_split],
+        up_glob=matInterm[:, :mlp_split],
+        out_glob=matSiLUOut[:, :mlp_split],
+        shards_per_token=3,
+      )
+      for shard_id in range(3):
+        silu1.bar(f"input{shard_id}", silu_in_bars[shard_id])
+        silu1.bar(f"output{shard_id}", silu_out_bars[shard_id])
 
     down_low_parts = []
     for shard_id in range(3):
@@ -1137,7 +1156,18 @@ def schedule_single_token(
       )
     ]
     mlp_prefix_schedules = [*gate_prefix_parts, *up_prefix_parts]
-    silu1 = silu1.place(N * 3, base_sm=num_sms)
+    if packed_silu_shards:
+      # Keep shard-0/1 consumers on the eight CTAs that finish the shard-1
+      # projection tail, and shard 2 on its late producer/consumer group.
+      # This avoids making early down-projection owners wait on an unrelated
+      # late shard while preserving all 24 token-shard tasks and barriers.
+      silu1 = [
+        silu1[0].place(N, base_sm=num_sms),
+        silu1[1].place(N, base_sm=num_sms),
+        silu1[2].place(N, base_sm=num_sms + 16),
+      ]
+    else:
+      silu1 = silu1.place(N * 3, base_sm=num_sms)
     down_low_parts = [
       part.place(part_sms, base_sm=base_sm)
       for part, (part_sms, base_sm) in zip(
@@ -1363,6 +1393,7 @@ else:
 print(
   f"run VDCores with {cur_offset+1} tokens... "
   f"fine_mlp_barriers={int(fine_mlp_barriers)}, "
+  f"packed_silu_shards={int(packed_silu_shards)}, "
   f"interleave_down_high={int(interleave_down_high)}, "
   f"fused_qk_rope={int(fused_qk_rope)}, "
   f"qkv_head_barriers={int(qkv_head_barriers)}, "
