@@ -1588,6 +1588,29 @@ allocator stall improved 553.312 to 494.080 us, but compute M2C wait worsened
 proof code was removed; do not reuse a retained slot unless consumer
 placement changes preserve the original publication cadence.
 
+### Rejected cross-task gate/up activation retention
+
+Gate and up tail projections share the same RMS activation.  A cross-task
+proof retained gate's four K1024 activation groups—eight physical shared
+slots—and reused them in the following up/SwiGLU task on the same CTA.  It
+preserved the two operators and their compute order and passed full S128
+tensor/token correctness (`20260808T170003Z-730493` and
+`20260808T171454Z-738493`).
+
+The matched track profile removed 128 LDU0 commands and M2C publications per
+CTA and reduced median compute M2C wait from 924.352 to 900.736 us, but median
+allocator stall increased from 544.512 to 630.400 us.  Partial retention was
+worse because one to three retained groups required separate reload and reuse
+RepeatM phases: the zero/one/two/three/four-group 301-sample medians were
+2.525088/2.529952/2.539520/2.550656/2.524864 ms.
+
+On an exact 11-op, 96-register image, full retention measured 2.525760 ms in
+`20260808T171531Z-739081`, versus 2.522976 ms for same-image normal reloads in
+`20260808T171616Z-739425` and 2.517504 ms for fresh production in
+`20260808T165134Z-725676`.  The duplicate loads are hidden well enough that
+their slot release and publication cadence are more valuable than the saved
+traffic.  All retention code and selectors were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

@@ -2350,3 +2350,32 @@ the control/load streams advance into work the consumer cannot yet use. All
 reuse opcodes, queue formats, selectors, and schedule changes were removed.
 Future slot-lifetime work must retain the current publication cadence or move
 the corresponding consumer earlier at the same time.
+
+## Rejected cross-task gate/up activation retention
+
+The gate and up tail projections consume the same four K1024 groups of the
+RMS-normalized activation, so a cross-task proof kept gate's eight physical
+8-KiB B slots resident and let the same CTA reuse them in the following
+up/SwiGLU task.  This preserved the separate projection operators and their
+compute order; only the shared-memory lifetime crossed the task boundary.
+Full S128 tensor validation and exact token 24748 passed in
+`20260808T170003Z-730493` and `20260808T171454Z-738493`.
+
+The traffic reduction was real.  A matched track image removed 128 LDU0
+commands and 128 M2C publications per CTA over the resident token, and median
+compute M2C wait fell from 924.352 to 900.736 us.  However, holding eight
+slots across the boundary raised median allocator stall from 544.512 to
+630.400 us.  Splitting the memory program to retain only the last one, two,
+or three groups also inserted a second RepeatM phase: 301-sample medians for
+zero through four retained groups were 2.525088, 2.529952, 2.539520,
+2.550656, and 2.524864 ms (`20260808T170937Z-735405` through
+`20260808T171136Z-736706`).
+
+An exact 11-op, 96-register image removed the diagnostic dispatch-footprint
+confound.  Full four-group retention measured 2.525760 ms in
+`20260808T171531Z-739081`, versus 2.522976 ms for the same binary with normal
+reloads in `20260808T171616Z-739425` and 2.517504 ms for fresh production in
+`20260808T165134Z-725676`.  The activation reloads are already overlapped and
+their slot release supplies useful allocator cadence; eliminating them moves
+pressure to the shared arena rather than shortening the token frontier.  All
+retention tasks, schedule forms, and build selectors were removed.
