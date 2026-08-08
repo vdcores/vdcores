@@ -26,7 +26,9 @@ cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
 cuda_defines = []
 if os.environ.get("DAE_AUX_SLOTS"):
     cuda_defines.extend([
-        "-DDAE_NUM_SLOTS=26",
+        "-DDAE_NUM_SLOTS=27",
+        "-DDAE_NUM_INSTS=192",
+        "-DDAE_DYNAMIC_SMEM_KB=219",
         "-DDAE_PACKED_SWAP_ATTENTION_SCRATCH=1",
     ])
 include_dirs = [

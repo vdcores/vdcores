@@ -5,7 +5,7 @@
 #include <vector>
 
 // runtime interface for DAE kernels
-size_t set_smem_size(size_t smem_size = (1024 * 212));
+size_t set_smem_size(size_t smem_size = dynamicSmemBytes);
 
 cudaError_t launch_dae(
   int numSMs,

@@ -23,6 +23,13 @@ static constexpr int slotSizeKb = 8;
 #define DAE_NUM_SLOTS 24
 #endif
 static constexpr int numSlots = DAE_NUM_SLOTS;
+#ifndef DAE_NUM_INSTS
+#define DAE_NUM_INSTS 512
+#endif
+#ifndef DAE_DYNAMIC_SMEM_KB
+#define DAE_DYNAMIC_SMEM_KB 212
+#endif
+static constexpr int dynamicSmemBytes = DAE_DYNAMIC_SMEM_KB * 1024;
 // Attention scratch is a physical dynamic-shared-memory region, not an
 // allocator slot.  The packed swapped-attention build places its compact
 // scratch after the allocator arena; other attention paths retain slot 24.
@@ -31,7 +38,7 @@ static constexpr int attentionScratchSlot = numSlots;
 #else
 static constexpr int attentionScratchSlot = 24;
 #endif
-static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
+static constexpr int numInsts = dae2LoadInstructions ? DAE_NUM_INSTS : 4096;
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 

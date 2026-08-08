@@ -1820,11 +1820,11 @@ sequence, while LDU1 carries the activation dependency. Keep activations on
 LDU1 and weights on LDU0 for down projection; all experimental hooks were
 removed.
 
-## Compact swapped-attention scratch unlocks 26 allocator slots
+## Compact swapped-attention scratch first unlocked 26 allocator slots
 
 The exact Llama swapped-attention task needs 2 KiB for its swizzled BF16 P
 tile and 2 KiB for an FP32 score transpose, but those representations do not
-have overlapping lifetimes. The qualified `aux_slots=1` build aliases them in
+have overlapping lifetimes. The first qualified `aux_slots=1` build aliased them in
 one 2-KiB region. All four compute warps first copy their score rows into
 registers, join through the existing compute-only barrier primitive, and only
 then overwrite the region with BF16 probabilities. Scratch can therefore live
@@ -1832,7 +1832,8 @@ above a 26-by-8-KiB allocator arena inside the unchanged 212-KiB dynamic
 shared-memory allocation. This avoids a schedule-specific attention-owner
 mask and gives every CTA two additional shared slots.
 
-Use the option only with the exact swapped-attention selective image:
+Use the option only with the exact swapped-attention selective image. The
+current option includes the 27th-slot sizing described below:
 
 ```bash
 DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops \
@@ -1921,3 +1922,75 @@ versus 2.540416 ms control (`20260808T090122Z-362816` and
 `20260808T090047Z-362540`). The full frontier prevents HBM contention but also
 discards the resident schedule's useful cross-epoch weight prefetch; all
 partition and barrier code was removed.
+
+## Right-size the exact instruction image for the 27th slot
+
+The exact S128 program uses at most 18 compute and 162 memory instructions per
+SM, so the generic 512-entry shared instruction caches were dead capacity.
+The retained exact-image build uses 192 entries, a 30-instruction margin over
+the measured maximum. This saves 7,680 bytes of static shared memory and lets
+`aux_slots=1` use a 27-by-8-KiB allocator arena, the packed 2-KiB attention
+scratch, and up to 1 KiB of base alignment inside a 219-KiB dynamic request.
+Ptxas reports 7,024 bytes of static shared memory, so the block occupies
+231,280 of the GB200's 232,448-byte opt-in limit. The image remains one CTA per
+SM and retains 96 registers, nine hardware barriers, a 96-byte stack, and zero
+spills.
+
+The dynamic request is now a compiled runtime constant exported through
+`runtime.config`, rather than a Python-only 212-KiB literal. `runtime.o`, the
+Python extension, instruction tensors, allocator slot IDs, and launch shared
+memory therefore all derive from the same opt-in build. The generic defaults
+remain 24 slots, 512 instructions, and 212 KiB; the 27-slot form is still
+restricted to the exact swapped-attention manifest.
+
+A rebuilt 26-slot control measured 2.537888 ms in
+`20260808T094320Z-398578`. Five profiling-free 27-slot internal medians were
+2.524704, 2.525824, 2.525312, 2.526656, and 2.524800 ms in jobs
+`20260808T094115Z-396940`, `20260808T094530Z-400421`,
+`20260808T094611Z-400916`, `20260808T101914Z-429988`, and
+`20260808T101954Z-430693`. Their median is 2.525312 ms, 12.576 us below the
+matched 26-slot control, 10.323% below strict vLLM's 2.816003 ms, and 9.091 us
+past the exact 10% target of 2.534403 ms.
+
+The diagnostic 27-slot trace `20260808T095032Z-404858` measured 2.660256 ms,
+versus 2.674720 ms for the matched retained 26-slot diagnostic
+`20260808T092031Z-380191`. Median allocator exhaustion fell from 648.544 to
+599.680 us and compute M2C wait from 716.480 to 707.616 us. This is a deeper
+useful prefetch window, not an instruction-dispatch saving: shrinking the
+cache makes room for one more live shared operand and moves the allocator
+frontier by 48.864 us.
+
+Final full S128 correctness passed in `20260808T101758Z-428833`; four resident
+tokens were exactly `[24748, 24748, 24748, 24748]` in
+`20260808T101838Z-429605`; all 34 schedule/attention host tests passed.
+
+## Rejected deeper and non-periodic cleanup on 27 slots
+
+Rotating the same private Q-buffer descriptors by 1, 2, 4, or 8 layers
+measured 2.528000, 2.526176, 2.527104, and 2.525920 ms in one sequential sweep
+(`20260808T095333Z-407402`). An eight-layer rotation also passed four resident
+tokens in `20260808T095513Z-409001`. The 2.080-us spread is run drift: all four
+forms issue identical traffic behind the same current-layer pre-RMS lifetime
+barrier. Keep the one-layer rotation because it is the shortest explicit
+lifetime proof.
+
+The non-periodic proof was requalified with the extra allocator slot. It used
+all 24 otherwise-free SM128--151 CTAs during LM head, advanced matching
+compute and memory VCore loops across the 32 layer-private buffers, and used a
+dedicated system barrier for exactly 2,048 completed stores. The barrier
+reached zero and four resident tokens passed in `20260808T101318Z-424975`.
+Its 2.542688-ms internal median (`20260808T101357Z-425528`) was 17.376 us
+slower than the retained five-run median: the concentrated store burst still
+competes with LM-head HBM traffic. The batch loop, barrier, debug counters, and
+depth selector were removed.
+
+This proof also established the synchronization rule for future deep cleanup:
+looping only the memory VCore leaves later load/store pairs without a compute
+consumer; looping only one track produced 65 of 128 expected arrivals in the
+two-layer diagnostic. Compute and memory loops must advance together, and the
+global completion wait must occur after every layer iteration has issued, not
+inside the first 64-store iteration. A separate attempt to move the retained
+clear dependency from the allocator to the zero-load LDU passed correctness
+but measured 2.541760 ms in `20260808T093213Z-389821`; blocking LDU0 delayed
+following weights by about 5.4 us. No additional cleanup barrier or runtime
+operator is retained.
