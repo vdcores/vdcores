@@ -1709,6 +1709,32 @@ the two-control mean, with no isolated task gain.  That marginal queue-phase
 shift does not justify expanding the minimal 12-op image to 13 opcodes.  The
 specialization, selector, benchmark path, and manifest entries were removed.
 
+### Rejected rebalanced 152-SM LM waves
+
+The retained LM head runs two 128-task waves, with four M128 output groups per
+task.  A schedule-only proof redistributed the same 256 tasks, padded rows,
+partial records, and argmax reduction into 136+120, 144+112, and 152+104
+waves.  It introduced no new opcode or larger task: the first wave simply
+admitted more physical CTAs and the second wave used correspondingly fewer.
+
+More concurrent weight streams made the first wave slower.  Against a
+2.505568-ms 301-sample control (`20260808T185046Z-792430`), second-wave-base-0
+medians were 2.509536 ms for 136+120, 2.506848 ms for 144+112, and 2.511808 ms
+for 152+104 (`20260808T185329Z-793770`, `20260808T185407Z-794169`, and
+`20260808T184957Z-791895`).  Moving the 104-task second wave to bases 24 and
+48 worsened the full-152 form to 2.513664 and 2.514208 ms
+(`20260808T185126Z-792645` and `20260808T185212Z-793142`).
+
+Matched stage profiles explain the reversal.  The retained 128-task first
+wave measured 84.032 us at p50 and 86.112 us at max, while the 144-task wave
+rose to 88.192 and 92.288 us.  Its smaller second wave recovered only
+2.464 us at p50 (63.168 versus 65.632 us), and the final LM frontier max moved
+from 227.616 to 230.944 us (`20260808T185631Z-795604` and
+`20260808T185713Z-795918`).  The 24 spare CTAs therefore do not provide free
+LM throughput: extra simultaneous weight streams lengthen the shared
+load/allocator path enough to dominate the reduced second wave.  All proof
+weight slicing, placement selectors, and schedule changes were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
