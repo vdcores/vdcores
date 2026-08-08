@@ -2095,3 +2095,52 @@ spills, and all 34 host tests passed. Independent 1,001-sample S128 restoration
 runs measured 2.523680 ms in `20260808T105450Z-461557` before the proof and
 2.520288 ms in `20260808T115311Z-510386` after all experimental code was
 removed; the latter also returned the correct one-token output.
+
+## Rejected no-clear and two-stage periodic Q cleanup
+
+The 27-slot image requalified cleanup deletion before attempting a versioned
+buffer implementation. Omitting all 64 per-layer Q-clear tasks is correct for
+one fresh Q generation: the complete S128 tensor check and token 24748 passed
+in `20260808T115803Z-514114`. It is not a reusable inference design because
+the two Q projection folds reduce into the same destination. A matched
+clear/no-clear/clear timing upper bound nevertheless measured
+2.521664/2.534912/2.524352 ms over 1,001 internal-timer samples in
+`20260808T115852Z-515205`. Deleting the pulse regressed 11.904 us against the
+control mean, so independent or versioned buffers cannot win merely by
+removing the store traffic.
+
+The diagnostic image explains the loss. With clear enabled versus disabled,
+median allocator-slot stall was 545.984 versus 574.400 us, compute M2C wait
+was 922.944 versus 937.280 us, LDU0 dependency wait was 7.520 versus
+17.600 us, and LDU1 dependency wait was 640.096 versus 673.184 us in
+`20260808T120249Z-518607`. Thus the early clear wave deliberately occupies a
+small amount of allocator/compute/store capacity and prevents a larger burst
+of speculative loads from reaching both LDU dependency frontiers. A future
+no-clear design must replace that useful pacing with a cheaper explicit
+mechanism; simply adding storage removes it.
+
+A deeper periodic proof retained every clear but split the 64-tile wave into
+two 32-tile cohorts with the original tile-to-SM ownership. The first half
+stayed behind current Q/K/V and the existing pre-attention-RMS lifetime edge;
+the second half moved after output projection, post-attention RMS, SiLU, or
+down projection. Controls at the beginning and end averaged 2.520432 ms. The
+four variants measured 2.522240, 2.520800, 2.527456, and 2.524256 ms,
+respectively, over 501 samples in `20260808T120737Z-521830`. Post-RMS is a
+0.368-us tie inside drift, while every later split loses the early pacing.
+All split/no-clear selectors and generalized clear-slice code were removed.
+
+No extra synchronization frontier was necessary for the split proof: both
+halves become safe at the same current-layer pre-RMS barrier, and delaying an
+already-safe store does not justify a new counter. The barrier budget is also
+tight. The default and system groups consume eight global counters, while 30
+layer barrier names times 33 instances consume 990; alignment makes the total
+1,000 of the VM's 1,024 counters. Naively adding one layer barrier would use
+1,032 counters after alignment and overflow. Only `bar_pre_attn_rms` uses the
+post-layer tail instance, so targeted tail-instance compaction could make room
+for exactly one additional per-layer frontier if a later buffer-generation
+design demonstrates that it is semantically required. Do not spend it on
+queue timing alone.
+
+The exact production source and 11-op, 96-register, nine-hardware-barrier
+image were restored. A final 1,001-sample S128 internal median was 2.521024 ms
+in `20260808T121039Z-524374`. Retain the one-layer-delayed 64-SM clear pulse.
