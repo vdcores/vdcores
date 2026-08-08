@@ -1451,6 +1451,33 @@ therefore insufficient when its issue shape worsens cross-track overlap. The
 specialized path, build flag, and benchmark selector were removed; retain the
 ordinary two-pack loop.
 
+### Rejected batched nonissuer GEMV cursor repair
+
+The issuer-owned M64 GEMV lets compute warp 0 dequeue operands, issue UMMA,
+wait for completion, and release slots. The other three compute warps normally
+walk the same K-tile loop only to advance their private M2C cursor and TMEM
+phase before the four-warp epilogue fence. A mechanism proof replaced those
+repeated branches and advances with one parity-preserving cursor update. It did
+not change an operand, memory instruction, UMMA group, slot lifetime, fence, or
+task result, and the exact image stayed at 96 registers, nine barriers, a
+96-byte stack, 7,024 bytes of static shared memory, and zero spills.
+
+Matched 2,001-sample task measurements showed that the skipped work was not
+critical. M4096/K4096 measured 6.880 us for the control and 6.848 us for the
+batched form (`20260808T152536Z-679039` and
+`20260808T152238Z-677492`), only 32 ns apart. The complete balanced
+M4096/K14336 down stage was exactly 20.832 us in both builds
+(`20260808T152604Z-679427` and `20260808T152305Z-677761`). At S128, the
+batched form measured 2.520064 ms versus 2.517824 ms for the freshly rebuilt
+control (`20260808T152336Z-677878` and `20260808T152633Z-679742`), a
+2.240-us regression.
+
+Nonissuer cursor maintenance executes while the issuing warp is waiting on
+the real operand/UMMA path, so removing it cannot shorten the task frontier.
+Making the three warps reach the recurring compute rendezvous earlier instead
+changes scheduler/barrier phase. The batch API, task branch, and build flag
+were removed; retain the per-tile cursor walk.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
