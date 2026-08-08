@@ -1739,3 +1739,25 @@ The diagnostic exact image uses 100 registers, nine hardware barriers, a
 restores 96 registers, nine barriers, a 96-byte stack, and zero spills; the
 fresh profiling-free S128 median was 2.575904 ms in
 `20260808T050051Z-159185`.
+
+## Late cleanup is pacing as well as work
+
+Treat deletion of a cleanup stream as a queue-scheduling change. On the
+current single-token image, deleting Q clear increased allocator-slot and
+LDU1 dependency stalls and regressed by about 5.9 us even though the stores
+themselves were small. A one-group pipelined TMA store was +1.856 us, early
+barrier-phased clear was about +125 us, and replacing clear with a
+barrier-correct fold-0 overwrite/fold-1 reduction was +104.992 us. The last
+form lost both parallel Q writeback and Q/K overlap. These mechanisms were
+removed; a versioned/no-clear design must restore the pacing explicitly and
+must budget any additional per-layer barrier IDs.
+
+The useful minimal change spreads the unchanged 64 Q-zero stores over
+SM88--151, one tile per CTA, instead of leaving two or three stores on each of
+24 late auxiliary CTAs. A 1,001-sample late24/late64/late24 sandwich measured
+2.580096/2.579488/2.582400 ms, or -1.760 us versus the control mean. The
+retained 11-op image stays at 96 registers, nine hardware barriers, a 96-byte
+stack, and zero spills. Full S128 correctness is
+`20260808T060649Z-214439`, four exact resident tokens are
+`20260808T060732Z-215233`, and the final profiling-free median is 2.572704 ms
+in `20260808T060813Z-215760`.

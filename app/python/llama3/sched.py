@@ -1254,17 +1254,19 @@ def schedule_single_token(
      for group_id in range(len(attn_out_head_groups))]
     if phased_attn_out else layerg['bar_attn_out']
   )
+  # Use one late Q-clear tile per CTA.  Spreading the unchanged stores over
+  # SM88--151 removes the auxiliary three-store cohort from the layer tail.
   clear_q = SchedClearQ(
     TmaLoad1D(matZero[:N * QKVTileM], bytes=N * QKVTileM * matZero.element_size()),
     ToSplitMCordAdapter(layerg['storeQClear'], 64, QKVTileM),
     N * QKVTileM * matZero.element_size(),
     QKVTileM,
-    aux_sms,
+    64,
     clear_wait_bars,
   )
   if not phased_attn_out:
     clear_q.bar("store", layerg['bar_q_clear'])
-  clear_q = clear_q.place(aux_sms, base_sm=num_sms)
+  clear_q = clear_q.place(64, base_sm=88)
 
   q_projection_profile_sms = (
     (*range(104), *range(num_sms, full_sms))

@@ -1260,6 +1260,28 @@ store service was only 106.080 us over the full token in
 registers, nine barriers, a 96-byte stack, and zero spills; its fresh S128
 median was 2.575904 ms in `20260808T050051Z-159185`.
 
+### Retained one-tile late Q cleanup
+
+The clear-tail profile led to four mechanism screens. Removing clear made a
+fresh token correct but regressed the median by about 5.9 us: the zero stores
+were useful pacing for descriptor-slot reuse. Allowing one pending TMA-store
+source-read group also regressed by 1.856 us, and moving clear behind phased
+attention-output barriers regressed by roughly 125 us because it displaced
+output/MLP work. A barrier-correct overwrite/reduce Q fold removed clear but
+serialized Q writeback and measured 2.685408 ms versus a 2.580416 ms control.
+All four proof paths were removed.
+
+The retained change keeps the same 64 stores and barriers but places one
+store on each CTA in SM88--151 instead of two or three on 24 auxiliary CTAs.
+A same-image late24/late64/late24 comparison measured
+2.580096/2.579488/2.582400 ms over 1,001 internal samples, a 1.760 us gain
+against the control mean. The final 11-op image remains at 96 registers,
+nine hardware barriers, a 96-byte stack, and zero spills. Full S128 tensor
+validation passed in `20260808T060649Z-214439`, four resident tokens matched
+`[24748, 24748, 24748, 24748]` in `20260808T060732Z-215233`, and the fresh
+1,001-sample internal median was 2.572704 ms in
+`20260808T060813Z-215760`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
