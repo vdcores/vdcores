@@ -1204,6 +1204,49 @@ was removed. The restored 11-op image passed all 20 runtime tests and four
 exact resident steps in `20260808T041134Z-116929`; its fresh 501-sample S128
 internal median was 2.569664 ms in `20260808T041219Z-117575`.
 
+### Rejected two-phase next-layer RMS handoff
+
+A dependency-changing RMS proof split the 4,096-element hidden row into two
+ordinary K2048 memory-op loads. Down-projection stores published independent
+low/high M-range barriers; one 128-thread RMS task cached the low half in
+registers, used a compute-group barrier before releasing that shared slot,
+then consumed the high half and preserved the production BF16 accumulation
+order. It did not create partial/finalizer tasks or a global round trip. The
+12-op image remained at 96 registers, nine hardware barriers, a 96-byte stack,
+and zero spills. Single-step tensor checks and token 24748 passed in
+`20260808T042924Z-132101`; four resident steps were exact in
+`20260808T043048Z-133145`.
+
+The layer group already uses 30 counters across 32 layers, so a 31st counter
+overflowed the memory instruction's 10-bit barrier field in
+`20260808T042354Z-127489`. Sharing head 7's Q and KV readiness counter
+reclaimed one ID. That sharing alone was neutral: 2.574784 ms versus the
+2.575456 ms production control in `20260808T042751Z-130619` and
+`20260808T042712Z-130059`.
+
+With RMS left on SMs 0--7, its 501-sample median was 2.574368 ms in
+`20260808T042838Z-131504`, only 0.416 us faster than the shared-counter
+control. Those owners still had late high-half down tasks ahead of RMS in
+their compute streams. Moving RMS to SMs 136--143 let it enter after only the
+early down work and wait for the high half inside the task, but measured
+2.577216 ms in `20260808T043127Z-133802`, a 2.432 us regression versus that
+control.
+
+The marker pair `20260808T043338Z-135482` /
+`20260808T043419Z-136106` confirms that the mechanism worked locally: the
+next-RMS absolute completion moved from about 83.8 us to 82.1 us. It did not
+move the converged boundary. Auxiliary Q-clear completion remained about
+83.7--84.4 us in the control and 83.8--84.3 us in the staged form. A ready
+memory operand therefore was not sufficient: compute-stream placement first
+hid roughly 1.7 us, but a different compute/clear track still owned layer
+progress. All split barriers, staged task/opcode, head-counter sharing, and
+selectors were removed. Future overlap work must correlate compute issue,
+both load VCore streams, slot lifetime, writeback, and synchronization on one
+timeline before specializing another consumer.
+The restored 11-op image passed all 20 runtime tests and four exact resident
+steps in `20260808T044341Z-144054`; its fresh 501-sample S128 internal median
+was 2.568672 ms in `20260808T044420Z-144879`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

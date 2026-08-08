@@ -1685,3 +1685,26 @@ must preserve the fine-grained producer order instead of making one CTA's
 weight burst denser. The restored 11-op image passed all 20 runtime tests and
 four exact resident steps in `20260808T041134Z-116929`; its fresh 501-sample
 S128 internal median was 2.569664 ms in `20260808T041219Z-117575`.
+
+## Cross-track overlap requires a shared timeline
+
+A two-phase next-layer RMS proof established an important placement limit.
+Down projection published low/high hidden-row readiness, and one RMS task
+cached the low K2048 half through the ordinary memory-op path before waiting
+for the high half. Moving that task from SMs 0--7 to SMs 136--143 advanced its
+absolute completion by about 1.7 us, but unprofiled S128 timing was neutral to
+worse and the auxiliary clear/loop frontier stayed near 84 us. The proof was
+correct and spill-free, then removed.
+
+Do not infer token overlap from a compute marker alone. For a candidate edge,
+correlate at least: compute opcode issue/completion, UMMA/TMEM drain, both LDU
+streams, allocator/shared-slot occupancy, writeback completion, and the exact
+barrier primitive/participant scope. Also inspect local instruction order: a
+globally ready operand cannot start a task that is still behind unrelated work
+in that CTA's compute stream, while moving the task may only expose a clear or
+memory-track successor. Prefer a mechanism screen and absolute per-SM
+frontiers before adding another task variant.
+The restored 11-op image retained 96 registers, nine barriers, a 96-byte
+stack, and zero spills; four resident steps were exact in
+`20260808T044341Z-144054`, and the fresh S128 internal median was 2.568672 ms
+in `20260808T044420Z-144879`.
