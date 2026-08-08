@@ -1775,6 +1775,36 @@ rose by 118.144/157.920 us and store-queue wait by 262.176 us
 the local reuse win empties the global load/compute pipeline.  Both fused
 opcodes, the 128-record reducer, schedule paths, and selectors were removed.
 
+### Retained head-pair attention-to-output readiness
+
+The M128 output schedule consumes attention results in K-aligned head groups.
+Its prior readiness split was heads `(0)`, `(1)`, and `(2--7)`, so the K1024
+partition for heads 2--3 unnecessarily waited for heads 4--7.  The default now
+publishes four groups, `(0)`, `(1)`, `(2--3)`, and `(4--7)`.  This is only a
+finer cross-stage dependency: output arithmetic, task placement, stores, and
+the 12-op compute image are unchanged.  To fit the extra group in the 10-bit
+logical-barrier encoding, head 7's Q and KV producers share one cumulative
+readiness counter; full single-step and looped correctness qualify the alias.
+
+Matched stage images show the intended overlap.  The absolute completion max
+of the heads-2/3 K1024 output partition moved from 25.856 to 24.992 us, and the
+full output frontier moved from 27.648 to 27.008 us
+(`20260808T193256Z-815721` and `20260808T193337Z-816288`).  A profiling-free
+1,001-sample control/candidate/control bracket measured
+2.510112/2.507168/2.510240 ms (`20260808T192703Z-812296`,
+`20260808T192755Z-812831`, and `20260808T193020Z-814290`), a 3.008-us gain
+against the control mean without changing a task opcode.
+
+The selector-free default passed every S128 tensor threshold and exact token
+24748 in `20260808T193616Z-817287`; four resident decode steps crossing the
+KV128 boundary exactly matched `[24748, 24748, 24748, 24748]` in
+`20260808T193658Z-817742`.  All 34 schedule/runtime host tests pass.  Its fresh
+1,001-sample internal median is 2.507712 ms in `20260808T193733Z-818093`,
+10.948% faster than strict vLLM's 2.816003-ms S128 baseline and 26.691 us past
+the 10%-lead target.  The exact production image remains at 12 compute
+opcodes, 96 registers, nine barriers, a 96-byte stack, 7,024 bytes of static
+shared memory, and zero spills.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

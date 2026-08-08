@@ -211,7 +211,14 @@ v_k_tail_heads = (3, 6, 7) if v_k_tail else ()
 if qkv_head_barriers and not fused_qk_rope:
   raise ValueError("per-head QKV barriers require fused Q/K RoPE tasks")
 phased_attn_out = os.environ.get("VDCORES_PHASED_ATTN_OUT", "1") == "1"
-attn_out_head_groups = ((0,), (1,), tuple(range(2, 8)))
+attn_out_head_groups = ((0,), (1,), (2, 3), tuple(range(4, 8)))
+
+def kv_head_bar_name(head):
+  # Reuse head 7's Q counter to stay within the 10-bit logical-barrier field.
+  if head == 7:
+    return f'bar_q_proj_head{head}'
+  return f'bar_qkv_attn_head{head}'
+
 device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
 full_sms = int(os.environ.get("VDCORES_LLAMA_SMS", str(blackwell_sms)))
 if full_sms > device_sms:
@@ -316,7 +323,8 @@ layerg.addBarrier('bar_post_attn_rms')
 if qkv_head_barriers:
   for head in range(8):
     layerg.addBarrier(f'bar_q_proj_head{head}')
-    layerg.addBarrier(f'bar_qkv_attn_head{head}')
+    if kv_head_bar_name(head) != f'bar_q_proj_head{head}':
+      layerg.addBarrier(kv_head_bar_name(head))
 if fine_mlp_barriers:
   for shard_id in range(3):
     layerg.addBarrier(f'bar_silu_in{shard_id}')
@@ -824,7 +832,7 @@ def schedule_single_token(
           rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
           hist_seq_len=token_pos,
           rope_counter_offsets=rope_counter_offsets,
-        ).bar("store", layerg[f'bar_qkv_attn_head{head}']).place(
+        ).bar("store", layerg[kv_head_bar_name(head)]).place(
           8, base_sm=64 + head * 8
         )
         for head in range(NUM_KV_HEAD)
@@ -898,7 +906,7 @@ def schedule_single_token(
         QKVAtom,
         MNK=((head * HEAD_DIM, HEAD_DIM), N, HIDDEN),
         tmas=(layerg['loadVW'], layerg['loadRMSLayer'], v_store),
-      ).bar("store", layerg[f'bar_qkv_attn_head{head}']).place(
+      ).bar("store", layerg[kv_head_bar_name(head)]).place(
         8,
         base_sm=(
           104 + v_k_tail_heads.index(head) * 8
@@ -932,7 +940,7 @@ def schedule_single_token(
       if qkv_head_barriers else None
     ),
     kv_head_bars=(
-      [layerg[f'bar_qkv_attn_head{head}'] for head in range(NUM_KV_HEAD)]
+      [layerg[kv_head_bar_name(head)] for head in range(NUM_KV_HEAD)]
       if qkv_head_barriers else None
     ),
     o_head_bars=(
