@@ -2175,6 +2175,16 @@ and their reduction stores still precede the final RMS frontier. The result is
 cross-stage path balancing, not a lower standalone GEMV time. It needs no new
 barrier, descriptor, compute operator, or runtime case.
 
+The post-retention multi-track audit also identifies the affected resource
+tail. Against the matched pre-offload diagnostic in
+`20260808T120249Z-518607`, maximum compute M2C wait fell from 1,158.880 to
+1,040.608 us, maximum allocator-slot stall from 806.848 to 682.624 us, and
+maximum LDU1 dependency wait from 956.896 to 817.088 us in
+`20260808T123230Z-542417`. Median values moved only slightly and sometimes in
+the opposite direction. The gain therefore comes from compressing pathological
+CTA tails across compute, shared-slot allocation, and the activation-load
+track, not from increasing average per-SM throughput.
+
 Full S128 tensor validation and token 24748 passed, and four resident decode
 steps exactly produced `[24748, 24748, 24748, 24748]`, in
 `20260808T122205Z-533609`. All 34 host schedule/attention tests pass. The final
