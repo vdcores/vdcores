@@ -1837,6 +1837,41 @@ baseline and 34.819 us past the 10%-lead target.  The exact image remains at
 12 compute opcodes, 96 registers, nine barriers, a 96-byte stack, 7,024 bytes
 of static shared memory, and zero spills.
 
+### Rejected final-down-wave spare-SM remaps
+
+A combined stage/track trace re-audited the final 104-contributor high-K down
+wave after the five output-readiness groups.  Several physical CTAs outside
+that wave finish their compute programs earlier, but the full per-SM tracks
+in `20260808T195613Z-828350` distinguish three very different histories:
+SM96--103 have high M2C and allocator pressure, SM136--143 have low store
+queue time but high LDU1 dependency time, and SM104--119 are intermediate.
+The diagnostic now accepts `VDCORES_TRACK_PROFILE_DETAIL=name[,name...]` to
+print those complete per-SM tracks.  The `down_high1` stage marker was also
+corrected to cover its actual SM0--95 and SM128--135 owners rather than the
+contiguous-but-wrong SM0--103 approximation.
+
+Two schedule proofs preserved all arithmetic, 104 releases, and logical tile
+coordinates.  Moving logical tasks 16--23 to SM136--143 measured 2.634016 ms,
+and moving tasks 16--31 to SM104--119 measured 2.580448 ms, versus a
+2.495040-ms control over 301 internal samples
+(`20260808T200013Z-830512`, `20260808T200056Z-831122`, and
+`20260808T195933Z-830348`).  An explicit physical-owner map then expressed
+each remap inside one unchanged logical task wave, ruling out extra schedule
+boundaries: the two forms still measured 2.641024 and 2.583584 ms
+(`20260808T200244Z-831988` and `20260808T200326Z-832254`).
+
+The matched track-only control/mid104 pair explains the 95.392-us profiled
+span increase (`20260808T200534Z-833460` and
+`20260808T200613Z-833764`).  Median compute M2C wait rose 96.736 us, allocator
+stall 99.872 us, LDU0 queue wait 80.288 us, LDU1 dependency wait 99.104 us,
+and store queue wait 99.264 us.  The relocated CTAs are free only on their
+compute stream; their pending load history delays the layer barrier and that
+delay propagates to every track in the next layer.  Both remaps, their
+selectors, and the unused explicit-map API were removed.  The restored exact
+production image remains 12-op/96-register/spill-free, all 34 host tests pass,
+and its fresh 301-sample median is 2.498944 ms in
+`20260808T200908Z-835733`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

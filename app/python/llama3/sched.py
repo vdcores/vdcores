@@ -1310,6 +1310,7 @@ def schedule_single_token(
     make_down_proj_high((2432, 1536)).place(96),
     make_down_proj_high((3968, 128)).place(8, base_sm=128),
   ]
+  down_high1_profile_sms = (*range(96), *range(128, 136))
   Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
@@ -1417,7 +1418,7 @@ def schedule_single_token(
     stage_profile_schedule_parts("down_high_rest_part", down_proj_high_rest),
     stage_profile_marker("down_high0", range(full_sms)),
     down_proj_high1,
-    stage_profile_marker("down_high1", range(104)),
+    stage_profile_marker("down_high1", down_high1_profile_sms),
 
     # rms for next layer
     pre_attn_rms,
@@ -1680,6 +1681,12 @@ if will_execute and track_profile:
       "VDCORES_TRACK_PROFILE=1 requires a runtime built with make track_profile=1"
     )
 
+  detailed_track_events = {
+    name.strip()
+    for name in os.environ.get("VDCORES_TRACK_PROFILE_DETAIL", "").split(",")
+    if name.strip()
+  }
+
   track_slots = {
     "compute_m2c_wait_us": 96,
     "alloc_slot_stall_us": 99,
@@ -1706,6 +1713,9 @@ if will_execute and track_profile:
       f"p90={float(torch.quantile(values, 0.9)):.3f},"
       f"max={values_us.max():.3f}] tail_sms={tail_sms}"
     )
+    if name in detailed_track_events:
+      detail = ",".join(f"{sm}:{value:.3f}" for sm, value in enumerate(values_us))
+      print(f"[track-profile-detail] {name}={detail}")
 
   count_slots = {
     "compute_m2c_calls": 97,
