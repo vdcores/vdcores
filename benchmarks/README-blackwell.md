@@ -1179,6 +1179,31 @@ The restored 11-op image passed all 20 runtime tests and four resident greedy
 steps in `20260808T034403Z-94356`; its fresh 501-sample S128 internal median
 was 2.570208 ms in `20260808T034444Z-95073`.
 
+### Rejected same-owner auxiliary up pairing
+
+A narrow paired-M64 task reused each normalized-activation B tile only for two
+up outputs already serialized on the same CTA and feeding the same MLP shard.
+Both outputs retained independent accumulators, their original BF16 order, two
+TMA stores, and two barrier releases. The selectable image stayed at 96
+registers/nine barriers/zero spills, and four resident steps were exact in
+`20260808T035827Z-106651`.
+
+| Scope | Controls (ms) | Paired (ms) | Delta |
+| --- | ---: | ---: | ---: |
+| Auxiliary shards 1 and 2 | 2.568832 / 2.572832 | 2.573824 | +2.992 us |
+| Critical shard 2 only | 2.572832 / 2.569152 | 2.572832 | +1.840 us |
+
+The marker run `20260808T040245Z-110233` showed a genuine local improvement:
+the slow auxiliary prefix became 0.5--2.0 us earlier and its shard-SiLU
+frontier improved about 1.2 us. The complete layer frontier was unchanged
+(84.416 versus 84.288 us control), because the denser paired weight issue and
+longer B-slot lifetime delayed concurrent main/down traffic. This is operand
+interference, not missing CUDA/TMEM compute throughput, so adding a helper
+warp to the paired task would not address the measured limit. All proof code
+was removed. The restored 11-op image passed all 20 runtime tests and four
+exact resident steps in `20260808T041134Z-116929`; its fresh 501-sample S128
+internal median was 2.569664 ms in `20260808T041219Z-117575`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

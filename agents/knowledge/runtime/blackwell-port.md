@@ -1647,3 +1647,41 @@ all 20 runtime tests, retained 96 registers/nine barriers/zero spills, and
 matched four repeated greedy tokens in `20260808T034403Z-94356`. Its fresh
 501-sample S128 internal median was 2.570208 ms in
 `20260808T034444Z-95073`.
+
+## Rejected same-owner auxiliary up pairing
+
+The current absolute profile in `20260808T034925Z-99210` confirmed that the
+layer boundary is already overlapped: down owners, next RMS, and auxiliary Q
+clear converge around 83.6--84.3 us, while loop progression adds only about
+0.4 us. The remaining deterministic spread inside MLP is the two- and
+three-task auxiliary up chain. A targeted paired M64 task therefore combined
+only two outputs already serialized on the same CTA and feeding the same
+2,048-row readiness shard. It retained independent M64 TMEM accumulators,
+immediate A-slot retirement, two ordinary TMA stores, and two barrier
+releases, but reused each four-tile normalized-activation B transaction.
+
+The 12-op selectable image stayed at 96 registers, nine barriers, a 96-byte
+stack, and zero spills. Four resident decode steps matched reference token
+24748 exactly in `20260808T035827Z-106651`. The full shard-1+2 pairing still
+lost: control/paired/control medians were
+2.568832/2.573824/2.572832 ms in `20260808T035909Z-107054`,
+`20260808T035948Z-107663`, and `20260808T040031Z-108397`, a 2.992 us
+regression against the control mean.
+
+The diagnostic profile in `20260808T040245Z-110233` showed that the task-local
+mechanism did work. The slow auxiliary prefix moved roughly 0.5--2.0 us
+earlier and the shard-SiLU absolute frontier improved by about 1.2 us versus
+`20260808T034925Z-99210`. The final layer frontier nevertheless changed from
+84.288 to 84.416 us. Pairing only critical shard 2 then measured 2.572832 ms
+in `20260808T040610Z-112732` versus bracketing 2.572832/2.569152 ms controls,
+a 1.840 us regression against their mean.
+
+This isolates the cost to operand scheduling rather than compute or TMEM
+drain: retaining B while issuing the second weight stream makes the local CTA
+earlier but perturbs concurrent main-tail/down traffic. An extra compute warp
+cannot repair that load/slot interference. The paired task, schedule wrapper,
+opcode, selector, and manifest entry were removed. Future cross-stage work
+must preserve the fine-grained producer order instead of making one CTA's
+weight burst denser. The restored 11-op image passed all 20 runtime tests and
+four exact resident steps in `20260808T041134Z-116929`; its fresh 501-sample
+S128 internal median was 2.569664 ms in `20260808T041219Z-117575`.
