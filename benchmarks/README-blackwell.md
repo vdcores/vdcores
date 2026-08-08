@@ -2005,6 +2005,29 @@ attention host tests pass.  Its fresh 1,001-sample profiling-free median is
 2.481248 ms in `20260808T222600Z-910497`, 11.89% faster than strict vLLM's
 2.816003-ms S128 baseline and 53.155 us beyond the 10%-lead threshold.
 
+### Rejected generic M128 x4 TMEM epilogue
+
+The register-streamed Q path benefits from four-column TMEM loads because it
+immediately consumes all four values in fused RoPE arithmetic.  Applying the
+same x4 load mechanically to the generic M128 output epilogue does not help.
+The isolated M4096/K4096, 128-owner task regressed from 6.400 to 6.432 us over
+2,001 internal samples (`20260808T223216Z-914165` and
+`20260808T223511Z-915594`).  Both forms keep the production image at 96
+registers, so this is not a register-occupancy artifact.
+
+Profiling-free resident runs were phase-sensitive: x4 measured
+2.475648/2.477792/2.479488 ms, while a rebuilt x1 control measured 2.479680 ms
+(`20260808T223611Z-916062`, `20260808T223731Z-916721`,
+`20260808T224412Z-920421`, and `20260808T224058Z-918428`).  A matched stage
+trace resolves that apparent improvement.  The output-projection p50/max
+frontier moved only 21.376/25.184 to 20.896/25.088 us, while its dependent
+post-attention RMS frontier worsened from 19.808/19.904 to
+19.936/20.192 us; final-layer max improved by only 0.064 us
+(`20260808T221637Z-905914` versus `20260808T224730Z-921986`).  The isolated
+regression and reversed dependent frontier show that the resident deltas are
+queue-phase noise.  Keep the generic M128 epilogue at x1; use x4 only in the
+fused Q/RoPE specialization where it removes a real shared-memory round trip.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

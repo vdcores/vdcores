@@ -2526,3 +2526,18 @@ The retained production image passes full S128 tensor/token checks and four
 resident KV128-crossing steps.  It remains 13-op, 96-register, nine-barrier,
 96-byte-stack, 7,024-byte-static-shared, and spill-free.  Its fresh 1,001-run
 internal median is 2.481248 ms, 11.89% faster than strict vLLM S128.
+
+## Rejected generic M128 x4 TMEM epilogue
+
+Do not infer from the fused Q/RoPE result that every M128 epilogue should use
+an x4 TMEM load.  The generic M4096/K4096 output task regresses from 6.400 to
+6.432 us when its x1 load is replaced by x4, with both selective images at 96
+registers.  Resident medians fluctuate by up to about 1.9 us in x4's favor,
+but the matched trace moves the dependent post-attention RMS p50/max later by
+0.128/0.288 us and advances the final-layer maximum by only 0.064 us.
+
+Keep the generic M128 epilogue at x1.  The Q specialization is different: its
+x4 fragment feeds four columns of fused register-only RoPE and deletes an
+unrotated shared-memory publication plus barrier.  Wider loads without such a
+consumer transformation merely change queue phase and are not a standalone
+optimization.
