@@ -2035,6 +2035,63 @@ Keep the one-layer-delayed RMS-gated cleanup. A future no-clear or deeper
 buffer-lifetime design should eliminate publication traffic rather than only
 subdivide it.
 
+## Rejected GEMV input-slot recycling
+
+An allocator-pressure proof delayed an ordinary M64N8 GEMV's TMA output
+descriptor and retained one 8-KiB physical slot from the final four-slot A
+tile after its UMMA completion. The first form made compute lane 0 bind the
+shifted descriptor to that slot. It preserved the exact image's 96 registers,
+nine hardware barriers, 96-byte stack, and zero spills, and eight consecutive
+M4096/K4096 GEMVs passed in job `20260808T112002Z-482657`. It was nevertheless
+slower in isolated 1,001-sample sandwiches: 7.072 us versus 7.008/7.008 us at
+K4096 (`20260808T112042Z-483417`) and 20.736 us versus 20.608/20.608 us at
+K14336 (`20260808T112125Z-483774`). A full S128 correctness run passed and
+returned token 24748 in `20260808T112317Z-485180`, but the exact-image
+control/variant/control medians were 2.523680/2.526624/2.527968 ms in
+`20260808T112400Z-485890`.
+
+The stronger form moved the 16-byte descriptor bind to LDU0. The deferred
+command follows the final A load on the same ordered track, so LDU0 can issue
+that TMA, overwrite its now-dead slot descriptor, and publish the normal M2C
+phase without changing the compute barrier or epilogue. This recovered the
+standalone cost: K4096 tied exactly at 6.976 us and K14336 measured 20.736 us
+versus 20.768/20.768 us controls in jobs `20260808T112824Z-489979` and
+`20260808T112901Z-490262`. Keeping the descriptor lookup inside only the rare
+deferred switch case was essential; putting its predicate on every LDU command
+slowed the whole image.
+
+Same-image schedule sweeps showed why the mechanism initially looked useful.
+On S128, none/out/down/all/none measured
+2.531744/2.533504/2.525376/2.525120/2.534400 ms in
+`20260808T113549Z-495903`. Down-only therefore gained 7.696 us against the
+control mean, while attention-output-only regressed 0.432 us. A reversed
+down/control/down run measured 2.527072/2.533728/2.526336 ms
+(`20260808T113738Z-497289`), again favoring down-only by 7.024 us. Down sits
+behind staged SiLU readiness and can use the earlier slot release for competing
+weight prefetch; the already-phased attention output does not.
+
+The decisive comparison used detached commit `078be70` and the experimental
+tree as separate compiled images under one GPU lock. The original 11-op image
+measured 2.524832/2.525120 ms around a 2.526400-ms down-only variant in
+`20260808T114112Z-500427`: the experiment was 1.424 us slower than the old
+binary mean. Reusing the existing issuer-only compute opcode instead of adding
+a twelfth dispatch case did not rescue it; old/new/old measured
+2.524992/2.529120/2.524160 ms in `20260808T114650Z-505068`, a 4.544-us
+regression. The 32-entry shifted-descriptor ring added 512 bytes of static
+shared memory (7,536 versus 7,024 bytes), and the runtime/handler footprint
+cost more globally than down scheduling recovered. All recycling opcodes,
+descriptor state, scheduler selectors, tests, and benchmark hooks were
+removed. No additional barrier is justified for this path; the existing
+LDU-owned M2C phase was already sufficient for correctness.
+
+The next cleanup study should instead compare versioned/no-clear Q buffers
+with a deeper periodic clear pipeline. Account for descriptor storage and
+barrier IDs explicitly: expand the dedicated barrier set if a buffer version
+has a real lifetime frontier, and do not place a new predicate on every LDU or
+allocator command merely to support a rare cleanup event.
+
 The restored exact 11-op image rebuilt at 96 registers/nine barriers with no
-spills, all 34 host tests passed, and a fresh 1,001-sample S128 internal median
-was 2.523680 ms in `20260808T105450Z-461557`.
+spills, and all 34 host tests passed. Independent 1,001-sample S128 restoration
+runs measured 2.523680 ms in `20260808T105450Z-461557` before the proof and
+2.520288 ms in `20260808T115311Z-510386` after all experimental code was
+removed; the latter also returned the correct one-token output.
