@@ -37,6 +37,11 @@ ifneq ($(track_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE
 endif
 
+ifneq ($(aux_slots),)
+	NVCC_FLAGS += -DDAE_NUM_SLOTS=26 -DDAE_PACKED_SWAP_ATTENTION_SCRATCH=1
+	export DAE_AUX_SLOTS := 1
+endif
+
 # Directories
 ifeq ($(debug),)
 	NVCC_FLAGS += -DNDEBUG

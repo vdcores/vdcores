@@ -23,6 +23,12 @@ if re.fullmatch(r"[0-9]{2,3}[af]?", cuda_arch) is None:
         f"Invalid DAE_CUDA_ARCH={cuda_arch!r}; expected an architecture such as 90a, 100a, or 103a"
     )
 cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
+cuda_defines = []
+if os.environ.get("DAE_AUX_SLOTS"):
+    cuda_defines.extend([
+        "-DDAE_NUM_SLOTS=26",
+        "-DDAE_PACKED_SWAP_ATTENTION_SCRATCH=1",
+    ])
 include_dirs = [
     os.path.join(this_dir, "include"),
     os.path.join(this_dir, "include", "dae"),
@@ -49,7 +55,7 @@ setup(
                     "-std=c++20",
                     "-DNDEBUG",
                     "-Xptxas=-v"
-                ],
+                ] + cuda_defines,
             },
             libraries=["cuda"],             # REQUIRED for cuTensorMap
             extra_link_args=extra_link_args,

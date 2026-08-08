@@ -74,7 +74,7 @@ void dae2(
   // TODO(zhiyuang): align this to lane 31 to avoid bank conflict?
   __shared__ int slot_avail;
   if (thread_id == 0)
-    slot_avail = (1U << numSlots) - 1; // all slots are available at the beginning. each bit represents a slot. 1 means available, 0 means occupied.
+    slot_avail = (1U << numSlots) - 1; // one bit per physical allocator slot
 
   // Init the queues
   #pragma nv_diag_suppress static_var_with_dynamic_init

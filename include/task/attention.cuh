@@ -833,7 +833,7 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode(
         float correction = 0.0f;
         if constexpr (FA4_SMEM_P) {
             data_t *p_ptr = static_cast<data_t *>(
-                get_slot_address(base, numSlots));
+                get_slot_address(base, attentionScratchSlot));
             auto sP = make_tensor(make_smem_ptr(p_ptr), layout_p);
             sm100_attention_softmax_tmem_smem_fa4<M, KV>(
                 tmem_s, cta_coord_s, sP,
@@ -863,7 +863,7 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode(
         if (tid < numThreadsPerWarp) {
             if constexpr (FA4_SMEM_P) {
                 data_t *p_ptr = static_cast<data_t *>(
-                    get_slot_address(base, numSlots));
+                    get_slot_address(base, attentionScratchSlot));
                 auto sP = make_tensor(make_smem_ptr(p_ptr), layout_p);
                 auto frag_p = cta_pv.make_fragment_A(sP);
                 #pragma unroll
@@ -1042,9 +1042,16 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
     // S and P deliberately alias the runtime's special scratch slot.  The two
     // layouts are transposed views with identical physical swizzle stacking.
     data_t *prob_ptr = static_cast<data_t *>(
-        get_slot_address(base, numSlots));
+        get_slot_address(base, attentionScratchSlot));
+#if defined(DAE_PACKED_SWAP_ATTENTION_SCRATCH)
+    // QK scores and P have disjoint lifetimes.  The score transpose is first
+    // loaded completely into registers, then the same 2-KiB region is reused
+    // for the BF16 probability tile.
+    accum_t *score_stage = reinterpret_cast<accum_t *>(prob_ptr);
+#else
     accum_t *score_stage = reinterpret_cast<accum_t *>(
         prob_ptr + cosize(layout_s));
+#endif
     auto sS = make_tensor(make_smem_ptr(prob_ptr), layout_s);
     auto sP = make_tensor(make_smem_ptr(prob_ptr), layout_p);
     auto cta_s = cta_qk.partition_C(sS);
@@ -1144,6 +1151,9 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
             scores[i] = score_stage[warp_id * KV + token];
             block_max = fmaxf(block_max, scores[i]);
         }
+#if defined(DAE_PACKED_SWAP_ATTENTION_SCRATCH)
+        __sync_compute_group(128);
+#endif
         accum_t warp_max;
         asm volatile(
             "redux.sync.max.NaN.f32 %0, %1, 0xffffffff;\n"

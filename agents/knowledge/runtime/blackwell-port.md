@@ -1819,3 +1819,50 @@ high-K, and 2.578240 ms for both. Load completion still enters one ordered M2C
 sequence, while LDU1 carries the activation dependency. Keep activations on
 LDU1 and weights on LDU0 for down projection; all experimental hooks were
 removed.
+
+## Compact swapped-attention scratch unlocks 26 allocator slots
+
+The exact Llama swapped-attention task needs 2 KiB for its swizzled BF16 P
+tile and 2 KiB for an FP32 score transpose, but those representations do not
+have overlapping lifetimes. The qualified `aux_slots=1` build aliases them in
+one 2-KiB region. All four compute warps first copy their score rows into
+registers, join through the existing compute-only barrier primitive, and only
+then overwrite the region with BF16 probabilities. Scratch can therefore live
+above a 26-by-8-KiB allocator arena inside the unchanged 212-KiB dynamic
+shared-memory allocation. This avoids a schedule-specific attention-owner
+mask and gives every CTA two additional shared slots.
+
+Use the option only with the exact swapped-attention selective image:
+
+```bash
+DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops \
+make aux_slots=1 pyext
+```
+
+`setup.py` receives the same build defines as `runtime.o`, and direct attention
+outputs derive their raw special-slot ID from `runtime.config.num_slots`, so
+the host encoder and resident kernel agree on the shifted special-slot range.
+Do not enable this option for a generic FA4 shared-P image without separately
+budgeting its larger scratch region.
+
+On fixed B8/S128, the 24-slot control measured 2.573248 ms. Two retained
+1,001-sample profiling-free internal medians were 2.543392 and 2.543360 ms,
+averaging 2.543376 ms. That is 29.872 us faster than control and 9.681% faster
+than strict vLLM's 2.816003 ms; the 10% target is 2.534403 ms. The exact image
+uses 96 registers, nine hardware barriers, a 96-byte stack, and zero spills.
+Full tensor correctness passed in `20260808T083254Z-337814`, four resident
+tokens passed in `20260808T083331Z-338417`, and all 34 schedule/attention host
+tests passed. A fresh profiling-free rebuild measured 2.543680 ms in
+`20260808T085133Z-353947`.
+
+The retained diagnostic run `20260808T084729Z-350511` confirms the mechanism:
+relative to the matched 24-slot trace, median allocator stall fell by 54.496
+us, compute M2C wait by 35.424 us, LDU0 queue wait by 38.048 us, and store
+queue wait by 29.472 us. LDU1 dependency wait increased by 24.128 us, so the
+extra depth is converting allocator starvation into useful prefetch while
+moving some pressure onto the activation stream.
+
+Cleanup must be requalified after this change. A later versioned/no-clear or
+deeper-clear proof should retain useful issuance pacing and model buffer
+lifetime explicitly. Add dedicated barrier IDs if required; do not overload a
+QKV, RMS, or MLP frontier merely to avoid expanding the barrier set.

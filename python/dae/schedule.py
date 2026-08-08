@@ -386,7 +386,7 @@ class SchedAttentionDecoding(Schedule):
         insts += [last_k, last_v]
         if self.direct_output:
             output = (
-                RawAddress(self.matO[req, head, ...], 24)
+                RawAddress(self.matO[req, head, ...], config.num_slots)
                 .bar(o_bar)
                 .writeback()
                 .group()

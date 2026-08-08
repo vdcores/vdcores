@@ -19,7 +19,18 @@ constexpr bool dae2LoadInstructions = true;
 constexpr bool dae2M2CObserverWait = DAE_M2C_OBSERVER_WAIT != 0;
 
 static constexpr int slotSizeKb = 8;
-static constexpr int numSlots = 24;
+#ifndef DAE_NUM_SLOTS
+#define DAE_NUM_SLOTS 24
+#endif
+static constexpr int numSlots = DAE_NUM_SLOTS;
+// Attention scratch is a physical dynamic-shared-memory region, not an
+// allocator slot.  The packed swapped-attention build places its compact
+// scratch after the allocator arena; other attention paths retain slot 24.
+#if defined(DAE_PACKED_SWAP_ATTENTION_SCRATCH)
+static constexpr int attentionScratchSlot = numSlots;
+#else
+static constexpr int attentionScratchSlot = 24;
+#endif
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
