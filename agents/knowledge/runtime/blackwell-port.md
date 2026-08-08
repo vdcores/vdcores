@@ -1782,3 +1782,25 @@ also consumes scarce per-layer counter IDs; if a future design needs more
 frontiers, expand the barrier model explicitly and require a moved whole-layer
 boundary, not only an earlier local marker. All staged-RMS machinery was
 removed.
+
+## Q storage is already layer-private; cleanup is still schedule state
+
+The Llama schedule already owns one Q allocation per layer. A token-end batch
+proof therefore removed every per-layer clear and had 24 auxiliary CTAs clean
+all 32 buffers while the main CTAs ran the LM head. A dedicated system barrier
+counted all 2,048 completed TMA stores before reuse; this is the correct way to
+expand synchronization rather than overloading a per-layer counter. The proof
+passed S128 correctness in `20260808T071429Z-270421`, but measured
+2.586240 ms versus 2.572544/2.572512 ms controls, +13.712 us. The barrier made
+the tail visible, while deleting periodic clear changed allocator/LDU pacing.
+
+A one-layer-delay proof retained one cleanup pulse per layer. Its descriptor
+order was rotated so layer L cleared L-1, current pre-attention RMS readiness
+provided the safe dependency, and SM88--151 executed cleanup concurrently with
+attention. It passed full S128 correctness and four resident-token reuse in
+`20260808T071853Z-274287` and `20260808T072416Z-278446`. Narrowing cleanup to
+24 auxiliary CTAs or moving it to SM64--127 was worse. The best placement
+initially appeared about 2.2 us faster, but a clean final
+control/delayed/control run was 2.571104/2.571904/2.572416 ms, making delayed
+0.144 us slower than the control mean. Cleanup location affects several
+tracks, and deltas below drift must not be retained. Both proofs were removed.

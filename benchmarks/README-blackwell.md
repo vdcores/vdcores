@@ -1302,6 +1302,31 @@ to SM128 or later also lost up to 9.216 us. Extra producer frontiers and
 compute barriers therefore do not buy a stable boundary gain; all opcodes,
 schedule hooks, barrier sharing, and selectors were removed.
 
+### Rejected deeper Q-clean pipelines
+
+The existing schedule already allocates a private Q buffer for every layer,
+so two proofs used that lifetime directly. First, all 2,048 layer/tile stores
+were batched onto SM128--151 beside the main-SM LM head. A new system barrier
+counted completed stores and gated buffer reuse. Full S128 correctness passed
+in `20260808T071429Z-270421`, but control/batch/control measured
+2.572544/2.586240/2.572512 ms (`20260808T071513Z-270969`,
+`20260808T071550Z-271454`, `20260808T071627Z-272083`): +13.712 us. Removing
+the per-layer cleanup pulses lost useful allocator/load pacing, and the batch
+left a token-end tail despite LM-head overlap.
+
+Second, each layer cleared the preceding layer's rotated Q descriptor after
+current Q/K/V projection. It waited on current pre-attention RMS readiness,
+then ran one tile per CTA on SM88--151 concurrently with attention, preserving
+the original store count and cadence without another barrier. Full S128
+correctness passed in `20260808T071853Z-274287`; four resident tokens matched
+`[24748] * 4` in `20260808T072416Z-278446`. Placement screens favored the
+64-CTA SM88--151 form over 24 auxiliary CTAs, 48 tail CTAs, or SM64--127, but
+its apparent 2.2 us gain did not survive the final minimal-code sandwich:
+control/delayed/control was 2.571104/2.571904/2.572416 ms in
+`20260808T072636Z-280421`, `20260808T072714Z-281051`, and
+`20260808T072755Z-281318`, or +0.144 us versus the control mean. Both deep
+pipelines and all selectors were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
