@@ -1036,6 +1036,30 @@ adapters, four half schedules, and selector were removed.
 The restored retained schedule measured a fresh 2.568928 ms in
 `20260808T013929Z-4185130`, 8.77% ahead of the strict vLLM baseline.
 
+### Absolute stage frontiers and rejected V remapping
+
+Per-SM marker times have two useful origins.  `frontier_us` remains relative
+to that SM's own layer-start marker, while `absolute_us` is relative to the
+earliest layer start across the resident grid.  The latter is required for
+placement decisions because different CTAs enter a layer at different times.
+`VDCORES_STAGE_PROFILE_DETAIL=name[,name...]` now prints both without adding
+an opcode or executing in the profiling-disabled production image.
+
+The absolute profile in `20260808T014257Z-4187811` showed Q completion
+balanced at about 11.4--12.6 us.  K heads 5--7 completed around 9.4 us, versus
+roughly 15 us for heads 0--4, so V heads 5/6/7 were tested on the three K-only
+groups in place of the retained 3/6/7 set.  The alternate mapping passed every
+S128 tensor threshold and exact token 24748 in
+`20260808T014527Z-4190044`.
+
+It did not improve the converged frontier.  On the identical 13-op marker
+image, a 301-sample control/alternate/control sequence measured
+2.578112/2.578880/2.579136 ms in `20260808T014357Z-4188846`,
+`20260808T014605Z-4190577`, and `20260808T014648Z-4191076`.  The alternate
+lies inside control drift, so production retains heads 3/6/7.  Component
+readiness is not sufficient when the head's attention/output chain is limited
+by a different owner.
+
 ### Rejected parked light-compute warps
 
 A selectable runtime prototype added one or two compute-only helper warps

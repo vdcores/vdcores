@@ -1551,6 +1551,7 @@ if will_execute and stage_profile:
   previous_name = None
   previous_event_id = None
   layer_start_event = stage_profile_events["layer_start"][0]
+  earliest_layer_start = profile[:, layer_start_event].astype("int64").min()
   for name, (event_id, active_sms) in ordered_profile_events:
     if previous_event_id is None:
       previous_name = name
@@ -1586,11 +1587,21 @@ if will_execute and stage_profile:
       f"max={frontier_us.max():.3f}] slow_sms={slow_sms} tail_sms={tail_sms}"
     )
     if name in detailed_profile_events:
-      detail = ",".join(
+      frontier_detail = ",".join(
         f"{sm}:{frontier_us[idx]:.3f}"
         for idx, sm in enumerate(active)
       )
-      print(f"[stage-profile-detail] {name} frontier_us={detail}")
+      absolute_us = (
+        profile[active, event_id].astype("int64") - earliest_layer_start
+      ) / 1.0e3
+      absolute_detail = ",".join(
+        f"{sm}:{absolute_us[idx]:.3f}"
+        for idx, sm in enumerate(active)
+      )
+      print(
+        f"[stage-profile-detail] {name} "
+        f"frontier_us={frontier_detail} absolute_us={absolute_detail}"
+      )
     previous_name = name
     previous_event_id = event_id
 

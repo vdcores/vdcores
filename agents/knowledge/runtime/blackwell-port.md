@@ -300,6 +300,21 @@ removed.  Do not revisit epoch ordering without a mechanism that also removes
 an epilogue or overlaps an independent consumer.
 The restored exact schedule measured 2.568928 ms over 501 internal samples.
 
+Stage-detail profiling must compare timestamps to one global layer origin,
+not to each CTA's local `layer_start`.  The latter answers how long a CTA has
+been active, but it can make a late-entering owner look artificially fast.
+`VDCORES_STAGE_PROFILE_DETAIL` therefore reports both `frontier_us` (local)
+and `absolute_us` (relative to the earliest layer start).  On the retained
+QKV map, absolute Q completion is balanced at roughly 11.4--12.6 us; K heads
+5--7 complete near 9.4 us while K heads 0--4 complete near 15 us.
+
+That correction motivated a valid heads-5/6/7 V-placement check.  With the
+same explicit RMS acquires as production, full S128 correctness passed, but a
+same-image 301-sample control/variant/control sequence measured
+2.578112/2.578880/2.579136 ms.  The variant lies inside the control drift and
+is rejected.  Keep V heads 3/6/7; an earlier component timestamp alone does
+not advance a converged per-head attention wave.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
