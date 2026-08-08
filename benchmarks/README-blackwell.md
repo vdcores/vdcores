@@ -2028,6 +2028,38 @@ regression and reversed dependent frontier show that the resident deltas are
 queue-phase noise.  Keep the generic M128 epilogue at x1; use x4 only in the
 fused Q/RoPE specialization where it removes a real shared-memory round trip.
 
+### Rejected tile-local fused prefix SwiGLU
+
+A task/schedule proof reused the retained M64 Up/SwiGLU epilogue for all 96
+materialized-prefix up tiles.  Each up task loaded its already-produced M64x8
+gate tile through the ordinary memory-op path, performed sigmoid while its
+final UMMA group completed, and wrote final SwiGLU directly.  It preserved the
+96 up tasks, their 152-SM placement, every down tile, and the shard-local
+readiness topology while deleting the materialized up store and the later
+coarse SiLU gate/up reloads.  The existing compute opcode kept the exact image
+at 96 registers with zero spills, and the one-step S128 output token remained
+`hello` in `20260808T230408Z-930737`.
+
+The missing overlap was on the load tracks, so both placements were measured.
+Putting the gate tile on LDU0 left it behind the 16 weight loads.  Moving only
+that tile to LDU1 let it follow the four activation commands and did not change
+the ordered M2C consumer protocol, but it did not recover the added per-tile
+SFU path.  In the control trace, the late up-prefix wave completed near
+58.6--59.6 us absolute and packed shard-2 SiLU completed by 62.048 us.  The
+LDU0 fused form completed near 63.0--63.5 us and moved next-RMS completion from
+80.800 to 83.680 us (`20260808T225623Z-926705` versus
+`20260808T230408Z-930737`).  The LDU1 form retained essentially the same
+63.360-us late-prefix maximum in `20260808T230923Z-933418`.
+
+The exact profiling-free production image rejects the mechanism decisively:
+1,001-sample internal medians were 2.509248 ms fused and 2.478496 ms control
+(`20260808T231508Z-936433` and `20260808T231614Z-937058`), a 30.752-us
+regression.  Distributing the same sigmoid work across projection owners does
+not make it free; it extends every owner before down work, whereas the packed
+eight-CTA SiLU shards exploit more instruction-level work and are already
+placed behind independent primary-tail computation.  All proof schedules,
+descriptors, and selectors were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

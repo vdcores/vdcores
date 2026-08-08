@@ -2541,3 +2541,28 @@ x4 fragment feeds four columns of fused register-only RoPE and deletes an
 unrotated shared-memory publication plus barrier.  Wider loads without such a
 consumer transformation merely change queue phase and are not a standalone
 optimization.
+
+## Rejected tile-local fused prefix SwiGLU
+
+Do not replace the packed 2,048-element prefix SiLU shards with one fused
+epilogue per M64 up tile.  The proof kept all 96 up tasks and their placement,
+loaded each materialized gate tile through the normal memory-op path, reused
+the retained Up/SwiGLU compute task, and wrote final SwiGLU directly.  It
+removed both the intermediate up store and the coarse gate/up reloads without
+adding an opcode or raising the 96-register image.
+
+Gate placement on LDU0 serialized behind 16 weight commands.  LDU1 reduced
+that queue to the four activation commands while preserving ordered M2C
+consumption, but neither form improved the frontier.  The packed control
+publishes shard 2 by 62.048 us absolute; fused publication remains around
+63.4--63.7 us, and next-RMS completion moves from 80.800 to 83.680 us in the
+matched LDU0 trace.  The LDU1 trace is essentially identical locally.
+Profiling-free internal medians are 2.509248 ms fused versus 2.478496 ms
+control, a 30.752-us loss.
+
+The coarse packed operator is valuable because each of eight owners has enough
+elementwise work to expose ILP while the primary CTAs execute the independent
+register-forwarded tail.  Spreading scalar SFU work over all projection owners
+lengthens the producer wave instead of hiding it.  Retain the separate packed
+SiLU shards unless a future design also changes which CTAs own the downstream
+work.
