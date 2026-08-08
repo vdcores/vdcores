@@ -192,6 +192,7 @@ packed_silu_shards = (
   and os.environ.get("VDCORES_PACKED_SILU_SHARDS", "1") == "1"
 )
 stage_profile = os.environ.get("VDCORES_STAGE_PROFILE", "0") == "1"
+track_profile = os.environ.get("VDCORES_TRACK_PROFILE", "0") == "1"
 interleave_down_high = (
   fine_mlp_barriers
   and os.environ.get("VDCORES_INTERLEAVE_DOWN_HIGH", "1") == "1"
@@ -1442,11 +1443,14 @@ print(
   f"q_fold1_aux_tail={int(q_fold1_aux_tail)}, "
   f"v_k_tail={int(v_k_tail)}, "
   f"phased_attn_out={int(phased_attn_out)}, "
-  f"stage_profile={int(stage_profile)}"
+  f"stage_profile={int(stage_profile)}, "
+  f"track_profile={int(track_profile)}"
 )
 dae.s()
 if will_execute:
   dae.prepare_launch()
+  if track_profile:
+    dae.profile.zero_()
 
 
 def control_flow_launch_plan():
@@ -1604,6 +1608,80 @@ if will_execute and stage_profile:
       )
     previous_name = name
     previous_event_id = event_id
+
+if will_execute and track_profile:
+  profile = dae.profile.cpu().numpy().astype("uint64")
+  track_magic = 0x4454524B50524631
+  if not (profile[:, 127] == track_magic).all():
+    raise RuntimeError(
+      "VDCORES_TRACK_PROFILE=1 requires a runtime built with make track_profile=1"
+    )
+
+  track_slots = {
+    "compute_m2c_wait_us": 96,
+    "alloc_slot_stall_us": 99,
+    "alloc_issue_barrier_us": 102,
+    "ldu0_queue_wait_us": 105,
+    "ldu0_dependency_wait_us": 107,
+    "ldu1_queue_wait_us": 110,
+    "ldu1_dependency_wait_us": 112,
+    "store_queue_wait_us": 115,
+    "store_service_us": 117,
+    "store_barrier_service_us": 118,
+  }
+  for name, event_id in track_slots.items():
+    values_us = profile[:, event_id].astype("float64") / 1.0e3
+    values = torch.from_numpy(values_us)
+    tail_order = values_us.argsort()[-min(6, len(values_us)):][::-1]
+    tail_sms = ",".join(
+      f"{sm}:{values_us[sm]:.3f}" for sm in tail_order
+    )
+    print(
+      "[track-profile] "
+      f"{name}[p10={float(torch.quantile(values, 0.1)):.3f},"
+      f"p50={float(torch.median(values)):.3f},"
+      f"p90={float(torch.quantile(values, 0.9)):.3f},"
+      f"max={values_us.max():.3f}] tail_sms={tail_sms}"
+    )
+
+  count_slots = {
+    "compute_m2c_calls": 97,
+    "compute_m2c_contended": 98,
+    "alloc_slot_stall_events": 100,
+    "alloc_slot_retries": 101,
+    "alloc_issue_barrier_contended": 103,
+    "alloc_instructions": 104,
+    "ldu0_queue_wait_calls": 106,
+    "ldu0_dependency_contended": 108,
+    "ldu0_commands": 109,
+    "ldu1_queue_wait_calls": 111,
+    "ldu1_dependency_contended": 113,
+    "ldu1_commands": 114,
+    "store_queue_wait_calls": 116,
+    "store_commands": 119,
+    "store_barrier_commands": 120,
+  }
+  for name, event_id in count_slots.items():
+    values = profile[:, event_id].astype("int64")
+    print(
+      "[track-profile-count] "
+      f"{name}[min={values.min()},p50={int(torch.median(torch.from_numpy(values)))},"
+      f"max={values.max()}]"
+    )
+
+  compute_span_ns = (
+    profile[:, 1].astype("int64") - profile[:, 0].astype("int64")
+  ).clip(min=1)
+  compute_wait_share = (
+    profile[:, 96].astype("float64") / compute_span_ns.astype("float64")
+  ) * 100.0
+  print(
+    "[track-profile-derived] "
+    f"compute_m2c_wait_share_pct[p10={float(torch.quantile(torch.from_numpy(compute_wait_share), 0.1)):.2f},"
+    f"p50={float(torch.median(torch.from_numpy(compute_wait_share))):.2f},"
+    f"p90={float(torch.quantile(torch.from_numpy(compute_wait_share), 0.9)):.2f},"
+    f"max={compute_wait_share.max():.2f}]"
+  )
 
 def print_generated_text():
   generated_token_ids = matTokens[

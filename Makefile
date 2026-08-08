@@ -33,6 +33,10 @@ ifneq ($(m2c_legacy),)
 	NVCC_FLAGS += -DDAE_M2C_OBSERVER_WAIT=0
 endif
 
+ifneq ($(track_profile),)
+	NVCC_FLAGS += -DDAE_TRACK_PROFILE
+endif
+
 # Directories
 ifeq ($(debug),)
 	NVCC_FLAGS += -DNDEBUG

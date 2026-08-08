@@ -1247,6 +1247,19 @@ The restored 11-op image passed all 20 runtime tests and four exact resident
 steps in `20260808T044341Z-144054`; its fresh 501-sample S128 internal median
 was 2.568672 ms in `20260808T044420Z-144879`.
 
+The retained diagnostic support now supplies that shared view.  Build with
+`make track_profile=1` and set `VDCORES_TRACK_PROFILE=1`; it reports per-SM
+allocator slot stalls, both LDU queue/dependency tracks, compute M2C waits,
+and store queue/service from reserved profile events.  A simultaneous stage
+trace in `20260808T045710Z-155849` showed the final Q-clear cohort on
+SM136--143 ending at 85.4--85.9 us after next RMS reached about 84.9 us, while
+the other clear cohorts ended around 80--81 us.  This is a Q-lifetime and
+placement candidate, not evidence that the store engine is saturated: median
+store service was only 106.080 us over the full token in
+`20260808T045415Z-153452`.  The profiling-free image remains unchanged at 96
+registers, nine barriers, a 96-byte stack, and zero spills; its fresh S128
+median was 2.575904 ms in `20260808T050051Z-159185`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

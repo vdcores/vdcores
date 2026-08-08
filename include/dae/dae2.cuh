@@ -187,12 +187,18 @@ void dae2(
         m2c, m2ld, minsts, &slot_avail,
         st_insts, smem_base, tma_descs, bars,
         initial_loop_counts
+#if defined(DAE_TRACK_PROFILE)
+        , sm_id, g_events
+#endif
       );
     } else if (warp_id == 1) {
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
           smem_base, tma_descs, bars
+#if defined(DAE_TRACK_PROFILE)
+          , sm_id, g_events
+#endif
         );
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
@@ -202,6 +208,9 @@ void dae2(
           m2ld[port_id], m2c,
           st_insts,
           smem_base, tma_descs, bars
+#if defined(DAE_TRACK_PROFILE)
+          , sm_id, port_id, g_events
+#endif
         );
       }
     } // End of warps

@@ -37,6 +37,41 @@ static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemo
 static constexpr int numProfileEvents = 128;
 static constexpr int numComputeLoopCounters = 4;
 
+#if defined(DAE_TRACK_PROFILE)
+// Diagnostic-only, per-SM aggregate counters.  Keep these at the high end of
+// the existing profile row so schedule-level OP_PROFILE_EVENT markers can use
+// the low IDs on the same global-timer timeline.
+enum DAETrackProfileEvent : int {
+  DAE_TRACK_COMPUTE_M2C_WAIT_NS = 96,
+  DAE_TRACK_COMPUTE_M2C_WAIT_CALLS = 97,
+  DAE_TRACK_COMPUTE_M2C_CONTENDED = 98,
+  DAE_TRACK_ALLOC_SLOT_STALL_NS = 99,
+  DAE_TRACK_ALLOC_SLOT_STALL_EVENTS = 100,
+  DAE_TRACK_ALLOC_SLOT_RETRIES = 101,
+  DAE_TRACK_ALLOC_ISSUE_BARRIER_NS = 102,
+  DAE_TRACK_ALLOC_ISSUE_BARRIER_CONTENDED = 103,
+  DAE_TRACK_ALLOC_INSTRUCTIONS = 104,
+  DAE_TRACK_LDU0_QUEUE_WAIT_NS = 105,
+  DAE_TRACK_LDU0_QUEUE_WAIT_CALLS = 106,
+  DAE_TRACK_LDU0_DEPENDENCY_WAIT_NS = 107,
+  DAE_TRACK_LDU0_DEPENDENCY_CONTENDED = 108,
+  DAE_TRACK_LDU0_COMMANDS = 109,
+  DAE_TRACK_LDU1_QUEUE_WAIT_NS = 110,
+  DAE_TRACK_LDU1_QUEUE_WAIT_CALLS = 111,
+  DAE_TRACK_LDU1_DEPENDENCY_WAIT_NS = 112,
+  DAE_TRACK_LDU1_DEPENDENCY_CONTENDED = 113,
+  DAE_TRACK_LDU1_COMMANDS = 114,
+  DAE_TRACK_STORE_QUEUE_WAIT_NS = 115,
+  DAE_TRACK_STORE_QUEUE_WAIT_CALLS = 116,
+  DAE_TRACK_STORE_SERVICE_NS = 117,
+  DAE_TRACK_STORE_BARRIER_SERVICE_NS = 118,
+  DAE_TRACK_STORE_COMMANDS = 119,
+  DAE_TRACK_STORE_BARRIER_COMMANDS = 120,
+  DAE_TRACK_MAGIC = 127,
+};
+static constexpr uint64_t daeTrackProfileMagic = 0x4454524b50524631ULL;
+#endif
+
 struct alignas(16) LoopCounters {
   uint32_t values[numComputeLoopCounters] = {};
 };

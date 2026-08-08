@@ -662,12 +662,20 @@ DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
-  DAE_UNUSED(pc, count, inst, smem_base, scratch_space, st_insts, m2c);
+  DAE_UNUSED(pc, count, inst, smem_base, scratch_space, st_insts);
   finish = true;
   c2m.template push<0, true>(thread_id, 0);
   if (thread_id == 0) {
     int event_base = sm_id * numProfileEvents;
     g_events[event_base + 1] = cuda::ptx::get_sreg_globaltimer();
+#if defined(DAE_TRACK_PROFILE)
+    g_events[event_base + DAE_TRACK_COMPUTE_M2C_WAIT_NS] = m2c.track_wait_ns;
+    g_events[event_base + DAE_TRACK_COMPUTE_M2C_WAIT_CALLS] =
+        m2c.track_wait_calls;
+    g_events[event_base + DAE_TRACK_COMPUTE_M2C_CONTENDED] =
+        m2c.track_contended_waits;
+    g_events[event_base + DAE_TRACK_MAGIC] = daeTrackProfileMagic;
+#endif
   }
   __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);
 }

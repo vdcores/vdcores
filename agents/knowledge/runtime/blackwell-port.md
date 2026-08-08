@@ -1708,3 +1708,34 @@ The restored 11-op image retained 96 registers, nine barriers, a 96-byte
 stack, and zero spills; four resident steps were exact in
 `20260808T044341Z-144054`, and the fresh S128 internal median was 2.568672 ms
 in `20260808T044420Z-144879`.
+
+## Opt-in multi-track profiling
+
+Build the selective runtime with `make track_profile=1` and run Llama with
+`VDCORES_TRACK_PROFILE=1` to collect per-SM aggregate time for slot-allocation
+retries, each LDU's command/dependency waits, compute M2C operand waits, and
+store queue/service.  The counters occupy profile events 96--120 and event
+127 carries a required image sentinel.  Schedule `OP_PROFILE_EVENT` markers
+remain in the lower range, so the stage and role views can share one
+`globaltimer` timeline.  Do not interpret store queue wait as a store stall:
+it is time for which the store VCore has no command; store service is reported
+separately.  The profiler is compile-time-only and the production image has no
+additional timer instructions or counter state.
+
+On the exact S128 schedule, full correctness and token 24748 passed in
+`20260808T045508Z-154231`.  A representative trace
+(`20260808T045415Z-153452`) measured median per-SM compute M2C wait of 985.248
+us (37.14% of the compute-thread span), allocator slot-exhaustion time of
+668.320 us, LDU0/LDU1 dependency waits of 8.224/652.608 us, and store service
+of 106.080 us.  A simultaneous stage trace
+(`20260808T045710Z-155849`) identified Q clear on SM136--143 as the final-layer
+tail: next RMS finished near 84.9 us, that clear cohort finished at
+85.4--85.9 us, and the slowest layer-loop arrival was 86.240 us.  Other clear
+cohorts finished near 80--81 us, so evaluate Q lifetime/placement before
+optimizing clear copy bandwidth.
+
+The diagnostic exact image uses 100 registers, nine hardware barriers, a
+144-byte stack, and zero spills.  Rebuilding without `track_profile=1`
+restores 96 registers, nine barriers, a 96-byte stack, and zero spills; the
+fresh profiling-free S128 median was 2.575904 ms in
+`20260808T050051Z-159185`.

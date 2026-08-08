@@ -17,25 +17,55 @@ struct SizeBoundedBarrierQueue {
   // register data
   unsigned ptr;
   uint32_t phase_parity = 0;
+#if defined(DAE_TRACK_PROFILE)
+  uint64_t track_wait_ns = 0;
+  uint64_t track_wait_calls = 0;
+  uint64_t track_contended_waits = 0;
+#endif
 
   __device__ __forceinline__ uint64_t *native_bar(unsigned slot_id) {
     return cuda::device::barrier_native_handle(barriers[slot_id]);
   }
 
   __device__ __forceinline__ void wait() {
+#if defined(DAE_TRACK_PROFILE)
+    // Observer waits run on all compute threads, but only thread zero carries
+    // the diagnostic state.  Non-observer queues are consumed by one memory
+    // lane, so that lane records its complete queue wait.
+    const bool track_wait = !ObserverWait || threadIdx.x == 0;
+    const uint64_t wait_start = track_wait
+        ? cuda::ptx::get_sreg_globaltimer()
+        : 0;
+#endif
     if constexpr (ObserverWait) {
       // The load VCore is the barrier's sole participant.  Compute threads
       // observe, rather than mutate, its phase transition.  The acquire wait
       // makes the completed TMA writes visible before the shared-memory read.
-      while (!cuda::ptx::mbarrier_try_wait_parity(
+      bool ready = cuda::ptx::mbarrier_try_wait_parity(
           cuda::ptx::sem_acquire,
           cuda::ptx::scope_cta,
           native_bar(ptr),
-          phase_parity)) {
+          phase_parity);
+#if defined(DAE_TRACK_PROFILE)
+      if (track_wait && !ready)
+        ++track_contended_waits;
+#endif
+      while (!ready) {
+        ready = cuda::ptx::mbarrier_try_wait_parity(
+            cuda::ptx::sem_acquire,
+            cuda::ptx::scope_cta,
+            native_bar(ptr),
+            phase_parity);
       }
     } else {
       barriers[ptr].arrive_and_wait();
     }
+#if defined(DAE_TRACK_PROFILE)
+    if (track_wait) {
+      track_wait_ns += cuda::ptx::get_sreg_globaltimer() - wait_start;
+      ++track_wait_calls;
+    }
+#endif
   }
 
   template<int PH = 0>
