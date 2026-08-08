@@ -2144,3 +2144,42 @@ queue timing alone.
 The exact production source and 11-op, 96-register, nine-hardware-barrier
 image were restored. A final 1,001-sample S128 internal median was 2.521024 ms
 in `20260808T121039Z-524374`. Retain the one-layer-delayed 64-SM clear pulse.
+
+## Retained critical-path down-tail offload
+
+A fresh 12-op marker trace exposed path imbalance that uniform down-task
+counts hid. In the final layer, SM96--103 reached `layers_done` at roughly
+79.7--80.1 us absolute, while auxiliary SM128--135 reached it near
+74.8--75.0 us (`20260808T121420Z-527159`). The retained schedule moves only
+the final two M64 tiles of the high-K down projection, four K folds per tile,
+from SM96--103 to SM128--135. The remaining 1,536 output rows keep their 96
+contributors on SM0--95. All 448 down contributors, output ranges, reduction
+stores, and `bar_layer` releases are unchanged.
+
+The first same-image screen measured control/SM128/SM144/control at
+2.525312/2.519808/2.572672/2.521696 ms over 501 internal-timer samples in
+`20260808T121659Z-529599`. SM128 gained 3.696 us against the control mean;
+SM144 lost 49.168 us because its apparent idle time was already compensating
+for a later producer path. On the exact 11-op image, control/SM128/control was
+2.524672/2.520192/2.524320 ms in `20260808T121938Z-531410`, a 4.304-us gain.
+The reversed SM128/control/SM128 order measured
+2.520608/2.522880/2.520608 ms in `20260808T122049Z-532592`, a 2.272-us gain.
+Across those strict runs, the control and offload medians are 2.524320 and
+2.520608 ms.
+
+The matched offload marker trace confirms the transfer rather than a task
+deletion: SM96--103 moved to about 75.6--76.1 us absolute, while SM128--135
+absorbed the eight tasks and moved to about 80.0--80.6 us
+(`20260808T122427Z-535831`). Those auxiliary CTAs do not own the LM-head wave,
+and their reduction stores still precede the final RMS frontier. The result is
+cross-stage path balancing, not a lower standalone GEMV time. It needs no new
+barrier, descriptor, compute operator, or runtime case.
+
+Full S128 tensor validation and token 24748 passed, and four resident decode
+steps exactly produced `[24748, 24748, 24748, 24748]`, in
+`20260808T122205Z-533609`. All 34 host schedule/attention tests pass. The final
+exact image remains at 96 registers, nine hardware barriers, a 96-byte stack,
+zero spills, and 7,024 bytes of static shared memory. Its fresh 1,001-sample
+profiling-free S128 internal median is 2.520352 ms in
+`20260808T122750Z-538407`: 10.499% faster than strict vLLM's 2.816003 ms and
+14.051 us beyond the 2.534403-ms 10%-lead target.

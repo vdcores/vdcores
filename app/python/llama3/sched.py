@@ -1009,10 +1009,10 @@ def schedule_single_token(
     ),
     gate_reg=reg_gate,
   ).bar("store", layerg['bar_silu_out2'])
-  # Balance the down projection over all 152 SMs.  The two low-K schedules
-  # contribute 192 fold-3 tasks and the two high-K schedules contribute 256
-  # fold-4 tasks.  Placement gives 144 SMs three K2048 tasks and eight SMs two
-  # tasks, instead of leaving the 104-SM rectangular core with a 28-tile tail.
+  # The two low-K schedules contribute 192 fold-3 tasks and the two high-K
+  # schedules contribute 256 fold-4 tasks.  Their placement uses all 152 SMs;
+  # the final high-K tail is moved separately below based on absolute-path
+  # readiness rather than uniform task count.
   down_proj_low0 = SchedGemv(LinearAtom,
     MNK=((0, 3072), N, 6144),
     fold=3,
@@ -1029,8 +1029,6 @@ def schedule_single_token(
       fold=4,
       tmas=(layerg['loadDown'], layerg['loadSiluLayer'], layerg['reduceHiddenLayer'])
     ).bar("load", layerg['bar_silu_out2']).bar("store", layerg['bar_layer'])
-
-  down_proj_high1 = make_down_proj_high((2432, 1664))
 
   if fine_mlp_barriers:
     silu_in_bars = [layerg[f'bar_silu_in{i}'] for i in range(3)]
@@ -1246,7 +1244,14 @@ def schedule_single_token(
     down_proj_high_rest = [make_down_proj_high((0, 2432)).place(152)]
     down_low_early_schedules = down_low_schedules
     down_low_late_schedules = []
-  down_proj_high1 = down_proj_high1.place(104)
+  # SM96--103 reach the layer boundary about four microseconds later than
+  # SM128--135.  Move the final two M tiles (four K folds each) to that
+  # auxiliary cohort; the tile set and all 448 reduction contributors stay
+  # unchanged, and no new readiness frontier is introduced.
+  down_proj_high1 = [
+    make_down_proj_high((2432, 1536)).place(96),
+    make_down_proj_high((3968, 128)).place(8, base_sm=128),
+  ]
   Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
