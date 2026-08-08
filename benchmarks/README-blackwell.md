@@ -1946,6 +1946,26 @@ The restored exact 13-op production image passes all 34 host tests and measures
 2.480800 ms over 1,001 internal samples in `20260808T211117Z-870460`, 11.904%
 faster than strict vLLM S128 and 53.603 us beyond the 10%-lead target.
 
+### Rejected 136--152-contributor Q waves
+
+The retained Q schedule uses 32 M128 rows with four K1024 folds, exactly 128
+contributors.  A full-SM family assigned selected rows eight K512 folds while
+leaving the others at four folds: two, four, or six eight-fold rows produce
+136, 144, or 152 total contributors.  This preserves Q arithmetic, fused
+RoPE, output reductions, and M128K128 packing while directly testing whether
+the 24 extra Blackwell CTAs can shorten the projection wave.
+
+All forms are correct, but none improves the isolated internal span.  Over
+2,001 samples, 136, 144, and 152 contributors each measured 6.912 us
+(`20260808T211955Z-874724`, `20260808T212023Z-875219`, and
+`20260808T211732Z-873646`).  The surrounding 128-contributor controls measured
+6.880 and 6.912 us (`20260808T211647Z-873179` and
+`20260808T211828Z-874243`).  More K folds trade shorter per-task activation
+loads for extra simultaneous weight streams and reduction records; the load
+and store paths reach their floor before all 152 CTAs are populated.  The
+mixed-fold benchmark selector and partitions were removed without an
+end-to-end schedule change.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

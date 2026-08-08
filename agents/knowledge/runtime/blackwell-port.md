@@ -2492,3 +2492,13 @@ and downstream queue frontier, not isolated GEMV time, decides this shape.
 Keep K/V packed M64K256 with their rank-3 stores.
 The restored Q-only M128 production image measures 2.480800 ms over 1,001
 internal samples and remains 11.904% faster than strict vLLM S128.
+
+## Rejected 136--152-contributor Q waves
+
+Using more than 128 Q contributors does not improve the M128 fused-RoPE wave.
+Assigning two, four, or six of the 32 output rows eight K512 folds and the
+remaining rows four K1024 folds yields 136, 144, or 152 tasks.  All three
+measure 6.912 us, versus 6.880/6.912 us for bracketing 128-task controls.
+The extra weight streams and reduction records consume the saved per-task
+activation interval.  Keep the four-fold, 128-owner Q topology and spend the
+remaining CTAs on genuinely independent stages instead of oversharding Q.
