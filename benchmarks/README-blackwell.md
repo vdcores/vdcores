@@ -1404,6 +1404,26 @@ padding while retaining 112 seven-group critical tasks and adding imbalance,
 so it cannot plausibly recover the measured 33 us loss.  Both proof opcodes,
 the 152-record reducer, schedule selector, and manifests were removed.
 
+### Rejected full auxiliary LM-tail expansion
+
+The retained epoch-1 remap uses only SM128--135 because they are the measured
+early auxiliary cohort.  A schedule-only upper bound also moved logical tasks
+104--119 onto SM136--151, using all 24 auxiliary SMs without changing task
+coordinates, partial records, or barrier counts.  In one same-GPU
+8/24/8/24 sequence, the 301-sample fixed-eight medians were
+2.516192/2.516224 ms and the full-auxiliary medians were
+2.518912/2.520864 ms (`20260808T144745Z-655181`).  Full auxiliary ownership
+therefore regressed 3.680 us against the fixed-eight mean.
+
+This is also the mechanism bound for dynamic epoch-1 claiming.  The extra
+CTAs can be early on the compute timeline while retaining late asynchronous
+LDU/allocator history, so a compute-side atomic queue would select owners from
+the wrong readiness signal.  A memory-VCore claimant would additionally need
+to communicate dynamic weight, vocabulary, and partial-record coordinates to
+the compute VCore.  That new handoff is not justified when simply exposing all
+24 candidates already loses.  The count selector was removed and the minimal
+fixed-eight remap retained.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
