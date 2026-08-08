@@ -1131,13 +1131,25 @@ its fresh 501-sample internal median was 2.588416 ms in
 
 ### Parked full-warpgroup base-cost qualification
 
-`make aux_warpgroup=1` builds an experimental 384-thread CTA with the normal
+An experimental build used a 384-thread CTA with the normal
 four-warp task interpreter, four parked auxiliary compute warps, and the
 unchanged four memory warps. Existing tasks and M2C/C2M barriers still have
 only 128 compute participants. A 501-sample default/aux/default S128
 sandwich measured 2.569824/2.574720/2.569120 ms, so the parked group costs
-5.248 us (0.20%) before it performs useful work. This selector is for paired
-projection-chain experiments; production builds omit it.
+5.248 us (0.20%) before it performed useful work.
+
+Paired projection chains did not repay that budget. Two independent UMMA
+issuers were neutral at K2048 (12.480 versus 12.512 us) and 0.224 us slower at
+K4096. Giving the sidecar only the completed TMEM epilogue was neutral for two
+tasks, but four tasks regressed from 26.464 to 26.880 us. A narrower
+32-producer-plus-128-consumer handoff still regressed two/four tasks by
+0.256/0.192 us. The gate/up form passed full S128 correctness and exact token
+24748, but its 2.579200 ms median was only 0.416 us inside same-image control
+drift and roughly 9.7 us slower than the neighboring production image. All
+paired-op, mailbox, barrier, schedule, and wider-runtime code was removed.
+The restored 11-op image returned to 96 registers, nine barriers, a 96-byte
+stack, and zero spills; four-token control-flow correctness passed and its
+fresh 501-sample S128 internal median was 2.569056 ms.
 
 ## Implementation references
 

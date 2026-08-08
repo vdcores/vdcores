@@ -1555,9 +1555,9 @@ spills. Full S128 validation passed every tensor threshold and exact token
 
 ## Parked full-warpgroup base cost
 
-The next sidecar experiment keeps the existing four-warp task ABI and queue
-participation exactly intact, but adds an opt-in second four-warp compute
-group with `make aux_warpgroup=1`. The auxiliary group blocks on named
+The sidecar experiment kept the existing four-warp task ABI and queue
+participation exactly intact, but added an opt-in second four-warp compute
+group. The auxiliary group blocked on named
 barrier 15 for an ordinary schedule, never interprets instructions, and never
 joins M2C or C2M. This is deliberately different from the old global T256
 runtime, where eight compute warps affected every queue phase. The default
@@ -1571,6 +1571,38 @@ S128 correctness passed every tensor threshold and exact token 24748 in
 default/aux/default sequence measured 2.569824/2.574720/2.569120 ms in
 `20260808T021121Z-17328`, `20260808T021400Z-19378`, and
 `20260808T021603Z-20972`. The parked 128 threads therefore cost 5.248 us
-against the control mean, or 0.20% of full S128. This is the fixed budget a
-paired projection-chain command must recover before the opt-in runtime can be
-selected; the production default remains unchanged.
+against the control mean, or 0.20% of full S128. This established the fixed
+budget for the projection-chain experiments below.
+
+Three coarse paired-projection organizations were then correctness checked
+with disjoint TMEM banks and independent completion ownership. First, both
+warpgroups issued independent UMMA streams. Two K2048 projection epochs were
+neutral at 12.480 versus 12.512 us, while two K4096 epochs regressed to 24.736
+versus 24.512 us in jobs `20260808T022721Z-30461`--
+`20260808T023027Z-33083`. The second organization kept UMMA issue on the
+original warpgroup and handed only a completed bank to the sidecar epilogue.
+Two-task K2048/K4096 results were again neutral at 12.384/24.640 versus
+12.416/24.672 us, but a four-task chain regressed to 26.880 from 26.464 us in
+`20260808T024706Z-47041` and `20260808T024736Z-47582`. Narrowing the repeated
+handoff to the 32-thread issuer warp plus the 128-thread epilogue group did
+not help: two and four tasks measured 12.672 and 26.656 us, regressions of
+0.256 and 0.192 us in `20260808T025053Z-50099` and
+`20260808T025024Z-49965`.
+
+The dependent gate/up form used one TMEM-ready edge and a second edge only
+where up consumed the gate tile. It passed every S128 tensor threshold and
+exact token 24748 in `20260808T024156Z-42543`. On the same selectable image,
+pair/control medians were 2.579200/2.579616 ms in
+`20260808T024234Z-43225` and `20260808T024311Z-43699`, a sub-drift 0.416 us
+apparent gain. That image used 100 registers and a 112-byte stack and remained
+about 9.7 us slower than the neighboring 256-thread production controls.
+
+The result is structural: the load VCore and one ordered UMMA stream already
+pace these M64 tasks, while every cross-warpgroup TMEM ownership transition
+costs about as much as the epilogue it can hide. Longer chains accumulate the
+transition cost. All mailbox, paired op, task splits, schedule wrappers,
+extra barriers, and the wider launch selector were removed; the minimal
+four-compute-warp runtime remains production. The restored exact image uses
+96 registers, nine barriers, a 96-byte stack, and zero spills. All 20 runtime
+tests passed; job `20260808T025743Z-55875` matched four repeated greedy tokens,
+and job `20260808T025824Z-56647` measured a 2.569056 ms S128 internal median.

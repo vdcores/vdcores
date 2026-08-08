@@ -39,6 +39,7 @@ void dae2(
 
   int sm_id = blockIdx.x;
   int thread_id = threadIdx.x;
+  int warp_id = (thread_id % 128) / 32;
   int lane_id = thread_id % 32;
 
 
@@ -114,13 +115,6 @@ void dae2(
   // reuse it across sequential compute tasks.
   __shared__ alignas(16) uint32_t tmem_base_ptr;
   __shared__ alignas(16) uint64_t tmem_mma_barrier;
-#if DAE_AUX_COMPUTE_WARPGROUP
-  // The sidecar blocks on a named barrier for the lifetime of an ordinary
-  // schedule.  A later paired-op dispatcher will add a mailbox beside this
-  // flag; keeping the skeleton separate lets us measure the CTA-shape tax
-  // before attributing any task-level speedup to it.
-  __shared__ int auxiliary_compute_done;
-#endif
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   using TmemAllocator = cute::TMEM::Allocator1Sm;
   TmemAllocator tmem_allocator{};
@@ -134,12 +128,6 @@ void dae2(
   if (thread_id == 0) {
     tmem_base_ptr = 0;
     tmem_mma_barrier = 0;
-  }
-#endif
-
-#if DAE_AUX_COMPUTE_WARPGROUP
-  if (thread_id == 0) {
-    auxiliary_compute_done = 0;
   }
 #endif
 
@@ -188,46 +176,28 @@ void dae2(
       // }
     }
     __cprint("Finished execution pc=%d", pc-1);
-#if DAE_AUX_COMPUTE_WARPGROUP
-    if (thread_id == 0) {
-      auxiliary_compute_done = 1;
-    }
-    // Release the parked sidecar so all CTA threads reach TMEM teardown.
-    __sync_aux_runtime_compute_groups();
-#endif
-#if DAE_AUX_COMPUTE_WARPGROUP
-  } else if (threadIdx.x < numRuntimeComputeThreads) {
-    // No polling and no memory-queue participation.  Explicit paired tasks
-    // will turn this into a command loop after the base overhead is known.
-    __sync_aux_runtime_compute_groups();
-    if (!auxiliary_compute_done) {
-      asm volatile("trap;");
-    }
-#endif
   } else { // memory warp group
     // TODO(zhiyuang): reduce the register usage in memory warps
     // cuda::ptx::set_max_nreg();
 
     // TODO(zhiyuang): change this to threadIdx.x predicates. will be faster than lane_id based?
-    const int memory_warp_id =
-        (thread_id - numRuntimeComputeThreads) / numThreadsPerWarp;
-    if (memory_warp_id == 0) {
+    if (warp_id == 0) {
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
         st_insts, smem_base, tma_descs, bars,
         initial_loop_counts
       );
-    } else if (memory_warp_id == 1) {
+    } else if (warp_id == 1) {
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
           smem_base, tma_descs, bars
         );
       }
-    } else if (memory_warp_id >= 2) { // LD Warps 0-1
+    } else if (warp_id >= 2) { // LD Warps 0-1
       if (lane_id == 0) {
-        int port_id = memory_warp_id - 2;
+        int port_id = warp_id - 2;
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,

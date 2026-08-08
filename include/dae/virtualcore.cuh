@@ -46,14 +46,6 @@ __device__ __forceinline__ void prefetch_l1(const T* addr) {
 
 static constexpr int __bar_cgroup = 8;
 #define __sync_compute_group(N) __sync_barrier<__bar_cgroup, N>()
-#if DAE_AUX_COMPUTE_WARPGROUP
-// Runtime-only rendezvous between the interpreter warpgroup and the parked
-// sidecar.  Task-local barriers use IDs 8 and 9, so keep this on a disjoint
-// hardware barrier.
-static constexpr int __bar_aux_runtime_cgroup = 15;
-#define __sync_aux_runtime_compute_groups() \
-  __sync_barrier<__bar_aux_runtime_cgroup, 2 * numComputeThreads>()
-#endif
 #define __activate_compute_group(N) if ((__compute_tid() >= N)) return
 
 #define __compute__ __device__
