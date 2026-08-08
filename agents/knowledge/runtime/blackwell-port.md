@@ -1994,3 +1994,47 @@ clear dependency from the allocator to the zero-load LDU passed correctness
 but measured 2.541760 ms in `20260808T093213Z-389821`; blocking LDU0 delayed
 following weights by about 5.4 us. No additional cleanup barrier or runtime
 operator is retained.
+
+## Rejected attention-snapshot Q cleanup barrier
+
+A finer lifetime proof replaced the retained next-layer RMS dependency with a
+dedicated 64-count barrier per layer. Each attention CTA published after its
+2-KiB Q TMA snapshot completed, and SM88--151 cleared the current layer's Q
+buffer while QK/softmax/PV continued. The proof used independent counters; it
+did not overload a QKV, RMS, or MLP frontier. Compacting only the unused tail
+instances of the repeated barrier group kept every referenced barrier in the
+VM's 10-bit field. The exact image remained at 96 registers, nine hardware
+barriers, a 96-byte stack, and zero spills.
+
+The first ownership form made the Q load VCore execute `arrive_and_wait()` on
+its own M2C mbarrier before decrementing the global counter. Compute remained
+an observer, so there was no invalid whole-CTA fence or memory-warp join. Full
+S128 correctness and exact token 24748 passed in
+`20260808T104306Z-451647`. A control/snapshot/control internal-timer sandwich
+measured 2.526592/2.535264/2.530080 ms in
+`20260808T104352Z-452458`, a 6.928-us regression against the control mean.
+The repeated LDU completion waits delayed later loads.
+
+The second form removed those waits. Lane 0 published through a small
+out-of-line helper immediately after the compute-side acquire observed the Q
+snapshot; the barrier address traveled in otherwise-zero Q-descriptor fields.
+An inline pointer-carrying version had first raised the image to 128 registers
+and was rejected before GPU timing. The out-of-line form restored 96 registers
+and passed full S128 correctness/token 24748 in
+`20260808T104909Z-456622`, but the matched control/snapshot/control run was
+2.526144/2.529408/2.524608 ms in `20260808T104948Z-457191`: still 4.032 us
+slower than the control mean.
+
+This establishes a publication floor for this design: all 64 disjoint Q
+snapshots still require 64 cross-SM updates per layer, or 2,048 per token.
+Splitting the wait into per-head barriers would move individual clear tiles
+earlier but would retain those updates, so expanding the barrier set around
+this losing primitive is not justified. All snapshot opcodes, descriptor
+packing, barrier compaction, schedule selectors, and helper code were removed.
+Keep the one-layer-delayed RMS-gated cleanup. A future no-clear or deeper
+buffer-lifetime design should eliminate publication traffic rather than only
+subdivide it.
+
+The restored exact 11-op image rebuilt at 96 registers/nine barriers with no
+spills, all 34 host tests passed, and a fresh 1,001-sample S128 internal median
+was 2.523680 ms in `20260808T105450Z-461557`.
