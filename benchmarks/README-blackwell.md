@@ -1683,6 +1683,32 @@ service from 118.464 to 125.664 us, and store-barrier service from 104.864 to
 repair this split-publication cadence.  All proof buffers, descriptors,
 selectors, and schedules were removed; retain the M64 materialized prefix.
 
+### Rejected M128 issuer-owned output specialization
+
+The retained output schedule already uses M128 tiles, so a mechanism proof
+compiled a dedicated issuer-owned M128N8 opcode analogous to the retained
+M64N8 path.  It changed only which compute warp dequeued operands, issued
+UMMA, and retired shared slots; tile coordinates, 152 physical owners,
+arithmetic, stores, and reductions remained identical.  Full S128 tensor
+validation and exact token 24748 passed in `20260808T184143Z-786922`.
+
+The isolated output partitions did not get faster.  Over 2,001 internal
+samples, the six-owner M768/K512 partition was exactly 3.520 us for both
+generic and issuer-owned forms (`20260808T183933Z-785794` and
+`20260808T184002Z-785978`).  The 26-owner M3328/K1024 partition was exactly
+6.240 us for both (`20260808T184030Z-786420` and
+`20260808T184056Z-786557`); issuer ownership also raised their average service
+times by 20 and 15 ns, respectively.
+
+There was a small resident-schedule effect, but it was below the threshold for
+another selected opcode.  A strict 1,001-sample generic/issuer/generic bracket
+measured 2.507392/2.506400/2.509088 ms
+(`20260808T184220Z-787569`, `20260808T184302Z-788062`, and
+`20260808T184359Z-788352`).  The issuer form is 1.840 us or 0.073% faster than
+the two-control mean, with no isolated task gain.  That marginal queue-phase
+shift does not justify expanding the minimal 12-op image to 13 opcodes.  The
+specialization, selector, benchmark path, and manifest entries were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
