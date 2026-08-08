@@ -247,6 +247,17 @@ main-path SM120--127 placement regressed by 80.384 us.  The current auxiliary
 serialization is hidden behind the gate/up tail; no shard-0 placement selector
 is retained.
 
+A grouped two-phase version of the register-forwarded 8,192-element MLP tail
+was also rejected.  It kept each fold-4 down task intact and selected one of
+two K4096 readiness counters inside `SchedGemvPhasedActivation`; sharing the
+already-KV-dominated head-7 Q/KV counter kept the static barrier IDs within
+the VM's 10-bit field.  Full tensor and four-token resident correctness passed,
+and the diagnostic image moved the next-RMS frontier about 2 us earlier, but
+the exact 11-op control/phase/control medians were
+2.588832/2.588128/2.590848 ms.  The 1.712 us gain is too small for the added
+frontier, so the complete proof was removed.  A coarse tail-first reorder was
+much worse at 2.881152 ms because it delayed the prefix gate producers.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a

@@ -641,6 +641,37 @@ SMs 136--143, initially appeared 3.504 us faster, but a 501-sample pair was
 existing paired shard-0/1 work is already hidden behind the main gate/up tail,
 so no selector or extra placement remains.
 
+### Rejected phased register-fused MLP tail
+
+Two structural forms tried to expose the independent 8,192-element
+register-forwarded gate/up tail earlier.  A coarse reorder ran the complete
+tail and 48 high-K down tasks before the materialized prefix.  It remained
+correct (job `20260807T235247Z-4098203`) but measured 2.881152 ms in
+`20260807T235328Z-4098657`: advancing the tail also delayed every prefix gate
+producer, so low-K readiness lost almost a full tail per layer.
+
+The finer form preserved the production order and split tail readiness into
+two K4096 phases.  Existing fold-4 down tasks used
+`SchedGemvPhasedActivation`, so each task selected its half's barrier inside
+one grouped memory program instead of recreating the older four-schedule
+handoff penalty.  The VM's 10-bit barrier field required sharing head 7's Q
+and KV counter; a separate screen showed that merge alone was neutral at
+2.596864 versus 2.596640 ms.  Full tensor correctness and token 24748 passed
+in `20260808T000102Z-4105406`, and four resident tokens exactly matched in
+`20260808T000655Z-4110115`.
+
+The diagnostic 13-op image initially appeared promising: a 501-sample
+control/phase/control sandwich measured 2.592608/2.586624/2.594656 ms, a
+7.008 us gain (jobs `20260808T000306Z-4107092`,
+`20260808T000345Z-4107660`, and `20260808T000428Z-4108302`).  Its marker trace
+moved the final-layer next-RMS frontier from 77.024 to 75.040 us.  The exact
+11-op production image did not confirm that magnitude: it measured
+2.588832/2.588128/2.590848 ms, only 1.712 us faster than the control mean
+(jobs `20260808T000930Z-4111870`, `20260808T001011Z-4112465`, and
+`20260808T001056Z-4113476`).  That is below the retention threshold for an
+extra per-layer frontier and a Q/KV dependency merge, so all phased-tail,
+barrier-sharing, and selector code was removed.
+
 ### Spare-SM and fusion follow-up
 
 The 24 SMs outside the 128-SM rectangular projection grid were explicitly
