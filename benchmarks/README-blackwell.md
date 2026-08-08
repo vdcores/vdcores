@@ -1327,6 +1327,25 @@ control/delayed/control was 2.571104/2.571904/2.572416 ms in
 `20260808T072755Z-281318`, or +0.144 us versus the control mean. Both deep
 pipelines and all selectors were removed.
 
+### Rejected down-projection load-order changes
+
+Two schedule-only proofs separated slot pressure from useful prefetch. An
+allocator-level gate blocked each down task until its SiLU input barrier was
+ready, preventing LDU0 weights from running ahead of the blocked LDU1
+activation. Against a 2.573536 ms control, gating low-K work measured
+2.587328 ms and gating high-K work measured 2.615104 ms in
+`20260808T073211Z-285531`, `20260808T073247Z-286280`, and
+`20260808T073324Z-286831`. The early weight stream is therefore productive
+overlap, not removable queue waste.
+
+The complementary proof kept that prefetch but sent the latter two of each
+four weight tiles to LDU1 after the activation command. Low-only and high-only
+forms were neutral at 2.573952/2.574400 ms; enabling both regressed to
+2.578240 ms (`20260808T073514Z-288238`, `20260808T073551Z-289022`,
+`20260808T073627Z-289737`). Both LDUs still feed one ordered M2C/UMMA stream,
+and extra weight traffic on LDU1 interferes with the dependency-bearing
+activation path. All gates, port hooks, and selectors were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

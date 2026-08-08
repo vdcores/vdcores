@@ -1804,3 +1804,18 @@ initially appeared about 2.2 us faster, but a clean final
 control/delayed/control run was 2.571104/2.571904/2.572416 ms, making delayed
 0.144 us slower than the control mean. Cleanup location affects several
 tracks, and deltas below drift must not be retained. Both proofs were removed.
+
+## Preserve early down weights on LDU0
+
+High allocator-slot and LDU1 dependency times do not imply that weights should
+wait behind activation readiness. An allocator `IssueBarrier` before low-K or
+high-K down work measured 2.587328/2.615104 ms versus a 2.573536 ms control.
+The existing LDU0 weight stream is hiding the SiLU producer edge; a strict
+same-track order exposes 13.8--41.6 us instead of removing a bubble.
+
+Using more concurrency did not help either. Sending weight tiles 2--3 of each
+four-tile group to LDU1 measured 2.573952 ms for low-K, 2.574400 ms for
+high-K, and 2.578240 ms for both. Load completion still enters one ordered M2C
+sequence, while LDU1 carries the activation dependency. Keep activations on
+LDU1 and weights on LDU0 for down projection; all experimental hooks were
+removed.
