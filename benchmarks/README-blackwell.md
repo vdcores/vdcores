@@ -1911,6 +1911,41 @@ selector-free 1,001-sample internal median is 2.474624 ms in
 `20260808T203214Z-849046`, 12.123% faster than strict vLLM's 2.816003-ms S128
 baseline and 59.779 us beyond the 10%-lead target.
 
+### Rejected M128 K/V schedule port
+
+K and V looked favorable in isolation under the same 64-owner topology.  K's
+fused-RoPE M64/M128/M64 medians were 4.544/4.192/4.544 us over 2,001 samples
+(`20260808T203441Z-850401`, `20260808T203510Z-850531`, and
+`20260808T203542Z-850780`).  V's issuer-only-M64/M128/issuer-only-M64 bracket
+was 4.128/3.808/4.128 us (`20260808T203610Z-851202`,
+`20260808T203637Z-851616`, and `20260808T203707Z-851812`).  Both M128 tasks
+therefore shorten their standalone waves by about 7.75% while preserving
+eight contributors per head.
+
+The schedule proof packed K/V as M128K128, halved each activation request,
+and used a rank-4 KV reduction descriptor whose traversal matches the native
+`[M64, N8, M-half]` TMEM epilogue.  K-only and combined K/V forms passed full
+S128 correctness and exact token 24748 in `20260808T204525Z-856440` and
+`20260808T205335Z-860862`.  A short same-image matrix initially appeared
+positive: 1,001-sample control endpoints were 2.488960/2.488000 ms, versus
+2.486368 ms for K, 2.487936 ms for V, and 2.484128 ms for K+V
+(`20260808T204629Z-857108` through `20260808T205006Z-858989`).
+
+Longer measurement rejects that conclusion.  A 2,001-sample
+control/candidate/control bracket measured 2.481056/2.487872/2.479456 ms
+(`20260808T210133Z-865631`, `20260808T210239Z-866297`, and
+`20260808T210354Z-866798`), so M128 K+V regresses 7.616 us against the control
+mean.  Matched stage traces explain why isolated task speed does not compose:
+K and V local p50 spans each fall by roughly 0.4 us, but attention completion
+max moves from 15.520 to 15.840 us and the layer frontier max from 75.968 to
+76.256 us (`20260808T205947Z-864388` and
+`20260808T205739Z-863222`).  Reduction-store ordering and downstream queue
+convergence absorb the smaller activation loads.  The M128 KV descriptors,
+packing, selectors, and schedule changes were removed; retain M128 only for Q.
+The restored exact 13-op production image passes all 34 host tests and measures
+2.480800 ms over 1,001 internal samples in `20260808T211117Z-870460`, 11.904%
+faster than strict vLLM S128 and 53.603 us beyond the 10%-lead target.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

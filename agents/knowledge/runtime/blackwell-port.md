@@ -2474,3 +2474,21 @@ default passes full token/tensor validation and four-token KV128 crossing;
 the 13-op image stays at 96 registers with no spills.  Its final selector-free
 1,001-sample internal median is 2.474624 ms, 12.123% faster than the strict
 2.816003-ms vLLM S128 baseline.
+
+## Rejected M128 K/V schedule port
+
+Do not generalize the Q retile to K and V based only on standalone results.
+At 64 owners, M128 shortens fused K from 4.544 to 4.192 us and V from 4.128
+to 3.808 us.  A correct rank-4 KV reduction map orders the TMA box as
+`[M64, N8, M-half, sequence]`, and both K-only and K+V forms pass full S128
+correctness.
+
+The longer full-token bracket nevertheless measures
+2.481056/2.487872/2.479456 ms for M64 control/M128 K+V/M64 control, a 7.616-us
+regression against the control mean.  Matched traces show both local task
+spans improve by about 0.4 us while attention max worsens 15.520 to
+15.840 us and the layer max worsens 75.968 to 76.256 us.  The reduction-store
+and downstream queue frontier, not isolated GEMV time, decides this shape.
+Keep K/V packed M64K256 with their rank-3 stores.
+The restored Q-only M128 production image measures 2.480800 ms over 1,001
+internal samples and remains 11.904% faster than strict vLLM S128.
