@@ -1872,6 +1872,45 @@ production image remains 12-op/96-register/spill-free, all 34 host tests pass,
 and its fresh 301-sample median is 2.498944 ms in
 `20260808T200908Z-835733`.
 
+### Retained M128 fused-Q/RoPE task
+
+The Q projection now spends the same 128 physical owners on wider Blackwell
+tasks.  Each query head changes from two K2048 folds with eight M64 tasks per
+fold to four K1024 folds with four M128 tasks per fold.  Arithmetic and the
+16 readiness releases per head are unchanged.  The physical owner set also
+stays SM0--103 plus SM128--151, so the proof changes task shape and activation
+traffic without conflating the already-qualified auxiliary placement.  Each
+task keeps the same M*K weight work but loads half as much RMS activation and
+uses the native 32-datapath M128 TMEM-to-register epilogue.
+
+An isolated full-Q wave at 128 SMs measured 7.424/6.880/7.392 us for the
+M64/M128/M64 2,001-sample bracket (`20260808T201738Z-840787`,
+`20260808T201803Z-841020`, and `20260808T201830Z-841482`).  The M128 task is
+7.1--7.3% faster while remaining within the existing 128 compute threads and
+shared-slot protocol.  In the full 13-op image, a profiling-free S128
+control/candidate/control bracket measured 2.498880/2.480064/2.498816 ms
+(`20260808T202338Z-844289`, `20260808T202415Z-844615`, and
+`20260808T202453Z-845019`), a retained 18.784-us/token improvement.
+
+Matched stage profiles show why the task result survives composition.  Q
+completion p50/max moved from 9.920/12.640 to 8.256/11.808 us, and the
+per-head attention frontier max moved from 17.632 to 15.168 us
+(`20260808T202719Z-846179` and `20260808T202756Z-846500`).  Smaller Q
+activation requests therefore advance K/V/attention through the shared load
+queues instead of merely shortening an isolated compute interval.
+
+Full S128 tensor validation and exact token 24748 passed in the final
+production image in `20260808T203304Z-849354`; four resident decode steps
+across KV128 exactly
+matched `[24748, 24748, 24748, 24748]` in `20260808T202839Z-847040`.  All 34
+host tests pass.  The production kernel remains at 96 registers, nine
+barriers, a 96-byte stack, 7,024 bytes of static shared memory, and zero
+spills.  The M64 Q selector and temporary probe manifest were removed; M64
+fused RoPE remains only because K projection still uses that task.  A fresh
+selector-free 1,001-sample internal median is 2.474624 ms in
+`20260808T203214Z-849046`, 12.123% faster than strict vLLM's 2.816003-ms S128
+baseline and 59.779 us beyond the 10%-lead target.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

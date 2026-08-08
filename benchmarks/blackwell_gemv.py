@@ -10,6 +10,7 @@ from dae.instructions import (
     Gemv_M64N8,
     Gemv_M64N8IssuerOnly,
     Gemv_M64N8_ROPE_128,
+    Gemv_M128N8_ROPE_128,
     Gemv_M128N8,
     Gemv_M128N8Direct4,
     Gemv_M128N8Group4B2,
@@ -96,7 +97,7 @@ def main() -> None:
             "fused RoPE, and two-op RoPE are exclusive"
         )
     if fused_rope:
-        atom = Gemv_M64N8_ROPE_128
+        atom = {64: Gemv_M64N8_ROPE_128, 128: Gemv_M128N8_ROPE_128}.get(tile_m)
     elif grouped_output:
         atom = Gemv_M128N8Direct4
     elif grouped_reduce:
@@ -113,9 +114,9 @@ def main() -> None:
             atom = {64: Gemv_M64N8, 128: Gemv_M128N8}.get(tile_m)
     if atom is None or ((grouped_output or grouped_reduce) and tile_m != 128):
         raise ValueError("unsupported GEMV tile/group/K configuration")
-    if fused_rope and (tile_m != 64 or not tile_packed or split_m != 1):
+    if fused_rope and (tile_m not in (64, 128) or not tile_packed or split_m != 1):
         raise ValueError(
-            "GEMV_FUSED_ROPE requires GEMV_TILE_M=64, packed weights, and "
+            "GEMV_FUSED_ROPE requires GEMV_TILE_M=64/128, packed weights, and "
             "GEMV_SPLIT_M=1"
         )
     if two_op_rope and (tile_m != 64 or not tile_packed or split_m != 1):
@@ -307,6 +308,7 @@ def main() -> None:
                     (load_matrix, load_vectors, store_output),
                     RawAddress(rope_rows, 32),
                     hist_seq_len=rope_position,
+                    Atom=atom,
                 )
             elif two_op_rope:
                 reg_store = RegStore(

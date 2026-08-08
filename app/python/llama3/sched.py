@@ -471,19 +471,22 @@ def seed_prefill_kv_cache():
 ###################################
 
 QKVAtom = Gemv_M64N8IssuerOnly
+QProjAtom = Gemv_M128N8_ROPE_128 if fused_qk_rope else QKVAtom
 LinearAtom = Gemv_M64N8IssuerOnly
 OutAtom = Gemv_M128N8
 LogitsAtom = Gemv_M128N8Argmax4
 QKVTileM, _, QKVTileK = QKVAtom.MNK
+QProjTileM, _, QProjTileK = QProjAtom.MNK
 LinearTileM, _, LinearTileK = LinearAtom.MNK
 OutTileM, _, OutTileK = OutAtom.MNK
 LogitsTileM, _, LogitsTileK = LogitsAtom.MNK
 
 print(
-  f"[weights] packing QKV/down as M{LinearTileM}K{LinearTileK} and "
+  f"[weights] packing Q as M{QProjTileM}K{QProjTileK}, "
+  f"KV/down as M{LinearTileM}K{LinearTileK}, and "
   f"output as M{OutTileM}K{OutTileK} tiles"
 )
-matqWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matqWs]
+matqWs = [pack_weight_tile_major(weight, QProjTileM, QProjTileK) for weight in matqWs]
 matkWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matkWs]
 matvWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matvWs]
 matOutWs = [pack_weight_tile_major(weight, OutTileM, OutTileK) for weight in matOutWs]
@@ -531,6 +534,7 @@ defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", QKVTileM, N, t
 
 # load tmas for the same matrix for "grouped" instructions
 layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, QKVTileK * QKVAtom.n_batch, Major.K))
+layerg.addTma("loadRMSQLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, QProjTileK * QProjAtom.n_batch, Major.K))
 layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, linear_output_tma("reduce"))
 layerg.addTma("reduceHiddenOutLayer", [matHidden] * num_layers, linear_output_tma("reduce", OutTileM))
 layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K))
@@ -556,10 +560,10 @@ cord_func_MN_cord2 = partial(cord_func_MN_major_cord2, iK=-3)
 tma_builder_K = partial(build_tma_wgmma_k, iN = -3)
 cord_func_K = partial(cord_func_K_major, iN=-3)
 
-layerg.addTma("loadQW", matqWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
+layerg.addTma("loadQW", matqWs, lambda t: weight_load_tma(t, QProjTileM, QProjTileK))
 layerg.addTma("loadKW", matkWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 layerg.addTma("loadVW", matvWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
-layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, QKVTileM, Major.MN))
+layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, QProjTileM, Major.MN))
 q_clear_targets = attnQs[-1:] + attnQs[:-1]
 layerg.addTma("storeQClear", q_clear_targets, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
@@ -790,33 +794,45 @@ def schedule_single_token(
       if control_flow else []
     )
     if qkv_head_barriers:
+      q_fold_count = 4
+      q_fold_k = HIDDEN // 4
+      q_tasks_per_head = 512 // QProjTileM
+
+      def q_fold_base_sm(head, fold):
+        if fold < 2:
+          return head * 8 + fold * 4
+        second_cohort = (
+          num_sms + (head - 5) * 8
+          if q_fold1_aux_tail and head >= 5
+          else 64 + head * 8
+        )
+        return second_cohort + (fold - 2) * 4
+
       QProj = [
         SchedGemvRope(
-          MNK=((head * 512, 512), N, (fold * 2048, 2048)),
-          tmas=(layerg['loadQW'], layerg['loadRMSLayer'], layerg['storeQ']),
+          MNK=((head * 512, 512), N, (fold * q_fold_k, q_fold_k)),
+          tmas=(layerg['loadQW'], layerg['loadRMSQLayer'], layerg['storeQ']),
           rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
           hist_seq_len=token_pos,
           rope_counter_offsets=rope_counter_offsets,
+          Atom=QProjAtom,
         ).bar("load", layerg['bar_pre_attn_rms']).bar(
           "store", layerg[f'bar_q_proj_head{head}']
         ).place(
-          8,
-          base_sm=(
-            num_sms + (head - 5) * 8
-            if q_fold1_aux_tail and fold == 1 and head >= 5
-            else fold * 64 + head * 8
-          ),
+          q_tasks_per_head,
+          base_sm=q_fold_base_sm(head, fold),
         )
-        for fold in range(2)
+        for fold in range(q_fold_count)
         for head in range(NUM_KV_HEAD)
       ]
     else:
       QProj = SchedGemvRope(
         MNK=(QW, N, HIDDEN),
-        tmas=(layerg['loadQW'], layerg['loadRMSLayer'], layerg['storeQ']),
+        tmas=(layerg['loadQW'], layerg['loadRMSQLayer'], layerg['storeQ']),
         rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
         hist_seq_len=token_pos,
         rope_counter_offsets=rope_counter_offsets,
+        Atom=QProjAtom,
       ).bar("load", layerg['bar_pre_attn_rms']).bar("store", layerg['bar_q_proj'])
     QRope = []
     k_store = maybe_counter_adapter(
@@ -858,7 +874,7 @@ def schedule_single_token(
     regLoadQ = RegLoad(0)
     QProj = SchedGemv(QKVAtom,
       MNK=(QW, N, HIDDEN),
-      tmas=(layerg['loadQW'], layerg['loadRMSLayer'], regStoreQ),
+      tmas=(layerg['loadQW'], layerg['loadRMSQLayer'], regStoreQ),
     ).bar("load", layerg['bar_pre_attn_rms'])
     QRope = SchedRope(ROPE_INTERLEAVE_512,
       tmas=(

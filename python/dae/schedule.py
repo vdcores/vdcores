@@ -1130,9 +1130,10 @@ class SchedGemvRope(Schedule):
                  rope_table: RawAddress,
                  hist_seq_len: int,
                  rope_counter_offsets=None,
+                 Atom=Gemv_M64N8_ROPE_128,
                  ):
         super().__init__()
-        self.Atom = Gemv_M64N8_ROPE_128
+        self.Atom = Atom
         self.MNK = MNK
         self.tmas = tmas
 

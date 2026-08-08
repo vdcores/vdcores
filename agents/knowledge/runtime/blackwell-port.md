@@ -2454,3 +2454,23 @@ per-layer buffers cannot recover the loss: splitting each output into two
 publications moves the bubble from LDU queues to M2C/store synchronization.
 All experimental buffers, descriptors, selectors, and schedules were
 removed; retain the M64 prefix.
+
+## Retained M128 fused Q projection
+
+Q is a favorable M128 retile even though the materialized MLP prefix is not.
+Use four K1024 folds of four M128 tasks per query head instead of two K2048
+folds of eight M64 tasks.  This preserves 128 total contributors, 16 releases
+per head, and the proven SM0--103 plus SM128--151 owner set, while halving the
+RMS-activation bytes requested by each task.  Q weights need their own
+M128K128 tile-major packing and activation/output TMA descriptors; K and V
+must retain their M64K256 resources.
+
+The 2,001-sample isolated M64/M128/M64 medians are 7.424/6.880/7.392 us.
+Full S128 internal medians are 2.498880/2.480064/2.498816 ms for the matched
+control/candidate/control.  Stage profiles move Q p50/max from
+9.920/12.640 to 8.256/11.808 us and attention max from 17.632 to 15.168 us,
+showing that the smaller activation requests advance downstream queues.  The
+default passes full token/tensor validation and four-token KV128 crossing;
+the 13-op image stays at 96 registers with no spills.  Its final selector-free
+1,001-sample internal median is 2.474624 ms, 12.123% faster than the strict
+2.816003-ms vLLM S128 baseline.

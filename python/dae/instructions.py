@@ -219,6 +219,14 @@ class Gemv_M64N8_ROPE_128(ComputeInstruction):
         super().__init__(opcode=opcode.OP_GEMV_M64N8_ROPE_128, args=[kTiles, hist_len, head_dim_ofst])
 
 
+class Gemv_M128N8_ROPE_128(ComputeInstruction):
+    MNK = (128, 8, 128)
+    n_batch = 4
+
+    def __init__(self, kTiles: int, hist_len: int, head_dim_ofst: int):
+        super().__init__(opcode=opcode.OP_GEMV_M128N8_ROPE_128, args=[kTiles, hist_len, head_dim_ofst])
+
+
 class Gemv_M192N16(ComputeInstruction):
     MNK = (192, 8, 128)
 
@@ -1259,6 +1267,7 @@ __all__ = [
     "Gemm_M64N64K64",
     "Gemm_M64N128K64",
     "Gemv_M64N8_ROPE_128",
+    "Gemv_M128N8_ROPE_128",
     "Gemv_M192N16",
     "Gemv_M64N8_MMA",
     "WGMMA_64x256x64_F16",

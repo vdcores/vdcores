@@ -234,8 +234,8 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
     static_assert(N % 8 == 0 && N >= 8 && N <= 256, "Unsupported SM100 UMMA N tile");
     static_assert(K % 16 == 0, "SM100 BF16 UMMA requires K to be a multiple of 16");
     static_assert(BLoadInterval > 0, "BLoadInterval must be positive");
-    static_assert(!ApplyRope || (M == 64 && N == 8 && !Residual),
-                  "The fused RoPE epilogue requires non-residual M64N8 output");
+    static_assert(!ApplyRope || ((M == 64 || M == 128) && N == 8 && !Residual),
+                  "The fused RoPE epilogue requires non-residual M64/M128N8 output");
     static_assert(!IssuerOnly || (!Residual && !ApplyRope && M == 64 && N == 8),
                   "issuer-only proof is isolated to ordinary M64N8 GEMV");
 
