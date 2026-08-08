@@ -1060,6 +1060,30 @@ lies inside control drift, so production retains heads 3/6/7.  Component
 readiness is not sufficient when the head's attention/output chain is limited
 by a different owner.
 
+### Rejected absolute-prefix rebalance and dual-port LM loads
+
+The absolute profile also exposed why the auxiliary MLP prefix cannot simply
+be spread over otherwise earlier main CTAs.  A schedule-only proof capped the
+192 gate/up prefix tasks at two per CTA and moved the late up tasks onto
+SM0--39.  Full S128 correctness and token 24748 passed in
+`20260808T015048Z-4194191`, but the 301-sample internal median was
+2.835872 ms in `20260808T015129Z-833`.  The profile in
+`20260808T015207Z-1581` showed prefix completion improving from about 62 to
+57 us while the layer frontier worsened from about 84 to 97 us: the moved
+work ran in front of those CTAs' independent register-forwarded gate/up tail.
+The placement selector was removed.
+
+Two LM-head load-VCore variants were also rejected.  Moving the small shared
+activation load to port 1 was neutral at 2.573504 versus 2.573536 ms in
+`20260808T015734Z-5956` and `20260808T015814Z-6642`.  Splitting two of the
+four weight-group TMA streams across port 1 passed every S128 tensor threshold
+and exact token 24748 in `20260808T015932Z-7875`, but a longer
+control/variant/control sequence measured 2.573920/2.575264/2.571872 ms in
+`20260808T020011Z-8115`, `20260808T020041Z-8504`, and
+`20260808T020111Z-8907`.  The 2.368 us regression against the control mean
+shows that two TMA issuers still feed one ordered M2C/UMMA/slot-retirement
+pipeline.  All port selectors and generic schedule hooks were removed.
+
 ### Rejected parked light-compute warps
 
 A selectable runtime prototype added one or two compute-only helper warps

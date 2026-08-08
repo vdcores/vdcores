@@ -315,6 +315,23 @@ same-image 301-sample control/variant/control sequence measured
 is rejected.  Keep V heads 3/6/7; an earlier component timestamp alone does
 not advance a converged per-head attention wave.
 
+Absolute MLP timing also explains why moving the auxiliary prefix tail onto
+apparently idle main CTAs is invalid optimization accounting.  The balanced
+map reduced maximum prefix completion from roughly 62 to 57 us, but those
+extra up GEMVs then ran before the same CTAs' register-forwarded gate/up tail.
+The layer frontier moved from about 84 to 97 us and the profiling-disabled
+301-sample median regressed to 2.835872 ms.  The proof was correct and was
+removed; the present 192-prefix-task plus 256-tail-task map already minimizes
+the maximum number of projection tasks per CTA.
+
+The second load VCore does not create another LM-head consumption pipeline.
+Sending only the activation to port 1 measured 2.573504 versus 2.573536 ms.
+Splitting the last two of four weight groups across port 1 passed full S128
+correctness, but a 501-sample control/variant/control comparison measured
+2.573920/2.575264/2.571872 ms, a 2.368 us regression against the control
+mean.  Both paths were removed.  The ordered M2C stream, slot retirement, and
+one UMMA consumer remain the limiting path even with two TMA issuer warps.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
