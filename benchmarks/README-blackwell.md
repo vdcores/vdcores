@@ -1019,6 +1019,23 @@ in `20260808T013237Z-4179012`.  `VDCORES_V_K_TAIL=0` restores the prior V
 placement for A/B runs; the production image remains at 96 registers, nine
 barriers, a 96-byte stack, and zero spills.
 
+### Rejected mixed LM-head epoch order
+
+A schedule-only proof split each 65,536-row LM-head epoch into two 64-CTA
+halves.  SM0--63 traversed epoch 0 then epoch 1, while SM64--127 traversed
+epoch 1 then epoch 0.  Thus both weight halves streamed in each physical wave
+without changing the 256 direct4 tasks, partial-record indices, fused argmax,
+or final barrier count.  Full S128 correctness and exact token 24748 passed in
+`20260808T013705Z-4182901`.
+
+The reordered path measured 2.574368 ms over 501 internal samples in
+`20260808T013743Z-4183357`, versus 2.573696 ms for the ordinary epoch order in
+`20260808T013821Z-4183936`.  The 0.672 us regression shows that merely mixing
+the two HBM streams does not remove the first-epoch cost.  The coordinate
+adapters, four half schedules, and selector were removed.
+The restored retained schedule measured a fresh 2.568928 ms in
+`20260808T013929Z-4185130`, 8.77% ahead of the strict vLLM baseline.
+
 ### Rejected parked light-compute warps
 
 A selectable runtime prototype added one or two compute-only helper warps

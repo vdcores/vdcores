@@ -292,6 +292,14 @@ layer-1 V.  The valid exact-image control/variant/control medians were
 exactly, no task or barrier count changes, and `VDCORES_V_K_TAIL=0` restores
 the earlier map.
 
+Interleaving the two LM-head weight epochs across complementary 64-SM groups
+was exact but neutral: mixed/ordinary 501-sample medians were
+2.574368/2.573696 ms.  Reversing which 512 MiB half each CTA sees first does
+not eliminate a task, transfer, or frontier, so the split schedules were
+removed.  Do not revisit epoch ordering without a mechanism that also removes
+an epilogue or overlaps an independent consumer.
+The restored exact schedule measured 2.568928 ms over 501 internal samples.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
