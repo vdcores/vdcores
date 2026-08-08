@@ -1735,6 +1735,46 @@ LM throughput: extra simultaneous weight streams lengthen the shared
 load/allocator path enough to dominate the reduced second wave.  All proof
 weight slicing, placement selectors, and schedule changes were removed.
 
+### Rejected high-resource fused-eight LM task
+
+The next proof kept the retained 128 concurrent LM streams but fused each
+CTA's two four-output tasks into one eight-output task.  This doubled live
+TMEM accumulator groups, halved partial records, and removed one task
+boundary.  A direct K512 load body needs one B plus 32 A memory steps, but the
+resident memory-warp `RepeatM` window is physically encoded by 32 lanes and a
+five-bit skip count.  The first executable form therefore used K256 B batches
+and the existing 17-step repeat cadence.
+
+That K256 form passed full S128 tensor validation and exact token 24748 in
+`20260808T190807Z-802168`, and its 14-op image remained at 96 registers with
+no spills.  It nevertheless measured 2.551392 ms versus 2.507072 ms for the
+same-image two-task control over 301 samples (`20260808T190923Z-802975` and
+`20260808T190846Z-802612`), a 44.320-us regression.  Wider per-K UMMA issue
+therefore loses substantially more than the fused boundary saves.
+
+A second form explicitly spent resources to preserve the proven four-output
+cadence and K512 B traffic.  Phase 0 retained all eight K512 B slots while it
+computed output groups 0--3; phase 1 revisited those slots for groups 4--7
+before releasing them.  The fully unrolled path raised the kernel from 96 to
+206 registers, with the same nine barriers, 96-byte stack, 7,024-byte static
+shared allocation, and zero spills.  Since the 219-KiB dynamic allocation
+already limits the kernel to one CTA/SM, this was a pure higher-resource task
+test rather than an occupancy tradeoff.  It also passed full S128 validation
+and exact token 24748 in `20260808T191328Z-805075`.
+
+Long B-slot lifetime overwhelmed the saved traffic.  In the same 206-register
+image, the retained-B form measured 2.680032 ms versus 2.513024 ms for the
+ordinary control (`20260808T191443Z-805473` and
+`20260808T191406Z-805225`), a 167.008-us regression.  Matched track profiles
+showed median compute M2C wait improve by 24.672 us and total allocator/load
+commands fall by nine, but allocator stall rose 148.704 us, stall events rose
+from 358 to 562, and retries from 3,533 to 4,508.  Median LDU0/LDU1 queue wait
+rose by 118.144/157.920 us and store-queue wait by 262.176 us
+(`20260808T191709Z-806782` and `20260808T191751Z-807107`).  Eight retained
+8-KiB slots leave too little of the 27-slot arena for four-slot A tiles, so
+the local reuse win empties the global load/compute pipeline.  Both fused
+opcodes, the 128-record reducer, schedule paths, and selectors were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
