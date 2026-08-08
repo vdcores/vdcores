@@ -1565,6 +1565,29 @@ pattern also paces M2C publication and consumption. Both split-direction
 selectors were removed. Future allocator work should preserve physical slot
 order and change admission/order only when the consumer can use the operand.
 
+### Rejected fused Up/SwiGLU gate-slot reuse
+
+The fused tail's gate RegStore slot becomes payload-dead after the T2R load,
+so three proofs reused it for the up/SwiGLU output instead of allocating a
+second store slot. Copying the special-slot TMA descriptor into the gate slot
+was correct but measured 2.523040 ms with a compute-group rendezvous and
+2.522592 ms with the sufficient warp-local rendezvous, versus a fresh
+2.519104-ms control. Directly passing separate descriptor/source slots to the
+store queue was invalid because the unallocated descriptor could be
+overwritten before delayed store service; job `20260808T163532Z-716775`
+failed final-hidden/final-RMS thresholds.
+
+A lifetime-correct memory-control-warp operator recorded the gate RegStore
+mask and issued the output TMA descriptor against that occupied slot. It
+passed full correctness and kept the exact 96-register, nine-barrier,
+96-byte-stack, zero-spill image, but allocation-loop and control-op forms
+measured 2.541248 and 2.542016 ms. Matched track runs showed why: median
+allocator stall improved 553.312 to 494.080 us, but compute M2C wait worsened
+926.624 to 944.992 us and LDU0/LDU1 queue-idle time increased by
+25.696/35.808 us. The output allocation is useful admission pacing. All
+proof code was removed; do not reuse a retained slot unless consumer
+placement changes preserve the original publication cadence.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

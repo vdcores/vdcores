@@ -2314,3 +2314,39 @@ No opcode, barrier, or task arithmetic changed in either proof. All ownership
 and port selectors were removed. Use simultaneous compute and LDU timelines
 before moving work to an apparently spare SM; a completed compute program
 does not imply that its asynchronous memory queues are empty.
+
+## Rejected fused Up/SwiGLU gate-slot reuse
+
+The fused tail already keeps the gate projection in a RegStore slot, reloads
+it into compute registers, overlaps SiLU with the final independent up UMMA
+group, and allocates a second shared slot for the output TMA store. Three
+proofs tested eliminating that final allocator round trip by overwriting the
+now-dead gate payload.
+
+The first proof issued the output store through a special descriptor slot and
+copied its 16-byte `MInst` into the gate slot. Moving the required compute
+rendezvous immediately behind the gate load kept it under the outstanding
+UMMA group and restored the exact 96-register image. A compute-group barrier
+measured 2.523040 ms; narrowing it to the disjoint warp-owned tile partitions
+measured 2.522592 ms. Both lose to the fresh 2.519104-ms control. A direct
+queue encoding removed the metadata copy but was unsafe: the special
+descriptor could be overwritten after compute consumed its readiness token
+and before the store warp serviced it. Job `20260808T163532Z-716775` exceeded
+the tensor threshold at 5.112% final-hidden and 5.161% final-RMS error.
+
+The lifetime-correct proof made the memory control warp remember the gate
+RegStore's physical mask and issue the later TMA descriptor directly against
+that occupied slot. Full tensor/token correctness passed, but both an
+allocation-loop form and a narrowed control-op form measured
+2.541248/2.542016 ms. Matched track profiles explain the regression. Relative
+to control, median allocator stall fell 553.312 to 494.080 us, while compute
+M2C wait rose 926.624 to 944.992 us and LDU0/LDU1 queue-idle time rose
+1,785.504/1,855.520 to 1,811.200/1,891.328 us. The profiled kernel span grew
+2.606 to 2.630 ms (`20260808T164553Z-722556` versus
+`20260808T164755Z-723547`).
+
+The ordinary output allocation is useful admission pacing: deleting it lets
+the control/load streams advance into work the consumer cannot yet use. All
+reuse opcodes, queue formats, selectors, and schedule changes were removed.
+Future slot-lifetime work must retain the current publication cadence or move
+the corresponding consumer earlier at the same time.
