@@ -2418,3 +2418,39 @@ baseline and 27.267 us past the 2.534403-ms 10%-lead threshold.  Adding the
 M128 family makes the selective manifest 12 operators, but the resident
 kernel remains at 96 registers, nine barriers, a 96-byte stack, 7,024 bytes
 of static shared memory, and zero spills.
+
+## Rejected M128 materialized-MLP prefix
+
+The separate 6,144-row gate and up prefixes were retiled from 96 M64 full-K
+tasks to 48 M128 tiles with two K2048 folds, still 96 tasks per projection.
+This preserved physical owners, arithmetic, and weight bytes per task while
+halving each task's B activation.  Since the two folds use reduction stores,
+16 auxiliary CTAs cleared one contiguous 12-KiB token row of each output
+before attention and contributed to the post-attention-RMS readiness
+barrier.  Static clear addresses are valid across layers, but their barrier
+field must be group-relative; omitting the group flag made every later clear
+arrive on layer 0 and deadlocked the loop at layer 1.
+
+The corrected form passed full S128 tensors and token 24748 in
+`20260808T181150Z-771165`.  Moving the 16 clear CTAs to bases 104, 120, 128,
+and 136 produced 301-sample medians of 2.514752, 2.512672, 2.510784, and
+2.508192 ms.  Strict 1,001-sample candidate runs averaged 2.513216 ms
+(`20260808T181453Z-773045` and `20260808T181614Z-773686`), 2.368 us slower
+than the intervening 2.510848-ms M64 control in
+`20260808T181535Z-773247`.  A no-clear fold-1 form used only 48 tasks per
+projection and regressed sharply to 3.306528 ms
+(`20260808T181810Z-774738`), demonstrating that 16 simultaneous owners per
+2,048-row shard do not expose enough system bandwidth.
+
+Matched track images show that clear traffic is not the deciding cost.
+M128 lowered median LDU0/LDU1 queue wait from 1,764.512/1,843.008 to
+1,741.664/1,815.296 us, while compute M2C wait rose 941.408 to 989.408 us,
+allocator stall 550.656 to 561.216 us, store service 118.464 to 125.664 us,
+and store-barrier service 104.864 to 117.632 us
+(`20260808T182032Z-776155` and `20260808T182111Z-776347`).  A deliberately
+invalid no-clear timing proof left M2C wait at 987.776 us and the diagnostic
+kernel span unchanged (`20260808T182210Z-776910`).  Thus independent
+per-layer buffers cannot recover the loss: splitting each output into two
+publications moves the bubble from LDU queues to M2C/store synchronization.
+All experimental buffers, descriptors, selectors, and schedules were
+removed; retain the M64 prefix.

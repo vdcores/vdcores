@@ -1651,6 +1651,38 @@ baseline and 27.267 us beyond the 10%-lead target.  The current selective
 image has 12 compute opcodes and remains at 96 registers, nine barriers, a
 96-byte stack, 7,024 bytes of static shared memory, and zero spills.
 
+### Rejected M128 materialized-MLP prefix
+
+An analogous M128 proof retiled the separately materialized 6,144-row gate
+and up prefixes without fusing the operators.  Each projection retained its
+96 tasks as 48 M128 tiles with two K2048 folds, preserving physical owners
+and per-task weight work while halving B-activation bytes.  Because both
+folds reduce concurrently, 16 auxiliary CTAs cleared one 12-KiB token row of
+each output before attention and joined that completion with post-attention
+RMS.  The looped clear stores must carry the resource-group flag; the first
+ungrouped proof arrived only on layer 0's barrier and stalled at layer 1.
+
+The corrected path passed every S128 tensor threshold and exact token 24748
+in `20260808T181150Z-771165`.  Clear-placement medians for bases 104, 120,
+128, and 136 were 2.514752, 2.512672, 2.510784, and 2.508192 ms over 301
+samples.  The best strict 1,001-sample candidate pair averaged 2.513216 ms
+(`20260808T181453Z-773045` and `20260808T181614Z-773686`), versus 2.510848 ms
+for the intervening M64 control (`20260808T181535Z-773247`): a 2.368-us
+regression.  A no-clear fold-1 form reduced each projection to 48 tasks but
+lost system bandwidth parallelism and measured 3.306528 ms in
+`20260808T181810Z-774738`.
+
+Track profiles isolate the loss.  Relative to M64, fold-2 M128 reduced median
+LDU0/LDU1 queue wait by 22.848/27.712 us, but compute M2C wait rose from
+941.408 to 989.408 us, allocator stall from 550.656 to 561.216 us, store
+service from 118.464 to 125.664 us, and store-barrier service from 104.864 to
+117.632 us (`20260808T182032Z-776155` and
+`20260808T182111Z-776347`).  Suppressing all clears left compute M2C wait at
+987.776 us and the profiling kernel span unchanged in
+`20260808T182210Z-776910`; per-layer independent buffers therefore cannot
+repair this split-publication cadence.  All proof buffers, descriptors,
+selectors, and schedules were removed; retain the M64 materialized prefix.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
