@@ -1424,6 +1424,33 @@ the compute VCore.  That new handoff is not justified when simply exposing all
 24 candidates already loses.  The count selector was removed and the minimal
 fixed-eight remap retained.
 
+### Rejected higher-ILP shared SwiGLU shard
+
+The higher-resource task screen specialized the single-token K2048 shared
+SwiGLU shard. Each compute thread loaded both of its 128-bit gate/up packs
+before arithmetic and kept all 16 BF16 lanes live so the compiler could issue
+their fast exponentials independently. It added no threads, memory traffic,
+queue handoff, or barrier. The exact image remained at 96 registers, nine
+hardware barriers, a 96-byte stack, 7,024 bytes of static shared memory, and
+zero spills because another selected path already set the kernel-wide register
+ceiling.
+
+The mechanism worked in isolation. On one locked GB200, an in-image
+baseline/ILP/baseline/ILP comparison over 2,001 internal samples measured
+2.560/2.464/2.560/2.464 us for the complete 24-SM, three-shard B8 task in
+`20260808T150135Z-665075`, a repeatable 96-ns or 3.75% improvement with zero
+error. It did not improve the inference critical path. Two 1,001-sample ILP
+runs measured 2.520832 and 2.520992 ms around a freshly rebuilt 2.519840-ms
+control (`20260808T150234Z-665880`, `20260808T150459Z-667290`, and
+`20260808T150713Z-668575`), a 1.072-us regression against the control.
+
+The standalone launch makes the 24 identical SFU/shared-store programs the
+whole frontier; in the resident schedule their more concentrated completion
+burst competes with concurrent down-projection traffic. Shortening a task is
+therefore insufficient when its issue shape worsens cross-track overlap. The
+specialized path, build flag, and benchmark selector were removed; retain the
+ordinary two-pack loop.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
