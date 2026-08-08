@@ -1542,6 +1542,29 @@ below neighboring run movement and much smaller than the qualified fixed-eight
 gain. The profile-selected sparse mapping was removed; retain the simple
 eight-task topology rather than encoding sub-microsecond tail noise.
 
+### Rejected split-direction shared-slot allocation
+
+The 27-slot exact image occupies 231,280 of the GB200's 232,448-byte opt-in
+shared-memory limit, so another physical 8-KiB slot does not fit. A capacity
+proof instead targeted fragmentation: one-slot activations and stores were
+allocated from the high end while multi-slot GEMV weights retained low-end
+first-fit. The arena, instruction stream, queues, tasks, and barriers were
+unchanged, and the image stayed at 96 registers, nine barriers, a 96-byte
+stack, 7,024 bytes of static shared memory, and zero spills.
+
+The mechanism reduced median allocator stall from about 607 to 458 us in the
+track image, but median compute M2C wait rose from about 720 to 946 us. Its
+1,001-sample profiling-free median was 2.525664 ms in
+`20260808T160016Z-697621`. Reversing the regions so one-slot operands kept
+their low-address cadence and weights grew from the high end measured
+2.527296 ms in `20260808T160512Z-700522`. Relative to the neighboring
+2.518592-ms two-control mean, the two forms regress 7.072 and 8.704 us.
+
+Contiguous availability alone is not the objective: the production first-fit
+pattern also paces M2C publication and consumption. Both split-direction
+selectors were removed. Future allocator work should preserve physical slot
+order and change admission/order only when the consumer can use the operand.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
