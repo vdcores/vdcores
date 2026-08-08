@@ -2193,3 +2193,46 @@ zero spills, and 7,024 bytes of static shared memory. Its fresh 1,001-sample
 profiling-free S128 internal median is 2.520352 ms in
 `20260808T122750Z-538407`: 10.499% faster than strict vLLM's 2.816003 ms and
 14.051 us beyond the 2.534403-ms 10%-lead target.
+
+## Rejected numerically safe grouped-down reduction
+
+The fast grouped M128 down proof could not be retained with its BF16 fold
+reduction because the error accumulated across 32 layers. A safe variant gave
+each of the 16 K folds a distinct FP32 partial record and reduced those records
+before adding the BF16 residual. The packed FP32 producer remained correct
+(0.141173% mean relative error, 0.031174 maximum) and cost only 0.272 us over
+the grouped-BF16 producer: the matched medians were 19.488/19.776/19.520 us in
+`20260808T130335Z-567570`, `20260808T130357Z-567898`, and
+`20260808T130418Z-568424`. Splitting the partial into four stores increased
+the median to 20.128 us in `20260808T131439Z-576402`.
+
+The reducer used both VDCores LDUs concurrently: each loaded one 32-KiB half
+of the FP32 record, after which the compute group summed 16 folds and emitted
+BF16. Its full internal time was 2.848 us in
+`20260808T125158Z-558255`; the same 32-SM resident image had a 0.384-us empty
+floor, so the net work was about 2.464 us. Eight serial 8-KiB loads took
+5.024 us (`20260808T125058Z-557442`). Direct scalar and explicit `float4`
+global-load sidecars took 6.272 and 4.512 us
+(`20260808T130853Z-571894`, `20260808T131058Z-573399`), confirming that
+the dual-LDU path is the right mechanism.
+
+A complete 152-SM proof assigned 24 reducers to auxiliary SM128--151 and
+reused eight main CTAs only after their producer barrier. With packed stores,
+its strict 1,001-sample completion-to-completion medians were 24.448 and
+24.512 us for main-CTA reuse bases 0 and 120
+(`20260808T133235Z-591802`, `20260808T133257Z-592072`). The result was
+correct at 0.140358% mean relative error. The fair retained M64 path, measured
+to the same output-completion frontier, was 23.296 us in
+`20260808T132614Z-586707`. Thus the best safe grouped path loses 1.152 us
+(4.95%) even though its producer is faster.
+
+The remaining loss is the grouped producer's TMA-store completion frontier,
+not FP32 arithmetic. A compute-owned TMEM-to-register-to-global producer used
+compute-group barriers around a single-thread fence (the memory warp did not
+join) and then published through C2M. It was correct but took 26.496 us
+one-shot versus 26.272 us for the packed TMA producer
+(`20260808T133028Z-590183`, `20260808T132332Z-584074`). Fusing only RMS
+sum-of-squares cannot recover the gap: the prior shared-RMS versus scale-only
+bound is about 0.480 us before accounting for compact reduction/finalization.
+All grouped-safe operators, descriptor builders, and benchmark-only schedule
+paths were removed. Retain the balanced M64 down implementation.
