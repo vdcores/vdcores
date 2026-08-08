@@ -211,11 +211,12 @@ v_k_tail_heads = (3, 6, 7) if v_k_tail else ()
 if qkv_head_barriers and not fused_qk_rope:
   raise ValueError("per-head QKV barriers require fused Q/K RoPE tasks")
 phased_attn_out = os.environ.get("VDCORES_PHASED_ATTN_OUT", "1") == "1"
-attn_out_head_groups = ((0,), (1,), (2, 3), tuple(range(4, 8)))
+attn_out_head_groups = ((0,), (1,), (2, 3), (4, 5), (6, 7))
 
 def kv_head_bar_name(head):
-  # Reuse head 7's Q counter to stay within the 10-bit logical-barrier field.
-  if head == 7:
+  # Reuse heads 6--7's Q counters to fit two extra output groups in the
+  # 10-bit logical-barrier field.
+  if head in (6, 7):
     return f'bar_q_proj_head{head}'
   return f'bar_qkv_attn_head{head}'
 
