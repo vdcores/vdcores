@@ -1761,3 +1761,24 @@ stack, and zero spills. Full S128 correctness is
 `20260808T060649Z-214439`, four exact resident tokens are
 `20260808T060732Z-215233`, and the final profiling-free median is 2.572704 ms
 in `20260808T060813Z-215760`.
+
+## Requalify dependency proofs after the bottleneck moves
+
+Spreading Q cleanup moved the converged frontier from clear to the
+down-to-next-RMS edge, but rebuilding the earlier staged-RMS proof did not
+make it retainable. The exact two-phase path passed full S128 correctness in
+`20260808T064051Z-243028`; four phases passed in
+`20260808T065037Z-250626`. The latter added more load publications and
+compute-group slot-release barriers and measured 2.579136 ms versus
+2.573440/2.573984 ms controls.
+
+More importantly, the apparent initial two-phase gain failed a fresh
+1,001-sample sandwich: control/staged/control was
+2.577472/2.577088/2.574880 ms, making staged 0.912 us slower than the control
+mean (`20260808T070043Z-259638`, `20260808T070127Z-260163`,
+`20260808T070202Z-260745`). Do not retain a structural dependency change on
+one sandwich whose delta is inside run-to-run drift. Increasing phase count
+also consumes scarce per-layer counter IDs; if a future design needs more
+frontiers, expand the barrier model explicitly and require a moved whole-layer
+boundary, not only an earlier local marker. All staged-RMS machinery was
+removed.

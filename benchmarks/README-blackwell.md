@@ -1282,6 +1282,26 @@ validation passed in `20260808T060649Z-214439`, four resident tokens matched
 1,001-sample internal median was 2.572704 ms in
 `20260808T060813Z-215760`.
 
+### Rejected post-cleanup staged-RMS revisit
+
+After the distributed clear stopped owning the layer boundary, the two-phase
+down-to-next-RMS proof was rebuilt and extended to four phases. Both forms
+kept the ordinary memory-op path, cached each published row range in
+registers, and used compute-group barriers before returning shared slots. A
+full S128 tensor check passed for two phases in `20260808T064051Z-243028` and
+for four phases in `20260808T065037Z-250626`.
+
+The first two-phase screen appeared 2.928 us faster, but a fresh exact-image
+1,001-sample control/staged/control qualification measured
+2.577472/2.577088/2.574880 ms in `20260808T070043Z-259638`,
+`20260808T070127Z-260163`, and `20260808T070202Z-260745`: the staged form is
+0.912 us slower than the control mean. Four phases measured 2.579136 ms
+against 2.573440/2.573984 ms controls (`20260808T065252Z-252754`,
+`20260808T065124Z-251323`, `20260808T065336Z-253360`). Moving the RMS owners
+to SM128 or later also lost up to 9.216 us. Extra producer frontiers and
+compute barriers therefore do not buy a stable boundary gain; all opcodes,
+schedule hooks, barrier sharing, and selectors were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
