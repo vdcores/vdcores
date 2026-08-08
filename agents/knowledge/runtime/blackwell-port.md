@@ -2281,3 +2281,36 @@ addition, and experimental schedules were removed. The restored 11-op image
 returned to 96 registers, nine hardware barriers, a 96-byte stack, and zero
 spills; its fresh 1,001-sample S128 internal median was 2.522592 ms in
 `20260808T135833Z-612404`.
+
+## Rejected RMS ownership and LDU-port moves after down-tail offload
+
+A fresh combined stage/track diagnostic in `20260808T140126Z-615264`
+showed why compute-only placement markers are insufficient. After the
+retained final down-tail offload, SM96--103 reached `layers_done` at about
+77.9--78.0 us absolute, while the current SM0--7 RMS owners completed the
+next-RMS frontier at 84.1--84.3 us and loop progression ended near
+84.5--84.6 us. However, SM96--103 also had the largest LDU0 queue wait
+(up to 1,870.208 us over the token), whereas SM0--7 owned the largest LDU0
+dependency wait (up to 351.488 us). The apparently idle compute cohort was
+not an idle load cohort.
+
+Moving the unchanged eight RMS tasks confirmed that distinction. With
+2.516512/2.517184-ms base-0 controls, bases 64, 96, 104, 128, and 144 measured
+2.521088, 2.526080, 2.529280, 2.528768, and 2.524352 ms over 301 internal
+samples in `20260808T140441Z-618195`. The newly freed SM96--103 cohort
+regressed 9.232 us against the control mean despite its early compute marker.
+
+A second proof independently routed the RMS weight prefetch and
+barrier-gated hidden load to LDU1. On SM0--7, port pairs 01/10/11 measured
+2.519392/2.517728/2.515776 ms versus 2.517216/2.517088-ms controls; on
+SM96--103 they measured 2.528416/2.524640/2.528896 ms
+(`20260808T140803Z-621252`). Only the all-LDU1 current-owner form screened
+positive. Its strict 1,001-sample qualification did not justify retention:
+two controls averaged 2.519776 ms and two all-LDU1 runs averaged 2.518752 ms
+in `20260808T141032Z-623381`, a 1.024-us / 0.04% gain below control drift
+and the threshold for changing a global load-track assignment.
+
+No opcode, barrier, or task arithmetic changed in either proof. All ownership
+and port selectors were removed. Use simultaneous compute and LDU timelines
+before moving work to an apparently spare SM; a completed compute program
+does not imply that its asynchronous memory queues are empty.
