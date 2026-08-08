@@ -1524,6 +1524,24 @@ compute-idle but retained unfavorable allocator/LDU history; placing another
 task there delayed the dependency-bearing memory track. Both remaps and the
 selector were removed.
 
+### Rejected sparse additional LM-tail offload
+
+After the retained eight-task epoch-1 offload, a detailed marker image put
+logical tasks 53, 60, and 58 at the remaining LM completion tail. A sparse
+schedule proof moved either task 53 alone or all three tasks to otherwise-idle
+SM144 onward. This was the low-bandwidth complement to the rejected 16-task
+auxiliary expansion; all logical coordinates, partial records, and the
+256-release argmax barrier remained unchanged.
+
+The 1,001-sample control/three-task/one-task/control sequence measured
+2.517312/2.517952/2.517792/2.519872 ms in
+`20260808T154614Z-690599`, `20260808T155247Z-694081`,
+`20260808T155326Z-694441`, and `20260808T155416Z-694652`. Against the
+2.518592-ms control mean, the apparent gains are only 0.640 and 0.800 us,
+below neighboring run movement and much smaller than the qualified fixed-eight
+gain. The profile-selected sparse mapping was removed; retain the simple
+eight-task topology rather than encoding sub-microsecond tail noise.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
