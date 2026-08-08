@@ -1346,6 +1346,37 @@ forms were neutral at 2.573952/2.574400 ms; enabling both regressed to
 and extra weight traffic on LDU1 interferes with the dependency-bearing
 activation path. All gates, port hooks, and selectors were removed.
 
+### Retained LM-head epoch-1 tail offload
+
+The first 128-task LM-head epoch consistently leaves SM96--103 behind the
+rest of the grid.  The second epoch formerly put another task on those same
+CTAs while SM128--135 were idle, making the eight fused-argmax partial
+releases part of the reducer's global-barrier tail.  The retained placement
+moves only logical epoch-1 tasks 96--103 onto physical SM128--135.  It keeps
+all 256 logical tasks, weight coordinates, partial-record indices, memory
+operations, and barrier release counts unchanged; no opcode or synchronization
+primitive is added.
+
+A 1,001-sample control/offload/control/offload qualification measured
+2.518560/2.516256/2.518976/2.516544 ms in
+`20260808T141741Z-629432`.  The two controls average 2.518768 ms and the two
+offload runs average 2.516400 ms, a stable 2.368 us schedule-only gain.  The
+same-job marker proof in `20260808T142517Z-635403` moved the LM completion
+frontier from 225.568 to 223.552 us and the eight-reducer completion frontier
+from 240.192 to 226.784 us.  Marker perturbation exaggerates the end-to-end
+effect, but confirms that earlier partial-barrier release—not a timestamp
+artifact—is the mechanism.
+
+The final selector-free schedule passed every S128 tensor threshold and exact
+token 24748, then matched four resident steps
+`[24748, 24748, 24748, 24748]` across KV128 in
+`20260808T143044Z-640105`.  Its exact 11-op production image remains at 96
+registers, nine hardware barriers, a 96-byte stack, 7,024 bytes of static
+shared memory, and zero spills.  A fresh 1,001-sample internal-timer run in
+`20260808T142953Z-639148` measured 2.518112 ms median at B8/S128.  This is
+10.58% faster than the strict 2.816003 ms vLLM baseline and 16.291 us below
+the 2.534403 ms threshold for a 10% win.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

@@ -604,7 +604,11 @@ def stage_profile_schedule_parts(prefix: str, schedules):
       schedule,
       stage_profile_marker(
         f"{prefix}{part_id}",
-        range(schedule.base_sm, schedule.base_sm + schedule.num_sms),
+        getattr(
+          schedule,
+          "profile_sms",
+          range(schedule.base_sm, schedule.base_sm + schedule.num_sms),
+        ),
       ),
     ])
   return profiled
@@ -620,6 +624,29 @@ class CounterOffsetCordAdapter(CordAdapter):
     for counter_reg, delta in self.offsets:
       inst = CounterOffsetMemoryInstruction(counter_reg, inst, delta)
     return inst
+
+
+class SchedLmHeadEpoch1TailOffload(Schedule):
+  """Move logical LM tasks 96--103 onto physical SMs 128--135."""
+
+  def __init__(self, inner):
+    super().__init__()
+    self.inner = inner
+    self.profile_sms = (*range(96), *range(104, 136))
+
+  def _on_place(self):
+    if self.num_sms != full_sms or self.inner.num_sms != num_sms:
+      raise ValueError("LM tail offload requires the 128-on-152 placement")
+
+  def schedule(self, sm: int):
+    if 0 <= sm < 96 or 104 <= sm < 128:
+      return self.inner.schedule(sm)
+    if 128 <= sm < 136:
+      return self.inner.schedule(sm - 32)
+    return []
+
+  def collect_barrier_release_counts(self):
+    return self.inner.collect_barrier_release_counts()
 
 
 class SchedClearQ(Schedule):
@@ -1126,7 +1153,13 @@ def schedule_single_token(
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
     sched.bar("partial", systemg['bar_argmax_partial'])
-    LogitsProj.append(sched.place(num_sms))
+    sched = sched.place(num_sms)
+    if i == 1:
+      # Epoch 0 leaves SM96--103 behind the rest of the grid.  Do not put the
+      # next epoch's partial-barrier tail on those CTAs when eight auxiliary
+      # CTAs are already idle; task coordinates and release counts stay exact.
+      sched = SchedLmHeadEpoch1TailOffload(sched).place(full_sms)
+    LogitsProj.append(sched)
 
   # The LM-head epilogue keeps logits in TMEM/registers and emits only one
   # compact maximum per task/token.  Eight reducer SMs consume the 256 records.
@@ -1372,7 +1405,10 @@ def schedule_single_token(
 
     # # logits
     stage_profile_schedule_parts("lm_head_epoch", LogitsProj),
-    stage_profile_marker("lm_head", range(num_sms)),
+    stage_profile_marker(
+      "lm_head",
+      getattr(LogitsProj[-1], "profile_sms", range(num_sms)),
+    ),
 
     # argmax and cleanup
     Argmax,
