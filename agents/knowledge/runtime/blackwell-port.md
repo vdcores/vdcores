@@ -284,6 +284,14 @@ nine-barrier, stack-96, and spill-free.  Keep the explicit K acquire whenever
 Q is not colocated: the prior physical placement was also carrying a semantic
 dependency.  Use `VDCORES_Q_FOLD1_AUX_TAIL=0` only for control measurements.
 
+The retained companion placement moves V heads 3, 6, and 7 from their long-Q
+owners onto the three K-only groups at SM104--127.  An explicit per-V RMS
+acquire is required; omitting it produces an invalid apparent gain with stale
+layer-1 V.  The valid exact-image control/variant/control medians were
+2.581376/2.574240/2.582592 ms, a further 7.744 us.  Four resident tokens pass
+exactly, no task or barrier count changes, and `VDCORES_V_K_TAIL=0` restores
+the earlier map.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a

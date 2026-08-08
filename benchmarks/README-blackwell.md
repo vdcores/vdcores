@@ -993,6 +993,32 @@ spills.
 frontier for selected existing profile markers.  This is diagnostic only and
 does not add a compute opcode or execute when stage profiling is disabled.
 
+### Retained Q/V versus K/V work rebalance
+
+After the auxiliary-Q split, SMs 104--127 own only one short K task while the
+original Q owners still serialize Q and V.  Per-head profiles selected V
+heads 3, 6, and 7 as the slow grouped-output contributors.  Their V tasks now
+run after K on SMs 104--127, leaving the original owners with Q alone.  This
+turns three long-Q-plus-short-V chains into long Q in parallel with short
+K-plus-short-V chains; all tensor ranges and head barrier counts remain
+unchanged.
+
+As with the Q move, the memory program needs an explicit semantic edge.  A
+first timing-only form appeared about 15 us faster but loaded stale next-layer
+RMS data and failed at layer 1.  Adding the RMS load barrier directly to each
+moved V schedule passed every S128 tensor threshold and exact token 24748 in
+`20260808T012706Z-4174330`; the final default repeated that validation in
+`20260808T013403Z-4180262`.
+
+On the exact 11-op image, valid control/rebalanced/control 1,001-sample
+medians were 2.581376/2.574240/2.582592 ms in jobs
+`20260808T013026Z-4177165`, `20260808T013107Z-4177759`, and
+`20260808T013150Z-4178381`.  The 7.744 us / 0.30% gain comes entirely from
+physical task ownership.  Four resident steps exactly matched the reference
+in `20260808T013237Z-4179012`.  `VDCORES_V_K_TAIL=0` restores the prior V
+placement for A/B runs; the production image remains at 96 registers, nine
+barriers, a 96-byte stack, and zero spills.
+
 ### Rejected parked light-compute warps
 
 A selectable runtime prototype added one or two compute-only helper warps

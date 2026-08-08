@@ -202,6 +202,11 @@ q_fold1_aux_tail = (
   qkv_head_barriers
   and os.environ.get("VDCORES_Q_FOLD1_AUX_TAIL", "1") == "1"
 )
+v_k_tail = (
+  q_fold1_aux_tail
+  and os.environ.get("VDCORES_V_K_TAIL", "1") == "1"
+)
+v_k_tail_heads = (3, 6, 7) if v_k_tail else ()
 if qkv_head_barriers and not fused_qk_rope:
   raise ValueError("per-head QKV barriers require fused Q/K RoPE tasks")
 phased_attn_out = os.environ.get("VDCORES_PHASED_ATTN_OUT", "1") == "1"
@@ -859,10 +864,16 @@ def schedule_single_token(
         MNK=((head * HEAD_DIM, HEAD_DIM), N, HIDDEN),
         tmas=(layerg['loadVW'], layerg['loadRMSLayer'], v_store),
       ).bar("store", layerg[f'bar_qkv_attn_head{head}']).place(
-        8, base_sm=head * 8
+        8,
+        base_sm=(
+          104 + v_k_tail_heads.index(head) * 8
+          if head in v_k_tail_heads else head * 8
+        ),
       )
       for head in range(NUM_KV_HEAD)
     ]
+    for head in v_k_tail_heads:
+      VProj[head].bar("load", layerg['bar_pre_attn_rms'])
   else:
     VProj = SchedGemv(QKVAtom,
       MNK=(VW, N, HIDDEN),
@@ -1258,6 +1269,15 @@ def schedule_single_token(
     (*range(104), *range(num_sms, full_sms))
     if q_fold1_aux_tail else range(128)
   )
+  v_projection_profile_sms = (
+    tuple(
+      104 + v_k_tail_heads.index(head) * 8 + task
+      if head in v_k_tail_heads else head * 8 + task
+      for head in range(NUM_KV_HEAD)
+      for task in range(8)
+    )
+    if v_k_tail_heads else range(64)
+  )
 
   dae.bind_late_barrier_counts(
     embed_rms,
@@ -1306,7 +1326,7 @@ def schedule_single_token(
     KRope,
     stage_profile_marker("k_rope", range(64, 128)),
     VProj,
-    stage_profile_marker("v_proj", range(64)),
+    stage_profile_marker("v_proj", v_projection_profile_sms),
 
     Gqa,
     stage_profile_marker("attention", range(N * NUM_KV_HEAD)),
@@ -1420,6 +1440,7 @@ print(
   f"fused_qk_rope={int(fused_qk_rope)}, "
   f"qkv_head_barriers={int(qkv_head_barriers)}, "
   f"q_fold1_aux_tail={int(q_fold1_aux_tail)}, "
+  f"v_k_tail={int(v_k_tail)}, "
   f"phased_attn_out={int(phased_attn_out)}, "
   f"stage_profile={int(stage_profile)}"
 )
