@@ -2379,3 +2379,42 @@ reloads in `20260808T171616Z-739425` and 2.517504 ms for fresh production in
 their slot release supplies useful allocator cadence; eliminating them moves
 pressure to the shared arena rather than shortening the token frontier.  All
 retention tasks, schedule forms, and build selectors were removed.
+
+## Retained 152-SM M128 output projection
+
+The output projection is the first stage retiled around the GB200's full 152
+SM topology rather than inherited M64 ownership.  Its weights are packed as
+M128K128 tiles and use the generic M128 UMMA family.  Six M128 rows use eight
+K512 folds and the other 26 use four K1024 folds, producing 48 + 104 = 152
+independent tasks.  K<2048 consumers map to SM64--139 outside the attention
+owners; the late folds map to SM0--63 and SM140--151.  This preserves the
+arithmetic, number of reduction records, and one-task-per-SM topology while
+halving each task's B-activation footprint and widening its TMEM/register
+epilogue extent.
+
+The 301-sample internal task-count sweep measured 2.519712, 2.506848,
+2.508512, and 2.506432 ms for 128, 136, 144, and 152 tasks.  A strict
+1,001-sample same-image qualification measured 2.511072 ms for the 136-task
+form, 2.508832 ms for the 152-task form, and 2.521664 ms for the original M64
+schedule (`20260808T174050Z-753404`, `20260808T174133Z-753675`, and
+`20260808T174215Z-754048`).  Keeping all physical owners is therefore faster
+than reducing task count and wins 12.832 us over the matched M64 control.
+
+Matched track profiles in `20260808T174449Z-755477` and
+`20260808T174532Z-755968` show median compute M2C wait falling from 715.136 to
+696.352 us, store service from 115.296 to 113.504 us, and contended compute
+calls from 40 to 30.  Allocator stall stayed neutral at 607.392/608.352 us;
+LDU1 dependency wait rose from 650.304 to 656.000 us.  The retile improves
+the activation-to-UMMA/epilogue track without pretending that the whole CTA
+is compute-idle or spending another shared slot.
+
+The minimal default passed full S128 tensors and exact token 24748 in
+`20260808T175059Z-758790`; four resident decode steps exactly matched
+`[24748, 24748, 24748, 24748]` across the KV128 boundary in
+`20260808T175136Z-759221`.  All 34 schedule/runtime host tests pass.  The
+fresh 1,001-sample profiling-free median is 2.507136 ms in
+`20260808T175211Z-759358`, 10.968% faster than strict vLLM's 2.816003-ms S128
+baseline and 27.267 us past the 2.534403-ms 10%-lead threshold.  Adding the
+M128 family makes the selective manifest 12 operators, but the resident
+kernel remains at 96 registers, nine barriers, a 96-byte stack, 7,024 bytes
+of static shared memory, and zero spills.

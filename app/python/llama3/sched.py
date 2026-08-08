@@ -463,16 +463,21 @@ def seed_prefill_kv_cache():
 
 QKVAtom = Gemv_M64N8IssuerOnly
 LinearAtom = Gemv_M64N8IssuerOnly
+OutAtom = Gemv_M128N8
 LogitsAtom = Gemv_M128N8Argmax4
 QKVTileM, _, QKVTileK = QKVAtom.MNK
 LinearTileM, _, LinearTileK = LinearAtom.MNK
+OutTileM, _, OutTileK = OutAtom.MNK
 LogitsTileM, _, LogitsTileK = LogitsAtom.MNK
 
-print(f"[weights] packing projections as contiguous M{LinearTileM}K{LinearTileK} tiles")
+print(
+  f"[weights] packing QKV/down as M{LinearTileM}K{LinearTileK} and "
+  f"output as M{OutTileM}K{OutTileK} tiles"
+)
 matqWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matqWs]
 matkWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matkWs]
 matvWs = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matvWs]
-matOutWs = [pack_weight_tile_major(weight, LinearTileM, LinearTileK) for weight in matOutWs]
+matOutWs = [pack_weight_tile_major(weight, OutTileM, OutTileK) for weight in matOutWs]
 matUps = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matUps]
 matGates = [pack_weight_tile_major(weight, QKVTileM, QKVTileK) for weight in matGates]
 matDowns = [pack_weight_tile_major(weight, LinearTileM, LinearTileK) for weight in matDowns]
@@ -496,8 +501,8 @@ def weight_load_tma(tma_tensor, tile_m, tile_k):
   return tma_tensor.wgmma_load_tiled(tile_m, tile_k)
 
 
-def linear_output_tma(mode):
-  return lambda t: t.wgmma(mode, N, LinearTileM, Major.MN)
+def linear_output_tma(mode, tile_m=LinearTileM):
+  return lambda t: t.wgmma(mode, N, tile_m, Major.MN)
 
 
 defaultg.addTma(
@@ -518,9 +523,10 @@ defaultg.addTma("loadRope", [matRope], lambda t: t._build("load", QKVTileM, N, t
 # load tmas for the same matrix for "grouped" instructions
 layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, QKVTileK * QKVAtom.n_batch, Major.K))
 layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, linear_output_tma("reduce"))
+layerg.addTma("reduceHiddenOutLayer", [matHidden] * num_layers, linear_output_tma("reduce", OutTileM))
 layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K))
 layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
-layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, LinearTileK * LinearAtom.n_batch, Major.K))
+layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, OutTileK * OutAtom.n_batch, Major.K))
 
 layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
 layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
@@ -529,7 +535,7 @@ layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
 
-layerg.addTma("loadOutWs", matOutWs, lambda t: weight_load_tma(t, LinearTileM, LinearTileK))
+layerg.addTma("loadOutWs", matOutWs, lambda t: weight_load_tma(t, OutTileM, OutTileK))
 layerg.addTma("loadDown", matDowns, lambda t: weight_load_tma(t, LinearTileM, LinearTileK))
 layerg.addTma("loadUp", matUps, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 layerg.addTma("loadGate", matGates, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
@@ -950,10 +956,10 @@ def schedule_single_token(
     Gqa.bar("q", layerg['bar_q_proj']).bar("k", layerg['bar_qkv_attn'])
 
   # accumulate to matHidden, which auto applies the residual add
-  # Twelve M tiles use four K folds and the other 52 use two folds: exactly
-  # 152 independent tasks, one for every Blackwell SM.
+  # Six M128 tiles use eight K512 folds and the other 26 use four K1024
+  # folds: exactly 152 independent tasks, one for every Blackwell SM.
   out_tmas = (
-    layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenLayer']
+    layerg['loadOutWs'], layerg['loadAttnOLayer'], layerg['reduceHiddenOutLayer']
   )
   if phased_attn_out:
     activation_bars = [
@@ -964,27 +970,37 @@ def schedule_single_token(
     ]
     def make_phased_out(mnk):
       return SchedGemvPhasedActivation(
-        LinearAtom, MNK=mnk, fold=1,
+        OutAtom, MNK=mnk, fold=1,
         tmas=out_tmas, activation_bars=activation_bars,
       ).bar("store", layerg['bar_out_mlp'])
 
-    # Put every K<2048 consumer on the 88 SMs outside attention. Late-K
-    # contributors take the complementary physical SM set after attention.
+    # Six M128 rows use eight K512 folds and the other 26 use four K1024
+    # folds: 48 + 104 tasks, exactly one per physical SM. K<2048 stays on the
+    # 76 CTAs outside attention; late-K uses the complementary physical set.
     out_proj_placement_specs = [
-      (make_phased_out(((0, 768), N, (0, 1024))), 12, 64),
-      (make_phased_out(((0, 768), N, (1024, 1024))), 12, 76),
-      (make_phased_out(((768, HIDDEN - 768), N, (0, 2048))), 52, 88),
-      (make_phased_out(((0, 768), N, (2048, 1024))), 12, 0),
-      (make_phased_out(((0, 768), N, (3072, 1024))), 12, 12),
-      (make_phased_out(((768, 2560), N, (2048, 2048))), 40, 24),
-      (make_phased_out(((3328, 768), N, (2048, 2048))), 12, 140),
+      *[
+        (make_phased_out(((0, 768), N, (head * 512, 512))),
+         6, 64 + head * 6)
+        for head in range(4)
+      ],
+      (make_phased_out(((768, HIDDEN - 768), N, (0, 1024))), 26, 88),
+      (make_phased_out(((768, HIDDEN - 768), N, (1024, 1024))), 26, 114),
+      *[
+        (make_phased_out(((0, 768), N, (2048 + head * 512, 512))),
+         6, head * 6)
+        for head in range(4)
+      ],
+      (make_phased_out(((768, 2560), N, (2048, 1024))), 20, 24),
+      (make_phased_out(((768, 2560), N, (3072, 1024))), 20, 44),
+      (make_phased_out(((3328, 768), N, (2048, 1024))), 6, 140),
+      (make_phased_out(((3328, 768), N, (3072, 1024))), 6, 146),
     ]
   else:
-    out_proj_fold4 = SchedGemv(
-      LinearAtom, MNK=((0, 768), N, HIDDEN), fold=4, tmas=out_tmas,
+    out_proj_fold8 = SchedGemv(
+      OutAtom, MNK=((0, 768), N, HIDDEN), fold=8, tmas=out_tmas,
     ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
-    out_proj_fold2 = SchedGemv(
-      LinearAtom, MNK=((768, HIDDEN - 768), N, HIDDEN), fold=2, tmas=out_tmas,
+    out_proj_fold4 = SchedGemv(
+      OutAtom, MNK=((768, HIDDEN - 768), N, HIDDEN), fold=4, tmas=out_tmas,
     ).bar("load", layerg['bar_attn_out']).bar("store", layerg['bar_out_mlp'])
     out_proj_placement_specs = None
 
@@ -1201,8 +1217,8 @@ def schedule_single_token(
     ]
   else:
     OutProj = [
-      out_proj_fold4.place(48),
-      out_proj_fold2.place(104, base_sm=48),
+      out_proj_fold8.place(48),
+      out_proj_fold4.place(104, base_sm=48),
     ]
   if fine_mlp_barriers:
     gate_prefix_parts = [

@@ -923,7 +923,7 @@ A/B diagnostics.
 Reproduce the retained path with:
 
 ```bash
-# Rebuild the exact spill-free 11-operator image used below.
+# Rebuild the current exact spill-free 12-operator image.
 DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops \
   make -B pyext
 
@@ -949,7 +949,8 @@ python benchmarks/blackwell_fixed_context_decode.py \
 
 Tensor-level validation passes for a non-control-flow step, exact greedy tokens
 match Hugging Face, and a 130-step launch crosses from one KV128 block to two
-with the unified online-softmax path. The exact 11-operator Llama image uses
+with the unified online-softmax path. At that milestone, the exact
+11-operator Llama image used
 128 registers, 9 barriers, a 96-byte stack frame, and zero spills. Removing
 the prior padded attention opcode from the selective image lowered the
 megakernel-wide register allocation from roughly 202 registers.
@@ -1610,6 +1611,45 @@ On an exact 11-op, 96-register image, full retention measured 2.525760 ms in
 `20260808T165134Z-725676`.  The duplicate loads are hidden well enough that
 their slot release and publication cadence are more valuable than the saved
 traffic.  All retention code and selectors were removed.
+
+### Retained 152-SM M128 output projection
+
+The output projection now uses native M128K128-packed weights instead of the
+shared M64K256 projection family.  It keeps exactly 152 independent tasks:
+the first six M128 rows use eight K512 folds (48 tasks), while the remaining
+26 rows use four K1024 folds (104 tasks).  The early K<2048 folds occupy
+physical SM64--139 outside the attention owners; late folds occupy the
+complementary SM0--63 and SM140--151 set.  Total arithmetic and the 152
+partial reductions are unchanged, but each task consumes half as many B
+activation bytes and gives TMEM/register epilogue work twice the M extent.
+
+A task-count sweep validates that the gain is not merely fewer tasks.  The
+301-sample internal medians for 128, 136, 144, and 152 tasks were 2.519712,
+2.506848, 2.508512, and 2.506432 ms.  In the exact 12-op image, 1,001-sample
+medians were 2.511072 ms for 136 tasks and 2.508832 ms for 152 tasks, versus
+2.521664 ms for the M64 control (`20260808T174050Z-753404`,
+`20260808T174133Z-753675`, and `20260808T174215Z-754048`).  Retaining all 152
+owners therefore wins 12.832 us while preserving one logical output task per
+physical SM.
+
+The matched multi-track profile explains the improvement.  Relative to M64,
+median compute M2C wait fell from 715.136 to 696.352 us, store service fell
+from 115.296 to 113.504 us, and the median count of contended compute calls
+fell from 40 to 30.  Allocator stall was effectively flat at
+607.392/608.352 us; LDU1 dependency wait rose from 650.304 to 656.000 us.
+Thus the useful mechanism is a shorter activation-to-UMMA/epilogue path, not
+extra shared-slot capacity (`20260808T174449Z-755477` and
+`20260808T174532Z-755968`).
+
+The minimal default passed full S128 tensor validation and exact token 24748
+in `20260808T175059Z-758790`.  Four resident decode steps crossing the KV128
+boundary exactly matched `[24748, 24748, 24748, 24748]` in
+`20260808T175136Z-759221`, and all 34 schedule/runtime host tests pass.  Its
+fresh 1,001-sample profiling-free internal median is 2.507136 ms in
+`20260808T175211Z-759358`, 10.968% faster than strict vLLM's 2.816003-ms S128
+baseline and 27.267 us beyond the 10%-lead target.  The current selective
+image has 12 compute opcodes and remains at 96 registers, nine barriers, a
+96-byte stack, 7,024 bytes of static shared memory, and zero spills.
 
 ## Implementation references
 
