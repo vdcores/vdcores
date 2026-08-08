@@ -273,6 +273,17 @@ the exact 11-op production image returned to 96 registers, nine barriers, a
 96-byte stack, and zero spills; full S128 correctness passed and the fresh
 501-sample internal median was 2.588416 ms.
 
+The retained cross-layer ownership follow-up moves Q fold 1 for heads 5--7
+from late down-projection owners SM104--127 onto SM128--151.  Their K tasks
+remain on SM104--127 and explicitly acquire the next-layer RMS barrier, so Q
+and K overlap without changing task shapes or per-head reduction barriers.
+The exact 11-op control/variant/control medians were
+2.589344/2.576576/2.588384 ms, a 12.288 us gain.  Full S128 tensor checks and
+four resident tokens pass exactly; the image remains 96-register,
+nine-barrier, stack-96, and spill-free.  Keep the explicit K acquire whenever
+Q is not colocated: the prior physical placement was also carrying a semantic
+dependency.  Use `VDCORES_Q_FOLD1_AUX_TAIL=0` only for control measurements.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a

@@ -960,6 +960,39 @@ Clean balanced-path checks pass at S1 and four-token control flow in
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
 bulk sequence launches on all 152 SMs.
 
+### Retained cross-layer Q/K ownership overlap
+
+The last down-projection frontier leaves SMs 104--127 later than the other Q
+owners, while all 24 auxiliary SMs have crossed the layer boundary.  The
+retained schedule therefore moves Q fold 1 for heads 5--7 from SMs 104--127
+to SMs 128--151.  K for those heads stays on SMs 104--127, so the two
+independent projections run concurrently after next-layer RMS instead of
+serializing on one CTA.  Output ranges, K folds, per-head barriers, compute
+opcodes, and reduction arithmetic are unchanged.
+
+This placement exposed an implicit dependency: K had inherited the RMS
+acquire from its colocated Q command.  The final form adds that load barrier
+only to the three vacated K head schedules.  The unchecked form corrupted K
+immediately; the explicit form passed every S128 tensor threshold and exact
+token 24748 in `20260808T010836Z-4161441`.  The final default configuration
+repeated that full validation in `20260808T011748Z-4166632`.
+
+On the exact 11-op image, a 1,001-sample control/overlap/control sandwich
+measured 2.589344/2.576576/2.588384 ms in jobs
+`20260808T011324Z-4164348`, `20260808T011405Z-4164605`, and
+`20260808T011446Z-4165097`.  The retained placement saves 12.288 us / 0.47%
+against the control mean and reaches 2.576576 ms at B8/S128, 8.50% ahead of
+the 2.816003 ms strict vLLM baseline under the agreed accounting.  Four
+resident steps across KV128 exactly matched
+`[24748, 24748, 24748, 24748]` in `20260808T011532Z-4165458`.
+`VDCORES_Q_FOLD1_AUX_TAIL=0` restores the colocated schedule for A/B runs.
+The image remains at 96 registers, nine barriers, a 96-byte stack, and zero
+spills.
+
+`VDCORES_STAGE_PROFILE_DETAIL=name[,name...]` prints the complete per-SM
+frontier for selected existing profile markers.  This is diagnostic only and
+does not add a compute opcode or execute when stage profiling is disabled.
+
 ### Rejected parked light-compute warps
 
 A selectable runtime prototype added one or two compute-only helper warps

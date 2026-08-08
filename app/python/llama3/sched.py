@@ -198,6 +198,10 @@ interleave_down_high = (
 )
 fused_qk_rope = os.environ.get("VDCORES_FUSED_QK_ROPE", "1") == "1"
 qkv_head_barriers = os.environ.get("VDCORES_QKV_HEAD_BARRIERS", "1") == "1"
+q_fold1_aux_tail = (
+  qkv_head_barriers
+  and os.environ.get("VDCORES_Q_FOLD1_AUX_TAIL", "1") == "1"
+)
 if qkv_head_barriers and not fused_qk_rope:
   raise ValueError("per-head QKV barriers require fused Q/K RoPE tasks")
 phased_attn_out = os.environ.get("VDCORES_PHASED_ATTN_OUT", "1") == "1"
@@ -746,7 +750,14 @@ def schedule_single_token(
           rope_counter_offsets=rope_counter_offsets,
         ).bar("load", layerg['bar_pre_attn_rms']).bar(
           "store", layerg[f'bar_q_proj_head{head}']
-        ).place(8, base_sm=fold * 64 + head * 8)
+        ).place(
+          8,
+          base_sm=(
+            num_sms + (head - 5) * 8
+            if q_fold1_aux_tail and fold == 1 and head >= 5
+            else fold * 64 + head * 8
+          ),
+        )
         for fold in range(2)
         for head in range(NUM_KV_HEAD)
       ]
@@ -778,6 +789,12 @@ def schedule_single_token(
         )
         for head in range(NUM_KV_HEAD)
       ]
+      if q_fold1_aux_tail:
+        # K normally inherits the next-layer RMS acquisition from its
+        # colocated Q fold.  Preserve that dependency when heads 5--7 move
+        # their Q owner to the auxiliary CTAs.
+        for head in range(5, NUM_KV_HEAD):
+          KProj[head].bar("load", layerg['bar_pre_attn_rms'])
     else:
       KProj = SchedGemvRope(
         MNK=(KW, N, HIDDEN),
@@ -1237,6 +1254,11 @@ def schedule_single_token(
     clear_q.bar("store", layerg['bar_q_clear'])
   clear_q = clear_q.place(aux_sms, base_sm=num_sms)
 
+  q_projection_profile_sms = (
+    (*range(104), *range(num_sms, full_sms))
+    if q_fold1_aux_tail else range(128)
+  )
+
   dae.bind_late_barrier_counts(
     embed_rms,
     copy_hidden,
@@ -1276,9 +1298,9 @@ def schedule_single_token(
   dae.i(
     stage_profile_marker("layer_start"),
     QProj,
-    stage_profile_marker("q_proj", range(128)),
+    stage_profile_marker("q_proj", q_projection_profile_sms),
     QRope,
-    stage_profile_marker("q_rope", range(128)),
+    stage_profile_marker("q_rope", q_projection_profile_sms),
     KProj,
     stage_profile_marker("k_proj", range(64, 128)),
     KRope,
@@ -1397,6 +1419,7 @@ print(
   f"interleave_down_high={int(interleave_down_high)}, "
   f"fused_qk_rope={int(fused_qk_rope)}, "
   f"qkv_head_barriers={int(qkv_head_barriers)}, "
+  f"q_fold1_aux_tail={int(q_fold1_aux_tail)}, "
   f"phased_attn_out={int(phased_attn_out)}, "
   f"stage_profile={int(stage_profile)}"
 )
@@ -1496,6 +1519,11 @@ else:
 
 if will_execute and stage_profile:
   profile = dae.profile.cpu().numpy()
+  detailed_profile_events = {
+    name.strip()
+    for name in os.environ.get("VDCORES_STAGE_PROFILE_DETAIL", "").split(",")
+    if name.strip()
+  }
   ordered_profile_events = sorted(
     stage_profile_events.items(), key=lambda item: item[1][0]
   )
@@ -1536,6 +1564,12 @@ if will_execute and stage_profile:
       f"p90={float(torch.quantile(torch.tensor(frontier_us), 0.9)):.3f},"
       f"max={frontier_us.max():.3f}] slow_sms={slow_sms} tail_sms={tail_sms}"
     )
+    if name in detailed_profile_events:
+      detail = ",".join(
+        f"{sm}:{frontier_us[idx]:.3f}"
+        for idx, sm in enumerate(active)
+      )
+      print(f"[stage-profile-detail] {name} frontier_us={detail}")
     previous_name = name
     previous_event_id = event_id
 
