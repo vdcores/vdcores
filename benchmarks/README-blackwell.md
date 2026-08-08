@@ -2060,6 +2060,48 @@ eight-CTA SiLU shards exploit more instruction-level work and are already
 placed behind independent primary-tail computation.  All proof schedules,
 descriptors, and selectors were removed.
 
+### Rejected paired gate/up tail task
+
+A second fusion proof targeted the 128 primary tail owners without changing
+their placement or any downstream down-projection tile.  One compute task held
+independent gate and up FP32 accumulators in TMEM, reused each K1024 activation
+tile for both projection streams, and drained both accumulators through one
+BF16-rounded SwiGLU epilogue.  This removed the duplicate activation load and
+the gate RegStore/RegLoad handoff while preserving the ordinary memory-op
+path.  The 14-op proof image remained at 96 registers, nine barriers, a
+96-byte stack, 7,024 bytes of static shared memory, and zero spills.  Full
+S128 tensor validation and exact token 24748 passed in
+`20260808T232948Z-943509`.
+
+Retiring each matching gate/up UMMA pair as one completion group reduced the
+local median gate-plus-up interval to 20.352 us, versus 9.920 + 10.912 =
+20.832 us for the two-task control, but did not advance the absolute SwiGLU or
+next-RMS frontier (`20260808T234044Z-949990` and
+`20260808T234126Z-950303`).  The shared-track diagnostic explains why.  Even
+though the median CTA executed 4,018 rather than 4,210 M2C handoffs, median
+compute M2C wait rose from 918.720 to 1,049.280 us and allocator-slot stall
+rose from 513.056 to 634.400 us over the token
+(`20260808T234437Z-952266` versus `20260808T234359Z-951596`).  Waiting for
+both A operands before either issue and releasing them together made the
+larger task an unnecessarily coarse scheduling unit.
+
+A finer variant consumed the gate A operand just in time, issued and retired
+gate, released that slot, and only then consumed and issued up while retaining
+the shared activation tile.  It recovered 57.120 us of compute wait and
+24.160 us of allocator stall in `20260808T234826Z-954660`, but still exceeded
+the two-task control by 73.440 and 97.184 us respectively.  It passed the full
+S128 tensor thresholds and exact token in `20260808T235119Z-956176`.
+Profiling-free paired/control/paired 1,001-sample internal medians were
+2.475136/2.474400/2.473536 ms (`20260808T235227Z-956811`,
+`20260808T235311Z-957062`, and `20260808T235359Z-957443`): the paired mean is
+only 0.064 us faster than control, far below a retainable gain.
+
+Activation reuse inside a non-frontier-owning task is therefore hidden by the
+resident pipeline, and enlarging that task perturbs slot progress enough to
+consume the local saving.  Keep the two retained operators and their
+register-mediated gate handoff.  The paired opcode, task, schedule, manifest
+entry, and selector were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
