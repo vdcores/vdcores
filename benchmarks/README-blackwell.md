@@ -960,6 +960,51 @@ Clean balanced-path checks pass at S1 and four-token control flow in
 `tests/blackwell_runtime_smoke.py` also covers synchronous, asynchronous, and
 bulk sequence launches on all 152 SMs.
 
+### Rejected parked light-compute warps
+
+A selectable runtime prototype added one or two compute-only helper warps
+after the existing four compute and four memory warps.  The helpers slept on
+a named barrier between commands rather than polling the instruction stream,
+and every data publication still used the compute barriers and the normal
+memory-op path.  This tested extra CUDA throughput without changing the
+well-qualified 128-thread implementations or making the memory VCore join an
+invalid thread fence.
+
+Three placements were screened in one spill-free selectable image.  A paired
+SwiGLU command assigned gate and up to separate warp groups.  A wide command
+joined both groups only for the late 2,048-element shard.  A balanced RMS
+command split the 512 BF16 vector packs 384/128 between the original four
+warps and two helpers, then used one six-warp reduction and one ordinary C2M
+publication.  Full S128 validation produced exact token 24748 for each
+mechanism; the two-helper image used 96 registers, 11 barriers, a 96-byte
+stack, and zero spills.
+
+Same-image 501-sample internal-timer sandwiches were all neutral or worse:
+
+| Extra-thread scope | Disabled controls (ms) | Enabled (ms) | Delta |
+| --- | ---: | ---: | ---: |
+| One-warp paired SwiGLU | 2.594816 / 2.595520 | 2.596640 | +1.472 us |
+| Two-warp paired SwiGLU | 2.594048 / 2.597920 | 2.594528 | -1.456 us |
+| Two-warp wide late shard | 2.599552 / 2.603232 | 2.602016 | +0.624 us |
+| Pair plus wide late shard | 2.599552 / 2.603232 | 2.602528 | +1.136 us |
+| Six-warp RMS | 2.592128 / 2.593984 | 2.593536 | +0.480 us |
+
+The apparent 1.456 us paired result is below the run-phase spread, and marker
+profiles showed the same 3.168 us maximum MLP-prefix-to-SwiGLU frontier with
+and without it: the earlier pair remained hidden behind late shard 2.  The
+wide and RMS forms exposed the recurring six-warp rendezvous and did not
+repay it with their small amount of elementwise work.  Relevant jobs are
+`20260808T002914Z-4128202`--`20260808T003053Z-4130061` for one helper,
+`20260808T003410Z-4133114`--`20260808T003527Z-4134186` for two helpers,
+`20260808T004316Z-4141337`--`20260808T004517Z-4142812` for wide SwiGLU, and
+`20260808T005045Z-4147638`, `20260808T005317Z-4149560`, and
+`20260808T005358Z-4149974` for RMS.  The helper opcodes, mailbox, barriers,
+selectors, and wider launch were removed; production remains the minimal
+eight-warp runtime and the exact 11-op image.  The restored image passed every
+S128 tensor threshold and exact token 24748 in `20260808T005920Z-4154831`;
+its fresh 501-sample internal median was 2.588416 ms in
+`20260808T005959Z-4155420`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

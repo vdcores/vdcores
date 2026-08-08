@@ -258,6 +258,21 @@ the exact 11-op control/phase/control medians were
 frontier, so the complete proof was removed.  A coarse tail-first reorder was
 much worse at 2.881152 ms because it delayed the prefix gate producers.
 
+Extending only selected elementwise tasks with parked helper warps also did
+not improve the resident frontier.  One- and two-warp paired SwiGLU, a
+192-thread late-shard SwiGLU, and a balanced 192-thread RMS all passed exact
+S128 validation, but their same-image deltas were respectively +1.472 us,
+-1.456 us (noise-sized), +0.624 us, and +0.480 us.  The helper slept on a
+named barrier instead of polling, so this result is not the earlier full
+eight-compute-warp interpreter penalty.  Per-stage markers showed that the
+earlier paired work was hidden behind shard 2, while the wide tasks paid a
+six-warp join for too little CUDA work.  Keep the 128-thread task variants and
+do not add a light-compute role unless it can own a longer independent
+epilogue chain without a recurring all-participant rendezvous.  After removal,
+the exact 11-op production image returned to 96 registers, nine barriers, a
+96-byte stack, and zero spills; full S128 correctness passed and the fresh
+501-sample internal median was 2.588416 ms.
+
 ## Projection-to-RoPE Handoff
 
 - `RegStore` followed by `RegLoad` is an on-SM shared-memory handoff, not a
