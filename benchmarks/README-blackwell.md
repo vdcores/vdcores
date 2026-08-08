@@ -1377,6 +1377,33 @@ shared memory, and zero spills.  A fresh 1,001-sample internal-timer run in
 10.58% faster than the strict 2.816003 ms vLLM baseline and 16.291 us below
 the 2.534403 ms threshold for a 10% win.
 
+### Rejected native-152 single-wave LM head
+
+A mechanism proof replaced the 256 four-group LM tasks on 128 logical owners
+with one seven-group task on every physical SM.  It kept seven accumulators in
+TMEM, emitted 152 partial records, and reduced those records directly.  The
+uniform layout padded the 131,072-row projection to 136,192 rows, spending
+3.9% more weight traffic to give every CTA the same critical-path work.  This
+was intentionally the latency-balanced upper-bound test before building an
+exact-work mixed six/seven-group layout.
+
+The proof passed all S128 tensor thresholds and exact token 24748 in
+`20260808T143746Z-646319`.  Its 11-op image still used 96 registers, nine
+hardware barriers, a 96-byte stack, 7,024 bytes of static shared memory, and
+zero spills, so occupancy or spilling did not cause the result.  Nevertheless,
+its 1,001-sample internal median was 2.551200 ms in
+`20260808T143827Z-647190`, 33.088 us slower than the retained 2.518112 ms.
+
+The marker image in `20260808T144044Z-649223` localized the regression.  The
+single seven-group LM wave took 149.536 us at p50 and 163.872 us at its tail;
+the eight-reducer frontier reached 257.504 us.  A larger per-task operand set
+reduces the number of activation loads, but also consumes more shared slots
+per K step and loses the useful two-command prefetch/retirement cadence of the
+retained four-group tasks.  An exact mixed layout would remove only the 3.9%
+padding while retaining 112 seven-group critical tasks and adding imbalance,
+so it cannot plausibly recover the measured 33 us loss.  Both proof opcodes,
+the 152-record reducer, schedule selector, and manifests were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
