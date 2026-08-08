@@ -1478,6 +1478,31 @@ Making the three warps reach the recurring compute rendezvous earlier instead
 changes scheduler/barrier phase. The batch API, task branch, and build flag
 were removed; retain the per-tile cursor walk.
 
+### Rejected higher-register resident kernel
+
+The exact single-token image reserves 219 KiB of dynamic shared memory, so it
+is structurally limited to one resident CTA per SM. A kernel-wide resource
+proof added `__launch_bounds__(256, 1)`, allowing ptxas to spend registers on
+more aggressive scheduling without changing tasks or runtime instructions.
+The resulting image used 150 registers instead of 96, with the same nine
+barriers, 96-byte stack, 7,024 bytes of static shared memory, and zero spills.
+
+Its 1,001-sample S128 internal median was 2.524576 ms in
+`20260808T153011Z-681475`, 6.752 us slower than the freshly rebuilt
+2.517824-ms control in `20260808T152633Z-679742`. An intermediate compiler
+budget used `__launch_bounds__(256, 2)`: dynamic shared memory still admitted
+only one physical CTA, while the launch-bound register heuristic produced a
+126-register image. It measured 2.524960 ms in
+`20260808T153419Z-683995`, 7.136 us slower than control.
+
+NVIDIA documents that `--maxrregcount` is ignored for kernels carrying launch
+bounds, so the two-block compiler hint was the supported way to probe the
+intermediate allocation. Both higher-resource images regress by essentially
+the same amount. The single resident CTA is not register-starved; compiler
+freedom changes its global instruction/latency balance without shortening the
+cross-track frontier. The launch-bound selector was removed and the 96-register
+production image retained.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
