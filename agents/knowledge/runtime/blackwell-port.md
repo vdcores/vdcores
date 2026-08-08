@@ -1862,7 +1862,62 @@ queue wait by 29.472 us. LDU1 dependency wait increased by 24.128 us, so the
 extra depth is converting allocator starvation into useful prefetch while
 moving some pressure onto the activation stream.
 
-Cleanup must be requalified after this change. A later versioned/no-clear or
-deeper-clear proof should retain useful issuance pacing and model buffer
+The allocator change requires the cleanup requalification below. Any further
+versioned/no-clear proof must retain useful issuance pacing and model buffer
 lifetime explicitly. Add dedicated barrier IDs if required; do not overload a
 QKV, RMS, or MLP frontier merely to avoid expanding the barrier set.
+
+## One-layer-deep Q cleanup on the 26-slot pipeline
+
+Requalifying cleanup after the allocator expansion changed the result of the
+earlier one-layer-delay proof. The retained schedule rotates only the grouped
+Q-clear descriptors: layer L clears the layer-L-1 private Q buffer. It waits
+on layer L's pre-attention RMS frontier, is issued behind current Q/K/V, and
+runs one unchanged tile per CTA on SM88--151 while the attention CTAs execute.
+The pre-RMS counter is the actual lifetime edge, so no QKV/MLP barrier is
+overloaded and no new operator or runtime path is needed.
+
+An exact-image control/delayed/control sandwich measured
+2.541344/2.536320/2.543712 ms over 1,001 internal-timer samples in jobs
+`20260808T091126Z-371554`, `20260808T091212Z-372148`, and
+`20260808T091249Z-372830`: a 6.208 us gain against the control mean. Two final
+default-path runs measured 2.535968 and 2.543072 ms in
+`20260808T092447Z-384212` and `20260808T092523Z-384493`. The median of the
+three retained runs is 2.536320 ms, 9.932% below strict vLLM's 2.816003 ms and
+1.917 us above the exact 10% target.
+
+The simultaneous stage/track diagnostic comparison
+(`20260808T091952Z-379549` versus `20260808T092031Z-380191`) shortened the
+diagnostic token from 2.684000 to 2.674720 ms. The clear pulse completed near
+15--18 us absolute under attention/output work instead of remaining at the
+layer tail; the layer-loop frontier maximum fell from 79.232 to 78.624 us.
+Median compute M2C wait fell from 724.000 to 716.480 us, while median store
+barrier service fell from 111.680 to 101.056 us. Allocator stall was roughly
+flat (646.816 versus 648.544 us), confirming that the gain is moved work and
+shorter synchronization exposure rather than deleted cleanup traffic.
+
+The stronger non-periodic proof removed all in-loop clears, cleaned all 32
+independent layer buffers on the 24 auxiliary CTAs during LM head, and used a
+dedicated system barrier for all 2,048 completed stores before token finish.
+It passed full and four-token correctness in `20260808T091515Z-374872` and
+`20260808T091550Z-375550`, but measured 2.552448 ms in
+`20260808T091627Z-376424`, 9.920 us slower than the nearby control mean. The
+store burst competed with LM-head bandwidth and removing periodic cleanup
+again changed useful allocator/LDU pacing, so the barrier and batch machinery
+were removed.
+
+A final barrier-elision proof relied on the RMS-gated Q/K/V task already
+present on every SM88--151 owner and the later compute-to-memory return to
+protect the clear store. It passed full and four-token correctness
+(`20260808T092655Z-385786`, `20260808T092730Z-386051`) but measured
+2.538880 ms in `20260808T092804Z-386585`, with no material improvement over
+the explicit-barrier result. Keep the explicit pre-RMS wait as the clearer
+lifetime proof.
+
+A separate spare-SM LM-head proof split epoch one across 104 main and 24
+auxiliary CTAs and held auxiliary allocation until all epoch-zero records were
+stored. It was exact in `20260808T090006Z-361651`, but measured 2.589728 ms
+versus 2.540416 ms control (`20260808T090122Z-362816` and
+`20260808T090047Z-362540`). The full frontier prevents HBM contention but also
+discards the resident schedule's useful cross-epoch weight prefetch; all
+partition and barrier code was removed.

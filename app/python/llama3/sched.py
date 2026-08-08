@@ -545,7 +545,8 @@ layerg.addTma("loadQW", matqWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK)
 layerg.addTma("loadKW", matkWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 layerg.addTma("loadVW", matvWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, QKVTileM, Major.MN))
-layerg.addTma("storeQClear", attnQs, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
+q_clear_targets = attnQs[-1:] + attnQs[:-1]
+layerg.addTma("storeQClear", q_clear_targets, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
 layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
 
@@ -1249,20 +1250,15 @@ def schedule_single_token(
   Argmax = Argmax.place(N)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
-  clear_wait_bars = (
-    [layerg[f'bar_attn_out_group{group_id}']
-     for group_id in range(len(attn_out_head_groups))]
-    if phased_attn_out else layerg['bar_attn_out']
-  )
-  # Use one late Q-clear tile per CTA.  Spreading the unchanged stores over
-  # SM88--151 removes the auxiliary three-store cohort from the layer tail.
+  # Layer L clears L-1 only after L's input-RMS frontier.  Issue the unchanged
+  # stores behind current Q/K/V so SM88--151 can overlap them with attention.
   clear_q = SchedClearQ(
     TmaLoad1D(matZero[:N * QKVTileM], bytes=N * QKVTileM * matZero.element_size()),
     ToSplitMCordAdapter(layerg['storeQClear'], 64, QKVTileM),
     N * QKVTileM * matZero.element_size(),
     QKVTileM,
     64,
-    clear_wait_bars,
+    layerg['bar_pre_attn_rms'],
   )
   if not phased_attn_out:
     clear_q.bar("store", layerg['bar_q_clear'])
@@ -1333,6 +1329,8 @@ def schedule_single_token(
 
     Gqa,
     stage_profile_marker("attention", range(N * NUM_KV_HEAD)),
+    clear_q,
+    stage_profile_marker("clear_q", range(88, full_sms)),
     stage_profile_schedule_parts("out_proj_part", OutProj),
     stage_profile_marker("out_proj", range(full_sms)),
 
@@ -1361,9 +1359,6 @@ def schedule_single_token(
     # rms for next layer
     pre_attn_rms,
     stage_profile_marker("next_rms", range(rms_sms)),
-
-    clear_q,
-    stage_profile_marker("clear_q", range(num_sms, full_sms)),
 
     # All 152 SMs need the layer loop.
     LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group = layerg),
