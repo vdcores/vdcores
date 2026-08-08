@@ -1151,6 +1151,34 @@ The restored 11-op image returned to 96 registers, nine barriers, a 96-byte
 stack, and zero spills; four-token control-flow correctness passed and its
 fresh 501-sample S128 internal median was 2.569056 ms.
 
+### Rejected distributed atomic LM-head reduction
+
+An absolute stage profile showed about 15.8 us between the slowest distributed
+LM-head completion marker and the final token marker. Compute-side atomic
+maxima, 16-way sharded atomic maxima, and a store-VCore-owned atomic handoff
+were tested as alternatives to the 256-record reducer. All forms used packed
+64-bit value/index keys and passed exact token correctness; the final staged
+store form also passed four consecutive resident steps in
+`20260808T033523Z-86948`.
+
+Same-image 501-sample internal-timer sandwiches were:
+
+| Reduction organization | Controls (ms) | Variant (ms) | Delta |
+| --- | ---: | ---: | ---: |
+| One compute-side key | 2.576192 / 2.575520 | 2.574464 | -1.392 us |
+| 16 sharded compute-side keys | 2.565248 / 2.572288 | 2.570688 | +1.920 us |
+| Store-VCore atomics | 2.570080 / 2.570816 | 2.570240 | -0.208 us |
+| Store-VCore epoch retention | 2.569920 / 2.570528 | 2.572448 | +2.224 us |
+
+The two apparent gains are below control drift. The staged form halved partial
+publications but still lost, and its selectable image required 128 rather than
+96 registers. This confirms that the existing reducer substantially overlaps
+the LM-head tail; replacing its records with contended global atomics does not
+remove a serial 15.8 us. All experimental runtime and task code was removed.
+The restored 11-op image passed all 20 runtime tests and four resident greedy
+steps in `20260808T034403Z-94356`; its fresh 501-sample S128 internal median
+was 2.570208 ms in `20260808T034444Z-95073`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

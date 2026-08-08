@@ -1606,3 +1606,44 @@ four-compute-warp runtime remains production. The restored exact image uses
 96 registers, nine barriers, a 96-byte stack, and zero spills. All 20 runtime
 tests passed; job `20260808T025743Z-55875` matched four repeated greedy tokens,
 and job `20260808T025824Z-56647` measured a 2.569056 ms S128 internal median.
+
+## Rejected distributed atomic LM-head reduction
+
+The refreshed stage profile in `20260808T030449Z-62995` placed the distributed
+LM-head projection frontier at roughly 229.5 us after the final layer start and
+the token reducer at roughly 245.3 us. Three proof-of-concept paths tested
+whether compact maxima could eliminate that apparent 15.8 us tail without
+materializing the existing 256 partial records.
+
+The first path packed each CTA's BF16 maximum and inverse vocabulary index into
+one ordered 64-bit key and performed eight compute-side `atomicMax` operations.
+It passed exact single- and four-token resident correctness in
+`20260808T031213Z-68948` and `20260808T031258Z-69592`. A
+control/atomic/control sequence measured 2.576192/2.574464/2.575520 ms, only a
+1.392 us apparent gain against the control mean. Sharding the key across 16
+independent destinations also passed repeated correctness but measured
+2.565248/2.570688/2.572288 ms, a 1.920 us regression against its control mean.
+
+The second organization sent eight packed keys through the ordinary shared
+slot and C2M path, letting the store VCore perform the atomics and publish the
+completion barrier. Its first form was neutral at
+2.570080/2.570240/2.570816 ms. A tighter form retained epoch 0's keys in the
+store VCore's registers, merged epoch 1, and issued only eight atomics plus 128
+partial-barrier releases for the whole LM head. It passed exact four-step
+resident decode in `20260808T033523Z-86948`, but the decisive
+control/variant/control medians were 2.569920/2.572448/2.570528 ms in
+`20260808T033611Z-87446`, `20260808T033653Z-88423`, and
+`20260808T033730Z-88677`: 2.224 us slower than the control mean.
+
+The store form also raised the selectable image from 96 to 128 registers. The
+profiled tail therefore was not a serial reducer-only interval: much of the
+reducer already overlaps the uneven LM-head completion frontier, while atomic
+publication adds contention and whole-image register pressure. All atomic
+opcodes, key buffers, store-VCore state, finalizer, schedule variants, and
+selectors were removed. A future LM-head change should reduce projection work
+or keep a non-atomic reduction wholly inside an existing owner; another global
+publication representation is not promising. The restored 11-op image passed
+all 20 runtime tests, retained 96 registers/nine barriers/zero spills, and
+matched four repeated greedy tokens in `20260808T034403Z-94356`. Its fresh
+501-sample S128 internal median was 2.570208 ms in
+`20260808T034444Z-95073`.
