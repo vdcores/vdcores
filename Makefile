@@ -33,6 +33,12 @@ ifneq ($(m2c_legacy),)
 	NVCC_FLAGS += -DDAE_M2C_OBSERVER_WAIT=0
 endif
 
+# Opt-in research runtime: keep the production four-warp compute group intact
+# and park a second warpgroup until an explicitly paired compute task wakes it.
+ifneq ($(aux_warpgroup),)
+	NVCC_FLAGS += -DDAE_AUX_COMPUTE_WARPGROUP=1
+endif
+
 # Directories
 ifeq ($(debug),)
 	NVCC_FLAGS += -DNDEBUG

@@ -1552,3 +1552,25 @@ image remained at 96 registers, nine barriers, a 96-byte stack, and zero
 spills. Full S128 validation passed every tensor threshold and exact token
 24748 in `20260807T192906Z-3864350`; its fresh 501-sample internal median was
 2.620640 ms in `20260807T192944Z-3865232`.
+
+## Parked full-warpgroup base cost
+
+The next sidecar experiment keeps the existing four-warp task ABI and queue
+participation exactly intact, but adds an opt-in second four-warp compute
+group with `make aux_warpgroup=1`. The auxiliary group blocks on named
+barrier 15 for an ordinary schedule, never interprets instructions, and never
+joins M2C or C2M. This is deliberately different from the old global T256
+runtime, where eight compute warps affected every queue phase. The default
+build still launches 256 threads and compiles at 96 registers, nine hardware
+barriers, a 96-byte stack, and zero spills. The opt-in 384-thread skeleton
+uses the same registers/stack/spill count; the named-barrier ID makes ptxas
+report 16 hardware barriers.
+
+S128 correctness passed every tensor threshold and exact token 24748 in
+`20260808T021323Z-18791`. On the exact 11-op image, a 501-sample
+default/aux/default sequence measured 2.569824/2.574720/2.569120 ms in
+`20260808T021121Z-17328`, `20260808T021400Z-19378`, and
+`20260808T021603Z-20972`. The parked 128 threads therefore cost 5.248 us
+against the control mean, or 0.20% of full S128. This is the fixed budget a
+paired projection-chain command must recover before the opt-in runtime can be
+selected; the production default remains unchanged.

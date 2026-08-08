@@ -18,6 +18,16 @@ constexpr bool dae2LoadInstructions = true;
 // phase transition, avoiding 128 redundant arrivals per loaded operand.
 constexpr bool dae2M2CObserverWait = DAE_M2C_OBSERVER_WAIT != 0;
 
+#ifndef DAE_AUX_COMPUTE_WARPGROUP
+#define DAE_AUX_COMPUTE_WARPGROUP 0
+#endif
+// Experimental only: the normal task ABI remains one 128-thread warpgroup.
+// The extra warpgroup is a separately dispatched compute sidecar and never
+// participates in the memory-core queues unless a paired task explicitly
+// hands work to it.
+constexpr bool dae2EnableAuxComputeWarpgroup =
+    DAE_AUX_COMPUTE_WARPGROUP != 0;
+
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
@@ -29,10 +39,18 @@ static constexpr int numSpecialSlots = 9;
 static_assert(numSlots + numSpecialSlots <= ((2<<6) - 1), "Total number of slots must be less than or equal to 32");
 
 static constexpr int numComputeWarps = 4;
+static constexpr int numAuxComputeWarps =
+    dae2EnableAuxComputeWarpgroup ? 4 : 0;
+static constexpr int numRuntimeComputeWarps =
+    numComputeWarps + numAuxComputeWarps;
 static constexpr int numMemoryWarps = 4;
 
 static constexpr int numThreadsPerWarp = 32;
-static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
+static constexpr int numComputeThreads = numThreadsPerWarp * numComputeWarps;
+static constexpr int numRuntimeComputeThreads =
+    numThreadsPerWarp * numRuntimeComputeWarps;
+static constexpr int numThreads =
+    numThreadsPerWarp * (numRuntimeComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
 static constexpr int numComputeLoopCounters = 4;

@@ -1129,6 +1129,16 @@ S128 tensor threshold and exact token 24748 in `20260808T005920Z-4154831`;
 its fresh 501-sample internal median was 2.588416 ms in
 `20260808T005959Z-4155420`.
 
+### Parked full-warpgroup base-cost qualification
+
+`make aux_warpgroup=1` builds an experimental 384-thread CTA with the normal
+four-warp task interpreter, four parked auxiliary compute warps, and the
+unchanged four memory warps. Existing tasks and M2C/C2M barriers still have
+only 128 compute participants. A 501-sample default/aux/default S128
+sandwich measured 2.569824/2.574720/2.569120 ms, so the parked group costs
+5.248 us (0.20%) before it performs useful work. This selector is for paired
+projection-chain experiments; production builds omit it.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
