@@ -2236,3 +2236,48 @@ sum-of-squares cannot recover the gap: the prior shared-RMS versus scale-only
 bound is about 0.480 us before accounting for compact reduction/finalization.
 All grouped-safe operators, descriptor builders, and benchmark-only schedule
 paths were removed. Retain the balanced M64 down implementation.
+
+## Rejected no-clear pacing substitutes
+
+The later no-clear revisit separated useful queue pacing from zero-store
+traffic. A schedule-only selector replaced the 64-SM Q-clear wave with one
+issue-stage wait on the first phased-attention output needed by each physical
+SM. Waiting on the exact group, or uniformly on groups 0, 1, or 2, measured
+2.573312/2.573408/2.573568/2.575744 ms versus 2.521088 and 2.516288 ms clear
+controls over 301 samples in `20260808T134313Z-600550`. No-clear was
+2.531616 ms. An issue barrier therefore creates global head-of-line blocking;
+it is not a cheaper form of the clear's asynchronous back-pressure.
+
+Redirecting the same Copy pipeline to harmless scratch isolated the payload.
+For 128/256/512/1,024-byte load/store copies, medians were
+2.515168/2.516928/2.521472/2.513472 ms, bracketed by 2.516960 and 2.514752 ms
+clear controls in `20260808T134624Z-603152`. The slot size and two
+memory-to-compute operands stayed unchanged. A second proof compiled the
+ordinary Dummy release operator and replaced Copy plus writeback with one
+load slot and one M2C/C2M handoff. Payloads of 16, 128, and 1,024 bytes were
+again indistinguishable in the short screen
+(`20260808T135049Z-606092`), but strict 1,001-sample controls exposed a
+real cadence loss: two clear medians averaged 2.525792 ms while two 16-byte
+load-only pulses averaged 2.531488 ms
+(`20260808T135316Z-608128`), a 5.696-us regression.
+
+Finally, a two-slot 16-byte scratch Copy retained the full handoff topology
+while making global traffic negligible. Two clear medians averaged
+2.524800 ms and two scratch-pulse medians averaged 2.526224 ms in
+`20260808T135447Z-609512`, only a 1.424-us loss. This proves that the
+1-KiB Q-zero payload is already hidden; the benefit is the allocator and
+two-slot Copy/M2C/C2M phase pulse. Independent Q storage cannot improve the
+current schedule merely by deleting the stores, and replacing them with
+synthetic work is not a useful final design.
+
+Keep the one-layer-delayed clear. It already uses the existing
+`bar_pre_attn_rms` lifetime edge. The issue-wait proof reused existing
+phased-attention barriers and was much worse, so there is no evidence for
+spending the one potentially recoverable per-layer barrier counter on
+cleanup. Reconsider versioned buffers or a deeper clear pipeline only if a
+future schedule removes the need for this queue-phase pulse or introduces a
+new buffer-reuse frontier. All selectors, scratch tensors, the Dummy opcode
+addition, and experimental schedules were removed. The restored 11-op image
+returned to 96 registers, nine hardware barriers, a 96-byte stack, and zero
+spills; its fresh 1,001-sample S128 internal median was 2.522592 ms in
+`20260808T135833Z-612404`.
