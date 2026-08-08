@@ -1503,6 +1503,27 @@ freedom changes its global instruction/latency balance without shortening the
 cross-track frontier. The launch-bound selector was removed and the 96-register
 production image retained.
 
+### Rejected next-RMS-owner down-tail offload
+
+The final-layer marker trace put next-RMS owners SM0--7 near 81.8 us absolute
+while several CTAs appeared compute-idle earlier. Two schedule-only proofs
+moved their eight high-K down contributors without changing arithmetic,
+memory instructions, or the 104 `bar_layer` releases. Sending them to
+SM144--151 added a second high-K wave on those CTAs and measured 2.556800 ms
+in `20260808T154326Z-689370`, 39.488 us slower than the nearby
+2.517312-ms control in `20260808T154614Z-690599`.
+
+The narrower proof used the physical SM96--103 hole left by the retained
+down-tail offload: logical tasks 8--95 kept their owners, logical tasks 0--7
+moved to SM96--103, and SM0--7 entered RMS immediately. Its 1,001-sample
+internal median was 2.522784 ms in `20260808T154533Z-690336`, still 5.472 us
+slower than control. A marker pass showed why. The relocated tasks made the
+global down frontier arrive on SM96--103 around 80.6--80.9 us, and next RMS
+completed near 83.2 us rather than the control's 81.44 us. Those CTAs were
+compute-idle but retained unfavorable allocator/LDU history; placing another
+task there delayed the dependency-bearing memory track. Both remaps and the
+selector were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
