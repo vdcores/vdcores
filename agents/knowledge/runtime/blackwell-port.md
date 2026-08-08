@@ -2502,3 +2502,27 @@ measure 6.912 us, versus 6.880/6.912 us for bracketing 128-task controls.
 The extra weight streams and reduction records consume the saved per-task
 activation interval.  Keep the four-fold, 128-owner Q topology and spend the
 remaining CTAs on genuinely independent stages instead of oversharding Q.
+
+## Register-streamed M128 Q/RoPE epilogue
+
+M128's 32-datapath TMEM mapping gives compute thread `t` row `t` across all
+eight batch columns, so adjacent-lane shuffles provide every interleaved RoPE
+pair.  Retain a four-column raw TMEM stream: load x4, apply the required TMEM
+load fence, round to BF16, shuffle the paired lane, rotate, and store only the
+final shared tile.  This deletes the unrotated shared write/read plus its
+intermediate compute-group barrier while preserving the memory-op reduction
+path.
+
+Full-Q medians are 6.912 us for the shared path and 6.880/6.816/6.784 us for
+x1/x2/x4 register streaming.  An eight-value register fragment also reaches
+6.784 us but raises the selective image to 128 registers; x4 stays at the
+production 96 registers with no spills.  The stage frontier improves Q
+p50/max from 8.256/11.808 to 7.968/11.360 us and attention max from 15.168 to
+14.944 us.  End-to-end composition hides nearly all of it: two 2,001-sample
+candidate medians are 2.480224/2.480320 ms versus a 2.480416-ms control.  Keep
+the task path, but do not report this as a material TBT improvement.
+
+The retained production image passes full S128 tensor/token checks and four
+resident KV128-crossing steps.  It remains 13-op, 96-register, nine-barrier,
+96-byte-stack, 7,024-byte-static-shared, and spill-free.  Its fresh 1,001-run
+internal median is 2.481248 ms, 11.89% faster than strict vLLM S128.

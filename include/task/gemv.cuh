@@ -350,10 +350,12 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
             if constexpr (ApplyRope) {
                 if (tile_idx + 1 == n_k_tiles) {
                     // The coefficient loads are independent of the final
-                    // accumulator. Submit UMMA first, then keep one pair per
-                    // thread live across its completion wait. Each thread rotates
-                    // two batches with the same head-local pair below.
-                    const int pair = tid % (M / 2);
+                    // accumulator. Submit UMMA first, then keep one coefficient
+                    // pair per thread live across its completion wait.
+                    // M128's native 32-datapath epilogue owns one complete
+                    // output row per compute thread, so adjacent lanes consume
+                    // the same rotary pair in its register path below.
+                    const int pair = M == 128 ? tid / 2 : tid % (M / 2);
                     rope_cosine = rope_row[rope_head_offset + pair * 2];
                     rope_sine = rope_row[rope_head_offset + pair * 2 + 1];
                 }
@@ -384,6 +386,37 @@ __device__ __forceinline__ void task_gemv_sm100_impl(
         GMMA::Layout_MN_SW128_Atom<data_t>{}, make_shape(Int<M>{}, Int<N>{}));
     auto s_output = make_tensor(make_smem_ptr(output_ptr), layout_output);
     auto cta_output = cta_mma.partition_C(s_output);
+
+    if constexpr (ApplyRope && M == 128) {
+        // Stream half of the eight-column TMEM fragment at a time. Thread t
+        // owns row t, so a lane-xor exchange supplies its adjacent RoPE row
+        // without publishing and rereading the unrotated tile in shared memory.
+        const float cosine = static_cast<float>(rope_cosine);
+        const float sine = static_cast<float>(rope_sine);
+        const uint32_t tmem_addr = raw_pointer_cast(tmem_acc.data());
+        #pragma unroll
+        for (int col = 0; col < N; col += 4) {
+            uint32_t raw_acc[4];
+            SM100_TMEM_LOAD_32dp32b4x::copy(
+                tmem_addr + col,
+                raw_acc[0], raw_acc[1], raw_acc[2], raw_acc[3]);
+            cutlass::arch::fence_view_async_tmem_load();
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float value = static_cast<float>(
+                    data_t(__uint_as_float(raw_acc[i])));
+                const float partner = __shfl_xor_sync(
+                    0xFFFFFFFFU, value, 1);
+                const float even = (tid & 1) ? partner : value;
+                const float odd = (tid & 1) ? value : partner;
+                s_output(tid, col + i) = data_t((tid & 1)
+                    ? even * sine + odd * cosine
+                    : even * cosine - odd * sine);
+            }
+        }
+        c2m.template push<0, true>(tid, output_slot);
+        return;
+    }
 
     // CUTLASS's SM100 epilogue policy uses the wide 16-datapath ownership
     // pattern for FP32 accumulators narrowed to 16-bit output.  It aligns the

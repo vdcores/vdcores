@@ -1966,6 +1966,45 @@ and store paths reach their floor before all 152 CTAs are populated.  The
 mixed-fold benchmark selector and partitions were removed without an
 end-to-end schedule change.
 
+### Retained register-streamed M128 Q/RoPE epilogue
+
+The M128 TMEM layout assigns compute thread `t` row `t` for all eight batch
+columns; the direct layout probe in `20260808T214211Z-887112` verified the
+same ownership for the x1 and x4 32-datapath loads.  Every interleaved RoPE
+pair is therefore two adjacent lanes within one warp.  The retained path
+loads four FP32 TMEM columns at a time, rounds them to BF16, exchanges the
+paired row with one lane-xor shuffle, rotates in registers, and publishes only
+the final swizzled shared tile.  It removes the unrotated shared write/read and
+its intervening 128-thread barrier without changing the reduction store or
+memory-operator protocol.
+
+Granularity matters.  One-, two-, and four-column streaming measured
+6.880/6.816/6.784 us over 2,001 full-Q iterations
+(`20260808T215720Z-896004`, `20260808T220017Z-897454`, and
+`20260808T220235Z-899022`), versus 6.912 us for both shared-epilogue controls
+(`20260808T212909Z-879960` and `20260808T213445Z-883249`).  Keeping all eight
+columns live also reaches 6.784 us (`20260808T214910Z-890917`) but raises the
+whole selective image to 128 registers.  Four-column streaming keeps the
+96-register, nine-barrier, 96-byte-stack, 7,024-byte-static-shared, zero-spill
+production shape and is the minimum task-level winner.
+
+The downstream gain is real but almost fully hidden later in the resident
+pipeline.  Two 2,001-sample profiling-free candidate medians are
+2.480224/2.480320 ms (`20260808T220336Z-899465` and
+`20260808T221253Z-904052`), versus 2.480416 ms for the rebuilt shared control
+(`20260808T220819Z-901817`): only 0.096--0.192 us/token.  Stage profiling does
+show the intended dependency advance: Q p50/max moves from 8.256/11.808 to
+7.968/11.360 us and attention max from 15.168 to 14.944 us, comparing
+`20260808T202756Z-846500` with `20260808T221637Z-905914`.  Treat this as a
+retained task-path improvement, not a new end-to-end TBT record.
+
+The final production build passes the full S128 tensor checks and exact token
+24748 in `20260808T222408Z-909485`; four resident steps across KV128 generate
+`hello` exactly four times in `20260808T222514Z-910153`.  All 34 schedule and
+attention host tests pass.  Its fresh 1,001-sample profiling-free median is
+2.481248 ms in `20260808T222600Z-910497`, 11.89% faster than strict vLLM's
+2.816003-ms S128 baseline and 53.155 us beyond the 10%-lead threshold.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
