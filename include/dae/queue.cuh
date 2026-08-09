@@ -6,7 +6,7 @@
 // each element is associated with one or more slot
 // So if the number of slots > QSIZE, both enqueue and dequeue will be safe,
 // reads as the slots are guaranteed to be unique per element
-template<typename T, unsigned QSIZE = 32>
+template<typename T, unsigned QSIZE = 32, bool ObserverWait = false>
 struct SizeBoundedBarrierQueue {
   static_assert(QSIZE > numSlots, "QSIZE must be larger than numSlots");
 
@@ -16,20 +16,67 @@ struct SizeBoundedBarrierQueue {
   T *data;
   // register data
   unsigned ptr;
+  uint32_t phase_parity = 0;
+#if defined(DAE_TRACK_PROFILE)
+  uint64_t track_wait_ns = 0;
+  uint64_t track_wait_calls = 0;
+  uint64_t track_contended_waits = 0;
+#endif
 
   __device__ __forceinline__ uint64_t *native_bar(unsigned slot_id) {
     return cuda::device::barrier_native_handle(barriers[slot_id]);
   }
 
   __device__ __forceinline__ void wait() {
-    barriers[ptr].arrive_and_wait();
+#if defined(DAE_TRACK_PROFILE)
+    // Observer waits run on all compute threads, but only thread zero carries
+    // the diagnostic state.  Non-observer queues are consumed by one memory
+    // lane, so that lane records its complete queue wait.
+    const bool track_wait = !ObserverWait || threadIdx.x == 0;
+    const uint64_t wait_start = track_wait
+        ? cuda::ptx::get_sreg_globaltimer()
+        : 0;
+#endif
+    if constexpr (ObserverWait) {
+      // The load VCore is the barrier's sole participant.  Compute threads
+      // observe, rather than mutate, its phase transition.  The acquire wait
+      // makes the completed TMA writes visible before the shared-memory read.
+      bool ready = cuda::ptx::mbarrier_try_wait_parity(
+          cuda::ptx::sem_acquire,
+          cuda::ptx::scope_cta,
+          native_bar(ptr),
+          phase_parity);
+#if defined(DAE_TRACK_PROFILE)
+      if (track_wait && !ready)
+        ++track_contended_waits;
+#endif
+      while (!ready) {
+        ready = cuda::ptx::mbarrier_try_wait_parity(
+            cuda::ptx::sem_acquire,
+            cuda::ptx::scope_cta,
+            native_bar(ptr),
+            phase_parity);
+      }
+    } else {
+      barriers[ptr].arrive_and_wait();
+    }
+#if defined(DAE_TRACK_PROFILE)
+    if (track_wait) {
+      track_wait_ns += cuda::ptx::get_sreg_globaltimer() - wait_start;
+      ++track_wait_calls;
+    }
+#endif
   }
 
   template<int PH = 0>
   __device__ __forceinline__ T pop() {
-    barriers[ptr].arrive_and_wait();
+    wait();
     T val = data[ptr];
     ptr = (ptr + 1) % QSIZE;
+    if constexpr (ObserverWait) {
+      if (ptr == 0)
+        phase_parity ^= 1;
+    }
     return val;
   }
 
@@ -53,6 +100,16 @@ struct SizeBoundedBarrierQueue {
   }
   __device__ __forceinline__ void advance() {
     ptr = (ptr + 1) % QSIZE;
+    if constexpr (ObserverWait) {
+      if (ptr == 0)
+        phase_parity ^= 1;
+    }
+  }
+  __device__ __forceinline__ void advance_by(unsigned count) {
+    const unsigned next = ptr + count;
+    if constexpr (ObserverWait)
+      phase_parity ^= (next / QSIZE) & 1U;
+    ptr = next % QSIZE;
   }
   __device__ __forceinline__ void commit() {
     static_cast<void>(barriers[ptr].arrive());
@@ -65,8 +122,8 @@ static __device__ __forceinline__ uint16_t extract(const int s) {
 }
 
 template<unsigned QSIZE = 32>
-struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE> {
-  using Base = SizeBoundedBarrierQueue<int, QSIZE>;
+struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE, false> {
+  using Base = SizeBoundedBarrierQueue<int, QSIZE, false>;
 
   uint32_t shared_avail;
 
@@ -91,7 +148,9 @@ struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE>
   template<int ThrPush = 0, bool writeback = false, bool free_slot = true> 
   __device__ __forceinline__ void push(int tid, int val) {
     if constexpr (writeback) {
-      if (val < 0)
+      // -1 is the invalid-allocation sentinel.  Do not reject every negative
+      // int: bit 31 is a valid one-hot completion for special raw slot 31.
+      if (val == -1)
         return;
 
       if (tid == ThrPush)

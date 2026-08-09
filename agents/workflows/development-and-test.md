@@ -2,6 +2,29 @@
 
 Use this as the standard loop when developing VDCores applications.
 
+## Experimental Git Checkpoints And Recovery
+
+Use Git checkpoints for bounded kernel and schedule experiments instead of
+manually reversing large proof branches.  Every Git command in this workspace
+must go through the scoped wrapper:
+
+```bash
+/home/azhpcuser/jiaxin/vdcores-project/git-local status --short
+/home/azhpcuser/jiaxin/vdcores-project/git-local restore \
+  --source=<known-good-commit> -- <explicit experiment files>
+```
+
+- Resolve and record the known-good commit before starting an experiment.
+- Restore only explicit experiment files; preserve unrelated user changes.
+- Documentation describing the rejected experiment may remain after the code
+  restore and should be committed as the experiment milestone.
+- A rebuild or test rerun is not required when tracked code is restored
+  exactly to a commit whose relevant build/tests already passed and the only
+  remaining tracked changes are documentation.  Confirm that condition with
+  `git status --short` and record the known-good commit in the documentation.
+- Rebuild and test normally if any source, manifest, generated-input, build
+  option, or runtime environment differs from the known-good state.
+
 ## When CUDA Runtime Or Kernel Code Changes
 
 If you change CUDA runtime or kernel code, rebuild the extension first.

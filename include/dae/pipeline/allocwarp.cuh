@@ -13,13 +13,19 @@ static __device__ __forceinline__ void prefetch_inst_window(
 static constexpr uint16_t repeatCounterModeFlag = 0x8000U;
 static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
 static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
+static constexpr uint16_t repeatSkipCountMask = 0x1F00U;
+static constexpr int repeatSkipCountShift = 8;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
-    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    const LoopCounters &initial_loop_counts
+#if defined(DAE_TRACK_PROFILE)
+    , const int sm_id, uint64_t *g_events
+#endif
 ) {
   static_assert(numSlots < 32, "Too many slots for single warp");
 
@@ -31,7 +37,19 @@ __device__ __forceinline__ void allocwarp_execute(
 
   MemoryVirtualCore di;
   di.init();
+  if (lane_id < numComputeLoopCounters) {
+    di.jmp_cnt = initial_loop_counts.values[lane_id];
+  }
   SharedMemoryAllocator<numSlots> alloc;
+
+#if defined(DAE_TRACK_PROFILE)
+  uint64_t slot_stall_ns = 0;
+  uint64_t slot_stall_events = 0;
+  uint64_t slot_retries = 0;
+  uint64_t issue_barrier_ns = 0;
+  uint64_t issue_barrier_contended = 0;
+  uint64_t allocation_instructions = 0;
+#endif
 
   __syncwarp();
 
@@ -80,6 +98,10 @@ __device__ __forceinline__ void allocwarp_execute(
     // we also commit in the alloc
     int alloc_mask = 0;
     if (di.pred_allocate) {
+#if defined(DAE_TRACK_PROFILE)
+      bool slot_stalled = false;
+      uint64_t slot_stall_start = 0;
+#endif
       while (true) {
         di.slot_alloc = alloc.allocate(lane_id, flags, inst.nslot(), alloc_mask);
         // TODO(zhiyuang): reorder this store
@@ -87,8 +109,29 @@ __device__ __forceinline__ void allocwarp_execute(
         __mprint("[id] after allocation: allocate=%d slot=%d",
           di.pred_allocate, di.slot_alloc);
 
-        if (di.slot_alloc >= 0)
+        if (di.slot_alloc >= 0) {
+#if defined(DAE_TRACK_PROFILE)
+          if (lane_id == 0) {
+            ++allocation_instructions;
+            if (slot_stalled) {
+              slot_stall_ns +=
+                  cuda::ptx::get_sreg_globaltimer() - slot_stall_start;
+              ++slot_stall_events;
+            }
+          }
+#endif
           break;
+        }
+
+#if defined(DAE_TRACK_PROFILE)
+        if (lane_id == 0) {
+          if (!slot_stalled) {
+            slot_stalled = true;
+            slot_stall_start = cuda::ptx::get_sreg_globaltimer();
+          }
+          ++slot_retries;
+        }
+#endif
 
         __nanosleep(allocRetrySleepCycles);
       }
@@ -145,11 +188,16 @@ __device__ __forceinline__ void allocwarp_execute(
           const bool accumulate_mode = inst.arg & repeatAccumulateModeFlag;
           const int counter_reg = inst.arg & repeatCounterRegMask;
           const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
+          const int repeat_count = inst.size + (count_counter_mode ? counter_value : 0);
+          const int skip_count = (inst.arg & repeatSkipCountMask) >> repeatSkipCountShift;
           // Accumulator repeats extend the active seed; they do not start a new
           // repeat window, so the final consumer keeps the original pc distance.
           if (!accumulate_mode) {
-            di.loop_counter = inst.size + (count_counter_mode ? counter_value : 0); // minus the current one
+            di.loop_counter = repeat_count; // minus the current one
             di.loop_start_pc = pc + 1;
+            if (repeat_count == 0 && skip_count > 0) {
+              next_pc = pc + 1 + skip_count;
+            }
           }
           auto reg_start = inst.num_slots & 0xFF;
           auto reg_end = inst.num_slots >> 8;
@@ -186,9 +234,18 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();
+#if defined(DAE_TRACK_PROFILE)
+            const uint64_t barrier_start = cuda::ptx::get_sreg_globaltimer();
+            if (*bar != 0)
+              ++issue_barrier_contended;
+#endif
             while (*bar != 0) {
               __nanosleep(barrierPollSleepCycles);
             }
+#if defined(DAE_TRACK_PROFILE)
+            issue_barrier_ns +=
+                cuda::ptx::get_sreg_globaltimer() - barrier_start;
+#endif
             __mprint("Issue barrier %d passed", inst.bar());
           }
           break;
@@ -228,5 +285,18 @@ __device__ __forceinline__ void allocwarp_execute(
   }
 
   // __print(lane_id, "End of Alloc warp execution");
+#if defined(DAE_TRACK_PROFILE)
+  if (lane_id == 0) {
+    const int event_base = sm_id * numProfileEvents;
+    g_events[event_base + DAE_TRACK_ALLOC_SLOT_STALL_NS] = slot_stall_ns;
+    g_events[event_base + DAE_TRACK_ALLOC_SLOT_STALL_EVENTS] = slot_stall_events;
+    g_events[event_base + DAE_TRACK_ALLOC_SLOT_RETRIES] = slot_retries;
+    g_events[event_base + DAE_TRACK_ALLOC_ISSUE_BARRIER_NS] = issue_barrier_ns;
+    g_events[event_base + DAE_TRACK_ALLOC_ISSUE_BARRIER_CONTENDED] =
+        issue_barrier_contended;
+    g_events[event_base + DAE_TRACK_ALLOC_INSTRUCTIONS] =
+        allocation_instructions;
+  }
+#endif
   __mprint("End of allocwarp");
 }

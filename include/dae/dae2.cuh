@@ -11,6 +11,9 @@
 #include <cuda/ptx>
 #include <bit>
 
+#include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/arch/barrier.h>
+
 // pipeline stages
 #include "pipeline/allocwarp.cuh"
 #include "pipeline/ldwarp.cuh"
@@ -30,7 +33,8 @@ void dae2(
   const MInst* __restrict__ memory_instructions,
   const CUtensorMap* __restrict__ tma_descs,
   int * __restrict__ bars,
-  uint64_t *  __restrict__ g_events
+  uint64_t *  __restrict__ g_events,
+  LoopCounters initial_loop_counts
 ) {
 
   int sm_id = blockIdx.x;
@@ -70,7 +74,7 @@ void dae2(
   // TODO(zhiyuang): align this to lane 31 to avoid bank conflict?
   __shared__ int slot_avail;
   if (thread_id == 0)
-    slot_avail = (1U << numSlots) - 1; // all slots are available at the beginning. each bit represents a slot. 1 means available, 0 means occupied.
+    slot_avail = (1U << numSlots) - 1; // one bit per physical allocator slot
 
   // Init the queues
   #pragma nv_diag_suppress static_var_with_dynamic_init
@@ -87,7 +91,7 @@ void dae2(
   __shared__ int c2m_data[numQueueElements];
   __shared__ int m2ld_data[2][numQueueElements];
 
-  SizeBoundedBarrierQueue<int, numQueueElements> m2c {
+  SizeBoundedBarrierQueue<int, numQueueElements, dae2M2CObserverWait> m2c {
     .barriers = barriers[0], .data = m2c_data, .ptr = 0
   };
   SizeBoundedBarrierAllocQueue<numQueueElements> c2m {
@@ -106,6 +110,36 @@ void dae2(
   // argmax uses this
   __shared__ uint64_t scratch_space[32]; // 8-bytes aligned
 
+  // Blackwell UMMA accumulates in tensor memory.  VDCores keeps one resident
+  // block per SM, so acquire TMEM once for the lifetime of the megakernel and
+  // reuse it across sequential compute tasks.
+  __shared__ alignas(16) uint32_t tmem_base_ptr;
+  // Barrier 0 serves ordinary UMMA tasks. Grouped fused-LM-head tasks use
+  // four completion barriers followed by four empty-stage acknowledgements.
+  static constexpr int tmemMmaBarrierCount = 9;
+  __shared__ alignas(16) uint64_t tmem_mma_barriers[tmemMmaBarrierCount];
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  using TmemAllocator = cute::TMEM::Allocator1Sm;
+  TmemAllocator tmem_allocator{};
+  if (thread_id / numThreadsPerWarp == 0) {
+    tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
+  }
+  if (thread_id == 0) {
+    #pragma unroll
+    for (int i = 0; i < tmemMmaBarrierCount; ++i) {
+      cute::initialize_barrier(tmem_mma_barriers[i], 1);
+    }
+  }
+#else
+  if (thread_id == 0) {
+    tmem_base_ptr = 0;
+    #pragma unroll
+    for (int i = 0; i < tmemMmaBarrierCount; ++i) {
+      tmem_mma_barriers[i] = 0;
+    }
+  }
+#endif
+
   if (threadIdx.x == 0) {
     int event_base = sm_id * numProfileEvents;
     g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
@@ -117,7 +151,12 @@ void dae2(
   if (threadIdx.x < numComputeWarps * 32) {
     CInst inst;
     uint32_t pc = 0;
-    uint32_t count[numComputeLoopCounters] = {};
+    uint32_t count[numComputeLoopCounters];
+    #pragma unroll
+    for (int i = 0; i < numComputeLoopCounters; ++i) {
+      count[i] = initial_loop_counts.values[i];
+    }
+    uint32_t tmem_mma_phase = 0;
     bool finish = false;
 
     while (!finish) {
@@ -132,6 +171,9 @@ void dae2(
         finish,
         inst,
         smem_base,
+        tmem_base_ptr,
+        tmem_mma_barriers,
+        tmem_mma_phase,
         scratch_space,
         st_insts,
         m2c,
@@ -152,13 +194,20 @@ void dae2(
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
-        st_insts, smem_base, tma_descs, bars
+        st_insts, smem_base, tma_descs, bars,
+        initial_loop_counts
+#if defined(DAE_TRACK_PROFILE)
+        , sm_id, g_events
+#endif
       );
     } else if (warp_id == 1) {
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
           smem_base, tma_descs, bars
+#if defined(DAE_TRACK_PROFILE)
+          , sm_id, g_events
+#endif
         );
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
@@ -168,10 +217,21 @@ void dae2(
           m2ld[port_id], m2c,
           st_insts,
           smem_base, tma_descs, bars
+#if defined(DAE_TRACK_PROFILE)
+          , sm_id, port_id, g_events
+#endif
         );
       }
     } // End of warps
   } // End of memory warp group
+
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  __syncthreads();
+  if (thread_id / numThreadsPerWarp == 0) {
+    tmem_allocator.release_allocation_lock();
+    tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+  }
+#endif
 
   // end of megakernel
 }

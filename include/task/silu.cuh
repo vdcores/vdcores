@@ -169,19 +169,29 @@ __device__ __forceinline__ void task_silu_smem_1D(
 ) {
     using data_t = __nv_bfloat16;
     using fetch_t = __nv_bfloat162;
+    struct alignas(16) Pack128 {
+        fetch_t values[4];
+    };
+    static_assert(K % 8 == 0, "128-bit BF16 vector path requires K divisible by 8");
 
     const int slot_out = m2c.pop();
-    fetch_t *sOut = (fetch_t *)get_slot_address(base, extract(slot_out));
+    Pack128 *sOut = (Pack128 *)get_slot_address(base, extract(slot_out));
     const int slot_gate = m2c.pop();
-    fetch_t *sGate = (fetch_t *)get_slot_address(base, extract(slot_gate));
+    const Pack128 *sGate = (const Pack128 *)get_slot_address(base, extract(slot_gate));
     const int slot_up = m2c.pop();
-    fetch_t *sUp = (fetch_t *)get_slot_address(base, extract(slot_up));
+    const Pack128 *sUp = (const Pack128 *)get_slot_address(base, extract(slot_up));
 
-    // unroll to fill the latency of smem load/store
-    #pragma unroll
-    for (int i = threadIdx.x; i < K / 2 * N; i += numComputeWarps * numThreadsPerWarp) {
-        // each thread load 1 register in one non-unrolled loop
-        sOut[i] = silu_and_mul<data_t>(sGate[i], sUp[i]);
+    constexpr int kComputeThreads = numComputeWarps * numThreadsPerWarp;
+    constexpr int kPacksPerToken = K / 8;
+    for (int i = threadIdx.x; i < kPacksPerToken * N; i += kComputeThreads) {
+        Pack128 gate = sGate[i];
+        Pack128 up = sUp[i];
+        Pack128 out;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out.values[j] = silu_and_mul<data_t>(gate.values[j], up.values[j]);
+        }
+        sOut[i] = out;
     }
 
     c2m.template push<0, true>(threadIdx.x, slot_out);

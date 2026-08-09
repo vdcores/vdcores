@@ -6,12 +6,27 @@
 template<typename C2M_Type>
 __device__ __forceinline__ void stwarp_execute_singlethread(
     C2M_Type &c2m, const MInst* slot_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars
+#if defined(DAE_TRACK_PROFILE)
+    , const int sm_id, uint64_t *g_events
+#endif
+    ) {
 
   __stprint("[ST Warp] Start ST warp execution");
+
+#if defined(DAE_TRACK_PROFILE)
+  uint64_t service_ns = 0;
+  uint64_t barrier_service_ns = 0;
+  uint64_t commands = 0;
+  uint64_t barrier_commands = 0;
+#endif
     
   int slot_mask = c2m.pop();
   while (slot_mask) {
+#if defined(DAE_TRACK_PROFILE)
+    const uint64_t service_start = cuda::ptx::get_sreg_globaltimer();
+    ++commands;
+#endif
   
     auto slot = extract(slot_mask);
     bool do_free = true;
@@ -144,6 +159,25 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
           cuda::ptx::cp_async_bulk_commit_group();
         }
         break;
+      case op(OP_ALLOC_WB_TMA_REDUCE_ADD_4D):
+        {
+          const uint16_t *cord = inst.coords;
+          __stprint("TMA 4D Reduce-Add: desc_idx=%d size=%d cord=(%d,%d,%d,%d)",
+                    inst.arg, inst.size, cord[0], cord[1], cord[2], cord[3]);
+          asm volatile(
+            "cp.reduce.async.bulk.tensor.4d.global.shared::cta.add.bulk_group "
+            "[%0, {%1, %2, %3, %4}], [%5];\n"
+            :
+            : "l"((void *)(tma_descs + inst.arg)),
+              "r"((int)cord[0]),
+              "r"((int)cord[1]),
+              "r"((int)cord[2]),
+              "r"((int)cord[3]),
+              "r"((uint32_t)__cvta_generic_to_shared(get_slot_address(smem_base, slot)))
+              : "memory");
+          cuda::ptx::cp_async_bulk_commit_group();
+        }
+        break;
       default:
         // unknown opcode
         __stprint("Unknown mem wb opcode: slot_mask=%x slot=%d op=%d opcode=%04x\n", slot_mask, slot, op(inst.opcode), inst.opcode);
@@ -153,6 +187,9 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
     // do bar for all instructions all at once
     if (opcode & MEM_OP_FLAGS_BARRIER) {
+#if defined(DAE_TRACK_PROFILE)
+      ++barrier_commands;
+#endif
       // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
       atomicSub(&bars[inst.bar()], 1);
@@ -170,8 +207,26 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
     if (do_free)
       c2m.reset(slot_mask);
+#if defined(DAE_TRACK_PROFILE)
+    const uint64_t current_service_ns =
+        cuda::ptx::get_sreg_globaltimer() - service_start;
+    service_ns += current_service_ns;
+    if (opcode & MEM_OP_FLAGS_BARRIER)
+      barrier_service_ns += current_service_ns;
+#endif
     slot_mask = c2m.pop();
   }
 
   __stprint("End of ST warp execution");
+#if defined(DAE_TRACK_PROFILE)
+  const int event_base = sm_id * numProfileEvents;
+  g_events[event_base + DAE_TRACK_STORE_QUEUE_WAIT_NS] = c2m.track_wait_ns;
+  g_events[event_base + DAE_TRACK_STORE_QUEUE_WAIT_CALLS] =
+      c2m.track_wait_calls;
+  g_events[event_base + DAE_TRACK_STORE_SERVICE_NS] = service_ns;
+  g_events[event_base + DAE_TRACK_STORE_BARRIER_SERVICE_NS] =
+      barrier_service_ns;
+  g_events[event_base + DAE_TRACK_STORE_COMMANDS] = commands;
+  g_events[event_base + DAE_TRACK_STORE_BARRIER_COMMANDS] = barrier_commands;
+#endif
 }

@@ -6,15 +6,27 @@ template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     const MInst *st_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars
+#if defined(DAE_TRACK_PROFILE)
+    , const int sm_id, const int port_id, uint64_t *g_events
+#endif
+    ) {
 
   __ldprint("[LD Warp] Start LD warp execution");
 
   int regFile[4];
+#if defined(DAE_TRACK_PROFILE)
+  uint64_t dependency_wait_ns = 0;
+  uint64_t dependency_contended = 0;
+  uint64_t commands = 0;
+#endif
   m2ld.wait();
   LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
 
   while (cmd.slot != SLOT_END) {
+#if defined(DAE_TRACK_PROFILE)
+    ++commands;
+#endif
     auto &slot = cmd.slot;
     auto inst = st_insts[slot];
 
@@ -29,6 +41,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     // TODO(zhiyuang): wait bar here if bar is set
     if ((opcode & MEM_OP_FLAGS_BARRIER) && !(opcode & MEM_OP_FLAGS_WRITEBACK)) {
       volatile int *bar = bars + inst.bar();
+#if defined(DAE_TRACK_PROFILE)
+      const uint64_t dependency_start = cuda::ptx::get_sreg_globaltimer();
+      if (*bar != 0)
+        ++dependency_contended;
+#endif
       // bool first_wait = true;
       // if (blockIdx.x == 0 && first_wait) {
       //   printf("[LD][sm=%d] check bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
@@ -41,6 +58,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         //   first_wait = false;
         // }
       }
+#if defined(DAE_TRACK_PROFILE)
+      dependency_wait_ns +=
+          cuda::ptx::get_sreg_globaltimer() - dependency_start;
+#endif
       __ldprint("wait for global barrier before load: bar=%d", inst.bar());
     };
 
@@ -190,5 +211,16 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   } // End of LD warp loop
 
   __ldprint("End of LD warp execution");
+#if defined(DAE_TRACK_PROFILE)
+  const int event_base = sm_id * numProfileEvents;
+  const int port_base = port_id == 0
+      ? DAE_TRACK_LDU0_QUEUE_WAIT_NS
+      : DAE_TRACK_LDU1_QUEUE_WAIT_NS;
+  g_events[event_base + port_base + 0] = m2ld.track_wait_ns;
+  g_events[event_base + port_base + 1] = m2ld.track_wait_calls;
+  g_events[event_base + port_base + 2] = dependency_wait_ns;
+  g_events[event_base + port_base + 3] = dependency_contended;
+  g_events[event_base + port_base + 4] = commands;
+#endif
   // __print(0, "End of LD warp execution");
 }

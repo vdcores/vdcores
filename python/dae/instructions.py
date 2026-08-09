@@ -19,9 +19,11 @@ from .tma_utils import (
     build_tma_1d,
     build_tma_wgmma_kmajor,
     build_tma_wgmma_mnmajor,
+    build_tma_wgmma_tile_major,
     bytes2slots,
     cord_func_2d_kmajor,
     cord_func_2d_mnmajor,
+    cord_func_2d_tile_major,
     cord_func_tma_1d,
     cords2addr,
     get_tensor_address,
@@ -63,6 +65,31 @@ class Gemv_M64N8(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
 
+
+class Gemv_M64N8UpSiLU(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 4
+
+    def __init__(self, kTiles: int):
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M64N8_UP_SILU,
+            args=[kTiles],
+        )
+
+
+class Gemv_M64N8IssuerOnly(ComputeInstruction):
+    MNK = (64, 8, 256)
+    n_batch = 4
+
+    def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
+        if residual:
+            raise ValueError("issuer-only M64N8 does not support residual input")
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M64N8_ISSUER_ONLY,
+            args=[kTiles, nprefeth],
+        )
+
+
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
@@ -84,12 +111,82 @@ class Gemv_M64N8B2(ComputeInstruction):
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=64, N=8, K=256, BLOAD=2, RESIDUAL=residual), args=[kTiles, nprefeth])
 
+
 class Gemv_M128N8(ComputeInstruction):
     MNK = (128, 8, 128)
     n_batch = 4
 
     def __init__(self, kTiles: int, nprefeth=0, residual: bool = False):
         super().__init__(opcode=family_ref("GEMV_WGMMA", M=128, N=8, K=128, BLOAD=4, RESIDUAL=residual), args=[kTiles, nprefeth])
+
+
+class Gemv_M128N8Direct4(ComputeInstruction):
+    MNK = (128, 8, 128)
+    n_batch = 4
+    direct_output = True
+    output_groups = 4
+
+    def __init__(self, kTiles: int, output_stride: int, output_group_stride: int):
+        if output_stride % self.MNK[0] or output_group_stride % self.MNK[0]:
+            raise ValueError("direct M128 GEMV strides must be multiples of 128")
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M128N8_DIRECT4,
+            args=[
+                kTiles,
+                output_stride // self.MNK[0],
+                output_group_stride // self.MNK[0],
+            ],
+        )
+
+
+class Gemv_M128N8Argmax4(ComputeInstruction):
+    MNK = (128, 8, 128)
+    n_batch = 4
+    output_groups = 4
+
+    def __init__(self, kTiles: int, output_group_stride: int,
+                 vocabulary_base: int):
+        if output_group_stride % self.MNK[0] or vocabulary_base % self.MNK[0]:
+            raise ValueError("fused M128 GEMV offsets must be multiples of 128")
+        super().__init__(
+            opcode=opcode.OP_GEMV_SM100_M128N8_ARGMAX4,
+            args=[
+                kTiles,
+                output_group_stride // self.MNK[0],
+                vocabulary_base // self.MNK[0],
+            ],
+        )
+
+
+class _GemvM128N8GroupedReduce(ComputeInstruction):
+    MNK = (128, 8, 128)
+
+    def __init__(self, kTiles: int):
+        super().__init__(opcode=self.opcode, args=[kTiles])
+
+
+class Gemv_M128N8Group4B2(_GemvM128N8GroupedReduce):
+    n_batch = 2
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B2
+
+
+class Gemv_M128N8Group4B3(_GemvM128N8GroupedReduce):
+    n_batch = 3
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B3
+
+
+class Gemv_M128N8Group4B4(_GemvM128N8GroupedReduce):
+    n_batch = 4
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B4
+
+
+class Gemv_M128N8Group4B7(_GemvM128N8GroupedReduce):
+    n_batch = 7
+    output_groups = 4
+    opcode = opcode.OP_GEMV_SM100_M128N8_GROUP4_B7
 
 class Gemm_M64N64(ComputeInstruction):
     MNK = (64, 64, 128)
@@ -120,6 +217,14 @@ class Gemv_M64N8_ROPE_128(ComputeInstruction):
 
     def __init__(self, kTiles: int, hist_len: int, head_dim_ofst: int):
         super().__init__(opcode=opcode.OP_GEMV_M64N8_ROPE_128, args=[kTiles, hist_len, head_dim_ofst])
+
+
+class Gemv_M128N8_ROPE_128(ComputeInstruction):
+    MNK = (128, 8, 128)
+    n_batch = 4
+
+    def __init__(self, kTiles: int, hist_len: int, head_dim_ofst: int):
+        super().__init__(opcode=opcode.OP_GEMV_M128N8_ROPE_128, args=[kTiles, hist_len, head_dim_ofst])
 
 
 class Gemv_M192N16(ComputeInstruction):
@@ -159,8 +264,8 @@ class ROPE_INTERLEAVE_512(ComputeInstruction):
 ATTENTION_DYNAMIC_LAST_KV_LEN_FLAG = 0x4
 ATTENTION_DYNAMIC_NUM_KV_BLOCKS_FLAG = 0x8
 ATTENTION_BLOCK_COUNTER_SHIFT = 4
-ATTENTION_BLOCK_COUNTER_MASK = 0xF
 ATTENTION_COUNTER_SHIFT = 8
+ATTENTION_OUTER_COUNTER_SHIFT = 12
 
 
 def _encode_attention_runtime_flags(
@@ -168,6 +273,7 @@ def _encode_attention_runtime_flags(
     need_rope: bool,
     seq_len_counter_reg: int | None = None,
     num_kv_block_counter_reg: int | None = None,
+    outer_seq_len_counter_reg: int | None = None,
 ) -> int:
     flags = 0
     if need_norm:
@@ -175,28 +281,50 @@ def _encode_attention_runtime_flags(
     if need_rope:
         flags |= 2
     if seq_len_counter_reg is not None:
-        assert 0 <= seq_len_counter_reg < 256, "seq_len_counter_reg must fit in 8 bits"
+        assert 0 <= seq_len_counter_reg < config.num_loop_counters
         flags |= ATTENTION_DYNAMIC_LAST_KV_LEN_FLAG
         flags |= seq_len_counter_reg << ATTENTION_COUNTER_SHIFT
     if num_kv_block_counter_reg is not None:
-        assert 0 <= num_kv_block_counter_reg <= ATTENTION_BLOCK_COUNTER_MASK, "num_kv_block_counter_reg must fit in 4 bits"
+        assert 0 <= num_kv_block_counter_reg < config.num_loop_counters
         flags |= ATTENTION_DYNAMIC_NUM_KV_BLOCKS_FLAG
         flags |= num_kv_block_counter_reg << ATTENTION_BLOCK_COUNTER_SHIFT
+    if outer_seq_len_counter_reg is not None:
+        assert 0 <= outer_seq_len_counter_reg < config.num_loop_counters
+        flags |= outer_seq_len_counter_reg << ATTENTION_OUTER_COUNTER_SHIFT
     return flags
 
-def _encode_attention_qkv_workload_flag(num_active_q: int, last_kv_active_token_len: int) -> int:
-    return num_active_q | (last_kv_active_token_len << 8)
+def _encode_attention_qkv_workload_flag(
+    num_active_q: int,
+    last_kv_active_token_len: int,
+    kv_block_size: int = 64,
+) -> int:
+    assert 0 < num_active_q < 0x80, "num_active_q must fit below the KV-tile flag"
+    assert kv_block_size in {64, 128}, "kv_block_size must be 64 or 128"
+    kv_tile_flag = 0x80 if kv_block_size == 128 else 0
+    return num_active_q | kv_tile_flag | (last_kv_active_token_len << 8)
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64, outer_seq_len_counter_reg: int | None = None, outer_seq_len_counter_stride: int = 0):
+        if outer_seq_len_counter_reg is None:
+            assert outer_seq_len_counter_stride == 0
+        else:
+            assert 0 < outer_seq_len_counter_stride < 256
+        assert 0 < num_kv_block < 256
+        encoded_num_kv_block = num_kv_block | (outer_seq_len_counter_stride << 8)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim,
             args=[
-                num_kv_block, 
-                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
-                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg)
+                encoded_num_kv_block,
+                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len, kv_block_size),
+                _encode_attention_runtime_flags(
+                    need_norm,
+                    need_rope,
+                    seq_len_counter_reg,
+                    num_kv_block_counter_reg,
+                    outer_seq_len_counter_reg,
+                ),
             ],
         )
 
@@ -204,7 +332,8 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim(ComputeInstruction):
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
     HEAD_DIM = 128
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64):
+        assert kv_block_size == 64, "MMA attention only supports KV64"
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA,
             args=[
@@ -213,6 +342,83 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA(ComputeInstruction):
                 _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg),
             ],
         )
+
+
+class ATTENTION_SM100_BF16_HDIM128_DIRECT(ComputeInstruction):
+    HEAD_DIM = 128
+
+    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = False, need_rope: bool = False, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64, outer_seq_len_counter_reg: int | None = None, outer_seq_len_counter_stride: int = 0):
+        assert not need_norm and not need_rope, (
+            "direct SM100 attention expects Q/K normalization and RoPE to be "
+            "scheduled separately"
+        )
+        if outer_seq_len_counter_reg is None:
+            assert outer_seq_len_counter_stride == 0
+        else:
+            assert 0 < outer_seq_len_counter_stride < 256
+        assert 0 < num_kv_block < 256
+        encoded_num_kv_block = num_kv_block | (outer_seq_len_counter_stride << 8)
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_SM100_BF16_HDIM128_DIRECT,
+            args=[
+                encoded_num_kv_block,
+                _encode_attention_qkv_workload_flag(
+                    num_active_q, last_kv_active_token_len, kv_block_size
+                ),
+                _encode_attention_runtime_flags(
+                    need_norm,
+                    need_rope,
+                    seq_len_counter_reg,
+                    num_kv_block_counter_reg,
+                    outer_seq_len_counter_reg,
+                ),
+            ],
+        )
+
+
+class ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT(ComputeInstruction):
+    HEAD_DIM = 128
+
+    def __init__(
+        self,
+        num_kv_block: int,
+        split_idx: int,
+        num_active_q: int,
+        last_kv_active_token_len: int,
+        kv_start_idx: int,
+        *,
+        kv_block_size: int = 64,
+        **_unused,
+    ):
+        assert split_idx < 16
+        super().__init__(
+            opcode=opcode.OP_ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT,
+            args=[
+                num_kv_block | (split_idx << 12),
+                _encode_attention_qkv_workload_flag(
+                    num_active_q, last_kv_active_token_len, kv_block_size
+                ),
+                kv_start_idx,
+            ],
+        )
+
+
+class ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT(
+    ATTENTION_SM100_BF16_HDIM128_DIRECT
+):
+    def __init__(self, *args, kv_block_size: int = 128, **kwargs):
+        assert kv_block_size == 128, "swapped SM100 attention requires KV128"
+        super().__init__(*args, kv_block_size=kv_block_size, **kwargs)
+        self.opcode = opcode.OP_ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+
+
+class ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT(
+    ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT
+):
+    def __init__(self, *args, kv_block_size: int = 128, **kwargs):
+        assert kv_block_size == 128, "swapped SM100 attention requires KV128"
+        super().__init__(*args, kv_block_size=kv_block_size, **kwargs)
+        self.opcode = opcode.OP_ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
 
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
@@ -245,11 +451,13 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA(ComputeInstruction):
 
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(ComputeInstruction):
     HEAD_DIM = 128
-    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True):
+    def __init__(self, num_kv_block: int, split_idx: int, num_active_q: int, last_kv_active_token_len: int, kv_start_idx: int, need_norm: bool = True, need_rope: bool = True, kv_block_size: int = 64):
         assert split_idx < 16, "split_idx must be less than 16 to fit in the instruction encoding"
         # pack need_norm and need_rope into a uint16 arg
         arg0 = num_kv_block | (split_idx << 12)
-        arg1 = num_active_q | (last_kv_active_token_len << 8)
+        arg1 = _encode_attention_qkv_workload_flag(
+            num_active_q, last_kv_active_token_len, kv_block_size
+        )
         arg2 = kv_start_idx # make this 16bit to support long seq
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split, 
@@ -272,12 +480,27 @@ class ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA(ComputeInstruction):
 class ATTN_SPLIT_POST_REDUCE(ComputeInstruction):
     HEAD_DIM = 128
     Q_TILE = 4
-    def __init__(self, num_split: int):
-        super().__init__(opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE, args=[num_split])
+    def __init__(
+        self,
+        num_split: int,
+        raw_partial: bool = False,
+        direct_output: bool = False,
+    ):
+        assert not direct_output or raw_partial
+        super().__init__(
+            opcode=opcode.OP_ATTN_SPLIT_POST_REDUCE,
+            args=[num_split, int(raw_partial) | (int(direct_output) << 1)],
+        )
+
 
 class SILU_MUL_SHARED_BF16_K_4096_INTER(ComputeInstruction):
     def __init__(self, num_token):
         super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_4096_INTER, args=[num_token])
+
+
+class SILU_MUL_SHARED_BF16_K_2048_INTER(ComputeInstruction):
+    def __init__(self, num_token):
+        super().__init__(opcode=opcode.OP_SILU_MUL_SHARED_BF16_K_2048_INTER, args=[num_token])
 
 
 class SILU_MUL_SHARED_BF16_K_64_SW128(ComputeInstruction):
@@ -310,8 +533,10 @@ class RMS_NORM_F16_K_5120_SMEM(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_5120_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
-def select_attention_decode_instruction(head_dim: int):
+def select_attention_decode_instruction(head_dim: int, direct_output: bool = False):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
+        if direct_output:
+            return ATTENTION_SM100_BF16_HDIM128_DIRECT
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim64.HEAD_DIM:
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA
@@ -383,6 +608,16 @@ class ARGMAX_REDUCE_bf16_1024_128(ComputeInstruction):
         super().__init__(opcode=opcode.OP_ARGMAX_REDUCE_bf16_1024_128, args=[num_active_token])
 
 
+class ARGMAX_REDUCE_GLOBAL_bf16_256(ComputeInstruction):
+    PARTIAL_TASKS = 256
+
+    def __init__(self, num_active_token: int):
+        super().__init__(
+            opcode=opcode.OP_ARGMAX_REDUCE_GLOBAL_bf16_256,
+            args=[num_active_token],
+        )
+
+
 class Dummy(ComputeInstruction):
     def __init__(self, iters: int):
         super().__init__(opcode=opcode.OP_DUMMY, args=[iters])
@@ -392,6 +627,18 @@ class Copy(ComputeInstruction):
     def __init__(self, iters: int, size: int):
         assert size % 4 == 0, "Copy size must be multiple of 4 bytes (size of uint32)"
         super().__init__(opcode=opcode.OP_COPY, args=[iters, size // 4])
+
+
+class ProfileEvent(ComputeInstruction):
+    """Record a compute-warpgroup arrival timestamp in the per-SM profile."""
+
+    def __init__(self, event_id: int):
+        if not 2 <= event_id < config.num_profile_events:
+            raise ValueError(
+                "profile event id must leave slots 0/1 for kernel start/end "
+                f"and be below {config.num_profile_events}, got {event_id}"
+            )
+        super().__init__(opcode=opcode.OP_PROFILE_EVENT, args=[event_id])
 
 
 class LoopC(ComputeInstruction):
@@ -630,6 +877,8 @@ class RepeatM(MemoryInstruction):
     COUNTER_MODE_FLAG = 0x8000
     COUNT_COUNTER_MODE_FLAG = 0x4000
     ACCUMULATE_MODE_FLAG = 0x2000
+    SKIP_COUNT_SHIFT = 8
+    SKIP_COUNT_MASK = 0x1F
     COUNTER_REG_MASK = 0x00FF
 
     def __init__(
@@ -786,6 +1035,8 @@ class RepeatM(MemoryInstruction):
             for reg_start, reg_end, delta_cords in regcords:
                 insts += [cls(0, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords, count_counter_reg=count_counter_reg)]
             insts[-1].size = count
+            assert len(steps) <= cls.SKIP_COUNT_MASK, "dynamic repeat window is too large to encode"
+            insts[-1].arg |= len(steps) << cls.SKIP_COUNT_SHIFT
 
         for inst, _ in steps:
             insts.append(inst)
@@ -917,6 +1168,7 @@ class TmaTensor(MemoryInstruction):
             "reduce": {
                 2: opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D,
                 3: opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_3D,
+                4: opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_4D,
             },
             "load": {
                 1: opcode.OP_ALLOC_TMA_LOAD_TENSOR_1D,
@@ -979,6 +1231,15 @@ class TmaTensor(MemoryInstruction):
     def wgmma_load(self, tileN: int, tileM: int, major: Major):
         return self.wgmma("load", tileN, tileM, major)
 
+    def wgmma_load_tiled(self, tileN: int, tileM: int):
+        return self._build(
+            "load",
+            tileM,
+            tileN,
+            build_tma_wgmma_tile_major,
+            cord_func_2d_tile_major,
+        )
+
     def wgmma_store(self, tileN: int, tileM: int, major: Major):
         return self.wgmma("store", tileN, tileM, major)
 
@@ -990,7 +1251,15 @@ __all__ = [
     "ComputeInstruction",
     "TerminateC",
     "Gemv_M64N8",
+    "Gemv_M64N8IssuerOnly",
+    "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
+    "Gemv_M128N8Direct4",
+    "Gemv_M128N8Argmax4",
+    "Gemv_M128N8Group4B2",
+    "Gemv_M128N8Group4B3",
+    "Gemv_M128N8Group4B4",
+    "Gemv_M128N8Group4B7",
     "Gemv_M64N8K64",
     "Gemv_M64N8K128",
     "Gemv_M64N8B2",
@@ -998,6 +1267,7 @@ __all__ = [
     "Gemm_M64N64K64",
     "Gemm_M64N128K64",
     "Gemv_M64N8_ROPE_128",
+    "Gemv_M128N8_ROPE_128",
     "Gemv_M192N16",
     "Gemv_M64N8_MMA",
     "WGMMA_64x256x64_F16",
@@ -1005,12 +1275,17 @@ __all__ = [
     "ROPE_INTERLEAVE_512",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA",
+    "ATTENTION_SM100_BF16_HDIM128_DIRECT",
+    "ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT",
+    "ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT",
+    "ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
     "ATTENTION_M64N64K16_F16_F32_64_64_hdim_split_MMA",
     "ATTN_SPLIT_POST_REDUCE",
     "SILU_MUL_SHARED_BF16_K_4096_INTER",
+    "SILU_MUL_SHARED_BF16_K_2048_INTER",
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
     "RMS_NORM_F16_K_4096_SMEM",
@@ -1024,8 +1299,10 @@ __all__ = [
     "ARGMAX_REDUCE_bf16_1152_132",
     "ARGMAX_PARTIAL_bf16_1024_65536_128",
     "ARGMAX_REDUCE_bf16_1024_128",
+    "ARGMAX_REDUCE_GLOBAL_bf16_256",
     "Dummy",
     "Copy",
+    "ProfileEvent",
     "LoopC",
     "MemoryInstruction",
     "TerminateM",

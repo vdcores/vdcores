@@ -1,59 +1,94 @@
 import torch
-import copy
+import os
 from math import sqrt
 from functools import partial
+from dae import runtime
 from dae.launcher import *
+from dae.instructions import ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
 from dae.util import *
-from dae.runtime import opcode, build_tma_desc 
 from qwen3.utils import *
 
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 32768
+ACTIVE_KV_SEQ_LEN = int(os.environ.get("ATTENTION_SEQ_LEN", "512"))
+if ACTIVE_KV_SEQ_LEN <= 0:
+    raise ValueError("ATTENTION_SEQ_LEN must be positive")
+KVTile = int(os.environ.get("ATTENTION_KV_TILE", "64"))
+if KVTile not in {64, 128}:
+    raise ValueError("ATTENTION_KV_TILE must be 64 or 128")
+KV_SEQ_LEN = ((ACTIVE_KV_SEQ_LEN + KVTile - 1) // KVTile) * KVTile
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
-NUM_REQ = 1
+NUM_REQ = int(os.environ.get("ATTENTION_BATCH", "1"))
+if NUM_REQ <= 0:
+    raise ValueError("ATTENTION_BATCH must be positive")
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 MAX_SPLIT = 16
+ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native_direct").strip().lower()
+if ATTENTION_IMPL not in {"native", "native_direct", "native_swap"}:
+    raise ValueError("ATTENTION_IMPL must be 'native', 'native_direct', or 'native_swap'")
+if ATTENTION_IMPL == "native_swap" and KVTile != 128:
+    raise ValueError("native_swap requires ATTENTION_KV_TILE=128")
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
-QTile = 16
-KVTile = 64
-
-split_kv = 2
+split_kv = int(os.environ.get("ATTENTION_SPLIT", "4"))
 assert split_kv <= MAX_SPLIT
+if split_kv <= 0:
+    raise ValueError("ATTENTION_SPLIT must be positive")
 num_sms = NUM_KV_HEAD * NUM_REQ * split_kv
-assert num_sms <= 132 # max sm count for HX00
+device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
+assert num_sms <= device_sms, f"split attention needs {num_sms} SMs, but the device has {device_sms}"
 
 dae = Launcher(num_sms, device=gpu)
 
 matQ = torch.rand(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu) - 0.5
-matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
-matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
+matK = torch.rand(NUM_REQ, NUM_KV_HEAD, KV_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
+matV = torch.rand(NUM_REQ, NUM_KV_HEAD, KV_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 matO_split = torch.zeros(split_kv, NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
-matP = torch.zeros(NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, MAX_SPLIT, dtype=torch.float, device=gpu)
+if ATTENTION_IMPL == "native_swap":
+    metadata_record_words = 1 + (
+        HEAD_GROUP_SIZE * 2 * MAX_SPLIT * torch.float32.itemsize
+    ) // torch.int64.itemsize
+    metadata_records_host = torch.zeros(
+        NUM_KV_HEAD, NUM_REQ, metadata_record_words, dtype=torch.int64
+    )
+    output_heads = matO.view(
+        NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM
+    )
+    for head in range(NUM_KV_HEAD):
+        for req in range(NUM_REQ):
+            metadata_records_host[head, req, 0] = output_heads[
+                req, head
+            ].data_ptr()
+    matMetadataRecords = metadata_records_host.to(device=gpu)
+    matP = None
+else:
+    matMetadataRecords = None
+    matP = torch.zeros(
+        NUM_KV_HEAD,
+        NUM_REQ * HEAD_GROUP_SIZE,
+        MAX_SPLIT,
+        dtype=torch.float,
+        device=gpu,
+    )
 
 # interleaved QKV
 matQ_attn_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
-matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
-matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
+matK_attn_view = matK
+matV_attn_view = matV
 matO_attn_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 matO_split_attn_view = matO_split.view(split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
-matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=gpu)
+tma_builder_K = partial(build_tma_wgmma_k, iN = -2)
+cord_func_K = partial(cord_func_K_major, iN=-2)
 
-tma_builder_K_inter = partial(build_tma_wgmma_k, iN = -3, swizzle=0)
-tma_builder_K = partial(build_tma_wgmma_k, iN = -3)
-cord_func_K = partial(cord_func_K_major, iN=-3)
-
-tma_builder_MN_inter = partial(build_tma_wgmma_mn, iK = -3, swizzle=0)
-tma_builder_MN = partial(build_tma_wgmma_mn, iK = -3)
-cord_func_MN = partial(cord_func_MN_major, iK=-3)
+tma_builder_MN = partial(build_tma_wgmma_mn, iK = -2)
+cord_func_MN = partial(cord_func_MN_major, iK=-2)
 
 def tma_load_o(mat: torch.Tensor, tileK: int, tileN: int):
     # [HEAD_DIM[0], HEAD_GROUP_SIZE, REP * HEAD_DIM[1] * NUM_KV_HEAD]
@@ -85,6 +120,19 @@ def cord_load_o(mat: torch.Tensor, rank: int):
         return [0, 0, 0, cords[0] * NUM_KV_HEAD + cords[1]]
     return cfunc
 
+
+def tma_load_gqa_q8(mat: torch.Tensor, tileK: int, tileN: int):
+    assert mat.element_size() == 2, "Only support float16/bfloat16 Q"
+    assert tileK == HEAD_DIM and tileN == 8
+    q_tile_repeat = 8 // HEAD_GROUP_SIZE
+    glob_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, NUM_REQ * NUM_KV_HEAD]
+    glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    box_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat, glob_dims, glob_strides, box_dims, [1] * rank, 128, 0
+    )
+
 def tma_load_split_attn(mat: torch.Tensor, tileS, tileO):
     assert tileS == split_kv
     assert tileO == HEAD_GROUP_SIZE * HEAD_DIM
@@ -112,19 +160,37 @@ def cord_load_split_attn(mat: torch.Tensor, rank: int):
         return [0, 0, cords[0], cords[1]]
     return cfunc
 
-tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
+tQ = (
+    TmaTensor(dae, matQ_attn_view)._build(
+        "load", HEAD_DIM, 8, tma_load_gqa_q8, cord_load_o
+    )
+    if ATTENTION_IMPL == "native_swap"
+    else TmaTensor(dae, matQ_attn_view)._build(
+        "load", HEAD_DIM, 64, tma_load_o, cord_load_o
+    )
+)
 tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
 tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 tO_split = TmaTensor(dae, matO_split_attn_view)._build("load", split_kv, HEAD_GROUP_SIZE*HEAD_DIM, tma_load_split_attn, cord_load_split_attn)
 
-need_norm = False
-need_rope = False
-
-NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
-last_active_kv_len = KV_SEQ_LEN % KVTile or KVTile
+NUM_KV_BLOCK = (ACTIVE_KV_SEQ_LEN + KVTile - 1) // KVTile
+last_active_kv_len = ACTIVE_KV_SEQ_LEN - (NUM_KV_BLOCK - 1) * KVTile
 assert last_active_kv_len <= KVTile
+assert NUM_KV_BLOCK % split_kv == 0, (
+    f"ATTENTION_SPLIT={split_kv} must divide the padded block count {NUM_KV_BLOCK}"
+)
 
 attn_bar = dae.new_bar(num_sms)
+
+def metadata_address(head: int, req: int, slot: int, *, reducer: bool):
+    if ATTENTION_IMPL == "native_swap":
+        inst = RawAddress(matMetadataRecords[head, req], slot)
+        if not reducer:
+            inst.delta(torch.int64.itemsize)
+        elif reducer:
+            inst.writeback()
+        return inst
+    return RawAddress(matP[head, req * HEAD_GROUP_SIZE], slot)
 
 def sm_task(sm: int):
     if sm >= num_sms:
@@ -137,30 +203,59 @@ def sm_task(sm: int):
     kv_start_block = split_stage * num_block_per_split
     kv_start_idx = kv_start_block * KVTile
     split_last_active_kv_len = last_active_kv_len if split_stage == split_kv - 1 else KVTile
+    attention_inst = (
+        ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT
+        if ATTENTION_IMPL == "native_swap"
+        else ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT
+        if ATTENTION_IMPL == "native_direct"
+        else ATTENTION_M64N64K16_F16_F32_64_64_hdim_split
+    )
+    split_output = (
+        RawAddress(matO_split_attn_view[split_stage, req, head, ...], 24)
+        .writeback()
+        if ATTENTION_IMPL in {"native_direct", "native_swap"}
+        else TmaStore1D(
+            matO_split_attn_view[split_stage, req, head, ...], numSlots=2
+        )
+    )
+    lse_slot = 25 if ATTENTION_IMPL in {"native_direct", "native_swap"} else 24
     insts = [
-        ATTENTION_M64N64K16_F16_F32_64_64_hdim_split(num_block_per_split, split_stage, HEAD_GROUP_SIZE, split_last_active_kv_len, kv_start_idx, need_norm=need_norm, need_rope=need_rope),
+        attention_inst(
+            num_block_per_split, split_stage, HEAD_GROUP_SIZE,
+            split_last_active_kv_len, kv_start_idx,
+            need_norm=False, need_rope=False,
+            kv_block_size=KVTile,
+        ),
         tQ.cord(req, head),
         RepeatM.on(num_block_per_split,
-            [tK.cord(req, kv_start_idx, head, 0), tK.cord2tma(0, KVTile, 0, 0)],
-            [tV.cord(req, kv_start_idx, head, 0), tV.cord2tma(0, KVTile, 0, 0)],
+            [tK.cord(req, head, kv_start_idx, 0), tK.cord2tma(0, 0, KVTile, 0)],
+            [tV.cord(req, head, kv_start_idx, 0), tV.cord2tma(0, 0, KVTile, 0)],
         ),
-        # here we override the allocator, to allocate enough space in the smem
-        # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(matO_split_attn_view[split_stage, req, head, ...], numSlots = 2),
-        RawAddress(matP[head, req * HEAD_GROUP_SIZE], 24).bar(attn_bar).writeback(),
+        split_output,
+        metadata_address(head, req, lse_slot, reducer=False)
+        .bar(attn_bar).writeback(),
     ]
 
     if sm >= NUM_KV_HEAD * NUM_REQ:
         return insts
-    head = sm % NUM_KV_HEAD
-    req = sm // NUM_KV_HEAD
+    reduce_head = sm % NUM_KV_HEAD
+    reduce_req = sm // NUM_KV_HEAD
     insts += [
-        ATTN_SPLIT_POST_REDUCE(split_kv),
-        RawAddress(matP[head], 25).bar(attn_bar),
-        # RepeatM(split_kv, delta_addr=matO.numel() * matO.element_size()),
-        # TmaLoad1D(matO_split_attn_view[0, req, head, ...]).jump(),
-        tO_split.cord(head, req),
-        TmaStore1D(matO_attn_view[req, head, ...]),
+        ATTN_SPLIT_POST_REDUCE(
+            split_kv,
+            raw_partial=ATTENTION_IMPL == "native_swap",
+            direct_output=ATTENTION_IMPL == "native_swap",
+        ),
+        metadata_address(
+            reduce_head,
+            reduce_req,
+            26 if ATTENTION_IMPL in {"native_direct", "native_swap"} else 25,
+            reducer=True,
+        ).bar(attn_bar),
+        tO_split.cord(reduce_head, reduce_req),
+        []
+        if ATTENTION_IMPL == "native_swap"
+        else TmaStore1D(matO_attn_view[reduce_req, reduce_head, ...]),
     ]
     return insts
 
@@ -177,12 +272,8 @@ dae_app(dae)
 
 def gqa_ref():
     Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)     # [B, Hkv, G, D]
-    K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)     # [B, S, Hkv, D]
-    V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)     # [B, S, Hkv, D]
-
-    # move K/V to [B, Hkv, S, D]
-    K = K.permute(0, 2, 1, 3)       # [B, Hkv, S, D]
-    V = V.permute(0, 2, 1, 3)       # [B, Hkv, S, D]
+    K = matK_attn_view     # [B, Hkv, S, D]
+    V = matV_attn_view     # [B, Hkv, S, D]
 
     # scores = Q @ K^T
     # Q: [B, Hkv, G, D]
@@ -190,7 +281,7 @@ def gqa_ref():
     # result: [B, Hkv, G, S]
     QK = torch.matmul(Q, K.transpose(-1, -2)) / sqrt(HEAD_DIM)
     # apply mask according to lsat_active_kv_len
-    total_active_KV_len = (NUM_KV_BLOCK-1) * KVTile + last_active_kv_len
+    total_active_KV_len = ACTIVE_KV_SEQ_LEN
     mask = torch.arange(KV_SEQ_LEN, device=gpu)[None, None, None, :] >= total_active_KV_len
     QK = QK.masked_fill(mask, float("-inf"))
 
@@ -201,46 +292,24 @@ def gqa_ref():
     return QK, torch.matmul(attn, V)
 
 
-def split_ref(split_stage):
-    """Per-split reference: each split computes local softmax only over its own KV slice.
-    Returns O_local = softmax_local(Q @ K_split^T / sqrt(D)) @ V_split  [B, Hkv, G, D]
-    and     lse     = max_local + log(sum_local)                         [B, Hkv, G]
-    """
-    num_block_per_split = NUM_KV_BLOCK // split_kv
-    kv_start = split_stage * num_block_per_split * KVTile
-    kv_end   = kv_start + num_block_per_split * KVTile
-    split_last_active = last_active_kv_len if split_stage == split_kv - 1 else KVTile
-    total_active = (num_block_per_split - 1) * KVTile + split_last_active
-
-    Q = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
-    K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
-    V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM).permute(0, 2, 1, 3)
-
-    K_split = K[:, :, kv_start:kv_end, :]   # [B, Hkv, S_split, D]
-    V_split = V[:, :, kv_start:kv_end, :]
-
-    scale = 1.0 / sqrt(HEAD_DIM)
-    QK = torch.matmul(Q * scale, K_split.transpose(-1, -2))  # [B, Hkv, G, S_split]
-
-    # mask tokens beyond the active length in this split's last block
-    S_split = kv_end - kv_start
-    mask = torch.arange(S_split, device=gpu)[None, None, None, :] >= total_active
-    QK = QK.masked_fill(mask, float("-inf"))
-
-    lse  = torch.logsumexp(QK, dim=-1)    # [B, Hkv, G]
-    attn = torch.softmax(QK, dim=-1)      # [B, Hkv, G, S_split]
-    O    = torch.matmul(attn, V_split)    # [B, Hkv, G, D]
-
-    return O.bfloat16(), lse
-
-
-# for s in range(split_kv):
-#     ref_O, ref_lse = split_ref(s)
-#     # matO_split_attn_view: [split_kv, NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM]
-#     tensor_diff(f"Split {s} O", ref_O[0], matO_split_attn_view[s, 0])
-#     # matP: [NUM_KV_HEAD, NUM_REQ * HEAD_GROUP_SIZE, split_kv], written as float32 by kernel
-#     ref_lse_hkv = ref_lse[0]  # [Hkv, G]
-#     tensor_diff(f"Split {s} LSE", ref_lse_hkv, matP[:, :HEAD_GROUP_SIZE, s].float())
-
-# refQK, refO = gqa_ref()
-# tensor_diff("Ref and DAE", refO[0], matO_attn_view[0])
+refQK, refO = gqa_ref()
+tensor_diff("Ref and DAE", refO, matO_attn_view)
+avg_diff_percent = (
+    (refO - matO_attn_view).abs().float().mean()
+    / refO.abs().float().mean()
+    * 100.0
+).item()
+max_abs_diff = (refO - matO_attn_view).abs().float().max().item()
+print(
+    "ATTENTION_RESULT "
+    f"impl={ATTENTION_IMPL}-gqa-split batch={NUM_REQ} active_seq={ACTIVE_KV_SEQ_LEN} "
+    f"kv_tile={KVTile} blocks={NUM_KV_BLOCK} split={split_kv} sms={num_sms} "
+    f"avg_diff_percent={avg_diff_percent:.6f} max_abs_diff={max_abs_diff:.6f}"
+)
+if os.environ.get("ATTENTION_STRICT", "0").strip().lower() not in {"0", "false", "no", "off"}:
+    max_diff_percent = float(os.environ.get("ATTENTION_MAX_DIFF_PERCENT", "1.0"))
+    if avg_diff_percent > max_diff_percent:
+        raise AssertionError(
+            f"attention average difference {avg_diff_percent:.6f}% exceeds "
+            f"{max_diff_percent:.6f}%"
+        )

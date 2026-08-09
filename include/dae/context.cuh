@@ -11,9 +11,34 @@ constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
 constexpr bool dae2LoadInstructions = true;
 
+#ifndef DAE_M2C_OBSERVER_WAIT
+#define DAE_M2C_OBSERVER_WAIT 1
+#endif
+// The load VCore owns each M2C barrier phase. Compute threads only observe the
+// phase transition, avoiding 128 redundant arrivals per loaded operand.
+constexpr bool dae2M2CObserverWait = DAE_M2C_OBSERVER_WAIT != 0;
+
 static constexpr int slotSizeKb = 8;
-static constexpr int numSlots = 24;
-static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
+#ifndef DAE_NUM_SLOTS
+#define DAE_NUM_SLOTS 24
+#endif
+static constexpr int numSlots = DAE_NUM_SLOTS;
+#ifndef DAE_NUM_INSTS
+#define DAE_NUM_INSTS 512
+#endif
+#ifndef DAE_DYNAMIC_SMEM_KB
+#define DAE_DYNAMIC_SMEM_KB 212
+#endif
+static constexpr int dynamicSmemBytes = DAE_DYNAMIC_SMEM_KB * 1024;
+// Attention scratch is a physical dynamic-shared-memory region, not an
+// allocator slot.  The packed swapped-attention build places its compact
+// scratch after the allocator arena; other attention paths retain slot 24.
+#if defined(DAE_PACKED_SWAP_ATTENTION_SCRATCH)
+static constexpr int attentionScratchSlot = numSlots;
+#else
+static constexpr int attentionScratchSlot = 24;
+#endif
+static constexpr int numInsts = dae2LoadInstructions ? DAE_NUM_INSTS : 4096;
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 
@@ -30,8 +55,48 @@ static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemo
 static constexpr int numProfileEvents = 128;
 static constexpr int numComputeLoopCounters = 4;
 
+#if defined(DAE_TRACK_PROFILE)
+// Diagnostic-only, per-SM aggregate counters.  Keep these at the high end of
+// the existing profile row so schedule-level OP_PROFILE_EVENT markers can use
+// the low IDs on the same global-timer timeline.
+enum DAETrackProfileEvent : int {
+  DAE_TRACK_COMPUTE_M2C_WAIT_NS = 96,
+  DAE_TRACK_COMPUTE_M2C_WAIT_CALLS = 97,
+  DAE_TRACK_COMPUTE_M2C_CONTENDED = 98,
+  DAE_TRACK_ALLOC_SLOT_STALL_NS = 99,
+  DAE_TRACK_ALLOC_SLOT_STALL_EVENTS = 100,
+  DAE_TRACK_ALLOC_SLOT_RETRIES = 101,
+  DAE_TRACK_ALLOC_ISSUE_BARRIER_NS = 102,
+  DAE_TRACK_ALLOC_ISSUE_BARRIER_CONTENDED = 103,
+  DAE_TRACK_ALLOC_INSTRUCTIONS = 104,
+  DAE_TRACK_LDU0_QUEUE_WAIT_NS = 105,
+  DAE_TRACK_LDU0_QUEUE_WAIT_CALLS = 106,
+  DAE_TRACK_LDU0_DEPENDENCY_WAIT_NS = 107,
+  DAE_TRACK_LDU0_DEPENDENCY_CONTENDED = 108,
+  DAE_TRACK_LDU0_COMMANDS = 109,
+  DAE_TRACK_LDU1_QUEUE_WAIT_NS = 110,
+  DAE_TRACK_LDU1_QUEUE_WAIT_CALLS = 111,
+  DAE_TRACK_LDU1_DEPENDENCY_WAIT_NS = 112,
+  DAE_TRACK_LDU1_DEPENDENCY_CONTENDED = 113,
+  DAE_TRACK_LDU1_COMMANDS = 114,
+  DAE_TRACK_STORE_QUEUE_WAIT_NS = 115,
+  DAE_TRACK_STORE_QUEUE_WAIT_CALLS = 116,
+  DAE_TRACK_STORE_SERVICE_NS = 117,
+  DAE_TRACK_STORE_BARRIER_SERVICE_NS = 118,
+  DAE_TRACK_STORE_COMMANDS = 119,
+  DAE_TRACK_STORE_BARRIER_COMMANDS = 120,
+  DAE_TRACK_MAGIC = 127,
+};
+static constexpr uint64_t daeTrackProfileMagic = 0x4454524b50524631ULL;
+#endif
+
+struct alignas(16) LoopCounters {
+  uint32_t values[numComputeLoopCounters] = {};
+};
+
 // barrier configurations
-static constexpr int numThreadsM2CBarrier = numComputeWarps * numThreadsPerWarp + 1;
+static constexpr int numThreadsM2CBarrier =
+    dae2M2CObserverWait ? 1 : numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsC2MBarrier = numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsLDBarrier = 2;
 

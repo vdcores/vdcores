@@ -11,6 +11,7 @@ size_t set_smem_size(size_t smem_size) {
     );
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
+        return 0;
     }
     return smem_size;
 }
@@ -23,22 +24,62 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  LoopCounters initial_loop_counts,
+  int64_t stream,
+  bool synchronize
 ) {
-  // wait for all pre-launch meta-data copying
-  cudaDeviceSynchronize();
+  if (synchronize) {
+    cudaDeviceSynchronize();
+  }
   cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
   dae2<<<numSMs, numThreads, smem_size, cuda_stream>>>(
     compute_instructions,
     memory_instructions,
     tma_descs,
     bars,
-    profile
+    profile,
+    initial_loop_counts
   );
   // TODO(zhiyuang): check launch error here?
 
-  cudaDeviceSynchronize();
+  if (synchronize) {
+    cudaDeviceSynchronize();
+  }
 
+  return cudaGetLastError();
+}
+
+cudaError_t launch_dae_sequence(
+  int numSMs,
+  size_t smem_size,
+  CInst* compute_instructions,
+  MInst* memory_instructions,
+  CUtensorMap* tma_descs,
+  int * bars,
+  uint64_t * profile,
+  const std::vector<LoopCounters>& initial_loop_counts,
+  int64_t stream,
+  bool synchronize
+) {
+  if (synchronize) {
+    cudaDeviceSynchronize();
+  }
+
+  cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  for (const LoopCounters& counters : initial_loop_counts) {
+    dae2<<<numSMs, numThreads, smem_size, cuda_stream>>>(
+      compute_instructions,
+      memory_instructions,
+      tma_descs,
+      bars,
+      profile,
+      counters
+    );
+  }
+
+  if (synchronize) {
+    cudaDeviceSynchronize();
+  }
   return cudaGetLastError();
 }
 

@@ -4,7 +4,10 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
+#include <cute/arch/mma_sm100.hpp>
+#include <cute/arch/copy_sm100.hpp>
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
+#include <cute/atom/copy_traits_sm100.hpp>
 #include <cute/algorithm/gemm.hpp>     // cute::gemm
 #include <cute/algorithm/tensor_reduce.hpp>     // cute::reduce
 #include <cute/algorithm/tensor_algorithms.hpp>     // cute::reduce
@@ -15,6 +18,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/arch/barrier.h>
 
 #include "context.cuh"
 #include "rms_norm.cuh"
@@ -83,21 +87,25 @@ __device__ __forceinline__ void rms_affine_rope_rows(
     const bool need_rope
 ) {
     constexpr int num_thread_per_token = (HEAD_DIM / 2 < N_COMPUTE_THREAD) ? HEAD_DIM / 2 : N_COMPUTE_THREAD;
-    constexpr int token_group_size = (N_COMPUTE_THREAD + num_thread_per_token - 1) / num_thread_per_token;
+    constexpr int token_group_size = N_COMPUTE_THREAD / num_thread_per_token;
     constexpr int num_warp_per_token = num_thread_per_token / 32;
     static_assert(num_thread_per_token % 32 == 0, "to simplify warp-level reduce");
+    static_assert(N_COMPUTE_THREAD % num_thread_per_token == 0, "token groups must be uniform");
 
-    const int warp_id = __compute_tid() / 32;
+    const int thread_id = __compute_tid();
+    const int warp_id = thread_id / 32;
     const int lane_id = __compute_tid() % 32;
-    const int ofst_in_token_group = __compute_tid() / num_thread_per_token;
-    const int lane_in_one_token = __compute_tid() % num_thread_per_token;
+    const int token_group = thread_id / num_thread_per_token;
+    const int lane_in_one_token = thread_id % num_thread_per_token;
 
-    #pragma unroll
-    for (int r = ofst_in_token_group; r < total_num_token; r += token_group_size) {
+    const int num_row_groups = (total_num_token + token_group_size - 1) / token_group_size;
+    for (int row_group = 0; row_group < num_row_groups; ++row_group) {
+        const int r = row_group * token_group_size + token_group;
+        const bool row_valid = r < total_num_token;
+        const int i = lane_in_one_token;
         float sum = 0.0f;
         if (need_norm) {
-            #pragma unroll
-            for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
+            if (row_valid) {
                 auto val = __bfloat1622float2(input(r, i));
                 sum += val.x * val.x + val.y * val.y;
             }
@@ -106,23 +114,22 @@ __device__ __forceinline__ void rms_affine_rope_rows(
                 sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
             if (lane_id == 0)
                 smem_reduce[warp_id] = sum;
-            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+            __sync_compute_group(N_COMPUTE_THREAD);
 
-            if (lane_in_one_token == 0) {
+            if (lane_in_one_token == 0 && row_valid) {
                 #pragma unroll
-                for (int i = 1; i < num_warp_per_token; ++i)
-                    sum += smem_reduce[i + ofst_in_token_group * num_warp_per_token];
-                smem_reduce[ofst_in_token_group] = sum;
+                for (int warp = 1; warp < num_warp_per_token; ++warp)
+                    sum += smem_reduce[warp + token_group * num_warp_per_token];
+                smem_reduce[N_COMPUTE_THREAD / 32 + token_group] = sum;
             }
-            __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+            __sync_compute_group(N_COMPUTE_THREAD);
         }
 
         const float rms_rcp = need_norm
-            ? rsqrtf(smem_reduce[ofst_in_token_group] / float(HEAD_DIM) + epsilon)
+            ? rsqrtf(smem_reduce[N_COMPUTE_THREAD / 32 + token_group] / float(HEAD_DIM) + epsilon)
             : 1.0f;
 
-        #pragma unroll
-        for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
+        if (row_valid) {
             auto val = __bfloat1622float2(input(r, i));
             if (need_norm) {
                 val.x *= rms_rcp;
@@ -141,7 +148,7 @@ __device__ __forceinline__ void rms_affine_rope_rows(
             }
             input(r, i) = __float22bfloat162_rn(val);
         }
-        __sync_barrier<num_thread_per_token>(ofst_in_token_group);
+        __sync_compute_group(N_COMPUTE_THREAD);
     }
 }
 
@@ -295,6 +302,975 @@ struct OnlineSoftmax {
 };
 
 }
+
+// SM100 decode attention keeps both the score and output accumulators in TMEM.
+// Scores are drained to registers for online softmax, packed back into TMEM as
+// BF16 probabilities, and consumed directly by the tensor-memory/shared-memory
+// PV UMMA.  This mirrors the Blackwell FA4/FlashInfer dataflow while preserving
+// VDCores' existing memory queues and shared-memory slot ABI.
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+template <class CopyOp, class TD, class DLayout>
+__device__ __forceinline__ void sm100_attention_tmem_load_raw(
+    uint32_t tmem_addr,
+    Tensor<TD, DLayout>& dst) {
+    static_assert(is_rmem<TD>::value, "raw TMEM load expects register dst");
+    using reg_t = typename remove_extent<typename CopyOp::DRegisters>::type;
+    auto r_dst = recast<reg_t>(dst);
+    constexpr int kRegisters = extent<typename CopyOp::DRegisters>::value;
+    CUTE_STATIC_ASSERT_V(size(r_dst) == Int<kRegisters>{});
+    detail::explode(
+        CopyOp::copy, &tmem_addr, seq<0>{}, r_dst, make_seq<kRegisters>{});
+}
+
+template <class CopyOp, class TS, class SLayout>
+__device__ __forceinline__ void sm100_attention_tmem_store_raw(
+    Tensor<TS, SLayout>& src,
+    uint32_t tmem_addr) {
+    static_assert(is_rmem<TS>::value, "raw TMEM store expects register src");
+    using reg_t = typename remove_extent<typename CopyOp::SRegisters>::type;
+    auto r_src = recast<reg_t>(src);
+    constexpr int kRegisters = extent<typename CopyOp::SRegisters>::value;
+    CUTE_STATIC_ASSERT_V(size(r_src) == Int<kRegisters>{});
+    detail::explode(
+        CopyOp::copy, r_src, make_seq<kRegisters>{}, &tmem_addr, seq<0>{});
+}
+
+template <int M, int N, typename TmemTensor, typename CoordTensor>
+__device__ __forceinline__ void sm100_attention_rescale_tmem_rows(
+    TmemTensor const& tmem_tensor,
+    CoordTensor const& coord_tensor,
+    const float scale,
+    const int num_active_rows) {
+    using namespace cute;
+    const int tid = __compute_tid();
+    const int active_warps = (num_active_rows + 15) / 16;
+    if (tid < 2 * M && tid / 32 < active_warps) {
+        using Load = SM100_TMEM_LOAD_16dp32b16x;
+        using Store = SM100_TMEM_STORE_16dp32b16x;
+        auto tiled_load = make_tmem_copy(Load{}, tmem_tensor);
+        auto tiled_store = make_tmem_copy(Store{}, tmem_tensor);
+        auto thr_load = tiled_load.get_slice(tid);
+        auto thr_store = tiled_store.get_slice(tid);
+        auto thread_tmem = thr_load.partition_S(tmem_tensor);
+        auto thread_coord = thr_load.partition_D(coord_tensor);
+        auto thread_tmem_store = thr_store.partition_D(tmem_tensor);
+        auto r_values = make_tensor<float>(shape(thread_coord));
+        copy(tiled_load, thread_tmem, r_values);
+        #pragma unroll
+        for (int i = 0; i < size(r_values); ++i) {
+            r_values(i) *= scale;
+        }
+        copy(tiled_store, r_values, thread_tmem_store);
+        cutlass::arch::fence_view_async_tmem_store();
+    }
+    __sync_compute_group(128);
+}
+
+template <int M, int N, typename TmemTensor, typename CoordTensor, typename SmemTensor>
+__device__ __forceinline__ void sm100_attention_store_tmem_rows(
+    TmemTensor const& tmem_tensor,
+    CoordTensor const& coord_tensor,
+    SmemTensor const& smem_tensor,
+    const float inv_sum,
+    const int num_active_rows) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    const int tid = __compute_tid();
+    const int active_warps = (num_active_rows + 15) / 16;
+    if (tid < 2 * M && tid / 32 < active_warps) {
+        using Load = SM100_TMEM_LOAD_16dp32b16x;
+        auto tiled_load = make_tmem_copy(Load{}, tmem_tensor);
+        auto thr_load = tiled_load.get_slice(tid);
+        auto thread_tmem = thr_load.partition_S(tmem_tensor);
+        auto thread_coord = thr_load.partition_D(coord_tensor);
+        auto thread_smem = thr_load.partition_D(smem_tensor);
+        auto r_values = make_tensor<float>(shape(thread_coord));
+        auto r_output = make_tensor<data_t>(shape(thread_smem));
+        copy(tiled_load, thread_tmem, r_values);
+        #pragma unroll
+        for (int i = 0; i < size(r_values); ++i) {
+            r_output(i) = data_t(r_values(i) * inv_sum);
+        }
+        copy(r_output, thread_smem);
+    }
+    __sync_compute_group(128);
+    cutlass::arch::fence_view_async_shared();
+}
+
+template <int M, int N, typename TmemTensor, typename CoordTensor>
+__device__ __forceinline__ void sm100_attention_store_tmem_rows_global(
+    TmemTensor const& tmem_tensor,
+    CoordTensor const& coord_tensor,
+    cutlass::bfloat16_t *output,
+    const float inv_sum,
+    const int num_active_rows) {
+    using namespace cute;
+    const int tid = __compute_tid();
+    const int active_warps = (num_active_rows + 15) / 16;
+    if (tid < 2 * M && tid / 32 < active_warps) {
+        using Load = SM100_TMEM_LOAD_16dp32b16x;
+        using accum_t = float;
+        using data_t = cutlass::bfloat16_t;
+        using packed_t = cutlass::Array<data_t, 4>;
+        auto tiled_load = make_tmem_copy(Load{}, tmem_tensor);
+        auto thr_load = tiled_load.get_slice(tid);
+        auto thread_tmem = thr_load.partition_S(tmem_tensor);
+        auto thread_coord = thr_load.partition_D(coord_tensor);
+        auto r_values = make_tensor<accum_t>(shape(thread_coord));
+        copy(tiled_load, thread_tmem, r_values);
+        static_assert(size(r_values) % 4 == 0,
+                      "TMEM output fragments must form aligned BF16x4 packs");
+        cutlass::NumericArrayConverter<data_t, accum_t, 4> convert;
+        #pragma unroll
+        for (int i = 0; i < size(r_values); i += 4) {
+            const int row = int(get<0>(thread_coord(i + 0)));
+            const int col = int(get<1>(thread_coord(i + 0)));
+            if (row < num_active_rows) {
+                cutlass::Array<accum_t, 4> values;
+                values[0] = r_values(i + 0) * inv_sum;
+                values[1] = r_values(i + 1) * inv_sum;
+                values[2] = r_values(i + 2) * inv_sum;
+                values[3] = r_values(i + 3) * inv_sum;
+                *reinterpret_cast<packed_t *>(output + row * N + col) =
+                    convert(values);
+            }
+        }
+    }
+}
+
+template <int M, int KV, typename TmemTensor, typename CoordTensor,
+          typename ProbTensor, typename ProbCoordTensor>
+__device__ __forceinline__ void sm100_attention_softmax_tmem_rows(
+    TmemTensor const& tmem_s,
+    CoordTensor const& coord_s,
+    ProbTensor const& tmem_p,
+    ProbCoordTensor const& coord_p,
+    const int block,
+    const int num_kv_blocks,
+    const int last_kv_active_token_len,
+    const int num_active_q,
+    int& logical_row,
+    float& row_max,
+    float& row_sum,
+    float& correction) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr float kScoreScale = M_LOG2E / 11.313708498984761f;
+    const int tid = __compute_tid();
+    const int active_score_warps = (num_active_q + 15) / 16;
+    correction = 0.0f;
+    if (tid < 2 * M && tid / 32 < active_score_warps) {
+        using ScoreLoad = SM100_TMEM_LOAD_16dp32b16x;
+        auto tiled_s_load = make_tmem_copy(ScoreLoad{}, tmem_s);
+        auto thr_s_load = tiled_s_load.get_slice(tid);
+        auto thread_tmem_s = thr_s_load.partition_S(tmem_s);
+        auto thread_coord_s = thr_s_load.partition_D(coord_s);
+        const int row = int(get<0>(thread_coord_s(0)));
+        logical_row = row;
+        auto r_s = make_tensor<accum_t>(shape(thread_coord_s));
+        copy(tiled_s_load, thread_tmem_s, r_s);
+
+        float block_max = -FLT_MAX;
+        #pragma unroll
+        for (int i = 0; i < size(r_s); ++i) {
+            const int col = int(get<1>(thread_coord_s(i)));
+            float score = r_s(i) * kScoreScale;
+            if (row >= num_active_q ||
+                (block == num_kv_blocks - 1 && col >= last_kv_active_token_len)) {
+                score = -FLT_MAX;
+            }
+            r_s(i) = score;
+            block_max = fmaxf(block_max, score);
+        }
+        block_max = fmaxf(
+            block_max,
+            __shfl_xor_sync(0xFFFFFFFFU, block_max, 16));
+        const float old_max = row_max;
+        row_max = fmaxf(row_max, block_max);
+        const bool row_valid = row < num_active_q && row_max != -FLT_MAX;
+        correction = old_max == -FLT_MAX ? 0.0f : exp2f(old_max - row_max);
+        float block_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < size(r_s); ++i) {
+            const float probability = row_valid ? exp2f(r_s(i) - row_max) : 0.0f;
+            r_s(i) = probability;
+            block_sum += probability;
+        }
+        block_sum += __shfl_xor_sync(0xFFFFFFFFU, block_sum, 16);
+        row_sum = row_sum * correction + block_sum;
+
+        using ProbStore = SM100_TMEM_STORE_16dp32b16x;
+        auto tiled_p_store = make_tmem_copy(ProbStore{}, tmem_p);
+        auto thr_p_store = tiled_p_store.get_slice(tid);
+        auto thread_coord_p = thr_p_store.partition_S(coord_p);
+        auto thread_tmem_p = thr_p_store.partition_D(tmem_p);
+        auto r_packed = make_tensor<uint32_t>(shape(thread_coord_p));
+        auto r_packed_pairs = recast<cutlass::Array<data_t, 2>>(r_packed);
+        cutlass::NumericArrayConverter<data_t, accum_t, 2> convert;
+        const int lane_half = (tid >> 4) & 1;
+        #pragma unroll
+        for (int i = 0; i < size(r_packed_pairs); ++i) {
+            const int chunk = i / 16;
+            const int pair_in_quarter = i & 7;
+            const int local_idx = chunk * 32 + 16 * lane_half + 2 * pair_in_quarter;
+            const int send_idx = chunk * 32 + 16 * (1 - lane_half) + 2 * pair_in_quarter;
+            const bool use_partner = ((i >> 3) & 1) != lane_half;
+            const accum_t partner_0 = __shfl_xor_sync(
+                0xFFFFFFFFU, r_s(send_idx), 16);
+            const accum_t partner_1 = __shfl_xor_sync(
+                0xFFFFFFFFU, r_s(send_idx + 1), 16);
+            cutlass::Array<accum_t, 2> pair;
+            pair[0] = use_partner ? partner_0 : r_s(local_idx);
+            pair[1] = use_partner ? partner_1 : r_s(local_idx + 1);
+            r_packed_pairs(i) = convert(pair);
+        }
+        copy(tiled_p_store, r_packed, thread_tmem_p);
+        cutlass::arch::fence_view_async_tmem_store();
+    }
+    __sync_compute_group(128);
+}
+
+template <int M, int KV, typename TmemTensor, typename CoordTensor,
+          typename ProbTensor>
+__device__ __forceinline__ void sm100_attention_softmax_tmem_smem_fa4(
+    TmemTensor const& tmem_s,
+    CoordTensor const& coord_s,
+    ProbTensor const& smem_p,
+    float *score_stage,
+    float *smem_reduce,
+    const int block,
+    const int num_kv_blocks,
+    const int last_kv_active_token_len,
+    const int num_active_q,
+    int& logical_row,
+    float& row_max,
+    float& row_sum,
+    float& correction) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr float kScoreScale = M_LOG2E / 11.313708498984761f;
+    constexpr int kValuesPerLane = KV / 32;
+    static_assert(KV == 64 || KV == 128);
+
+    const int tid = __compute_tid();
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    // One warp drains the QK accumulator.  The 16-DP TMEM mapping gives two
+    // lanes to each row; stage only the live GQA rows in a compact linear
+    // buffer so all four compute warps can participate in softmax.
+    if (tid < 32) {
+        using ScoreLoad = SM100_TMEM_LOAD_16dp32b16x;
+        auto tiled_load = make_tmem_copy(ScoreLoad{}, tmem_s);
+        auto thr_load = tiled_load.get_slice(lane_id);
+        auto thread_tmem = thr_load.partition_S(tmem_s);
+        auto thread_coord = thr_load.partition_D(coord_s);
+        auto r_s = make_tensor<accum_t>(shape(thread_coord));
+        copy(tiled_load, thread_tmem, r_s);
+        #pragma unroll
+        for (int i = 0; i < size(r_s); ++i) {
+            const int row = int(get<0>(thread_coord(i)));
+            const int col = int(get<1>(thread_coord(i)));
+            if (row < num_active_q) {
+                score_stage[row * KV + col] =
+                    (block + 1 < num_kv_blocks ||
+                     col < last_kv_active_token_len)
+                    ? r_s(i) * kScoreScale : -FLT_MAX;
+            }
+        }
+    }
+    __sync_compute_group(128);
+
+    accum_t scores[kValuesPerLane];
+    accum_t block_max = -FLT_MAX;
+    if (warp_id < num_active_q) {
+        #pragma unroll
+        for (int i = 0; i < kValuesPerLane; ++i) {
+            scores[i] = score_stage[
+                warp_id * KV + lane_id * kValuesPerLane + i];
+            block_max = fmaxf(block_max, scores[i]);
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            block_max = fmaxf(
+                block_max,
+                __shfl_xor_sync(0xFFFFFFFFU, block_max, offset));
+        }
+    }
+
+    accum_t block_sum = 0.0f;
+    if (warp_id < num_active_q) {
+        const accum_t old_max = block == 0
+            ? -FLT_MAX : smem_reduce[warp_id];
+        const accum_t old_sum = block == 0
+            ? 0.0f : smem_reduce[4 + warp_id];
+        const accum_t new_max = fmaxf(old_max, block_max);
+        const accum_t row_correction = old_max == -FLT_MAX
+            ? 0.0f : exp2f(old_max - new_max);
+        #pragma unroll
+        for (int i = 0; i < kValuesPerLane; ++i) {
+            scores[i] = exp2f(scores[i] - new_max);
+            block_sum += scores[i];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            block_sum += __shfl_xor_sync(
+                0xFFFFFFFFU, block_sum, offset);
+        }
+        if (lane_id == 0) {
+            smem_reduce[warp_id] = new_max;
+            smem_reduce[4 + warp_id] =
+                old_sum * row_correction + block_sum;
+            smem_reduce[8 + warp_id] = row_correction;
+        }
+    }
+
+    // Every score has been consumed into registers; the same special-slot
+    // storage can now hold the swizzled BF16 probability tile for SS PV.
+    __sync_compute_group(128);
+    if (warp_id < num_active_q) {
+        #pragma unroll
+        for (int i = 0; i < kValuesPerLane; ++i) {
+            const int col = lane_id * kValuesPerLane + i;
+            // layout_p is hierarchically tiled; its flattened logical index
+            // is M-major even though the physical shared layout is swizzled.
+            smem_p(warp_id + M * col) = data_t(scores[i]);
+        }
+    }
+    __sync_compute_group(128);
+    cutlass::arch::fence_view_async_shared();
+
+    // Restore the 16-DP row ownership expected by the output epilogue and
+    // split-LSE publication.  Only warp 0 consumes these values afterwards.
+    if (tid < 32) {
+        logical_row = lane_id & 15;
+        if (logical_row < num_active_q) {
+            row_max = smem_reduce[logical_row];
+            row_sum = smem_reduce[4 + logical_row];
+            correction = smem_reduce[8 + logical_row];
+        }
+    } else {
+        logical_row = num_active_q;
+    }
+}
+
+template <int HEAD_DIM, int KV_BLOCK_SIZE = 64,
+          bool SPLIT_KV = false, int MAX_SPLIT = 16,
+          bool DIRECT_OUTPUT = false,
+          bool FA4_SMEM_P = false,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_attention_fwd_sm100_decode(
+    const int num_kv_blocks,
+    const int split_idx,
+    const int num_active_q,
+    const int last_kv_active_token_len,
+    const bool runtime_need_norm,
+    const bool runtime_need_rope,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    void *base,
+    float *smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    using vec2_t = typename F16Traits<data_t>::vec2_t;
+
+    constexpr int M = 64;
+    constexpr int KV = KV_BLOCK_SIZE;
+    constexpr int O_N = HEAD_DIM;
+    constexpr uint32_t P_OFFSET = 0;
+    constexpr uint32_t O_OFFSET = 128;
+    static_assert(HEAD_DIM == 128, "The SM100 decode path is specialized for Llama head_dim=128");
+    static_assert(KV == 64 || KV == 128, "The SM100 decode path supports 64- or 128-token KV tiles");
+
+    using QKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, KV, UMMA::Major::K, UMMA::Major::K>;
+    using PVAtom = std::conditional_t<
+        FA4_SMEM_P,
+        SM100_MMA_F16BF16_SS<
+            data_t, data_t, accum_t, M, O_N,
+            UMMA::Major::K, UMMA::Major::MN>,
+        SM100_MMA_F16BF16_TS<
+            data_t, data_t, accum_t, M, O_N,
+            UMMA::Major::K, UMMA::Major::MN>>;
+
+    const int tid = __compute_tid();
+    auto tiled_qk = make_tiled_mma(QKAtom{});
+    auto cta_qk = tiled_qk.get_slice(0);
+    auto tiled_pv = make_tiled_mma(PVAtom{});
+    auto cta_pv = tiled_pv.get_slice(0);
+
+    auto q_shape = partition_shape_A(tiled_qk, make_shape(Int<M>{}, Int<HEAD_DIM>{}));
+    auto k_shape = partition_shape_B(tiled_qk, make_shape(Int<KV>{}, Int<HEAD_DIM>{}));
+    auto v_shape = partition_shape_B(tiled_pv, make_shape(Int<O_N>{}, Int<KV>{}));
+    auto p_shape = partition_shape_A(tiled_pv, make_shape(Int<M>{}, Int<KV>{}));
+    auto layout_q = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, q_shape);
+    auto layout_k = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, k_shape);
+    auto layout_v = UMMA::tile_to_mma_shape(UMMA::Layout_MN_SW128_Atom<data_t>{}, v_shape);
+    auto layout_p = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<data_t>{}, p_shape);
+
+    auto logical_s = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<KV>{}), make_stride(Int<KV>{}, Int<1>{})));
+    auto coord_s = make_identity_tensor(make_shape(Int<M>{}, Int<KV>{}));
+    auto cta_s = cta_qk.partition_C(logical_s);
+    auto cta_coord_s = cta_qk.partition_C(coord_s);
+    auto tmem_s = cta_qk.make_fragment_C(cta_s);
+    tmem_s.data() = tmem_base_ptr;
+
+    auto logical_o = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<O_N>{}), make_stride(Int<O_N>{}, Int<1>{})));
+    auto coord_o = make_identity_tensor(make_shape(Int<M>{}, Int<O_N>{}));
+    auto cta_o = cta_pv.partition_C(logical_o);
+    auto cta_coord_o = cta_pv.partition_C(coord_o);
+    auto tmem_o = cta_pv.make_fragment_C(cta_o);
+    tmem_o.data() = tmem_base_ptr + O_OFFSET;
+
+    // The PV A operand aliases the QK accumulator columns.  A packed 16-bit
+    // TMEM store writes two BF16 probabilities into each 32-bit score column.
+    auto tmem_p_view = tmem_s.compose(
+        make_layout(make_shape(Int<M>{}, Int<KV / 2>{})));
+    tmem_p_view.data() = tmem_base_ptr + P_OFFSET;
+    auto coord_p_view = cta_coord_s.compose(
+        make_layout(make_shape(Int<M>{}, Int<KV / 2>{})));
+
+    const bool use_fused_qk = runtime_need_norm || runtime_need_rope;
+    int side_slot = 0;
+    int k_store_slot = 0;
+    const vec2_t *q_norm_weight = nullptr;
+    const vec2_t *k_norm_weight = nullptr;
+    const vec2_t *rope_row = nullptr;
+    vec2_t *k_store_ptr = nullptr;
+    if (use_fused_qk) {
+        side_slot = m2c.template pop<0>();
+        const vec2_t *packed = static_cast<const vec2_t *>(
+            get_slot_address(base, extract(side_slot)));
+        q_norm_weight = packed;
+        k_norm_weight = packed + HEAD_DIM / 2;
+        rope_row = packed + HEAD_DIM;
+        k_store_slot = m2c.template pop<0>();
+        k_store_ptr = static_cast<vec2_t *>(get_slot_address(base, extract(k_store_slot)));
+    }
+
+    const int q_slot = m2c.template pop<0>();
+    data_t *q_ptr = static_cast<data_t *>(get_slot_address(base, extract(q_slot)));
+    auto sQ = make_tensor(make_smem_ptr(q_ptr), layout_q);
+    auto layout_q_vec = tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<vec2_t>{},
+        make_shape(Int<M>{}, Int<HEAD_DIM / 2>{}));
+    auto sQ_vec = make_tensor(make_smem_ptr(reinterpret_cast<vec2_t *>(q_ptr)), layout_q_vec);
+    if (use_fused_qk) {
+        rms_affine_rope_rows<HEAD_DIM, 128>(
+            sQ_vec, num_active_q, smem_reduce, 1.0e-6f,
+            q_norm_weight, rope_row, runtime_need_norm, runtime_need_rope);
+        // The two 64-thread row groups finish independently.  Join them before
+        // UMMA can consume the full Q tile, then publish generic shared stores
+        // to the asynchronous tensor-core proxy.
+        __sync_compute_group(128);
+        cutlass::arch::fence_view_async_shared();
+    }
+    auto frag_q = cta_qk.make_fragment_A(sQ);
+
+    int logical_row = tid;
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+
+    int k_slot = m2c.template pop<0>();
+    int o_slot = 0;
+    for (int block = 0; block < num_kv_blocks; ++block) {
+        data_t *k_ptr = static_cast<data_t *>(get_slot_address(base, extract(k_slot)));
+        auto sK = make_tensor(make_smem_ptr(k_ptr), layout_k);
+        auto frag_k = cta_qk.make_fragment_B(sK);
+
+        if (use_fused_qk && block == num_kv_blocks - 1 && last_kv_active_token_len > 0) {
+            auto layout_k_vec = tile_to_shape(
+                GMMA::Layout_K_SW128_Atom<vec2_t>{},
+                make_shape(Int<KV>{}, Int<HEAD_DIM / 2>{}));
+            auto sK_vec = make_tensor(make_smem_ptr(reinterpret_cast<vec2_t *>(k_ptr)), layout_k_vec);
+            const int row = last_kv_active_token_len - 1;
+            rms_affine_rope_single_row<HEAD_DIM>(
+                sK_vec, row, smem_reduce, 1.0e-6f,
+                k_norm_weight, rope_row, runtime_need_norm, runtime_need_rope);
+            cutlass::arch::fence_view_async_shared();
+            if (tid < HEAD_DIM / 2) {
+                k_store_ptr[tid] = sK_vec(row, tid);
+            }
+            __sync_compute_group(128);
+        }
+
+        tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
+        if (tid < numThreadsPerWarp) {
+            #pragma unroll
+            for (int k_block = 0; k_block < size<2>(frag_q); ++k_block) {
+                gemm(tiled_qk, frag_q(_, _, k_block), frag_k(_, _, k_block), tmem_s);
+                tiled_qk.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+
+        // K and V are consecutive in the memory queue. Consume V while QK
+        // executes so the queue synchronization and any remaining TMA latency
+        // are hidden behind tcgen05 rather than paid after softmax.
+        const int v_slot = m2c.template pop<0>();
+        data_t *v_ptr = static_cast<data_t *>(get_slot_address(base, extract(v_slot)));
+        auto sV = make_tensor(make_smem_ptr(v_ptr), layout_v);
+        auto frag_v = cta_pv.make_fragment_B(sV);
+        if constexpr (FA4_SMEM_P) {
+            if (num_kv_blocks == 1) {
+                o_slot = m2c.template pop<0>();
+            }
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+
+        float correction = 0.0f;
+        if constexpr (FA4_SMEM_P) {
+            data_t *p_ptr = static_cast<data_t *>(
+                get_slot_address(base, attentionScratchSlot));
+            auto sP = make_tensor(make_smem_ptr(p_ptr), layout_p);
+            sm100_attention_softmax_tmem_smem_fa4<M, KV>(
+                tmem_s, cta_coord_s, sP,
+                reinterpret_cast<float *>(p_ptr), smem_reduce,
+                block, num_kv_blocks,
+                last_kv_active_token_len, num_active_q,
+                logical_row, row_max, row_sum, correction);
+        } else {
+            auto dummy_p = make_tensor(
+                make_smem_ptr(static_cast<data_t *>(nullptr)), layout_p);
+            auto tmem_p = cta_pv.make_fragment_A(dummy_p);
+            tmem_p.data() = tmem_base_ptr + P_OFFSET;
+            sm100_attention_softmax_tmem_rows<M, KV>(
+                tmem_s, cta_coord_s, tmem_p_view, coord_p_view,
+                block, num_kv_blocks, last_kv_active_token_len, num_active_q,
+                logical_row, row_max, row_sum, correction);
+        }
+
+        if (block > 0) {
+            sm100_attention_rescale_tmem_rows<M, O_N>(
+                tmem_o, cta_coord_o, correction, num_active_q);
+        }
+
+        c2m.push(tid, k_slot);
+
+        tiled_pv.accumulate_ = block == 0 ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
+        if (tid < numThreadsPerWarp) {
+            if constexpr (FA4_SMEM_P) {
+                data_t *p_ptr = static_cast<data_t *>(
+                    get_slot_address(base, attentionScratchSlot));
+                auto sP = make_tensor(make_smem_ptr(p_ptr), layout_p);
+                auto frag_p = cta_pv.make_fragment_A(sP);
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(frag_p); ++k_block) {
+                    gemm(tiled_pv, frag_p(_, _, k_block),
+                         frag_v(_, _, k_block), tmem_o);
+                    tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+                }
+            } else {
+                auto dummy_p = make_tensor(
+                    make_smem_ptr(static_cast<data_t *>(nullptr)), layout_p);
+                auto tmem_p = cta_pv.make_fragment_A(dummy_p);
+                tmem_p.data() = tmem_base_ptr + P_OFFSET;
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(tmem_p); ++k_block) {
+                    gemm(tiled_pv, tmem_p(_, _, k_block),
+                         frag_v(_, _, k_block), tmem_o);
+                    tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+                }
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+
+        // Likewise, pre-consume the next K tile while PV is in flight. The
+        // single TMEM completion barrier remains ordered QK/PV/QK/PV.
+        int next_k_slot = 0;
+        if (block + 1 < num_kv_blocks) {
+            next_k_slot = m2c.template pop<0>();
+        } else if constexpr (!FA4_SMEM_P) {
+            // The output allocation follows the final V tile in the memory
+            // stream. Hide that queue transaction under the final PV UMMA.
+            o_slot = m2c.template pop<0>();
+        } else if (num_kv_blocks > 1) {
+            o_slot = m2c.template pop<0>();
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+
+        // Issue the direct epilogue before returning the input slots.  The
+        // raw global stores can drain while the queue bookkeeping for V/Q is
+        // performed, instead of sitting at the very end of the task.
+        if constexpr (DIRECT_OUTPUT) {
+            if (block + 1 == num_kv_blocks) {
+                const float inv_sum =
+                    tid < 2 * M && logical_row < num_active_q && row_sum > 0.0f
+                    ? 1.0f / row_sum : 0.0f;
+                data_t *o_ptr = static_cast<data_t *>(
+                    slot_2_glob_ptr(st_insts, o_slot));
+                sm100_attention_store_tmem_rows_global<M, O_N>(
+                    tmem_o, cta_coord_o, o_ptr, inv_sum, num_active_q);
+                // Raw-address allocations carry the special-slot index on
+                // M2C, but C2M/ST consumes a slot mask.  Preserve the
+                // production output barrier by publishing the corresponding
+                // one-hot mask (the standalone harness has no output bar and
+                // did not expose this distinction).
+                c2m.template push<31, true, false>(
+                    tid, 1U << o_slot);
+            }
+        }
+        c2m.push(tid, v_slot);
+        k_slot = next_k_slot;
+    }
+
+    c2m.push(tid, q_slot);
+    if (use_fused_qk) {
+        c2m.push(tid, side_slot);
+        c2m.template push<0, true>(tid, k_store_slot);
+    }
+
+    if constexpr (!DIRECT_OUTPUT) {
+        const float inv_sum =
+            tid < 2 * M && logical_row < num_active_q && row_sum > 0.0f
+            ? 1.0f / row_sum : 0.0f;
+        data_t *o_ptr = static_cast<data_t *>(get_slot_address(base, extract(o_slot)));
+        auto sO = make_tensor(
+            make_smem_ptr(o_ptr),
+            make_layout(make_shape(Int<M>{}, Int<O_N>{}), make_stride(Int<O_N>{}, Int<1>{})));
+        auto cta_sO = cta_pv.partition_C(sO);
+        sm100_attention_store_tmem_rows<M, O_N>(
+            tmem_o, cta_coord_o, cta_sO, inv_sum, num_active_q);
+        c2m.template push<0, true>(tid, o_slot);
+    }
+
+    if constexpr (SPLIT_KV) {
+        // The score accumulator is kept in the log2 domain, matching the
+        // exp2-based split reducer.  A 16-DP TMEM load assigns two threads to
+        // each row; both publish the same scalar, so duplicate stores are
+        // benign and avoid another synchronization/shuffle.
+        const int lse_slot = m2c.template pop<0>();
+        accum_t *lse_ptr = static_cast<accum_t *>(
+            slot_2_glob_ptr(st_insts, lse_slot));
+        if (tid < 2 * M && logical_row < num_active_q && row_sum > 0.0f) {
+            lse_ptr[logical_row * MAX_SPLIT + split_idx] =
+                row_max + log2f(row_sum);
+        }
+        __sync_compute_group(128);
+        c2m.template push<31, true, false>(tid, 1U << lse_slot);
+    }
+}
+
+// Low-latency GQA decode specialization for Blackwell.  Instead of padding the
+// four local query heads to the M=64 dimension, transpose both GEMMs so the
+// sequence/head dimension occupies M=128 and the query-head dimension occupies
+// N=8.  This is the same swapped-A/B formulation used by CUTLASS' SM100 TGV GQA
+// example: S = K * Q and O = V * P.  A 32-DP TMEM load gives every compute
+// thread one sequence/output row, allowing all four compute warps to perform
+// softmax and the TMEM correction in parallel.
+template <bool SPLIT_KV = false, int MAX_SPLIT = 16,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_attention_fwd_sm100_decode_swap(
+    const int num_kv_blocks,
+    const int split_idx,
+    const int num_active_q,
+    const int last_kv_active_token_len,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    void *base,
+    float *smem_reduce,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+
+    constexpr int D = 128;
+    constexpr int KV = 128;
+    constexpr int Q = 8;
+    constexpr int ACTIVE_Q = 4;
+    constexpr uint32_t O_OFFSET = 32;
+    constexpr int kScoreTmemColumnBits =
+        ACTIVE_Q * sizeof_bits_v<accum_t>;
+    constexpr int kOutputTmemColumnBits =
+        ACTIVE_Q * sizeof_bits_v<accum_t>;
+    static_assert(kScoreTmemColumnBits == 128);
+    static_assert(kOutputTmemColumnBits == 128);
+
+    using QKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, KV, Q,
+        UMMA::Major::K, UMMA::Major::K>;
+    using PVAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, D, Q,
+        UMMA::Major::MN, UMMA::Major::K>;
+
+    const int tid = __compute_tid();
+    const int warp_id = tid / numThreadsPerWarp;
+    const int lane_id = tid % numThreadsPerWarp;
+    auto tiled_qk = make_tiled_mma(QKAtom{});
+    auto cta_qk = tiled_qk.get_slice(0);
+    auto tiled_pv = make_tiled_mma(PVAtom{});
+    auto cta_pv = tiled_pv.get_slice(0);
+
+    auto k_shape = partition_shape_A(
+        tiled_qk, make_shape(Int<KV>{}, Int<D>{}));
+    auto q_shape = partition_shape_B(
+        tiled_qk, make_shape(Int<Q>{}, Int<D>{}));
+    auto v_shape = partition_shape_A(
+        tiled_pv, make_shape(Int<D>{}, Int<KV>{}));
+    auto layout_k = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, k_shape);
+    auto layout_q = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, q_shape);
+    auto layout_v = UMMA::tile_to_mma_shape(
+        UMMA::Layout_MN_SW128_Atom<data_t>{}, v_shape);
+
+    auto shape_s = make_shape(Int<KV>{}, Int<Q>{});
+    auto shape_p = make_shape(Int<Q>{}, Int<KV>{});
+    auto layout_s = tile_to_shape(
+        UMMA::Layout_MN_SW128_Atom<data_t>{}, shape_s,
+        Step<_1, _2>{});
+    auto layout_p = tile_to_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, shape_p,
+        Step<_2, _1>{});
+
+    // S and P deliberately alias the runtime's special scratch slot.  The two
+    // layouts are transposed views with identical physical swizzle stacking.
+    data_t *prob_ptr = static_cast<data_t *>(
+        get_slot_address(base, attentionScratchSlot));
+#if defined(DAE_PACKED_SWAP_ATTENTION_SCRATCH)
+    // QK scores and P have disjoint lifetimes.  The score transpose is first
+    // loaded completely into registers, then the same 2-KiB region is reused
+    // for the BF16 probability tile.
+    accum_t *score_stage = reinterpret_cast<accum_t *>(prob_ptr);
+#else
+    accum_t *score_stage = reinterpret_cast<accum_t *>(
+        prob_ptr + cosize(layout_s));
+#endif
+    auto sS = make_tensor(make_smem_ptr(prob_ptr), layout_s);
+    auto sP = make_tensor(make_smem_ptr(prob_ptr), layout_p);
+    auto cta_s = cta_qk.partition_C(sS);
+    auto cta_p = cta_pv.partition_B(sP);
+    auto frag_p = cta_pv.make_fragment_B(cta_p);
+    auto tmem_s = cta_qk.make_fragment_C(cta_s);
+    tmem_s.data() = tmem_base_ptr;
+
+    auto logical_o = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<D>{}, Int<Q>{})));
+    auto cta_o = cta_pv.partition_C(logical_o);
+    auto tmem_o = cta_pv.make_fragment_C(cta_o);
+    tmem_o.data() = tmem_base_ptr + O_OFFSET;
+
+    auto score_load_op =
+        TMEM::op_repeater<SM100_TMEM_LOAD_32dp32b1x,
+                          kScoreTmemColumnBits>();
+    const uint32_t score_tmem_addr = raw_pointer_cast(tmem_s.data());
+    auto r_scores = make_tensor<accum_t>(Int<ACTIVE_Q>{});
+
+    auto output_load_op =
+        TMEM::op_repeater<SM100_TMEM_LOAD_32dp32b1x,
+                          kOutputTmemColumnBits>();
+    auto output_store_op =
+        TMEM::op_repeater<SM100_TMEM_STORE_32dp32b1x,
+                          kOutputTmemColumnBits>();
+    const uint32_t output_tmem_addr = raw_pointer_cast(tmem_o.data());
+    auto r_output = make_tensor<accum_t>(Int<ACTIVE_Q>{});
+
+    const int q_slot = m2c.template pop<0>();
+    data_t *q_ptr = static_cast<data_t *>(
+        get_slot_address(base, extract(q_slot)));
+    auto sQ = make_tensor(make_smem_ptr(q_ptr), layout_q);
+    auto frag_q = cta_qk.make_fragment_B(sQ);
+
+    accum_t row_max = -FLT_MAX;
+    accum_t row_sum = 0.0f;
+
+    int k_slot = m2c.template pop<0>();
+    int o_slot = 0;
+    constexpr accum_t kScoreScale = M_LOG2E / 11.313708498984761f;
+    for (int block = 0; block < num_kv_blocks; ++block) {
+        data_t *k_ptr = static_cast<data_t *>(
+            get_slot_address(base, extract(k_slot)));
+        auto sK = make_tensor(make_smem_ptr(k_ptr), layout_k);
+        auto frag_k = cta_qk.make_fragment_A(sK);
+
+        tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
+        if (tid < numThreadsPerWarp) {
+            #pragma unroll
+            for (int k_block = 0;
+                 k_block < size<2>(frag_k); ++k_block) {
+                gemm(tiled_qk, frag_k(_, _, k_block),
+                     frag_q(_, _, k_block), tmem_s);
+                tiled_qk.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+
+        // Consume V and the following K/output descriptor while QK executes.
+        const int v_slot = m2c.template pop<0>();
+        data_t *v_ptr = static_cast<data_t *>(
+            get_slot_address(base, extract(v_slot)));
+        auto sV = make_tensor(make_smem_ptr(v_ptr), layout_v);
+        auto frag_v = cta_pv.make_fragment_A(sV);
+        int next_k_slot = 0;
+        if (block + 1 < num_kv_blocks) {
+            next_k_slot = m2c.template pop<0>();
+        } else {
+            o_slot = m2c.template pop<0>();
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+
+        sm100_attention_tmem_load_raw<decltype(score_load_op)>(
+            score_tmem_addr, r_scores);
+        cutlass::arch::fence_view_async_tmem_load();
+        const bool token_valid =
+            block + 1 < num_kv_blocks || tid < last_kv_active_token_len;
+        #pragma unroll
+        for (int q = 0; q < ACTIVE_Q; ++q) {
+            score_stage[q * KV + tid] = token_valid && q < num_active_q
+                ? r_scores(q) * kScoreScale : -FLT_MAX;
+        }
+        __sync_compute_group(128);
+        c2m.push(tid, k_slot);
+
+        // Transpose the softmax work in shared memory: one warp owns one live
+        // query column and each lane consumes four sequence positions.  This
+        // replaces four CTA-wide reductions with one warp reduction per query.
+        accum_t scores[KV / numThreadsPerWarp];
+        accum_t block_max = -FLT_MAX;
+        #pragma unroll
+        for (int i = 0; i < KV / numThreadsPerWarp; ++i) {
+            const int token = lane_id + i * numThreadsPerWarp;
+            scores[i] = score_stage[warp_id * KV + token];
+            block_max = fmaxf(block_max, scores[i]);
+        }
+#if defined(DAE_PACKED_SWAP_ATTENTION_SCRATCH)
+        __sync_compute_group(128);
+#endif
+        accum_t warp_max;
+        asm volatile(
+            "redux.sync.max.NaN.f32 %0, %1, 0xffffffff;\n"
+            : "=f"(warp_max) : "f"(block_max));
+        const bool query_valid =
+            warp_id < num_active_q && warp_max != -FLT_MAX;
+        const accum_t new_max = query_valid
+            ? fmaxf(row_max, warp_max) : -FLT_MAX;
+        const accum_t correction = row_max == -FLT_MAX
+            ? 0.0f : exp2f(row_max - new_max);
+        row_max = new_max;
+
+        accum_t block_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < KV / numThreadsPerWarp; ++i) {
+            scores[i] = query_valid
+                ? exp2f(scores[i] - new_max) : 0.0f;
+            block_sum += scores[i];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            block_sum += __shfl_xor_sync(
+                0xFFFFFFFFU, block_sum, offset);
+        }
+        row_sum = row_sum * correction + block_sum;
+
+        // The live and padded P columns are disjoint across warps.  Keep the
+        // padded UMMA columns zero while publishing the four live columns.
+        #pragma unroll
+        for (int i = 0; i < KV / numThreadsPerWarp; ++i) {
+            const int token = lane_id + i * numThreadsPerWarp;
+            sS(token, warp_id) = data_t(scores[i]);
+            sS(token, warp_id + ACTIVE_Q) = data_t(0.0f);
+        }
+        if (lane_id == 0) {
+            smem_reduce[warp_id] = row_max;
+            smem_reduce[ACTIVE_Q + warp_id] = row_sum;
+            smem_reduce[2 * ACTIVE_Q + warp_id] = correction;
+        }
+
+        cutlass::arch::fence_view_async_shared();
+        __sync_compute_group(128);
+
+        if (block > 0) {
+            sm100_attention_tmem_load_raw<decltype(output_load_op)>(
+                output_tmem_addr, r_output);
+            cutlass::arch::fence_view_async_tmem_load();
+            #pragma unroll
+            for (int q = 0; q < ACTIVE_Q; ++q) {
+                r_output(q) *= smem_reduce[2 * ACTIVE_Q + q];
+            }
+            sm100_attention_tmem_store_raw<decltype(output_store_op)>(
+                r_output, output_tmem_addr);
+            cutlass::arch::fence_view_async_tmem_store();
+            __sync_compute_group(128);
+        }
+
+        tiled_pv.accumulate_ = block == 0
+            ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
+        if (tid < numThreadsPerWarp) {
+            #pragma unroll
+            for (int k_block = 0; k_block < size<2>(frag_v); ++k_block) {
+                gemm(tiled_pv, frag_v(_, _, k_block),
+                     frag_p(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+
+        if (block + 1 == num_kv_blocks) {
+            sm100_attention_tmem_load_raw<decltype(output_load_op)>(
+                output_tmem_addr, r_output);
+            cutlass::arch::fence_view_async_tmem_load();
+            data_t *o_ptr = static_cast<data_t *>(
+                slot_2_glob_ptr(st_insts, o_slot));
+            #pragma unroll
+            for (int q = 0; q < ACTIVE_Q; ++q) {
+                if (q < num_active_q) {
+                    accum_t output_scale = 1.0f;
+                    if constexpr (!SPLIT_KV) {
+                        const accum_t total_mass =
+                            smem_reduce[ACTIVE_Q + q];
+                        output_scale = total_mass > 0.0f
+                            ? 1.0f / total_mass : 0.0f;
+                    }
+                    o_ptr[q * D + tid] =
+                        data_t(r_output(q) * output_scale);
+                }
+            }
+            c2m.template push<31, true, false>(tid, 1U << o_slot);
+        }
+        c2m.push(tid, v_slot);
+        k_slot = next_k_slot;
+    }
+
+    c2m.push(tid, q_slot);
+
+    if constexpr (SPLIT_KV) {
+        const int lse_slot = m2c.template pop<0>();
+        accum_t *lse_ptr = static_cast<accum_t *>(
+            slot_2_glob_ptr(st_insts, lse_slot));
+        if (tid < num_active_q &&
+            smem_reduce[ACTIVE_Q + tid] > 0.0f) {
+            lse_ptr[(tid * 2 + 0) * MAX_SPLIT + split_idx] =
+                smem_reduce[tid];
+            lse_ptr[(tid * 2 + 1) * MAX_SPLIT + split_idx] =
+                smem_reduce[ACTIVE_Q + tid];
+        }
+        __sync_compute_group(128);
+        c2m.template push<31, true, false>(tid, 1U << lse_slot);
+    }
+}
+
+#endif
 
 template <int HEAD_DIM,
           int Q_BLOCK_SIZE,
@@ -931,11 +1907,103 @@ __device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(
     }
 }
 
+template <int HEAD_DIM, int NUM_Q, int MAX_SPLIT,
+          typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_split_post_reduce2_raw_direct(
+    void *base,
+    const MInst *st_insts,
+    M2C_Type& m2c,
+    C2M_Type& c2m) {
+    static_assert(NUM_Q == 4);
+    static_assert(HEAD_DIM == 128);
+
+    using namespace cute;
+    using data_t = __nv_bfloat16;
+    using accum_t = float;
+    using Tr = F16Traits<data_t>;
+    using vec2_t = typename Tr::vec2_t;
+    struct alignas(8) vec4_t {
+        vec2_t lo;
+        vec2_t hi;
+    };
+
+    constexpr int THREADS_PER_Q = 32;
+    constexpr int ELEMS_PER_THREAD = (HEAD_DIM / 2) / THREADS_PER_Q;
+    const int thread_id = threadIdx.x;
+    const int lane_id = thread_id % THREADS_PER_Q;
+    const int my_q = thread_id / THREADS_PER_Q;
+    const int my_i_base = lane_id * ELEMS_PER_THREAD;
+
+    const int slot_meta = m2c.template pop<0>();
+    const uint8_t* record = static_cast<const uint8_t *>(
+        slot_2_glob_ptr(st_insts, slot_meta));
+    vec2_t* output = reinterpret_cast<vec2_t *>(
+        *reinterpret_cast<const uint64_t *>(record));
+    const accum_t* metadata = reinterpret_cast<const accum_t *>(
+        record + sizeof(uint64_t));
+
+    accum_t lane_max = -FLT_MAX;
+    accum_t lane_mass = 0.0f;
+    if (lane_id < 2) {
+        lane_max = metadata[(my_q * 2 + 0) * MAX_SPLIT + lane_id];
+        lane_mass = metadata[(my_q * 2 + 1) * MAX_SPLIT + lane_id];
+    }
+    const accum_t peer_max = __shfl_xor_sync(
+        0xFFFFFFFFU, lane_max, 1);
+    accum_t lane_scale = 0.0f;
+    accum_t lane_weighted_mass = 0.0f;
+    if (lane_id < 2) {
+        lane_scale = exp2f(lane_max - fmaxf(lane_max, peer_max));
+        lane_weighted_mass = lane_scale * lane_mass;
+    }
+    const accum_t peer_weighted_mass = __shfl_xor_sync(
+        0xFFFFFFFFU, lane_weighted_mass, 1);
+    const accum_t lane_weight = lane_id < 2
+        ? lane_scale / (lane_weighted_mass + peer_weighted_mass)
+        : 0.0f;
+    const accum_t weight0 = __shfl_sync(
+        0xFFFFFFFFU, lane_weight, 0);
+    const accum_t weight1 = __shfl_sync(
+        0xFFFFFFFFU, lane_weight, 1);
+
+    const int slot_split = m2c.template pop<0>();
+    const vec2_t* split_ptr = static_cast<const vec2_t *>(
+        get_slot_address(base, extract(slot_split)));
+    constexpr int VEC2_PER_SPLIT = NUM_Q * (HEAD_DIM / 2);
+    const int output_idx = my_q * (HEAD_DIM / 2) + my_i_base;
+    const vec4_t packed0 = *reinterpret_cast<const vec4_t *>(
+        split_ptr + output_idx);
+    const vec4_t packed1 = *reinterpret_cast<const vec4_t *>(
+        split_ptr + VEC2_PER_SPLIT + output_idx);
+    const float2 partial0_lo = Tr::to_float2(packed0.lo);
+    const float2 partial0_hi = Tr::to_float2(packed0.hi);
+    const float2 partial1_lo = Tr::to_float2(packed1.lo);
+    const float2 partial1_hi = Tr::to_float2(packed1.hi);
+    const vec4_t packed_output = {
+        Tr::from_float2({
+            partial0_lo.x * weight0 + partial1_lo.x * weight1,
+            partial0_lo.y * weight0 + partial1_lo.y * weight1,
+        }),
+        Tr::from_float2({
+            partial0_hi.x * weight0 + partial1_hi.x * weight1,
+            partial0_hi.y * weight0 + partial1_hi.y * weight1,
+        }),
+    };
+    *reinterpret_cast<vec4_t *>(output + output_idx) = packed_output;
+
+    __sync_compute_group(128);
+    c2m.push(thread_id, slot_split);
+    c2m.template push<31, true, false>(
+        thread_id, 1U << slot_meta);
+}
+
 template <int HEAD_DIM,
           int NUM_Q,
           int KV_BLOCK_SIZE,
           int MAX_SPLIT,
           int THREADS_PER_Q,   // tuning knob: threads assigned to each Q row
+          bool RAW_PARTIAL = false,
+          bool DIRECT_OUTPUT = false,
           typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_split_post_reduce(
     const int num_split,
@@ -947,6 +2015,7 @@ __device__ __forceinline__ void task_split_post_reduce(
 ) {
     static_assert(NUM_Q * THREADS_PER_Q <= 128, "active threads must not exceed warpgroup size");
     static_assert((HEAD_DIM / 2) % THREADS_PER_Q == 0, "HEAD_DIM/2 must be divisible by THREADS_PER_Q");
+    static_assert(THREADS_PER_Q == 32, "split reduction assigns one warp to each Q row");
 
     // ELEMS_PER_THREAD: consecutive vec2 columns each active thread accumulates.
     // ACTIVE_THREADS: threads [0, ACTIVE_THREADS) do work; the rest participate in syncs only.
@@ -960,6 +2029,7 @@ __device__ __forceinline__ void task_split_post_reduce(
     using vec2_t  = typename Tr::vec2_t;
 
     const int thread_id = threadIdx.x;
+    const int lane_id   = thread_id % 32;
     const int my_q      = thread_id / THREADS_PER_Q;
     const int my_i_base = (thread_id % THREADS_PER_Q) * ELEMS_PER_THREAD;
 
@@ -969,27 +2039,52 @@ __device__ __forceinline__ void task_split_post_reduce(
     auto layout_split_O = make_layout(
         make_shape(num_split, Int<NUM_Q>{}, Int<HEAD_DIM/2>{}),
         LayoutRight{});
-    auto layout_lse = make_layout(
-        make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
-        LayoutRight{});
-
     // LSE lives in global memory — available immediately (raw address, no TMA wait).
     const int slot_lse = m2c.template pop<0>();
-    const accum_t* __restrict__ sLSE_ptr = (accum_t*)slot_2_glob_ptr(st_insts, slot_lse);
-    auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
+    const void* metadata_record = slot_2_glob_ptr(st_insts, slot_lse);
+    const accum_t* __restrict__ sLSE_ptr =
+        static_cast<const accum_t *>(metadata_record);
+    vec2_t* direct_output_ptr = nullptr;
+    if constexpr (DIRECT_OUTPUT) {
+        direct_output_ptr = reinterpret_cast<vec2_t *>(
+            *static_cast<const uint64_t *>(metadata_record));
+        sLSE_ptr = reinterpret_cast<const accum_t *>(
+            static_cast<const uint8_t *>(metadata_record) + sizeof(uint64_t));
+    }
 
-    // Phase 1: preprocess LSE while the split-O TMA load is still in flight.
-    // Each thread caches num_split scale factors (one scalar per split, not per element).
-    accum_t sn_arr[MAX_SPLIT];
-    accum_t sum_all = 0.f;
-    if (thread_id < ACTIVE_THREADS) {
-        accum_t max_all = -FLT_MAX;
-        for (int s = 0; s < num_split; ++s)
-            max_all = fmaxf(max_all, gLSE(my_q, s));
-        for (int s = 0; s < num_split; ++s) {
-            sn_arr[s] = exp2f(gLSE(my_q, s) - max_all);
-            sum_all  += sn_arr[s];
+    // Phase 1: one lane owns one split's LSE. Warp reductions and broadcasts
+    // replace the previous 32-way redundant exp2 work for every output lane.
+    accum_t lane_max = -FLT_MAX;
+    accum_t lane_mass = 0.0f;
+    if constexpr (RAW_PARTIAL) {
+        auto layout_meta = make_layout(
+            make_shape(Int<NUM_Q>{}, Int<2>{}, Int<MAX_SPLIT>{}),
+            LayoutRight{});
+        auto gMeta = make_tensor(make_gmem_ptr(sLSE_ptr), layout_meta);
+        if (lane_id < num_split) {
+            lane_max = gMeta(my_q, 0, lane_id);
+            lane_mass = gMeta(my_q, 1, lane_id);
         }
+    } else {
+        auto layout_lse = make_layout(
+            make_shape(Int<NUM_Q>{}, Int<MAX_SPLIT>{}),
+            LayoutRight{});
+        auto gLSE = make_tensor(make_gmem_ptr(sLSE_ptr), layout_lse);
+        if (lane_id < num_split) {
+            lane_max = gLSE(my_q, lane_id);
+            lane_mass = 1.0f;
+        }
+    }
+    accum_t max_all;
+    asm volatile(
+        "redux.sync.max.NaN.f32 %0, %1, 0xffffffff;\n"
+        : "=f"(max_all) : "f"(lane_max));
+    const accum_t lane_scale = lane_id < num_split
+        ? exp2f(lane_max - max_all) : 0.0f;
+    accum_t sum_all = lane_scale * lane_mass;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_all += __shfl_xor_sync(0xFFFFFFFFU, sum_all, offset);
     }
 
     // Block on the TMA only now — overlap with phase 1 gives it extra time to complete.
@@ -1003,8 +2098,9 @@ __device__ __forceinline__ void task_split_post_reduce(
     for (int e = 0; e < ELEMS_PER_THREAD; ++e) acc[e] = {0.f, 0.f};
 
     if (thread_id < ACTIVE_THREADS) {
+        #pragma unroll
         for (int s = 0; s < num_split; ++s) {
-            const accum_t sn = sn_arr[s];
+            const accum_t sn = __shfl_sync(0xFFFFFFFFU, lane_scale, s);
             #pragma unroll
             for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
                 float2 oo = Tr::to_float2(split_O(s, my_q, my_i_base + e));
@@ -1018,19 +2114,33 @@ __device__ __forceinline__ void task_split_post_reduce(
     __sync_compute_group(128);
     c2m.push(thread_id, slot_split);
 
-    // Normalize and write to output smem.
-    const int slot_final = m2c.template pop<0>();
-    vec2_t* sF_ptr = (vec2_t*)get_slot_address(base, extract(slot_final));
-    auto sF = make_tensor(make_smem_ptr(sF_ptr), layout_sO);
-
-    if (thread_id < ACTIVE_THREADS) {
-        const accum_t inv_sum = 1.f / sum_all;
-        #pragma unroll
-        for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
-            sF(my_q, my_i_base + e) = Tr::from_float2({acc[e].x * inv_sum, acc[e].y * inv_sum});
+    // Normalize and either publish directly or write to the TMA output slot.
+    const accum_t inv_sum = 1.f / sum_all;
+    if constexpr (DIRECT_OUTPUT) {
+        if (thread_id < ACTIVE_THREADS) {
+            #pragma unroll
+            for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
+                direct_output_ptr[
+                    my_q * (HEAD_DIM / 2) + my_i_base + e] =
+                    Tr::from_float2(
+                        {acc[e].x * inv_sum, acc[e].y * inv_sum});
+            }
         }
+        c2m.template push<31, true, false>(
+            thread_id, 1U << slot_lse);
+    } else {
+        const int slot_final = m2c.template pop<0>();
+        vec2_t* sF_ptr = static_cast<vec2_t *>(
+            get_slot_address(base, extract(slot_final)));
+        auto sF = make_tensor(make_smem_ptr(sF_ptr), layout_sO);
+        if (thread_id < ACTIVE_THREADS) {
+            #pragma unroll
+            for (int e = 0; e < ELEMS_PER_THREAD; ++e) {
+                sF(my_q, my_i_base + e) = Tr::from_float2(
+                    {acc[e].x * inv_sum, acc[e].y * inv_sum});
+            }
+        }
+        __sync_compute_group(128);
+        c2m.template push<0, true>(thread_id, slot_final);
     }
-
-    __sync_compute_group(128);
-    c2m.template push<0, true>(thread_id, slot_final);
 }

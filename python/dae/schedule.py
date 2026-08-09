@@ -259,7 +259,14 @@ class SchedAttentionDecoding(Schedule):
                  num_active_q=64,
                  seq_len_counter_reg: int | None = None,
                  num_kv_block_counter_reg: int | None = None,
-                 max_loop_count: int = 1):
+                 max_loop_count: int = 1,
+                 outer_seq_len_counter_reg: int | None = None,
+                 outer_seq_len_counter_stride: int = 0,
+                 swapped_qk_pv: bool = False,
+                 q_head_bars=None,
+                 kv_head_bars=None,
+                 o_head_bars=None,
+                 head_major: bool = False):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -273,23 +280,58 @@ class SchedAttentionDecoding(Schedule):
         self.seq_len_counter_reg = seq_len_counter_reg
         self.num_kv_block_counter_reg = num_kv_block_counter_reg
         self.max_loop_count = max_loop_count
+        self.outer_seq_len_counter_reg = outer_seq_len_counter_reg
+        self.outer_seq_len_counter_stride = outer_seq_len_counter_stride
+        self.swapped_qk_pv = swapped_qk_pv
+        self.q_head_bars = q_head_bars
+        self.kv_head_bars = kv_head_bars
+        self.o_head_bars = o_head_bars
+        self.head_major = head_major
+        if (q_head_bars is None) != (kv_head_bars is None):
+            raise ValueError("q_head_bars and kv_head_bars must be provided together")
+        if q_head_bars is not None:
+            if len(q_head_bars) != NUM_KV_HEADS or len(kv_head_bars) != NUM_KV_HEADS:
+                raise ValueError("head-barrier arrays must match NUM_KV_HEADS")
+        if o_head_bars is not None and len(o_head_bars) != NUM_KV_HEADS:
+            raise ValueError("output head-barrier array must match NUM_KV_HEADS")
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
-        self.AttentionInst = select_attention_decode_instruction(matO.shape[-1])
         self.use_qwen_fused_qk = side_input is not None
+        self.direct_output = matO.shape[-1] == 128 and not self.use_qwen_fused_qk
+        if swapped_qk_pv:
+            if not self.direct_output or self.block_size != 128:
+                raise ValueError(
+                    "swapped SM100 decode requires direct HDIM128 output and KV128"
+                )
+            if self.num_active_q > 4:
+                raise ValueError(
+                    "swapped SM100 decode supports at most four active GQA heads"
+                )
+            self.AttentionInst = ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+        else:
+            self.AttentionInst = select_attention_decode_instruction(
+                matO.shape[-1], direct_output=self.direct_output
+            )
         if self.use_qwen_fused_qk and not all(side is not None for side in (side_input, k_store, token_pos)):
             raise ValueError("SchedAttentionDecoding requires side_input, k_store, and token_pos together for the fused Qwen path")
 
     def _on_place(self):
         assert self.num_sms == self.required_sms, f"SchedAttentionDecoding requires {self.required_sms} SMs, got {self.num_sms}"
 
+    def _map_req_head(self, sm: int):
+        if self.head_major:
+            return sm % self.reqs, sm // self.reqs
+        return sm // self.num_heads, sm % self.num_heads
+
     def schedule(self, sm: int):
         if sm < 0:
             return []
 
-        req = sm // self.num_heads
-        head = sm % self.num_heads
+        req, head = self._map_req_head(sm)
         head_dim = self.matO.shape[-1]
+        q_bar = self.q_head_bars[head] if self.q_head_bars is not None else self._bar("q")
+        kv_bar = self.kv_head_bars[head] if self.kv_head_bars is not None else self._bar("k")
+        o_bar = self.o_head_bars[head] if self.o_head_bars is not None else self._bar("o")
 
         tQ, tK, tV = self.tmas
 
@@ -315,6 +357,9 @@ class SchedAttentionDecoding(Schedule):
                 need_rope=self.use_qwen_fused_qk,
                 seq_len_counter_reg=self.seq_len_counter_reg,
                 num_kv_block_counter_reg=self.num_kv_block_counter_reg,
+                kv_block_size=self.block_size,
+                outer_seq_len_counter_reg=self.outer_seq_len_counter_reg,
+                outer_seq_len_counter_stride=self.outer_seq_len_counter_stride,
             ),
         ]
         if self.use_qwen_fused_qk:
@@ -323,7 +368,7 @@ class SchedAttentionDecoding(Schedule):
                 self.k_store[req].cord((self.token_pos * self.num_heads + head) * head_dim).group(),
             ]
         insts += [
-            tQ.cord(req, head).bar(self._bar("q")).group(),
+            tQ.cord(req, head).bar(q_bar).group(),
             RepeatM.on(num_kv_blocks - 1,
                 # this k-barrier will also barrier following V load
                 [tK.cord(req, 0, head, 0).port(1).group(), tK.cord2tma(0, self.block_size, 0, 0)],
@@ -333,13 +378,26 @@ class SchedAttentionDecoding(Schedule):
             # TODO(zhiyuang): reuse the accumulator register
             # only the last block has new generated KV cache
         ]
-        last_k = tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(self._bar("k")).group().port(1)
+        last_k = tK.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).bar(kv_bar).group().port(1)
         last_v = tV.cord(req, self.block_size * (num_kv_blocks - 1), head, 0).group().port(1)
         if self.num_kv_block_counter_reg is not None:
             last_k = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_k, tK.cord2tma(0, self.block_size, 0, 0))
             last_v = RepeatM.offsetByCounter(self.num_kv_block_counter_reg, last_v, tV.cord2tma(0, self.block_size, 0, 0))
         insts += [last_k, last_v]
-        insts.append(TmaStore1D(self.matO[req, head, ...], numSlots = 2).bar(self._bar("o")).group())
+        if self.direct_output:
+            output = (
+                RawAddress(self.matO[req, head, ...], config.num_slots)
+                .bar(o_bar)
+                .writeback()
+                .group()
+            )
+        else:
+            output = (
+                TmaStore1D(self.matO[req, head, ...], numSlots=2)
+                .bar(o_bar)
+                .group()
+            )
+        insts.append(output)
         return insts
 
     def bar_release_count(self, role: str):
@@ -592,6 +650,312 @@ class SchedGemv(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
+
+class SchedGemvPhasedActivation(SchedGemv):
+    """One GEMV task whose activation repeats observe staged producer bars.
+
+    Consecutive repeats with the same barrier stay in one RepeatM program, so
+    the compute opcode, tile shape, and normal weight/activation pipeline are
+    unchanged. Only genuine producer boundaries add another memory segment.
+    """
+
+    def __init__(self, Atom, MNK, tmas, activation_bars,
+                 fold: int | None = None, prefetch=True, group=True):
+        super().__init__(
+            Atom, MNK, tmas, fold=fold, prefetch=prefetch, group=group
+        )
+        self.activation_bars = list(activation_bars)
+
+    def validate(self):
+        super().validate()
+        TileK = self.Atom.MNK[2]
+        repeat_k = TileK * self.Atom.n_batch
+        base_k = self.MNK_base[2]
+        total_k = base_k + self.MNK[2]
+        assert base_k % repeat_k == 0
+        assert total_k % repeat_k == 0
+        assert len(self.activation_bars) >= total_k // repeat_k
+        assert self._bar("load") is None, (
+            "phased activation GEMV takes its load barriers explicitly"
+        )
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        baseM, _, baseK = self.MNK_base
+        n_batch = self.Atom.n_batch
+        loadA, loadB, storeC = self.tmas
+
+        m = baseM + (sm % self.sm_per_fold) * TileM
+        k = baseK + (sm // self.sm_per_fold) * self.k_per_fold
+        repeat_k = TileK * n_batch
+        n_repeat = self.k_per_fold // repeat_k
+        store_group = self.group and self._bar("store") is not None
+
+        phased_loads = []
+        local_repeat = 0
+        while local_repeat < n_repeat:
+            global_repeat = k // repeat_k + local_repeat
+            bar_id = self.activation_bars[global_repeat]
+            run_length = 1
+            while (
+                local_repeat + run_length < n_repeat
+                and self.activation_bars[global_repeat + run_length] == bar_id
+            ):
+                run_length += 1
+
+            segment_k = k + local_repeat * repeat_k
+            load_steps = [
+                (loadB.cord(0, segment_k).group(),
+                 loadB.cord2tma(0, repeat_k)),
+                *[
+                    (loadA.cord(m, segment_k + TileK * i).group(),
+                     loadA.cord2tma(0, repeat_k))
+                    for i in range(n_batch)
+                ],
+            ]
+            phased_loads.extend(
+                RepeatM.onSync(
+                    0, bar_id, run_length, *load_steps,
+                    asyncPort=self.prefetch,
+                )
+            )
+            local_repeat += run_length
+
+        return [
+            self.Atom(self.k_per_fold // TileK),
+            phased_loads,
+            storeC.cord(0, m).bar(self._bar("store")).group(store_group),
+        ]
+
+
+class SchedGemvUpSiLU(SchedGemv):
+    """Up projection whose final UMMA group overlaps gate SiLU work."""
+
+    def __init__(self, MNK, tmas, gate_reg: int):
+        super().__init__(Gemv_M64N8UpSiLU, MNK, tmas)
+        self.gate_reg = gate_reg
+
+    def schedule(self, sm: int):
+        insts = super().schedule(sm)
+        if not insts:
+            return insts
+        insts.insert(len(insts) - 1, RegLoad(self.gate_reg))
+        return insts
+
+
+class SchedGemvMGroup(Schedule):
+    def __init__(self, Atom, MNK, tmas, direct_output,
+                 direct_output_slot: int = 24, group: bool = True):
+        super().__init__()
+        self.Atom = Atom
+        self.MNK = MNK
+        self.tmas = tmas
+        self.direct_output = direct_output
+        self.direct_output_slot = direct_output_slot
+        self.group = group
+
+    def _on_place(self):
+        TileM, TileN, TileK = self.Atom.MNK
+        M, N, K = self.MNK
+        assert M == self.num_sms * TileM * self.Atom.output_groups
+        assert N == TileN
+        assert K % (TileK * self.Atom.n_batch) == 0
+        assert tuple(self.direct_output.shape) == (N, M)
+        assert len(self.tmas) == 2
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        _, _, K = self.MNK
+        loadA, loadB = self.tmas
+        m = sm * TileM
+        output_group_stride = self.num_sms * TileM
+        n_repeat = K // (TileK * self.Atom.n_batch)
+        load_group = self.group and self._bar("load") is not None
+        store_group = self.group and self._bar("store") is not None
+
+        load_steps = [
+            (loadB.cord(0, 0).group(load_group),
+             loadB.cord2tma(0, TileK * self.Atom.n_batch)),
+        ]
+        for k_tile in range(self.Atom.n_batch):
+            for output_group in range(self.Atom.output_groups):
+                group_m = m + output_group * output_group_stride
+                load_a = loadA.cord(
+                    group_m, k_tile * TileK
+                ).group(load_group)
+                load_steps.append((
+                    load_a,
+                    loadA.cord2tma(0, TileK * self.Atom.n_batch),
+                ))
+
+        output = (
+            RawAddress(self.direct_output, self.direct_output_slot)
+            .delta(m * self.direct_output.element_size())
+            .bar(self._bar("store"))
+            .writeback()
+            .group(store_group)
+        )
+        return [
+            self.Atom(K // TileK, self.direct_output.shape[-1],
+                      output_group_stride),
+            RepeatM.onSync(0, self._bar("load"), n_repeat, *load_steps),
+            output,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedGemvMGroupArgmax(Schedule):
+    """Grouped LM-head GEMV that emits one argmax record per task/token."""
+
+    def __init__(self, Atom, MNK, tmas, mat_out_partial,
+                 vocabulary_base: int, partial_base: int,
+                 partial_slot: int = 30, group: bool = False):
+        super().__init__()
+        self.Atom = Atom
+        self.MNK = MNK
+        self.tmas = tmas
+        self.mat_out_partial = mat_out_partial
+        self.vocabulary_base = vocabulary_base
+        self.partial_base = partial_base
+        self.partial_slot = partial_slot
+        self.group = group
+
+    def _on_place(self):
+        tile_m, tile_n, tile_k = self.Atom.MNK
+        m, n, k = self.MNK
+        assert m == self.num_sms * tile_m * self.Atom.output_groups
+        assert n == tile_n
+        assert k % (tile_k * self.Atom.n_batch) == 0
+        assert self.mat_out_partial.shape[0] == n
+        assert self.mat_out_partial.shape[2] == 16
+        assert self.partial_base + self.num_sms <= self.mat_out_partial.shape[1]
+        assert self.vocabulary_base % tile_m == 0
+        assert len(self.tmas) == 2
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        tile_m, _, tile_k = self.Atom.MNK
+        _, _, k = self.MNK
+        load_a, load_b = self.tmas
+        m = sm * tile_m
+        output_group_stride = self.num_sms * tile_m
+        n_repeat = k // (tile_k * self.Atom.n_batch)
+        load_group = self.group and self._bar("load") is not None
+
+        load_steps = [
+            (load_b.cord(0, 0).group(load_group),
+             load_b.cord2tma(0, tile_k * self.Atom.n_batch)),
+        ]
+        for k_tile in range(self.Atom.n_batch):
+            for output_group in range(self.Atom.output_groups):
+                group_m = m + output_group * output_group_stride
+                load_steps.append((
+                    load_a.cord(group_m, k_tile * tile_k).group(load_group),
+                    load_a.cord2tma(0, tile_k * self.Atom.n_batch),
+                ))
+
+        partial = self.partial_base + sm
+        partial_out = (
+            RawAddress(self.mat_out_partial[0, partial], self.partial_slot)
+            .bar(self._bar("partial"))
+            .writeback()
+        )
+        return [
+            self.Atom(
+                k // tile_k,
+                output_group_stride,
+                self.vocabulary_base + m,
+            ),
+            RepeatM.onSync(0, self._bar("load"), n_repeat, *load_steps),
+            partial_out,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "partial":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedGemvMGroupReduce(Schedule):
+    def __init__(self, Atom, MNK, tmas, group: bool = True):
+        super().__init__()
+        self.Atom = Atom
+        self.MNK = MNK
+        self.tmas = tmas
+        self.group = group
+        self.m_groups = None
+        self.fold = None
+        self.k_per_fold = None
+
+    def _on_place(self):
+        TileM, TileN, TileK = self.Atom.MNK
+        M, N, K = self.MNK
+        assert M % (TileM * self.Atom.output_groups) == 0
+        assert N == TileN
+        self.m_groups = M // (TileM * self.Atom.output_groups)
+        assert self.num_sms % self.m_groups == 0
+        self.fold = self.num_sms // self.m_groups
+        assert K % self.fold == 0
+        self.k_per_fold = K // self.fold
+        assert self.k_per_fold % (TileK * self.Atom.n_batch) == 0
+        assert len(self.tmas) == 3
+        assert self.tmas[-1].mode == "reduce"
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        loadA, loadB, storeC = self.tmas
+        m = (sm % self.m_groups) * TileM
+        k = (sm // self.m_groups) * self.k_per_fold
+        output_group_stride = self.m_groups * TileM
+        n_repeat = self.k_per_fold // (TileK * self.Atom.n_batch)
+        load_group = self.group and self._bar("load") is not None
+        store_group = self.group and self._bar("store") is not None
+
+        load_steps = [
+            (loadB.cord(0, k).group(load_group),
+             loadB.cord2tma(0, TileK * self.Atom.n_batch)),
+        ]
+        for k_tile in range(self.Atom.n_batch):
+            for output_group in range(self.Atom.output_groups):
+                group_m = m + output_group * output_group_stride
+                load_steps.append((
+                    loadA.cord(group_m, k + k_tile * TileK).group(load_group),
+                    loadA.cord2tma(0, TileK * self.Atom.n_batch),
+                ))
+
+        output = (
+            storeC.cord(0, m)
+            .bar(self._bar("store"))
+            .group(store_group)
+        )
+
+        return [
+            self.Atom(self.k_per_fold // TileK),
+            RepeatM.onSync(0, self._bar("load"), n_repeat, *load_steps),
+            output,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedGemm(Schedule):
     def __init__(self, Atom,
                  MNK: tuple[int, int, int],
@@ -765,9 +1129,11 @@ class SchedGemvRope(Schedule):
                  tmas: tuple[TmaTensor],
                  rope_table: RawAddress,
                  hist_seq_len: int,
+                 rope_counter_offsets=None,
+                 Atom=Gemv_M64N8_ROPE_128,
                  ):
         super().__init__()
-        self.Atom = Gemv_M64N8_ROPE_128
+        self.Atom = Atom
         self.MNK = MNK
         self.tmas = tmas
 
@@ -789,6 +1155,7 @@ class SchedGemvRope(Schedule):
         self.MNK_base = MNK_base
         self.rope_table = rope_table
         self.hist_seq_len = hist_seq_len
+        self.rope_counter_offsets = rope_counter_offsets or []
 
         self.fold = None
         self.prefetch = True
@@ -828,9 +1195,14 @@ class SchedGemvRope(Schedule):
 
         n_repeat = self.k_per_fold // (TileK * n_batch)
 
+        rope_table = self.rope_table.copy().delta(self.hist_seq_len * 128 * 2)
+        for counter_reg, delta in self.rope_counter_offsets:
+            rope_table = CounterOffsetMemoryInstruction(
+                counter_reg, rope_table, delta)
+
         insts = [
             self.Atom(self.k_per_fold // TileK, self.hist_seq_len, m % 128),
-            self.rope_table,
+            rope_table,
             RepeatM.onSync(0, self._bar("load"), n_repeat,
                 (loadB.cord(0, k).group(), loadB.cord2tma(0, TileK * n_batch)),
                 *[
@@ -839,7 +1211,7 @@ class SchedGemvRope(Schedule):
                 ],
                 asyncPort=self.prefetch,
             ),
-            storeC.cord(0, self.hist_seq_len, m).bar(self._bar("store")).group(),
+            storeC.cord(0, m).bar(self._bar("store")).group(),
         ]
         return insts
 
@@ -987,6 +1359,7 @@ class SchedRMS(Schedule):
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
+
 class SchedSiLU(Schedule):
     def __init__(self,
                  base_raw_slot: int,
@@ -1057,20 +1430,64 @@ class SchedSmemSiLUInterleaved(Schedule):
                  num_token: int,
                  gate_glob: torch.Tensor,
                  up_glob: torch.Tensor,
-                 out_glob: torch.Tensor):
+                 out_glob: torch.Tensor,
+                 shards_per_token: int = 1,
+                 fixed_shard_id: int | None = None):
         super().__init__()
         self.num_token = num_token
         self.gate_glob = gate_glob
         self.up_glob = up_glob
         self.out_glob = out_glob
+        self.shards_per_token = shards_per_token
+        self.fixed_shard_id = fixed_shard_id
 
     def _on_place(self):
+        if self.shards_per_token == 3:
+            assert self.gate_glob.shape == self.up_glob.shape == self.out_glob.shape
+            assert self.gate_glob.shape[-1] == 6144, (
+                "Three-way SwiGLU sharding requires a 6144-element prefix"
+            )
+            if self.fixed_shard_id is None:
+                assert self.num_sms == self.num_token * self.shards_per_token, (
+                    "Three-way SwiGLU sharding requires one SM per token shard"
+                )
+            else:
+                assert 0 <= self.fixed_shard_id < self.shards_per_token
+                assert self.num_sms == self.num_token, (
+                    "A fixed SwiGLU shard requires one SM per token"
+                )
+            self.tokens_per_sm = 1
+            return
+        assert self.shards_per_token == 1, "Supported SwiGLU shard counts are 1 and 3"
         assert self.num_token % self.num_sms == 0, "Number of tokens must be divisible by number of SMs"
         self.tokens_per_sm = self.num_token // self.num_sms
 
     def schedule(self, sm):
         if sm < 0:
             return []
+
+        if self.shards_per_token == 3:
+            if self.fixed_shard_id is None:
+                token_id = sm // self.shards_per_token
+                shard_id = sm % self.shards_per_token
+            else:
+                token_id = sm
+                shard_id = self.fixed_shard_id
+            shard_width = self.gate_glob.shape[-1] // self.shards_per_token
+            shard_start = shard_id * shard_width
+            shard_end = shard_start + shard_width
+            fine_input = self._bar(f"input{shard_id}")
+            fine_output = self._bar(f"output{shard_id}")
+            input_bar = fine_input if fine_input is not None else self._bar("input")
+            output_bar = fine_output if fine_output is not None else self._bar("output")
+            return [
+                SILU_MUL_SHARED_BF16_K_2048_INTER(1),
+                TmaStore1D(self.out_glob[token_id, shard_start:shard_end])
+                    .bar(output_bar).group(),
+                TmaLoad1D(self.gate_glob[token_id, shard_start:shard_end])
+                    .bar(input_bar).group(),
+                TmaLoad1D(self.up_glob[token_id, shard_start:shard_end]),
+            ]
 
         start_token_id = sm * self.tokens_per_sm
         end_token_id = (sm + 1) * self.tokens_per_sm
@@ -1089,9 +1506,17 @@ class SchedSmemSiLUInterleaved(Schedule):
         return insts
 
     def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, self.num_token)
+        if role == "output":
+            return self._bar_release_if_present(
+                role, self.num_token * self.shards_per_token
+            )
+        if role.startswith("output") and role[6:].isdigit():
+            shard_id = int(role[6:])
+            if 0 <= shard_id < self.shards_per_token:
+                return self._bar_release_if_present(role, self.num_token)
+        return 0
+
+
 
 class SchedRegSiLUFused(Schedule):
     def __init__(self,
@@ -1124,6 +1549,7 @@ class SchedRegSiLUFused(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
 
 class SchedSmemSiLU_K_4096_N_1(Schedule):
     def __init__(self,
@@ -1241,6 +1667,50 @@ class SchedArgmax(Schedule):
         if role == "final":
             return self._bar_release_if_present(role, min(self.num_token, self.num_sms))
         return 0
+
+
+class SchedArgmaxReduceGlobal(Schedule):
+    """Reduce absolute-index argmax records produced by fused LM-head tasks."""
+
+    def __init__(self, num_token: int, AtomReduce,
+                 mat_out_partial: torch.Tensor,
+                 mat_final_out: torch.Tensor,
+                 final_counter_offsets: list[tuple[int, int]] | None = None):
+        super().__init__()
+        self.num_token = num_token
+        self.AtomReduce = AtomReduce
+        self.mat_out_partial = mat_out_partial
+        self.mat_final_out = mat_final_out
+        self.final_counter_offsets = final_counter_offsets
+
+    def _on_place(self):
+        assert self.num_sms == self.num_token
+        assert self.mat_out_partial.shape == (
+            self.num_token, self.AtomReduce.PARTIAL_TASKS, 16)
+        assert self.mat_final_out.shape == (self.num_token,)
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        final_out = (
+            RawAddress(self.mat_final_out[sm], 29)
+            .bar(self._bar("final"))
+            .writeback()
+        )
+        if self.final_counter_offsets:
+            final_out = RepeatM.offsetByCounters(
+                self.final_counter_offsets, final_out)
+        return [
+            self.AtomReduce(1),
+            RawAddress(self.mat_out_partial[sm], 27)
+            .bar(self._bar("partial")),
+            final_out,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "final":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 def interleave(*schedules):

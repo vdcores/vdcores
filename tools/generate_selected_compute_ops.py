@@ -242,12 +242,20 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
         "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);",
     ]
     if entry["family"] == "gemv_wgmma":
+        residual = "true" if entry["residual"] else "false"
         body = [
+            "#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)",
+            (
+                f"  task_gemv_sm100<{entry['m']}, {entry['n']}, {entry['k']}, {entry['bload']}, {residual}>"
+                "(inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, smem_base, m2c, c2m);"
+            ),
+            "#else",
             "  using gemv_atom = cute::SM90_64x8x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;",
             (
-                f"  task_gemv<gemv_atom, {entry['m']}, {entry['k']}, {entry['bload']}, false>"
+                f"  task_gemv<gemv_atom, {entry['m']}, {entry['k']}, {entry['bload']}, {residual}>"
                 "(inst.args[0], inst.args[1], smem_base, m2c, c2m);"
             ),
+            "#endif",
         ]
     elif entry["family"] == "gemv_mma":
         body = [

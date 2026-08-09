@@ -13,6 +13,9 @@ import numpy as np
 import torch
 
 
+_stream_cache_policy_signatures = {}
+
+
 def extract_compute_operator_names(launcher) -> list[str]:
     operator_names = []
     seen = set()
@@ -214,13 +217,17 @@ class ResourceGroup:
 
 class Launcher:
     def __init__(self, num_sms : int = 1, device = 'cuda'):
-        self.smem_size = 202 * 1024 # 202 KB
+        # Exact selective images may trade unused static instruction storage
+        # for a larger allocator arena.  Keep the host request tied to the
+        # constants compiled into the resident kernel.
+        self.smem_size = config.dynamic_smem_size
         self.num_sms = num_sms
         self.device = device
 
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
         self.profile = torch.empty((num_sms, config.num_profile_events), dtype=torch.uint64, device=self.device)
+        self.loop_counters = [0] * config.num_loop_counters
 
         self.cinsts = torch.empty((num_sms, self.max_insts, 8), dtype=torch.uint8)
         self.minsts = torch.empty((num_sms, self.max_insts, 16), dtype=torch.uint8)
@@ -230,6 +237,7 @@ class Launcher:
         self.tmas = []
 
         self.need_instruction_build = True
+        self._compute_operator_names = None
 
         self.num_bars = 0
         self.bar_values = {}
@@ -244,6 +252,8 @@ class Launcher:
 
         self._cache_window_override = None
         self._cache_window_requests = []
+        self._launch_buffers = None
+        self._bar_sources_initialized = False
 
         runtime.set_smem_size(self.smem_size)
 
@@ -263,13 +273,16 @@ class Launcher:
         bar_id = self.num_bars
         self.bar_values[bar_id] = value
         self.num_bars += 1
+        self._bar_sources_initialized = False
         return bar_id
     def set_bar(self, bar_id: int, value: int):
         assert bar_id in self.bar_values, f"bar_id {bar_id} does not exist"
         assert isinstance(value, int), "bar value must be an int"
         self.bar_values[bar_id] = value
+        self._bar_sources_initialized = False
     def new_tma(self, desc: torch.Tensor) -> int:
         self.tmas.append(desc)
+        self._launch_buffers = None
         return len(self.tmas) - 1
 
     # instruction management
@@ -300,6 +313,36 @@ class Launcher:
                     self.mptrs,
                 )
             self.need_instruction_build = False
+            self._launch_buffers = None
+
+    def set_loop_counter(self, reg: int, value: int):
+        if not 0 <= reg < config.num_loop_counters:
+            raise ValueError(
+                f"loop counter register must be in [0, {config.num_loop_counters}), got {reg}"
+            )
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"loop counter value must fit in uint32, got {value}")
+        self.loop_counters[reg] = value
+
+    def prepare_launch(self):
+        self.build_instructions()
+        if self._launch_buffers is None:
+            cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
+            minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
+            if len(self.tmas) == 0:
+                tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
+            else:
+                tma = torch.stack(self.tmas).to(self.device)
+            self._launch_buffers = (cinsts, minsts, tma)
+
+        if not self._bar_sources_initialized:
+            bar_src_int_view = self.bars_src.view(torch.uint32)
+            for bar_id, value in self.bar_values.items():
+                if value is not None:
+                    bar_src_int_view[bar_id] = value
+            self._bar_sources_initialized = True
+
+        return self._launch_buffers
 
     def _cache_window_dict(self, tensor, *, hit_ratio, hit_policy, miss_policy, num_bytes=None):
         if not isinstance(tensor, torch.Tensor):
@@ -415,12 +458,48 @@ class Launcher:
             num_bytes=num_bytes,
         )
 
+    @staticmethod
+    def _cache_policy_signature(cache_window):
+        if cache_window is None:
+            return None
+        tensor = cache_window["tensor"]
+        return (
+            tensor.device.index,
+            tensor.data_ptr(),
+            tensor.numel() * tensor.element_size(),
+            cache_window["hit_ratio"],
+            cache_window["hit_policy"],
+            cache_window["miss_policy"],
+            cache_window["num_bytes"],
+        )
+
+    def _apply_launch_cache_policy(self, stream, cache_window):
+        stream_key = (torch.cuda.current_device(), int(stream))
+        signature = self._cache_policy_signature(cache_window)
+        if _stream_cache_policy_signatures.get(stream_key, object()) == signature:
+            return
+
+        if cache_window is None:
+            runtime.reset_cache_policy(stream)
+        else:
+            runtime.set_cache_policy(
+                cache_window["tensor"],
+                stream,
+                cache_window["hit_ratio"],
+                cache_window["hit_policy"],
+                cache_window["miss_policy"],
+                cache_window["num_bytes"] if cache_window["num_bytes"] is not None else -1,
+            )
+        _stream_cache_policy_signatures[stream_key] = signature
+
     def i(self, *insts):
         """Add instructions to all SM builders."""
         for inst in insts:
             for b in self.builder:
                 b.add(inst)
         self.need_instruction_build = True
+        self._launch_buffers = None
+        self._compute_operator_names = None
 
     def collect_barrier_release_counts(self, *insts):
         counts = {}
@@ -465,8 +544,8 @@ class Launcher:
             mi += len(b.minsts)
         return ci / self.num_sms, mi / self.num_sms
 
-    def launch(self):
-        self.build_instructions()
+    def _prepare_runtime_launch(self, reset_bars):
+        cinsts, minsts, tma = self.prepare_launch()
 
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
         if supported_compute_ops is not None:
@@ -484,55 +563,58 @@ class Launcher:
         if unbound_bar_ids:
             raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
 
-        # Load the model using the runtime
-        cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
-        minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
-
         stream = torch.cuda.current_stream().cuda_stream
         # TODO(zhiyuang): check this?
 
         # init the bars based on dict
-        bar_int_view = self.bars.view(torch.uint32)
-        bar_src_int_view = self.bars_src.view(torch.uint32)
-        for bar_id, value in self.bar_values.items():
-            bar_int_view[bar_id] = value
-            bar_src_int_view[bar_id] = value
+        if reset_bars:
+            self.bars.copy_(self.bars_src)
 
         # print("bars before launch:", self.bar_values)
 
-        if len(self.tmas) == 0:
-            tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
-        else:
-            tma = torch.stack(self.tmas).to(self.device)
         profile = self.profile.view(torch.uint8).view(self.num_sms * config.num_profile_events, 8)
-
-        runtime.reset_cache_policy(stream)
         cache_window = self._select_launch_cache_window(
             bars=self.bars,
             tma=tma,
             cinsts=cinsts,
             minsts=minsts,
         )
-        if cache_window is not None:
-            runtime.set_cache_policy(
-                cache_window["tensor"],
-                stream,
-                cache_window["hit_ratio"],
-                cache_window["hit_policy"],
-                cache_window["miss_policy"],
-                cache_window["num_bytes"] if cache_window["num_bytes"] is not None else -1,
-            )
+        self._apply_launch_cache_policy(stream, cache_window)
+
+        return cinsts, minsts, tma, profile, stream
+
+    def launch(self, *, synchronize=True, reset_bars=True):
+        cinsts, minsts, tma, profile, stream = self._prepare_runtime_launch(reset_bars)
 
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
             self.bars, profile,
-            stream
+            self.loop_counters,
+            stream,
+            synchronize,
+        )
+        assert ret == 0
+
+    def launch_sequence(self, loop_counter_values, *, synchronize=True, reset_bars=True):
+        loop_counter_values = [list(values) for values in loop_counter_values]
+        if not loop_counter_values:
+            raise ValueError("loop_counter_values must not be empty")
+        cinsts, minsts, tma, profile, stream = self._prepare_runtime_launch(reset_bars)
+        ret = runtime.launch_dae_sequence(
+            self.num_sms, self.smem_size,
+            cinsts, minsts, tma,
+            self.bars, profile,
+            loop_counter_values,
+            stream,
+            synchronize,
         )
         assert ret == 0
 
     def compute_operator_names(self) -> list[str]:
-        return extract_compute_operator_names(self)
+        if self._compute_operator_names is None:
+            self._compute_operator_names = extract_compute_operator_names(self)
+        return self._compute_operator_names
     
     def bench(self, iterations : int = 100,
                     total_bytes : int | None = None, total_flops : int | None = None):

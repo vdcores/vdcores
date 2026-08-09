@@ -2,6 +2,7 @@
 #include "dae/context.cuh"
 
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 
 #include <cuda.h>            // Driver API
 #include <cuda_runtime.h>
@@ -15,9 +16,37 @@
 
 namespace py = pybind11;
 
+static cudaDeviceProp current_device_prop();
+static void set_persistent_cache();
+
+static LoopCounters checked_loop_counts(const std::vector<int64_t>& values) {
+  TORCH_CHECK(
+      values.size() == numComputeLoopCounters,
+      "initial_loop_counts must have ", numComputeLoopCounters, " elements");
+  LoopCounters counters{};
+  for (int i = 0; i < numComputeLoopCounters; ++i) {
+    TORCH_CHECK(
+        values[i] >= 0 && values[i] <= UINT32_MAX,
+        "initial_loop_counts[", i, "] must fit in uint32");
+    counters.values[i] = static_cast<uint32_t>(values[i]);
+  }
+  return counters;
+}
+
 // function 1: set smem size
 size_t py_set_smem_size(size_t requested_size) {
-  return set_smem_size(requested_size);
+  const cudaDeviceProp prop = current_device_prop();
+  const size_t max_optin = static_cast<size_t>(prop.sharedMemPerBlockOptin);
+  TORCH_CHECK(
+      requested_size <= max_optin,
+      "requested dynamic shared memory (", requested_size,
+      " bytes) exceeds this device's per-block opt-in limit (", max_optin, " bytes)");
+  const size_t configured_size = set_smem_size(requested_size);
+  TORCH_CHECK(
+      configured_size == requested_size,
+      "failed to configure dae2 dynamic shared memory to ", requested_size, " bytes");
+  set_persistent_cache();
+  return configured_size;
 }
 
 template <typename T>
@@ -139,12 +168,18 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
-    int64_t stream
+    const std::vector<int64_t>& initial_loop_counts,
+    int64_t stream,
+    bool synchronize
 ) {
-  set_persistent_cache();
-
-  // fixed for H100 for now
-  TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
+  const cudaDeviceProp prop = current_device_prop();
+  TORCH_CHECK(
+      num_sms > 0 && num_sms <= prop.multiProcessorCount,
+      "num_sms out of range for ", prop.name, ": requested ", num_sms,
+      ", device has ", prop.multiProcessorCount, " SMs");
+  TORCH_CHECK(
+      smem_size <= static_cast<size_t>(prop.sharedMemPerBlockOptin),
+      "smem_size exceeds this device's per-block opt-in shared-memory limit");
 
   // Make sure we run on the right device/stream
   auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");
@@ -152,17 +187,85 @@ int py_launch_dae(
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+  LoopCounters counters = checked_loop_counts(initial_loop_counts);
 
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, prof, counters, stream, synchronize
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
 
   // Return something meaningful; often you return profile or nothing.
   return 0;
+}
+
+int py_launch_dae_sequence(
+    int64_t num_sms,
+    size_t smem_size,
+    torch::Tensor compute_insts_bytes,
+    torch::Tensor memory_insts_bytes,
+    torch::Tensor tma_descs_bytes,
+    torch::Tensor bars_int32,
+    torch::Tensor profile_u64,
+    const std::vector<std::vector<int64_t>>& sequence_loop_counts,
+    int64_t stream,
+    bool synchronize
+) {
+  const cudaDeviceProp prop = current_device_prop();
+  TORCH_CHECK(
+      num_sms > 0 && num_sms <= prop.multiProcessorCount,
+      "num_sms out of range for ", prop.name, ": requested ", num_sms,
+      ", device has ", prop.multiProcessorCount, " SMs");
+  TORCH_CHECK(
+      smem_size <= static_cast<size_t>(prop.sharedMemPerBlockOptin),
+      "smem_size exceeds this device's per-block opt-in shared-memory limit");
+  TORCH_CHECK(!sequence_loop_counts.empty(), "sequence_loop_counts must not be empty");
+
+  auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");
+  auto minst = check_tensor_ptr<MInst>(memory_insts_bytes, "memory_insts_bytes");
+  auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
+  auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
+  auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+
+  std::vector<LoopCounters> counters;
+  counters.reserve(sequence_loop_counts.size());
+  for (const auto& values : sequence_loop_counts) {
+    counters.push_back(checked_loop_counts(values));
+  }
+
+  cudaError_t st = launch_dae_sequence(
+      static_cast<int>(num_sms), smem_size,
+      cinst, minst, tma,
+      bars, prof, counters, stream, synchronize
+  );
+  TORCH_CHECK(st == cudaSuccess, "launch_dae_sequence failed: ", cudaGetErrorString(st));
+  return 0;
+}
+
+int py_launch_dae_legacy(
+    int64_t num_sms,
+    size_t smem_size,
+    torch::Tensor compute_insts_bytes,
+    torch::Tensor memory_insts_bytes,
+    torch::Tensor tma_descs_bytes,
+    torch::Tensor bars_int32,
+    torch::Tensor profile_u64,
+    int64_t stream
+) {
+  return py_launch_dae(
+      num_sms,
+      smem_size,
+      compute_insts_bytes,
+      memory_insts_bytes,
+      tma_descs_bytes,
+      bars_int32,
+      profile_u64,
+      std::vector<int64_t>(numComputeLoopCounters, 0),
+      stream,
+      true
+  );
 }
 
 // function 3: build TMA descriptors
@@ -371,7 +474,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("slot_size") = slotSizeKb * 1024;
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
+  config.attr("dynamic_smem_size") = dynamicSmemBytes;
   config.attr("num_profile_events") = numProfileEvents;
+  config.attr("num_loop_counters") = numComputeLoopCounters;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;
@@ -391,7 +496,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_smem_size", &py_set_smem_size,
             "Set dynamic shared memory size for DAE2 kernel");
   m.def("launch_dae", &py_launch_dae,
+            py::arg("num_sms"),
+            py::arg("smem_size"),
+            py::arg("compute_insts_bytes"),
+            py::arg("memory_insts_bytes"),
+            py::arg("tma_descs_bytes"),
+            py::arg("bars_int32"),
+            py::arg("profile_u64"),
+            py::arg("initial_loop_counts"),
+            py::arg("stream"),
+            py::arg("synchronize") = true,
             "Launch DAE2 kernel with given parameters");
+  m.def("launch_dae", &py_launch_dae_legacy,
+            py::arg("num_sms"),
+            py::arg("smem_size"),
+            py::arg("compute_insts_bytes"),
+            py::arg("memory_insts_bytes"),
+            py::arg("tma_descs_bytes"),
+            py::arg("bars_int32"),
+            py::arg("profile_u64"),
+            py::arg("stream"),
+            "Launch DAE2 with zero loop counters and synchronous completion");
+  m.def("launch_dae_sequence", &py_launch_dae_sequence,
+            py::arg("num_sms"),
+            py::arg("smem_size"),
+            py::arg("compute_insts_bytes"),
+            py::arg("memory_insts_bytes"),
+            py::arg("tma_descs_bytes"),
+            py::arg("bars_int32"),
+            py::arg("profile_u64"),
+            py::arg("sequence_loop_counts"),
+            py::arg("stream"),
+            py::arg("synchronize") = true,
+            "Launch a sequence of independent DAE2 kernels with one host dispatch");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("reset_cache_policy", &py_reset_cache_policy,

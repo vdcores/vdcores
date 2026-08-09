@@ -26,7 +26,12 @@ The repository includes a decoding demo for `meta-llama/Llama-3.1-8B` in [`app/p
 
 
 
-VDCores currently supports Hopper GPUs with 132SMs (eg, GH200, H100 NVL) . For the cleanest setup, we recommend starting from a fresh environment with CUDA 13.0, following [`setup.sh`](setup.sh) as the reference setup path.
+VDCores supports datacenter Blackwell SM100 and Hopper targets. The current
+default build is `sm_100a`; the single-token Llama schedule is tuned for a
+152-SM GB200. For the cleanest setup, start from a fresh CUDA 13.0 environment
+and use [`setup.sh`](setup.sh) as the reference setup path. Blackwell task and
+end-to-end measurements are recorded in
+[`benchmarks/README-blackwell.md`](benchmarks/README-blackwell.md).
 
 Typical setup:
 
@@ -40,13 +45,14 @@ export HF_TOKEN=...
 # 3) Optimize runtime and run demo
 python app/python/llama3/sched.py -w
 make pyext
-python app/python/llama3/sched.py -N 256 "Write a hello world in Python."
+python app/python/llama3/sched.py -N 128 "Write a hello world in Python."
 ```
 
 Notes:
 
 - A clean environment with CUDA 13.0 is recommended. If you are setting up from scratch, use [`setup.sh`](setup.sh) as the reference.
-- The build is currently configured for `sm_90a` in [`Makefile`](Makefile) and [`setup.py`](setup.py), so only Hopper-class GPUs are currently supported.
+- The build defaults to `sm_100a` in [`Makefile`](Makefile) and [`setup.py`](setup.py). Set `DAE_CUDA_ARCH=90a` for a Hopper regression build.
+- The tuned Llama path launches one token per VDCores megakernel. Persistent multi-token fusion is intentionally deferred to a later milestone.
 - The Python extension is packaged as `dae` and links [`src/torch_runtime.cu`](src/torch_runtime.cu) with [`src/runtime.cu`](src/runtime.cu) via `runtime.o`.
 
 ## Getting Started

@@ -1,48 +1,61 @@
 import torch
-import copy
 import os
 from math import sqrt
 from functools import partial
+from dae import runtime
 from dae.launcher import *
+from dae.instructions import ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
 from dae.util import *
-from dae.runtime import opcode, build_tma_desc 
 from qwen3.utils import *
-import sys
 
 gpu = torch.device("cuda")
 torch.manual_seed(0)
 
-KV_SEQ_LEN = 64
+ACTIVE_KV_SEQ_LEN = int(os.environ.get("ATTENTION_SEQ_LEN", "48"))
+if ACTIVE_KV_SEQ_LEN <= 0:
+    raise ValueError("ATTENTION_SEQ_LEN must be positive")
+ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "native_direct").lower()
+KVTile = int(os.environ.get("ATTENTION_KV_TILE", "64"))
+if KVTile not in {64, 128}:
+    raise ValueError("ATTENTION_KV_TILE must be 64 or 128")
+if ATTENTION_IMPL == "native_swap" and KVTile != 128:
+    raise ValueError("native_swap requires ATTENTION_KV_TILE=128")
+KV_SEQ_LEN = ((ACTIVE_KV_SEQ_LEN + KVTile - 1) // KVTile) * KVTile
 HEAD_DIM = 128
 HIDDEN_SIZE = 4096
-NUM_REQ = 1
+NUM_REQ = int(os.environ.get("ATTENTION_BATCH", "1"))
+if NUM_REQ <= 0:
+    raise ValueError("ATTENTION_BATCH must be positive")
 NUM_Q_HEAD = 32
 NUM_KV_HEAD = 8
 HEAD_GROUP_SIZE = NUM_Q_HEAD // NUM_KV_HEAD
 
 assert HIDDEN_SIZE == NUM_KV_HEAD * HEAD_GROUP_SIZE * HEAD_DIM, "Q size must match HIDDEN SIZE"
 
-QTile = 16
-KVTile = 64
-
-num_sms = NUM_Q_HEAD * NUM_REQ
-assert num_sms <= 132 # max sm count for HX00
+ATTENTION_TOPOLOGY = os.environ.get("ATTENTION_TOPOLOGY", "head").strip().lower()
+if ATTENTION_TOPOLOGY not in {"head", "gqa"}:
+    raise ValueError("ATTENTION_TOPOLOGY must be 'head' or 'gqa'")
+compute_heads = NUM_Q_HEAD if ATTENTION_TOPOLOGY == "head" else NUM_KV_HEAD
+num_sms = compute_heads * NUM_REQ
+device_sms = torch.cuda.get_device_properties(gpu).multi_processor_count
+assert num_sms <= device_sms, f"attention needs {num_sms} SMs, but the device has {device_sms}"
 
 dae = Launcher(num_sms, device=gpu)
 
 matQ = torch.rand(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu) - 0.5
-matK = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
-matV = torch.rand(NUM_REQ * KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
+matK = torch.rand(NUM_REQ, NUM_KV_HEAD, KV_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
+matV = torch.rand(NUM_REQ, NUM_KV_HEAD, KV_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=gpu) - 0.5
 matO = torch.zeros(NUM_REQ, HIDDEN_SIZE, dtype=torch.bfloat16, device=gpu)
 
-# interleaved QKV
-matQ_attn_view = matQ.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
-matK_attn_view = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
-matV_attn_view = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)
-matO_attn_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
-
-matQK = torch.zeros(NUM_REQ, NUM_KV_HEAD, 64, 64, dtype=torch.bfloat16, device=gpu)
-
+# Q is head-interleaved; the KV cache is head-major so batches and heads are
+# contiguous in the collapsed TMA dimension.
+matQ_head_view = matQ.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
+matQ_gqa_view = matQ.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matK_attn_view = matK
+matV_attn_view = matV
+matO_head_view = matO.view(NUM_REQ, NUM_Q_HEAD, HEAD_DIM)
+matO_gqa_view = matO.view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
+matO_attn_view = matO_head_view if ATTENTION_TOPOLOGY == "head" else matO_gqa_view
 
 def env_flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -77,13 +90,11 @@ def apply_rms_affine_rope_heads(hidden_states: torch.Tensor, weight: torch.Tenso
         dim=-1,
     ).flatten(-2).to(dtype=weight.dtype)
 
-tma_builder_K_inter = partial(build_tma_wgmma_k, iN = -3, swizzle=0)
-tma_builder_K = partial(build_tma_wgmma_k, iN = -3)
-cord_func_K = partial(cord_func_K_major, iN=-3)
+tma_builder_K = partial(build_tma_wgmma_k, iN = -2)
+cord_func_K = partial(cord_func_K_major, iN=-2)
 
-tma_builder_MN_inter = partial(build_tma_wgmma_mn, iK = -3, swizzle=0)
-tma_builder_MN = partial(build_tma_wgmma_mn, iK = -3)
-cord_func_MN = partial(cord_func_MN_major, iK=-3)
+tma_builder_MN = partial(build_tma_wgmma_mn, iK = -2)
+cord_func_MN = partial(cord_func_MN_major, iK=-2)
 
 def tma_load_o(mat: torch.Tensor, tileK: int, tileN: int):
     # [HEAD_DIM[0], HEAD_GROUP_SIZE, REP * HEAD_DIM[1] * NUM_KV_HEAD]
@@ -116,27 +127,79 @@ def cord_load_o(mat: torch.Tensor, rank: int):
     return cfunc
 
 
-tQ = TmaTensor(dae, matQ_attn_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
-tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
-tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
+def tma_load_gqa_q(mat: torch.Tensor, tileK: int, tileN: int):
+    assert mat.element_size() == 2, "Only support float16/bfloat16 Q"
+    assert tileK == HEAD_DIM and tileN == 64
+    glob_dims = [64, HEAD_GROUP_SIZE, 16, 2, NUM_REQ * NUM_KV_HEAD]
+    glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    box_dims = [64, HEAD_GROUP_SIZE, 16, 2, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat, glob_dims, glob_strides, box_dims, [1] * rank, 128, 0
+    )
+
+
+def cord_load_gqa_q(mat: torch.Tensor, rank: int):
+    assert rank == 5
+    def cfunc(*cords):
+        assert len(cords) == 2, f"cords should be (req, kv_head), but got {cords}"
+        return [0, 0, 0, cords[0] * NUM_KV_HEAD + cords[1]]
+    return cfunc
+
+
+def tma_load_gqa_q8(mat: torch.Tensor, tileK: int, tileN: int):
+    assert mat.element_size() == 2, "Only support float16/bfloat16 Q"
+    assert tileK == HEAD_DIM and tileN == 8
+    assert 8 % HEAD_GROUP_SIZE == 0
+    q_tile_repeat = 8 // HEAD_GROUP_SIZE
+    glob_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, NUM_REQ * NUM_KV_HEAD]
+    glob_strides = [HEAD_DIM * 2, 0, 64 * 2, HEAD_DIM * HEAD_GROUP_SIZE * 2]
+    box_dims = [64, HEAD_GROUP_SIZE, q_tile_repeat, 2, 1]
+    rank = len(glob_dims)
+    return rank, runtime.build_tma_desc(
+        mat, glob_dims, glob_strides, box_dims, [1] * rank, 128, 0
+    )
+
+
+if ATTENTION_TOPOLOGY == "head":
+    tQ = TmaTensor(dae, matQ_head_view)._build("load", HEAD_DIM, 64, tma_load_o, cord_load_o)
+    tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
+    tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
+else:
+    if ATTENTION_IMPL == "native_swap":
+        tQ = TmaTensor(dae, matQ_gqa_view)._build(
+            "load", HEAD_DIM, 8, tma_load_gqa_q8, cord_load_gqa_q
+        )
+    else:
+        tQ = TmaTensor(dae, matQ_gqa_view)._build("load", HEAD_DIM, 64, tma_load_gqa_q, cord_load_gqa_q)
+    tK = TmaTensor(dae, matK_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_K, cord_func_K)
+    tV = TmaTensor(dae, matV_attn_view)._build("load", HEAD_DIM, KVTile, tma_builder_MN, cord_func_MN)
 
 need_norm = env_flag("ATTENTION_NEED_NORM", False)
 need_rope = env_flag("ATTENTION_NEED_ROPE", False)
 if need_norm != need_rope:
     raise ValueError("attention_simple_decoding.py mirrors the fused Qwen decode path, so norm and rope must be enabled together")
+if ATTENTION_IMPL == "native_swap" and (ATTENTION_TOPOLOGY != "gqa" or need_norm or need_rope):
+    raise ValueError("native_swap currently requires gqa topology with separate norm/rope")
 
-ATTENTION_IMPL = os.environ.get("ATTENTION_IMPL", "hopper").lower()
 if ATTENTION_IMPL == "mma":
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA
-elif ATTENTION_IMPL in ("hopper", "gmma", ""):
+elif ATTENTION_IMPL == "native_direct":
+    attention_inst = ATTENTION_SM100_BF16_HDIM128_DIRECT
+elif ATTENTION_IMPL == "native_swap":
+    attention_inst = ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT
+elif ATTENTION_IMPL in ("native", "hopper", "gmma", ""):
     attention_inst = ATTENTION_M64N64K16_F16_F32_64_64_hdim
 else:
-    raise ValueError(f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; expected 'hopper' or 'mma'")
+    raise ValueError(
+        f"Unsupported ATTENTION_IMPL={ATTENTION_IMPL!r}; "
+        "expected 'native_swap', 'native_direct', 'native', or 'mma'"
+    )
 
 NUM_KV_BLOCK = (KV_SEQ_LEN + KVTile - 1) // KVTile
-last_active_kv_len = 48
+last_active_kv_len = ACTIVE_KV_SEQ_LEN - (NUM_KV_BLOCK - 1) * KVTile
 assert last_active_kv_len <= KVTile
-total_active_kv_len = (NUM_KV_BLOCK - 1) * KVTile + last_active_kv_len
+total_active_kv_len = ACTIVE_KV_SEQ_LEN
 token_pos = total_active_kv_len - 1
 
 rope_theta = float(os.environ.get("ROPE_THETA", "1000000.0"))
@@ -150,37 +213,52 @@ matSideInput[:, 2 * HEAD_DIM:3 * HEAD_DIM] = rope_table
 
 tSideInput = TmaTensor(dae, matSideInput).tensor1d("load", 3 * HEAD_DIM)
 current_k_store = [
-    TmaTensor(dae, matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD * HEAD_DIM)[req]).tensor1d("store", HEAD_DIM)
+    TmaTensor(dae, matK_attn_view[req]).tensor1d("store", HEAD_DIM)
     for req in range(NUM_REQ)
 ]
 
 if need_norm and need_rope and token_pos > 0:
-    matK_attn_view[:, :token_pos] = apply_rms_affine_rope_heads(
-        matK_attn_view[:, :token_pos],
+    matK_attn_view[:, :, :token_pos] = apply_rms_affine_rope_heads(
+        matK_attn_view[:, :, :token_pos],
         k_norm_weight,
-        rope_table[:token_pos].view(1, token_pos, 1, HEAD_DIM),
+        rope_table[:token_pos].view(1, 1, token_pos, HEAD_DIM),
         eps=1.0e-6,
     )
 
 def sm_task(sm: int):
-    head = sm % NUM_Q_HEAD
-    req = sm // NUM_Q_HEAD
-    kv_head = head // HEAD_GROUP_SIZE
+    compute_head = sm % compute_heads
+    req = sm // compute_heads
+    if ATTENTION_TOPOLOGY == "head":
+        kv_head = compute_head // HEAD_GROUP_SIZE
+        q_cord = tQ.cord(req, compute_head)
+        output = matO_head_view[req, compute_head, ...]
+        num_active_q = 1
+    else:
+        kv_head = compute_head
+        q_cord = tQ.cord(req, kv_head)
+        output = matO_gqa_view[req, kv_head, ...]
+        num_active_q = HEAD_GROUP_SIZE
 
     insts = [
-        attention_inst(NUM_KV_BLOCK, 4, last_active_kv_len, need_norm=need_norm, need_rope=need_rope),
-        tSideInput.cord(token_pos * 3 * HEAD_DIM) if need_norm and need_rope else [],
-        current_k_store[req].cord((token_pos * NUM_KV_HEAD + kv_head) * HEAD_DIM) if need_norm and need_rope else [],
-        tQ.cord(req, head),
-        RepeatM.on(NUM_KV_BLOCK - 1,
-            [tK.cord(req, 0, kv_head, 0), tK.cord2tma(0, KVTile, 0, 0)],
-            [tV.cord(req, 0, kv_head, 0), tV.cord2tma(0, KVTile, 0, 0)],
+        attention_inst(
+            NUM_KV_BLOCK, num_active_q, last_active_kv_len,
+            need_norm=need_norm, need_rope=need_rope,
+            kv_block_size=KVTile,
         ),
-        tK.cord(req, KVTile * (NUM_KV_BLOCK - 1), kv_head, 0),
-        tV.cord(req, KVTile * (NUM_KV_BLOCK - 1), kv_head, 0),
+        tSideInput.cord(token_pos * 3 * HEAD_DIM) if need_norm and need_rope else [],
+        current_k_store[req].cord((kv_head * KV_SEQ_LEN + token_pos) * HEAD_DIM) if need_norm and need_rope else [],
+        q_cord,
+        RepeatM.on(NUM_KV_BLOCK - 1,
+            [tK.cord(req, kv_head, 0, 0), tK.cord2tma(0, 0, KVTile, 0)],
+            [tV.cord(req, kv_head, 0, 0), tV.cord2tma(0, 0, KVTile, 0)],
+        ),
+        tK.cord(req, kv_head, KVTile * (NUM_KV_BLOCK - 1), 0),
+        tV.cord(req, kv_head, KVTile * (NUM_KV_BLOCK - 1), 0),
         # here we override the allocator, to allocate enough space in the smem
         # but we will only write back the first 128*16*2 bytes to the output mat
-        TmaStore1D(matO_attn_view[req, head, ...])
+        RawAddress(output, 24).writeback()
+        if ATTENTION_IMPL in {"native_direct", "native_swap"}
+        else TmaStore1D(output, numSlots=2)
     ]
     return insts
 
@@ -205,12 +283,8 @@ def gqa_ref():
             eps=1.0e-6,
         ).view(NUM_REQ, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
-    K = matK.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)     # [B, S, Hkv, D]
-    V = matV.view(NUM_REQ, KV_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM)     # [B, S, Hkv, D]
-
-    # move K/V to [B, Hkv, S, D]
-    K = K.permute(0, 2, 1, 3)       # [B, Hkv, S, D]
-    V = V.permute(0, 2, 1, 3)       # [B, Hkv, S, D]
+    K = matK_attn_view     # [B, Hkv, S, D]
+    V = matV_attn_view     # [B, Hkv, S, D]
 
     # scores = Q @ K^T
     # Q: [B, Hkv, G, D]
@@ -227,5 +301,24 @@ def gqa_ref():
     return QK, torch.matmul(attn, V)
 
 refQK, refO = gqa_ref()
-tensor_diff("Ref and DAE", refO.view(matO_attn_view.shape), matO_attn_view)
-
+refO = refO.view(matO_attn_view.shape)
+tensor_diff("Ref and DAE", refO, matO_attn_view)
+avg_diff_percent = (
+    (refO - matO_attn_view).abs().float().mean()
+    / refO.abs().float().mean()
+    * 100.0
+).item()
+max_abs_diff = (refO - matO_attn_view).abs().float().max().item()
+print(
+    "ATTENTION_RESULT "
+    f"impl={ATTENTION_IMPL}-{ATTENTION_TOPOLOGY} batch={NUM_REQ} active_seq={ACTIVE_KV_SEQ_LEN} "
+    f"kv_tile={KVTile} blocks={NUM_KV_BLOCK} "
+    f"avg_diff_percent={avg_diff_percent:.6f} max_abs_diff={max_abs_diff:.6f}"
+)
+if env_flag("ATTENTION_STRICT", False):
+    max_diff_percent = float(os.environ.get("ATTENTION_MAX_DIFF_PERCENT", "1.0"))
+    if avg_diff_percent > max_diff_percent:
+        raise AssertionError(
+            f"attention average difference {avg_diff_percent:.6f}% exceeds "
+            f"{max_diff_percent:.6f}%"
+        )
