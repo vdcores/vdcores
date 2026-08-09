@@ -2179,6 +2179,42 @@ advance the dependency frontier because longer M128 commands interfere with
 other tracks.  The extra M128 weights, descriptors, selector, and schedule
 branches were removed.
 
+### Rejected mixed-shape high-K down wave
+
+A follow-up applied the same whole-worker accounting to the K6144--14336
+down-projection tail.  The control has 256 M64/K2048 contributors in that
+range.  The first exact proof put one high-K task on every resident CTA using
+104 M128/K2048 plus 48 M64/K2048 contributors; long M128 tasks were assigned
+to workers with only one earlier low-K task, while short M64 tasks went to
+the heavier streams.  Full S128 tensor checks and exact token 75987 passed in
+`20260809T020042Z-1025334`.
+
+The arithmetic saving did not compose with the resident queues.  A matched
+track profile (`20260809T021158Z-1031819` versus
+`20260809T021235Z-1032587`) increased median compute M2C wait by 85.568 us,
+allocator-slot stall by 51.936 us, and final store-queue lifetime by
+62.528 us.  The candidate issued fewer store commands, but the longer M128
+commands coarsened operand retirement and delayed the shared dependency
+stream.  A strict form that prevented activation/weight prefetch measured
+2.525344 ms and was slightly worse, confirming that early weight runahead was
+still productive.
+
+Whole-pool contributor counts of 152, 144, and 128 were tested rather than
+treating 128 as a hardware limit.  Their 301-sample medians were
+2.522976/2.516640/2.533664 ms; a uniform 152-task form using 104 M128/K2048
+plus 48 M128/K1024 tasks measured 2.517664 ms.  The best 144-task placement
+left the allocator/M2C-tail workers SM128--135 free of high-K work, but it
+still trailed the nearby 2.478880-ms control by 37.760 us.  Thus mixed opcode
+cadence was not the primary problem: the coarser worker streams themselves
+destroyed useful cross-task overlap.
+
+An M128 issuer-only specialization was also screened independently.  It kept
+all memory operations unchanged, parked three compute warps in the UMMA
+mainloop, and rejoined the four warps for the native epilogue.  Standalone
+M128/K2048 measured 10.752 us versus 10.656 us generic, and its resident
+candidate measured 2.524576 ms.  The specialization, duplicated M128 weights,
+descriptors, selectors, and all mixed-wave schedule branches were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
