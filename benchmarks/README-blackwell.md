@@ -2316,6 +2316,75 @@ four resident tokens across KV128 exactly matched
 `[24748, 24748, 24748, 24748]` in `20260809T080733Z-2352605`.  The 34 focused
 schedule/runtime host tests also pass.
 
+### Early-release overhead and non-UMMA overlap follow-up
+
+The retained grouped-LM task already releases warp 0 to issue the next UMMA
+while warp 1 retires operands and warps 1--3 perform eligible TMEM/CUDA
+epilogue work.  Follow-up experiments separated the cost of that mechanism
+from the usefulness of overlapping generic global-memory work.
+
+Reducing the observer work did not help.  Letting only lane 32 dequeue each LM
+operand and bulk-advancing lanes 33--63 produced 2.476160/2.476608-ms medians,
+versus a freshly rebuilt 2.474400-ms control.  Electing one lane per warp to
+wait each UMMA mbarrier measured 2.480800 ms, 6.400 us behind that control;
+the added warp synchronization cost more than warp-wide barrier observation.
+Moving the already-retained bulk cursor update for warps 2--3 before the
+mainloop was exact but measured 2.485024 ms versus the immediately following
+2.480128-ms control.  The sidecars' instruction position affects warp issue
+cadence even when their cursor update has no payload dependency, so keep the
+single post-pipeline `advance_by`.
+
+Two larger proofs showed that more overlap is physically available, but its
+command cost matters.  A two-phase LM stream finished output groups 0--1 over
+the full K dimension, then replayed the 64-KiB B activation stream while
+groups 2--3 issued.  It was exact and kept the 96-register, nine-barrier,
+spill-free image.  Stage profiling moved the final LM/argmax frontier from
+the retained 232.192 us to 224.544 us, proving that three sidecar warps were
+draining TMEM and running CUDA reductions concurrently with later UMMA.  The
+extra TMA requests and M2C tokens nevertheless raised the profiling-free
+median to 2.478016 ms, 3.616 us above the fresh 2.474400-ms control
+(`20260809T105418Z-3850995` and `20260809T103338Z-3660016`; stage job
+`20260809T105805Z-3882301`).
+
+Reordering only the final resident B interval removed the replay, but made
+each output group consume four consecutive UMMA completions instead of
+rotating among four independent full/empty stages.  The proof remained exact,
+but expanded to 118 registers and a 224-entry diagnostic instruction image
+and measured 2.498176 ms (`20260809T110901Z-3994157`).  Independent-group
+rotation is therefore latency hiding in the UMMA track, not incidental load
+order.
+
+Generic global-memory reduction can also overlap the next UMMA epoch.  The
+lowest-overhead proof reduced epoch 0 in place on eight otherwise-free SMs,
+used an `IssueBarrier` plus one raw-address token for both input and output,
+and merged that record with the 128 epoch-1 records.  It passed the complete
+S128 tensor/token check in `20260809T112256Z-4126000`.  Two 2,001-sample
+candidate medians were 2.480704/2.477184 ms, while surrounding exact-source
+controls were 2.480128/2.476928 ms
+(`20260809T112352Z-4135990`, `20260809T112518Z-4145758`,
+`20260809T111640Z-4069132`, and `20260809T112847Z-4178982`).  Candidate and
+control means are 2.478944 and 2.478528 ms: the global reduction is hidden,
+but its compute dispatch and two cross-SM barrier edges consume the benefit.
+The simpler retained 256-record reducer remains selected.
+
+The cohort version of the same experiment exposed an important raw-address
+lifetime rule.  A CTA that issues later raw input or output descriptors before
+an earlier sidecar compute/writeback drains must use independent live special
+slots for both directions.  Separating only the output slot still permits
+`st_insts[slot].address` to be overwritten.  With independent slots the
+two-wave proof was exact at 2.482272 ms; assigning one polling sidecar per
+spare SM improved the instrumented frontier but regressed production to
+2.486784 ms because the extra memory VMs interfered with LM traffic.  Do not
+infer a production gain from marker movement alone.
+
+Finally, SM100 synchronization for this pipeline must remain proxy-correct.
+`tcgen05.commit` and `tcgen05.wait::ld/st` track prior operations from the
+same issuing thread; `wait::ld` is not a completion primitive for an MMA that
+consumes shared memory.  A different warp may access completed TMEM only
+after the producer commits to an mbarrier, the consumer waits that barrier,
+and the consumer executes `tcgen05.fence::after_thread_sync`.  Reusable TMEM
+stages additionally need the explicit consumer-to-producer empty edge.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

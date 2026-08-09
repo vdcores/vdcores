@@ -2566,3 +2566,35 @@ register-forwarded tail.  Spreading scalar SFU work over all projection owners
 lengthens the producer wave instead of hiding it.  Retain the separate packed
 SiLU shards unless a future design also changes which CTAs own the downstream
 work.
+
+## Early compute release: measured limits
+
+The retained four-stage grouped LM head is already the minimal positive
+compute-release mechanism.  Warp 0 rotates among independent UMMA/TMEM stages,
+warp 1 retires exact operand lifetimes, and warps 1--3 drain final TMEM slices.
+Bulk-skipping the two non-consuming M2C cursors after the pipeline is faster
+than lane-elected dequeues, elected mbarrier waits, or moving that cursor
+advance before the mainloop.  Those alternatives lose about 2.0, 6.4, and
+4.9 us respectively in matched or adjacent 2,001-sample S128 measurements.
+
+Additional non-UMMA overlap is real but not free.  Replaying the 64-KiB LM B
+stream let sidecar TMEM/CUDA work overlap roughly half an epoch and moved an
+instrumented final frontier 7.648 us earlier, yet production lost 3.616 us to
+the extra TMA/M2C stream.  Reordering the final resident B tile instead
+serialized same-group UMMA completion and lost about 18--24 us.  Preserve the
+K-major rotation across four independent group barriers.
+
+An in-place epoch-0 global argmax on eight free SMs reduced two raw-address
+handoffs to one and overlapped the reduction with epoch-1 UMMA.  Its candidate
+mean was 2.478944 ms versus 2.478528 ms for bracketing retained controls, so
+the separate dispatch and cross-SM barriers exactly consumed the saved final
+reduction.  Keep the simpler final 256-record reducer unless the reduction can
+be folded into an already-dispatched task without delaying LM loads.
+
+Raw-address descriptors are live VM state.  Concurrent sidecars must keep
+both later input and output pointers in independent special slots until the
+earlier consumer/writeback drains; separating only output slots is incorrect.
+For TMEM handoff, use the official producer commit/mbarrier wait plus
+`tcgen05.fence::after_thread_sync` sequence.  `tcgen05.wait::ld/st` only tracks
+operations issued by the same thread and cannot replace an MMA-completion
+edge.
