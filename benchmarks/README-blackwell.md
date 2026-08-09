@@ -2215,6 +2215,59 @@ M128/K2048 measured 10.752 us versus 10.656 us generic, and its resident
 candidate measured 2.524576 ms.  The specialization, duplicated M128 weights,
 descriptors, selectors, and all mixed-wave schedule branches were removed.
 
+### Retained four-stage grouped-LM-head TMEM pipeline
+
+The fused four-output LM-head task now treats its already-disjoint TMEM
+column ranges as four static pipeline stages.  Compute warp 0 acquires an
+empty stage and issues the next UMMA group.  Warp 1 waits for that group's
+completion, returns the exact A slot (and the four-use B slot when its
+lifetime ends), and acknowledges that the stage can be reused.  On the last
+K tile, all four compute warps drain disjoint row slices from TMEM and build
+their local argmax candidates.  This overlaps UMMA issue with operand
+retirement and, at the epilogue, with TMEM-to-register/CUDA work without a
+TMA or shared-memory round trip.
+
+Four proof shapes separated the mechanism from queue-order effects.  Merely
+splitting the final four UMMA completions regressed by 2.400 us when the
+issuer retained slot ownership and by 3.424 us when warp 1 retired final-tile
+slots.  Pipelining all 32 K tiles through four full/empty stage pairs was the
+only positive form.  Dequeueing the next A operand before acquiring its empty
+stage gave back 2.144 us, showing that speculative runahead extends shared
+slot lifetime under UMMA backpressure.  The retained path therefore acquires
+the empty stage first.
+
+The initial 2,001-sample proof bracket measured 2.479712/2.479040 ms for the
+surrounding controls and 2.474816/2.474720 ms for the pipeline
+(`20260809T034954Z-1125643`, `20260809T035921Z-1154888`,
+`20260809T035258Z-1135640`, and `20260809T040156Z-1162143`).  A later tight
+qualification after removing all proof selectors measured a 2.479936-ms
+control and 2.476864/2.478880-ms candidates
+(`20260809T043513Z-1279096`, `20260809T043751Z-1297147`, and
+`20260809T043852Z-1301891`).  The conservative candidate mean is
+2.477872 ms, 2.064 us faster than its matched control and 12.006% faster than
+the fixed-context vLLM S128 baseline of 2.816003 ms.  It remains 56.531 us
+past the 10%-lead target.
+
+Matched track diagnostics attribute the direction to earlier operand
+retirement rather than extra allocator capacity: median compute M2C wait fell
+10.112 us, LDU1 queue wait 19.712 us, and store queue wait 4.576 us, while
+allocator-slot stall was unchanged within 0.224 us
+(`20260809T040943Z-1178050` versus `20260809T041219Z-1181344`).  Track
+instrumentation changes the pipeline build from 96 to 124 registers, so use
+these values as directional attribution, not additive latency.  Stage markers
+also move work across the LM-head/argmax boundary; the comparable final
+frontier improved only 0.448 us in the instrumented pair
+(`20260809T040409Z-1168386` versus `20260809T040645Z-1174081`).
+
+The minimal retained source has no experiment selector or persistent phase
+field.  It adds eight CTA-lifetime mbarriers (64 bytes of static shared
+memory), keeping the exact production image at 96 registers, nine hardware
+barriers, a 96-byte stack, 7,088 bytes of static shared memory, and zero
+spills.  Full S128 tensor checks and exact token 24748 passed in
+`20260809T041825Z-1196122`; four resident control-flow tokens, including the
+KV128 boundary, exactly matched `[24748, 24748, 24748, 24748]` in
+`20260809T041914Z-1198388`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

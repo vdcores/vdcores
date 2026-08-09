@@ -114,7 +114,10 @@ void dae2(
   // block per SM, so acquire TMEM once for the lifetime of the megakernel and
   // reuse it across sequential compute tasks.
   __shared__ alignas(16) uint32_t tmem_base_ptr;
-  __shared__ alignas(16) uint64_t tmem_mma_barrier;
+  // Barrier 0 serves ordinary UMMA tasks. Grouped fused-LM-head tasks use
+  // four completion barriers followed by four empty-stage acknowledgements.
+  static constexpr int tmemMmaBarrierCount = 9;
+  __shared__ alignas(16) uint64_t tmem_mma_barriers[tmemMmaBarrierCount];
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   using TmemAllocator = cute::TMEM::Allocator1Sm;
   TmemAllocator tmem_allocator{};
@@ -122,12 +125,18 @@ void dae2(
     tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
   }
   if (thread_id == 0) {
-    cute::initialize_barrier(tmem_mma_barrier, 1);
+    #pragma unroll
+    for (int i = 0; i < tmemMmaBarrierCount; ++i) {
+      cute::initialize_barrier(tmem_mma_barriers[i], 1);
+    }
   }
 #else
   if (thread_id == 0) {
     tmem_base_ptr = 0;
-    tmem_mma_barrier = 0;
+    #pragma unroll
+    for (int i = 0; i < tmemMmaBarrierCount; ++i) {
+      tmem_mma_barriers[i] = 0;
+    }
   }
 #endif
 
@@ -163,7 +172,7 @@ void dae2(
         inst,
         smem_base,
         tmem_base_ptr,
-        &tmem_mma_barrier,
+        tmem_mma_barriers,
         tmem_mma_phase,
         scratch_space,
         st_insts,

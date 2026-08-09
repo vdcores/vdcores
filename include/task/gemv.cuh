@@ -726,59 +726,6 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
     auto tmem_acc = cta_mma.make_fragment_C(cta_c);
     tmem_acc.data() = tmem_base_ptr;
 
-    int live_b_slot = 0;
-    constexpr int b_tile_elements = N * K;
-
-    for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
-        data_t *sB_ptr;
-        if (tile_idx % BLoadInterval == 0) {
-            live_b_slot = m2c.template pop<0>();
-            sB_ptr = static_cast<data_t *>(
-                get_slot_address(base, extract(live_b_slot)));
-        } else {
-            sB_ptr = static_cast<data_t *>(
-                get_slot_address(base, extract(live_b_slot)))
-                + (tile_idx % BLoadInterval) * b_tile_elements;
-        }
-
-        #pragma unroll
-        for (int output_group = 0; output_group < OutputGroups;
-             ++output_group) {
-            const int slot_a = m2c.template pop<0>();
-            data_t *sA_ptr = static_cast<data_t *>(
-                get_slot_address(base, extract(slot_a)));
-            auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
-            auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
-            auto frag_a = cta_mma.make_fragment_A(sA);
-            auto frag_b = cta_mma.make_fragment_B(sB);
-            auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
-            group_tmem_acc.data() = tmem_base_ptr + output_group * N;
-            tiled_mma.accumulate_ = tile_idx == 0
-                                  ? UMMA::ScaleOut::Zero
-                                  : UMMA::ScaleOut::One;
-
-            if (tid < numThreadsPerWarp) {
-                #pragma unroll
-                for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
-                    gemm(tiled_mma, frag_a(_, _, k_block),
-                         frag_b(_, _, k_block), group_tmem_acc);
-                    tiled_mma.accumulate_ = UMMA::ScaleOut::One;
-                }
-                cutlass::arch::umma_arrive(tmem_mma_barrier);
-            }
-            cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
-            tmem_mma_phase ^= 1;
-
-            int release_mask = slot_a;
-            if (output_group + 1 == OutputGroups
-                && ((tile_idx + 1) % BLoadInterval == 0
-                    || tile_idx + 1 == n_k_tiles)) {
-                release_mask |= live_b_slot;
-            }
-            c2m.push(tid, release_mask);
-        }
-    }
-
     auto coord_c = make_identity_tensor(make_shape(Int<M>{}, Int<N>{}));
     auto cta_coord_c = cta_mma.partition_C(coord_c);
     using TmemLoad = SM100_TMEM_LOAD_32dp32b4x;
@@ -793,15 +740,7 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
         }
     }
 
-    int output_slot = -1;
-    data_t *output_ptr = nullptr;
-    if constexpr (!FuseArgmax) {
-        output_slot = m2c.template pop<0>();
-        output_ptr = static_cast<data_t *>(
-            slot_2_glob_ptr(st_insts, output_slot));
-    }
-    #pragma unroll
-    for (int output_group = 0; output_group < OutputGroups; ++output_group) {
+    auto drain_group = [&](const int output_group, data_t *output_ptr) {
         auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
         group_tmem_acc.data() = tmem_base_ptr + output_group * N;
         TiledCopy tiled_t2r = make_tmem_copy(TmemLoad{}, group_tmem_acc);
@@ -827,6 +766,188 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
                            + output_group * output_group_stride + row]
                     = candidate;
             }
+        }
+    };
+
+    int live_b_slot = 0;
+    constexpr int b_tile_elements = N * K;
+
+    if constexpr (FuseArgmax) {
+        static_assert(OutputGroups == 4,
+                      "fused argmax uses four static TMEM stages");
+        constexpr int full_barrier_base = 1;
+        constexpr int empty_barrier_base = full_barrier_base + OutputGroups;
+
+        // Each group owns a disjoint TMEM column range and a full/empty
+        // barrier pair. Warp 0 issues UMMA, warp 1 retires the exact operand
+        // slots as each group completes, and all four warps drain disjoint
+        // final-row slices. Acquire the empty stage before dequeueing the next
+        // A operand so backpressure cannot extend its shared-memory lifetime.
+        assert((n_k_tiles & 1) == 0);
+        for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
+            data_t *sB_ptr = nullptr;
+            if (tile_idx % BLoadInterval == 0) {
+                if (tid < 2 * numThreadsPerWarp) {
+                    live_b_slot = m2c.template pop<0>();
+                } else {
+                    m2c.advance();
+                }
+            }
+            if (tid < numThreadsPerWarp) {
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)))
+                    + (tile_idx % BLoadInterval) * b_tile_elements;
+            }
+
+            #pragma unroll
+            for (int output_group = 0; output_group < OutputGroups;
+                 ++output_group) {
+                if (tid < numThreadsPerWarp) {
+                    if (tile_idx > 0) {
+                        cute::wait_barrier(
+                            *(tmem_mma_barrier + empty_barrier_base
+                              + output_group),
+                            uint32_t((tile_idx - 1) & 1));
+                    }
+                    const int slot_a = m2c.template pop<0>();
+                    data_t *sA_ptr = static_cast<data_t *>(
+                        get_slot_address(base, extract(slot_a)));
+                    auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
+                    auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+                    auto frag_a = cta_mma.make_fragment_A(sA);
+                    auto frag_b = cta_mma.make_fragment_B(sB);
+                    auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+                    group_tmem_acc.data() =
+                        tmem_base_ptr + output_group * N;
+                    tiled_mma.accumulate_ = tile_idx == 0
+                                          ? UMMA::ScaleOut::Zero
+                                          : UMMA::ScaleOut::One;
+                    #pragma unroll
+                    for (int k_block = 0; k_block < size<2>(frag_a);
+                         ++k_block) {
+                        gemm(tiled_mma, frag_a(_, _, k_block),
+                             frag_b(_, _, k_block), group_tmem_acc);
+                        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+                    }
+                    cutlass::arch::umma_arrive(
+                        tmem_mma_barrier + full_barrier_base + output_group);
+                } else if (tid < 2 * numThreadsPerWarp) {
+                    const int slot_a = m2c.template pop<0>();
+                    cute::wait_barrier(
+                        *(tmem_mma_barrier + full_barrier_base + output_group),
+                        uint32_t(tile_idx & 1));
+
+                    int release_mask = slot_a;
+                    if (output_group + 1 == OutputGroups
+                        && ((tile_idx + 1) % BLoadInterval == 0
+                            || tile_idx + 1 == n_k_tiles)) {
+                        release_mask |= live_b_slot;
+                    }
+                    c2m.template push<numThreadsPerWarp>(tid, release_mask);
+
+                    if (tid == numThreadsPerWarp) {
+                        cuda::ptx::mbarrier_arrive(
+                            cuda::ptx::sem_release,
+                            cuda::ptx::scope_cta,
+                            cuda::ptx::space_shared,
+                            tmem_mma_barrier + empty_barrier_base
+                            + output_group);
+                    }
+                    if (tile_idx + 1 == n_k_tiles) {
+                        asm volatile(
+                            "tcgen05.fence::after_thread_sync;" ::: "memory");
+                        drain_group(output_group, nullptr);
+                    }
+                } else {
+                    m2c.advance();
+                    if (tile_idx + 1 == n_k_tiles) {
+                        cute::wait_barrier(
+                            *(tmem_mma_barrier + full_barrier_base
+                              + output_group),
+                            uint32_t(tile_idx & 1));
+                        asm volatile(
+                            "tcgen05.fence::after_thread_sync;" ::: "memory");
+                        drain_group(output_group, nullptr);
+                    }
+                }
+            }
+        }
+
+        if (tid < numThreadsPerWarp) {
+            cute::wait_barrier(
+                *(tmem_mma_barrier + full_barrier_base + OutputGroups - 1),
+                uint32_t((n_k_tiles - 1) & 1));
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            #pragma unroll
+            for (int output_group = 0; output_group < OutputGroups;
+                 ++output_group) {
+                drain_group(output_group, nullptr);
+            }
+        }
+    } else {
+        for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
+            data_t *sB_ptr;
+            if (tile_idx % BLoadInterval == 0) {
+                live_b_slot = m2c.template pop<0>();
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)));
+            } else {
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)))
+                    + (tile_idx % BLoadInterval) * b_tile_elements;
+            }
+
+            #pragma unroll
+            for (int output_group = 0; output_group < OutputGroups;
+                 ++output_group) {
+                const int slot_a = m2c.template pop<0>();
+                data_t *sA_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(slot_a)));
+                auto sA = make_tensor(make_smem_ptr(sA_ptr), layout_sA);
+                auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+                auto frag_a = cta_mma.make_fragment_A(sA);
+                auto frag_b = cta_mma.make_fragment_B(sB);
+                auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+                group_tmem_acc.data() = tmem_base_ptr + output_group * N;
+                tiled_mma.accumulate_ = tile_idx == 0
+                                      ? UMMA::ScaleOut::Zero
+                                      : UMMA::ScaleOut::One;
+                if (tid < numThreadsPerWarp) {
+                    #pragma unroll
+                    for (int k_block = 0; k_block < size<2>(frag_a);
+                         ++k_block) {
+                        gemm(tiled_mma, frag_a(_, _, k_block),
+                             frag_b(_, _, k_block), group_tmem_acc);
+                        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+                    }
+                    cutlass::arch::umma_arrive(tmem_mma_barrier);
+                }
+                cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+                tmem_mma_phase ^= 1;
+
+                int release_mask = slot_a;
+                if (output_group + 1 == OutputGroups
+                    && ((tile_idx + 1) % BLoadInterval == 0
+                        || tile_idx + 1 == n_k_tiles)) {
+                    release_mask |= live_b_slot;
+                }
+                c2m.push(tid, release_mask);
+            }
+        }
+    }
+
+    int output_slot = -1;
+    data_t *output_ptr = nullptr;
+    if constexpr (!FuseArgmax) {
+        output_slot = m2c.template pop<0>();
+        output_ptr = static_cast<data_t *>(
+            slot_2_glob_ptr(st_insts, output_slot));
+    }
+    if constexpr (!FuseArgmax) {
+        #pragma unroll
+        for (int output_group = 0; output_group < OutputGroups;
+             ++output_group) {
+            drain_group(output_group, output_ptr);
         }
     }
 
