@@ -2102,6 +2102,39 @@ consume the local saving.  Keep the two retained operators and their
 register-mediated gate handoff.  The paired opcode, task, schedule, manifest
 entry, and selector were removed.
 
+### Rejected exact-work LM-head epoch exchange
+
+An exact-work placement proof tested whether the 24 auxiliary Blackwell CTAs
+could overlap the two 128-owner LM-head epochs without changing task shape,
+arithmetic, or reduction records.  It moved an epoch-0 cohort to idle
+auxiliary CTAs and let the corresponding main CTAs start epoch 1 as soon as
+the final layer became ready.  The reducer-aware form reserved SM128--135 for
+the retained epoch-1 tail offload and exchanged logical SM0--7 with
+SM136--143.  Full S128 tensor validation, exact token 24748, and four resident
+KV128 steps all passed (`20260809T003903Z-982032` and
+`20260809T003959Z-982553`).
+
+Moving 16 tasks from the naturally late SM96 cohort did not advance LM-head
+completion and delayed argmax by about 4.8 us in matched stage traces
+(`20260809T002451Z-974212` and `20260809T002551Z-974730`).  Moving 16 tasks
+from reducer owners was also negative (`20260809T002839Z-976096`).  The
+eight-task reducer-aware form appeared slightly positive in short
+profiling-free runs, but longer qualification showed only a noise-scale
+effect.  Two 2,001-sample candidate medians were 2.477536/2.479616 ms
+(`20260809T005050Z-987918` and `20260809T005219Z-988474`), versus
+2.479840/2.480224 ms for controls (`20260809T005132Z-988035` and
+`20260809T005259Z-988877`): a mean saving of only 1.456 us, or 0.059%.
+
+The matched instrumented trace contradicts a critical-path interpretation:
+global LM-head completion worsened from 227.872 to 230.272 us and final
+argmax from 237.248 to 238.144 us
+(`20260809T004307Z-984038` and `20260809T004417Z-984789`).  Although median
+LDU1 queue wait fell 19.520 us, allocator stall rose 9.600 us and store queue
+wait rose 7.104 us.  Redistributing exact work changes queue phase but does
+not remove work or a dependency.  The exchange wrapper, selectors, and
+selective load-barrier API were therefore removed; retain the simpler
+two-epoch schedule.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
