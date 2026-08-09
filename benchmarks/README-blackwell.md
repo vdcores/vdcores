@@ -2385,6 +2385,36 @@ after the producer commits to an mbarrier, the consumer waits that barrier,
 and the consumer executes `tcgen05.fence::after_thread_sync`.  Reusable TMEM
 stages additionally need the explicit consumer-to-producer empty edge.
 
+### Rejected in-task cross-epoch argmax fold
+
+A follow-up removed the standalone epoch-0 argmax dispatch entirely.  Eight
+already-dispatched epoch-1 LM tasks each reduced one token's 128 epoch-0
+records in place, then the existing final reducer consumed one epoch-0
+summary plus the 128 epoch-1 records.  The epoch-1 operand loads remained
+ahead of the epoch-0 `IssueBarrier`, and the folded work reused the LM task's
+raw-address output and final compute/C2M publication edge.
+
+The first warp-2 version exposed a limit of the retained bulk M2C cursor.
+Warps 2--3 skip 136 operand entries at once; after four 32-entry ring wraps,
+the parity is sufficient for retirement but cannot identify a fresh payload
+without observing the intervening phases.  The production path never
+dereferences those skipped values.  Dereferencing warp 2's apparent raw slot
+therefore produced an illegal global address.  Moving the fold to warp 1,
+which consumes every M2C payload exactly, fixed the fault and also overlapped
+its generic global loads/reduction with warp 0's final TMEM drains.  All eight
+summaries passed the full S128 tensor check and exact token 24748 in
+`20260809T121333Z-419260` with the unchanged 96-register, nine-barrier,
+spill-free image.
+
+The valid overlap was not a production win.  Its 2,001-sample internal median
+was 2.486720 ms (`20260809T121421Z-427411`), versus 2.478048 ms for the exact
+retained source immediately afterward (`20260809T121724Z-456896`) and
+2.476928 ms for the preceding retained control.  The 32-thread sidecar
+extends eight selected LM CTAs more than deleting the small 128-thread final
+reduction saves, a net 8.672 us (+0.35%) against the matched control.  Keep
+the two-operator path.  The complete proof is preserved in Git stash
+`wip: warp1 cross-epoch argmax overlap`.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

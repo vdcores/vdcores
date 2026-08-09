@@ -2598,3 +2598,19 @@ For TMEM handoff, use the official producer commit/mbarrier wait plus
 `tcgen05.fence::after_thread_sync` sequence.  `tcgen05.wait::ld/st` only tracks
 operations issued by the same thread and cannot replace an MMA-completion
 edge.
+
+Do not dereference an M2C value obtained after a multi-wrap bulk cursor skip.
+The grouped LM sidecar warps skip 136 entries in a 32-entry parity ring; that
+is valid for retirement bookkeeping, but the same parity recurs before all
+intervening payloads have been observed.  Only the exact-consuming issuer and
+retirer warps may use the later raw-address value.  This was verified by an
+in-task argmax fold: warp 2 faulted on the apparent pointer, while warp 1
+passed exact S128 correctness and overlapped global reduction with warp 0's
+TMEM drain.
+
+Do not retain that argmax fold for performance.  It measured 2.486720 ms
+internally versus a 2.478048-ms exact-source control (+8.672 us).  Folding a
+32-thread global reduction into eight LM CTAs lengthens their critical path
+more than eliminating the small standalone 128-thread reducer saves.  The
+minimal two-operator path remains production; the proof is stored as
+`wip: warp1 cross-epoch argmax overlap`.
