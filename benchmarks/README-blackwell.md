@@ -2268,6 +2268,54 @@ spills.  Full S128 tensor checks and exact token 24748 passed in
 KV128 boundary, exactly matched `[24748, 24748, 24748, 24748]` in
 `20260809T041914Z-1198388`.
 
+### Retained bulk cursor retirement for LM-head sidecar warps
+
+Early UMMA release makes compute warp 0 the issuer and warp 1 the operand
+retirer, but warps 2 and 3 must still keep their private M2C queue cursors in
+phase before all four warps rejoin for the final TMEM drain and argmax.  The
+original pipeline paid for that bookkeeping one queue element at a time:
+each non-consuming sidecar executed 128 A-slot advances and eight B-slot
+advances in every grouped LM-head task.  The retained form performs one
+bounded cursor/phase update after the pipeline instead.  It does not change
+which warp waits for or releases an operand, any barrier edge, the memory
+program, the task schedule, or the final four-warp reduction.
+
+Two 2,001-sample candidates measured 2.475936 and 2.477632 ms, versus
+2.479904 and 2.478720 ms for the surrounding exact-source controls
+(`20260809T074943Z-2193738`, `20260809T075828Z-2272635`,
+`20260809T075436Z-2235614`, and `20260809T080136Z-2296418`).  The candidate
+mean is 2.476784 ms, a 2.528-us reduction.  A final rebuilt production image
+measured 2.476512 ms in `20260809T082447Z-2503291`.  The bracketed mean is
+12.046% faster than the fixed-context vLLM S128 baseline of 2.816003 ms and
+57.619 us beyond the 10%-lead target.
+
+The instrumentation makes the mechanism visible despite the small unprofiled
+delta.  In matched single-launch stage images, the median LM-head-to-argmax
+interval fell from 19.904 to 12.928 us and the final argmax frontier from
+239.680 to 232.192 us (`20260809T081717Z-2440799` and
+`20260809T081422Z-2414909`).  This is compute-side queue bookkeeping removed
+after early operand release; allocator capacity and the global-memory command
+stream are unchanged.
+
+Several broader epilogue mechanisms were rejected before retaining the
+minimal cursor change.  Eagerly dequeuing the next ordinary-M128 output on
+all compute threads or on a lane-32 sidecar extended a shared-slot lifetime
+and regressed production by roughly 4--5 us.  Replacing the compute-group
+join with ad-hoc producer mbarriers did not preserve the complete scratch
+visibility contract.  Emitting 32 per-warp global records removed the local
+block reduction but widened the reducer, raised the image to 99 registers,
+and regressed by about 8.1 us.  Embedding atomics in the LM-head epilogue also
+failed to improve the profiling-free result.  These results favor keeping
+generic-memory publication behind the existing compute join while removing
+only bookkeeping that has no data or synchronization role.
+
+The final image remains at 96 registers, nine barriers, a 96-byte stack,
+7,088 bytes of static shared memory, and zero spills.  Full S128 tensor
+validation and exact token 24748 passed in `20260809T080652Z-2345964`;
+four resident tokens across KV128 exactly matched
+`[24748, 24748, 24748, 24748]` in `20260809T080733Z-2352605`.  The 34 focused
+schedule/runtime host tests also pass.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM

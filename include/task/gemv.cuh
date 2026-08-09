@@ -789,8 +789,6 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
             if (tile_idx % BLoadInterval == 0) {
                 if (tid < 2 * numThreadsPerWarp) {
                     live_b_slot = m2c.template pop<0>();
-                } else {
-                    m2c.advance();
                 }
             }
             if (tid < numThreadsPerWarp) {
@@ -859,7 +857,6 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
                         drain_group(output_group, nullptr);
                     }
                 } else {
-                    m2c.advance();
                     if (tile_idx + 1 == n_k_tiles) {
                         cute::wait_barrier(
                             *(tmem_mma_barrier + full_barrier_base
@@ -871,6 +868,13 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
                     }
                 }
             }
+        }
+
+        if (tid >= 2 * numThreadsPerWarp) {
+            const unsigned skipped_inputs =
+                unsigned(n_k_tiles * OutputGroups)
+                + unsigned((n_k_tiles + BLoadInterval - 1) / BLoadInterval);
+            m2c.advance_by(skipped_inputs);
         }
 
         if (tid < numThreadsPerWarp) {

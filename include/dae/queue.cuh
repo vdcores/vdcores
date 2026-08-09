@@ -105,6 +105,12 @@ struct SizeBoundedBarrierQueue {
         phase_parity ^= 1;
     }
   }
+  __device__ __forceinline__ void advance_by(unsigned count) {
+    const unsigned next = ptr + count;
+    if constexpr (ObserverWait)
+      phase_parity ^= (next / QSIZE) & 1U;
+    ptr = next % QSIZE;
+  }
   __device__ __forceinline__ void commit() {
     static_cast<void>(barriers[ptr].arrive());
   }
