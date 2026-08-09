@@ -2135,6 +2135,50 @@ not remove work or a dependency.  The exchange wrapper, selectors, and
 selective load-barrier API were therefore removed; retain the simpler
 two-epoch schedule.
 
+### Rejected mixed-shape MLP-prefix rebalance
+
+SM100 has native one-SM UMMA M tiles at M64 and M128, so the prefix-shape
+proof used a mixture of those tasks rather than inventing a separate CTA
+class.  Every experiment treated all 152 resident CTAs as one worker pool and
+rebuilt each affected worker's complete ordered stream, including its
+materialized gate/up task, register-tail task, and downstream queue history.
+An isolated M64 K4096 issuer task measured 11.104 us in
+`20260809T010958Z-998435`; its M128 counterpart measured 19.200 us in
+`20260809T011019Z-998807`.  M128 is therefore efficient for two rows of work,
+but occupies a shared command stream for 1.73 times as long.
+
+Three whole-pool packings tested whether that task efficiency composes.  A
+one-prefix-task-per-worker form used 20 M128 plus 56 M64 tiles for each of gate
+and up.  It passed exact-token validation in `20260809T011712Z-1002040`, but
+the workers receiving long M128 tasks were also late register-tail owners:
+the prefix/SwiGLU frontier advanced about 6 us while the tail moved about 4 us
+later and next-RMS/layer completion regressed about 5.3 us in
+`20260809T011822Z-1002634`.  A localized form coalesced only adjacent shard-2
+up tiles on workers without a register tail.  It passed in
+`20260809T012405Z-1005243`, but its layer frontier improved only 0.256 us in
+`20260809T012447Z-1005875`, below a stable effect.
+
+The final balance coalesced every adjacent up pair available without moving a
+long task onto a register-tail owner: 144 M64 and 24 M128 prefix tasks total.
+Workers 0--127 each kept one short prefix task before their tail; workers
+128--135 had one M128 task; workers 136--151 had one M64 followed by one M128
+task.  Full tensor thresholds and exact token 24748 passed in
+`20260809T013140Z-1009371`.  Against control `20260809T005717Z-991214`, the
+matched stage trace `20260809T013243Z-1010084` moved prefix max
+58.528 to 58.880 us, packed-SwiGLU max 60.640 to 61.632 us, tail max 59.232
+to 61.120 us, and left layer max exactly 75.872 us.  Q and output also became
+slightly later from the changed per-worker queue history.
+
+Long profiling-free production pairs reject the apparent phase win.  The two
+mixed-shape medians were 2.486048/2.486912 ms
+(`20260809T013711Z-1012426` and `20260809T013842Z-1013447`), versus
+2.481120/2.481088 ms for unchanged controls
+(`20260809T013756Z-1012807` and `20260809T013923Z-1013766`).  The mixed mean
+is 5.376 us slower.  Fewer task boundaries and less activation traffic do not
+advance the dependency frontier because longer M128 commands interfere with
+other tracks.  The extra M128 weights, descriptors, selector, and schedule
+branches were removed.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
