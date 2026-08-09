@@ -2614,3 +2614,44 @@ internally versus a 2.478048-ms exact-source control (+8.672 us).  Folding a
 more than eliminating the small standalone 128-thread reducer saves.  The
 minimal two-operator path remains production; the proof is stored as
 `wip: warp1 cross-epoch argmax overlap`.
+
+## Retained compact Up/SwiGLU compute release
+
+Use role release to overlap generic CUDA work with UMMA only when the
+sidecars can leave the operand stream without becoming payload owners.  In
+the retained M64N8K256 Up/SwiGLU task, warp 0 alone consumes the 16 A and four
+B M2C messages, issues and waits UMMA, and publishes their exact releases.
+Warps 1--3 advance those 20 private cursor positions once, then consume the
+following gate record and run shared-memory loads plus sigmoid/SFU while warp
+0 continues.  They rejoin once before the common TMEM epilogue.  This avoids
+per-tile sidecar queue operations and mbarrier observation without changing
+the memory program, operator graph, or persistent schedule.
+
+Do not size a cross-warp handoff from the source partition returned by
+`SM100_TMEM_LOAD_16dp256b1x`.  Its source view contains 128 replicated
+positions per thread, while `partition_D(cta_mma.partition_C(...))` gives the
+four logical M64N8 outputs actually owned by each thread.  Keep warps 1--3's
+four gate values in registers; let one helper warp compute warp 0's four
+values and place only 512 bytes in unused tail space of the existing gate
+slot.  The retained helper is warp 2.  The existing
+`tcgen05.fence::before_thread_sync`, 128-thread compute-group barrier, and
+`tcgen05.fence::after_thread_sync` make the compact tail visible.  No new
+opcode, slot, mbarrier, or TMA round trip is needed.  This destination/source
+distinction was derived from CUTLASS 4.6.1's SM100 TMEM copy traits.
+
+The retained three-run internal mean is 2.472619 ms versus a 2.478400-ms
+exact-source control, a 5.781-us (0.233%) gain.  The matched instrumented
+gate-tail-to-SiLU-tail p50 improves 10.944 to 10.752 us; multiplied across 32
+layers, 6.144 us predicts the end-to-end delta.  The image remains 96
+registers, nine barriers, spill-free, and exact across four resident KV128
+steps.
+
+Do not generalize this result to scattered global-memory sidecars.  An exact
+eight-CTA cross-epoch argmax fold lost 13.920 us, and a scratch-retained form
+that also removed the raw/C2M pulse lost 33.536 us because the pulse provides
+admission pacing.  Never omit a final empty mbarrier transition merely
+because a current consumer is finished: in a persistent task, it can be the
+parity seed required by the next replay.  Prefer non-UMMA overlap that fits an
+already-live shared slot and the existing join; keep global sidecars separate
+unless they remove more latency than their dispatch, memory scattering, and
+cross-SM synchronization add.

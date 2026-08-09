@@ -555,6 +555,8 @@ __device__ __forceinline__ void task_gemv_up_silu_sm100(
                   "up/SwiGLU overlap is specialized for M64N8K256 B4");
 
     const int tid = __compute_tid();
+    const int warp_id = tid / numThreadsPerWarp;
+    const int lane_id = tid % numThreadsPerWarp;
     auto tiled_mma = make_tiled_mma(Atom{});
     auto cta_mma = tiled_mma.get_slice(0);
     auto mma_shape_a = partition_shape_A(
@@ -580,35 +582,38 @@ __device__ __forceinline__ void task_gemv_up_silu_sm100(
     TiledCopy tiled_t2r = make_tmem_copy(TmemLoad{}, tmem_acc);
     ThrCopy thr_t2r = tiled_t2r.get_slice(tid);
     auto thread_tmem = thr_t2r.partition_S(tmem_acc);
-    auto r_gate = make_tensor<data_t>(shape(thread_tmem));
-    auto r_gate_silu = make_tensor<accum_t>(shape(thread_tmem));
+    auto coord_c = make_identity_tensor(make_shape(Int<M>{}, Int<N>{}));
+    auto thread_coord = thr_t2r.partition_D(cta_mma.partition_C(coord_c));
+    static_assert(size(thread_coord) == 4,
+                  "M64N8 epilogue must own four outputs per thread");
+    auto r_gate = make_tensor<data_t>(shape(thread_coord));
+    auto r_gate_silu = make_tensor<accum_t>(shape(thread_coord));
 
     tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
     int live_b_slot = 0;
-    int gate_slot = 0;
     constexpr int b_tile_elements = N * K;
-    for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
-        data_t *sB_ptr;
-        if (tile_idx % BLoadInterval == 0) {
-            live_b_slot = m2c.template pop<0>();
-            sB_ptr = static_cast<data_t *>(
-                get_slot_address(base, extract(live_b_slot)));
-        } else {
-            sB_ptr = static_cast<data_t *>(
-                get_slot_address(base, extract(live_b_slot)))
-                + (tile_idx % BLoadInterval) * b_tile_elements;
-        }
+    if (warp_id == 0) {
+        for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {
+            data_t *sB_ptr;
+            if (tile_idx % BLoadInterval == 0) {
+                live_b_slot = m2c.template pop<0>();
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)));
+            } else {
+                sB_ptr = static_cast<data_t *>(
+                    get_slot_address(base, extract(live_b_slot)))
+                    + (tile_idx % BLoadInterval) * b_tile_elements;
+            }
 
-        const int slot_a = m2c.template pop<0>();
-        auto sA = make_tensor(
-            make_smem_ptr(static_cast<data_t *>(
-                get_slot_address(base, extract(slot_a)))),
-            layout_sA);
-        auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
-        auto frag_a = cta_mma.make_fragment_A(sA);
-        auto frag_b = cta_mma.make_fragment_B(sB);
+            const int slot_a = m2c.template pop<0>();
+            auto sA = make_tensor(
+                make_smem_ptr(static_cast<data_t *>(
+                    get_slot_address(base, extract(slot_a)))),
+                layout_sA);
+            auto sB = make_tensor(make_smem_ptr(sB_ptr), layout_sB);
+            auto frag_a = cta_mma.make_fragment_A(sA);
+            auto frag_b = cta_mma.make_fragment_B(sB);
 
-        if (tid < numThreadsPerWarp) {
             #pragma unroll
             for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
                 gemm(tiled_mma, frag_a(_, _, k_block),
@@ -616,36 +621,68 @@ __device__ __forceinline__ void task_gemv_up_silu_sm100(
                 tiled_mma.accumulate_ = UMMA::ScaleOut::One;
             }
             cutlass::arch::umma_arrive(tmem_mma_barrier);
-        }
 
-        if (tile_idx + 1 == n_k_tiles) {
-            // Publish the RegLoad after the operand repeat. Its queue handoff,
-            // shared load, and SFU operations are independent of the up
-            // accumulator and overlap only the final completion phase, so they
-            // cannot delay earlier slot release or weight prefetch.
-            gate_slot = m2c.template pop<0>();
-            auto s_gate = make_tensor(
-                make_smem_ptr(static_cast<data_t *>(
-                    get_slot_address(base, extract(gate_slot)))),
-                layout_output);
-            auto thread_gate = thr_t2r.partition_D(
+            cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+            tmem_mma_phase ^= 1;
+            int release_mask = slot_a;
+            if ((tile_idx + 1) % BLoadInterval == 0
+                || tile_idx + 1 == n_k_tiles) {
+                release_mask |= live_b_slot;
+            }
+            c2m.push(tid, release_mask);
+        }
+    } else {
+        const unsigned operand_messages =
+            unsigned(n_k_tiles)
+            + unsigned((n_k_tiles + BLoadInterval - 1) / BLoadInterval);
+        m2c.advance_by(operand_messages);
+        tmem_mma_phase ^= unsigned(n_k_tiles) & 1U;
+    }
+
+    // Sidecars consume the gate while warp 0 owns the independent UMMA
+    // stream. Warps 1--3 keep their four logical values in registers; the
+    // selected warp-2 helper also computes warp 0's four values into 512
+    // bytes of otherwise unused gate-slot tail. This is the epilogue
+    // destination shape, not the replicated 16dp256b source shape.
+    const int gate_slot = m2c.template pop<0>();
+    data_t *gate_ptr = static_cast<data_t *>(
+        get_slot_address(base, extract(gate_slot)));
+    auto s_gate = make_tensor(make_smem_ptr(gate_ptr), layout_output);
+    auto thread_gate = thr_t2r.partition_D(cta_mma.partition_C(s_gate));
+    float *warp0_gate_silu = reinterpret_cast<float *>(gate_ptr + M * N);
+    if (warp_id != 0) {
+        copy(thread_gate, r_gate);
+        #pragma unroll
+        for (int i = 0; i < size(r_gate_silu); ++i) {
+            const float gate = static_cast<float>(r_gate(i));
+            r_gate_silu(i) = gate / (1.0f + expf(-gate));
+        }
+        if (warp_id == 2) {
+            ThrCopy warp0_thr_t2r = tiled_t2r.get_slice(lane_id);
+            auto warp0_thread_gate = warp0_thr_t2r.partition_D(
                 cta_mma.partition_C(s_gate));
-            copy(thread_gate, r_gate);
+            auto r_warp0_gate = make_fragment_like(warp0_thread_gate);
+            copy(warp0_thread_gate, r_warp0_gate);
             #pragma unroll
-            for (int i = 0; i < size(r_gate_silu); ++i) {
-                const float gate = static_cast<float>(r_gate(i));
-                r_gate_silu(i) = gate / (1.0f + expf(-gate));
+            for (int i = 0; i < size(r_warp0_gate); ++i) {
+                const float gate = static_cast<float>(r_warp0_gate(i));
+                warp0_gate_silu[lane_id * size(r_warp0_gate) + i] =
+                    gate / (1.0f + expf(-gate));
             }
         }
+    }
 
-        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
-        tmem_mma_phase ^= 1;
-        int release_mask = slot_a;
-        if ((tile_idx + 1) % BLoadInterval == 0
-            || tile_idx + 1 == n_k_tiles) {
-            release_mask |= live_b_slot;
+    if (warp_id == 0) {
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    }
+    __sync_compute_group(128);
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int i = 0; i < size(r_gate_silu); ++i) {
+            r_gate_silu(i) =
+                warp0_gate_silu[lane_id * size(r_gate_silu) + i];
         }
-        c2m.push(tid, release_mask);
     }
 
     const int output_slot = m2c.template pop<0>();

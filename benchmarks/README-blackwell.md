@@ -2415,6 +2415,65 @@ reduction saves, a net 8.672 us (+0.35%) against the matched control.  Keep
 the two-operator path.  The complete proof is preserved in Git stash
 `wip: warp1 cross-epoch argmax overlap`.
 
+### Retained compact Up/SwiGLU sidecar release
+
+The Up/SwiGLU task now applies the earlier compute-role release to work that
+is neither another UMMA nor a TMEM drain.  Warp 0 exclusively owns the
+16-tile up-projection UMMA stream, its exact M2C payloads, completion waits,
+and operand releases.  Warps 1--3 retire their private queue state with one
+bounded `advance_by`, dequeue the already-loaded gate tile, and execute their
+shared-memory loads plus CUDA sigmoid/SFU work while warp 0 continues the
+UMMA stream.  This removes per-tile sidecar queue and barrier participation;
+there is still one four-warp join before the final TMEM-to-register epilogue.
+
+The helper handoff is deliberately compact.  CUTLASS
+`SM100_TMEM_LOAD_16dp256b1x` exposes a replicated 128-position source
+partition per compute thread, but the M64N8 epilogue destination owns exactly
+four logical values per thread.  Warps 1--3 retain those four sigmoid values
+in registers.  The measured-best warp-2 helper also evaluates warp 0's four
+values and writes only 32 lanes times four FP32 values (512 bytes) into the
+unused tail of the existing 8-KiB gate slot.  Warp 0 reads that compact
+handoff after the existing proxy fence and compute-group barrier.  The path
+adds no opcode, task, queue slot, TMA round trip, mbarrier, or schedule edge.
+Round-robin placement of warp 0's values across all three sidecars was exact
+but only 0.048 us faster than the initial warp-1 proof and did not justify the
+extra mapping; the simpler warp-2 helper measured best in the retained runs.
+
+Three profiling-free 2,001-sample medians for the retained path were
+2.471744, 2.473568, and 2.472544 ms, for a 2.472619-ms mean.  The exact-source
+matched control was 2.478400 ms, so the change saves 5.781 us (0.233%) per
+token.  Against the opening retained image in this round (2.476608 ms), it
+saves 3.989 us.  The final 2.472544-ms production image is 0.343459 ms, or
+12.20%, faster than the fixed-context vLLM S128 baseline of 2.816003 ms under
+the established comparison convention.  Candidate jobs are
+`20260809T135333Z-1387346`, `20260809T135429Z-1399703`, and
+`20260809T140523Z-1503907`; the matched control is
+`20260809T133812Z-1237691`.
+
+Matched stage images attribute the gain to the intended overlap.  The
+gate-tail-to-SiLU-tail interval moved from 10.944/11.360/12.032 us to
+10.752/11.232/11.552 us at p50/p90/max
+(`20260809T140107Z-1457528` versus `20260809T135726Z-1426315`).  The 0.192-us
+median reduction across 32 layers predicts 6.144 us, close to the measured
+5.781-us end-to-end gain.
+
+Broader generic-memory experiments define the current limit.  Folding an
+epoch-0 argmax into eight epoch-1 LM tasks through scattered global loads was
+exact but measured 2.490528 ms, 13.920 us behind the opening retained image.
+Keeping the summaries in task scratch while deleting the raw/C2M pulse
+measured 2.510144 ms; that pulse supplies useful admission pacing.  Omitting
+the final empty mbarrier transition deadlocked the first persistent-task
+replay because the transition seeds the next operator's stage parity.  Thus
+generic shared-memory/SFU work is profitable when it fits an existing slot
+and join, while scattered global work or deletion of cross-task parity edges
+is not.
+
+The final image remains at 96 registers, nine barriers, a 96-byte stack,
+7,088 bytes of static shared memory, and zero spills.  Full S128 tensor/token
+correctness passed in `20260809T135214Z-1375690`; four resident tokens across
+KV128 exactly matched `[24748, 24748, 24748, 24748]` in
+`20260809T140430Z-1495661`.  All 34 focused schedule/runtime host tests pass.
+
 ## Implementation references
 
 The retained implementation follows the SM100 programming model and UMMA/TMEM
