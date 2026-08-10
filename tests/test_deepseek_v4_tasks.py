@@ -71,6 +71,17 @@ def test_long_context_plan_caps_only_csa_compressed_selection():
     assert hca.attention_candidates == 160
 
 
+def test_early_csa_plan_uses_only_the_available_window():
+    csa = build_layer_decode_plan(2, 0)
+
+    assert csa.compressed_rows == 0
+    assert csa.compressed_selected == 0
+    assert csa.attention_candidates == 1
+    assert not csa.should_compress
+    assert "index_score" not in csa.stages
+    assert "index_topk" not in csa.stages
+
+
 def test_partial_rope_preserves_prefix_and_supports_inverse():
     source = torch.linspace(-1, 1, 2 * 512, dtype=torch.float32).reshape(2, 512)
     angles = torch.linspace(-0.7, 0.7, 32)

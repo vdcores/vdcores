@@ -139,6 +139,8 @@ quality, memory-footprint, or TBT claim.
 On one GB200, the following breadth checks completed with finite residuals and
 logits:
 
+- 43 layers at positions 0 and 3: window-only startup followed by the first
+  ratio-4 compressor/index-cache boundary.
 - 43 layers at position 127: 2 SWA, 21 CSA, 20 HCA, and the full 129,280-token
   vocabulary head.
 - 43 layers at position 4095: the same layer mix with 1,024 compressed CSA

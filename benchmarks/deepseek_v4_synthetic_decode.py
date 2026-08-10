@@ -578,25 +578,28 @@ class SyntheticDecode:
         self.index_scores = torch.empty(
             (plan.compressed_rows,), dtype=torch.float32, device=d
         )
-        score = self._stage(
-            "index.score",
-            SchedDsv4IndexScore(
-                self.index_q_hadamard,
-                self.index_cache[: plan.compressed_rows],
-                self.index_head_weights,
-                self.index_scores,
-            ),
-            min(plan.compressed_rows, self.sms),
-        )
-        selected = self.csa_indices[-plan.compressed_selected :]
-        topk = self._stage(
-            "index.topk",
-            SchedDsv4TopK512(
-                self.index_scores,
-                selected,
-                index_offset=cfg.sliding_window,
-            ),
-        )
+        selection = ()
+        if plan.compressed_rows:
+            score = self._stage(
+                "index.score",
+                SchedDsv4IndexScore(
+                    self.index_q_hadamard,
+                    self.index_cache[: plan.compressed_rows],
+                    self.index_head_weights,
+                    self.index_scores,
+                ),
+                min(plan.compressed_rows, self.sms),
+            )
+            selected = self.csa_indices[-plan.compressed_selected :]
+            topk = self._stage(
+                "index.topk",
+                SchedDsv4TopK512(
+                    self.index_scores,
+                    selected,
+                    index_offset=cfg.sliding_window,
+                ),
+            )
+            selection = (score, topk)
 
         projected = 2 * cfg.index_head_dim
         values = torch.empty((projected,), dtype=torch.float32, device=d)
@@ -646,7 +649,7 @@ class SyntheticDecode:
         )
         self.indexer = {
             "main": (index_q_linear, q_rope, q_hadamard, weights),
-            "selection": (score, topk),
+            "selection": selection,
             "compress": (value_proj, score_proj, pool, norm, rope, rotate),
             "values": values,
             "scores": scores,
@@ -895,9 +898,8 @@ class SyntheticDecode:
             self.index_cache[plan.compressed_rows - 1].copy_(
                 self.indexer["hadamard"].reshape(-1)
             )
-        score, topk = self.indexer["selection"]
-        score.run(self.trace)
-        topk.run(self.trace)
+        for stage in self.indexer["selection"]:
+            stage.run(self.trace)
 
     def _run_attention(self, plan) -> None:
         self.hc_attn_project.run(self.trace)
@@ -1008,8 +1010,8 @@ def main() -> None:
     config = DeepSeekV4FlashConfig()
     if not 1 <= args.layers <= config.num_layers:
         parser.error("layers must be in [1,43]")
-    if args.start_pos < 127:
-        parser.error("the synthetic flow currently requires start-pos >= 127")
+    if args.start_pos < 0:
+        parser.error("start-pos must be non-negative")
     if args.vocab_size <= 0 or args.vocab_size > config.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if min(args.sms, args.iterations) <= 0 or args.warmup < 0:
