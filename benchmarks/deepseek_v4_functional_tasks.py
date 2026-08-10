@@ -50,6 +50,7 @@ from dae.schedule import (
 _BENCH_WARMUP = 0
 _BENCH_ITERATIONS = 1
 _INDEX_ROWS = 640
+_ATTENTION_TOPK = 512
 
 
 def launch(schedule, num_sms: int, device: torch.device) -> float:
@@ -189,7 +190,7 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
         device=device,
     ) * 0.125
     indices = torch.randperm(kv_rows, generator=generator, device=device)[
-        : config.index_topk
+        : _ATTENTION_TOPK
     ].to(torch.int32)
     sink = torch.linspace(
         -0.5, 0.5, config.num_heads, dtype=torch.float32, device=device
@@ -202,7 +203,7 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
     )
     expected = sparse_attention_512_reference(q, kv, indices, sink)
     report_close(
-        "sparse_attention_h64_d512_k512",
+        f"sparse_attention_h64_d512_k{_ATTENTION_TOPK}",
         output,
         expected,
         rtol=3.0e-2,
@@ -569,7 +570,7 @@ def run_norm_activation(device: torch.device, generator: torch.Generator) -> Non
 
 
 def main() -> None:
-    global _BENCH_ITERATIONS, _BENCH_WARMUP, _INDEX_ROWS
+    global _ATTENTION_TOPK, _BENCH_ITERATIONS, _BENCH_WARMUP, _INDEX_ROWS
 
     tasks: dict[str, Callable[[torch.device, torch.Generator], None]] = {
         "quantization": run_quantization,
@@ -588,6 +589,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--index-rows", type=int, default=640)
+    parser.add_argument("--attention-topk", type=int, default=512)
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("warmup must be non-negative and iterations must be positive")
@@ -596,6 +598,9 @@ def main() -> None:
     if args.index_rows < 512 or args.index_rows > 0xFFFF:
         parser.error("index rows must be in [512,65535]")
     _INDEX_ROWS = args.index_rows
+    if args.attention_topk <= 0 or args.attention_topk > 768:
+        parser.error("attention top-k must be in [1,768]")
+    _ATTENTION_TOPK = args.attention_topk
 
     device = torch.device("cuda")
     torch.set_float32_matmul_precision("highest")

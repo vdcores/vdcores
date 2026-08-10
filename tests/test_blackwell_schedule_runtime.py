@@ -10,6 +10,7 @@ from dae.instructions import (
     ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT,
     ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT,
     ARGMAX_REDUCE_GLOBAL_bf16_256,
+    Copy,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     Gemv_M128N8_ROPE_128,
@@ -24,7 +25,8 @@ from dae.instructions import (
 )
 from dae.runtime import opcode
 from dae.launcher import Launcher
-from dae.schedule import SchedAttentionDecoding, SchedSmemSiLUInterleaved
+from dae.schedule import Schedule, SchedAttentionDecoding, SchedSmemSiLUInterleaved
+from dae.sequential import SequentialProgram, SequentialStage
 from dae.tma_utils import (
     cords2addr,
     cord_func_2d_tile_major,
@@ -93,6 +95,127 @@ def test_routed_tma_load_encodes_l2_lookup_and_shared_span():
     assert instruction.arg == (257 << 3) | 5
     assert instruction.size == 16384
     assert cords2addr(instruction.cords) == FakeRoutingState.data_ptr()
+
+
+def test_sequential_program_uses_stu_release_and_gates_both_ldu_ports():
+    class FakeLauncher:
+        num_sms = 2
+        num_bars = 0
+        max_insts = 32
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+    class TwoPortStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ).port(1),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = SequentialProgram(
+        launcher,
+        [
+            SequentialStage("producer", TwoPortStage(), 2),
+            SequentialStage("consumer", TwoPortStage(), 2),
+        ],
+    )
+
+    assert launcher.bar_values == {0: 2}
+    assert len(program.placed_schedules) == 2
+    for instructions in program.instructions:
+        memory = [
+            inst for inst in instructions if isinstance(inst, MemoryInstruction)
+        ]
+        producer_store = memory[2]
+        consumer_load0, consumer_load1 = memory[3:5]
+        assert producer_store.opcode & 0x10
+        assert producer_store.num_slots >> 6 == 0
+        assert consumer_load0.opcode & 0x10
+        assert consumer_load1.opcode & 0x10
+        assert consumer_load0.num_slots >> 6 == 0
+        assert consumer_load1.num_slots >> 6 == 0
+
+
+def test_sequential_program_binds_model_specific_input_role_to_same_edge():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 32
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            return bar_id
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            load = MemoryInstruction(
+                opcode.OP_ALLOC_LDU_LOAD_1D,
+                num_slots=1,
+                arg=0,
+                size=16,
+                address=0,
+            )
+            if self._bar("route") is not None:
+                load.bar(self._bar("route"))
+            return [
+                Copy(1, 16),
+                load,
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        [
+            SequentialStage("route", BasicStage(), 1),
+            SequentialStage("expert", BasicStage(), 1, input_role="route"),
+        ],
+    )
+    expert_load = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+    ][2]
+    assert expert_load.opcode & 0x10
+    assert expert_load.num_slots >> 6 == 0
 
 
 def test_nvfp4_gemv_encodes_shared_shard_shape():

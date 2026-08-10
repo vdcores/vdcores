@@ -18,7 +18,9 @@ import torch
 from dae.deepseek_v4 import DeepSeekV4FlashConfig, decode_window_indices
 from dae.deepseek_v4_flow import build_decode_plan
 from dae.launcher import Launcher
+from dae.routing import RoutedAddressTable
 from dae.schedule import (
+    SchedDsv4Copy1D,
     SchedDsv4ExpertReduce,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4GatedPool,
@@ -34,31 +36,32 @@ from dae.schedule import (
     SchedDsv4SparseAttention512,
     SchedDsv4TopK512,
     SchedFp8Block128Gemv,
-    SchedNvfp4Gemv,
+    SchedRoutedNvfp4Gemv,
     SchedRMS,
     SchedSmemSiLUInterleaved,
     SchedDsv4Fp8Quant128,
 )
+from dae.sequential import SequentialProgram, SequentialStage
 
 
 @dataclass
 class Stage:
     name: str
-    launcher: Launcher
     schedule: object
-
-    def run(self, trace: bool = False) -> None:
-        if trace:
-            print(f"DSV4_E2E_STAGE name={self.name}", flush=True)
-        self.launcher.launch(synchronize=False)
+    num_sms: int
+    input_role: str | None = None
 
 
-def build_stage(name: str, schedule, num_sms: int, device: torch.device) -> Stage:
-    launcher = Launcher(num_sms, device=device)
-    launcher.s(schedule.place(num_sms))
-    # Keep the schedule alive: RawAddress instructions carry device pointers,
-    # and several synthetic weights/views are owned only by the schedule.
-    return Stage(name, launcher, schedule)
+def build_stage(
+    name: str,
+    schedule,
+    num_sms: int,
+    device: torch.device,
+    *,
+    input_role: str | None = None,
+) -> Stage:
+    del device
+    return Stage(name, schedule, num_sms, input_role)
 
 
 class WeightFactory:
@@ -117,9 +120,6 @@ class Fp8Activation:
             device,
         )
 
-    def run(self, trace: bool) -> None:
-        self.stage.run(trace)
-
 
 class Fp8Linear:
     def __init__(
@@ -146,9 +146,6 @@ class Fp8Linear:
             device,
         )
 
-    def run(self, trace: bool) -> None:
-        self.stage.run(trace)
-
 
 class Nvfp4Activation:
     def __init__(self, name: str, source: torch.Tensor, sms: int, device):
@@ -172,41 +169,42 @@ class Nvfp4Activation:
             device,
         )
 
-    def run(self, trace: bool) -> None:
-        self.stage.run(trace)
 
-
-class Nvfp4Linear:
+class RoutedNvfp4Linear:
     def __init__(
         self,
         name: str,
-        factory: WeightFactory,
+        table: RoutedAddressTable,
+        route_rank: int,
+        weight_fields: list[int],
+        weight_scale_fields: list[int],
+        alpha_field: int,
+        rows: int,
+        k: int,
         activation: Nvfp4Activation,
         output: torch.Tensor,
         sms: int,
         device: torch.device,
     ):
-        weight, weight_scale = factory.nvfp4(
-            output.numel(), activation.quantized.numel() * 2
-        )
-        alpha = torch.tensor([1.0e-4], dtype=torch.float32, device=device)
-        linear_sms = min(output.numel(), sms)
+        linear_sms = min(rows // 8, sms)
         self.stage = build_stage(
-            f"{name}.gemv_nvfp4",
-            SchedNvfp4Gemv(
-                weight,
-                weight_scale,
+            f"{name}.gemv_nvfp4_routed",
+            SchedRoutedNvfp4Gemv(
+                table.state,
+                route_rank,
+                weight_fields,
+                weight_scale_fields,
+                alpha_field,
+                rows,
+                k,
                 activation.quantized,
                 activation.scale,
-                alpha,
                 output.reshape(-1),
             ),
             linear_sms,
             device,
+            input_role="route",
         )
-
-    def run(self, trace: bool) -> None:
-        self.stage.run(trace)
 
 
 class SyntheticDecode:
@@ -214,7 +212,10 @@ class SyntheticDecode:
         self.args = args
         self.device = device
         self.config = DeepSeekV4FlashConfig()
-        self.plans = build_decode_plan(args.start_pos, self.config)[: args.layers]
+        plan_end = args.first_layer + args.layers
+        self.plans = build_decode_plan(args.start_pos, self.config)[
+            args.first_layer:plan_end
+        ]
         self.sms = min(
             args.sms,
             torch.cuda.get_device_properties(device).multi_processor_count,
@@ -225,6 +226,7 @@ class SyntheticDecode:
         self._build_attention_path()
         self._build_ffn_path()
         self._build_head()
+        self._build_program()
 
     def _stage(self, name: str, schedule, sms: int = 1) -> Stage:
         return build_stage(name, schedule, sms, self.device)
@@ -376,6 +378,7 @@ class SyntheticDecode:
         self.q_rope_stage = self._stage(
             "attn.q_rope",
             SchedDsv4Rope512_64(self.q_normalized, self.rope_table, self.q_rope),
+            cfg.num_heads,
         )
 
         self.kv = torch.empty((cfg.head_dim,), dtype=torch.bfloat16, device=d)
@@ -448,6 +451,7 @@ class SyntheticDecode:
                 self.attention_inverse,
                 inverse=True,
             ),
+            cfg.num_heads,
         )
         grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
         self.o_rank = torch.empty(
@@ -552,6 +556,7 @@ class SyntheticDecode:
             SchedDsv4Rope128_64(
                 self.index_q, self.rope_table, self.index_q_rope
             ),
+            cfg.index_heads,
         )
         self.index_q_hadamard = torch.empty_like(self.index_q)
         q_hadamard = self._stage(
@@ -677,7 +682,42 @@ class SyntheticDecode:
         self.hash_indices[:6] = torch.tensor(
             [3, 17, 29, 71, 130, 255], dtype=torch.int32, device=d
         )
-        self.expert_indices = torch.empty((8,), dtype=torch.int32, device=d)
+
+        self.ffn_hidden_nvfp4 = Nvfp4Activation(
+            "ffn.hidden", self.norm_hidden, self.sms, d
+        )
+        routed_columns = {}
+
+        def add_routed_linear(prefix: str, rows: int, k: int):
+            weight, weight_scale = self.factory.nvfp4(rows, k)
+            alpha = torch.zeros((4,), dtype=torch.float32, device=d)
+            alpha[0] = 1.0e-4
+            active_sms = min(rows // 8, self.sms)
+            groups_per_sm, extra = divmod(rows // 8, active_sms)
+            weight_names = []
+            scale_names = []
+            for sm in range(active_sms):
+                group_start = sm * groups_per_sm + min(sm, extra)
+                group_count = groups_per_sm + (1 if sm < extra else 0)
+                row_start = group_start * 8
+                row_stop = row_start + group_count * 8
+                weight_name = f"{prefix}.weight.sm{sm}"
+                scale_name = f"{prefix}.weight_scale.sm{sm}"
+                routed_columns[weight_name] = [weight[row_start:row_stop]] * 256
+                routed_columns[scale_name] = [
+                    weight_scale[row_start:row_stop]
+                ] * 256
+                weight_names.append(weight_name)
+                scale_names.append(scale_name)
+            alpha_name = f"{prefix}.alpha"
+            routed_columns[alpha_name] = [alpha] * 256
+            return weight_names, scale_names, alpha_name
+
+        gate_names = add_routed_linear("gate", 2048, 4096)
+        up_names = add_routed_linear("up", 2048, 4096)
+        down_names = add_routed_linear("down", 4096, 2048)
+        self.routed_table = RoutedAddressTable(routed_columns)
+        self.expert_indices = self.routed_table.route_indices_storage
         self.expert_weights = torch.empty((8,), dtype=torch.float32, device=d)
         self.router_hash = self._stage(
             "ffn.route_hash",
@@ -702,9 +742,17 @@ class SyntheticDecode:
             ),
         )
 
-        self.ffn_hidden_nvfp4 = Nvfp4Activation(
-            "ffn.hidden", self.norm_hidden, self.sms, d
-        )
+        def field_ids(names):
+            weight_names, scale_names, alpha_name = names
+            return (
+                [self.routed_table.field(name) for name in weight_names],
+                [self.routed_table.field(name) for name in scale_names],
+                self.routed_table.field(alpha_name),
+            )
+
+        gate_fields = field_ids(gate_names)
+        up_fields = field_ids(up_names)
+        down_fields = field_ids(down_names)
         self.routed_gate = torch.empty((6, 2048), dtype=torch.bfloat16, device=d)
         self.routed_up = torch.empty_like(self.routed_gate)
         self.routed_middle = torch.empty_like(self.routed_gate)
@@ -716,15 +764,31 @@ class SyntheticDecode:
         self.routed_down_linears = []
         for rank in range(6):
             self.routed_gate_linears.append(
-                Nvfp4Linear(
-                    f"ffn.expert{rank}.gate", self.factory,
-                    self.ffn_hidden_nvfp4, self.routed_gate[rank], self.sms, d
+                RoutedNvfp4Linear(
+                    f"ffn.expert{rank}.gate",
+                    self.routed_table,
+                    rank,
+                    *gate_fields,
+                    2048,
+                    4096,
+                    self.ffn_hidden_nvfp4,
+                    self.routed_gate[rank],
+                    self.sms,
+                    d,
                 )
             )
             self.routed_up_linears.append(
-                Nvfp4Linear(
-                    f"ffn.expert{rank}.up", self.factory,
-                    self.ffn_hidden_nvfp4, self.routed_up[rank], self.sms, d
+                RoutedNvfp4Linear(
+                    f"ffn.expert{rank}.up",
+                    self.routed_table,
+                    rank,
+                    *up_fields,
+                    2048,
+                    4096,
+                    self.ffn_hidden_nvfp4,
+                    self.routed_up[rank],
+                    self.sms,
+                    d,
                 )
             )
             self.routed_swiglu.append(
@@ -744,9 +808,17 @@ class SyntheticDecode:
             )
             self.routed_middle_quant.append(activation)
             self.routed_down_linears.append(
-                Nvfp4Linear(
-                    f"ffn.expert{rank}.down", self.factory,
-                    activation, self.routed_output[rank], self.sms, d
+                RoutedNvfp4Linear(
+                    f"ffn.expert{rank}.down",
+                    self.routed_table,
+                    rank,
+                    *down_fields,
+                    4096,
+                    2048,
+                    activation,
+                    self.routed_output[rank],
+                    self.sms,
+                    d,
                 )
             )
 
@@ -843,154 +915,229 @@ class SyntheticDecode:
         self.kv_cache.copy_(self.cache_seed)
         self.index_cache.copy_(self.index_cache_seed)
 
-    def _check(self, name: str, *tensors: torch.Tensor) -> None:
-        if not self.trace:
-            return
-        torch.cuda.synchronize()
-        for tensor in tensors:
-            finite = torch.isfinite(tensor)
-            if not bool(finite.all().item()):
-                bad = int((~finite).sum().item())
-                raise AssertionError(
-                    f"stage {name} produced {bad} non-finite values"
-                )
-        print(f"DSV4_E2E_CHECK name={name} status=finite", flush=True)
+    @staticmethod
+    def _unwrap_stage(stage) -> Stage:
+        return stage if isinstance(stage, Stage) else stage.stage
 
-    def _run_compressor(self, ratio: int, should_compress: bool) -> None:
+    def _copy_stage(
+        self, name: str, source: torch.Tensor, destination: torch.Tensor
+    ) -> Stage:
+        return self._stage(name, SchedDsv4Copy1D(source, destination))
+
+    def _compressor_stages(self, plan) -> list[Stage]:
+        ratio = plan.compress_ratio
         data = self.compress[ratio]
         value_proj, score_proj, pool, norm, rope = data["stages"]
-        value_proj.run(self.trace)
-        score_proj.run(self.trace)
         projected_rows = 2 if ratio == 4 else 1
-        data["value_state"][-projected_rows:].copy_(
-            data["values"].reshape(projected_rows, -1)
-        )
-        data["score_state"][-projected_rows:].copy_(
-            data["scores"].reshape(projected_rows, -1)
-        )
-        if not should_compress:
-            return
-        pool.run(self.trace)
-        norm.run(self.trace)
-        rope.run(self.trace)
+        stages = [
+            value_proj,
+            score_proj,
+            self._copy_stage(
+                f"compress.r{ratio}.value_state_store",
+                data["values"].reshape(projected_rows, -1),
+                data["value_state"][-projected_rows:],
+            ),
+            self._copy_stage(
+                f"compress.r{ratio}.score_state_store",
+                data["scores"].reshape(projected_rows, -1),
+                data["score_state"][-projected_rows:],
+            ),
+        ]
+        if plan.should_compress:
+            stages.extend((pool, norm, rope))
+            stages.append(
+                self._copy_stage(
+                    f"compress.r{ratio}.cache_store",
+                    data["rotated"].reshape(-1),
+                    self.kv_cache[
+                        self.config.sliding_window + plan.compressed_rows - 1
+                    ],
+                )
+            )
+        return stages
 
-    def _run_indexer(self, plan) -> None:
+    def _indexer_stages(self, plan) -> list[Stage]:
         if self.indexer is None:
             raise RuntimeError("CSA layer requested without an indexer")
         index_q, q_rope, q_hadamard, weights = self.indexer["main"]
-        index_q.run(self.trace)
-        q_rope.run(self.trace)
-        q_hadamard.run(self.trace)
-        weights.run(self.trace)
+        stages = [self._unwrap_stage(index_q), q_rope, q_hadamard, weights]
         if plan.should_compress:
             value_proj, score_proj, pool, norm, rope, rotate = self.indexer["compress"]
-            value_proj.run(self.trace)
-            score_proj.run(self.trace)
-            self.indexer["value_state"][-2:].copy_(
-                self.indexer["values"].reshape(2, -1)
+            stages.extend((value_proj, score_proj))
+            stages.extend(
+                (
+                    self._copy_stage(
+                        "index.compress_value_state_store",
+                        self.indexer["values"].reshape(2, -1),
+                        self.indexer["value_state"][-2:],
+                    ),
+                    self._copy_stage(
+                        "index.compress_score_state_store",
+                        self.indexer["scores"].reshape(2, -1),
+                        self.indexer["score_state"][-2:],
+                    ),
+                    pool,
+                    norm,
+                    rope,
+                    rotate,
+                    self._copy_stage(
+                        "index.cache_store",
+                        self.indexer["hadamard"].reshape(-1),
+                        self.index_cache[plan.compressed_rows - 1],
+                    ),
+                )
             )
-            self.indexer["score_state"][-2:].copy_(
-                self.indexer["scores"].reshape(2, -1)
-            )
-            pool.run(self.trace)
-            norm.run(self.trace)
-            rope.run(self.trace)
-            rotate.run(self.trace)
-            self.index_cache[plan.compressed_rows - 1].copy_(
-                self.indexer["hadamard"].reshape(-1)
-            )
-        for stage in self.indexer["selection"]:
-            stage.run(self.trace)
+        stages.extend(self.indexer["selection"])
+        return stages
 
-    def _run_attention(self, plan) -> None:
-        self.hc_attn_project.run(self.trace)
-        self.hc_attn_pre.run(self.trace)
-        self.attn_norm.run(self.trace)
-        self._check("attn_hc_norm", self.hidden, self.norm_hidden)
-        self.hidden_fp8.run(self.trace)
-        self.q_a.run(self.trace)
-        self.q_norm.run(self.trace)
-        self.q_rank_fp8.run(self.trace)
-        self.q_b.run(self.trace)
-        self.q_head_norm.run(self.trace)
-        self.q_rope_stage.run(self.trace)
-        self.kv_proj.run(self.trace)
-        self.kv_norm.run(self.trace)
-        self.kv_rope_stage.run(self.trace)
-        self._check("attn_qkv", self.q_rope, self.kv_rope)
-        self.kv_cache[self.args.start_pos % self.config.sliding_window].copy_(
-            self.kv_rope.reshape(-1)
-        )
-        if plan.compress_ratio:
-            self._run_compressor(plan.compress_ratio, plan.should_compress)
-            if plan.should_compress:
+    def _attention_stages(self, plan) -> list[Stage]:
+        stages = [
+            self.hc_attn_project,
+            self.hc_attn_pre,
+            self.attn_norm,
+            self.hidden_fp8.stage,
+            self.q_a.stage,
+            self.q_norm,
+            self.q_rank_fp8.stage,
+            self.q_b.stage,
+            self.q_head_norm,
+            self.q_rope_stage,
+            self.kv_proj.stage,
+            self.kv_norm,
+            self.kv_rope_stage,
+            self._copy_stage(
+                "attn.window_cache_store",
+                self.kv_rope.reshape(-1),
                 self.kv_cache[
-                    self.config.sliding_window + plan.compressed_rows - 1
-                ].copy_(self.compress[plan.compress_ratio]["rotated"].reshape(-1))
+                    self.args.start_pos % self.config.sliding_window
+                ],
+            ),
+        ]
+        if plan.compress_ratio:
+            stages.extend(self._compressor_stages(plan))
         if plan.attention_kind == "csa":
-            self._run_indexer(plan)
-        self.attention_stages[plan.attention_kind].run(self.trace)
-        self.attention_inverse_stage.run(self.trace)
-        self._check("attention_output", self.attention_inverse)
+            stages.extend(self._indexer_stages(plan))
+        stages.extend(
+            (
+                self.attention_stages[plan.attention_kind],
+                self.attention_inverse_stage,
+            )
+        )
         for activation, linear in zip(
             self.o_group_activations, self.o_group_linears
         ):
-            activation.run(self.trace)
-            linear.run(self.trace)
-        self.o_rank_fp8.run(self.trace)
-        self.o_b.run(self.trace)
-        self._check("attention_projection", self.branch)
-        self.hc_attn_post.run(self.trace)
-        self._check("attention_hc_post", self.next_residual)
-        self.residual.copy_(self.next_residual)
-
-    def _run_ffn(self, plan) -> None:
-        self.hc_ffn_project.run(self.trace)
-        self.hc_ffn_pre.run(self.trace)
-        self.ffn_norm.run(self.trace)
-        self._check("ffn_hc_norm", self.hidden, self.norm_hidden)
-        self.ffn_hidden_fp8.run(self.trace)
-        self.router_projection.run(self.trace)
-        (self.router_hash if plan.hash_routing else self.router_score).run(self.trace)
-        self.ffn_hidden_nvfp4.run(self.trace)
-        for rank in range(6):
-            self.routed_gate_linears[rank].run(self.trace)
-            self.routed_up_linears[rank].run(self.trace)
-            self._check(
-                f"expert{rank}_projections",
-                self.routed_gate[rank],
-                self.routed_up[rank],
+            stages.extend((activation.stage, linear.stage))
+        stages.extend(
+            (
+                self.o_rank_fp8.stage,
+                self.o_b.stage,
+                self.hc_attn_post,
+                self._copy_stage(
+                    "attn.residual_store", self.next_residual, self.residual
+                ),
             )
-            self.routed_swiglu[rank].run(self.trace)
-            self._check(f"expert{rank}_swiglu", self.routed_middle[rank])
-            self.routed_middle_quant[rank].run(self.trace)
-            self.routed_down_linears[rank].run(self.trace)
-            self._check(f"expert{rank}_down", self.routed_output[rank])
-        self._check("routed_experts", self.routed_output)
-        self.shared_gate_linear.run(self.trace)
-        self.shared_up_linear.run(self.trace)
-        self.shared_swiglu.run(self.trace)
-        self.shared_middle_fp8.run(self.trace)
-        self.shared_down_linear.run(self.trace)
-        self._check("shared_expert", self.shared_output)
-        self.expert_reduce.run(self.trace)
-        self._check("expert_reduce", self.branch)
-        self.hc_ffn_post.run(self.trace)
-        self._check("ffn_hc_post", self.next_residual)
-        self.residual.copy_(self.next_residual)
+        )
+        return stages
+
+    def _ffn_stages(self, plan) -> list[Stage]:
+        stages = [
+            self.hc_ffn_project,
+            self.hc_ffn_pre,
+            self.ffn_norm,
+            self.ffn_hidden_fp8.stage,
+            self.router_projection.stage,
+            self.router_hash if plan.hash_routing else self.router_score,
+            self.ffn_hidden_nvfp4.stage,
+        ]
+        for rank in range(6):
+            stages.extend(
+                (
+                    self.routed_gate_linears[rank].stage,
+                    self.routed_up_linears[rank].stage,
+                    self.routed_swiglu[rank],
+                    self.routed_middle_quant[rank].stage,
+                    self.routed_down_linears[rank].stage,
+                )
+            )
+        stages.extend(
+            (
+                self.shared_gate_linear.stage,
+                self.shared_up_linear.stage,
+                self.shared_swiglu,
+                self.shared_middle_fp8.stage,
+                self.shared_down_linear.stage,
+                self.expert_reduce,
+                self.hc_ffn_post,
+                self._copy_stage(
+                    "ffn.residual_store", self.next_residual, self.residual
+                ),
+            )
+        )
+        return stages
+
+    def _build_program(self) -> None:
+        stages = []
+        serial_sm = 0
+
+        def append_stage(name: str, stage: Stage) -> None:
+            nonlocal serial_sm
+            base_sm = 0
+            if stage.num_sms == 1:
+                base_sm = serial_sm
+                serial_sm = (serial_sm + 1) % self.sms
+            stages.append(
+                SequentialStage(
+                    name,
+                    stage.schedule,
+                    stage.num_sms,
+                    base_sm=base_sm,
+                    input_role=stage.input_role,
+                )
+            )
+
+        for plan in self.plans:
+            for stage in self._attention_stages(plan) + self._ffn_stages(plan):
+                append_stage(f"layer{plan.layer_id}.{stage.name}", stage)
+        for stage in (
+            self.head_project,
+            self.head_hc,
+            self.head_norm_stage,
+            self.logits_stage,
+        ):
+            append_stage(stage.name, stage)
+        if self.args.max_stages:
+            stages = stages[: self.args.max_stages]
+        self.partial_program = len(stages) == 0 or stages[-1].name != "head.logits_fp32"
+        self.launcher = Launcher(self.sms, device=self.device)
+        self.program = SequentialProgram(self.launcher, stages)
+        self.launcher.s(self.program)
+        if self.trace:
+            for stage in stages:
+                print(f"DSV4_E2E_STAGE name={stage.name}", flush=True)
+        print(
+            "DSV4_E2E_PROGRAM "
+            f"launches=1 stages={len(stages)} barriers={len(self.program.barriers)} "
+            f"compute_insts={self.program.max_compute_instructions} "
+            f"memory_insts={self.program.max_memory_instructions}",
+            flush=True,
+        )
 
     def run_once(self) -> tuple[int, torch.Tensor]:
         self.reset()
-        for plan in self.plans:
-            self._run_attention(plan)
-            self._run_ffn(plan)
-        self.head_project.run(self.trace)
-        self.head_hc.run(self.trace)
-        self.head_norm_stage.run(self.trace)
-        self.logits_stage.run(self.trace)
+        self.launcher.launch(synchronize=False)
         torch.cuda.synchronize()
+        if self.trace and hasattr(self, "csa_indices"):
+            print(
+                "DSV4_E2E_CSA_INDICES "
+                f"min={int(self.csa_indices.min().item())} "
+                f"max={int(self.csa_indices.max().item())} "
+                f"count={self.csa_indices.numel()}",
+                flush=True,
+            )
         if not bool(torch.isfinite(self.residual).all().item()):
             raise AssertionError("synthetic decode produced non-finite residual state")
+        if self.partial_program:
+            return -1, self.residual.clone()
         if not bool(torch.isfinite(self.logits).all().item()):
             raise AssertionError("synthetic decode produced non-finite logits")
         token = int(torch.argmax(self.logits).item())
@@ -999,7 +1146,8 @@ class SyntheticDecode:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--layers", type=int, default=43)
+    parser.add_argument("--layers", type=int, default=1)
+    parser.add_argument("--first-layer", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=127)
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--sms", type=int, default=152)
@@ -1007,16 +1155,29 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--trace-stages", action="store_true")
+    parser.add_argument(
+        "--max-stages",
+        type=int,
+        default=0,
+        help="diagnostic: launch only this prefix of the flattened program",
+    )
     args = parser.parse_args()
     config = DeepSeekV4FlashConfig()
     if not 1 <= args.layers <= config.num_layers:
         parser.error("layers must be in [1,43]")
+    if (
+        args.first_layer < 0
+        or args.first_layer + args.layers > config.num_layers
+    ):
+        parser.error("first-layer plus layers must stay inside [0,43)")
     if args.start_pos < 0:
         parser.error("start-pos must be non-negative")
     if args.vocab_size <= 0 or args.vocab_size > config.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if min(args.sms, args.iterations) <= 0 or args.warmup < 0:
         parser.error("sms/iterations must be positive and warmup non-negative")
+    if args.max_stages < 0:
+        parser.error("max-stages must be non-negative")
 
     device = torch.device("cuda")
     started = time.monotonic()
@@ -1050,9 +1211,13 @@ def main() -> None:
     kinds = {kind: 0 for kind in ("swa", "csa", "hca")}
     for plan in flow.plans:
         kinds[plan.attention_kind] += 1
+    result_name = (
+        "DSV4_E2E_PREFIX" if flow.partial_program else "DSV4_E2E_SYNTHETIC"
+    )
     print(
-        "DSV4_E2E_SYNTHETIC status=PASS "
-        f"layers={args.layers} start_pos={args.start_pos} "
+        f"{result_name} status=PASS launches=1 "
+        f"first_layer={args.first_layer} layers={args.layers} "
+        f"start_pos={args.start_pos} "
         f"swa={kinds['swa']} csa={kinds['csa']} hca={kinds['hca']} "
         f"vocab={args.vocab_size} token={reference_token} "
         f"build_s={build_seconds:.3f} min_ms={min(timings_ms):.6f} "

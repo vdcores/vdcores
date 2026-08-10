@@ -77,6 +77,22 @@ rows, and indexed KV reads stream through bounded shared tiles. No task uses
 `__threadfence`; compute-group synchronization stays inside compute and
 memory dependencies/barriers stay in the memory VM.
 
+The breadth-first layer assembly uses `SequentialProgram` to render every
+placed task into a single resident launch. Each stage boundary is released by
+the producer's final STU completion on every active SM, and the next stage
+waits on its first allocating LDU instruction on each load port. It does not
+insert `IssueBarrier`, host synchronization, or a compute-side fence. Placed
+schedules remain owned by the program because placement can create HBM routing
+or indexed-load tables referenced by LDU instructions. Single-SM stages rotate
+across resident SMs to keep the per-SM instruction image bounded.
+
+The synthetic one-layer launch now exercises all three layer templates:
+SWA/hash routing, CSA/index routing, and HCA/ratio-128 compression. Host tensor
+copies between tasks were replaced by queued shared-memory copies, and expert
+gate/up/down projections use `SchedRoutedNvfp4Gemv`, so the route result is
+consumed by LDU rather than by compute. The full 43-layer resident loop and
+checkpoint-backed token flow remain the next assembly gate.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median
@@ -93,6 +109,12 @@ memory dependencies/barriers stay in the memory VM.
   SwiGLU, and all mHC stages.  After parallel quantization/index selection, the
   selective image uses 64 registers, nine barriers, a 112-byte stack frame, no
   spills, and 14,720 bytes static shared memory.
+- One-launch synthetic layer templates, one GB200: SWA used 85 stages and a
+  71/329 max compute/memory instruction image; CSA used 108 stages and 94/402;
+  HCA used 93 stages and 79/353. All three completed in one launch with finite,
+  repeatable outputs. The 24-op selective image used 70 registers, nine
+  barriers, a 112-byte stack frame, no spills, and 14,720 bytes static shared
+  memory.
 - FP8 LM-head shape M129280 K4096, 152 SMs: max absolute error 0.003906 and
   656.800 us for the one-iteration projection-shape stress check.  M4096 K4096
   remained at 15.840 us median after pointer-offset sharding.
