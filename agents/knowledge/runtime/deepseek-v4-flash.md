@@ -189,24 +189,52 @@ absolute BF16 error).  This verifies checkpoint-to-VDCores dtype, layout, and
 scalar-scale routing for both quantization families.
 
 `benchmarks/deepseek_v4_checkpoint_decode.py` is the first complete
-real-weight VDCores flow.  It streams one input token through every transformer
-layer and the vocabulary head without materializing the full checkpoint in
-host or device memory.  Embedding and head rows are sliced directly from their
-safetensors shards, while each layer loads only its active routed experts and
-releases the layer weights before advancing.  On one allocator-managed GPU
-(`10.0.16.24:1`), token 791 at position zero passed all 43 layers (2 SWA, 21
-CSA, and 20 HCA), both hash and score routing, NVFP4 routed experts, the FP8
+position-zero real-weight VDCores flow.  It streams one input token through
+every transformer layer and the vocabulary head without materializing the full
+checkpoint in host or device memory.  Embedding and head rows are sliced
+directly from their safetensors shards, while each layer loads only its active
+routed experts and releases the layer weights before advancing.  On one
+allocator-managed GPU (`10.0.16.24:1`), token 791 passed all 43 layers (2 SWA,
+21 CSA, and 20 HCA), both hash and score routing, NVFP4 routed experts, the FP8
 shared expert and attention projections, BF16 routers/compressors, mHC, and
-the full 129,280-row head.  It selected output token 20 with finite logits in
-[-35.75, 15.8125] and completed in 75.981 seconds.
+the full 129,280-row head.
+
+The first run exposed a model-semantic error that isolated task tests had
+mirrored: the non-symmetric mHC Sinkhorn matrix must update residual streams as
+`comb.T @ residual`, matching both the official Transformers model and vLLM's
+TileLang kernel.  After correcting the CUDA task and reference, all 43 layers
+selected token 14 with finite logits in [-31.875, 18.625].  A matched vLLM
+0.23.0 greedy run from the same one-token prompt emitted `[14, 223]`, so the
+first VDCores token now agrees with the framework reference.  The corrected
+streaming run took 86.522 seconds, which is I/O- and launch-dominated and is
+not a TBT measurement.
 
 This position-zero run is a breadth gate, not a quality or TBT result.  RoPE is
 identity there, and historical compressed/index cache state is empty, so the
 compressor/index projections execute for coverage but their outputs are not
 consumed.  The harness also streams weights from local storage and launches
-tasks individually.  Reference-token comparison, multi-token cache
-correctness, resident-weight execution, and timed framework parity remain
-separate gates.
+tasks individually.  Multi-token cache correctness, resident-weight
+execution, and timed framework parity remain separate gates.
+
+## Profiling and optimization gate
+
+Detailed tuning starts only after the second-token run consumes populated
+window/compressor/index state and matches its framework token.  Then make the
+full non-MTP checkpoint resident on one GPU, retain enough memory for the
+matched cache lengths, and measure launch-inclusive decode without checkpoint
+I/O or per-layer allocation/free time.
+
+Use batch 1 and identical greedy two-token requests for VDCores, vLLM, and
+SGLang at context lengths 128, 512, and 4096.  Record warmups, at least 30 timed
+steps, min/median/p90 TBT, cache dtype/layout, allocated memory, task-image
+revision, and framework versions.  Profile one representative context before
+tuning, attributing total time and launch count to attention, routed/shared
+experts, quantization, mHC/norm, and the output head.  Prioritize only stages
+that materially contribute to model TBT.  Expected first candidates are
+persistent schedule composition, quantize-to-GEMV fusion, adjacent mHC
+post/pre fusion, overlap of independent attention projections, and removal of
+Python launcher/allocation work; task microbenchmarks remain diagnostic rather
+than the optimization objective.
 
 The CUDA-13/Blackwell vLLM 0.23.0 environment on that worker completed a real
 TP=1, one-GPU, two-token inference at context 128.  vLLM selected FP4 experts

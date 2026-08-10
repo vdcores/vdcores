@@ -268,7 +268,7 @@ def hc_post_reference(
     comb: torch.Tensor,
 ) -> torch.Tensor:
     output = post[:, None] * branch.float()[None, :]
-    output += torch.einsum("ji,id->jd", comb.float(), residual.float())
+    output += torch.einsum("ij,id->jd", comb.float(), residual.float())
     return output.to(branch.dtype)
 
 

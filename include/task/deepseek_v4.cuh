@@ -1041,8 +1041,9 @@ __device__ __forceinline__ void task_dsv4_hc_post(
     float value = post[output_branch] * __bfloat162float(branch[dim]);
 #pragma unroll
     for (int input_branch = 0; input_branch < kHc; ++input_branch) {
+      // The model updates streams with comb^T @ residual.
       value = fmaf(
-          comb[output_branch * kHc + input_branch],
+          comb[input_branch * kHc + output_branch],
           __bfloat162float(residual[input_branch * kHidden + dim]),
           value);
     }

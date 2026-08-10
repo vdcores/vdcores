@@ -133,10 +133,10 @@ def run_vllm(args: argparse.Namespace) -> None:
             generate_full_batch(prompts)
 
         samples_ms = []
-        for _ in range(args.samples):
+        for sample_id in range(args.samples):
             outputs = generate_full_batch(prompts)
             request_ms = []
-            for output in outputs:
+            for request_id, output in enumerate(outputs):
                 metrics = output.metrics
                 if metrics is None or metrics.first_token_ts <= 0:
                     raise RuntimeError("vLLM did not return engine token timestamps")
@@ -148,6 +148,14 @@ def run_vllm(args: argparse.Namespace) -> None:
                 request_ms.append(
                     (metrics.last_token_ts - metrics.first_token_ts) * 1.0e3
                 )
+                if args.emit_token_ids:
+                    token_ids = list(output.outputs[0].token_ids)
+                    print(
+                        "FIXED_CONTEXT_TOKENS "
+                        f"framework=vllm context={context} sample={sample_id} "
+                        f"request={request_id} token_ids={token_ids}",
+                        flush=True,
+                    )
             # Requests in one decode batch normally share a timestamp.  Taking
             # the maximum retains the full batch step if completion handling
             # introduces a small skew.
@@ -248,10 +256,10 @@ def run_sglang(args: argparse.Namespace) -> None:
                 generate_once(input_ids)
 
             samples_ms = []
-            for _ in range(args.samples):
+            for sample_id in range(args.samples):
                 outputs = generate_once(input_ids)
                 request_ms = []
-                for output in outputs:
+                for request_id, output in enumerate(outputs):
                     meta = output["meta_info"]
                     if meta.get("completion_tokens") != 2:
                         raise RuntimeError(
@@ -267,6 +275,14 @@ def run_sglang(args: argparse.Namespace) -> None:
                     # With two output tokens, decode_throughput is exactly the
                     # reciprocal of the one-token decode interval.
                     request_ms.append(1.0e3 / decode_throughput)
+                    if args.emit_token_ids:
+                        print(
+                            "FIXED_CONTEXT_TOKENS "
+                            f"framework=sglang context={context} "
+                            f"sample={sample_id} request={request_id} "
+                            f"token_ids={output['output_ids']}",
+                            flush=True,
+                        )
                 samples_ms.append(max(request_ms))
 
             emit_result(
@@ -288,6 +304,11 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--emit-token-ids",
+        action="store_true",
+        help="emit each measured request's generated token IDs",
+    )
     parser.add_argument(
         "--profile-context",
         type=int,

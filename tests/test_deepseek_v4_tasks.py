@@ -10,6 +10,7 @@ from dae.deepseek_v4 import (
     gated_pool_reference,
     hadamard_reference,
     hc_head_reference,
+    hc_post_reference,
     hc_pre_reference,
     index_score_reference,
     route_top6_reference,
@@ -162,6 +163,24 @@ def test_hc_reference_shapes_and_sinkhorn_column_sums():
     assert post.shape == (4,)
     assert comb.shape == (4, 4)
     torch.testing.assert_close(comb.sum(dim=0), torch.ones(4), rtol=2.0e-5, atol=2.0e-5)
+
+
+def test_hc_post_consumes_the_transposed_sinkhorn_matrix():
+    residual = torch.eye(4, dtype=torch.bfloat16)
+    branch = torch.zeros(4, dtype=torch.bfloat16)
+    post = torch.zeros(4)
+    comb = torch.tensor(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0, 10.0, 11.0],
+            [12.0, 13.0, 14.0, 15.0],
+        ]
+    )
+
+    actual = hc_post_reference(branch, residual, post, comb)
+
+    torch.testing.assert_close(actual, comb.T.to(torch.bfloat16))
 
 
 def test_hadamard_reference_is_normalized_and_self_inverse():
