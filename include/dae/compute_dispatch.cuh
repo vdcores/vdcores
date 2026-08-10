@@ -4,6 +4,7 @@
 
 #include "task/argmax.cuh"
 #include "task/attention.cuh"
+#include "task/deepseek_v4.cuh"
 #include "task/fp8.cuh"
 #include "task/gemv.cuh"
 #include "task/nvfp4.cuh"
@@ -137,6 +138,119 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_SM100) {
   task_fp8_block128_gemv_sm100(inst.args[0], inst.args[1], inst.args[2],
                                st_insts, m2c, c2m);
 #endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_512_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_rope_512_64(
+      inst.args[0], inst.args[1] != 0, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_SPARSE_ATTENTION_512) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_sparse_attention_512(
+      inst.args[0], inst.args[1], smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROUTE_TOP6) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_route_top6(
+      inst.args[0] != 0,
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_EXPERT_REDUCE) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, inst, smem_base,
+             tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space,
+             g_events);
+  task_dsv4_expert_reduce(st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_fp32_bf16_gemv(
+      inst.args[0], inst.args[1], smem_base,
+      st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_hc_pre(
+      inst.args[0],
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_POST) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, inst, smem_base,
+             tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space,
+             g_events);
+  task_dsv4_hc_post(st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_2048) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
+             tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, g_events);
+  task_silu_clamp_smem_1D<2048>(
+      inst.args[0],
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_HADAMARD) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_hadamard(
+      inst.args[0], inst.args[1], smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_gated_pool(
+      inst.args[0], inst.args[1], st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_INDEX_SCORE) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_index_score(
+      inst.args[0], smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_TOPK_512) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_topk512(
+      inst.args[0], inst.args[1], inst.args[2], st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_HEAD) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_hc_head(
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args)),
+      smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP8_QUANT_128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_fp8_quant128(
+      inst.args[0], smem_base, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_NVFP4_QUANT_16) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_nvfp4_quant16(
+      inst.args[0], smem_base, st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M128N8_DIRECT4) {
@@ -605,6 +719,30 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_2048_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
   task_rms_norm_f16_from_smem<2048, __nv_bfloat16>(
+    smem_base,
+    inst.args[0],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_512_SMEM) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
+  task_rms_norm_f16_from_smem<512, __nv_bfloat16>(
+    smem_base,
+    inst.args[0],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_1024_SMEM) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
+  task_rms_norm_f16_from_smem<1024, __nv_bfloat16>(
     smem_base,
     inst.args[0],
     *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),

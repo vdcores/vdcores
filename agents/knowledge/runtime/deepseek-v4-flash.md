@@ -41,6 +41,29 @@ yet: it synchronously reformats every K256 slice and only has one natural SM
 per M128 tile.  Defer its prepacking/TMA/split-K redesign until the broad
 model path can be profiled.
 
+## Broad functional task coverage
+
+The correctness-first single-token path now covers every DeepSeek-specific
+operation needed to assemble decode without substituting another framework's
+model math:
+
+- BF16-to-E4M3/UE8M0 block-128 activation quantization and BF16-to-ModelOpt
+  packed NVFP4/per-16-E4M3 activation quantization.
+- Partial interleaved RoPE over the final 64 of 512 dimensions, including the
+  inverse output rotation.
+- Sparse 64-head, 512-dimensional attention over supplied window/compressed
+  indices with the learned denominator-only attention sink.
+- Ratio-4/ratio-128 gated compressed-KV pooling, normalized Hadamard rotation,
+  learned 64x128 index scoring, top-512 selection, and decode index helpers.
+- Sqrt-softplus top-6 routing, hash routing, bounded 2048-wide SwiGLU, routed
+  plus shared expert reduction, and the existing quantized projection tasks.
+- 512/1024 RMSNorm, FP32-weight/BF16-input small projection, mHC pre/Sinkhorn,
+  mHC post, and final/MTP mHC-head reduction.
+
+The FP8 and FP32 schedules address each output shard through pointer offsets,
+so their instruction fields no longer cap matrices at 65,535 rows.  The FP8
+path was exercised at the actual 129,280-by-4,096 LM-head shape.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median
@@ -49,6 +72,21 @@ model path can be profiled.
   us median task time.  This is a correctness baseline, not a tuned result.
 - FP8 block-128, M4096 K4096, 152 SMs: max absolute error 1.5e-5 versus the
   quantized reference; 16.320 us median kernel span.
+- Broad functional sweep, one GB200: all 21 checks passed, including exact
+  activation-quantized bit patterns, 64x512 sparse attention with top-k 512,
+  both compression ratios, learned indexing, MoE routing/reduction, bounded
+  SwiGLU, and all mHC stages.  The selective image uses 56 registers, nine
+  barriers, a 4,160-byte stack frame, no spills, and 14,720 bytes static shared
+  memory.
+- FP8 LM-head shape M129280 K4096, 152 SMs: max absolute error 0.003906 and
+  656.800 us for the one-iteration functional check.  M4096 K4096 remained at
+  15.840 us median after pointer-offset sharding.
+
+These functional timings are exploration data, not parity claims.  In
+particular, the serial correctness top-512 selector measured 46.703 ms and the
+NVFP4 activation quantizer measured 364.256 us at K4096.  Keep them visible in
+the first end-to-end profile, but do not tune them in isolation before the
+model flow is assembled.
 
 All GPU checks must run through the cluster MPI launcher with one rank and the
 target checkout on `PYTHONPATH`.

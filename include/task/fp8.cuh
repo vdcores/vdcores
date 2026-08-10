@@ -16,7 +16,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
     int rows,
     int k,
-    int row_start,
+    int row_in_scale_block,
     const MInst *st_insts,
     M2CQueue &m2c,
     C2MQueue &c2m) {
@@ -59,14 +59,14 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
 
   for (int local_row = row_group; local_row < rows;
        local_row += kRowsPerWave) {
-    const int row = row_start + local_row;
+    const int scale_row = row_in_scale_block + local_row;
     float partial = 0.0f;
     for (int fragment_idx = lane_in_group;
          fragment_idx < num_fragments;
          fragment_idx += 16) {
       const auto weight_fragment =
           *reinterpret_cast<const InputFragment *>(
-              weight + row * k + fragment_idx * kValuesPerFragment);
+              weight + local_row * k + fragment_idx * kValuesPerFragment);
       const auto input_fragment =
           *reinterpret_cast<const InputFragment *>(
               input + fragment_idx * kValuesPerFragment);
@@ -74,7 +74,8 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
       const FloatFragment input_values = convert_fp8(input_fragment);
       const int scale_k = fragment_idx / 4;
       const float scale =
-          convert_scale(weight_scale[(row / 128) * scale_k_stride + scale_k]) *
+          convert_scale(
+              weight_scale[(scale_row / 128) * scale_k_stride + scale_k]) *
           convert_scale(input_scale[scale_k]);
 
 #pragma unroll
@@ -89,7 +90,7 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
       partial += __shfl_down_sync(group_mask, partial, offset, 16);
     }
     if (lane_in_group == 0) {
-      output[row] = cutlass::bfloat16_t(partial);
+      output[local_row] = cutlass::bfloat16_t(partial);
     }
   }
 

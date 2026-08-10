@@ -123,17 +123,164 @@ class Nvfp4GemvUmmaSm100(ComputeInstruction):
 class Fp8Block128GemvSm100(ComputeInstruction):
     """E4M3/UE8M0 block-128 decode GEMV over one output-row shard."""
 
-    def __init__(self, rows: int, k: int, row_start: int):
+    def __init__(self, rows: int, k: int, row_in_scale_block: int):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("FP8 GEMV rows must fit in a positive uint16")
         if k <= 0 or k > 0xFFFF or k % 128:
             raise ValueError("FP8 GEMV K must be a positive uint16 multiple of 128")
-        if row_start < 0 or row_start > 0xFFFF:
-            raise ValueError("FP8 GEMV row_start must fit in uint16")
+        if not 0 <= row_in_scale_block < 128:
+            raise ValueError("FP8 GEMV scale-block row offset must be in [0,128)")
         super().__init__(
             opcode=opcode.OP_FP8_BLOCK128_GEMV_SM100,
-            args=[rows, k, row_start],
+            args=[rows, k, row_in_scale_block],
         )
+
+
+class Dsv4Rope512_64(ComputeInstruction):
+    def __init__(self, rows: int, inverse: bool = False):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("DeepSeek RoPE rows must fit in a positive uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_ROPE_512_64,
+            args=[rows, int(inverse)],
+        )
+
+
+class Dsv4SparseAttention512(ComputeInstruction):
+    def __init__(self, head: int, topk: int):
+        if head < 0 or head > 0xFFFF:
+            raise ValueError("DeepSeek attention head must fit in uint16")
+        if topk <= 0 or topk > 0xFFFF:
+            raise ValueError("DeepSeek attention topk must fit in a positive uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_SPARSE_ATTENTION_512,
+            args=[head, topk],
+        )
+
+
+class Dsv4RouteTop6(ComputeInstruction):
+    def __init__(self, hash_routing: bool, route_scale: float = 1.5):
+        if route_scale <= 0:
+            raise ValueError("DeepSeek route_scale must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_ROUTE_TOP6,
+            args=[int(hash_routing), encode_bfloat16_u16(route_scale)],
+        )
+
+
+class Dsv4ExpertReduce(ComputeInstruction):
+    def __init__(self):
+        super().__init__(opcode=opcode.OP_DSV4_EXPERT_REDUCE, args=[])
+
+
+class Dsv4Fp32Bf16Gemv(ComputeInstruction):
+    def __init__(self, rows: int, k: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("DeepSeek FP32 GEMV rows must fit in uint16")
+        if k <= 0 or k > 0xFFFF:
+            raise ValueError("DeepSeek FP32 GEMV K must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP32_BF16_GEMV,
+            args=[rows, k],
+        )
+
+
+class Dsv4HcPre(ComputeInstruction):
+    def __init__(self, sinkhorn_iters: int = 20, epsilon: float = 1.0e-6):
+        if sinkhorn_iters <= 0 or sinkhorn_iters > 0xFFFF:
+            raise ValueError("DeepSeek Sinkhorn iterations must fit in uint16")
+        if epsilon <= 0:
+            raise ValueError("DeepSeek mHC epsilon must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_HC_PRE,
+            args=[sinkhorn_iters, encode_bfloat16_u16(epsilon)],
+        )
+
+
+class Dsv4HcPost(ComputeInstruction):
+    def __init__(self):
+        super().__init__(opcode=opcode.OP_DSV4_HC_POST, args=[])
+
+
+class Dsv4SiluClampMul2048(ComputeInstruction):
+    def __init__(self, num_token: int, limit: float = 10.0):
+        if num_token <= 0 or num_token > 0xFFFF:
+            raise ValueError("DeepSeek SwiGLU token count must fit in uint16")
+        if limit <= 0:
+            raise ValueError("DeepSeek SwiGLU limit must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_SILU_CLAMP_MUL_2048,
+            args=[num_token, encode_bfloat16_u16(limit)],
+        )
+
+
+class Dsv4Hadamard(ComputeInstruction):
+    def __init__(self, row: int, width: int):
+        if row < 0 or row > 0xFFFF:
+            raise ValueError("DeepSeek Hadamard row must fit in uint16")
+        if width not in (128, 512):
+            raise ValueError("DeepSeek Hadamard width must be 128 or 512")
+        super().__init__(
+            opcode=opcode.OP_DSV4_HADAMARD,
+            args=[row, width],
+        )
+
+
+class Dsv4GatedPool(ComputeInstruction):
+    def __init__(self, pool_rows: int, width: int):
+        if pool_rows <= 0 or pool_rows > 0xFFFF:
+            raise ValueError("DeepSeek gated-pool rows must fit in uint16")
+        if width not in (128, 512):
+            raise ValueError("DeepSeek gated-pool width must be 128 or 512")
+        super().__init__(
+            opcode=opcode.OP_DSV4_GATED_POOL,
+            args=[pool_rows, width],
+        )
+
+
+class Dsv4IndexScore(ComputeInstruction):
+    def __init__(self, rows: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("DeepSeek index-score rows must fit in uint16")
+        super().__init__(opcode=opcode.OP_DSV4_INDEX_SCORE, args=[rows])
+
+
+class Dsv4TopK512(ComputeInstruction):
+    def __init__(self, rows: int, topk: int, index_offset: int = 0):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("DeepSeek top-k rows must fit in uint16")
+        if topk <= 0 or topk > min(rows, 512):
+            raise ValueError("DeepSeek index top-k must be in [1,min(rows,512)]")
+        if index_offset < 0 or index_offset > 0xFFFF:
+            raise ValueError("DeepSeek index offset must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_TOPK_512,
+            args=[rows, topk, index_offset],
+        )
+
+
+class Dsv4HcHead(ComputeInstruction):
+    def __init__(self, epsilon: float = 1.0e-6):
+        if epsilon <= 0:
+            raise ValueError("DeepSeek mHC head epsilon must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_HC_HEAD,
+            args=[encode_bfloat16_u16(epsilon)],
+        )
+
+
+class Dsv4Fp8Quant128(ComputeInstruction):
+    def __init__(self, k: int):
+        if k <= 0 or k > 0xFFFF or k % 128:
+            raise ValueError("DeepSeek FP8 quant K must be a uint16 multiple of 128")
+        super().__init__(opcode=opcode.OP_DSV4_FP8_QUANT_128, args=[k])
+
+
+class Dsv4Nvfp4Quant16(ComputeInstruction):
+    def __init__(self, k: int):
+        if k <= 0 or k > 0xFFFF or k % 16:
+            raise ValueError("DeepSeek NVFP4 quant K must be a uint16 multiple of 16")
+        super().__init__(opcode=opcode.OP_DSV4_NVFP4_QUANT_16, args=[k])
 
 
 class Gemv_M64N8K64(ComputeInstruction):
@@ -574,6 +721,16 @@ class RMS_NORM_F16_K_2048_SMEM(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_2048_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
+class RMS_NORM_F16_K_512_SMEM(ComputeInstruction):
+    def __init__(self, num_token: int, epsilon: float):
+        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_512_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
+
+
+class RMS_NORM_F16_K_1024_SMEM(ComputeInstruction):
+    def __init__(self, num_token: int, epsilon: float):
+        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_1024_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
+
+
 class RMS_NORM_F16_K_5120_SMEM(ComputeInstruction):
     def __init__(self, num_token: int, epsilon: float):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_5120_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
@@ -606,6 +763,10 @@ def select_rms_smem_instruction(hidden_size: int):
         return RMS_NORM_F16_K_4096_SMEM
     if hidden_size == 2048:
         return RMS_NORM_F16_K_2048_SMEM
+    if hidden_size == 1024:
+        return RMS_NORM_F16_K_1024_SMEM
+    if hidden_size == 512:
+        return RMS_NORM_F16_K_512_SMEM
     if hidden_size == 5120:
         return RMS_NORM_F16_K_5120_SMEM
     if hidden_size == 128:
@@ -1301,6 +1462,21 @@ __all__ = [
     "Nvfp4GemvSm100",
     "Nvfp4GemvUmmaSm100",
     "Fp8Block128GemvSm100",
+    "Dsv4Rope512_64",
+    "Dsv4SparseAttention512",
+    "Dsv4RouteTop6",
+    "Dsv4ExpertReduce",
+    "Dsv4Fp32Bf16Gemv",
+    "Dsv4HcPre",
+    "Dsv4HcPost",
+    "Dsv4SiluClampMul2048",
+    "Dsv4Hadamard",
+    "Dsv4GatedPool",
+    "Dsv4IndexScore",
+    "Dsv4TopK512",
+    "Dsv4HcHead",
+    "Dsv4Fp8Quant128",
+    "Dsv4Nvfp4Quant16",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",
@@ -1340,6 +1516,8 @@ __all__ = [
     "RMS_NORM_F16_K_4096_SMEM",
     "RMS_NORM_F16_K_128_SMEM",
     "RMS_NORM_F16_K_2048_SMEM",
+    "RMS_NORM_F16_K_512_SMEM",
+    "RMS_NORM_F16_K_1024_SMEM",
     "select_attention_decode_instruction",
     "select_rms_glob_instruction",
     "select_rms_smem_instruction",

@@ -238,11 +238,99 @@ class SchedFp8Block128Gemv(Schedule):
         row_count = rows_per_sm + (1 if sm < extra else 0)
         slot = self.base_raw_slot
         return [
-            Fp8Block128GemvSm100(row_count, self.k, row_start),
-            RawAddress(self.weight, slot),
-            RawAddress(self.weight_scale, slot + 1),
+            Fp8Block128GemvSm100(row_count, self.k, row_start % 128),
+            RawAddress(self.weight[row_start], slot),
+            RawAddress(self.weight_scale[row_start // 128], slot + 1),
             RawAddress(self.activation.reshape(-1), slot + 2),
             RawAddress(self.activation_scale.reshape(-1), slot + 3),
+            RawAddress(self.output[row_start], slot + 4)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4Rope512_64(Schedule):
+    def __init__(self, input, table, output, inverse=False, base_raw_slot=24):
+        super().__init__()
+        self.input = input
+        self.table = table
+        self.output = output
+        self.inverse = inverse
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek partial RoPE currently uses exactly one SM")
+        if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
+                self.input.shape[1] != 512):
+            raise ValueError("DeepSeek RoPE input must be BF16 [rows,512]")
+        if self.output.dtype != torch.bfloat16 or self.output.shape != self.input.shape:
+            raise ValueError("DeepSeek RoPE output must match the input")
+        if (self.table.dtype != torch.float32 or
+                tuple(self.table.shape) != (32, 2)):
+            raise ValueError("DeepSeek RoPE table must be FP32 [32,2]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4Rope512_64(self.input.shape[0], self.inverse),
+            RawAddress(self.input, slot),
+            RawAddress(self.table, slot + 1),
+            RawAddress(self.output, slot + 2)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4SparseAttention512(Schedule):
+    def __init__(self, q, kv, indices, sink, output, base_raw_slot=24):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.indices = indices
+        self.sink = sink
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if (self.q.dtype != torch.bfloat16 or self.q.ndim != 2 or
+                self.q.shape[1] != 512):
+            raise ValueError("DeepSeek sparse Q must be BF16 [heads,512]")
+        self.heads = self.q.shape[0]
+        if self.num_sms != self.heads:
+            raise ValueError("DeepSeek sparse attention uses one SM per head")
+        if (self.kv.dtype != torch.bfloat16 or self.kv.ndim != 2 or
+                self.kv.shape[1] != 512):
+            raise ValueError("DeepSeek sparse KV must be BF16 [rows,512]")
+        if self.indices.dtype != torch.int32 or self.indices.ndim != 1:
+            raise ValueError("DeepSeek sparse indices must be int32 [topk]")
+        if self.indices.numel() <= 0:
+            raise ValueError("DeepSeek sparse attention needs at least one index")
+        if self.sink.dtype != torch.float32 or self.sink.numel() != self.heads:
+            raise ValueError("DeepSeek attention sink must be FP32 [heads]")
+        if self.output.dtype != torch.bfloat16 or self.output.shape != self.q.shape:
+            raise ValueError("DeepSeek sparse output must match Q")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4SparseAttention512(sm, self.indices.numel()),
+            RawAddress(self.q, slot),
+            RawAddress(self.kv, slot + 1),
+            RawAddress(self.indices, slot + 2),
+            RawAddress(self.sink, slot + 3),
             RawAddress(self.output, slot + 4)
                 .bar(self._bar("output")).writeback(),
         ]
@@ -251,6 +339,521 @@ class SchedFp8Block128Gemv(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4RouteTop6(Schedule):
+    def __init__(self, logits, bias, hash_indices, output_indices,
+                 output_weights, hash_routing=False, route_scale=1.5,
+                 base_raw_slot=24):
+        super().__init__()
+        self.logits = logits
+        self.bias = bias
+        self.hash_indices = hash_indices
+        self.output_indices = output_indices
+        self.output_weights = output_weights
+        self.hash_routing = hash_routing
+        self.route_scale = route_scale
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek routing currently uses exactly one SM")
+        if self.logits.dtype != torch.bfloat16 or self.logits.numel() != 256:
+            raise ValueError("DeepSeek routing logits must contain 256 BF16 values")
+        if self.bias.dtype != torch.float32 or self.bias.numel() != 256:
+            raise ValueError("DeepSeek routing bias must contain 256 FP32 values")
+        if self.hash_indices.dtype != torch.int32 or self.hash_indices.numel() != 6:
+            raise ValueError("DeepSeek hash routing must provide six int32 ids")
+        if self.output_indices.dtype != torch.int32 or self.output_indices.numel() != 6:
+            raise ValueError("DeepSeek route output must contain six int32 ids")
+        if self.output_weights.dtype != torch.float32 or self.output_weights.numel() != 6:
+            raise ValueError("DeepSeek route output must contain six FP32 weights")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4RouteTop6(self.hash_routing, self.route_scale),
+            RawAddress(self.logits, slot),
+            RawAddress(self.bias, slot + 1),
+            RawAddress(self.hash_indices, slot + 2),
+            RawAddress(self.output_indices, slot + 3).writeback(),
+            RawAddress(self.output_weights, slot + 4)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4ExpertReduce(Schedule):
+    def __init__(self, routed, weights, shared, output, base_raw_slot=24):
+        super().__init__()
+        self.routed = routed
+        self.weights = weights
+        self.shared = shared
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek expert reduction currently uses exactly one SM")
+        if self.routed.dtype != torch.bfloat16 or tuple(self.routed.shape) != (6, 4096):
+            raise ValueError("routed expert outputs must be BF16 [6,4096]")
+        if self.weights.dtype != torch.float32 or self.weights.numel() != 6:
+            raise ValueError("expert weights must contain six FP32 values")
+        if self.shared.dtype != torch.bfloat16 or self.shared.numel() != 4096:
+            raise ValueError("shared expert output must contain 4096 BF16 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != 4096:
+            raise ValueError("expert reduction output must contain 4096 BF16 values")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4ExpertReduce(),
+            RawAddress(self.routed, slot),
+            RawAddress(self.weights, slot + 1),
+            RawAddress(self.shared, slot + 2),
+            RawAddress(self.output, slot + 3)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4Fp32Bf16Gemv(Schedule):
+    def __init__(self, weight, input, output, base_raw_slot=24):
+        super().__init__()
+        self.weight = weight
+        self.input = input
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.weight.dtype != torch.float32 or self.weight.ndim != 2:
+            raise ValueError("DeepSeek mHC weight must be rank-2 FP32")
+        self.rows, self.k = self.weight.shape
+        if self.input.dtype != torch.bfloat16 or self.input.numel() != self.k:
+            raise ValueError("DeepSeek mHC input must be BF16 [K]")
+        if self.output.dtype != torch.float32 or self.output.numel() != self.rows:
+            raise ValueError("DeepSeek mHC GEMV output must be FP32 [rows]")
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("DeepSeek mHC GEMV requires 1 <= num_sms <= rows")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        slot = self.base_raw_slot
+        return [
+            Dsv4Fp32Bf16Gemv(row_count, self.k),
+            RawAddress(self.weight[row_start], slot),
+            RawAddress(self.input, slot + 1),
+            RawAddress(self.output[row_start], slot + 2)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4HcPre(Schedule):
+    def __init__(self, residual, mixes, scale, base, output, post, comb,
+                 sinkhorn_iters=20, epsilon=1.0e-6, base_raw_slot=24):
+        super().__init__()
+        self.residual = residual
+        self.mixes = mixes
+        self.scale = scale
+        self.base = base
+        self.output = output
+        self.post = post
+        self.comb = comb
+        self.sinkhorn_iters = sinkhorn_iters
+        self.epsilon = epsilon
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek mHC pre currently uses exactly one SM")
+        if self.residual.dtype != torch.bfloat16 or tuple(self.residual.shape) != (4, 4096):
+            raise ValueError("mHC residual must be BF16 [4,4096]")
+        if self.mixes.dtype != torch.float32 or self.mixes.numel() != 24:
+            raise ValueError("mHC mixes must contain 24 FP32 values")
+        if self.scale.dtype != torch.float32 or self.scale.numel() != 3:
+            raise ValueError("mHC scale must contain three FP32 values")
+        if self.base.dtype != torch.float32 or self.base.numel() != 24:
+            raise ValueError("mHC base must contain 24 FP32 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != 4096:
+            raise ValueError("mHC pre output must contain 4096 BF16 values")
+        if self.post.dtype != torch.float32 or self.post.numel() != 4:
+            raise ValueError("mHC post coefficients must contain four FP32 values")
+        if self.comb.dtype != torch.float32 or tuple(self.comb.shape) != (4, 4):
+            raise ValueError("mHC combination matrix must be FP32 [4,4]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4HcPre(self.sinkhorn_iters, self.epsilon),
+            RawAddress(self.residual, slot),
+            RawAddress(self.mixes, slot + 1),
+            RawAddress(self.scale, slot + 2),
+            RawAddress(self.base, slot + 3),
+            RawAddress(self.output, slot + 4)
+                .bar(self._bar("output")).writeback(),
+            RawAddress(self.post, slot + 5).writeback(),
+            RawAddress(self.comb, slot + 6).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4HcPost(Schedule):
+    def __init__(self, branch, residual, post, comb, output, base_raw_slot=24):
+        super().__init__()
+        self.branch = branch
+        self.residual = residual
+        self.post = post
+        self.comb = comb
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek mHC post currently uses exactly one SM")
+        if self.branch.dtype != torch.bfloat16 or self.branch.numel() != 4096:
+            raise ValueError("mHC branch must contain 4096 BF16 values")
+        if self.residual.dtype != torch.bfloat16 or tuple(self.residual.shape) != (4, 4096):
+            raise ValueError("mHC residual must be BF16 [4,4096]")
+        if self.post.dtype != torch.float32 or self.post.numel() != 4:
+            raise ValueError("mHC post coefficients must contain four FP32 values")
+        if self.comb.dtype != torch.float32 or tuple(self.comb.shape) != (4, 4):
+            raise ValueError("mHC combination matrix must be FP32 [4,4]")
+        if self.output.dtype != torch.bfloat16 or tuple(self.output.shape) != (4, 4096):
+            raise ValueError("mHC post output must be BF16 [4,4096]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4HcPost(),
+            RawAddress(self.branch, slot),
+            RawAddress(self.residual, slot + 1),
+            RawAddress(self.post, slot + 2),
+            RawAddress(self.comb, slot + 3),
+            RawAddress(self.output, slot + 4)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4Hadamard(Schedule):
+    def __init__(self, input, output, base_raw_slot=24):
+        super().__init__()
+        self.input = input
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
+                self.input.shape[1] not in (128, 512)):
+            raise ValueError("DeepSeek Hadamard input must be BF16 [rows,128|512]")
+        if self.output.dtype != torch.bfloat16 or self.output.shape != self.input.shape:
+            raise ValueError("DeepSeek Hadamard output must match the input")
+        self.rows, self.width = self.input.shape
+        if self.num_sms != self.rows:
+            raise ValueError("DeepSeek Hadamard uses one SM per row")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4Hadamard(sm, self.width),
+            RawAddress(self.input, slot),
+            RawAddress(self.output, slot + 1)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4GatedPool(Schedule):
+    def __init__(self, values, scores, output, base_raw_slot=24):
+        super().__init__()
+        self.values = values
+        self.scores = scores
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek gated pooling currently uses exactly one SM")
+        if (self.values.dtype != torch.float32 or self.values.ndim != 2 or
+                self.values.shape[1] not in (128, 512)):
+            raise ValueError("DeepSeek gated-pool values must be FP32 [rows,128|512]")
+        if self.scores.dtype != torch.float32 or self.scores.shape != self.values.shape:
+            raise ValueError("DeepSeek gated-pool scores must match the values")
+        if (self.output.dtype != torch.bfloat16 or self.output.ndim != 1 or
+                self.output.shape[0] != self.values.shape[1]):
+            raise ValueError("DeepSeek gated-pool output must be BF16 [width]")
+        self.pool_rows, self.width = self.values.shape
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4GatedPool(self.pool_rows, self.width),
+            RawAddress(self.values, slot),
+            RawAddress(self.scores, slot + 1),
+            RawAddress(self.output, slot + 2)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4IndexScore(Schedule):
+    def __init__(self, q, kv, head_weights, output, base_raw_slot=24):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.head_weights = head_weights
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.q.dtype != torch.bfloat16 or tuple(self.q.shape) != (64, 128):
+            raise ValueError("DeepSeek index Q must be BF16 [64,128]")
+        if (self.kv.dtype != torch.bfloat16 or self.kv.ndim != 2 or
+                self.kv.shape[1] != 128):
+            raise ValueError("DeepSeek index KV must be BF16 [rows,128]")
+        self.rows = self.kv.shape[0]
+        if self.head_weights.dtype != torch.float32 or self.head_weights.numel() != 64:
+            raise ValueError("DeepSeek index head weights must be FP32 [64]")
+        if self.output.dtype != torch.float32 or self.output.numel() != self.rows:
+            raise ValueError("DeepSeek index scores must be FP32 [rows]")
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("DeepSeek index score requires 1 <= num_sms <= rows")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        slot = self.base_raw_slot
+        return [
+            Dsv4IndexScore(row_count),
+            RawAddress(self.q, slot),
+            RawAddress(self.kv[row_start], slot + 1),
+            RawAddress(self.head_weights, slot + 2),
+            RawAddress(self.output[row_start], slot + 3)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4TopK512(Schedule):
+    def __init__(self, scores, output, index_offset=0, base_raw_slot=24):
+        super().__init__()
+        self.scores = scores
+        self.output = output
+        self.index_offset = index_offset
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek index top-k currently uses exactly one SM")
+        if self.scores.dtype != torch.float32 or self.scores.ndim != 1:
+            raise ValueError("DeepSeek index scores must be FP32 [rows]")
+        if (self.scores.numel() <= 0 or self.scores.numel() > 0xFFFF or
+                self.output.numel() <= 0 or
+                self.output.numel() > min(self.scores.numel(), 512)):
+            raise ValueError("DeepSeek index top-k dimensions are invalid")
+        if self.output.dtype != torch.int32 or self.output.ndim != 1:
+            raise ValueError("DeepSeek index output must be int32 [topk]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4TopK512(
+                self.scores.numel(), self.output.numel(), self.index_offset
+            ),
+            RawAddress(self.scores, slot),
+            RawAddress(self.output, slot + 1)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4HcHead(Schedule):
+    def __init__(self, residual, mixes, scale, base, output,
+                 epsilon=1.0e-6, base_raw_slot=24):
+        super().__init__()
+        self.residual = residual
+        self.mixes = mixes
+        self.scale = scale
+        self.base = base
+        self.output = output
+        self.epsilon = epsilon
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek mHC head currently uses exactly one SM")
+        if self.residual.dtype != torch.bfloat16 or tuple(self.residual.shape) != (4, 4096):
+            raise ValueError("mHC head residual must be BF16 [4,4096]")
+        if self.mixes.dtype != torch.float32 or self.mixes.numel() != 4:
+            raise ValueError("mHC head mixes must contain four FP32 values")
+        if self.scale.dtype != torch.float32 or self.scale.numel() != 1:
+            raise ValueError("mHC head scale must contain one FP32 value")
+        if self.base.dtype != torch.float32 or self.base.numel() != 4:
+            raise ValueError("mHC head base must contain four FP32 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != 4096:
+            raise ValueError("mHC head output must contain 4096 BF16 values")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4HcHead(self.epsilon),
+            RawAddress(self.residual, slot),
+            RawAddress(self.mixes, slot + 1),
+            RawAddress(self.scale, slot + 2),
+            RawAddress(self.base, slot + 3),
+            RawAddress(self.output, slot + 4)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4Fp8Quant128(Schedule):
+    def __init__(self, input, output, scale, base_raw_slot=24):
+        super().__init__()
+        self.input = input
+        self.output = output
+        self.scale = scale
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek FP8 activation quantization uses one SM")
+        if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
+            raise ValueError("DeepSeek FP8 quant input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % 128:
+            raise ValueError("DeepSeek FP8 quant K must be divisible by 128")
+        if (self.output.dtype != torch.float8_e4m3fn or
+                self.output.shape != self.input.shape):
+            raise ValueError("DeepSeek FP8 quant output must be E4M3 [K]")
+        if (self.scale.dtype != torch.float8_e8m0fnu or
+                self.scale.numel() != self.k // 128):
+            raise ValueError("DeepSeek FP8 quant scale must be UE8M0 [K/128]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4Fp8Quant128(self.k),
+            RawAddress(self.input, slot),
+            RawAddress(self.output, slot + 1).writeback(),
+            RawAddress(self.scale, slot + 2)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4Nvfp4Quant16(Schedule):
+    def __init__(self, input, global_scale, output, scale, base_raw_slot=24):
+        super().__init__()
+        self.input = input
+        self.global_scale = global_scale
+        self.output = output
+        self.scale = scale
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek NVFP4 activation quantization uses one SM")
+        if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
+            raise ValueError("DeepSeek NVFP4 quant input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % 16:
+            raise ValueError("DeepSeek NVFP4 quant K must be divisible by 16")
+        if self.global_scale.dtype != torch.float32 or self.global_scale.numel() != 1:
+            raise ValueError("DeepSeek NVFP4 global scale must be scalar FP32")
+        if self.output.dtype != torch.uint8 or self.output.numel() != self.k // 2:
+            raise ValueError("DeepSeek NVFP4 quant output must be packed uint8 [K/2]")
+        if (self.scale.dtype != torch.float8_e4m3fn or
+                self.scale.numel() != self.k // 16):
+            raise ValueError("DeepSeek NVFP4 quant scale must be E4M3 [K/16]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4Nvfp4Quant16(self.k),
+            RawAddress(self.input, slot),
+            RawAddress(self.global_scale.reshape(-1), slot + 1),
+            RawAddress(self.output, slot + 2).writeback(),
+            RawAddress(self.scale, slot + 3)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
 
 
 class ListSchedule(Schedule):
@@ -1614,7 +2217,8 @@ class SchedSmemSiLUInterleaved(Schedule):
                  up_glob: torch.Tensor,
                  out_glob: torch.Tensor,
                  shards_per_token: int = 1,
-                 fixed_shard_id: int | None = None):
+                 fixed_shard_id: int | None = None,
+                 swiglu_limit: float = 0.0):
         super().__init__()
         self.num_token = num_token
         self.gate_glob = gate_glob
@@ -1622,6 +2226,7 @@ class SchedSmemSiLUInterleaved(Schedule):
         self.out_glob = out_glob
         self.shards_per_token = shards_per_token
         self.fixed_shard_id = fixed_shard_id
+        self.swiglu_limit = swiglu_limit
 
     def _on_place(self):
         if self.shards_per_token == 3:
@@ -1641,6 +2246,10 @@ class SchedSmemSiLUInterleaved(Schedule):
             self.tokens_per_sm = 1
             return
         assert self.shards_per_token == 1, "Supported SwiGLU shard counts are 1 and 3"
+        if self.gate_glob.shape != self.up_glob.shape or self.gate_glob.shape != self.out_glob.shape:
+            raise ValueError("SwiGLU gate, up, and output tensors must match")
+        if self.gate_glob.shape[-1] not in (2048, 4096):
+            raise ValueError("SwiGLU supports 2048- or 4096-wide rows")
         assert self.num_token % self.num_sms == 0, "Number of tokens must be divisible by number of SMs"
         self.tokens_per_sm = self.num_token // self.num_sms
 
@@ -1663,7 +2272,9 @@ class SchedSmemSiLUInterleaved(Schedule):
             input_bar = fine_input if fine_input is not None else self._bar("input")
             output_bar = fine_output if fine_output is not None else self._bar("output")
             return [
-                SILU_MUL_SHARED_BF16_K_2048_INTER(1),
+                (Dsv4SiluClampMul2048(1, self.swiglu_limit)
+                 if self.swiglu_limit > 0
+                 else SILU_MUL_SHARED_BF16_K_2048_INTER(1)),
                 TmaStore1D(self.out_glob[token_id, shard_start:shard_end])
                     .bar(output_bar).group(),
                 TmaLoad1D(self.gate_glob[token_id, shard_start:shard_end])
@@ -1679,8 +2290,22 @@ class SchedSmemSiLUInterleaved(Schedule):
             if i == start_token_id:
                 gate = gate.bar(self._bar("input")).group()
 
+            width = self.gate_glob.shape[-1]
+            if width == 2048:
+                silu = (
+                    Dsv4SiluClampMul2048(1, self.swiglu_limit)
+                    if self.swiglu_limit > 0
+                    else SILU_MUL_SHARED_BF16_K_2048_INTER(1)
+                )
+            else:
+                if self.swiglu_limit > 0:
+                    raise ValueError(
+                        "bounded SwiGLU is currently implemented for K=2048"
+                    )
+                silu = SILU_MUL_SHARED_BF16_K_4096_INTER(1)
+
             insts.extend([
-                SILU_MUL_SHARED_BF16_K_4096_INTER(1),
+                silu,
                 TmaStore1D(self.out_glob[i]).bar(self._bar("output")).group(),
                 gate,
                 TmaLoad1D(self.up_glob[i]),

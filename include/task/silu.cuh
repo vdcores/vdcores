@@ -198,3 +198,55 @@ __device__ __forceinline__ void task_silu_smem_1D(
     // a write push ensures the threading order
     c2m.template push<0>(threadIdx.x, slot_gate | slot_up);
 }
+
+template<int K,
+         typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_silu_clamp_smem_1D(
+    const int N,
+    const float limit,
+    void *base,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+    using data_t = __nv_bfloat16;
+    using Tr = F16Traits<data_t>;
+    using fetch_t = typename Tr::vec2_t;
+    struct alignas(16) Pack128 {
+        fetch_t values[4];
+    };
+    static_assert(K % 8 == 0, "128-bit BF16 vector path requires K divisible by 8");
+
+    const int slot_out = m2c.pop();
+    auto *sOut = static_cast<Pack128 *>(get_slot_address(base, extract(slot_out)));
+    const int slot_gate = m2c.pop();
+    const auto *sGate = static_cast<const Pack128 *>(
+        get_slot_address(base, extract(slot_gate)));
+    const int slot_up = m2c.pop();
+    const auto *sUp = static_cast<const Pack128 *>(
+        get_slot_address(base, extract(slot_up)));
+
+    constexpr int kComputeThreads = numComputeWarps * numThreadsPerWarp;
+    constexpr int kPacksPerToken = K / 8;
+    for (int i = threadIdx.x; i < kPacksPerToken * N; i += kComputeThreads) {
+        const Pack128 gate = sGate[i];
+        const Pack128 up = sUp[i];
+        Pack128 out;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 gate_values = Tr::to_float2(gate.values[j]);
+            float2 up_values = Tr::to_float2(up.values[j]);
+            gate_values.x = fminf(gate_values.x, limit);
+            gate_values.y = fminf(gate_values.y, limit);
+            up_values.x = fminf(fmaxf(up_values.x, -limit), limit);
+            up_values.y = fminf(fmaxf(up_values.y, -limit), limit);
+            float2 result;
+            result.x = gate_values.x / (1.0f + expf(-gate_values.x)) * up_values.x;
+            result.y = gate_values.y / (1.0f + expf(-gate_values.y)) * up_values.y;
+            out.values[j] = Tr::from_float2(result);
+        }
+        sOut[i] = out;
+    }
+
+    c2m.template push<0, true>(threadIdx.x, slot_out);
+    c2m.template push<0>(threadIdx.x, slot_gate | slot_up);
+}

@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""Single-GPU correctness sweep for DeepSeek-V4-Flash-specific tasks."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Callable
+
+import torch
+
+from dae.deepseek_v4 import (
+    DeepSeekV4FlashConfig,
+    apply_partial_rope_512_64,
+    bounded_swiglu,
+    gated_pool_reference,
+    hadamard_reference,
+    hc_head_reference,
+    hc_post_reference,
+    hc_pre_reference,
+    index_score_reference,
+    route_top6_reference,
+    sparse_attention_512_reference,
+)
+from dae.deepseek_v4_quant import quantize_fp8_block128, quantize_nvfp4
+from dae.launcher import Launcher
+from dae.schedule import (
+    SchedDsv4ExpertReduce,
+    SchedDsv4Fp8Quant128,
+    SchedDsv4Fp32Bf16Gemv,
+    SchedDsv4GatedPool,
+    SchedDsv4Hadamard,
+    SchedDsv4HcHead,
+    SchedDsv4HcPost,
+    SchedDsv4HcPre,
+    SchedDsv4IndexScore,
+    SchedDsv4Nvfp4Quant16,
+    SchedDsv4Rope512_64,
+    SchedDsv4RouteTop6,
+    SchedDsv4SparseAttention512,
+    SchedDsv4TopK512,
+    SchedRMS,
+    SchedSmemSiLUInterleaved,
+)
+
+
+def launch(schedule, num_sms: int, device: torch.device) -> float:
+    launcher = Launcher(num_sms, device=device)
+    launcher.s(schedule.place(num_sms))
+    launcher.launch()
+    profile = launcher.profile[:, :2].cpu().numpy()
+    return float(profile[:, 1].max() - profile[:, 0].min()) / 1.0e3
+
+
+def report_close(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+    latency_us: float,
+) -> None:
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    print(
+        f"DSV4_FUNCTIONAL task={name} status=PASS "
+        f"max_abs={max_abs:.8f} latency_us={latency_us:.3f}",
+        flush=True,
+    )
+
+
+def run_rope(device: torch.device, generator: torch.Generator) -> None:
+    rows = 64
+    source = torch.randn(
+        (rows, 512), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    angles = torch.linspace(-1.25, 1.25, 32, dtype=torch.float32, device=device)
+    table = torch.stack((angles.cos(), angles.sin()), dim=1)
+    for inverse in (False, True):
+        output = torch.empty_like(source)
+        latency = launch(
+            SchedDsv4Rope512_64(source, table, output, inverse=inverse),
+            1,
+            device,
+        )
+        expected = apply_partial_rope_512_64(source, table, inverse=inverse)
+        report_close(
+            f"rope512_64_inverse_{int(inverse)}",
+            output,
+            expected,
+            rtol=1.0e-2,
+            atol=1.0e-2,
+            latency_us=latency,
+        )
+
+
+def run_quantization(device: torch.device, generator: torch.Generator) -> None:
+    source = torch.randn(
+        (4096,), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    source[::257] *= 16
+
+    fp8_output = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    fp8_scale = torch.empty(
+        (source.numel() // 128,), dtype=torch.float8_e8m0fnu, device=device
+    )
+    fp8_latency = launch(
+        SchedDsv4Fp8Quant128(source, fp8_output, fp8_scale), 1, device
+    )
+    expected_fp8, expected_fp8_scale = quantize_fp8_block128(source)
+    torch.testing.assert_close(
+        fp8_output.view(torch.uint8),
+        expected_fp8.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        fp8_scale.view(torch.uint8),
+        expected_fp8_scale.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    print(
+        "DSV4_FUNCTIONAL task=fp8_activation_quant128 status=PASS "
+        f"max_abs=0.00000000 latency_us={fp8_latency:.3f}",
+        flush=True,
+    )
+
+    expected_nvfp4, expected_nvfp4_scale, global_scale = quantize_nvfp4(source)
+    nvfp4_output = torch.empty(
+        (source.numel() // 2,), dtype=torch.uint8, device=device
+    )
+    nvfp4_scale = torch.empty(
+        (source.numel() // 16,), dtype=torch.float8_e4m3fn, device=device
+    )
+    nvfp4_latency = launch(
+        SchedDsv4Nvfp4Quant16(
+            source, global_scale, nvfp4_output, nvfp4_scale
+        ),
+        1,
+        device,
+    )
+    torch.testing.assert_close(nvfp4_output, expected_nvfp4, rtol=0, atol=0)
+    torch.testing.assert_close(
+        nvfp4_scale.view(torch.uint8),
+        expected_nvfp4_scale.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    print(
+        "DSV4_FUNCTIONAL task=nvfp4_activation_quant16 status=PASS "
+        f"max_abs=0.00000000 latency_us={nvfp4_latency:.3f}",
+        flush=True,
+    )
+
+
+def run_attention(device: torch.device, generator: torch.Generator) -> None:
+    config = DeepSeekV4FlashConfig()
+    kv_rows = 768
+    q = torch.randn(
+        (config.num_heads, config.head_dim),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    ) * 0.125
+    kv = torch.randn(
+        (kv_rows, config.head_dim),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    ) * 0.125
+    indices = torch.randperm(kv_rows, generator=generator, device=device)[
+        : config.index_topk
+    ].to(torch.int32)
+    sink = torch.linspace(
+        -0.5, 0.5, config.num_heads, dtype=torch.float32, device=device
+    )
+    output = torch.empty_like(q)
+    latency = launch(
+        SchedDsv4SparseAttention512(q, kv, indices, sink, output),
+        config.num_heads,
+        device,
+    )
+    expected = sparse_attention_512_reference(q, kv, indices, sink)
+    report_close(
+        "sparse_attention_h64_d512_k512",
+        output,
+        expected,
+        rtol=3.0e-2,
+        atol=1.0e-2,
+        latency_us=latency,
+    )
+
+
+def run_router(device: torch.device, generator: torch.Generator) -> None:
+    logits = torch.randn(
+        (256,), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    bias = torch.linspace(-0.4, 0.4, 256, dtype=torch.float32, device=device)
+    bias[[3, 29, 71]] += torch.tensor(
+        [3.0, 2.0, 1.0], dtype=torch.float32, device=device
+    )
+    hash_indices = torch.tensor(
+        [9, 71, 5, 255, 130, 44], dtype=torch.int32, device=device
+    )
+
+    for hash_routing in (False, True):
+        output_indices = torch.empty((6,), dtype=torch.int32, device=device)
+        output_weights = torch.empty((6,), dtype=torch.float32, device=device)
+        latency = launch(
+            SchedDsv4RouteTop6(
+                logits,
+                bias,
+                hash_indices,
+                output_indices,
+                output_weights,
+                hash_routing=hash_routing,
+            ),
+            1,
+            device,
+        )
+        expected_weights, expected_indices = route_top6_reference(
+            logits,
+            bias,
+            hash_indices=hash_indices if hash_routing else None,
+        )
+        torch.testing.assert_close(output_indices, expected_indices, rtol=0, atol=0)
+        report_close(
+            f"route_top6_hash_{int(hash_routing)}",
+            output_weights,
+            expected_weights,
+            rtol=2.0e-5,
+            atol=2.0e-5,
+            latency_us=latency,
+        )
+
+
+def run_expert_reduce(device: torch.device, generator: torch.Generator) -> None:
+    routed = torch.randn(
+        (6, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    weights = torch.rand((6,), generator=generator, dtype=torch.float32, device=device)
+    weights = weights / weights.sum() * 1.5
+    shared = torch.randn(
+        (4096,), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    output = torch.empty_like(shared)
+    latency = launch(
+        SchedDsv4ExpertReduce(routed, weights, shared, output), 1, device
+    )
+    expected = (
+        shared.float() + (routed.float() * weights[:, None]).sum(dim=0)
+    ).to(torch.bfloat16)
+    report_close(
+        "expert_reduce_top6_shared1",
+        output,
+        expected,
+        rtol=2.0e-2,
+        atol=1.0e-2,
+        latency_us=latency,
+    )
+
+
+def run_compression_indexer(
+    device: torch.device,
+    generator: torch.Generator,
+) -> None:
+    q_source = torch.randn(
+        (64, 128), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    q = torch.empty_like(q_source)
+    hadamard_latency = launch(
+        SchedDsv4Hadamard(q_source, q), 64, device
+    )
+    report_close(
+        "index_hadamard_h64_d128",
+        q,
+        hadamard_reference(q_source),
+        rtol=2.0e-2,
+        atol=2.0e-2,
+        latency_us=hadamard_latency,
+    )
+
+    wide_source = torch.randn(
+        (2, 512), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    wide_output = torch.empty_like(wide_source)
+    wide_latency = launch(
+        SchedDsv4Hadamard(wide_source, wide_output), 2, device
+    )
+    report_close(
+        "hadamard_rows2_d512",
+        wide_output,
+        hadamard_reference(wide_source),
+        rtol=2.0e-2,
+        atol=2.0e-2,
+        latency_us=wide_latency,
+    )
+
+    pool_shapes = ((8, 512, "ratio4_overlap"), (128, 512, "ratio128"))
+    for pool_rows, width, label in pool_shapes:
+        values = torch.randn(
+            (pool_rows, width),
+            generator=generator,
+            dtype=torch.float32,
+            device=device,
+        ) * 0.125
+        scores = torch.randn(
+            (pool_rows, width),
+            generator=generator,
+            dtype=torch.float32,
+            device=device,
+        )
+        pooled = torch.empty((width,), dtype=torch.bfloat16, device=device)
+        pool_latency = launch(
+            SchedDsv4GatedPool(values, scores, pooled), 1, device
+        )
+        expected_pool = gated_pool_reference(values, scores).to(torch.bfloat16)
+        report_close(
+            f"compress_pool_{label}",
+            pooled,
+            expected_pool,
+            rtol=2.0e-2,
+            atol=1.0e-2,
+            latency_us=pool_latency,
+        )
+
+    rows = 640
+    kv = torch.randn(
+        (rows, 128), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    head_weights = torch.randn(
+        (64,), generator=generator, dtype=torch.float32, device=device
+    ) / (128 * 64) ** 0.5
+    scores = torch.empty((rows,), dtype=torch.float32, device=device)
+    num_sms = min(rows, torch.cuda.get_device_properties(device).multi_processor_count)
+    score_latency = launch(
+        SchedDsv4IndexScore(q, kv, head_weights, scores), num_sms, device
+    )
+    expected_scores = index_score_reference(q, kv, head_weights)
+    report_close(
+        "index_score_h64_d128",
+        scores,
+        expected_scores,
+        rtol=2.0e-4,
+        atol=2.0e-4,
+        latency_us=score_latency,
+    )
+
+    indices = torch.empty((512,), dtype=torch.int32, device=device)
+    topk_latency = launch(
+        SchedDsv4TopK512(scores, indices, index_offset=128), 1, device
+    )
+    expected_indices = scores.topk(512).indices.to(torch.int32) + 128
+    torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+    print(
+        "DSV4_FUNCTIONAL task=index_topk512 status=PASS "
+        f"max_abs=0.00000000 latency_us={topk_latency:.3f}",
+        flush=True,
+    )
+
+
+def run_hc(device: torch.device, generator: torch.Generator) -> None:
+    residual = torch.randn(
+        (4, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    projection = torch.randn(
+        (24, 4 * 4096), generator=generator, dtype=torch.float32, device=device
+    ) * 0.005
+    mixes = torch.empty((24,), dtype=torch.float32, device=device)
+    gemv_latency = launch(
+        SchedDsv4Fp32Bf16Gemv(projection, residual.reshape(-1), mixes),
+        24,
+        device,
+    )
+    expected_mixes = projection @ residual.float().reshape(-1)
+    report_close(
+        "hc_projection_fp32_bf16",
+        mixes,
+        expected_mixes,
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        latency_us=gemv_latency,
+    )
+
+    scale = torch.tensor([0.75, 1.25, 0.5], dtype=torch.float32, device=device)
+    base = torch.randn(
+        (24,), generator=generator, dtype=torch.float32, device=device
+    ) * 0.1
+    hidden = torch.empty((4096,), dtype=torch.bfloat16, device=device)
+    post = torch.empty((4,), dtype=torch.float32, device=device)
+    comb = torch.empty((4, 4), dtype=torch.float32, device=device)
+    pre_latency = launch(
+        SchedDsv4HcPre(residual, mixes, scale, base, hidden, post, comb),
+        1,
+        device,
+    )
+    expected_hidden, expected_post, expected_comb = hc_pre_reference(
+        residual, mixes, scale, base
+    )
+    report_close(
+        "hc_pre_hidden",
+        hidden,
+        expected_hidden,
+        rtol=2.0e-2,
+        atol=1.0e-2,
+        latency_us=pre_latency,
+    )
+    torch.testing.assert_close(post, expected_post, rtol=2.0e-5, atol=2.0e-5)
+    torch.testing.assert_close(comb, expected_comb, rtol=2.0e-5, atol=2.0e-5)
+
+    branch = torch.randn(
+        (4096,), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    output = torch.empty_like(residual)
+    post_latency = launch(
+        SchedDsv4HcPost(branch, residual, post, comb, output), 1, device
+    )
+    expected_output = hc_post_reference(branch, residual, post, comb)
+    report_close(
+        "hc_post",
+        output,
+        expected_output,
+        rtol=2.0e-2,
+        atol=1.0e-2,
+        latency_us=post_latency,
+    )
+
+    head_mixes = mixes[:4].clone()
+    head_scale = torch.tensor([0.625], dtype=torch.float32, device=device)
+    head_base = base[:4].clone()
+    head_output = torch.empty((4096,), dtype=torch.bfloat16, device=device)
+    head_latency = launch(
+        SchedDsv4HcHead(
+            residual, head_mixes, head_scale, head_base, head_output
+        ),
+        1,
+        device,
+    )
+    expected_head = hc_head_reference(
+        residual, head_mixes, head_scale, head_base
+    )
+    report_close(
+        "hc_head",
+        head_output,
+        expected_head,
+        rtol=2.0e-2,
+        atol=1.0e-2,
+        latency_us=head_latency,
+    )
+
+
+def run_norm_activation(device: torch.device, generator: torch.Generator) -> None:
+    for width in (512, 1024):
+        source = torch.randn(
+            (1, width), generator=generator, dtype=torch.bfloat16, device=device
+        ) * 0.25
+        weight = (
+            torch.randn(
+                (width,), generator=generator, dtype=torch.bfloat16, device=device
+            )
+            * 0.05
+            + 1.0
+        )
+        output = torch.empty_like(source)
+        latency = launch(
+            SchedRMS(1, 1.0e-6, source, output, weight, hidden_size=width),
+            1,
+            device,
+        )
+        expected = (
+            source.float()
+            * torch.rsqrt(source.float().square().mean(dim=-1, keepdim=True) + 1.0e-6)
+            * weight.float()
+        ).to(torch.bfloat16)
+        report_close(
+            f"rmsnorm_{width}",
+            output,
+            expected,
+            rtol=3.0e-2,
+            atol=3.0e-2,
+            latency_us=latency,
+        )
+
+    gate = torch.randn(
+        (1, 2048), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 8.0
+    up = torch.randn(
+        (1, 2048), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 8.0
+    output = torch.empty_like(gate)
+    latency = launch(
+        SchedSmemSiLUInterleaved(
+            1, gate, up, output, swiglu_limit=10.0
+        ),
+        1,
+        device,
+    )
+    expected = bounded_swiglu(gate, up, limit=10.0)
+    report_close(
+        "bounded_swiglu_2048",
+        output,
+        expected,
+        rtol=2.0e-2,
+        atol=6.0e-2,
+        latency_us=latency,
+    )
+
+
+def main() -> None:
+    tasks: dict[str, Callable[[torch.device, torch.Generator], None]] = {
+        "quantization": run_quantization,
+        "rope": run_rope,
+        "attention": run_attention,
+        "router": run_router,
+        "expert-reduce": run_expert_reduce,
+        "compression-indexer": run_compression_indexer,
+        "hc": run_hc,
+        "norm-activation": run_norm_activation,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=("all", *tasks), default="all")
+    parser.add_argument("--seed", type=int, default=20260810)
+    args = parser.parse_args()
+
+    device = torch.device("cuda")
+    torch.set_float32_matmul_precision("highest")
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    selected = tasks.items() if args.task == "all" else ((args.task, tasks[args.task]),)
+    for _, function in selected:
+        function(device, generator)
+
+    props = torch.cuda.get_device_properties(device)
+    print(
+        f"DSV4_FUNCTIONAL_SUMMARY status=PASS device={props.name!r} "
+        f"cc={props.major}.{props.minor} task={args.task}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
