@@ -303,9 +303,15 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
         bf16_weight, fp32_input, bf16_output
     ).place(num_sms)
     bf16_instructions = bf16_schedule.schedule(sm)
-    assert bf16_instructions[0].args == [row_count, 1]
+    assert bf16_instructions[0].args == [row_count, 1, 0]
     assert bf16_instructions[1].tensor.data_ptr() == bf16_weight[row_start].data_ptr()
     assert bf16_instructions[3].tensor.data_ptr() == bf16_output[row_start].data_ptr()
+
+    fp32_from_bf16 = torch.empty((rows,), dtype=torch.float32)
+    fp32_from_bf16_schedule = SchedDsv4Bf16Gemv(
+        bf16_weight, fp32_input, fp32_from_bf16
+    ).place(num_sms)
+    assert fp32_from_bf16_schedule.schedule(sm)[0].args == [row_count, 1, 1]
 
 
 def test_activation_quant_schedules_shard_whole_scale_blocks(monkeypatch):

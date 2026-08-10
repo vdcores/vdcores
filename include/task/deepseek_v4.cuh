@@ -502,6 +502,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_bf16_gemv(
     int rows,
     int k,
+    bool output_fp32,
     void *smem_base,
     const MInst *st_insts,
     M2CQueue &m2c,
@@ -513,8 +514,7 @@ __device__ __forceinline__ void task_dsv4_bf16_gemv(
   const auto *input = static_cast<const __nv_bfloat16 *>(
       slot_2_glob_ptr(st_insts, input_slot));
   const int output_slot = m2c.template pop<0>();
-  auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+  void *output = slot_2_glob_ptr(st_insts, output_slot);
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
@@ -537,8 +537,14 @@ __device__ __forceinline__ void task_dsv4_bf16_gemv(
     }
     __sync_compute_group(128);
     if (tid == 0) {
-      output[local_row] = __float2bfloat16(
-          warp_reduce[0] + warp_reduce[1] + warp_reduce[2] + warp_reduce[3]);
+      const float value = warp_reduce[0] + warp_reduce[1] +
+                          warp_reduce[2] + warp_reduce[3];
+      if (output_fp32) {
+        static_cast<float *>(output)[local_row] = value;
+      } else {
+        static_cast<__nv_bfloat16 *>(output)[local_row] =
+            __float2bfloat16(value);
+      }
     }
     __sync_compute_group(128);
   }

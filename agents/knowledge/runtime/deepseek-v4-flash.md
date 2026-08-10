@@ -215,25 +215,35 @@ compressor/index projections execute for coverage but their outputs are not
 consumed.  The harness also streams weights from local storage and launches
 tasks individually.
 
-The harness now also supports the early autoregressive positions before the
-first ratio-4 compressed entry.  Its generated main and Yarn-scaled compressor
-RoPE tables match the official Transformers implementation exactly, and it
-keeps a 128-row circular window KV cache for every layer.  A two-step run from
-token 791 recomputed position zero, fed token 14 back at position one, attended
-both live KV rows in all 43 layers, and emitted `[14, 223]`, exactly matching
-vLLM's greedy IDs.  The streaming steps took 87.241 and 88.270 seconds
+The harness now also supports the first four autoregressive positions.  Its
+generated main and Yarn-scaled compressor RoPE tables match the official
+Transformers implementation exactly, and it keeps a 128-row circular window
+KV cache plus FP32 compressor/index partial state for every layer.  A two-step
+run from token 791 recomputed position zero, fed token 14 back at position one,
+attended both live KV rows in all 43 layers, and emitted `[14, 223]`, exactly
+matching vLLM's greedy IDs.  The streaming steps took 87.241 and 88.270 seconds
 (175.519 seconds total); these timings include checkpoint I/O, allocation, and
-individual Python launches and remain non-performance data.  The next
-correctness gate is position three, where CSA's first ratio-4 compressed and
-index entries become attention-visible.
+individual Python launches and remain non-performance data.
+
+The position-three gate exposed that ordinary Q/K and inverse-output RoPE is
+layer-dependent: SWA layers use the main theta, while CSA/HCA layers use the
+same Yarn-scaled compressor theta as their compressed keys.  After fixing that
+selection, a four-step, 43-layer run emitted `[14, 223, 18, 90]`, exactly
+matching vLLM.  Position three pooled and normalized the first ratio-4 entry,
+ran the 128-wide Hadamard indexer and top-k selection, and consumed the selected
+compressed row in all 21 CSA layers.  The four streamed steps took 354.070
+seconds total and remain functional rather than performance data.  The next
+cache-state breadth gate is the first ratio-128 HCA entry; it should be reached
+without treating the streaming harness's checkpoint I/O as model TBT.
 
 ## Profiling and optimization gate
 
-Detailed tuning starts only after the position-three run consumes populated
-window/compressor/index state and matches its framework token.  Then make the
-full non-MTP checkpoint resident on one GPU, retain enough memory for the
-matched cache lengths, and measure launch-inclusive decode without checkpoint
-I/O or per-layer allocation/free time.
+Detailed tuning starts only after the broad cache-state and resident-model
+functional gates.  The position-three CSA gate now passes.  Next make the full
+non-MTP checkpoint resident on one GPU, retain enough memory for the matched
+cache lengths, and measure launch-inclusive decode without checkpoint I/O or
+per-layer allocation/free time.  Validate the ratio-128 HCA transition as part
+of that resident flow before optimizing individual tasks.
 
 Use batch 1 and identical greedy two-token requests for VDCores, vLLM, and
 SGLang at context lengths 128, 512, and 4096.  Record warmups, at least 30 timed

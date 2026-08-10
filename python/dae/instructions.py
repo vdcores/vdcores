@@ -198,14 +198,14 @@ class Dsv4Fp32Bf16Gemv(ComputeInstruction):
 
 
 class Dsv4Bf16Gemv(ComputeInstruction):
-    def __init__(self, rows: int, k: int):
+    def __init__(self, rows: int, k: int, output_fp32: bool = False):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("DeepSeek BF16 GEMV rows must fit in uint16")
         if k <= 0 or k > 0xFFFF:
             raise ValueError("DeepSeek BF16 GEMV K must fit in uint16")
         super().__init__(
             opcode=opcode.OP_DSV4_BF16_GEMV,
-            args=[rows, k],
+            args=[rows, k, int(output_fp32)],
         )
 
 

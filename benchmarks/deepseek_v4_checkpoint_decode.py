@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Stream a real DeepSeek-V4 checkpoint through VDCores on one GPU.
 
-The early autoregressive breadth gate supports positions before the first
-ratio-4 compressed entry.  It preserves each layer's sliding-window KV state,
-uses the checkpoint's position-dependent RoPE, and greedily feeds each output
-token into the next step.  Weights are loaded lazily from worker-local storage
-and released after use, so the complete model runs on one GPU without first
-duplicating the 157-GiB checkpoint in host or device memory.  This is a
-functional flow, not TBT data.
+The autoregressive breadth gate preserves each layer's sliding-window,
+compressor, and index state, uses the checkpoint's position-dependent RoPE,
+and greedily feeds each output token into the next step.  Weights are loaded
+lazily from worker-local storage and released after use, so the complete model
+runs on one GPU without first duplicating the 157-GiB checkpoint in host or
+device memory.  This is a functional flow, not TBT data.
 """
 
 from __future__ import annotations
@@ -35,15 +34,18 @@ from dae.schedule import (
     SchedDsv4ExpertReduce,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
+    SchedDsv4GatedPool,
     SchedDsv4Hadamard,
     SchedDsv4HcHead,
     SchedDsv4HcPost,
     SchedDsv4HcPre,
+    SchedDsv4IndexScore,
     SchedDsv4Nvfp4Quant16,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
+    SchedDsv4TopK512,
     SchedFp8Block128Gemv,
     SchedNvfp4Gemv,
     SchedRMS,
@@ -76,6 +78,11 @@ class CheckpointDecode:
             dtype=torch.bfloat16,
             device=device,
         )
+        self.compressor_partials: dict[
+            tuple[int, str], tuple[list[torch.Tensor], list[torch.Tensor]]
+        ] = {}
+        self.attention_compressed: dict[int, list[torch.Tensor]] = {}
+        self.index_compressed: dict[int, list[torch.Tensor]] = {}
 
     def _run(self, schedule, sms: int) -> None:
         launcher = Launcher(sms, device=self.device)
@@ -207,6 +214,7 @@ class CheckpointDecode:
         source: torch.Tensor,
         *,
         row_slice: slice | None = None,
+        output_dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         if row_slice is None:
             weight = self._load([name])[name]
@@ -215,13 +223,74 @@ class CheckpointDecode:
                 name, row_slice, device=str(self.device)
             )
         output = torch.empty(
-            (weight.shape[0],), dtype=torch.bfloat16, device=self.device
+            (weight.shape[0],), dtype=output_dtype, device=self.device
         )
         self._run(
             SchedDsv4Bf16Gemv(weight, source.reshape(-1), output),
             min(output.numel(), self.sms),
         )
         return output
+
+    def _compress(
+        self,
+        layer_id: int,
+        state_name: str,
+        prefix: str,
+        normalized: torch.Tensor,
+        position: int,
+        ratio: int,
+        head_dim: int,
+    ) -> torch.Tensor | None:
+        kv = self._bf16_weight(
+            f"{prefix}.wkv.weight",
+            normalized,
+            output_dtype=torch.float32,
+        )
+        gate = self._bf16_weight(
+            f"{prefix}.wgate.weight",
+            normalized,
+            output_dtype=torch.float32,
+        )
+        ape = self._load([f"{prefix}.ape"])[f"{prefix}.ape"]
+        gate.add_(ape[position % ratio])
+        kv_rows, gate_rows = self.compressor_partials.setdefault(
+            (layer_id, state_name), ([], [])
+        )
+        kv_rows.append(kv)
+        gate_rows.append(gate)
+        if (position + 1) % ratio:
+            return None
+
+        current_kv = torch.stack(kv_rows[-ratio:])
+        current_gate = torch.stack(gate_rows[-ratio:])
+        if ratio == 4:
+            values = current_kv[:, head_dim:]
+            scores = current_gate[:, head_dim:]
+            if len(kv_rows) > ratio:
+                previous_kv = torch.stack(kv_rows[-2 * ratio : -ratio])
+                previous_gate = torch.stack(gate_rows[-2 * ratio : -ratio])
+                values = torch.cat((previous_kv[:, :head_dim], values))
+                scores = torch.cat((previous_gate[:, :head_dim], scores))
+        else:
+            values = current_kv
+            scores = current_gate
+
+        pooled = torch.empty(
+            (head_dim,), dtype=torch.bfloat16, device=self.device
+        )
+        self._run(SchedDsv4GatedPool(values, scores, pooled), 1)
+        norm = self._load([f"{prefix}.norm.weight"])[f"{prefix}.norm.weight"]
+        pooled = self._rms(pooled, norm)
+        compressed_position = position - ratio + 1
+        table = deepseek_v4_rope_table(
+            compressed_position,
+            compressed=True,
+            config=self.config,
+            device=self.device,
+        )
+        if head_dim == self.config.head_dim:
+            return self._rope512(pooled, table=table)
+        return self._rope128(pooled, table=table)
 
     def _hc_pre(
         self,
@@ -274,12 +343,21 @@ class CheckpointDecode:
         self._run(SchedDsv4HcPost(branch, residual, post, comb, output), 1)
         return output
 
-    def _rope512(self, source: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+    def _rope512(
+        self,
+        source: torch.Tensor,
+        *,
+        inverse: bool = False,
+        table: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         rows = source.reshape(-1, 512)
         output = torch.empty_like(rows)
         self._run(
             SchedDsv4Rope512_64(
-                rows, self.main_rope_table, output, inverse=inverse
+                rows,
+                self.main_rope_table if table is None else table,
+                output,
+                inverse=inverse,
             ),
             1,
         )
@@ -292,14 +370,35 @@ class CheckpointDecode:
         q_rank_activation: torch.Tensor,
         q_rank_scale: torch.Tensor,
         position: int,
-    ) -> None:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         plan = build_layer_decode_plan(layer_id, position, self.config)
         if plan.compress_ratio:
             prefix = f"layers.{layer_id}.attn.compressor"
-            self._bf16_weight(f"{prefix}.wkv.weight", normalized)
-            self._bf16_weight(f"{prefix}.wgate.weight", normalized)
+            compressed = self._compress(
+                layer_id,
+                "attention",
+                prefix,
+                normalized,
+                position,
+                plan.compress_ratio,
+                self.config.head_dim,
+            )
+            if compressed is not None:
+                self.attention_compressed.setdefault(layer_id, []).append(
+                    compressed.reshape(-1)
+                )
         if plan.attention_kind != "csa":
-            return
+            rows = self.attention_compressed.get(layer_id, [])
+            if not rows:
+                return None, None
+            compressed_kv = torch.stack(rows)
+            indices = torch.arange(
+                self.config.sliding_window,
+                self.config.sliding_window + len(rows),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            return compressed_kv, indices
         prefix = f"layers.{layer_id}.attn.indexer"
         linear = self.checkpoint.load_fp8_linear(
             f"{prefix}.wq_b", device=str(self.device)
@@ -308,15 +407,87 @@ class CheckpointDecode:
         index_q = self._rope128(index_q.reshape(64, 128))
         transformed = torch.empty_like(index_q)
         self._run(SchedDsv4Hadamard(index_q, transformed), 64)
-        self._bf16_weight(f"{prefix}.weights_proj.weight", normalized)
+        head_weights = self._bf16_weight(
+            f"{prefix}.weights_proj.weight", normalized
+        ).float()
+        head_weights.mul_(
+            self.config.index_head_dim**-0.5 * self.config.index_heads**-0.5
+        )
         compressor = f"{prefix}.compressor"
-        self._bf16_weight(f"{compressor}.wkv.weight", normalized)
-        self._bf16_weight(f"{compressor}.wgate.weight", normalized)
+        compressed_index = self._compress(
+            layer_id,
+            "index",
+            compressor,
+            normalized,
+            position,
+            plan.compress_ratio,
+            self.config.index_head_dim,
+        )
+        if compressed_index is not None:
+            transformed_index = torch.empty_like(compressed_index.reshape(1, -1))
+            self._run(
+                SchedDsv4Hadamard(
+                    compressed_index.reshape(1, -1), transformed_index
+                ),
+                1,
+            )
+            self.index_compressed.setdefault(layer_id, []).append(
+                transformed_index.reshape(-1)
+            )
 
-    def _rope128(self, source: torch.Tensor) -> torch.Tensor:
+        attention_rows = self.attention_compressed.get(layer_id, [])
+        index_rows = self.index_compressed.get(layer_id, [])
+        if not attention_rows:
+            return None, None
+        if len(attention_rows) != len(index_rows):
+            raise AssertionError(
+                f"layer {layer_id} attention/index compressor counts differ"
+            )
+        compressed_kv = torch.stack(attention_rows)
+        index_kv = torch.stack(index_rows)
+        scores = torch.empty(
+            (len(index_rows),), dtype=torch.float32, device=self.device
+        )
+        self._run(
+            SchedDsv4IndexScore(
+                transformed,
+                index_kv,
+                head_weights,
+                scores,
+            ),
+            min(scores.numel(), self.sms),
+        )
+        selected = torch.empty(
+            (min(self.config.index_topk, scores.numel()),),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._run(
+            SchedDsv4TopK512(
+                scores,
+                selected,
+                index_offset=self.config.sliding_window,
+            ),
+            1,
+        )
+        return compressed_kv, selected
+
+    def _rope128(
+        self,
+        source: torch.Tensor,
+        *,
+        table: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         rows = source.reshape(-1, 128)
         output = torch.empty_like(rows)
-        self._run(SchedDsv4Rope128_64(rows, self.compress_rope_table, output), 1)
+        self._run(
+            SchedDsv4Rope128_64(
+                rows,
+                self.compress_rope_table if table is None else table,
+                output,
+            ),
+            1,
+        )
         return output.reshape_as(source)
 
     def _attention(
@@ -326,6 +497,11 @@ class CheckpointDecode:
         position: int,
     ) -> torch.Tensor:
         prefix = f"layers.{layer_id}.attn"
+        rope_table = (
+            self.main_rope_table
+            if self.config.compress_ratios[layer_id] == 0
+            else self.compress_rope_table
+        )
         hidden_activation, hidden_scale = self._quant_fp8(normalized)
         q_a = self.checkpoint.load_fp8_linear(
             f"{prefix}.wq_a", device=str(self.device)
@@ -341,7 +517,7 @@ class CheckpointDecode:
         )
         q = self._fp8_loaded(q_b, q_rank_activation, q_rank_scale).reshape(64, 512)
         q = self._rms(q)
-        q = self._rope512(q)
+        q = self._rope512(q, table=rope_table)
 
         kv_linear = self.checkpoint.load_fp8_linear(
             f"{prefix}.wkv", device=str(self.device)
@@ -351,8 +527,8 @@ class CheckpointDecode:
             f"{prefix}.kv_norm.weight"
         ]
         kv = self._rms(kv, kv_norm_weight)
-        kv = self._rope512(kv.reshape(1, 512))
-        self._attention_side_paths(
+        kv = self._rope512(kv.reshape(1, 512), table=rope_table)
+        compressed_kv, compressed_indices = self._attention_side_paths(
             layer_id,
             normalized,
             q_rank_activation,
@@ -371,12 +547,18 @@ class CheckpointDecode:
             indices = decode_window_indices(
                 position, self.config.sliding_window
             ).to(self.device)
+        attention_kv = cache
+        if compressed_kv is not None:
+            attention_kv = torch.cat((cache, compressed_kv))
+            indices = torch.cat((indices, compressed_indices))
         attended = torch.empty_like(q)
         self._run(
-            SchedDsv4SparseAttention512(q, cache, indices, sink, attended),
+            SchedDsv4SparseAttention512(
+                q, attention_kv, indices, sink, attended
+            ),
             64,
         )
-        attended = self._rope512(attended, inverse=True)
+        attended = self._rope512(attended, inverse=True, table=rope_table)
 
         grouped = attended.reshape(self.config.o_groups, -1)
         wo_a = self.checkpoint.load_fp8_linear(
@@ -659,9 +841,9 @@ def main() -> None:
     if not 0 <= args.token_id < config.vocab_size:
         parser.error("token-id is outside the vocabulary")
     if args.start_pos != 0:
-        parser.error("the early real-checkpoint breadth gate supports start-pos=0")
-    if not 1 <= args.decode_tokens <= 3:
-        parser.error("decode-tokens must be in [1,3] before compressed-cache support")
+        parser.error("the real-checkpoint breadth gate currently requires start-pos=0")
+    if not 1 <= args.decode_tokens <= 4:
+        parser.error("decode-tokens must be in [1,4] for the current breadth gate")
     if not 1 <= args.vocab_size <= config.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0:

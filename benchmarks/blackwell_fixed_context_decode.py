@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Measure launch-inclusive framework decode at a fixed KV context length.
 
-Each invocation configures one engine for one context length.  Every request
-has ``context - 1`` prompt tokens and produces exactly two output tokens.  The
-interval between the framework's first- and second-token engine timestamps is
-therefore one decode step whose attention sees ``context`` KV tokens.  Prefill
-and the first-token latency are not part of the reported interval.
+Each invocation configures one engine for one context length.  By default,
+every request has ``context - 1`` prompt tokens and produces exactly two output
+tokens.  The interval between the framework's first- and second-token engine
+timestamps is therefore one decode step whose attention sees ``context`` KV
+tokens.  Prefill and the first-token latency are not part of the reported
+interval.  Longer output sequences may be requested for correctness reference,
+but they deliberately do not emit a fixed-context timing result.
 """
 
 from __future__ import annotations
@@ -65,7 +67,7 @@ def run_vllm(args: argparse.Namespace) -> None:
             )
 
     context = args.contexts[0]
-    engine_max_model_len = context + 1
+    engine_max_model_len = context - 1 + args.output_tokens
     # The measured first->second-token interval is decode-only only if every
     # request completes prefill before the first token is emitted.  Size the
     # scheduler's token budget for the complete strict batch; otherwise vLLM
@@ -77,10 +79,14 @@ def run_vllm(args: argparse.Namespace) -> None:
         f"framework=vllm batch={args.batch} context={context} "
         f"engine_max_model_len={engine_max_model_len} dtype=bfloat16 "
         f"kv_cache_dtype={args.kv_cache_dtype} "
+        f"output_tokens={args.output_tokens} "
         f"max_num_batched_tokens={engine_max_num_batched_tokens} "
         "strict_batch=1 unchunked_strict_prefill=1",
         flush=True,
     )
+    engine_options = {}
+    if args.disable_flashinfer_autotune:
+        engine_options["kernel_config"] = {"enable_flashinfer_autotune": False}
     engine = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -96,11 +102,12 @@ def run_vllm(args: argparse.Namespace) -> None:
         trust_remote_code=False,
         disable_log_stats=False,
         profiler_config=profiler_config,
+        **engine_options,
     )
     sampling = SamplingParams(
         temperature=0.0,
         ignore_eos=True,
-        max_tokens=2,
+        max_tokens=args.output_tokens,
         detokenize=False,
     )
 
@@ -140,14 +147,15 @@ def run_vllm(args: argparse.Namespace) -> None:
                 metrics = output.metrics
                 if metrics is None or metrics.first_token_ts <= 0:
                     raise RuntimeError("vLLM did not return engine token timestamps")
-                if metrics.num_generation_tokens != 2:
+                if metrics.num_generation_tokens != args.output_tokens:
                     raise RuntimeError(
-                        "expected two generated tokens, got "
+                        f"expected {args.output_tokens} generated tokens, got "
                         f"{metrics.num_generation_tokens}"
                     )
-                request_ms.append(
-                    (metrics.last_token_ts - metrics.first_token_ts) * 1.0e3
-                )
+                if args.output_tokens == 2:
+                    request_ms.append(
+                        (metrics.last_token_ts - metrics.first_token_ts) * 1.0e3
+                    )
                 if args.emit_token_ids:
                     token_ids = list(output.outputs[0].token_ids)
                     print(
@@ -159,9 +167,11 @@ def run_vllm(args: argparse.Namespace) -> None:
             # Requests in one decode batch normally share a timestamp.  Taking
             # the maximum retains the full batch step if completion handling
             # introduces a small skew.
-            samples_ms.append(max(request_ms))
+            if args.output_tokens == 2:
+                samples_ms.append(max(request_ms))
 
-        emit_result("vllm", vllm.__version__, context, args.batch, samples_ms)
+        if args.output_tokens == 2:
+            emit_result("vllm", vllm.__version__, context, args.batch, samples_ms)
 
         if context == args.profile_context:
             # Async scheduling can dispatch the next GPU graph before the
@@ -191,12 +201,13 @@ def run_sglang(args: argparse.Namespace) -> None:
     import sglang
 
     context = args.contexts[0]
-    engine_context_length = context + 16
+    engine_context_length = context - 1 + args.output_tokens + 16
     engine_max_prefill_tokens = args.batch * (context - 1)
     print(
         "FIXED_CONTEXT_CONFIG "
         f"framework=sglang batch={args.batch} context={context} "
         f"engine_context_length={engine_context_length} dtype=bfloat16 "
+        f"output_tokens={args.output_tokens} "
         f"max_prefill_tokens={engine_max_prefill_tokens} "
         "strict_batch=1 unchunked_strict_prefill=1",
         flush=True,
@@ -227,7 +238,7 @@ def run_sglang(args: argparse.Namespace) -> None:
     sampling = {
         "temperature": 0.0,
         "ignore_eos": True,
-        "max_new_tokens": 2,
+        "max_new_tokens": args.output_tokens,
     }
 
     def generate_once(input_ids: list[list[int]]) -> list[dict]:
@@ -238,7 +249,7 @@ def run_sglang(args: argparse.Namespace) -> None:
             stream=True,
         ):
             meta = output["meta_info"]
-            if meta.get("completion_tokens") == 2:
+            if meta.get("completion_tokens") == args.output_tokens:
                 final_outputs[output["index"]] = output
         if len(final_outputs) != args.batch:
             raise RuntimeError(
@@ -261,20 +272,21 @@ def run_sglang(args: argparse.Namespace) -> None:
                 request_ms = []
                 for request_id, output in enumerate(outputs):
                     meta = output["meta_info"]
-                    if meta.get("completion_tokens") != 2:
+                    if meta.get("completion_tokens") != args.output_tokens:
                         raise RuntimeError(
-                            "expected two generated tokens, got "
+                            f"expected {args.output_tokens} generated tokens, got "
                             f"{meta.get('completion_tokens')}"
                         )
-                    decode_throughput = meta.get("decode_throughput")
-                    if decode_throughput is None or decode_throughput <= 0:
-                        raise RuntimeError(
-                            "SGLang did not return a positive decode throughput: "
-                            f"meta_info={meta!r}"
-                        )
-                    # With two output tokens, decode_throughput is exactly the
-                    # reciprocal of the one-token decode interval.
-                    request_ms.append(1.0e3 / decode_throughput)
+                    if args.output_tokens == 2:
+                        decode_throughput = meta.get("decode_throughput")
+                        if decode_throughput is None or decode_throughput <= 0:
+                            raise RuntimeError(
+                                "SGLang did not return a positive decode throughput: "
+                                f"meta_info={meta!r}"
+                            )
+                        # With two output tokens, decode_throughput is exactly the
+                        # reciprocal of the one-token decode interval.
+                        request_ms.append(1.0e3 / decode_throughput)
                     if args.emit_token_ids:
                         print(
                             "FIXED_CONTEXT_TOKENS "
@@ -283,11 +295,13 @@ def run_sglang(args: argparse.Namespace) -> None:
                             f"token_ids={output['output_ids']}",
                             flush=True,
                         )
-                samples_ms.append(max(request_ms))
+                if args.output_tokens == 2:
+                    samples_ms.append(max(request_ms))
 
-            emit_result(
-                "sglang", sglang.__version__, context, args.batch, samples_ms
-            )
+            if args.output_tokens == 2:
+                emit_result(
+                    "sglang", sglang.__version__, context, args.batch, samples_ms
+                )
     finally:
         engine.shutdown()
 
@@ -304,6 +318,12 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--output-tokens", type=int, default=2)
+    parser.add_argument(
+        "--disable-flashinfer-autotune",
+        action="store_true",
+        help="skip FlashInfer MoE autotuning for functional reference runs",
+    )
     parser.add_argument(
         "--emit-token-ids",
         action="store_true",
@@ -326,8 +346,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.batch <= 0 or args.warmups < 0 or args.samples <= 0:
-        parser.error("batch and samples must be positive; warmups must be non-negative")
+    if (
+        args.batch <= 0
+        or args.warmups < 0
+        or args.samples <= 0
+        or args.output_tokens < 2
+    ):
+        parser.error(
+            "batch, samples, and output-tokens must be positive (at least two "
+            "output tokens); warmups must be non-negative"
+        )
     if len(args.contexts) != 1:
         parser.error(
             "fixed-context results require exactly one --contexts value per process "
@@ -348,6 +376,10 @@ def main() -> None:
             parser.error("--profile-dir is not used with --profile-kind cuda")
     elif args.profile_dir:
         parser.error("--profile-dir requires --profile-context")
+    if args.profile_context is not None and args.output_tokens != 2:
+        parser.error("fixed-context profiling requires --output-tokens=2")
+    if args.disable_flashinfer_autotune and args.framework != "vllm":
+        parser.error("--disable-flashinfer-autotune currently supports only vLLM")
 
     if args.framework == "vllm":
         run_vllm(args)

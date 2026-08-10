@@ -511,8 +511,10 @@ class SchedDsv4Bf16Gemv(Schedule):
         self.rows, self.k = self.weight.shape
         if self.input.dtype != torch.bfloat16 or self.input.numel() != self.k:
             raise ValueError("DeepSeek BF16 GEMV input must contain K BF16 values")
-        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
-            raise ValueError("DeepSeek BF16 GEMV output must contain M BF16 values")
+        if self.output.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("DeepSeek BF16 GEMV output must be BF16 or FP32")
+        if self.output.numel() != self.rows:
+            raise ValueError("DeepSeek BF16 GEMV output must contain M values")
         if self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("DeepSeek BF16 GEMV requires 1 <= num_sms <= M")
         if self.base_raw_slot < config.num_slots or self.base_raw_slot + 2 >= 32:
@@ -526,7 +528,9 @@ class SchedDsv4Bf16Gemv(Schedule):
         row_count = rows_per_sm + (1 if sm < extra else 0)
         slot = self.base_raw_slot
         return [
-            Dsv4Bf16Gemv(row_count, self.k),
+            Dsv4Bf16Gemv(
+                row_count, self.k, output_fp32=self.output.dtype == torch.float32
+            ),
             RawAddress(self.weight[row_start], slot),
             RawAddress(self.input.reshape(-1), slot + 1),
             RawAddress(self.output[row_start], slot + 2)

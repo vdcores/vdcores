@@ -493,6 +493,22 @@ def run_bf16_linear(device: torch.device, generator: torch.Generator) -> None:
         latency_us=latency,
     )
 
+    output_fp32 = torch.empty((rows,), dtype=torch.float32, device=device)
+    latency = launch(
+        SchedDsv4Bf16Gemv(weight, source, output_fp32),
+        min(rows, torch.cuda.get_device_properties(device).multi_processor_count),
+        device,
+    )
+    expected_fp32 = weight.float() @ source.float()
+    report_close(
+        "bf16_checkpoint_gemv_fp32",
+        output_fp32,
+        expected_fp32,
+        rtol=1.0e-5,
+        atol=1.0e-5,
+        latency_us=latency,
+    )
+
 
 def run_norm_activation(device: torch.device, generator: torch.Generator) -> None:
     for width in (512, 1024):
