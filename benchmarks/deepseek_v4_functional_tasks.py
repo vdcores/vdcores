@@ -11,6 +11,7 @@ import torch
 
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
+    apply_partial_rope_128_64,
     apply_partial_rope_512_64,
     bounded_swiglu,
     gated_pool_reference,
@@ -35,6 +36,7 @@ from dae.schedule import (
     SchedDsv4HcPre,
     SchedDsv4IndexScore,
     SchedDsv4Nvfp4Quant16,
+    SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
@@ -83,28 +85,29 @@ def report_close(
 
 
 def run_rope(device: torch.device, generator: torch.Generator) -> None:
-    rows = 64
-    source = torch.randn(
-        (rows, 512), generator=generator, dtype=torch.bfloat16, device=device
-    )
     angles = torch.linspace(-1.25, 1.25, 32, dtype=torch.float32, device=device)
     table = torch.stack((angles.cos(), angles.sin()), dim=1)
-    for inverse in (False, True):
-        output = torch.empty_like(source)
-        latency = launch(
-            SchedDsv4Rope512_64(source, table, output, inverse=inverse),
-            1,
-            device,
+    for width, schedule_cls, reference in (
+        (512, SchedDsv4Rope512_64, apply_partial_rope_512_64),
+        (128, SchedDsv4Rope128_64, apply_partial_rope_128_64),
+    ):
+        source = torch.randn(
+            (64, width), generator=generator, dtype=torch.bfloat16, device=device
         )
-        expected = apply_partial_rope_512_64(source, table, inverse=inverse)
-        report_close(
-            f"rope512_64_inverse_{int(inverse)}",
-            output,
-            expected,
-            rtol=1.0e-2,
-            atol=1.0e-2,
-            latency_us=latency,
-        )
+        for inverse in (False, True):
+            output = torch.empty_like(source)
+            latency = launch(
+                schedule_cls(source, table, output, inverse=inverse), 1, device
+            )
+            expected = reference(source, table, inverse=inverse)
+            report_close(
+                f"rope{width}_64_inverse_{int(inverse)}",
+                output,
+                expected,
+                rtol=1.0e-2,
+                atol=1.0e-2,
+                latency_us=latency,
+            )
 
 
 def run_quantization(device: torch.device, generator: torch.Generator) -> None:

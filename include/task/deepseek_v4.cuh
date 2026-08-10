@@ -157,15 +157,15 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
 }
 
 // Apply the DeepSeek partial rotary embedding to the final 64 dimensions of
-// each 512-wide row.  The table is float32 [32, 2] in (cos, sin) order.
-template <typename M2CQueue, typename C2MQueue>
-__device__ __forceinline__ void task_dsv4_rope_512_64(
+// each attention (512-wide) or indexer (128-wide) row.  The table is float32
+// [32, 2] in (cos, sin) order.
+template <int kHeadDim, typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_rope_64(
     int rows,
     bool inverse,
     const MInst *st_insts,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  constexpr int kHeadDim = 512;
   constexpr int kRopeDim = 64;
   constexpr int kRopeStart = kHeadDim - kRopeDim;
 

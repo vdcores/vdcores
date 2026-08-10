@@ -50,8 +50,9 @@ model math:
 - BF16-to-E4M3/UE8M0 block-128 activation quantization and BF16-to-ModelOpt
   packed NVFP4/per-16-E4M3 activation quantization.  Both schedules shard only
   at complete scale-block boundaries and can use all available SMs.
-- Partial interleaved RoPE over the final 64 of 512 dimensions, including the
-  inverse output rotation.
+- Partial interleaved RoPE over the final 64 dimensions of both the 512-wide
+  attention heads and 128-wide indexer heads, including the inverse attention
+  output rotation.
 - Sparse 64-head, 512-dimensional attention over supplied window/compressed
   indices with the learned denominator-only attention sink.
 - Ratio-4/ratio-128 gated compressed-KV pooling, normalized Hadamard rotation,
@@ -122,6 +123,30 @@ package or disturb an occupied device.
 
 These timings remain exploration data.  Assemble and profile the whole model
 before doing finer task tuning.
+
+## Synthetic single-GPU decode flow
+
+`python/dae/deepseek_v4_flow.py` describes the official per-token layer order
+and cache/index cardinalities.  `benchmarks/deepseek_v4_synthetic_decode.py`
+connects that plan to VDCores schedules for all attention families, both
+compressors, CSA indexing, mHC residual paths, NVFP4 routed experts, the FP8
+shared expert and other quantized projections, and the final head.  It keeps
+checkpoint-sized tensor dimensions while reusing one deterministic tensor per
+weight shape; this makes it a topology/dataflow test rather than a checkpoint,
+quality, memory-footprint, or TBT claim.
+
+On one GB200, the following breadth checks completed with finite residuals and
+logits:
+
+- 43 layers at position 127: 2 SWA, 21 CSA, 20 HCA, and the full 129,280-token
+  vocabulary head.
+- 43 layers at position 4095: the same layer mix with 1,024 compressed CSA
+  rows, exact top-512 selection, and 640 attention candidates.
+
+The synthetic graph deliberately remains untuned and currently executes many
+individual task launches.  The next functional milestone is loading real
+checkpoint tensors into this flow; only then should its profile drive task
+fusion, launch reduction, and TBT work.
 
 All GPU checks must run through the cluster MPI launcher with one rank and the
 target checkout on `PYTHONPATH`.

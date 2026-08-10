@@ -292,6 +292,32 @@ class SchedDsv4Rope512_64(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4Rope128_64(SchedDsv4Rope512_64):
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek index RoPE currently uses exactly one SM")
+        if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
+                self.input.shape[1] != 128):
+            raise ValueError("DeepSeek index RoPE input must be BF16 [rows,128]")
+        if self.output.dtype != torch.bfloat16 or self.output.shape != self.input.shape:
+            raise ValueError("DeepSeek index RoPE output must match the input")
+        if (self.table.dtype != torch.float32 or
+                tuple(self.table.shape) != (32, 2)):
+            raise ValueError("DeepSeek index RoPE table must be FP32 [32,2]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        slot = self.base_raw_slot
+        return [
+            Dsv4Rope128_64(self.input.shape[0], self.inverse),
+            RawAddress(self.input, slot),
+            RawAddress(self.table, slot + 1),
+            RawAddress(self.output, slot + 2)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+
 class SchedDsv4SparseAttention512(Schedule):
     def __init__(self, q, kv, indices, sink, output, base_raw_slot=24):
         super().__init__()

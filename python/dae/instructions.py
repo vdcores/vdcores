@@ -146,6 +146,18 @@ class Dsv4Rope512_64(ComputeInstruction):
         )
 
 
+class Dsv4Rope128_64(ComputeInstruction):
+    def __init__(self, rows: int, inverse: bool = False):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError(
+                "DeepSeek index RoPE rows must fit in a positive uint16"
+            )
+        super().__init__(
+            opcode=opcode.OP_DSV4_ROPE_128_64,
+            args=[rows, int(inverse)],
+        )
+
+
 class Dsv4SparseAttention512(ComputeInstruction):
     def __init__(self, head: int, topk: int):
         if head < 0 or head > 0xFFFF:
@@ -1463,6 +1475,7 @@ __all__ = [
     "Nvfp4GemvUmmaSm100",
     "Fp8Block128GemvSm100",
     "Dsv4Rope512_64",
+    "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",

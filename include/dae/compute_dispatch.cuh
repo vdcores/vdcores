@@ -143,7 +143,14 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_SM100) {
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_512_64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_rope_512_64(
+  task_dsv4_rope_64<512>(
+      inst.args[0], inst.args[1] != 0, st_insts, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_128_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_rope_64<128>(
       inst.args[0], inst.args[1] != 0, st_insts, m2c, c2m);
 }
 

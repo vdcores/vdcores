@@ -2,6 +2,7 @@ import torch
 
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
+    apply_partial_rope_128_64,
     apply_partial_rope_512_64,
     bounded_swiglu,
     decode_compressed_indices,
@@ -14,6 +15,7 @@ from dae.deepseek_v4 import (
     route_top6_reference,
     sparse_attention_512_reference,
 )
+from dae.deepseek_v4_flow import build_decode_plan, build_layer_decode_plan
 from dae.runtime import opcode
 from dae.schedule import (
     SchedDsv4Fp32Bf16Gemv,
@@ -35,6 +37,40 @@ def test_deepseek_v4_flash_config_covers_transformer_and_mtp():
     assert config.experts_per_token == 6
 
 
+def test_decode_plan_covers_all_attention_families_and_model_stages():
+    plan = build_decode_plan(127)
+
+    assert len(plan) == 43
+    assert sum(layer.attention_kind == "swa" for layer in plan) == 2
+    assert sum(layer.attention_kind == "csa" for layer in plan) == 21
+    assert sum(layer.attention_kind == "hca" for layer in plan) == 20
+    assert sum(layer.hash_routing for layer in plan) == 3
+    assert all(layer.should_compress for layer in plan if layer.compress_ratio)
+    assert plan[0].attention_candidates == 128
+    assert plan[2].attention_candidates == 160
+    assert plan[3].attention_candidates == 129
+    assert "index_topk" in plan[2].stages
+    assert "index_topk" not in plan[3].stages
+    assert plan[0].stages[-4:] == (
+        "routed_expert_nvfp4",
+        "shared_expert_fp8",
+        "expert_reduce",
+        "hc_ffn_post",
+    )
+
+
+def test_long_context_plan_caps_only_csa_compressed_selection():
+    csa = build_layer_decode_plan(2, 4095)
+    hca = build_layer_decode_plan(3, 4095)
+
+    assert csa.compressed_rows == 1024
+    assert csa.compressed_selected == 512
+    assert csa.attention_candidates == 640
+    assert hca.compressed_rows == 32
+    assert hca.compressed_selected == 32
+    assert hca.attention_candidates == 160
+
+
 def test_partial_rope_preserves_prefix_and_supports_inverse():
     source = torch.linspace(-1, 1, 2 * 512, dtype=torch.float32).reshape(2, 512)
     angles = torch.linspace(-0.7, 0.7, 32)
@@ -45,6 +81,18 @@ def test_partial_rope_preserves_prefix_and_supports_inverse():
 
     torch.testing.assert_close(rotated[:, :-64], source[:, :-64], rtol=0, atol=0)
     torch.testing.assert_close(restored, source, rtol=1.0e-6, atol=1.0e-6)
+
+    index_source = source[:, :128].clone()
+    index_rotated = apply_partial_rope_128_64(index_source, table)
+    index_restored = apply_partial_rope_128_64(
+        index_rotated, table, inverse=True
+    )
+    torch.testing.assert_close(
+        index_rotated[:, :-64], index_source[:, :-64], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        index_restored, index_source, rtol=1.0e-6, atol=1.0e-6
+    )
 
 
 def test_sparse_attention_sink_is_denominator_only():

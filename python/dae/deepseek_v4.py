@@ -55,15 +55,14 @@ class DeepSeekV4FlashConfig:
         ]
 
 
-def apply_partial_rope_512_64(
+def _apply_partial_rope_64(
     tensor: torch.Tensor,
     table: torch.Tensor,
     *,
     inverse: bool = False,
 ) -> torch.Tensor:
-    """Apply interleaved RoPE to the final 64 dimensions of 512-wide rows."""
-    if tensor.shape[-1] != 512 or table.shape != (32, 2):
-        raise ValueError("partial RoPE expects [...,512] and table [32,2]")
+    if tensor.shape[-1] not in (128, 512) or table.shape != (32, 2):
+        raise ValueError("partial RoPE expects width 128/512 and table [32,2]")
     output = tensor.clone()
     rope = tensor[..., -64:].float().reshape(*tensor.shape[:-1], 32, 2)
     cosine = table[:, 0]
@@ -74,6 +73,30 @@ def apply_partial_rope_512_64(
         (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
     ).flatten(-2).to(tensor.dtype)
     return output
+
+
+def apply_partial_rope_512_64(
+    tensor: torch.Tensor,
+    table: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply interleaved RoPE to the final 64 dimensions of 512-wide rows."""
+    if tensor.shape[-1] != 512:
+        raise ValueError("attention partial RoPE expects [...,512]")
+    return _apply_partial_rope_64(tensor, table, inverse=inverse)
+
+
+def apply_partial_rope_128_64(
+    tensor: torch.Tensor,
+    table: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply interleaved RoPE to the final 64 dimensions of 128-wide rows."""
+    if tensor.shape[-1] != 128:
+        raise ValueError("index partial RoPE expects [...,128]")
+    return _apply_partial_rope_64(tensor, table, inverse=inverse)
 
 
 def sparse_attention_512_reference(
@@ -267,6 +290,7 @@ def hc_head_reference(
 
 __all__ = [
     "DeepSeekV4FlashConfig",
+    "apply_partial_rope_128_64",
     "apply_partial_rope_512_64",
     "sparse_attention_512_reference",
     "route_top6_reference",
