@@ -11,6 +11,7 @@ Start here for the VDCores runtime and VM model.
 Then pull in narrower notes as needed:
 
 - [blackwell-port.md](blackwell-port.md)
+- [deepseek-v4-flash.md](deepseek-v4-flash.md)
 - [memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
 - [gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
 
@@ -22,5 +23,7 @@ Then pull in narrower notes as needed:
   instruction-field meanings and operator-by-operator state transitions
 - [blackwell-port.md](blackwell-port.md):
   SM100/SM103 build targeting, device-derived launch limits, and the Blackwell runtime smoke test
+- [deepseek-v4-flash.md](deepseek-v4-flash.md):
+  single-GPU model shape, NVFP4/FP8 checkpoint contracts, task coverage, and verified baselines
 - [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md):
   queue protocol and deadlock-oriented guidance

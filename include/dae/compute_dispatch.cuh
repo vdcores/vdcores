@@ -4,7 +4,10 @@
 
 #include "task/argmax.cuh"
 #include "task/attention.cuh"
+#include "task/fp8.cuh"
 #include "task/gemv.cuh"
+#include "task/nvfp4.cuh"
+#include "task/nvfp4_umma.cuh"
 #include "task/rms_norm.cuh"
 #include "task/silu.cuh"
 #include "task/wgmma.cuh"
@@ -107,6 +110,32 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M64N8_ISSUER_ONLY) {
   task_gemv_sm100_issuer_only<64, 8, 256, 4>(
       inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
       smem_base, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_nvfp4_gemv_sm100(inst.args[0], inst.args[1], st_insts, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_nvfp4_gemv_umma_sm100(
+      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+      tmem_mma_barrier, tmem_mma_phase, st_insts, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_fp8_block128_gemv_sm100(inst.args[0], inst.args[1], inst.args[2],
+                               st_insts, m2c, c2m);
 #endif
 }
 

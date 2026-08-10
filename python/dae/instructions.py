@@ -90,6 +90,52 @@ class Gemv_M64N8IssuerOnly(ComputeInstruction):
         )
 
 
+class Nvfp4GemvSm100(ComputeInstruction):
+    """ModelOpt-compatible W4A4 decode GEMV over one output-row shard."""
+
+    def __init__(self, rows: int, k: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("NVFP4 GEMV rows must fit in a positive uint16")
+        if k <= 0 or k > 0xFFFF or k % 32:
+            raise ValueError("NVFP4 GEMV K must be a positive uint16 multiple of 32")
+        super().__init__(
+            opcode=opcode.OP_NVFP4_GEMV_SM100,
+            args=[rows, k, 0],
+        )
+
+
+class Nvfp4GemvUmmaSm100(ComputeInstruction):
+    """Native SM100 block-scaled UMMA over one <=128-row output tile."""
+
+    def __init__(self, rows: int, k: int, output_columns: int = 1):
+        if not 1 <= rows <= 128:
+            raise ValueError("NVFP4 UMMA rows must be in [1, 128]")
+        if k <= 0 or k > 0xFFFF or k % 256:
+            raise ValueError("NVFP4 UMMA K must be a uint16 multiple of 256")
+        if output_columns not in (1, 8):
+            raise ValueError("NVFP4 UMMA output_columns must be 1 or 8")
+        super().__init__(
+            opcode=opcode.OP_NVFP4_GEMV_UMMA_SM100,
+            args=[rows, k, output_columns],
+        )
+
+
+class Fp8Block128GemvSm100(ComputeInstruction):
+    """E4M3/UE8M0 block-128 decode GEMV over one output-row shard."""
+
+    def __init__(self, rows: int, k: int, row_start: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("FP8 GEMV rows must fit in a positive uint16")
+        if k <= 0 or k > 0xFFFF or k % 128:
+            raise ValueError("FP8 GEMV K must be a positive uint16 multiple of 128")
+        if row_start < 0 or row_start > 0xFFFF:
+            raise ValueError("FP8 GEMV row_start must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_FP8_BLOCK128_GEMV_SM100,
+            args=[rows, k, row_start],
+        )
+
+
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
@@ -1252,6 +1298,9 @@ __all__ = [
     "TerminateC",
     "Gemv_M64N8",
     "Gemv_M64N8IssuerOnly",
+    "Nvfp4GemvSm100",
+    "Nvfp4GemvUmmaSm100",
+    "Fp8Block128GemvSm100",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",

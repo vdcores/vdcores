@@ -71,6 +71,188 @@ class Schedule:
         return self.schedule(mapped_sm)
 
 
+class SchedNvfp4Gemv(Schedule):
+    """Shard a ModelOpt NVFP4 matrix-vector multiply across resident SMs."""
+
+    def __init__(self, weight, weight_scale, activation, activation_scale,
+                 alpha, output, base_raw_slot=24):
+        super().__init__()
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.activation = activation
+        self.activation_scale = activation_scale
+        self.alpha = alpha
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _expected_output_elements(self, rows):
+        return rows
+
+    def _on_place(self):
+        if self.weight.dtype != torch.uint8 or self.weight.ndim != 2:
+            raise ValueError("NVFP4 weight must be a rank-2 packed uint8 tensor")
+        rows, packed_k = self.weight.shape
+        self.rows = rows
+        self.k = packed_k * 2
+        if self.k % 32:
+            raise ValueError("NVFP4 K must be divisible by 32")
+        if tuple(self.weight_scale.shape) != (rows, self.k // 16):
+            raise ValueError("weight_scale must have shape [M, K/16]")
+        if self.weight_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError("weight_scale must use torch.float8_e4m3fn")
+        if self.activation.dtype != torch.uint8 or self.activation.numel() != self.k // 2:
+            raise ValueError("activation must contain K/2 packed uint8 values")
+        if (self.activation_scale.dtype != torch.float8_e4m3fn or
+                self.activation_scale.numel() != self.k // 16):
+            raise ValueError("activation_scale must contain K/16 E4M3 values")
+        if self.alpha.dtype != torch.float32 or self.alpha.numel() != 1:
+            raise ValueError("alpha must be a scalar float32 tensor")
+        expected_output = self._expected_output_elements(rows)
+        if (self.output.dtype != torch.bfloat16 or
+                self.output.numel() != expected_output):
+            raise ValueError(
+                f"output must contain {expected_output} BF16 values"
+            )
+        if self.num_sms <= 0 or self.num_sms > rows:
+            raise ValueError("NVFP4 GEMV requires 1 <= num_sms <= M")
+        if self.base_raw_slot < config.num_slots:
+            raise ValueError("base_raw_slot must name a special slot")
+        if (self.base_raw_slot + 5 >= config.num_slots + config.num_special_slots or
+                self.base_raw_slot + 5 >= 32):
+            raise ValueError("NVFP4 GEMV needs six C2M-addressable consecutive special slots")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        slot = self.base_raw_slot
+        return [
+            Nvfp4GemvSm100(row_count, self.k),
+            RawAddress(self.weight[row_start], slot),
+            RawAddress(self.weight_scale[row_start], slot + 1),
+            RawAddress(self.activation.reshape(-1), slot + 2),
+            RawAddress(self.activation_scale.reshape(-1), slot + 3),
+            RawAddress(self.alpha.reshape(-1), slot + 4),
+            RawAddress(self.output[row_start], slot + 5)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedNvfp4GemvUmma(SchedNvfp4Gemv):
+    """Map one native block-scaled UMMA tile to each resident SM."""
+
+    def __init__(self, weight, weight_scale, activation, activation_scale,
+                 alpha, output, base_raw_slot=24, output_columns=1):
+        if output_columns not in (1, 8):
+            raise ValueError("NVFP4 UMMA output_columns must be 1 or 8")
+        self.output_columns = output_columns
+        super().__init__(
+            weight, weight_scale, activation, activation_scale,
+            alpha, output, base_raw_slot
+        )
+
+    def _expected_output_elements(self, rows):
+        return rows * self.output_columns
+
+    def _on_place(self):
+        super()._on_place()
+        rows_per_sm = (self.rows + self.num_sms - 1) // self.num_sms
+        if rows_per_sm > 128:
+            raise ValueError("NVFP4 UMMA supports at most 128 output rows per SM")
+        if self.k % 256:
+            raise ValueError("NVFP4 UMMA K must be divisible by 256")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        slot = self.base_raw_slot
+        return [
+            Nvfp4GemvUmmaSm100(
+                row_count, self.k, self.output_columns
+            ),
+            RawAddress(self.weight[row_start], slot),
+            RawAddress(self.weight_scale[row_start], slot + 1),
+            RawAddress(self.activation.reshape(-1), slot + 2),
+            RawAddress(self.activation_scale.reshape(-1), slot + 3),
+            RawAddress(self.alpha.reshape(-1), slot + 4),
+            RawAddress(
+                self.output[row_start * self.output_columns], slot + 5
+            )
+                .bar(self._bar("output")).writeback(),
+        ]
+
+
+class SchedFp8Block128Gemv(Schedule):
+    """Shard an E4M3/UE8M0 checkpoint GEMV across resident SMs."""
+
+    def __init__(self, weight, weight_scale, activation, activation_scale,
+                 output, base_raw_slot=24):
+        super().__init__()
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.activation = activation
+        self.activation_scale = activation_scale
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.weight.dtype != torch.float8_e4m3fn or self.weight.ndim != 2:
+            raise ValueError("FP8 weight must be a rank-2 E4M3 tensor")
+        self.rows, self.k = self.weight.shape
+        if self.k % 128:
+            raise ValueError("FP8 GEMV K must be divisible by 128")
+        expected_weight_sf = ((self.rows + 127) // 128, self.k // 128)
+        if (self.weight_scale.dtype != torch.float8_e8m0fnu or
+                tuple(self.weight_scale.shape) != expected_weight_sf):
+            raise ValueError(
+                f"weight_scale must be UE8M0 with shape {expected_weight_sf}"
+            )
+        if (self.activation.dtype != torch.float8_e4m3fn or
+                self.activation.numel() != self.k):
+            raise ValueError("activation must contain K E4M3 values")
+        if (self.activation_scale.dtype != torch.float8_e8m0fnu or
+                self.activation_scale.numel() != self.k // 128):
+            raise ValueError("activation_scale must contain K/128 UE8M0 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
+            raise ValueError("output must contain M BF16 values")
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("FP8 GEMV requires 1 <= num_sms <= M")
+        if self.base_raw_slot < config.num_slots or self.base_raw_slot + 4 >= 32:
+            raise ValueError("FP8 GEMV needs five C2M-addressable special slots")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        slot = self.base_raw_slot
+        return [
+            Fp8Block128GemvSm100(row_count, self.k, row_start),
+            RawAddress(self.weight, slot),
+            RawAddress(self.weight_scale, slot + 1),
+            RawAddress(self.activation.reshape(-1), slot + 2),
+            RawAddress(self.activation_scale.reshape(-1), slot + 3),
+            RawAddress(self.output, slot + 4)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class ListSchedule(Schedule):
     def __init__(self, items, lead_bars=None, tail_bars=None, warn_boundary_bars=False):
         super().__init__()
