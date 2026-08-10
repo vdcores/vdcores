@@ -38,11 +38,6 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     // all ops are writeback ops
 
     switch(op(opcode)) {
-      case op(OP_ALLOC_ROUTED_RAW_ADDRESS):
-        // Routed raw outputs are written directly by compute.  Reaching
-        // the store warp provides completion/barrier handling and frees the
-        // normal metadata slot; there is no TMA copy to issue here.
-        break;
       case op(OP_ALLOC_WB_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(
@@ -54,6 +49,35 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
         );
         cuda::ptx::cp_async_bulk_commit_group();
       } 
+        break;
+      case op(OP_ALLOC_WB_STU_STORE_1D):
+      {
+        auto *dst = reinterpret_cast<unsigned char *>(inst.address);
+        const auto *src = static_cast<const unsigned char *>(
+            get_slot_address(smem_base, slot));
+        int offset = 0;
+        if ((reinterpret_cast<uintptr_t>(dst) & 0xF) == 0) {
+          for (; offset + 16 <= inst.size; offset += 16) {
+            *reinterpret_cast<uint4 *>(dst + offset) =
+                *reinterpret_cast<const uint4 *>(src + offset);
+          }
+        }
+        if ((reinterpret_cast<uintptr_t>(dst + offset) & 0x3) == 0) {
+          for (; offset + 4 <= inst.size; offset += 4) {
+            *reinterpret_cast<uint32_t *>(dst + offset) =
+                *reinterpret_cast<const uint32_t *>(src + offset);
+          }
+        }
+        if ((reinterpret_cast<uintptr_t>(dst + offset) & 0x1) == 0) {
+          for (; offset + 2 <= inst.size; offset += 2) {
+            *reinterpret_cast<uint16_t *>(dst + offset) =
+                *reinterpret_cast<const uint16_t *>(src + offset);
+          }
+        }
+        for (; offset < inst.size; ++offset) {
+          dst[offset] = src[offset];
+        }
+      }
         break;
       case op(OP_ALLOC_WB_TMA_STORE_2D):
         {

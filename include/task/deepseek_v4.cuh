@@ -47,26 +47,29 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_fp8_quant128(
     int k,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using Fp8 = cutlass::float_e4m3_t;
   using Scale = cutlass::float_ue8m0_t;
 
-  const int input_slot = m2c.template pop<0>();
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<Fp8 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
-  const int scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, output_slot));
+  const int scale_slots = m2c.template pop<0>();
+  const int scale_slot = extract(scale_slots);
   auto *scales = static_cast<Scale *>(
-      slot_2_glob_ptr(st_insts, scale_slot));
+      get_slot_address(smem_base, scale_slot));
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *shared = static_cast<float *>(smem_base);
+  auto *shared = static_cast<float *>(task_scratch);
   for (int block = 0; block < k / 128; ++block) {
     const float value = __bfloat162float(input[block * 128 + tid]);
     float maximum = fabsf(value);
@@ -94,9 +97,9 @@ __device__ __forceinline__ void task_dsv4_fp8_quant128(
     __sync_compute_group(128);
   }
 
-  __threadfence();
-  c2m.template push<31, true, false>(
-      tid, (1U << output_slot) | (1U << scale_slot));
+  c2m.push(tid, input_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+  c2m.template push<31, true, false>(tid, scale_slots);
 }
 
 // Quantize one BF16 activation vector to ModelOpt's packed E2M1/per-16 E4M3
@@ -105,26 +108,30 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
     int k,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using Scale = cutlass::float_e4m3_t;
 
-  const int input_slot = m2c.template pop<0>();
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int global_scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_slot));
+  const int global_scale_slots = m2c.template pop<0>();
+  const int global_scale_slot = extract(global_scale_slots);
   const auto *global_scale = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, global_scale_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, global_scale_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<uint8_t *>(
-      slot_2_glob_ptr(st_insts, output_slot));
-  const int scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, output_slot));
+  const int scale_slots = m2c.template pop<0>();
+  const int scale_slot = extract(scale_slots);
   auto *scales = static_cast<Scale *>(
-      slot_2_glob_ptr(st_insts, scale_slot));
+      get_slot_address(smem_base, scale_slot));
 
   const int tid = __compute_tid();
-  auto *shared = static_cast<float *>(smem_base);
+  auto *shared = static_cast<float *>(task_scratch);
   for (int block = 0; block < k / 16; ++block) {
     if (tid == 0) {
       float maximum = 0.0f;
@@ -151,9 +158,9 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
     __sync_compute_group(128);
   }
 
-  __threadfence();
-  c2m.template push<31, true, false>(
-      tid, (1U << output_slot) | (1U << scale_slot));
+  c2m.push(tid, input_slots | global_scale_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+  c2m.template push<31, true, false>(tid, scale_slots);
 }
 
 // Apply the DeepSeek partial rotary embedding to the final 64 dimensions of
@@ -163,21 +170,24 @@ template <int kHeadDim, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_rope_64(
     int rows,
     bool inverse,
-    const MInst *st_insts,
+    void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kRopeDim = 64;
   constexpr int kRopeStart = kHeadDim - kRopeDim;
 
-  const int input_slot = m2c.template pop<0>();
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int table_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_slot));
+  const int table_slots = m2c.template pop<0>();
+  const int table_slot = extract(table_slots);
   const auto *table = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, table_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, table_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   constexpr int kPairsPerRow = kRopeDim / 2;
@@ -204,8 +214,8 @@ __device__ __forceinline__ void task_dsv4_rope_64(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, input_slots | table_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Correctness-first sparse decode attention for the DeepSeek 64x512 query and
@@ -214,36 +224,32 @@ __device__ __forceinline__ void task_dsv4_rope_64(
 // as an extra denominator-only logit, matching the official inference path.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_sparse_attention_512(
-    int head,
     int topk,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHeadDim = 512;
   constexpr int kValuesPerThread = kHeadDim / 128;
   constexpr float kSoftmaxScale = 0.04419417382415922f;  // 1 / sqrt(512)
 
-  const int q_slot = m2c.template pop<0>();
+  const int q_slots = m2c.template pop<0>();
+  const int q_slot = extract(q_slots);
   const auto *q = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, q_slot)) + head * kHeadDim;
-  const int kv_slot = m2c.template pop<0>();
-  const auto *kv = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, kv_slot));
-  const int indices_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, q_slot));
+  const int indices_slots = m2c.template pop<0>();
+  const int indices_slot = extract(indices_slots);
   const auto *indices = static_cast<const int *>(
-      slot_2_glob_ptr(st_insts, indices_slot));
-  const int sink_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, indices_slot));
+  const int sink_slots = m2c.template pop<0>();
+  const int sink_slot = extract(sink_slots);
   const auto *sink = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, sink_slot));
-  const int output_slot = m2c.template pop<0>();
-  auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot)) + head * kHeadDim;
+      get_slot_address(smem_base, sink_slot));
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *warp_reduce = static_cast<float *>(smem_base);
+  auto *warp_reduce = static_cast<float *>(task_scratch);
 
   float q_values[kValuesPerThread];
   float accum[kValuesPerThread] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -252,14 +258,19 @@ __device__ __forceinline__ void task_dsv4_sparse_attention_512(
     q_values[item] = __bfloat162float(q[tid + item * 128]);
   }
 
-  float running_max = sink[head];
+  float running_max = sink[0];
   float running_sum = 1.0f;
   for (int selected = 0; selected < topk; ++selected) {
     const int kv_row = indices[selected];
+    const int kv_slots = m2c.template pop<0>();
+    const int kv_slot = extract(kv_slots);
+    const auto *kv_ptr = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, kv_slot));
     if (kv_row < 0) {
+      __sync_compute_group(128);
+      c2m.push(tid, kv_slots);
       continue;
     }
-    const auto *kv_ptr = kv + kv_row * kHeadDim;
     float partial = 0.0f;
     float kv_values[kValuesPerThread];
 #pragma unroll
@@ -292,8 +303,14 @@ __device__ __forceinline__ void task_dsv4_sparse_attention_512(
       accum[item] = accum[item] * old_scale + probability * kv_values[item];
     }
     running_max = new_max;
+    __sync_compute_group(128);
+    c2m.push(tid, kv_slots);
   }
 
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, output_slot));
   const float inverse_sum = 1.0f / running_sum;
 #pragma unroll
   for (int item = 0; item < kValuesPerThread; ++item) {
@@ -301,8 +318,8 @@ __device__ __forceinline__ void task_dsv4_sparse_attention_512(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, q_slots | indices_slots | sink_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Select DeepSeek's top-6 routed experts from 256 gate logits.  Hash layers
@@ -313,30 +330,35 @@ __device__ __forceinline__ void task_dsv4_route_top6(
     bool hash_routing,
     float route_scale,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kExperts = 256;
   constexpr int kTopK = 6;
 
-  const int logits_slot = m2c.template pop<0>();
+  const int logits_slots = m2c.template pop<0>();
+  const int logits_slot = extract(logits_slots);
   const auto *logits = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, logits_slot));
-  const int bias_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, logits_slot));
+  const int bias_slots = m2c.template pop<0>();
+  const int bias_slot = extract(bias_slots);
   const auto *bias = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, bias_slot));
-  const int hash_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, bias_slot));
+  const int hash_slots = m2c.template pop<0>();
+  const int hash_slot = extract(hash_slots);
   const auto *hash_indices = static_cast<const int *>(
-      slot_2_glob_ptr(st_insts, hash_slot));
-  const int indices_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, hash_slot));
+  const int indices_slots = m2c.template pop<0>();
+  const int indices_slot = extract(indices_slots);
   auto *output_indices = static_cast<int *>(
-      slot_2_glob_ptr(st_insts, indices_slot));
-  const int weights_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, indices_slot));
+  const int weights_slots = m2c.template pop<0>();
+  const int weights_slot = extract(weights_slots);
   auto *output_weights = static_cast<float *>(
-      slot_2_glob_ptr(st_insts, weights_slot));
+      get_slot_address(smem_base, weights_slot));
 
   const int tid = __compute_tid();
-  auto *original_scores = static_cast<float *>(smem_base);
+  auto *original_scores = static_cast<float *>(task_scratch);
   auto *selection_scores = original_scores + kExperts;
   for (int expert = tid; expert < kExperts; expert += 128) {
     const float transformed =
@@ -396,12 +418,9 @@ __device__ __forceinline__ void task_dsv4_route_top6(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  // These are two independent raw-address completions.  Queue them
-  // separately so the store warp observes the barrier attached to either
-  // output instead of treating the bit union as one allocator span.
-  c2m.template push<31, true, false>(tid, 1U << indices_slot);
-  c2m.template push<31, true, false>(tid, 1U << weights_slot);
+  c2m.push(tid, logits_slots | bias_slots | hash_slots);
+  c2m.template push<0, true>(tid, indices_slots);
+  c2m.template push<0, true>(tid, weights_slots);
 }
 
 // Sum the six routed expert down projections and one shared expert.  Applying
@@ -409,24 +428,28 @@ __device__ __forceinline__ void task_dsv4_route_top6(
 // because the down projection is linear.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_expert_reduce(
-    const MInst *st_insts,
+    void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHidden = 4096;
   constexpr int kTopK = 6;
 
-  const int routed_slot = m2c.template pop<0>();
+  const int routed_slots = m2c.template pop<0>();
+  const int routed_slot = extract(routed_slots);
   const auto *routed = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, routed_slot));
-  const int weights_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, routed_slot));
+  const int weights_slots = m2c.template pop<0>();
+  const int weights_slot = extract(weights_slots);
   const auto *weights = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, weights_slot));
-  const int shared_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, weights_slot));
+  const int shared_slots = m2c.template pop<0>();
+  const int shared_slot = extract(shared_slots);
   const auto *shared = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, shared_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, shared_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   for (int dim = tid; dim < kHidden; dim += 128) {
@@ -442,59 +465,62 @@ __device__ __forceinline__ void task_dsv4_expert_reduce(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, routed_slots | weights_slots | shared_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // FP32-weight/BF16-input GEMV for the small mHC mixing projections.  It is
 // deliberately scalar and correctness-oriented; one SM owns one or more rows.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
-    int rows,
     int k,
+    int tile_k,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  const int weight_slot = m2c.template pop<0>();
-  const auto *weight = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, weight_slot));
-  const int input_slot = m2c.template pop<0>();
-  const auto *input = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int output_slot = m2c.template pop<0>();
-  auto *output = static_cast<float *>(
-      slot_2_glob_ptr(st_insts, output_slot));
-
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *warp_reduce = static_cast<float *>(smem_base);
-  for (int local_row = 0; local_row < rows; ++local_row) {
-    float partial = 0.0f;
-    for (int column = tid; column < k; column += 128) {
+  auto *warp_reduce = static_cast<float *>(task_scratch);
+  float partial = 0.0f;
+  for (int column_start = 0; column_start < k; column_start += tile_k) {
+    const int columns = min(tile_k, k - column_start);
+    const int weight_slots = m2c.template pop<0>();
+    const int weight_slot = extract(weight_slots);
+    const auto *weight = static_cast<const float *>(
+        get_slot_address(smem_base, weight_slot));
+    const int input_slots = m2c.template pop<0>();
+    const int input_slot = extract(input_slots);
+    const auto *input = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, input_slot));
+    for (int column = tid; column < columns; column += 128) {
       partial = fmaf(
-          weight[local_row * k + column],
+          weight[column],
           __bfloat162float(input[column]),
           partial);
     }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
-    }
-    if (lane == 0) {
-      warp_reduce[warp] = partial;
-    }
     __sync_compute_group(128);
-    if (tid == 0) {
-      output[local_row] = warp_reduce[0] + warp_reduce[1] +
-                          warp_reduce[2] + warp_reduce[3];
-    }
-    __sync_compute_group(128);
+    c2m.push(tid, weight_slots | input_slots);
   }
-
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<float *>(
+      get_slot_address(smem_base, output_slot));
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
+  }
+  if (lane == 0) {
+    warp_reduce[warp] = partial;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    output[0] = warp_reduce[0] + warp_reduce[1] +
+                warp_reduce[2] + warp_reduce[3];
+  }
+  __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // BF16-weight/input/output GEMV for checkpoint linears that are intentionally
@@ -503,78 +529,81 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
 // projection above without expanding large BF16 checkpoint matrices to FP32.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_bf16_gemv(
-    int rows,
     int k,
+    int tile_k,
     bool output_fp32,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  const int weight_slot = m2c.template pop<0>();
-  const auto *weight = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, weight_slot));
-  const int input_slot = m2c.template pop<0>();
-  const auto *input = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int output_slot = m2c.template pop<0>();
-  void *output = slot_2_glob_ptr(st_insts, output_slot);
-
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *warp_reduce = static_cast<float *>(smem_base);
-  for (int local_row = 0; local_row < rows; ++local_row) {
-    float partial = 0.0f;
-    for (int column = tid; column < k; column += 128) {
+  auto *warp_reduce = static_cast<float *>(task_scratch);
+  float partial = 0.0f;
+  for (int column_start = 0; column_start < k; column_start += tile_k) {
+    const int columns = min(tile_k, k - column_start);
+    const int weight_slots = m2c.template pop<0>();
+    const int weight_slot = extract(weight_slots);
+    const auto *weight = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, weight_slot));
+    const int input_slots = m2c.template pop<0>();
+    const int input_slot = extract(input_slots);
+    const auto *input = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, input_slot));
+    for (int column = tid; column < columns; column += 128) {
       partial = fmaf(
-          __bfloat162float(weight[local_row * k + column]),
+          __bfloat162float(weight[column]),
           __bfloat162float(input[column]),
           partial);
     }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
-    }
-    if (lane == 0) {
-      warp_reduce[warp] = partial;
-    }
     __sync_compute_group(128);
-    if (tid == 0) {
-      const float value = warp_reduce[0] + warp_reduce[1] +
-                          warp_reduce[2] + warp_reduce[3];
-      if (output_fp32) {
-        static_cast<float *>(output)[local_row] = value;
-      } else {
-        static_cast<__nv_bfloat16 *>(output)[local_row] =
-            __float2bfloat16(value);
-      }
-    }
-    __sync_compute_group(128);
+    c2m.push(tid, weight_slots | input_slots);
   }
-
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  void *output = get_slot_address(smem_base, output_slot);
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
+  }
+  if (lane == 0) {
+    warp_reduce[warp] = partial;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    const float value = warp_reduce[0] + warp_reduce[1] +
+                        warp_reduce[2] + warp_reduce[3];
+    if (output_fp32) {
+      static_cast<float *>(output)[0] = value;
+    } else {
+      static_cast<__nv_bfloat16 *>(output)[0] = __float2bfloat16(value);
+    }
+  }
+  __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Normalized Walsh-Hadamard transform used by the ratio-4 indexer before its
 // simulated FP4 dot products.  One SM owns one 128- or 512-wide row.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hadamard(
-    int row,
     int width,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  const int input_slot = m2c.template pop<0>();
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, input_slot)) + row * width;
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot)) + row * width;
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
-  auto *values = static_cast<float *>(smem_base);
+  auto *values = static_cast<float *>(task_scratch);
   for (int dim = tid; dim < width; dim += 128) {
     values[dim] = __bfloat162float(input[dim]);
   }
@@ -599,8 +628,8 @@ __device__ __forceinline__ void task_dsv4_hadamard(
     output[dim] = __float2bfloat16(values[dim] * scale);
   }
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, input_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Dimension-wise gated pooling for compressed KV state.  The caller supplies
@@ -610,38 +639,60 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_gated_pool(
     int pool_rows,
     int width,
-    const MInst *st_insts,
+    void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  const int values_slot = m2c.template pop<0>();
-  const auto *values = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, values_slot));
-  const int scores_slot = m2c.template pop<0>();
-  const auto *scores = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, scores_slot));
-  const int output_slot = m2c.template pop<0>();
-  auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
-
   const int tid = __compute_tid();
-  for (int dim = tid; dim < width; dim += 128) {
-    float maximum = -__int_as_float(0x7f800000);
-    for (int row = 0; row < pool_rows; ++row) {
-      maximum = fmaxf(maximum, scores[row * width + dim]);
-    }
-    float denominator = 0.0f;
-    float numerator = 0.0f;
-    for (int row = 0; row < pool_rows; ++row) {
-      const float probability = __expf(scores[row * width + dim] - maximum);
-      denominator += probability;
-      numerator = fmaf(probability, values[row * width + dim], numerator);
-    }
-    output[dim] = __float2bfloat16(numerator / denominator);
+  constexpr int kMaxValuesPerThread = 4;
+  float maximum[kMaxValuesPerThread];
+  float denominator[kMaxValuesPerThread];
+  float numerator[kMaxValuesPerThread];
+#pragma unroll
+  for (int item = 0; item < kMaxValuesPerThread; ++item) {
+    maximum[item] = -__int_as_float(0x7f800000);
+    denominator[item] = 0.0f;
+    numerator[item] = 0.0f;
   }
 
+  for (int row = 0; row < pool_rows; ++row) {
+    const int values_slots = m2c.template pop<0>();
+    const int values_slot = extract(values_slots);
+    const auto *values = static_cast<const float *>(
+        get_slot_address(smem_base, values_slot));
+    const int scores_slots = m2c.template pop<0>();
+    const int scores_slot = extract(scores_slots);
+    const auto *scores = static_cast<const float *>(
+        get_slot_address(smem_base, scores_slot));
+#pragma unroll
+    for (int item = 0; item < kMaxValuesPerThread; ++item) {
+      const int dim = tid + item * 128;
+      if (dim < width) {
+        const float score = scores[dim];
+        const float next_max = fmaxf(maximum[item], score);
+        const float old_scale = __expf(maximum[item] - next_max);
+        const float probability = __expf(score - next_max);
+        denominator[item] = denominator[item] * old_scale + probability;
+        numerator[item] = numerator[item] * old_scale + probability * values[dim];
+        maximum[item] = next_max;
+      }
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, values_slots | scores_slots);
+  }
+
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, output_slot));
+#pragma unroll
+  for (int item = 0; item < kMaxValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    if (dim < width) {
+      output[dim] = __float2bfloat16(numerator[item] / denominator[item]);
+    }
+  }
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Learned ratio-4 index score.  Each SM handles a contiguous KV-row shard;
@@ -651,29 +702,33 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_index_score(
     int rows,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHeads = 64;
   constexpr int kHeadDim = 128;
 
-  const int q_slot = m2c.template pop<0>();
+  const int q_slots = m2c.template pop<0>();
+  const int q_slot = extract(q_slots);
   const auto *q = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, q_slot));
-  const int kv_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, q_slot));
+  const int kv_slots = m2c.template pop<0>();
+  const int kv_slot = extract(kv_slots);
   const auto *kv = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, kv_slot));
-  const int weights_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, kv_slot));
+  const int weights_slots = m2c.template pop<0>();
+  const int weights_slot = extract(weights_slots);
   const auto *head_weights = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, weights_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, weights_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<float *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *warp_reduce = static_cast<float *>(smem_base);
+  auto *warp_reduce = static_cast<float *>(task_scratch);
   for (int row = 0; row < rows; ++row) {
     float warp_score = 0.0f;
     for (int head = warp; head < kHeads; head += 4) {
@@ -706,8 +761,8 @@ __device__ __forceinline__ void task_dsv4_index_score(
     __sync_compute_group(128);
   }
 
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, q_slots | kv_slots | weights_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Exact streaming top-k selection for indexer scores.  A 1024-element shared
@@ -720,23 +775,20 @@ __device__ __forceinline__ void task_dsv4_topk512(
     int topk,
     int index_offset,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kSortSize = 1024;
   constexpr int kRetained = 512;
-  const int scores_slot = m2c.template pop<0>();
-  const auto *scores = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, scores_slot));
-  const int output_slot = m2c.template pop<0>();
-  auto *output = static_cast<int *>(
-      slot_2_glob_ptr(st_insts, output_slot));
-
   const int tid = __compute_tid();
-  auto *sort_scores = static_cast<float *>(smem_base);
+  auto *sort_scores = static_cast<float *>(task_scratch);
   auto *sort_indices = reinterpret_cast<int *>(sort_scores + kSortSize);
 
   int processed = min(rows, kSortSize);
+  int scores_slots = m2c.template pop<0>();
+  int scores_slot = extract(scores_slots);
+  const float *scores = static_cast<const float *>(
+      get_slot_address(smem_base, scores_slot));
   for (int item = tid; item < kSortSize; item += 128) {
     sort_scores[item] = item < processed
         ? scores[item]
@@ -744,6 +796,7 @@ __device__ __forceinline__ void task_dsv4_topk512(
     sort_indices[item] = item < processed ? item : -1;
   }
   __sync_compute_group(128);
+  c2m.push(tid, scores_slots);
 
   while (true) {
     for (int width = 2; width <= kSortSize; width <<= 1) {
@@ -773,23 +826,31 @@ __device__ __forceinline__ void task_dsv4_topk512(
       break;
     }
     const int chunk = min(kRetained, rows - processed);
+    scores_slots = m2c.template pop<0>();
+    scores_slot = extract(scores_slots);
+    scores = static_cast<const float *>(
+        get_slot_address(smem_base, scores_slot));
     for (int item = tid; item < kRetained; item += 128) {
       sort_scores[item] = item < chunk
-          ? scores[processed + item]
+          ? scores[item]
           : -__int_as_float(0x7f800000);
       sort_indices[item] = item < chunk ? processed + item : -1;
     }
     processed += chunk;
     __sync_compute_group(128);
+    c2m.push(tid, scores_slots);
   }
 
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<int *>(
+      get_slot_address(smem_base, output_slot));
   for (int rank = tid; rank < topk; rank += 128) {
     output[rank] = sort_indices[kSortSize - 1 - rank] + index_offset;
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Final/MTP hyper-connection head: normalize the four raw projection values,
@@ -798,32 +859,37 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hc_head(
     float epsilon,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHc = 4;
   constexpr int kHidden = 4096;
 
-  const int residual_slot = m2c.template pop<0>();
+  const int residual_slots = m2c.template pop<0>();
+  const int residual_slot = extract(residual_slots);
   const auto *residual = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, residual_slot));
-  const int mixes_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, residual_slot));
+  const int mixes_slots = m2c.template pop<0>();
+  const int mixes_slot = extract(mixes_slots);
   const auto *mixes = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, mixes_slot));
-  const int scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, mixes_slot));
+  const int scale_slots = m2c.template pop<0>();
+  const int scale_slot = extract(scale_slots);
   const auto *scale = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, scale_slot));
-  const int base_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, scale_slot));
+  const int base_slots = m2c.template pop<0>();
+  const int base_slot = extract(base_slots);
   const auto *base = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, base_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, base_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *shared = static_cast<float *>(smem_base);
+  auto *shared = static_cast<float *>(task_scratch);
   auto *warp_reduce = shared;
   auto *pre = shared + 4;
 
@@ -866,8 +932,8 @@ __device__ __forceinline__ void task_dsv4_hc_head(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, residual_slots | mixes_slots | scale_slots | base_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Convert 24 mHC projection values into pre/post/comb coefficients and form
@@ -877,38 +943,45 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
     int sinkhorn_iters,
     float epsilon,
     void *smem_base,
-    const MInst *st_insts,
+    void *task_scratch,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHc = 4;
   constexpr int kHidden = 4096;
 
-  const int residual_slot = m2c.template pop<0>();
+  const int residual_slots = m2c.template pop<0>();
+  const int residual_slot = extract(residual_slots);
   const auto *residual = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, residual_slot));
-  const int mixes_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, residual_slot));
+  const int mixes_slots = m2c.template pop<0>();
+  const int mixes_slot = extract(mixes_slots);
   const auto *mixes = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, mixes_slot));
-  const int scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, mixes_slot));
+  const int scale_slots = m2c.template pop<0>();
+  const int scale_slot = extract(scale_slots);
   const auto *scale = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, scale_slot));
-  const int base_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, scale_slot));
+  const int base_slots = m2c.template pop<0>();
+  const int base_slot = extract(base_slots);
   const auto *base = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, base_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, base_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
-  const int post_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, output_slot));
+  const int post_slots = m2c.template pop<0>();
+  const int post_slot = extract(post_slots);
   auto *post_output = static_cast<float *>(
-      slot_2_glob_ptr(st_insts, post_slot));
-  const int comb_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, post_slot));
+  const int comb_slots = m2c.template pop<0>();
+  const int comb_slot = extract(comb_slots);
   auto *comb_output = static_cast<float *>(
-      slot_2_glob_ptr(st_insts, comb_slot));
+      get_slot_address(smem_base, comb_slot));
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *shared = static_cast<float *>(smem_base);
+  auto *shared = static_cast<float *>(task_scratch);
   auto *warp_reduce = shared;
   auto *pre = shared + 4;
   auto *post = pre + kHc;
@@ -1014,34 +1087,40 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(
-      tid, (1U << output_slot) | (1U << post_slot) | (1U << comb_slot));
+  c2m.push(tid, residual_slots | mixes_slots | scale_slots | base_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+  c2m.template push<31, true, false>(tid, post_slots);
+  c2m.template push<31, true, false>(tid, comb_slots);
 }
 
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hc_post(
-    const MInst *st_insts,
+    void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHc = 4;
   constexpr int kHidden = 4096;
 
-  const int branch_slot = m2c.template pop<0>();
+  const int branch_slots = m2c.template pop<0>();
+  const int branch_slot = extract(branch_slots);
   const auto *branch = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, branch_slot));
-  const int residual_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, branch_slot));
+  const int residual_slots = m2c.template pop<0>();
+  const int residual_slot = extract(residual_slots);
   const auto *residual = static_cast<const __nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, residual_slot));
-  const int post_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, residual_slot));
+  const int post_slots = m2c.template pop<0>();
+  const int post_slot = extract(post_slots);
   const auto *post = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, post_slot));
-  const int comb_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, post_slot));
+  const int comb_slots = m2c.template pop<0>();
+  const int comb_slot = extract(comb_slots);
   const auto *comb = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, comb_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, comb_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   for (int item = tid; item < kHc * kHidden; item += 128) {
@@ -1060,6 +1139,6 @@ __device__ __forceinline__ void task_dsv4_hc_post(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(tid, branch_slots | residual_slots | post_slots | comb_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }

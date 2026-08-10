@@ -592,7 +592,7 @@ class CheckpointDecode:
         logits = self._bf16_weight(f"{prefix}.weight", normalized)
         hash_routing = layer_id < self.config.num_hash_layers
         if hash_routing:
-            hash_indices = self.checkpoint.load_tensor_slice(
+            loaded_hash_indices = self.checkpoint.load_tensor_slice(
                 f"{prefix}.tid2eid",
                 token_id,
                 device=str(self.device),
@@ -601,22 +601,14 @@ class CheckpointDecode:
                 (self.config.num_experts,), dtype=torch.float32, device=self.device
             )
         else:
-            hash_indices = torch.zeros(
-                (self.config.experts_per_token,),
-                dtype=torch.int32,
-                device=self.device,
+            loaded_hash_indices = torch.zeros(
+                (self.config.experts_per_token,), dtype=torch.int32, device=self.device
             )
             bias = self._load([f"{prefix}.bias"])[f"{prefix}.bias"]
-        indices = torch.empty(
-            (self.config.experts_per_token,),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        weights = torch.empty(
-            (self.config.experts_per_token,),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        hash_indices = torch.zeros((8,), dtype=torch.int32, device=self.device)
+        hash_indices[: self.config.experts_per_token].copy_(loaded_hash_indices)
+        indices = torch.empty((8,), dtype=torch.int32, device=self.device)
+        weights = torch.empty((8,), dtype=torch.float32, device=self.device)
         self._run(
             SchedDsv4RouteTop6(
                 logits,
@@ -629,7 +621,10 @@ class CheckpointDecode:
             ),
             1,
         )
-        return indices, weights
+        return (
+            indices[: self.config.experts_per_token],
+            weights[: self.config.experts_per_token],
+        )
 
     def _expert(
         self,

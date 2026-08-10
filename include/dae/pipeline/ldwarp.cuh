@@ -81,6 +81,34 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           cuda::aligned_size_t<16>(inst.size)
         );
         break; }
+      case op(OP_ALLOC_LDU_LOAD_1D): {
+        __ldprint("LDU 1D load: size=%d", inst.size);
+        auto *dst = static_cast<unsigned char *>(
+            get_slot_address(smem_base, slot));
+        const auto *src = reinterpret_cast<const unsigned char *>(inst.address);
+        int offset = 0;
+        if ((reinterpret_cast<uintptr_t>(src) & 0xF) == 0) {
+          for (; offset + 16 <= inst.size; offset += 16) {
+            *reinterpret_cast<uint4 *>(dst + offset) =
+                *reinterpret_cast<const uint4 *>(src + offset);
+          }
+        }
+        if ((reinterpret_cast<uintptr_t>(src + offset) & 0x3) == 0) {
+          for (; offset + 4 <= inst.size; offset += 4) {
+            *reinterpret_cast<uint32_t *>(dst + offset) =
+                *reinterpret_cast<const uint32_t *>(src + offset);
+          }
+        }
+        if ((reinterpret_cast<uintptr_t>(src + offset) & 0x1) == 0) {
+          for (; offset + 2 <= inst.size; offset += 2) {
+            *reinterpret_cast<uint16_t *>(dst + offset) =
+                *reinterpret_cast<const uint16_t *>(src + offset);
+          }
+        }
+        for (; offset < inst.size; ++offset) {
+          dst[offset] = src[offset];
+        }
+        break; }
       case op(OP_ALLOC_TMA_LOAD_TENSOR_1D): {
         __ldprint("TMA Tensor 1D Load: size=%d", inst.size);
         asm volatile(
@@ -201,19 +229,21 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         __ldprint("[REG] load: reg_id=%d bar=%d slotMask=0x%X", inst.size, bar, regFile[inst.size]);
         break;
       }
-      case op(OP_ALLOC_ROUTED_RAW_ADDRESS): {
-        // HBM layout: six int32 route ids, uint32 field stride,
-        // uint32 expert count, then row-major uint64 pointer entries.
+      case op(OP_ALLOC_ROUTED_TMA_LOAD_1D): {
+        // HBM layout: eight int32 route-id slots, uint32 field stride,
+        // uint32 expert count, two padding words, then row-major uint64
+        // pointer entries. The low three arg bits select the route rank; the
+        // remaining bits select the pointer field.
         constexpr int kRouteCount = 6;
-        constexpr int kHeaderInts = 8;
+        constexpr int kHeaderInts = 12;
         const auto *header = reinterpret_cast<const int *>(inst.address);
-        const int route_rank = inst.arg;
-        const int pointer_field = inst.size;
+        const int route_rank = inst.arg & 0x7;
+        const int pointer_field = inst.arg >> 3;
         uint64_t resolved = 0;
         if (route_rank >= 0 && route_rank < kRouteCount) {
           const int expert = load_l2(header + route_rank);
-          const int field_stride = load_l2(header + 6);
-          const int expert_count = load_l2(header + 7);
+          const int field_stride = load_l2(header + 8);
+          const int expert_count = load_l2(header + 9);
           if (expert >= 0 && expert < expert_count &&
               pointer_field >= 0 && pointer_field < field_stride) {
             const auto *pointer_table =
@@ -222,10 +252,55 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
                 pointer_table + expert * field_stride + pointer_field);
           }
         }
-        st_insts[slot].address = resolved;
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
         __ldprint(
-            "Routed raw address: rank=%d field=%d resolved=0x%lx",
-            route_rank, pointer_field, resolved);
+            "Routed TMA 1D load: rank=%d field=%d size=%d resolved=0x%lx",
+            route_rank, pointer_field, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_ALLOC_INDEXED_TMA_LOAD_1D): {
+        // HBM record: base pointer, pointer to one int32 index, then packed
+        // uint32 (row count, row stride). RepeatM advances across records.
+        const auto *state = reinterpret_cast<const uint64_t *>(inst.address);
+        const uint64_t base = load_l2_u64(state + 0);
+        const uint64_t index_address = load_l2_u64(state + 1);
+        const uint64_t shape = load_l2_u64(state + 2);
+        const int row_count = static_cast<int>(shape & 0xFFFFFFFFULL);
+        const int row_stride = static_cast<int>(shape >> 32);
+        const int row = load_l2(
+            reinterpret_cast<const int *>(index_address));
+        if (base == 0 || index_address == 0 || row >= row_count ||
+            row_stride < inst.size) {
+          asm volatile("trap;");
+        }
+        if (row < 0) {
+          auto *dst = static_cast<unsigned char *>(
+              get_slot_address(smem_base, slot));
+          for (int offset = 0; offset < inst.size; ++offset) {
+            dst[offset] = 0;
+          }
+          break;
+        }
+        const uint64_t resolved = base + uint64_t(row) * row_stride;
+        __ldprint(
+            "Indexed TMA 1D load: row=%d size=%d resolved=0x%lx",
+            row, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
         break;
       }
     }

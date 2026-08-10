@@ -93,27 +93,18 @@ class Gemv_M64N8IssuerOnly(ComputeInstruction):
 class Nvfp4GemvSm100(ComputeInstruction):
     """ModelOpt-compatible W4A4 decode GEMV over one output-row shard."""
 
-    ROUTED_ADDRESS_FLAG = 0x8000
-
     def __init__(
         self,
         rows: int,
         k: int,
-        row_start: int = 0,
-        routed_addresses: bool = False,
     ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("NVFP4 GEMV rows must fit in a positive uint16")
         if k <= 0 or k > 0xFFFF or k % 32:
             raise ValueError("NVFP4 GEMV K must be a positive uint16 multiple of 32")
-        if row_start < 0 or row_start >= self.ROUTED_ADDRESS_FLAG:
-            raise ValueError("NVFP4 GEMV row_start must fit in 15 bits")
-        address_mode = row_start
-        if routed_addresses:
-            address_mode |= self.ROUTED_ADDRESS_FLAG
         super().__init__(
             opcode=opcode.OP_NVFP4_GEMV_SM100,
-            args=[rows, k, address_mode],
+            args=[rows, k, 0],
         )
 
 
@@ -172,14 +163,12 @@ class Dsv4Rope128_64(ComputeInstruction):
 
 
 class Dsv4SparseAttention512(ComputeInstruction):
-    def __init__(self, head: int, topk: int):
-        if head < 0 or head > 0xFFFF:
-            raise ValueError("DeepSeek attention head must fit in uint16")
+    def __init__(self, topk: int):
         if topk <= 0 or topk > 0xFFFF:
             raise ValueError("DeepSeek attention topk must fit in a positive uint16")
         super().__init__(
             opcode=opcode.OP_DSV4_SPARSE_ATTENTION_512,
-            args=[head, topk],
+            args=[topk],
         )
 
 
@@ -199,26 +188,26 @@ class Dsv4ExpertReduce(ComputeInstruction):
 
 
 class Dsv4Fp32Bf16Gemv(ComputeInstruction):
-    def __init__(self, rows: int, k: int):
-        if rows <= 0 or rows > 0xFFFF:
-            raise ValueError("DeepSeek FP32 GEMV rows must fit in uint16")
+    def __init__(self, k: int, tile_k: int):
         if k <= 0 or k > 0xFFFF:
             raise ValueError("DeepSeek FP32 GEMV K must fit in uint16")
+        if tile_k <= 0 or tile_k > 0xFFFF:
+            raise ValueError("DeepSeek FP32 GEMV tile K must fit in uint16")
         super().__init__(
             opcode=opcode.OP_DSV4_FP32_BF16_GEMV,
-            args=[rows, k],
+            args=[k, tile_k],
         )
 
 
 class Dsv4Bf16Gemv(ComputeInstruction):
-    def __init__(self, rows: int, k: int, output_fp32: bool = False):
-        if rows <= 0 or rows > 0xFFFF:
-            raise ValueError("DeepSeek BF16 GEMV rows must fit in uint16")
+    def __init__(self, k: int, tile_k: int, output_fp32: bool = False):
         if k <= 0 or k > 0xFFFF:
             raise ValueError("DeepSeek BF16 GEMV K must fit in uint16")
+        if tile_k <= 0 or tile_k > 0xFFFF:
+            raise ValueError("DeepSeek BF16 GEMV tile K must fit in uint16")
         super().__init__(
             opcode=opcode.OP_DSV4_BF16_GEMV,
-            args=[rows, k, int(output_fp32)],
+            args=[k, tile_k, int(output_fp32)],
         )
 
 
@@ -252,14 +241,12 @@ class Dsv4SiluClampMul2048(ComputeInstruction):
 
 
 class Dsv4Hadamard(ComputeInstruction):
-    def __init__(self, row: int, width: int):
-        if row < 0 or row > 0xFFFF:
-            raise ValueError("DeepSeek Hadamard row must fit in uint16")
+    def __init__(self, width: int):
         if width not in (128, 512):
             raise ValueError("DeepSeek Hadamard width must be 128 or 512")
         super().__init__(
             opcode=opcode.OP_DSV4_HADAMARD,
-            args=[row, width],
+            args=[width],
         )
 
 
@@ -1309,17 +1296,20 @@ class RawAddress(MemoryInstruction):
         )
 
 
-class RoutedRawAddress(MemoryInstruction):
-    """Resolve a queue-backed pointer from an HBM routing table in LDU."""
+class RoutedTmaLoad1D(MemoryInstruction):
+    """Resolve one routed field in LDU and copy it into shared memory."""
 
     ROUTE_COUNT = 6
-    HEADER_BYTES = 32
+    ROUTE_BITS = 3
+    MAX_POINTER_FIELD = (1 << (16 - ROUTE_BITS)) - 1
+    HEADER_BYTES = 48
 
     def __init__(
         self,
         routing_state: torch.Tensor,
         route_rank: int,
         pointer_field: int,
+        bytes: int,
     ):
         assert routing_state.device.type == "cuda"
         if not routing_state.is_contiguous():
@@ -1328,14 +1318,40 @@ class RoutedRawAddress(MemoryInstruction):
             raise ValueError("routing_state must contain the 32-byte routing header")
         if not 0 <= route_rank < self.ROUTE_COUNT:
             raise ValueError("route_rank must be in [0, 6)")
-        if not 0 <= pointer_field <= 0xFFFF:
-            raise ValueError("pointer_field must fit in uint16")
+        if not 0 <= pointer_field <= self.MAX_POINTER_FIELD:
+            raise ValueError("pointer_field must fit in 13 bits")
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("routed TMA load size must be a 16-byte-aligned uint16")
+        num_slots = bytes2slots(bytes)
+        if num_slots > config.num_slots:
+            raise ValueError("routed TMA load exceeds the shared-slot arena")
         super().__init__(
-            opcode=opcode.OP_ALLOC_ROUTED_RAW_ADDRESS,
-            num_slots=1,
-            arg=route_rank,
-            size=pointer_field,
+            opcode=opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D,
+            num_slots=num_slots,
+            arg=(pointer_field << self.ROUTE_BITS) | route_rank,
+            size=bytes,
             address=routing_state.data_ptr(),
+        )
+
+
+class IndexedTmaLoad1D(MemoryInstruction):
+    """Resolve one runtime row index in LDU and load the row into shared."""
+
+    RECORD_BYTES = 24
+
+    def __init__(self, indexed_record: torch.Tensor, bytes: int):
+        if indexed_record.device.type != "cuda" or not indexed_record.is_contiguous():
+            raise ValueError("indexed load record must be a contiguous CUDA tensor")
+        if indexed_record.numel() * indexed_record.element_size() < self.RECORD_BYTES:
+            raise ValueError("indexed load record must contain three uint64 values")
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("indexed TMA load size must be a 16-byte-aligned uint16")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D,
+            num_slots=bytes2slots(bytes),
+            arg=0,
+            size=bytes,
+            address=indexed_record.data_ptr(),
         )
 
 
@@ -1409,6 +1425,24 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+class LduLoad1D(MemoryInstruction):
+    """Load arbitrary-sized metadata through LDU into normal shared slots."""
+
+    def __init__(self, src: torch.Tensor, bytes: int | None = None):
+        address = get_tensor_address(src)
+        if bytes is None:
+            bytes = src.numel() * src.element_size()
+        if bytes <= 0 or bytes > 0xFFFF:
+            raise ValueError("LDU load size must be a positive uint16")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_LDU_LOAD_1D,
+            num_slots=bytes2slots(bytes),
+            arg=0,
+            size=bytes,
+            address=address,
+        )
+
+
 class TmaStore1D(MemoryInstruction):
     def __init__(self, dst: torch.Tensor, bytes: int | None = None, numSlots: int | None = None):
         address = get_tensor_address(dst)
@@ -1428,6 +1462,24 @@ class TmaStore1D(MemoryInstruction):
         new_inst = copy.copy(self)
         new_inst.delta(addr)
         return new_inst
+
+
+class StuStore1D(MemoryInstruction):
+    """Store arbitrary-sized metadata from normal shared slots through STU."""
+
+    def __init__(self, dst: torch.Tensor, bytes: int | None = None):
+        address = get_tensor_address(dst)
+        if bytes is None:
+            bytes = dst.numel() * dst.element_size()
+        if bytes <= 0 or bytes > 0xFFFF:
+            raise ValueError("STU store size must be a positive uint16")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_WB_STU_STORE_1D,
+            num_slots=bytes2slots(bytes),
+            arg=0,
+            size=bytes,
+            address=address,
+        )
 
 
 class TmaTensor(MemoryInstruction):
@@ -1606,12 +1658,15 @@ __all__ = [
     "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",
-    "RoutedRawAddress",
+    "RoutedTmaLoad1D",
+    "IndexedTmaLoad1D",
+    "LduLoad1D",
     "IssueBarrier",
     "CC0",
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
     "TmaStore1D",
+    "StuStore1D",
     "TmaTensor",
 ]

@@ -3,6 +3,7 @@ import warnings
 
 from .runtime import *
 from .launcher import *
+from .routing import IndexedLoadTable
 
 class Schedule:
     def __init__(self):
@@ -71,11 +72,40 @@ class Schedule:
         return self.schedule(mapped_sm)
 
 
+def _aligned_row_shard(rows: int, num_sms: int, sm: int, alignment: int = 8):
+    if rows % alignment:
+        raise ValueError(f"row count must be divisible by {alignment}")
+    groups = rows // alignment
+    active_sms = min(num_sms, groups)
+    if sm < 0 or sm >= active_sms:
+        return active_sms, 0, 0
+    groups_per_sm, extra = divmod(groups, active_sms)
+    group_start = sm * groups_per_sm + min(sm, extra)
+    group_count = groups_per_sm + (1 if sm < extra else 0)
+    return active_sms, group_start * alignment, group_count * alignment
+
+
+def _shared_load_1d(tensor, bytes: int | None = None):
+    """Use bulk TMA when legal, otherwise the LDU metadata-copy path."""
+    size = tensor.numel() * tensor.element_size() if bytes is None else bytes
+    if size % 16 == 0 and tensor.data_ptr() % 16 == 0:
+        return TmaLoad1D(tensor, bytes=size)
+    return LduLoad1D(tensor, bytes=size)
+
+
+def _shared_store_1d(tensor, bytes: int | None = None):
+    """Use bulk TMA when legal, otherwise the STU metadata-copy path."""
+    size = tensor.numel() * tensor.element_size() if bytes is None else bytes
+    if size % 16 == 0 and tensor.data_ptr() % 16 == 0:
+        return TmaStore1D(tensor, bytes=size)
+    return StuStore1D(tensor, bytes=size)
+
+
 class SchedNvfp4Gemv(Schedule):
-    """Shard a ModelOpt NVFP4 matrix-vector multiply across resident SMs."""
+    """Load one static NVFP4 shard through LDU and compute from shared slots."""
 
     def __init__(self, weight, weight_scale, activation, activation_scale,
-                 alpha, output, base_raw_slot=24):
+                 alpha, output):
         super().__init__()
         self.weight = weight
         self.weight_scale = weight_scale
@@ -83,20 +113,24 @@ class SchedNvfp4Gemv(Schedule):
         self.activation_scale = activation_scale
         self.alpha = alpha
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _expected_output_elements(self, rows):
         return rows
 
+    def _output_view(self, row_start, row_count):
+        return self.output[row_start:row_start + row_count]
+
+    def _compute_instruction(self, row_count):
+        return Nvfp4GemvSm100(row_count, self.k)
+
     def _on_place(self):
         if self.weight.dtype != torch.uint8 or self.weight.ndim != 2:
             raise ValueError("NVFP4 weight must be a rank-2 packed uint8 tensor")
-        rows, packed_k = self.weight.shape
-        self.rows = rows
+        self.rows, packed_k = self.weight.shape
         self.k = packed_k * 2
-        if self.k % 32:
-            raise ValueError("NVFP4 K must be divisible by 32")
-        if tuple(self.weight_scale.shape) != (rows, self.k // 16):
+        if self.k % 256:
+            raise ValueError("shared NVFP4 GEMV requires K divisible by 256")
+        if tuple(self.weight_scale.shape) != (self.rows, self.k // 16):
             raise ValueError("weight_scale must have shape [M, K/16]")
         if self.weight_scale.dtype != torch.float8_e4m3fn:
             raise ValueError("weight_scale must use torch.float8_e4m3fn")
@@ -107,57 +141,54 @@ class SchedNvfp4Gemv(Schedule):
             raise ValueError("activation_scale must contain K/16 E4M3 values")
         if self.alpha.dtype != torch.float32 or self.alpha.numel() != 1:
             raise ValueError("alpha must be a scalar float32 tensor")
-        expected_output = self._expected_output_elements(rows)
         if (self.output.dtype != torch.bfloat16 or
-                self.output.numel() != expected_output):
-            raise ValueError(
-                f"output must contain {expected_output} BF16 values"
-            )
-        if self.num_sms <= 0 or self.num_sms > rows:
-            raise ValueError("NVFP4 GEMV requires 1 <= num_sms <= M")
-        if self.base_raw_slot < config.num_slots:
-            raise ValueError("base_raw_slot must name a special slot")
-        if (self.base_raw_slot + 5 >= config.num_slots + config.num_special_slots or
-                self.base_raw_slot + 5 >= 32):
-            raise ValueError("NVFP4 GEMV needs six C2M-addressable consecutive special slots")
+                self.output.numel() != self._expected_output_elements(self.rows)):
+            raise ValueError("output has the wrong BF16 element count")
+        if self.num_sms <= 0:
+            raise ValueError("NVFP4 GEMV requires at least one SM")
+        self.active_sms, _, _ = _aligned_row_shard(
+            self.rows, self.num_sms, 0
+        )
+        self.alpha_storage = torch.zeros(
+            (4,), dtype=torch.float32, device=self.alpha.device
+        )
+        self.alpha_storage[0].copy_(self.alpha.reshape(-1)[0])
 
     def schedule(self, sm):
-        if sm < 0:
+        active_sms, row_start, row_count = _aligned_row_shard(
+            self.rows, self.num_sms, sm
+        )
+        if row_count == 0:
             return []
-        rows_per_sm, extra = divmod(self.rows, self.num_sms)
-        row_start = sm * rows_per_sm + min(sm, extra)
-        row_count = rows_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
+        weight = self.weight[row_start:row_start + row_count]
+        weight_scale = self.weight_scale[row_start:row_start + row_count]
+        output = self._output_view(row_start, row_count)
         return [
-            Nvfp4GemvSm100(row_count, self.k),
-            RawAddress(self.weight[row_start], slot),
-            RawAddress(self.weight_scale[row_start], slot + 1),
-            RawAddress(self.activation.reshape(-1), slot + 2),
-            RawAddress(self.activation_scale.reshape(-1), slot + 3),
-            RawAddress(self.alpha.reshape(-1), slot + 4),
-            RawAddress(self.output[row_start], slot + 5)
-                .bar(self._bar("output")).writeback(),
+            self._compute_instruction(row_count),
+            TmaLoad1D(weight),
+            TmaLoad1D(weight_scale),
+            TmaLoad1D(self.activation.reshape(-1)),
+            TmaLoad1D(self.activation_scale.reshape(-1)),
+            TmaLoad1D(self.alpha_storage),
+            TmaStore1D(output).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, self.num_sms)
+        return self._bar_release_if_present(role, self.active_sms)
 
 
 class SchedRoutedNvfp4Gemv(Schedule):
-    """Run one routed NVFP4 expert without copying route ids to the host."""
+    """Resolve expert shards in LDU, then compute solely from shared slots."""
 
     def __init__(
         self,
         routing_state,
         route_rank,
-        weight_field,
-        weight_scale_field,
-        activation_field,
-        activation_scale_field,
+        weight_fields,
+        weight_scale_fields,
         alpha_field,
-        output_field,
         rows,
         k,
         activation,
@@ -167,12 +198,9 @@ class SchedRoutedNvfp4Gemv(Schedule):
         super().__init__()
         self.routing_state = routing_state
         self.route_rank = route_rank
-        self.weight_field = weight_field
-        self.weight_scale_field = weight_scale_field
-        self.activation_field = activation_field
-        self.activation_scale_field = activation_scale_field
+        self.weight_fields = tuple(weight_fields)
+        self.weight_scale_fields = tuple(weight_scale_fields)
         self.alpha_field = alpha_field
-        self.output_field = output_field
         self.rows = rows
         self.k = k
         self.activation = activation
@@ -181,144 +209,109 @@ class SchedRoutedNvfp4Gemv(Schedule):
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
-            raise ValueError("routed address state must be a CUDA tensor")
+            raise ValueError("routing state must be a CUDA tensor")
         if not self.routing_state.is_contiguous():
-            raise ValueError("routed address state must be contiguous")
-        if not 0 <= self.route_rank < RoutedRawAddress.ROUTE_COUNT:
+            raise ValueError("routing state must be contiguous")
+        if not 0 <= self.route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
             raise ValueError("route_rank must be in [0, 6)")
-        for field in (
-            self.weight_field,
-            self.weight_scale_field,
-            self.activation_field,
-            self.activation_scale_field,
-            self.alpha_field,
-            self.output_field,
-        ):
-            if not 0 <= field <= 0xFFFF:
-                raise ValueError("routed pointer fields must fit in uint16")
-        if self.rows <= 0 or self.rows >= Nvfp4GemvSm100.ROUTED_ADDRESS_FLAG:
-            raise ValueError("routed NVFP4 rows must fit in 15 bits")
-        if self.k <= 0 or self.k > 0xFFFF or self.k % 32:
-            raise ValueError("routed NVFP4 K must be a uint16 multiple of 32")
-        if (
-            self.activation.dtype != torch.uint8
-            or self.activation.numel() != self.k // 2
-        ):
+        if self.rows <= 0 or self.rows > 0xFFFF or self.rows % 8:
+            raise ValueError("routed NVFP4 rows must be a positive multiple of 8")
+        if self.k <= 0 or self.k > 0xFFFF or self.k % 256:
+            raise ValueError("routed NVFP4 K must be a uint16 multiple of 256")
+        if (self.activation.dtype != torch.uint8 or
+                self.activation.numel() != self.k // 2):
             raise ValueError("activation must contain K/2 packed uint8 values")
-        if (
-            self.activation_scale.dtype != torch.float8_e4m3fn
-            or self.activation_scale.numel() != self.k // 16
-        ):
+        if (self.activation_scale.dtype != torch.float8_e4m3fn or
+                self.activation_scale.numel() != self.k // 16):
             raise ValueError("activation_scale must contain K/16 E4M3 values")
         if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
             raise ValueError("output must contain M BF16 values")
-        if self.num_sms <= 0 or self.num_sms > self.rows:
-            raise ValueError("routed NVFP4 GEMV requires 1 <= num_sms <= M")
+        self.active_sms, _, _ = _aligned_row_shard(
+            self.rows, self.num_sms, 0
+        )
+        if (len(self.weight_fields) != self.active_sms or
+                len(self.weight_scale_fields) != self.active_sms):
+            raise ValueError("routed weight fields must contain one field per active SM")
+        for field in (*self.weight_fields, *self.weight_scale_fields, self.alpha_field):
+            if not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+                raise ValueError("routed pointer fields must fit in 13 bits")
 
     def schedule(self, sm):
-        if sm < 0:
+        _, row_start, row_count = _aligned_row_shard(
+            self.rows, self.num_sms, sm
+        )
+        if row_count == 0:
             return []
         route_bar = self._bar("route")
         if route_bar is None:
             raise ValueError("routed NVFP4 GEMV requires a route barrier")
-        rows_per_sm, extra = divmod(self.rows, self.num_sms)
-        row_start = sm * rows_per_sm + min(sm, extra)
-        row_count = rows_per_sm + (1 if sm < extra else 0)
+        weight_bytes = row_count * (self.k // 2)
+        scale_bytes = row_count * (self.k // 16)
         return [
-            Nvfp4GemvSm100(
-                row_count,
-                self.k,
-                row_start=row_start,
-                routed_addresses=True,
-            ),
-            RoutedRawAddress(
-                self.routing_state, self.route_rank, self.weight_field
-            ).bar(route_bar),
-            RoutedRawAddress(
-                self.routing_state, self.route_rank, self.weight_scale_field
-            ),
-            RoutedRawAddress(
-                self.routing_state, self.route_rank, self.activation_field
-            ),
-            RoutedRawAddress(
+            Nvfp4GemvSm100(row_count, self.k),
+            RoutedTmaLoad1D(
                 self.routing_state,
                 self.route_rank,
-                self.activation_scale_field,
+                self.weight_fields[sm],
+                weight_bytes,
+            ).bar(route_bar),
+            RoutedTmaLoad1D(
+                self.routing_state,
+                self.route_rank,
+                self.weight_scale_fields[sm],
+                scale_bytes,
             ),
-            RoutedRawAddress(
-                self.routing_state, self.route_rank, self.alpha_field
+            TmaLoad1D(self.activation.reshape(-1)),
+            TmaLoad1D(self.activation_scale.reshape(-1)),
+            RoutedTmaLoad1D(
+                self.routing_state, self.route_rank, self.alpha_field, 16
             ),
-            RoutedRawAddress(
-                self.routing_state, self.route_rank, self.output_field
-            )
-                .bar(self._bar("output")).writeback(),
+            TmaStore1D(
+                self.output[row_start:row_start + row_count]
+            ).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, self.num_sms)
+        return self._bar_release_if_present(role, self.active_sms)
 
 
 class SchedNvfp4GemvUmma(SchedNvfp4Gemv):
     """Map one native block-scaled UMMA tile to each resident SM."""
 
     def __init__(self, weight, weight_scale, activation, activation_scale,
-                 alpha, output, base_raw_slot=24, output_columns=1):
+                 alpha, output, output_columns=1):
         if output_columns not in (1, 8):
             raise ValueError("NVFP4 UMMA output_columns must be 1 or 8")
         self.output_columns = output_columns
         super().__init__(
-            weight, weight_scale, activation, activation_scale,
-            alpha, output, base_raw_slot
+            weight, weight_scale, activation, activation_scale, alpha, output
         )
 
     def _expected_output_elements(self, rows):
         return rows * self.output_columns
 
-    def _on_place(self):
-        super()._on_place()
-        rows_per_sm = (self.rows + self.num_sms - 1) // self.num_sms
-        if rows_per_sm > 128:
-            raise ValueError("NVFP4 UMMA supports at most 128 output rows per SM")
-        if self.k % 256:
-            raise ValueError("NVFP4 UMMA K must be divisible by 256")
+    def _output_view(self, row_start, row_count):
+        start = row_start * self.output_columns
+        stop = (row_start + row_count) * self.output_columns
+        return self.output.reshape(-1)[start:stop]
 
-    def schedule(self, sm):
-        if sm < 0:
-            return []
-        rows_per_sm, extra = divmod(self.rows, self.num_sms)
-        row_start = sm * rows_per_sm + min(sm, extra)
-        row_count = rows_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
-        return [
-            Nvfp4GemvUmmaSm100(
-                row_count, self.k, self.output_columns
-            ),
-            RawAddress(self.weight[row_start], slot),
-            RawAddress(self.weight_scale[row_start], slot + 1),
-            RawAddress(self.activation.reshape(-1), slot + 2),
-            RawAddress(self.activation_scale.reshape(-1), slot + 3),
-            RawAddress(self.alpha.reshape(-1), slot + 4),
-            RawAddress(
-                self.output[row_start * self.output_columns], slot + 5
-            )
-                .bar(self._bar("output")).writeback(),
-        ]
+    def _compute_instruction(self, row_count):
+        return Nvfp4GemvUmmaSm100(row_count, self.k, self.output_columns)
 
 
 class SchedFp8Block128Gemv(Schedule):
     """Shard an E4M3/UE8M0 checkpoint GEMV across resident SMs."""
 
     def __init__(self, weight, weight_scale, activation, activation_scale,
-                 output, base_raw_slot=24):
+                 output):
         super().__init__()
         self.weight = weight
         self.weight_scale = weight_scale
         self.activation = activation
         self.activation_scale = activation_scale
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.weight.dtype != torch.float8_e4m3fn or self.weight.ndim != 2:
@@ -342,8 +335,6 @@ class SchedFp8Block128Gemv(Schedule):
             raise ValueError("output must contain M BF16 values")
         if self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("FP8 GEMV requires 1 <= num_sms <= M")
-        if self.base_raw_slot < config.num_slots or self.base_raw_slot + 4 >= 32:
-            raise ValueError("FP8 GEMV needs five C2M-addressable special slots")
 
     def schedule(self, sm):
         if sm < 0:
@@ -351,16 +342,28 @@ class SchedFp8Block128Gemv(Schedule):
         rows_per_sm, extra = divmod(self.rows, self.num_sms)
         row_start = sm * rows_per_sm + min(sm, extra)
         row_count = rows_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
-        return [
-            Fp8Block128GemvSm100(row_count, self.k, row_start % 128),
-            RawAddress(self.weight[row_start], slot),
-            RawAddress(self.weight_scale[row_start // 128], slot + 1),
-            RawAddress(self.activation.reshape(-1), slot + 2),
-            RawAddress(self.activation_scale.reshape(-1), slot + 3),
-            RawAddress(self.output[row_start], slot + 4)
-                .bar(self._bar("output")).writeback(),
-        ]
+        max_tile_rows = max(1, 65520 // self.k)
+        instructions = []
+        row_end = row_start + row_count
+        for tile_start in range(row_start, row_end, max_tile_rows):
+            tile_end = min(tile_start + max_tile_rows, row_end)
+            tile_rows = tile_end - tile_start
+            scale_start = tile_start // 128
+            scale_end = (tile_end + 127) // 128
+            instructions += [
+                Fp8Block128GemvSm100(
+                    tile_rows, self.k, tile_start % 128
+                ),
+                _shared_load_1d(self.weight[tile_start:tile_end]),
+                _shared_load_1d(self.weight_scale[scale_start:scale_end]),
+                _shared_load_1d(self.activation.reshape(-1)),
+                _shared_load_1d(self.activation_scale.reshape(-1)),
+            ]
+            store = _shared_store_1d(self.output[tile_start:tile_end])
+            if tile_end == row_end:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -369,17 +372,14 @@ class SchedFp8Block128Gemv(Schedule):
 
 
 class SchedDsv4Rope512_64(Schedule):
-    def __init__(self, input, table, output, inverse=False, base_raw_slot=24):
+    def __init__(self, input, table, output, inverse=False):
         super().__init__()
         self.input = input
         self.table = table
         self.output = output
         self.inverse = inverse
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek partial RoPE currently uses exactly one SM")
         if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
                 self.input.shape[1] != 512):
             raise ValueError("DeepSeek RoPE input must be BF16 [rows,512]")
@@ -388,29 +388,31 @@ class SchedDsv4Rope512_64(Schedule):
         if (self.table.dtype != torch.float32 or
                 tuple(self.table.shape) != (32, 2)):
             raise ValueError("DeepSeek RoPE table must be FP32 [32,2]")
+        self.rows = self.input.shape[0]
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("DeepSeek partial RoPE requires 1 <= num_sms <= rows")
 
     def schedule(self, sm):
-        if sm != 0:
+        if sm < 0:
             return []
-        slot = self.base_raw_slot
-        return [
-            Dsv4Rope512_64(self.input.shape[0], self.inverse),
-            RawAddress(self.input, slot),
-            RawAddress(self.table, slot + 1),
-            RawAddress(self.output, slot + 2)
-                .bar(self._bar("output")).writeback(),
-        ]
+        instructions = []
+        for row in range(sm, self.rows, self.num_sms):
+            instructions += [
+                Dsv4Rope512_64(1, self.inverse),
+                TmaLoad1D(self.input[row]),
+                TmaLoad1D(self.table),
+                TmaStore1D(self.output[row]).bar(self._bar("output")),
+            ]
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(role, self.rows)
 
 
 class SchedDsv4Rope128_64(SchedDsv4Rope512_64):
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek index RoPE currently uses exactly one SM")
         if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
                 self.input.shape[1] != 128):
             raise ValueError("DeepSeek index RoPE input must be BF16 [rows,128]")
@@ -419,29 +421,32 @@ class SchedDsv4Rope128_64(SchedDsv4Rope512_64):
         if (self.table.dtype != torch.float32 or
                 tuple(self.table.shape) != (32, 2)):
             raise ValueError("DeepSeek index RoPE table must be FP32 [32,2]")
+        self.rows = self.input.shape[0]
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("DeepSeek index RoPE requires 1 <= num_sms <= rows")
 
     def schedule(self, sm):
-        if sm != 0:
+        if sm < 0:
             return []
-        slot = self.base_raw_slot
-        return [
-            Dsv4Rope128_64(self.input.shape[0], self.inverse),
-            RawAddress(self.input, slot),
-            RawAddress(self.table, slot + 1),
-            RawAddress(self.output, slot + 2)
-                .bar(self._bar("output")).writeback(),
-        ]
+        instructions = []
+        for row in range(sm, self.rows, self.num_sms):
+            instructions += [
+                Dsv4Rope128_64(1, self.inverse),
+                TmaLoad1D(self.input[row]),
+                TmaLoad1D(self.table),
+                TmaStore1D(self.output[row]).bar(self._bar("output")),
+            ]
+        return instructions
 
 
 class SchedDsv4SparseAttention512(Schedule):
-    def __init__(self, q, kv, indices, sink, output, base_raw_slot=24):
+    def __init__(self, q, kv, indices, sink, output):
         super().__init__()
         self.q = q
         self.kv = kv
         self.indices = indices
         self.sink = sink
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if (self.q.dtype != torch.bfloat16 or self.q.ndim != 2 or
@@ -461,20 +466,31 @@ class SchedDsv4SparseAttention512(Schedule):
             raise ValueError("DeepSeek attention sink must be FP32 [heads]")
         if self.output.dtype != torch.bfloat16 or self.output.shape != self.q.shape:
             raise ValueError("DeepSeek sparse output must match Q")
+        self.indexed_table = IndexedLoadTable(self.kv, self.indices)
 
     def schedule(self, sm):
         if sm < 0:
             return []
-        slot = self.base_raw_slot
-        return [
-            Dsv4SparseAttention512(sm, self.indices.numel()),
-            RawAddress(self.q, slot),
-            RawAddress(self.kv, slot + 1),
-            RawAddress(self.indices, slot + 2),
-            RawAddress(self.sink, slot + 3),
-            RawAddress(self.output, slot + 4)
-                .bar(self._bar("output")).writeback(),
+        instructions = [
+            Dsv4SparseAttention512(self.indices.numel()),
+            TmaLoad1D(self.q[sm]),
+            _shared_load_1d(self.indices),
+            _shared_load_1d(self.sink[sm:sm + 1]),
         ]
+        load = IndexedTmaLoad1D(
+            self.indexed_table.state[0], 512 * 2
+        )
+        step = (load, IndexedTmaLoad1D.RECORD_BYTES)
+        if self._bar("indices") is None:
+            instructions += RepeatM.on(self.indices.numel(), step)
+        else:
+            instructions += RepeatM.onSync(
+                0, self._bar("indices"), self.indices.numel(), step
+            )
+        instructions.append(
+            TmaStore1D(self.output[sm]).bar(self._bar("output"))
+        )
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -484,8 +500,7 @@ class SchedDsv4SparseAttention512(Schedule):
 
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
-                 output_weights, hash_routing=False, route_scale=1.5,
-                 base_raw_slot=24):
+                 output_weights, hash_routing=False, route_scale=1.5):
         super().__init__()
         self.logits = logits
         self.bias = bias
@@ -494,7 +509,6 @@ class SchedDsv4RouteTop6(Schedule):
         self.output_weights = output_weights
         self.hash_routing = hash_routing
         self.route_scale = route_scale
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -503,25 +517,23 @@ class SchedDsv4RouteTop6(Schedule):
             raise ValueError("DeepSeek routing logits must contain 256 BF16 values")
         if self.bias.dtype != torch.float32 or self.bias.numel() != 256:
             raise ValueError("DeepSeek routing bias must contain 256 FP32 values")
-        if self.hash_indices.dtype != torch.int32 or self.hash_indices.numel() != 6:
-            raise ValueError("DeepSeek hash routing must provide six int32 ids")
-        if self.output_indices.dtype != torch.int32 or self.output_indices.numel() != 6:
-            raise ValueError("DeepSeek route output must contain six int32 ids")
-        if self.output_weights.dtype != torch.float32 or self.output_weights.numel() != 6:
-            raise ValueError("DeepSeek route output must contain six FP32 weights")
+        if self.hash_indices.dtype != torch.int32 or self.hash_indices.numel() != 8:
+            raise ValueError("DeepSeek hash routing storage must contain eight int32 values")
+        if self.output_indices.dtype != torch.int32 or self.output_indices.numel() != 8:
+            raise ValueError("DeepSeek route-id storage must contain eight int32 values")
+        if self.output_weights.dtype != torch.float32 or self.output_weights.numel() != 8:
+            raise ValueError("DeepSeek route-weight storage must contain eight FP32 values")
 
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
         return [
             Dsv4RouteTop6(self.hash_routing, self.route_scale),
-            RawAddress(self.logits, slot),
-            RawAddress(self.bias, slot + 1),
-            RawAddress(self.hash_indices, slot + 2),
-            RawAddress(self.output_indices, slot + 3).writeback(),
-            RawAddress(self.output_weights, slot + 4)
-                .bar(self._bar("output")).writeback(),
+            TmaLoad1D(self.logits),
+            TmaLoad1D(self.bias),
+            TmaLoad1D(self.hash_indices),
+            TmaStore1D(self.output_indices).bar(self._bar("output")),
+            TmaStore1D(self.output_weights),
         ]
 
     def bar_release_count(self, role: str):
@@ -531,13 +543,12 @@ class SchedDsv4RouteTop6(Schedule):
 
 
 class SchedDsv4ExpertReduce(Schedule):
-    def __init__(self, routed, weights, shared, output, base_raw_slot=24):
+    def __init__(self, routed, weights, shared, output):
         super().__init__()
         self.routed = routed
         self.weights = weights
         self.shared = shared
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -554,14 +565,12 @@ class SchedDsv4ExpertReduce(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
         return [
             Dsv4ExpertReduce(),
-            RawAddress(self.routed, slot),
-            RawAddress(self.weights, slot + 1),
-            RawAddress(self.shared, slot + 2),
-            RawAddress(self.output, slot + 3)
-                .bar(self._bar("output")).writeback(),
+            TmaLoad1D(self.routed),
+            _shared_load_1d(self.weights),
+            TmaLoad1D(self.shared),
+            TmaStore1D(self.output).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
@@ -571,12 +580,13 @@ class SchedDsv4ExpertReduce(Schedule):
 
 
 class SchedDsv4Fp32Bf16Gemv(Schedule):
-    def __init__(self, weight, input, output, base_raw_slot=24):
+    TILE_K = 8192
+
+    def __init__(self, weight, input, output):
         super().__init__()
         self.weight = weight
         self.input = input
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.weight.dtype != torch.float32 or self.weight.ndim != 2:
@@ -595,14 +605,20 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         rows_per_sm, extra = divmod(self.rows, self.num_sms)
         row_start = sm * rows_per_sm + min(sm, extra)
         row_count = rows_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
-        return [
-            Dsv4Fp32Bf16Gemv(row_count, self.k),
-            RawAddress(self.weight[row_start], slot),
-            RawAddress(self.input, slot + 1),
-            RawAddress(self.output[row_start], slot + 2)
-                .bar(self._bar("output")).writeback(),
-        ]
+        instructions = []
+        for local_row, row in enumerate(range(row_start, row_start + row_count)):
+            instructions.append(Dsv4Fp32Bf16Gemv(self.k, self.TILE_K))
+            for column in range(0, self.k, self.TILE_K):
+                end = min(column + self.TILE_K, self.k)
+                instructions += [
+                    _shared_load_1d(self.weight[row, column:end]),
+                    _shared_load_1d(self.input[column:end]),
+                ]
+            store = _shared_store_1d(self.output[row:row + 1])
+            if local_row + 1 == row_count:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -613,12 +629,13 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
 class SchedDsv4Bf16Gemv(Schedule):
     """Shard an unquantized checkpoint BF16 GEMV across resident SMs."""
 
-    def __init__(self, weight, input, output, base_raw_slot=24):
+    TILE_K = 16384
+
+    def __init__(self, weight, input, output):
         super().__init__()
         self.weight = weight
         self.input = input
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.weight.dtype != torch.bfloat16 or self.weight.ndim != 2:
@@ -632,8 +649,6 @@ class SchedDsv4Bf16Gemv(Schedule):
             raise ValueError("DeepSeek BF16 GEMV output must contain M values")
         if self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("DeepSeek BF16 GEMV requires 1 <= num_sms <= M")
-        if self.base_raw_slot < config.num_slots or self.base_raw_slot + 2 >= 32:
-            raise ValueError("DeepSeek BF16 GEMV needs three special slots")
 
     def schedule(self, sm):
         if sm < 0:
@@ -641,16 +656,23 @@ class SchedDsv4Bf16Gemv(Schedule):
         rows_per_sm, extra = divmod(self.rows, self.num_sms)
         row_start = sm * rows_per_sm + min(sm, extra)
         row_count = rows_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
-        return [
-            Dsv4Bf16Gemv(
-                row_count, self.k, output_fp32=self.output.dtype == torch.float32
-            ),
-            RawAddress(self.weight[row_start], slot),
-            RawAddress(self.input.reshape(-1), slot + 1),
-            RawAddress(self.output[row_start], slot + 2)
-                .bar(self._bar("output")).writeback(),
-        ]
+        instructions = []
+        for local_row, row in enumerate(range(row_start, row_start + row_count)):
+            instructions.append(Dsv4Bf16Gemv(
+                self.k, self.TILE_K,
+                output_fp32=self.output.dtype == torch.float32,
+            ))
+            for column in range(0, self.k, self.TILE_K):
+                end = min(column + self.TILE_K, self.k)
+                instructions += [
+                    _shared_load_1d(self.weight[row, column:end]),
+                    _shared_load_1d(self.input.reshape(-1)[column:end]),
+                ]
+            store = _shared_store_1d(self.output[row:row + 1])
+            if local_row + 1 == row_count:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -660,7 +682,7 @@ class SchedDsv4Bf16Gemv(Schedule):
 
 class SchedDsv4HcPre(Schedule):
     def __init__(self, residual, mixes, scale, base, output, post, comb,
-                 sinkhorn_iters=20, epsilon=1.0e-6, base_raw_slot=24):
+                 sinkhorn_iters=20, epsilon=1.0e-6):
         super().__init__()
         self.residual = residual
         self.mixes = mixes
@@ -671,7 +693,6 @@ class SchedDsv4HcPre(Schedule):
         self.comb = comb
         self.sinkhorn_iters = sinkhorn_iters
         self.epsilon = epsilon
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -694,17 +715,15 @@ class SchedDsv4HcPre(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
         return [
             Dsv4HcPre(self.sinkhorn_iters, self.epsilon),
-            RawAddress(self.residual, slot),
-            RawAddress(self.mixes, slot + 1),
-            RawAddress(self.scale, slot + 2),
-            RawAddress(self.base, slot + 3),
-            RawAddress(self.output, slot + 4)
-                .bar(self._bar("output")).writeback(),
-            RawAddress(self.post, slot + 5).writeback(),
-            RawAddress(self.comb, slot + 6).writeback(),
+            TmaLoad1D(self.residual),
+            TmaLoad1D(self.mixes),
+            _shared_load_1d(self.scale),
+            TmaLoad1D(self.base),
+            TmaStore1D(self.output).bar(self._bar("output")),
+            TmaStore1D(self.post),
+            TmaStore1D(self.comb),
         ]
 
     def bar_release_count(self, role: str):
@@ -714,14 +733,13 @@ class SchedDsv4HcPre(Schedule):
 
 
 class SchedDsv4HcPost(Schedule):
-    def __init__(self, branch, residual, post, comb, output, base_raw_slot=24):
+    def __init__(self, branch, residual, post, comb, output):
         super().__init__()
         self.branch = branch
         self.residual = residual
         self.post = post
         self.comb = comb
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -740,15 +758,13 @@ class SchedDsv4HcPost(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
         return [
             Dsv4HcPost(),
-            RawAddress(self.branch, slot),
-            RawAddress(self.residual, slot + 1),
-            RawAddress(self.post, slot + 2),
-            RawAddress(self.comb, slot + 3),
-            RawAddress(self.output, slot + 4)
-                .bar(self._bar("output")).writeback(),
+            TmaLoad1D(self.branch),
+            TmaLoad1D(self.residual),
+            TmaLoad1D(self.post),
+            TmaLoad1D(self.comb),
+            TmaStore1D(self.output).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
@@ -758,11 +774,10 @@ class SchedDsv4HcPost(Schedule):
 
 
 class SchedDsv4Hadamard(Schedule):
-    def __init__(self, input, output, base_raw_slot=24):
+    def __init__(self, input, output):
         super().__init__()
         self.input = input
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
@@ -777,12 +792,10 @@ class SchedDsv4Hadamard(Schedule):
     def schedule(self, sm):
         if sm < 0:
             return []
-        slot = self.base_raw_slot
         return [
-            Dsv4Hadamard(sm, self.width),
-            RawAddress(self.input, slot),
-            RawAddress(self.output, slot + 1)
-                .bar(self._bar("output")).writeback(),
+            Dsv4Hadamard(self.width),
+            TmaLoad1D(self.input[sm]),
+            TmaStore1D(self.output[sm]).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
@@ -792,12 +805,11 @@ class SchedDsv4Hadamard(Schedule):
 
 
 class SchedDsv4GatedPool(Schedule):
-    def __init__(self, values, scores, output, base_raw_slot=24):
+    def __init__(self, values, scores, output):
         super().__init__()
         self.values = values
         self.scores = scores
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -815,14 +827,16 @@ class SchedDsv4GatedPool(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
-        return [
-            Dsv4GatedPool(self.pool_rows, self.width),
-            RawAddress(self.values, slot),
-            RawAddress(self.scores, slot + 1),
-            RawAddress(self.output, slot + 2)
-                .bar(self._bar("output")).writeback(),
-        ]
+        instructions = [Dsv4GatedPool(self.pool_rows, self.width)]
+        for row in range(self.pool_rows):
+            instructions += [
+                TmaLoad1D(self.values[row]),
+                TmaLoad1D(self.scores[row]),
+            ]
+        instructions.append(
+            TmaStore1D(self.output).bar(self._bar("output"))
+        )
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -831,13 +845,14 @@ class SchedDsv4GatedPool(Schedule):
 
 
 class SchedDsv4IndexScore(Schedule):
-    def __init__(self, q, kv, head_weights, output, base_raw_slot=24):
+    TILE_ROWS = 240
+
+    def __init__(self, q, kv, head_weights, output):
         super().__init__()
         self.q = q
         self.kv = kv
         self.head_weights = head_weights
         self.output = output
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.q.dtype != torch.bfloat16 or tuple(self.q.shape) != (64, 128):
@@ -859,15 +874,21 @@ class SchedDsv4IndexScore(Schedule):
         rows_per_sm, extra = divmod(self.rows, self.num_sms)
         row_start = sm * rows_per_sm + min(sm, extra)
         row_count = rows_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
-        return [
-            Dsv4IndexScore(row_count),
-            RawAddress(self.q, slot),
-            RawAddress(self.kv[row_start], slot + 1),
-            RawAddress(self.head_weights, slot + 2),
-            RawAddress(self.output[row_start], slot + 3)
-                .bar(self._bar("output")).writeback(),
-        ]
+        instructions = []
+        row_end = row_start + row_count
+        for tile_start in range(row_start, row_end, self.TILE_ROWS):
+            tile_end = min(tile_start + self.TILE_ROWS, row_end)
+            instructions += [
+                Dsv4IndexScore(tile_end - tile_start),
+                TmaLoad1D(self.q),
+                TmaLoad1D(self.kv[tile_start:tile_end]),
+                TmaLoad1D(self.head_weights),
+            ]
+            store = _shared_store_1d(self.output[tile_start:tile_end])
+            if tile_end == row_end:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -876,12 +897,11 @@ class SchedDsv4IndexScore(Schedule):
 
 
 class SchedDsv4TopK512(Schedule):
-    def __init__(self, scores, output, index_offset=0, base_raw_slot=24):
+    def __init__(self, scores, output, index_offset=0):
         super().__init__()
         self.scores = scores
         self.output = output
         self.index_offset = index_offset
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -898,15 +918,21 @@ class SchedDsv4TopK512(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
-        return [
+        instructions = [
             Dsv4TopK512(
                 self.scores.numel(), self.output.numel(), self.index_offset
             ),
-            RawAddress(self.scores, slot),
-            RawAddress(self.output, slot + 1)
-                .bar(self._bar("output")).writeback(),
         ]
+        first = min(self.scores.numel(), 1024)
+        instructions.append(_shared_load_1d(self.scores[:first]))
+        for start in range(first, self.scores.numel(), 512):
+            instructions.append(
+                _shared_load_1d(self.scores[start:min(start + 512, self.scores.numel())])
+            )
+        instructions.append(
+            _shared_store_1d(self.output).bar(self._bar("output"))
+        )
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -916,7 +942,7 @@ class SchedDsv4TopK512(Schedule):
 
 class SchedDsv4HcHead(Schedule):
     def __init__(self, residual, mixes, scale, base, output,
-                 epsilon=1.0e-6, base_raw_slot=24):
+                 epsilon=1.0e-6):
         super().__init__()
         self.residual = residual
         self.mixes = mixes
@@ -924,7 +950,6 @@ class SchedDsv4HcHead(Schedule):
         self.base = base
         self.output = output
         self.epsilon = epsilon
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -943,15 +968,13 @@ class SchedDsv4HcHead(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        slot = self.base_raw_slot
         return [
             Dsv4HcHead(self.epsilon),
-            RawAddress(self.residual, slot),
-            RawAddress(self.mixes, slot + 1),
-            RawAddress(self.scale, slot + 2),
-            RawAddress(self.base, slot + 3),
-            RawAddress(self.output, slot + 4)
-                .bar(self._bar("output")).writeback(),
+            TmaLoad1D(self.residual),
+            TmaLoad1D(self.mixes),
+            _shared_load_1d(self.scale),
+            TmaLoad1D(self.base),
+            TmaStore1D(self.output).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
@@ -961,12 +984,11 @@ class SchedDsv4HcHead(Schedule):
 
 
 class SchedDsv4Fp8Quant128(Schedule):
-    def __init__(self, input, output, scale, base_raw_slot=24):
+    def __init__(self, input, output, scale):
         super().__init__()
         self.input = input
         self.output = output
         self.scale = scale
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
@@ -992,13 +1014,14 @@ class SchedDsv4Fp8Quant128(Schedule):
         blocks_per_sm, extra = divmod(self.blocks, self.num_sms)
         block_start = sm * blocks_per_sm + min(sm, extra)
         block_count = blocks_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
+        source = self.input[block_start * 128:(block_start + block_count) * 128]
+        quantized = self.output[block_start * 128:(block_start + block_count) * 128]
+        scales = self.scale[block_start:block_start + block_count]
         return [
             Dsv4Fp8Quant128(block_count * 128),
-            RawAddress(self.input[block_start * 128:], slot),
-            RawAddress(self.output[block_start * 128:], slot + 1).writeback(),
-            RawAddress(self.scale[block_start:], slot + 2)
-                .bar(self._bar("output")).writeback(),
+            _shared_load_1d(source),
+            _shared_store_1d(quantized),
+            _shared_store_1d(scales).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):
@@ -1008,13 +1031,12 @@ class SchedDsv4Fp8Quant128(Schedule):
 
 
 class SchedDsv4Nvfp4Quant16(Schedule):
-    def __init__(self, input, global_scale, output, scale, base_raw_slot=24):
+    def __init__(self, input, global_scale, output, scale):
         super().__init__()
         self.input = input
         self.global_scale = global_scale
         self.output = output
         self.scale = scale
-        self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
@@ -1041,14 +1063,15 @@ class SchedDsv4Nvfp4Quant16(Schedule):
         blocks_per_sm, extra = divmod(self.blocks, self.num_sms)
         block_start = sm * blocks_per_sm + min(sm, extra)
         block_count = blocks_per_sm + (1 if sm < extra else 0)
-        slot = self.base_raw_slot
+        source = self.input[block_start * 16:(block_start + block_count) * 16]
+        quantized = self.output[block_start * 8:(block_start + block_count) * 8]
+        scales = self.scale[block_start:block_start + block_count]
         return [
             Dsv4Nvfp4Quant16(block_count * 16),
-            RawAddress(self.input[block_start * 16:], slot),
-            RawAddress(self.global_scale.reshape(-1), slot + 1),
-            RawAddress(self.output[block_start * 8:], slot + 2).writeback(),
-            RawAddress(self.scale[block_start:], slot + 3)
-                .bar(self._bar("output")).writeback(),
+            _shared_load_1d(source),
+            _shared_load_1d(self.global_scale.reshape(-1)),
+            _shared_store_1d(quantized),
+            _shared_store_1d(scales).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):

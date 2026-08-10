@@ -17,7 +17,7 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
     int rows,
     int k,
     int row_in_scale_block,
-    const MInst *st_insts,
+    void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using Fp8 = cutlass::float_e4m3_t;
@@ -28,21 +28,26 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
   static_assert(sizeof(InputFragment) == 32,
                 "32 FP8 values must occupy one 256-bit load");
 
-  const int weight_slot = m2c.template pop<0>();
+  const int weight_slots = m2c.template pop<0>();
+  const int weight_slot = extract(weight_slots);
   const auto *weight = static_cast<const Fp8 *>(
-      slot_2_glob_ptr(st_insts, weight_slot));
-  const int weight_scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, weight_slot));
+  const int weight_scale_slots = m2c.template pop<0>();
+  const int weight_scale_slot = extract(weight_scale_slots);
   const auto *weight_scale = static_cast<const Scale *>(
-      slot_2_glob_ptr(st_insts, weight_scale_slot));
-  const int input_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, weight_scale_slot));
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const Fp8 *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int input_scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_slot));
+  const int input_scale_slots = m2c.template pop<0>();
+  const int input_scale_slot = extract(input_scale_slots);
   const auto *input_scale = static_cast<const Scale *>(
-      slot_2_glob_ptr(st_insts, input_scale_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_scale_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<cutlass::bfloat16_t *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   const int lane_in_group = tid & 15;
@@ -95,6 +100,8 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(
+      tid,
+      weight_slots | weight_scale_slots | input_slots | input_scale_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }

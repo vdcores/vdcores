@@ -219,13 +219,14 @@ def run_router(device: torch.device, generator: torch.Generator) -> None:
     bias[[3, 29, 71]] += torch.tensor(
         [3.0, 2.0, 1.0], dtype=torch.float32, device=device
     )
-    hash_indices = torch.tensor(
+    hash_indices = torch.zeros((8,), dtype=torch.int32, device=device)
+    hash_indices[:6] = torch.tensor(
         [9, 71, 5, 255, 130, 44], dtype=torch.int32, device=device
     )
 
     for hash_routing in (False, True):
-        output_indices = torch.empty((6,), dtype=torch.int32, device=device)
-        output_weights = torch.empty((6,), dtype=torch.float32, device=device)
+        output_indices = torch.empty((8,), dtype=torch.int32, device=device)
+        output_weights = torch.empty((8,), dtype=torch.float32, device=device)
         latency = launch(
             SchedDsv4RouteTop6(
                 logits,
@@ -241,12 +242,12 @@ def run_router(device: torch.device, generator: torch.Generator) -> None:
         expected_weights, expected_indices = route_top6_reference(
             logits,
             bias,
-            hash_indices=hash_indices if hash_routing else None,
+            hash_indices=hash_indices[:6] if hash_routing else None,
         )
-        torch.testing.assert_close(output_indices, expected_indices, rtol=0, atol=0)
+        torch.testing.assert_close(output_indices[:6], expected_indices, rtol=0, atol=0)
         report_close(
             f"route_top6_hash_{int(hash_routing)}",
-            output_weights,
+            output_weights[:6],
             expected_weights,
             rtol=2.0e-5,
             atol=2.0e-5,

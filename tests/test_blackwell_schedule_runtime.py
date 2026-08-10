@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -17,7 +19,7 @@ from dae.instructions import (
     Nvfp4GemvSm100,
     ProfileEvent,
     RepeatM,
-    RoutedRawAddress,
+    RoutedTmaLoad1D,
     TmaTensor,
 )
 from dae.runtime import opcode
@@ -59,7 +61,7 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
 
 
-def test_routed_raw_address_encodes_l2_lookup_in_normal_slot():
+def test_routed_tma_load_encodes_l2_lookup_and_shared_span():
     class FakeDevice:
         type = "cuda"
 
@@ -72,7 +74,7 @@ def test_routed_raw_address_encodes_l2_lookup_in_normal_slot():
 
         @staticmethod
         def numel():
-            return 8
+            return 6
 
         @staticmethod
         def element_size():
@@ -82,24 +84,36 @@ def test_routed_raw_address_encodes_l2_lookup_in_normal_slot():
         def data_ptr():
             return 0x123456789ABC
 
-    instruction = RoutedRawAddress(FakeRoutingState(), 5, 257).bar(9)
+    instruction = RoutedTmaLoad1D(
+        FakeRoutingState(), 5, 257, 16384
+    ).bar(9)
 
-    assert instruction.opcode == opcode.OP_ALLOC_ROUTED_RAW_ADDRESS | 16
-    assert instruction.num_slots == 1 | (9 << 6)
-    assert instruction.arg == 5
-    assert instruction.size == 257
+    assert instruction.opcode == opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D | 16
+    assert instruction.num_slots == 2 | (9 << 6)
+    assert instruction.arg == (257 << 3) | 5
+    assert instruction.size == 16384
     assert cords2addr(instruction.cords) == FakeRoutingState.data_ptr()
 
 
-def test_nvfp4_routed_address_mode_encodes_row_start():
-    instruction = Nvfp4GemvSm100(
-        32,
-        256,
-        row_start=64,
-        routed_addresses=True,
-    )
+def test_nvfp4_gemv_encodes_shared_shard_shape():
+    instruction = Nvfp4GemvSm100(32, 256)
 
-    assert instruction.args == [32, 256, 0x8040]
+    assert instruction.args == [32, 256, 0]
+
+
+def test_deepseek_compute_tasks_cannot_escape_shared_memory():
+    root = Path(__file__).resolve().parents[1]
+    sources = [
+        root / "include/task/deepseek_v4.cuh",
+        root / "include/task/fp8.cuh",
+        root / "include/task/nvfp4.cuh",
+        root / "include/task/nvfp4_umma.cuh",
+    ]
+    combined = "\n".join(source.read_text() for source in sources)
+
+    assert "slot_2_glob_ptr" not in combined
+    assert "const MInst *st_insts" not in combined
+    assert "__threadfence" not in combined
 
 
 def test_profile_event_reserves_kernel_start_and_end_slots():

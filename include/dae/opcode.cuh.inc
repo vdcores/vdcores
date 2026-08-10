@@ -31,9 +31,16 @@ DAE_OP(OP_ALLOC_WB_TMA_REDUCE_ADD_4D, MK_MOP(24, MEM_OP_FLAGS_ALLOCATE | MEM_OP_
 //   2. always write to slot regardless of writeback flag
 
 DAE_OP(OP_ALLOC_WB_RAW_ADDRESS, MK_MOP(23, MEM_OP_FLAGS_ALLOCATE))
-// Routed pointers use normal allocator slots, so their metadata remains live
-// until the consuming compute instruction returns the token.
-DAE_OP(OP_ALLOC_ROUTED_RAW_ADDRESS, MK_MOP(25, MEM_OP_FLAGS_ALLOCATE))
+// Resolve the selected expert in LDU and copy its field into normal shared
+// slots. Compute only observes the resulting shared-slot mask.
+DAE_OP(OP_ALLOC_ROUTED_TMA_LOAD_1D, MK_MOP(25, MEM_OP_FLAGS_ALLOCATE))
+// Synchronous memory-core copies for small or non-16-byte-aligned metadata.
+// Compute still consumes allocator-owned shared slots; these are not raw
+// address escape hatches.
+DAE_OP(OP_ALLOC_LDU_LOAD_1D, MK_MOP(26, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_WB_STU_STORE_1D, MK_MOP(27, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
+// Resolve a runtime row index in LDU and load that row into shared memory.
+DAE_OP(OP_ALLOC_INDEXED_TMA_LOAD_1D, MK_MOP(28, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

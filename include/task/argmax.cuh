@@ -184,13 +184,11 @@ __device__ __forceinline__ void task_argmax_reduce_kernel(int num_active_tokens,
     }
   }
 
-  __threadfence();
   c2m.template push<31, true, false>(tid, 1 << output_slot);
 }
 
 // Reduce absolute-index records emitted directly by the LM-head epilogue.
-// The producer joins its compute warps before C2M publishes each record; this
-// fence only makes the final token store visible and is not a warp-group join.
+// The producer joins its compute warps before C2M publishes each record.
 template <int NUM_PARTIAL_TASKS, typename data_t,
           typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_argmax_reduce_global_kernel(
@@ -229,6 +227,5 @@ __device__ __forceinline__ void task_argmax_reduce_global_kernel(
     }
   }
 
-  __threadfence();
   c2m.template push<31, true, false>(tid, 1U << output_slot);
 }

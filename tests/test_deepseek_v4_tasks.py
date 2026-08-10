@@ -246,23 +246,17 @@ def test_hc_head_reference_reduces_four_streams():
 
 
 def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
-    class FakeRawAddress:
-        def __init__(self, tensor, slot):
+    class FakeTransfer:
+        def __init__(self, tensor):
             self.tensor = tensor
-            self.slot = slot
 
         def bar(self, _):
             return self
 
-        def writeback(self):
-            return self
-
-    monkeypatch.setitem(
-        SchedFp8Block128Gemv.schedule.__globals__,
-        "RawAddress",
-        FakeRawAddress,
-    )
-    rows, k, num_sms = 129280, 128, 3
+    globals_ = SchedFp8Block128Gemv.schedule.__globals__
+    monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
+    rows, k, num_sms = 65544, 128, 65544
     weight = torch.empty((rows, k), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty(
         ((rows + 127) // 128, k // 128), dtype=torch.float8_e8m0fnu
@@ -274,14 +268,14 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
         weight, weight_scale, activation, activation_scale, output
     ).place(num_sms)
 
-    sm = 2
+    sm = rows - 1
     rows_per_sm, extra = divmod(rows, num_sms)
     row_start = sm * rows_per_sm + min(sm, extra)
     row_count = rows_per_sm + (1 if sm < extra else 0)
     instructions = schedule.schedule(sm)
     assert row_start > 0xFFFF
     assert instructions[0].opcode == opcode.OP_FP8_BLOCK128_GEMV_SM100
-    assert instructions[0].args == [row_count, k, row_start % 128]
+    assert instructions[0].args == [1, k, row_start % 128]
     assert instructions[1].tensor.data_ptr() == weight[row_start].data_ptr()
     assert instructions[2].tensor.data_ptr() == weight_scale[row_start // 128].data_ptr()
     assert instructions[5].tensor.data_ptr() == output[row_start].data_ptr()
@@ -293,7 +287,7 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
         fp32_weight, fp32_input, fp32_output
     ).place(num_sms)
     fp32_instructions = fp32_schedule.schedule(sm)
-    assert fp32_instructions[0].args == [row_count, 1]
+    assert fp32_instructions[0].args == [1, 8192]
     assert fp32_instructions[1].tensor.data_ptr() == fp32_weight[row_start].data_ptr()
     assert fp32_instructions[3].tensor.data_ptr() == fp32_output[row_start].data_ptr()
 
@@ -303,7 +297,7 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
         bf16_weight, fp32_input, bf16_output
     ).place(num_sms)
     bf16_instructions = bf16_schedule.schedule(sm)
-    assert bf16_instructions[0].args == [row_count, 1, 0]
+    assert bf16_instructions[0].args == [1, 16384, 0]
     assert bf16_instructions[1].tensor.data_ptr() == bf16_weight[row_start].data_ptr()
     assert bf16_instructions[3].tensor.data_ptr() == bf16_output[row_start].data_ptr()
 
@@ -311,26 +305,20 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
     fp32_from_bf16_schedule = SchedDsv4Bf16Gemv(
         bf16_weight, fp32_input, fp32_from_bf16
     ).place(num_sms)
-    assert fp32_from_bf16_schedule.schedule(sm)[0].args == [row_count, 1, 1]
+    assert fp32_from_bf16_schedule.schedule(sm)[0].args == [1, 16384, 1]
 
 
 def test_activation_quant_schedules_shard_whole_scale_blocks(monkeypatch):
-    class FakeRawAddress:
-        def __init__(self, tensor, slot):
+    class FakeTransfer:
+        def __init__(self, tensor):
             self.tensor = tensor
-            self.slot = slot
 
         def bar(self, _):
             return self
 
-        def writeback(self):
-            return self
-
-    monkeypatch.setitem(
-        SchedDsv4Fp8Quant128.schedule.__globals__,
-        "RawAddress",
-        FakeRawAddress,
-    )
+    globals_ = SchedDsv4Fp8Quant128.schedule.__globals__
+    monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
     source = torch.empty((4096,), dtype=torch.bfloat16)
 
     fp8_output = torch.empty_like(source, dtype=torch.float8_e4m3fn)

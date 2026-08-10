@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 
+from dae.deepseek_v4 import route_top6_reference
 from dae.deepseek_v4_quant import dequantize_nvfp4, quantize_nvfp4
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
@@ -35,8 +36,10 @@ def main() -> None:
     activation, activation_scale, input_scale = quantize_nvfp4(
         activation_source
     )
-    default_alpha = (default_scale2 * input_scale).reshape(1)
-    selected_alpha = (selected_scale2 * input_scale).reshape(1)
+    default_alpha = torch.zeros((4,), dtype=torch.float32, device=device)
+    selected_alpha = torch.zeros((4,), dtype=torch.float32, device=device)
+    default_alpha[0] = default_scale2 * input_scale
+    selected_alpha[0] = selected_scale2 * input_scale
     output = torch.empty((rows,), dtype=torch.bfloat16, device=device)
 
     def expert_column(default, selected):
@@ -44,23 +47,38 @@ def main() -> None:
         column[selected_expert] = selected
         return column
 
-    table = RoutedAddressTable(
-        {
-            "weight": expert_column(default_weight, selected_weight),
-            "weight_scale": expert_column(default_scale, selected_scale),
-            "activation": [activation] * 256,
-            "activation_scale": [activation_scale] * 256,
-            "alpha": expert_column(default_alpha, selected_alpha),
-            "output": [output] * 256,
-        }
-    )
+    columns = {
+        "alpha": expert_column(default_alpha, selected_alpha),
+    }
+    weight_fields = []
+    weight_scale_fields = []
+    rows_per_sm = rows // num_sms
+    for sm in range(num_sms):
+        row_start = sm * rows_per_sm
+        row_stop = row_start + rows_per_sm
+        weight_name = f"weight_sm{sm}"
+        scale_name = f"weight_scale_sm{sm}"
+        columns[weight_name] = expert_column(
+            default_weight[row_start:row_stop],
+            selected_weight[row_start:row_stop],
+        )
+        columns[scale_name] = expert_column(
+            default_scale[row_start:row_stop],
+            selected_scale[row_start:row_stop],
+        )
+        weight_fields.append(weight_name)
+        weight_scale_fields.append(scale_name)
+    table = RoutedAddressTable(columns)
 
-    logits = torch.zeros((256,), dtype=torch.bfloat16, device=device)
+    logits = torch.linspace(
+        -1.0, 1.0, 256, dtype=torch.bfloat16, device=device
+    )
     bias = torch.zeros((256,), dtype=torch.float32, device=device)
-    hash_indices = torch.tensor(
+    hash_indices = torch.zeros((8,), dtype=torch.int32, device=device)
+    hash_indices[:6] = torch.tensor(
         [selected_expert, 0, 1, 2, 3, 4], dtype=torch.int32, device=device
     )
-    route_weights = torch.empty((6,), dtype=torch.float32, device=device)
+    route_weights = torch.empty((8,), dtype=torch.float32, device=device)
 
     launcher = Launcher(num_sms, device=device)
     route_bar = launcher.new_bar(1)
@@ -69,19 +87,16 @@ def main() -> None:
         logits,
         bias,
         hash_indices,
-        table.route_indices,
+        table.route_indices_storage,
         route_weights,
         hash_routing=True,
     ).bar("output", route_bar).place(1)
     expert = SchedRoutedNvfp4Gemv(
         table.state,
         route_rank=0,
-        weight_field=table.field("weight"),
-        weight_scale_field=table.field("weight_scale"),
-        activation_field=table.field("activation"),
-        activation_scale_field=table.field("activation_scale"),
+        weight_fields=[table.field(name) for name in weight_fields],
+        weight_scale_fields=[table.field(name) for name in weight_scale_fields],
         alpha_field=table.field("alpha"),
-        output_field=table.field("output"),
         rows=rows,
         k=k,
         activation=activation,
@@ -96,6 +111,12 @@ def main() -> None:
         @ dequantize_nvfp4(activation, activation_scale, input_scale)
     ).to(torch.bfloat16)
     torch.testing.assert_close(output, reference, rtol=5.0e-2, atol=5.0e-2)
+    expected_route_weights, _ = route_top6_reference(
+        logits, bias, hash_indices=hash_indices[:6]
+    )
+    torch.testing.assert_close(
+        route_weights[:6], expected_route_weights, rtol=1.0e-5, atol=1.0e-5
+    )
     assert table.route_indices.tolist()[0] == selected_expert
     assert launcher.bars.view(torch.int32)[output_bar].item() == 0
     max_abs = (output.float() - reference.float()).abs().max().item()

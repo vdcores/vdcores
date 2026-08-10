@@ -68,10 +68,14 @@ model math:
 - 512/1024 RMSNorm, FP32-weight/BF16-input small projection, mHC pre/Sinkhorn,
   mHC post, and final/MTP mHC-head reduction.
 
-The FP8 and FP32 schedules address each output shard through pointer offsets,
-so their instruction fields no longer cap matrices at 65,535 rows.  The FP8
-path was stress-tested at 129,280-by-4,096; the actual checkpoint head is
-unquantized BF16 rather than FP8.
+DeepSeek compute tasks have a strict shared-memory contract: queue operands
+are allocator slot masks, never global pointers or `MInst` metadata. LDU
+resolves static, routed, and indexed addresses and fills shared slots; STU
+owns every global write. Bulk payloads use TMA, while small or misaligned
+metadata uses an LDU/STU copy opcode. Large linears, top-k inputs, compression
+rows, and indexed KV reads stream through bounded shared tiles. No task uses
+`__threadfence`; compute-group synchronization stays inside compute and
+memory dependencies/barriers stay in the memory VM.
 
 ## Verified GB200 baselines (2026-08-10)
 
@@ -83,11 +87,11 @@ unquantized BF16 rather than FP8.
   quantized reference; 16.320 us median kernel span.
 - BF16 checkpoint GEMV, M256 K4096, 152 SMs: bit-exact BF16 reference and
   9.920 us in a one-iteration router-shape smoke.
-- Broad functional sweep, one GB200: all 21 checks passed, including exact
+- Broad shared-slot functional sweep, one GB200: all 25 checks passed, including exact
   activation-quantized bit patterns, 64x512 sparse attention with top-k 512,
   both compression ratios, learned indexing, MoE routing/reduction, bounded
   SwiGLU, and all mHC stages.  After parallel quantization/index selection, the
-  selective image uses 56 registers, nine barriers, a 112-byte stack frame, no
+  selective image uses 64 registers, nine barriers, a 112-byte stack frame, no
   spills, and 14,720 bytes static shared memory.
 - FP8 LM-head shape M129280 K4096, 152 SMs: max absolute error 0.003906 and
   656.800 us for the one-iteration projection-shape stress check.  M4096 K4096
@@ -152,23 +156,33 @@ logits:
   rows, exact top-512 selection, and 640 attention candidates.
 
 The synthetic graph deliberately remains untuned and currently executes many
-individual task launches.  The next functional milestone is loading real
-checkpoint tensors into this flow; only then should its profile drive task
-fusion, launch reduction, and TBT work.
+individual task launches. It is a reference harness, not the VDCores assembly
+target. Production assembly follows Llama/Qwen: schedules flatten task and
+memory instructions into one compute queue and one memory queue, then issue
+one `Launcher.launch()` per decode token.
 
 ## Single-launch routed expert foundation
 
 Routed expert selection no longer needs a host readback to choose checkpoint
-addresses.  `RoutedAddressTable` keeps the six route ids and an
-expert-by-field pointer table in HBM.  `OP_ALLOC_ROUTED_RAW_ADDRESS` is a true
-LDU operation: after the router's output dependency becomes ready, LDU reads
-the selected expert and pointer through L2 and publishes an allocator-owned
-address slot to compute.  All six NVFP4 operands use this same operator; no
-separate static-address compatibility operator is part of the routed path.
+addresses. `RoutedAddressTable` keeps eight padded route-id words (six valid
+ids), routing metadata, and an expert-by-field pointer table in HBM. After the
+router output dependency becomes ready, `OP_ALLOC_ROUTED_TMA_LOAD_1D` reads
+the selected expert and pointer through L2, copies the selected tensor slice
+into normal allocator-owned shared slots, and publishes only the slot mask to
+compute. There is no queued-address compatibility object and no alloc-warp
+issue barrier. The first routed load carries the route dependency; same-port
+LDU ordering covers later expert fields.
+
+Sparse attention uses the same boundary through
+`OP_ALLOC_INDEXED_TMA_LOAD_1D`: LDU reads runtime KV row ids and streams those
+rows into shared memory. `RepeatM` advances compact 24-byte HBM lookup records,
+so top-512 attention does not require hundreds of materialized memory
+instructions. Compute sees shared Q, indices, sink, KV row tiles, and output
+slots only.
 
 The first composed proof used one `Launcher.launch()` for hash routing and a
-four-SM sharded NVFP4 GEMV.  Expert 37 remained on device from routing through
-address selection, and the output was bit-exact to the quantized reference.
+four-SM sharded NVFP4 GEMV. Expert 37 remained on device from routing through
+the LDU tensor load, and the output was bit-exact to the quantized reference.
 This is the required routing/addressing foundation for a whole-layer queued
 schedule, not a TBT result.
 

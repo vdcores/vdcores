@@ -79,7 +79,10 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 - `OP_ALLOC_WB_TMA_REDUCE_ADD_2D`
 - `OP_ALLOC_WB_TMA_REDUCE_ADD_3D`
 - `OP_ALLOC_WB_RAW_ADDRESS`
-- `OP_ALLOC_ROUTED_RAW_ADDRESS`
+- `OP_ALLOC_ROUTED_TMA_LOAD_1D`
+- `OP_ALLOC_LDU_LOAD_1D`
+- `OP_ALLOC_WB_STU_STORE_1D`
+- `OP_ALLOC_INDEXED_TMA_LOAD_1D`
 
 ### Control-flow and non-alloc ops
 
@@ -226,8 +229,18 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 Barrier behavior for load ops:
 
 - if `BARRIER` is set and `WRITEBACK` is not set, the load warp waits for `bars[bar] == 0` before issuing the load
-- routed-address resolution happens in LDU after this dependency wait; it does
+- routed/indexed address resolution happens in LDU after this dependency wait; it does
   not require an alloc-warp `OP_ISSUE_BARRIER`
+
+- `OP_ALLOC_LDU_LOAD_1D`
+  - synchronously copies small or non-16-byte-aligned metadata from global
+    memory into normal shared slots on LDU
+- `OP_ALLOC_ROUTED_TMA_LOAD_1D`
+  - resolves a top-6 expert field from the HBM routing table and TMA-loads the
+    selected payload into normal shared slots
+- `OP_ALLOC_INDEXED_TMA_LOAD_1D`
+  - reads one runtime row index from a compact HBM record and TMA-loads that row
+  - `RepeatM` may advance through 24-byte records for long gather streams
 
 ### Store-side / writeback ops
 
@@ -237,6 +250,10 @@ Barrier behavior for load ops:
     - `address` = global destination pointer
   - effect:
     - store warp copies shared-memory slot contents to global memory
+
+- `OP_ALLOC_WB_STU_STORE_1D`
+  - synchronously stores small or non-16-byte-aligned shared metadata through
+    STU
 
 - `OP_ALLOC_WB_TMA_STORE_2D`
 - `OP_ALLOC_WB_TMA_STORE_3D`
@@ -260,7 +277,7 @@ Barrier behavior for writeback ops:
 
 - if `BARRIER` is set, the store warp waits for the async store to complete and then decrements `bars[bar]`
 
-### Pseudo-register and raw-address ops
+### Pseudo-register and legacy raw-address ops
 
 - `OP_ALLOC_WB_REG_STORE`
   - fields:
@@ -290,33 +307,35 @@ Barrier behavior for writeback ops:
     - allocator bypasses normal slot allocation
     - the pointer becomes available through `st_insts[special_slot].address`
   - practical meaning:
-    - carry raw global pointers through the VM for compute kernels that write or read global memory directly
+    - legacy escape hatch for compute kernels that write or read global memory
+      directly; new tasks must not use it
 
-- `OP_ALLOC_ROUTED_RAW_ADDRESS`
+- `OP_ALLOC_ROUTED_TMA_LOAD_1D`
   - fields:
-    - `nslot() = 1`, so the address record has allocator-managed lifetime
+    - `nslot()` = payload slot span
     - `address` = HBM routing-state base
-    - `arg` = route rank in `[0,6)`
-    - `size` = pointer-table field id
+    - low three `arg` bits = route rank in `[0,6)`
+    - remaining `arg` bits = pointer-table field id
+    - `size` = tensor byte count
     - optional input `BARRIER` = route-completion dependency
   - HBM state layout:
-    - six `int32` selected expert ids
-    - `uint32` pointer-field stride
-    - `uint32` expert count
+    - eight `int32` route-id words (first six valid)
+    - `int32` pointer-field stride and expert count
+    - two padding words
     - row-major `uint64 [expert, field]` pointer table
   - observed effect:
     - LDU reads the selected expert id and resolved pointer through L2-cached
       global loads
-    - LDU rewrites `st_insts[slot].address` before publishing the normal-slot
-      mask to compute
-    - compute extracts the normal slot, consumes the global pointer, and
-      returns the input mask through `c2m`
-    - when used as a direct global output with `WRITEBACK`, the store warp
-      performs completion/barrier handling and frees the metadata slot without
-      issuing a TMA copy
+    - LDU copies the selected field into allocator-owned shared slots before
+      publishing the mask
+    - compute consumes shared payload and returns the mask through `c2m`
   - scheduling rule:
     - the first routed address after a router carries the route dependency;
       later lookups on the same LDU port are ordered behind it
+
+Task handlers must not call `__threadfence()`. Compute-only synchronization
+uses compute-group barriers; cross-core visibility is owned by LDU/STU queue
+completion and memory barriers.
 
 ## Compute Operators
 

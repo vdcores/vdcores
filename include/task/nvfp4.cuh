@@ -20,9 +20,9 @@
 //   input_scale  [K / 16] E4M3
 //   alpha        scalar float32 (weight_scale_2 * input_scale)
 //
-// Six special slots carry those five inputs and the BF16 output.  The memory
-// virtual core can therefore keep the resident instruction stream static while
-// expert selection changes the raw addresses from token to token.
+// The memory virtual core loads the selected expert shard and the activation
+// operands into allocator-owned shared slots.  This task never dereferences a
+// global pointer; routing and address resolution remain entirely in LDU.
 //
 // This helper is a register-compact adaptation of the packed conversion path
 // in CUTLASS GemvBlockScaled.  One 32-bit word contains eight E2M1 values; the
@@ -96,9 +96,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_nvfp4_gemv_sm100(
     int rows,
     int k,
-    int row_start,
-    bool routed_addresses,
-    const MInst *st_insts,
+    void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using Fp4 = cutlass::float_e2m1_t;
@@ -108,34 +106,30 @@ __device__ __forceinline__ void task_nvfp4_gemv_sm100(
   static_assert(sizeof(PackedFragment) == 16,
                 "32 packed FP4 values must occupy one 128-bit load");
 
-  const int weight_token = m2c.template pop<0>();
-  const int weight_slot =
-      routed_addresses ? extract(weight_token) : weight_token;
+  const int weight_slots = m2c.template pop<0>();
+  const int weight_slot = extract(weight_slots);
   const auto *weight = static_cast<const uint8_t *>(
-      slot_2_glob_ptr(st_insts, weight_slot));
-  const int weight_scale_token = m2c.template pop<0>();
-  const int weight_scale_slot =
-      routed_addresses ? extract(weight_scale_token) : weight_scale_token;
+      get_slot_address(smem_base, weight_slot));
+  const int weight_scale_slots = m2c.template pop<0>();
+  const int weight_scale_slot = extract(weight_scale_slots);
   const auto *weight_scale = static_cast<const Scale *>(
-      slot_2_glob_ptr(st_insts, weight_scale_slot));
-  const int input_token = m2c.template pop<0>();
-  const int input_slot = routed_addresses ? extract(input_token) : input_token;
+      get_slot_address(smem_base, weight_scale_slot));
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const uint8_t *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int input_scale_token = m2c.template pop<0>();
-  const int input_scale_slot =
-      routed_addresses ? extract(input_scale_token) : input_scale_token;
+      get_slot_address(smem_base, input_slot));
+  const int input_scale_slots = m2c.template pop<0>();
+  const int input_scale_slot = extract(input_scale_slots);
   const auto *input_scale = static_cast<const Scale *>(
-      slot_2_glob_ptr(st_insts, input_scale_slot));
-  const int alpha_token = m2c.template pop<0>();
-  const int alpha_slot = routed_addresses ? extract(alpha_token) : alpha_token;
+      get_slot_address(smem_base, input_scale_slot));
+  const int alpha_slots = m2c.template pop<0>();
+  const int alpha_slot = extract(alpha_slots);
   const auto *alpha_ptr = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, alpha_slot));
-  const int output_token = m2c.template pop<0>();
-  const int output_slot =
-      routed_addresses ? extract(output_token) : output_token;
+      get_slot_address(smem_base, alpha_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<cutlass::bfloat16_t *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   constexpr int kThreadsPerRow = 8;
@@ -158,7 +152,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_sm100(
       const int packed_offset = fragment_idx * sizeof(PackedFragment);
       const auto weight_fragment =
           *reinterpret_cast<const PackedFragment *>(
-              weight + (row_start + row) * packed_row_stride + packed_offset);
+              weight + row * packed_row_stride + packed_offset);
       const auto input_fragment =
           *reinterpret_cast<const PackedFragment *>(input + packed_offset);
       const auto *weight_words =
@@ -169,7 +163,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_sm100(
       const int sf = fragment_idx * 2;
       const uint16_t weight_scale_pair =
           *reinterpret_cast<const uint16_t *>(
-              weight_scale + (row_start + row) * scale_row_stride + sf);
+              weight_scale + row * scale_row_stride + sf);
       const uint16_t input_scale_pair =
           *reinterpret_cast<const uint16_t *>(input_scale + sf);
       float scale0;
@@ -207,21 +201,14 @@ __device__ __forceinline__ void task_nvfp4_gemv_sm100(
           group_mask, partial, offset, kThreadsPerRow);
     }
     if (lane_in_group == 0) {
-      output[row_start + row] = cutlass::bfloat16_t(partial * alpha);
+      output[row] = cutlass::bfloat16_t(partial * alpha);
     }
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  // Raw-address M2C records contain the literal special-slot id, while C2M
-  // writeback records always carry the allocator's one-hot slot mask.
-  if (routed_addresses) {
-    c2m.push(
-        tid,
-        weight_token | weight_scale_token | input_token |
-            input_scale_token | alpha_token);
-    c2m.template push<31, true, false>(tid, output_token);
-  } else {
-    c2m.template push<31, true, false>(tid, 1U << output_slot);
-  }
+  c2m.push(
+      tid,
+      weight_slots | weight_scale_slots | input_slots |
+          input_scale_slots | alpha_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }

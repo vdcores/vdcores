@@ -10,14 +10,15 @@ import torch
 class RoutedAddressTable:
     """HBM routing ids plus an expert-by-field device-pointer table.
 
-    The first 32 bytes are consumed directly by the LDU handler: six int32
-    route ids, the pointer-field stride, and the expert count.  The remaining
-    storage is a row-major uint64 pointer table.  Target tensors are retained
-    so every queued pointer remains valid for the table's lifetime.
+    The first 48 bytes are consumed directly by the LDU handler: eight int32
+    route-id slots, the pointer-field stride, the expert count, and two padding
+    words.  The remaining storage is a row-major uint64 pointer table.  Target
+    tensors are retained so every routed load target remains valid.
     """
 
     ROUTE_COUNT = 6
-    HEADER_BYTES = 32
+    HEADER_BYTES = 48
+    MAX_FIELDS = 1 << 13
 
     def __init__(self, columns: Mapping[str, Sequence[torch.Tensor]]):
         if not columns:
@@ -32,8 +33,8 @@ class RoutedAddressTable:
             raise ValueError("routed address table requires at least one expert")
         if expert_count > 0x7FFFFFFF:
             raise ValueError("routed address expert count must fit in int32")
-        if len(normalized) > 0xFFFF:
-            raise ValueError("routed address field count must fit in uint16")
+        if len(normalized) > self.MAX_FIELDS:
+            raise ValueError("routed address field count must fit in 13 bits")
         if any(len(column) != expert_count for column in normalized):
             raise ValueError("every routed address field must cover every expert")
 
@@ -65,22 +66,23 @@ class RoutedAddressTable:
         self.device = device
         self._targets = tuple(targets)
         self.state = torch.empty(
-            (4 + expert_count * self.field_count,),
+            (6 + expert_count * self.field_count,),
             dtype=torch.int64,
             device=device,
         )
-        header = self.state[:4].view(torch.int32)
+        header = self.state[:6].view(torch.int32)
         header.zero_()
-        header[6] = self.field_count
-        header[7] = expert_count
+        header[8] = self.field_count
+        header[9] = expert_count
         pointers = torch.tensor(
             pointer_rows,
             dtype=torch.int64,
             device=device,
         )
-        self.state[4:].copy_(pointers.reshape(-1))
+        self.state[6:].copy_(pointers.reshape(-1))
         self.route_indices = header[: self.ROUTE_COUNT]
-        self.pointer_table = self.state[4:].reshape(expert_count, self.field_count)
+        self.route_indices_storage = header[:8]
+        self.pointer_table = self.state[6:].reshape(expert_count, self.field_count)
 
     def field(self, name: str) -> int:
         try:
@@ -89,4 +91,37 @@ class RoutedAddressTable:
             raise KeyError(f"unknown routed address field {name!r}") from None
 
 
-__all__ = ["RoutedAddressTable"]
+class IndexedLoadTable:
+    """Stable HBM pointers used by LDU for runtime indexed row loads."""
+
+    def __init__(self, rows: torch.Tensor, indices: torch.Tensor):
+        if rows.device.type != "cuda" or indices.device != rows.device:
+            raise ValueError("indexed rows and indices must share one CUDA device")
+        if not rows.is_contiguous() or rows.ndim < 2:
+            raise ValueError("indexed rows must be a contiguous row-major tensor")
+        if indices.dtype != torch.int32 or not indices.is_contiguous():
+            raise ValueError("indexed load indices must be contiguous int32")
+        row_count = rows.shape[0]
+        row_bytes = rows[0].numel() * rows.element_size()
+        if row_count <= 0 or row_count > 0x7FFFFFFF:
+            raise ValueError("indexed row count must fit in int32")
+        if row_bytes <= 0 or row_bytes > 0x7FFFFFFF:
+            raise ValueError("indexed row stride must fit in int32")
+        self.rows = rows
+        self.indices = indices
+        records = [
+            [
+                rows.data_ptr(),
+                indices.data_ptr() + rank * indices.element_size(),
+                (row_bytes << 32) | row_count,
+            ]
+            for rank in range(indices.numel())
+        ]
+        self.state = torch.tensor(
+            records,
+            dtype=torch.int64,
+            device=rows.device,
+        )
+
+
+__all__ = ["IndexedLoadTable", "RoutedAddressTable"]

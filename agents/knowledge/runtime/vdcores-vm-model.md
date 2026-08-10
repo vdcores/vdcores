@@ -136,7 +136,8 @@ The live protocol centers on three queues.
 - Direction: memory to compute
 - Payload:
   - usually a slot mask for normal slots
-  - sometimes a special-slot id or a register-restored mask
+  - legacy operators may still publish a special-slot id
+  - register loads may republish a remembered normal-slot mask
 - Meaning:
   - the data behind this token is ready for compute consumption
 
@@ -169,22 +170,24 @@ There are two token shapes in flight.
 - Example:
   - a 2-slot allocation at lead slot `5` becomes bits `5` and `6`
 - Consumers that need a base slot call `extract(mask)`.
-- Routed raw addresses also use a one-slot normal allocation.  The slot stores
-  address metadata rather than tensor payload, which prevents the alloc warp
-  from overwriting an address record before compute consumes it.
+- Routed and indexed loads allocate normal slots and place tensor payload in
+  those slots. Address resolution stays inside LDU; compute receives the same
+  slot-mask shape as a static TMA load.
 
 ### Special slot token
 
 - Requests with `nslot >= numSlots` bypass the shared-memory allocator.
 - The returned value is used directly as a special-slot index into `st_insts`.
-- This is how raw global pointers and some register/address carriers travel through the VM.
+- This legacy mechanism can carry raw pointers for older operators. New task
+  contracts must not use it.
 
 Compiled-mode note:
 
 - `st_insts[]` is semantic slot metadata, not a mandatory write on every compiled alloc step.
 - In interpreted alloc, normal shared-memory producers still materialize the full `MInst` into `st_insts[lead_slot]` because later memory-side stages consume that metadata generically.
 - In compiled mode, a producer only needs to write the `st_insts[slot]` fields that some later compiled path still reads.
-- In the current compiled support set, only `OP_ALLOC_WB_RAW_ADDRESS` still requires `st_insts[slot].address`, because the store path recovers the raw global pointer through `slot_2_glob_ptr(st_insts, slot)`.
+- `OP_ALLOC_WB_RAW_ADDRESS` remains only for older operators that have not yet
+  been migrated. DeepSeek/FP8/NVFP4 compute handlers do not consume it.
 - Ordinary compiled shared-memory producers and current reg-carrier paths do not need a full `st_insts` materialization once their consumers are lowered from the frozen compiled spec.
 
 ## Allocator Model
@@ -410,19 +413,34 @@ Observed behavior from [python/dae/instructions.py](/home1/11362/depctg/vdcores/
 - the pointer is stored in `st_insts[slot_id].address`
 - compute kernels recover it with `slot_2_glob_ptr(...)`
 
-This is the path used for outputs that compute writes directly to global memory without a shared-memory writeback tile.
+This is a legacy path. Do not use it for new tasks: LDU must load global input
+into shared slots and STU must store shared outputs.
 
-### `RoutedRawAddress`
+### `RoutedTmaLoad1D`
 
-- The alloc warp reserves one normal slot and sends its record to LDU.
-- LDU reads a route id plus a `uint64` pointer-table entry from HBM, rewrites
-  the slot's address, and only then publishes the normal-slot mask to compute.
+- The alloc warp reserves the requested normal slot span and sends its record
+  to LDU.
+- LDU reads a route id plus a `uint64` pointer-table entry from HBM, copies the
+  resolved payload into that shared span, then publishes the slot mask.
 - An input barrier on the first lookup holds LDU until routing output is
   globally visible.  Serial execution on that LDU port orders subsequent
   routed lookups without an alloc-warp issue barrier.
-- Compute returns routed input masks normally; a routed direct-output mask
-  follows the store/completion path so its global barrier is released and its
-  metadata slot is freed.
+- Compute consumes and returns routed input masks exactly like static loads.
+
+### `IndexedTmaLoad1D`
+
+- Each 24-byte HBM record contains a row-base pointer, one runtime-index
+  pointer, and packed row count/stride metadata.
+- LDU validates the index and copies the selected row into shared memory.
+- `RepeatM` advances across records, keeping long sparse-attention gathers
+  compact in the memory queue.
+
+## Task synchronization invariant
+
+Task code must never call `__threadfence()`. Only compute threads enter task
+handlers, while memory virtual cores progress independently. Compute uses
+compute-group barriers; global readiness and writeback use LDU/STU queue
+completion plus memory barriers.
 
 ## State Transition Sketch
 

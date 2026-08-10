@@ -55,7 +55,6 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_sm100(
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t &tmem_mma_phase,
-    const MInst *st_insts,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using namespace cute;
@@ -79,24 +78,30 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_sm100(
 
   static_assert(kTileK % TiledMma::K == 0);
 
-  const int weight_slot = m2c.template pop<0>();
+  const int weight_slots = m2c.template pop<0>();
+  const int weight_slot = extract(weight_slots);
   const auto *weight = static_cast<const uint8_t *>(
-      slot_2_glob_ptr(st_insts, weight_slot));
-  const int weight_scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, weight_slot));
+  const int weight_scale_slots = m2c.template pop<0>();
+  const int weight_scale_slot = extract(weight_scale_slots);
   const auto *weight_scale = static_cast<const CheckpointScale *>(
-      slot_2_glob_ptr(st_insts, weight_scale_slot));
-  const int input_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, weight_scale_slot));
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
   const auto *input = static_cast<const uint8_t *>(
-      slot_2_glob_ptr(st_insts, input_slot));
-  const int input_scale_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_slot));
+  const int input_scale_slots = m2c.template pop<0>();
+  const int input_scale_slot = extract(input_scale_slots);
   const auto *input_scale = static_cast<const CheckpointScale *>(
-      slot_2_glob_ptr(st_insts, input_scale_slot));
-  const int alpha_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, input_scale_slot));
+  const int alpha_slots = m2c.template pop<0>();
+  const int alpha_slot = extract(alpha_slots);
   const auto *alpha_ptr = static_cast<const float *>(
-      slot_2_glob_ptr(st_insts, alpha_slot));
-  const int output_slot = m2c.template pop<0>();
+      get_slot_address(smem_base, alpha_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
   auto *output = static_cast<Output *>(
-      slot_2_glob_ptr(st_insts, output_slot));
+      get_slot_address(smem_base, output_slot));
 
   const int tid = __compute_tid();
   const int packed_row_stride = k / 2;
@@ -326,6 +331,9 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_sm100(
   }
 
   __sync_compute_group(128);
-  __threadfence();
-  c2m.template push<31, true, false>(tid, 1U << output_slot);
+  c2m.push(
+      tid,
+      weight_slots | weight_scale_slots | input_slots |
+          input_scale_slots | alpha_slots);
+  c2m.template push<0, true>(tid, output_slots);
 }

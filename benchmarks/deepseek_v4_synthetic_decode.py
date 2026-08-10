@@ -673,11 +673,12 @@ class SyntheticDecode:
             self.sms, d
         )
         self.router_bias = torch.linspace(-0.5, 0.5, 256, dtype=torch.float32, device=d)
-        self.hash_indices = torch.tensor(
+        self.hash_indices = torch.zeros((8,), dtype=torch.int32, device=d)
+        self.hash_indices[:6] = torch.tensor(
             [3, 17, 29, 71, 130, 255], dtype=torch.int32, device=d
         )
-        self.expert_indices = torch.empty((6,), dtype=torch.int32, device=d)
-        self.expert_weights = torch.empty((6,), dtype=torch.float32, device=d)
+        self.expert_indices = torch.empty((8,), dtype=torch.int32, device=d)
+        self.expert_weights = torch.empty((8,), dtype=torch.float32, device=d)
         self.router_hash = self._stage(
             "ffn.route_hash",
             SchedDsv4RouteTop6(
@@ -782,7 +783,7 @@ class SyntheticDecode:
             "ffn.expert_reduce",
             SchedDsv4ExpertReduce(
                 self.routed_output,
-                self.expert_weights,
+                self.expert_weights[:6],
                 self.shared_output,
                 self.branch,
             ),
