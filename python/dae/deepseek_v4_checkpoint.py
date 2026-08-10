@@ -71,6 +71,31 @@ class DeepSeekV4CheckpointAudit:
     files_checked: bool
 
 
+@dataclass(frozen=True)
+class Fp8LinearCheckpointTensors:
+    """Raw E4M3/UE8M0 tensors for one checkpoint linear."""
+
+    prefix: str
+    weight: object
+    scale: object
+
+
+@dataclass(frozen=True)
+class Nvfp4LinearCheckpointTensors:
+    """Raw packed-E2M1 tensors and scalar scales for one routed linear."""
+
+    prefix: str
+    weight: object
+    weight_scale: object
+    weight_scale_2: object
+    input_scale: object
+
+    @property
+    def alpha(self):
+        """Return the scalar multiplier consumed by ``SchedNvfp4Gemv``."""
+        return (self.weight_scale_2 * self.input_scale).reshape(1)
+
+
 def _put(
     specs: dict[str, ExpectedTensorSpec],
     name: str,
@@ -500,12 +525,82 @@ class DeepSeekV4Checkpoint:
                     result[name] = tensor.clone() if device == "cpu" else tensor.to(device)
         return result
 
+    def load_fp8_linear(
+        self,
+        prefix: str,
+        *,
+        device: str = "cpu",
+    ) -> Fp8LinearCheckpointTensors:
+        """Load one raw E4M3/UE8M0 checkpoint linear by prefix."""
+        names = (f"{prefix}.weight", f"{prefix}.scale")
+        specs = self.inspect(names)
+        weight_spec, scale_spec = (specs[name] for name in names)
+        if weight_spec.dtype != "F8_E4M3" or len(weight_spec.shape) != 2:
+            raise ValueError(f"{prefix} is not a rank-2 checkpoint FP8 linear")
+        rows, k = weight_spec.shape
+        expected_scale = ((rows + 127) // 128, k // 128)
+        if k % 128 or scale_spec.dtype != "F8_E8M0" or scale_spec.shape != expected_scale:
+            raise ValueError(
+                f"{prefix} FP8 scale must be F8_E8M0{expected_scale}, got "
+                f"{scale_spec.dtype}{scale_spec.shape}"
+            )
+        tensors = self.load_tensors(names, device=device)
+        return Fp8LinearCheckpointTensors(
+            prefix=prefix,
+            weight=tensors[names[0]],
+            scale=tensors[names[1]],
+        )
+
+    def load_nvfp4_linear(
+        self,
+        prefix: str,
+        *,
+        device: str = "cpu",
+    ) -> Nvfp4LinearCheckpointTensors:
+        """Load one raw ModelOpt NVFP4 checkpoint linear by prefix."""
+        names = (
+            f"{prefix}.weight",
+            f"{prefix}.weight_scale",
+            f"{prefix}.weight_scale_2",
+            f"{prefix}.input_scale",
+        )
+        specs = self.inspect(names)
+        weight_spec, scale_spec, scale2_spec, input_scale_spec = (
+            specs[name] for name in names
+        )
+        if weight_spec.dtype != "U8" or len(weight_spec.shape) != 2:
+            raise ValueError(f"{prefix} is not a rank-2 checkpoint NVFP4 linear")
+        rows, packed_k = weight_spec.shape
+        expected_scale = (rows, packed_k // 8)
+        if (
+            packed_k % 16
+            or scale_spec.dtype != "F8_E4M3"
+            or scale_spec.shape != expected_scale
+        ):
+            raise ValueError(
+                f"{prefix} NVFP4 scale must be F8_E4M3{expected_scale}, got "
+                f"{scale_spec.dtype}{scale_spec.shape}"
+            )
+        for name, spec in zip(names[2:], (scale2_spec, input_scale_spec)):
+            if spec.dtype != "F32" or spec.shape != ():
+                raise ValueError(f"{name} must be a scalar F32 tensor")
+        tensors = self.load_tensors(names, device=device)
+        return Nvfp4LinearCheckpointTensors(
+            prefix=prefix,
+            weight=tensors[names[0]],
+            weight_scale=tensors[names[1]],
+            weight_scale_2=tensors[names[2]],
+            input_scale=tensors[names[3]],
+        )
+
 
 __all__ = [
     "INDEX_FILENAME",
     "ExpectedTensorSpec",
     "SafeTensorSpec",
     "DeepSeekV4CheckpointAudit",
+    "Fp8LinearCheckpointTensors",
+    "Nvfp4LinearCheckpointTensors",
     "DeepSeekV4Checkpoint",
     "expected_inference_tensor_specs",
     "read_safetensors_header",

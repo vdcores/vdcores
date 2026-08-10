@@ -175,6 +175,15 @@ occupies 157 GiB on local EXT4 storage.  Its local header audit passed the same
 must be pinned to this host because `/mnt` is worker-local; checkpoints must
 never be copied into the NFS source tree or a worker home directory.
 
+`DeepSeekV4Checkpoint.load_fp8_linear()` and `load_nvfp4_linear()` bind a
+named checkpoint prefix to the raw schedule-ready tensors without
+dequantizing or rewriting it.  The real-checkpoint task smoke on one GB200
+passed for `layers.2.attn.wq_a` (E4M3/UE8M0, exact against the quantized
+reference) and `layers.2.ffn.experts.0.w1` (packed NVFP4, 0.048096 maximum
+absolute BF16 error).  This verifies checkpoint-to-VDCores dtype, layout, and
+scalar-scale routing for both quantization families; it is not yet a complete
+real-weight transformer layer.
+
 The CUDA-13/Blackwell vLLM 0.23.0 environment on that worker completed a real
 TP=1, one-GPU, two-token inference at context 128.  vLLM selected FP4 experts
 through FlashInfer TRT-LLM, FP8 DeepGEMM linears, FP8 MLA KV cache, and FP8

@@ -97,3 +97,38 @@ def test_checkpoint_index_rejects_shard_path_traversal(tmp_path):
     _write_index(tmp_path, {"value": "../outside.safetensors"})
     with pytest.raises(ValueError, match="unsafe checkpoint shard"):
         DeepSeekV4Checkpoint(tmp_path, _small_config())
+
+
+def test_checkpoint_linear_helpers_preserve_raw_quantized_tensors(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    fp8_prefix = "layers.0.attn.wq_a"
+    nvfp4_prefix = "layers.0.ffn.experts.0.w1"
+    tensors = {
+        f"{fp8_prefix}.weight": torch.ones(
+            (128, 128), dtype=torch.float8_e4m3fn
+        ),
+        f"{fp8_prefix}.scale": torch.ones(
+            (1, 1), dtype=torch.float8_e8m0fnu
+        ),
+        f"{nvfp4_prefix}.weight": torch.full(
+            (128, 64), 0x22, dtype=torch.uint8
+        ),
+        f"{nvfp4_prefix}.weight_scale": torch.ones(
+            (128, 8), dtype=torch.float8_e4m3fn
+        ),
+        f"{nvfp4_prefix}.weight_scale_2": torch.tensor(0.25),
+        f"{nvfp4_prefix}.input_scale": torch.tensor(0.5),
+    }
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    safetensors_torch.save_file(tensors, shard)
+    _write_index(tmp_path, {name: shard.name for name in tensors})
+
+    checkpoint = DeepSeekV4Checkpoint(tmp_path, _small_config())
+    fp8 = checkpoint.load_fp8_linear(fp8_prefix)
+    nvfp4 = checkpoint.load_nvfp4_linear(nvfp4_prefix)
+
+    assert fp8.weight.dtype == torch.float8_e4m3fn
+    assert fp8.scale.dtype == torch.float8_e8m0fnu
+    assert nvfp4.weight.dtype == torch.uint8
+    assert nvfp4.weight_scale.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(nvfp4.alpha, torch.tensor([0.125]))
