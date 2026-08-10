@@ -495,6 +495,50 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4Bf16Gemv(Schedule):
+    """Shard an unquantized checkpoint BF16 GEMV across resident SMs."""
+
+    def __init__(self, weight, input, output, base_raw_slot=24):
+        super().__init__()
+        self.weight = weight
+        self.input = input
+        self.output = output
+        self.base_raw_slot = base_raw_slot
+
+    def _on_place(self):
+        if self.weight.dtype != torch.bfloat16 or self.weight.ndim != 2:
+            raise ValueError("DeepSeek BF16 GEMV weight must be rank-2 BF16")
+        self.rows, self.k = self.weight.shape
+        if self.input.dtype != torch.bfloat16 or self.input.numel() != self.k:
+            raise ValueError("DeepSeek BF16 GEMV input must contain K BF16 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
+            raise ValueError("DeepSeek BF16 GEMV output must contain M BF16 values")
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("DeepSeek BF16 GEMV requires 1 <= num_sms <= M")
+        if self.base_raw_slot < config.num_slots or self.base_raw_slot + 2 >= 32:
+            raise ValueError("DeepSeek BF16 GEMV needs three special slots")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        slot = self.base_raw_slot
+        return [
+            Dsv4Bf16Gemv(row_count, self.k),
+            RawAddress(self.weight[row_start], slot),
+            RawAddress(self.input.reshape(-1), slot + 1),
+            RawAddress(self.output[row_start], slot + 2)
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4HcPre(Schedule):
     def __init__(self, residual, mixes, scale, base, output, post, comb,
                  sinkhorn_iters=20, epsilon=1.0e-6, base_raw_slot=24):

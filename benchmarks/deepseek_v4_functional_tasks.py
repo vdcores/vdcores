@@ -26,6 +26,7 @@ from dae.deepseek_v4 import (
 from dae.deepseek_v4_quant import quantize_fp8_block128, quantize_nvfp4
 from dae.launcher import Launcher
 from dae.schedule import (
+    SchedDsv4Bf16Gemv,
     SchedDsv4ExpertReduce,
     SchedDsv4Fp8Quant128,
     SchedDsv4Fp32Bf16Gemv,
@@ -468,6 +469,31 @@ def run_hc(device: torch.device, generator: torch.Generator) -> None:
     )
 
 
+def run_bf16_linear(device: torch.device, generator: torch.Generator) -> None:
+    rows, k = 256, 4096
+    weight = torch.randn(
+        (rows, k), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.01
+    source = torch.randn(
+        (k,), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.01
+    output = torch.empty((rows,), dtype=torch.bfloat16, device=device)
+    latency = launch(
+        SchedDsv4Bf16Gemv(weight, source, output),
+        min(rows, torch.cuda.get_device_properties(device).multi_processor_count),
+        device,
+    )
+    expected = (weight.float() @ source.float()).to(torch.bfloat16)
+    report_close(
+        "bf16_checkpoint_gemv",
+        output,
+        expected,
+        rtol=2.0e-2,
+        atol=5.0e-2,
+        latency_us=latency,
+    )
+
+
 def run_norm_activation(device: torch.device, generator: torch.Generator) -> None:
     for width in (512, 1024):
         source = torch.randn(
@@ -536,6 +562,7 @@ def main() -> None:
         "expert-reduce": run_expert_reduce,
         "compression-indexer": run_compression_indexer,
         "hc": run_hc,
+        "bf16-linear": run_bf16_linear,
         "norm-activation": run_norm_activation,
     }
     parser = argparse.ArgumentParser()

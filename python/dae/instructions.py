@@ -197,6 +197,18 @@ class Dsv4Fp32Bf16Gemv(ComputeInstruction):
         )
 
 
+class Dsv4Bf16Gemv(ComputeInstruction):
+    def __init__(self, rows: int, k: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("DeepSeek BF16 GEMV rows must fit in uint16")
+        if k <= 0 or k > 0xFFFF:
+            raise ValueError("DeepSeek BF16 GEMV K must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_BF16_GEMV,
+            args=[rows, k],
+        )
+
+
 class Dsv4HcPre(ComputeInstruction):
     def __init__(self, sinkhorn_iters: int = 20, epsilon: float = 1.0e-6):
         if sinkhorn_iters <= 0 or sinkhorn_iters > 0xFFFF:
@@ -1480,6 +1492,7 @@ __all__ = [
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",
+    "Dsv4Bf16Gemv",
     "Dsv4HcPre",
     "Dsv4HcPost",
     "Dsv4SiluClampMul2048",

@@ -494,6 +494,59 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
   c2m.template push<31, true, false>(tid, 1U << output_slot);
 }
 
+// BF16-weight/input/output GEMV for checkpoint linears that are intentionally
+// not quantized (router, compressors, indexer weights, embedding head).  FP32
+// accumulation retains the same correctness-first row sharding as the mHC
+// projection above without expanding large BF16 checkpoint matrices to FP32.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_bf16_gemv(
+    int rows,
+    int k,
+    void *smem_base,
+    const MInst *st_insts,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  const int weight_slot = m2c.template pop<0>();
+  const auto *weight = static_cast<const __nv_bfloat16 *>(
+      slot_2_glob_ptr(st_insts, weight_slot));
+  const int input_slot = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      slot_2_glob_ptr(st_insts, input_slot));
+  const int output_slot = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      slot_2_glob_ptr(st_insts, output_slot));
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *warp_reduce = static_cast<float *>(smem_base);
+  for (int local_row = 0; local_row < rows; ++local_row) {
+    float partial = 0.0f;
+    for (int column = tid; column < k; column += 128) {
+      partial = fmaf(
+          __bfloat162float(weight[local_row * k + column]),
+          __bfloat162float(input[column]),
+          partial);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
+    }
+    if (lane == 0) {
+      warp_reduce[warp] = partial;
+    }
+    __sync_compute_group(128);
+    if (tid == 0) {
+      output[local_row] = __float2bfloat16(
+          warp_reduce[0] + warp_reduce[1] + warp_reduce[2] + warp_reduce[3]);
+    }
+    __sync_compute_group(128);
+  }
+
+  __threadfence();
+  c2m.template push<31, true, false>(tid, 1U << output_slot);
+}
+
 // Normalized Walsh-Hadamard transform used by the ratio-4 indexer before its
 // simulated FP4 dot products.  One SM owns one 128- or 512-wide row.
 template <typename M2CQueue, typename C2MQueue>

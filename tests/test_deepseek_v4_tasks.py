@@ -18,6 +18,7 @@ from dae.deepseek_v4 import (
 from dae.deepseek_v4_flow import build_decode_plan, build_layer_decode_plan
 from dae.runtime import opcode
 from dae.schedule import (
+    SchedDsv4Bf16Gemv,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
     SchedDsv4Nvfp4Quant16,
@@ -260,6 +261,16 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
     assert fp32_instructions[0].args == [row_count, 1]
     assert fp32_instructions[1].tensor.data_ptr() == fp32_weight[row_start].data_ptr()
     assert fp32_instructions[3].tensor.data_ptr() == fp32_output[row_start].data_ptr()
+
+    bf16_weight = torch.empty((rows, 1), dtype=torch.bfloat16)
+    bf16_output = torch.empty((rows,), dtype=torch.bfloat16)
+    bf16_schedule = SchedDsv4Bf16Gemv(
+        bf16_weight, fp32_input, bf16_output
+    ).place(num_sms)
+    bf16_instructions = bf16_schedule.schedule(sm)
+    assert bf16_instructions[0].args == [row_count, 1]
+    assert bf16_instructions[1].tensor.data_ptr() == bf16_weight[row_start].data_ptr()
+    assert bf16_instructions[3].tensor.data_ptr() == bf16_output[row_start].data_ptr()
 
 
 def test_activation_quant_schedules_shard_whole_scale_blocks(monkeypatch):

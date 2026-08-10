@@ -185,6 +185,14 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
       st_insts, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_bf16_gemv(
+      inst.args[0], inst.args[1], smem_base,
+      st_insts, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);

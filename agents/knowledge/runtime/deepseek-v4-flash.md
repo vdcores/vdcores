@@ -33,6 +33,9 @@ kernel tuning; performance work should be driven by an end-to-end profile.
 - A native SM100 block-scaled UMMA NVFP4 path with verified operand swizzles,
   E4M3 scale placement, UTCCP-to-TMEM transfer, and all eight output columns.
 - A raw-checkpoint E4M3/UE8M0 block-128 FP8 GEMV.
+- A BF16-weight/input/output GEMV with FP32 accumulation for checkpoint
+  linears that are intentionally unquantized: routing, compression, index
+  weighting, embeddings, and the vocabulary head.
 - Python checkpoint-contract quantize/dequantize helpers and standalone
   correctness/latency benchmarks.
 
@@ -78,6 +81,8 @@ unquantized BF16 rather than FP8.
   us median task time.  This is a correctness baseline, not a tuned result.
 - FP8 block-128, M4096 K4096, 152 SMs: max absolute error 1.5e-5 versus the
   quantized reference; 16.320 us median kernel span.
+- BF16 checkpoint GEMV, M256 K4096, 152 SMs: bit-exact BF16 reference and
+  9.920 us in a one-iteration router-shape smoke.
 - Broad functional sweep, one GB200: all 21 checks passed, including exact
   activation-quantized bit patterns, 64x512 sparse attention with top-k 512,
   both compression ratios, learned indexing, MoE routing/reduction, bounded
