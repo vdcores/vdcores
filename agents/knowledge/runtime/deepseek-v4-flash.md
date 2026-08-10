@@ -195,6 +195,84 @@ shapes. The next review should therefore correlate these layer frontiers with
 allocator slot stalls, LDU queue/dependency wait, and STU service counters
 before changing task tiles.
 
+## Single-layer placement and overlap review
+
+Job `20260810T233130Z-1687171` profiled the marker-free layer-0 SWA/hash
+program plus a 4,096-row head on one B300. Five CUDA samples were 0.651,
+0.615, 0.669, 0.662, and 0.671 ms; the median sample was 0.662 ms and its
+internal compute frontier was 0.527 ms. A separate layer-marker run attributed
+about 0.487 ms to the transformer layer and 0.055 ms to the small head.
+
+The transformer layer contains 83 logical stages and 82 internal stage edges.
+Attention has 34 stages with an equal-stage placement coverage of 47.8%; FFN
+has 49 stages with 68.6%; the complete layer has 60.1%. This is only a static
+placement proxy, not achieved utilization: 40 stages use all 152 SMs while 18
+stages use one SM. The one-SM stages rotate their base SM, but the strict stage
+chain means that rotation does not create concurrency.
+
+`SequentialProgram` currently makes every edge a global phase dependency. The
+producer's final STU writeback on every active SM decrements a device counter,
+and the first allocating consumer load waits for zero in LDU. The marker-free
+run measured exactly 7,584 producer arrivals and 7,687 contended consumer
+checks out of 7,712 possible stage gates (99.68%). Aggregate per-SM counters
+showed LDU dependency waiting over 56.3% of the grid envelope, allocator slot
+stalling over 65.2%, a compute non-wait upper bound of 32.7%, and STU service
+of 8.0%. These warp-role percentages overlap and must not be added.
+
+All 54,609 payload load commands used LDU0; LDU1 processed no payload command.
+The allocator reserves a shared slot before LDU evaluates the dependency, so
+a blocked load retains its slot and later commands can fill the 24-slot arena.
+No `IssueBarrier` or `__threadfence` was present or executed. The address
+resolution model remains correct: routed and indexed addresses are resolved
+inside LDU from HBM/local routing state, not in compute.
+
+The missing broad overlap is a DAG rather than a kernel-launch issue. Q and KV
+branches can run concurrently after hidden quantization; eight output groups
+can fan out after inverse RoPE; router/routed experts and the shared expert can
+overlap; six routed experts are independent after route selection; and W1/W3
+are independent inside each expert. These must stay in the same resident
+VDCores launch and queues. Only true joins need memory-role dependencies.
+
+The first overlap pass should therefore combine ready-task-aware SM placement,
+operand-specific LDU dependencies, both LDU ports, and non-slot-consuming
+dependency admission. Later adaptive fusion may retain compatible producer
+tiles in allocator-owned shared slots through `LoadReg`/`StoreReg`-style task
+handoffs instead of forcing an STU-to-HBM-to-LDU round trip.
+
+## Performance target and optimization phases
+
+The performance target is 16 ms TBT for the complete 43-layer network plus
+head on one GPU, corresponding to roughly 0.35-0.4 ms per layer after allowing
+for the head and resident-loop overhead. The measured 79.53 ms baseline is a
+4.97x gap, so optimization decisions must be driven by end-to-end attribution
+rather than isolated best-case task numbers.
+
+Work proceeds in three measured phases:
+
+1. Kernel and VDCores task optimization. Compare matched FP4, FP8, attention,
+   quantization, normalization, routing, and reduction tasks with FlashInfer,
+   FA4 where semantics match, and Triton. Consider Blackwell-native layouts
+   and instructions, preprocessing immutable checkpoint layout, loading scale
+   and data in one TMA transaction, and using fixed/raw addresses or
+   register-preloaded values for short frequent state such as routing results.
+   Use adaptive fusion and shared-memory register handoff only when it removes
+   measured traffic or latency without exposing global pointers to compute.
+2. Overlap optimization. Replace the false linear stage chain with true DAG
+   edges, jointly assign SMs across ready branches, use both LDU ports, prefetch
+   independent weights/metadata, and release or hand off producer tiles at the
+   narrowest safe granularity. This remains one launch, one compute queue, and
+   one memory queue per resident SM.
+3. Progressive-layer slowdown. Correlate layer and loop iteration with
+   allocator stalls, dependency waits, LDU/STU service, instruction/cache
+   behavior, barrier reloads, and frequency/thermal state. Separate runtime
+   state growth or counter drift from architecture/system effects, then fix
+   only reproduced causes.
+
+Commit a milestone only after the applicable correctness gate passes and a
+representative median improvement exceeds run-to-run noise. Record rejected
+experiments in `.agentlog/`; do not preserve tuning that merely moves time
+between counters or regresses complete-token latency.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median
