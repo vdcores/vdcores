@@ -48,13 +48,17 @@ operation needed to assemble decode without substituting another framework's
 model math:
 
 - BF16-to-E4M3/UE8M0 block-128 activation quantization and BF16-to-ModelOpt
-  packed NVFP4/per-16-E4M3 activation quantization.
+  packed NVFP4/per-16-E4M3 activation quantization.  Both schedules shard only
+  at complete scale-block boundaries and can use all available SMs.
 - Partial interleaved RoPE over the final 64 of 512 dimensions, including the
   inverse output rotation.
 - Sparse 64-head, 512-dimensional attention over supplied window/compressed
   indices with the learned denominator-only attention sink.
 - Ratio-4/ratio-128 gated compressed-KV pooling, normalized Hadamard rotation,
-  learned 64x128 index scoring, top-512 selection, and decode index helpers.
+  learned 64x128 index scoring, exact streaming top-512 selection, and decode
+  index helpers.  The selector retains 512 candidates while merging 512-row
+  chunks, so it remains exact beyond the initial 1024 rows without a large
+  thread-local array.
 - Sqrt-softplus top-6 routing, hash routing, bounded 2048-wide SwiGLU, routed
   plus shared expert reduction, and the existing quantized projection tasks.
 - 512/1024 RMSNorm, FP32-weight/BF16-input small projection, mHC pre/Sinkhorn,
@@ -75,18 +79,49 @@ path was exercised at the actual 129,280-by-4,096 LM-head shape.
 - Broad functional sweep, one GB200: all 21 checks passed, including exact
   activation-quantized bit patterns, 64x512 sparse attention with top-k 512,
   both compression ratios, learned indexing, MoE routing/reduction, bounded
-  SwiGLU, and all mHC stages.  The selective image uses 56 registers, nine
-  barriers, a 4,160-byte stack frame, no spills, and 14,720 bytes static shared
-  memory.
+  SwiGLU, and all mHC stages.  After parallel quantization/index selection, the
+  selective image uses 56 registers, nine barriers, a 112-byte stack frame, no
+  spills, and 14,720 bytes static shared memory.
 - FP8 LM-head shape M129280 K4096, 152 SMs: max absolute error 0.003906 and
   656.800 us for the one-iteration functional check.  M4096 K4096 remained at
   15.840 us median after pointer-offset sharding.
 
-These functional timings are exploration data, not parity claims.  In
-particular, the serial correctness top-512 selector measured 46.703 ms and the
-NVFP4 activation quantizer measured 364.256 us at K4096.  Keep them visible in
-the first end-to-end profile, but do not tune them in isolation before the
-model flow is assembled.
+## Matched task comparison
+
+`benchmarks/deepseek_v4_triton_tasks.py` supplies shape- and math-matched
+Triton references for the task classes where Triton is the applicable
+baseline.  It uses CUDA-graph replay to remove Python launch overhead and
+performs bit-exact checks for both activation quantizers.  The VDCores sweep
+uses repeated internal profile spans.  On the same single GB200, representative
+medians in microseconds were:
+
+| Task | Shape | VDCores | Triton |
+| --- | --- | ---: | ---: |
+| FP8 activation quantization | K4096 | 2.656 | 2.032 |
+| NVFP4 activation quantization | K4096 | 3.680 | 1.984 |
+| Sparse attention | H64, D512, K512 | 197.856 | 101.779 |
+| Index score | rows640, H64, D128 | 19.008 | 2.646 |
+| Top-512 | rows640 | 39.648 | 20.912 |
+| RMSNorm | K512 | 2.144 | 1.338 |
+| RMSNorm | K1024 | 2.112 | 1.626 |
+| Bounded SwiGLU | K2048 | 2.176 | 1.517 |
+
+At 4096 index rows, exact VDCores index score/top-512 measured 63.840/280.896
+us versus Triton/PyTorch 7.152/33.187 us.  These remaining attention and
+indexing gaps are explicit end-to-end profile targets, not parity claims.
+The structural pass reduced K4096 NVFP4 quantization from 361.216 to 3.680 us
+and rows640 top-512 from 47.500 ms to 39.648 us.
+
+FA4 is not a semantic reference for the supplied-index, shared-D512 sparse
+attention task: its standard dense/paged decode interface does not implement
+the model's selected-index plus denominator-only-sink contract.  FlashInfer is
+the applicable external reference for native NVFP4 GEMV and paged attention;
+run those comparisons only from a worker that has its matching CUDA-13
+environment and a free GPU.  Do not silently substitute an unavailable
+package or disturb an occupied device.
+
+These timings remain exploration data.  Assemble and profile the whole model
+before doing finer task tuning.
 
 All GPU checks must run through the cluster MPI launcher with one rank and the
 target checkout on `PYTHONPATH`.

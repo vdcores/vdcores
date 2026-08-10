@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import statistics
 from collections.abc import Callable
 
 import torch
@@ -43,12 +44,24 @@ from dae.schedule import (
 )
 
 
+_BENCH_WARMUP = 0
+_BENCH_ITERATIONS = 1
+_INDEX_ROWS = 640
+
+
 def launch(schedule, num_sms: int, device: torch.device) -> float:
     launcher = Launcher(num_sms, device=device)
     launcher.s(schedule.place(num_sms))
-    launcher.launch()
-    profile = launcher.profile[:, :2].cpu().numpy()
-    return float(profile[:, 1].max() - profile[:, 0].min()) / 1.0e3
+    for _ in range(_BENCH_WARMUP):
+        launcher.launch()
+    timings_us = []
+    for _ in range(_BENCH_ITERATIONS):
+        launcher.launch()
+        profile = launcher.profile[:, :2].cpu().numpy()
+        timings_us.append(
+            float(profile[:, 1].max() - profile[:, 0].min()) / 1.0e3
+        )
+    return statistics.median(timings_us)
 
 
 def report_close(
@@ -104,8 +117,10 @@ def run_quantization(device: torch.device, generator: torch.Generator) -> None:
     fp8_scale = torch.empty(
         (source.numel() // 128,), dtype=torch.float8_e8m0fnu, device=device
     )
+    num_device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    fp8_sms = min(source.numel() // 128, num_device_sms)
     fp8_latency = launch(
-        SchedDsv4Fp8Quant128(source, fp8_output, fp8_scale), 1, device
+        SchedDsv4Fp8Quant128(source, fp8_output, fp8_scale), fp8_sms, device
     )
     expected_fp8, expected_fp8_scale = quantize_fp8_block128(source)
     torch.testing.assert_close(
@@ -137,7 +152,7 @@ def run_quantization(device: torch.device, generator: torch.Generator) -> None:
         SchedDsv4Nvfp4Quant16(
             source, global_scale, nvfp4_output, nvfp4_scale
         ),
-        1,
+        min(source.numel() // 16, num_device_sms),
         device,
     )
     torch.testing.assert_close(nvfp4_output, expected_nvfp4, rtol=0, atol=0)
@@ -325,7 +340,7 @@ def run_compression_indexer(
             latency_us=pool_latency,
         )
 
-    rows = 640
+    rows = _INDEX_ROWS
     kv = torch.randn(
         (rows, 128), generator=generator, dtype=torch.bfloat16, device=device
     ) * 0.125
@@ -508,6 +523,8 @@ def run_norm_activation(device: torch.device, generator: torch.Generator) -> Non
 
 
 def main() -> None:
+    global _BENCH_ITERATIONS, _BENCH_WARMUP, _INDEX_ROWS
+
     tasks: dict[str, Callable[[torch.device, torch.Generator], None]] = {
         "quantization": run_quantization,
         "rope": run_rope,
@@ -521,7 +538,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=("all", *tasks), default="all")
     parser.add_argument("--seed", type=int, default=20260810)
+    parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--index-rows", type=int, default=640)
     args = parser.parse_args()
+    if args.warmup < 0 or args.iterations <= 0:
+        parser.error("warmup must be non-negative and iterations must be positive")
+    _BENCH_WARMUP = args.warmup
+    _BENCH_ITERATIONS = args.iterations
+    if args.index_rows < 512 or args.index_rows > 0xFFFF:
+        parser.error("index rows must be in [512,65535]")
+    _INDEX_ROWS = args.index_rows
 
     device = torch.device("cuda")
     torch.set_float32_matmul_precision("highest")

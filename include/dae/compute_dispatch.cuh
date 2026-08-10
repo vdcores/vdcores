@@ -225,10 +225,11 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_INDEX_SCORE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_TOPK_512) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
   task_dsv4_topk512(
-      inst.args[0], inst.args[1], inst.args[2], st_insts, m2c, c2m);
+      inst.args[0], inst.args[1], inst.args[2], smem_base,
+      st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_HEAD) {

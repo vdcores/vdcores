@@ -17,38 +17,28 @@ __device__ __forceinline__ float dsv4_softplus(float value) {
 
 __device__ __forceinline__ float dsv4_ceil_e4m3(float value) {
   value = fminf(fmaxf(value, 0x1p-9f), 448.0f);
-  for (int code = 1; code <= 0x7e; ++code) {
-    const int exponent = (code >> 3) & 0xf;
-    const int mantissa = code & 0x7;
-    const float candidate = exponent == 0
-        ? ldexpf(float(mantissa), -9)
-        : ldexpf(1.0f + float(mantissa) / 8.0f, exponent - 7);
-    if (candidate >= value) {
-      return candidate;
-    }
+  if (value < 0x1p-6f) {
+    return ceilf(value * 512.0f) / 512.0f;
   }
-  return 448.0f;
-}
-
-__device__ __forceinline__ float dsv4_fp4_value(int code) {
-  constexpr float values[16] = {
-      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-  return values[code];
+  float exponent = floorf(log2f(value));
+  float mantissa = ceilf((value / exp2f(exponent) - 1.0f) * 8.0f);
+  if (mantissa >= 8.0f) {
+    exponent += 1.0f;
+    mantissa = 0.0f;
+  }
+  return exp2f(exponent) * (1.0f + mantissa / 8.0f);
 }
 
 __device__ __forceinline__ uint8_t dsv4_nearest_fp4(float value) {
-  int best_code = 0;
-  float best_distance = fabsf(value - dsv4_fp4_value(0));
-#pragma unroll
-  for (int code = 1; code < 16; ++code) {
-    const float distance = fabsf(value - dsv4_fp4_value(code));
-    if (distance < best_distance) {
-      best_distance = distance;
-      best_code = code;
-    }
+  const float magnitude = fabsf(value);
+  int code = int(magnitude > 0.25f) + int(magnitude > 0.75f) +
+             int(magnitude > 1.25f) + int(magnitude > 1.75f) +
+             int(magnitude > 2.5f) + int(magnitude > 3.5f) +
+             int(magnitude > 5.0f);
+  if (value < 0.0f && code != 0) {
+    code += 8;
   }
-  return static_cast<uint8_t>(best_code);
+  return static_cast<uint8_t>(code);
 }
 
 // Quantize one BF16 activation vector to the E4M3/UE8M0 block-128 contract
@@ -593,7 +583,8 @@ __device__ __forceinline__ void task_dsv4_gated_pool(
 }
 
 // Learned ratio-4 index score.  Each SM handles a contiguous KV-row shard;
-// within a row the four warps reduce all 128 dimensions for each of 64 heads.
+// within a row the four warps independently reduce one head at a time.  This
+// keeps all warps useful and needs only one warpgroup reduction per row.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_index_score(
     int rows,
@@ -622,28 +613,33 @@ __device__ __forceinline__ void task_dsv4_index_score(
   const int warp = tid >> 5;
   auto *warp_reduce = static_cast<float *>(smem_base);
   for (int row = 0; row < rows; ++row) {
-    float score = 0.0f;
-    for (int head = 0; head < kHeads; ++head) {
-      float partial =
-          __bfloat162float(q[head * kHeadDim + tid]) *
-          __bfloat162float(kv[row * kHeadDim + tid]);
+    float warp_score = 0.0f;
+    for (int head = warp; head < kHeads; head += 4) {
+      float partial = 0.0f;
+#pragma unroll
+      for (int item = 0; item < 4; ++item) {
+        const int dim = lane + item * 32;
+        partial = fmaf(
+            __bfloat162float(q[head * kHeadDim + dim]),
+            __bfloat162float(kv[row * kHeadDim + dim]),
+            partial);
+      }
 #pragma unroll
       for (int offset = 16; offset > 0; offset >>= 1) {
         partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
       }
       if (lane == 0) {
-        warp_reduce[warp] = partial;
+        warp_score = fmaf(
+            fmaxf(partial, 0.0f), head_weights[head], warp_score);
       }
-      __sync_compute_group(128);
-      if (tid == 0) {
-        const float dot = warp_reduce[0] + warp_reduce[1] +
-                          warp_reduce[2] + warp_reduce[3];
-        score = fmaf(fmaxf(dot, 0.0f), head_weights[head], score);
-      }
-      __sync_compute_group(128);
     }
+    if (lane == 0) {
+      warp_reduce[warp] = warp_score;
+    }
+    __sync_compute_group(128);
     if (tid == 0) {
-      output[row] = score;
+      output[row] = warp_reduce[0] + warp_reduce[1] +
+                    warp_reduce[2] + warp_reduce[3];
     }
     __sync_compute_group(128);
   }
@@ -652,17 +648,21 @@ __device__ __forceinline__ void task_dsv4_index_score(
   c2m.template push<31, true, false>(tid, 1U << output_slot);
 }
 
-// Correctness-first top-k selection for indexer scores.  Decode contexts up
-// to the model maximum fit in the uint16 row count after ratio-4 compression.
+// Exact streaming top-k selection for indexer scores.  A 1024-element shared
+// bitonic network produces the first candidates, then merges each subsequent
+// 512-row chunk with the retained top 512.  Decode contexts up to the model
+// maximum fit in the uint16 row count after ratio-4 compression.
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_topk512(
     int rows,
     int topk,
     int index_offset,
+    void *smem_base,
     const MInst *st_insts,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  constexpr int kMaxTopK = 512;
+  constexpr int kSortSize = 1024;
+  constexpr int kRetained = 512;
   const int scores_slot = m2c.template pop<0>();
   const auto *scores = static_cast<const float *>(
       slot_2_glob_ptr(st_insts, scores_slot));
@@ -671,34 +671,58 @@ __device__ __forceinline__ void task_dsv4_topk512(
       slot_2_glob_ptr(st_insts, output_slot));
 
   const int tid = __compute_tid();
-  if (tid == 0) {
-    float selected_scores[kMaxTopK];
-    int selected_indices[kMaxTopK];
-    for (int rank = 0; rank < topk; ++rank) {
-      selected_scores[rank] = -__int_as_float(0x7f800000);
-      selected_indices[rank] = -1;
-    }
-    for (int row = 0; row < rows; ++row) {
-      const float candidate = scores[row];
-      int insert = topk;
-      for (int rank = 0; rank < topk; ++rank) {
-        if (candidate > selected_scores[rank]) {
-          insert = rank;
-          break;
+  auto *sort_scores = static_cast<float *>(smem_base);
+  auto *sort_indices = reinterpret_cast<int *>(sort_scores + kSortSize);
+
+  int processed = min(rows, kSortSize);
+  for (int item = tid; item < kSortSize; item += 128) {
+    sort_scores[item] = item < processed
+        ? scores[item]
+        : -__int_as_float(0x7f800000);
+    sort_indices[item] = item < processed ? item : -1;
+  }
+  __sync_compute_group(128);
+
+  while (true) {
+    for (int width = 2; width <= kSortSize; width <<= 1) {
+      for (int stride = width >> 1; stride > 0; stride >>= 1) {
+        for (int item = tid; item < kSortSize; item += 128) {
+          const int peer = item ^ stride;
+          if (peer > item) {
+            const float left = sort_scores[item];
+            const float right = sort_scores[peer];
+            const int left_index = sort_indices[item];
+            const int right_index = sort_indices[peer];
+            const bool ascending = (item & width) == 0;
+            const bool swap = ascending ? left > right : left < right;
+            if (swap) {
+              sort_scores[item] = right;
+              sort_scores[peer] = left;
+              sort_indices[item] = right_index;
+              sort_indices[peer] = left_index;
+            }
+          }
         }
-      }
-      if (insert < topk) {
-        for (int rank = topk - 1; rank > insert; --rank) {
-          selected_scores[rank] = selected_scores[rank - 1];
-          selected_indices[rank] = selected_indices[rank - 1];
-        }
-        selected_scores[insert] = candidate;
-        selected_indices[insert] = row;
+        __sync_compute_group(128);
       }
     }
-    for (int rank = 0; rank < topk; ++rank) {
-      output[rank] = selected_indices[rank] + index_offset;
+
+    if (processed >= rows) {
+      break;
     }
+    const int chunk = min(kRetained, rows - processed);
+    for (int item = tid; item < kRetained; item += 128) {
+      sort_scores[item] = item < chunk
+          ? scores[processed + item]
+          : -__int_as_float(0x7f800000);
+      sort_indices[item] = item < chunk ? processed + item : -1;
+    }
+    processed += chunk;
+    __sync_compute_group(128);
+  }
+
+  for (int rank = tid; rank < topk; rank += 128) {
+    output[rank] = sort_indices[kSortSize - 1 - rank] + index_offset;
   }
 
   __sync_compute_group(128);

@@ -780,13 +780,16 @@ class SchedDsv4Fp8Quant128(Schedule):
         self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek FP8 activation quantization uses one SM")
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
             raise ValueError("DeepSeek FP8 quant input must be a BF16 vector")
         self.k = self.input.numel()
         if self.k % 128:
             raise ValueError("DeepSeek FP8 quant K must be divisible by 128")
+        self.blocks = self.k // 128
+        if self.num_sms <= 0 or self.num_sms > self.blocks:
+            raise ValueError(
+                "DeepSeek FP8 quant requires 1 <= num_sms <= K/128"
+            )
         if (self.output.dtype != torch.float8_e4m3fn or
                 self.output.shape != self.input.shape):
             raise ValueError("DeepSeek FP8 quant output must be E4M3 [K]")
@@ -795,21 +798,24 @@ class SchedDsv4Fp8Quant128(Schedule):
             raise ValueError("DeepSeek FP8 quant scale must be UE8M0 [K/128]")
 
     def schedule(self, sm):
-        if sm != 0:
+        if sm < 0:
             return []
+        blocks_per_sm, extra = divmod(self.blocks, self.num_sms)
+        block_start = sm * blocks_per_sm + min(sm, extra)
+        block_count = blocks_per_sm + (1 if sm < extra else 0)
         slot = self.base_raw_slot
         return [
-            Dsv4Fp8Quant128(self.k),
-            RawAddress(self.input, slot),
-            RawAddress(self.output, slot + 1).writeback(),
-            RawAddress(self.scale, slot + 2)
+            Dsv4Fp8Quant128(block_count * 128),
+            RawAddress(self.input[block_start * 128:], slot),
+            RawAddress(self.output[block_start * 128:], slot + 1).writeback(),
+            RawAddress(self.scale[block_start:], slot + 2)
                 .bar(self._bar("output")).writeback(),
         ]
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedDsv4Nvfp4Quant16(Schedule):
@@ -822,13 +828,16 @@ class SchedDsv4Nvfp4Quant16(Schedule):
         self.base_raw_slot = base_raw_slot
 
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek NVFP4 activation quantization uses one SM")
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
             raise ValueError("DeepSeek NVFP4 quant input must be a BF16 vector")
         self.k = self.input.numel()
         if self.k % 16:
             raise ValueError("DeepSeek NVFP4 quant K must be divisible by 16")
+        self.blocks = self.k // 16
+        if self.num_sms <= 0 or self.num_sms > self.blocks:
+            raise ValueError(
+                "DeepSeek NVFP4 quant requires 1 <= num_sms <= K/16"
+            )
         if self.global_scale.dtype != torch.float32 or self.global_scale.numel() != 1:
             raise ValueError("DeepSeek NVFP4 global scale must be scalar FP32")
         if self.output.dtype != torch.uint8 or self.output.numel() != self.k // 2:
@@ -838,22 +847,25 @@ class SchedDsv4Nvfp4Quant16(Schedule):
             raise ValueError("DeepSeek NVFP4 quant scale must be E4M3 [K/16]")
 
     def schedule(self, sm):
-        if sm != 0:
+        if sm < 0:
             return []
+        blocks_per_sm, extra = divmod(self.blocks, self.num_sms)
+        block_start = sm * blocks_per_sm + min(sm, extra)
+        block_count = blocks_per_sm + (1 if sm < extra else 0)
         slot = self.base_raw_slot
         return [
-            Dsv4Nvfp4Quant16(self.k),
-            RawAddress(self.input, slot),
+            Dsv4Nvfp4Quant16(block_count * 16),
+            RawAddress(self.input[block_start * 16:], slot),
             RawAddress(self.global_scale.reshape(-1), slot + 1),
-            RawAddress(self.output, slot + 2).writeback(),
-            RawAddress(self.scale, slot + 3)
+            RawAddress(self.output[block_start * 8:], slot + 2).writeback(),
+            RawAddress(self.scale[block_start:], slot + 3)
                 .bar(self._bar("output")).writeback(),
         ]
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class ListSchedule(Schedule):

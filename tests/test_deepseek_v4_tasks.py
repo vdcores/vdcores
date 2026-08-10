@@ -15,7 +15,12 @@ from dae.deepseek_v4 import (
     sparse_attention_512_reference,
 )
 from dae.runtime import opcode
-from dae.schedule import SchedDsv4Fp32Bf16Gemv, SchedFp8Block128Gemv
+from dae.schedule import (
+    SchedDsv4Fp32Bf16Gemv,
+    SchedDsv4Fp8Quant128,
+    SchedDsv4Nvfp4Quant16,
+    SchedFp8Block128Gemv,
+)
 
 
 def test_deepseek_v4_flash_config_covers_transformer_and_mtp():
@@ -196,3 +201,46 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
     assert fp32_instructions[0].args == [row_count, 1]
     assert fp32_instructions[1].tensor.data_ptr() == fp32_weight[row_start].data_ptr()
     assert fp32_instructions[3].tensor.data_ptr() == fp32_output[row_start].data_ptr()
+
+
+def test_activation_quant_schedules_shard_whole_scale_blocks(monkeypatch):
+    class FakeRawAddress:
+        def __init__(self, tensor, slot):
+            self.tensor = tensor
+            self.slot = slot
+
+        def bar(self, _):
+            return self
+
+        def writeback(self):
+            return self
+
+    monkeypatch.setitem(
+        SchedDsv4Fp8Quant128.schedule.__globals__,
+        "RawAddress",
+        FakeRawAddress,
+    )
+    source = torch.empty((4096,), dtype=torch.bfloat16)
+
+    fp8_output = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    fp8_scale = torch.empty((32,), dtype=torch.float8_e8m0fnu)
+    fp8_schedule = SchedDsv4Fp8Quant128(
+        source, fp8_output, fp8_scale
+    ).place(3)
+    fp8_instructions = fp8_schedule.schedule(2)
+    assert fp8_instructions[0].args == [10 * 128]
+    assert fp8_instructions[1].tensor.data_ptr() == source[22 * 128:].data_ptr()
+    assert fp8_instructions[2].tensor.data_ptr() == fp8_output[22 * 128:].data_ptr()
+    assert fp8_instructions[3].tensor.data_ptr() == fp8_scale[22:].data_ptr()
+
+    global_scale = torch.ones((1,), dtype=torch.float32)
+    fp4_output = torch.empty((2048,), dtype=torch.uint8)
+    fp4_scale = torch.empty((256,), dtype=torch.float8_e4m3fn)
+    fp4_schedule = SchedDsv4Nvfp4Quant16(
+        source, global_scale, fp4_output, fp4_scale
+    ).place(3)
+    fp4_instructions = fp4_schedule.schedule(2)
+    assert fp4_instructions[0].args == [85 * 16]
+    assert fp4_instructions[1].tensor.data_ptr() == source[171 * 16:].data_ptr()
+    assert fp4_instructions[3].tensor.data_ptr() == fp4_output[171 * 8:].data_ptr()
+    assert fp4_instructions[4].tensor.data_ptr() == fp4_scale[171:].data_ptr()
