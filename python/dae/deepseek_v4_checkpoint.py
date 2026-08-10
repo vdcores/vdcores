@@ -525,6 +525,28 @@ class DeepSeekV4Checkpoint:
                     result[name] = tensor.clone() if device == "cpu" else tensor.to(device)
         return result
 
+    def load_tensor_slice(
+        self,
+        name: str,
+        index,
+        *,
+        device: str = "cpu",
+    ):
+        """Load a basic-indexed tensor slice without materializing the full tensor."""
+        filename = self.weight_map.get(name)
+        if filename is None:
+            raise KeyError(f"checkpoint tensor {name!r} is not indexed")
+        try:
+            from safetensors import safe_open
+        except ImportError as error:
+            raise RuntimeError("loading checkpoint data requires safetensors") from error
+        with safe_open(
+            str(self.root / filename), framework="pt", device="cpu"
+        ) as shard:
+            tensor = shard.get_slice(name)[index]
+            tensor = tensor.clone()
+        return tensor if device == "cpu" else tensor.to(device)
+
     def load_fp8_linear(
         self,
         prefix: str,

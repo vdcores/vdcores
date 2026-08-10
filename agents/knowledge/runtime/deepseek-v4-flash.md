@@ -186,8 +186,27 @@ dequantizing or rewriting it.  The real-checkpoint task smoke on one GB200
 passed for `layers.2.attn.wq_a` (E4M3/UE8M0, exact against the quantized
 reference) and `layers.2.ffn.experts.0.w1` (packed NVFP4, 0.048096 maximum
 absolute BF16 error).  This verifies checkpoint-to-VDCores dtype, layout, and
-scalar-scale routing for both quantization families; it is not yet a complete
-real-weight transformer layer.
+scalar-scale routing for both quantization families.
+
+`benchmarks/deepseek_v4_checkpoint_decode.py` is the first complete
+real-weight VDCores flow.  It streams one input token through every transformer
+layer and the vocabulary head without materializing the full checkpoint in
+host or device memory.  Embedding and head rows are sliced directly from their
+safetensors shards, while each layer loads only its active routed experts and
+releases the layer weights before advancing.  On one allocator-managed GPU
+(`10.0.16.24:1`), token 791 at position zero passed all 43 layers (2 SWA, 21
+CSA, and 20 HCA), both hash and score routing, NVFP4 routed experts, the FP8
+shared expert and attention projections, BF16 routers/compressors, mHC, and
+the full 129,280-row head.  It selected output token 20 with finite logits in
+[-35.75, 15.8125] and completed in 75.981 seconds.
+
+This position-zero run is a breadth gate, not a quality or TBT result.  RoPE is
+identity there, and historical compressed/index cache state is empty, so the
+compressor/index projections execute for coverage but their outputs are not
+consumed.  The harness also streams weights from local storage and launches
+tasks individually.  Reference-token comparison, multi-token cache
+correctness, resident-weight execution, and timed framework parity remain
+separate gates.
 
 The CUDA-13/Blackwell vLLM 0.23.0 environment on that worker completed a real
 TP=1, one-GPU, two-token inference at context 128.  vLLM selected FP4 experts

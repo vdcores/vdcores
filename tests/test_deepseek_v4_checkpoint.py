@@ -132,3 +132,6 @@ def test_checkpoint_linear_helpers_preserve_raw_quantized_tensors(tmp_path):
     assert nvfp4.weight.dtype == torch.uint8
     assert nvfp4.weight_scale.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(nvfp4.alpha, torch.tensor([0.125]))
+    sliced = checkpoint.load_tensor_slice(f"{fp8_prefix}.weight", slice(3, 7))
+    assert sliced.shape == (4, 128)
+    assert sliced.dtype == torch.float8_e4m3fn
