@@ -67,7 +67,8 @@ model math:
 
 The FP8 and FP32 schedules address each output shard through pointer offsets,
 so their instruction fields no longer cap matrices at 65,535 rows.  The FP8
-path was exercised at the actual 129,280-by-4,096 LM-head shape.
+path was stress-tested at 129,280-by-4,096; the actual checkpoint head is
+unquantized BF16 rather than FP8.
 
 ## Verified GB200 baselines (2026-08-10)
 
@@ -84,8 +85,8 @@ path was exercised at the actual 129,280-by-4,096 LM-head shape.
   selective image uses 56 registers, nine barriers, a 112-byte stack frame, no
   spills, and 14,720 bytes static shared memory.
 - FP8 LM-head shape M129280 K4096, 152 SMs: max absolute error 0.003906 and
-  656.800 us for the one-iteration functional check.  M4096 K4096 remained at
-  15.840 us median after pointer-offset sharding.
+  656.800 us for the one-iteration projection-shape stress check.  M4096 K4096
+  remained at 15.840 us median after pointer-offset sharding.
 
 ## Matched task comparison
 
@@ -147,6 +148,27 @@ The synthetic graph deliberately remains untuned and currently executes many
 individual task launches.  The next functional milestone is loading real
 checkpoint tensors into this flow; only then should its profile drive task
 fusion, launch reduction, and TBT work.
+
+## Real-checkpoint preflight
+
+`python/dae/deepseek_v4_checkpoint.py` generates and validates the exact raw
+non-MTP checkpoint contract, parses safetensors headers without materializing
+payloads, and lazily loads only explicitly requested tensors while preserving
+their FP8/NVFP4 layouts.  `benchmarks/deepseek_v4_checkpoint_audit.py` can audit
+either a local download or HTTPS range-read headers from the official NVIDIA
+repository.
+
+At NVIDIA revision `7fc18be2b215ae48260383d4a228ec8a033046f7`, all 46 remote
+shard headers passed: 135,235 total tensors, including 133,660 base-inference
+tensors and 1,575 MTP tensors.  Total tensor payload is 168,266,793,544 bytes;
+the base model without MTP is 164,673,005,788 bytes (153.36 GiB).  A 189,471
+MiB GB200 therefore has about 31.67 GiB left before caches, activations, task
+images, and allocator overhead.  This is a viable but tight single-GPU fit.
+
+The cluster already has CUDA-13/Blackwell environments with explicit
+DeepSeek-V4 support for vLLM 0.23.0 and SGLang 0.5.12.post1, plus FlashInfer
+0.6.15.  A real E2E run still requires an authorized worker-local checkpoint
+download; do not place the 168-GB payload on NFS.
 
 All GPU checks must run through the cluster MPI launcher with one rank and the
 target checkout on `PYTHONPATH`.
