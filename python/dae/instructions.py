@@ -1035,6 +1035,7 @@ class LoopM(MemoryInstruction):
         reg=0,
         bar_shift: int = 0,
         tma_shift: int = 0,
+        advance_indirect_layer: bool = False,
         resource_group=None,
     ):
         if resource_group is not None:
@@ -1049,7 +1050,7 @@ class LoopM(MemoryInstruction):
             num_slots=reg,
             arg=0,
             size=count,
-            cords=[pc, 0, bar_shift_mask, tma_shift],
+            cords=[pc, int(advance_indirect_layer), bar_shift_mask, tma_shift],
         )
 
     @classmethod
@@ -1059,6 +1060,19 @@ class LoopM(MemoryInstruction):
             return cls(count, pc, **kwargs)
 
         return smfunc
+
+
+class ResetIndirectLayer(MemoryInstruction):
+    """Reset the allocator-owned linear index before one layer family."""
+
+    def __init__(self):
+        super().__init__(
+            opcode=opcode.OP_RESET_INDIRECT_LAYER,
+            num_slots=0,
+            arg=0,
+            size=0,
+            address=0,
+        )
 
 
 class CounterOffsetMemoryInstruction:
@@ -1364,15 +1378,33 @@ def _validate_indirect_pointer_entry(pointer_entry):
         raise ValueError("indirect pointer entries must contain at least one int64")
 
 
+def _indirect_layer_opcode(base_opcode: int, layer_indexed: bool) -> int:
+    if not layer_indexed:
+        return base_opcode
+    variants = {
+        opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D:
+            opcode.OP_ALLOC_LAYER_TMA_LOAD_1D,
+        opcode.OP_ALLOC_INDIRECT_LDU_LOAD_1D:
+            opcode.OP_ALLOC_LAYER_LDU_LOAD_1D,
+        opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D:
+            opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D,
+        opcode.OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D:
+            opcode.OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D,
+    }
+    return variants[base_opcode]
+
+
 class IndirectTmaLoad1D(MemoryInstruction):
     """Resolve one source pointer through HBM, then TMA-load shared slots."""
 
-    def __init__(self, pointer_entry, bytes: int):
+    def __init__(self, pointer_entry, bytes: int, *, layer_indexed=False):
         _validate_indirect_pointer_entry(pointer_entry)
         if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
             raise ValueError("indirect TMA load size must be a 16-byte-aligned uint16")
         super().__init__(
-            opcode=opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D,
+            opcode=_indirect_layer_opcode(
+                opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D, layer_indexed
+            ),
             num_slots=bytes2slots(bytes),
             arg=0,
             size=bytes,
@@ -1383,12 +1415,14 @@ class IndirectTmaLoad1D(MemoryInstruction):
 class IndirectLduLoad1D(MemoryInstruction):
     """Resolve one source pointer through HBM for an arbitrary-size LDU copy."""
 
-    def __init__(self, pointer_entry, bytes: int):
+    def __init__(self, pointer_entry, bytes: int, *, layer_indexed=False):
         _validate_indirect_pointer_entry(pointer_entry)
         if bytes <= 0 or bytes > 0xFFFF:
             raise ValueError("indirect LDU load size must be a positive uint16")
         super().__init__(
-            opcode=opcode.OP_ALLOC_INDIRECT_LDU_LOAD_1D,
+            opcode=_indirect_layer_opcode(
+                opcode.OP_ALLOC_INDIRECT_LDU_LOAD_1D, layer_indexed
+            ),
             num_slots=bytes2slots(bytes),
             arg=0,
             size=bytes,
@@ -1405,6 +1439,8 @@ class IndirectRoutedTmaLoad1D(MemoryInstruction):
         route_rank: int,
         pointer_field: int,
         bytes: int,
+        *,
+        layer_indexed=False,
     ):
         _validate_indirect_pointer_entry(state_descriptor)
         if state_descriptor.numel() < 2:
@@ -1416,7 +1452,10 @@ class IndirectRoutedTmaLoad1D(MemoryInstruction):
         if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
             raise ValueError("indirect routed TMA load size must be aligned")
         super().__init__(
-            opcode=opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D,
+            opcode=_indirect_layer_opcode(
+                opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D,
+                layer_indexed,
+            ),
             num_slots=bytes2slots(bytes),
             arg=(pointer_field << RoutedTmaLoad1D.ROUTE_BITS) | route_rank,
             size=bytes,
@@ -1427,12 +1466,15 @@ class IndirectRoutedTmaLoad1D(MemoryInstruction):
 class IndirectIndexedTmaLoad1D(MemoryInstruction):
     """Resolve an indexed-load record pointer before selecting its runtime row."""
 
-    def __init__(self, record_pointer_entry, bytes: int):
+    def __init__(self, record_pointer_entry, bytes: int, *, layer_indexed=False):
         _validate_indirect_pointer_entry(record_pointer_entry)
         if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
             raise ValueError("indirect indexed TMA load size must be aligned")
         super().__init__(
-            opcode=opcode.OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D,
+            opcode=_indirect_layer_opcode(
+                opcode.OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D,
+                layer_indexed,
+            ),
             num_slots=bytes2slots(bytes),
             arg=0,
             size=bytes,
@@ -1440,7 +1482,9 @@ class IndirectIndexedTmaLoad1D(MemoryInstruction):
         )
 
 
-def indirect_1d_from(inst: MemoryInstruction, pointer_entry):
+def indirect_1d_from(
+    inst: MemoryInstruction, pointer_entry, *, layer_indexed=False
+):
     """Replace one direct 1D memory instruction while preserving its flags."""
     base_opcode = inst.opcode & ~((1 << 6) - 1)
     builders = {
@@ -1461,9 +1505,12 @@ def indirect_1d_from(inst: MemoryInstruction, pointer_entry):
             inst.arg & 0x7,
             inst.arg >> 3,
             inst.size,
+            layer_indexed=layer_indexed,
         )
     else:
-        replacement = builder(pointer_entry, inst.size)
+        replacement = builder(
+            pointer_entry, inst.size, layer_indexed=layer_indexed
+        )
     replacement.opcode |= inst.opcode & ((1 << 6) - 1)
     replacement.num_slots = inst.num_slots
     replacement.arg = inst.arg
@@ -1800,6 +1847,7 @@ __all__ = [
     "MemoryInstruction",
     "TerminateM",
     "LoopM",
+    "ResetIndirectLayer",
     "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",

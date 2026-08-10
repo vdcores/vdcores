@@ -77,9 +77,9 @@ class LayeredSchedule(Schedule):
 
     The wrapped schedule is rendered once from the first tensor in every
     mapping. Direct LDU addresses that fall inside those representative
-    tensors are replaced by one device pointer column. Memory-loop counters
-    offset the pointer-column address; the selected source or destination is
-    resolved only by LDU.
+    tensors are replaced by one device pointer column. Compact indirect-load
+    opcodes let the allocator select that column entry with its linear layer
+    index; the selected source is resolved only by LDU.
     """
 
     _ADDRESS_ONLY_OPS = {
@@ -196,29 +196,19 @@ class LayeredSchedule(Schedule):
                     dtype=torch.int64,
                     device=alternatives[0].device,
                 )
-                entry_bytes = 2 * pointer_table.element_size()
             else:
                 pointer_table = torch.tensor(
                     [tensor.data_ptr() + offset for tensor in alternatives],
                     dtype=torch.int64,
                     device=alternatives[0].device,
                 )
-                entry_bytes = pointer_table.element_size()
             self._pointer_cache[cache_key] = pointer_table
             self._pointer_tables.append(pointer_table)
-        else:
-            entry_bytes = (
-                2 * pointer_table.element_size()
-                if base_opcode
-                == (opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1))
-                else pointer_table.element_size()
-            )
-        replacement = indirect_1d_from(inst, pointer_table.reshape(-1)[:2])
-        for counter, stride in self.counter_strides:
-            replacement = CounterOffsetMemoryInstruction(
-                counter, replacement, stride * entry_bytes
-            )
-        return replacement
+        return indirect_1d_from(
+            inst,
+            pointer_table.reshape(-1)[:2],
+            layer_indexed=self.layer_count > 1,
+        )
 
     def _transform(self, item):
         if item is None or isinstance(item, ComputeInstruction):

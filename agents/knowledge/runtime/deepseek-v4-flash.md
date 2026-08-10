@@ -92,8 +92,7 @@ write directly into their next consumer's cache/state destination; the two
 residual sublayers ping-pong between resident buffers, so there are no explicit
 inter-stage copy tasks. Expert gate/up/down projections use
 `SchedRoutedNvfp4Gemv`, so the route result is consumed by LDU rather than by
-compute. The checkpoint-backed resident token flow remains the next assembly
-gate.
+compute.
 
 The synthetic 43-layer transformer plus output head now also executes as one
 launch. The host assembler emits one SWA/hash body repeated twice, one CSA/hash
@@ -105,29 +104,49 @@ instruction queues in HBM rather than consuming shared memory for a 512-entry
 image.
 
 Loop dependency reuse stays entirely in the memory VM. Repeated bodies use two
-barrier banks: the inner `LOOP` shifts all body dependencies to the second bank,
-then a loop-tail command reloads both banks before an outer loop re-enters the
-body. For the twenty HCA/CSA pairs this is a two-way inner loop nested in a
-ten-way outer loop. The two LDU handlers rendezvous on a memory-only
-`cuda::barrier`; after every SM has drained the bank pair, the last arrival
-restores its counters from the launcher's HBM source. Following loads remain
-FIFO behind this command. There is no `IssueBarrier`, compute-side
-synchronization, `__threadfence`, or model-data copy in this path.
+barrier banks: the inner `LOOP` shifts all body dependencies to the second bank.
+The memory-only reload command is part of that repeated body, waits for the
+current bank's final STU completion, restores both banks, and remains FIFO ahead
+of the next iteration's LDU commands. For the twenty HCA/CSA pairs this is a
+two-way inner loop nested in a ten-way outer loop. The two LDU handlers
+rendezvous on memory-only `cuda::barrier` objects; no compute thread joins.
+There is no `IssueBarrier`, compute-side synchronization, `__threadfence`, or
+model-data copy in this path.
 
 Real layer weights are not unrolled into 43 instruction bodies.
 `LayeredSchedule` replaces a representative schedule's direct 1D weight loads
-with compact HBM pointer columns. Memory-loop counters select the current entry
-and LDU resolves the checkpoint address. Routed loads use a two-word descriptor
-containing one fixed route-result address plus the current layer's expert
-pointer table. Router output therefore stays in one HBM buffer; no indirect
-store path exists. Persistent cache outputs use ordinary counter-strided STU
-addresses.
+with compact HBM pointer columns. One allocator-owned linear layer index is
+reset before a repeated family and advanced once per body. Every layer-indexed
+dynamic load uses that index directly, avoiding per-load `RepeatM` address
+arithmetic and schedule-specific `loop1`/`loop2` opcodes. LDU resolves the
+checkpoint address. Routed loads use a two-word descriptor containing one
+fixed route-result address plus the current layer's expert pointer table.
+Router output therefore stays in one HBM buffer; no indirect store path exists.
+Persistent cache outputs use ordinary counter-strided STU addresses.
 
 `DeepSeekV4ShapePolicy` supplies the initial functional tile/SM assignment from
 operator shape: FP8 linears expose row tiles, NVFP4 linears expose aligned M8
 groups, activation quantizers expose complete scale blocks, and sparse
 attention uses one SM per head. These are breadth-first assignments and remain
 subject to end-to-end profiling after the resident flow passes.
+
+## Checkpoint-resident one-launch gate
+
+`benchmarks/deepseek_v4_resident_one_launch.py` loads the durable worker-local
+checkpoint into one B300, builds routed pointer tables without copying weight
+payloads, and assembles position zero from four bodies: layers 0-1, layer 2,
+the odd HCA family, and the even CSA family. The odd/even bodies share a 2x10
+loop index while retaining distinct checkpoint pointer columns. The router
+writes one fixed eight-word HBM result, and all six experts resolve weight,
+weight-scale, input-scale, and alpha fields in LDU.
+
+The 2026-08-10 full gate used 153.379 GiB of resident checkpoint storage and
+left 29.933 GiB free. It represented 3,781 logical stages with 354 queued stage
+bodies, 612 dependency counters, 1,197 compute instructions, and 4,052 memory
+instructions in the unchanged 4,096-entry images. One VDCores launch over all
+43 layers and the 129,280-row head emitted reference token 14 for input token
+791 at position zero. The first launch took 13,364.171 ms; this is a functional
+breadth result, not a TBT-parity claim.
 
 ## Verified GB200 baselines (2026-08-10)
 

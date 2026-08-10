@@ -10,6 +10,7 @@ from .instructions import (
     LoopC,
     LoopM,
     MemoryInstruction,
+    ResetIndirectLayer,
 )
 from .runtime import config
 from .schedule import Schedule
@@ -270,6 +271,9 @@ class LoopedSequentialProgram:
             required_counters = int(bank_count > 1) + int(outer_count > 1)
             if required_counters > config.num_loop_counters:
                 raise ValueError("looped program exceeds runtime loop-counter capacity")
+            if block.repeat > 1:
+                for sm in range(launcher.num_sms):
+                    self.instructions[sm].append(ResetIndirectLayer())
             compute_start = [
                 (compute_base[sm] + sum(
                     isinstance(inst, ComputeInstruction)
@@ -330,6 +334,21 @@ class LoopedSequentialProgram:
 
             inner_reg = 0
             outer_reg = int(bank_count > 1)
+            if block.reload_after:
+                # Keep the reload in the repeated memory body. It waits for
+                # the current bank's final STU completion and sits ahead of
+                # every following LDU command in both port FIFOs, providing
+                # the loop-carried dependency without an IssueBarrier.
+                reload = LduReloadBarriers(
+                    launcher.bars_src,
+                    segment.barrier_start,
+                    barriers_per_bank * bank_count,
+                    0,
+                ).bar(segment.completion_barrier)
+                if bank_count > 1:
+                    reload.group()
+                for sm in range(launcher.num_sms):
+                    self.instructions[sm].append(reload.copy())
             if bank_count > 1:
                 for sm in range(launcher.num_sms):
                     self.instructions[sm].extend(
@@ -340,27 +359,21 @@ class LoopedSequentialProgram:
                                 memory_start[sm],
                                 reg=inner_reg,
                                 bar_shift=barriers_per_bank,
+                                advance_indirect_layer=True,
                             ),
                         )
                     )
-            if block.reload_after:
-                reload = LduReloadBarriers(
-                    launcher.bars_src,
-                    segment.barrier_start,
-                    barriers_per_bank * bank_count,
-                    0,
-                ).bar(
-                    segment.completion_barrier
-                    + (bank_count - 1) * barriers_per_bank
-                )
-                for sm in range(launcher.num_sms):
-                    self.instructions[sm].append(reload.copy())
             if outer_count > 1:
                 for sm in range(launcher.num_sms):
                     self.instructions[sm].extend(
                         (
                             LoopC(outer_count, compute_start[sm], reg=outer_reg),
-                            LoopM(outer_count, memory_start[sm], reg=outer_reg),
+                            LoopM(
+                                outer_count,
+                                memory_start[sm],
+                                reg=outer_reg,
+                                advance_indirect_layer=bank_count == 1,
+                            ),
                         )
                     )
 

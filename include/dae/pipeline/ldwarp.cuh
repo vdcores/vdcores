@@ -88,7 +88,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           cuda::aligned_size_t<16>(inst.size)
         );
         break; }
-      case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D): {
+      case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):
+      case op(OP_ALLOC_LAYER_TMA_LOAD_1D): {
         const uint64_t resolved = load_l2_u64(
             reinterpret_cast<const uint64_t *>(inst.address));
         if (resolved == 0) {
@@ -133,7 +134,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           dst[offset] = src[offset];
         }
         break; }
-      case op(OP_ALLOC_INDIRECT_LDU_LOAD_1D): {
+      case op(OP_ALLOC_INDIRECT_LDU_LOAD_1D):
+      case op(OP_ALLOC_LAYER_LDU_LOAD_1D): {
         const uint64_t resolved = load_l2_u64(
             reinterpret_cast<const uint64_t *>(inst.address));
         if (resolved == 0) {
@@ -326,7 +328,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
         break;
       }
-      case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D): {
+      case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D):
+      case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D): {
         constexpr int kRouteCount = 6;
         constexpr int kHeaderInts = 12;
         // HBM descriptor: a fixed route-result pointer followed by the
@@ -407,7 +410,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
         break;
       }
-      case op(OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D): {
+      case op(OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D):
+      case op(OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D): {
         const uint64_t record_address = load_l2_u64(
             reinterpret_cast<const uint64_t *>(inst.address));
         if (record_address == 0) {

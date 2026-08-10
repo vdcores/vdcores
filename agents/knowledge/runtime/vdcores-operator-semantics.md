@@ -260,10 +260,16 @@ Barrier behavior for load ops:
   - `address` points to one HBM pointer to the ordinary 24-byte indexed record
   - LDU resolves the record before applying its runtime row index
 
-`RepeatM.offsetByCounter(s)` selects indirect descriptor entries for compact
-layer loops. There is deliberately no indirect store opcode: fixed scratch
-outputs use fixed addresses and persistent layer caches use regular strided
-STU addresses.
+The four `OP_ALLOC_LAYER_*_LOAD_1D` forms have the same LDU behavior as their
+indirect counterparts, but the allocator first advances the pointer-column
+entry by its current linear layer index (eight bytes, or sixteen bytes for the
+routed descriptor). `OP_RESET_INDIRECT_LAYER` resets that allocator-only
+index once before a repeated family; the memory `LOOP` advances it once per
+logical body. This avoids emitting address arithmetic before every load and
+does not expose the scheduler's nested-loop shape in the load ISA.
+
+There is deliberately no indirect store opcode: fixed scratch outputs use
+fixed addresses and persistent layer caches use regular strided STU addresses.
 
 ### Store-side / writeback ops
 

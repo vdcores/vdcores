@@ -25,6 +25,7 @@ from dae.instructions import (
     Nvfp4GemvSm100,
     ProfileEvent,
     RepeatM,
+    ResetIndirectLayer,
     RoutedTmaLoad1D,
     TmaTensor,
 )
@@ -129,14 +130,22 @@ def test_indirect_loads_keep_address_selection_in_ldu():
             return 0x23456789ABC0
 
     direct = IndirectTmaLoad1D(FakePointerTable(), 4096)
+    layered = IndirectTmaLoad1D(
+        FakePointerTable(), 4096, layer_indexed=True
+    )
     routed = IndirectRoutedTmaLoad1D(
-        FakePointerTable(), 4, 511, 16384
+        FakePointerTable(),
+        4,
+        511,
+        16384,
+        layer_indexed=True,
     )
 
     assert direct.opcode == opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D
+    assert layered.opcode == opcode.OP_ALLOC_LAYER_TMA_LOAD_1D
     assert direct.num_slots == 1
     assert cords2addr(direct.cords) == FakePointerTable.data_ptr()
-    assert routed.opcode == opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D
+    assert routed.opcode == opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D
     assert routed.arg == (511 << 3) | 4
     assert routed.num_slots == 2
 
@@ -363,15 +372,19 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     reload = next(
         inst
         for inst in memory
-        if inst.opcode & ~0x10 == opcode.OP_LDU_RELOAD_BARRIERS
+        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F)
     )
-    assert reload.opcode & ~0x10 == opcode.OP_LDU_RELOAD_BARRIERS
+    assert (reload.opcode & ~0x3F) == (
+        opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F
+    )
+    assert reload.opcode & 0x4
     assert reload.num_slots & 0x3F == config.num_slots
-    assert reload.num_slots >> 6 == 3
+    assert reload.num_slots >> 6 == 1
     assert reload.size == 4
     loop = next(inst for inst in memory if isinstance(inst, LoopM))
     assert loop.size == 2
-    assert loop.cords[0] == 0
+    assert loop.cords[0] == 1
+    assert loop.cords[1] == 1
     assert loop.cords[2] == 2 << 6
     shifted_body = [
         inst
@@ -466,8 +479,10 @@ def test_looped_program_nests_two_barrier_banks_inside_ten_outer_iterations():
     memory_loops = [
         inst for inst in program.instructions[0] if isinstance(inst, LoopM)
     ]
+    assert isinstance(program.instructions[0][0], ResetIndirectLayer)
     assert [inst.args for inst in compute_loops] == [[2, 0, 0], [10, 0, 1]]
     assert [(inst.size, inst.num_slots) for inst in memory_loops] == [(2, 0), (10, 1)]
+    assert [inst.cords[1] for inst in memory_loops] == [1, 0]
 
 
 def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():

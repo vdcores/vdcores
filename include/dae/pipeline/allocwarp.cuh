@@ -38,6 +38,7 @@ __device__ __forceinline__ void allocwarp_execute(
 
   MemoryVirtualCore di;
   di.init();
+  uint32_t indirect_layer_index = 0;
   if (lane_id < numComputeLoopCounters) {
     di.jmp_cnt = initial_loop_counts.values[lane_id];
   }
@@ -81,6 +82,19 @@ __device__ __forceinline__ void allocwarp_execute(
       inst.address += addr_accum;
       __mprint("[Loop][loop_counter=%d] Updated address addr + 0x? -> 0x%lx",
                 di.loop_counter, inst.address);
+    }
+
+    // All layer-indexed dynamic loads in one repeated body share this linear
+    // allocator index. The loop control advances it once per logical body,
+    // replacing per-load address-arithmetic instruction sequences.
+    const int decoded_op = op(inst.opcode);
+    if (decoded_op >= op(OP_ALLOC_LAYER_TMA_LOAD_1D) &&
+        decoded_op <= op(OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D)) {
+      const int entry_bytes =
+          decoded_op == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D) ? 16 : 8;
+      if (lane_id == 0) {
+        inst.address += uint64_t(indirect_layer_index) * entry_bytes;
+      }
     }
 
     // A2. shift the arg field for group instructions (usually with tmas and bars)
@@ -228,8 +242,14 @@ __device__ __forceinline__ void allocwarp_execute(
           }
           next_pc = __shfl_sync(0xFFFFFFFF, next_pc, inst.num_slots);
           shift = __shfl_sync(0xFFFFFFFF, shift, inst.num_slots);
+          if (inst.coords[1] & 0x1)
+            ++indirect_layer_index;
           __mprint("Loop: pc=%d reg=%d count=%d reg0=%d target_pc=%d arg_offset=%u",
             pc, inst.num_slots, inst.size, __shfl_sync(ALL_THREADS, di.jmp_cnt, inst.num_slots), next_pc, shift);
+        }
+        break;
+        case op(OP_RESET_INDIRECT_LAYER): {
+          indirect_layer_index = 0;
         }
         break;
         case op(OP_LDU_RELOAD_BARRIERS): {
