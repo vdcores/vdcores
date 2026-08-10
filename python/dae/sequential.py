@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .instructions import (
     ComputeInstruction,
+    LduProfileLayer,
     LduReloadBarriers,
     LoopC,
     LoopM,
@@ -31,6 +32,7 @@ class SequentialStage:
     num_sms: int
     base_sm: int = 0
     input_role: str | None = None
+    profile_after: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,11 +140,20 @@ class SequentialProgram:
         stages: list[SequentialStage] | tuple[SequentialStage, ...],
         *,
         completion_barrier: bool = False,
+        profile_event_count: int | None = None,
     ):
         self.launcher = launcher
         self.stages = tuple(stages)
         if not self.stages:
             raise ValueError("sequential program requires at least one stage")
+        if profile_event_count is None:
+            profile_event_count = sum(stage.profile_after for stage in self.stages)
+        self.profile_event_count = int(profile_event_count)
+        layer_profile_capacity = (
+            config.reload_profile_event_base - config.layer_profile_event_base
+        )
+        if not 0 <= self.profile_event_count <= layer_profile_capacity:
+            raise ValueError("layer profile events exceed the runtime profile row")
 
         self.instructions = [[] for _ in range(launcher.num_sms)]
         self.barriers = []
@@ -156,6 +167,7 @@ class SequentialProgram:
 
         previous = None
         previous_name = None
+        previous_profile_after = False
         for stage in self.stages:
             if stage.num_sms <= 0:
                 raise ValueError(f"stage {stage.name!r} must use at least one SM")
@@ -174,6 +186,14 @@ class SequentialProgram:
                 self.barriers.append(input_bar)
                 for tail in tails:
                     _attach_bar(tail, input_bar, stage=previous_name)
+                if previous_profile_after:
+                    if self.profile_event_count == 0:
+                        raise ValueError("profiled stage requires profile event capacity")
+                    marker = LduProfileLayer(
+                        config.layer_profile_event_base, self.profile_event_count
+                    ).bar(input_bar)
+                    for instructions in self.instructions:
+                        instructions.append(marker.copy())
 
             schedule = stage.schedule._clone()
             if input_bar is not None and stage.input_role is not None:
@@ -201,6 +221,7 @@ class SequentialProgram:
                 self.instructions[sm].extend(instructions)
             previous = rendered
             previous_name = stage.name
+            previous_profile_after = stage.profile_after
 
         if completion_barrier:
             count, tails = _writeback_tail(previous, previous_name)
@@ -210,6 +231,18 @@ class SequentialProgram:
             self.barriers.append(self.completion_barrier)
             for tail in tails:
                 _attach_bar(tail, self.completion_barrier, stage=previous_name)
+            if previous_profile_after:
+                if self.profile_event_count == 0:
+                    raise ValueError("profiled stage requires profile event capacity")
+                marker = LduProfileLayer(
+                    config.layer_profile_event_base, self.profile_event_count
+                ).bar(self.completion_barrier)
+                for instructions in self.instructions:
+                    instructions.append(marker.copy())
+        elif previous_profile_after:
+            raise ValueError(
+                "a profiled final stage requires a completion barrier"
+            )
         self.barrier_stop = launcher.num_bars
 
         max_compute = max(
@@ -252,6 +285,15 @@ class LoopedSequentialProgram:
         self.stage_stats = []
         self.segments = []
         self.placed_schedules = []
+        self.profile_event_count = sum(
+            sum(stage.profile_after for stage in block.stages) * block.repeat
+            for block in self.blocks
+        )
+        layer_profile_capacity = (
+            config.reload_profile_event_base - config.layer_profile_event_base
+        )
+        if self.profile_event_count > layer_profile_capacity:
+            raise ValueError("layer profile events exceed the runtime profile row")
         compute_base = launcher.copy_cptrs()
         memory_base = launcher.copy_mptrs()
 
@@ -293,6 +335,7 @@ class LoopedSequentialProgram:
                 launcher,
                 block.stages,
                 completion_barrier=block.reload_after,
+                profile_event_count=self.profile_event_count,
             )
             self.segments.append(segment)
             barriers_per_bank = segment.barrier_stop - segment.barrier_start
@@ -343,7 +386,7 @@ class LoopedSequentialProgram:
                     launcher.bars_src,
                     segment.barrier_start,
                     barriers_per_bank * bank_count,
-                    0,
+                    2 if self.profile_event_count else 0,
                 ).bar(segment.completion_barrier)
                 if bank_count > 1:
                     reload.group()

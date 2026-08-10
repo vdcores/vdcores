@@ -59,6 +59,10 @@ DAE_OP(OP_ALLOC_LAYER_LDU_LOAD_1D, MK_MOP(35, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D, MK_MOP(36, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D, MK_MOP(37, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_RESET_INDIRECT_LAYER, MK_MOP(38, MEM_OP_FLAGS_NONE))
+// Diagnostic-only layer frontier. LDU waits on the attached layer-tail
+// barrier, records globaltimer[event_base + internal_counter], then advances
+// that counter. The compact loop body therefore needs no per-layer unroll.
+DAE_OP(OP_LDU_PROFILE_LAYER, MK_MOP(39, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

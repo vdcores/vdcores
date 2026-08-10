@@ -145,8 +145,55 @@ left 29.933 GiB free. It represented 3,781 logical stages with 354 queued stage
 bodies, 612 dependency counters, 1,197 compute instructions, and 4,052 memory
 instructions in the unchanged 4,096-entry images. One VDCores launch over all
 43 layers and the 129,280-row head emitted reference token 14 for input token
-791 at position zero. The first launch took 13,364.171 ms; this is a functional
-breadth result, not a TBT-parity claim.
+791 at position zero.
+
+The original 13,364.171-ms report was not TBT. The CUDA start event was queued
+before the first call materialized and uploaded the 152-SM instruction/TMA
+image, so the stream sat idle between the event and the resident kernel. The
+benchmark now calls `prepare_launch()` before timing and performs one untimed
+prime launch. Queue construction/upload remains visible as setup time but is
+not charged to a token.
+
+## Per-layer internal-counter profile
+
+The diagnostic path adds four static memory instructions, raising the full
+image from 4,052 to 4,056 memory instructions. At each logical layer tail, an
+LDU control command waits on the existing final-STU dependency and records
+`globaltimer[layer_base + internal_layer_counter]`; it then increments that
+LDU-local counter. The 43 layers are still looped rather than unrolled. The
+existing barrier-reload command likewise records a second internal-counter
+range after rearming dependencies. Profile slots 2-63 are layer frontiers,
+64-95 are reload frontiers, and 96-127 remain aggregate runtime counters. This
+uses neither `IssueBarrier`, `__threadfence`, nor a compute/memory joint
+barrier.
+
+Job `20260810T213255Z-1100716` ran five profiled, checkpoint-resident samples on
+one B300 and preserved reference token 14. CUDA samples were 80.794, 79.530,
+72.035, 81.054, and 75.447 ms; the median was 79.530 ms. The corresponding
+median-sample internal span was 79.275 ms:
+
+| Component | Time (ms) | Internal span |
+| --- | ---: | ---: |
+| 43 transformer layers | 74.797 | 94.35% |
+| 23 loop dependency reloads | 2.555 | 3.22% |
+| 129,280-row output head | 1.923 | 2.43% |
+
+Layer-family summaries from that same sample were:
+
+| Family | Layers | Median layer (ms) | Sum (ms) |
+| --- | ---: | ---: | ---: |
+| SWA/hash | 2 | 0.583 | 1.165 |
+| CSA/hash | 1 | 0.735 | 0.735 |
+| HCA/score | 20 | 2.482 | 41.849 |
+| CSA/score | 20 | 1.573 | 31.048 |
+
+Pair reloads median 0.138 ms and total 2.424 ms, so reload is measurable but
+not the primary gap. The stronger structural signal is iteration-dependent
+layer time: the first HCA/CSA pair was 0.762/0.640 ms, while later HCA layers
+clustered as high as 2.49 ms and CSA layers as high as 2.10 ms despite common
+shapes. The next review should therefore correlate these layer frontiers with
+allocator slot stalls, LDU queue/dependency wait, and STU service counters
+before changing task tiles.
 
 ## Verified GB200 baselines (2026-08-10)
 

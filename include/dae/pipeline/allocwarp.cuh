@@ -252,7 +252,8 @@ __device__ __forceinline__ void allocwarp_execute(
           indirect_layer_index = 0;
         }
         break;
-        case op(OP_LDU_RELOAD_BARRIERS): {
+        case op(OP_LDU_RELOAD_BARRIERS):
+        case op(OP_LDU_PROFILE_LAYER): {
           if (lane_id == 0) {
             const int special_slot = inst.nslot();
             if (special_slot < numSlots ||

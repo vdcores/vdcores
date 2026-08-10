@@ -56,16 +56,22 @@ static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
+static constexpr int layerProfileEventBase = 2;
+static constexpr int reloadProfileEventBase = 64;
+static constexpr int trackProfileEventBase = 96;
+static_assert(layerProfileEventBase < reloadProfileEventBase);
+static_assert(reloadProfileEventBase < trackProfileEventBase);
+static_assert(trackProfileEventBase < numProfileEvents);
 static constexpr int numComputeLoopCounters = 4;
 static constexpr int lduBarrierReloadArrival = numBars - 2;
 static constexpr int lduBarrierReloadDone = numBars - 1;
 
 #if defined(DAE_TRACK_PROFILE)
 // Diagnostic-only, per-SM aggregate counters.  Keep these at the high end of
-// the existing profile row so schedule-level OP_PROFILE_EVENT markers can use
-// the low IDs on the same global-timer timeline.
+// the existing profile row so layer and reload frontiers can use low IDs on
+// the same global-timer timeline.
 enum DAETrackProfileEvent : int {
-  DAE_TRACK_COMPUTE_M2C_WAIT_NS = 96,
+  DAE_TRACK_COMPUTE_M2C_WAIT_NS = trackProfileEventBase,
   DAE_TRACK_COMPUTE_M2C_WAIT_CALLS = 97,
   DAE_TRACK_COMPUTE_M2C_CONTENDED = 98,
   DAE_TRACK_ALLOC_SLOT_STALL_NS = 99,

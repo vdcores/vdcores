@@ -913,7 +913,7 @@ class MemoryInstruction(Instruction):
         assert len(cords) <= 4, "Maximum 4 cords are supported"
         self.cords = cords + [0] * (4 - len(cords))
         for i in range(4):
-            assert 0 <= self.cords[i] < 2**16 - 1, "cord values must be a uint16"
+            assert 0 <= self.cords[i] < 2**16, "cord values must be a uint16"
 
     def delta(self, delta):
         if isinstance(delta, int):
@@ -1544,6 +1544,30 @@ class LduReloadBarriers(MemoryInstruction):
             arg=first_bar,
             size=count,
             address=bar_source.data_ptr(),
+        )
+
+
+class LduProfileLayer(MemoryInstruction):
+    """Record one completed-layer frontier with an LDU-local counter."""
+
+    def __init__(
+        self,
+        event_base: int,
+        event_count: int,
+        special_slot: int = 0,
+    ):
+        if event_base < config.layer_profile_event_base or event_count <= 0:
+            raise ValueError("layer profile events must follow kernel slots 0/1")
+        if event_base + event_count > config.reload_profile_event_base:
+            raise ValueError("layer profile events overlap reload profile slots")
+        if not 0 <= special_slot < config.num_special_slots - 1:
+            raise ValueError("layer profiling requires two adjacent special slots")
+        super().__init__(
+            opcode=opcode.OP_LDU_PROFILE_LAYER,
+            num_slots=config.num_slots + special_slot,
+            arg=event_base,
+            size=event_count,
+            address=0,
         )
 
 

@@ -268,6 +268,13 @@ index once before a repeated family; the memory `LOOP` advances it once per
 logical body. This avoids emitting address arithmetic before every load and
 does not expose the scheduler's nested-loop shape in the load ISA.
 
+`OP_LDU_PROFILE_LAYER` is diagnostic control flow rather than a data load. It
+is queued on both LDU ports, waits on an attached layer-tail dependency, and
+lets port 0 record `globaltimer[event_base + ldu_local_counter]` before
+incrementing that counter. The ordinary LDU barrier-reload command records its
+own post-reload counter range in tracking builds. Neither operation involves
+compute threads, an issue barrier, or a thread fence.
+
 There is deliberately no indirect store opcode: fixed scratch outputs use
 fixed addresses and persistent layer caches use regular strided STU addresses.
 

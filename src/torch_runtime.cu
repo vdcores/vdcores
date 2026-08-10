@@ -476,6 +476,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("max_insts") = numInsts;
   config.attr("dynamic_smem_size") = dynamicSmemBytes;
   config.attr("num_profile_events") = numProfileEvents;
+  config.attr("layer_profile_event_base") = layerProfileEventBase;
+  config.attr("reload_profile_event_base") = reloadProfileEventBase;
+  config.attr("track_profile_event_base") = trackProfileEventBase;
   config.attr("num_loop_counters") = numComputeLoopCounters;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;

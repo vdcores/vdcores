@@ -22,6 +22,7 @@ from dae.instructions import (
     MemoryInstruction,
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
+    LduProfileLayer,
     Nvfp4GemvSm100,
     ProfileEvent,
     RepeatM,
@@ -73,6 +74,18 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert repeat.arg & RepeatM.COUNT_COUNTER_MODE_FLAG
     assert repeat.arg & RepeatM.COUNTER_REG_MASK == 3
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
+
+
+def test_memory_instruction_accepts_maximum_uint16_address_chunk():
+    instruction = MemoryInstruction(
+        opcode.OP_RESET_INDIRECT_LAYER,
+        num_slots=0,
+        arg=0,
+        size=0,
+        cords=[0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF],
+    )
+
+    assert instruction.cords == [0xFFFF] * 4
 
 
 def test_routed_tma_load_encodes_l2_lookup_and_shared_span():
@@ -345,7 +358,9 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
                 "body",
                 (
                     SequentialStage("producer", BasicStage(), 2),
-                    SequentialStage("consumer", BasicStage(), 2),
+                    SequentialStage(
+                        "consumer", BasicStage(), 2, profile_after=True
+                    ),
                 ),
                 repeat=2,
                 barrier_banks=2,
@@ -378,14 +393,24 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
         opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F
     )
     assert reload.opcode & 0x4
-    assert reload.num_slots & 0x3F == config.num_slots
+    assert reload.num_slots & 0x3F == config.num_slots + 2
     assert reload.num_slots >> 6 == 1
     assert reload.size == 4
+    profile_layer = next(
+        inst
+        for inst in memory
+        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_PROFILE_LAYER & ~0x3F)
+    )
+    assert profile_layer.opcode & 0x4
+    assert profile_layer.num_slots >> 6 == 1
+    assert profile_layer.arg == 2
+    assert profile_layer.size == 2
     loop = next(inst for inst in memory if isinstance(inst, LoopM))
     assert loop.size == 2
     assert loop.cords[0] == 1
     assert loop.cords[1] == 1
     assert loop.cords[2] == 2 << 6
+    assert memory.index(profile_layer) < memory.index(reload) < memory.index(loop)
     shifted_body = [
         inst
         for inst in memory
@@ -528,6 +553,21 @@ def test_profile_event_reserves_kernel_start_and_end_slots():
     assert instruction.args == [17]
     with pytest.raises(ValueError, match="slots 0/1"):
         ProfileEvent(1)
+
+
+def test_ldu_layer_profile_encodes_internal_counter_range():
+    assert config.layer_profile_event_base == 2
+    assert config.reload_profile_event_base == 64
+    assert config.track_profile_event_base == 96
+    instruction = LduProfileLayer(config.layer_profile_event_base, 43).bar(7)
+
+    assert (instruction.opcode & ~0x3F) == (
+        opcode.OP_LDU_PROFILE_LAYER & ~0x3F
+    )
+    assert instruction.num_slots & 0x3F == config.num_slots
+    assert instruction.num_slots >> 6 == 7
+    assert instruction.arg == config.layer_profile_event_base
+    assert instruction.size == 43
 
 
 def test_attention_runtime_counter_fields_are_disjoint():

@@ -25,6 +25,7 @@ from dae.deepseek_v4_checkpoint import (
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy, ShapeAssignment
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
+from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayeredSchedule,
     SchedDsv4Bf16Gemv,
@@ -95,6 +96,14 @@ class ResidentOneLaunchDecode:
         }
         self.head_stages = self._build_head()
         self._build_program()
+        prepare_started = time.monotonic()
+        self.launcher.prepare_launch()
+        torch.cuda.synchronize(self.device)
+        print(
+            "DSV4_ONE_LAUNCH_PREPARE status=PASS "
+            f"elapsed_s={time.monotonic() - prepare_started:.3f}",
+            flush=True,
+        )
 
     def _load_checkpoint(self) -> DeepSeekV4ResidentCheckpoint:
         disk = DeepSeekV4Checkpoint(self.args.checkpoint, self.config)
@@ -1163,7 +1172,12 @@ class ResidentOneLaunchDecode:
     def _build_program(self) -> None:
         serial_sm = 0
 
-        def queued(stage: Stage, prefix: str = "") -> SequentialStage:
+        def queued(
+            stage: Stage,
+            prefix: str = "",
+            *,
+            profile_after: bool = False,
+        ) -> SequentialStage:
             nonlocal serial_sm
             base_sm = 0
             if stage.num_sms == 1:
@@ -1175,25 +1189,33 @@ class ResidentOneLaunchDecode:
                 stage.num_sms,
                 base_sm=base_sm,
                 input_role=stage.input_role,
+                profile_after=profile_after,
             )
+
+        def queued_family(family: LayerFamily) -> list[SequentialStage]:
+            stages = self.family_stages[family.representative]
+            return [
+                queued(
+                    stage,
+                    f"{family.name}.",
+                    profile_after=(
+                        self.args.profile_layers and index + 1 == len(stages)
+                    ),
+                )
+                for index, stage in enumerate(stages)
+            ]
 
         self.launcher = Launcher(self.sms, device=self.device)
         if self.args.layers == 1:
             family = self.families[0]
-            stages = [
-                queued(stage, f"{family.name}.")
-                for stage in self.family_stages[family.representative]
-            ]
+            stages = queued_family(family)
             stages.extend(queued(stage) for stage in self.head_stages)
             self.program = SequentialProgram(self.launcher, stages)
             logical_stages = len(stages)
             queue_stages = logical_stages
         elif self.args.layers == 2:
             family = self.families[0]
-            family_stages = [
-                queued(stage, f"{family.name}.")
-                for stage in self.family_stages[family.representative]
-            ]
+            family_stages = queued_family(family)
             head_stages = [queued(stage) for stage in self.head_stages]
             blocks = (
                 SequentialBlock(
@@ -1211,21 +1233,9 @@ class ResidentOneLaunchDecode:
             queue_stages = sum(len(block.stages) for block in blocks)
         else:
             swa, layer2, hca, csa = self.families
-            swa_stages = [
-                queued(stage, f"{swa.name}.")
-                for stage in self.family_stages[swa.representative]
-            ]
-            layer2_stages = [
-                queued(stage, f"{layer2.name}.")
-                for stage in self.family_stages[layer2.representative]
-            ]
-            pair_stages = [
-                queued(stage, f"{hca.name}.")
-                for stage in self.family_stages[hca.representative]
-            ] + [
-                queued(stage, f"{csa.name}.")
-                for stage in self.family_stages[csa.representative]
-            ]
+            swa_stages = queued_family(swa)
+            layer2_stages = queued_family(layer2)
+            pair_stages = queued_family(hca) + queued_family(csa)
             head_stages = [queued(stage) for stage in self.head_stages]
             blocks = (
                 SequentialBlock(
@@ -1252,9 +1262,27 @@ class ResidentOneLaunchDecode:
             f"logical_stages={logical_stages} queue_stages={queue_stages} "
             f"barriers={len(self.program.barriers)} "
             f"compute_insts={self.program.max_compute_instructions} "
-            f"memory_insts={self.program.max_memory_instructions}",
+            f"memory_insts={self.program.max_memory_instructions} "
+            f"layer_profile_events={self.program.profile_event_count}",
             flush=True,
         )
+        if self.args.profile_layers and self.program.profile_event_count != self.args.layers:
+            raise AssertionError(
+                "internal layer counter does not cover every requested layer"
+            )
+        if self.args.profile_layers:
+            for family in self.families:
+                stages = self.family_stages[family.representative]
+                print(
+                    "DSV4_LAYER_PROCESS "
+                    f"family={family.name} "
+                    f"layers={','.join(str(layer) for layer in family.layer_ids)} "
+                    f"attention={self.config.attention_kind(family.representative)} "
+                    f"routing={'hash' if family.representative < self.config.num_hash_layers else 'score'} "
+                    f"stage_count={len(stages)} "
+                    f"sequence={','.join(stage.name for stage in stages)}",
+                    flush=True,
+                )
         for assignment in sorted(
             self.assignments.values(),
             key=lambda item: (item.task, item.rows, item.k),
@@ -1269,6 +1297,8 @@ class ResidentOneLaunchDecode:
 
     def run_once(self) -> tuple[int, float, torch.Tensor]:
         self.residual.copy_(self.initial_residual)
+        if self.args.profile_layers:
+            self.launcher.profile.zero_()
         torch.cuda.synchronize(self.device)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -1283,6 +1313,108 @@ class ResidentOneLaunchDecode:
         token = int(torch.argmax(logits_fp32).item())
         return token, start.elapsed_time(end), logits_fp32
 
+    def report_layer_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_layers:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "layer profiling requires a runtime built with track_profile=1"
+            )
+        start_frontier = max(int(value) for value in profile[:, 0])
+        end_frontier = max(int(value) for value in profile[:, 1])
+        boundaries = []
+        spreads = []
+        for layer_id in range(self.args.layers):
+            event_id = runtime_config.layer_profile_event_base + layer_id
+            values = [int(value) for value in profile[:, event_id]]
+            if any(value == 0 for value in values):
+                raise RuntimeError(f"layer {layer_id} profile event was not recorded")
+            boundaries.append(max(values))
+            spreads.append(max(values) - min(values))
+
+        if self.args.layers == 1:
+            reload_after_layers = ()
+        elif self.args.layers == 2:
+            reload_after_layers = (0, 1)
+        else:
+            reload_after_layers = (0, 1, 2, *range(4, self.args.layers, 2))
+        reload_frontiers = []
+        reload_spreads = []
+        for reload_index, layer_id in enumerate(reload_after_layers):
+            event_id = runtime_config.reload_profile_event_base + reload_index
+            values = [int(value) for value in profile[:, event_id]]
+            if any(value == 0 for value in values):
+                raise RuntimeError(
+                    f"reload after layer {layer_id} was not recorded"
+                )
+            reload_frontiers.append(max(values))
+            reload_spreads.append(max(values) - min(values))
+
+        previous = start_frontier
+        layer_total = 0
+        reload_total = 0
+        reload_index = 0
+        for layer_id, (boundary, spread) in enumerate(zip(boundaries, spreads)):
+            elapsed = boundary - previous
+            if elapsed < 0:
+                raise RuntimeError("layer profile frontiers are not monotonic")
+            layer_total += elapsed
+            previous = boundary
+            family = next(
+                family for family in self.families if layer_id in family.layer_ids
+            )
+            print(
+                "DSV4_LAYER_TIME "
+                f"layer={layer_id} family={family.name} "
+                f"attention={self.config.attention_kind(layer_id)} "
+                f"routing={'hash' if layer_id < self.config.num_hash_layers else 'score'} "
+                f"stages={len(self.family_stages[family.representative])} "
+                f"elapsed_ms={elapsed / 1.0e6:.6f} "
+                f"frontier_spread_us={spread / 1.0e3:.3f}",
+                flush=True,
+            )
+            if layer_id in reload_after_layers:
+                reload_frontier = reload_frontiers[reload_index]
+                reload_elapsed = reload_frontier - boundary
+                if reload_elapsed < 0:
+                    raise RuntimeError("reload profile frontier precedes its layer")
+                reload_total += reload_elapsed
+                print(
+                    "DSV4_RELOAD_TIME "
+                    f"after_layer={layer_id} "
+                    f"barriers={'pair' if layer_id >= 4 else 'family'} "
+                    f"elapsed_ms={reload_elapsed / 1.0e6:.6f} "
+                    f"frontier_spread_us={reload_spreads[reload_index] / 1.0e3:.3f}",
+                    flush=True,
+                )
+                previous = reload_frontier
+                reload_index += 1
+            else:
+                previous = boundary
+        head_elapsed = end_frontier - previous
+        if head_elapsed < 0:
+            raise RuntimeError("head profile frontier precedes the final layer")
+        internal_span = end_frontier - start_frontier
+        print(
+            "DSV4_LAYER_PROFILE_SUMMARY "
+            f"layers={self.args.layers} layer_total_ms={layer_total / 1.0e6:.6f} "
+            f"reload_total_ms={reload_total / 1.0e6:.6f} "
+            f"head_ms={head_elapsed / 1.0e6:.6f} "
+            f"internal_span_ms={internal_span / 1.0e6:.6f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -1295,6 +1427,11 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--expected-token-id", type=int)
     parser.add_argument("--resident-reserve-gib", type=float, default=8.0)
+    parser.add_argument(
+        "--profile-layers",
+        action="store_true",
+        help="record compact per-layer LDU globaltimer frontiers",
+    )
     args = parser.parse_args()
     cfg = DeepSeekV4FlashConfig()
     if not 0 <= args.token_id < cfg.vocab_size:
@@ -1311,6 +1448,17 @@ def main() -> None:
     flow = ResidentOneLaunchDecode(args, device)
     torch.cuda.synchronize(device)
     build_seconds = time.monotonic() - build_started
+    prime_token, prime_ms, _ = flow.run_once()
+    if args.expected_token_id is not None and prime_token != args.expected_token_id:
+        raise AssertionError(
+            f"prime launch emitted token {prime_token}, "
+            f"expected {args.expected_token_id}"
+        )
+    print(
+        "DSV4_ONE_LAUNCH_PRIME status=PASS "
+        f"output_token={prime_token} elapsed_ms={prime_ms:.6f}",
+        flush=True,
+    )
     for _ in range(args.warmup):
         token, _, _ = flow.run_once()
         if args.expected_token_id is not None and token != args.expected_token_id:
@@ -1319,11 +1467,19 @@ def main() -> None:
             )
 
     timings = []
+    profile_samples = []
     reference_token = None
     logits = None
-    for _ in range(args.iterations):
+    for iteration in range(args.iterations):
         token, elapsed_ms, logits = flow.run_once()
         timings.append(elapsed_ms)
+        if args.profile_layers:
+            profile_samples.append(flow.launcher.profile.cpu().clone())
+        print(
+            "DSV4_ONE_LAUNCH_SAMPLE "
+            f"iteration={iteration} elapsed_ms={elapsed_ms:.6f}",
+            flush=True,
+        )
         if reference_token is None:
             reference_token = token
         elif token != reference_token:
@@ -1334,6 +1490,17 @@ def main() -> None:
             f"expected {args.expected_token_id}"
         )
     assert logits is not None
+    if args.profile_layers:
+        median_timing = statistics.median(timings)
+        profile_index = min(
+            range(len(timings)),
+            key=lambda index: abs(timings[index] - median_timing),
+        )
+        flow.report_layer_profile(
+            profile_samples[profile_index],
+            sample_index=profile_index,
+            sample_cuda_ms=timings[profile_index],
+        )
     print(
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "
         f"layers={args.layers} token_id={args.token_id} "

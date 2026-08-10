@@ -22,6 +22,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   uint64_t dependency_wait_ns = 0;
   uint64_t dependency_contended = 0;
   uint64_t commands = 0;
+  uint32_t profile_layer_counter = 0;
+  uint32_t profile_reload_counter = 0;
 #endif
   m2ld.wait();
   LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
@@ -39,7 +41,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     auto &bar = cmd.bar;
     bool produces_compute_operand = true;
 
-    if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS))
+    if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS) ||
+        op(opcode) == op(OP_LDU_PROFILE_LAYER))
       ldu_control_publish_barrier->arrive_and_wait();
 
     __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
@@ -484,6 +487,34 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         // Port 1 cannot consume a following loop iteration until port 0 has
         // observed the device-wide completion phase after restoring counters.
         ldu_control_barrier->arrive_and_wait();
+#if defined(DAE_TRACK_PROFILE)
+        if (port_id == 0 && inst.nslot() == numSlots + 2) {
+          const int event_id = reloadProfileEventBase + profile_reload_counter;
+          if (event_id >= trackProfileEventBase) {
+            asm volatile("trap;");
+          }
+          g_events[sm_id * numProfileEvents + event_id] =
+              cuda::ptx::get_sreg_globaltimer();
+          ++profile_reload_counter;
+        }
+#endif
+        break;
+      }
+      case op(OP_LDU_PROFILE_LAYER): {
+        produces_compute_operand = false;
+#if defined(DAE_TRACK_PROFILE)
+        if (port_id == 0) {
+          const int event_id = inst.arg + profile_layer_counter;
+          if (profile_layer_counter >= inst.size ||
+              event_id < layerProfileEventBase ||
+              event_id >= reloadProfileEventBase) {
+            asm volatile("trap;");
+          }
+          g_events[sm_id * numProfileEvents + event_id] =
+              cuda::ptx::get_sreg_globaltimer();
+          ++profile_layer_counter;
+        }
+#endif
         break;
       }
     }
