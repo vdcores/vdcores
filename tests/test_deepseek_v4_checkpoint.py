@@ -7,6 +7,7 @@ import torch
 from dae.deepseek_v4 import DeepSeekV4FlashConfig
 from dae.deepseek_v4_checkpoint import (
     DeepSeekV4Checkpoint,
+    DeepSeekV4ResidentCheckpoint,
     expected_inference_tensor_specs,
     read_safetensors_header,
 )
@@ -135,3 +136,56 @@ def test_checkpoint_linear_helpers_preserve_raw_quantized_tensors(tmp_path):
     sliced = checkpoint.load_tensor_slice(f"{fp8_prefix}.weight", slice(3, 7))
     assert sliced.shape == (4, 128)
     assert sliced.dtype == torch.float8_e4m3fn
+
+
+def test_resident_checkpoint_packs_aligned_read_only_views(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    fp8_prefix = "layers.0.attn.wq_a"
+    nvfp4_prefix = "layers.0.ffn.experts.0.w1"
+    tensors = {
+        f"{fp8_prefix}.weight": torch.ones(
+            (128, 128), dtype=torch.float8_e4m3fn
+        ),
+        f"{fp8_prefix}.scale": torch.ones(
+            (1, 1), dtype=torch.float8_e8m0fnu
+        ),
+        f"{nvfp4_prefix}.weight": torch.full(
+            (128, 64), 0x22, dtype=torch.uint8
+        ),
+        f"{nvfp4_prefix}.weight_scale": torch.ones(
+            (128, 8), dtype=torch.float8_e4m3fn
+        ),
+        f"{nvfp4_prefix}.weight_scale_2": torch.tensor(0.25),
+        f"{nvfp4_prefix}.input_scale": torch.tensor(0.5),
+    }
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    safetensors_torch.save_file(tensors, shard)
+    _write_index(tmp_path, {name: shard.name for name in tensors})
+
+    checkpoint = DeepSeekV4Checkpoint(tmp_path, _small_config())
+    resident = DeepSeekV4ResidentCheckpoint.from_checkpoint(
+        checkpoint,
+        device="cpu",
+        names=tensors,
+    )
+
+    assert resident.tensor_bytes == sum(
+        tensor.numel() * tensor.element_size() for tensor in tensors.values()
+    )
+    assert resident.storage_bytes >= resident.tensor_bytes
+    fp8 = resident.load_fp8_linear(fp8_prefix)
+    nvfp4 = resident.load_nvfp4_linear(nvfp4_prefix)
+    torch.testing.assert_close(
+        fp8.weight.float(), tensors[f"{fp8_prefix}.weight"].float()
+    )
+    torch.testing.assert_close(
+        nvfp4.weight, tensors[f"{nvfp4_prefix}.weight"]
+    )
+    torch.testing.assert_close(nvfp4.alpha, torch.tensor([0.125]))
+    sliced = resident.load_tensor_slice(
+        f"{fp8_prefix}.weight", slice(3, 7)
+    )
+    assert (
+        sliced.untyped_storage().data_ptr()
+        == fp8.weight.untyped_storage().data_ptr()
+    )

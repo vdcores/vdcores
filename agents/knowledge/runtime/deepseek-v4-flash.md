@@ -259,6 +259,15 @@ reference) and `layers.2.ffn.experts.0.w1` (packed NVFP4, 0.048096 maximum
 absolute BF16 error).  This verifies checkpoint-to-VDCores dtype, layout, and
 scalar-scale routing for both quantization families.
 
+`DeepSeekV4ResidentCheckpoint` packs the non-MTP tensors into aligned,
+per-shard device buffers while preserving their raw dtypes and exposes
+read-only views without per-layer device copies. On `10.0.16.24:1`, all 45
+base-model shards loaded from the durable `/mnt` checkpoint in 69.459 seconds:
+153.364 GiB of tensor payload occupied 153.379 GiB of storage and left 29.933
+GiB free. A resident layer-0 plus 4,096-row head smoke then passed. This
+validates model residency and memory headroom; that smoke still used the
+streaming task launcher and is not a one-launch or TBT result.
+
 `benchmarks/deepseek_v4_checkpoint_decode.py` is the first complete
 position-zero real-weight VDCores flow.  It streams one input token through
 every transformer layer and the vocabulary head without materializing the full

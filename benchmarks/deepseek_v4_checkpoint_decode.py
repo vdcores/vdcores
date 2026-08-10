@@ -24,6 +24,7 @@ from dae.deepseek_v4 import (
 )
 from dae.deepseek_v4_checkpoint import (
     DeepSeekV4Checkpoint,
+    DeepSeekV4ResidentCheckpoint,
     Fp8LinearCheckpointTensors,
     Nvfp4LinearCheckpointTensors,
 )
@@ -58,7 +59,48 @@ class CheckpointDecode:
         self.args = args
         self.device = device
         self.config = DeepSeekV4FlashConfig()
-        self.checkpoint = DeepSeekV4Checkpoint(args.checkpoint, self.config)
+        disk_checkpoint = DeepSeekV4Checkpoint(args.checkpoint, self.config)
+        if args.resident:
+            load_started = time.monotonic()
+            print(
+                "DSV4_RESIDENT_LOAD status=START "
+                f"checkpoint={args.checkpoint} reserve_gib={args.resident_reserve_gib:.3f}",
+                flush=True,
+            )
+
+            def report_resident_progress(
+                shard_index: int,
+                shard_count: int,
+                filename: str,
+                shard_bytes: int,
+                loaded_bytes: int,
+            ) -> None:
+                print(
+                    "DSV4_RESIDENT_SHARD status=PASS "
+                    f"shard={shard_index}/{shard_count} filename={filename} "
+                    f"storage_gib={shard_bytes / (1 << 30):.3f} "
+                    f"loaded_gib={loaded_bytes / (1 << 30):.3f}",
+                    flush=True,
+                )
+
+            self.checkpoint = DeepSeekV4ResidentCheckpoint.from_checkpoint(
+                disk_checkpoint,
+                device=device,
+                reserve_bytes=int(args.resident_reserve_gib * (1 << 30)),
+                progress=report_resident_progress,
+            )
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            print(
+                "DSV4_RESIDENT_LOAD status=PASS "
+                f"tensor_gib={self.checkpoint.tensor_bytes / (1 << 30):.3f} "
+                f"storage_gib={self.checkpoint.storage_bytes / (1 << 30):.3f} "
+                f"free_gib={free_bytes / (1 << 30):.3f} "
+                f"total_gib={total_bytes / (1 << 30):.3f} "
+                f"elapsed_s={time.monotonic() - load_started:.3f}",
+                flush=True,
+            )
+        else:
+            self.checkpoint = disk_checkpoint
         self.sms = min(
             args.sms,
             torch.cuda.get_device_properties(device).multi_processor_count,
@@ -794,8 +836,9 @@ class CheckpointDecode:
                 f"elapsed_s={time.monotonic() - layer_started:.3f}",
                 flush=True,
             )
-            gc.collect()
-            torch.cuda.empty_cache()
+            if not self.args.resident:
+                gc.collect()
+                torch.cuda.empty_cache()
         token, logits = self._head(residual)
         return token, logits, time.monotonic() - started
 
@@ -808,10 +851,18 @@ class CheckpointDecode:
             position = self.args.start_pos + step
             token, logits, elapsed = self._run_token(token_id, position)
             outputs.append(token)
+            memory = ""
+            if self.args.resident:
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                memory = (
+                    f" free_gib={free_bytes / (1 << 30):.3f}"
+                    f" allocated_gib={torch.cuda.memory_allocated(self.device) / (1 << 30):.3f}"
+                    f" reserved_gib={torch.cuda.memory_reserved(self.device) / (1 << 30):.3f}"
+                )
             print(
                 "DSV4_CHECKPOINT_TOKEN status=PASS "
                 f"position={position} input_token={token_id} "
-                f"output_token={token} elapsed_s={elapsed:.3f}",
+                f"output_token={token} elapsed_s={elapsed:.3f}{memory}",
                 flush=True,
             )
             token_id = token
@@ -829,6 +880,17 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--sms", type=int, default=152)
     parser.add_argument("--trace-stages", action="store_true")
+    parser.add_argument(
+        "--resident",
+        action="store_true",
+        help="load every non-MTP checkpoint tensor into one GPU before decode",
+    )
+    parser.add_argument(
+        "--resident-reserve-gib",
+        type=float,
+        default=8.0,
+        help="minimum GPU memory to leave free after resident storage allocation",
+    )
     args = parser.parse_args()
     config = DeepSeekV4FlashConfig()
     if not 1 <= args.layers <= config.num_layers:
@@ -843,6 +905,8 @@ def main() -> None:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0:
         parser.error("sms must be positive")
+    if args.resident_reserve_gib < 0:
+        parser.error("resident-reserve-gib must be non-negative")
 
     expected = None
     if args.expected_token_ids is not None:
@@ -863,6 +927,7 @@ def main() -> None:
         "DSV4_CHECKPOINT_DECODE status=PASS "
         f"layers={args.layers} start_pos=0 token_id={args.token_id} "
         f"decode_tokens={args.decode_tokens} vocab={args.vocab_size} "
+        f"resident={int(args.resident)} "
         f"output_tokens={tokens} "
         f"logit_min={float(logits.float().min().item()):.6f} "
         f"logit_max={float(logits.float().max().item()):.6f} "

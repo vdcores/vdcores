@@ -11,7 +11,7 @@ import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .deepseek_v4 import DeepSeekV4FlashConfig
 
@@ -616,6 +616,239 @@ class DeepSeekV4Checkpoint:
         )
 
 
+class DeepSeekV4ResidentCheckpoint:
+    """Read-only shard-packed device views of a raw inference checkpoint."""
+
+    def __init__(
+        self,
+        checkpoint: DeepSeekV4Checkpoint,
+        tensors: dict[str, object],
+        storage_buffers: list[object],
+        *,
+        device,
+        tensor_bytes: int,
+        storage_bytes: int,
+    ) -> None:
+        self.source = checkpoint
+        self.config = checkpoint.config
+        self.root = checkpoint.root
+        self.weight_map = checkpoint.weight_map
+        self._tensors = tensors
+        self._storage_buffers = storage_buffers
+        self.device = device
+        self.tensor_bytes = tensor_bytes
+        self.storage_bytes = storage_bytes
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint: DeepSeekV4Checkpoint,
+        *,
+        device,
+        names: Iterable[str] | None = None,
+        alignment: int = 256,
+        reserve_bytes: int = 0,
+        progress: Callable[[int, int, str, int, int], None] | None = None,
+    ) -> "DeepSeekV4ResidentCheckpoint":
+        """Pack selected tensors into aligned per-shard device storage.
+
+        When ``names`` is omitted, all non-MTP inference tensors are loaded and
+        validated against the model contract.  Returned tensor views are
+        read-only by convention so repeated decode steps share one resident
+        copy of every checkpoint weight.
+        """
+        if alignment <= 0 or alignment & (alignment - 1):
+            raise ValueError("resident checkpoint alignment must be a power of two")
+        if reserve_bytes < 0:
+            raise ValueError("resident checkpoint reserve must be non-negative")
+
+        try:
+            import torch
+            from safetensors import safe_open
+        except ImportError as error:
+            raise RuntimeError(
+                "loading a resident checkpoint requires torch and safetensors"
+            ) from error
+
+        target_device = torch.device(device)
+        if target_device.type == "cuda" and target_device.index is None:
+            target_device = torch.device("cuda", torch.cuda.current_device())
+
+        expected = None
+        if names is None:
+            expected = expected_inference_tensor_specs(checkpoint.config)
+            selected_names = tuple(expected)
+        else:
+            selected_names = tuple(names)
+        if not selected_names:
+            raise ValueError("resident checkpoint requires at least one tensor")
+        if len(set(selected_names)) != len(selected_names):
+            raise ValueError("resident checkpoint tensor names must be unique")
+
+        specs = checkpoint.inspect(selected_names)
+        if expected is not None:
+            for name, expected_spec in expected.items():
+                actual = specs[name]
+                if (actual.dtype, actual.shape) != (
+                    expected_spec.dtype,
+                    expected_spec.shape,
+                ):
+                    raise ValueError(
+                        f"checkpoint tensor {name} expected "
+                        f"{expected_spec.dtype}{expected_spec.shape}, got "
+                        f"{actual.dtype}{actual.shape}"
+                    )
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for name in selected_names:
+            grouped[checkpoint.weight_map[name]].append(name)
+
+        shard_layouts = []
+        total_tensor_bytes = 0
+        total_storage_bytes = 0
+        for filename in sorted(grouped):
+            offset = 0
+            entries = []
+            for name in grouped[filename]:
+                offset = (offset + alignment - 1) & -alignment
+                spec = specs[name]
+                entries.append((name, offset, spec))
+                offset += spec.nbytes
+                total_tensor_bytes += spec.nbytes
+            shard_layouts.append((filename, offset, entries))
+            total_storage_bytes += offset
+
+        if target_device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(target_device)
+            if total_storage_bytes + reserve_bytes > free_bytes:
+                raise MemoryError(
+                    "resident checkpoint plus requested reserve exceeds free GPU "
+                    f"memory: storage={total_storage_bytes} reserve={reserve_bytes} "
+                    f"free={free_bytes}"
+                )
+
+        resident_tensors: dict[str, object] = {}
+        storage_buffers: list[object] = []
+        loaded_storage_bytes = 0
+        for shard_index, (filename, shard_bytes, entries) in enumerate(
+            shard_layouts, start=1
+        ):
+            packed = torch.empty((shard_bytes,), dtype=torch.uint8)
+            dtypes = {}
+            previous_end = 0
+            with safe_open(
+                str(checkpoint.root / filename), framework="pt", device="cpu"
+            ) as shard:
+                for name, offset, spec in entries:
+                    if offset > previous_end:
+                        packed[previous_end:offset].zero_()
+                    source = shard.get_tensor(name)
+                    source_bytes = (
+                        source.contiguous().reshape(-1).view(torch.uint8)
+                    )
+                    if source_bytes.numel() != spec.nbytes:
+                        raise ValueError(
+                            f"checkpoint tensor {name} payload changed while loading"
+                        )
+                    packed[offset : offset + spec.nbytes].copy_(source_bytes)
+                    dtypes[name] = source.dtype
+                    previous_end = offset + spec.nbytes
+
+            storage = packed.to(target_device)
+            storage_buffers.append(storage)
+            for name, offset, spec in entries:
+                raw = storage[offset : offset + spec.nbytes]
+                resident_tensors[name] = raw.view(dtypes[name]).reshape(spec.shape)
+            loaded_storage_bytes += shard_bytes
+            if progress is not None:
+                progress(
+                    shard_index,
+                    len(shard_layouts),
+                    filename,
+                    shard_bytes,
+                    loaded_storage_bytes,
+                )
+
+        return cls(
+            checkpoint,
+            resident_tensors,
+            storage_buffers,
+            device=target_device,
+            tensor_bytes=total_tensor_bytes,
+            storage_bytes=total_storage_bytes,
+        )
+
+    def _check_device(self, device) -> None:
+        import torch
+
+        requested = torch.device(device)
+        if requested.type != self.device.type:
+            raise ValueError(
+                f"resident checkpoint is on {self.device}, not {requested}"
+            )
+        if requested.index is not None and requested.index != self.device.index:
+            raise ValueError(
+                f"resident checkpoint is on {self.device}, not {requested}"
+            )
+
+    def load_tensors(
+        self,
+        names: Iterable[str],
+        *,
+        device="cpu",
+    ) -> dict[str, object]:
+        """Return read-only resident tensor views without copying."""
+        self._check_device(device)
+        result = {}
+        for name in names:
+            try:
+                result[name] = self._tensors[name]
+            except KeyError:
+                raise KeyError(
+                    f"checkpoint tensor {name!r} is not resident"
+                ) from None
+        return result
+
+    def load_tensor_slice(self, name: str, index, *, device="cpu"):
+        """Return a basic-indexed view of one resident tensor."""
+        return self.load_tensors([name], device=device)[name][index]
+
+    def load_fp8_linear(
+        self,
+        prefix: str,
+        *,
+        device="cpu",
+    ) -> Fp8LinearCheckpointTensors:
+        names = (f"{prefix}.weight", f"{prefix}.scale")
+        tensors = self.load_tensors(names, device=device)
+        return Fp8LinearCheckpointTensors(
+            prefix=prefix,
+            weight=tensors[names[0]],
+            scale=tensors[names[1]],
+        )
+
+    def load_nvfp4_linear(
+        self,
+        prefix: str,
+        *,
+        device="cpu",
+    ) -> Nvfp4LinearCheckpointTensors:
+        names = (
+            f"{prefix}.weight",
+            f"{prefix}.weight_scale",
+            f"{prefix}.weight_scale_2",
+            f"{prefix}.input_scale",
+        )
+        tensors = self.load_tensors(names, device=device)
+        return Nvfp4LinearCheckpointTensors(
+            prefix=prefix,
+            weight=tensors[names[0]],
+            weight_scale=tensors[names[1]],
+            weight_scale_2=tensors[names[2]],
+            input_scale=tensors[names[3]],
+        )
+
+
 __all__ = [
     "INDEX_FILENAME",
     "ExpectedTensorSpec",
@@ -624,6 +857,7 @@ __all__ = [
     "Fp8LinearCheckpointTensors",
     "Nvfp4LinearCheckpointTensors",
     "DeepSeekV4Checkpoint",
+    "DeepSeekV4ResidentCheckpoint",
     "expected_inference_tensor_specs",
     "read_safetensors_header",
     "read_safetensors_header_url",
