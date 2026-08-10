@@ -76,6 +76,7 @@ def run_vllm(args: argparse.Namespace) -> None:
         "FIXED_CONTEXT_CONFIG "
         f"framework=vllm batch={args.batch} context={context} "
         f"engine_max_model_len={engine_max_model_len} dtype=bfloat16 "
+        f"kv_cache_dtype={args.kv_cache_dtype} "
         f"max_num_batched_tokens={engine_max_num_batched_tokens} "
         "strict_batch=1 unchunked_strict_prefill=1",
         flush=True,
@@ -84,6 +85,7 @@ def run_vllm(args: argparse.Namespace) -> None:
         model=args.model,
         tokenizer=args.model,
         dtype="bfloat16",
+        kv_cache_dtype=args.kv_cache_dtype,
         max_model_len=engine_max_model_len,
         max_num_seqs=args.batch,
         max_num_batched_tokens=engine_max_num_batched_tokens,
@@ -284,6 +286,7 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--token-id", type=int, default=DEFAULT_TOKEN_ID)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
         "--profile-context",

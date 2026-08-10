@@ -167,10 +167,31 @@ the base model without MTP is 164,673,005,788 bytes (153.36 GiB).  A 189,471
 MiB GB200 therefore has about 31.67 GiB left before caches, activations, task
 images, and allocator overhead.  This is a viable but tight single-GPU fit.
 
-The cluster already has CUDA-13/Blackwell environments with explicit
-DeepSeek-V4 support for vLLM 0.23.0 and SGLang 0.5.12.post1, plus FlashInfer
-0.6.15.  A real E2E run still requires an authorized worker-local checkpoint
-download; do not place the 168-GB payload on NFS.
+The pinned checkpoint is downloaded on worker `10.0.16.24` at
+`/mnt/checkpoints/nvidia/DeepSeek-V4-Flash-NVFP4`; its Hugging Face cache is
+also worker-local at `/mnt/checkpoints/huggingface-cache`.  The model directory
+occupies 157 GiB on local EXT4 storage.  Its local header audit passed the same
+135,235-tensor, 46-shard contract as the remote audit.  Checkpoint-backed jobs
+must be pinned to this host because `/mnt` is worker-local; checkpoints must
+never be copied into the NFS source tree or a worker home directory.
+
+The CUDA-13/Blackwell vLLM 0.23.0 environment on that worker completed a real
+TP=1, one-GPU, two-token inference at context 128.  vLLM selected FP4 experts
+through FlashInfer TRT-LLM, FP8 DeepGEMM linears, FP8 MLA KV cache, and FP8
+Lightning Indexer cache.  It loaded 153.97 GiB of model state, retained 25.57
+GiB for KV cache (63,071 tokens), and exited cleanly.  The environment's PyPI
+CUDA compiler had drifted to 13.3 while its runtime headers remained 13.0;
+pinning both `CUDA_HOME` and `CUDA_PATH` to `/usr/local/cuda` selected the
+coherent system CUDA 13.0 toolchain and fixed TileLang mHC compilation without
+changing installed packages.
+
+The first cold start spent 1,177 seconds profiling, compiling cached SM100
+operators, warming DeepGEMM, and running FlashInfer's built-in 21-profile MoE
+selection.  The one-sample eager harness reported a 0.736501 ms first-to-second
+token interval.  Treat this only as an E2E functional smoke result: it had no
+warmup or statistical sample set and is not a framework TBT baseline or parity
+claim.
 
 All GPU checks must run through the cluster MPI launcher with one rank and the
-target checkout on `PYTHONPATH`.
+target checkout on `PYTHONPATH`.  Runs using this checkpoint must also select
+worker `10.0.16.24` and pass the explicit `/mnt` checkpoint path.
