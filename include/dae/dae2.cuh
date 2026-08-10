@@ -79,12 +79,16 @@ void dae2(
   // Init the queues
   #pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ cuda::barrier<cuda::thread_scope_block> barriers[4][numQueueElements];
+  __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_barrier;
   assert(numQueueElements <= blockDim.x && "Too many slots for barriers");
   if (threadIdx.x < numQueueElements) {
     init(&barriers[0][threadIdx.x], numThreadsM2CBarrier);
     init(&barriers[1][threadIdx.x], numThreadsC2MBarrier);
     init(&barriers[2][threadIdx.x], numThreadsLDBarrier);
     init(&barriers[3][threadIdx.x], numThreadsLDBarrier);
+  }
+  if (threadIdx.x == 0) {
+    init(&ldu_control_barrier, 2);
   }
 
   __shared__ int m2c_data[numQueueElements];
@@ -216,9 +220,9 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars
+          smem_base, tma_descs, bars, &ldu_control_barrier, port_id
 #if defined(DAE_TRACK_PROFILE)
-          , sm_id, port_id, g_events
+          , sm_id, g_events
 #endif
         );
       }

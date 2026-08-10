@@ -231,6 +231,25 @@ __device__ __forceinline__ void allocwarp_execute(
             pc, inst.num_slots, inst.size, __shfl_sync(ALL_THREADS, di.jmp_cnt, inst.num_slots), next_pc, shift);
         }
         break;
+        case op(OP_LDU_RELOAD_BARRIERS): {
+          if (lane_id == 0) {
+            const int special_slot = inst.nslot();
+            if (special_slot < numSlots ||
+                special_slot + 1 >= numSlots + numSpecialSlots) {
+              asm volatile("trap;");
+            }
+            for (int port = 0; port < 2; ++port) {
+              const int slot = special_slot + port;
+              st_insts[slot] = inst;
+              LdCmd ld;
+              ld.init(slot, 0, inst.opcode);
+              m2ld[port].put(ld.raw);
+              m2ld[port].commit();
+              m2ld[port].advance();
+            }
+          }
+        }
+        break;
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();

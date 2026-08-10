@@ -10,12 +10,15 @@ from dae.instructions import (
     ATTENTION_SM100_BF16_HDIM128_SWAP_DIRECT,
     ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT,
     ARGMAX_REDUCE_GLOBAL_bf16_256,
+    ComputeInstruction,
     Copy,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     Gemv_M128N8_ROPE_128,
     Gemv_M64N8_ROPE_128,
     Gemv_M64N8UpSiLU,
+    LoopC,
+    LoopM,
     MemoryInstruction,
     Nvfp4GemvSm100,
     ProfileEvent,
@@ -23,10 +26,15 @@ from dae.instructions import (
     RoutedTmaLoad1D,
     TmaTensor,
 )
-from dae.runtime import opcode
+from dae.runtime import config, opcode
 from dae.launcher import Launcher
 from dae.schedule import Schedule, SchedAttentionDecoding, SchedSmemSiLUInterleaved
-from dae.sequential import SequentialProgram, SequentialStage
+from dae.sequential import (
+    LoopedSequentialProgram,
+    SequentialBlock,
+    SequentialProgram,
+    SequentialStage,
+)
 from dae.tma_utils import (
     cords2addr,
     cord_func_2d_tile_major,
@@ -216,6 +224,117 @@ def test_sequential_program_binds_model_specific_input_role_to_same_edge():
     ][2]
     assert expert_load.opcode & 0x10
     assert expert_load.num_slots >> 6 == 0
+
+
+def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeBarrierSource:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 1 << 20
+
+        @staticmethod
+        def element_size():
+            return 4
+
+        @staticmethod
+        def data_ptr():
+            return 0x12340000
+
+    class FakeLauncher:
+        num_sms = 2
+        num_bars = 0
+        max_insts = 64
+        bars_src = FakeBarrierSource()
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def copy_cptrs(self):
+            return [0] * self.num_sms
+
+        def copy_mptrs(self):
+            return [0] * self.num_sms
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = LoopedSequentialProgram(
+        launcher,
+        (
+            SequentialBlock(
+                "body",
+                (
+                    SequentialStage("producer", BasicStage(), 2),
+                    SequentialStage("consumer", BasicStage(), 2),
+                ),
+                repeat=2,
+            ),
+            SequentialBlock(
+                "tail",
+                (SequentialStage("tail", BasicStage(), 2),),
+                reload_after=False,
+            ),
+        ),
+    )
+
+    assert launcher.bar_values == {0: 2, 1: 2}
+    compute = [
+        inst for inst in program.instructions[0]
+        if isinstance(inst, ComputeInstruction)
+    ]
+    memory = [
+        inst for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+    ]
+    assert isinstance(compute[2], LoopC)
+    assert compute[2].args == [2, 0, 0]
+    reload = next(
+        inst
+        for inst in memory
+        if inst.opcode & ~0x10 == opcode.OP_LDU_RELOAD_BARRIERS
+    )
+    assert reload.opcode & ~0x10 == opcode.OP_LDU_RELOAD_BARRIERS
+    assert reload.num_slots & 0x3F == config.num_slots
+    assert reload.num_slots >> 6 == 1
+    loop = next(inst for inst in memory if isinstance(inst, LoopM))
+    assert loop.size == 2
+    assert loop.cords[0] == 0
+    assert all((inst.opcode & ~0x10) != opcode.OP_ISSUE_BARRIER for inst in memory)
 
 
 def test_nvfp4_gemv_encodes_shared_shard_shape():

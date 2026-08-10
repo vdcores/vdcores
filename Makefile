@@ -37,6 +37,11 @@ ifneq ($(track_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE
 endif
 
+ifneq ($(global_insts),)
+	NVCC_FLAGS += -DDAE_LOAD_INSTRUCTIONS=0
+	export DAE_GLOBAL_INSTRUCTIONS := 1
+endif
+
 ifneq ($(aux_slots),)
 	NVCC_FLAGS += -DDAE_NUM_SLOTS=27 -DDAE_NUM_INSTS=192 -DDAE_DYNAMIC_SMEM_KB=219 -DDAE_PACKED_SWAP_ATTENTION_SCRATCH=1
 	export DAE_AUX_SLOTS := 1
@@ -94,7 +99,7 @@ run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
-	pip install -e . --no-build-isolation
+	$(PYTHON) -m pip install -e . --no-build-isolation
 
 FORCE:
 

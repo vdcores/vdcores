@@ -9,7 +9,10 @@
 constexpr bool dae2EnableLooping = true;
 constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
-constexpr bool dae2LoadInstructions = true;
+#ifndef DAE_LOAD_INSTRUCTIONS
+#define DAE_LOAD_INSTRUCTIONS 1
+#endif
+constexpr bool dae2LoadInstructions = DAE_LOAD_INSTRUCTIONS != 0;
 
 #ifndef DAE_M2C_OBSERVER_WAIT
 #define DAE_M2C_OBSERVER_WAIT 1
@@ -54,6 +57,8 @@ static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemo
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
 static constexpr int numComputeLoopCounters = 4;
+static constexpr int lduBarrierReloadArrival = numBars - 2;
+static constexpr int lduBarrierReloadDone = numBars - 1;
 
 #if defined(DAE_TRACK_PROFILE)
 // Diagnostic-only, per-SM aggregate counters.  Keep these at the high end of

@@ -6,9 +6,11 @@ template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     MInst *st_insts,
-    const void *smem_base, const CUtensorMap *tma_descs, int *bars
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    cuda::barrier<cuda::thread_scope_block> *ldu_control_barrier,
+    const int port_id
 #if defined(DAE_TRACK_PROFILE)
-    , const int sm_id, const int port_id, uint64_t *g_events
+    , const int sm_id, uint64_t *g_events
 #endif
     ) {
 
@@ -34,6 +36,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
     auto &opcode = cmd.opcode;
     auto &bar = cmd.bar;
+    bool produces_compute_operand = true;
 
     __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
 
@@ -300,13 +303,52 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             cuda::aligned_size_t<16>(inst.size),
             m2c.barriers[bar]);
         cuda::device::barrier_expect_tx(
-            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+          m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_LDU_RELOAD_BARRIERS): {
+        produces_compute_operand = false;
+        // Both LDU lanes reach this point only after all earlier commands on
+        // their own ports have drained and the loop-tail STU dependency has
+        // reached zero. The first rendezvous therefore makes it safe for the
+        // last block to restore the loop-local dependency counters.
+        ldu_control_barrier->arrive_and_wait();
+        if (port_id == 0) {
+          int *arrivals = bars + lduBarrierReloadArrival;
+          int *done = bars + lduBarrierReloadDone;
+          const int ticket = atomicAdd(arrivals, 1);
+          const int phase = ticket / gridDim.x + 1;
+          const bool last = (ticket + 1) % gridDim.x == 0;
+          if (last) {
+            const int first_bar = inst.arg;
+            const int count = inst.size;
+            const int *source = reinterpret_cast<const int *>(inst.address);
+            if (first_bar < 0 || count <= 0 ||
+                first_bar + count > lduBarrierReloadArrival) {
+              asm volatile("trap;");
+            }
+            for (int offset = 0; offset < count; ++offset) {
+              atomicExch(
+                  bars + first_bar + offset,
+                  load_l2(source + first_bar + offset));
+            }
+            atomicExch(done, phase);
+          } else {
+            while (atomicAdd(done, 0) < phase) {
+              __nanosleep(barrierPollSleepCycles);
+            }
+          }
+        }
+        // Port 1 cannot consume a following loop iteration until port 0 has
+        // observed the device-wide completion phase after restoring counters.
+        ldu_control_barrier->arrive_and_wait();
         break;
       }
     }
 
     // m2c data should be prepared in the CFU
-    (void)m2c.barriers[bar].arrive();
+    if (produces_compute_operand)
+      (void)m2c.barriers[bar].arrive();
 
     m2ld.wait();
     cmd.raw = m2ld.data[m2ld.ptr];

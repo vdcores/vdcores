@@ -40,7 +40,12 @@ from dae.schedule import (
     SchedSmemSiLUInterleaved,
     SchedDsv4Fp8Quant128,
 )
-from dae.sequential import SequentialProgram, SequentialStage
+from dae.sequential import (
+    LoopedSequentialProgram,
+    SequentialBlock,
+    SequentialProgram,
+    SequentialStage,
+)
 
 
 @dataclass
@@ -1019,47 +1024,93 @@ class SyntheticDecode:
         return stages
 
     def _build_program(self) -> None:
-        stages = []
         serial_sm = 0
 
-        def append_stage(name: str, stage: Stage) -> None:
+        def queued_stage(name: str, stage: Stage) -> SequentialStage:
             nonlocal serial_sm
             base_sm = 0
             if stage.num_sms == 1:
                 base_sm = serial_sm
                 serial_sm = (serial_sm + 1) % self.sms
-            stages.append(
-                SequentialStage(
-                    name,
-                    stage.schedule,
-                    stage.num_sms,
-                    base_sm=base_sm,
-                    input_role=stage.input_role,
-                )
+            return SequentialStage(
+                name,
+                stage.schedule,
+                stage.num_sms,
+                base_sm=base_sm,
+                input_role=stage.input_role,
             )
 
-        for plan in self.plans:
-            for stage in self._attention_stages(plan) + self._ffn_stages(plan):
-                append_stage(f"layer{plan.layer_id}.{stage.name}", stage)
-        for stage in (
-            self.head_project,
-            self.head_hc,
-            self.head_norm_stage,
-            self.logits_stage,
-        ):
-            append_stage(stage.name, stage)
-        if self.args.max_stages:
-            stages = stages[: self.args.max_stages]
-        self.partial_program = len(stages) == 0 or stages[-1].name != "head.logits_fp32"
+        def queued_layer(plan, label: str) -> list[SequentialStage]:
+            return [
+                queued_stage(f"{label}.{stage.name}", stage)
+                for stage in self._attention_stages(plan) + self._ffn_stages(plan)
+            ]
+
+        head = [
+            queued_stage(stage.name, stage)
+            for stage in (
+                self.head_project,
+                self.head_hc,
+                self.head_norm_stage,
+                self.logits_stage,
+            )
+        ]
         self.launcher = Launcher(self.sms, device=self.device)
-        self.program = SequentialProgram(self.launcher, stages)
+        full_model = (
+            self.args.first_layer == 0
+            and self.args.layers == self.config.num_layers
+            and not self.args.max_stages
+        )
+        if full_model:
+            plans = {plan.layer_id: plan for plan in self.plans}
+            blocks = (
+                SequentialBlock(
+                    "layers0-1.swa_hash",
+                    queued_layer(plans[0], "swa_hash"),
+                    repeat=2,
+                ),
+                SequentialBlock(
+                    "layer2.csa_hash",
+                    queued_layer(plans[2], "csa_hash"),
+                ),
+                SequentialBlock(
+                    "layers3-42.hca_csa_score",
+                    tuple(
+                        queued_layer(plans[3], "hca_score")
+                        + queued_layer(plans[4], "csa_score")
+                    ),
+                    repeat=20,
+                ),
+                SequentialBlock("head", head, reload_after=False),
+            )
+            self.program = LoopedSequentialProgram(self.launcher, blocks)
+            logical_stages = sum(
+                len(block.stages) * block.repeat for block in blocks
+            )
+            queued_bodies = sum(len(block.stages) for block in blocks)
+            self.partial_program = False
+        else:
+            stages = []
+            for plan in self.plans:
+                stages.extend(queued_layer(plan, f"layer{plan.layer_id}"))
+            stages.extend(head)
+            if self.args.max_stages:
+                stages = stages[: self.args.max_stages]
+            self.partial_program = (
+                len(stages) == 0 or stages[-1].name != "head.logits_fp32"
+            )
+            self.program = SequentialProgram(self.launcher, stages)
+            logical_stages = len(stages)
+            queued_bodies = len(stages)
+
         self.launcher.s(self.program)
         if self.trace:
-            for stage in stages:
-                print(f"DSV4_E2E_STAGE name={stage.name}", flush=True)
+            for stage_name, _, _ in self.program.stage_stats:
+                print(f"DSV4_E2E_STAGE name={stage_name}", flush=True)
         print(
             "DSV4_E2E_PROGRAM "
-            f"launches=1 stages={len(stages)} barriers={len(self.program.barriers)} "
+            f"launches=1 stages={logical_stages} queue_stages={queued_bodies} "
+            f"barriers={len(self.program.barriers)} "
             f"compute_insts={self.program.max_compute_instructions} "
             f"memory_insts={self.program.max_memory_instructions}",
             flush=True,

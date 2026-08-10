@@ -24,6 +24,8 @@ if re.fullmatch(r"[0-9]{2,3}[af]?", cuda_arch) is None:
     )
 cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
 cuda_defines = []
+if os.environ.get("DAE_GLOBAL_INSTRUCTIONS"):
+    cuda_defines.append("-DDAE_LOAD_INSTRUCTIONS=0")
 if os.environ.get("DAE_AUX_SLOTS"):
     cuda_defines.extend([
         "-DDAE_NUM_SLOTS=27",

@@ -41,6 +41,9 @@ DAE_OP(OP_ALLOC_LDU_LOAD_1D, MK_MOP(26, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_WB_STU_STORE_1D, MK_MOP(27, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
 // Resolve a runtime row index in LDU and load that row into shared memory.
 DAE_OP(OP_ALLOC_INDEXED_TMA_LOAD_1D, MK_MOP(28, MEM_OP_FLAGS_ALLOCATE))
+// Queue-local loop control. Both LDU ports drain through this command, then
+// one LDU lane reloads a dependency-barrier range from its HBM source.
+DAE_OP(OP_LDU_RELOAD_BARRIERS, MK_MOP(29, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

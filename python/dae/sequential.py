@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .instructions import ComputeInstruction, MemoryInstruction
+from .instructions import (
+    ComputeInstruction,
+    LduReloadBarriers,
+    LoopC,
+    LoopM,
+    MemoryInstruction,
+)
 from .runtime import config
 from .schedule import Schedule
 
@@ -24,6 +30,16 @@ class SequentialStage:
     num_sms: int
     base_sm: int = 0
     input_role: str | None = None
+
+
+@dataclass(frozen=True)
+class SequentialBlock:
+    """A queue body that may repeat before advancing to the next body."""
+
+    name: str
+    stages: tuple[SequentialStage, ...] | list[SequentialStage]
+    repeat: int = 1
+    reload_after: bool = True
 
 
 def _flatten(item, sm: int, output: list) -> None:
@@ -114,7 +130,13 @@ class SequentialProgram:
     edge, which preserves ordering even when a stage uses both load ports.
     """
 
-    def __init__(self, launcher, stages: list[SequentialStage] | tuple[SequentialStage, ...]):
+    def __init__(
+        self,
+        launcher,
+        stages: list[SequentialStage] | tuple[SequentialStage, ...],
+        *,
+        completion_barrier: bool = False,
+    ):
         self.launcher = launcher
         self.stages = tuple(stages)
         if not self.stages:
@@ -122,6 +144,8 @@ class SequentialProgram:
 
         self.instructions = [[] for _ in range(launcher.num_sms)]
         self.barriers = []
+        self.barrier_start = launcher.num_bars
+        self.completion_barrier = None
         self.stage_stats = []
         # Placement may materialize device-side routing/index tables or padded
         # scalar storage referenced by encoded memory instructions.  Retain
@@ -142,7 +166,7 @@ class SequentialProgram:
             input_bar = None
             if previous is not None:
                 count, tails = _writeback_tail(previous, previous_name)
-                if launcher.num_bars >= config.max_bars:
+                if launcher.num_bars >= config.max_bars - 2:
                     raise ValueError("sequential program exceeds the runtime barrier capacity")
                 input_bar = launcher.new_bar(count)
                 self.barriers.append(input_bar)
@@ -176,6 +200,16 @@ class SequentialProgram:
             previous = rendered
             previous_name = stage.name
 
+        if completion_barrier:
+            count, tails = _writeback_tail(previous, previous_name)
+            if launcher.num_bars >= config.max_bars - 2:
+                raise ValueError("sequential program exceeds the runtime barrier capacity")
+            self.completion_barrier = launcher.new_bar(count)
+            self.barriers.append(self.completion_barrier)
+            for tail in tails:
+                _attach_bar(tail, self.completion_barrier, stage=previous_name)
+        self.barrier_stop = launcher.num_bars
+
         max_compute = max(
             sum(isinstance(inst, ComputeInstruction) for inst in instructions)
             for instructions in self.instructions
@@ -198,4 +232,114 @@ class SequentialProgram:
         return self.instructions[sm]
 
 
-__all__ = ["SequentialProgram", "SequentialStage"]
+class LoopedSequentialProgram:
+    """Compose repeatable stage bodies into one compute/memory queue pair."""
+
+    def __init__(
+        self,
+        launcher,
+        blocks: list[SequentialBlock] | tuple[SequentialBlock, ...],
+    ):
+        self.launcher = launcher
+        self.blocks = tuple(blocks)
+        if not self.blocks:
+            raise ValueError("looped sequential program requires at least one block")
+
+        self.instructions = [[] for _ in range(launcher.num_sms)]
+        self.barriers = []
+        self.stage_stats = []
+        self.segments = []
+        self.placed_schedules = []
+        compute_base = launcher.copy_cptrs()
+        memory_base = launcher.copy_mptrs()
+        loop_reg = 0
+        special_slot = 0
+
+        for block in self.blocks:
+            if not 1 <= block.repeat <= 0xFFFF:
+                raise ValueError(f"block {block.name!r} repeat must fit in uint16")
+            if block.repeat > 1 and not block.reload_after:
+                raise ValueError(
+                    f"repeated block {block.name!r} must reload its dependencies"
+                )
+            if block.repeat > 1 and loop_reg >= config.num_loop_counters:
+                raise ValueError("looped program exceeds runtime loop-counter capacity")
+            if block.reload_after and special_slot + 1 >= config.num_special_slots:
+                raise ValueError("looped program exceeds LDU control-slot capacity")
+
+            compute_start = [
+                (compute_base[sm] + sum(
+                    isinstance(inst, ComputeInstruction)
+                    for inst in self.instructions[sm]
+                )) % launcher.max_insts
+                for sm in range(launcher.num_sms)
+            ]
+            memory_start = [
+                (memory_base[sm] + sum(
+                    isinstance(inst, MemoryInstruction)
+                    for inst in self.instructions[sm]
+                )) % launcher.max_insts
+                for sm in range(launcher.num_sms)
+            ]
+
+            segment = SequentialProgram(
+                launcher,
+                block.stages,
+                completion_barrier=block.reload_after,
+            )
+            self.segments.append(segment)
+            self.barriers.extend(segment.barriers)
+            self.stage_stats.extend(segment.stage_stats)
+            self.placed_schedules.extend(segment.placed_schedules)
+            for sm in range(launcher.num_sms):
+                self.instructions[sm].extend(segment.instructions[sm])
+
+            if block.reload_after:
+                barrier_count = segment.barrier_stop - segment.barrier_start
+                reload = LduReloadBarriers(
+                    launcher.bars_src,
+                    segment.barrier_start,
+                    barrier_count,
+                    special_slot,
+                ).bar(segment.completion_barrier)
+                for sm in range(launcher.num_sms):
+                    self.instructions[sm].append(reload.copy())
+                special_slot += 2
+
+            if block.repeat > 1:
+                for sm in range(launcher.num_sms):
+                    self.instructions[sm].extend(
+                        (
+                            LoopC(block.repeat, compute_start[sm], reg=loop_reg),
+                            LoopM(block.repeat, memory_start[sm], reg=loop_reg),
+                        )
+                    )
+                loop_reg += 1
+
+        max_compute = max(
+            sum(isinstance(inst, ComputeInstruction) for inst in instructions)
+            for instructions in self.instructions
+        )
+        max_memory = max(
+            sum(isinstance(inst, MemoryInstruction) for inst in instructions)
+            for instructions in self.instructions
+        )
+        if max_compute + 1 > launcher.max_insts or max_memory + 1 > launcher.max_insts:
+            raise ValueError(
+                "looped sequential program exceeds the instruction queue: "
+                f"compute={max_compute + 1}/{launcher.max_insts}, "
+                f"memory={max_memory + 1}/{launcher.max_insts}"
+            )
+        self.max_compute_instructions = max_compute + 1
+        self.max_memory_instructions = max_memory + 1
+
+    def __call__(self, sm: int):
+        return self.instructions[sm]
+
+
+__all__ = [
+    "LoopedSequentialProgram",
+    "SequentialBlock",
+    "SequentialProgram",
+    "SequentialStage",
+]

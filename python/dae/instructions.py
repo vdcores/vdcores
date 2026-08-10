@@ -874,7 +874,9 @@ class ProfileEvent(ComputeInstruction):
 
 class LoopC(ComputeInstruction):
     def __init__(self, count: int, pc: int, reg: int = 0):
-        assert 0 <= reg < 2**16, "reg must fit in uint16"
+        assert 0 <= reg < config.num_loop_counters, (
+            "reg must select a runtime compute-loop counter"
+        )
         super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc, reg])
 
     @classmethod
@@ -1355,6 +1357,35 @@ class IndexedTmaLoad1D(MemoryInstruction):
         )
 
 
+class LduReloadBarriers(MemoryInstruction):
+    """Drain both LDU ports and restore one loop-local barrier range."""
+
+    def __init__(
+        self,
+        bar_source: torch.Tensor,
+        first_bar: int,
+        count: int,
+        special_slot: int,
+    ):
+        if bar_source.device.type != "cuda" or not bar_source.is_contiguous():
+            raise ValueError("barrier reload source must be a contiguous CUDA tensor")
+        if first_bar < 0 or count <= 0:
+            raise ValueError("barrier reload range must be non-empty")
+        if first_bar + count > config.max_bars - 2:
+            raise ValueError("barrier reload range overlaps runtime handshake counters")
+        if bar_source.numel() * bar_source.element_size() < 4 * (first_bar + count):
+            raise ValueError("barrier reload source does not cover the requested range")
+        if not 0 <= special_slot < config.num_special_slots - 1:
+            raise ValueError("barrier reload requires two adjacent special slots")
+        super().__init__(
+            opcode=opcode.OP_LDU_RELOAD_BARRIERS,
+            num_slots=config.num_slots + special_slot,
+            arg=first_bar,
+            size=count,
+            address=bar_source.data_ptr(),
+        )
+
+
 class IssueBarrier(MemoryInstruction):
     def __init__(self, bar: int):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
@@ -1660,6 +1691,7 @@ __all__ = [
     "RawAddress",
     "RoutedTmaLoad1D",
     "IndexedTmaLoad1D",
+    "LduReloadBarriers",
     "LduLoad1D",
     "IssueBarrier",
     "CC0",

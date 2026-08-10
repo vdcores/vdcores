@@ -92,8 +92,25 @@ write directly into their next consumer's cache/state destination; the two
 residual sublayers ping-pong between resident buffers, so there are no explicit
 inter-stage copy tasks. Expert gate/up/down projections use
 `SchedRoutedNvfp4Gemv`, so the route result is consumed by LDU rather than by
-compute. The full 43-layer resident loop and checkpoint-backed token flow remain
-the next assembly gate.
+compute. The checkpoint-backed resident token flow remains the next assembly
+gate.
+
+The synthetic 43-layer transformer plus output head now also executes as one
+launch. The host assembler emits one SWA/hash body repeated twice, one CSA/hash
+body, one HCA/CSA score-routed pair repeated twenty times, and the head. This
+represents 3,815 logical stages with 355 queued stage bodies, 350 compute
+instructions, 1,505 memory instructions, and 354 dependency counters. The
+functional build uses `global_insts=1`, leaving the 4,096-entry instruction
+queues in HBM rather than consuming shared memory for a 512-entry image.
+
+Loop dependency reuse stays entirely in the memory VM. A loop-tail command is
+queued to both LDU ports behind the final STU completion dependency. The two LDU
+handlers rendezvous on a memory-only `cuda::barrier`; after every SM has drained
+the body, the last arrival reloads that body's dependency-counter range from
+the launcher's HBM source. Following loads remain FIFO behind this command.
+There is no `IssueBarrier`, compute-side synchronization, `__threadfence`, or
+model-data copy in this path. Two consecutive full-model launches produced the
+same finite residual and token on one B300 GPU.
 
 ## Verified GB200 baselines (2026-08-10)
 
