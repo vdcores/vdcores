@@ -19,7 +19,6 @@ COMMON_ATTENTION_STAGES = (
     "kv_fp8",
     "kv_norm",
     "kv_rope",
-    "window_cache_store",
 )
 
 COMMON_ATTENTION_TAIL = (
@@ -88,7 +87,6 @@ def build_layer_decode_plan(
                 "attention_compressor_pool",
                 "attention_compressor_norm",
                 "attention_compressor_rope",
-                "compressed_cache_store",
             )
     if attention_kind == "csa":
         compression_stages += (
@@ -103,7 +101,6 @@ def build_layer_decode_plan(
                 "index_compressor_norm",
                 "index_compressor_rope",
                 "index_kv_hadamard",
-                "index_cache_store",
             )
         if compressed_rows:
             compression_stages += ("index_score", "index_topk")

@@ -54,6 +54,11 @@ def test_decode_plan_covers_all_attention_families_and_model_stages():
     assert plan[3].attention_candidates == 129
     assert "index_topk" in plan[2].stages
     assert "index_topk" not in plan[3].stages
+    assert not any(
+        stage.endswith("cache_store")
+        for layer in plan
+        for stage in layer.stages
+    )
     assert plan[0].stages[-4:] == (
         "routed_expert_nvfp4",
         "shared_expert_fp8",

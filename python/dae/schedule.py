@@ -1081,47 +1081,6 @@ class SchedDsv4Nvfp4Quant16(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
-class SchedDsv4Copy1D(Schedule):
-    """Queue a small contiguous device-to-device copy through shared memory."""
-
-    def __init__(self, source, destination):
-        super().__init__()
-        self.source = source
-        self.destination = destination
-
-    def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek queued copy currently uses exactly one SM")
-        if not self.source.is_contiguous() or not self.destination.is_contiguous():
-            raise ValueError("DeepSeek queued copy tensors must be contiguous")
-        self.bytes = self.source.numel() * self.source.element_size()
-        destination_bytes = (
-            self.destination.numel() * self.destination.element_size()
-        )
-        if self.bytes != destination_bytes:
-            raise ValueError("DeepSeek queued copy source/destination sizes must match")
-        if self.bytes <= 0 or self.bytes > 0xFFFF or self.bytes % 4:
-            raise ValueError(
-                "DeepSeek queued copy size must be a positive uint16 multiple of four"
-            )
-
-    def schedule(self, sm):
-        if sm != 0:
-            return []
-        return [
-            Copy(1, self.bytes),
-            _shared_load_1d(self.source.reshape(-1)),
-            _shared_store_1d(self.destination.reshape(-1)).bar(
-                self._bar("output")
-            ),
-        ]
-
-    def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, 1)
-
-
 class ListSchedule(Schedule):
     def __init__(self, items, lead_bars=None, tail_bars=None, warn_boundary_bars=False):
         super().__init__()

@@ -87,11 +87,13 @@ or indexed-load tables referenced by LDU instructions. Single-SM stages rotate
 across resident SMs to keep the per-SM instruction image bounded.
 
 The synthetic one-layer launch now exercises all three layer templates:
-SWA/hash routing, CSA/index routing, and HCA/ratio-128 compression. Host tensor
-copies between tasks were replaced by queued shared-memory copies, and expert
-gate/up/down projections use `SchedRoutedNvfp4Gemv`, so the route result is
-consumed by LDU rather than by compute. The full 43-layer resident loop and
-checkpoint-backed token flow remain the next assembly gate.
+SWA/hash routing, CSA/index routing, and HCA/ratio-128 compression. Producers
+write directly into their next consumer's cache/state destination; the two
+residual sublayers ping-pong between resident buffers, so there are no explicit
+inter-stage copy tasks. Expert gate/up/down projections use
+`SchedRoutedNvfp4Gemv`, so the route result is consumed by LDU rather than by
+compute. The full 43-layer resident loop and checkpoint-backed token flow remain
+the next assembly gate.
 
 ## Verified GB200 baselines (2026-08-10)
 

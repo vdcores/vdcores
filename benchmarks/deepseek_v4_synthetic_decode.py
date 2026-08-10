@@ -20,7 +20,6 @@ from dae.deepseek_v4_flow import build_decode_plan
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
 from dae.schedule import (
-    SchedDsv4Copy1D,
     SchedDsv4ExpertReduce,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4GatedPool,
@@ -288,18 +287,23 @@ class SyntheticDecode:
         ) * 0.01
         self.index_cache = self.index_cache_seed.clone()
 
-    def _build_hc_pair(self, prefix: str):
+    def _build_hc_pair(
+        self,
+        prefix: str,
+        residual: torch.Tensor,
+        output_residual: torch.Tensor,
+    ):
         project = self._stage(
             f"{prefix}.hc_project",
             SchedDsv4Fp32Bf16Gemv(
-                self.hc_weight, self.residual.reshape(-1), self.mixes
+                self.hc_weight, residual.reshape(-1), self.mixes
             ),
             24,
         )
         pre = self._stage(
             f"{prefix}.hc_pre",
             SchedDsv4HcPre(
-                self.residual,
+                residual,
                 self.mixes,
                 self.hc_scale,
                 self.hc_base,
@@ -322,10 +326,10 @@ class SyntheticDecode:
             f"{prefix}.hc_post",
             SchedDsv4HcPost(
                 self.branch,
-                self.residual,
+                residual,
                 self.post,
                 self.comb,
-                self.next_residual,
+                output_residual,
             ),
         )
         return project, pre, norm, post
@@ -337,7 +341,7 @@ class SyntheticDecode:
             self.hc_attn_pre,
             self.attn_norm,
             self.hc_attn_post,
-        ) = self._build_hc_pair("attn")
+        ) = self._build_hc_pair("attn", self.residual, self.next_residual)
 
         self.hidden_fp8 = Fp8Activation("attn.hidden", self.norm_hidden, self.sms, d)
         self.q_rank = torch.empty((cfg.q_lora_rank,), dtype=torch.bfloat16, device=d)
@@ -397,7 +401,9 @@ class SyntheticDecode:
                 self.kv_weight,
             ),
         )
-        self.kv_rope = torch.empty((1, cfg.head_dim), dtype=torch.bfloat16, device=d)
+        self.kv_rope = self.kv_cache[
+            self.args.start_pos % cfg.sliding_window
+        ].reshape(1, cfg.head_dim)
         self.kv_rope_stage = self._stage(
             "attn.kv_rope",
             SchedDsv4Rope512_64(
@@ -487,8 +493,10 @@ class SyntheticDecode:
             width = cfg.head_dim
             coff = 2 if ratio == 4 else 1
             projected = coff * width
-            values = torch.empty((projected,), dtype=torch.float32, device=d)
-            scores = torch.empty_like(values)
+            value_state = torch.zeros((rows, width), dtype=torch.float32, device=d)
+            score_state = torch.zeros_like(value_state)
+            values = value_state[-coff:].reshape(projected)
+            scores = score_state[-coff:].reshape(projected)
             weight = torch.zeros(
                 (projected, cfg.hidden_size), dtype=torch.float32, device=d
             )
@@ -502,8 +510,6 @@ class SyntheticDecode:
                 SchedDsv4Fp32Bf16Gemv(weight, self.norm_hidden, scores),
                 min(projected, self.sms),
             )
-            value_state = torch.zeros((rows, width), dtype=torch.float32, device=d)
-            score_state = torch.zeros_like(value_state)
             pooled = torch.empty((width,), dtype=torch.bfloat16, device=d)
             pool = self._stage(
                 f"compress.r{ratio}.pool",
@@ -520,7 +526,17 @@ class SyntheticDecode:
                     torch.ones_like(pooled),
                 ),
             )
-            rotated = torch.empty((1, width), dtype=torch.bfloat16, device=d)
+            compressed_rows = max(
+                (
+                    plan.compressed_rows
+                    for plan in self.plans
+                    if plan.compress_ratio == ratio
+                ),
+                default=0,
+            )
+            rotated = self.kv_cache[
+                cfg.sliding_window + max(1, compressed_rows) - 1
+            ].reshape(1, width)
             rope = self._stage(
                 f"compress.r{ratio}.rope",
                 SchedDsv4Rope512_64(
@@ -528,12 +544,6 @@ class SyntheticDecode:
                 ),
             )
             self.compress[ratio] = {
-                "values": values,
-                "scores": scores,
-                "value_state": value_state,
-                "score_state": score_state,
-                "pooled": pooled,
-                "rotated": rotated,
                 "stages": (value_proj, score_proj, pool, norm, rope),
             }
 
@@ -607,8 +617,10 @@ class SyntheticDecode:
             selection = (score, topk)
 
         projected = 2 * cfg.index_head_dim
-        values = torch.empty((projected,), dtype=torch.float32, device=d)
-        scores = torch.empty_like(values)
+        value_state = torch.zeros((8, 128), dtype=torch.float32, device=d)
+        score_state = torch.zeros_like(value_state)
+        values = value_state[-2:].reshape(projected)
+        scores = score_state[-2:].reshape(projected)
         projection = torch.zeros(
             (projected, cfg.hidden_size), dtype=torch.float32, device=d
         )
@@ -622,8 +634,6 @@ class SyntheticDecode:
             SchedDsv4Fp32Bf16Gemv(projection, self.norm_hidden, scores),
             min(projected, self.sms),
         )
-        value_state = torch.zeros((8, 128), dtype=torch.float32, device=d)
-        score_state = torch.zeros_like(value_state)
         pooled = torch.empty((128,), dtype=torch.bfloat16, device=d)
         pool = self._stage(
             "index.compress_pool",
@@ -647,7 +657,9 @@ class SyntheticDecode:
                 normalized.reshape(1, -1), self.rope_table, rotated
             ),
         )
-        hadamard = torch.empty_like(rotated)
+        hadamard = self.index_cache[
+            max(1, plan.compressed_rows) - 1
+        ].reshape(1, cfg.index_head_dim)
         rotate = self._stage(
             "index.compress_hadamard",
             SchedDsv4Hadamard(rotated, hadamard),
@@ -656,11 +668,6 @@ class SyntheticDecode:
             "main": (index_q_linear, q_rope, q_hadamard, weights),
             "selection": selection,
             "compress": (value_proj, score_proj, pool, norm, rope, rotate),
-            "values": values,
-            "scores": scores,
-            "value_state": value_state,
-            "score_state": score_state,
-            "hadamard": hadamard,
         }
 
     def _build_ffn_path(self) -> None:
@@ -670,7 +677,7 @@ class SyntheticDecode:
             self.hc_ffn_pre,
             self.ffn_norm,
             self.hc_ffn_post,
-        ) = self._build_hc_pair("ffn")
+        ) = self._build_hc_pair("ffn", self.next_residual, self.residual)
         self.ffn_hidden_fp8 = Fp8Activation("ffn.hidden", self.norm_hidden, self.sms, d)
         self.router_logits = torch.empty((256,), dtype=torch.bfloat16, device=d)
         self.router_projection = Fp8Linear(
@@ -919,41 +926,13 @@ class SyntheticDecode:
     def _unwrap_stage(stage) -> Stage:
         return stage if isinstance(stage, Stage) else stage.stage
 
-    def _copy_stage(
-        self, name: str, source: torch.Tensor, destination: torch.Tensor
-    ) -> Stage:
-        return self._stage(name, SchedDsv4Copy1D(source, destination))
-
     def _compressor_stages(self, plan) -> list[Stage]:
         ratio = plan.compress_ratio
         data = self.compress[ratio]
         value_proj, score_proj, pool, norm, rope = data["stages"]
-        projected_rows = 2 if ratio == 4 else 1
-        stages = [
-            value_proj,
-            score_proj,
-            self._copy_stage(
-                f"compress.r{ratio}.value_state_store",
-                data["values"].reshape(projected_rows, -1),
-                data["value_state"][-projected_rows:],
-            ),
-            self._copy_stage(
-                f"compress.r{ratio}.score_state_store",
-                data["scores"].reshape(projected_rows, -1),
-                data["score_state"][-projected_rows:],
-            ),
-        ]
+        stages = [value_proj, score_proj]
         if plan.should_compress:
             stages.extend((pool, norm, rope))
-            stages.append(
-                self._copy_stage(
-                    f"compress.r{ratio}.cache_store",
-                    data["rotated"].reshape(-1),
-                    self.kv_cache[
-                        self.config.sliding_window + plan.compressed_rows - 1
-                    ],
-                )
-            )
         return stages
 
     def _indexer_stages(self, plan) -> list[Stage]:
@@ -963,30 +942,7 @@ class SyntheticDecode:
         stages = [self._unwrap_stage(index_q), q_rope, q_hadamard, weights]
         if plan.should_compress:
             value_proj, score_proj, pool, norm, rope, rotate = self.indexer["compress"]
-            stages.extend((value_proj, score_proj))
-            stages.extend(
-                (
-                    self._copy_stage(
-                        "index.compress_value_state_store",
-                        self.indexer["values"].reshape(2, -1),
-                        self.indexer["value_state"][-2:],
-                    ),
-                    self._copy_stage(
-                        "index.compress_score_state_store",
-                        self.indexer["scores"].reshape(2, -1),
-                        self.indexer["score_state"][-2:],
-                    ),
-                    pool,
-                    norm,
-                    rope,
-                    rotate,
-                    self._copy_stage(
-                        "index.cache_store",
-                        self.indexer["hadamard"].reshape(-1),
-                        self.index_cache[plan.compressed_rows - 1],
-                    ),
-                )
-            )
+            stages.extend((value_proj, score_proj, pool, norm, rope, rotate))
         stages.extend(self.indexer["selection"])
         return stages
 
@@ -1005,13 +961,6 @@ class SyntheticDecode:
             self.kv_proj.stage,
             self.kv_norm,
             self.kv_rope_stage,
-            self._copy_stage(
-                "attn.window_cache_store",
-                self.kv_rope.reshape(-1),
-                self.kv_cache[
-                    self.args.start_pos % self.config.sliding_window
-                ],
-            ),
         ]
         if plan.compress_ratio:
             stages.extend(self._compressor_stages(plan))
@@ -1032,9 +981,6 @@ class SyntheticDecode:
                 self.o_rank_fp8.stage,
                 self.o_b.stage,
                 self.hc_attn_post,
-                self._copy_stage(
-                    "attn.residual_store", self.next_residual, self.residual
-                ),
             )
         )
         return stages
@@ -1068,9 +1014,6 @@ class SyntheticDecode:
                 self.shared_down_linear.stage,
                 self.expert_reduce,
                 self.hc_ffn_post,
-                self._copy_stage(
-                    "ffn.residual_store", self.next_residual, self.residual
-                ),
             )
         )
         return stages
