@@ -80,6 +80,7 @@ void dae2(
   #pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ cuda::barrier<cuda::thread_scope_block> barriers[4][numQueueElements];
   __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_barrier;
+  __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_publish_barrier;
   assert(numQueueElements <= blockDim.x && "Too many slots for barriers");
   if (threadIdx.x < numQueueElements) {
     init(&barriers[0][threadIdx.x], numThreadsM2CBarrier);
@@ -89,6 +90,7 @@ void dae2(
   }
   if (threadIdx.x == 0) {
     init(&ldu_control_barrier, 2);
+    init(&ldu_control_publish_barrier, numThreadsPerWarp + 2);
   }
 
   __shared__ int m2c_data[numQueueElements];
@@ -199,6 +201,7 @@ void dae2(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
         st_insts, smem_base, tma_descs, bars,
+        &ldu_control_publish_barrier,
         initial_loop_counts
 #if defined(DAE_TRACK_PROFILE)
         , sm_id, g_events
@@ -220,7 +223,8 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars, &ldu_control_barrier, port_id
+          smem_base, tma_descs, bars, &ldu_control_barrier,
+          &ldu_control_publish_barrier, port_id
 #if defined(DAE_TRACK_PROFILE)
           , sm_id, g_events
 #endif

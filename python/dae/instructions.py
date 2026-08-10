@@ -1357,6 +1357,120 @@ class IndexedTmaLoad1D(MemoryInstruction):
         )
 
 
+def _validate_indirect_pointer_entry(pointer_entry):
+    if pointer_entry.device.type != "cuda" or not pointer_entry.is_contiguous():
+        raise ValueError("indirect pointer entries must be contiguous CUDA tensors")
+    if pointer_entry.dtype != torch.int64 or pointer_entry.numel() < 1:
+        raise ValueError("indirect pointer entries must contain at least one int64")
+
+
+class IndirectTmaLoad1D(MemoryInstruction):
+    """Resolve one source pointer through HBM, then TMA-load shared slots."""
+
+    def __init__(self, pointer_entry, bytes: int):
+        _validate_indirect_pointer_entry(pointer_entry)
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("indirect TMA load size must be a 16-byte-aligned uint16")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D,
+            num_slots=bytes2slots(bytes),
+            arg=0,
+            size=bytes,
+            address=pointer_entry.data_ptr(),
+        )
+
+
+class IndirectLduLoad1D(MemoryInstruction):
+    """Resolve one source pointer through HBM for an arbitrary-size LDU copy."""
+
+    def __init__(self, pointer_entry, bytes: int):
+        _validate_indirect_pointer_entry(pointer_entry)
+        if bytes <= 0 or bytes > 0xFFFF:
+            raise ValueError("indirect LDU load size must be a positive uint16")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_INDIRECT_LDU_LOAD_1D,
+            num_slots=bytes2slots(bytes),
+            arg=0,
+            size=bytes,
+            address=pointer_entry.data_ptr(),
+        )
+
+
+class IndirectRoutedTmaLoad1D(MemoryInstruction):
+    """Resolve fixed route IDs plus one layer pointer table in LDU."""
+
+    def __init__(
+        self,
+        state_descriptor,
+        route_rank: int,
+        pointer_field: int,
+        bytes: int,
+    ):
+        _validate_indirect_pointer_entry(state_descriptor)
+        if state_descriptor.numel() < 2:
+            raise ValueError("indirect routed state descriptor needs two int64 words")
+        if not 0 <= route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not 0 <= pointer_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+            raise ValueError("pointer_field must fit in 13 bits")
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("indirect routed TMA load size must be aligned")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D,
+            num_slots=bytes2slots(bytes),
+            arg=(pointer_field << RoutedTmaLoad1D.ROUTE_BITS) | route_rank,
+            size=bytes,
+            address=state_descriptor.data_ptr(),
+        )
+
+
+class IndirectIndexedTmaLoad1D(MemoryInstruction):
+    """Resolve an indexed-load record pointer before selecting its runtime row."""
+
+    def __init__(self, record_pointer_entry, bytes: int):
+        _validate_indirect_pointer_entry(record_pointer_entry)
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("indirect indexed TMA load size must be aligned")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D,
+            num_slots=bytes2slots(bytes),
+            arg=0,
+            size=bytes,
+            address=record_pointer_entry.data_ptr(),
+        )
+
+
+def indirect_1d_from(inst: MemoryInstruction, pointer_entry):
+    """Replace one direct 1D memory instruction while preserving its flags."""
+    base_opcode = inst.opcode & ~((1 << 6) - 1)
+    builders = {
+        opcode.OP_ALLOC_TMA_LOAD_1D & ~((1 << 6) - 1): IndirectTmaLoad1D,
+        opcode.OP_ALLOC_LDU_LOAD_1D & ~((1 << 6) - 1): IndirectLduLoad1D,
+        opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1): IndirectRoutedTmaLoad1D,
+        opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D & ~((1 << 6) - 1): IndirectIndexedTmaLoad1D,
+    }
+    try:
+        builder = builders[base_opcode]
+    except KeyError:
+        raise ValueError(
+            f"memory opcode {base_opcode:#x} has no indirect 1D form"
+        ) from None
+    if builder is IndirectRoutedTmaLoad1D:
+        replacement = builder(
+            pointer_entry,
+            inst.arg & 0x7,
+            inst.arg >> 3,
+            inst.size,
+        )
+    else:
+        replacement = builder(pointer_entry, inst.size)
+    replacement.opcode |= inst.opcode & ((1 << 6) - 1)
+    replacement.num_slots = inst.num_slots
+    replacement.arg = inst.arg
+    replacement.annotation = inst.annotation.copy()
+    return replacement
+
+
 class LduReloadBarriers(MemoryInstruction):
     """Drain both LDU ports and restore one loop-local barrier range."""
 
@@ -1691,6 +1805,11 @@ __all__ = [
     "RawAddress",
     "RoutedTmaLoad1D",
     "IndexedTmaLoad1D",
+    "IndirectTmaLoad1D",
+    "IndirectLduLoad1D",
+    "IndirectRoutedTmaLoad1D",
+    "IndirectIndexedTmaLoad1D",
+    "indirect_1d_from",
     "LduReloadBarriers",
     "LduLoad1D",
     "IssueBarrier",

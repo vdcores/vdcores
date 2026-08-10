@@ -44,6 +44,13 @@ DAE_OP(OP_ALLOC_INDEXED_TMA_LOAD_1D, MK_MOP(28, MEM_OP_FLAGS_ALLOCATE))
 // Queue-local loop control. Both LDU ports drain through this command, then
 // one LDU lane reloads a dependency-barrier range from its HBM source.
 DAE_OP(OP_LDU_RELOAD_BARRIERS, MK_MOP(29, MEM_OP_FLAGS_NONE))
+// Resolve the actual source record through one HBM pointer entry.
+// Counter-derived address offsets select the current layer's entry while the
+// compute task continues to consume only allocator-owned shared slots.
+DAE_OP(OP_ALLOC_INDIRECT_TMA_LOAD_1D, MK_MOP(30, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_INDIRECT_LDU_LOAD_1D, MK_MOP(31, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D, MK_MOP(32, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D, MK_MOP(33, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

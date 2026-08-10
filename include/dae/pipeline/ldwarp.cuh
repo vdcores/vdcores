@@ -8,6 +8,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     MInst *st_insts,
     const void *smem_base, const CUtensorMap *tma_descs, int *bars,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_barrier,
+    cuda::barrier<cuda::thread_scope_block> *ldu_control_publish_barrier,
     const int port_id
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
@@ -37,6 +38,9 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     auto &opcode = cmd.opcode;
     auto &bar = cmd.bar;
     bool produces_compute_operand = true;
+
+    if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS))
+      ldu_control_publish_barrier->arrive_and_wait();
 
     __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
 
@@ -84,6 +88,23 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           cuda::aligned_size_t<16>(inst.size)
         );
         break; }
+      case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D): {
+        const uint64_t resolved = load_l2_u64(
+            reinterpret_cast<const uint64_t *>(inst.address));
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
+        __ldprint(
+            "Indirect TMA 1D load: size=%d resolved=0x%lx",
+            inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break; }
       case op(OP_ALLOC_LDU_LOAD_1D): {
         __ldprint("LDU 1D load: size=%d", inst.size);
         auto *dst = static_cast<unsigned char *>(
@@ -91,6 +112,41 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         const auto *src = reinterpret_cast<const unsigned char *>(inst.address);
         int offset = 0;
         if ((reinterpret_cast<uintptr_t>(src) & 0xF) == 0) {
+          for (; offset + 16 <= inst.size; offset += 16) {
+            *reinterpret_cast<uint4 *>(dst + offset) =
+                *reinterpret_cast<const uint4 *>(src + offset);
+          }
+        }
+        if ((reinterpret_cast<uintptr_t>(src + offset) & 0x3) == 0) {
+          for (; offset + 4 <= inst.size; offset += 4) {
+            *reinterpret_cast<uint32_t *>(dst + offset) =
+                *reinterpret_cast<const uint32_t *>(src + offset);
+          }
+        }
+        if ((reinterpret_cast<uintptr_t>(src + offset) & 0x1) == 0) {
+          for (; offset + 2 <= inst.size; offset += 2) {
+            *reinterpret_cast<uint16_t *>(dst + offset) =
+                *reinterpret_cast<const uint16_t *>(src + offset);
+          }
+        }
+        for (; offset < inst.size; ++offset) {
+          dst[offset] = src[offset];
+        }
+        break; }
+      case op(OP_ALLOC_INDIRECT_LDU_LOAD_1D): {
+        const uint64_t resolved = load_l2_u64(
+            reinterpret_cast<const uint64_t *>(inst.address));
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
+        __ldprint(
+            "Indirect LDU 1D load: size=%d resolved=0x%lx",
+            inst.size, resolved);
+        auto *dst = static_cast<unsigned char *>(
+            get_slot_address(smem_base, slot));
+        const auto *src = reinterpret_cast<const unsigned char *>(resolved);
+        int offset = 0;
+        if ((resolved & 0xF) == 0) {
           for (; offset + 16 <= inst.size; offset += 16) {
             *reinterpret_cast<uint4 *>(dst + offset) =
                 *reinterpret_cast<const uint4 *>(src + offset);
@@ -270,6 +326,51 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
         break;
       }
+      case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D): {
+        constexpr int kRouteCount = 6;
+        constexpr int kHeaderInts = 12;
+        // HBM descriptor: a fixed route-result pointer followed by the
+        // current layer's ordinary RoutedAddressTable state pointer.
+        const auto *descriptor =
+            reinterpret_cast<const uint64_t *>(inst.address);
+        const uint64_t route_address = load_l2_u64(descriptor + 0);
+        const uint64_t state_address = load_l2_u64(descriptor + 1);
+        if (route_address == 0 || state_address == 0) {
+          asm volatile("trap;");
+        }
+        const auto *header = reinterpret_cast<const int *>(state_address);
+        const auto *route_ids = reinterpret_cast<const int *>(route_address);
+        const int route_rank = inst.arg & 0x7;
+        const int pointer_field = inst.arg >> 3;
+        uint64_t resolved = 0;
+        if (route_rank >= 0 && route_rank < kRouteCount) {
+          const int expert = load_l2(route_ids + route_rank);
+          const int field_stride = load_l2(header + 8);
+          const int expert_count = load_l2(header + 9);
+          if (expert >= 0 && expert < expert_count &&
+              pointer_field >= 0 && pointer_field < field_stride) {
+            const auto *pointer_table =
+                reinterpret_cast<const uint64_t *>(header + kHeaderInts);
+            resolved = load_l2_u64(
+                pointer_table + expert * field_stride + pointer_field);
+          }
+        }
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
+        __ldprint(
+            "Indirect routed TMA 1D load: rank=%d field=%d size=%d "
+            "state=0x%lx resolved=0x%lx",
+            route_rank, pointer_field, inst.size, state_address, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
       case op(OP_ALLOC_INDEXED_TMA_LOAD_1D): {
         // HBM record: base pointer, pointer to one int32 index, then packed
         // uint32 (row count, row stride). RepeatM advances across records.
@@ -304,6 +405,43 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             m2c.barriers[bar]);
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D): {
+        const uint64_t record_address = load_l2_u64(
+            reinterpret_cast<const uint64_t *>(inst.address));
+        if (record_address == 0) {
+          asm volatile("trap;");
+        }
+        const auto *state = reinterpret_cast<const uint64_t *>(record_address);
+        const uint64_t base = load_l2_u64(state + 0);
+        const uint64_t index_address = load_l2_u64(state + 1);
+        const uint64_t shape = load_l2_u64(state + 2);
+        const int row_count = static_cast<int>(shape & 0xFFFFFFFFULL);
+        const int row_stride = static_cast<int>(shape >> 32);
+        if (base == 0 || index_address == 0) {
+          asm volatile("trap;");
+        }
+        const int row = load_l2(reinterpret_cast<const int *>(index_address));
+        if (row >= row_count || row_stride < inst.size) {
+          asm volatile("trap;");
+        }
+        if (row < 0) {
+          auto *dst = static_cast<unsigned char *>(
+              get_slot_address(smem_base, slot));
+          for (int offset = 0; offset < inst.size; ++offset) {
+            dst[offset] = 0;
+          }
+          break;
+        }
+        const uint64_t resolved = base + uint64_t(row) * row_stride;
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
         break;
       }
       case op(OP_LDU_RELOAD_BARRIERS): {

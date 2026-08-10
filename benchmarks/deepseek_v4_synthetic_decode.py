@@ -1068,6 +1068,7 @@ class SyntheticDecode:
                     "layers0-1.swa_hash",
                     queued_layer(plans[0], "swa_hash"),
                     repeat=2,
+                    barrier_banks=2,
                 ),
                 SequentialBlock(
                     "layer2.csa_hash",
@@ -1080,6 +1081,7 @@ class SyntheticDecode:
                         + queued_layer(plans[4], "csa_score")
                     ),
                     repeat=20,
+                    barrier_banks=2,
                 ),
                 SequentialBlock("head", head, reload_after=False),
             )

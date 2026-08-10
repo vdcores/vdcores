@@ -97,20 +97,37 @@ gate.
 
 The synthetic 43-layer transformer plus output head now also executes as one
 launch. The host assembler emits one SWA/hash body repeated twice, one CSA/hash
-body, one HCA/CSA score-routed pair repeated twenty times, and the head. This
-represents 3,815 logical stages with 355 queued stage bodies, 350 compute
-instructions, 1,505 memory instructions, and 354 dependency counters. The
-functional build uses `global_insts=1`, leaving the 4,096-entry instruction
-queues in HBM rather than consuming shared memory for a 512-entry image.
+body, one HCA/CSA score-routed pair repeated twenty times, and the head. At
+position zero this represents 3,524 logical stages with 330 queued stage
+bodies, 341 compute instructions, 1,470 memory instructions, and 571 dependency
+counters. The functional build uses `global_insts=1`, leaving the 4,096-entry
+instruction queues in HBM rather than consuming shared memory for a 512-entry
+image.
 
-Loop dependency reuse stays entirely in the memory VM. A loop-tail command is
-queued to both LDU ports behind the final STU completion dependency. The two LDU
-handlers rendezvous on a memory-only `cuda::barrier`; after every SM has drained
-the body, the last arrival reloads that body's dependency-counter range from
-the launcher's HBM source. Following loads remain FIFO behind this command.
-There is no `IssueBarrier`, compute-side synchronization, `__threadfence`, or
-model-data copy in this path. Two consecutive full-model launches produced the
-same finite residual and token on one B300 GPU.
+Loop dependency reuse stays entirely in the memory VM. Repeated bodies use two
+barrier banks: the inner `LOOP` shifts all body dependencies to the second bank,
+then a loop-tail command reloads both banks before an outer loop re-enters the
+body. For the twenty HCA/CSA pairs this is a two-way inner loop nested in a
+ten-way outer loop. The two LDU handlers rendezvous on a memory-only
+`cuda::barrier`; after every SM has drained the bank pair, the last arrival
+restores its counters from the launcher's HBM source. Following loads remain
+FIFO behind this command. There is no `IssueBarrier`, compute-side
+synchronization, `__threadfence`, or model-data copy in this path.
+
+Real layer weights are not unrolled into 43 instruction bodies.
+`LayeredSchedule` replaces a representative schedule's direct 1D weight loads
+with compact HBM pointer columns. Memory-loop counters select the current entry
+and LDU resolves the checkpoint address. Routed loads use a two-word descriptor
+containing one fixed route-result address plus the current layer's expert
+pointer table. Router output therefore stays in one HBM buffer; no indirect
+store path exists. Persistent cache outputs use ordinary counter-strided STU
+addresses.
+
+`DeepSeekV4ShapePolicy` supplies the initial functional tile/SM assignment from
+operator shape: FP8 linears expose row tiles, NVFP4 linears expose aligned M8
+groups, activation quantizers expose complete scale blocks, and sparse
+attention uses one SM per head. These are breadth-first assignments and remain
+subject to end-to-end profiling after the resident flow passes.
 
 ## Verified GB200 baselines (2026-08-10)
 

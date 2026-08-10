@@ -9,7 +9,7 @@ from dae.deepseek_v4 import route_top6_reference
 from dae.deepseek_v4_quant import dequantize_nvfp4, quantize_nvfp4
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
-from dae.schedule import SchedDsv4RouteTop6, SchedRoutedNvfp4Gemv
+from dae.schedule import LayeredSchedule, SchedDsv4RouteTop6, SchedRoutedNvfp4Gemv
 
 
 def main() -> None:
@@ -68,7 +68,15 @@ def main() -> None:
         )
         weight_fields.append(weight_name)
         weight_scale_fields.append(scale_name)
-    table = RoutedAddressTable(columns)
+    owners = tuple(target for column in columns.values() for target in column)
+    table = RoutedAddressTable.from_pointer_columns(
+        {
+            name: [target.data_ptr() for target in column]
+            for name, column in columns.items()
+        },
+        device=device,
+        owners=owners,
+    )
 
     logits = torch.linspace(
         -1.0, 1.0, 256, dtype=torch.bfloat16, device=device
@@ -79,6 +87,7 @@ def main() -> None:
         [selected_expert, 0, 1, 2, 3, 4], dtype=torch.int32, device=device
     )
     route_weights = torch.empty((8,), dtype=torch.float32, device=device)
+    route_indices = torch.empty((8,), dtype=torch.int32, device=device)
 
     launcher = Launcher(num_sms, device=device)
     route_bar = launcher.new_bar(1)
@@ -87,11 +96,11 @@ def main() -> None:
         logits,
         bias,
         hash_indices,
-        table.route_indices_storage,
+        route_indices,
         route_weights,
         hash_routing=True,
     ).bar("output", route_bar).place(1)
-    expert = SchedRoutedNvfp4Gemv(
+    expert_inner = SchedRoutedNvfp4Gemv(
         table.state,
         route_rank=0,
         weight_fields=[table.field(name) for name in weight_fields],
@@ -102,7 +111,17 @@ def main() -> None:
         activation=activation,
         activation_scale=activation_scale,
         output=output,
-    ).bar("route", route_bar).bar("output", output_bar).place(num_sms)
+    )
+    expert = (
+        LayeredSchedule(
+            expert_inner,
+            ((table.state, (table.state,)),),
+            route_indices=route_indices,
+        )
+        .bar("route", route_bar)
+        .bar("output", output_bar)
+        .place(num_sms)
+    )
     launcher.s(route, expert)
     launcher.launch()
 
@@ -117,11 +136,11 @@ def main() -> None:
     torch.testing.assert_close(
         route_weights[:6], expected_route_weights, rtol=1.0e-5, atol=1.0e-5
     )
-    assert table.route_indices.tolist()[0] == selected_expert
+    assert route_indices.tolist()[0] == selected_expert
     assert launcher.bars.view(torch.int32)[output_bar].item() == 0
     max_abs = (output.float() - reference.float()).abs().max().item()
     print(
-        "DSV4_ROUTED_LOAD status=PASS "
+        "DSV4_ROUTED_LOAD status=PASS indirect=1 "
         f"launches=1 selected_expert={selected_expert} sms={num_sms} "
         f"max_abs={max_abs:.6f}",
         flush=True,

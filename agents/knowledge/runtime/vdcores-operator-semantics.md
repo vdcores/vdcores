@@ -83,6 +83,10 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 - `OP_ALLOC_LDU_LOAD_1D`
 - `OP_ALLOC_WB_STU_STORE_1D`
 - `OP_ALLOC_INDEXED_TMA_LOAD_1D`
+- `OP_ALLOC_INDIRECT_TMA_LOAD_1D`
+- `OP_ALLOC_INDIRECT_LDU_LOAD_1D`
+- `OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D`
+- `OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D`
 
 ### Control-flow and non-alloc ops
 
@@ -241,6 +245,25 @@ Barrier behavior for load ops:
 - `OP_ALLOC_INDEXED_TMA_LOAD_1D`
   - reads one runtime row index from a compact HBM record and TMA-loads that row
   - `RepeatM` may advance through 24-byte records for long gather streams
+
+- `OP_ALLOC_INDIRECT_TMA_LOAD_1D`
+  - `address` points to one HBM `uint64` source-pointer entry
+  - LDU resolves that pointer and bulk-loads `size` bytes into normal slots
+- `OP_ALLOC_INDIRECT_LDU_LOAD_1D`
+  - same pointer resolution, with the arbitrary-size synchronous LDU copy path
+- `OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D`
+  - `address` points to a two-word HBM descriptor: fixed route-id address and
+    current layer `RoutedAddressTable` state address
+  - LDU reads the selected expert from the fixed route result, then resolves the
+    field from the current layer table
+- `OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D`
+  - `address` points to one HBM pointer to the ordinary 24-byte indexed record
+  - LDU resolves the record before applying its runtime row index
+
+`RepeatM.offsetByCounter(s)` selects indirect descriptor entries for compact
+layer loops. There is deliberately no indirect store opcode: fixed scratch
+outputs use fixed addresses and persistent layer caches use regular strided
+STU addresses.
 
 ### Store-side / writeback ops
 

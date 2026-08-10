@@ -22,6 +22,7 @@ __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
     MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    cuda::barrier<cuda::thread_scope_block> *ldu_control_publish_barrier,
     const LoopCounters &initial_loop_counts
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
@@ -248,6 +249,10 @@ __device__ __forceinline__ void allocwarp_execute(
               m2ld[port].advance();
             }
           }
+          __syncwarp();
+          // Do not allow a later control command to overwrite the shared
+          // metadata slots until both LDU handlers have copied this command.
+          ldu_control_publish_barrier->arrive_and_wait();
         }
         break;
         case op(OP_ISSUE_BARRIER): {

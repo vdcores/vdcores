@@ -20,6 +20,8 @@ from dae.instructions import (
     LoopC,
     LoopM,
     MemoryInstruction,
+    IndirectRoutedTmaLoad1D,
+    IndirectTmaLoad1D,
     Nvfp4GemvSm100,
     ProfileEvent,
     RepeatM,
@@ -27,6 +29,7 @@ from dae.instructions import (
     TmaTensor,
 )
 from dae.runtime import config, opcode
+from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.launcher import Launcher
 from dae.schedule import Schedule, SchedAttentionDecoding, SchedSmemSiLUInterleaved
 from dae.sequential import (
@@ -103,6 +106,39 @@ def test_routed_tma_load_encodes_l2_lookup_and_shared_span():
     assert instruction.arg == (257 << 3) | 5
     assert instruction.size == 16384
     assert cords2addr(instruction.cords) == FakeRoutingState.data_ptr()
+
+
+def test_indirect_loads_keep_address_selection_in_ldu():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakePointerTable:
+        device = FakeDevice()
+        dtype = torch.int64
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 2
+
+        @staticmethod
+        def data_ptr():
+            return 0x23456789ABC0
+
+    direct = IndirectTmaLoad1D(FakePointerTable(), 4096)
+    routed = IndirectRoutedTmaLoad1D(
+        FakePointerTable(), 4, 511, 16384
+    )
+
+    assert direct.opcode == opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D
+    assert direct.num_slots == 1
+    assert cords2addr(direct.cords) == FakePointerTable.data_ptr()
+    assert routed.opcode == opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D
+    assert routed.arg == (511 << 3) | 4
+    assert routed.num_slots == 2
 
 
 def test_sequential_program_uses_stu_release_and_gates_both_ldu_ports():
@@ -303,6 +339,7 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
                     SequentialStage("consumer", BasicStage(), 2),
                 ),
                 repeat=2,
+                barrier_banks=2,
             ),
             SequentialBlock(
                 "tail",
@@ -312,7 +349,7 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
         ),
     )
 
-    assert launcher.bar_values == {0: 2, 1: 2}
+    assert launcher.bar_values == {0: 2, 1: 2, 2: 2, 3: 2}
     compute = [
         inst for inst in program.instructions[0]
         if isinstance(inst, ComputeInstruction)
@@ -330,11 +367,122 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     )
     assert reload.opcode & ~0x10 == opcode.OP_LDU_RELOAD_BARRIERS
     assert reload.num_slots & 0x3F == config.num_slots
-    assert reload.num_slots >> 6 == 1
+    assert reload.num_slots >> 6 == 3
+    assert reload.size == 4
     loop = next(inst for inst in memory if isinstance(inst, LoopM))
     assert loop.size == 2
     assert loop.cords[0] == 0
+    assert loop.cords[2] == 2 << 6
+    shifted_body = [
+        inst
+        for inst in memory
+        if inst.opcode & 0x10 and (inst.num_slots >> 6) < 2
+    ]
+    assert shifted_body
+    assert all(inst.opcode & 0x4 for inst in shifted_body)
     assert all((inst.opcode & ~0x10) != opcode.OP_ISSUE_BARRIER for inst in memory)
+
+
+def test_looped_program_nests_two_barrier_banks_inside_ten_outer_iterations():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeBarrierSource:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 1 << 20
+
+        @staticmethod
+        def element_size():
+            return 4
+
+        @staticmethod
+        def data_ptr():
+            return 0x34560000
+
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 64
+        bars_src = FakeBarrierSource()
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def copy_cptrs(self):
+            return [0]
+
+        def copy_mptrs(self):
+            return [0]
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = LoopedSequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialBlock(
+                "pairs",
+                (SequentialStage("pair", BasicStage(), 1),),
+                repeat=20,
+                barrier_banks=2,
+            ),
+        ),
+    )
+    compute_loops = [
+        inst for inst in program.instructions[0] if isinstance(inst, LoopC)
+    ]
+    memory_loops = [
+        inst for inst in program.instructions[0] if isinstance(inst, LoopM)
+    ]
+    assert [inst.args for inst in compute_loops] == [[2, 0, 0], [10, 0, 1]]
+    assert [(inst.size, inst.num_slots) for inst in memory_loops] == [(2, 0), (10, 1)]
+
+
+def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():
+    policy = DeepSeekV4ShapePolicy(152)
+
+    fp8 = policy.fp8_gemv(4096, 4096)
+    fp4 = policy.nvfp4_gemv(2048, 4096)
+    quant = policy.quantize(4096, 16)
+    attention = policy.attention(64, 512)
+
+    assert (fp8.num_sms, fp8.tile_rows, fp8.tile_k) == (152, 15, 128)
+    assert (fp4.num_sms, fp4.row_alignment, fp4.tile_k) == (152, 8, 256)
+    assert all(fp4.shard(sm)[1] % 8 == 0 for sm in range(fp4.num_sms))
+    assert quant.num_sms == 152
+    assert attention.num_sms == 64
 
 
 def test_nvfp4_gemv_encodes_shared_shard_shape():

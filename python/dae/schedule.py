@@ -72,6 +72,175 @@ class Schedule:
         return self.schedule(mapped_sm)
 
 
+class LayeredSchedule(Schedule):
+    """Select layer-specific 1D operands from HBM without unrolling a task.
+
+    The wrapped schedule is rendered once from the first tensor in every
+    mapping. Direct LDU addresses that fall inside those representative
+    tensors are replaced by one device pointer column. Memory-loop counters
+    offset the pointer-column address; the selected source or destination is
+    resolved only by LDU.
+    """
+
+    _ADDRESS_ONLY_OPS = {
+        opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D & ~((1 << 6) - 1),
+    }
+    _SUPPORTED_OPS = {
+        opcode.OP_ALLOC_TMA_LOAD_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_LDU_LOAD_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D & ~((1 << 6) - 1),
+    }
+
+    def __init__(
+        self,
+        schedule,
+        tensor_groups,
+        *,
+        counter_strides=(),
+        route_indices=None,
+    ):
+        super().__init__()
+        self.inner = schedule
+        self.tensor_groups = tuple(
+            (representative, tuple(alternatives))
+            for representative, alternatives in tensor_groups
+        )
+        self.counter_strides = tuple(
+            (int(counter), int(stride))
+            for counter, stride in counter_strides
+        )
+        self.route_indices = route_indices
+
+    def _on_place(self):
+        if not self.tensor_groups:
+            raise ValueError("layered schedule requires at least one tensor group")
+        group_lengths = {len(alternatives) for _, alternatives in self.tensor_groups}
+        if len(group_lengths) != 1 or next(iter(group_lengths)) <= 0:
+            raise ValueError("layered tensor groups must have one common nonzero length")
+        self.layer_count = next(iter(group_lengths))
+        for counter, stride in self.counter_strides:
+            if not 0 <= counter < 32 or stride <= 0:
+                raise ValueError("layered counter strides require reg [0,31] and positive stride")
+        for representative, alternatives in self.tensor_groups:
+            if not isinstance(representative, torch.Tensor):
+                raise ValueError("layered representatives must be tensors")
+            if representative.device.type != "cuda" or not representative.is_contiguous():
+                raise ValueError("layered tensor groups must be contiguous CUDA tensors")
+            for alternative in alternatives:
+                if not isinstance(alternative, torch.Tensor):
+                    raise ValueError("layered alternatives must be tensors")
+                if (
+                    alternative.device != representative.device
+                    or alternative.dtype != representative.dtype
+                    or alternative.shape != representative.shape
+                    or not alternative.is_contiguous()
+                ):
+                    raise ValueError(
+                        "layered alternatives must match representative device/dtype/shape"
+                    )
+        if self.route_indices is not None and (
+            not isinstance(self.route_indices, torch.Tensor)
+            or self.route_indices.device.type != "cuda"
+            or self.route_indices.dtype != torch.int32
+            or self.route_indices.numel() < 6
+            or not self.route_indices.is_contiguous()
+        ):
+            raise ValueError("layered route indices must be contiguous CUDA int32")
+        inner = self.inner._clone()
+        inner._bars.update(self._bars)
+        self.placed_inner = inner.place(self.num_sms)
+        self._pointer_tables = []
+        self._pointer_cache = {}
+
+    def _match_group(self, inst):
+        address = cords2addr(inst.cords)
+        base_opcode = inst.opcode & ~((1 << 6) - 1)
+        for group_id, (representative, alternatives) in enumerate(self.tensor_groups):
+            start = representative.data_ptr()
+            nbytes = representative.numel() * representative.element_size()
+            offset = address - start
+            if offset < 0 or offset >= nbytes:
+                continue
+            if base_opcode not in self._ADDRESS_ONLY_OPS and offset + inst.size > nbytes:
+                continue
+            return group_id, offset, alternatives
+        return None
+
+    def _transform_memory(self, inst):
+        base_opcode = inst.opcode & ~((1 << 6) - 1)
+        match = self._match_group(inst)
+        if match is None:
+            return inst
+        if base_opcode not in self._SUPPORTED_OPS:
+            raise ValueError(
+                f"layered tensor address is used by unsupported opcode {base_opcode:#x}"
+            )
+        group_id, offset, alternatives = match
+        cache_key = (group_id, offset, base_opcode)
+        pointer_table = self._pointer_cache.get(cache_key)
+        if pointer_table is None:
+            if base_opcode == (
+                opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1)
+            ):
+                if self.route_indices is None:
+                    raise ValueError(
+                        "layered routed loads require a fixed route-index buffer"
+                    )
+                pointer_table = torch.tensor(
+                    [
+                        [self.route_indices.data_ptr(), tensor.data_ptr() + offset]
+                        for tensor in alternatives
+                    ],
+                    dtype=torch.int64,
+                    device=alternatives[0].device,
+                )
+                entry_bytes = 2 * pointer_table.element_size()
+            else:
+                pointer_table = torch.tensor(
+                    [tensor.data_ptr() + offset for tensor in alternatives],
+                    dtype=torch.int64,
+                    device=alternatives[0].device,
+                )
+                entry_bytes = pointer_table.element_size()
+            self._pointer_cache[cache_key] = pointer_table
+            self._pointer_tables.append(pointer_table)
+        else:
+            entry_bytes = (
+                2 * pointer_table.element_size()
+                if base_opcode
+                == (opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1))
+                else pointer_table.element_size()
+            )
+        replacement = indirect_1d_from(inst, pointer_table.reshape(-1)[:2])
+        for counter, stride in self.counter_strides:
+            replacement = CounterOffsetMemoryInstruction(
+                counter, replacement, stride * entry_bytes
+            )
+        return replacement
+
+    def _transform(self, item):
+        if item is None or isinstance(item, ComputeInstruction):
+            return item
+        if isinstance(item, MemoryInstruction):
+            return self._transform_memory(item)
+        if isinstance(item, (list, tuple)):
+            transformed = [self._transform(child) for child in item]
+            return type(item)(transformed) if isinstance(item, tuple) else transformed
+        if hasattr(item, "expand_instructions"):
+            return self._transform(item.expand_instructions())
+        if callable(item):
+            return lambda sm: self._transform(item(sm))
+        raise TypeError(f"unsupported layered schedule item {type(item).__name__}")
+
+    def schedule(self, sm: int):
+        return self._transform(self.placed_inner.schedule(sm))
+
+    def bar_release_count(self, role: str):
+        return self.placed_inner.bar_release_count(role)
+
+
 def _aligned_row_shard(rows: int, num_sms: int, sm: int, alignment: int = 8):
     if rows % alignment:
         raise ValueError(f"row count must be divisible by {alignment}")
@@ -1071,6 +1240,80 @@ class SchedDsv4Nvfp4Quant16(Schedule):
             Dsv4Nvfp4Quant16(block_count * 16),
             _shared_load_1d(source),
             _shared_load_1d(self.global_scale.reshape(-1)),
+            _shared_store_1d(quantized),
+            _shared_store_1d(scales).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedRoutedDsv4Nvfp4Quant16(Schedule):
+    """Quantize with the selected expert's input scale resolved by LDU."""
+
+    def __init__(
+        self,
+        routing_state,
+        route_rank,
+        scale_field,
+        input,
+        output,
+        scale,
+    ):
+        super().__init__()
+        self.routing_state = routing_state
+        self.route_rank = route_rank
+        self.scale_field = scale_field
+        self.input = input
+        self.output = output
+        self.scale = scale
+
+    def _on_place(self):
+        if self.routing_state.device.type != "cuda":
+            raise ValueError("routing state must be a CUDA tensor")
+        if not 0 <= self.route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not 0 <= self.scale_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+            raise ValueError("routed scale field must fit in 13 bits")
+        if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
+            raise ValueError("DeepSeek NVFP4 quant input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % 16:
+            raise ValueError("DeepSeek NVFP4 quant K must be divisible by 16")
+        self.blocks = self.k // 16
+        if self.num_sms <= 0 or self.num_sms > self.blocks:
+            raise ValueError("DeepSeek NVFP4 quant requires 1 <= num_sms <= K/16")
+        if self.output.dtype != torch.uint8 or self.output.numel() != self.k // 2:
+            raise ValueError("DeepSeek NVFP4 quant output must be packed uint8 [K/2]")
+        if (
+            self.scale.dtype != torch.float8_e4m3fn
+            or self.scale.numel() != self.k // 16
+        ):
+            raise ValueError("DeepSeek NVFP4 quant scale must be E4M3 [K/16]")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        route_bar = self._bar("route")
+        if route_bar is None:
+            raise ValueError("routed NVFP4 quant requires a route barrier")
+        blocks_per_sm, extra = divmod(self.blocks, self.num_sms)
+        block_start = sm * blocks_per_sm + min(sm, extra)
+        block_count = blocks_per_sm + (1 if sm < extra else 0)
+        source = self.input[block_start * 16:(block_start + block_count) * 16]
+        quantized = self.output[block_start * 8:(block_start + block_count) * 8]
+        scales = self.scale[block_start:block_start + block_count]
+        return [
+            Dsv4Nvfp4Quant16(block_count * 16),
+            _shared_load_1d(source),
+            RoutedTmaLoad1D(
+                self.routing_state,
+                self.route_rank,
+                self.scale_field,
+                16,
+            ).bar(route_bar),
             _shared_store_1d(quantized),
             _shared_store_1d(scales).bar(self._bar("output")),
         ]

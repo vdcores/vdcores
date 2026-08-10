@@ -20,6 +20,67 @@ class RoutedAddressTable:
     HEADER_BYTES = 48
     MAX_FIELDS = 1 << 13
 
+    @classmethod
+    def from_pointer_columns(
+        cls,
+        columns: Mapping[str, Sequence[int]],
+        *,
+        device,
+        owners: Sequence[object] = (),
+    ) -> "RoutedAddressTable":
+        """Build a routed table from retained-storage device addresses."""
+        if not columns:
+            raise ValueError("routed address table requires at least one field")
+        field_ids = {name: index for index, name in enumerate(columns)}
+        if any(not name for name in field_ids):
+            raise ValueError("routed address field names must be non-empty")
+        normalized = tuple(
+            tuple(int(address) for address in column)
+            for column in columns.values()
+        )
+        expert_count = len(normalized[0])
+        if expert_count <= 0:
+            raise ValueError("routed address table requires at least one expert")
+        if expert_count > 0x7FFFFFFF:
+            raise ValueError("routed address expert count must fit in int32")
+        if len(normalized) > cls.MAX_FIELDS:
+            raise ValueError("routed address field count must fit in 13 bits")
+        if any(len(column) != expert_count for column in normalized):
+            raise ValueError("every routed address field must cover every expert")
+        if any(
+            not 0 < address < (1 << 63)
+            for column in normalized
+            for address in column
+        ):
+            raise ValueError("routed address pointers must fit in signed int64")
+
+        target_device = torch.device(device)
+        if target_device.type != "cuda":
+            raise ValueError("routed address table must reside on CUDA")
+        pointer_columns = torch.tensor(normalized, dtype=torch.int64)
+        pointer_rows = pointer_columns.t().contiguous()
+
+        self = cls.__new__(cls)
+        self._field_ids = field_ids
+        self.expert_count = expert_count
+        self.field_count = len(normalized)
+        self.device = target_device
+        self._targets = tuple(owners)
+        self.state = torch.empty(
+            (6 + expert_count * self.field_count,),
+            dtype=torch.int64,
+            device=target_device,
+        )
+        header = self.state[:6].view(torch.int32)
+        header.zero_()
+        header[8] = self.field_count
+        header[9] = expert_count
+        self.state[6:].copy_(pointer_rows.to(target_device).reshape(-1))
+        self.route_indices = header[: self.ROUTE_COUNT]
+        self.route_indices_storage = header[:8]
+        self.pointer_table = self.state[6:].reshape(expert_count, self.field_count)
+        return self
+
     def __init__(self, columns: Mapping[str, Sequence[torch.Tensor]]):
         if not columns:
             raise ValueError("routed address table requires at least one field")

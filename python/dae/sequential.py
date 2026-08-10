@@ -40,6 +40,7 @@ class SequentialBlock:
     stages: tuple[SequentialStage, ...] | list[SequentialStage]
     repeat: int = 1
     reload_after: bool = True
+    barrier_banks: int = 1
 
 
 def _flatten(item, sm: int, output: list) -> None:
@@ -233,7 +234,7 @@ class SequentialProgram:
 
 
 class LoopedSequentialProgram:
-    """Compose repeatable stage bodies into one compute/memory queue pair."""
+    """Compose compact nested loops with shifted dependency-barrier banks."""
 
     def __init__(
         self,
@@ -252,8 +253,6 @@ class LoopedSequentialProgram:
         self.placed_schedules = []
         compute_base = launcher.copy_cptrs()
         memory_base = launcher.copy_mptrs()
-        loop_reg = 0
-        special_slot = 0
 
         for block in self.blocks:
             if not 1 <= block.repeat <= 0xFFFF:
@@ -262,11 +261,15 @@ class LoopedSequentialProgram:
                 raise ValueError(
                     f"repeated block {block.name!r} must reload its dependencies"
                 )
-            if block.repeat > 1 and loop_reg >= config.num_loop_counters:
+            if block.barrier_banks <= 0:
+                raise ValueError(f"block {block.name!r} barrier_banks must be positive")
+            bank_count = min(block.barrier_banks, block.repeat)
+            while block.repeat % bank_count:
+                bank_count -= 1
+            outer_count = block.repeat // bank_count
+            required_counters = int(bank_count > 1) + int(outer_count > 1)
+            if required_counters > config.num_loop_counters:
                 raise ValueError("looped program exceeds runtime loop-counter capacity")
-            if block.reload_after and special_slot + 1 >= config.num_special_slots:
-                raise ValueError("looped program exceeds LDU control-slot capacity")
-
             compute_start = [
                 (compute_base[sm] + sum(
                     isinstance(inst, ComputeInstruction)
@@ -288,33 +291,78 @@ class LoopedSequentialProgram:
                 completion_barrier=block.reload_after,
             )
             self.segments.append(segment)
-            self.barriers.extend(segment.barriers)
+            barriers_per_bank = segment.barrier_stop - segment.barrier_start
+            if bank_count > 1:
+                if not block.reload_after or barriers_per_bank <= 0:
+                    raise ValueError(
+                        f"block {block.name!r} needs a completion barrier for shifting"
+                    )
+                base_values = [
+                    launcher.bar_values[bar_id]
+                    for bar_id in range(segment.barrier_start, segment.barrier_stop)
+                ]
+                for _ in range(1, bank_count):
+                    for value in base_values:
+                        if launcher.num_bars >= config.max_bars - 2:
+                            raise ValueError(
+                                "looped program exceeds shifted barrier capacity"
+                            )
+                        launcher.new_bar(value)
+                for instructions in segment.instructions:
+                    for inst in instructions:
+                        if not isinstance(inst, MemoryInstruction):
+                            continue
+                        if not inst.opcode & _MEM_BARRIER:
+                            continue
+                        bar_id = _bar_id(inst)
+                        if segment.barrier_start <= bar_id < segment.barrier_stop:
+                            inst.group()
+            self.barriers.extend(
+                range(
+                    segment.barrier_start,
+                    segment.barrier_start + barriers_per_bank * bank_count,
+                )
+            )
             self.stage_stats.extend(segment.stage_stats)
             self.placed_schedules.extend(segment.placed_schedules)
             for sm in range(launcher.num_sms):
                 self.instructions[sm].extend(segment.instructions[sm])
 
-            if block.reload_after:
-                barrier_count = segment.barrier_stop - segment.barrier_start
-                reload = LduReloadBarriers(
-                    launcher.bars_src,
-                    segment.barrier_start,
-                    barrier_count,
-                    special_slot,
-                ).bar(segment.completion_barrier)
-                for sm in range(launcher.num_sms):
-                    self.instructions[sm].append(reload.copy())
-                special_slot += 2
-
-            if block.repeat > 1:
+            inner_reg = 0
+            outer_reg = int(bank_count > 1)
+            if bank_count > 1:
                 for sm in range(launcher.num_sms):
                     self.instructions[sm].extend(
                         (
-                            LoopC(block.repeat, compute_start[sm], reg=loop_reg),
-                            LoopM(block.repeat, memory_start[sm], reg=loop_reg),
+                            LoopC(bank_count, compute_start[sm], reg=inner_reg),
+                            LoopM(
+                                bank_count,
+                                memory_start[sm],
+                                reg=inner_reg,
+                                bar_shift=barriers_per_bank,
+                            ),
                         )
                     )
-                loop_reg += 1
+            if block.reload_after:
+                reload = LduReloadBarriers(
+                    launcher.bars_src,
+                    segment.barrier_start,
+                    barriers_per_bank * bank_count,
+                    0,
+                ).bar(
+                    segment.completion_barrier
+                    + (bank_count - 1) * barriers_per_bank
+                )
+                for sm in range(launcher.num_sms):
+                    self.instructions[sm].append(reload.copy())
+            if outer_count > 1:
+                for sm in range(launcher.num_sms):
+                    self.instructions[sm].extend(
+                        (
+                            LoopC(outer_count, compute_start[sm], reg=outer_reg),
+                            LoopM(outer_count, memory_start[sm], reg=outer_reg),
+                        )
+                    )
 
         max_compute = max(
             sum(isinstance(inst, ComputeInstruction) for inst in instructions)
