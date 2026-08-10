@@ -93,14 +93,27 @@ class Gemv_M64N8IssuerOnly(ComputeInstruction):
 class Nvfp4GemvSm100(ComputeInstruction):
     """ModelOpt-compatible W4A4 decode GEMV over one output-row shard."""
 
-    def __init__(self, rows: int, k: int):
+    ROUTED_ADDRESS_FLAG = 0x8000
+
+    def __init__(
+        self,
+        rows: int,
+        k: int,
+        row_start: int = 0,
+        routed_addresses: bool = False,
+    ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("NVFP4 GEMV rows must fit in a positive uint16")
         if k <= 0 or k > 0xFFFF or k % 32:
             raise ValueError("NVFP4 GEMV K must be a positive uint16 multiple of 32")
+        if row_start < 0 or row_start >= self.ROUTED_ADDRESS_FLAG:
+            raise ValueError("NVFP4 GEMV row_start must fit in 15 bits")
+        address_mode = row_start
+        if routed_addresses:
+            address_mode |= self.ROUTED_ADDRESS_FLAG
         super().__init__(
             opcode=opcode.OP_NVFP4_GEMV_SM100,
-            args=[rows, k, 0],
+            args=[rows, k, address_mode],
         )
 
 
@@ -1296,6 +1309,36 @@ class RawAddress(MemoryInstruction):
         )
 
 
+class RoutedRawAddress(MemoryInstruction):
+    """Resolve a queue-backed pointer from an HBM routing table in LDU."""
+
+    ROUTE_COUNT = 6
+    HEADER_BYTES = 32
+
+    def __init__(
+        self,
+        routing_state: torch.Tensor,
+        route_rank: int,
+        pointer_field: int,
+    ):
+        assert routing_state.device.type == "cuda"
+        if not routing_state.is_contiguous():
+            raise ValueError("routing_state must be contiguous")
+        if routing_state.numel() * routing_state.element_size() < self.HEADER_BYTES:
+            raise ValueError("routing_state must contain the 32-byte routing header")
+        if not 0 <= route_rank < self.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not 0 <= pointer_field <= 0xFFFF:
+            raise ValueError("pointer_field must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_ROUTED_RAW_ADDRESS,
+            num_slots=1,
+            arg=route_rank,
+            size=pointer_field,
+            address=routing_state.data_ptr(),
+        )
+
+
 class IssueBarrier(MemoryInstruction):
     def __init__(self, bar: int):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
@@ -1563,6 +1606,7 @@ __all__ = [
     "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",
+    "RoutedRawAddress",
     "IssueBarrier",
     "CC0",
     "RegStore",

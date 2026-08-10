@@ -79,6 +79,7 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 - `OP_ALLOC_WB_TMA_REDUCE_ADD_2D`
 - `OP_ALLOC_WB_TMA_REDUCE_ADD_3D`
 - `OP_ALLOC_WB_RAW_ADDRESS`
+- `OP_ALLOC_ROUTED_RAW_ADDRESS`
 
 ### Control-flow and non-alloc ops
 
@@ -225,6 +226,8 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
 Barrier behavior for load ops:
 
 - if `BARRIER` is set and `WRITEBACK` is not set, the load warp waits for `bars[bar] == 0` before issuing the load
+- routed-address resolution happens in LDU after this dependency wait; it does
+  not require an alloc-warp `OP_ISSUE_BARRIER`
 
 ### Store-side / writeback ops
 
@@ -288,6 +291,32 @@ Barrier behavior for writeback ops:
     - the pointer becomes available through `st_insts[special_slot].address`
   - practical meaning:
     - carry raw global pointers through the VM for compute kernels that write or read global memory directly
+
+- `OP_ALLOC_ROUTED_RAW_ADDRESS`
+  - fields:
+    - `nslot() = 1`, so the address record has allocator-managed lifetime
+    - `address` = HBM routing-state base
+    - `arg` = route rank in `[0,6)`
+    - `size` = pointer-table field id
+    - optional input `BARRIER` = route-completion dependency
+  - HBM state layout:
+    - six `int32` selected expert ids
+    - `uint32` pointer-field stride
+    - `uint32` expert count
+    - row-major `uint64 [expert, field]` pointer table
+  - observed effect:
+    - LDU reads the selected expert id and resolved pointer through L2-cached
+      global loads
+    - LDU rewrites `st_insts[slot].address` before publishing the normal-slot
+      mask to compute
+    - compute extracts the normal slot, consumes the global pointer, and
+      returns the input mask through `c2m`
+    - when used as a direct global output with `WRITEBACK`, the store warp
+      performs completion/barrier handling and frees the metadata slot without
+      issuing a TMA copy
+  - scheduling rule:
+    - the first routed address after a router carries the route dependency;
+      later lookups on the same LDU port are ordered behind it
 
 ## Compute Operators
 

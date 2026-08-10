@@ -145,6 +145,121 @@ class SchedNvfp4Gemv(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedRoutedNvfp4Gemv(Schedule):
+    """Run one routed NVFP4 expert without copying route ids to the host."""
+
+    def __init__(
+        self,
+        routing_state,
+        route_rank,
+        weight_field,
+        weight_scale_field,
+        activation_field,
+        activation_scale_field,
+        alpha_field,
+        output_field,
+        rows,
+        k,
+        activation,
+        activation_scale,
+        output,
+    ):
+        super().__init__()
+        self.routing_state = routing_state
+        self.route_rank = route_rank
+        self.weight_field = weight_field
+        self.weight_scale_field = weight_scale_field
+        self.activation_field = activation_field
+        self.activation_scale_field = activation_scale_field
+        self.alpha_field = alpha_field
+        self.output_field = output_field
+        self.rows = rows
+        self.k = k
+        self.activation = activation
+        self.activation_scale = activation_scale
+        self.output = output
+
+    def _on_place(self):
+        if self.routing_state.device.type != "cuda":
+            raise ValueError("routed address state must be a CUDA tensor")
+        if not self.routing_state.is_contiguous():
+            raise ValueError("routed address state must be contiguous")
+        if not 0 <= self.route_rank < RoutedRawAddress.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        for field in (
+            self.weight_field,
+            self.weight_scale_field,
+            self.activation_field,
+            self.activation_scale_field,
+            self.alpha_field,
+            self.output_field,
+        ):
+            if not 0 <= field <= 0xFFFF:
+                raise ValueError("routed pointer fields must fit in uint16")
+        if self.rows <= 0 or self.rows >= Nvfp4GemvSm100.ROUTED_ADDRESS_FLAG:
+            raise ValueError("routed NVFP4 rows must fit in 15 bits")
+        if self.k <= 0 or self.k > 0xFFFF or self.k % 32:
+            raise ValueError("routed NVFP4 K must be a uint16 multiple of 32")
+        if (
+            self.activation.dtype != torch.uint8
+            or self.activation.numel() != self.k // 2
+        ):
+            raise ValueError("activation must contain K/2 packed uint8 values")
+        if (
+            self.activation_scale.dtype != torch.float8_e4m3fn
+            or self.activation_scale.numel() != self.k // 16
+        ):
+            raise ValueError("activation_scale must contain K/16 E4M3 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
+            raise ValueError("output must contain M BF16 values")
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("routed NVFP4 GEMV requires 1 <= num_sms <= M")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        route_bar = self._bar("route")
+        if route_bar is None:
+            raise ValueError("routed NVFP4 GEMV requires a route barrier")
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        return [
+            Nvfp4GemvSm100(
+                row_count,
+                self.k,
+                row_start=row_start,
+                routed_addresses=True,
+            ),
+            RoutedRawAddress(
+                self.routing_state, self.route_rank, self.weight_field
+            ).bar(route_bar),
+            RoutedRawAddress(
+                self.routing_state, self.route_rank, self.weight_scale_field
+            ),
+            RoutedRawAddress(
+                self.routing_state, self.route_rank, self.activation_field
+            ),
+            RoutedRawAddress(
+                self.routing_state,
+                self.route_rank,
+                self.activation_scale_field,
+            ),
+            RoutedRawAddress(
+                self.routing_state, self.route_rank, self.alpha_field
+            ),
+            RoutedRawAddress(
+                self.routing_state, self.route_rank, self.output_field
+            )
+                .bar(self._bar("output")).writeback(),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedNvfp4GemvUmma(SchedNvfp4Gemv):
     """Map one native block-scaled UMMA tile to each resident SM."""
 

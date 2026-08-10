@@ -33,6 +33,14 @@ __device__ __forceinline__ int load_l2(const int* addr) {
     return val;
 }
 
+__device__ __forceinline__ uint64_t load_l2_u64(const uint64_t* addr) {
+    uint64_t val;
+    asm volatile(
+        "ld.global.cg.u64 %0, [%1];"
+        : "=l"(val) : "l"(addr));
+    return val;
+}
+
 template<typename T>
 __device__ __forceinline__ void prefetch_l1(const T* addr) {
     asm volatile(

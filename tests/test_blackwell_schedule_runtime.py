@@ -14,8 +14,10 @@ from dae.instructions import (
     Gemv_M64N8_ROPE_128,
     Gemv_M64N8UpSiLU,
     MemoryInstruction,
+    Nvfp4GemvSm100,
     ProfileEvent,
     RepeatM,
+    RoutedRawAddress,
     TmaTensor,
 )
 from dae.runtime import opcode
@@ -55,6 +57,49 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert repeat.arg & RepeatM.COUNT_COUNTER_MODE_FLAG
     assert repeat.arg & RepeatM.COUNTER_REG_MASK == 3
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
+
+
+def test_routed_raw_address_encodes_l2_lookup_in_normal_slot():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeRoutingState:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 8
+
+        @staticmethod
+        def element_size():
+            return 8
+
+        @staticmethod
+        def data_ptr():
+            return 0x123456789ABC
+
+    instruction = RoutedRawAddress(FakeRoutingState(), 5, 257).bar(9)
+
+    assert instruction.opcode == opcode.OP_ALLOC_ROUTED_RAW_ADDRESS | 16
+    assert instruction.num_slots == 1 | (9 << 6)
+    assert instruction.arg == 5
+    assert instruction.size == 257
+    assert cords2addr(instruction.cords) == FakeRoutingState.data_ptr()
+
+
+def test_nvfp4_routed_address_mode_encodes_row_start():
+    instruction = Nvfp4GemvSm100(
+        32,
+        256,
+        row_start=64,
+        routed_addresses=True,
+    )
+
+    assert instruction.args == [32, 256, 0x8040]
 
 
 def test_profile_event_reserves_kernel_start_and_end_slots():

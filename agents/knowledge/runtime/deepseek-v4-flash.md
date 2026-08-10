@@ -156,6 +156,22 @@ individual task launches.  The next functional milestone is loading real
 checkpoint tensors into this flow; only then should its profile drive task
 fusion, launch reduction, and TBT work.
 
+## Single-launch routed expert foundation
+
+Routed expert selection no longer needs a host readback to choose checkpoint
+addresses.  `RoutedAddressTable` keeps the six route ids and an
+expert-by-field pointer table in HBM.  `OP_ALLOC_ROUTED_RAW_ADDRESS` is a true
+LDU operation: after the router's output dependency becomes ready, LDU reads
+the selected expert and pointer through L2 and publishes an allocator-owned
+address slot to compute.  All six NVFP4 operands use this same operator; no
+separate static-address compatibility operator is part of the routed path.
+
+The first composed proof used one `Launcher.launch()` for hash routing and a
+four-SM sharded NVFP4 GEMV.  Expert 37 remained on device from routing through
+address selection, and the output was bit-exact to the quantized reference.
+This is the required routing/addressing foundation for a whole-layer queued
+schedule, not a TBT result.
+
 ## Real-checkpoint preflight
 
 `python/dae/deepseek_v4_checkpoint.py` generates and validates the exact raw

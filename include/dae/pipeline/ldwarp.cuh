@@ -5,7 +5,7 @@
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
-    const MInst *st_insts,
+    MInst *st_insts,
     const void *smem_base, const CUtensorMap *tma_descs, int *bars
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, const int port_id, uint64_t *g_events
@@ -199,6 +199,33 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       case op(OP_ALLOC_REG_LOAD): {
         m2c.data[bar] = regFile[inst.size];
         __ldprint("[REG] load: reg_id=%d bar=%d slotMask=0x%X", inst.size, bar, regFile[inst.size]);
+        break;
+      }
+      case op(OP_ALLOC_ROUTED_RAW_ADDRESS): {
+        // HBM layout: six int32 route ids, uint32 field stride,
+        // uint32 expert count, then row-major uint64 pointer entries.
+        constexpr int kRouteCount = 6;
+        constexpr int kHeaderInts = 8;
+        const auto *header = reinterpret_cast<const int *>(inst.address);
+        const int route_rank = inst.arg;
+        const int pointer_field = inst.size;
+        uint64_t resolved = 0;
+        if (route_rank >= 0 && route_rank < kRouteCount) {
+          const int expert = load_l2(header + route_rank);
+          const int field_stride = load_l2(header + 6);
+          const int expert_count = load_l2(header + 7);
+          if (expert >= 0 && expert < expert_count &&
+              pointer_field >= 0 && pointer_field < field_stride) {
+            const auto *pointer_table =
+                reinterpret_cast<const uint64_t *>(header + kHeaderInts);
+            resolved = load_l2_u64(
+                pointer_table + expert * field_stride + pointer_field);
+          }
+        }
+        st_insts[slot].address = resolved;
+        __ldprint(
+            "Routed raw address: rank=%d field=%d resolved=0x%lx",
+            route_rank, pointer_field, resolved);
         break;
       }
     }

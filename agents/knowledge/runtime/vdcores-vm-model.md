@@ -169,6 +169,9 @@ There are two token shapes in flight.
 - Example:
   - a 2-slot allocation at lead slot `5` becomes bits `5` and `6`
 - Consumers that need a base slot call `extract(mask)`.
+- Routed raw addresses also use a one-slot normal allocation.  The slot stores
+  address metadata rather than tensor payload, which prevents the alloc warp
+  from overwriting an address record before compute consumes it.
 
 ### Special slot token
 
@@ -408,6 +411,18 @@ Observed behavior from [python/dae/instructions.py](/home1/11362/depctg/vdcores/
 - compute kernels recover it with `slot_2_glob_ptr(...)`
 
 This is the path used for outputs that compute writes directly to global memory without a shared-memory writeback tile.
+
+### `RoutedRawAddress`
+
+- The alloc warp reserves one normal slot and sends its record to LDU.
+- LDU reads a route id plus a `uint64` pointer-table entry from HBM, rewrites
+  the slot's address, and only then publishes the normal-slot mask to compute.
+- An input barrier on the first lookup holds LDU until routing output is
+  globally visible.  Serial execution on that LDU port orders subsequent
+  routed lookups without an alloc-warp issue barrier.
+- Compute returns routed input masks normally; a routed direct-output mask
+  follows the store/completion path so its global barrier is released and its
+  metadata slot is freed.
 
 ## State Transition Sketch
 

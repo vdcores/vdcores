@@ -118,7 +118,11 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, smem_base, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_nvfp4_gemv_sm100(inst.args[0], inst.args[1], st_insts, m2c, c2m);
+  constexpr uint16_t kRoutedAddressFlag = 0x8000U;
+  task_nvfp4_gemv_sm100(
+      inst.args[0], inst.args[1], inst.args[2] & ~kRoutedAddressFlag,
+      (inst.args[2] & kRoutedAddressFlag) != 0,
+      st_insts, m2c, c2m);
 #endif
 }
 

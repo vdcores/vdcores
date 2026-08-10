@@ -38,6 +38,11 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     // all ops are writeback ops
 
     switch(op(opcode)) {
+      case op(OP_ALLOC_ROUTED_RAW_ADDRESS):
+        // Routed raw outputs are written directly by compute.  Reaching
+        // the store warp provides completion/barrier handling and frees the
+        // normal metadata slot; there is no TMA copy to issue here.
+        break;
       case op(OP_ALLOC_WB_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(

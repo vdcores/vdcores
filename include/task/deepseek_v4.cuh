@@ -397,8 +397,11 @@ __device__ __forceinline__ void task_dsv4_route_top6(
 
   __sync_compute_group(128);
   __threadfence();
-  c2m.template push<31, true, false>(
-      tid, (1U << indices_slot) | (1U << weights_slot));
+  // These are two independent raw-address completions.  Queue them
+  // separately so the store warp observes the barrier attached to either
+  // output instead of treating the bit union as one allocator span.
+  c2m.template push<31, true, false>(tid, 1U << indices_slot);
+  c2m.template push<31, true, false>(tid, 1U << weights_slot);
 }
 
 // Sum the six routed expert down projections and one shared expert.  Applying
