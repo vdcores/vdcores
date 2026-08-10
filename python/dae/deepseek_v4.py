@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import ceil, floor, log, pi, sqrt
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +36,12 @@ class DeepSeekV4FlashConfig:
     route_scale: float = 1.5
     swiglu_limit: float = 10.0
     rms_epsilon: float = 1.0e-6
+    rope_theta: float = 10000.0
+    compress_rope_theta: float = 160000.0
+    rope_scaling_factor: float = 16.0
+    rope_original_max_position_embeddings: int = 65536
+    rope_beta_fast: float = 32.0
+    rope_beta_slow: float = 1.0
     compress_ratios: tuple[int, ...] = (
         0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
         4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
@@ -53,6 +59,47 @@ class DeepSeekV4FlashConfig:
         return {0: "swa", 4: "csa", 128: "hca"}[
             self.compress_ratios[layer_id]
         ]
+
+
+def deepseek_v4_rope_table(
+    position: int,
+    *,
+    compressed: bool = False,
+    config: DeepSeekV4FlashConfig | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Build the checkpoint's interleaved 64-wide main/compressor RoPE row."""
+    if position < 0:
+        raise ValueError("RoPE position must be non-negative")
+    config = config or DeepSeekV4FlashConfig()
+    dim = config.rope_dim
+    base = config.compress_rope_theta if compressed else config.rope_theta
+    exponents = torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
+    frequencies = torch.pow(
+        torch.tensor(base, dtype=torch.float32, device=device), exponents
+    )
+    inverse = frequencies.reciprocal()
+    if compressed:
+        interpolation = inverse / config.rope_scaling_factor
+
+        def correction(rotations: float) -> float:
+            return (
+                dim
+                * log(
+                    config.rope_original_max_position_embeddings
+                    / (rotations * 2.0 * pi)
+                )
+                / (2.0 * log(base))
+            )
+
+        low = max(floor(correction(config.rope_beta_fast)), 0)
+        high = min(ceil(correction(config.rope_beta_slow)), dim - 1)
+        ramp = torch.arange(dim // 2, dtype=torch.float32, device=device)
+        ramp = ((ramp - low) / max(high - low, 0.001)).clamp(0.0, 1.0)
+        extrapolation = 1.0 - ramp
+        inverse = interpolation * (1.0 - extrapolation) + inverse * extrapolation
+    angles = inverse * float(position)
+    return torch.stack((angles.cos(), angles.sin()), dim=1)
 
 
 def _apply_partial_rope_64(
@@ -290,6 +337,7 @@ def hc_head_reference(
 
 __all__ = [
     "DeepSeekV4FlashConfig",
+    "deepseek_v4_rope_table",
     "apply_partial_rope_128_64",
     "apply_partial_rope_512_64",
     "sparse_attention_512_reference",

@@ -213,12 +213,23 @@ This position-zero run is a breadth gate, not a quality or TBT result.  RoPE is
 identity there, and historical compressed/index cache state is empty, so the
 compressor/index projections execute for coverage but their outputs are not
 consumed.  The harness also streams weights from local storage and launches
-tasks individually.  Multi-token cache correctness, resident-weight
-execution, and timed framework parity remain separate gates.
+tasks individually.
+
+The harness now also supports the early autoregressive positions before the
+first ratio-4 compressed entry.  Its generated main and Yarn-scaled compressor
+RoPE tables match the official Transformers implementation exactly, and it
+keeps a 128-row circular window KV cache for every layer.  A two-step run from
+token 791 recomputed position zero, fed token 14 back at position one, attended
+both live KV rows in all 43 layers, and emitted `[14, 223]`, exactly matching
+vLLM's greedy IDs.  The streaming steps took 87.241 and 88.270 seconds
+(175.519 seconds total); these timings include checkpoint I/O, allocation, and
+individual Python launches and remain non-performance data.  The next
+correctness gate is position three, where CSA's first ratio-4 compressed and
+index entries become attention-visible.
 
 ## Profiling and optimization gate
 
-Detailed tuning starts only after the second-token run consumes populated
+Detailed tuning starts only after the position-three run consumes populated
 window/compressor/index state and matches its framework token.  Then make the
 full non-MTP checkpoint resident on one GPU, retain enough memory for the
 matched cache lengths, and measure launch-inclusive decode without checkpoint

@@ -7,6 +7,7 @@ from dae.deepseek_v4 import (
     bounded_swiglu,
     decode_compressed_indices,
     decode_window_indices,
+    deepseek_v4_rope_table,
     gated_pool_reference,
     hadamard_reference,
     hc_head_reference,
@@ -59,6 +60,21 @@ def test_decode_plan_covers_all_attention_families_and_model_stages():
         "expert_reduce",
         "hc_ffn_post",
     )
+
+
+def test_checkpoint_rope_tables_cover_main_and_yarn_compressor_frequencies():
+    identity = deepseek_v4_rope_table(0)
+    main = deepseek_v4_rope_table(1)
+    compressed = deepseek_v4_rope_table(1, compressed=True)
+
+    assert identity.shape == (32, 2)
+    torch.testing.assert_close(identity[:, 0], torch.ones(32))
+    torch.testing.assert_close(identity[:, 1], torch.zeros(32))
+    torch.testing.assert_close(main[0], torch.tensor([0.5403023, 0.8414710]))
+    torch.testing.assert_close(
+        compressed[-1], torch.tensor([1.0, 5.6805294e-7]), atol=1.0e-7, rtol=1.0e-5
+    )
+    assert not torch.equal(main, compressed)
 
 
 def test_long_context_plan_caps_only_csa_compressed_selection():

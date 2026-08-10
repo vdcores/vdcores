@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Stream a real DeepSeek-V4 checkpoint through VDCores on one GPU.
 
-The first breadth gate intentionally supports decode position zero.  At that
-position RoPE is exactly identity and no historical compressed/index cache is
-consumed, while every transformer layer, both routing modes, both quantized
-linear formats, mHC, sparse attention, and the real vocabulary head execute.
-Weights are loaded lazily from worker-local storage and released after use, so
-the complete model runs on one GPU without first duplicating the 157-GiB
-checkpoint in host or device memory.  This is a functional flow, not TBT data.
+The early autoregressive breadth gate supports positions before the first
+ratio-4 compressed entry.  It preserves each layer's sliding-window KV state,
+uses the checkpoint's position-dependent RoPE, and greedily feeds each output
+token into the next step.  Weights are loaded lazily from worker-local storage
+and released after use, so the complete model runs on one GPU without first
+duplicating the 157-GiB checkpoint in host or device memory.  This is a
+functional flow, not TBT data.
 """
 
 from __future__ import annotations
@@ -18,7 +18,11 @@ import time
 
 import torch
 
-from dae.deepseek_v4 import DeepSeekV4FlashConfig
+from dae.deepseek_v4 import (
+    DeepSeekV4FlashConfig,
+    decode_window_indices,
+    deepseek_v4_rope_table,
+)
 from dae.deepseek_v4_checkpoint import (
     DeepSeekV4Checkpoint,
     Fp8LinearCheckpointTensors,
@@ -57,8 +61,21 @@ class CheckpointDecode:
             args.sms,
             torch.cuda.get_device_properties(device).multi_processor_count,
         )
-        self.rope_table = torch.zeros((32, 2), dtype=torch.float32, device=device)
-        self.rope_table[:, 0] = 1.0
+        self.main_rope_table = deepseek_v4_rope_table(
+            args.start_pos, config=self.config, device=device
+        )
+        self.compress_rope_table = deepseek_v4_rope_table(
+            args.start_pos, compressed=True, config=self.config, device=device
+        )
+        self.window_kv = torch.empty(
+            (
+                args.layers,
+                self.config.sliding_window,
+                self.config.head_dim,
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+        )
 
     def _run(self, schedule, sms: int) -> None:
         launcher = Launcher(sms, device=self.device)
@@ -261,7 +278,9 @@ class CheckpointDecode:
         rows = source.reshape(-1, 512)
         output = torch.empty_like(rows)
         self._run(
-            SchedDsv4Rope512_64(rows, self.rope_table, output, inverse=inverse),
+            SchedDsv4Rope512_64(
+                rows, self.main_rope_table, output, inverse=inverse
+            ),
             1,
         )
         return output.reshape_as(source)
@@ -272,8 +291,9 @@ class CheckpointDecode:
         normalized: torch.Tensor,
         q_rank_activation: torch.Tensor,
         q_rank_scale: torch.Tensor,
+        position: int,
     ) -> None:
-        plan = build_layer_decode_plan(layer_id, 0, self.config)
+        plan = build_layer_decode_plan(layer_id, position, self.config)
         if plan.compress_ratio:
             prefix = f"layers.{layer_id}.attn.compressor"
             self._bf16_weight(f"{prefix}.wkv.weight", normalized)
@@ -296,10 +316,15 @@ class CheckpointDecode:
     def _rope128(self, source: torch.Tensor) -> torch.Tensor:
         rows = source.reshape(-1, 128)
         output = torch.empty_like(rows)
-        self._run(SchedDsv4Rope128_64(rows, self.rope_table, output), 1)
+        self._run(SchedDsv4Rope128_64(rows, self.compress_rope_table, output), 1)
         return output.reshape_as(source)
 
-    def _attention(self, layer_id: int, normalized: torch.Tensor) -> torch.Tensor:
+    def _attention(
+        self,
+        layer_id: int,
+        normalized: torch.Tensor,
+        position: int,
+    ) -> torch.Tensor:
         prefix = f"layers.{layer_id}.attn"
         hidden_activation, hidden_scale = self._quant_fp8(normalized)
         q_a = self.checkpoint.load_fp8_linear(
@@ -328,14 +353,27 @@ class CheckpointDecode:
         kv = self._rms(kv, kv_norm_weight)
         kv = self._rope512(kv.reshape(1, 512))
         self._attention_side_paths(
-            layer_id, normalized, q_rank_activation, q_rank_scale
+            layer_id,
+            normalized,
+            q_rank_activation,
+            q_rank_scale,
+            position,
         )
 
         sink = self._load([f"{prefix}.attn_sink"])[f"{prefix}.attn_sink"]
-        indices = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        cache = self.window_kv[layer_id]
+        cache[position % self.config.sliding_window].copy_(kv.reshape(-1))
+        if position < self.config.sliding_window:
+            indices = torch.arange(
+                position + 1, dtype=torch.int32, device=self.device
+            )
+        else:
+            indices = decode_window_indices(
+                position, self.config.sliding_window
+            ).to(self.device)
         attended = torch.empty_like(q)
         self._run(
-            SchedDsv4SparseAttention512(q, kv, indices, sink, attended),
+            SchedDsv4SparseAttention512(q, cache, indices, sink, attended),
             64,
         )
         attended = self._rope512(attended, inverse=True)
@@ -366,6 +404,7 @@ class CheckpointDecode:
         self,
         layer_id: int,
         normalized: torch.Tensor,
+        token_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prefix = f"layers.{layer_id}.ffn.gate"
         logits = self._bf16_weight(f"{prefix}.weight", normalized)
@@ -373,7 +412,7 @@ class CheckpointDecode:
         if hash_routing:
             hash_indices = self.checkpoint.load_tensor_slice(
                 f"{prefix}.tid2eid",
-                self.args.token_id,
+                token_id,
                 device=str(self.device),
             ).to(torch.int32)
             bias = torch.zeros(
@@ -473,8 +512,13 @@ class CheckpointDecode:
         )
         return self._fp8(f"{prefix}.w2", middle)
 
-    def _ffn(self, layer_id: int, normalized: torch.Tensor) -> torch.Tensor:
-        indices, weights = self._route(layer_id, normalized)
+    def _ffn(
+        self,
+        layer_id: int,
+        normalized: torch.Tensor,
+        token_id: int,
+    ) -> torch.Tensor:
+        indices, weights = self._route(layer_id, normalized, token_id)
         expert_ids = [int(value) for value in indices.cpu().tolist()]
         if any(not 0 <= value < self.config.num_experts for value in expert_ids):
             raise AssertionError(f"layer {layer_id} emitted invalid experts {expert_ids}")
@@ -495,12 +539,18 @@ class CheckpointDecode:
             )
         return output
 
-    def _layer(self, layer_id: int, residual: torch.Tensor) -> torch.Tensor:
+    def _layer(
+        self,
+        layer_id: int,
+        residual: torch.Tensor,
+        token_id: int,
+        position: int,
+    ) -> torch.Tensor:
         normalized, post, comb = self._hc_pre(layer_id, "attn", residual)
-        branch = self._attention(layer_id, normalized)
+        branch = self._attention(layer_id, normalized, position)
         residual = self._hc_post(branch, residual, post, comb)
         normalized, post, comb = self._hc_pre(layer_id, "ffn", residual)
-        branch = self._ffn(layer_id, normalized)
+        branch = self._ffn(layer_id, normalized, token_id)
         residual = self._hc_post(branch, residual, post, comb)
         if not bool(torch.isfinite(residual).all().item()):
             raise AssertionError(f"layer {layer_id} produced non-finite residual state")
@@ -539,20 +589,31 @@ class CheckpointDecode:
             raise AssertionError("checkpoint decode produced non-finite logits")
         return int(torch.argmax(logits).item()), logits
 
-    def run(self) -> tuple[int, torch.Tensor, float]:
+    def _run_token(
+        self,
+        token_id: int,
+        position: int,
+    ) -> tuple[int, torch.Tensor, float]:
+        self.main_rope_table = deepseek_v4_rope_table(
+            position, config=self.config, device=self.device
+        )
+        self.compress_rope_table = deepseek_v4_rope_table(
+            position, compressed=True, config=self.config, device=self.device
+        )
         embedding = self.checkpoint.load_tensor_slice(
             "embed.weight",
-            self.args.token_id,
+            token_id,
             device=str(self.device),
         )
         residual = embedding.reshape(1, -1).repeat(self.config.hc_mult, 1)
         started = time.monotonic()
         for layer_id in range(self.args.layers):
             layer_started = time.monotonic()
-            residual = self._layer(layer_id, residual)
+            residual = self._layer(layer_id, residual, token_id, position)
             print(
                 "DSV4_CHECKPOINT_LAYER status=PASS "
-                f"layer={layer_id} kind={self.config.attention_kind(layer_id)} "
+                f"position={position} layer={layer_id} "
+                f"kind={self.config.attention_kind(layer_id)} "
                 f"elapsed_s={time.monotonic() - layer_started:.3f}",
                 flush=True,
             )
@@ -561,6 +622,24 @@ class CheckpointDecode:
         token, logits = self._head(residual)
         return token, logits, time.monotonic() - started
 
+    def run(self) -> tuple[list[int], torch.Tensor, float]:
+        token_id = self.args.token_id
+        outputs: list[int] = []
+        logits = torch.empty(0, device=self.device)
+        started = time.monotonic()
+        for step in range(self.args.decode_tokens):
+            position = self.args.start_pos + step
+            token, logits, elapsed = self._run_token(token_id, position)
+            outputs.append(token)
+            print(
+                "DSV4_CHECKPOINT_TOKEN status=PASS "
+                f"position={position} input_token={token_id} "
+                f"output_token={token} elapsed_s={elapsed:.3f}",
+                flush=True,
+            )
+            token_id = token
+        return outputs, logits, time.monotonic() - started
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -568,6 +647,8 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--token-id", type=int, default=791)
     parser.add_argument("--start-pos", type=int, default=0)
+    parser.add_argument("--decode-tokens", type=int, default=1)
+    parser.add_argument("--expected-token-ids")
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--sms", type=int, default=152)
     parser.add_argument("--trace-stages", action="store_true")
@@ -578,18 +659,34 @@ def main() -> None:
     if not 0 <= args.token_id < config.vocab_size:
         parser.error("token-id is outside the vocabulary")
     if args.start_pos != 0:
-        parser.error("the first real-checkpoint breadth gate supports start-pos=0")
+        parser.error("the early real-checkpoint breadth gate supports start-pos=0")
+    if not 1 <= args.decode_tokens <= 3:
+        parser.error("decode-tokens must be in [1,3] before compressed-cache support")
     if not 1 <= args.vocab_size <= config.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0:
         parser.error("sms must be positive")
 
+    expected = None
+    if args.expected_token_ids is not None:
+        try:
+            expected = [int(value) for value in args.expected_token_ids.split(",")]
+        except ValueError as error:
+            parser.error(f"expected-token-ids must be comma-separated integers: {error}")
+        if len(expected) != args.decode_tokens:
+            parser.error("expected-token-ids must contain one ID per decode token")
+
     flow = CheckpointDecode(args, torch.device("cuda"))
-    token, logits, elapsed = flow.run()
+    tokens, logits, elapsed = flow.run()
+    if expected is not None and tokens != expected:
+        raise AssertionError(
+            f"checkpoint decode emitted {tokens}, expected {expected}"
+        )
     print(
         "DSV4_CHECKPOINT_DECODE status=PASS "
         f"layers={args.layers} start_pos=0 token_id={args.token_id} "
-        f"vocab={args.vocab_size} output_token={token} "
+        f"decode_tokens={args.decode_tokens} vocab={args.vocab_size} "
+        f"output_tokens={tokens} "
         f"logit_min={float(logits.float().min().item()):.6f} "
         f"logit_max={float(logits.float().max().item()):.6f} "
         f"elapsed_s={elapsed:.3f}",
