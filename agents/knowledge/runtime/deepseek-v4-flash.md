@@ -594,6 +594,32 @@ slowdown remains absent. The selective SM100a image uses 75 registers, nine
 barriers, no spills, and a compact repeated program of 467 barriers, 297
 compute instructions, and 1,301 memory instructions.
 
+Tracked one-layer job `20260811T051822Z-3024096` attributes 0.302--0.322 ms to
+the layer body and 0.328--0.330 ms to the complete FP8 head and argmax. The
+routed-expert join remains the largest layer group at 79--81 us; the query/KV
+and eight attention-output branches are already overlapped. A full tracked
+prime completed, but the instrumented image stalled on its second 43-layer
+launch. The exact benchmark orphan was identified and removed without touching
+other worker jobs. This is isolated from the zero-instrumentation production
+image, which remains repeatable over 30 launches.
+
+Two-layer tracked control job `20260811T052418Z-3031738` remained repeatable:
+the two SWA/hash layers measured 0.306--0.326 ms each, active-bank reloads were
+2.6--2.8 us each, the head was 0.327--0.330 ms, and clocks stayed at
+2.03--2.05 GHz. This confirms that neither layer placement nor the distributed
+reload introduces progressive work at small repeat count; full-model profile
+instrumentation itself needs a separate bounded repair before another all-layer
+counter trace.
+
+An adaptive-fusion experiment retained eight per-SM FP8-head maxima in one
+shared slot with `RegStore`/`RegLoad`, eliminating the full-logit round trip and
+one argmax stage. It was token-correct and a 30-sample full run measured a
+15.153 ms median, but a controlled revision A/B rejected it: committed baseline
+`b9f5357` measured 0.670 ms median for one layer plus head with a tight
+0.650--0.686 ms range, while the fused candidate repeated at 0.773 ms median
+and was bimodal over 0.631--0.806 ms. The apparent full-model gain was queue
+phase noise, so all fused source was reverted rather than retained.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
