@@ -504,6 +504,9 @@ class ResidentOneLaunchDecode:
         *,
         family: LayerFamily | None = None,
         weight_suffix: str | None = None,
+        base_sm: int | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         rows = source.reshape(-1, source.shape[-1])
         out_rows = output.reshape_as(rows)
@@ -525,7 +528,14 @@ class ResidentOneLaunchDecode:
         )
         if weights is not None:
             schedule = self._layered(schedule, family, weights)
-        return self._stage(name, schedule, rows.shape[0])
+        return self._stage(
+            name,
+            schedule,
+            rows.shape[0],
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
 
     def _hc_stages(
         self,
@@ -580,6 +590,25 @@ class ResidentOneLaunchDecode:
         cfg = self.config
         layer_id = family.representative
         kind = cfg.attention_kind(layer_id)
+        rope_table = self.main_rope if kind == "swa" else self.compress_rope
+        q_placement = self.policy.weighted_parallel_partition(
+            0, (cfg.q_lora_rank, cfg.head_dim)
+        )
+        kv_placement = self.policy.weighted_parallel_partition(
+            1, (cfg.q_lora_rank, cfg.head_dim)
+        )
+        q_base, q_sms = q_placement
+        kv_base, _ = kv_placement
+        q_quant_sms = min(
+            q_sms,
+            self.policy.quantize(cfg.q_lora_rank, 128).num_sms,
+        )
+        qkv_input_ready = f"{family.name}.attn.qkv.input.ready"
+        q_a_ready = f"{family.name}.attn.q_a.ready"
+        q_norm_ready = f"{family.name}.attn.q_norm.ready"
+        kv_ready = f"{family.name}.attn.kv.ready"
+        kv_norm_ready = f"{family.name}.attn.kv_norm.ready"
+        qkv_prefix_join = f"{family.name}.attn.qkv.prefix.join"
         stages, post = self._hc_stages(
             family, "attn", self.residual, self.next_residual
         )
@@ -589,6 +618,7 @@ class ResidentOneLaunchDecode:
                 self.norm_hidden,
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
+                release_group=qkv_input_ready,
             )
         )
         stages.append(
@@ -599,6 +629,9 @@ class ResidentOneLaunchDecode:
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
                 self.q_rank,
+                placement=q_placement,
+                wait_group=qkv_input_ready,
+                release_group=q_a_ready,
             )
         )
         stages.append(
@@ -608,6 +641,9 @@ class ResidentOneLaunchDecode:
                 self.q_rank_norm,
                 family=family,
                 weight_suffix="attn.q_norm.weight",
+                base_sm=q_base,
+                wait_group=q_a_ready,
+                release_group=q_norm_ready,
             )
         )
         stages.append(
@@ -616,25 +652,9 @@ class ResidentOneLaunchDecode:
                 self.q_rank_norm,
                 self.q_rank_fp8,
                 self.q_rank_fp8_scale,
-            )
-        )
-        stages.append(
-            self._fp8_linear_stage(
-                "attn.q_b",
-                family,
-                "attn.wq_b",
-                self.q_rank_fp8,
-                self.q_rank_fp8_scale,
-                self.q,
-            )
-        )
-        stages.append(self._rms_stage("attn.q_head_norm", self.q, self.q_norm))
-        rope_table = self.main_rope if kind == "swa" else self.compress_rope
-        stages.append(
-            self._stage(
-                "attn.q_rope",
-                SchedDsv4Rope512_64(self.q_norm, rope_table, self.q_rope),
-                self.policy.attention(cfg.num_heads, cfg.head_dim),
+                placement=(q_base, q_quant_sms),
+                wait_group=q_norm_ready,
+                release_group=qkv_prefix_join,
             )
         )
         stages.append(
@@ -645,6 +665,9 @@ class ResidentOneLaunchDecode:
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
                 self.kv,
+                placement=kv_placement,
+                wait_group=qkv_input_ready,
+                release_group=kv_ready,
             )
         )
         stages.append(
@@ -654,6 +677,9 @@ class ResidentOneLaunchDecode:
                 self.kv_norm,
                 family=family,
                 weight_suffix="attn.kv_norm.weight",
+                base_sm=kv_base,
+                wait_group=kv_ready,
+                release_group=kv_norm_ready,
             )
         )
         stages.append(
@@ -662,6 +688,28 @@ class ResidentOneLaunchDecode:
                 SchedDsv4Rope512_64(
                     self.kv_norm.reshape(1, -1), rope_table, self.kv_row
                 ),
+                base_sm=kv_base,
+                wait_group=kv_norm_ready,
+                release_group=qkv_prefix_join,
+            )
+        )
+        stages.append(
+            self._fp8_linear_stage(
+                "attn.q_b",
+                family,
+                "attn.wq_b",
+                self.q_rank_fp8,
+                self.q_rank_fp8_scale,
+                self.q,
+                wait_group=qkv_prefix_join,
+            )
+        )
+        stages.append(self._rms_stage("attn.q_head_norm", self.q, self.q_norm))
+        stages.append(
+            self._stage(
+                "attn.q_rope",
+                SchedDsv4Rope512_64(self.q_norm, rope_table, self.q_rope),
+                self.policy.attention(cfg.num_heads, cfg.head_dim),
             )
         )
 

@@ -893,6 +893,10 @@ def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():
         (100, 25),
         (125, 25),
     ]
+    assert [
+        policy.weighted_parallel_partition(branch, (1024, 512))
+        for branch in range(2)
+    ] == [(0, 101), (101, 51)]
     assert all(fp4.shard(sm)[1] % 8 == 0 for sm in range(fp4.num_sms))
     assert (quant.num_sms, quant.tile_rows) == (16, 16)
     assert attention.num_sms == 64

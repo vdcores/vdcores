@@ -516,6 +516,32 @@ the still-serial shared expert takes 33.1 us. The Q and KV paths take 45.5 and
 9.2 us, and the eight-way attention-output group now takes 27.5 us. These are
 the next broad overlap/adaptive-fusion candidates.
 
+### Shape-weighted Q-prefix/KV fan-out
+
+The independent query-prefix and KV projection chains now fan out immediately
+after the hidden-state FP8 quantizer and join only before `q_b`, the first
+query consumer that also requires completed KV state. Their contiguous SM
+partitions are derived from output shape: the 1,024-row Q branch receives 101
+SMs and the 512-row KV branch receives 51 SMs. Q projection, normalization,
+and quantization remain on the first partition; KV projection, normalization,
+and RoPE remain on the second. This is queue-level placement inside the same
+resident launch, with no intermediate copy or global pointer in a compute
+task.
+
+Matched production task probes measured 8.160 us for the Q projection at
+M1024/K4096 on 101 SMs and 8.064 us for KV at M512/K4096 on 51 SMs. The
+one-layer checkpoint gate, job `20260811T033437Z-2901475`, preserved token
+2835 over 20 samples at a 0.401 ms median. Full exploration job
+`20260811T033501Z-2902408` preserved token 14 at an 18.338 ms median.
+
+The 30-sample production acceptance, job `20260811T033838Z-2906723`,
+preserved token 14 and measured 18.343--19.036 ms, median 18.614 ms. The
+resident image uses 464 barriers, 1,089 compute instructions, and 3,564 memory
+instructions. This improves the 21.752 ms boundary by 3.138 ms (14.4%) and
+leaves 2.614 ms to the 16 ms target. Samples do not grow with token iteration,
+so the overlap did not reintroduce the earlier progressive queue-pressure
+failure.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

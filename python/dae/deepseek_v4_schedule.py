@@ -150,5 +150,28 @@ class DeepSeekV4ShapePolicy:
         width = self.resident_sms // branches
         return branch * width, width
 
+    def weighted_parallel_partition(
+        self, branch: int, weights: tuple[int, ...]
+    ) -> tuple[int, int]:
+        """Partition the grid by positive shape weights with one SM minimum."""
+        if not weights or len(weights) > self.resident_sms:
+            raise ValueError("weighted branches must fit the resident SM grid")
+        if any(weight <= 0 for weight in weights):
+            raise ValueError("parallel branch weights must be positive")
+        if not 0 <= branch < len(weights):
+            raise ValueError("parallel branch index is out of range")
+        remaining = self.resident_sms - len(weights)
+        total_weight = sum(weights)
+        extras = [remaining * weight // total_weight for weight in weights]
+        unassigned = remaining - sum(extras)
+        remainders = [remaining * weight % total_weight for weight in weights]
+        order = sorted(
+            range(len(weights)), key=lambda index: (-remainders[index], index)
+        )
+        for index in order[:unassigned]:
+            extras[index] += 1
+        widths = [extra + 1 for extra in extras]
+        return sum(widths[:branch]), widths[branch]
+
 
 __all__ = ["DeepSeekV4ShapePolicy", "ShapeAssignment"]
