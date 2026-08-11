@@ -88,10 +88,12 @@ __device__ __forceinline__ void allocwarp_execute(
     // allocator index. The loop control advances it once per logical body,
     // replacing per-load address-arithmetic instruction sequences.
     const int decoded_op = op(inst.opcode);
-    if (decoded_op >= op(OP_ALLOC_LAYER_TMA_LOAD_1D) &&
-        decoded_op <= op(OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D)) {
+    if ((decoded_op >= op(OP_ALLOC_LAYER_TMA_LOAD_1D) &&
+         decoded_op <= op(OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D)) ||
+        decoded_op == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D)) {
       const int entry_bytes =
-          decoded_op == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D) ? 16 : 8;
+          (decoded_op == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D) ||
+           decoded_op == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D)) ? 16 : 8;
       if (lane_id == 0) {
         inst.address += uint64_t(indirect_layer_index) * entry_bytes;
       }

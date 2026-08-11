@@ -388,7 +388,9 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break;
       }
       case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D):
-      case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D): {
+      case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D):
+      case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D):
+      case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D): {
         constexpr int kRouteCount = 6;
         constexpr int kHeaderInts = 12;
         // HBM descriptor: a fixed route-result pointer followed by the
@@ -419,6 +421,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         }
         if (resolved == 0) {
           asm volatile("trap;");
+        }
+        if (op(inst.opcode) == op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D) ||
+            op(inst.opcode) == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D)) {
+          routedBaseAddress = resolved;
         }
         __ldprint(
             "Indirect routed TMA 1D load: rank=%d field=%d size=%d "

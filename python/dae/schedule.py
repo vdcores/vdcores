@@ -84,12 +84,14 @@ class LayeredSchedule(Schedule):
 
     _ADDRESS_ONLY_OPS = {
         opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D & ~((1 << 6) - 1),
         opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D & ~((1 << 6) - 1),
     }
     _SUPPORTED_OPS = {
         opcode.OP_ALLOC_TMA_LOAD_1D & ~((1 << 6) - 1),
         opcode.OP_ALLOC_LDU_LOAD_1D & ~((1 << 6) - 1),
         opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D & ~((1 << 6) - 1),
         opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D & ~((1 << 6) - 1),
     }
 
@@ -181,8 +183,9 @@ class LayeredSchedule(Schedule):
         cache_key = (group_id, offset, base_opcode)
         pointer_table = self._pointer_cache.get(cache_key)
         if pointer_table is None:
-            if base_opcode == (
-                opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1)
+            if base_opcode in (
+                opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1),
+                opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D & ~((1 << 6) - 1),
             ):
                 if self.route_indices is None:
                     raise ValueError(

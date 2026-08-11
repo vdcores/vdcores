@@ -1530,6 +1530,8 @@ def _indirect_layer_opcode(base_opcode: int, layer_indexed: bool) -> int:
             opcode.OP_ALLOC_LAYER_LDU_LOAD_1D,
         opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D:
             opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D,
+        opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D:
+            opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D,
         opcode.OP_ALLOC_INDIRECT_INDEXED_TMA_LOAD_1D:
             opcode.OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D,
     }
@@ -1605,6 +1607,31 @@ class IndirectRoutedTmaLoad1D(MemoryInstruction):
         )
 
 
+class IndirectRoutedTmaLoadBase1D(IndirectRoutedTmaLoad1D):
+    """Resolve a layer-routed tile and cache its base in the issuing LDU."""
+
+    def __init__(
+        self,
+        state_descriptor,
+        route_rank: int,
+        pointer_field: int,
+        bytes: int,
+        *,
+        layer_indexed=False,
+    ):
+        super().__init__(
+            state_descriptor,
+            route_rank,
+            pointer_field,
+            bytes,
+            layer_indexed=False,
+        )
+        self.opcode = _indirect_layer_opcode(
+            opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D,
+            layer_indexed,
+        )
+
+
 class IndirectIndexedTmaLoad1D(MemoryInstruction):
     """Resolve an indexed-load record pointer before selecting its runtime row."""
 
@@ -1633,6 +1660,7 @@ def indirect_1d_from(
         opcode.OP_ALLOC_TMA_LOAD_1D & ~((1 << 6) - 1): IndirectTmaLoad1D,
         opcode.OP_ALLOC_LDU_LOAD_1D & ~((1 << 6) - 1): IndirectLduLoad1D,
         opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~((1 << 6) - 1): IndirectRoutedTmaLoad1D,
+        opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D & ~((1 << 6) - 1): IndirectRoutedTmaLoadBase1D,
         opcode.OP_ALLOC_INDEXED_TMA_LOAD_1D & ~((1 << 6) - 1): IndirectIndexedTmaLoad1D,
     }
     try:
@@ -1641,7 +1669,7 @@ def indirect_1d_from(
         raise ValueError(
             f"memory opcode {base_opcode:#x} has no indirect 1D form"
         ) from None
-    if builder is IndirectRoutedTmaLoad1D:
+    if builder in (IndirectRoutedTmaLoad1D, IndirectRoutedTmaLoadBase1D):
         replacement = builder(
             pointer_entry,
             inst.arg & 0x7,
@@ -2049,6 +2077,7 @@ __all__ = [
     "IndirectTmaLoad1D",
     "IndirectLduLoad1D",
     "IndirectRoutedTmaLoad1D",
+    "IndirectRoutedTmaLoadBase1D",
     "IndirectIndexedTmaLoad1D",
     "indirect_1d_from",
     "LduReloadBarriers",

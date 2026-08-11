@@ -22,6 +22,7 @@ from dae.instructions import (
     LoopC,
     LoopM,
     MemoryInstruction,
+    IndirectRoutedTmaLoadBase1D,
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
     LduProfileLayer,
@@ -173,6 +174,13 @@ def test_indirect_loads_keep_address_selection_in_ldu():
         16384,
         layer_indexed=True,
     )
+    routed_base = IndirectRoutedTmaLoadBase1D(
+        FakePointerTable(),
+        4,
+        511,
+        16384,
+        layer_indexed=True,
+    )
 
     assert direct.opcode == opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D
     assert layered.opcode == opcode.OP_ALLOC_LAYER_TMA_LOAD_1D
@@ -181,6 +189,9 @@ def test_indirect_loads_keep_address_selection_in_ldu():
     assert routed.opcode == opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D
     assert routed.arg == (511 << 3) | 4
     assert routed.num_slots == 2
+    assert routed_base.opcode == opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D
+    assert routed_base.arg == routed.arg
+    assert routed_base.num_slots == routed.num_slots
 
 
 def test_sequential_program_uses_stu_release_and_gates_both_ldu_ports():

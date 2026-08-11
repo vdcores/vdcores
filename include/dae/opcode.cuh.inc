@@ -72,6 +72,11 @@ DAE_OP(OP_ALLOC_TMA_LOAD_REG_1D, MK_MOP(40, MEM_OP_FLAGS_ALLOCATE))
 // rereading route metadata or pointer tables.
 DAE_OP(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(41, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D, MK_MOP(42, MEM_OP_FLAGS_ALLOCATE))
+// Indirect/layer forms combine the layer pointer-table selection with routed
+// base caching.  The descriptor remains entirely LDU-owned; compute observes
+// only the allocated shared slots.
+DAE_OP(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(43, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(44, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 
