@@ -11,6 +11,7 @@ from .instructions import (
     LoopC,
     LoopM,
     MemoryInstruction,
+    ProfileStep,
     ResetIndirectLayer,
 )
 from .runtime import config
@@ -36,6 +37,7 @@ class SequentialStage:
     wait_for_previous: bool = True
     wait_group: str | None = None
     release_group: str | None = None
+    profile_step_event: int | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +190,19 @@ class SequentialProgram:
         )
         if not 0 <= self.profile_event_count <= layer_profile_capacity:
             raise ValueError("layer profile events exceed the runtime profile row")
+        step_events = [
+            stage.profile_step_event
+            for stage in self.stages
+            if stage.profile_step_event is not None
+        ]
+        if len(step_events) != len(set(step_events)):
+            raise ValueError("step profile events must be unique")
+        if any(
+            event < config.layer_profile_event_base
+            or event >= config.reload_profile_event_base
+            for event in step_events
+        ):
+            raise ValueError("step profile events exceed the layer-profile range")
 
         self.instructions = [[] for _ in range(launcher.num_sms)]
         self.barriers = []
@@ -289,6 +304,20 @@ class SequentialProgram:
             for sm in range(launcher.num_sms):
                 instructions = []
                 _flatten(placed(sm), sm, instructions)
+                if (
+                    stage.profile_step_event is not None
+                    and any(
+                        isinstance(inst, ComputeInstruction)
+                        for inst in instructions
+                    )
+                ):
+                    instructions.insert(
+                        0,
+                        ProfileStep(stage.profile_step_event, begin=True),
+                    )
+                    instructions.append(
+                        ProfileStep(stage.profile_step_event, begin=False)
+                    )
                 rendered.append(instructions)
             if balance_load_ports:
                 _balance_load_ports(rendered)

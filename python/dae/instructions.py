@@ -1031,6 +1031,32 @@ class ProfileEvent(ComputeInstruction):
         )
 
 
+class ProfileStep(ComputeInstruction):
+    """Record one compute-side step duration and its M2C wait component.
+
+    A begin/end pair reuses one profile slot.  The runtime packs the elapsed
+    nanoseconds into the low 32 bits and the M2C-wait delta into the high 32
+    bits when the end marker executes.  This is diagnostic-only and never
+    joins a memory warp.
+    """
+
+    def __init__(self, event_id: int, *, begin: bool):
+        if not (
+            config.layer_profile_event_base
+            <= event_id
+            < config.reload_profile_event_base
+        ):
+            raise ValueError(
+                "step profile event id must fit the layer-profile range "
+                f"[{config.layer_profile_event_base}, "
+                f"{config.reload_profile_event_base}), got {event_id}"
+            )
+        super().__init__(
+            opcode=opcode.OP_PROFILE_EVENT,
+            args=[event_id, 2 if begin else 3],
+        )
+
+
 class LoopC(ComputeInstruction):
     def __init__(self, count: int, pc: int, reg: int = 0):
         assert 0 <= reg < config.num_loop_counters, (
@@ -2133,6 +2159,7 @@ __all__ = [
     "Dummy",
     "Copy",
     "ProfileEvent",
+    "ProfileStep",
     "LoopC",
     "MemoryInstruction",
     "TerminateM",

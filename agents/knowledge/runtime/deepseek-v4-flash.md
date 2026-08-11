@@ -1435,3 +1435,48 @@ The 32-op tracked build is spill-free at 78 registers, nine barriers, a
 m2c wait is now about 63%, allocator slot stall 66%, and LDU dependency wait
 64--66%. The accepted 14.880672-ms result beats the earlier 16-ms objective
 but remains 9.466517 ms above the strict 5.414155-ms framework target.
+
+## Barrier-free queued-step profiling (2026-08-11)
+
+The context-128 optimization boundary is revision `cb27544`. A fresh tracked
+full-network run measured a 15.154208-ms CUDA median and a 15.055872-ms
+internal span: 14.664736 ms in 43 transformer layers, 0.063520 ms in reloads,
+and 0.327616 ms in the output head. HCA-score and CSA-score layers had stable
+0.320496/0.364704-ms medians, so this boundary has no iteration-dependent
+layer slowdown.
+
+Diagnostic builds can wrap each queued stage's compute sequence in a paired
+`ProfileStep`. The begin marker stores low global-timer bits plus the current
+cumulative M2C-pop wait; the end marker replaces that slot with elapsed time
+and wait delta. It records only on SMs that execute compute for the stage.
+There is no new producer/consumer dependency, memory participant, issue
+barrier, compute/memory barrier, or thread fence. The existing profile row
+supports 62 stages per window; multiple one-layer launches cover longer
+families. Production operator images do not select `OP_PROFILE_EVENT`.
+
+The representative SWA/HCA/CSA natural layer frontiers were
+304.640/335.840/399.616 us, split into 208.768/232.416/294.656 us of
+attention and 95.872/103.424/104.960 us of FFN. Queued-step measurements show
+the following structural costs:
+
+- Sparse attention performs 60.832, 60.576, and 74.528 us of active compute
+  in SWA, HCA, and CSA. The associated M2C readiness wait is only 3.104 us in
+  SWA and 16.672--23.904 us in compressed families. The matched Triton task
+  is 26--33 us, so attention has a kernel gap independent of scheduler wait.
+- Each of the eight disjoint o_a branches performs about 18.4--21.0 us of
+  active projection work; o_b performs about 19.5--20.0 us. Later branches
+  can first wait 72--97 us in their local queue. Because branches overlap,
+  those waits must not be summed; natural join frontiers remain the source of
+  critical-path attribution.
+- Routed expert projections perform about 7.4--8.7 us each, while shared
+  expert projections perform about 13.4--14.6 us. Router compute is short but
+  begins after a 25--28-us readiness wait. CSA's main and index compressor
+  chains also contain several small compute steps separated by M2C waits.
+
+This separates the next board exploration into two mechanisms. First reduce
+the attention and dense FP8 active task times against Triton/FA4/FlashInfer
+and DeepGEMM references. Then shorten concrete readiness edges or revise
+shape-derived placement where the per-step counters show idle queues. Keep
+the accepted one-SM-per-head attention placement until a bounded, liveness-
+safe alternative passes repeated launches; do not reuse the abandoned
+grouped multi-SM schedule.

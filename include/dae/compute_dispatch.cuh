@@ -927,19 +927,38 @@ DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
   // Diagnostic-only schedule marker.  Synchronize only the four compute
   // warps: the memory warps are independent VM roles and never join this
   // barrier.  Production images do not select this opcode.
+  const int mode = inst.args[1];
   int dependency_slots = 0;
-  if (inst.args[1] != 0) {
+  if (mode == 1) {
     dependency_slots = m2c.template pop<0>();
   }
   __sync_compute_group(128);
   if (thread_id == 0) {
     const int event_id = inst.args[0];
     if (event_id >= 2 && event_id < numProfileEvents) {
-      g_events[sm_id * numProfileEvents + event_id] =
-          cuda::ptx::get_sreg_globaltimer();
+      uint64_t &event = g_events[sm_id * numProfileEvents + event_id];
+#if defined(DAE_TRACK_PROFILE)
+      if (mode == 2) {
+        const uint32_t timer =
+            static_cast<uint32_t>(cuda::ptx::get_sreg_globaltimer());
+        const uint32_t wait = static_cast<uint32_t>(m2c.track_wait_ns);
+        event = (static_cast<uint64_t>(wait) << 32) | timer;
+      } else if (mode == 3) {
+        const uint64_t begin = event;
+        const uint32_t elapsed =
+            static_cast<uint32_t>(cuda::ptx::get_sreg_globaltimer()) -
+            static_cast<uint32_t>(begin);
+        const uint32_t wait = static_cast<uint32_t>(m2c.track_wait_ns) -
+            static_cast<uint32_t>(begin >> 32);
+        event = (static_cast<uint64_t>(wait) << 32) | elapsed;
+      } else
+#endif
+      {
+        event = cuda::ptx::get_sreg_globaltimer();
+      }
     }
   }
-  if (inst.args[1] != 0) {
+  if (mode == 1) {
     c2m.push(thread_id, dependency_slots);
   }
 }

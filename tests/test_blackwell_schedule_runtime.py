@@ -34,6 +34,7 @@ from dae.instructions import (
     Nvfp4GemvUmmaStreamSm100,
     Nvfp4UmmaPrepackSm100,
     ProfileEvent,
+    ProfileStep,
     RepeatM,
     ResetIndirectLayer,
     RoutedTmaLoad1D,
@@ -1189,6 +1190,67 @@ def test_profile_event_reserves_kernel_start_and_end_slots():
     assert ProfileEvent(18, wait_for_memory=True).args == [18, 1]
     with pytest.raises(ValueError, match="slots 0/1"):
         ProfileEvent(1)
+
+
+def test_profile_step_encodes_paired_counter_modes():
+    assert ProfileStep(17, begin=True).args == [17, 2]
+    assert ProfileStep(17, begin=False).args == [17, 3]
+    with pytest.raises(ValueError, match="layer-profile range"):
+        ProfileStep(config.reload_profile_event_base, begin=True)
+
+
+def test_sequential_step_profile_does_not_add_a_dependency_barrier():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 32
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            return bar_id
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = SequentialProgram(
+        launcher,
+        (
+            SequentialStage(
+                "profiled",
+                BasicStage(),
+                1,
+                profile_step_event=config.layer_profile_event_base,
+            ),
+        ),
+    )
+    compute = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, ComputeInstruction)
+    ]
+    assert [inst.args[1] for inst in compute if isinstance(inst, ProfileStep)] == [2, 3]
+    assert launcher.num_bars == 0
 
 
 def test_ldu_layer_profile_encodes_internal_counter_range():

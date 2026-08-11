@@ -1905,6 +1905,8 @@ class ResidentOneLaunchDecode:
     def _build_program(self) -> None:
         serial_sm = 0
         self.stage_profile_labels: list[str] = []
+        self.step_profile_records: list[tuple[int, str, int, int, int]] = []
+        self.step_profile_total = 0
 
         def profile_stage(name: str) -> bool:
             if not self.args.profile_stages:
@@ -1944,6 +1946,7 @@ class ResidentOneLaunchDecode:
             prefix: str = "",
             *,
             profile_after: bool = False,
+            profile_step_event: int | None = None,
         ) -> SequentialStage:
             nonlocal serial_sm
             base_sm = 0 if stage.base_sm is None else stage.base_sm
@@ -1960,10 +1963,12 @@ class ResidentOneLaunchDecode:
                 wait_for_previous=stage.wait_for_previous,
                 wait_group=stage.wait_group,
                 release_group=stage.release_group,
+                profile_step_event=profile_step_event,
             )
 
         def queued_family(family: LayerFamily) -> list[SequentialStage]:
             stages = self.family_stages[family.representative]
+            self.step_profile_total = len(stages)
             queued_stages = []
             for index, stage in enumerate(stages):
                 stage_profile_after = profile_stage(stage.name)
@@ -1974,13 +1979,37 @@ class ResidentOneLaunchDecode:
                         else stage.name
                     )
                     self.stage_profile_labels.append(label)
-                queued_stages.append(queued(
+                step_event = None
+                if (
+                    self.args.profile_steps
+                    and self.args.profile_step_start
+                    <= index
+                    < self.args.profile_step_start + self.args.profile_step_count
+                ):
+                    step_event = (
+                        runtime_config.layer_profile_event_base
+                        + index
+                        - self.args.profile_step_start
+                    )
+                queued_stage = queued(
                     stage,
                     f"{family.name}.",
                     profile_after=(
                         self.args.profile_layers and index + 1 == len(stages)
                     ) or stage_profile_after,
-                ))
+                    profile_step_event=step_event,
+                )
+                queued_stages.append(queued_stage)
+                if step_event is not None:
+                    self.step_profile_records.append(
+                        (
+                            index,
+                            stage.name,
+                            step_event,
+                            queued_stage.base_sm,
+                            queued_stage.num_sms,
+                        )
+                    )
             return queued_stages
 
         self.launcher = Launcher(self.sms, device=self.device)
@@ -2056,7 +2085,8 @@ class ResidentOneLaunchDecode:
             f"barriers={len(self.program.barriers)} "
             f"compute_insts={self.program.max_compute_instructions} "
             f"memory_insts={self.program.max_memory_instructions} "
-            f"layer_profile_events={self.program.profile_event_count}",
+            f"layer_profile_events={self.program.profile_event_count} "
+            f"step_profile_events={len(self.step_profile_records)}",
             flush=True,
         )
         if self.args.profile_layers and self.program.profile_event_count != self.args.layers:
@@ -2069,6 +2099,10 @@ class ResidentOneLaunchDecode:
         ):
             raise AssertionError(
                 "internal stage counter does not cover every requested boundary"
+            )
+        if self.args.profile_steps and not self.step_profile_records:
+            raise AssertionError(
+                "step profile window does not overlap this layer's queued steps"
             )
         if self.args.profile_layers:
             for family in self.families:
@@ -2367,6 +2401,92 @@ class ResidentOneLaunchDecode:
             flush=True,
         )
 
+    def report_step_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_steps:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "step profiling requires a runtime built with track_profile=1"
+            )
+
+        summed_local_elapsed_ns = 0
+        summed_wait_ns = 0
+        for (
+            step_index,
+            name,
+            event_id,
+            base_sm,
+            num_sms,
+        ) in self.step_profile_records:
+            samples = []
+            for sm in range(base_sm, base_sm + num_sms):
+                packed = int(profile[sm, event_id])
+                if packed == 0:
+                    continue
+                samples.append(
+                    (
+                        sm,
+                        packed & 0xFFFFFFFF,
+                        (packed >> 32) & 0xFFFFFFFF,
+                    )
+                )
+            if not samples:
+                raise RuntimeError(
+                    f"step profile event {event_id} for {name!r} was not recorded"
+                )
+            critical_sm, elapsed_ns, wait_ns = max(
+                samples, key=lambda sample: sample[1]
+            )
+            active_samples = [
+                (sm, max(0, sample_elapsed_ns - sample_wait_ns))
+                for sm, sample_elapsed_ns, sample_wait_ns in samples
+            ]
+            max_active_sm, max_active_ns = max(
+                active_samples,
+                key=lambda sample: sample[1],
+            )
+            active_ns = max(0, elapsed_ns - wait_ns)
+            summed_local_elapsed_ns += elapsed_ns
+            summed_wait_ns += wait_ns
+            elapsed_values = [sample[1] for sample in samples]
+            active_values = [sample[1] for sample in active_samples]
+            print(
+                "DSV4_STEP_TIME "
+                f"step={step_index} name={name} "
+                f"base_sm={base_sm} assigned_sms={num_sms} "
+                f"active_sms={len(samples)} critical_sm={critical_sm} "
+                f"elapsed_us={elapsed_ns / 1.0e3:.3f} "
+                f"median_elapsed_us={statistics.median(elapsed_values) / 1.0e3:.3f} "
+                f"m2c_wait_us={wait_ns / 1.0e3:.3f} "
+                f"compute_active_us={active_ns / 1.0e3:.3f} "
+                f"max_active_sm={max_active_sm} "
+                f"max_compute_active_us={max_active_ns / 1.0e3:.3f} "
+                f"median_compute_active_us="
+                f"{statistics.median(active_values) / 1.0e3:.3f} "
+                f"m2c_wait_pct={100.0 * wait_ns / elapsed_ns if elapsed_ns else 0.0:.3f}",
+                flush=True,
+            )
+        print(
+            "DSV4_STEP_PROFILE_SUMMARY "
+            f"window_start={self.args.profile_step_start} "
+            f"window_steps={len(self.step_profile_records)} "
+            f"layer_steps={self.step_profile_total} "
+            f"summed_local_elapsed_us={summed_local_elapsed_ns / 1.0e3:.3f} "
+            f"summed_local_m2c_wait_us={summed_wait_ns / 1.0e3:.3f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -2430,6 +2550,29 @@ def main() -> None:
         help="record selected one-layer stage-group completion frontiers",
     )
     parser.add_argument(
+        "--profile-steps",
+        action="store_true",
+        help=(
+            "record per-queued-step compute-side duration and M2C wait without "
+            "adding a dependency barrier"
+        ),
+    )
+    parser.add_argument(
+        "--profile-step-start",
+        type=int,
+        default=0,
+        help="first queued layer step included by --profile-steps",
+    )
+    parser.add_argument(
+        "--profile-step-count",
+        type=int,
+        default=(
+            runtime_config.reload_profile_event_base
+            - runtime_config.layer_profile_event_base
+        ),
+        help="number of queued layer steps included by --profile-steps",
+    )
+    parser.add_argument(
         "--profile-all-samples",
         action="store_true",
         help="report layer frontiers and aggregate counters for every sample",
@@ -2450,11 +2593,29 @@ def main() -> None:
         parser.error("sms/iterations must be positive and warmup non-negative")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
-    if args.profile_layers and args.profile_stages:
-        parser.error("--profile-layers and --profile-stages are mutually exclusive")
-    if args.profile_stages and args.layers != 1:
-        parser.error("--profile-stages requires --layers 1")
-    if args.profile_all_samples and not (args.profile_layers or args.profile_stages):
+    profile_modes = sum(
+        (args.profile_layers, args.profile_stages, args.profile_steps)
+    )
+    if profile_modes > 1:
+        parser.error(
+            "--profile-layers, --profile-stages, and --profile-steps are mutually exclusive"
+        )
+    if (args.profile_stages or args.profile_steps) and args.layers != 1:
+        parser.error("stage/step profiling requires --layers 1")
+    step_capacity = (
+        runtime_config.reload_profile_event_base
+        - runtime_config.layer_profile_event_base
+    )
+    if (
+        args.profile_step_start < 0
+        or not 1 <= args.profile_step_count <= step_capacity
+    ):
+        parser.error(
+            f"step profile window requires start >= 0 and count in [1,{step_capacity}]"
+        )
+    if not args.profile_steps and args.profile_step_start != 0:
+        parser.error("--profile-step-start requires --profile-steps")
+    if args.profile_all_samples and not profile_modes:
         parser.error("--profile-all-samples requires a profiling mode")
 
     device = torch.device("cuda")
@@ -2494,7 +2655,7 @@ def main() -> None:
     for iteration in range(args.iterations):
         token, elapsed_ms, logits = flow.run_once()
         timings.append(elapsed_ms)
-        if args.profile_layers or args.profile_stages:
+        if profile_modes:
             profile_samples.append(flow.launcher.profile.cpu().clone())
         print(
             "DSV4_ONE_LAUNCH_SAMPLE "
@@ -2511,7 +2672,7 @@ def main() -> None:
             f"expected {args.expected_token_id}"
         )
     assert logits is not None
-    if args.profile_layers or args.profile_stages:
+    if profile_modes:
         median_timing = statistics.median(timings)
         profile_index = min(
             range(len(timings)),
@@ -2523,11 +2684,12 @@ def main() -> None:
             else (profile_index,)
         )
         for sample_index in profile_indices:
-            reporter = (
-                flow.report_layer_profile
-                if args.profile_layers
-                else flow.report_stage_profile
-            )
+            if args.profile_layers:
+                reporter = flow.report_layer_profile
+            elif args.profile_stages:
+                reporter = flow.report_stage_profile
+            else:
+                reporter = flow.report_step_profile
             reporter(
                 profile_samples[sample_index],
                 sample_index=sample_index,
