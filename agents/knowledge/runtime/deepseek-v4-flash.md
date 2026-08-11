@@ -1192,15 +1192,25 @@ DeepGEMM medians were respectively 5.9816, 6.5608, 5.9952, and 8.9768 us.
 The native SM100 MXF8 proof preprocesses each immutable weight into combined
 M128/K128 data-plus-scale records and directly quantizes BF16 into combined
 N8/K128 activation records. Token-time compute receives only allocator-owned
-shared addresses, keeps activation chunks through `TmaLoadReg1D`/`RegLoad`,
-and streams weights in a bounded K loop. There is no raw/global compute
-pointer, intermediate layout copy, indirect store, issue barrier, thread
-fence, or full K unroll. FP8 activation records require a 2,048-byte stride:
-the natural 1,536-byte payload put every odd UTCCP scale descriptor on only a
-512-byte boundary and corrupted K tile 1. Padding to the next 1,024-byte scale
-boundary made weight data, weight scales, direct activation layout, and BF16
-output exact for K128 through K8192. Zero blocks also bypass floating division
-so fast-math FTZ cannot create NaN FP8 data.
+shared addresses and streams both operands in bounded K loops. There is no
+raw/global compute pointer, intermediate layout copy, indirect store, issue
+barrier, thread fence, or full K unroll. FP8 activation records require a
+2,048-byte stride: the natural 1,536-byte payload put every odd UTCCP scale
+descriptor on only a 512-byte boundary and corrupted K tile 1. Padding to the
+next 1,024-byte scale boundary made weight data, weight scales, direct
+activation layout, and BF16 output exact for K128 through K8192. Zero blocks
+also bypass floating division so fast-math FTZ cannot create NaN FP8 data.
+
+The first integration retained one 16-KiB activation allocation while eight
+16,896-byte weight records streamed. That is not a valid VDCores slot plan:
+the activation consumes two 8-KiB slots and each weight consumes three, so the
+load window can demand 26 slots from the 24-slot arena. It intermittently
+deadlocked after 3--11 repeated full-depth launches. Neither removing
+`LoadReg` reuse nor changing the LDU dependency poll fixed it. The accepted
+schedule instead loads four activation records as one 8-KiB, one-slot chunk,
+streams at most four three-slot weights, then releases the chunk. Its peak
+operand footprint is 13 slots and it completed the repeated-depth and
+production liveness gates.
 
 The native task is selectively profitable. Exact production-shape medians are
 18.848 us for M1024/K4096, 11.296 us for M32768/K1024, and 39.600 us for
@@ -1213,3 +1223,31 @@ these variants are not part of the accepted policy. The spill-free selective
 image uses 44 registers, nine barriers, a 112-byte stack, and 2,192 bytes of
 static shared memory. Integrate only q_b, then require an exact full-network
 measurement before accepting an end-to-end milestone.
+
+## Resident native FP8 q_b milestone (2026-08-11)
+
+The resident loader now converts only main-attention and indexer q_b checkpoint
+linears into native M128/K128 records while each shard is loaded. Raw E4M3 data
+and UE8M0 scales are staged in their final resident span, converted with one
+shape-reused temporary, and overwritten in place. The complete checkpoint is
+never duplicated. Native q_b storage raises the resident image only from
+153.379 to 153.426 GiB and leaves 29.795 GiB free on the 184-GiB B300.
+
+The production graph directly quantizes the normalized 1,024-wide q rank into
+eight 2,048-byte native activation records. Main q_b uses 152 SMs; the
+8,192-row index q_b uses 64 SMs. Both use LDU1 for bounded one-slot activation
+chunks and LDU0 for combined data-plus-scale weight records. The final bounded
+task is exact at M32768/K1024 and measures 12.032 us in its task benchmark,
+versus 23.424 us for the scalar VDCores q_b task. q_a, o_a, o_b, shared
+experts, and the vocabulary head remain on their measured faster scalar FP8
+paths.
+
+Production job `20260811T123330Z-2057880` used one GPU, one persistent launch,
+the durable `/mnt` checkpoint, three warmups, and 30 timed tokens. It preserved
+reference token 14 and measured 11.459520/11.593600/11.739296 ms
+min/median/max. This improves the prior accepted 11.652480-ms median by
+0.058880 ms (0.51%) and is 4.406400 ms under the 16-ms target. First/last-15
+medians were 11.594176/11.593024 ms; no progressive slowdown or liveness stall
+remained. The one-launch image has 418 barriers and 245/1,213 maximum
+compute/memory instructions. Its 32-op SM100a binary uses 70 registers, nine
+barriers, a 96-byte stack, 2,448 bytes static shared memory, and no spills.

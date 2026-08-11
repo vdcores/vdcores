@@ -40,7 +40,7 @@ def main() -> None:
     if args.m <= 0 or args.k <= 0 or args.m % 128 or args.k % 128:
         parser.error("M and K must be positive multiples of 128")
     if args.k > 8192:
-        parser.error("the native activation register path supports K <= 8192")
+        parser.error("the native MXF8 path supports K <= 8192")
     if min(args.warmup, args.iterations) <= 0:
         parser.error("timing counts must be positive")
 

@@ -110,8 +110,20 @@ class NativeNvfp4LinearCheckpointTensors:
         return (self.weight_scale_2 * self.input_scale).reshape(1)
 
 
+@dataclass(frozen=True)
+class NativeFp8LinearCheckpointTensors:
+    """Combined SM100 MXF8 weight tiles for one resident FP8 linear."""
+
+    prefix: str
+    weight_tiles: object
+
+
 def _native_nvfp4_name(prefix: str) -> str:
     return f"{prefix}.__vdcores_native_weight"
+
+
+def _native_fp8_name(prefix: str) -> str:
+    return f"{prefix}.__vdcores_native_fp8_weight"
 
 
 def _put(
@@ -647,6 +659,7 @@ class DeepSeekV4ResidentCheckpoint:
         tensor_bytes: int,
         storage_bytes: int,
         native_nvfp4_prefixes: Iterable[str] = (),
+        native_fp8_prefixes: Iterable[str] = (),
     ) -> None:
         self.source = checkpoint
         self.config = checkpoint.config
@@ -658,6 +671,7 @@ class DeepSeekV4ResidentCheckpoint:
         self.tensor_bytes = tensor_bytes
         self.storage_bytes = storage_bytes
         self.native_nvfp4_prefixes = frozenset(native_nvfp4_prefixes)
+        self.native_fp8_prefixes = frozenset(native_fp8_prefixes)
 
     @classmethod
     def from_checkpoint(
@@ -669,6 +683,7 @@ class DeepSeekV4ResidentCheckpoint:
         alignment: int = 256,
         reserve_bytes: int = 0,
         native_nvfp4: bool = False,
+        native_fp8_prefixes: Iterable[str] = (),
         progress: Callable[[int, int, str, int, int], None] | None = None,
     ) -> "DeepSeekV4ResidentCheckpoint":
         """Pack selected tensors into aligned per-shard device storage.
@@ -694,8 +709,9 @@ class DeepSeekV4ResidentCheckpoint:
         target_device = torch.device(device)
         if target_device.type == "cuda" and target_device.index is None:
             target_device = torch.device("cuda", torch.cuda.current_device())
-        if native_nvfp4 and target_device.type != "cuda":
-            raise ValueError("native resident NVFP4 packing requires a CUDA device")
+        requested_native_fp8 = frozenset(native_fp8_prefixes)
+        if (native_nvfp4 or requested_native_fp8) and target_device.type != "cuda":
+            raise ValueError("native resident packing requires a CUDA device")
 
         expected = None
         if names is None:
@@ -756,6 +772,40 @@ class DeepSeekV4ResidentCheckpoint:
                     (rows // 128, packed_k // 128, 18432),
                 )
 
+        native_fp8_pairs: dict[
+            str, tuple[str, str, tuple[int, int, int]]
+        ] = {}
+        for prefix in requested_native_fp8:
+            weight_name = f"{prefix}.weight"
+            scale_name = f"{prefix}.scale"
+            if weight_name not in selected_name_set or scale_name not in selected_name_set:
+                raise ValueError(
+                    f"native FP8 prefix {prefix} is not fully resident"
+                )
+            weight_spec = specs[weight_name]
+            scale_spec = specs[scale_name]
+            if weight_spec.dtype != "F8_E4M3" or len(weight_spec.shape) != 2:
+                raise ValueError(f"{prefix} is not a rank-2 E4M3 linear")
+            rows, k = weight_spec.shape
+            if (
+                rows % 128
+                or k % 128
+                or scale_spec.dtype != "F8_E8M0"
+                or scale_spec.shape != (rows // 128, k // 128)
+            ):
+                raise ValueError(
+                    f"{prefix} cannot be converted to native M128/K128 tiles"
+                )
+            if checkpoint.weight_map[weight_name] != checkpoint.weight_map[scale_name]:
+                raise ValueError(
+                    f"{prefix} weight and scale must share one checkpoint shard"
+                )
+            native_fp8_pairs[prefix] = (
+                weight_name,
+                scale_name,
+                (rows // 128, k // 128, 16896),
+            )
+
         grouped: dict[str, list[str]] = defaultdict(list)
         for name in selected_names:
             grouped[checkpoint.weight_map[name]].append(name)
@@ -771,7 +821,18 @@ class DeepSeekV4ResidentCheckpoint:
                 for weight_name, scale_name, shape in native_pairs.values()
                 if checkpoint.weight_map[weight_name] == filename
             }
-            paired_scales = {scale_name for scale_name, _ in weight_to_pair.values()}
+            fp8_weight_to_pair = {
+                weight_name: (scale_name, shape)
+                for weight_name, scale_name, shape in native_fp8_pairs.values()
+                if checkpoint.weight_map[weight_name] == filename
+            }
+            paired_scales = {
+                scale_name
+                for scale_name, _ in (
+                    *weight_to_pair.values(),
+                    *fp8_weight_to_pair.values(),
+                )
+            }
             ordered_names = []
             emitted = set()
             for name in grouped[filename]:
@@ -783,12 +844,33 @@ class DeepSeekV4ResidentCheckpoint:
                     scale_name, _ = weight_to_pair[name]
                     ordered_names.append(scale_name)
                     emitted.add(scale_name)
-            for name in ordered_names:
+                elif name in fp8_weight_to_pair:
+                    scale_name, _ = fp8_weight_to_pair[name]
+                    ordered_names.append(scale_name)
+                    emitted.add(scale_name)
+            index = 0
+            while index < len(ordered_names):
+                name = ordered_names[index]
                 offset = (offset + alignment - 1) & -alignment
                 spec = specs[name]
                 entries.append((name, offset, spec))
-                offset += spec.nbytes
                 total_tensor_bytes += spec.nbytes
+                if name in fp8_weight_to_pair:
+                    scale_name, native_shape = fp8_weight_to_pair[name]
+                    scale_spec = specs[scale_name]
+                    scale_offset = offset + spec.nbytes
+                    entries.append((scale_name, scale_offset, scale_spec))
+                    total_tensor_bytes += scale_spec.nbytes
+                    native_bytes = math.prod(native_shape)
+                    if spec.nbytes + scale_spec.nbytes > native_bytes:
+                        raise ValueError(
+                            f"{name} raw FP8 span exceeds native storage"
+                        )
+                    offset += native_bytes
+                    index += 2
+                    continue
+                offset += spec.nbytes
+                index += 1
             shard_layouts.append((filename, offset, entries))
             total_storage_bytes += offset
 
@@ -835,7 +917,10 @@ class DeepSeekV4ResidentCheckpoint:
             }
             native_source_names = {
                 name
-                for weight_name, scale_name, _ in native_pairs.values()
+                for weight_name, scale_name, _ in (
+                    *native_pairs.values(),
+                    *native_fp8_pairs.values(),
+                )
                 for name in (weight_name, scale_name)
             }
             for name, offset, spec in entries:
@@ -843,7 +928,7 @@ class DeepSeekV4ResidentCheckpoint:
                     continue
                 raw = storage[offset : offset + spec.nbytes]
                 resident_tensors[name] = raw.view(dtypes[name]).reshape(spec.shape)
-            if native_pairs:
+            if native_pairs or native_fp8_pairs:
                 from . import runtime
 
                 temporaries = {}
@@ -877,6 +962,41 @@ class DeepSeekV4ResidentCheckpoint:
                     ].reshape(native_shape)
                     native.copy_(temporary)
                     resident_tensors[_native_nvfp4_name(prefix)] = native
+                fp8_temporaries = {}
+                for prefix, (
+                    weight_name,
+                    scale_name,
+                    native_shape,
+                ) in native_fp8_pairs.items():
+                    if checkpoint.weight_map[weight_name] != filename:
+                        continue
+                    weight_offset, weight_spec = entry_by_name[weight_name]
+                    scale_offset, scale_spec = entry_by_name[scale_name]
+                    if scale_offset != weight_offset + weight_spec.nbytes:
+                        raise ValueError(
+                            f"{prefix} resident FP8 weight/scale span is not contiguous"
+                        )
+                    weight = storage[
+                        weight_offset : weight_offset + weight_spec.nbytes
+                    ].view(dtypes[weight_name]).reshape(weight_spec.shape)
+                    checkpoint_scale = storage[
+                        scale_offset : scale_offset + scale_spec.nbytes
+                    ].view(dtypes[scale_name]).reshape(scale_spec.shape)
+                    temporary = fp8_temporaries.get(native_shape)
+                    if temporary is None:
+                        temporary = torch.empty(
+                            native_shape, dtype=torch.uint8, device=target_device
+                        )
+                        fp8_temporaries[native_shape] = temporary
+                    runtime.prepack_fp8_checkpoint(
+                        weight, checkpoint_scale, temporary
+                    )
+                    native_bytes = math.prod(native_shape)
+                    native = storage[
+                        weight_offset : weight_offset + native_bytes
+                    ].reshape(native_shape)
+                    native.copy_(temporary)
+                    resident_tensors[_native_fp8_name(prefix)] = native
             loaded_storage_bytes += shard_bytes
             if progress is not None:
                 progress(
@@ -895,6 +1015,7 @@ class DeepSeekV4ResidentCheckpoint:
             tensor_bytes=total_tensor_bytes,
             storage_bytes=total_storage_bytes,
             native_nvfp4_prefixes=native_pairs,
+            native_fp8_prefixes=native_fp8_pairs,
         )
 
     def _check_device(self, device) -> None:
@@ -986,6 +1107,19 @@ class DeepSeekV4ResidentCheckpoint:
             input_scale=tensors[names[2]],
         )
 
+    def load_native_fp8_linear(
+        self,
+        prefix: str,
+        *,
+        device="cpu",
+    ) -> NativeFp8LinearCheckpointTensors:
+        name = _native_fp8_name(prefix)
+        tensor = self.load_tensors((name,), device=device)[name]
+        return NativeFp8LinearCheckpointTensors(
+            prefix=prefix,
+            weight_tiles=tensor,
+        )
+
 
 __all__ = [
     "INDEX_FILENAME",
@@ -995,6 +1129,7 @@ __all__ = [
     "Fp8LinearCheckpointTensors",
     "Nvfp4LinearCheckpointTensors",
     "NativeNvfp4LinearCheckpointTensors",
+    "NativeFp8LinearCheckpointTensors",
     "DeepSeekV4Checkpoint",
     "DeepSeekV4ResidentCheckpoint",
     "expected_inference_tensor_specs",

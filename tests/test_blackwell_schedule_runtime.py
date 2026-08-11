@@ -408,12 +408,10 @@ def test_dsv4_nvfp4_native_quant_encodes_k_tile_count():
     assert instruction.args == [1]
 
 
-def test_fp8_streaming_umma_encodes_chunks_and_retention():
-    instruction = Fp8GemvUmmaStreamSm100(
-        64, 3, retain_activation=True
-    )
+def test_fp8_streaming_umma_encodes_k_tiles():
+    instruction = Fp8GemvUmmaStreamSm100(64)
 
-    assert instruction.args == [64, 3, 1]
+    assert instruction.args == [64]
 
 
 def test_fp8_umma_prepack_encodes_kind_and_k_tile_count():
@@ -430,13 +428,13 @@ def test_dsv4_fp8_native_quant_encodes_k_tile_count():
     assert instruction.args == [1]
 
 
-def test_fp8_native_stream_retains_activation_across_shape_shard(monkeypatch):
+def test_fp8_native_stream_bounds_activation_chunks_to_one_slot(monkeypatch):
     monkeypatch.setattr(
         "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
     )
     schedule = SchedFp8GemvUmmaStream(
-        torch.empty((3, 2, 16896), dtype=torch.uint8),
-        torch.empty((2, 2048), dtype=torch.uint8),
+        torch.empty((3, 8, 16896), dtype=torch.uint8),
+        torch.empty((8, 2048), dtype=torch.uint8),
         torch.empty((384,), dtype=torch.bfloat16),
     ).place(2)
 
@@ -446,9 +444,23 @@ def test_fp8_native_stream_retains_activation_across_shape_shard(monkeypatch):
         if isinstance(inst, Fp8GemvUmmaStreamSm100)
     ]
 
-    assert [inst.args for inst in compute] == [[2, 1, 1], [2, 1, 0]]
-    assert any(isinstance(inst, TmaLoadReg1D) for inst in instructions)
-    assert any(isinstance(inst, RegLoad) for inst in instructions)
+    assert [inst.args for inst in compute] == [[8], [8]]
+    assert not any(isinstance(inst, TmaLoadReg1D) for inst in instructions)
+    assert not any(isinstance(inst, RegLoad) for inst in instructions)
+    activation_loads = [
+        inst
+        for inst in instructions
+        if isinstance(inst, MemoryInstruction) and inst.size == 4 * 2048
+    ]
+    weight_loads = [
+        inst
+        for inst in instructions
+        if isinstance(inst, MemoryInstruction) and inst.size == 16896
+    ]
+    assert len(activation_loads) == 4
+    assert all(inst.num_slots == 1 for inst in activation_loads)
+    assert len(weight_loads) == 16
+    assert all(inst.num_slots == 3 for inst in weight_loads)
 
 
 def test_dsv4_shard_swiglu_encodes_bound_and_width():

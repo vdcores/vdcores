@@ -33,6 +33,7 @@ from dae.schedule import (
     SchedArgmaxSmemReduce,
     SchedDsv4Bf16Gemv,
     SchedDsv4ExpertReduce,
+    SchedDsv4Fp8QuantUmmaB,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
     SchedDsv4Hadamard,
@@ -45,6 +46,7 @@ from dae.schedule import (
     SchedDsv4SparseAttention512,
     SchedDsv4SwiGluShard128,
     SchedFp8Block128Gemv,
+    SchedFp8GemvUmmaStream,
     SchedRMS,
     SchedRoutedDsv4Nvfp4QuantUmmaB,
     SchedRoutedNvfp4GemvUmmaStream,
@@ -145,6 +147,22 @@ class ResidentOneLaunchDecode:
             names=names,
             reserve_bytes=int(self.args.resident_reserve_gib * (1 << 30)),
             native_nvfp4=True,
+            native_fp8_prefixes=(
+                tuple(
+                    prefix
+                    for layer_id in range(self.args.layers)
+                    for prefix in (
+                        f"layers.{layer_id}.attn.wq_b",
+                        *(
+                            (f"layers.{layer_id}.attn.indexer.wq_b",)
+                            if self.config.attention_kind(layer_id) == "csa"
+                            else ()
+                        ),
+                    )
+                )
+                if self.args.fp8_qb_mode == "native"
+                else ()
+            ),
             progress=progress,
         )
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
@@ -291,10 +309,19 @@ class ResidentOneLaunchDecode:
         )
         self.q_rank = torch.empty((cfg.q_lora_rank,), dtype=torch.bfloat16, device=d)
         self.q_rank_norm = torch.empty_like(self.q_rank)
-        self.q_rank_fp8 = torch.empty_like(self.q_rank, dtype=torch.float8_e4m3fn)
-        self.q_rank_fp8_scale = torch.empty(
-            (cfg.q_lora_rank // 128,), dtype=torch.float8_e8m0fnu, device=d
-        )
+        if self.args.fp8_qb_mode == "native":
+            self.q_rank_native_fp8 = torch.empty(
+                (cfg.q_lora_rank // 128, 2048), dtype=torch.uint8, device=d
+            )
+        else:
+            self.q_rank_fp8 = torch.empty_like(
+                self.q_rank, dtype=torch.float8_e4m3fn
+            )
+            self.q_rank_fp8_scale = torch.empty(
+                (cfg.q_lora_rank // 128,),
+                dtype=torch.float8_e8m0fnu,
+                device=d,
+            )
         self.q = torch.empty(
             (cfg.num_heads, cfg.head_dim), dtype=torch.bfloat16, device=d
         )
@@ -414,6 +441,35 @@ class ResidentOneLaunchDecode:
             release_group=release_group,
         )
 
+    def _native_fp8_quant_stage(
+        self,
+        name: str,
+        source: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> Stage:
+        assignment = self.policy.quantize(source.numel(), 128)
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            if num_sms != assignment.num_sms:
+                raise ValueError(
+                    "native FP8 quant placement must match its K128 tiles"
+                )
+        return self._stage(
+            name,
+            SchedDsv4Fp8QuantUmmaB(
+                source.reshape(-1), output
+            ),
+            assignment,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
     def _fp8_linear_stage(
         self,
         name: str,
@@ -456,6 +512,47 @@ class ResidentOneLaunchDecode:
         )
         schedule = self._layered(schedule, family, weights, scales)
         assignment = self.policy.fp8_gemv(output.numel(), activation.numel())
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            assignment = replace(assignment, num_sms=num_sms)
+        return self._stage(
+            name,
+            schedule,
+            assignment,
+            wait_for_previous=wait_for_previous,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
+    def _native_fp8_linear_stage(
+        self,
+        name: str,
+        family: LayerFamily,
+        suffix: str,
+        activation: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        wait_for_previous: bool = True,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> Stage:
+        linears = tuple(
+            self.checkpoint.load_native_fp8_linear(
+                f"layers.{layer_id}.{suffix}", device=self.device
+            )
+            for layer_id in family.layer_ids
+        )
+        weights = tuple(linear.weight_tiles for linear in linears)
+        schedule = SchedFp8GemvUmmaStream(
+            weights[0], activation, output.reshape(-1)
+        )
+        schedule = self._layered(schedule, family, weights)
+        assignment = self.policy.fp8_umma_gemv(
+            output.numel(), activation.shape[0] * 128
+        )
         base_sm = None
         if placement is not None:
             base_sm, num_sms = placement
@@ -643,17 +740,29 @@ class ResidentOneLaunchDecode:
                 release_group=q_norm_ready,
             )
         )
-        stages.append(
-            self._fp8_quant_stage(
-                "attn.q_rank.quant_fp8",
-                self.q_rank_norm,
-                self.q_rank_fp8,
-                self.q_rank_fp8_scale,
-                placement=(q_base, q_quant_sms),
-                wait_group=q_norm_ready,
-                release_group=qkv_prefix_join,
+        if self.args.fp8_qb_mode == "native":
+            stages.append(
+                self._native_fp8_quant_stage(
+                    "attn.q_rank.quant_native_fp8",
+                    self.q_rank_norm,
+                    self.q_rank_native_fp8,
+                    placement=(q_base, q_quant_sms),
+                    wait_group=q_norm_ready,
+                    release_group=qkv_prefix_join,
+                )
             )
-        )
+        else:
+            stages.append(
+                self._fp8_quant_stage(
+                    "attn.q_rank.quant_fp8",
+                    self.q_rank_norm,
+                    self.q_rank_fp8,
+                    self.q_rank_fp8_scale,
+                    placement=(q_base, q_quant_sms),
+                    wait_group=q_norm_ready,
+                    release_group=qkv_prefix_join,
+                )
+            )
         stages.append(
             self._fp8_linear_stage(
                 "attn.kv",
@@ -690,17 +799,29 @@ class ResidentOneLaunchDecode:
                 release_group=qkv_prefix_join,
             )
         )
-        stages.append(
-            self._fp8_linear_stage(
-                "attn.q_b",
-                family,
-                "attn.wq_b",
-                self.q_rank_fp8,
-                self.q_rank_fp8_scale,
-                self.q,
-                wait_group=qkv_prefix_join,
+        if self.args.fp8_qb_mode == "native":
+            stages.append(
+                self._native_fp8_linear_stage(
+                    "attn.q_b",
+                    family,
+                    "attn.wq_b",
+                    self.q_rank_native_fp8,
+                    self.q,
+                    wait_group=qkv_prefix_join,
+                )
             )
-        )
+        else:
+            stages.append(
+                self._fp8_linear_stage(
+                    "attn.q_b",
+                    family,
+                    "attn.wq_b",
+                    self.q_rank_fp8,
+                    self.q_rank_fp8_scale,
+                    self.q,
+                    wait_group=qkv_prefix_join,
+                )
+            )
         stages.append(self._rms_stage("attn.q_head_norm", self.q, self.q_norm))
         stages.append(
             self._stage(
@@ -733,16 +854,27 @@ class ResidentOneLaunchDecode:
             )
 
         if kind == "csa":
-            stages.append(
-                self._fp8_linear_stage(
-                    "index.q_b",
-                    family,
-                    "attn.indexer.wq_b",
-                    self.q_rank_fp8,
-                    self.q_rank_fp8_scale,
-                    self.index_q,
+            if self.args.fp8_qb_mode == "native":
+                stages.append(
+                    self._native_fp8_linear_stage(
+                        "index.q_b",
+                        family,
+                        "attn.indexer.wq_b",
+                        self.q_rank_native_fp8,
+                        self.index_q,
+                    )
                 )
-            )
+            else:
+                stages.append(
+                    self._fp8_linear_stage(
+                        "index.q_b",
+                        family,
+                        "attn.indexer.wq_b",
+                        self.q_rank_fp8,
+                        self.q_rank_fp8_scale,
+                        self.index_q,
+                    )
+                )
             stages.append(
                 self._stage(
                     "index.q_rope",
@@ -1875,6 +2007,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--expected-token-id", type=int)
     parser.add_argument("--resident-reserve-gib", type=float, default=8.0)
+    parser.add_argument(
+        "--fp8-qb-mode",
+        choices=("native", "scalar"),
+        default="native",
+        help="select the q_b kernel for matched end-to-end A/B profiling",
+    )
     parser.add_argument(
         "--profile-layers",
         action="store_true",

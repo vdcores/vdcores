@@ -31,6 +31,10 @@ constexpr int kNvfp4TileK = 256;
 constexpr int kNvfp4PackedK = kNvfp4TileK / 2;
 constexpr int kNvfp4WeightDataBytes = kNvfp4TileM * kNvfp4PackedK;
 constexpr int kNvfp4WeightTileBytes = 18432;
+constexpr int kFp8TileM = 128;
+constexpr int kFp8TileK = 128;
+constexpr int kFp8WeightDataBytes = kFp8TileM * kFp8TileK;
+constexpr int kFp8WeightTileBytes = 16896;
 
 __global__ void prepack_nvfp4_checkpoint_kernel(
     const uint8_t *__restrict__ weight,
@@ -133,6 +137,102 @@ void py_prepack_nvfp4_checkpoint(
   const cudaError_t error = cudaGetLastError();
   TORCH_CHECK(error == cudaSuccess,
               "NVFP4 checkpoint prepack failed: ", cudaGetErrorString(error));
+}
+
+__global__ void prepack_fp8_checkpoint_kernel(
+    const uint8_t *__restrict__ weight,
+    const cutlass::float_ue8m0_t *__restrict__ checkpoint_scale,
+    uint8_t *__restrict__ output,
+    int k,
+    int k_tiles) {
+  using namespace cute;
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+  using Atom = SM100_MMA_MXF8F6F4_SS<
+      Fp8, Fp8, float, Scale, kFp8TileM, 8,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<32>;
+  using ScaleProblemShape = Shape<Int<kFp8TileM>, Int<128>, Int<kFp8TileK>>;
+
+  const int m_tile = blockIdx.x / k_tiles;
+  const int k_tile = blockIdx.x - m_tile * k_tiles;
+  auto *tile_output = output + blockIdx.x * kFp8WeightTileBytes;
+
+  for (int index = threadIdx.x; index < kFp8WeightDataBytes;
+       index += blockDim.x) {
+    const int row = index / kFp8TileK;
+    const int destination_column = index - row * kFp8TileK;
+    const int destination_chunk = destination_column / 16;
+    const int byte_in_chunk = destination_column - destination_chunk * 16;
+    const int source_chunk = destination_chunk ^ (row & 7);
+    const int source_column =
+        k_tile * kFp8TileK + source_chunk * 16 + byte_in_chunk;
+    tile_output[index] =
+        weight[(m_tile * kFp8TileM + row) * k + source_column];
+  }
+
+  TiledMma tiled_mma;
+  const auto logical_sfa = ScaleConfig::tile_atom_to_shape_SFA(
+      ScaleProblemShape{});
+  constexpr int kScaleColumns = kFp8TileK / 32;
+  auto *packed_scale = reinterpret_cast<Scale *>(
+      tile_output + kFp8WeightDataBytes);
+  const Scale tile_scale = checkpoint_scale[m_tile * k_tiles + k_tile];
+  for (int index = threadIdx.x;
+       index < kFp8TileM * kScaleColumns;
+       index += blockDim.x) {
+    const int row = index / kScaleColumns;
+    const int sf = index - row * kScaleColumns;
+    const int destination = int(logical_sfa(row, sf * 32));
+    packed_scale[destination] = tile_scale;
+  }
+}
+
+void py_prepack_fp8_checkpoint(
+    torch::Tensor weight,
+    torch::Tensor checkpoint_scale,
+    torch::Tensor output) {
+  TORCH_CHECK(weight.is_cuda() && checkpoint_scale.is_cuda() && output.is_cuda(),
+              "FP8 prepack tensors must be CUDA tensors");
+  TORCH_CHECK(weight.device() == checkpoint_scale.device() &&
+                  weight.device() == output.device(),
+              "FP8 prepack tensors must share one CUDA device");
+  TORCH_CHECK(weight.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+                  weight.dim() == 2 && weight.is_contiguous(),
+              "FP8 weight must be contiguous rank-2 E4M3");
+  TORCH_CHECK(checkpoint_scale.scalar_type() ==
+                  at::ScalarType::Float8_e8m0fnu &&
+                  checkpoint_scale.dim() == 2 &&
+                  checkpoint_scale.is_contiguous(),
+              "FP8 scale must be contiguous rank-2 UE8M0");
+  const int64_t rows = weight.size(0);
+  const int64_t k = weight.size(1);
+  TORCH_CHECK(rows % kFp8TileM == 0 && k % kFp8TileK == 0,
+              "FP8 weight must be M128/K128 aligned");
+  const int64_t m_tiles = rows / kFp8TileM;
+  const int64_t k_tiles = k / kFp8TileK;
+  TORCH_CHECK(checkpoint_scale.size(0) == m_tiles &&
+                  checkpoint_scale.size(1) == k_tiles,
+              "FP8 checkpoint scale shape does not match the weight");
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Byte &&
+                  output.is_contiguous() && output.dim() == 3 &&
+                  output.size(0) == m_tiles && output.size(1) == k_tiles &&
+                  output.size(2) == kFp8WeightTileBytes,
+              "FP8 native output must be contiguous [M/128,K/128,16896] uint8");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(weight.device().index());
+  prepack_fp8_checkpoint_kernel<<<
+      static_cast<unsigned>(m_tiles * k_tiles), 256, 0, stream>>>(
+      reinterpret_cast<const uint8_t *>(weight.data_ptr()),
+      reinterpret_cast<const cutlass::float_ue8m0_t *>(
+          checkpoint_scale.data_ptr()),
+      output.data_ptr<uint8_t>(),
+      static_cast<int>(k),
+      static_cast<int>(k_tiles));
+  const cudaError_t error = cudaGetLastError();
+  TORCH_CHECK(error == cudaSuccess,
+              "FP8 checkpoint prepack failed: ", cudaGetErrorString(error));
 }
 
 }  // namespace
@@ -672,4 +772,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("checkpoint_scale"),
             py::arg("output"),
             "Convert one raw checkpoint NVFP4 linear to native SM100 tiles");
+  m.def("prepack_fp8_checkpoint", &py_prepack_fp8_checkpoint,
+            py::arg("weight"),
+            py::arg("checkpoint_scale"),
+            py::arg("output"),
+            "Convert one raw checkpoint FP8 linear to native SM100 tiles");
 }

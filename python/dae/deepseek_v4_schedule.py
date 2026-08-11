@@ -75,6 +75,18 @@ class DeepSeekV4ShapePolicy:
             tile_k=128,
         )
 
+    def fp8_umma_gemv(self, rows: int, k: int) -> ShapeAssignment:
+        if rows % 128 or k % 128:
+            raise ValueError("native FP8 GEMV requires M128/K128 alignment")
+        return self._rows(
+            "fp8_umma_gemv",
+            rows,
+            k,
+            alignment=128,
+            tile_rows=128,
+            tile_k=128,
+        )
+
     def nvfp4_gemv(self, rows: int, k: int) -> ShapeAssignment:
         if k % 256:
             raise ValueError("NVFP4 GEMV K must be divisible by 256")

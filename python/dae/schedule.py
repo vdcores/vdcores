@@ -1270,7 +1270,7 @@ class SchedFp8GemvUmmaStream(Schedule):
     TILE_M = SchedFp8UmmaPrepack.TILE_M
     WEIGHT_TILE_BYTES = SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES
     ACTIVATION_TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
-    ACTIVATION_TILES_PER_CHUNK = 28
+    ACTIVATION_TILES_PER_CHUNK = 4
 
     def __init__(self, weight_tiles, activation_tiles, output):
         super().__init__()
@@ -1309,9 +1309,6 @@ class SchedFp8GemvUmmaStream(Schedule):
             or not self.output.is_contiguous()
         ):
             raise ValueError("native FP8 output must contain M BF16 values")
-        self.activation_chunks = (
-            self.k_tiles + self.ACTIVATION_TILES_PER_CHUNK - 1
-        ) // self.ACTIVATION_TILES_PER_CHUNK
 
     def _tile_shard(self, sm):
         tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
@@ -1319,46 +1316,38 @@ class SchedFp8GemvUmmaStream(Schedule):
         tile_count = tiles_per_sm + int(sm < extra)
         return tile_start, tile_count
 
-    def _activation_chunk(self, chunk):
-        start = chunk * self.ACTIVATION_TILES_PER_CHUNK
-        stop = min(start + self.ACTIVATION_TILES_PER_CHUNK, self.k_tiles)
-        return self.activation_tiles[start:stop].reshape(-1)
-
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
         tile_start, tile_count = self._tile_shard(sm)
         instructions = []
-        for local_index, output_tile in enumerate(
-            range(tile_start, tile_start + tile_count)
-        ):
-            first_output = local_index == 0
-            final_output = local_index + 1 == tile_count
+        for output_tile in range(tile_start, tile_start + tile_count):
+            final_output = output_tile + 1 == tile_start + tile_count
             instructions.append(
-                Fp8GemvUmmaStreamSm100(
-                    self.k_tiles,
-                    self.activation_chunks,
-                    retain_activation=not final_output,
-                )
+                Fp8GemvUmmaStreamSm100(self.k_tiles)
             )
-            for chunk in range(self.activation_chunks):
-                if first_output:
-                    activation = self._activation_chunk(chunk)
-                    if final_output:
-                        load = TmaLoad1D(activation)
-                    else:
-                        load = TmaLoadReg1D(
-                            activation, chunk, 1
-                        )
-                else:
-                    load = RegLoad(chunk, slot_id=chunk).fixed_port(1)
-                instructions.append(load.fixed_port(1))
-            for k_tile in range(self.k_tiles):
+            for chunk_start in range(
+                0, self.k_tiles, self.ACTIVATION_TILES_PER_CHUNK
+            ):
+                chunk_stop = min(
+                    chunk_start + self.ACTIVATION_TILES_PER_CHUNK,
+                    self.k_tiles,
+                )
                 instructions.append(
                     TmaLoad1D(
-                        self.weight_tiles[output_tile, k_tile].reshape(-1)
-                    ).fixed_port(0)
+                        self.activation_tiles[
+                            chunk_start:chunk_stop
+                        ].reshape(-1)
+                    ).fixed_port(1)
                 )
+                for k_tile in range(chunk_start, chunk_stop):
+                    instructions.append(
+                        TmaLoad1D(
+                            self.weight_tiles[
+                                output_tile, k_tile
+                            ].reshape(-1)
+                        ).fixed_port(0)
+                    )
             row_start = output_tile * self.TILE_M
             store = TmaStore1D(
                 self.output[row_start : row_start + self.TILE_M]

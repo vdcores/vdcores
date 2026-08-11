@@ -184,17 +184,12 @@ class Fp8GemvUmmaStreamSm100(ComputeInstruction):
     def __init__(
         self,
         k_tiles: int,
-        activation_chunks: int,
-        *,
-        retain_activation: bool = False,
     ):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("FP8 UMMA K-tile count must fit uint16")
-        if activation_chunks not in (1, 2, 3):
-            raise ValueError("FP8 UMMA activation chunk count must be in [1,3]")
         super().__init__(
             opcode=opcode.OP_FP8_GEMV_UMMA_STREAM_SM100,
-            args=[k_tiles, activation_chunks, int(retain_activation)],
+            args=[k_tiles],
         )
 
 
