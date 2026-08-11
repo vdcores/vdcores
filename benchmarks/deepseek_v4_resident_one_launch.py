@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -72,6 +72,9 @@ class Stage:
     num_sms: int
     input_role: str | None = None
     wait_for_previous: bool = True
+    base_sm: int | None = None
+    wait_group: str | None = None
+    release_group: str | None = None
 
 
 class ResidentOneLaunchDecode:
@@ -207,10 +210,22 @@ class ResidentOneLaunchDecode:
         *,
         input_role: str | None = None,
         wait_for_previous: bool = True,
+        base_sm: int | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         if isinstance(sms, ShapeAssignment):
             sms = self._remember(sms)
-        return Stage(name, schedule, int(sms), input_role, wait_for_previous)
+        return Stage(
+            name,
+            schedule,
+            int(sms),
+            input_role,
+            wait_for_previous,
+            base_sm,
+            wait_group,
+            release_group,
+        )
 
     @staticmethod
     def _groups(*tensor_sets: tuple[torch.Tensor, ...]):
@@ -383,12 +398,23 @@ class ResidentOneLaunchDecode:
         source: torch.Tensor,
         output: torch.Tensor,
         scale: torch.Tensor,
+        *,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         assignment = self.policy.quantize(source.numel(), 128)
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            assignment = replace(assignment, num_sms=num_sms)
         return self._stage(
             name,
             SchedDsv4Fp8Quant128(source.reshape(-1), output.reshape(-1), scale),
             assignment,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
         )
 
     def _fp8_linear_stage(
@@ -402,6 +428,9 @@ class ResidentOneLaunchDecode:
         *,
         row_slice: slice | None = None,
         wait_for_previous: bool = True,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         linears = tuple(
             self.checkpoint.load_fp8_linear(
@@ -430,11 +459,18 @@ class ResidentOneLaunchDecode:
         )
         schedule = self._layered(schedule, family, weights, scales)
         assignment = self.policy.fp8_gemv(output.numel(), activation.numel())
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            assignment = replace(assignment, num_sms=num_sms)
         return self._stage(
             name,
             schedule,
             assignment,
             wait_for_previous=wait_for_previous,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
         )
 
     def _bf16_linear_stage(
@@ -725,6 +761,8 @@ class ResidentOneLaunchDecode:
                 self.policy.attention(cfg.num_heads, cfg.head_dim),
             )
         )
+        output_ready_group = f"{family.name}.attn.output.ready"
+        output_join_group = f"{family.name}.attn.output.join"
         stages.append(
             self._stage(
                 "attn.inverse_rope",
@@ -735,16 +773,22 @@ class ResidentOneLaunchDecode:
                     inverse=True,
                 ),
                 cfg.num_heads,
+                release_group=output_ready_group,
             )
         )
         grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
         for group in range(cfg.o_groups):
+            placement = self.policy.parallel_partition(group, cfg.o_groups)
+            quant_group = f"{family.name}.attn.output.g{group}.quant"
             stages.append(
                 self._fp8_quant_stage(
                     f"attn.o_a.g{group}.quant_fp8",
                     grouped[group],
                     self.o_group_fp8[group],
                     self.o_group_scale[group],
+                    placement=placement,
+                    wait_group=output_ready_group,
+                    release_group=quant_group,
                 )
             )
             start = group * cfg.o_lora_rank
@@ -757,6 +801,9 @@ class ResidentOneLaunchDecode:
                     self.o_group_scale[group],
                     self.o_rank[group],
                     row_slice=slice(start, start + cfg.o_lora_rank),
+                    placement=placement,
+                    wait_group=quant_group,
+                    release_group=output_join_group,
                 )
             )
         stages.append(
@@ -765,6 +812,7 @@ class ResidentOneLaunchDecode:
                 self.o_rank.reshape(-1),
                 self.o_rank_fp8,
                 self.o_rank_scale,
+                wait_group=output_join_group,
             )
         )
         stages.append(
@@ -1213,7 +1261,7 @@ class ResidentOneLaunchDecode:
                 "attn.kv_rope",
                 "attn.sparse_swa",
                 "attn.inverse_rope",
-                *(f"attn.o_a.g{group}" for group in range(8)),
+                "attn.o_a.g7",
                 "attn.o_b",
                 "attn.hc_post",
                 "ffn.hc_pre",
@@ -1246,8 +1294,8 @@ class ResidentOneLaunchDecode:
             profile_after: bool = False,
         ) -> SequentialStage:
             nonlocal serial_sm
-            base_sm = 0
-            if stage.num_sms == 1:
+            base_sm = 0 if stage.base_sm is None else stage.base_sm
+            if stage.base_sm is None and stage.num_sms == 1:
                 base_sm = serial_sm
                 serial_sm = (serial_sm + 1) % self.sms
             return SequentialStage(
@@ -1258,6 +1306,8 @@ class ResidentOneLaunchDecode:
                 input_role=stage.input_role,
                 profile_after=profile_after,
                 wait_for_previous=stage.wait_for_previous,
+                wait_group=stage.wait_group,
+                release_group=stage.release_group,
             )
 
         def queued_family(family: LayerFamily) -> list[SequentialStage]:

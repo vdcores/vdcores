@@ -433,6 +433,8 @@ def test_sequential_profile_markers_can_use_reserved_special_slots():
 
     class BasicStage(Schedule):
         def schedule(self, sm):
+            if sm < 0:
+                return []
             return [
                 Copy(1, 16),
                 MemoryInstruction(
@@ -466,6 +468,111 @@ def test_sequential_profile_markers_can_use_reserved_special_slots():
     )
 
     assert marker.num_slots & 0x3F == config.num_slots + 7
+
+
+def test_sequential_program_fans_out_and_joins_labeled_stage_groups():
+    class FakeLauncher:
+        num_sms = 4
+        num_bars = 0
+        max_insts = 32
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def set_bar(self, bar_id, count):
+            self.bar_values[bar_id] = count
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = SequentialProgram(
+        launcher,
+        (
+            SequentialStage(
+                "producer", BasicStage(), 2, release_group="ready"
+            ),
+            SequentialStage(
+                "branch0",
+                BasicStage(),
+                2,
+                wait_group="ready",
+                release_group="join",
+            ),
+            SequentialStage(
+                "branch1",
+                BasicStage(),
+                2,
+                base_sm=2,
+                profile_after=True,
+                wait_group="ready",
+                release_group="join",
+            ),
+            SequentialStage(
+                "consumer", BasicStage(), 4, wait_group="join"
+            ),
+        ),
+    )
+
+    assert launcher.bar_values == {0: 2, 1: 4}
+    assert program.barriers == [0, 1]
+    marker = next(
+        inst
+        for inst in program.instructions[0]
+        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_PROFILE_LAYER & ~0x3F)
+    )
+    assert marker.num_slots >> 6 == 1
+    for sm in range(4):
+        memory = [
+            inst
+            for inst in program.instructions[sm]
+            if isinstance(inst, MemoryInstruction)
+        ]
+        if sm < 2:
+            assert memory[1].num_slots >> 6 == 0
+        assert memory[-2].num_slots >> 6 == 1
+
+
+def test_sequential_program_rejects_wait_group_without_producer():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 8
+
+    with pytest.raises(ValueError, match="groups with no producers"):
+        SequentialProgram(
+            FakeLauncher(),
+            (
+                SequentialStage(
+                    "consumer", Schedule(), 1, wait_group="missing"
+                ),
+            ),
+        )
 
 
 def test_sequential_program_binds_model_specific_input_role_to_same_edge():
@@ -760,6 +867,16 @@ def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():
 
     assert (fp8.num_sms, fp8.tile_rows, fp8.tile_k) == (152, 15, 128)
     assert (fp4.num_sms, fp4.row_alignment, fp4.tile_k) == (152, 8, 256)
+    assert [policy.parallel_partition(branch, 8) for branch in range(8)] == [
+        (0, 19),
+        (19, 19),
+        (38, 19),
+        (57, 19),
+        (76, 19),
+        (95, 19),
+        (114, 19),
+        (133, 19),
+    ]
     assert all(fp4.shard(sm)[1] % 8 == 0 for sm in range(fp4.num_sms))
     assert (quant.num_sms, quant.tile_rows) == (16, 16)
     assert attention.num_sms == 64

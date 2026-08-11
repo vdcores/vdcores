@@ -34,6 +34,8 @@ class SequentialStage:
     input_role: str | None = None
     profile_after: bool = False
     wait_for_previous: bool = True
+    wait_group: str | None = None
+    release_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +199,34 @@ class SequentialProgram:
         # every placed schedule for at least as long as the launch program.
         self.placed_schedules = []
 
+        release_groups = []
+        for stage in self.stages:
+            if (
+                stage.release_group is not None
+                and stage.release_group not in release_groups
+            ):
+                release_groups.append(stage.release_group)
+        wait_groups = {
+            stage.wait_group
+            for stage in self.stages
+            if stage.wait_group is not None
+        }
+        missing_groups = wait_groups.difference(release_groups)
+        if missing_groups:
+            raise ValueError(
+                "sequential stage waits on groups with no producers: "
+                f"{sorted(missing_groups)}"
+            )
+        group_barriers = {}
+        group_release_counts = {group: 0 for group in release_groups}
+        for group in release_groups:
+            if launcher.num_bars >= config.max_bars - 2:
+                raise ValueError(
+                    "sequential program exceeds the runtime barrier capacity"
+                )
+            group_barriers[group] = launcher.new_bar(None)
+            self.barriers.append(group_barriers[group])
+
         previous = None
         previous_stage = None
         previous_name = None
@@ -211,7 +241,9 @@ class SequentialProgram:
                 )
 
             input_bar = None
-            if previous is not None and stage.wait_for_previous:
+            if stage.wait_group is not None:
+                input_bar = group_barriers[stage.wait_group]
+            elif previous is not None and stage.wait_for_previous:
                 count, tails = _writeback_tail(previous, previous_name)
                 if launcher.num_bars >= config.max_bars - 2:
                     raise ValueError("sequential program exceeds the runtime barrier capacity")
@@ -219,16 +251,6 @@ class SequentialProgram:
                 self.barriers.append(input_bar)
                 for tail in tails:
                     _attach_bar(tail, input_bar, stage=previous_name)
-                if previous_profile_after:
-                    if self.profile_event_count == 0:
-                        raise ValueError("profiled stage requires profile event capacity")
-                    marker = LduProfileLayer(
-                        config.layer_profile_event_base,
-                        self.profile_event_count,
-                        special_slot=profile_special_slot,
-                    ).bar(input_bar)
-                    for instructions in self.instructions:
-                        instructions.append(marker.copy())
             elif previous is not None:
                 if previous_profile_after:
                     raise ValueError(
@@ -242,6 +264,21 @@ class SequentialProgram:
                         f"independent stage {stage.name!r} must match the "
                         "previous stage placement so its queue tail dominates"
                     )
+
+            if previous_profile_after:
+                if input_bar is None:
+                    raise ValueError(
+                        "a profiled stage requires a following dependency"
+                    )
+                if self.profile_event_count == 0:
+                    raise ValueError("profiled stage requires profile event capacity")
+                marker = LduProfileLayer(
+                    config.layer_profile_event_base,
+                    self.profile_event_count,
+                    special_slot=profile_special_slot,
+                ).bar(input_bar)
+                for instructions in self.instructions:
+                    instructions.append(marker.copy())
 
             schedule = stage.schedule._clone()
             if input_bar is not None and stage.input_role is not None:
@@ -269,10 +306,22 @@ class SequentialProgram:
             self.stage_stats.append((stage.name, max_compute, max_memory))
             for sm, instructions in enumerate(rendered):
                 self.instructions[sm].extend(instructions)
+            if stage.release_group is not None:
+                count, tails = _writeback_tail(rendered, stage.name)
+                release_bar = group_barriers[stage.release_group]
+                for tail in tails:
+                    _attach_bar(tail, release_bar, stage=stage.name)
+                group_release_counts[stage.release_group] += count
             previous = rendered
             previous_stage = stage
             previous_name = stage.name
             previous_profile_after = stage.profile_after
+
+        for group, bar_id in group_barriers.items():
+            count = group_release_counts[group]
+            if count <= 0:
+                raise ValueError(f"release group {group!r} has no active producers")
+            launcher.set_bar(bar_id, count)
 
         if completion_barrier:
             count, tails = _writeback_tail(previous, previous_name)

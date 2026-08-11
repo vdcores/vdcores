@@ -440,6 +440,33 @@ ahead of smaller task tuning. The next overlap loop should therefore add a
 real fan-out/join representation and shape-derived SM partitions for the six
 routed experts and eight output groups, retaining the single resident launch.
 
+### Shape-partitioned attention output fan-out
+
+The resident assembler now supports named wait/release groups. Multiple
+producers can decrement one join counter and multiple consumers can observe
+one ready counter; stages without an explicit group retain the existing strict
+edge. The mechanism is entirely inside the per-SM instruction queues and
+shifted barrier banks of the same resident launch.
+
+After inverse RoPE, one 64-arrival ready counter releases eight output
+quantize/GEMV branches. The shape policy assigns each branch a contiguous
+19-SM partition. Each quantizer releases a private branch counter to its GEMV,
+and all eight GEMVs contribute 19 arrivals to one 152-arrival join before
+`o_rank` quantization. This replaces serial whole-grid assignments without
+changing output layout or adding an inter-stage copy.
+
+The one-layer tracked gate, job `20260811T023413Z-2601579`, preserved token
+2835 and measured 0.499 ms median. The full tracked job
+`20260811T023449Z-2604883` preserved token 14 and measured 25.289--25.748 ms,
+median 25.643 ms. Its median-sample layer/reload/head spans were
+22.848/1.217/1.408 ms. Compared with the post-fusion profile, dependency
+counters fell from 555 to 506, allocator instructions from 2,191,707 to
+2,047,571, and stores from 538,195 to 503,107.
+
+Production job `20260811T023842Z-2623799` preserved token 14 over 30 samples
+and measured 24.682--25.206 ms, median 24.952 ms. This improves the 26.571 ms
+boundary by 1.619 ms (6.1%) and leaves 8.952 ms to the 16 ms target.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

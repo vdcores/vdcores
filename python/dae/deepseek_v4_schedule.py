@@ -119,5 +119,16 @@ class DeepSeekV4ShapePolicy:
             tile_k=head_dim,
         )
 
+    def parallel_partition(self, branch: int, branches: int) -> tuple[int, int]:
+        """Return a shape-independent contiguous SM share for one ready branch."""
+        if branches <= 0 or branches > self.resident_sms:
+            raise ValueError("parallel branch count must fit the resident SM grid")
+        if not 0 <= branch < branches:
+            raise ValueError("parallel branch index is out of range")
+        base_width, extra = divmod(self.resident_sms, branches)
+        width = base_width + int(branch < extra)
+        base = branch * base_width + min(branch, extra)
+        return base, width
+
 
 __all__ = ["DeepSeekV4ShapePolicy", "ShapeAssignment"]
