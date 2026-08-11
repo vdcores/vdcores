@@ -302,6 +302,11 @@ but HCA layers still grow from roughly 0.58 ms to occasional 1.24 ms while CSA
 layers are near 0.53--0.56 ms, so dependency-aware admission and the broader
 task DAG remain necessary for the 16 ms target.
 
+The matching non-instrumented production build, job
+`20260811T005835Z-2121571`, ran 30 post-warmup tokens with reference token 14.
+Samples were 33.360--34.500 ms with a 34.074 ms median. Use this stable value,
+not the tracked diagnostic timing, as the starting TBT for the next loop.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
