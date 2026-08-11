@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda/atomic>
+
 #include "virtualcore.cuh"
 
 template<typename M2LD_Type, typename M2C_Type>
@@ -465,37 +467,41 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         produces_compute_operand = false;
         // Both LDU lanes reach this point only after all earlier commands on
         // their own ports have drained and the loop-tail STU dependency has
-        // reached zero. The first rendezvous therefore makes it safe for the
-        // last block to restore the loop-local dependency counters.
+        // reached zero. The first rendezvous therefore makes it safe for each
+        // block's port 0 to restore a disjoint slice of the active bank.
         ldu_control_barrier->arrive_and_wait();
         if (port_id == 0) {
           int *arrivals = bars + lduBarrierReloadArrival;
-          int *done = bars + lduBarrierReloadDone;
-          const int ticket = atomicAdd(arrivals, 1);
-          const int phase = ticket / gridDim.x + 1;
-          const bool last = (ticket + 1) % gridDim.x == 0;
-          if (last) {
-            const int count = inst.size;
-            // The attached completion barrier is the last barrier in the
-            // active shifted bank. Derive that bank's first barrier instead
-            // of restoring every bank on every loop iteration.
-            const int first_bar = inst.bar() + 1 - count;
-            const int *source = reinterpret_cast<const int *>(inst.address);
-            if (first_bar < inst.arg || count <= 0 ||
-                (first_bar - inst.arg) % count != 0 ||
-                first_bar + count > lduBarrierReloadArrival) {
-              asm volatile("trap;");
-            }
-            for (int offset = 0; offset < count; ++offset) {
-              atomicExch(
-                  bars + first_bar + offset,
-                  load_l2(source + first_bar + offset));
-            }
-            atomicExch(done, phase);
-          } else {
-            while (atomicAdd(done, 0) < phase) {
-              __nanosleep(barrierPollSleepCycles);
-            }
+          const int count = inst.size;
+          // The attached completion barrier is the last barrier in the
+          // active shifted bank. Derive that bank's first barrier instead of
+          // restoring every bank on every loop iteration.
+          const int first_bar = inst.bar() + 1 - count;
+          const int *source = reinterpret_cast<const int *>(inst.address);
+          if (first_bar < inst.arg || count <= 0 ||
+              (first_bar - inst.arg) % count != 0 ||
+              first_bar + count > lduBarrierReloadArrival) {
+            asm volatile("trap;");
+          }
+          for (int offset = blockIdx.x; offset < count;
+               offset += gridDim.x) {
+            cuda::atomic_ref<int, cuda::thread_scope_device> destination(
+                bars[first_bar + offset]);
+            destination.store(
+                load_l2(source + first_bar + offset),
+                cuda::memory_order_relaxed);
+          }
+
+          // The release/acquire chain on the single arrivals word orders every
+          // block's disjoint counter stores. All blocks observe the completed
+          // phase before either LDU port can advance into the next iteration.
+          cuda::atomic_ref<int, cuda::thread_scope_device> arrivals_ref(
+              *arrivals);
+          const int ticket = arrivals_ref.fetch_add(
+              1, cuda::memory_order_acq_rel);
+          const int phase_end = (ticket / gridDim.x + 1) * gridDim.x;
+          while (arrivals_ref.load(cuda::memory_order_acquire) < phase_end) {
+            __nanosleep(barrierPollSleepCycles);
           }
         }
         // Port 1 cannot consume a following loop iteration until port 0 has

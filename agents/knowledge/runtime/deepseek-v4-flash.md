@@ -542,6 +542,30 @@ leaves 2.614 ms to the 16 ms target. Samples do not grow with token iteration,
 so the overlap did not reintroduce the earlier progressive queue-pressure
 failure.
 
+### Parallel active-bank reload
+
+Loop barrier restoration is now distributed across all 152 LDU0 handlers.
+Each handler restores a disjoint strided slice of the active shifted bank,
+then a single device-scope release/acquire counter forms the memory-only
+completion barrier before either local LDU port advances. There is no compute
+participant, IssueBarrier, or thread fence. The first attempted publication
+scheme let a designated final arrival publish a separate phase word; it
+passed the two-layer probe but stalled on a repeated full-model launch and was
+rejected. The retained count-threshold form makes every LDU0 handler observe
+the completed phase directly.
+
+Tracked full-checkpoint job `20260811T040008Z-2932683` preserved token 14 and
+measured 17.941 ms. Active-bank reload total fell from about 1.11 ms to 0.065
+ms; layer bodies were 16.332 ms and the head was 1.337 ms. The shorter global
+pause also reduced downstream queue pressure, so the gain is larger than the
+reload interval alone.
+
+Production job `20260811T040350Z-2936582` preserved token 14 over 30 samples
+and measured 16.284--16.478 ms, median 16.397 ms. This improves the 18.614 ms
+boundary by 2.217 ms (11.9%) and leaves 0.397 ms to the 16 ms target. The
+sample sequence remains flat with iteration, confirming that the earlier
+progressive system/queue overhead has not returned.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
