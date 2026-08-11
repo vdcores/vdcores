@@ -10,14 +10,17 @@ import torch
 
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.deepseek_v4_quant import dequantize_nvfp4, quantize_nvfp4
-from dae.instructions import ProfileEvent
+from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
 from dae.schedule import (
     SchedNvfp4Gemv,
     SchedNvfp4GemvUmma,
+    SchedNvfp4GemvUmmaStream,
+    SchedNvfp4UmmaPrepack,
     SchedRoutedNvfp4Gemv,
 )
+from dae.tma_utils import Major
 
 
 def main() -> None:
@@ -26,7 +29,9 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=4096)
     parser.add_argument("--sms", type=int, default=0)
     parser.add_argument(
-        "--implementation", choices=("cuda", "umma"), default="cuda"
+        "--implementation",
+        choices=("cuda", "umma", "umma_stream"),
+        default="cuda",
     )
     parser.add_argument(
         "--routed-tiles",
@@ -270,6 +275,88 @@ def main() -> None:
                 activation_scale=activation_sf,
                 output=output,
                 route_ready=True,
+            ).place(num_sms)
+        elif args.implementation == "umma_stream":
+            if args.m % 128 or args.k % 256:
+                raise ValueError("streaming UMMA requires M128 and K256 alignment")
+            m_tiles = args.m // 128
+            k_tiles = args.k // 256
+            if num_sms != m_tiles:
+                raise ValueError(
+                    "streaming UMMA requires one SM per M128 output tile"
+                )
+            weight_scale_tiles = (
+                weight_sf.view(m_tiles, 128, k_tiles, 16)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
+            activation_rows = (
+                activation.reshape(1, -1).expand(8, -1).contiguous()
+            )
+            activation_scale_tiles = activation_sf.view(k_tiles, 16)
+            alpha_storage = torch.zeros(
+                (4,), dtype=torch.float32, device=device
+            )
+            alpha_storage[0].copy_(alpha.reshape(-1)[0])
+
+            # This is immutable/setup work, deliberately outside the measured
+            # token-time launcher.  The resulting native tiles place data and
+            # scales in one byte range so each operand needs only one LDU/TMA
+            # transaction in the streaming task.
+            packed_weight = torch.empty(
+                (
+                    m_tiles,
+                    k_tiles,
+                    SchedNvfp4UmmaPrepack.WEIGHT_TILE_BYTES,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            packed_activation = torch.empty(
+                (
+                    k_tiles,
+                    SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            weight_prepack_launcher = Launcher(m_tiles, device=device)
+            weight_tma = TmaTensor(weight_prepack_launcher, weight).wgmma_load(
+                128, 128, Major.K
+            )
+            weight_prepack_launcher.s(
+                SchedNvfp4UmmaPrepack(
+                    SchedNvfp4UmmaPrepack.WEIGHT,
+                    weight,
+                    weight_scale_tiles,
+                    packed_weight,
+                    weight_tma,
+                ).place(m_tiles)
+            )
+            weight_prepack_launcher.launch()
+
+            activation_prepack_launcher = Launcher(1, device=device)
+            activation_tma = TmaTensor(
+                activation_prepack_launcher, activation_rows
+            ).wgmma_load(8, 128, Major.K)
+            activation_prepack_launcher.s(
+                SchedNvfp4UmmaPrepack(
+                    SchedNvfp4UmmaPrepack.ACTIVATION,
+                    activation_rows,
+                    activation_scale_tiles,
+                    packed_activation,
+                    activation_tma,
+                ).place(1)
+            )
+            activation_prepack_launcher.launch()
+            torch.cuda.synchronize()
+            stage(f"native_prepack_complete_{num_sms}")
+
+            schedule = SchedNvfp4GemvUmmaStream(
+                packed_weight,
+                packed_activation,
+                alpha_storage,
+                output,
             ).place(num_sms)
         else:
             schedule_cls = (

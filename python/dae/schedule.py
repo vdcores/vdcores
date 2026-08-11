@@ -541,6 +541,162 @@ class SchedNvfp4GemvUmma(SchedNvfp4Gemv):
         return Nvfp4GemvUmmaSm100(row_count, self.k, self.output_columns)
 
 
+class SchedNvfp4UmmaPrepack(Schedule):
+    """Setup-only conversion to combined native data/scale K256 tiles."""
+
+    WEIGHT = Nvfp4UmmaPrepackSm100.WEIGHT
+    ACTIVATION = Nvfp4UmmaPrepackSm100.ACTIVATION
+    TILE_M = 128
+    TILE_K = 256
+    WEIGHT_TILE_BYTES = 18432
+    ACTIVATION_TILE_BYTES = 3072
+
+    def __init__(self, kind, data, scale_tiles, output, data_tma):
+        super().__init__()
+        self.kind = kind
+        self.data = data
+        self.scale_tiles = scale_tiles
+        self.output = output
+        self.data_tma = data_tma
+
+    def _on_place(self):
+        if self.kind not in (self.WEIGHT, self.ACTIVATION):
+            raise ValueError("NVFP4 prepack kind must be weight or activation")
+        if self.data.dtype != torch.uint8 or self.data.ndim != 2:
+            raise ValueError("NVFP4 prepack data must be rank-2 packed uint8")
+        if self.data.shape[1] % (self.TILE_K // 2):
+            raise ValueError("NVFP4 prepack K must be K256 aligned")
+        self.k_tiles = self.data.shape[1] // (self.TILE_K // 2)
+        if self.kind == self.WEIGHT:
+            if self.data.shape[0] % self.TILE_M:
+                raise ValueError("NVFP4 prepack weight rows must be M128 aligned")
+            self.m_tiles = self.data.shape[0] // self.TILE_M
+            if self.num_sms != self.m_tiles:
+                raise ValueError("weight prepack requires one SM per M128 tile")
+            expected_scales = (self.m_tiles, self.k_tiles, self.TILE_M, 16)
+            expected_output = (
+                self.m_tiles,
+                self.k_tiles,
+                self.WEIGHT_TILE_BYTES,
+            )
+            expected_tma_bytes = self.TILE_M * (self.TILE_K // 2)
+        else:
+            self.m_tiles = 1
+            if tuple(self.data.shape) != (8, self.k_tiles * (self.TILE_K // 2)):
+                raise ValueError("activation prepack data must be [8,K/2]")
+            if self.num_sms != 1:
+                raise ValueError("activation prepack requires one SM")
+            expected_scales = (self.k_tiles, 16)
+            expected_output = (self.k_tiles, self.ACTIVATION_TILE_BYTES)
+            expected_tma_bytes = 8 * (self.TILE_K // 2)
+        if (
+            self.scale_tiles.dtype != torch.float8_e4m3fn
+            or tuple(self.scale_tiles.shape) != expected_scales
+            or not self.scale_tiles.is_contiguous()
+        ):
+            raise ValueError(f"NVFP4 prepack scales must be {expected_scales} E4M3")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != expected_output
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(f"NVFP4 prepack output must be uint8 {expected_output}")
+        if self.data_tma.size != expected_tma_bytes:
+            raise ValueError("NVFP4 prepack data TMA has the wrong tile size")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = [Nvfp4UmmaPrepackSm100(self.kind, self.k_tiles)]
+        row_start = sm * self.TILE_M if self.kind == self.WEIGHT else 0
+        for tile in range(self.k_tiles):
+            packed_k_start = tile * (self.TILE_K // 2)
+            scale = (
+                self.scale_tiles[sm, tile]
+                if self.kind == self.WEIGHT
+                else self.scale_tiles[tile]
+            )
+            output = (
+                self.output[sm, tile]
+                if self.kind == self.WEIGHT
+                else self.output[tile]
+            )
+            instructions.extend(
+                (
+                    self.data_tma.cord(row_start, packed_k_start),
+                    TmaLoad1D(scale.reshape(-1)),
+                    TmaStore1D(output.reshape(-1)),
+                )
+            )
+        return instructions
+
+
+class SchedNvfp4GemvUmmaStream(Schedule):
+    """One M128 output tile with combined data/scale K256 operand loads."""
+
+    TILE_M = SchedNvfp4UmmaPrepack.TILE_M
+    WEIGHT_TILE_BYTES = SchedNvfp4UmmaPrepack.WEIGHT_TILE_BYTES
+    ACTIVATION_TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(self, weight_tiles, activation_tiles, alpha, output):
+        super().__init__()
+        self.weight_tiles = weight_tiles
+        self.activation_tiles = activation_tiles
+        self.alpha = alpha
+        self.output = output
+
+    def _on_place(self):
+        if (
+            self.weight_tiles.dtype != torch.uint8
+            or self.weight_tiles.ndim != 3
+            or self.weight_tiles.shape[2] != self.WEIGHT_TILE_BYTES
+            or not self.weight_tiles.is_contiguous()
+        ):
+            raise ValueError("streaming weight tiles must be [M/128,K/256,18432] uint8")
+        self.m_tiles, self.k_tiles, _ = self.weight_tiles.shape
+        if self.num_sms != self.m_tiles:
+            raise ValueError("streaming NVFP4 requires one M128 tile per SM")
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or tuple(self.activation_tiles.shape)
+            != (self.k_tiles, self.ACTIVATION_TILE_BYTES)
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError("streaming activation tiles must be [K/256,3072] uint8")
+        self.rows = self.m_tiles * self.TILE_M
+        if self.alpha.dtype != torch.float32 or self.alpha.numel() != 4:
+            raise ValueError("streaming NVFP4 alpha storage must contain four FP32 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
+            raise ValueError("streaming NVFP4 output must contain M BF16 values")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = [
+            Nvfp4GemvUmmaStreamSm100(self.k_tiles),
+            TmaLoad1D(self.alpha).fixed_port(1),
+        ]
+        for tile in range(self.k_tiles):
+            instructions.extend(
+                (
+                    TmaLoad1D(self.weight_tiles[sm, tile].reshape(-1)).fixed_port(0),
+                    TmaLoad1D(self.activation_tiles[tile].reshape(-1)).fixed_port(1),
+                )
+            )
+        row_start = sm * self.TILE_M
+        instructions.append(
+            TmaStore1D(
+                self.output[row_start : row_start + self.TILE_M]
+            ).bar(self._bar("output"))
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedFp8Block128Gemv(Schedule):
     """Shard an E4M3/UE8M0 checkpoint GEMV across resident SMs."""
 

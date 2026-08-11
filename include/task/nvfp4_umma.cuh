@@ -12,6 +12,7 @@
 #include <cutlass/bfloat16.h>
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/detail/sm100_tmem_helper.hpp>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
 // CUTLASS 4.6.1's get_utccp_smem_desc_tensor is intentionally a host-side
@@ -209,7 +210,6 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_sm100(
   constexpr int kPackedSegmentsB = kTileN * kTileK / 32;
   constexpr int kScalesA = kTileM * kTileK / kScaleVector;
   constexpr int kScalesB = kTileN * kTileK / kScaleVector;
-
   tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
   for (int tile = 0; tile < num_k_tiles; ++tile) {
     for (int segment = tid; segment < kPackedSegmentsA; segment += 128) {
@@ -335,5 +335,316 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_sm100(
       tid,
       weight_slots | weight_scale_slots | input_slots |
           input_scale_slots | alpha_slots);
+  c2m.template push<0, true>(tid, output_slots);
+}
+
+// Setup-only layout conversion. The data input has already been placed in its
+// native swizzle by TMA. This task copies those bytes beside the matching
+// native scale layout so the token-time path can fetch data and scales with
+// one ordinary TMA transaction. Kind 0 packs M128 weight tiles; kind 1 packs
+// the replicated N8 activation tile.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_nvfp4_umma_prepack_sm100(
+    int kind,
+    int num_k_tiles,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using namespace cute;
+  using Fp4 = cutlass::float_e2m1_t;
+  using CheckpointScale = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue4m3_t;
+  using Accum = float;
+
+  constexpr int kTileM = 128;
+  constexpr int kTileN = 8;
+  constexpr int kTileK = 256;
+  constexpr int kScaleVector = 16;
+  using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+  using Atom = SM100_MMA_MXF4_SS<
+      Fp4, Fp4, Accum, Scale,
+      kTileM, kTileN, kScaleVector,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+
+  TiledMma tiled_mma;
+  auto mma_shape_a = partition_shape_A(
+      tiled_mma, make_shape(Int<kTileM>{}, Int<kTileK>{}));
+  auto mma_shape_b = partition_shape_B(
+      tiled_mma, make_shape(Int<kTileN>{}, Int<kTileK>{}));
+  auto layout_sA = UMMA::tile_to_mma_shape(
+      UMMA::Layout_K_SW128_Atom<Fp4>{}, mma_shape_a);
+  auto layout_sB = UMMA::tile_to_mma_shape(
+      UMMA::Layout_K_SW128_Atom<Fp4>{}, mma_shape_b);
+  using LayoutSFA = decltype(
+      ScaleConfig::deduce_smem_layoutSFA(TiledMma{}, TileShape{}));
+  using LayoutSFB = decltype(
+      ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+  constexpr int kAlignment = 128;
+  constexpr int kABytes = (cosize_v<decltype(layout_sA)> + 1) / 2;
+  constexpr int kBBytes = (cosize_v<decltype(layout_sB)> + 1) / 2;
+  constexpr int kAStorageBytes =
+      (kABytes + kAlignment - 1) & -kAlignment;
+  constexpr int kBStorageBytes =
+      (kBBytes + kAlignment - 1) & -kAlignment;
+  constexpr int kSFABytes = cosize_v<LayoutSFA>;
+  constexpr int kSFBBytes = cosize_v<LayoutSFB>;
+  static_assert(kAStorageBytes + kSFABytes == 18432);
+  static_assert(kBStorageBytes + kSFBBytes == 3072);
+
+  using ScaleProblemShape = Shape<Int<kTileM>, Int<128>, Int<kTileK>>;
+  const auto logical_sfa =
+      ScaleConfig::tile_atom_to_shape_SFA(ScaleProblemShape{});
+  const auto logical_sfb =
+      ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
+  constexpr int kScalesA = kTileM * kTileK / kScaleVector;
+  constexpr int kScalesB = kTileN * kTileK / kScaleVector;
+  cutlass::NumericConverter<Scale, CheckpointScale> convert_scale;
+  const int tid = __compute_tid();
+
+  for (int tile = 0; tile < num_k_tiles; ++tile) {
+    const int data_slots = m2c.template pop<0>();
+    const auto *data = static_cast<const uint8_t *>(
+        get_slot_address(smem_base, extract(data_slots)));
+    const int scale_slots = m2c.template pop<0>();
+    const auto *scale = static_cast<const CheckpointScale *>(
+        get_slot_address(smem_base, extract(scale_slots)));
+    const int output_slots = m2c.template pop<0>();
+    auto *output = static_cast<uint8_t *>(
+        get_slot_address(smem_base, extract(output_slots)));
+
+    const int data_bytes = kind == 0 ? kABytes : kBBytes;
+    const int scale_offset = kind == 0 ? kAStorageBytes : kBStorageBytes;
+    const int scale_bytes = kind == 0 ? kSFABytes : kSFBBytes;
+    for (int offset = tid * 16; offset < data_bytes; offset += 128 * 16) {
+      *reinterpret_cast<uint4 *>(output + offset) =
+          *reinterpret_cast<const uint4 *>(data + offset);
+    }
+    for (int offset = tid; offset < scale_bytes; offset += 128) {
+      output[scale_offset + offset] = 0;
+    }
+    __sync_compute_group(128);
+
+    if (kind == 0) {
+      auto *packed_scale = reinterpret_cast<Scale *>(
+          output + kAStorageBytes);
+      for (int index = tid; index < kScalesA; index += 128) {
+        const int row = index / (kTileK / kScaleVector);
+        const int sf = index % (kTileK / kScaleVector);
+        const int dst = int(logical_sfa(row, sf * kScaleVector));
+        packed_scale[dst] = convert_scale(
+            scale[row * (kTileK / kScaleVector) + sf]);
+      }
+    } else {
+      auto *packed_scale = reinterpret_cast<Scale *>(
+          output + kBStorageBytes);
+      for (int index = tid; index < kScalesB; index += 128) {
+        const int sf = index % (kTileK / kScaleVector);
+        const int row = index / (kTileK / kScaleVector);
+        const int dst = int(logical_sfb(row, sf * kScaleVector));
+        packed_scale[dst] = convert_scale(scale[sf]);
+      }
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, data_slots | scale_slots);
+    c2m.template push<0, true>(tid, output_slots);
+  }
+}
+
+// Performance-oriented native path. LDU places prepacked data and scale bytes
+// in one shared allocation for each operand and streams K256 tiles through
+// native block-scaled UMMA.
+// Each load contains one M128/K256 weight tile or one broadcast N8/K256
+// activation tile directly in its UMMA data and scale layouts. Compute moves
+// the native scales to TMEM, issues block-scaled UMMA, and retires each tile
+// before consuming the next.
+// No global address is visible here; the same operand stream can later be fed
+// by routed LDU commands without changing this task.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
+    int num_k_tiles,
+    void *smem_base,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using namespace cute;
+  using Fp4 = cutlass::float_e2m1_t;
+  using Scale = cutlass::float_ue4m3_t;
+  using Accum = float;
+  using Output = cutlass::bfloat16_t;
+
+  constexpr int kTileM = 128;
+  constexpr int kTileN = 8;
+  constexpr int kTileK = 256;
+  constexpr int kScaleVector = 16;
+  using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+  using Atom = SM100_MMA_MXF4_SS<
+      Fp4, Fp4, Accum, Scale,
+      kTileM, kTileN, kScaleVector,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+
+  const int alpha_slots = m2c.template pop<0>();
+  const int alpha_slot = extract(alpha_slots);
+  const auto *alpha_ptr = static_cast<const float *>(
+      get_slot_address(smem_base, alpha_slot));
+  const float alpha = *alpha_ptr;
+  const int tid = __compute_tid();
+
+  TiledMma tiled_mma;
+  auto cta_mma = tiled_mma.get_slice(0);
+  auto mma_shape_a = partition_shape_A(
+      tiled_mma, make_shape(Int<kTileM>{}, Int<kTileK>{}));
+  auto mma_shape_b = partition_shape_B(
+      tiled_mma, make_shape(Int<kTileN>{}, Int<kTileK>{}));
+  auto layout_sA = UMMA::tile_to_mma_shape(
+      UMMA::Layout_K_SW128_Atom<Fp4>{}, mma_shape_a);
+  auto layout_sB = UMMA::tile_to_mma_shape(
+      UMMA::Layout_K_SW128_Atom<Fp4>{}, mma_shape_b);
+  using LayoutSFA = decltype(
+      ScaleConfig::deduce_smem_layoutSFA(TiledMma{}, TileShape{}));
+  using LayoutSFB = decltype(
+      ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+
+  constexpr int kDescriptorAlignment = 128;
+  constexpr int kABytes = (cosize_v<decltype(layout_sA)> + 1) / 2;
+  constexpr int kBBytes = (cosize_v<decltype(layout_sB)> + 1) / 2;
+  constexpr int kAStorageBytes =
+      (kABytes + kDescriptorAlignment - 1) & -kDescriptorAlignment;
+  constexpr int kBStorageBytes =
+      (kBBytes + kDescriptorAlignment - 1) & -kDescriptorAlignment;
+  constexpr int kSFABytes = cosize_v<LayoutSFA>;
+  constexpr int kSFBBytes = cosize_v<LayoutSFB>;
+  static_assert(kAStorageBytes + kSFABytes == 18432);
+  static_assert(kBStorageBytes + kSFBBytes == 3072);
+
+  auto logical_c = make_tensor(
+      make_smem_ptr(static_cast<Accum *>(nullptr)),
+      make_layout(
+          make_shape(Int<kTileM>{}, Int<kTileN>{}),
+          make_stride(Int<kTileN>{}, Int<1>{})));
+  auto cta_c = cta_mma.partition_C(logical_c);
+  auto tmem_acc = cta_mma.make_fragment_C(cta_c);
+  tmem_acc.data() = tmem_base_ptr;
+
+  auto tCtSFA = make_tensor<typename TiledMma::FrgTypeSFA>(
+      shape(LayoutSFA{}));
+  auto tCtSFB = make_tensor<typename TiledMma::FrgTypeSFB>(
+      shape(LayoutSFB{}));
+  tCtSFA.data() = tmem_base_ptr +
+      cutlass::detail::find_tmem_tensor_col_offset(tmem_acc);
+  tCtSFB.data() = tCtSFA.data().get() +
+      cutlass::detail::find_tmem_tensor_col_offset(tCtSFA);
+
+  auto tCtSFA_compact = make_tensor(
+      tCtSFA.data(), filter_zeros(tCtSFA.layout()));
+  auto tCtSFB_compact = make_tensor(
+      tCtSFB.data(), filter_zeros(tCtSFB.layout()));
+  using Utccp = SM100_UTCCP_4x32dp128bit_1cta;
+  auto copy_sfa = make_utccp_copy(Utccp{}, tCtSFA_compact);
+  auto copy_sfb = make_utccp_copy(Utccp{}, tCtSFB_compact);
+  auto copy_sfa_slice = copy_sfa.get_slice(0);
+  auto copy_sfb_slice = copy_sfb.get_slice(0);
+  auto copy_sfa_dst = copy_sfa_slice.partition_D(tCtSFA_compact);
+  auto copy_sfb_dst = copy_sfb_slice.partition_D(tCtSFB_compact);
+
+  tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
+  for (int tile = 0; tile < num_k_tiles; ++tile) {
+    const int weight_slots = m2c.template pop<0>();
+    const int weight_slot = extract(weight_slots);
+    auto *weight_base = static_cast<uint8_t *>(
+        get_slot_address(smem_base, weight_slot));
+    auto sA = make_tensor(
+        make_smem_ptr(reinterpret_cast<Fp4 *>(weight_base)),
+        layout_sA);
+    auto tCrA = cta_mma.make_fragment_A(sA);
+    auto tCsSFA = make_tensor(
+        make_smem_ptr(reinterpret_cast<Scale *>(
+            weight_base + kAStorageBytes)),
+        LayoutSFA{});
+    auto tCsSFA_compact = make_tensor(
+        tCsSFA.data(), filter_zeros(tCsSFA.layout()));
+    auto copy_sfa_src_raw = copy_sfa_slice.partition_S(tCsSFA_compact);
+    auto copy_sfa_src =
+        dae_get_utccp_smem_desc_tensor<Utccp>(copy_sfa_src_raw);
+
+    const int input_slots = m2c.template pop<0>();
+    const int input_slot = extract(input_slots);
+    auto *input_base = static_cast<uint8_t *>(
+        get_slot_address(smem_base, input_slot));
+    auto sB = make_tensor(
+        make_smem_ptr(reinterpret_cast<Fp4 *>(input_base)),
+        layout_sB);
+    auto tCrB = cta_mma.make_fragment_B(sB);
+    auto tCsSFB = make_tensor(
+        make_smem_ptr(reinterpret_cast<Scale *>(
+            input_base + kBStorageBytes)),
+        LayoutSFB{});
+    auto tCsSFB_compact = make_tensor(
+        tCsSFB.data(), filter_zeros(tCsSFB.layout()));
+    auto copy_sfb_src_raw = copy_sfb_slice.partition_S(tCsSFB_compact);
+    auto copy_sfb_src =
+        dae_get_utccp_smem_desc_tensor<Utccp>(copy_sfb_src_raw);
+
+    if (tid < 32 && elect_one_sync()) {
+      copy(copy_sfa, copy_sfa_src, copy_sfa_dst);
+      copy(copy_sfb, copy_sfb_src, copy_sfb_dst);
+    }
+    if (tid < 32) {
+#pragma unroll
+      for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+        gemm(
+            tiled_mma.with(
+                tiled_mma.accumulate_,
+                tCtSFA(_, _, k_block),
+                tCtSFB(_, _, k_block)),
+            tCrA(_, _, k_block),
+            tCrB(_, _, k_block),
+            tmem_acc);
+        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+      }
+      cutlass::arch::umma_arrive(tmem_mma_barrier);
+    }
+    cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+    tmem_mma_phase ^= 1;
+    c2m.push(tid, weight_slots | input_slots);
+  }
+
+  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+  __sync_compute_group(128);
+  asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<Output *>(
+      get_slot_address(smem_base, output_slot));
+  auto coord_c = make_identity_tensor(
+      make_shape(Int<kTileM>{}, Int<kTileN>{}));
+  auto cta_coord_c = cta_mma.partition_C(coord_c);
+  using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
+  auto tAcc = tmem_acc(make_coord(_, _), _0{}, _0{});
+  auto cAcc = cta_coord_c(make_coord(_, _), _0{}, _0{});
+  auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
+  const int thread_idx = tid % size(tiled_t2r);
+  auto thread_t2r = tiled_t2r.get_slice(thread_idx);
+  auto thread_tmem = thread_t2r.partition_S(tAcc);
+  auto thread_coord = thread_t2r.partition_D(cAcc);
+  auto r_acc = make_tensor<Accum>(shape(thread_coord));
+  copy(tiled_t2r, thread_tmem, r_acc);
+#pragma unroll
+  for (int index = 0; index < size(r_acc); ++index) {
+    const int row = int(get<0>(thread_coord(index)));
+    const int col = int(get<1>(thread_coord(index)));
+    if (row < kTileM && col == 0) {
+      output[row] = Output(r_acc(index) * alpha);
+    }
+  }
+
+  __sync_compute_group(128);
+  c2m.push(tid, alpha_slots);
   c2m.template push<0, true>(tid, output_slots);
 }

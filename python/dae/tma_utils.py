@@ -342,15 +342,17 @@ def cord_func_m128n8_grouped_output(
 
 # pytorch-major cord functions
 def cord_func_2d_kmajor(mat: torch.Tensor, rank : int):
+    block_k = 128 // mat.element_size()
+
     def cord_func(*cords):
         assert len(mat.shape) == len(cords), f"cords length {len(cords)} does not match mat rank {len(mat.shape)}"
         rest = np.dot(mat.stride()[:-2], cords[:-2]) // prod(mat.shape[-2:])
         rest = int(rest)
         
         if rank == 3: #(...rest, M, K)
-            return [0, cords[-2], cords[-1] // 64]
+            return [0, cords[-2], cords[-1] // block_k]
         elif rank == 4: # (B, C, M//blockM, K//blockK)
-            return [0, cords[-2], cords[-1] // 64, rest]
+            return [0, cords[-2], cords[-1] // block_k, rest]
         else:
             raise ValueError(f"Unsupported rank {rank} for mn-major cord function")
     return cord_func

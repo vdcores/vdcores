@@ -24,6 +24,8 @@ from dae.instructions import (
     IndirectTmaLoad1D,
     LduProfileLayer,
     Nvfp4GemvSm100,
+    Nvfp4GemvUmmaStreamSm100,
+    Nvfp4UmmaPrepackSm100,
     ProfileEvent,
     RepeatM,
     ResetIndirectLayer,
@@ -42,6 +44,7 @@ from dae.sequential import (
 )
 from dae.tma_utils import (
     cords2addr,
+    cord_func_2d_kmajor,
     cord_func_2d_tile_major,
     cord_func_m128n8_grouped_output,
     pack_weight_tile_major,
@@ -59,6 +62,13 @@ def test_tile_major_weight_pack_round_trip_and_coordinates():
 
     cord = cord_func_2d_tile_major(packed, packed.dim())
     assert cord(64, 256) == [0, 0, 1, 1]
+
+
+def test_kmajor_uint8_coordinates_use_128_byte_blocks():
+    packed_fp4 = torch.empty((8, 256), dtype=torch.uint8)
+    cord = cord_func_2d_kmajor(packed_fp4, 3)
+
+    assert cord(0, 128) == [0, 0, 1]
 
 
 def test_dynamic_repeat_encodes_zero_count_skip_window():
@@ -341,6 +351,20 @@ def test_nvfp4_gemv_can_retain_activation_slots():
     instruction = Nvfp4GemvSm100(16, 4096, retain_activation=True)
 
     assert instruction.args == [16, 4096, 1]
+
+
+def test_nvfp4_streaming_umma_encodes_k_tile_count():
+    instruction = Nvfp4GemvUmmaStreamSm100(16)
+
+    assert instruction.args == [16]
+
+
+def test_nvfp4_umma_prepack_encodes_kind_and_k_tile_count():
+    instruction = Nvfp4UmmaPrepackSm100(
+        Nvfp4UmmaPrepackSm100.ACTIVATION, 16
+    )
+
+    assert instruction.args == [1, 16]
 
 
 def test_sequential_program_elides_only_same_placement_independent_edge():

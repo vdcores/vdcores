@@ -719,6 +719,34 @@ the current native oracle's synchronous in-task checkpoint reformat. Weight
 data and scales should share a load transaction when the preprocessed layout
 demonstrates a task and end-to-end win without duplicating the resident model.
 
+That native layout proof now passes. Setup preprocessing emits one combined
+18,432-byte M128/K256 weight tile (16,384 bytes FP4 data plus 2,048 bytes native
+scales) and one 3,072-byte broadcast N8/K256 activation tile. The token-time
+task consumes one fixed-port LDU load per operand, moves native scales to TMEM,
+and issues block-scaled SM100 UMMA from a compact runtime K-tile loop. It has no
+global compute pointer, indirect store, issue barrier, thread fence, or
+inter-stage HBM copy. The narrow image uses 44 registers, nine barriers, an
+80-byte stack frame, and no spills; 81 focused tests pass.
+
+Random-scale outputs were exact at M128/K256 and M128/K4096. On production
+projection shapes, combined-layout jobs `20260811T073746Z-3577928` and
+`20260811T073804Z-3580496` measured 15.936 us for M2048/K4096 on 16 SMs and
+8.800 us for M4096/K2048 on 32 SMs. These improve on the current routed
+25-SM medians of 19.008 and 17.408 us by 16.2% and 49.4%, respectively. They
+remain slower than FlashInfer's whole-GPU graph-amortized kernels and are a
+kernel milestone, not a network-TBT result.
+
+The weight conversion is immutable setup work and the combined representation
+does not exceed the raw FP4-data-plus-scale byte count, so production should
+replace rather than duplicate resident expert storage. Activation layout is
+token-dependent: the task benchmark preprocesses it outside the measured GEMV
+span, so production must make the NVFP4 quantizer emit the native activation
+tile directly or hand it off through shared memory. Six-expert placement also
+needs a shape-derived wave assignment: W1/W3 require 96 M128 tiles and fit
+concurrently, while W2 has 192 tiles and cannot assign one tile to every SM at
+once on a 152-SM GPU. Do those structural integrations and measure the complete
+routed-expert group before further UMMA instruction tuning.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median

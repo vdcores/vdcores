@@ -125,6 +125,35 @@ class Nvfp4GemvUmmaSm100(ComputeInstruction):
         )
 
 
+class Nvfp4GemvUmmaStreamSm100(ComputeInstruction):
+    """Stream pre-swizzled K256 operands into native SM100 block-scale UMMA."""
+
+    def __init__(self, k_tiles: int):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("NVFP4 streaming UMMA K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_NVFP4_GEMV_UMMA_STREAM_SM100,
+            args=[k_tiles],
+        )
+
+
+class Nvfp4UmmaPrepackSm100(ComputeInstruction):
+    """Prepack direct-TMA NVFP4 data and raw scales into one native tile."""
+
+    WEIGHT = 0
+    ACTIVATION = 1
+
+    def __init__(self, kind: int, k_tiles: int):
+        if kind not in (self.WEIGHT, self.ACTIVATION):
+            raise ValueError("NVFP4 UMMA prepack kind must be weight or activation")
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("NVFP4 UMMA prepack K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_NVFP4_UMMA_PREPACK_SM100,
+            args=[kind, k_tiles],
+        )
+
+
 class Fp8Block128GemvSm100(ComputeInstruction):
     """E4M3/UE8M0 block-128 decode GEMV over one output-row shard."""
 
@@ -1854,6 +1883,8 @@ __all__ = [
     "Gemv_M64N8IssuerOnly",
     "Nvfp4GemvSm100",
     "Nvfp4GemvUmmaSm100",
+    "Nvfp4GemvUmmaStreamSm100",
+    "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Dsv4Rope512_64",
     "Dsv4Rope128_64",
