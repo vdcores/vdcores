@@ -71,6 +71,7 @@ class Stage:
     schedule: object
     num_sms: int
     input_role: str | None = None
+    wait_for_previous: bool = True
 
 
 class ResidentOneLaunchDecode:
@@ -205,10 +206,11 @@ class ResidentOneLaunchDecode:
         sms: int | ShapeAssignment = 1,
         *,
         input_role: str | None = None,
+        wait_for_previous: bool = True,
     ) -> Stage:
         if isinstance(sms, ShapeAssignment):
             sms = self._remember(sms)
-        return Stage(name, schedule, int(sms), input_role)
+        return Stage(name, schedule, int(sms), input_role, wait_for_previous)
 
     @staticmethod
     def _groups(*tensor_sets: tuple[torch.Tensor, ...]):
@@ -399,6 +401,7 @@ class ResidentOneLaunchDecode:
         output: torch.Tensor,
         *,
         row_slice: slice | None = None,
+        wait_for_previous: bool = True,
     ) -> Stage:
         linears = tuple(
             self.checkpoint.load_fp8_linear(
@@ -427,7 +430,12 @@ class ResidentOneLaunchDecode:
         )
         schedule = self._layered(schedule, family, weights, scales)
         assignment = self.policy.fp8_gemv(output.numel(), activation.numel())
-        return self._stage(name, schedule, assignment)
+        return self._stage(
+            name,
+            schedule,
+            assignment,
+            wait_for_previous=wait_for_previous,
+        )
 
     def _bf16_linear_stage(
         self,
@@ -436,6 +444,8 @@ class ResidentOneLaunchDecode:
         suffix: str,
         source: torch.Tensor,
         output: torch.Tensor,
+        *,
+        wait_for_previous: bool = True,
     ) -> Stage:
         weights = self._family_tensors(family, suffix)
         schedule = SchedDsv4Bf16Gemv(
@@ -443,7 +453,12 @@ class ResidentOneLaunchDecode:
         )
         schedule = self._layered(schedule, family, weights)
         assignment = self.policy.bf16_gemv(output.numel(), source.numel())
-        return self._stage(name, schedule, assignment)
+        return self._stage(
+            name,
+            schedule,
+            assignment,
+            wait_for_previous=wait_for_previous,
+        )
 
     def _rms_stage(
         self,
@@ -632,6 +647,7 @@ class ResidentOneLaunchDecode:
                     "attn.compressor.wgate.weight",
                     self.norm_hidden,
                     self.compress_scores[:width],
+                    wait_for_previous=False,
                 )
             )
 
@@ -689,6 +705,7 @@ class ResidentOneLaunchDecode:
                     "attn.indexer.compressor.wgate.weight",
                     self.norm_hidden,
                     self.index_compress_scores,
+                    wait_for_previous=False,
                 )
             )
 
@@ -889,6 +906,8 @@ class ResidentOneLaunchDecode:
         activation: torch.Tensor,
         activation_scale: torch.Tensor,
         output: torch.Tensor,
+        *,
+        wait_for_previous: bool = True,
     ) -> Stage:
         assignment = self.policy.nvfp4_gemv(rows, k)
         table = tables[0]
@@ -911,10 +930,15 @@ class ResidentOneLaunchDecode:
             activation.reshape(-1),
             activation_scale.reshape(-1),
             output.reshape(-1),
+            route_ready=not wait_for_previous,
         )
         schedule = self._routed_layered(schedule, family, tables)
         return self._stage(
-            name, schedule, assignment, input_role="route"
+            name,
+            schedule,
+            assignment,
+            input_role="route" if wait_for_previous else None,
+            wait_for_previous=wait_for_previous,
         )
 
     def _hash_row(self, layer_id: int) -> torch.Tensor:
@@ -1011,6 +1035,7 @@ class ResidentOneLaunchDecode:
                     self.routed_input[rank],
                     self.routed_input_scale[rank],
                     self.routed_up[rank],
+                    wait_for_previous=False,
                 )
             )
             stages.append(
@@ -1070,6 +1095,7 @@ class ResidentOneLaunchDecode:
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
                 self.shared_up,
+                wait_for_previous=False,
             )
         )
         stages.append(
@@ -1190,6 +1216,7 @@ class ResidentOneLaunchDecode:
                 base_sm=base_sm,
                 input_role=stage.input_role,
                 profile_after=profile_after,
+                wait_for_previous=stage.wait_for_previous,
             )
 
         def queued_family(family: LayerFamily) -> list[SequentialStage]:

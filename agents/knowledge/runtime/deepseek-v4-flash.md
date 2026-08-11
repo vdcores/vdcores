@@ -322,6 +322,27 @@ checkpoint gate measured 0.557 ms median. Full checkpoint job
 measured 33.007--34.276 ms, median 33.731 ms. This is a 0.342 ms complete-token
 improvement over the 34.074 ms dual-LDU production boundary.
 
+### Same-placement dependency elision
+
+The first explicit-DAG milestone omits a predecessor edge only when adjacent
+stages use the identical SM interval. Per-SM compute, LDU, and STU queue order
+then makes the later stage tail dominate the earlier tail; the next true edge
+is their join. The assembler rejects an elided edge across different
+placements. This is queue ordering inside the same resident launch, not an
+additional schedule or launch.
+
+This removes false W1-to-W3 edges for the six routed experts and shared expert,
+and same-shape compressor value-to-gate edges. W3 still dynamically resolves
+the selected expert's addresses in LDU; its identical-placement W1 predecessor
+has already passed the route edge, so no redundant route wait is needed.
+There is no IssueBarrier, compute/memory joint barrier, or thread fence.
+
+The one-layer checkpoint median improved from 0.557 to 0.517 ms. Full job
+`20260811T013151Z-2288944` preserved token 14 over 30 samples and measured
+31.319--34.329 ms, median 32.130 ms. The queued compute/memory images remained
+1,197/4,052 instructions while dependency counters fell from 612 to 555. This
+is a 1.601 ms (4.7%) complete-token improvement over the 33.731 ms boundary.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

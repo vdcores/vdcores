@@ -284,6 +284,79 @@ def test_sequential_program_balances_default_loads_by_size():
     assert [bool(inst.opcode & 0x20) for inst in loads] == [False, True, True]
 
 
+def test_sequential_program_elides_only_same_placement_independent_edge():
+    class FakeLauncher:
+        num_sms = 2
+        num_bars = 0
+        max_insts = 32
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = SequentialProgram(
+        launcher,
+        (
+            SequentialStage("first", BasicStage(), 2),
+            SequentialStage(
+                "independent", BasicStage(), 2, wait_for_previous=False
+            ),
+            SequentialStage("join", BasicStage(), 2),
+        ),
+    )
+    assert launcher.bar_values == {0: 2}
+    memory = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+    ]
+    first_store = memory[1]
+    independent_store = memory[3]
+    join_load = memory[4]
+    assert not first_store.opcode & 0x10
+    assert independent_store.opcode & 0x10
+    assert join_load.opcode & 0x10
+
+    with pytest.raises(ValueError, match="must match the previous stage placement"):
+        SequentialProgram(
+            FakeLauncher(),
+            (
+                SequentialStage("first", BasicStage(), 2),
+                SequentialStage(
+                    "bad", BasicStage(), 1, wait_for_previous=False
+                ),
+            ),
+        )
+
+
 def test_sequential_program_binds_model_specific_input_role_to_same_edge():
     class FakeLauncher:
         num_sms = 1

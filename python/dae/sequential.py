@@ -33,6 +33,7 @@ class SequentialStage:
     base_sm: int = 0
     input_role: str | None = None
     profile_after: bool = False
+    wait_for_previous: bool = True
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ class SequentialProgram:
         self.placed_schedules = []
 
         previous = None
+        previous_stage = None
         previous_name = None
         previous_profile_after = False
         for stage in self.stages:
@@ -198,7 +200,7 @@ class SequentialProgram:
                 )
 
             input_bar = None
-            if previous is not None:
+            if previous is not None and stage.wait_for_previous:
                 count, tails = _writeback_tail(previous, previous_name)
                 if launcher.num_bars >= config.max_bars - 2:
                     raise ValueError("sequential program exceeds the runtime barrier capacity")
@@ -214,6 +216,19 @@ class SequentialProgram:
                     ).bar(input_bar)
                     for instructions in self.instructions:
                         instructions.append(marker.copy())
+            elif previous is not None:
+                if previous_profile_after:
+                    raise ValueError(
+                        "a profiled stage cannot elide its completion edge"
+                    )
+                if (
+                    stage.base_sm != previous_stage.base_sm
+                    or stage.num_sms != previous_stage.num_sms
+                ):
+                    raise ValueError(
+                        f"independent stage {stage.name!r} must match the "
+                        "previous stage placement so its queue tail dominates"
+                    )
 
             schedule = stage.schedule._clone()
             if input_bar is not None and stage.input_role is not None:
@@ -242,6 +257,7 @@ class SequentialProgram:
             for sm, instructions in enumerate(rendered):
                 self.instructions[sm].extend(instructions)
             previous = rendered
+            previous_stage = stage
             previous_name = stage.name
             previous_profile_after = stage.profile_after
 

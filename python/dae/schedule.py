@@ -353,6 +353,8 @@ class SchedRoutedNvfp4Gemv(Schedule):
         activation,
         activation_scale,
         output,
+        *,
+        route_ready=False,
     ):
         super().__init__()
         self.routing_state = routing_state
@@ -365,6 +367,7 @@ class SchedRoutedNvfp4Gemv(Schedule):
         self.activation = activation
         self.activation_scale = activation_scale
         self.output = output
+        self.route_ready = bool(route_ready)
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
@@ -402,18 +405,21 @@ class SchedRoutedNvfp4Gemv(Schedule):
         if row_count == 0:
             return []
         route_bar = self._bar("route")
-        if route_bar is None:
+        if route_bar is None and not self.route_ready:
             raise ValueError("routed NVFP4 GEMV requires a route barrier")
         weight_bytes = row_count * (self.k // 2)
         scale_bytes = row_count * (self.k // 16)
+        weight_load = RoutedTmaLoad1D(
+            self.routing_state,
+            self.route_rank,
+            self.weight_fields[sm],
+            weight_bytes,
+        )
+        if route_bar is not None:
+            weight_load.bar(route_bar)
         return [
             Nvfp4GemvSm100(row_count, self.k),
-            RoutedTmaLoad1D(
-                self.routing_state,
-                self.route_rank,
-                self.weight_fields[sm],
-                weight_bytes,
-            ).bar(route_bar),
+            weight_load,
             RoutedTmaLoad1D(
                 self.routing_state,
                 self.route_rank,
