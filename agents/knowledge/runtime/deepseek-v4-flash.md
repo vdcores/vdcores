@@ -655,6 +655,43 @@ representative median improvement exceeds run-to-run noise. Record rejected
 experiments in `.agentlog/`; do not preserve tuning that merely moves time
 between counters or regresses complete-token latency.
 
+## Fixed-context framework comparison (2026-08-11)
+
+`benchmarks/blackwell_fixed_context_decode.py` now runs statistical one-GPU,
+batch-one, context-128 decode baselines with three warmups and 30 timed second
+tokens. The strict SGLang path accepts an explicit MoE runner so the NVFP4
+checkpoint uses `flashinfer_mxfp4`; its default Triton runner is not compatible
+with this checkpoint's routed-expert hidden-size/layout contract. SGLang also
+requires the upstream DeepSeek FlashMLA package used by its release image; the
+dedicated SGLang environment has revision
+`15f13e5030374295491c5ce31b02d7e63a7772c6` installed without modifying the
+system environment or checkpoint.
+
+The current results on the same checkpoint worker are:
+
+| Runtime | Job | Min (ms) | Median (ms) | P90 (ms) | Max (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| VDCores production | `20260811T051221Z-3014131` | 15.103 | 15.222 | - | 15.290 |
+| vLLM 0.23.0 | `20260811T055307Z-3067569` | 5.661 | 6.016 | 6.085 | 6.148 |
+| SGLang 0.5.12.post1 | `20260811T062825Z-3124544` | 6.855 | 7.322 | 7.345 | 7.355 |
+
+VDCores is currently 2.53x the vLLM median and 2.08x the SGLang median. It
+would need another 9.206 ms versus vLLM or 7.900 ms versus SGLang to reach
+those observed medians. This is not yet a semantic parity comparison: the
+framework harness decodes after a real 128-token prefill, whereas the current
+resident VDCores performance program is the position-zero/cache-empty flow.
+Framework token IDs therefore are not expected to match token 14, and the
+ratios are a structural prioritization signal rather than a parity claim.
+
+The per-layer VDCores profile still makes the next loop unambiguous: a typical
+layer body is about 0.30--0.32 ms and the routed-expert join is its largest
+measured group at 79--81 us. Establish a matched M/K/top-6 NVFP4 task
+comparison against FlashInfer before changing production, then prioritize a
+Blackwell-native or better-prepacked expert path only if the task gap explains
+a material fraction of complete-token time. Dense FP8 and real-context
+attention follow; small barrier or instruction-count tuning stays behind
+these board-level gates.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median

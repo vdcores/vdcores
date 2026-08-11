@@ -207,6 +207,7 @@ def run_sglang(args: argparse.Namespace) -> None:
         "FIXED_CONTEXT_CONFIG "
         f"framework=sglang batch={args.batch} context={context} "
         f"engine_context_length={engine_context_length} dtype=bfloat16 "
+        f"moe_runner_backend={args.sglang_moe_runner_backend} "
         f"output_tokens={args.output_tokens} "
         f"max_prefill_tokens={engine_max_prefill_tokens} "
         "strict_batch=1 unchunked_strict_prefill=1",
@@ -229,6 +230,7 @@ def run_sglang(args: argparse.Namespace) -> None:
         cuda_graph_max_bs=args.batch,
         disable_piecewise_cuda_graph=True,
         attention_backend="flashinfer",
+        moe_runner_backend=args.sglang_moe_runner_backend,
         page_size=64,
         skip_tokenizer_init=True,
         enable_metrics=True,
@@ -318,6 +320,11 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--sglang-moe-runner-backend",
+        default="auto",
+        help="SGLang MoE runner (DeepSeek-V4 NVFP4 uses flashinfer_mxfp4)",
+    )
     parser.add_argument("--output-tokens", type=int, default=2)
     parser.add_argument(
         "--disable-flashinfer-autotune",
@@ -380,6 +387,8 @@ def main() -> None:
         parser.error("fixed-context profiling requires --output-tokens=2")
     if args.disable_flashinfer_autotune and args.framework != "vllm":
         parser.error("--disable-flashinfer-autotune currently supports only vLLM")
+    if args.sglang_moe_runner_backend != "auto" and args.framework != "sglang":
+        parser.error("--sglang-moe-runner-backend applies only to SGLang")
 
     if args.framework == "vllm":
         run_vllm(args)
