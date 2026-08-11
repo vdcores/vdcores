@@ -1095,6 +1095,285 @@ class SchedDsv4SwiGluShard128(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedFp8UmmaPrepack(Schedule):
+    """Setup-only conversion to combined native MXF8 K128 tiles."""
+
+    WEIGHT = Fp8UmmaPrepackSm100.WEIGHT
+    ACTIVATION = Fp8UmmaPrepackSm100.ACTIVATION
+    TILE_M = 128
+    TILE_N = 8
+    TILE_K = 128
+    WEIGHT_TILE_BYTES = 16896
+    ACTIVATION_TILE_BYTES = 2048
+
+    def __init__(self, kind, data, scale_tiles, output, data_tma):
+        super().__init__()
+        self.kind = kind
+        self.data = data
+        self.scale_tiles = scale_tiles
+        self.output = output
+        self.data_tma = data_tma
+
+    def _on_place(self):
+        if self.kind not in (self.WEIGHT, self.ACTIVATION):
+            raise ValueError("FP8 prepack kind must be weight or activation")
+        if self.data.dtype != torch.float8_e4m3fn or self.data.ndim != 2:
+            raise ValueError("FP8 prepack data must be rank-2 E4M3")
+        if self.data.shape[1] % self.TILE_K:
+            raise ValueError("FP8 prepack K must be K128 aligned")
+        self.k_tiles = self.data.shape[1] // self.TILE_K
+        if self.kind == self.WEIGHT:
+            if self.data.shape[0] % self.TILE_M:
+                raise ValueError("FP8 prepack weight rows must be M128 aligned")
+            self.m_tiles = self.data.shape[0] // self.TILE_M
+            if not 0 < self.num_sms <= self.m_tiles:
+                raise ValueError("weight prepack needs 1..M/128 SMs")
+            expected_scales = (self.m_tiles, self.k_tiles)
+            expected_output = (
+                self.m_tiles,
+                self.k_tiles,
+                self.WEIGHT_TILE_BYTES,
+            )
+            expected_tma_bytes = self.TILE_M * self.TILE_K
+        else:
+            self.m_tiles = 1
+            if tuple(self.data.shape) != (
+                self.TILE_N,
+                self.k_tiles * self.TILE_K,
+            ):
+                raise ValueError("FP8 activation prepack data must be [8,K]")
+            if self.num_sms != 1:
+                raise ValueError("FP8 activation prepack requires one SM")
+            expected_scales = (self.k_tiles,)
+            expected_output = (
+                self.k_tiles,
+                self.ACTIVATION_TILE_BYTES,
+            )
+            expected_tma_bytes = self.TILE_N * self.TILE_K
+        if (
+            self.scale_tiles.dtype != torch.float8_e8m0fnu
+            or tuple(self.scale_tiles.shape) != expected_scales
+            or not self.scale_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                f"FP8 prepack scales must be UE8M0 {expected_scales}"
+            )
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != expected_output
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                f"FP8 prepack output must be uint8 {expected_output}"
+            )
+        if self.data_tma.size != expected_tma_bytes:
+            raise ValueError("FP8 prepack data TMA has the wrong tile size")
+
+    def _tile_shard(self, sm):
+        tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        return tile_start, tile_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        if self.kind == self.ACTIVATION:
+            instructions = [Fp8UmmaPrepackSm100(self.kind, self.k_tiles)]
+            output_tile = 0
+            tile_count = 1
+        else:
+            output_tile, tile_count = self._tile_shard(sm)
+            instructions = []
+        for m_tile in range(output_tile, output_tile + tile_count):
+            if self.kind == self.WEIGHT:
+                instructions.append(
+                    Fp8UmmaPrepackSm100(self.kind, self.k_tiles)
+                )
+            row_start = m_tile * self.TILE_M if self.kind == self.WEIGHT else 0
+            for k_tile in range(self.k_tiles):
+                scale = (
+                    self.scale_tiles[m_tile, k_tile]
+                    if self.kind == self.WEIGHT
+                    else self.scale_tiles[k_tile]
+                )
+                output = (
+                    self.output[m_tile, k_tile]
+                    if self.kind == self.WEIGHT
+                    else self.output[k_tile]
+                )
+                instructions.extend(
+                    (
+                        self.data_tma.cord(
+                            row_start, k_tile * self.TILE_K
+                        ).fixed_port(0),
+                        _shared_load_1d(scale.reshape(-1)).fixed_port(1),
+                        TmaStore1D(output.reshape(-1)),
+                    )
+                )
+        return instructions
+
+
+class SchedDsv4Fp8QuantUmmaB(Schedule):
+    """Quantize BF16 directly into combined native N8/K128 MXF8 tiles."""
+
+    TILE_K = SchedFp8UmmaPrepack.TILE_K
+    TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(self, input, output):
+        super().__init__()
+        self.input = input
+        self.output = output
+
+    def _on_place(self):
+        if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
+            raise ValueError("native FP8 quant input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % self.TILE_K:
+            raise ValueError("native FP8 quant K must be K128 aligned")
+        self.k_tiles = self.k // self.TILE_K
+        if self.num_sms != self.k_tiles:
+            raise ValueError("native FP8 quant requires one SM per K128 tile")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                f"native FP8 output must be uint8 "
+                f"[{self.k_tiles},{self.TILE_BYTES}]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        start = sm * self.TILE_K
+        return [
+            Dsv4Fp8QuantUmmaBSm100(1),
+            _shared_load_1d(
+                self.input[start : start + self.TILE_K]
+            ).fixed_port(1),
+            TmaStore1D(self.output[sm].reshape(-1)).bar(
+                self._bar("output")
+            ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedFp8GemvUmmaStream(Schedule):
+    """Shape-sharded M128/K128 native MXF8 projection."""
+
+    TILE_M = SchedFp8UmmaPrepack.TILE_M
+    WEIGHT_TILE_BYTES = SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES
+    ACTIVATION_TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+    ACTIVATION_TILES_PER_CHUNK = 28
+
+    def __init__(self, weight_tiles, activation_tiles, output):
+        super().__init__()
+        self.weight_tiles = weight_tiles
+        self.activation_tiles = activation_tiles
+        self.output = output
+
+    def _on_place(self):
+        if (
+            self.weight_tiles.dtype != torch.uint8
+            or self.weight_tiles.ndim != 3
+            or self.weight_tiles.shape[2] != self.WEIGHT_TILE_BYTES
+            or not self.weight_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "native FP8 weights must be [M/128,K/128,16896] uint8"
+            )
+        self.m_tiles, self.k_tiles, _ = self.weight_tiles.shape
+        if not 0 < self.num_sms <= self.m_tiles:
+            raise ValueError("native FP8 GEMV needs 1..M/128 SMs")
+        if not 0 < self.k_tiles <= 64:
+            raise ValueError("native FP8 GEMV supports 1..64 K128 tiles")
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or tuple(self.activation_tiles.shape)
+            != (self.k_tiles, self.ACTIVATION_TILE_BYTES)
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "native FP8 activations must be [K/128,2048] uint8"
+            )
+        self.rows = self.m_tiles * self.TILE_M
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.numel() != self.rows
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("native FP8 output must contain M BF16 values")
+        self.activation_chunks = (
+            self.k_tiles + self.ACTIVATION_TILES_PER_CHUNK - 1
+        ) // self.ACTIVATION_TILES_PER_CHUNK
+
+    def _tile_shard(self, sm):
+        tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        return tile_start, tile_count
+
+    def _activation_chunk(self, chunk):
+        start = chunk * self.ACTIVATION_TILES_PER_CHUNK
+        stop = min(start + self.ACTIVATION_TILES_PER_CHUNK, self.k_tiles)
+        return self.activation_tiles[start:stop].reshape(-1)
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        tile_start, tile_count = self._tile_shard(sm)
+        instructions = []
+        for local_index, output_tile in enumerate(
+            range(tile_start, tile_start + tile_count)
+        ):
+            first_output = local_index == 0
+            final_output = local_index + 1 == tile_count
+            instructions.append(
+                Fp8GemvUmmaStreamSm100(
+                    self.k_tiles,
+                    self.activation_chunks,
+                    retain_activation=not final_output,
+                )
+            )
+            for chunk in range(self.activation_chunks):
+                if first_output:
+                    activation = self._activation_chunk(chunk)
+                    if final_output:
+                        load = TmaLoad1D(activation)
+                    else:
+                        load = TmaLoadReg1D(
+                            activation, chunk, 1
+                        )
+                else:
+                    load = RegLoad(chunk, slot_id=chunk).fixed_port(1)
+                instructions.append(load.fixed_port(1))
+            for k_tile in range(self.k_tiles):
+                instructions.append(
+                    TmaLoad1D(
+                        self.weight_tiles[output_tile, k_tile].reshape(-1)
+                    ).fixed_port(0)
+                )
+            row_start = output_tile * self.TILE_M
+            store = TmaStore1D(
+                self.output[row_start : row_start + self.TILE_M]
+            )
+            if final_output:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedFp8Block128Gemv(Schedule):
     """Shard an E4M3/UE8M0 checkpoint GEMV across resident SMs."""
 

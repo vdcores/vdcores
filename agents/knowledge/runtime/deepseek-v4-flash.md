@@ -1167,3 +1167,49 @@ compute/memory instructions, down from 425 and 269/1,269.  The production
 This is an accepted overlap milestone; future tuning should profile attention
 and dense FP8 work against matched FA4/FlashInfer/Triton primitives rather
 than fine-tune the now hidden shared-expert path.
+
+## Full-layer counter audit and native FP8 board (2026-08-11)
+
+Tracked full-network job `20260811T101318Z-667822` emitted token 14 in
+11.647648 ms. Its internal span was 11.559520 ms: 11.206240 ms across the 43
+layers, 0.062720 ms in layer reloads, and 0.290560 ms in the head. HCA score
+layers stayed around 0.236--0.258 ms and CSA score layers around
+0.279--0.285 ms. Reloads remained 2.624--2.880 us, all SM-frontier spreads
+were at most 0.448 us, and physical-SM clocks stayed 2.018--2.039 GHz. The
+first/last sample audit and these counters independently reject cumulative
+architectural or system slowdown. The remaining 58--59% compute/allocator
+wait and 57--58% LDU dependency wait are per-layer backpressure, not growing
+state.
+
+Representative position-zero layer job `20260811T101516Z-684733` measured a
+234.688-us body. Attention consumed 137.408 us and FFN 97.280 us. Sparse SWA
+itself was only 5.408 us; the material attention costs were q_b, o_a, and o_b
+FP8 projections. Matched isolated VDCores scalar FP8 medians were 7.680 us for
+M1024/K4096, 23.424 us for M32768/K1024, 21.184 us for M1024/K4096 under the
+production 19-SM placement, and 21.248 us for M4096/K8192. Graph-amortized
+DeepGEMM medians were respectively 5.9816, 6.5608, 5.9952, and 8.9768 us.
+
+The native SM100 MXF8 proof preprocesses each immutable weight into combined
+M128/K128 data-plus-scale records and directly quantizes BF16 into combined
+N8/K128 activation records. Token-time compute receives only allocator-owned
+shared addresses, keeps activation chunks through `TmaLoadReg1D`/`RegLoad`,
+and streams weights in a bounded K loop. There is no raw/global compute
+pointer, intermediate layout copy, indirect store, issue barrier, thread
+fence, or full K unroll. FP8 activation records require a 2,048-byte stride:
+the natural 1,536-byte payload put every odd UTCCP scale descriptor on only a
+512-byte boundary and corrupted K tile 1. Padding to the next 1,024-byte scale
+boundary made weight data, weight scales, direct activation layout, and BF16
+output exact for K128 through K8192. Zero blocks also bypass floating division
+so fast-math FTZ cannot create NaN FP8 data.
+
+The native task is selectively profitable. Exact production-shape medians are
+18.848 us for M1024/K4096, 11.296 us for M32768/K1024, and 39.600 us for
+M4096/K8192; direct activation quantization is about 1.8--2.0 us. Thus q_b is
+2.07x faster than the existing 23.424-us VDCores task, while q_a/o_a and o_b
+must retain their scalar paths. Barrier batching was rejected after regressing
+those three shapes to 36.896, 13.056, and 73.184 us. Alternating weight loads
+over both LDU ports was neutral, and 128 versus 152 q_b SMs was also tied;
+these variants are not part of the accepted policy. The spill-free selective
+image uses 44 registers, nine barriers, a 112-byte stack, and 2,192 bytes of
+static shared memory. Integrate only q_b, then require an exact full-network
+measurement before accepting an end-to-end milestone.

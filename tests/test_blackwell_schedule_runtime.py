@@ -12,6 +12,7 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     ComputeInstruction,
     Copy,
+    Dsv4Fp8QuantUmmaBSm100,
     Dsv4Nvfp4QuantUmmaBSm100,
     Dsv4SiluClampMul128,
     Gemv_M128N8Argmax4,
@@ -26,6 +27,8 @@ from dae.instructions import (
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
     LduProfileLayer,
+    Fp8GemvUmmaStreamSm100,
+    Fp8UmmaPrepackSm100,
     Nvfp4GemvSm100,
     Nvfp4GemvUmmaStreamSm100,
     Nvfp4UmmaPrepackSm100,
@@ -33,7 +36,9 @@ from dae.instructions import (
     RepeatM,
     ResetIndirectLayer,
     RoutedTmaLoad1D,
+    RegLoad,
     TmaLoadAddressReg1D,
+    TmaLoadReg1D,
     TmaTensor,
 )
 from dae.runtime import config, opcode
@@ -41,6 +46,7 @@ from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.launcher import Launcher
 from dae.schedule import (
     Schedule,
+    SchedFp8GemvUmmaStream,
     SchedAttentionDecoding,
     SchedDsv4SwiGluShard128,
     SchedRoutedNvfp4GemvUmmaStream,
@@ -400,6 +406,49 @@ def test_dsv4_nvfp4_native_quant_encodes_k_tile_count():
     instruction = Dsv4Nvfp4QuantUmmaBSm100(1)
 
     assert instruction.args == [1]
+
+
+def test_fp8_streaming_umma_encodes_chunks_and_retention():
+    instruction = Fp8GemvUmmaStreamSm100(
+        64, 3, retain_activation=True
+    )
+
+    assert instruction.args == [64, 3, 1]
+
+
+def test_fp8_umma_prepack_encodes_kind_and_k_tile_count():
+    instruction = Fp8UmmaPrepackSm100(
+        Fp8UmmaPrepackSm100.ACTIVATION, 32
+    )
+
+    assert instruction.args == [1, 32]
+
+
+def test_dsv4_fp8_native_quant_encodes_k_tile_count():
+    instruction = Dsv4Fp8QuantUmmaBSm100(1)
+
+    assert instruction.args == [1]
+
+
+def test_fp8_native_stream_retains_activation_across_shape_shard(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedFp8GemvUmmaStream(
+        torch.empty((3, 2, 16896), dtype=torch.uint8),
+        torch.empty((2, 2048), dtype=torch.uint8),
+        torch.empty((384,), dtype=torch.bfloat16),
+    ).place(2)
+
+    instructions = schedule.schedule(0)
+    compute = [
+        inst for inst in instructions
+        if isinstance(inst, Fp8GemvUmmaStreamSm100)
+    ]
+
+    assert [inst.args for inst in compute] == [[2, 1, 1], [2, 1, 0]]
+    assert any(isinstance(inst, TmaLoadReg1D) for inst in instructions)
+    assert any(isinstance(inst, RegLoad) for inst in instructions)
 
 
 def test_dsv4_shard_swiglu_encodes_bound_and_width():

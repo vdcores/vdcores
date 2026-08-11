@@ -178,6 +178,55 @@ class Fp8Block128GemvSm100(ComputeInstruction):
         )
 
 
+class Fp8GemvUmmaStreamSm100(ComputeInstruction):
+    """Stream combined native MXF8 operands through SM100 UMMA."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        activation_chunks: int,
+        *,
+        retain_activation: bool = False,
+    ):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("FP8 UMMA K-tile count must fit uint16")
+        if activation_chunks not in (1, 2, 3):
+            raise ValueError("FP8 UMMA activation chunk count must be in [1,3]")
+        super().__init__(
+            opcode=opcode.OP_FP8_GEMV_UMMA_STREAM_SM100,
+            args=[k_tiles, activation_chunks, int(retain_activation)],
+        )
+
+
+class Fp8UmmaPrepackSm100(ComputeInstruction):
+    """Pack checkpoint FP8 data and block-128 scales for native UMMA."""
+
+    WEIGHT = 0
+    ACTIVATION = 1
+
+    def __init__(self, kind: int, k_tiles: int):
+        if kind not in (self.WEIGHT, self.ACTIVATION):
+            raise ValueError("FP8 UMMA prepack kind must be weight or activation")
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("FP8 UMMA prepack K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_FP8_UMMA_PREPACK_SM100,
+            args=[kind, k_tiles],
+        )
+
+
+class Dsv4Fp8QuantUmmaBSm100(ComputeInstruction):
+    """Quantize BF16 K128 tiles into the native N8 MXF8 B layout."""
+
+    def __init__(self, k_tiles: int = 1):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("native FP8 quant K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP8_QUANT_UMMA_B_SM100,
+            args=[k_tiles],
+        )
+
+
 class Dsv4Rope512_64(ComputeInstruction):
     def __init__(self, rows: int, inverse: bool = False):
         if rows <= 0 or rows > 0xFFFF:
@@ -1988,6 +2037,8 @@ __all__ = [
     "Nvfp4GemvUmmaStreamSm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
+    "Fp8GemvUmmaStreamSm100",
+    "Fp8UmmaPrepackSm100",
     "Dsv4Rope512_64",
     "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
@@ -2007,6 +2058,7 @@ __all__ = [
     "Dsv4Fp8Quant128",
     "Dsv4Nvfp4Quant16",
     "Dsv4Nvfp4QuantUmmaBSm100",
+    "Dsv4Fp8QuantUmmaBSm100",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",
