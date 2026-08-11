@@ -20,6 +20,7 @@ from dae.schedule import (
     SchedNvfp4GemvUmmaStream,
     SchedNvfp4UmmaPrepack,
     SchedRoutedNvfp4Gemv,
+    SchedRoutedNvfp4GemvUmmaStream,
 )
 from dae.tma_utils import Major
 
@@ -43,6 +44,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--routed-native",
+        action="store_true",
+        help="resolve combined native weight tiles through the routing table",
+    )
+    parser.add_argument(
         "--sms-list",
         default="",
         help="comma-separated SM counts; reuses one quantized input for a sweep",
@@ -56,6 +62,16 @@ def main() -> None:
             "emit token-dependent activation data/scales directly in the "
             "combined native UMMA layout and verify it against setup prepack"
         ),
+    )
+    parser.add_argument(
+        "--bulk-activation",
+        action="store_true",
+        help="load all native activation K tiles in one shared allocation",
+    )
+    parser.add_argument(
+        "--reuse-activation-pair",
+        action="store_true",
+        help="benchmark W1/W3-style retain then RegLoad reuse on the same SMs",
     )
     parser.add_argument("--trace-stages", action="store_true")
     parser.add_argument(
@@ -96,8 +112,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.routed_tiles and args.implementation != "cuda":
         parser.error("--routed-tiles currently supports only --implementation cuda")
+    if args.routed_native and args.implementation != "umma_stream":
+        parser.error("--routed-native requires --implementation umma_stream")
+    if args.routed_native and args.reuse_activation_pair:
+        parser.error("--routed-native does not use the static paired benchmark")
     if args.native_activation_quant and args.implementation != "umma_stream":
         parser.error("--native-activation-quant requires --implementation umma_stream")
+    if args.bulk_activation and args.implementation != "umma_stream":
+        parser.error("--bulk-activation requires --implementation umma_stream")
+    if args.reuse_activation_pair and args.implementation != "umma_stream":
+        parser.error("--reuse-activation-pair requires --implementation umma_stream")
     if args.native_activation_quant and (
         args.indexed_activation
         or args.block_indexed_activation
@@ -298,7 +322,7 @@ def main() -> None:
                 raise ValueError("streaming UMMA requires M128 and K256 alignment")
             m_tiles = args.m // 128
             k_tiles = args.k // 256
-            if num_sms != m_tiles:
+            if num_sms != m_tiles and not args.routed_native:
                 raise ValueError(
                     "streaming UMMA requires one SM per M128 output tile"
                 )
@@ -470,12 +494,62 @@ def main() -> None:
                     flush=True,
                 )
 
-            schedule = SchedNvfp4GemvUmmaStream(
-                packed_weight,
-                packed_activation,
-                alpha_storage,
-                output,
-            ).place(num_sms)
+            if args.routed_native:
+                columns = {}
+                native_field_names = []
+                for m_tile in range(m_tiles):
+                    name = f"native.weight.m{m_tile}"
+                    columns[name] = [packed_weight[m_tile, 0].data_ptr()]
+                    native_field_names.append(name)
+                columns["native.alpha"] = [alpha_storage.data_ptr()]
+                native_table = RoutedAddressTable.from_pointer_columns(
+                    columns,
+                    device=device,
+                    owners=(packed_weight, alpha_storage),
+                )
+                native_table.route_indices[0] = 0
+                schedule = SchedRoutedNvfp4GemvUmmaStream(
+                    native_table.state,
+                    0,
+                    tuple(
+                        native_table.field(name) for name in native_field_names
+                    ),
+                    native_table.field("native.alpha"),
+                    packed_activation,
+                    output,
+                    route_ready=True,
+                    activation_mode=(
+                        "load" if args.bulk_activation else "stream"
+                    ),
+                ).place(num_sms)
+            elif args.reuse_activation_pair:
+                reuse_output = torch.empty_like(output)
+                schedule = (
+                    SchedNvfp4GemvUmmaStream(
+                        packed_weight,
+                        packed_activation,
+                        alpha_storage,
+                        output,
+                        activation_mode="retain",
+                    ).place(num_sms),
+                    SchedNvfp4GemvUmmaStream(
+                        packed_weight,
+                        packed_activation,
+                        alpha_storage,
+                        reuse_output,
+                        activation_mode="reuse",
+                    ).place(num_sms),
+                )
+            else:
+                schedule = SchedNvfp4GemvUmmaStream(
+                    packed_weight,
+                    packed_activation,
+                    alpha_storage,
+                    output,
+                    activation_mode=(
+                        "load" if args.bulk_activation else "stream"
+                    ),
+                ).place(num_sms)
         else:
             schedule_cls = (
                 SchedNvfp4Gemv
@@ -497,7 +571,7 @@ def main() -> None:
             ).place(num_sms)
         launcher.s(
             ProfileEvent(2),
-            schedule,
+            *(schedule if isinstance(schedule, tuple) else (schedule,)),
             ProfileEvent(3),
         )
         stage(f"launcher_ready_{num_sms}")
@@ -548,6 +622,13 @@ def main() -> None:
         torch.testing.assert_close(
             output_matrix, expected, rtol=2e-2, atol=5e-2
         )
+        if args.reuse_activation_pair:
+            torch.testing.assert_close(
+                reuse_output.reshape_as(expected),
+                expected,
+                rtol=2e-2,
+                atol=5e-2,
+            )
 
         for _ in range(args.warmup):
             launcher.launch()
@@ -567,8 +648,9 @@ def main() -> None:
         print(
             "DSV4_NVFP4_GEMV_RESULT "
             f"implementation={args.implementation} "
-            f"addressing={'routed_tiled' if args.routed_tiles else 'static'} "
+            f"addressing={('routed_tiled' if args.routed_tiles else ('routed_native' if args.routed_native else 'static'))} "
             f"shape={args.m}x1x{args.k} sms={num_sms} "
+            f"passes={2 if args.reuse_activation_pair else 1} "
             f"task_min_us={min(task_timings):.6f} "
             f"task_median_us={statistics.median(task_timings):.6f} "
             f"task_max_us={max(task_timings):.6f} "

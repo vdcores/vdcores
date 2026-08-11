@@ -67,6 +67,11 @@ DAE_OP(OP_LDU_PROFILE_LAYER, MK_MOP(39, MEM_OP_FLAGS_NONE))
 // in the issuing LDU handler for a later OP_ALLOC_REG_LOAD. This aliases the
 // original shared allocation; it does not copy the operand.
 DAE_OP(OP_ALLOC_TMA_LOAD_REG_1D, MK_MOP(40, MEM_OP_FLAGS_ALLOCATE))
+// Resolve one routed base pointer into a port-local LDU address register while
+// loading its first tile. Later fixed-offset loads reuse that address without
+// rereading route metadata or pointer tables.
+DAE_OP(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(41, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D, MK_MOP(42, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

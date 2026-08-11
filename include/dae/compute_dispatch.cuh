@@ -137,7 +137,8 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_STREAM_SM100) {
              g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_nvfp4_gemv_umma_stream_sm100(
-      inst.args[0], smem_base, tmem_base_ptr, tmem_mma_barrier,
+      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+      tmem_mma_barrier,
       tmem_mma_phase, m2c, c2m);
 #endif
 }

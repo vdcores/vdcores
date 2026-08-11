@@ -4,6 +4,29 @@
 
 #include "virtualcore.cuh"
 
+__device__ __forceinline__ uint64_t ldu_resolve_routed_address(
+    uint64_t state_address, uint16_t encoded_field_rank) {
+  constexpr int kRouteCount = 6;
+  constexpr int kHeaderInts = 12;
+  const auto *header = reinterpret_cast<const int *>(state_address);
+  const int route_rank = encoded_field_rank & 0x7;
+  const int pointer_field = encoded_field_rank >> 3;
+  if (route_rank < 0 || route_rank >= kRouteCount) {
+    return 0;
+  }
+  const int expert = load_l2(header + route_rank);
+  const int field_stride = load_l2(header + 8);
+  const int expert_count = load_l2(header + 9);
+  if (expert < 0 || expert >= expert_count ||
+      pointer_field < 0 || pointer_field >= field_stride) {
+    return 0;
+  }
+  const auto *pointer_table =
+      reinterpret_cast<const uint64_t *>(header + kHeaderInts);
+  return load_l2_u64(
+      pointer_table + expert * field_stride + pointer_field);
+}
+
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
@@ -20,6 +43,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   __ldprint("[LD Warp] Start LD warp execution");
 
   int regFile[4];
+  uint64_t routedBaseAddress = 0;
 #if defined(DAE_TRACK_PROFILE)
   uint64_t dependency_wait_ns = 0;
   uint64_t dependency_contended = 0;
@@ -310,30 +334,50 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         // uint32 expert count, two padding words, then row-major uint64
         // pointer entries. The low three arg bits select the route rank; the
         // remaining bits select the pointer field.
-        constexpr int kRouteCount = 6;
-        constexpr int kHeaderInts = 12;
-        const auto *header = reinterpret_cast<const int *>(inst.address);
-        const int route_rank = inst.arg & 0x7;
-        const int pointer_field = inst.arg >> 3;
-        uint64_t resolved = 0;
-        if (route_rank >= 0 && route_rank < kRouteCount) {
-          const int expert = load_l2(header + route_rank);
-          const int field_stride = load_l2(header + 8);
-          const int expert_count = load_l2(header + 9);
-          if (expert >= 0 && expert < expert_count &&
-              pointer_field >= 0 && pointer_field < field_stride) {
-            const auto *pointer_table =
-                reinterpret_cast<const uint64_t *>(header + kHeaderInts);
-            resolved = load_l2_u64(
-                pointer_table + expert * field_stride + pointer_field);
-          }
-        }
+        const uint64_t resolved =
+            ldu_resolve_routed_address(inst.address, inst.arg);
         if (resolved == 0) {
           asm volatile("trap;");
         }
         __ldprint(
             "Routed TMA 1D load: rank=%d field=%d size=%d resolved=0x%lx",
-            route_rank, pointer_field, inst.size, resolved);
+            inst.arg & 0x7, inst.arg >> 3, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D): {
+        const uint64_t resolved =
+            ldu_resolve_routed_address(inst.address, inst.arg);
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
+        routedBaseAddress = resolved;
+        __ldprint(
+            "Routed TMA base: rank=%d field=%d size=%d resolved=0x%lx",
+            inst.arg & 0x7, inst.arg >> 3, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D): {
+        if (inst.arg != 0 || routedBaseAddress == 0) {
+          asm volatile("trap;");
+        }
+        const uint64_t resolved = routedBaseAddress + inst.address;
+        __ldprint(
+            "Address-register TMA: reg=%d offset=%lu size=%d resolved=0x%lx",
+            inst.arg, inst.address, inst.size, resolved);
         cuda::device::memcpy_async_tx(
             static_cast<char *>(get_slot_address(smem_base, slot)),
             reinterpret_cast<const char *>(resolved),

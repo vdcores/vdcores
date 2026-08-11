@@ -766,6 +766,37 @@ stack frame, and no spills; 82 focused tests pass. Routed scale lookup,
 top-six wave placement, resident weight replacement, and complete-group TBT
 remain the next acceptance boundary.
 
+The adaptive-fusion and routed-base proof now removes the next structural
+costs without changing that acceptance boundary. A bulk activation mode gives
+each compute task one contiguous shared allocation for all K256 native tiles;
+the runtime K loop derives each tile address by a fixed shift. M2048/K4096
+dropped from 15.728 to 9.536 us in job `20260811T081644Z-3848595`, and
+M4096/K2048 dropped from 8.768 to 5.984 us in job
+`20260811T081707Z-3852210`. A W1/W3-style pair retains that allocation with
+`TmaLoadReg1D` and consumes it with `RegLoad`, so no data is copied: job
+`20260811T081812Z-3861409` measured both projections together at 18.016 us,
+1.056 us below two independent bulk loads.
+
+The first routed-native version repeated the HBM route and pointer-table read
+for every K tile and regressed W1 to 14.880 us in job
+`20260811T082144Z-3882817`; it was rejected. The accepted LDU path resolves
+the route once into one port-local scalar address register while loading the
+first combined weight tile, then issues fixed compile-time offsets for the
+remaining K tiles. Compute still sees only shared-slot masks. The first routed
+load on both LDU ports waits for route completion, with no `IssueBarrier`,
+thread fence, indirect store, global compute pointer, or inter-stage copy.
+
+Routed W1 then measured 9.728 us in job `20260811T082826Z-3939218`, only
+0.192 us over static bulk. Shape-derived placement assigns contiguous M128
+tiles to any `1..M/128` SMs; routed W2 therefore maps 32 tiles over its 25-SM
+production share, with seven SMs processing a second tile through local
+activation reuse. Job `20260811T082847Z-3941836` measured 10.784 us, 38.1%
+below the prior routed CUDA-core 17.408-us task. The selective image remains at
+48 registers, nine barriers, an 80-byte stack, and no spills; 85 focused tests
+pass. This accepts the adaptive-fusion/routed-address primitives. Six-route
+concurrency, resident replacement, and the complete routed-expert span remain
+the next milestone.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median

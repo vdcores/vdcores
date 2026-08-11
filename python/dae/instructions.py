@@ -128,12 +128,20 @@ class Nvfp4GemvUmmaSm100(ComputeInstruction):
 class Nvfp4GemvUmmaStreamSm100(ComputeInstruction):
     """Stream pre-swizzled K256 operands into native SM100 block-scale UMMA."""
 
-    def __init__(self, k_tiles: int):
+    def __init__(
+        self,
+        k_tiles: int,
+        *,
+        retain_activation: bool = False,
+        bulk_activation: bool = False,
+    ):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("NVFP4 streaming UMMA K-tile count must fit uint16")
+        if retain_activation and not bulk_activation:
+            raise ValueError("retained native activation must use one bulk allocation")
         super().__init__(
             opcode=opcode.OP_NVFP4_GEMV_UMMA_STREAM_SM100,
-            args=[k_tiles],
+            args=[k_tiles, int(retain_activation), int(bulk_activation)],
         )
 
 
@@ -1430,6 +1438,43 @@ class RoutedTmaLoad1D(MemoryInstruction):
         )
 
 
+class RoutedTmaLoadBase1D(RoutedTmaLoad1D):
+    """Resolve/load a routed base and cache its address in LDU register zero."""
+
+    ADDRESS_REGISTER = 0
+
+    def __init__(
+        self,
+        routing_state: torch.Tensor,
+        route_rank: int,
+        pointer_field: int,
+        bytes: int,
+    ):
+        super().__init__(routing_state, route_rank, pointer_field, bytes)
+        self.opcode = opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D
+
+
+class TmaLoadAddressReg1D(MemoryInstruction):
+    """Load from one port-local routed base plus a compile-time byte offset."""
+
+    def __init__(self, address_register: int, offset: int, bytes: int):
+        if address_register != RoutedTmaLoadBase1D.ADDRESS_REGISTER:
+            raise ValueError("routed LDU currently exposes address register zero")
+        if offset < 0:
+            raise ValueError("LDU address-register offset must be non-negative")
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError(
+                "address-register TMA size must be a 16-byte-aligned uint16"
+            )
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D,
+            num_slots=bytes2slots(bytes),
+            arg=address_register,
+            size=bytes,
+            address=offset,
+        )
+
+
 class IndexedTmaLoad1D(MemoryInstruction):
     """Resolve one runtime row index in LDU and load the row into shared."""
 
@@ -1980,6 +2025,8 @@ __all__ = [
     "RepeatM",
     "RawAddress",
     "RoutedTmaLoad1D",
+    "RoutedTmaLoadBase1D",
+    "TmaLoadAddressReg1D",
     "IndexedTmaLoad1D",
     "IndirectTmaLoad1D",
     "IndirectLduLoad1D",

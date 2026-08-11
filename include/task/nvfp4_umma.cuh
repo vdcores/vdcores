@@ -584,6 +584,8 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant_umma_b_sm100(
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
     int num_k_tiles,
+    int retain_activation,
+    int bulk_activation,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
@@ -614,6 +616,14 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
       get_slot_address(smem_base, alpha_slot));
   const float alpha = *alpha_ptr;
   const int tid = __compute_tid();
+
+  int bulk_input_slots = 0;
+  uint8_t *bulk_input_base = nullptr;
+  if (bulk_activation) {
+    bulk_input_slots = m2c.template pop<0>();
+    bulk_input_base = static_cast<uint8_t *>(
+        get_slot_address(smem_base, extract(bulk_input_slots)));
+  }
 
   TiledMma tiled_mma;
   auto cta_mma = tiled_mma.get_slice(0);
@@ -692,10 +702,13 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
     auto copy_sfa_src =
         dae_get_utccp_smem_desc_tensor<Utccp>(copy_sfa_src_raw);
 
-    const int input_slots = m2c.template pop<0>();
-    const int input_slot = extract(input_slots);
-    auto *input_base = static_cast<uint8_t *>(
-        get_slot_address(smem_base, input_slot));
+    const int input_slots = bulk_activation
+        ? bulk_input_slots
+        : m2c.template pop<0>();
+    auto *input_base = bulk_activation
+        ? bulk_input_base + tile * (kBStorageBytes + kSFBBytes)
+        : static_cast<uint8_t *>(
+              get_slot_address(smem_base, extract(input_slots)));
     auto sB = make_tensor(
         make_smem_ptr(reinterpret_cast<Fp4 *>(input_base)),
         layout_sB);
@@ -731,7 +744,14 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
     }
     cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
     tmem_mma_phase ^= 1;
-    c2m.push(tid, weight_slots | input_slots);
+    c2m.push(tid, weight_slots);
+    if (!bulk_activation) {
+      c2m.push(tid, input_slots);
+    }
+  }
+
+  if (bulk_activation && !retain_activation) {
+    c2m.push(tid, bulk_input_slots);
   }
 
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");

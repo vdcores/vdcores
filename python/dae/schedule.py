@@ -682,6 +682,71 @@ class SchedDsv4Nvfp4QuantUmmaB(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedRoutedDsv4Nvfp4QuantUmmaB(Schedule):
+    """Resolve one expert scale in LDU and emit final native activation tiles."""
+
+    TILE_K = SchedDsv4Nvfp4QuantUmmaB.TILE_K
+    TILE_BYTES = SchedDsv4Nvfp4QuantUmmaB.TILE_BYTES
+
+    def __init__(self, routing_state, route_rank, scale_field, input, output):
+        super().__init__()
+        self.routing_state = routing_state
+        self.route_rank = route_rank
+        self.scale_field = scale_field
+        self.input = input
+        self.output = output
+
+    def _on_place(self):
+        if self.routing_state.device.type != "cuda":
+            raise ValueError("routing state must be a CUDA tensor")
+        if not 0 <= self.route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not 0 <= self.scale_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+            raise ValueError("routed native scale field must fit in 13 bits")
+        if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
+            raise ValueError("routed native NVFP4 input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % self.TILE_K:
+            raise ValueError("routed native NVFP4 K must be K256 aligned")
+        self.k_tiles = self.k // self.TILE_K
+        if self.num_sms != self.k_tiles:
+            raise ValueError("routed native quant requires one SM per K256 tile")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                f"routed native output must be uint8 [{self.k_tiles},{self.TILE_BYTES}]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        route_bar = self._bar("route")
+        if route_bar is None:
+            raise ValueError("routed native NVFP4 quant requires a route barrier")
+        start = sm * self.TILE_K
+        return [
+            Dsv4Nvfp4QuantUmmaBSm100(1),
+            _shared_load_1d(self.input[start : start + self.TILE_K]),
+            RoutedTmaLoad1D(
+                self.routing_state,
+                self.route_rank,
+                self.scale_field,
+                16,
+            ).bar(route_bar),
+            _shared_store_1d(self.output[sm].reshape(-1)).bar(
+                self._bar("output")
+            ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedNvfp4GemvUmmaStream(Schedule):
     """One M128 output tile with combined data/scale K256 operand loads."""
 
@@ -689,12 +754,25 @@ class SchedNvfp4GemvUmmaStream(Schedule):
     WEIGHT_TILE_BYTES = SchedNvfp4UmmaPrepack.WEIGHT_TILE_BYTES
     ACTIVATION_TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
 
-    def __init__(self, weight_tiles, activation_tiles, alpha, output):
+    def __init__(
+        self,
+        weight_tiles,
+        activation_tiles,
+        alpha,
+        output,
+        *,
+        activation_mode="stream",
+    ):
         super().__init__()
         self.weight_tiles = weight_tiles
         self.activation_tiles = activation_tiles
         self.alpha = alpha
         self.output = output
+        if activation_mode not in ("stream", "load", "retain", "reuse"):
+            raise ValueError(
+                "native activation_mode must be stream, load, retain, or reuse"
+            )
+        self.activation_mode = activation_mode
 
     def _on_place(self):
         if (
@@ -724,22 +802,209 @@ class SchedNvfp4GemvUmmaStream(Schedule):
         if sm < 0 or sm >= self.num_sms:
             return []
         instructions = [
-            Nvfp4GemvUmmaStreamSm100(self.k_tiles),
+            Nvfp4GemvUmmaStreamSm100(
+                self.k_tiles,
+                retain_activation=self.activation_mode == "retain",
+                bulk_activation=self.activation_mode != "stream",
+            ),
             TmaLoad1D(self.alpha).fixed_port(1),
         ]
-        for tile in range(self.k_tiles):
-            instructions.extend(
-                (
-                    TmaLoad1D(self.weight_tiles[sm, tile].reshape(-1)).fixed_port(0),
-                    TmaLoad1D(self.activation_tiles[tile].reshape(-1)).fixed_port(1),
+        if self.activation_mode == "load":
+            instructions.append(
+                TmaLoad1D(self.activation_tiles.reshape(-1)).fixed_port(1)
+            )
+        elif self.activation_mode == "retain":
+            instructions.append(
+                TmaLoadReg1D(
+                    self.activation_tiles.reshape(-1), 0, 1
                 )
             )
+        elif self.activation_mode == "reuse":
+            instructions.append(RegLoad(0, slot_id=0).fixed_port(1))
+        for tile in range(self.k_tiles):
+            instructions.append(
+                TmaLoad1D(
+                    self.weight_tiles[sm, tile].reshape(-1)
+                ).fixed_port(0)
+            )
+            if self.activation_mode == "stream":
+                instructions.append(
+                    TmaLoad1D(
+                        self.activation_tiles[tile].reshape(-1)
+                    ).fixed_port(1)
+                )
         row_start = sm * self.TILE_M
         instructions.append(
             TmaStore1D(
                 self.output[row_start : row_start + self.TILE_M]
             ).bar(self._bar("output"))
         )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedRoutedNvfp4GemvUmmaStream(Schedule):
+    """Resolve combined native weight tiles and run one or more M128 tasks/SM."""
+
+    TILE_M = SchedNvfp4UmmaPrepack.TILE_M
+    WEIGHT_TILE_BYTES = SchedNvfp4UmmaPrepack.WEIGHT_TILE_BYTES
+    ACTIVATION_TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(
+        self,
+        routing_state,
+        route_rank,
+        weight_fields,
+        alpha_field,
+        activation_tiles,
+        output,
+        *,
+        route_ready=False,
+        activation_mode="load",
+    ):
+        super().__init__()
+        self.routing_state = routing_state
+        self.route_rank = route_rank
+        self.weight_fields = tuple(weight_fields)
+        self.alpha_field = alpha_field
+        self.activation_tiles = activation_tiles
+        self.output = output
+        self.route_ready = bool(route_ready)
+        if activation_mode not in ("stream", "load", "retain", "reuse"):
+            raise ValueError(
+                "routed native activation_mode must be stream, load, retain, or reuse"
+            )
+        self.activation_mode = activation_mode
+
+    def _on_place(self):
+        if self.routing_state.device.type != "cuda":
+            raise ValueError("routing state must be a CUDA tensor")
+        if not 0 <= self.route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not self.weight_fields:
+            raise ValueError("routed native weights require at least one M128 tile")
+        self.m_tiles = len(self.weight_fields)
+        if not 0 < self.num_sms <= self.m_tiles:
+            raise ValueError("routed native GEMV needs 1..M/128 SMs")
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or self.activation_tiles.ndim != 2
+            or self.activation_tiles.shape[1] != self.ACTIVATION_TILE_BYTES
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError("routed activation tiles must be [K/256,3072] uint8")
+        self.k_tiles = self.activation_tiles.shape[0]
+        for field in (
+            *self.weight_fields,
+            self.alpha_field,
+        ):
+            if not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+                raise ValueError("routed native pointer fields must fit in 13 bits")
+        self.rows = self.m_tiles * self.TILE_M
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
+            raise ValueError("routed native output must contain M BF16 values")
+        if self.activation_mode in ("retain", "reuse") and self.num_sms != self.m_tiles:
+            raise ValueError(
+                "cross-stage retained activation requires one M128 tile per SM"
+            )
+
+    def _tile_shard(self, sm):
+        tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        return tile_start, tile_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        route_bar = self._bar("route")
+        if route_bar is None and not self.route_ready:
+            raise ValueError("routed native NVFP4 GEMV requires a route barrier")
+        tile_start, tile_count = self._tile_shard(sm)
+        instructions = []
+        for local_index, output_tile in enumerate(
+            range(tile_start, tile_start + tile_count)
+        ):
+            first_output = local_index == 0
+            final_output = local_index + 1 == tile_count
+            retain = self.activation_mode == "retain" or (
+                self.activation_mode == "load" and not final_output
+            )
+            bulk = self.activation_mode != "stream"
+            instructions.append(
+                Nvfp4GemvUmmaStreamSm100(
+                    self.k_tiles,
+                    retain_activation=retain,
+                    bulk_activation=bulk,
+                )
+            )
+            alpha_load = RoutedTmaLoad1D(
+                self.routing_state,
+                self.route_rank,
+                self.alpha_field,
+                16,
+            ).fixed_port(1)
+            if first_output and route_bar is not None:
+                alpha_load.bar(route_bar)
+            instructions.append(alpha_load)
+
+            if self.activation_mode == "stream":
+                activation_kind = "stream"
+            elif self.activation_mode == "retain":
+                activation_kind = "retain"
+            elif self.activation_mode == "reuse":
+                activation_kind = "reuse"
+            elif first_output:
+                activation_kind = "retain" if not final_output else "load"
+            else:
+                activation_kind = "reuse"
+            if activation_kind == "load":
+                instructions.append(
+                    TmaLoad1D(self.activation_tiles.reshape(-1)).fixed_port(1)
+                )
+            elif activation_kind == "retain":
+                instructions.append(
+                    TmaLoadReg1D(
+                        self.activation_tiles.reshape(-1), 0, 1
+                    )
+                )
+            elif activation_kind == "reuse":
+                instructions.append(RegLoad(0, slot_id=0).fixed_port(1))
+
+            for k_tile in range(self.k_tiles):
+                if k_tile == 0:
+                    weight_load = RoutedTmaLoadBase1D(
+                        self.routing_state,
+                        self.route_rank,
+                        self.weight_fields[output_tile],
+                        self.WEIGHT_TILE_BYTES,
+                    )
+                else:
+                    weight_load = TmaLoadAddressReg1D(
+                        RoutedTmaLoadBase1D.ADDRESS_REGISTER,
+                        k_tile * self.WEIGHT_TILE_BYTES,
+                        self.WEIGHT_TILE_BYTES,
+                    )
+                if first_output and k_tile == 0 and route_bar is not None:
+                    weight_load.bar(route_bar)
+                instructions.append(weight_load.fixed_port(0))
+                if activation_kind == "stream":
+                    instructions.append(
+                        TmaLoad1D(
+                            self.activation_tiles[k_tile].reshape(-1)
+                        ).fixed_port(1)
+                    )
+            row_start = output_tile * self.TILE_M
+            store = TmaStore1D(
+                self.output[row_start : row_start + self.TILE_M]
+            )
+            if final_output:
+                store.bar(self._bar("output"))
+            instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):

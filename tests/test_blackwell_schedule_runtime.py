@@ -31,12 +31,18 @@ from dae.instructions import (
     RepeatM,
     ResetIndirectLayer,
     RoutedTmaLoad1D,
+    TmaLoadAddressReg1D,
     TmaTensor,
 )
 from dae.runtime import config, opcode
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.launcher import Launcher
-from dae.schedule import Schedule, SchedAttentionDecoding, SchedSmemSiLUInterleaved
+from dae.schedule import (
+    Schedule,
+    SchedAttentionDecoding,
+    SchedRoutedNvfp4GemvUmmaStream,
+    SchedSmemSiLUInterleaved,
+)
 from dae.sequential import (
     LoopedSequentialProgram,
     SequentialBlock,
@@ -357,7 +363,15 @@ def test_nvfp4_gemv_can_retain_activation_slots():
 def test_nvfp4_streaming_umma_encodes_k_tile_count():
     instruction = Nvfp4GemvUmmaStreamSm100(16)
 
-    assert instruction.args == [16]
+    assert instruction.args == [16, 0, 0]
+
+
+def test_nvfp4_streaming_umma_encodes_retained_bulk_activation():
+    instruction = Nvfp4GemvUmmaStreamSm100(
+        16, retain_activation=True, bulk_activation=True
+    )
+
+    assert instruction.args == [16, 1, 1]
 
 
 def test_nvfp4_umma_prepack_encodes_kind_and_k_tile_count():
@@ -372,6 +386,71 @@ def test_dsv4_nvfp4_native_quant_encodes_k_tile_count():
     instruction = Dsv4Nvfp4QuantUmmaBSm100(1)
 
     assert instruction.args == [1]
+
+
+def test_routed_address_register_load_encodes_fixed_offset():
+    instruction = TmaLoadAddressReg1D(0, 18432, 18432)
+
+    assert instruction.opcode == opcode.OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D
+    assert instruction.num_slots == 3
+    assert cords2addr(instruction.cords) == 18432
+
+
+def test_routed_native_gemv_gates_both_ldu_ports_on_route(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeRoutingState:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 6
+
+        @staticmethod
+        def element_size():
+            return 8
+
+        @staticmethod
+        def data_ptr():
+            return 0x123456789ABC
+
+    instructions = (
+        SchedRoutedNvfp4GemvUmmaStream(
+            FakeRoutingState(),
+            0,
+            (1,),
+            2,
+            torch.empty((2, 3072), dtype=torch.uint8),
+            torch.empty((128,), dtype=torch.bfloat16),
+        )
+        .bar("route", 7)
+        .place(1)
+        .schedule(0)
+    )
+    routed_loads = [
+        inst
+        for inst in instructions
+        if isinstance(inst, MemoryInstruction)
+        and (inst.opcode & ~0x3F)
+        in (
+            opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D & ~0x3F,
+            opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D & ~0x3F,
+        )
+    ]
+
+    assert len(routed_loads) == 2
+    assert all(inst.opcode & 16 for inst in routed_loads)
+    assert {inst.num_slots >> 6 for inst in routed_loads} == {7}
+    assert {bool(inst.opcode & 32) for inst in routed_loads} == {False, True}
 
 
 def test_sequential_program_elides_only_same_placement_independent_edge():
