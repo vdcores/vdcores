@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checkpoint-resident DeepSeek-V4 position-0 decode in one VDCores launch.
+"""Checkpoint-resident DeepSeek-V4 decode in one VDCores launch.
 
 The full model is represented by four shape families: layers 0-1, layer 2,
 odd HCA layers, and even CSA layers.  Repeated families use runtime loop
@@ -22,6 +22,7 @@ from dae.deepseek_v4_checkpoint import (
     DeepSeekV4ResidentCheckpoint,
     expected_inference_tensor_specs,
 )
+from dae.deepseek_v4_flow import build_layer_decode_plan
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy, ShapeAssignment
 from dae.deepseek_v4_quant import quantize_fp8_block128
 from dae.launcher import Launcher
@@ -36,15 +37,18 @@ from dae.schedule import (
     SchedDsv4Fp8QuantUmmaB,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
+    SchedDsv4GatedPool,
     SchedDsv4Hadamard,
     SchedDsv4HcHead,
     SchedDsv4HcPost,
     SchedDsv4HcPre,
+    SchedDsv4IndexScore,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
     SchedDsv4SwiGluShard128,
+    SchedDsv4TopK512,
     SchedFp8Block128Gemv,
     SchedFp8GemvUmmaStream,
     SchedRMS,
@@ -106,6 +110,12 @@ class ResidentOneLaunchDecode:
         }
         self.head_stages = self._build_head()
         self._build_program()
+        print(
+            "DSV4_COMPUTE_OPS "
+            f"count={len(self.launcher.compute_operator_names())} "
+            f"ops={','.join(self.launcher.compute_operator_names())}",
+            flush=True,
+        )
         prepare_started = time.monotonic()
         self.launcher.prepare_launch()
         torch.cuda.synchronize(self.device)
@@ -119,7 +129,12 @@ class ResidentOneLaunchDecode:
         disk = DeepSeekV4Checkpoint(self.args.checkpoint, self.config)
         names = None
         if self.args.layers != self.config.num_layers:
-            prefix = tuple(f"layers.{layer_id}." for layer_id in range(self.args.layers))
+            layer_ids = (
+                (self.args.single_layer_id,)
+                if self.args.layers == 1
+                else tuple(range(self.args.layers))
+            )
+            prefix = tuple(f"layers.{layer_id}." for layer_id in layer_ids)
             names = tuple(
                 name
                 for name in expected_inference_tensor_specs(self.config)
@@ -179,7 +194,10 @@ class ResidentOneLaunchDecode:
 
     def _families(self) -> tuple[LayerFamily, ...]:
         if self.args.layers == 1:
-            return (LayerFamily("layer0.swa_hash", (0,)),)
+            layer_id = self.args.single_layer_id
+            kind = self.config.attention_kind(layer_id)
+            routing = "hash" if layer_id < self.config.num_hash_layers else "score"
+            return (LayerFamily(f"layer{layer_id}.{kind}_{routing}", (layer_id,)),)
         if self.args.layers == 2:
             return (LayerFamily("layers0-1.swa_hash", (0, 1), ((0, 1),)),)
         if self.args.layers != self.config.num_layers:
@@ -294,12 +312,66 @@ class ResidentOneLaunchDecode:
         self.post = torch.empty((4,), dtype=torch.float32, device=d)
         self.comb = torch.empty((4, 4), dtype=torch.float32, device=d)
 
-        self.main_rope = deepseek_v4_rope_table(0, config=cfg, device=d)
-        self.compress_rope = deepseek_v4_rope_table(
-            0, compressed=True, config=cfg, device=d
+        self.decode_position = self.args.context_length - 1
+        self.main_rope = deepseek_v4_rope_table(
+            self.decode_position, config=cfg, device=d
         )
-        self.kv_row = torch.empty((1, cfg.head_dim), dtype=torch.bfloat16, device=d)
-        self.attention_indices = torch.zeros((1,), dtype=torch.int32, device=d)
+        self.compress_rope = deepseek_v4_rope_table(
+            self.decode_position, compressed=True, config=cfg, device=d
+        )
+
+        def seeded(shape, *, dtype, seed, scale=0.125):
+            generator = torch.Generator(device=d).manual_seed(seed)
+            values = torch.randn(
+                shape,
+                dtype=torch.float32,
+                device=d,
+                generator=generator,
+            ).mul_(scale)
+            return values if dtype == torch.float32 else values.to(dtype)
+
+        representatives = {"swa": 0, "csa": 2, "hca": 3}
+        self.attention_plans = {
+            kind: build_layer_decode_plan(layer_id, self.decode_position, cfg)
+            for kind, layer_id in representatives.items()
+        }
+        self.attention_cache = {}
+        self.attention_indices_by_kind = {}
+        self.current_kv_rows = {}
+        self.current_compressed_rows = {}
+        for kind_index, kind in enumerate(("swa", "csa", "hca")):
+            plan = self.attention_plans[kind]
+            cache_rows = cfg.sliding_window + plan.compressed_rows
+            cache = seeded(
+                (cache_rows, cfg.head_dim),
+                dtype=torch.bfloat16,
+                seed=202608110 + kind_index,
+            )
+            valid_window = min(cfg.sliding_window, self.args.context_length)
+            indices = torch.empty(
+                (plan.attention_candidates,), dtype=torch.int32, device=d
+            )
+            indices[:valid_window].copy_(
+                torch.arange(valid_window, dtype=torch.int32, device=d)
+            )
+            if plan.compressed_selected:
+                indices[valid_window:].copy_(
+                    torch.arange(
+                        cfg.sliding_window,
+                        cfg.sliding_window + plan.compressed_selected,
+                        dtype=torch.int32,
+                        device=d,
+                    )
+                )
+            self.attention_cache[kind] = cache
+            self.attention_indices_by_kind[kind] = indices
+            window_row = self.decode_position % cfg.sliding_window
+            self.current_kv_rows[kind] = cache[window_row : window_row + 1]
+            if plan.should_compress:
+                compressed_row = cfg.sliding_window + plan.compressed_rows - 1
+                self.current_compressed_rows[kind] = cache[
+                    compressed_row : compressed_row + 1
+                ]
 
         self.hidden_fp8 = torch.empty(
             (cfg.hidden_size,), dtype=torch.float8_e4m3fn, device=d
@@ -352,6 +424,44 @@ class ResidentOneLaunchDecode:
 
         self.compress_values = torch.empty((1024,), dtype=torch.float32, device=d)
         self.compress_scores = torch.empty_like(self.compress_values)
+        self.attention_pool_history_values = {}
+        self.attention_pool_history_scores = {}
+        self.attention_pooled = {}
+        self.attention_pooled_norm = {}
+        self.compressed_output_rope = {}
+        for kind_index, kind in enumerate(("csa", "hca")):
+            plan = self.attention_plans[kind]
+            if not plan.should_compress:
+                continue
+            pool_rows = (
+                plan.compress_ratio
+                if plan.compress_ratio != 4 or plan.compressed_rows == 1
+                else 2 * plan.compress_ratio
+            )
+            self.attention_pool_history_values[kind] = seeded(
+                (pool_rows - 1, cfg.head_dim),
+                dtype=torch.float32,
+                seed=202608120 + kind_index,
+            )
+            self.attention_pool_history_scores[kind] = seeded(
+                (pool_rows - 1, cfg.head_dim),
+                dtype=torch.float32,
+                seed=202608130 + kind_index,
+                scale=0.25,
+            )
+            self.attention_pooled[kind] = torch.empty(
+                (cfg.head_dim,), dtype=torch.bfloat16, device=d
+            )
+            self.attention_pooled_norm[kind] = torch.empty_like(
+                self.attention_pooled[kind]
+            )
+            compressed_position = self.decode_position - plan.compress_ratio + 1
+            self.compressed_output_rope[kind] = deepseek_v4_rope_table(
+                compressed_position,
+                compressed=True,
+                config=cfg,
+                device=d,
+            )
         self.index_q = torch.empty(
             (cfg.index_heads, cfg.index_head_dim), dtype=torch.bfloat16, device=d
         )
@@ -364,6 +474,37 @@ class ResidentOneLaunchDecode:
             (2 * cfg.index_head_dim,), dtype=torch.float32, device=d
         )
         self.index_compress_scores = torch.empty_like(self.index_compress_values)
+        csa_plan = self.attention_plans["csa"]
+        self.index_cache = seeded(
+            (csa_plan.compressed_rows, cfg.index_head_dim),
+            dtype=torch.bfloat16,
+            seed=202608140,
+        )
+        self.index_scores = torch.empty(
+            (csa_plan.compressed_rows,), dtype=torch.float32, device=d
+        )
+        if csa_plan.should_compress:
+            index_pool_rows = (
+                csa_plan.compress_ratio
+                if csa_plan.compressed_rows == 1
+                else 2 * csa_plan.compress_ratio
+            )
+            self.index_pool_history_values = seeded(
+                (index_pool_rows - 1, cfg.index_head_dim),
+                dtype=torch.float32,
+                seed=202608150,
+            )
+            self.index_pool_history_scores = seeded(
+                (index_pool_rows - 1, cfg.index_head_dim),
+                dtype=torch.float32,
+                seed=202608160,
+                scale=0.25,
+            )
+            self.index_pooled = torch.empty(
+                (cfg.index_head_dim,), dtype=torch.bfloat16, device=d
+            )
+            self.index_pooled_norm = torch.empty_like(self.index_pooled)
+            self.index_pooled_rope = torch.empty_like(self.index_pooled).reshape(1, -1)
 
         self.router_logits = torch.empty(
             (cfg.num_experts,), dtype=torch.bfloat16, device=d
@@ -687,6 +828,7 @@ class ResidentOneLaunchDecode:
         cfg = self.config
         layer_id = family.representative
         kind = cfg.attention_kind(layer_id)
+        plan = self.attention_plans[kind]
         rope_table = self.main_rope if kind == "swa" else self.compress_rope
         q_placement = self.policy.weighted_parallel_partition(
             0, (cfg.q_lora_rank, cfg.head_dim)
@@ -795,7 +937,9 @@ class ResidentOneLaunchDecode:
             self._stage(
                 "attn.kv_rope",
                 SchedDsv4Rope512_64(
-                    self.kv_norm.reshape(1, -1), rope_table, self.kv_row
+                    self.kv_norm.reshape(1, -1),
+                    rope_table,
+                    self.current_kv_rows[kind],
                 ),
                 base_sm=kv_base,
                 wait_group=kv_norm_ready,
@@ -855,6 +999,53 @@ class ResidentOneLaunchDecode:
                     wait_for_previous=False,
                 )
             )
+            if plan.should_compress:
+                ape_tensors = self._family_tensors(
+                    family, "attn.compressor.ape"
+                )
+                tail_offset = cfg.head_dim if plan.compress_ratio == 4 else 0
+                ape_rows = tuple(
+                    ape[
+                        self.decode_position % plan.compress_ratio,
+                        tail_offset : tail_offset + cfg.head_dim,
+                    ]
+                    for ape in ape_tensors
+                )
+                pool = SchedDsv4GatedPool(
+                    self.attention_pool_history_values[kind],
+                    self.attention_pool_history_scores[kind],
+                    self.attention_pooled[kind],
+                    tail_values=self.compress_values[
+                        tail_offset : tail_offset + cfg.head_dim
+                    ],
+                    tail_scores=self.compress_scores[
+                        tail_offset : tail_offset + cfg.head_dim
+                    ],
+                    tail_bias=ape_rows[0],
+                )
+                pool = self._layered(pool, family, ape_rows)
+                stages.append(
+                    self._stage("attn.compressor.pool", pool)
+                )
+                stages.append(
+                    self._rms_stage(
+                        "attn.compressor.norm",
+                        self.attention_pooled[kind],
+                        self.attention_pooled_norm[kind],
+                        family=family,
+                        weight_suffix="attn.compressor.norm.weight",
+                    )
+                )
+                stages.append(
+                    self._stage(
+                        "attn.compressor.rope",
+                        SchedDsv4Rope512_64(
+                            self.attention_pooled_norm[kind].reshape(1, -1),
+                            self.compressed_output_rope[kind],
+                            self.current_compressed_rows[kind],
+                        ),
+                    )
+                )
 
         if kind == "csa":
             if self.args.fp8_qb_mode == "native":
@@ -924,12 +1115,94 @@ class ResidentOneLaunchDecode:
                     wait_for_previous=False,
                 )
             )
+            if plan.should_compress:
+                index_ape_tensors = self._family_tensors(
+                    family, "attn.indexer.compressor.ape"
+                )
+                index_ape_rows = tuple(
+                    ape[
+                        self.decode_position % plan.compress_ratio,
+                        cfg.index_head_dim : 2 * cfg.index_head_dim,
+                    ]
+                    for ape in index_ape_tensors
+                )
+                index_pool = SchedDsv4GatedPool(
+                    self.index_pool_history_values,
+                    self.index_pool_history_scores,
+                    self.index_pooled,
+                    tail_values=self.index_compress_values[
+                        cfg.index_head_dim : 2 * cfg.index_head_dim
+                    ],
+                    tail_scores=self.index_compress_scores[
+                        cfg.index_head_dim : 2 * cfg.index_head_dim
+                    ],
+                    tail_bias=index_ape_rows[0],
+                )
+                index_pool = self._layered(
+                    index_pool, family, index_ape_rows
+                )
+                stages.append(
+                    self._stage("index.compressor.pool", index_pool)
+                )
+                stages.append(
+                    self._rms_stage(
+                        "index.compressor.norm",
+                        self.index_pooled,
+                        self.index_pooled_norm,
+                        family=family,
+                        weight_suffix="attn.indexer.compressor.norm.weight",
+                    )
+                )
+                stages.append(
+                    self._stage(
+                        "index.compressor.rope",
+                        SchedDsv4Rope128_64(
+                            self.index_pooled_norm.reshape(1, -1),
+                            self.compressed_output_rope[kind],
+                            self.index_pooled_rope,
+                        ),
+                    )
+                )
+                stages.append(
+                    self._stage(
+                        "index.compressor.hadamard",
+                        SchedDsv4Hadamard(
+                            self.index_pooled_rope,
+                            self.index_cache[-1:],
+                        ),
+                    )
+                )
+            if plan.compressed_rows:
+                stages.append(
+                    self._stage(
+                        "index.score",
+                        SchedDsv4IndexScore(
+                            self.index_q_hadamard,
+                            self.index_cache,
+                            self.index_head_weights,
+                            self.index_scores,
+                        ),
+                        min(plan.compressed_rows, self.sms),
+                    )
+                )
+                stages.append(
+                    self._stage(
+                        "index.topk",
+                        SchedDsv4TopK512(
+                            self.index_scores,
+                            self.attention_indices_by_kind[kind][
+                                -plan.compressed_selected :
+                            ],
+                            index_offset=cfg.sliding_window,
+                        ),
+                    )
+                )
 
         sinks = self._family_tensors(family, "attn.attn_sink")
         sparse = SchedDsv4SparseAttention512(
             self.q_rope,
-            self.kv_row,
-            self.attention_indices,
+            self.attention_cache[kind],
+            self.attention_indices_by_kind[kind],
             sinks[0],
             self.attention_output,
         )
@@ -1575,7 +1848,18 @@ class ResidentOneLaunchDecode:
                 "attn.hidden.quant_fp8",
                 "attn.q_rope",
                 "attn.kv_rope",
+                "attn.compressor.wgate",
+                "attn.compressor.pool",
+                "attn.compressor.rope",
+                "index.q_hadamard",
+                "index.compressor.wgate",
+                "index.compressor.pool",
+                "index.compressor.hadamard",
+                "index.score",
+                "index.topk",
                 "attn.sparse_swa",
+                "attn.sparse_csa",
+                "attn.sparse_hca",
                 "attn.inverse_rope",
                 "attn.o_a.g7",
                 "attn.o_b",
@@ -1696,6 +1980,9 @@ class ResidentOneLaunchDecode:
         print(
             "DSV4_ONE_LAUNCH_PROGRAM "
             f"model_launches=1 layers={self.args.layers} "
+            f"context={self.args.context_length} "
+            f"position={self.decode_position} "
+            f"prefix_cache={'current_token' if self.args.context_length == 1 else 'deterministic_seeded'} "
             f"logical_stages={logical_stages} queue_stages={queue_stages} "
             f"barriers={len(self.program.barriers)} "
             f"compute_insts={self.program.max_compute_instructions} "
@@ -1727,6 +2014,19 @@ class ResidentOneLaunchDecode:
                     f"sequence={','.join(stage.name for stage in stages)}",
                     flush=True,
                 )
+        for kind in ("swa", "csa", "hca"):
+            plan = self.attention_plans[kind]
+            print(
+                "DSV4_CONTEXT_PLAN "
+                f"kind={kind} context={self.args.context_length} "
+                f"position={self.decode_position} "
+                f"window={min(self.config.sliding_window, self.args.context_length)} "
+                f"compressed_rows={plan.compressed_rows} "
+                f"compressed_selected={plan.compressed_selected} "
+                f"attention_candidates={plan.attention_candidates} "
+                f"compress_now={int(plan.should_compress)}",
+                flush=True,
+            )
         for assignment in sorted(
             self.assignments.values(),
             key=lambda item: (item.task, item.rows, item.k),
@@ -2003,7 +2303,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--layers", type=int, choices=(1, 2, 43), default=1)
+    parser.add_argument(
+        "--single-layer-id",
+        type=int,
+        default=0,
+        help="checkpoint layer to use when --layers=1",
+    )
     parser.add_argument("--token-id", type=int, default=791)
+    parser.add_argument(
+        "--context-length",
+        type=int,
+        default=1,
+        help=(
+            "timed decode context in [1,128]; contexts above one use a "
+            "deterministic resident prefix while the current KV/compressed "
+            "rows are produced inside the launch"
+        ),
+    )
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--sms", type=int, default=152)
     parser.add_argument("--warmup", type=int, default=0)
@@ -2035,6 +2351,12 @@ def main() -> None:
     cfg = DeepSeekV4FlashConfig()
     if not 0 <= args.token_id < cfg.vocab_size:
         parser.error("token-id is outside the vocabulary")
+    if not 0 <= args.single_layer_id < cfg.num_layers:
+        parser.error("single-layer-id is outside the transformer")
+    if args.layers != 1 and args.single_layer_id != 0:
+        parser.error("single-layer-id is only valid with --layers=1")
+    if not 1 <= args.context_length <= cfg.sliding_window:
+        parser.error("context-length must be in [1,128]")
     if not 1 <= args.vocab_size <= cfg.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0 or args.iterations <= 0 or args.warmup < 0:
@@ -2127,6 +2449,8 @@ def main() -> None:
     print(
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "
         f"layers={args.layers} token_id={args.token_id} "
+        f"context={args.context_length} position={args.context_length - 1} "
+        f"prefix_cache={'current_token' if args.context_length == 1 else 'deterministic_seeded'} "
         f"vocab={args.vocab_size} output_token={reference_token} "
         f"build_s={build_seconds:.3f} min_ms={min(timings):.6f} "
         f"median_ms={statistics.median(timings):.6f} "

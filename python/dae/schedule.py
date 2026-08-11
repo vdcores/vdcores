@@ -1884,11 +1884,23 @@ class SchedDsv4Hadamard(Schedule):
 
 
 class SchedDsv4GatedPool(Schedule):
-    def __init__(self, values, scores, output):
+    def __init__(
+        self,
+        values,
+        scores,
+        output,
+        *,
+        tail_values=None,
+        tail_scores=None,
+        tail_bias=None,
+    ):
         super().__init__()
         self.values = values
         self.scores = scores
         self.output = output
+        self.tail_values = tail_values
+        self.tail_scores = tail_scores
+        self.tail_bias = tail_bias
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -1901,18 +1913,69 @@ class SchedDsv4GatedPool(Schedule):
         if (self.output.dtype != torch.bfloat16 or self.output.ndim != 1 or
                 self.output.shape[0] != self.values.shape[1]):
             raise ValueError("DeepSeek gated-pool output must be BF16 [width]")
-        self.pool_rows, self.width = self.values.shape
+        history_rows, self.width = self.values.shape
+        if (self.tail_values is None) != (self.tail_scores is None):
+            raise ValueError(
+                "DeepSeek gated-pool tail values and scores must be supplied together"
+            )
+        if self.tail_values is not None:
+            if (
+                self.tail_values.dtype != torch.float32
+                or self.tail_values.numel() != self.width
+                or not self.tail_values.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek gated-pool tail values must be contiguous FP32 [width]"
+                )
+            if (
+                self.tail_scores.dtype != torch.float32
+                or self.tail_scores.shape != self.tail_values.shape
+                or not self.tail_scores.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek gated-pool tail scores must match the tail values"
+                )
+        if self.tail_bias is not None:
+            if self.tail_values is None:
+                raise ValueError(
+                    "DeepSeek gated-pool tail bias requires a tail row"
+                )
+            if (
+                self.tail_bias.dtype != torch.float32
+                or self.tail_bias.numel() != self.width
+                or not self.tail_bias.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek gated-pool tail bias must be contiguous FP32 [width]"
+                )
+        self.pool_rows = history_rows + int(self.tail_values is not None)
+        if self.pool_rows <= 0:
+            raise ValueError("DeepSeek gated pooling needs at least one row")
 
     def schedule(self, sm):
         if sm != 0:
             return []
         row_bytes = self.width * self.values.element_size()
-        instructions = [Dsv4GatedPool(self.pool_rows, self.width)]
-        instructions += RepeatM.on(
-            self.pool_rows,
-            (TmaLoad1D(self.values[0]), row_bytes),
-            (TmaLoad1D(self.scores[0]), row_bytes),
-        )
+        instructions = [
+            Dsv4GatedPool(
+                self.pool_rows,
+                self.width,
+                tail_bias=self.tail_bias is not None,
+            )
+        ]
+        if self.values.shape[0]:
+            instructions += RepeatM.on(
+                self.values.shape[0],
+                (TmaLoad1D(self.values[0]), row_bytes),
+                (TmaLoad1D(self.scores[0]), row_bytes),
+            )
+        if self.tail_values is not None:
+            instructions += [
+                TmaLoad1D(self.tail_values),
+                TmaLoad1D(self.tail_scores),
+            ]
+            if self.tail_bias is not None:
+                instructions.append(TmaLoad1D(self.tail_bias))
         instructions.append(
             TmaStore1D(self.output).bar(self._bar("output"))
         )

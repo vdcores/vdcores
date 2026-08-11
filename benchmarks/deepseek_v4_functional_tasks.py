@@ -346,6 +346,39 @@ def run_compression_indexer(
             atol=1.0e-2,
             latency_us=pool_latency,
         )
+        if pool_rows == 8:
+            tail_bias = torch.randn(
+                (width,),
+                generator=generator,
+                dtype=torch.float32,
+                device=device,
+            )
+            segmented = torch.empty_like(pooled)
+            segmented_latency = launch(
+                SchedDsv4GatedPool(
+                    values[:-1],
+                    scores[:-1],
+                    segmented,
+                    tail_values=values[-1],
+                    tail_scores=scores[-1],
+                    tail_bias=tail_bias,
+                ),
+                1,
+                device,
+            )
+            biased_scores = scores.clone()
+            biased_scores[-1].add_(tail_bias)
+            expected_segmented = gated_pool_reference(
+                values, biased_scores
+            ).to(torch.bfloat16)
+            report_close(
+                "compress_pool_ratio4_segmented_tail_bias",
+                segmented,
+                expected_segmented,
+                rtol=2.0e-2,
+                atol=1.0e-2,
+                latency_us=segmented_latency,
+            )
 
     rows = _INDEX_ROWS
     kv = torch.randn(

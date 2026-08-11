@@ -349,14 +349,14 @@ class Dsv4Hadamard(ComputeInstruction):
 
 
 class Dsv4GatedPool(ComputeInstruction):
-    def __init__(self, pool_rows: int, width: int):
+    def __init__(self, pool_rows: int, width: int, tail_bias: bool = False):
         if pool_rows <= 0 or pool_rows > 0xFFFF:
             raise ValueError("DeepSeek gated-pool rows must fit in uint16")
         if width not in (128, 512):
             raise ValueError("DeepSeek gated-pool width must be 128 or 512")
         super().__init__(
             opcode=opcode.OP_DSV4_GATED_POOL,
-            args=[pool_rows, width],
+            args=[pool_rows, width, int(tail_bias)],
         )
 
 

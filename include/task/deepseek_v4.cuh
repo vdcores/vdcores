@@ -710,6 +710,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_gated_pool(
     int pool_rows,
     int width,
+    bool tail_bias,
     void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
@@ -734,11 +735,19 @@ __device__ __forceinline__ void task_dsv4_gated_pool(
     const int scores_slot = extract(scores_slots);
     const auto *scores = static_cast<const float *>(
         get_slot_address(smem_base, scores_slot));
+    int bias_slots = 0;
+    const float *bias = nullptr;
+    if (tail_bias && row + 1 == pool_rows) {
+      bias_slots = m2c.template pop<0>();
+      const int bias_slot = extract(bias_slots);
+      bias = static_cast<const float *>(
+          get_slot_address(smem_base, bias_slot));
+    }
 #pragma unroll
     for (int item = 0; item < kMaxValuesPerThread; ++item) {
       const int dim = tid + item * 128;
       if (dim < width) {
-        const float score = scores[dim];
+        const float score = scores[dim] + (bias == nullptr ? 0.0f : bias[dim]);
         const float next_max = fmaxf(maximum[item], score);
         const float old_scale = __expf(maximum[item] - next_max);
         const float probability = __expf(score - next_max);
@@ -748,7 +757,7 @@ __device__ __forceinline__ void task_dsv4_gated_pool(
       }
     }
     __sync_compute_group(128);
-    c2m.push(tid, values_slots | scores_slots);
+    c2m.push(tid, values_slots | scores_slots | bias_slots);
   }
 
   const int output_slots = m2c.template pop<0>();

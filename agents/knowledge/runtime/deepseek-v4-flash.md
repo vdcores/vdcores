@@ -1292,3 +1292,41 @@ from the native-q_b milestone and is 4.821840 ms under the 16-ms target. The
 queue image has 418 barriers and 253/1,301 maximum compute/memory
 instructions. The 32-op production binary remains spill-free at 70 registers,
 nine barriers, a 96-byte stack, and 2,448 bytes static shared memory.
+
+## Resident context-128 shape gate (2026-08-11)
+
+`deepseek_v4_resident_one_launch.py --context-length 128` now executes the
+position-127 decode shape in the existing single persistent launch. SWA, CSA,
+and HCA consume 128, 160, and 129 attention candidates respectively. Every
+compressed layer runs the current-token compressor boundary; CSA also runs its
+index compressor, Hadamard transform, 32-row score, and top-k selection. The
+current window KV and compressed rows are produced by the layer inside the
+launch. The immutable prefix rows are deterministic resident test data, so
+this is a workload/correctness gate and not prompt-semantic parity with the
+framework baselines.
+
+The compressor pool accepts a separately loaded current row and fuses the
+position-dependent APE into that final row. This avoids an add/copy stage and
+keeps every operand in the ordinary LDU/shared-slot protocol. The segmented
+ratio-4 path is exact against the PyTorch reference. Job
+`20260811T155858Z-294886` measured 9.696 us for its eight-row/512-wide form and
+115.424 us for the serial 128-row form, immediately identifying ratio-128
+pooling as a structural kernel target.
+
+Full-network job `20260811T160651Z-391620` used one GB200, one launch, three
+warmups, and five measured samples. It emitted repeatable token 5, and the FP8
+head agreed with the independent BF16 head. Samples were
+29.872768--30.415264 ms with a 30.149376-ms median. The context-one regression
+job `20260811T160854Z-417208` still emitted reference token 14 in 11.026720 ms.
+The context-128 image has 451 barriers and 255/1,313 maximum compute/memory
+instructions. `benchmarks/deepseek_v4_resident.ops` selects its 30 operators;
+the SM100 binary uses 84 registers, nine barriers, a 96-byte stack, 2,448 bytes
+of static shared memory, and no spills.
+
+The strict target is 5.414155 ms, ten percent below vLLM's 6.015728-ms
+context-128 median; this also beats the corresponding 6.589777-ms SGLang
+target. The 30.149376-ms shape-gate baseline must first be decomposed by
+representative SWA/CSA/HCA stage and memory/compute idle counters. In
+particular, replace the serial ratio-128 pool and row-at-a-time sparse
+attention with board-competitive mechanisms before changing narrow runtime
+parameters.
