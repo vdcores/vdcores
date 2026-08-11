@@ -171,6 +171,7 @@ class SequentialProgram:
         *,
         completion_barrier: bool = False,
         profile_event_count: int | None = None,
+        profile_special_slot: int = 0,
         balance_load_ports: bool = False,
     ):
         self.launcher = launcher
@@ -222,7 +223,9 @@ class SequentialProgram:
                     if self.profile_event_count == 0:
                         raise ValueError("profiled stage requires profile event capacity")
                     marker = LduProfileLayer(
-                        config.layer_profile_event_base, self.profile_event_count
+                        config.layer_profile_event_base,
+                        self.profile_event_count,
+                        special_slot=profile_special_slot,
                     ).bar(input_bar)
                     for instructions in self.instructions:
                         instructions.append(marker.copy())
@@ -283,7 +286,9 @@ class SequentialProgram:
                 if self.profile_event_count == 0:
                     raise ValueError("profiled stage requires profile event capacity")
                 marker = LduProfileLayer(
-                    config.layer_profile_event_base, self.profile_event_count
+                    config.layer_profile_event_base,
+                    self.profile_event_count,
+                    special_slot=profile_special_slot,
                 ).bar(self.completion_barrier)
                 for instructions in self.instructions:
                     instructions.append(marker.copy())

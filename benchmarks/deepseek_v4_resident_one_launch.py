@@ -1201,6 +1201,43 @@ class ResidentOneLaunchDecode:
 
     def _build_program(self) -> None:
         serial_sm = 0
+        self.stage_profile_labels: list[str] = []
+
+        def profile_stage(name: str) -> bool:
+            if not self.args.profile_stages:
+                return False
+            if name in {
+                "attn.hc_pre",
+                "attn.hidden.quant_fp8",
+                "attn.q_rope",
+                "attn.kv_rope",
+                "attn.sparse_swa",
+                "attn.inverse_rope",
+                *(f"attn.o_a.g{group}" for group in range(8)),
+                "attn.o_b",
+                "attn.hc_post",
+                "ffn.hc_pre",
+                "ffn.hidden.quant_fp8",
+                "ffn.route",
+                "ffn.shared.w3",
+                "ffn.shared.swiglu",
+                "ffn.shared.middle.quant_fp8",
+                "ffn.shared.w2",
+                "ffn.expert_reduce",
+                "ffn.hc_post",
+            }:
+                return True
+            if not name.startswith("ffn.expert"):
+                return False
+            return name.endswith(
+                (
+                    ".input.quant_nvfp4",
+                    ".w3",
+                    ".swiglu",
+                    ".middle.quant_nvfp4",
+                    ".w2",
+                )
+            )
 
         def queued(
             stage: Stage,
@@ -1225,16 +1262,19 @@ class ResidentOneLaunchDecode:
 
         def queued_family(family: LayerFamily) -> list[SequentialStage]:
             stages = self.family_stages[family.representative]
-            return [
-                queued(
+            queued_stages = []
+            for index, stage in enumerate(stages):
+                stage_profile_after = profile_stage(stage.name)
+                if stage_profile_after:
+                    self.stage_profile_labels.append(stage.name)
+                queued_stages.append(queued(
                     stage,
                     f"{family.name}.",
                     profile_after=(
                         self.args.profile_layers and index + 1 == len(stages)
-                    ),
-                )
-                for index, stage in enumerate(stages)
-            ]
+                    ) or stage_profile_after,
+                ))
+            return queued_stages
 
         self.launcher = Launcher(self.sms, device=self.device)
         if self.args.layers == 1:
@@ -1242,7 +1282,10 @@ class ResidentOneLaunchDecode:
             stages = queued_family(family)
             stages.extend(queued(stage) for stage in self.head_stages)
             self.program = SequentialProgram(
-                self.launcher, stages, balance_load_ports=True
+                self.launcher,
+                stages,
+                profile_special_slot=7 if self.args.profile_stages else 0,
+                balance_load_ports=True,
             )
             logical_stages = len(stages)
             queue_stages = logical_stages
@@ -1307,6 +1350,13 @@ class ResidentOneLaunchDecode:
             raise AssertionError(
                 "internal layer counter does not cover every requested layer"
             )
+        if (
+            self.args.profile_stages
+            and self.program.profile_event_count != len(self.stage_profile_labels)
+        ):
+            raise AssertionError(
+                "internal stage counter does not cover every requested boundary"
+            )
         if self.args.profile_layers:
             for family in self.families:
                 stages = self.family_stages[family.representative]
@@ -1334,7 +1384,7 @@ class ResidentOneLaunchDecode:
 
     def run_once(self) -> tuple[int, float, torch.Tensor]:
         self.residual.copy_(self.initial_residual)
-        if self.args.profile_layers:
+        if self.args.profile_layers or self.args.profile_stages:
             self.launcher.profile.zero_()
         torch.cuda.synchronize(self.device)
         start = torch.cuda.Event(enable_timing=True)
@@ -1517,6 +1567,59 @@ class ResidentOneLaunchDecode:
             flush=True,
         )
 
+    def report_stage_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_stages:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "stage profiling requires a runtime built with track_profile=1"
+            )
+        previous = max(int(value) for value in profile[:, 0])
+        end_frontier = max(int(value) for value in profile[:, 1])
+        grouped_total = 0
+        for index, label in enumerate(self.stage_profile_labels):
+            event_id = runtime_config.layer_profile_event_base + index
+            values = [int(value) for value in profile[:, event_id]]
+            if any(value == 0 for value in values):
+                raise RuntimeError(
+                    f"stage profile boundary {label!r} was not recorded"
+                )
+            boundary = max(values)
+            elapsed = boundary - previous
+            if elapsed < 0:
+                raise RuntimeError("stage profile frontiers are not monotonic")
+            grouped_total += elapsed
+            print(
+                "DSV4_STAGE_GROUP_TIME "
+                f"index={index} through={label} "
+                f"elapsed_ms={elapsed / 1.0e6:.6f} "
+                f"frontier_spread_us={(max(values) - min(values)) / 1.0e3:.3f}",
+                flush=True,
+            )
+            previous = boundary
+        head_elapsed = end_frontier - previous
+        if head_elapsed < 0:
+            raise RuntimeError("head frontier precedes the final stage boundary")
+        print(
+            "DSV4_STAGE_PROFILE_SUMMARY "
+            f"boundaries={len(self.stage_profile_labels)} "
+            f"layer_ms={grouped_total / 1.0e6:.6f} "
+            f"head_ms={head_elapsed / 1.0e6:.6f} "
+            f"internal_span_ms={(end_frontier - max(int(value) for value in profile[:, 0])) / 1.0e6:.6f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -1535,6 +1638,11 @@ def main() -> None:
         help="record compact per-layer LDU globaltimer frontiers",
     )
     parser.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="record selected one-layer stage-group completion frontiers",
+    )
+    parser.add_argument(
         "--profile-all-samples",
         action="store_true",
         help="report layer frontiers and aggregate counters for every sample",
@@ -1549,8 +1657,12 @@ def main() -> None:
         parser.error("sms/iterations must be positive and warmup non-negative")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
-    if args.profile_all_samples and not args.profile_layers:
-        parser.error("--profile-all-samples requires --profile-layers")
+    if args.profile_layers and args.profile_stages:
+        parser.error("--profile-layers and --profile-stages are mutually exclusive")
+    if args.profile_stages and args.layers != 1:
+        parser.error("--profile-stages requires --layers 1")
+    if args.profile_all_samples and not (args.profile_layers or args.profile_stages):
+        parser.error("--profile-all-samples requires a profiling mode")
 
     device = torch.device("cuda")
     build_started = time.monotonic()
@@ -1582,7 +1694,7 @@ def main() -> None:
     for iteration in range(args.iterations):
         token, elapsed_ms, logits = flow.run_once()
         timings.append(elapsed_ms)
-        if args.profile_layers:
+        if args.profile_layers or args.profile_stages:
             profile_samples.append(flow.launcher.profile.cpu().clone())
         print(
             "DSV4_ONE_LAUNCH_SAMPLE "
@@ -1599,7 +1711,7 @@ def main() -> None:
             f"expected {args.expected_token_id}"
         )
     assert logits is not None
-    if args.profile_layers:
+    if args.profile_layers or args.profile_stages:
         median_timing = statistics.median(timings)
         profile_index = min(
             range(len(timings)),
@@ -1611,7 +1723,12 @@ def main() -> None:
             else (profile_index,)
         )
         for sample_index in profile_indices:
-            flow.report_layer_profile(
+            reporter = (
+                flow.report_layer_profile
+                if args.profile_layers
+                else flow.report_stage_profile
+            )
+            reporter(
                 profile_samples[sample_index],
                 sample_index=sample_index,
                 sample_cuda_ms=timings[sample_index],

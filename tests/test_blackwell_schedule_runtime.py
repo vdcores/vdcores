@@ -416,6 +416,58 @@ def test_sequential_program_elides_only_same_placement_independent_edge():
         )
 
 
+def test_sequential_profile_markers_can_use_reserved_special_slots():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 32
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialStage("profiled", BasicStage(), 1, profile_after=True),
+            SequentialStage("tail", BasicStage(), 1),
+        ),
+        profile_special_slot=7,
+    )
+    marker = next(
+        inst
+        for inst in program.instructions[0]
+        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_PROFILE_LAYER & ~0x3F)
+    )
+
+    assert marker.num_slots & 0x3F == config.num_slots + 7
+
+
 def test_sequential_program_binds_model_specific_input_role_to_same_edge():
     class FakeLauncher:
         num_sms = 1

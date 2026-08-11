@@ -403,6 +403,43 @@ preserved token 14 over 30 samples and measured 26.234--27.088 ms, median
 26.571 ms. This improves the 27.206 ms boundary by 0.635 ms (2.3%) and leaves
 10.571 ms to the 16 ms target.
 
+### Stage-group overlap attribution
+
+The post-fusion full-model profile, job `20260811T021559Z-2510693`, preserved
+token 14 over six samples and measured 26.805--27.440 ms, median 27.213 ms in
+the tracked build. Layer, reload, and head spans were 23.77--24.25,
+1.346--1.356, and 1.394--1.455 ms. Every token executed 2,191,707 allocator
+instructions, 1,188,680/1,023,091 LDU commands, and 538,195 stores. Both LDUs
+still spent about 68--70% of the grid envelope waiting on dependencies and the
+allocator about 69--70% stalled for slots, while clocks and frontier spreads
+were stable. Remaining slowdown is therefore structural serialization and
+slot pressure, not progressive work, clock, or host overhead.
+
+The one-layer diagnostic can mark 55 existing dependency frontiers without
+changing the task graph. Its control descriptors use reserved special slots
+7/8; slots 0/1 remain dedicated to the adaptive W1/W3 register handoff. This
+separation is required because the allocator can publish a later control
+descriptor before an earlier RegLoad has drained from an LDU FIFO.
+
+Job `20260811T022342Z-2548920` preserved layer-0 token 2835 over five tracked
+samples. The median sample's 0.443 ms layer span divided into 0.195 ms for
+attention and 0.249 ms for FFN. The largest serial branch groups were:
+
+| Group | Serial time (us) | Independent branches |
+| --- | ---: | ---: |
+| Six routed experts | 173.9 | 6 |
+| Eight attention output groups | 69.9 | 8 |
+| Q path | 45.2 | 1 of Q/KV fan-out |
+| Shared expert | 30.7 | 1 alongside routed experts |
+| KV path | 9.2 | 1 of Q/KV fan-out |
+
+The idealized branch maxima are about 35.1 us for routed experts and 8.7 us
+for attention output groups. Partitioning will make the real values larger,
+but the measurement puts roughly 0.20--0.24 ms/layer of structural overlap
+ahead of smaller task tuning. The next overlap loop should therefore add a
+real fan-out/join representation and shape-derived SM partitions for the six
+routed experts and eight output groups, retaining the single resident launch.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
