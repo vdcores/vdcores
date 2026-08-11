@@ -2047,6 +2047,103 @@ class SchedDsv4GatedPool(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4GatedPoolPacked8Shard128(Schedule):
+    """Pool a prepacked history with one independent 128-wide shard per SM."""
+
+    ROWS_PER_BLOCK = 8
+    SHARD_WIDTH = 128
+
+    def __init__(
+        self,
+        packed_history,
+        history_rows,
+        output,
+        *,
+        tail_values,
+        tail_scores,
+        tail_bias,
+    ):
+        super().__init__()
+        self.packed_history = packed_history
+        self.history_rows = int(history_rows)
+        self.output = output
+        self.tail_values = tail_values
+        self.tail_scores = tail_scores
+        self.tail_bias = tail_bias
+
+    def _on_place(self):
+        expected_tail = (
+            self.packed_history.shape[0] * self.SHARD_WIDTH
+            if self.packed_history.ndim == 5
+            else -1
+        )
+        if (
+            self.packed_history.dtype != torch.float32
+            or self.packed_history.ndim != 5
+            or tuple(self.packed_history.shape[2:])
+            != (self.ROWS_PER_BLOCK, 2, self.SHARD_WIDTH)
+            or not self.packed_history.is_contiguous()
+        ):
+            raise ValueError(
+                "packed gated-pool history must be contiguous FP32 "
+                "[shards,blocks,8,2,128]"
+            )
+        self.shards, self.blocks = self.packed_history.shape[:2]
+        if self.num_sms != self.shards:
+            raise ValueError("packed gated pooling uses one SM per width shard")
+        if not 0 < self.history_rows <= self.blocks * self.ROWS_PER_BLOCK:
+            raise ValueError("packed gated-pool row count exceeds its blocks")
+        for name, tensor in (
+            ("tail values", self.tail_values),
+            ("tail scores", self.tail_scores),
+            ("tail bias", self.tail_bias),
+        ):
+            if (
+                tensor.dtype != torch.float32
+                or tensor.numel() != expected_tail
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"packed gated-pool {name} must be contiguous FP32 [width]"
+                )
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.ndim != 1
+            or self.output.numel() != expected_tail
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("packed gated-pool output must be contiguous BF16 [width]")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        block_bytes = (
+            self.ROWS_PER_BLOCK * 2 * self.SHARD_WIDTH
+            * self.packed_history.element_size()
+        )
+        instructions = [Dsv4GatedPoolPacked8Shard128(self.history_rows)]
+        instructions += RepeatM.on(
+            self.blocks,
+            (TmaLoad1D(self.packed_history[sm, 0].reshape(-1)), block_bytes),
+        )
+        shard_start = sm * self.SHARD_WIDTH
+        shard_end = shard_start + self.SHARD_WIDTH
+        instructions += [
+            TmaLoad1D(self.tail_values[shard_start:shard_end]),
+            TmaLoad1D(self.tail_scores[shard_start:shard_end]),
+            TmaLoad1D(self.tail_bias[shard_start:shard_end]),
+            TmaStore1D(self.output[shard_start:shard_end]).bar(
+                self._bar("output")
+            ),
+        ]
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4IndexScore(Schedule):
     TILE_ROWS = 240
 

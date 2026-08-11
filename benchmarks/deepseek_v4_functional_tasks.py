@@ -20,6 +20,7 @@ from dae.deepseek_v4 import (
     hc_post_reference,
     hc_pre_reference,
     index_score_reference,
+    pack_gated_pool_history,
     route_top6_reference,
     sparse_attention_512_reference,
 )
@@ -31,6 +32,7 @@ from dae.schedule import (
     SchedDsv4Fp8Quant128,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4GatedPool,
+    SchedDsv4GatedPoolPacked8Shard128,
     SchedDsv4Hadamard,
     SchedDsv4HcHead,
     SchedDsv4HcPost,
@@ -405,6 +407,42 @@ def run_compression_indexer(
                 rtol=2.0e-2,
                 atol=1.0e-2,
                 latency_us=segmented_latency,
+            )
+        if pool_rows == 128:
+            tail_bias = torch.randn(
+                (width,),
+                generator=generator,
+                dtype=torch.float32,
+                device=device,
+            )
+            packed_history = pack_gated_pool_history(
+                values[:-1], scores[:-1]
+            )
+            packed_output = torch.empty_like(pooled)
+            packed_latency = launch(
+                SchedDsv4GatedPoolPacked8Shard128(
+                    packed_history,
+                    pool_rows - 1,
+                    packed_output,
+                    tail_values=values[-1],
+                    tail_scores=scores[-1],
+                    tail_bias=tail_bias,
+                ),
+                width // 128,
+                device,
+            )
+            biased_scores = scores.clone()
+            biased_scores[-1].add_(tail_bias)
+            packed_expected = gated_pool_reference(
+                values, biased_scores
+            ).to(torch.bfloat16)
+            report_close(
+                "compress_pool_ratio128_packed8_shard128",
+                packed_output,
+                packed_expected,
+                rtol=2.0e-2,
+                atol=1.0e-2,
+                latency_us=packed_latency,
             )
 
     rows = _INDEX_ROWS

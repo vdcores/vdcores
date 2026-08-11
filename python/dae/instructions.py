@@ -370,6 +370,16 @@ class Dsv4GatedPool(ComputeInstruction):
         )
 
 
+class Dsv4GatedPoolPacked8Shard128(ComputeInstruction):
+    def __init__(self, history_rows: int):
+        if history_rows <= 0 or history_rows > 0xFFFF:
+            raise ValueError("packed gated-pool rows must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_GATED_POOL_PACKED8_SHARD128,
+            args=[history_rows],
+        )
+
+
 class Dsv4IndexScore(ComputeInstruction):
     def __init__(self, rows: int):
         if rows <= 0 or rows > 0xFFFF:
@@ -2060,6 +2070,7 @@ __all__ = [
     "Dsv4SiluClampMul128",
     "Dsv4Hadamard",
     "Dsv4GatedPool",
+    "Dsv4GatedPoolPacked8Shard128",
     "Dsv4IndexScore",
     "Dsv4TopK512",
     "Dsv4HcHead",

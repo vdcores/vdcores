@@ -33,12 +33,13 @@ warmups, 30 samples, and exact token 14. Keep the historical starting baseline
 for attribution, but compare new end-to-end milestones against this current
 record.
 
-At context 128, the accepted workload-shape record is 20.051071 ms after
-contiguous four-row attention and exhaustive CSA-selection elimination. The
-strict comparison target remains 5.414155 ms, ten percent below vLLM's
-6.015728-ms median and below SGLang's 6.589777-ms ten-percent target.
-Context-128 prefix rows are deterministic resident test data, so this record
-is a shape/performance gate rather than prompt-semantic parity.
+At context 128, the accepted workload-shape record is 14.880672 ms after
+contiguous four-row attention, exhaustive CSA-selection elimination, and
+packed/sharded ratio-128 pooling. The strict comparison target remains
+5.414155 ms, ten percent below vLLM's 6.015728-ms median and below SGLang's
+6.589777-ms ten-percent target. Context-128 prefix rows are deterministic
+resident test data, so this record is a shape/performance gate rather than
+prompt-semantic parity.
 
 ## Phase 1: task kernels
 
@@ -64,6 +65,12 @@ that shape.
 When CSA's compressed-row count does not exceed the top-k cap, skip its index
 query, head-weight, score, and top-k stages entirely. The index compressor must
 still run on its compression boundary because it produces future cache state.
+
+For ratio-128 pooling, store immutable history natively as four dimension
+shards, eight rows per block, with value/score pairs adjacent. One 8-KiB TMA
+then supplies both operands for eight rows to one SM. Keep the current
+projection tail in its producer layout and load it directly; do not add a
+runtime repack stage.
 
 ## Phase 2: overlap
 

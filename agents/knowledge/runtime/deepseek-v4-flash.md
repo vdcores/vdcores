@@ -1403,3 +1403,35 @@ maximum compute/memory instructions.
 Tracked samples still report 71--73% compute m2c wait, 72--76% LDU dependency
 wait, and 74--75% allocator slot stall. The semantic elimination is accepted,
 but the 20.051071-ms result remains 3.70x the strict 5.414155-ms target.
+
+## Packed/sharded ratio-128 pooling (2026-08-11)
+
+Ratio-128 compressor pooling is independent by output dimension. Its history
+is now preprocessed once into contiguous
+`[4 shards, 16 blocks, 8 rows, value/score, 128 dims]` storage. Each 8-KiB TMA
+carries both FP32 operands for eight rows, and four SMs own disjoint 128-wide
+output shards. The dynamic value, score, and APE tail remains in its producer
+layout and is loaded directly, so there is no runtime repack or inter-stage
+copy. A normal memory repeat advances blocks; compute contains ordinary loops
+and only compute-group synchronization.
+
+Functional job `20260811T165754Z-1004507` passed an independent BF16
+reference. Scalar/packed ratio-128 medians were 119.264/11.456 us, a 10.4x
+task speedup. The ratio-4 control stayed on its existing 9.888-us segmented
+path. The shape policy derives four SMs from 512 / 128 rather than using a
+tuned occupancy constant.
+
+Representative HCA job `20260811T165901Z-1017040` emitted identical token and
+logit range. Packed/scalar medians were 0.476160/0.924352 ms, and the pool
+boundary fell from 136.000 to 13.408 us. Full tracked job
+`20260811T165935Z-1023821` used one `.24` GB200, one launch, three warmups, and
+five samples. It emitted stable token 5 and measured
+14.873792/14.880672/14.990528 ms min/median/max. This saves 5.170399 ms (25.8%)
+from exhaustive-selection elimination and 15.268704 ms (50.6%) from the
+initial context-128 gate.
+
+The 32-op tracked build is spill-free at 78 registers, nine barriers, a
+208-byte stack, and 2,448 bytes static shared memory. Grid-normalized compute
+m2c wait is now about 63%, allocator slot stall 66%, and LDU dependency wait
+64--66%. The accepted 14.880672-ms result beats the earlier 16-ms objective
+but remains 9.466517 ms above the strict 5.414155-ms framework target.

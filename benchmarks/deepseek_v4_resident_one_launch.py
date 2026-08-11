@@ -16,7 +16,11 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from dae.deepseek_v4 import DeepSeekV4FlashConfig, deepseek_v4_rope_table
+from dae.deepseek_v4 import (
+    DeepSeekV4FlashConfig,
+    deepseek_v4_rope_table,
+    pack_gated_pool_history,
+)
 from dae.deepseek_v4_checkpoint import (
     DeepSeekV4Checkpoint,
     DeepSeekV4ResidentCheckpoint,
@@ -38,6 +42,7 @@ from dae.schedule import (
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
     SchedDsv4GatedPool,
+    SchedDsv4GatedPoolPacked8Shard128,
     SchedDsv4Hadamard,
     SchedDsv4HcHead,
     SchedDsv4HcPost,
@@ -429,6 +434,7 @@ class ResidentOneLaunchDecode:
         self.compress_scores = torch.empty_like(self.compress_values)
         self.attention_pool_history_values = {}
         self.attention_pool_history_scores = {}
+        self.attention_pool_history_packed = {}
         self.attention_pooled = {}
         self.attention_pooled_norm = {}
         self.compressed_output_rope = {}
@@ -441,16 +447,21 @@ class ResidentOneLaunchDecode:
                 if plan.compress_ratio != 4 or plan.compressed_rows == 1
                 else 2 * plan.compress_ratio
             )
-            self.attention_pool_history_values[kind] = seeded(
+            history_values = seeded(
                 (pool_rows - 1, cfg.head_dim),
                 dtype=torch.float32,
                 seed=202608120 + kind_index,
             )
-            self.attention_pool_history_scores[kind] = seeded(
+            history_scores = seeded(
                 (pool_rows - 1, cfg.head_dim),
                 dtype=torch.float32,
                 seed=202608130 + kind_index,
                 scale=0.25,
+            )
+            self.attention_pool_history_values[kind] = history_values
+            self.attention_pool_history_scores[kind] = history_scores
+            self.attention_pool_history_packed[kind] = pack_gated_pool_history(
+                history_values, history_scores
             )
             self.attention_pooled[kind] = torch.empty(
                 (cfg.head_dim,), dtype=torch.bfloat16, device=d
@@ -1014,21 +1025,47 @@ class ResidentOneLaunchDecode:
                     ]
                     for ape in ape_tensors
                 )
-                pool = SchedDsv4GatedPool(
-                    self.attention_pool_history_values[kind],
-                    self.attention_pool_history_scores[kind],
-                    self.attention_pooled[kind],
-                    tail_values=self.compress_values[
-                        tail_offset : tail_offset + cfg.head_dim
-                    ],
-                    tail_scores=self.compress_scores[
-                        tail_offset : tail_offset + cfg.head_dim
-                    ],
-                    tail_bias=ape_rows[0],
+                history_values = self.attention_pool_history_values[kind]
+                tail_values = self.compress_values[
+                    tail_offset : tail_offset + cfg.head_dim
+                ]
+                tail_scores = self.compress_scores[
+                    tail_offset : tail_offset + cfg.head_dim
+                ]
+                use_packed_pool = (
+                    self.args.gated_pool_mode == "packed"
+                    or (
+                        self.args.gated_pool_mode == "auto"
+                        and plan.compress_ratio == 128
+                    )
                 )
+                if use_packed_pool:
+                    pool = SchedDsv4GatedPoolPacked8Shard128(
+                        self.attention_pool_history_packed[kind],
+                        history_values.shape[0],
+                        self.attention_pooled[kind],
+                        tail_values=tail_values,
+                        tail_scores=tail_scores,
+                        tail_bias=ape_rows[0],
+                    )
+                    pool_sms = self.policy.gated_pool(
+                        cfg.head_dim,
+                        history_values.shape[0] + 1,
+                        packed=True,
+                    )
+                else:
+                    pool = SchedDsv4GatedPool(
+                        history_values,
+                        self.attention_pool_history_scores[kind],
+                        self.attention_pooled[kind],
+                        tail_values=tail_values,
+                        tail_scores=tail_scores,
+                        tail_bias=ape_rows[0],
+                    )
+                    pool_sms = 1
                 pool = self._layered(pool, family, ape_rows)
                 stages.append(
-                    self._stage("attn.compressor.pool", pool)
+                    self._stage("attn.compressor.pool", pool, pool_sms)
                 )
                 stages.append(
                     self._rms_stage(
@@ -2013,6 +2050,7 @@ class ResidentOneLaunchDecode:
             f"position={self.decode_position} "
             f"attention={self.args.attention_mode} "
             f"index_selection={self.args.index_selection_mode} "
+            f"gated_pool={self.args.gated_pool_mode} "
             f"prefix_cache={'current_token' if self.args.context_length == 1 else 'deterministic_seeded'} "
             f"logical_stages={logical_stages} queue_stages={queue_stages} "
             f"barriers={len(self.program.barriers)} "
@@ -2376,6 +2414,12 @@ def main() -> None:
         help="force CSA score/top-k work for exhaustive-selection A/B profiling",
     )
     parser.add_argument(
+        "--gated-pool-mode",
+        choices=("auto", "packed", "scalar"),
+        default="auto",
+        help="select the compressor pooling layout for matched A/B profiling",
+    )
+    parser.add_argument(
         "--profile-layers",
         action="store_true",
         help="record compact per-layer LDU globaltimer frontiers",
@@ -2495,6 +2539,7 @@ def main() -> None:
         f"context={args.context_length} position={args.context_length - 1} "
         f"attention={args.attention_mode} "
         f"index_selection={args.index_selection_mode} "
+        f"gated_pool={args.gated_pool_mode} "
         f"prefix_cache={'current_token' if args.context_length == 1 else 'deterministic_seeded'} "
         f"vocab={args.vocab_size} output_token={reference_token} "
         f"build_s={build_seconds:.3f} min_ms={min(timings):.6f} "

@@ -217,6 +217,40 @@ def gated_pool_reference(
     return (values.float() * scores.float().softmax(dim=0)).sum(dim=0)
 
 
+def pack_gated_pool_history(
+    values: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    shard_width: int = 128,
+    rows_per_block: int = 8,
+) -> torch.Tensor:
+    """Prepack value/score rows into one slot-sized TMA block per shard."""
+    if values.shape != scores.shape or values.ndim != 2:
+        raise ValueError("gated-pool history expects matching [rows,width] tensors")
+    if values.dtype != torch.float32 or scores.dtype != torch.float32:
+        raise ValueError("gated-pool history must be FP32")
+    rows, width = values.shape
+    if rows <= 0 or width % shard_width:
+        raise ValueError("gated-pool history needs rows and complete width shards")
+    if shard_width <= 0 or rows_per_block <= 0:
+        raise ValueError("gated-pool packing dimensions must be positive")
+    shards = width // shard_width
+    blocks = (rows + rows_per_block - 1) // rows_per_block
+    padded_rows = blocks * rows_per_block
+    paired = torch.zeros(
+        (padded_rows, shards, 2, shard_width),
+        dtype=torch.float32,
+        device=values.device,
+    )
+    paired[:rows, :, 0].copy_(values.reshape(rows, shards, shard_width))
+    paired[:rows, :, 1].copy_(scores.reshape(rows, shards, shard_width))
+    return (
+        paired.permute(1, 0, 2, 3)
+        .contiguous()
+        .reshape(shards, blocks, rows_per_block, 2, shard_width)
+    )
+
+
 def index_score_reference(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -345,6 +379,7 @@ __all__ = [
     "bounded_swiglu",
     "hadamard_reference",
     "gated_pool_reference",
+    "pack_gated_pool_history",
     "index_score_reference",
     "decode_window_indices",
     "decode_compressed_indices",

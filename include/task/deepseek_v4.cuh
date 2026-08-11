@@ -909,6 +909,79 @@ __device__ __forceinline__ void task_dsv4_gated_pool(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
+// Dimension-sharded gated pooling over immutable, prepacked history.  One
+// 8-KiB TMA carries eight rows of both values and scores for 128 dimensions.
+// The dynamic tail remains in its producer layout and is loaded separately;
+// no inter-stage layout copy is introduced.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_gated_pool_packed8_shard128(
+    int history_rows,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kWidth = 128;
+  constexpr int kRowsPerBlock = 8;
+  const int tid = __compute_tid();
+  float maximum = -__int_as_float(0x7f800000);
+  float denominator = 0.0f;
+  float numerator = 0.0f;
+
+  for (int row_start = 0; row_start < history_rows;
+       row_start += kRowsPerBlock) {
+    const int block_slots = m2c.template pop<0>();
+    const int block_slot = extract(block_slots);
+    const auto *block = static_cast<const float *>(
+        get_slot_address(smem_base, block_slot));
+    const int remaining = history_rows - row_start;
+    const int block_rows =
+        remaining < kRowsPerBlock ? remaining : kRowsPerBlock;
+#pragma unroll 1
+    for (int row = 0; row < block_rows; ++row) {
+      const float value = block[(row * 2) * kWidth + tid];
+      const float score = block[(row * 2 + 1) * kWidth + tid];
+      const float next_max = fmaxf(maximum, score);
+      const float old_scale = __expf(maximum - next_max);
+      const float probability = __expf(score - next_max);
+      denominator = denominator * old_scale + probability;
+      numerator = numerator * old_scale + probability * value;
+      maximum = next_max;
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, block_slots);
+  }
+
+  const int tail_values_slots = m2c.template pop<0>();
+  const int tail_values_slot = extract(tail_values_slots);
+  const auto *tail_values = static_cast<const float *>(
+      get_slot_address(smem_base, tail_values_slot));
+  const int tail_scores_slots = m2c.template pop<0>();
+  const int tail_scores_slot = extract(tail_scores_slots);
+  const auto *tail_scores = static_cast<const float *>(
+      get_slot_address(smem_base, tail_scores_slot));
+  const int tail_bias_slots = m2c.template pop<0>();
+  const int tail_bias_slot = extract(tail_bias_slots);
+  const auto *tail_bias = static_cast<const float *>(
+      get_slot_address(smem_base, tail_bias_slot));
+  const float tail_score = tail_scores[tid] + tail_bias[tid];
+  const float next_max = fmaxf(maximum, tail_score);
+  const float old_scale = __expf(maximum - next_max);
+  const float probability = __expf(tail_score - next_max);
+  denominator = denominator * old_scale + probability;
+  numerator = numerator * old_scale + probability * tail_values[tid];
+
+  __sync_compute_group(128);
+  c2m.push(
+      tid, tail_values_slots | tail_scores_slots | tail_bias_slots);
+
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, output_slot));
+  output[tid] = __float2bfloat16(numerator / denominator);
+  __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
 // Learned ratio-4 index score.  Each SM handles a contiguous KV-row shard;
 // within a row the four warps independently reduce one head at a time.  This
 // keeps all warps useful and needs only one warpgroup reduction per row.

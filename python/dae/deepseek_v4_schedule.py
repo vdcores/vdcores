@@ -140,6 +140,25 @@ class DeepSeekV4ShapePolicy:
             tile_k=head_dim,
         )
 
+    def gated_pool(
+        self, width: int, pool_rows: int, *, packed: bool
+    ) -> ShapeAssignment:
+        if pool_rows <= 0 or width not in (128, 512):
+            raise ValueError("invalid DeepSeek gated-pool shape")
+        if not packed:
+            return ShapeAssignment(
+                "gated_pool_scalar", width, pool_rows, 1,
+                tile_rows=width, tile_k=1,
+            )
+        return self._rows(
+            "gated_pool_packed8",
+            width,
+            pool_rows,
+            alignment=128,
+            tile_rows=128,
+            tile_k=8,
+        )
+
     def hc_post(self, hidden_size: int, streams: int) -> ShapeAssignment:
         if hidden_size % 128:
             raise ValueError("mHC post hidden size must be divisible by 128")

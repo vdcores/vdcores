@@ -16,6 +16,7 @@ from dae.deepseek_v4 import (
     hc_post_reference,
     hc_pre_reference,
     index_score_reference,
+    pack_gated_pool_history,
     route_top6_reference,
     sparse_attention_512_reference,
 )
@@ -183,6 +184,28 @@ def test_sparse_attention_sink_is_denominator_only():
     )
 
     assert dominant_sink.abs().max() < no_sink.abs().max()
+
+
+def test_gated_pool_history_pack_keeps_value_score_pairs_per_shard():
+    values = torch.arange(11 * 512, dtype=torch.float32).reshape(11, 512)
+    scores = -values
+    packed = pack_gated_pool_history(values, scores)
+
+    assert packed.shape == (4, 2, 8, 2, 128)
+    unpacked_values = (
+        packed[:, :, :, 0]
+        .reshape(4, 16, 128)[:, :11]
+        .permute(1, 0, 2)
+        .reshape_as(values)
+    )
+    unpacked_scores = (
+        packed[:, :, :, 1]
+        .reshape(4, 16, 128)[:, :11]
+        .permute(1, 0, 2)
+        .reshape_as(scores)
+    )
+    torch.testing.assert_close(unpacked_values, values)
+    torch.testing.assert_close(unpacked_scores, scores)
 
 
 def test_router_bias_changes_selection_but_not_selected_weight_values():
