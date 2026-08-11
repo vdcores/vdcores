@@ -497,6 +497,25 @@ resident image now uses 471 barriers, 1,089 compute instructions, and 3,572
 memory instructions. This improves the 24.952 ms boundary by 3.200 ms (12.8%)
 and leaves 5.752 ms to the 16 ms target.
 
+The post-fan-out tracked job `20260811T030016Z-2731223` measured
+22.244--22.912 ms over six correct tokens, median 22.436 ms. A representative
+sample split into 19.753 ms of layers, 1.132 ms of active-bank reloads, and
+1.369 ms for the vocabulary head. Every sample executed exactly 1,767,383
+allocator instructions, 1,058,562/728,885 LDU commands, and 456,409 stores;
+SM clocks stayed near 2.05 GHz. CSA layers remained near 0.39--0.42 ms while
+HCA varied around a stable mode rather than increasing with loop position.
+The progressive slowdown remains eliminated; the variation is queue and slot
+backpressure on fixed work, not accumulated state or a system-frequency loss.
+
+Stage profiling now marks only the aggregate routed-expert join. Inserting a
+marker within an earlier rank would place it in every SM queue before later
+sibling branches and destroy the overlap being measured. DAG-safe job
+`20260811T030329Z-2749377` attributed a 0.306 ms layer span to 0.148 ms of
+attention and 0.158 ms of FFN. Routed experts take 78.7 us after fan-out, while
+the still-serial shared expert takes 33.1 us. The Q and KV paths take 45.5 and
+9.2 us, and the eight-way attention-output group now takes 27.5 us. These are
+the next broad overlap/adaptive-fusion candidates.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

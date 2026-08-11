@@ -1370,15 +1370,12 @@ class ResidentOneLaunchDecode:
                 return True
             if not name.startswith("ffn.expert"):
                 return False
-            return name.endswith(
-                (
-                    ".input.quant_nvfp4",
-                    ".w3",
-                    ".swiglu",
-                    ".middle.quant_nvfp4",
-                    ".w2",
-                )
-            )
+            # A marker within one expert branch would be inserted into every
+            # SM queue and serialize the still-unqueued sibling branches.
+            # Expert 5's W2 is textually last and releases the shared routed
+            # join, so this boundary observes all six branches without
+            # changing their overlap.
+            return name == "ffn.expert5.w2"
 
         def queued(
             stage: Stage,
