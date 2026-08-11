@@ -232,6 +232,58 @@ def test_sequential_program_uses_stu_release_and_gates_both_ldu_ports():
         assert consumer_load1.num_slots >> 6 == 0
 
 
+def test_sequential_program_balances_default_loads_by_size():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 32
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            return bar_id
+
+    class ThreeLoadStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            loads = [
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=size,
+                    address=0,
+                )
+                for size in (64, 16, 16)
+            ]
+            return [
+                Copy(1, 16),
+                *loads,
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        [SequentialStage("balanced", ThreeLoadStage(), 1)],
+        balance_load_ports=True,
+    )
+    loads = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+        and inst.opcode & 0x1
+        and not inst.opcode & 0x2
+    ]
+    assert [bool(inst.opcode & 0x20) for inst in loads] == [False, True, True]
+
+
 def test_sequential_program_binds_model_specific_input_role_to_same_edge():
     class FakeLauncher:
         num_sms = 1

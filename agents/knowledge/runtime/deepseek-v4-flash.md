@@ -278,6 +278,30 @@ samples had about 10.4k, despite the same 54,609 allocator instructions. All
 controls on LDU1. This elevates load-port balancing and dependency-aware slot
 admission above clock tuning or physical-SM exclusion.
 
+### Dual-LDU operand overlap
+
+The first accepted overlap milestone greedily assigns each stage's default
+allocating loads to the LDU port with fewer encoded bytes while preserving
+explicit port-1 assignments. Both ports remain children of the same allocator
+instruction stream and resident launch, and the first load on every active
+port receives the same true stage dependency.
+
+On one layer, job `20260811T005301Z-2094018` split 54,913 load commands into
+28,752 on LDU0 and 26,161 on LDU1. Thirty tracked samples tightened to
+0.5585--0.5716 ms with a 0.5643 ms median, versus a controlled 0.7019 ms
+single-port median; the transformer frontier fell to about 0.431 ms and
+allocator slot-stall events stabilized near 7.0k.
+
+The 43-layer gate, job `20260811T005339Z-2097329`, preserved reference token
+14 and measured 34.569--36.113 ms over ten tracked samples, median 35.275 ms.
+The previous six-sample tracked median was 72.831 ms. The median-sample
+internal breakdown is 30.827 ms in layers, 2.833 ms in reloads, and 1.688 ms
+in the full head. Work counts did not change; LDU0/LDU1 handled
+1,308,392/1,167,571 commands. This removes the large token-level timing modes,
+but HCA layers still grow from roughly 0.58 ms to occasional 1.24 ms while CSA
+layers are near 0.53--0.56 ms, so dependency-aware admission and the broader
+task DAG remain necessary for the 16 ms target.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

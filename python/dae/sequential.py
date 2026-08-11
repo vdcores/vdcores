@@ -126,6 +126,25 @@ def _gate_load_ports(per_sm: list[list], bar_id: int, stage: str) -> None:
         raise ValueError(f"sequential stage {stage!r} has no active SMs")
 
 
+def _balance_load_ports(per_sm: list[list]) -> None:
+    """Distribute stage operands over both LDU FIFOs by encoded byte size."""
+
+    for instructions in per_sm:
+        port_bytes = [0, 0]
+        for inst in instructions:
+            if not isinstance(inst, MemoryInstruction):
+                continue
+            if not inst.opcode & _MEM_ALLOCATE or inst.opcode & _MEM_WRITEBACK:
+                continue
+            if inst.opcode & _MEM_PORT1:
+                port = 1
+            else:
+                port = 1 if port_bytes[1] < port_bytes[0] else 0
+                if port == 1:
+                    inst.port(1)
+            port_bytes[port] += max(1, inst.size)
+
+
 class SequentialProgram:
     """Render a strict stage chain into per-SM compute/memory queues.
 
@@ -141,6 +160,7 @@ class SequentialProgram:
         *,
         completion_barrier: bool = False,
         profile_event_count: int | None = None,
+        balance_load_ports: bool = False,
     ):
         self.launcher = launcher
         self.stages = tuple(stages)
@@ -205,6 +225,8 @@ class SequentialProgram:
                 instructions = []
                 _flatten(placed(sm), sm, instructions)
                 rendered.append(instructions)
+            if balance_load_ports:
+                _balance_load_ports(rendered)
             if input_bar is not None:
                 _gate_load_ports(rendered, input_bar, stage.name)
 
@@ -274,6 +296,8 @@ class LoopedSequentialProgram:
         self,
         launcher,
         blocks: list[SequentialBlock] | tuple[SequentialBlock, ...],
+        *,
+        balance_load_ports: bool = False,
     ):
         self.launcher = launcher
         self.blocks = tuple(blocks)
@@ -336,6 +360,7 @@ class LoopedSequentialProgram:
                 block.stages,
                 completion_barrier=block.reload_after,
                 profile_event_count=self.profile_event_count,
+                balance_load_ports=balance_load_ports,
             )
             self.segments.append(segment)
             barriers_per_bank = segment.barrier_stop - segment.barrier_start

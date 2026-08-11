@@ -1210,7 +1210,9 @@ class ResidentOneLaunchDecode:
             family = self.families[0]
             stages = queued_family(family)
             stages.extend(queued(stage) for stage in self.head_stages)
-            self.program = SequentialProgram(self.launcher, stages)
+            self.program = SequentialProgram(
+                self.launcher, stages, balance_load_ports=True
+            )
             logical_stages = len(stages)
             queue_stages = logical_stages
         elif self.args.layers == 2:
@@ -1226,7 +1228,9 @@ class ResidentOneLaunchDecode:
                 ),
                 SequentialBlock("head", head_stages, reload_after=False),
             )
-            self.program = LoopedSequentialProgram(self.launcher, blocks)
+            self.program = LoopedSequentialProgram(
+                self.launcher, blocks, balance_load_ports=True
+            )
             logical_stages = sum(
                 len(block.stages) * block.repeat for block in blocks
             )
@@ -1250,7 +1254,9 @@ class ResidentOneLaunchDecode:
                 ),
                 SequentialBlock("head", head_stages, reload_after=False),
             )
-            self.program = LoopedSequentialProgram(self.launcher, blocks)
+            self.program = LoopedSequentialProgram(
+                self.launcher, blocks, balance_load_ports=True
+            )
             logical_stages = sum(
                 len(block.stages) * block.repeat for block in blocks
             )
