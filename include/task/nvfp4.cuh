@@ -96,6 +96,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_nvfp4_gemv_sm100(
     int rows,
     int k,
+    int retain_activation,
     void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
@@ -206,9 +207,10 @@ __device__ __forceinline__ void task_nvfp4_gemv_sm100(
   }
 
   __sync_compute_group(128);
-  c2m.push(
-      tid,
-      weight_slots | weight_scale_slots | input_slots |
-          input_scale_slots | alpha_slots);
+  int release_slots = weight_slots | weight_scale_slots | alpha_slots;
+  if (!retain_activation) {
+    release_slots |= input_slots | input_scale_slots;
+  }
+  c2m.push(tid, release_slots);
   c2m.template push<31, true, false>(tid, output_slots);
 }

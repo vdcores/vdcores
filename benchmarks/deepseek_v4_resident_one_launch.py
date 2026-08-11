@@ -908,6 +908,7 @@ class ResidentOneLaunchDecode:
         output: torch.Tensor,
         *,
         wait_for_previous: bool = True,
+        activation_mode: str = "load",
     ) -> Stage:
         assignment = self.policy.nvfp4_gemv(rows, k)
         table = tables[0]
@@ -931,6 +932,7 @@ class ResidentOneLaunchDecode:
             activation_scale.reshape(-1),
             output.reshape(-1),
             route_ready=not wait_for_previous,
+            activation_mode=activation_mode,
         )
         schedule = self._routed_layered(schedule, family, tables)
         return self._stage(
@@ -1021,6 +1023,7 @@ class ResidentOneLaunchDecode:
                     self.routed_input[rank],
                     self.routed_input_scale[rank],
                     self.routed_gate[rank],
+                    activation_mode="retain",
                 )
             )
             stages.append(
@@ -1036,6 +1039,7 @@ class ResidentOneLaunchDecode:
                     self.routed_input_scale[rank],
                     self.routed_up[rank],
                     wait_for_previous=False,
+                    activation_mode="reuse",
                 )
             )
             stages.append(

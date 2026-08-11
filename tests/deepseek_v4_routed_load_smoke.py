@@ -40,7 +40,8 @@ def main() -> None:
     selected_alpha = torch.zeros((4,), dtype=torch.float32, device=device)
     default_alpha[0] = default_scale2 * input_scale
     selected_alpha[0] = selected_scale2 * input_scale
-    output = torch.empty((rows,), dtype=torch.bfloat16, device=device)
+    output_w1 = torch.empty((rows,), dtype=torch.bfloat16, device=device)
+    output_w3 = torch.empty((rows,), dtype=torch.bfloat16, device=device)
 
     def expert_column(default, selected):
         column = [default] * 256
@@ -100,7 +101,7 @@ def main() -> None:
         route_weights,
         hash_routing=True,
     ).bar("output", route_bar).place(1)
-    expert_inner = SchedRoutedNvfp4Gemv(
+    expert_w1_inner = SchedRoutedNvfp4Gemv(
         table.state,
         route_rank=0,
         weight_fields=[table.field(name) for name in weight_fields],
@@ -110,26 +111,50 @@ def main() -> None:
         k=k,
         activation=activation,
         activation_scale=activation_scale,
-        output=output,
+        output=output_w1,
+        activation_mode="retain",
     )
-    expert = (
+    expert_w1 = (
         LayeredSchedule(
-            expert_inner,
+            expert_w1_inner,
             ((table.state, (table.state,)),),
             route_indices=route_indices,
         )
         .bar("route", route_bar)
+        .place(num_sms)
+    )
+    expert_w3_inner = SchedRoutedNvfp4Gemv(
+        table.state,
+        route_rank=0,
+        weight_fields=[table.field(name) for name in weight_fields],
+        weight_scale_fields=[table.field(name) for name in weight_scale_fields],
+        alpha_field=table.field("alpha"),
+        rows=rows,
+        k=k,
+        activation=activation,
+        activation_scale=activation_scale,
+        output=output_w3,
+        route_ready=True,
+        activation_mode="reuse",
+    )
+    expert_w3 = (
+        LayeredSchedule(
+            expert_w3_inner,
+            ((table.state, (table.state,)),),
+            route_indices=route_indices,
+        )
         .bar("output", output_bar)
         .place(num_sms)
     )
-    launcher.s(route, expert)
+    launcher.s(route, expert_w1, expert_w3)
     launcher.launch()
 
     reference = (
         dequantize_nvfp4(selected_weight, selected_scale, selected_scale2)
         @ dequantize_nvfp4(activation, activation_scale, input_scale)
     ).to(torch.bfloat16)
-    torch.testing.assert_close(output, reference, rtol=5.0e-2, atol=5.0e-2)
+    torch.testing.assert_close(output_w1, reference, rtol=5.0e-2, atol=5.0e-2)
+    torch.testing.assert_close(output_w3, reference, rtol=5.0e-2, atol=5.0e-2)
     expected_route_weights, _ = route_top6_reference(
         logits, bias, hash_indices=hash_indices[:6]
     )
@@ -138,9 +163,12 @@ def main() -> None:
     )
     assert route_indices.tolist()[0] == selected_expert
     assert launcher.bars.view(torch.int32)[output_bar].item() == 0
-    max_abs = (output.float() - reference.float()).abs().max().item()
+    max_abs = max(
+        (output_w1.float() - reference.float()).abs().max().item(),
+        (output_w3.float() - reference.float()).abs().max().item(),
+    )
     print(
-        "DSV4_ROUTED_LOAD status=PASS indirect=1 "
+        "DSV4_ROUTED_LOAD status=PASS indirect=1 adaptive_fusion=1 "
         f"launches=1 selected_expert={selected_expert} sms={num_sms} "
         f"max_abs={max_abs:.6f}",
         flush=True,

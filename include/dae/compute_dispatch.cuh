@@ -119,7 +119,7 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_SM100) {
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_nvfp4_gemv_sm100(
-      inst.args[0], inst.args[1], smem_base, m2c, c2m);
+      inst.args[0], inst.args[1], inst.args[2], smem_base, m2c, c2m);
 #endif
 }
 

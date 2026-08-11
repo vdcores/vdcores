@@ -284,6 +284,65 @@ def test_sequential_program_balances_default_loads_by_size():
     assert [bool(inst.opcode & 0x20) for inst in loads] == [False, True, True]
 
 
+def test_sequential_program_preserves_fixed_load_ports():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 16
+
+        def new_bar(self, count):
+            self.num_bars += 1
+            return self.num_bars - 1
+
+    class FixedLoadStage(Schedule):
+        def schedule(self, sm):
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_TMA_LOAD_REG_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=1024,
+                    address=0,
+                ).fixed_port(1),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_TMA_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        [SequentialStage("fixed", FixedLoadStage(), 1)],
+        balance_load_ports=True,
+    )
+    loads = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+        and inst.opcode & 0x1
+        and not inst.opcode & 0x2
+    ]
+    assert loads[0].annotation["fixed_port"] == 1
+    assert [bool(inst.opcode & 0x20) for inst in loads] == [True, False]
+
+
+def test_nvfp4_gemv_can_retain_activation_slots():
+    instruction = Nvfp4GemvSm100(16, 4096, retain_activation=True)
+
+    assert instruction.args == [16, 4096, 1]
+
+
 def test_sequential_program_elides_only_same_placement_independent_edge():
     class FakeLauncher:
         num_sms = 2

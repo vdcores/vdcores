@@ -63,6 +63,10 @@ DAE_OP(OP_RESET_INDIRECT_LAYER, MK_MOP(38, MEM_OP_FLAGS_NONE))
 // barrier, records globaltimer[event_base + internal_counter], then advances
 // that counter. The compact loop body therefore needs no per-layer unroll.
 DAE_OP(OP_LDU_PROFILE_LAYER, MK_MOP(39, MEM_OP_FLAGS_NONE))
+// Load one operand into allocator-owned shared slots and retain its slot mask
+// in the issuing LDU handler for a later OP_ALLOC_REG_LOAD. This aliases the
+// original shared allocation; it does not copy the operand.
+DAE_OP(OP_ALLOC_TMA_LOAD_REG_1D, MK_MOP(40, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

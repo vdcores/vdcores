@@ -137,7 +137,17 @@ def _balance_load_ports(per_sm: list[list]) -> None:
                 continue
             if not inst.opcode & _MEM_ALLOCATE or inst.opcode & _MEM_WRITEBACK:
                 continue
-            if inst.opcode & _MEM_PORT1:
+            fixed_port = inst.annotation.get("fixed_port")
+            if fixed_port is not None:
+                if fixed_port not in (0, 1):
+                    raise ValueError(f"invalid fixed LDU port {fixed_port!r}")
+                encoded_port = 1 if inst.opcode & _MEM_PORT1 else 0
+                if encoded_port != fixed_port:
+                    raise ValueError(
+                        "fixed LDU port annotation disagrees with encoded port"
+                    )
+                port = fixed_port
+            elif inst.opcode & _MEM_PORT1:
                 port = 1
             else:
                 port = 1 if port_bytes[1] < port_bytes[0] else 0

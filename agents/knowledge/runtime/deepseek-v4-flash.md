@@ -377,6 +377,32 @@ preserved token 14 over 30 samples and measured 26.713--27.797 ms, median
 27.206 ms. This is a 4.924 ms (15.3%) complete-token improvement over the
 32.130 ms boundary.
 
+### Zero-copy routed W1/W3 adaptive fusion
+
+Routed W1 and W3 consume the same packed NVFP4 activation and per-16 scale on
+every SM. A dedicated LDU instruction now TMA-loads each operand into ordinary
+allocator-owned shared slots and records that slot mask in the issuing LDU's
+four-entry local register file. W1 omits those masks from its release; W3 uses
+fixed-port `RegLoad` commands to consume the same slots and releases them after
+its compute task. The two operands are pinned to distinct LDU ports because
+the register files are handler-local. This is a slot alias, not an
+inter-stage copy, and does not expose a global address to compute.
+
+The handoff retains three shared slots per active SM only across each adjacent
+W1/W3 pair. It removes one 2,048-byte activation load and one 256-byte scale
+load per SM, route rank, and layer: about 86.2 MiB of repeated HBM traffic for
+the 43-layer token. It adds no compute or memory queue entries, dependency
+counter, launch, or fence. Fixed-port annotations are preserved by the
+dual-LDU balancer so a later schedule rewrite cannot silently move one half of
+the handoff to the wrong handler.
+
+Focused job `20260811T020928Z-2477023` ran route, retained W1, and reused W3 in
+one launch and was bit-exact (`max_abs=0`). The one-layer checkpoint gate
+measured 0.5169 ms median. Production job `20260811T020955Z-2479547`
+preserved token 14 over 30 samples and measured 26.234--27.088 ms, median
+26.571 ms. This improves the 27.206 ms boundary by 0.635 ms (2.3%) and leaves
+10.571 ms to the 16 ms target.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

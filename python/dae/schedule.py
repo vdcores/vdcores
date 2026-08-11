@@ -355,6 +355,7 @@ class SchedRoutedNvfp4Gemv(Schedule):
         output,
         *,
         route_ready=False,
+        activation_mode="load",
     ):
         super().__init__()
         self.routing_state = routing_state
@@ -368,6 +369,11 @@ class SchedRoutedNvfp4Gemv(Schedule):
         self.activation_scale = activation_scale
         self.output = output
         self.route_ready = bool(route_ready)
+        if activation_mode not in ("load", "retain", "reuse"):
+            raise ValueError(
+                "activation_mode must be 'load', 'retain', or 'reuse'"
+            )
+        self.activation_mode = activation_mode
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
@@ -417,8 +423,27 @@ class SchedRoutedNvfp4Gemv(Schedule):
         )
         if route_bar is not None:
             weight_load.bar(route_bar)
+        if self.activation_mode == "retain":
+            activation_load = TmaLoadReg1D(
+                self.activation.reshape(-1), 0, 0
+            )
+            activation_scale_load = TmaLoadReg1D(
+                self.activation_scale.reshape(-1), 1, 1
+            )
+        elif self.activation_mode == "reuse":
+            activation_load = RegLoad(0, slot_id=0).fixed_port(0)
+            activation_scale_load = RegLoad(1, slot_id=1).fixed_port(1)
+        else:
+            activation_load = TmaLoad1D(self.activation.reshape(-1))
+            activation_scale_load = TmaLoad1D(
+                self.activation_scale.reshape(-1)
+            )
         return [
-            Nvfp4GemvSm100(row_count, self.k),
+            Nvfp4GemvSm100(
+                row_count,
+                self.k,
+                retain_activation=self.activation_mode == "retain",
+            ),
             weight_load,
             RoutedTmaLoad1D(
                 self.routing_state,
@@ -426,8 +451,8 @@ class SchedRoutedNvfp4Gemv(Schedule):
                 self.weight_scale_fields[sm],
                 scale_bytes,
             ),
-            TmaLoad1D(self.activation.reshape(-1)),
-            TmaLoad1D(self.activation_scale.reshape(-1)),
+            activation_load,
+            activation_scale_load,
             RoutedTmaLoad1D(
                 self.routing_state, self.route_rank, self.alpha_field, 16
             ),

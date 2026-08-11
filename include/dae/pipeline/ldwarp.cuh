@@ -77,6 +77,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
     // TODO(zhiyuang): change location?
     switch(op(opcode)) {
+      case op(OP_ALLOC_TMA_LOAD_REG_1D):
       case op(OP_ALLOC_TMA_LOAD_1D): {
         __ldprint("TMA 1D Load: size=%d", inst.size);
         // We need to get a slot ID first, as we will use its barrier
@@ -90,6 +91,15 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           m2c.barriers[bar],
           cuda::aligned_size_t<16>(inst.size)
         );
+        if (op(opcode) == op(OP_ALLOC_TMA_LOAD_REG_1D)) {
+          if (inst.arg >= 4) {
+            asm volatile("trap;");
+          }
+          regFile[inst.arg] = mkSlotMask(slot, inst.nslot());
+          __ldprint(
+              "[REG] retain TMA: reg_id=%d slot=%d nslot=%d mask=0x%X",
+              inst.arg, slot, inst.nslot(), regFile[inst.arg]);
+        }
         break; }
       case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):
       case op(OP_ALLOC_LAYER_TMA_LOAD_1D): {

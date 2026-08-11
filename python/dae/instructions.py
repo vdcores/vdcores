@@ -97,6 +97,7 @@ class Nvfp4GemvSm100(ComputeInstruction):
         self,
         rows: int,
         k: int,
+        retain_activation: bool = False,
     ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("NVFP4 GEMV rows must fit in a positive uint16")
@@ -104,7 +105,7 @@ class Nvfp4GemvSm100(ComputeInstruction):
             raise ValueError("NVFP4 GEMV K must be a positive uint16 multiple of 32")
         super().__init__(
             opcode=opcode.OP_NVFP4_GEMV_SM100,
-            args=[rows, k, 0],
+            args=[rows, k, int(retain_activation)],
         )
 
 
@@ -958,6 +959,18 @@ class MemoryInstruction(Instruction):
             return self
         raise ValueError("Only port 0 and 1 are supported")
 
+    def fixed_port(self, port_id: int):
+        """Pin an instruction to one LDU FIFO during load balancing."""
+        if port_id not in (0, 1):
+            raise ValueError("Only port 0 and 1 are supported")
+        encoded_port = 1 if self.opcode & 32 else 0
+        if encoded_port != port_id:
+            if encoded_port == 1:
+                raise ValueError("Cannot repin a port-1 memory instruction to port 0")
+            self.port(1)
+        self.annotation["fixed_port"] = port_id
+        return self
+
     def copy(self):
         other = MemoryInstruction(
             opcode=self.opcode,
@@ -1641,6 +1654,25 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+class TmaLoadReg1D(TmaLoad1D):
+    """TMA-load into shared slots retained for a later same-LDU RegLoad."""
+
+    def __init__(
+        self,
+        src: torch.Tensor,
+        reg_id: int,
+        port_id: int,
+        bytes: int | None = None,
+        numSlots: int | None = None,
+    ):
+        if not 0 <= reg_id < 4:
+            raise ValueError("TMA load register id must be in [0, 4)")
+        super().__init__(src, bytes=bytes, numSlots=numSlots)
+        self.opcode = opcode.OP_ALLOC_TMA_LOAD_REG_1D
+        self.arg = reg_id
+        self.fixed_port(port_id)
+
+
 class LduLoad1D(MemoryInstruction):
     """Load arbitrary-sized metadata through LDU into normal shared slots."""
 
@@ -1889,6 +1921,7 @@ __all__ = [
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
+    "TmaLoadReg1D",
     "TmaStore1D",
     "StuStore1D",
     "TmaTensor",
