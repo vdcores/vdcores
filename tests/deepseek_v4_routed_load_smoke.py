@@ -15,7 +15,7 @@ from dae.schedule import LayeredSchedule, SchedDsv4RouteTop6, SchedRoutedNvfp4Ge
 def main() -> None:
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260810)
-    rows, k, num_sms = 128, 256, 4
+    rows, k, num_sms = 128, 4096, 2
     selected_expert = 37
 
     default_source = torch.randn(
@@ -54,21 +54,30 @@ def main() -> None:
     weight_fields = []
     weight_scale_fields = []
     rows_per_sm = rows // num_sms
+    tile_rows = (65520 // (k // 2) // 8) * 8
     for sm in range(num_sms):
         row_start = sm * rows_per_sm
         row_stop = row_start + rows_per_sm
-        weight_name = f"weight_sm{sm}"
-        scale_name = f"weight_scale_sm{sm}"
-        columns[weight_name] = expert_column(
-            default_weight[row_start:row_stop],
-            selected_weight[row_start:row_stop],
-        )
-        columns[scale_name] = expert_column(
-            default_scale[row_start:row_stop],
-            selected_scale[row_start:row_stop],
-        )
-        weight_fields.append(weight_name)
-        weight_scale_fields.append(scale_name)
+        sm_weight_fields = []
+        sm_scale_fields = []
+        for tile_index, tile_start in enumerate(
+            range(row_start, row_stop, tile_rows)
+        ):
+            tile_stop = min(row_stop, tile_start + tile_rows)
+            weight_name = f"weight_sm{sm}_tile{tile_index}"
+            scale_name = f"weight_scale_sm{sm}_tile{tile_index}"
+            columns[weight_name] = expert_column(
+                default_weight[tile_start:tile_stop],
+                selected_weight[tile_start:tile_stop],
+            )
+            columns[scale_name] = expert_column(
+                default_scale[tile_start:tile_stop],
+                selected_scale[tile_start:tile_stop],
+            )
+            sm_weight_fields.append(weight_name)
+            sm_scale_fields.append(scale_name)
+        weight_fields.append(tuple(sm_weight_fields))
+        weight_scale_fields.append(tuple(sm_scale_fields))
     owners = tuple(target for column in columns.values() for target in column)
     table = RoutedAddressTable.from_pointer_columns(
         {
@@ -104,8 +113,14 @@ def main() -> None:
     expert_w1_inner = SchedRoutedNvfp4Gemv(
         table.state,
         route_rank=0,
-        weight_fields=[table.field(name) for name in weight_fields],
-        weight_scale_fields=[table.field(name) for name in weight_scale_fields],
+        weight_fields=[
+            tuple(table.field(name) for name in fields)
+            for fields in weight_fields
+        ],
+        weight_scale_fields=[
+            tuple(table.field(name) for name in fields)
+            for fields in weight_scale_fields
+        ],
         alpha_field=table.field("alpha"),
         rows=rows,
         k=k,
@@ -126,8 +141,14 @@ def main() -> None:
     expert_w3_inner = SchedRoutedNvfp4Gemv(
         table.state,
         route_rank=0,
-        weight_fields=[table.field(name) for name in weight_fields],
-        weight_scale_fields=[table.field(name) for name in weight_scale_fields],
+        weight_fields=[
+            tuple(table.field(name) for name in fields)
+            for fields in weight_fields
+        ],
+        weight_scale_fields=[
+            tuple(table.field(name) for name in fields)
+            for fields in weight_scale_fields
+        ],
         alpha_field=table.field("alpha"),
         rows=rows,
         k=k,
@@ -169,7 +190,7 @@ def main() -> None:
     )
     print(
         "DSV4_ROUTED_LOAD status=PASS indirect=1 adaptive_fusion=1 "
-        f"launches=1 selected_expert={selected_expert} sms={num_sms} "
+        f"tiled=1 launches=1 selected_expert={selected_expert} sms={num_sms} "
         f"max_abs={max_abs:.6f}",
         flush=True,
     )

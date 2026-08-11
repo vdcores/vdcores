@@ -467,6 +467,36 @@ Production job `20260811T023842Z-2623799` preserved token 14 over 30 samples
 and measured 24.682--25.206 ms, median 24.952 ms. This improves the 26.571 ms
 boundary by 1.619 ms (6.1%) and leaves 8.952 ms to the 16 ms target.
 
+### Shape-partitioned routed-expert fan-out
+
+The six routed experts now execute as independent subgraphs in six uniform
+25-SM partitions (150 active SMs, with the two remainder SMs intentionally
+idle). Each rank uses 16 SMs for input quantization, 25 for W1/W3, one for
+SwiGLU, eight for middle quantization, and 25 for W2. Private ready counters
+connect those phases, W1 and W3 jointly release the gate/up join, and all six
+W2 tails contribute to one 150-arrival expert join. The shared expert waits on
+that join. This is still one resident VDCores launch with only per-SM compute
+and memory instruction queues.
+
+A 25-SM row shard is larger than the routed TMA uint16 transaction limit, so
+the shape policy bounds K=4096 projections to 24-row tiles and K=2048
+projections to 56-row tiles. The checkpoint routing table contains one direct
+LDU-resolved pointer field per SM and row tile. No compute task performs
+pointer arithmetic, and no HBM inter-stage copy is added. Within each
+partition, the first W1 tile retains the packed activation and scale in the
+two LDU-local slot registers; later W1 tiles and every W3 tile reuse those
+same shared allocations, with the last W3 tile releasing them.
+
+The multi-tile route/W1/W3 smoke, job `20260811T025223Z-2691911`, was
+bit-exact. The layer-0 checkpoint gate, job `20260811T025254Z-2694432`,
+preserved token 2835 and measured 0.398--0.417 ms over ten samples, median
+0.404 ms. Full exploration job `20260811T025318Z-2696481` preserved token 14
+at a 21.310 ms median. The 30-sample production acceptance, job
+`20260811T025524Z-2706785`, measured 21.525--22.131 ms, median 21.752 ms. The
+resident image now uses 471 barriers, 1,089 compute instructions, and 3,572
+memory instructions. This improves the 24.952 ms boundary by 3.200 ms (12.8%)
+and leaves 5.752 ms to the 16 ms target.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

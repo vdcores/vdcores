@@ -78,8 +78,17 @@ class DeepSeekV4ShapePolicy:
     def nvfp4_gemv(self, rows: int, k: int) -> ShapeAssignment:
         if k % 256:
             raise ValueError("NVFP4 GEMV K must be divisible by 256")
+        packed_row_bytes = k // 2
+        tile_rows = (65520 // packed_row_bytes // 8) * 8
+        if tile_rows <= 0:
+            raise ValueError("NVFP4 K is too large for one aligned routed tile")
         return self._rows(
-            "nvfp4_gemv", rows, k, alignment=8, tile_rows=8, tile_k=256
+            "nvfp4_gemv",
+            rows,
+            k,
+            alignment=8,
+            tile_rows=tile_rows,
+            tile_k=256,
         )
 
     def bf16_gemv(self, rows: int, k: int) -> ShapeAssignment:
@@ -129,6 +138,17 @@ class DeepSeekV4ShapePolicy:
         width = base_width + int(branch < extra)
         base = branch * base_width + min(branch, extra)
         return base, width
+
+    def uniform_parallel_partition(
+        self, branch: int, branches: int
+    ) -> tuple[int, int]:
+        """Return equal contiguous shares, leaving any remainder SMs idle."""
+        if branches <= 0 or branches > self.resident_sms:
+            raise ValueError("parallel branch count must fit the resident SM grid")
+        if not 0 <= branch < branches:
+            raise ValueError("parallel branch index is out of range")
+        width = self.resident_sms // branches
+        return branch * width, width
 
 
 __all__ = ["DeepSeekV4ShapePolicy", "ShapeAssignment"]

@@ -840,22 +840,40 @@ class ResidentOneLaunchDecode:
         if existing is not None:
             return existing
         cfg = self.config
+        _, expert_sms = self.policy.uniform_parallel_partition(
+            0, cfg.experts_per_token
+        )
         assignments = {
-            "w1": self.policy.nvfp4_gemv(
-                cfg.expert_intermediate_size, cfg.hidden_size
+            "w1": replace(
+                self.policy.nvfp4_gemv(
+                    cfg.expert_intermediate_size, cfg.hidden_size
+                ),
+                num_sms=expert_sms,
             ),
-            "w3": self.policy.nvfp4_gemv(
-                cfg.expert_intermediate_size, cfg.hidden_size
+            "w3": replace(
+                self.policy.nvfp4_gemv(
+                    cfg.expert_intermediate_size, cfg.hidden_size
+                ),
+                num_sms=expert_sms,
             ),
-            "w2": self.policy.nvfp4_gemv(
-                cfg.hidden_size, cfg.expert_intermediate_size
+            "w2": replace(
+                self.policy.nvfp4_gemv(
+                    cfg.hidden_size, cfg.expert_intermediate_size
+                ),
+                num_sms=expert_sms,
             ),
         }
         columns: dict[str, list[int]] = {}
         for tag, assignment in assignments.items():
             for sm in range(assignment.num_sms):
-                columns[f"{tag}.weight.sm{sm}"] = []
-                columns[f"{tag}.weight_scale.sm{sm}"] = []
+                row_start, row_count = assignment.shard(sm)
+                for tile_index, _ in enumerate(
+                    range(row_start, row_start + row_count, assignment.tile_rows)
+                ):
+                    columns[f"{tag}.weight.sm{sm}.tile{tile_index}"] = []
+                    columns[
+                        f"{tag}.weight_scale.sm{sm}.tile{tile_index}"
+                    ] = []
 
         linears = {tag: [] for tag in assignments}
         for expert_id in range(cfg.num_experts):
@@ -866,13 +884,22 @@ class ResidentOneLaunchDecode:
                 )
                 linears[tag].append(linear)
                 for sm in range(assignment.num_sms):
-                    row_start, _ = assignment.shard(sm)
-                    columns[f"{tag}.weight.sm{sm}"].append(
-                        self._row_pointer(linear.weight, row_start)
-                    )
-                    columns[f"{tag}.weight_scale.sm{sm}"].append(
-                        self._row_pointer(linear.weight_scale, row_start)
-                    )
+                    row_start, row_count = assignment.shard(sm)
+                    for tile_index, tile_start in enumerate(
+                        range(
+                            row_start,
+                            row_start + row_count,
+                            assignment.tile_rows,
+                        )
+                    ):
+                        columns[
+                            f"{tag}.weight.sm{sm}.tile{tile_index}"
+                        ].append(self._row_pointer(linear.weight, tile_start))
+                        columns[
+                            f"{tag}.weight_scale.sm{sm}.tile{tile_index}"
+                        ].append(
+                            self._row_pointer(linear.weight_scale, tile_start)
+                        )
 
         def stack(tag: str, field: str) -> torch.Tensor:
             return torch.stack(
@@ -924,6 +951,10 @@ class ResidentOneLaunchDecode:
         source: torch.Tensor,
         output: torch.Tensor,
         scale: torch.Tensor,
+        *,
+        base_sm: int | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         representative = tables[0]
         schedule = SchedRoutedDsv4Nvfp4Quant16(
@@ -940,6 +971,9 @@ class ResidentOneLaunchDecode:
             schedule,
             self.policy.quantize(source.numel(), 16),
             input_role="route",
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
         )
 
     def _routed_linear_stage(
@@ -957,16 +991,37 @@ class ResidentOneLaunchDecode:
         *,
         wait_for_previous: bool = True,
         activation_mode: str = "load",
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         assignment = self.policy.nvfp4_gemv(rows, k)
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            assignment = replace(assignment, num_sms=num_sms)
         table = tables[0]
         weight_fields = [
-            table.field(f"{tag}.weight.sm{sm}")
+            tuple(
+                table.field(f"{tag}.weight.sm{sm}.tile{tile_index}")
+                for tile_index, _ in enumerate(
+                    range(row_start, row_start + row_count, assignment.tile_rows)
+                )
+            )
             for sm in range(assignment.num_sms)
+            for row_start, row_count in (assignment.shard(sm),)
         ]
         scale_fields = [
-            table.field(f"{tag}.weight_scale.sm{sm}")
+            tuple(
+                table.field(
+                    f"{tag}.weight_scale.sm{sm}.tile{tile_index}"
+                )
+                for tile_index, _ in enumerate(
+                    range(row_start, row_start + row_count, assignment.tile_rows)
+                )
+            )
             for sm in range(assignment.num_sms)
+            for row_start, row_count in (assignment.shard(sm),)
         ]
         schedule = SchedRoutedNvfp4Gemv(
             table.state,
@@ -989,6 +1044,9 @@ class ResidentOneLaunchDecode:
             assignment,
             input_role="route" if wait_for_previous else None,
             wait_for_previous=wait_for_previous,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
         )
 
     def _hash_row(self, layer_id: int) -> torch.Tensor:
@@ -1043,10 +1101,26 @@ class ResidentOneLaunchDecode:
         )
         route_groups = (hash_rows,) if hash_routing else (biases,)
         route = self._layered(route, family, *route_groups)
-        stages.append(self._stage("ffn.route", route))
+        experts_ready = f"{family.name}.ffn.experts.ready"
+        expert_join = f"{family.name}.ffn.experts.join"
+        stages.append(
+            self._stage(
+                "ffn.route",
+                route,
+                release_group=experts_ready,
+            )
+        )
 
         tables = tuple(self._routing_table(layer) for layer in family.layer_ids)
         for rank in range(cfg.experts_per_token):
+            placement = self.policy.uniform_parallel_partition(
+                rank, cfg.experts_per_token
+            )
+            base_sm, _ = placement
+            input_ready = f"{family.name}.ffn.expert{rank}.input.ready"
+            gate_up_ready = f"{family.name}.ffn.expert{rank}.gate_up.ready"
+            middle_ready = f"{family.name}.ffn.expert{rank}.middle.ready"
+            down_ready = f"{family.name}.ffn.expert{rank}.down.ready"
             stages.append(
                 self._routed_quant_stage(
                     f"ffn.expert{rank}.input.quant_nvfp4",
@@ -1057,6 +1131,9 @@ class ResidentOneLaunchDecode:
                     self.norm_hidden,
                     self.routed_input[rank],
                     self.routed_input_scale[rank],
+                    base_sm=base_sm,
+                    wait_group=experts_ready,
+                    release_group=input_ready,
                 )
             )
             stages.append(
@@ -1072,6 +1149,9 @@ class ResidentOneLaunchDecode:
                     self.routed_input_scale[rank],
                     self.routed_gate[rank],
                     activation_mode="retain",
+                    placement=placement,
+                    wait_group=input_ready,
+                    release_group=gate_up_ready,
                 )
             )
             stages.append(
@@ -1088,6 +1168,9 @@ class ResidentOneLaunchDecode:
                     self.routed_up[rank],
                     wait_for_previous=False,
                     activation_mode="reuse",
+                    placement=placement,
+                    wait_group=input_ready,
+                    release_group=gate_up_ready,
                 )
             )
             stages.append(
@@ -1100,6 +1183,9 @@ class ResidentOneLaunchDecode:
                         self.routed_middle[rank : rank + 1],
                         swiglu_limit=cfg.swiglu_limit,
                     ),
+                    base_sm=base_sm,
+                    wait_group=gate_up_ready,
+                    release_group=middle_ready,
                 )
             )
             stages.append(
@@ -1112,6 +1198,9 @@ class ResidentOneLaunchDecode:
                     self.routed_middle[rank],
                     self.routed_middle_packed[rank],
                     self.routed_middle_scale[rank],
+                    base_sm=base_sm,
+                    wait_group=middle_ready,
+                    release_group=down_ready,
                 )
             )
             stages.append(
@@ -1126,6 +1215,9 @@ class ResidentOneLaunchDecode:
                     self.routed_middle_packed[rank],
                     self.routed_middle_scale[rank],
                     self.routed_output[rank],
+                    placement=placement,
+                    wait_group=down_ready,
+                    release_group=expert_join,
                 )
             )
 
@@ -1137,6 +1229,7 @@ class ResidentOneLaunchDecode:
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
                 self.shared_gate,
+                wait_group=expert_join,
             )
         )
         stages.append(

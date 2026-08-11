@@ -866,7 +866,12 @@ def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():
     attention = policy.attention(64, 512)
 
     assert (fp8.num_sms, fp8.tile_rows, fp8.tile_k) == (152, 15, 128)
-    assert (fp4.num_sms, fp4.row_alignment, fp4.tile_k) == (152, 8, 256)
+    assert (
+        fp4.num_sms,
+        fp4.row_alignment,
+        fp4.tile_rows,
+        fp4.tile_k,
+    ) == (152, 8, 24, 256)
     assert [policy.parallel_partition(branch, 8) for branch in range(8)] == [
         (0, 19),
         (19, 19),
@@ -876,6 +881,17 @@ def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():
         (95, 19),
         (114, 19),
         (133, 19),
+    ]
+    assert [
+        policy.uniform_parallel_partition(branch, 6)
+        for branch in range(6)
+    ] == [
+        (0, 25),
+        (25, 25),
+        (50, 25),
+        (75, 25),
+        (100, 25),
+        (125, 25),
     ]
     assert all(fp4.shard(sm)[1] % 8 == 0 for sm in range(fp4.num_sms))
     assert (quant.num_sms, quant.tile_rows) == (16, 16)

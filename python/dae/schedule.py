@@ -360,8 +360,14 @@ class SchedRoutedNvfp4Gemv(Schedule):
         super().__init__()
         self.routing_state = routing_state
         self.route_rank = route_rank
-        self.weight_fields = tuple(weight_fields)
-        self.weight_scale_fields = tuple(weight_scale_fields)
+        self.weight_fields = tuple(
+            tuple(fields) if isinstance(fields, (list, tuple)) else (fields,)
+            for fields in weight_fields
+        )
+        self.weight_scale_fields = tuple(
+            tuple(fields) if isinstance(fields, (list, tuple)) else (fields,)
+            for fields in weight_scale_fields
+        )
         self.alpha_field = alpha_field
         self.rows = rows
         self.k = k
@@ -400,7 +406,27 @@ class SchedRoutedNvfp4Gemv(Schedule):
         if (len(self.weight_fields) != self.active_sms or
                 len(self.weight_scale_fields) != self.active_sms):
             raise ValueError("routed weight fields must contain one field per active SM")
-        for field in (*self.weight_fields, *self.weight_scale_fields, self.alpha_field):
+        self.tile_rows = (65520 // (self.k // 2) // 8) * 8
+        if self.tile_rows <= 0:
+            raise ValueError("routed NVFP4 K is too large for an aligned tile")
+        for sm in range(self.active_sms):
+            _, _, row_count = _aligned_row_shard(
+                self.rows, self.num_sms, sm
+            )
+            expected_tiles = (row_count + self.tile_rows - 1) // self.tile_rows
+            if (
+                len(self.weight_fields[sm]) != expected_tiles
+                or len(self.weight_scale_fields[sm]) != expected_tiles
+            ):
+                raise ValueError(
+                    "routed weight fields must contain one field per row tile"
+                )
+        flat_fields = (
+            *(field for fields in self.weight_fields for field in fields),
+            *(field for fields in self.weight_scale_fields for field in fields),
+            self.alpha_field,
+        )
+        for field in flat_fields:
             if not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
                 raise ValueError("routed pointer fields must fit in 13 bits")
 
@@ -413,53 +439,77 @@ class SchedRoutedNvfp4Gemv(Schedule):
         route_bar = self._bar("route")
         if route_bar is None and not self.route_ready:
             raise ValueError("routed NVFP4 GEMV requires a route barrier")
-        weight_bytes = row_count * (self.k // 2)
-        scale_bytes = row_count * (self.k // 16)
-        weight_load = RoutedTmaLoad1D(
-            self.routing_state,
-            self.route_rank,
-            self.weight_fields[sm],
-            weight_bytes,
-        )
-        if route_bar is not None:
-            weight_load.bar(route_bar)
-        if self.activation_mode == "retain":
-            activation_load = TmaLoadReg1D(
-                self.activation.reshape(-1), 0, 0
-            )
-            activation_scale_load = TmaLoadReg1D(
-                self.activation_scale.reshape(-1), 1, 1
-            )
-        elif self.activation_mode == "reuse":
-            activation_load = RegLoad(0, slot_id=0).fixed_port(0)
-            activation_scale_load = RegLoad(1, slot_id=1).fixed_port(1)
-        else:
-            activation_load = TmaLoad1D(self.activation.reshape(-1))
-            activation_scale_load = TmaLoad1D(
-                self.activation_scale.reshape(-1)
-            )
-        return [
-            Nvfp4GemvSm100(
-                row_count,
-                self.k,
-                retain_activation=self.activation_mode == "retain",
-            ),
-            weight_load,
-            RoutedTmaLoad1D(
+        instructions = []
+        tile_count = len(self.weight_fields[sm])
+        for tile_index, tile_offset in enumerate(
+            range(0, row_count, self.tile_rows)
+        ):
+            tile_count_rows = min(self.tile_rows, row_count - tile_offset)
+            weight_bytes = tile_count_rows * (self.k // 2)
+            scale_bytes = tile_count_rows * (self.k // 16)
+            weight_load = RoutedTmaLoad1D(
                 self.routing_state,
                 self.route_rank,
-                self.weight_scale_fields[sm],
-                scale_bytes,
-            ),
-            activation_load,
-            activation_scale_load,
-            RoutedTmaLoad1D(
-                self.routing_state, self.route_rank, self.alpha_field, 16
-            ),
-            TmaStore1D(
-                self.output[row_start:row_start + row_count]
-            ).bar(self._bar("output")),
-        ]
+                self.weight_fields[sm][tile_index],
+                weight_bytes,
+            )
+            if route_bar is not None:
+                weight_load.bar(route_bar)
+
+            first_tile = tile_index == 0
+            final_tile = tile_index + 1 == tile_count
+            if first_tile and self.activation_mode in ("load", "retain"):
+                if self.activation_mode == "retain" or not final_tile:
+                    activation_load = TmaLoadReg1D(
+                        self.activation.reshape(-1), 0, 0
+                    )
+                    activation_scale_load = TmaLoadReg1D(
+                        self.activation_scale.reshape(-1), 1, 1
+                    )
+                else:
+                    activation_load = TmaLoad1D(self.activation.reshape(-1))
+                    activation_scale_load = TmaLoad1D(
+                        self.activation_scale.reshape(-1)
+                    )
+            else:
+                activation_load = RegLoad(0, slot_id=0).fixed_port(0)
+                activation_scale_load = RegLoad(1, slot_id=1).fixed_port(1)
+
+            retain_activation = (
+                self.activation_mode == "retain" or not final_tile
+            )
+            tile_start = row_start + tile_offset
+            store = TmaStore1D(
+                self.output[tile_start:tile_start + tile_count_rows]
+            )
+            if final_tile:
+                store.bar(self._bar("output"))
+            instructions.extend(
+                (
+                    Nvfp4GemvSm100(
+                        tile_count_rows,
+                        self.k,
+                        retain_activation=retain_activation,
+                    ),
+                    weight_load,
+                    RoutedTmaLoad1D(
+                        self.routing_state,
+                        self.route_rank,
+                        self.weight_scale_fields[sm][tile_index],
+                        scale_bytes,
+                    ),
+                    activation_load,
+                    activation_scale_load,
+                    RoutedTmaLoad1D(
+                        self.routing_state,
+                        self.route_rank,
+                        self.alpha_field,
+                        16,
+                    ),
+                    store,
+                )
+            )
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
