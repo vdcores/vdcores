@@ -520,7 +520,11 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     assert reload.opcode & 0x4
     assert reload.num_slots & 0x3F == config.num_slots + 2
     assert reload.num_slots >> 6 == 1
-    assert reload.size == 4
+    assert reload.arg == 0
+    assert reload.size == 2
+    # Bank zero spans barriers [0, 2); the shifted bank spans [2, 4).
+    assert (reload.num_slots >> 6) + 1 - reload.size == 0
+    assert (reload.num_slots >> 6) + 2 + 1 - reload.size == 2
     profile_layer = next(
         inst
         for inst in memory

@@ -358,6 +358,25 @@ backpressure rather than host, thermal, clock, or fixed-physical-SM overhead.
 The remaining system-level targets are the repeatable HCA mode and roughly
 2.6 ms of loop dependency reloads.
 
+### Active-bank barrier reload
+
+Each compact loop iteration consumes one shifted dependency-barrier bank, but
+the original reload restored both banks every time. LDU now derives the active
+bank's first barrier from the shifted completion barrier and restores only that
+bank. The assembler supplies one bank's barrier count. The reload still drains
+both LDU ports, waits for the current STU tail, and provides the memory-only
+loop-carried dependency on every iteration; no task unrolling or new launch is
+introduced.
+
+The two-layer tracked gate cut each reload from roughly 0.059--0.060 ms to
+0.029--0.032 ms. Full tracked job `20260811T014612Z-2360742` measured
+26.627--27.297 ms over six tokens, median 26.973 ms. Reload time fell from
+about 2.59 to 1.34 ms, and reduced reset/backpressure also lowered layer time
+from about 27.3 to 23.9 ms. Production job `20260811T014956Z-2378731`
+preserved token 14 over 30 samples and measured 26.713--27.797 ms, median
+27.206 ms. This is a 4.924 ms (15.3%) complete-token improvement over the
+32.130 ms boundary.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

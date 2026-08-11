@@ -465,10 +465,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           const int phase = ticket / gridDim.x + 1;
           const bool last = (ticket + 1) % gridDim.x == 0;
           if (last) {
-            const int first_bar = inst.arg;
             const int count = inst.size;
+            // The attached completion barrier is the last barrier in the
+            // active shifted bank. Derive that bank's first barrier instead
+            // of restoring every bank on every loop iteration.
+            const int first_bar = inst.bar() + 1 - count;
             const int *source = reinterpret_cast<const int *>(inst.address);
-            if (first_bar < 0 || count <= 0 ||
+            if (first_bar < inst.arg || count <= 0 ||
+                (first_bar - inst.arg) % count != 0 ||
                 first_bar + count > lduBarrierReloadArrival) {
               asm volatile("trap;");
             }

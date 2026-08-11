@@ -426,7 +426,7 @@ class LoopedSequentialProgram:
                 reload = LduReloadBarriers(
                     launcher.bars_src,
                     segment.barrier_start,
-                    barriers_per_bank * bank_count,
+                    barriers_per_bank,
                     2 if self.profile_event_count else 0,
                 ).bar(segment.completion_barrier)
                 if bank_count > 1:
