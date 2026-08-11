@@ -4,6 +4,14 @@
 #include <torch/extension.h>
 #include <pybind11/stl.h>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <cute/arch/mma_sm100.hpp>
+#include <cute/atom/mma_traits_sm100.hpp>
+#include <cute/tensor.hpp>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
+#include <cutlass/numeric_conversion.h>
+#include <cutlass/numeric_types.h>
+
 #include <cuda.h>            // Driver API
 #include <cuda_runtime.h>
 
@@ -15,6 +23,119 @@
 #include <vector>
 
 namespace py = pybind11;
+
+namespace {
+
+constexpr int kNvfp4TileM = 128;
+constexpr int kNvfp4TileK = 256;
+constexpr int kNvfp4PackedK = kNvfp4TileK / 2;
+constexpr int kNvfp4WeightDataBytes = kNvfp4TileM * kNvfp4PackedK;
+constexpr int kNvfp4WeightTileBytes = 18432;
+
+__global__ void prepack_nvfp4_checkpoint_kernel(
+    const uint8_t *__restrict__ weight,
+    const cutlass::float_e4m3_t *__restrict__ checkpoint_scale,
+    uint8_t *__restrict__ output,
+    int packed_k,
+    int k_tiles) {
+  using namespace cute;
+  using Fp4 = cutlass::float_e2m1_t;
+  using Scale = cutlass::float_ue4m3_t;
+  using Atom = SM100_MMA_MXF4_SS<
+      Fp4, Fp4, float, Scale,
+      kNvfp4TileM, 8, 16,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+  using ScaleProblemShape = Shape<Int<kNvfp4TileM>, Int<128>, Int<kNvfp4TileK>>;
+
+  const int m_tile = blockIdx.x / k_tiles;
+  const int k_tile = blockIdx.x - m_tile * k_tiles;
+  auto *tile_output = output + blockIdx.x * kNvfp4WeightTileBytes;
+
+  // This is the inverse of the 128-byte TMA XOR swizzle used by the UMMA A
+  // operand. Each physical 16-byte chunk receives logical chunk d xor row.
+  for (int index = threadIdx.x; index < kNvfp4WeightDataBytes;
+       index += blockDim.x) {
+    const int row = index / kNvfp4PackedK;
+    const int destination_column = index - row * kNvfp4PackedK;
+    const int destination_chunk = destination_column / 16;
+    const int byte_in_chunk = destination_column - destination_chunk * 16;
+    const int source_chunk = destination_chunk ^ (row & 7);
+    const int source_column =
+        k_tile * kNvfp4PackedK + source_chunk * 16 + byte_in_chunk;
+    tile_output[index] =
+        weight[(m_tile * kNvfp4TileM + row) * packed_k + source_column];
+  }
+
+  TiledMma tiled_mma;
+  const auto logical_sfa = ScaleConfig::tile_atom_to_shape_SFA(
+      ScaleProblemShape{});
+  cutlass::NumericConverter<Scale, cutlass::float_e4m3_t> convert_scale;
+  constexpr int kScaleColumns = kNvfp4TileK / 16;
+  auto *packed_scale = reinterpret_cast<Scale *>(
+      tile_output + kNvfp4WeightDataBytes);
+  const int source_scale_columns = packed_k / 8;
+  for (int index = threadIdx.x;
+       index < kNvfp4TileM * kScaleColumns;
+       index += blockDim.x) {
+    const int row = index / kScaleColumns;
+    const int sf = index - row * kScaleColumns;
+    const int destination = int(logical_sfa(row, sf * 16));
+    packed_scale[destination] = convert_scale(
+        checkpoint_scale[
+            (m_tile * kNvfp4TileM + row) * source_scale_columns +
+            k_tile * kScaleColumns + sf]);
+  }
+}
+
+void py_prepack_nvfp4_checkpoint(
+    torch::Tensor weight,
+    torch::Tensor checkpoint_scale,
+    torch::Tensor output) {
+  TORCH_CHECK(weight.is_cuda() && checkpoint_scale.is_cuda() && output.is_cuda(),
+              "NVFP4 prepack tensors must be CUDA tensors");
+  TORCH_CHECK(weight.device() == checkpoint_scale.device() &&
+                  weight.device() == output.device(),
+              "NVFP4 prepack tensors must share one CUDA device");
+  TORCH_CHECK(weight.scalar_type() == at::ScalarType::Byte &&
+                  weight.dim() == 2 && weight.is_contiguous(),
+              "NVFP4 weight must be contiguous rank-2 uint8");
+  TORCH_CHECK(checkpoint_scale.scalar_type() ==
+                  at::ScalarType::Float8_e4m3fn &&
+                  checkpoint_scale.dim() == 2 &&
+                  checkpoint_scale.is_contiguous(),
+              "NVFP4 scale must be contiguous rank-2 E4M3");
+  const int64_t rows = weight.size(0);
+  const int64_t packed_k = weight.size(1);
+  TORCH_CHECK(rows % kNvfp4TileM == 0 && packed_k % kNvfp4PackedK == 0,
+              "NVFP4 weight must be M128/K256 aligned");
+  TORCH_CHECK(checkpoint_scale.size(0) == rows &&
+                  checkpoint_scale.size(1) == packed_k / 8,
+              "NVFP4 checkpoint scale shape does not match the weight");
+  const int64_t m_tiles = rows / kNvfp4TileM;
+  const int64_t k_tiles = packed_k / kNvfp4PackedK;
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Byte &&
+                  output.is_contiguous() && output.dim() == 3 &&
+                  output.size(0) == m_tiles && output.size(1) == k_tiles &&
+                  output.size(2) == kNvfp4WeightTileBytes,
+              "NVFP4 native output must be contiguous [M/128,K/256,18432] uint8");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(weight.device().index());
+  prepack_nvfp4_checkpoint_kernel<<<
+      static_cast<unsigned>(m_tiles * k_tiles), 256, 0, stream>>>(
+      weight.data_ptr<uint8_t>(),
+      reinterpret_cast<const cutlass::float_e4m3_t *>(
+          checkpoint_scale.data_ptr()),
+      output.data_ptr<uint8_t>(),
+      static_cast<int>(packed_k),
+      static_cast<int>(k_tiles));
+  const cudaError_t error = cudaGetLastError();
+  TORCH_CHECK(error == cudaSuccess,
+              "NVFP4 checkpoint prepack failed: ", cudaGetErrorString(error));
+}
+
+}  // namespace
 
 static cudaDeviceProp current_device_prop();
 static void set_persistent_cache();
@@ -546,4 +667,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("miss_policy"),
             py::arg("num_bytes") = -1,
             "Set cache policy for a CUDA tensor on the specified stream");
+  m.def("prepack_nvfp4_checkpoint", &py_prepack_nvfp4_checkpoint,
+            py::arg("weight"),
+            py::arg("checkpoint_scale"),
+            py::arg("output"),
+            "Convert one raw checkpoint NVFP4 linear to native SM100 tiles");
 }

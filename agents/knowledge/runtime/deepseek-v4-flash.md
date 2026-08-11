@@ -1083,3 +1083,44 @@ claim.
 All GPU checks must run through the cluster MPI launcher with one rank and the
 target checkout on `PYTHONPATH`.  Runs using this checkpoint must also select
 worker `10.0.16.24` and pass the explicit `/mnt` checkpoint path.
+
+## Native resident top-six milestone (2026-08-11)
+
+The resident loader can now replace each routed expert's raw packed FP4 data
+and E4M3 scales with the combined SM100 UMMA tile layout while loading a shard.
+The native layout is exactly the same size as the two raw tensors. Conversion
+uses a small temporary linear and overwrites their contiguous resident span;
+it never duplicates the 153-GiB checkpoint. The durable source remains
+`/mnt/checkpoints/nvidia/DeepSeek-V4-Flash-NVFP4`. A CUDA converter was
+byte-exact against the queued VDCores prepack oracle for multiple M128 and
+K256 tiles, including the resident overwrite path.
+
+Repeated layer bodies now have indirect/layer routed-base LDU opcodes. The
+first native weight tile resolves the layer and expert in LDU and caches its
+base on that load port; later K tiles use fixed offsets. Compute continues to
+see allocator-owned shared slots only. There is no compute global pointer,
+address queue, indirect store, issue barrier, thread fence, or token-time
+prepack/copy stage.
+
+The production FFN assigns six disjoint 25-SM branches from the model shape.
+Each branch quantizes its native input on 16 SMs, retains W1/W3 M128 outputs in
+separate port-local shared registers, fuses them on those 16 SMs, materializes
+only the required 2,048-value middle repartition, quantizes it on eight SMs,
+and executes W2 over 25 SMs. Seven W2 SMs process a second M128 output tile.
+Only the weighted expert reduction joins all six branches.
+
+One-layer job `20260811T094703Z-432626` preserved the independent full-vocab
+token `78571` and measured 0.645344--0.670272 ms, median 0.653664 ms. Full
+job `20260811T094747Z-441094` loaded 153.379 GiB in 72.227 seconds, retained
+29.912 GiB free, preserved token `14`, and measured
+13.019616/13.040736/13.052544 ms min/median/max over ten samples. This is
+2.181376 ms (14.3%) below the accepted 15.222112-ms baseline and 2.959264 ms
+under the 16-ms target. Samples remain flat, so the prior progressive slowdown
+has not returned.
+
+The one-launch repeated program shrank from 467 barriers and 297/1,301 maximum
+compute/memory instructions to 425 barriers and 269/1,269 instructions. The
+29-op SM100a image uses 75 registers, nine barriers, a 96-byte stack, 2,448
+bytes static shared memory, and no spills. The next loop is overlap profiling,
+especially shared-expert execution versus the routed branches, followed by a
+fresh per-layer slowdown/counter audit before further kernel tuning.
