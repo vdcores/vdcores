@@ -96,13 +96,17 @@ class DeepSeekV4ShapePolicy:
         if k <= 0 or block <= 0 or k % block:
             raise ValueError("quantization K must contain complete scale blocks")
         blocks = k // block
+        blocks_per_sm = 16 if block == 16 else 1
         return ShapeAssignment(
             f"quantize_{block}",
             blocks,
             k,
-            min(self.resident_sms, blocks),
+            min(
+                self.resident_sms,
+                (blocks + blocks_per_sm - 1) // blocks_per_sm,
+            ),
             row_alignment=1,
-            tile_rows=1,
+            tile_rows=blocks_per_sm,
             tile_k=block,
         )
 

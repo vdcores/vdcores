@@ -130,33 +130,43 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
   auto *scales = static_cast<Scale *>(
       get_slot_address(smem_base, scale_slot));
 
+  constexpr int kThreadsPerBlock = 8;
+  constexpr int kBlocksPerComputeGroup = 128 / kThreadsPerBlock;
   const int tid = __compute_tid();
-  auto *shared = static_cast<float *>(task_scratch);
-  for (int block = 0; block < k / 16; ++block) {
-    if (tid == 0) {
-      float maximum = 0.0f;
-#pragma unroll
-      for (int element = 0; element < 16; ++element) {
-        maximum = fmaxf(
-            maximum,
-            fabsf(__bfloat162float(input[block * 16 + element])));
-      }
-      shared[0] = dsv4_ceil_e4m3(
-          maximum / (6.0f * global_scale[0]));
-      scales[block] = Scale(shared[0]);
+  const int block_lane = tid & (kThreadsPerBlock - 1);
+  const int block_group = tid / kThreadsPerBlock;
+  const int warp_lane = tid & 31;
+  const unsigned block_mask =
+      0xFFU << (warp_lane & ~(kThreadsPerBlock - 1));
+  const float model_scale = global_scale[0];
+  auto *inverse_scales = static_cast<float *>(task_scratch);
+  const auto *input_pairs =
+      reinterpret_cast<const __nv_bfloat162 *>(input);
+
+  for (int block = block_group; block < k / 16;
+       block += kBlocksPerComputeGroup) {
+    const __nv_bfloat162 pair = input_pairs[block * 8 + block_lane];
+    const float2 values = __bfloat1622float2(pair);
+    float maximum = fmaxf(fabsf(values.x), fabsf(values.y));
+    for (int offset = kThreadsPerBlock / 2; offset > 0; offset >>= 1) {
+      maximum = fmaxf(
+          maximum,
+          __shfl_down_sync(
+              block_mask, maximum, offset, kThreadsPerBlock));
     }
-    __sync_compute_group(128);
-    if (tid < 8) {
-      const int first = block * 16 + tid * 2;
-      const float inverse_scale = 1.0f / (shared[0] * global_scale[0]);
-      const uint8_t low = dsv4_nearest_fp4(
-          __bfloat162float(input[first]) * inverse_scale);
-      const uint8_t high = dsv4_nearest_fp4(
-          __bfloat162float(input[first + 1]) * inverse_scale);
-      output[block * 8 + tid] = low | (high << 4);
+    if (block_lane == 0) {
+      const float block_scale =
+          dsv4_ceil_e4m3(maximum / (6.0f * model_scale));
+      scales[block] = Scale(block_scale);
+      inverse_scales[block_group] = 1.0f / (block_scale * model_scale);
     }
-    __sync_compute_group(128);
+    __syncwarp(block_mask);
+    const float inverse_scale = inverse_scales[block_group];
+    const uint8_t low = dsv4_nearest_fp4(values.x * inverse_scale);
+    const uint8_t high = dsv4_nearest_fp4(values.y * inverse_scale);
+    output[block * 8 + block_lane] = low | (high << 4);
   }
+  __sync_compute_group(128);
 
   c2m.push(tid, input_slots | global_scale_slots);
   c2m.template push<31, true, false>(tid, output_slots);

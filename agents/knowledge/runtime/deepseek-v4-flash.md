@@ -307,6 +307,21 @@ The matching non-instrumented production build, job
 Samples were 33.360--34.500 ms with a 34.074 ms median. Use this stable value,
 not the tracked diagnostic timing, as the starting TBT for the next loop.
 
+### NVFP4 activation-quantization placement
+
+The accepted Blackwell quantizer maps one scale block to each eight-thread
+subgroup. Sixteen subgroups reduce and pack 16 blocks concurrently with a
+compact block loop, warp-local synchronization, and one final compute-group
+barrier. The shape policy therefore assigns 16 blocks per SM: K4096 uses 16
+SMs and K2048 uses eight instead of spreading one or two tiny blocks over most
+of the device.
+
+The task stayed bit-exact and improved from 3.904 to 3.712 us. The one-layer
+checkpoint gate measured 0.557 ms median. Full checkpoint job
+`20260811T011035Z-2181920` preserved reference token 14 over 30 samples and
+measured 33.007--34.276 ms, median 33.731 ms. This is a 0.342 ms complete-token
+improvement over the 34.074 ms dual-LDU production boundary.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

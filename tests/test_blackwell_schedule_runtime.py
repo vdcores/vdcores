@@ -573,7 +573,7 @@ def test_deepseek_shape_policy_assigns_complete_scale_and_row_tiles():
     assert (fp8.num_sms, fp8.tile_rows, fp8.tile_k) == (152, 15, 128)
     assert (fp4.num_sms, fp4.row_alignment, fp4.tile_k) == (152, 8, 256)
     assert all(fp4.shard(sm)[1] % 8 == 0 for sm in range(fp4.num_sms))
-    assert quant.num_sms == 152
+    assert (quant.num_sms, quant.tile_rows) == (16, 16)
     assert attention.num_sms == 64
 
 
