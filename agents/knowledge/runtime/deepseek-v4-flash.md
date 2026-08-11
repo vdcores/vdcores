@@ -1124,3 +1124,46 @@ compute/memory instructions to 425 barriers and 269/1,269 instructions. The
 bytes static shared memory, and no spills. The next loop is overlap profiling,
 especially shared-expert execution versus the routed branches, followed by a
 fresh per-layer slowdown/counter audit before further kernel tuning.
+
+## Routed/shared FFN overlap milestone (2026-08-11)
+
+Internal stage frontiers showed that the native top-six routed branches took
+about 45--54 us after routing, while the shared expert was still serialized
+behind their join for another 31--38 us.  The shared path was therefore an
+independent critical-path tail, not an NVFP4 task-kernel deficit.  The FFN now
+derives a 96/56-SM split directly from the model shape: each of the six routed
+experts receives 16 SMs (one M128 W2 tile per SM for each wave), and the FP8
+shared expert executes concurrently on SMs 96--151.  Both paths join only
+before the weighted expert reduction.
+
+The dependency graph publishes the normalized FFN input once.  Routing and
+the hidden FP8 quantizer wait on that boundary independently; only the shared
+expert waits for hidden quantization.  Routed native activation quantization
+continues directly from routing.  This removes the old routed-to-shared hard
+join without adding a launch, global pointer, copy, issue barrier, thread
+fence, or cross-role barrier.
+
+Tracked one-layer job `20260811T095819Z-543150` preserved reference token
+`78571` and measured a roughly 229--234 us layer span despite marker overhead,
+down from about 264 us before the split.  The joined expert-output frontier was
+51--53 us after routing/dispatch, showing that the shared path fits beneath the
+routed path instead of adding its former serial tail.  A non-stage-profile
+one-layer run measured 0.579808/0.586160/0.597408 ms min/median/max.
+
+Production full-network job `20260811T100727Z-618515` loaded 153.379 GiB from
+the durable `/mnt` checkpoint in 70.884 seconds, retained 29.912 GiB free, and
+emitted exact token `14`.  With three warmups, 30 samples measured
+11.591968/11.652480/11.737472 ms min/median/max.  This is 1.388256 ms (10.6%)
+faster than the 13.040736-ms native-resident milestone, 3.569632 ms (23.5%)
+faster than the original 15.222112-ms accepted baseline, and 4.347520 ms under
+the 16-ms target.  The first- and last-15 medians were 11.650720 and
+11.662976 ms, while the fitted sample slope was -0.000317 ms/iteration; there
+is no progressive slowdown.
+
+The repeated 43-layer image now has 418 barriers and 253/1,197 maximum
+compute/memory instructions, down from 425 and 269/1,269.  The production
+29-op SM100a binary remains spill-free at 75 registers, nine barriers, a
+96-byte stack, and 2,448 bytes static shared memory; all 88 focused tests pass.
+This is an accepted overlap milestone; future tuning should profile attention
+and dense FP8 work against matched FA4/FlashInfer/Triton primitives rather
+than fine-tune the now hidden shared-expert path.

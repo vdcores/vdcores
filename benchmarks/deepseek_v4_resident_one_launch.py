@@ -1057,24 +1057,38 @@ class ResidentOneLaunchDecode:
 
     def _build_ffn(self, family: LayerFamily) -> list[Stage]:
         cfg = self.config
+        routed_branch_sms = cfg.expert_intermediate_size // 128
+        routed_sms = cfg.experts_per_token * routed_branch_sms
+        shared_base = routed_sms
+        shared_sms = self.sms - routed_sms
+        if shared_sms <= 0:
+            raise ValueError("FFN placement has no SMs left for the shared expert")
         stages, post = self._hc_stages(
             family, "ffn", self.next_residual, self.residual
         )
+        ffn_input_ready = f"{family.name}.ffn.input.ready"
+        stages[-1] = replace(stages[-1], release_group=ffn_input_ready)
+        shared_ready = f"{family.name}.ffn.shared.ready"
         stages.append(
             self._fp8_quant_stage(
                 "ffn.hidden.quant_fp8",
                 self.norm_hidden,
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
+                wait_group=ffn_input_ready,
+                release_group=shared_ready,
             )
         )
         stages.append(
-            self._bf16_linear_stage(
-                "ffn.router",
-                family,
-                "ffn.gate.weight",
-                self.norm_hidden,
-                self.router_logits,
+            replace(
+                self._bf16_linear_stage(
+                    "ffn.router",
+                    family,
+                    "ffn.gate.weight",
+                    self.norm_hidden,
+                    self.router_logits,
+                ),
+                wait_group=ffn_input_ready,
             )
         )
         hash_routing = family.representative < cfg.num_hash_layers
@@ -1107,9 +1121,7 @@ class ResidentOneLaunchDecode:
 
         tables = tuple(self._routing_table(layer) for layer in family.layer_ids)
         for rank in range(cfg.experts_per_token):
-            placement = self.policy.uniform_parallel_partition(
-                rank, cfg.experts_per_token
-            )
+            placement = (rank * routed_branch_sms, routed_branch_sms)
             base_sm, branch_sms = placement
             input_ready = f"{family.name}.ffn.expert{rank}.input.ready"
             middle_ready = f"{family.name}.ffn.expert{rank}.middle.ready"
@@ -1222,7 +1234,8 @@ class ResidentOneLaunchDecode:
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
                 self.shared_gate,
-                wait_group=expert_join,
+                placement=(shared_base, shared_sms),
+                wait_group=shared_ready,
             )
         )
         stages.append(
@@ -1234,6 +1247,7 @@ class ResidentOneLaunchDecode:
                 self.hidden_fp8_scale,
                 self.shared_up,
                 wait_for_previous=False,
+                placement=(shared_base, shared_sms),
             )
         )
         stages.append(
@@ -1246,6 +1260,7 @@ class ResidentOneLaunchDecode:
                     self.shared_middle.reshape(1, -1),
                     swiglu_limit=cfg.swiglu_limit,
                 ),
+                base_sm=shared_base,
             )
         )
         stages.append(
@@ -1254,6 +1269,10 @@ class ResidentOneLaunchDecode:
                 self.shared_middle,
                 self.shared_middle_fp8,
                 self.shared_middle_scale,
+                placement=(
+                    shared_base,
+                    cfg.expert_intermediate_size // 128,
+                ),
             )
         )
         stages.append(
@@ -1264,6 +1283,8 @@ class ResidentOneLaunchDecode:
                 self.shared_middle_fp8,
                 self.shared_middle_scale,
                 self.shared_output,
+                placement=(shared_base, shared_sms),
+                release_group=expert_join,
             )
         )
         stages.append(
@@ -1275,6 +1296,7 @@ class ResidentOneLaunchDecode:
                     self.shared_output,
                     self.branch,
                 ),
+                wait_group=expert_join,
             )
         )
         stages.append(post)
@@ -1424,24 +1446,13 @@ class ResidentOneLaunchDecode:
                 "attn.o_b",
                 "attn.hc_post",
                 "ffn.hc_pre",
-                "ffn.hidden.quant_fp8",
                 "ffn.route",
-                "ffn.shared.w3",
-                "ffn.shared.swiglu",
-                "ffn.shared.middle.quant_fp8",
                 "ffn.shared.w2",
                 "ffn.expert_reduce",
                 "ffn.hc_post",
             }:
                 return True
-            if not name.startswith("ffn.expert"):
-                return False
-            # A marker within one expert branch would be inserted into every
-            # SM queue and serialize the still-unqueued sibling branches.
-            # Expert 5's W2 is textually last and releases the shared routed
-            # join, so this boundary observes all six branches without
-            # changing their overlap.
-            return name == "ffn.expert5.w2"
+            return False
 
         def queued(
             stage: Stage,
@@ -1472,7 +1483,12 @@ class ResidentOneLaunchDecode:
             for index, stage in enumerate(stages):
                 stage_profile_after = profile_stage(stage.name)
                 if stage_profile_after:
-                    self.stage_profile_labels.append(stage.name)
+                    label = (
+                        "ffn.outputs_join"
+                        if stage.name == "ffn.shared.w2"
+                        else stage.name
+                    )
+                    self.stage_profile_labels.append(label)
                 queued_stages.append(queued(
                     stage,
                     f"{family.name}.",
