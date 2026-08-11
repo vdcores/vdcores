@@ -850,6 +850,32 @@ class ARGMAX_REDUCE_GLOBAL_bf16_256(ComputeInstruction):
         )
 
 
+class ArgmaxSmemPartialBf16(ComputeInstruction):
+    """Reduce one BF16 shared-memory row range to an absolute-index record."""
+
+    def __init__(self, rows: int, row_start: int):
+        if not 1 <= rows <= 0xFFFF:
+            raise ValueError("shared argmax rows must fit in a positive uint16")
+        if not 0 <= row_start <= 0xFFFFFFFF:
+            raise ValueError("shared argmax row start must fit in uint32")
+        super().__init__(
+            opcode=opcode.OP_ARGMAX_SMEM_PARTIAL_BF16,
+            args=[rows, row_start & 0xFFFF, row_start >> 16],
+        )
+
+
+class ArgmaxSmemReduceBf16(ComputeInstruction):
+    """Reduce shared absolute-index records to one int64 token."""
+
+    def __init__(self, records: int):
+        if not 1 <= records <= 0xFFFF:
+            raise ValueError("shared argmax record count must fit in uint16")
+        super().__init__(
+            opcode=opcode.OP_ARGMAX_SMEM_REDUCE_BF16,
+            args=[records],
+        )
+
+
 class Dummy(ComputeInstruction):
     def __init__(self, iters: int):
         super().__init__(opcode=opcode.OP_DUMMY, args=[iters])
@@ -1896,6 +1922,8 @@ __all__ = [
     "ARGMAX_PARTIAL_bf16_1024_65536_128",
     "ARGMAX_REDUCE_bf16_1024_128",
     "ARGMAX_REDUCE_GLOBAL_bf16_256",
+    "ArgmaxSmemPartialBf16",
+    "ArgmaxSmemReduceBf16",
     "Dummy",
     "Copy",
     "ProfileEvent",

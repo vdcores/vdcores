@@ -566,13 +566,42 @@ boundary by 2.217 ms (11.9%) and leaves 0.397 ms to the 16 ms target. The
 sample sequence remains flat with iteration, confirming that the earlier
 progressive system/queue overhead has not returned.
 
+### FP8 vocabulary head and queue-native argmax
+
+The immutable BF16 vocabulary weight is now preprocessed once, after checkpoint
+residency, into the same E4M3/UE8M0 block-128 format used by the other FP8
+linears. The 129,280-by-4,096 converted weight occupies 0.493 GiB and took
+0.697 seconds in the production acceptance run; neither cost is part of TBT.
+Each token quantizes the normalized hidden state and uses the existing
+shape-sharded FP8 GEMV rather than 850 scalar BF16 row groups.
+
+Argmax remains inside the resident queues. The 152 GEMV shards feed 152
+allocator-shared BF16 ranges to generic partial reducers; ordinary STU writes
+one 16-byte value/index record per shard, and one final shared-memory reducer
+emits the int64 token. Ties choose the lowest vocabulary index. Compute tasks
+see only allocator slots: there is no compute-side global pointer, indirect
+store, host readback, extra launch, IssueBarrier, or thread fence.
+
+The one-layer full-vocabulary checkpoint gate, job
+`20260811T051003Z-3011199`, emitted token 78571 exactly matching an independent
+BF16 vocabulary GEMV and measured 0.817 ms for the layer plus head. Full-model
+exploration job `20260811T051031Z-3011830` emitted token 14 at a 15.407 ms
+median. Production job `20260811T051221Z-3014131` then preserved token 14 over
+30 samples and measured 15.103--15.290 ms, median 15.222 ms. This improves the
+16.397 ms boundary by 1.175 ms (7.2%) and clears the 16 ms target by 0.778 ms.
+The first and last samples were 15.220 and 15.237 ms, so the prior progressive
+slowdown remains absent. The selective SM100a image uses 75 registers, nine
+barriers, no spills, and a compact repeated program of 467 barriers, 297
+compute instructions, and 1,301 memory instructions.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
 head on one GPU, corresponding to roughly 0.35-0.4 ms per layer after allowing
-for the head and resident-loop overhead. The measured 79.53 ms baseline is a
-4.97x gap, so optimization decisions must be driven by end-to-end attribution
-rather than isolated best-case task numbers.
+for the head and resident-loop overhead. The first measured baseline was
+79.53 ms; the accepted production boundary is now 15.222 ms. Further
+optimization decisions remain driven by end-to-end attribution rather than
+isolated best-case task numbers.
 
 Work proceeds in three measured phases:
 

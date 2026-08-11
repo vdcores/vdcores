@@ -819,6 +819,22 @@ DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_REDUCE_GLOBAL_bf16_256) {
       inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_SMEM_PARTIAL_BF16) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, g_events);
+  const int row_start = int(uint32_t(inst.args[1]) |
+                            (uint32_t(inst.args[2]) << 16));
+  task_argmax_smem_partial_bf16(
+      inst.args[0], row_start, smem_base, scratch_space, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_SMEM_REDUCE_BF16) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, g_events);
+  task_argmax_smem_reduce_bf16(
+      inst.args[0], smem_base, scratch_space, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, inst, scratch_space, st_insts, g_events);
   task_rope_interleaved<512>(smem_base, m2c, c2m);

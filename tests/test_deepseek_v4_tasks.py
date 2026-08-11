@@ -1,5 +1,7 @@
 import torch
 
+from dae.instructions import ArgmaxSmemPartialBf16, ArgmaxSmemReduceBf16
+
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
     apply_partial_rope_128_64,
@@ -20,12 +22,43 @@ from dae.deepseek_v4 import (
 from dae.deepseek_v4_flow import build_decode_plan, build_layer_decode_plan
 from dae.runtime import opcode
 from dae.schedule import (
+    SchedArgmaxSmemPartial,
+    SchedArgmaxSmemReduce,
     SchedDsv4Bf16Gemv,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
     SchedDsv4Nvfp4Quant16,
     SchedFp8Block128Gemv,
 )
+
+
+def test_shared_argmax_instructions_and_shape_sharding(monkeypatch):
+    class FakeTransfer:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def bar(self, _):
+            return self
+
+    globals_ = SchedArgmaxSmemPartial.schedule.__globals__
+    monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
+
+    logits = torch.empty((129280,), dtype=torch.bfloat16)
+    partials = torch.empty((152, 16), dtype=torch.uint8)
+    partial = SchedArgmaxSmemPartial(logits, partials).place(152)
+    first = partial.schedule(0)
+    last = partial.schedule(151)
+
+    assert isinstance(first[0], ArgmaxSmemPartialBf16)
+    assert first[0].args == [856, 0, 0]
+    assert isinstance(last[0], ArgmaxSmemPartialBf16)
+    assert last[0].args == [848, 62896, 1]
+
+    output = torch.empty((1,), dtype=torch.int64)
+    reduce = SchedArgmaxSmemReduce(partials, output).place(1).schedule(0)
+    assert isinstance(reduce[0], ArgmaxSmemReduceBf16)
+    assert reduce[0].args == [152]
 
 
 def test_deepseek_v4_flash_config_covers_transformer_and_mtp():

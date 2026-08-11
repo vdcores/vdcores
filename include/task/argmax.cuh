@@ -23,7 +23,9 @@ __device__ __forceinline__ void warp_reduce_max_idx(T &val, long long &idx) {
     float tmp = __shfl_down_sync(0xffffffff, (float)val, offset);
     T other_val = (T)tmp;
     long long other_idx = __shfl_down_sync(0xffffffff, idx, offset);
-    if (other_val > val) {
+    if (other_idx >= 0 &&
+        (idx < 0 || other_val > val ||
+         (other_val == val && other_idx < idx))) {
       val = other_val;
       idx = other_idx;
     }
@@ -60,7 +62,9 @@ __device__ __forceinline__ void block_reduce_max_idx(void *smem, T &val, long lo
     for (int i = 0; i < num_warps; i++) {
       T warp_val = smem_vals[i];
       long long warp_idx = smem_idxs[i];
-      if (warp_val > block_max_val) {
+      if (warp_idx >= 0 &&
+          (block_max_idx < 0 || warp_val > block_max_val ||
+           (warp_val == block_max_val && warp_idx < block_max_idx))) {
         block_max_val = warp_val;
         block_max_idx = warp_idx;
       }
@@ -69,6 +73,85 @@ __device__ __forceinline__ void block_reduce_max_idx(void *smem, T &val, long lo
     val = block_max_val;
     idx = block_max_idx;
   }
+}
+
+// Queue-native one-token argmax. The partial task consumes BF16 logits from
+// allocator-owned shared memory and emits one compact record back through the
+// ordinary STU path. The reducer likewise consumes shared records and emits
+// one int64 token; neither task observes a global address.
+template <typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_argmax_smem_partial_bf16(
+    int rows,
+    int row_start,
+    void *smem_base,
+    void *scratchpad,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<FusedArgmaxRecord *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  __nv_bfloat16 local_max = __float2bfloat16(-FLT_MAX);
+  long long local_idx = -1;
+  for (int row = tid; row < rows; row += 128) {
+    const __nv_bfloat16 candidate = input[row];
+    const long long candidate_idx = row_start + row;
+    if (local_idx < 0 || candidate > local_max ||
+        (candidate == local_max && candidate_idx < local_idx)) {
+      local_max = candidate;
+      local_idx = candidate_idx;
+    }
+  }
+  block_reduce_max_idx(scratchpad, local_max, local_idx);
+  if (tid == 0) {
+    output[0].value = local_max;
+    output[0].padding[0] = 0;
+    output[0].padding[1] = 0;
+    output[0].padding[2] = 0;
+    output[0].index = local_idx;
+  }
+  __sync_compute_group(128);
+  c2m.push(tid, input_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+template <typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_argmax_smem_reduce_bf16(
+    int records,
+    void *smem_base,
+    void *scratchpad,
+    M2C_Type &m2c,
+    C2M_Type &c2m) {
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const FusedArgmaxRecord *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<long long *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  __nv_bfloat16 local_max = __float2bfloat16(-FLT_MAX);
+  long long local_idx = -1;
+  for (int record = tid; record < records; record += 128) {
+    const FusedArgmaxRecord candidate = input[record];
+    if (candidate.index >= 0 &&
+        (local_idx < 0 || candidate.value > local_max ||
+         (candidate.value == local_max && candidate.index < local_idx))) {
+      local_max = candidate.value;
+      local_idx = candidate.index;
+    }
+  }
+  block_reduce_max_idx(scratchpad, local_max, local_idx);
+  if (tid == 0) {
+    output[0] = local_idx;
+  }
+  __sync_compute_group(128);
+  c2m.push(tid, input_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // assume half, vectorize it

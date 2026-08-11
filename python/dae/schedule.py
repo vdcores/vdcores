@@ -2926,6 +2926,85 @@ class SchedSmemSiLU_K_4096_N_1(Schedule):
         ]
         return insts
 
+class SchedArgmaxSmemPartial(Schedule):
+    """Reduce disjoint BF16 logit ranges to compact shared/STU records."""
+
+    RECORD_BYTES = 16
+
+    def __init__(self, logits: torch.Tensor, partials: torch.Tensor):
+        super().__init__()
+        self.logits = logits
+        self.partials = partials
+
+    def _on_place(self):
+        if (self.logits.dtype != torch.bfloat16 or self.logits.ndim != 1 or
+                not self.logits.is_contiguous()):
+            raise ValueError("shared argmax logits must be contiguous rank-1 BF16")
+        if self.logits.numel() % 8:
+            raise ValueError("shared argmax logits must contain a multiple of 8 values")
+        if self.num_sms > self.logits.numel() // 8:
+            raise ValueError("shared argmax requires at least eight logits per SM")
+        if (self.partials.dtype != torch.uint8 or
+                tuple(self.partials.shape) != (self.num_sms, self.RECORD_BYTES) or
+                not self.partials.is_contiguous()):
+            raise ValueError(
+                "shared argmax partials must be contiguous uint8 [num_sms,16]"
+            )
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        _, row_start, row_count = _aligned_row_shard(
+            self.logits.numel(), self.num_sms, sm, alignment=8
+        )
+        return [
+            ArgmaxSmemPartialBf16(row_count, row_start),
+            _shared_load_1d(self.logits[row_start:row_start + row_count]),
+            _shared_store_1d(self.partials[sm]).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedArgmaxSmemReduce(Schedule):
+    """Reduce compact absolute-index records to one int64 token."""
+
+    def __init__(self, partials: torch.Tensor, output: torch.Tensor):
+        super().__init__()
+        self.partials = partials
+        self.output = output
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("shared argmax reduction uses exactly one SM")
+        if (self.partials.dtype != torch.uint8 or self.partials.ndim != 2 or
+                self.partials.shape[1] != SchedArgmaxSmemPartial.RECORD_BYTES or
+                not self.partials.is_contiguous()):
+            raise ValueError("shared argmax partials must be contiguous uint8 [N,16]")
+        if not 1 <= self.partials.shape[0] <= 0xFFFF:
+            raise ValueError("shared argmax partial count must fit in uint16")
+        if (self.output.dtype != torch.int64 or self.output.numel() != 1 or
+                not self.output.is_contiguous()):
+            raise ValueError("shared argmax output must be one contiguous int64")
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        return [
+            ArgmaxSmemReduceBf16(self.partials.shape[0]),
+            _shared_load_1d(self.partials),
+            _shared_store_1d(self.output).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
 class SchedArgmax(Schedule):
     def __init__(self,
                  num_token: int,

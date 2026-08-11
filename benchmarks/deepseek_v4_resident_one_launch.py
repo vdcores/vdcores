@@ -23,11 +23,14 @@ from dae.deepseek_v4_checkpoint import (
     expected_inference_tensor_specs,
 )
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy, ShapeAssignment
+from dae.deepseek_v4_quant import quantize_fp8_block128
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
 from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayeredSchedule,
+    SchedArgmaxSmemPartial,
+    SchedArgmaxSmemReduce,
     SchedDsv4Bf16Gemv,
     SchedDsv4ExpertReduce,
     SchedDsv4Fp32Bf16Gemv,
@@ -1348,6 +1351,7 @@ class ResidentOneLaunchDecode:
             (cfg.hidden_size,), dtype=torch.bfloat16, device=self.device
         )
         self.head_norm = torch.empty_like(self.head_hidden)
+        self.fp8_head = self.args.vocab_size == cfg.vocab_size
         self.logits = torch.empty(
             (self.args.vocab_size,), dtype=torch.bfloat16, device=self.device
         )
@@ -1377,6 +1381,78 @@ class ResidentOneLaunchDecode:
             ),
         ]
         head_weight = self._tensor("head.weight")[: self.args.vocab_size]
+        if self.fp8_head:
+            print(
+                "DSV4_HEAD_PREPROCESS status=START "
+                f"rows={self.args.vocab_size} k={cfg.hidden_size} format=fp8_block128",
+                flush=True,
+            )
+            preprocess_started = time.monotonic()
+            self.head_weight_fp8, self.head_weight_scale = (
+                quantize_fp8_block128(head_weight)
+            )
+            self.head_input_fp8 = torch.empty(
+                (cfg.hidden_size,), dtype=torch.float8_e4m3fn, device=self.device
+            )
+            self.head_input_scale = torch.empty(
+                (cfg.hidden_size // 128,),
+                dtype=torch.float8_e8m0fnu,
+                device=self.device,
+            )
+            head_assignment = self.policy.fp8_gemv(
+                self.args.vocab_size, cfg.hidden_size
+            )
+            self.head_argmax_partial = torch.empty(
+                (head_assignment.num_sms, 16),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self.output_token = torch.empty(
+                (1,), dtype=torch.int64, device=self.device
+            )
+            stages.extend(
+                (
+                    self._fp8_quant_stage(
+                        "head.quant_fp8",
+                        self.head_norm,
+                        self.head_input_fp8,
+                        self.head_input_scale,
+                    ),
+                    self._stage(
+                        "head.logits.fp8",
+                        SchedFp8Block128Gemv(
+                            self.head_weight_fp8,
+                            self.head_weight_scale,
+                            self.head_input_fp8,
+                            self.head_input_scale,
+                            self.logits,
+                        ),
+                        head_assignment,
+                    ),
+                    self._stage(
+                        "head.argmax.partial",
+                        SchedArgmaxSmemPartial(
+                            self.logits, self.head_argmax_partial
+                        ),
+                        head_assignment.num_sms,
+                    ),
+                    self._stage(
+                        "head.argmax.reduce",
+                        SchedArgmaxSmemReduce(
+                            self.head_argmax_partial, self.output_token
+                        ),
+                        1,
+                    ),
+                )
+            )
+            print(
+                "DSV4_HEAD_PREPROCESS status=PASS "
+                f"weight_gib={self.head_weight_fp8.numel() * self.head_weight_fp8.element_size() / (1 << 30):.3f} "
+                f"elapsed_s={time.monotonic() - preprocess_started:.3f}",
+                flush=True,
+            )
+            return stages
+
         stages.append(
             self._stage(
                 "head.logits",
@@ -1581,12 +1657,33 @@ class ResidentOneLaunchDecode:
         self.launcher.launch(synchronize=False)
         end.record()
         end.synchronize()
+        if self.fp8_head:
+            return int(self.output_token.item()), start.elapsed_time(end), torch.empty(0)
         logits_cpu = self.logits.cpu()
         logits_fp32 = logits_cpu.float()
         if not bool(torch.isfinite(logits_fp32).all().item()):
             raise AssertionError("one-launch checkpoint logits are not finite")
         token = int(torch.argmax(logits_fp32).item())
         return token, start.elapsed_time(end), logits_fp32
+
+    def validate_fp8_head(self, token: int) -> None:
+        if not self.fp8_head:
+            return
+        reference_logits = torch.mv(
+            self._tensor("head.weight")[: self.config.vocab_size],
+            self.head_norm,
+        )
+        reference_token = int(torch.argmax(reference_logits).item())
+        if token != reference_token:
+            raise AssertionError(
+                "FP8 head emitted "
+                f"token {token}, reference BF16 GEMV emitted {reference_token}"
+            )
+        print(
+            "DSV4_HEAD_REFERENCE status=PASS "
+            f"output_token={token}",
+            flush=True,
+        )
 
     def report_layer_profile(
         self,
@@ -1857,12 +1954,19 @@ def main() -> None:
     flow = ResidentOneLaunchDecode(args, device)
     torch.cuda.synchronize(device)
     build_seconds = time.monotonic() - build_started
-    prime_token, prime_ms, _ = flow.run_once()
+    prime_token, prime_ms, prime_logits = flow.run_once()
+    flow.validate_fp8_head(prime_token)
     if args.expected_token_id is not None and prime_token != args.expected_token_id:
         raise AssertionError(
             f"prime launch emitted token {prime_token}, "
             f"expected {args.expected_token_id}"
         )
+    logit_summary = (
+        f"logit_min={float(prime_logits.min().item()):.6f} "
+        f"logit_max={float(prime_logits.max().item()):.6f}"
+        if prime_logits.numel()
+        else "logits=fp8_argmax"
+    )
     print(
         "DSV4_ONE_LAUNCH_PRIME status=PASS "
         f"output_token={prime_token} elapsed_ms={prime_ms:.6f}",
@@ -1928,8 +2032,7 @@ def main() -> None:
         f"build_s={build_seconds:.3f} min_ms={min(timings):.6f} "
         f"median_ms={statistics.median(timings):.6f} "
         f"max_ms={max(timings):.6f} "
-        f"logit_min={float(logits.min().item()):.6f} "
-        f"logit_max={float(logits.max().item()):.6f}",
+        f"{logit_summary}",
         flush=True,
     )
 
