@@ -8,10 +8,16 @@ import statistics
 
 import torch
 
+from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.deepseek_v4_quant import dequantize_nvfp4, quantize_nvfp4
 from dae.instructions import ProfileEvent
 from dae.launcher import Launcher
-from dae.schedule import SchedNvfp4Gemv, SchedNvfp4GemvUmma
+from dae.routing import RoutedAddressTable
+from dae.schedule import (
+    SchedNvfp4Gemv,
+    SchedNvfp4GemvUmma,
+    SchedRoutedNvfp4Gemv,
+)
 
 
 def main() -> None:
@@ -21,6 +27,14 @@ def main() -> None:
     parser.add_argument("--sms", type=int, default=0)
     parser.add_argument(
         "--implementation", choices=("cuda", "umma"), default="cuda"
+    )
+    parser.add_argument(
+        "--routed-tiles",
+        action="store_true",
+        help=(
+            "use the production routed/TMA tiling path; this permits the "
+            "25-SM expert partition whose full static shard exceeds uint16"
+        ),
     )
     parser.add_argument(
         "--sms-list",
@@ -66,6 +80,8 @@ def main() -> None:
         help="use constant +1 FP4 data and one distinct E4M3 scale per block",
     )
     args = parser.parse_args()
+    if args.routed_tiles and args.implementation != "cuda":
+        parser.error("--routed-tiles currently supports only --implementation cuda")
 
     def stage(name: str) -> None:
         if args.trace_stages:
@@ -189,18 +205,94 @@ def main() -> None:
             (args.m * output_columns,), dtype=torch.bfloat16, device=device
         )
         launcher = Launcher(num_sms, device=device)
-        schedule_cls = (
-            SchedNvfp4Gemv
-            if args.implementation == "cuda"
-            else SchedNvfp4GemvUmma
-        )
+        if args.routed_tiles:
+            assignment = DeepSeekV4ShapePolicy(num_sms).nvfp4_gemv(
+                args.m, args.k
+            )
+            columns: dict[str, list[int]] = {}
+            weight_field_names: list[tuple[str, ...]] = []
+            scale_field_names: list[tuple[str, ...]] = []
+            for sm in range(assignment.num_sms):
+                row_start, row_count = assignment.shard(sm)
+                sm_weight_fields = []
+                sm_scale_fields = []
+                for tile_index, tile_start in enumerate(
+                    range(
+                        row_start,
+                        row_start + row_count,
+                        assignment.tile_rows,
+                    )
+                ):
+                    weight_name = f"weight.sm{sm}.tile{tile_index}"
+                    scale_name = f"weight_scale.sm{sm}.tile{tile_index}"
+                    weight_address = (
+                        weight.data_ptr()
+                        + tile_start * weight.stride(0) * weight.element_size()
+                    )
+                    scale_address = (
+                        weight_sf.data_ptr()
+                        + tile_start
+                        * weight_sf.stride(0)
+                        * weight_sf.element_size()
+                    )
+                    columns[weight_name] = [weight_address] * 256
+                    columns[scale_name] = [scale_address] * 256
+                    sm_weight_fields.append(weight_name)
+                    sm_scale_fields.append(scale_name)
+                weight_field_names.append(tuple(sm_weight_fields))
+                scale_field_names.append(tuple(sm_scale_fields))
+            alpha_storage = torch.zeros(
+                (4,), dtype=torch.float32, device=device
+            )
+            alpha_storage[0].copy_(alpha.reshape(-1)[0])
+            columns["alpha"] = [alpha_storage.data_ptr()] * 256
+            table = RoutedAddressTable.from_pointer_columns(
+                columns,
+                device=device,
+                owners=(weight, weight_sf, alpha_storage),
+            )
+            table.route_indices[0] = 0
+            schedule = SchedRoutedNvfp4Gemv(
+                table.state,
+                route_rank=0,
+                weight_fields=[
+                    tuple(table.field(name) for name in names)
+                    for names in weight_field_names
+                ],
+                weight_scale_fields=[
+                    tuple(table.field(name) for name in names)
+                    for names in scale_field_names
+                ],
+                alpha_field=table.field("alpha"),
+                rows=args.m,
+                k=args.k,
+                activation=activation,
+                activation_scale=activation_sf,
+                output=output,
+                route_ready=True,
+            ).place(num_sms)
+        else:
+            schedule_cls = (
+                SchedNvfp4Gemv
+                if args.implementation == "cuda"
+                else SchedNvfp4GemvUmma
+            )
+            schedule = schedule_cls(
+                weight,
+                weight_sf,
+                activation,
+                activation_sf,
+                alpha,
+                output,
+                **(
+                    {"output_columns": output_columns}
+                    if args.implementation == "umma"
+                    else {}
+                ),
+            ).place(num_sms)
         launcher.s(
             ProfileEvent(2),
-            schedule_cls(
-                weight, weight_sf, activation, activation_sf, alpha, output,
-                **({"output_columns": output_columns}
-                   if args.implementation == "umma" else {})
-            ).place(num_sms),
+            schedule,
             ProfileEvent(3),
         )
         stage(f"launcher_ready_{num_sms}")
@@ -270,6 +362,7 @@ def main() -> None:
         print(
             "DSV4_NVFP4_GEMV_RESULT "
             f"implementation={args.implementation} "
+            f"addressing={'routed_tiled' if args.routed_tiles else 'static'} "
             f"shape={args.m}x1x{args.k} sms={num_sms} "
             f"task_min_us={min(task_timings):.6f} "
             f"task_median_us={statistics.median(task_timings):.6f} "

@@ -692,6 +692,33 @@ a material fraction of complete-token time. Dense FP8 and real-context
 attention follow; small barrier or instruction-count tuning stays behind
 these board-level gates.
 
+The first matched NVFP4 board exploration completed that gate. The VDCores
+static raw-checkpoint task measured 5.504 us for M2048/K4096 on 128 SMs and
+5.664 us for M4096/K2048 on 128 SMs. FlashInfer 0.6.12 CUTLASS CUDA-graph
+amortized medians were 4.579 us and 3.656 us respectively in jobs
+`20260811T065145Z-3187993` and `20260811T065325Z-3192804`. The graph result is
+the relevant comparison because VDCores is already inside one persistent
+launch; FlashInfer's independently launched event medians include much larger
+host/kernel-launch effects.
+
+`deepseek_v4_nvfp4_gemv.py --routed-tiles` now exercises the actual dynamic
+LDU pointer resolution, uint16-bounded row tiling, and retained activation used
+by a production expert partition. On the production 25-SM share, job
+`20260811T065825Z-3241097` measured 19.008 us for M2048/K4096 and job
+`20260811T065849Z-3244549` measured 17.408 us for M4096/K2048; both were
+bit-exact to the raw-checkpoint quantized reference. The respective 50-SM
+medians were 11.856 and 10.656 us, showing ordinary SM scaling rather than a
+dominant routed-address penalty.
+
+These values explain the 79--81 us top-6 join: each 25-SM branch executes two
+up/gate projections, SwiGLU and requantization, then one down projection. A
+small route-address or barrier change cannot close the framework gap. The next
+kernel proof should instead stream prepacked K tiles through LDU into native
+SM100 block-scaled UMMA, overlap tile loads with tensor-core issue, and avoid
+the current native oracle's synchronous in-task checkpoint reformat. Weight
+data and scales should share a load transaction when the preprocessed layout
+demonstrates a task and end-to-end win without duplicating the resident model.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median
