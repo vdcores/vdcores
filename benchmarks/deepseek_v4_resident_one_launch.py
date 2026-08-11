@@ -1051,7 +1051,11 @@ class ResidentOneLaunchDecode:
                 )
 
         if kind == "csa":
-            if self.args.fp8_qb_mode == "native":
+            run_index_selection = (
+                self.args.index_selection_mode == "force"
+                or plan.requires_index_selection
+            )
+            if run_index_selection and self.args.fp8_qb_mode == "native":
                 stages.append(
                     self._native_fp8_linear_stage(
                         "index.q_b",
@@ -1061,7 +1065,7 @@ class ResidentOneLaunchDecode:
                         self.index_q,
                     )
                 )
-            else:
+            elif run_index_selection:
                 stages.append(
                     self._fp8_linear_stage(
                         "index.q_b",
@@ -1072,33 +1076,34 @@ class ResidentOneLaunchDecode:
                         self.index_q,
                     )
                 )
-            stages.append(
-                self._stage(
-                    "index.q_rope",
-                    SchedDsv4Rope128_64(
-                        self.index_q, self.compress_rope, self.index_q_rope
-                    ),
-                    cfg.index_heads,
+            if run_index_selection:
+                stages.append(
+                    self._stage(
+                        "index.q_rope",
+                        SchedDsv4Rope128_64(
+                            self.index_q, self.compress_rope, self.index_q_rope
+                        ),
+                        cfg.index_heads,
+                    )
                 )
-            )
-            stages.append(
-                self._stage(
-                    "index.q_hadamard",
-                    SchedDsv4Hadamard(
-                        self.index_q_rope, self.index_q_hadamard
-                    ),
-                    cfg.index_heads,
+                stages.append(
+                    self._stage(
+                        "index.q_hadamard",
+                        SchedDsv4Hadamard(
+                            self.index_q_rope, self.index_q_hadamard
+                        ),
+                        cfg.index_heads,
+                    )
                 )
-            )
-            stages.append(
-                self._bf16_linear_stage(
-                    "index.weights",
-                    family,
-                    "attn.indexer.weights_proj.weight",
-                    self.norm_hidden,
-                    self.index_head_weights,
+                stages.append(
+                    self._bf16_linear_stage(
+                        "index.weights",
+                        family,
+                        "attn.indexer.weights_proj.weight",
+                        self.norm_hidden,
+                        self.index_head_weights,
+                    )
                 )
-            )
             stages.append(
                 self._bf16_linear_stage(
                     "index.compressor.wkv",
@@ -1175,7 +1180,7 @@ class ResidentOneLaunchDecode:
                         ),
                     )
                 )
-            if plan.compressed_rows:
+            if run_index_selection and plan.compressed_rows:
                 stages.append(
                     self._stage(
                         "index.score",
@@ -2007,6 +2012,7 @@ class ResidentOneLaunchDecode:
             f"context={self.args.context_length} "
             f"position={self.decode_position} "
             f"attention={self.args.attention_mode} "
+            f"index_selection={self.args.index_selection_mode} "
             f"prefix_cache={'current_token' if self.args.context_length == 1 else 'deterministic_seeded'} "
             f"logical_stages={logical_stages} queue_stages={queue_stages} "
             f"barriers={len(self.program.barriers)} "
@@ -2364,6 +2370,12 @@ def main() -> None:
         help="select the sparse-attention compute mechanism for matched A/B profiling",
     )
     parser.add_argument(
+        "--index-selection-mode",
+        choices=("auto", "force"),
+        default="auto",
+        help="force CSA score/top-k work for exhaustive-selection A/B profiling",
+    )
+    parser.add_argument(
         "--profile-layers",
         action="store_true",
         help="record compact per-layer LDU globaltimer frontiers",
@@ -2482,6 +2494,7 @@ def main() -> None:
         f"layers={args.layers} token_id={args.token_id} "
         f"context={args.context_length} position={args.context_length - 1} "
         f"attention={args.attention_mode} "
+        f"index_selection={args.index_selection_mode} "
         f"prefix_cache={'current_token' if args.context_length == 1 else 'deterministic_seeded'} "
         f"vocab={args.vocab_size} output_token={reference_token} "
         f"build_s={build_seconds:.3f} min_ms={min(timings):.6f} "

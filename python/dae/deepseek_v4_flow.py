@@ -52,6 +52,7 @@ class DeepSeekV4LayerDecodePlan:
     hash_routing: bool
     compressed_rows: int
     compressed_selected: int
+    requires_index_selection: bool
     attention_candidates: int
     should_compress: bool
     stages: tuple[str, ...]
@@ -75,6 +76,10 @@ def build_layer_decode_plan(
         if attention_kind == "csa"
         else compressed_rows
     )
+    requires_index_selection = (
+        attention_kind == "csa"
+        and compressed_selected < compressed_rows
+    )
     valid_window = min(config.sliding_window, start_pos + 1)
     attention_candidates = valid_window + compressed_selected
     should_compress = bool(ratio and (start_pos + 1) % ratio == 0)
@@ -89,12 +94,13 @@ def build_layer_decode_plan(
                 "attention_compressor_rope",
             )
     if attention_kind == "csa":
-        compression_stages += (
-            "index_q_b_fp8",
-            "index_q_rope",
-            "index_q_hadamard",
-            "index_compressor_project",
-        )
+        if requires_index_selection:
+            compression_stages += (
+                "index_q_b_fp8",
+                "index_q_rope",
+                "index_q_hadamard",
+            )
+        compression_stages += ("index_compressor_project",)
         if should_compress:
             compression_stages += (
                 "index_compressor_pool",
@@ -102,7 +108,7 @@ def build_layer_decode_plan(
                 "index_compressor_rope",
                 "index_kv_hadamard",
             )
-        if compressed_rows:
+        if requires_index_selection:
             compression_stages += ("index_score", "index_topk")
 
     return DeepSeekV4LayerDecodePlan(
@@ -113,6 +119,7 @@ def build_layer_decode_plan(
         hash_routing=layer_id < config.num_hash_layers,
         compressed_rows=compressed_rows,
         compressed_selected=compressed_selected,
+        requires_index_selection=requires_index_selection,
         attention_candidates=attention_candidates,
         should_compress=should_compress,
         stages=(

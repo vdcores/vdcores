@@ -1377,3 +1377,29 @@ wait, and 76--77% allocator slot stall after normalization to the SM-grid
 envelope. Those large independent idle fractions prioritize dependency and
 placement mechanisms over narrow softmax tuning. The strict 5.414155-ms target
 is not yet met.
+
+## Exhaustive CSA-selection elimination (2026-08-11)
+
+`DeepSeekV4LayerDecodePlan.requires_index_selection` is true only when CSA has
+more compressed rows than its 512-row cap. If the compressed cache fits under
+the cap, every row is selected and the index query, query RoPE/Hadamard,
+head-weight projection, score, and top-k cannot change attention. The schedule
+now removes those six stages while retaining the index compressor that creates
+future cache state. A forced mode preserves the old path for A/B checks.
+
+Representative layer-2 job `20260811T164730Z-878540` emitted the same token
+and logit range in both modes. Auto/forced medians were 0.532480/0.613056 ms;
+forced query preparation, score, and top-k boundaries were 11.104, 4.928, and
+32.608 us. The auto layer contains 98 rather than 104 logical stages.
+
+Full tracked job `20260811T164840Z-892133` used one `.24` GB200, one launch,
+three warmups, and five samples. It emitted stable token 5; samples were
+20.070593/19.114304/19.982817/20.051071/20.516159 ms, with a 20.051071-ms
+median. This saves 1.479040 ms (6.87%) from contiguous attention and 10.098305
+ms (33.49%) from the initial context-128 gate. The looped program drops from
+4,030 to 3,904 logical stages, 448 to 430 barriers, and 223/1,105 to 213/1,059
+maximum compute/memory instructions.
+
+Tracked samples still report 71--73% compute m2c wait, 72--76% LDU dependency
+wait, and 74--75% allocator slot stall. The semantic elimination is accepted,
+but the 20.051071-ms result remains 3.70x the strict 5.414155-ms target.

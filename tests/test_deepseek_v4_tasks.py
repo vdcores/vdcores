@@ -85,7 +85,9 @@ def test_decode_plan_covers_all_attention_families_and_model_stages():
     assert plan[0].attention_candidates == 128
     assert plan[2].attention_candidates == 160
     assert plan[3].attention_candidates == 129
-    assert "index_topk" in plan[2].stages
+    assert plan[2].compressed_rows == plan[2].compressed_selected
+    assert not plan[2].requires_index_selection
+    assert "index_topk" not in plan[2].stages
     assert "index_topk" not in plan[3].stages
     assert not any(
         stage.endswith("cache_store")
@@ -121,7 +123,9 @@ def test_long_context_plan_caps_only_csa_compressed_selection():
 
     assert csa.compressed_rows == 1024
     assert csa.compressed_selected == 512
+    assert csa.requires_index_selection
     assert csa.attention_candidates == 640
+    assert "index_topk" in csa.stages
     assert hca.compressed_rows == 32
     assert hca.compressed_selected == 32
     assert hca.attention_candidates == 160
