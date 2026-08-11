@@ -51,6 +51,7 @@ _BENCH_WARMUP = 0
 _BENCH_ITERATIONS = 1
 _INDEX_ROWS = 640
 _ATTENTION_TOPK = 512
+_HC_POST_SMS = 32
 
 
 def launch(schedule, num_sms: int, device: torch.device) -> float:
@@ -435,7 +436,9 @@ def run_hc(device: torch.device, generator: torch.Generator) -> None:
     ) * 0.125
     output = torch.empty_like(residual)
     post_latency = launch(
-        SchedDsv4HcPost(branch, residual, post, comb, output), 1, device
+        SchedDsv4HcPost(branch, residual, post, comb, output),
+        _HC_POST_SMS,
+        device,
     )
     expected_output = hc_post_reference(branch, residual, post, comb)
     report_close(
@@ -570,7 +573,8 @@ def run_norm_activation(device: torch.device, generator: torch.Generator) -> Non
 
 
 def main() -> None:
-    global _ATTENTION_TOPK, _BENCH_ITERATIONS, _BENCH_WARMUP, _INDEX_ROWS
+    global _ATTENTION_TOPK, _BENCH_ITERATIONS, _BENCH_WARMUP, _HC_POST_SMS
+    global _INDEX_ROWS
 
     tasks: dict[str, Callable[[torch.device, torch.Generator], None]] = {
         "quantization": run_quantization,
@@ -590,6 +594,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--index-rows", type=int, default=640)
     parser.add_argument("--attention-topk", type=int, default=512)
+    parser.add_argument("--hc-post-sms", type=int, default=32)
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("warmup must be non-negative and iterations must be positive")
@@ -601,6 +606,13 @@ def main() -> None:
     if args.attention_topk <= 0 or args.attention_topk > 768:
         parser.error("attention top-k must be in [1,768]")
     _ATTENTION_TOPK = args.attention_topk
+    if (
+        args.hc_post_sms <= 0
+        or 4096 % args.hc_post_sms
+        or (4096 // args.hc_post_sms) % 8
+    ):
+        parser.error("hc-post-sms must produce 16-byte-aligned equal shards")
+    _HC_POST_SMS = args.hc_post_sms
 
     device = torch.device("cuda")
     torch.set_float32_matmul_precision("highest")

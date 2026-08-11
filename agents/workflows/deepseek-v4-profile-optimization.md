@@ -27,10 +27,11 @@ The starting complete-token baseline is 79.530 ms median with 74.797 ms in 43
 layers, 2.555 ms in barrier reloads, and 1.923 ms in the full vocabulary head.
 The target is 16 ms.
 
-The current accepted production record is 11.593600 ms median at the native
-q_b milestone: one GPU, one persistent launch, three warmups, 30 samples, and
-exact token 14. Keep the historical starting baseline for attribution, but
-compare new end-to-end milestones against this current record.
+The current accepted production record is 11.178160 ms median at the
+shape-sharded mHC-post milestone: one GPU, one persistent launch, three
+warmups, 30 samples, and exact token 14. Keep the historical starting baseline
+for attribution, but compare new end-to-end milestones against this current
+record.
 
 ## Phase 1: task kernels
 

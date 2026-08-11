@@ -12,6 +12,7 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     ComputeInstruction,
     Copy,
+    Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Nvfp4QuantUmmaBSm100,
     Dsv4SiluClampMul128,
@@ -46,6 +47,7 @@ from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.launcher import Launcher
 from dae.schedule import (
     Schedule,
+    SchedDsv4HcPost,
     SchedFp8GemvUmmaStream,
     SchedAttentionDecoding,
     SchedDsv4SwiGluShard128,
@@ -426,6 +428,38 @@ def test_dsv4_fp8_native_quant_encodes_k_tile_count():
     instruction = Dsv4Fp8QuantUmmaBSm100(1)
 
     assert instruction.args == [1]
+
+
+def test_dsv4_hc_post_encodes_local_width():
+    instruction = Dsv4HcPost(128)
+
+    assert instruction.args == [128]
+
+
+def test_dsv4_hc_post_uses_shape_aligned_shared_shards(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedDsv4HcPost(
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((4, 4), dtype=torch.float32),
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+    ).place(32)
+
+    instructions = schedule.schedule(0)
+    compute = [inst for inst in instructions if isinstance(inst, Dsv4HcPost)]
+    memory = [
+        inst for inst in instructions if isinstance(inst, MemoryInstruction)
+    ]
+
+    assert [inst.args for inst in compute] == [[128]]
+    assert len(memory) == 11
+    assert all(inst.num_slots == 1 for inst in memory)
+    assignment = DeepSeekV4ShapePolicy(152).hc_post(4096, 4)
+    assert assignment.num_sms == 32
+    assert assignment.row_alignment == 128
 
 
 def test_fp8_native_stream_bounds_activation_chunks_to_one_slot(monkeypatch):

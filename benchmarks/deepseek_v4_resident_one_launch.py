@@ -677,6 +677,9 @@ class ResidentOneLaunchDecode:
                 self.comb,
                 output_residual,
             ),
+            self.policy.hc_post(
+                self.config.hidden_size, self.config.hc_mult
+            ),
         )
         return [project_stage, pre_stage, norm_stage], post_stage
 

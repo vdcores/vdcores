@@ -1804,8 +1804,14 @@ class SchedDsv4HcPost(Schedule):
         self.output = output
 
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek mHC post currently uses exactly one SM")
+        if (
+            self.num_sms <= 0
+            or 4096 % self.num_sms
+            or (4096 // self.num_sms) % 8
+        ):
+            raise ValueError(
+                "DeepSeek mHC post requires 16-byte-aligned equal shards"
+            )
         if self.branch.dtype != torch.bfloat16 or self.branch.numel() != 4096:
             raise ValueError("mHC branch must contain 4096 BF16 values")
         if self.residual.dtype != torch.bfloat16 or tuple(self.residual.shape) != (4, 4096):
@@ -1818,21 +1824,32 @@ class SchedDsv4HcPost(Schedule):
             raise ValueError("mHC post output must be BF16 [4,4096]")
 
     def schedule(self, sm):
-        if sm != 0:
+        if sm < 0 or sm >= self.num_sms:
             return []
-        return [
-            Dsv4HcPost(),
-            TmaLoad1D(self.branch),
-            TmaLoad1D(self.residual),
+        width = 4096 // self.num_sms
+        start = sm * width
+        stop = start + width
+        instructions = [
+            Dsv4HcPost(width),
+            TmaLoad1D(self.branch[start:stop]),
+            *(
+                TmaLoad1D(self.residual[branch, start:stop])
+                for branch in range(4)
+            ),
             TmaLoad1D(self.post),
             TmaLoad1D(self.comb),
-            TmaStore1D(self.output).bar(self._bar("output")),
         ]
+        stores = [
+            TmaStore1D(self.output[branch, start:stop])
+            for branch in range(4)
+        ]
+        stores[-1].bar(self._bar("output"))
+        return instructions + stores
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedDsv4Hadamard(Schedule):

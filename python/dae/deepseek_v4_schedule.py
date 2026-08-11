@@ -140,6 +140,18 @@ class DeepSeekV4ShapePolicy:
             tile_k=head_dim,
         )
 
+    def hc_post(self, hidden_size: int, streams: int) -> ShapeAssignment:
+        if hidden_size % 128:
+            raise ValueError("mHC post hidden size must be divisible by 128")
+        return self._rows(
+            "hc_post",
+            hidden_size,
+            streams,
+            alignment=128,
+            tile_rows=128,
+            tile_k=streams,
+        )
+
     def parallel_partition(self, branch: int, branches: int) -> tuple[int, int]:
         """Return a shape-independent contiguous SM share for one ready branch."""
         if branches <= 0 or branches > self.resident_sms:

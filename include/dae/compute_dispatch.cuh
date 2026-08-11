@@ -262,10 +262,10 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_POST) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, inst, st_insts,
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
              tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space,
              g_events);
-  task_dsv4_hc_post(smem_base, m2c, c2m);
+  task_dsv4_hc_post(inst.args[0], smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_2048) {

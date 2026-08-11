@@ -306,8 +306,10 @@ class Dsv4HcPre(ComputeInstruction):
 
 
 class Dsv4HcPost(ComputeInstruction):
-    def __init__(self):
-        super().__init__(opcode=opcode.OP_DSV4_HC_POST, args=[])
+    def __init__(self, width: int):
+        if width <= 0 or width > 4096:
+            raise ValueError("DeepSeek mHC post width must be in [1,4096]")
+        super().__init__(opcode=opcode.OP_DSV4_HC_POST, args=[width])
 
 
 class Dsv4SiluClampMul2048(ComputeInstruction):

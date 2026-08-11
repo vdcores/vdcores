@@ -1251,3 +1251,44 @@ medians were 11.594176/11.593024 ms; no progressive slowdown or liveness stall
 remained. The one-launch image has 418 barriers and 245/1,213 maximum
 compute/memory instructions. Its 32-op SM100a binary uses 70 registers, nine
 barriers, a 96-byte stack, 2,448 bytes static shared memory, and no spills.
+
+## Shape-sharded mHC post milestone (2026-08-11)
+
+The refreshed position-zero stage profile in job
+`20260811T124820Z-2243628` measured a 227.040-us layer body. Both mHC-post
+updates were still one-SM elementwise tasks and cost 11.872 and 11.648 us.
+The task has no cross-dimension dependency: each output dimension reads the
+same four post coefficients and 4x4 combination matrix, then independently
+updates four residual streams.
+
+The accepted schedule derives 32 SMs from 4,096 / 128 dimensions. Each SM
+LDU-loads one 128-value branch shard, four matching residual shards, and the
+small fixed coefficients into normal shared slots. Compute updates the four
+local output shards with ordinary loops, and STU writes those shards. The
+working set is 11 of 24 slots. There is no compute global pointer, issue
+barrier, thread fence, inter-stage copy, or per-layer unroll. The same task
+opcode now carries only its local width.
+
+Isolated exact medians were 10.480 us for the original one-SM task in job
+`20260811T125149Z-2282925`, then 7.200/7.008/7.104 us for 16/32/64 SMs in
+jobs `20260811T125712Z-2345603`, `20260811T125650Z-2341476`, and
+`20260811T125740Z-2350648`. The natural 128-dimension/32-SM shape won the
+coarse screen. In one-layer job `20260811T125814Z-2356950`, the two mHC-post
+boundaries fell to 6.688 and 6.848 us and the layer body fell to 215.872 us,
+saving 11.168 us from the matched tracked baseline.
+
+The complete tracked job `20260811T125853Z-2365516` preserved token 14 and
+measured 11.324192--11.374656 ms across five samples. HCA/CSA family bands,
+2.2--2.8-us reloads, per-SM frontiers, and roughly 2.025-GHz clocks remained
+flat across all 43 layers; the previously reported progressive slowdown is
+still absent.
+
+Production job `20260811T130421Z-2428119` used one B300, one persistent
+launch, the durable `/mnt` checkpoint, three warmups, and 30 timed tokens. It
+preserved token 14 and measured 11.087136/11.178160/11.298816 ms
+min/median/max. First/last-15 medians were 11.176416/11.184384 ms and the
+linear slope was -0.000497 ms per iteration. This saves 0.415440 ms (3.58%)
+from the native-q_b milestone and is 4.821840 ms under the 16-ms target. The
+queue image has 418 barriers and 253/1,301 maximum compute/memory
+instructions. The 32-op production binary remains spill-free at 70 registers,
+nine barriers, a 96-byte stack, and 2,448 bytes static shared memory.

@@ -1166,50 +1166,58 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
 
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hc_post(
+    int width,
     void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHc = 4;
-  constexpr int kHidden = 4096;
 
   const int branch_slots = m2c.template pop<0>();
-  const int branch_slot = extract(branch_slots);
   const auto *branch = static_cast<const __nv_bfloat16 *>(
-      get_slot_address(smem_base, branch_slot));
-  const int residual_slots = m2c.template pop<0>();
-  const int residual_slot = extract(residual_slots);
-  const auto *residual = static_cast<const __nv_bfloat16 *>(
-      get_slot_address(smem_base, residual_slot));
+      get_slot_address(smem_base, extract(branch_slots)));
+  int residual_slots[kHc];
+  const __nv_bfloat16 *residual[kHc];
+  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+    residual_slots[branch_index] = m2c.template pop<0>();
+    residual[branch_index] = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(residual_slots[branch_index])));
+  }
   const int post_slots = m2c.template pop<0>();
-  const int post_slot = extract(post_slots);
   const auto *post = static_cast<const float *>(
-      get_slot_address(smem_base, post_slot));
+      get_slot_address(smem_base, extract(post_slots)));
   const int comb_slots = m2c.template pop<0>();
-  const int comb_slot = extract(comb_slots);
   const auto *comb = static_cast<const float *>(
-      get_slot_address(smem_base, comb_slot));
-  const int output_slots = m2c.template pop<0>();
-  const int output_slot = extract(output_slots);
-  auto *output = static_cast<__nv_bfloat16 *>(
-      get_slot_address(smem_base, output_slot));
+      get_slot_address(smem_base, extract(comb_slots)));
+  int output_slots[kHc];
+  __nv_bfloat16 *output[kHc];
+  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+    output_slots[branch_index] = m2c.template pop<0>();
+    output[branch_index] = static_cast<__nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(output_slots[branch_index])));
+  }
 
   const int tid = __compute_tid();
-  for (int item = tid; item < kHc * kHidden; item += 128) {
-    const int output_branch = item / kHidden;
-    const int dim = item % kHidden;
-    float value = post[output_branch] * __bfloat162float(branch[dim]);
-#pragma unroll
-    for (int input_branch = 0; input_branch < kHc; ++input_branch) {
-      // The model updates streams with comb^T @ residual.
-      value = fmaf(
-          comb[input_branch * kHc + output_branch],
-          __bfloat162float(residual[input_branch * kHidden + dim]),
-          value);
+  for (int output_branch = 0; output_branch < kHc; ++output_branch) {
+    for (int dim = tid; dim < width; dim += 128) {
+      float value = post[output_branch] * __bfloat162float(branch[dim]);
+      for (int input_branch = 0; input_branch < kHc; ++input_branch) {
+        // The model updates streams with comb^T @ residual.
+        value = fmaf(
+            comb[input_branch * kHc + output_branch],
+            __bfloat162float(residual[input_branch][dim]),
+            value);
+      }
+      output[output_branch][dim] = __float2bfloat16(value);
     }
-    output[item] = __float2bfloat16(value);
   }
 
   __sync_compute_group(128);
-  c2m.push(tid, branch_slots | residual_slots | post_slots | comb_slots);
-  c2m.template push<31, true, false>(tid, output_slots);
+  int input_slots = branch_slots | post_slots | comb_slots;
+  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+    input_slots |= residual_slots[branch_index];
+  }
+  c2m.push(tid, input_slots);
+  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+    c2m.template push<31, true, false>(tid, output_slots[branch_index]);
+  }
 }
