@@ -1331,8 +1331,13 @@ class ResidentOneLaunchDecode:
             )
         start_frontier = max(int(value) for value in profile[:, 0])
         end_frontier = max(int(value) for value in profile[:, 1])
+        physical_sm_ids = [
+            int(value)
+            for value in profile[:, runtime_config.track_profile_event_base + 25]
+        ]
         boundaries = []
         spreads = []
+        frontier_vcores = []
         for layer_id in range(self.args.layers):
             event_id = runtime_config.layer_profile_event_base + layer_id
             values = [int(value) for value in profile[:, event_id]]
@@ -1340,6 +1345,7 @@ class ResidentOneLaunchDecode:
                 raise RuntimeError(f"layer {layer_id} profile event was not recorded")
             boundaries.append(max(values))
             spreads.append(max(values) - min(values))
+            frontier_vcores.append(max(range(len(values)), key=values.__getitem__))
 
         if self.args.layers == 1:
             reload_after_layers = ()
@@ -1349,6 +1355,7 @@ class ResidentOneLaunchDecode:
             reload_after_layers = (0, 1, 2, *range(4, self.args.layers, 2))
         reload_frontiers = []
         reload_spreads = []
+        reload_frontier_vcores = []
         for reload_index, layer_id in enumerate(reload_after_layers):
             event_id = runtime_config.reload_profile_event_base + reload_index
             values = [int(value) for value in profile[:, event_id]]
@@ -1358,12 +1365,17 @@ class ResidentOneLaunchDecode:
                 )
             reload_frontiers.append(max(values))
             reload_spreads.append(max(values) - min(values))
+            reload_frontier_vcores.append(
+                max(range(len(values)), key=values.__getitem__)
+            )
 
         previous = start_frontier
         layer_total = 0
         reload_total = 0
         reload_index = 0
-        for layer_id, (boundary, spread) in enumerate(zip(boundaries, spreads)):
+        for layer_id, (boundary, spread, frontier_vcore) in enumerate(
+            zip(boundaries, spreads, frontier_vcores)
+        ):
             elapsed = boundary - previous
             if elapsed < 0:
                 raise RuntimeError("layer profile frontiers are not monotonic")
@@ -1379,7 +1391,9 @@ class ResidentOneLaunchDecode:
                 f"routing={'hash' if layer_id < self.config.num_hash_layers else 'score'} "
                 f"stages={len(self.family_stages[family.representative])} "
                 f"elapsed_ms={elapsed / 1.0e6:.6f} "
-                f"frontier_spread_us={spread / 1.0e3:.3f}",
+                f"frontier_spread_us={spread / 1.0e3:.3f} "
+                f"frontier_vcore={frontier_vcore} "
+                f"frontier_physical_sm={physical_sm_ids[frontier_vcore]}",
                 flush=True,
             )
             if layer_id in reload_after_layers:
@@ -1393,7 +1407,10 @@ class ResidentOneLaunchDecode:
                     f"after_layer={layer_id} "
                     f"barriers={'pair' if layer_id >= 4 else 'family'} "
                     f"elapsed_ms={reload_elapsed / 1.0e6:.6f} "
-                    f"frontier_spread_us={reload_spreads[reload_index] / 1.0e3:.3f}",
+                    f"frontier_spread_us={reload_spreads[reload_index] / 1.0e3:.3f} "
+                    f"frontier_vcore={reload_frontier_vcores[reload_index]} "
+                    "frontier_physical_sm="
+                    f"{physical_sm_ids[reload_frontier_vcores[reload_index]]}",
                     flush=True,
                 )
                 previous = reload_frontier
@@ -1417,6 +1434,15 @@ class ResidentOneLaunchDecode:
         def counter_sum(offset: int) -> int:
             return sum(int(value) for value in profile[:, counter_base + offset])
 
+        sm_clock_ghz = []
+        for vcore in range(profile.shape[0]):
+            elapsed_ns = int(profile[vcore, 1]) - int(profile[vcore, 0])
+            elapsed_cycles = int(profile[vcore, counter_base + 27]) - int(
+                profile[vcore, counter_base + 26]
+            )
+            if elapsed_ns > 0:
+                sm_clock_ghz.append(elapsed_cycles / elapsed_ns)
+
         print(
             "DSV4_TRACK_PROFILE_SAMPLE "
             f"sample_index={sample_index if sample_index is not None else -1} "
@@ -1430,6 +1456,9 @@ class ResidentOneLaunchDecode:
             f"ldu1_dependency_wait_grid_pct={grid_percent(16):.3f} "
             f"store_queue_wait_grid_pct={grid_percent(19):.3f} "
             f"store_service_grid_pct={grid_percent(21):.3f} "
+            f"sm_clock_ghz_min={min(sm_clock_ghz):.3f} "
+            f"sm_clock_ghz_median={statistics.median(sm_clock_ghz):.3f} "
+            f"sm_clock_ghz_max={max(sm_clock_ghz):.3f} "
             f"allocator_instructions={counter_sum(8)} "
             f"ldu0_commands={counter_sum(13)} "
             f"ldu1_commands={counter_sum(18)} "

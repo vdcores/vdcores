@@ -862,6 +862,9 @@ DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
     int event_base = sm_id * numProfileEvents;
     g_events[event_base + 1] = cuda::ptx::get_sreg_globaltimer();
 #if defined(DAE_TRACK_PROFILE)
+    uint64_t sm_clock_end;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(sm_clock_end));
+    g_events[event_base + DAE_TRACK_SM_CLOCK_END] = sm_clock_end;
     g_events[event_base + DAE_TRACK_COMPUTE_M2C_WAIT_NS] = m2c.track_wait_ns;
     g_events[event_base + DAE_TRACK_COMPUTE_M2C_WAIT_CALLS] =
         m2c.track_wait_calls;

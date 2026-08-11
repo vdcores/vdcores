@@ -267,6 +267,17 @@ other three GPUs on its GB200 module were occupied and cumulative hardware
 power-brake time was present, so clock/power telemetry remains a secondary
 control.
 
+The next discriminator records the physical SM ID and `clock64` at resident
+kernel start/end. A 20-sample one-layer run showed no fixed straggler and no
+frequency mode: the frontier moved across physical SMs and the median inferred
+SM clock stayed at 2.047--2.055 GHz in both fast and slow samples. Most layer
+frontier spreads were below 1 us. The reproducible mode change is allocator
+backpressure instead: fast samples had about 7.6k slot-stall events, while slow
+samples had about 10.4k, despite the same 54,609 allocator instructions. All
+54,761 payload/control commands went to LDU0 except the 152 duplicated profile
+controls on LDU1. This elevates load-port balancing and dependency-aware slot
+admission above clock tuning or physical-SM exclusion.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus

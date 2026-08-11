@@ -149,6 +149,14 @@ void dae2(
   if (threadIdx.x == 0) {
     int event_base = sm_id * numProfileEvents;
     g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+#if defined(DAE_TRACK_PROFILE)
+    uint32_t physical_sm_id;
+    uint64_t sm_clock_start;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(physical_sm_id));
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(sm_clock_start));
+    g_events[event_base + DAE_TRACK_PHYSICAL_SM_ID] = physical_sm_id;
+    g_events[event_base + DAE_TRACK_SM_CLOCK_START] = sm_clock_start;
+#endif
   }
 
   __syncthreads();
