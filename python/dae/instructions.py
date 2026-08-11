@@ -254,6 +254,16 @@ class Dsv4SparseAttention512(ComputeInstruction):
         )
 
 
+class Dsv4ContiguousAttention512Block4(ComputeInstruction):
+    def __init__(self, rows: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("DeepSeek attention rows must fit in a positive uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4,
+            args=[rows],
+        )
+
+
 class Dsv4RouteTop6(ComputeInstruction):
     def __init__(self, hash_routing: bool, route_scale: float = 1.5):
         if route_scale <= 0:
@@ -2039,6 +2049,7 @@ __all__ = [
     "Dsv4Rope512_64",
     "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
+    "Dsv4ContiguousAttention512Block4",
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",

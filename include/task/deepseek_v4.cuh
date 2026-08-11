@@ -342,6 +342,140 @@ __device__ __forceinline__ void task_dsv4_sparse_attention_512(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
+// Four contiguous rows share one TMA slot and one online-softmax step.  Each
+// compute warp owns one score row, so the 512-wide dot needs only a warp
+// reduction.  Thread zero evaluates the scalar exponentials once and
+// publishes four probabilities through the compute scratchpad; all threads
+// then update disjoint output dimensions.  Shape policy selects this task only
+// when the chosen set is the entire contiguous cache.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_contiguous_attention_512_block4(
+    int rows,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kHeadDim = 512;
+  constexpr int kRowsPerBatch = 4;
+  constexpr int kQValuesPerLane = kHeadDim / 32;
+  constexpr int kOutputValuesPerThread = kHeadDim / 128;
+  constexpr float kSoftmaxScale = 0.04419417382415922f;
+
+  const int q_slots = m2c.template pop<0>();
+  const int q_slot = extract(q_slots);
+  const auto *q = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, q_slot));
+  const int sink_slots = m2c.template pop<0>();
+  const int sink_slot = extract(sink_slots);
+  const auto *sink = static_cast<const float *>(
+      get_slot_address(smem_base, sink_slot));
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *shared = static_cast<float *>(task_scratch);
+
+  float q_values[kQValuesPerLane];
+#pragma unroll 1
+  for (int item = 0; item < kQValuesPerLane; ++item) {
+    q_values[item] = __bfloat162float(q[lane + item * 32]);
+  }
+  float accum[kOutputValuesPerThread] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float running_max = 0.0f;
+  float running_sum = 0.0f;
+  if (tid == 0) {
+    running_max = sink[0];
+    running_sum = 1.0f;
+  }
+
+  for (int batch_start = 0; batch_start < rows;
+       batch_start += kRowsPerBatch) {
+    const int remaining = rows - batch_start;
+    const int batch_rows =
+        remaining < kRowsPerBatch ? remaining : kRowsPerBatch;
+    const int kv_slots = m2c.template pop<0>();
+    const int kv_slot = extract(kv_slots);
+    const auto *kv_batch = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, kv_slot));
+
+    if (warp < batch_rows) {
+      const auto *kv = kv_batch + warp * kHeadDim;
+      float partial = 0.0f;
+#pragma unroll 1
+      for (int item = 0; item < kQValuesPerLane; ++item) {
+        partial = fmaf(
+            q_values[item],
+            __bfloat162float(kv[lane + item * 32]),
+            partial);
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
+      }
+      if (lane == 0) {
+        shared[warp] = partial * kSoftmaxScale;
+      }
+    }
+    __sync_compute_group(128);
+
+    if (tid == 0) {
+      float next_max = running_max;
+#pragma unroll 1
+      for (int row = 0; row < batch_rows; ++row) {
+        next_max = fmaxf(next_max, shared[row]);
+      }
+      const float old_scale = __expf(running_max - next_max);
+      float next_sum = running_sum * old_scale;
+      shared[4] = old_scale;
+#pragma unroll 1
+      for (int row = 0; row < batch_rows; ++row) {
+        const float probability = __expf(shared[row] - next_max);
+        shared[5 + row] = probability;
+        next_sum += probability;
+      }
+      running_max = next_max;
+      running_sum = next_sum;
+    }
+    __sync_compute_group(128);
+
+    const float old_scale = shared[4];
+#pragma unroll 1
+    for (int item = 0; item < kOutputValuesPerThread; ++item) {
+      const int dim = tid + item * 128;
+      float update = 0.0f;
+#pragma unroll 1
+      for (int row = 0; row < batch_rows; ++row) {
+        update = fmaf(
+            shared[5 + row],
+            __bfloat162float(kv_batch[row * kHeadDim + dim]),
+            update);
+      }
+      accum[item] = accum[item] * old_scale + update;
+    }
+    __sync_compute_group(128);
+
+    c2m.push(tid, kv_slots);
+  }
+
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, output_slot));
+  if (tid == 0) {
+    shared[9] = 1.0f / running_sum;
+  }
+  __sync_compute_group(128);
+  const float inverse_sum = shared[9];
+#pragma unroll 1
+  for (int item = 0; item < kOutputValuesPerThread; ++item) {
+    output[tid + item * 128] =
+        __float2bfloat16(accum[item] * inverse_sum);
+  }
+
+  __sync_compute_group(128);
+  c2m.push(tid, q_slots | sink_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
 // Select DeepSeek's top-6 routed experts from 256 gate logits.  Hash layers
 // provide the six expert ids directly but still use the transformed scores as
 // routing weights.

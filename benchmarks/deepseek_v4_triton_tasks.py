@@ -295,19 +295,21 @@ def run_quantization(device, generator, args) -> None:
 
 
 def run_attention(device, generator, args) -> None:
+    topk = args.attention_topk
+    kv_rows = max(768, topk)
     q = torch.randn(
         (64, 512), generator=generator, dtype=torch.bfloat16, device=device
     ) * 0.125
     kv = torch.randn(
-        (768, 512), generator=generator, dtype=torch.bfloat16, device=device
+        (kv_rows, 512), generator=generator, dtype=torch.bfloat16, device=device
     ) * 0.125
-    indices = torch.randperm(768, generator=generator, device=device)[:512].to(
+    indices = torch.randperm(kv_rows, generator=generator, device=device)[:topk].to(
         torch.int32
     )
     sink = torch.linspace(-0.5, 0.5, 64, dtype=torch.float32, device=device)
     output = torch.empty_like(q)
     function = lambda: sparse_attention512_kernel[(64,)](
-        q, kv, indices, sink, output, TOPK=512, BLOCK_N=16, num_warps=8
+        q, kv, indices, sink, output, TOPK=topk, BLOCK_N=16, num_warps=8
     )
     function()
     selected = kv[indices.long()].float()
@@ -317,7 +319,7 @@ def run_attention(device, generator, args) -> None:
     )[:, :-1]
     expected = (probabilities @ selected).to(torch.bfloat16)
     torch.testing.assert_close(output, expected, rtol=3.0e-2, atol=1.0e-2)
-    emit("sparse_attention", "h64_d512_k512", function, args)
+    emit("sparse_attention", f"h64_d512_k{topk}", function, args)
 
 
 def run_indexer(device, generator, args) -> None:
@@ -340,14 +342,15 @@ def run_indexer(device, generator, args) -> None:
     torch.testing.assert_close(scores, expected, rtol=2.0e-4, atol=2.0e-4)
     emit("index_score", f"rows{rows}_h64_d128", score_fn, args)
 
-    values = torch.empty((512,), dtype=scores.dtype, device=device)
-    indices = torch.empty((512,), dtype=torch.int64, device=device)
+    topk = min(512, rows)
+    values = torch.empty((topk,), dtype=scores.dtype, device=device)
+    indices = torch.empty((topk,), dtype=torch.int64, device=device)
 
     def topk_fn():
-        torch.topk(scores, 512, out=(values, indices))
+        torch.topk(scores, topk, out=(values, indices))
 
     topk_fn()
-    emit("torch_topk", f"rows{rows}_k512", topk_fn, args)
+    emit("torch_topk", f"rows{rows}_k{topk}", topk_fn, args)
 
 
 def run_norm_activation(device, generator, args) -> None:
@@ -401,11 +404,14 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--inner", type=int, default=20)
     parser.add_argument("--index-rows", type=int, default=640)
+    parser.add_argument("--attention-topk", type=int, default=512)
     args = parser.parse_args()
     if min(args.warmup, args.samples, args.inner) <= 0:
         raise ValueError("timing counts must be positive")
-    if args.index_rows < 512 or args.index_rows > 0xFFFF:
-        raise ValueError("index rows must be in [512,65535]")
+    if args.index_rows <= 0 or args.index_rows > 0xFFFF:
+        raise ValueError("index rows must be in [1,65535]")
+    if args.attention_topk <= 0 or args.attention_topk > 0xFFFF:
+        raise ValueError("attention top-k must be in [1,65535]")
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260810)

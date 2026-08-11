@@ -41,6 +41,7 @@ from dae.schedule import (
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
+    SchedDsv4ContiguousAttention512Block4,
     SchedDsv4TopK512,
     SchedRMS,
     SchedSmemSiLUInterleaved,
@@ -51,6 +52,7 @@ _BENCH_WARMUP = 0
 _BENCH_ITERATIONS = 1
 _INDEX_ROWS = 640
 _ATTENTION_TOPK = 512
+_ATTENTION_IMPLEMENTATION = "both"
 _HC_POST_SMS = 32
 
 
@@ -196,21 +198,46 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
     sink = torch.linspace(
         -0.5, 0.5, config.num_heads, dtype=torch.float32, device=device
     )
-    output = torch.empty_like(q)
-    latency = launch(
-        SchedDsv4SparseAttention512(q, kv, indices, sink, output),
-        config.num_heads,
-        device,
-    )
     expected = sparse_attention_512_reference(q, kv, indices, sink)
-    report_close(
-        f"sparse_attention_h64_d512_k{_ATTENTION_TOPK}",
-        output,
-        expected,
-        rtol=3.0e-2,
-        atol=1.0e-2,
-        latency_us=latency,
-    )
+    if _ATTENTION_IMPLEMENTATION in ("both", "scalar"):
+        output = torch.empty_like(q)
+        latency = launch(
+            SchedDsv4SparseAttention512(q, kv, indices, sink, output),
+            config.num_heads,
+            device,
+        )
+        report_close(
+            f"sparse_attention_scalar_h64_d512_k{_ATTENTION_TOPK}",
+            output,
+            expected,
+            rtol=3.0e-2,
+            atol=1.0e-2,
+            latency_us=latency,
+        )
+
+    if _ATTENTION_IMPLEMENTATION in ("both", "contiguous"):
+        contiguous_indices = torch.arange(
+            _ATTENTION_TOPK, dtype=torch.int32, device=device
+        )
+        contiguous_expected = sparse_attention_512_reference(
+            q, kv, contiguous_indices, sink
+        )
+        contiguous_output = torch.empty_like(q)
+        contiguous_latency = launch(
+            SchedDsv4ContiguousAttention512Block4(
+                q, kv, _ATTENTION_TOPK, sink, contiguous_output
+            ),
+            config.num_heads,
+            device,
+        )
+        report_close(
+            f"attention_contiguous_block4_h64_d512_k{_ATTENTION_TOPK}",
+            contiguous_output,
+            contiguous_expected,
+            rtol=3.0e-2,
+            atol=1.0e-2,
+            latency_us=contiguous_latency,
+        )
 
 
 def run_router(device: torch.device, generator: torch.Generator) -> None:
@@ -606,7 +633,8 @@ def run_norm_activation(device: torch.device, generator: torch.Generator) -> Non
 
 
 def main() -> None:
-    global _ATTENTION_TOPK, _BENCH_ITERATIONS, _BENCH_WARMUP, _HC_POST_SMS
+    global _ATTENTION_IMPLEMENTATION, _ATTENTION_TOPK
+    global _BENCH_ITERATIONS, _BENCH_WARMUP, _HC_POST_SMS
     global _INDEX_ROWS
 
     tasks: dict[str, Callable[[torch.device, torch.Generator], None]] = {
@@ -627,6 +655,11 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--index-rows", type=int, default=640)
     parser.add_argument("--attention-topk", type=int, default=512)
+    parser.add_argument(
+        "--attention-implementation",
+        choices=("both", "scalar", "contiguous"),
+        default="both",
+    )
     parser.add_argument("--hc-post-sms", type=int, default=32)
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
@@ -639,6 +672,7 @@ def main() -> None:
     if args.attention_topk <= 0 or args.attention_topk > 768:
         parser.error("attention top-k must be in [1,768]")
     _ATTENTION_TOPK = args.attention_topk
+    _ATTENTION_IMPLEMENTATION = args.attention_implementation
     if (
         args.hc_post_sms <= 0
         or 4096 % args.hc_post_sms

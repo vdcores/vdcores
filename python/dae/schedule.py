@@ -1560,6 +1560,66 @@ class SchedDsv4SparseAttention512(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4ContiguousAttention512Block4(Schedule):
+    """Load four adjacent KV rows per TMA for an all-rows attention set."""
+
+    ROWS_PER_BATCH = 4
+    ROW_BYTES = 512 * 2
+
+    def __init__(self, q, kv, rows, sink, output):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.rows = int(rows)
+        self.sink = sink
+        self.output = output
+
+    def _on_place(self):
+        if (self.q.dtype != torch.bfloat16 or self.q.ndim != 2 or
+                self.q.shape[1] != 512):
+            raise ValueError("DeepSeek contiguous Q must be BF16 [heads,512]")
+        self.heads = self.q.shape[0]
+        if self.num_sms != self.heads:
+            raise ValueError("DeepSeek contiguous attention uses one SM per head")
+        if (self.kv.dtype != torch.bfloat16 or self.kv.ndim != 2 or
+                self.kv.shape[1] != 512 or not self.kv.is_contiguous()):
+            raise ValueError("DeepSeek contiguous KV must be contiguous BF16 [rows,512]")
+        if self.rows <= 0 or self.rows > self.kv.shape[0]:
+            raise ValueError("DeepSeek contiguous attention rows exceed the KV cache")
+        if self.sink.dtype != torch.float32 or self.sink.numel() != self.heads:
+            raise ValueError("DeepSeek attention sink must be FP32 [heads]")
+        if self.output.dtype != torch.bfloat16 or self.output.shape != self.q.shape:
+            raise ValueError("DeepSeek contiguous output must match Q")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        instructions = [
+            Dsv4ContiguousAttention512Block4(self.rows),
+            TmaLoad1D(self.q[sm]),
+            _shared_load_1d(self.sink[sm:sm + 1]),
+        ]
+        full_batches, tail_rows = divmod(self.rows, self.ROWS_PER_BATCH)
+        if full_batches:
+            batch_bytes = self.ROWS_PER_BATCH * self.ROW_BYTES
+            instructions += RepeatM.on(
+                full_batches,
+                (TmaLoad1D(self.kv[:self.ROWS_PER_BATCH].reshape(-1)), batch_bytes),
+            )
+        if tail_rows:
+            tail_start = full_batches * self.ROWS_PER_BATCH
+            instructions.append(TmaLoad1D(self.kv[tail_start:self.rows].reshape(-1)))
+        instructions.append(
+            TmaStore1D(self.output[sm]).bar(self._bar("output"))
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
                  output_weights, hash_routing=False, route_scale=1.5):

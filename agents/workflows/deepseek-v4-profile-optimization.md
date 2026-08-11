@@ -33,6 +33,13 @@ warmups, 30 samples, and exact token 14. Keep the historical starting baseline
 for attribution, but compare new end-to-end milestones against this current
 record.
 
+At context 128, the accepted workload-shape record is 21.530111 ms after
+contiguous four-row attention. The strict comparison target remains 5.414155
+ms, ten percent below vLLM's 6.015728-ms median and below SGLang's
+6.589777-ms ten-percent target. Context-128 prefix rows are deterministic
+resident test data, so this record is a shape/performance gate rather than
+prompt-semantic parity.
+
 ## Phase 1: task kernels
 
 1. Rank tasks by end-to-end contribution, then run shape- and math-matched
@@ -47,6 +54,12 @@ record.
    measured adjacent-task traffic. Keep global addresses out of compute.
 5. Accept only correctness-preserving task wins that improve the containing
    layer or full token; commit each independent valid milestone.
+
+For contexts at which CSA selects every compressed row, treat the selected set
+as contiguous even if top-k permutes its order. Group four 512-wide rows into
+one fixed-address TMA and use a compact memory repeat. Do not apply this path
+once `compressed_selected < compressed_rows`; retain indexed LDU selection for
+that shape.
 
 ## Phase 2: overlap
 

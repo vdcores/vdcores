@@ -47,6 +47,7 @@ from dae.schedule import (
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
+    SchedDsv4ContiguousAttention512Block4,
     SchedDsv4SwiGluShard128,
     SchedDsv4TopK512,
     SchedFp8Block128Gemv,
@@ -127,14 +128,16 @@ class ResidentOneLaunchDecode:
 
     def _load_checkpoint(self) -> DeepSeekV4ResidentCheckpoint:
         disk = DeepSeekV4Checkpoint(self.args.checkpoint, self.config)
+        resident_layer_ids = (
+            (self.args.single_layer_id,)
+            if self.args.layers == 1
+            else tuple(range(self.args.layers))
+        )
         names = None
         if self.args.layers != self.config.num_layers:
-            layer_ids = (
-                (self.args.single_layer_id,)
-                if self.args.layers == 1
-                else tuple(range(self.args.layers))
+            prefix = tuple(
+                f"layers.{layer_id}." for layer_id in resident_layer_ids
             )
-            prefix = tuple(f"layers.{layer_id}." for layer_id in layer_ids)
             names = tuple(
                 name
                 for name in expected_inference_tensor_specs(self.config)
@@ -165,7 +168,7 @@ class ResidentOneLaunchDecode:
             native_fp8_prefixes=(
                 tuple(
                     prefix
-                    for layer_id in range(self.args.layers)
+                    for layer_id in resident_layer_ids
                     for prefix in (
                         f"layers.{layer_id}.attn.wq_b",
                         *(
@@ -1199,13 +1202,34 @@ class ResidentOneLaunchDecode:
                 )
 
         sinks = self._family_tensors(family, "attn.attn_sink")
-        sparse = SchedDsv4SparseAttention512(
-            self.q_rope,
-            self.attention_cache[kind],
-            self.attention_indices_by_kind[kind],
-            sinks[0],
-            self.attention_output,
+        attention_rows = self.attention_indices_by_kind[kind].numel()
+        use_contiguous_attention = (
+            self.args.attention_mode == "contiguous"
+            or (
+                self.args.attention_mode == "auto"
+                and attention_rows >= 16
+            )
         )
+        if use_contiguous_attention:
+            if plan.compressed_selected != plan.compressed_rows:
+                raise ValueError(
+                    "contiguous attention requires the complete compressed cache"
+                )
+            sparse = SchedDsv4ContiguousAttention512Block4(
+                self.q_rope,
+                self.attention_cache[kind],
+                attention_rows,
+                sinks[0],
+                self.attention_output,
+            )
+        else:
+            sparse = SchedDsv4SparseAttention512(
+                self.q_rope,
+                self.attention_cache[kind],
+                self.attention_indices_by_kind[kind],
+                sinks[0],
+                self.attention_output,
+            )
         sparse = self._layered(sparse, family, sinks)
         stages.append(
             self._stage(
@@ -1982,6 +2006,7 @@ class ResidentOneLaunchDecode:
             f"model_launches=1 layers={self.args.layers} "
             f"context={self.args.context_length} "
             f"position={self.decode_position} "
+            f"attention={self.args.attention_mode} "
             f"prefix_cache={'current_token' if self.args.context_length == 1 else 'deterministic_seeded'} "
             f"logical_stages={logical_stages} queue_stages={queue_stages} "
             f"barriers={len(self.program.barriers)} "
@@ -2333,6 +2358,12 @@ def main() -> None:
         help="select the q_b kernel for matched end-to-end A/B profiling",
     )
     parser.add_argument(
+        "--attention-mode",
+        choices=("auto", "contiguous", "scalar"),
+        default="auto",
+        help="select the sparse-attention compute mechanism for matched A/B profiling",
+    )
+    parser.add_argument(
         "--profile-layers",
         action="store_true",
         help="record compact per-layer LDU globaltimer frontiers",
@@ -2450,6 +2481,7 @@ def main() -> None:
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "
         f"layers={args.layers} token_id={args.token_id} "
         f"context={args.context_length} position={args.context_length - 1} "
+        f"attention={args.attention_mode} "
         f"prefix_cache={'current_token' if args.context_length == 1 else 'deterministic_seeded'} "
         f"vocab={args.vocab_size} output_token={reference_token} "
         f"build_s={build_seconds:.3f} min_ms={min(timings):.6f} "

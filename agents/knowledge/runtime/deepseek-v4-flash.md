@@ -1330,3 +1330,50 @@ representative SWA/CSA/HCA stage and memory/compute idle counters. In
 particular, replace the serial ratio-128 pool and row-at-a-time sparse
 attention with board-competitive mechanisms before changing narrow runtime
 parameters.
+
+## Context-128 contiguous-attention traffic milestone (2026-08-11)
+
+At positions through 127, CSA's compressed cache has at most 32 rows while the
+selection cap is 512. SWA, HCA, and CSA therefore all attend the complete
+contiguous candidate cache; top-k may permute CSA rows, but softmax attention
+is invariant to that permutation. The resident schedule now proves
+`compressed_selected == compressed_rows` before selecting its contiguous
+path. Longer shapes retain the indexed task.
+
+A coarse 1/4/8/16-row screen selected 16 rows as the automatic crossover:
+scalar wins at one and four rows, the two paths tie at eight, and grouped
+traffic is clearly ahead by 16. This keeps the position-zero path on scalar
+attention without tuning a narrow threshold.
+Full context-one regression job `20260811T164157Z-807590` emitted reference
+token 14 and measured an 11.045088-ms median across five samples.
+
+The accepted task uses four compute warps for four row scores, evaluates four
+online-softmax updates together, and transfers the four adjacent BF16 KV rows
+with one 4-KiB fixed-address TMA. A memory `RepeatM` advances by four rows, so
+the layer family keeps a compact queue instead of unrolling row loads. Compute
+receives only allocator-owned slot masks; it has no index or global pointer,
+copy stage, issue barrier, joint memory/compute barrier, or thread fence.
+
+On one allocator-managed `.24` GB200, task job
+`20260811T163112Z-683642` measured scalar/contiguous medians of
+100.032/64.224 us at 128 rows, 106.624/65.344 us at 129 rows, and
+124.000/78.656 us at 160 rows. All outputs passed the independent BF16
+reference. The corresponding matched Triton medians are 26.263, 29.354, and
+32.582 us, so a 2.2--2.4x task gap remains.
+
+The representative CSA stage gate (`20260811T163146Z-690318`) passed and put
+the 160-row attention boundary at roughly 78.5 us. The complete tracked job
+`20260811T163220Z-696275` used one GPU, one launch, three warmups, and five
+samples; it emitted stable token 5 and measured
+21.463552/21.530111/22.030048 ms min/median/max. The same-build scalar control
+`20260811T163416Z-718238` measured a 27.485537-ms median, so grouped contiguous
+traffic saves 5.955426 ms (21.7%). Relative to the original 30.149376-ms shape
+gate, the cumulative reduction is 28.6%.
+
+The selected 31-op tracked image uses 80 registers, nine barriers, a 208-byte
+stack, 2,448 bytes of static shared memory, and no spills. Representative full
+token counters still show 74--75% compute m2c wait, 75--77% LDU dependency
+wait, and 76--77% allocator slot stall after normalization to the SM-grid
+envelope. Those large independent idle fractions prioritize dependency and
+placement mechanisms over narrow softmax tuning. The strict 5.414155-ms target
+is not yet met.
