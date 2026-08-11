@@ -337,6 +337,18 @@ class Dsv4Nvfp4Quant16(ComputeInstruction):
         super().__init__(opcode=opcode.OP_DSV4_NVFP4_QUANT_16, args=[k])
 
 
+class Dsv4Nvfp4QuantUmmaBSm100(ComputeInstruction):
+    """Quantize K256 tiles directly into the native N8 UMMA B layout."""
+
+    def __init__(self, k_tiles: int):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("DeepSeek native NVFP4 K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_NVFP4_QUANT_UMMA_B_SM100,
+            args=[k_tiles],
+        )
+
+
 class Gemv_M64N8K64(ComputeInstruction):
     MNK = (64, 8, 64)
     n_batch = 1
@@ -1903,6 +1915,7 @@ __all__ = [
     "Dsv4HcHead",
     "Dsv4Fp8Quant128",
     "Dsv4Nvfp4Quant16",
+    "Dsv4Nvfp4QuantUmmaBSm100",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",

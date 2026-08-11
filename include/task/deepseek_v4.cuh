@@ -15,6 +15,14 @@ __device__ __forceinline__ float dsv4_softplus(float value) {
   return fmaxf(value, 0.0f) + log1pf(__expf(-fabsf(value)));
 }
 
+__device__ __forceinline__ float dsv4_div_rn(
+    float numerator, float denominator) {
+  float result;
+  asm volatile("div.rn.f32 %0, %1, %2;"
+               : "=f"(result) : "f"(numerator), "f"(denominator));
+  return result;
+}
+
 __device__ __forceinline__ float dsv4_ceil_e4m3(float value) {
   value = fminf(fmaxf(value, 0x1p-9f), 448.0f);
   if (value < 0x1p-6f) {
@@ -139,7 +147,7 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
   const unsigned block_mask =
       0xFFU << (warp_lane & ~(kThreadsPerBlock - 1));
   const float model_scale = global_scale[0];
-  auto *inverse_scales = static_cast<float *>(task_scratch);
+  auto *quant_denominators = static_cast<float *>(task_scratch);
   const auto *input_pairs =
       reinterpret_cast<const __nv_bfloat162 *>(input);
 
@@ -156,14 +164,16 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
     }
     if (block_lane == 0) {
       const float block_scale =
-          dsv4_ceil_e4m3(maximum / (6.0f * model_scale));
+          dsv4_ceil_e4m3(dsv4_div_rn(maximum, 6.0f * model_scale));
       scales[block] = Scale(block_scale);
-      inverse_scales[block_group] = 1.0f / (block_scale * model_scale);
+      quant_denominators[block_group] = block_scale * model_scale;
     }
     __syncwarp(block_mask);
-    const float inverse_scale = inverse_scales[block_group];
-    const uint8_t low = dsv4_nearest_fp4(values.x * inverse_scale);
-    const uint8_t high = dsv4_nearest_fp4(values.y * inverse_scale);
+    const float quant_denominator = quant_denominators[block_group];
+    const uint8_t low = dsv4_nearest_fp4(
+        dsv4_div_rn(values.x, quant_denominator));
+    const uint8_t high = dsv4_nearest_fp4(
+        dsv4_div_rn(values.y, quant_denominator));
     output[block * 8 + block_lane] = low | (high << 4);
   }
   __sync_compute_group(128);

@@ -151,6 +151,15 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_UMMA_PREPACK_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_NVFP4_QUANT_UMMA_B_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_nvfp4_quant_umma_b_sm100(
+      inst.args[0], smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);

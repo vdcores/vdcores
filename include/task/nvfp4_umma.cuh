@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.cuh"
+#include "deepseek_v4.cuh"
 #include "type.cuh"
 #include "virtualcore.cuh"
 
@@ -450,6 +451,125 @@ __device__ __forceinline__ void task_nvfp4_umma_prepack_sm100(
     c2m.push(tid, data_slots | scale_slots);
     c2m.template push<0, true>(tid, output_slots);
   }
+}
+
+// Quantize token-dependent BF16 activations directly into the combined native
+// N8/K256 UMMA B layout. This avoids materializing raw packed data/scales and
+// then copying them through a separate preprocessing stage.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_nvfp4_quant_umma_b_sm100(
+    int num_k_tiles,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using namespace cute;
+  using Fp4 = cutlass::float_e2m1_t;
+  using Scale = cutlass::float_ue4m3_t;
+  using Accum = float;
+
+  constexpr int kTileM = 128;
+  constexpr int kTileN = 8;
+  constexpr int kTileK = 256;
+  constexpr int kScaleVector = 16;
+  using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+  using Atom = SM100_MMA_MXF4_SS<
+      Fp4, Fp4, Accum, Scale,
+      kTileM, kTileN, kScaleVector,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+
+  using LayoutSFB = decltype(
+      ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+  using ScaleProblemShape = Shape<Int<kTileM>, Int<128>, Int<kTileK>>;
+  const auto logical_sfb =
+      ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
+
+  constexpr int kAlignment = 128;
+  constexpr int kBBytes = kTileN * kTileK / 2;
+  constexpr int kBStorageBytes =
+      (kBBytes + kAlignment - 1) & -kAlignment;
+  constexpr int kSFBBytes = cosize_v<LayoutSFB>;
+  static_assert(kBStorageBytes + kSFBBytes == 3072);
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int global_scale_slots = m2c.template pop<0>();
+  const auto *global_scale = static_cast<const float *>(
+      get_slot_address(smem_base, extract(global_scale_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<uint8_t *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  constexpr int kThreadsPerBlock = 8;
+  const int tid = __compute_tid();
+  const int block_lane = tid & (kThreadsPerBlock - 1);
+  const int block_group = tid / kThreadsPerBlock;
+  const int warp_lane = tid & 31;
+  const unsigned block_mask =
+      0xFFU << (warp_lane & ~(kThreadsPerBlock - 1));
+  const float model_scale = global_scale[0];
+  auto *quant_denominators = static_cast<float *>(task_scratch);
+  const auto *input_pairs =
+      reinterpret_cast<const __nv_bfloat162 *>(input);
+
+  for (int tile = 0; tile < num_k_tiles; ++tile) {
+    auto *tile_output = output + tile * (kBStorageBytes + kSFBBytes);
+    auto *packed_scale = reinterpret_cast<Scale *>(
+        tile_output + kBStorageBytes);
+    for (int offset = tid; offset < kSFBBytes; offset += 128) {
+      tile_output[kBStorageBytes + offset] = 0;
+    }
+    __sync_compute_group(128);
+
+    const int block = block_group;
+    const __nv_bfloat162 pair = input_pairs[
+        tile * (kTileK / 2) + block * (kScaleVector / 2) + block_lane];
+    const float2 values = __bfloat1622float2(pair);
+    float maximum = fmaxf(fabsf(values.x), fabsf(values.y));
+    for (int offset = kThreadsPerBlock / 2; offset > 0; offset >>= 1) {
+      maximum = fmaxf(
+          maximum,
+          __shfl_down_sync(
+              block_mask, maximum, offset, kThreadsPerBlock));
+    }
+    if (block_lane == 0) {
+      const float block_scale =
+          dsv4_ceil_e4m3(dsv4_div_rn(maximum, 6.0f * model_scale));
+      quant_denominators[block_group] = block_scale * model_scale;
+      for (int row = 0; row < kTileN; ++row) {
+        const int dst = int(logical_sfb(row, block * kScaleVector));
+        packed_scale[dst] = Scale(block_scale);
+      }
+    }
+    __syncwarp(block_mask);
+
+    const float quant_denominator = quant_denominators[block_group];
+    const uint8_t low = dsv4_nearest_fp4(
+        dsv4_div_rn(values.x, quant_denominator));
+    const uint8_t high = dsv4_nearest_fp4(
+        dsv4_div_rn(values.y, quant_denominator));
+    const uint8_t packed = low | (high << 4);
+    // TMA's 128-byte swizzle treats each row as eight 16-byte chunks.
+    // Physical destination chunk d receives logical source chunk d xor row.
+    // Invert that relation here while each 8-thread group owns one 8-byte
+    // half-chunk of freshly quantized packed values.
+    const int source_chunk = block / 2;
+    const int half = block & 1;
+    for (int row = 0; row < kTileN; ++row) {
+      const int destination_chunk = source_chunk ^ row;
+      const int destination =
+          row * (kTileK / 2) + destination_chunk * 16 +
+          half * kThreadsPerBlock + block_lane;
+      tile_output[destination] = packed;
+    }
+    __sync_compute_group(128);
+  }
+
+  c2m.push(tid, input_slots | global_scale_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
 }
 
 // Performance-oriented native path. LDU places prepacked data and scale bytes

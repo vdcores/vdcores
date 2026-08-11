@@ -631,6 +631,57 @@ class SchedNvfp4UmmaPrepack(Schedule):
         return instructions
 
 
+class SchedDsv4Nvfp4QuantUmmaB(Schedule):
+    """Emit native N8/K256 FP4 data and scales without an intermediate copy."""
+
+    TILE_K = SchedNvfp4UmmaPrepack.TILE_K
+    TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(self, input, global_scale, output):
+        super().__init__()
+        self.input = input
+        self.global_scale = global_scale
+        self.output = output
+
+    def _on_place(self):
+        if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
+            raise ValueError("native NVFP4 quant input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % self.TILE_K:
+            raise ValueError("native NVFP4 quant K must be K256 aligned")
+        self.k_tiles = self.k // self.TILE_K
+        if self.num_sms != self.k_tiles:
+            raise ValueError("native NVFP4 quant requires one SM per K256 tile")
+        if self.global_scale.dtype != torch.float32 or self.global_scale.numel() != 1:
+            raise ValueError("native NVFP4 global scale must be scalar FP32")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                f"native NVFP4 output must be uint8 [{self.k_tiles},{self.TILE_BYTES}]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        start = sm * self.TILE_K
+        return [
+            Dsv4Nvfp4QuantUmmaBSm100(1),
+            _shared_load_1d(self.input[start : start + self.TILE_K]),
+            _shared_load_1d(self.global_scale.reshape(-1)),
+            _shared_store_1d(self.output[sm].reshape(-1)).bar(
+                self._bar("output")
+            ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedNvfp4GemvUmmaStream(Schedule):
     """One M128 output tile with combined data/scale K256 operand loads."""
 

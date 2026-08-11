@@ -14,6 +14,7 @@ from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
 from dae.schedule import (
+    SchedDsv4Nvfp4QuantUmmaB,
     SchedNvfp4Gemv,
     SchedNvfp4GemvUmma,
     SchedNvfp4GemvUmmaStream,
@@ -48,6 +49,14 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--native-activation-quant",
+        action="store_true",
+        help=(
+            "emit token-dependent activation data/scales directly in the "
+            "combined native UMMA layout and verify it against setup prepack"
+        ),
+    )
     parser.add_argument("--trace-stages", action="store_true")
     parser.add_argument(
         "--diagnostic",
@@ -87,6 +96,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.routed_tiles and args.implementation != "cuda":
         parser.error("--routed-tiles currently supports only --implementation cuda")
+    if args.native_activation_quant and args.implementation != "umma_stream":
+        parser.error("--native-activation-quant requires --implementation umma_stream")
+    if args.native_activation_quant and (
+        args.indexed_activation
+        or args.block_indexed_activation
+        or args.indexed_scales
+    ):
+        parser.error("native activation quant requires an unmodified BF16 source")
 
     def stage(name: str) -> None:
         if args.trace_stages:
@@ -351,6 +368,107 @@ def main() -> None:
             activation_prepack_launcher.launch()
             torch.cuda.synchronize()
             stage(f"native_prepack_complete_{num_sms}")
+
+            if args.native_activation_quant:
+                prepacked_activation = packed_activation
+                packed_activation = torch.empty_like(prepacked_activation)
+                native_quant_launcher = Launcher(k_tiles, device=device)
+                native_quant_schedule = SchedDsv4Nvfp4QuantUmmaB(
+                    input_source,
+                    input_scale.reshape(-1),
+                    packed_activation,
+                ).place(k_tiles)
+                native_quant_launcher.s(
+                    ProfileEvent(2),
+                    native_quant_schedule,
+                    ProfileEvent(3),
+                )
+                native_quant_launcher.launch()
+                torch.cuda.synchronize()
+                if not torch.equal(packed_activation, prepacked_activation):
+                    mismatch = packed_activation != prepacked_activation
+                    data_mismatch = mismatch[:, :1024].sum().item()
+                    scale_mismatch = mismatch[:, 1024:].sum().item()
+                    first = mismatch.nonzero()[0]
+                    tile_index, byte_index = (int(value) for value in first)
+                    scale_indices = mismatch[:, 1024:].nonzero()
+                    if scale_indices.numel():
+                        scale_tile, scale_offset = (
+                            int(value) for value in scale_indices[0]
+                        )
+                        scale_byte = scale_offset + 1024
+                        scale_detail = (
+                            f"{scale_tile}:{scale_byte}:"
+                            f"{int(packed_activation[scale_tile, scale_byte])}:"
+                            f"{int(prepacked_activation[scale_tile, scale_byte])}"
+                        )
+                    else:
+                        scale_detail = "none"
+                    print(
+                        "DSV4_NVFP4_NATIVE_LAYOUT_MISMATCH "
+                        f"data_bytes={data_mismatch} "
+                        f"scale_bytes={scale_mismatch} "
+                        f"per_tile={mismatch.sum(dim=1).cpu().tolist()} "
+                        f"first={tile_index}:{byte_index} "
+                        f"actual={int(packed_activation[tile_index, byte_index])} "
+                        f"expected={int(prepacked_activation[tile_index, byte_index])} "
+                        f"scale_first_actual_expected={scale_detail}",
+                        flush=True,
+                    )
+                    if args.k == 256:
+                        source_chunks = activation.reshape(8, 16).cpu()
+
+                        def chunk_map(tensor):
+                            chunks = tensor[0, :1024].reshape(64, 16).cpu()
+                            return [
+                                next(
+                                    (
+                                        index
+                                        for index in range(8)
+                                        if torch.equal(chunk, source_chunks[index])
+                                    ),
+                                    -1,
+                                )
+                                for chunk in chunks
+                            ]
+
+                        print(
+                            "DSV4_NVFP4_NATIVE_CHUNK_MAP "
+                            f"actual={chunk_map(packed_activation)} "
+                            f"expected={chunk_map(prepacked_activation)}",
+                            flush=True,
+                        )
+                torch.testing.assert_close(
+                    packed_activation,
+                    prepacked_activation,
+                    rtol=0,
+                    atol=0,
+                )
+                for _ in range(args.warmup):
+                    native_quant_launcher.launch()
+                torch.cuda.synchronize()
+                native_quant_timings = []
+                for _ in range(args.iterations):
+                    native_quant_launcher.launch()
+                    native_profile = (
+                        native_quant_launcher.profile[:, :4].cpu().numpy()
+                    )
+                    native_quant_timings.append(
+                        (
+                            native_profile[:, 3].max()
+                            - native_profile[:, 2].min()
+                        )
+                        / 1.0e3
+                    )
+                print(
+                    "DSV4_NVFP4_QUANT_UMMA_RESULT "
+                    f"shape=1x{args.k} sms={k_tiles} "
+                    f"task_min_us={min(native_quant_timings):.6f} "
+                    f"task_median_us={statistics.median(native_quant_timings):.6f} "
+                    f"task_max_us={max(native_quant_timings):.6f} "
+                    "layout_exact=true",
+                    flush=True,
+                )
 
             schedule = SchedNvfp4GemvUmmaStream(
                 packed_weight,

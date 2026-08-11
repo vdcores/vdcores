@@ -12,6 +12,7 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     ComputeInstruction,
     Copy,
+    Dsv4Nvfp4QuantUmmaBSm100,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     Gemv_M128N8_ROPE_128,
@@ -365,6 +366,12 @@ def test_nvfp4_umma_prepack_encodes_kind_and_k_tile_count():
     )
 
     assert instruction.args == [1, 16]
+
+
+def test_dsv4_nvfp4_native_quant_encodes_k_tile_count():
+    instruction = Dsv4Nvfp4QuantUmmaBSm100(1)
+
+    assert instruction.args == [1]
 
 
 def test_sequential_program_elides_only_same_placement_independent_edge():

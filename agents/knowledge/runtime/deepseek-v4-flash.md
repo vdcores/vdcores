@@ -747,6 +747,25 @@ concurrently, while W2 has 192 tiles and cannot assign one tile to every SM at
 once on a 152-SM GPU. Do those structural integrations and measure the complete
 routed-expert group before further UMMA instruction tuning.
 
+The token-dependent activation gap is now closed at the task boundary. A new
+quantizer consumes BF16 plus the selected expert's scalar input scale and emits
+the final 3,072-byte N8/K256 native tile directly. Quantized FP4 bytes follow
+Blackwell's 128-byte TMA XOR swizzle and scale bytes are written in the native
+SFB layout; there is no raw FP4/scale output and no layout-copy stage. Precise
+round-to-nearest division makes its result byte-exact to the independent
+ModelOpt reference, including scale-boundary cases that fast reciprocal
+multiplication rounded differently.
+
+Job `20260811T081132Z-3810639` measured the K4096 quantizer at 2.880 us on 16
+shape-derived K256 SMs, versus the previous raw-layout 3.680 us task baseline,
+and its following M2048/K4096 GEMV measured 15.728 us. Job
+`20260811T081156Z-3813722` measured K2048 quantization at 2.752 us on eight SMs
+and M4096/K2048 GEMV at 8.768 us. Both native layouts and final GEMV outputs
+were exact. The selective image uses 48 registers, nine barriers, an 80-byte
+stack frame, and no spills; 82 focused tests pass. Routed scale lookup,
+top-six wave placement, resident weight replacement, and complete-group TBT
+remain the next acceptance boundary.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median
