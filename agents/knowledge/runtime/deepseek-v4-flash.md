@@ -343,6 +343,21 @@ The one-layer checkpoint median improved from 0.557 to 0.517 ms. Full job
 1,197/4,052 instructions while dependency counters fell from 612 to 555. This
 is a 1.601 ms (4.7%) complete-token improvement over the 33.731 ms boundary.
 
+The post-DAG repeated-layer profile, job `20260811T013645Z-2313767`, ran six
+tracked tokens in 31.230--31.831 ms. Layer, reload, and head spans were
+27.054--27.621, 2.546--2.625, and 1.436--1.494 ms. CSA stayed near
+0.49--0.51 ms throughout. HCA moved from about 0.50--0.55 ms on its first body
+to a mostly stable 0.81--0.83 ms mode, with occasional 0.64--0.66 ms bodies;
+it no longer grew monotonically with loop position.
+
+All samples executed exactly 2,191,707 allocator instructions,
+1,110,248/1,101,523 LDU commands, and 538,195 stores. Inferred SM clocks stayed
+near 2.05 GHz and layer-frontier spreads remained below one microsecond. This
+confirms that the original progressive slowdown was queue/allocator
+backpressure rather than host, thermal, clock, or fixed-physical-SM overhead.
+The remaining system-level targets are the repeatable HCA mode and roughly
+2.6 ms of loop dependency reloads.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
