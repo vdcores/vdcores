@@ -59,6 +59,9 @@ The target is 16 ms.
 
 1. Capture per-layer frontier, barrier reload, allocator, LDU0/LDU1, STU, and
    compute-wait counters for repeated 43-layer samples.
+   Add `--profile-layers --profile-all-samples` to report every sample rather
+   than only the median sample; each report includes exact command counts and
+   counter time normalized to the SM-grid envelope.
 2. Compare identical-shape family iterations and correlate the first
    divergence with loop counters, barrier-bank reuse, pointer-table position,
    instruction working set, cache state, and GPU clocks/thermals.

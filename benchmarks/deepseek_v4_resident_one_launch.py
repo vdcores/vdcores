@@ -1404,6 +1404,42 @@ class ResidentOneLaunchDecode:
         if head_elapsed < 0:
             raise RuntimeError("head profile frontier precedes the final layer")
         internal_span = end_frontier - start_frontier
+        grid_envelope = internal_span * profile.shape[0]
+        counter_base = runtime_config.track_profile_event_base
+
+        def grid_percent(offset: int) -> float:
+            if grid_envelope <= 0:
+                return 0.0
+            return 100.0 * sum(
+                int(value) for value in profile[:, counter_base + offset]
+            ) / grid_envelope
+
+        def counter_sum(offset: int) -> int:
+            return sum(int(value) for value in profile[:, counter_base + offset])
+
+        print(
+            "DSV4_TRACK_PROFILE_SAMPLE "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f} "
+            f"internal_span_ms={internal_span / 1.0e6:.6f} "
+            f"compute_m2c_wait_grid_pct={grid_percent(0):.3f} "
+            f"allocator_slot_stall_grid_pct={grid_percent(3):.3f} "
+            f"ldu0_queue_wait_grid_pct={grid_percent(9):.3f} "
+            f"ldu0_dependency_wait_grid_pct={grid_percent(11):.3f} "
+            f"ldu1_queue_wait_grid_pct={grid_percent(14):.3f} "
+            f"ldu1_dependency_wait_grid_pct={grid_percent(16):.3f} "
+            f"store_queue_wait_grid_pct={grid_percent(19):.3f} "
+            f"store_service_grid_pct={grid_percent(21):.3f} "
+            f"allocator_instructions={counter_sum(8)} "
+            f"ldu0_commands={counter_sum(13)} "
+            f"ldu1_commands={counter_sum(18)} "
+            f"store_commands={counter_sum(23)} "
+            f"compute_m2c_contended={counter_sum(2)} "
+            f"allocator_slot_stall_events={counter_sum(4)} "
+            f"ldu0_dependency_contended={counter_sum(12)} "
+            f"ldu1_dependency_contended={counter_sum(17)}",
+            flush=True,
+        )
         print(
             "DSV4_LAYER_PROFILE_SUMMARY "
             f"layers={self.args.layers} layer_total_ms={layer_total / 1.0e6:.6f} "
@@ -1432,6 +1468,11 @@ def main() -> None:
         action="store_true",
         help="record compact per-layer LDU globaltimer frontiers",
     )
+    parser.add_argument(
+        "--profile-all-samples",
+        action="store_true",
+        help="report layer frontiers and aggregate counters for every sample",
+    )
     args = parser.parse_args()
     cfg = DeepSeekV4FlashConfig()
     if not 0 <= args.token_id < cfg.vocab_size:
@@ -1442,6 +1483,8 @@ def main() -> None:
         parser.error("sms/iterations must be positive and warmup non-negative")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
+    if args.profile_all_samples and not args.profile_layers:
+        parser.error("--profile-all-samples requires --profile-layers")
 
     device = torch.device("cuda")
     build_started = time.monotonic()
@@ -1496,11 +1539,17 @@ def main() -> None:
             range(len(timings)),
             key=lambda index: abs(timings[index] - median_timing),
         )
-        flow.report_layer_profile(
-            profile_samples[profile_index],
-            sample_index=profile_index,
-            sample_cuda_ms=timings[profile_index],
+        profile_indices = (
+            range(len(profile_samples))
+            if args.profile_all_samples
+            else (profile_index,)
         )
+        for sample_index in profile_indices:
+            flow.report_layer_profile(
+                profile_samples[sample_index],
+                sample_index=sample_index,
+                sample_cuda_ms=timings[sample_index],
+            )
     print(
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "
         f"layers={args.layers} token_id={args.token_id} "

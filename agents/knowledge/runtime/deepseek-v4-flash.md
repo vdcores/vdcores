@@ -239,6 +239,34 @@ dependency admission. Later adaptive fusion may retain compatible producer
 tiles in allocator-owned shared slots through `LoadReg`/`StoreReg`-style task
 handoffs instead of forcing an STU-to-HBM-to-LDU round trip.
 
+## Repeated-token variance diagnosis
+
+The full-token path has a second structural problem that is large enough to
+mask task-kernel A/B results. In one no-track baseline run, five identical
+samples were 47.752, 86.907, 47.233, 47.077, and 84.758 ms. A longer tracked
+run produced 69.296--75.781 ms samples, while a 120-sample run again separated
+into a fast mode near 45.5 ms and a common slow mode near 81--86 ms. Output
+token 14 remained stable.
+
+`--profile-all-samples` extends the resident benchmark to retain and report
+all per-layer frontier rows and aggregate counters. The tracked samples did
+the same amount of work: 2,455,899 allocator instructions, 2,465,931 LDU0
+commands, 10,032 LDU1 commands, and 670,291 stores per token. Reloads stayed
+near 0.14 ms per repeated pair. The slowdown instead appears inside nominally
+identical layer bodies, frequently in almost exact 0.524288 ms increments;
+later HCA/CSA layers commonly land near 1.96/2.10 ms after the first pair is
+near 0.75/0.78 ms.
+
+This evidence rules out growing instruction counts and an indirect-layer
+counter leak. The leading runtime hypothesis is delayed cross-SM visibility
+in the LDU dependency poll: STU releases a global barrier with `atomicSub`, but
+LDU currently polls the same word through an ordinary volatile load. Test an
+L2-coherent LDU load or atomic observation before attributing the effect to
+kernel math. The assigned GPU was otherwise process-isolated, although the
+other three GPUs on its GB200 module were occupied and cumulative hardware
+power-brake time was present, so clock/power telemetry remains a secondary
+control.
+
 ## Performance target and optimization phases
 
 The performance target is 16 ms TBT for the complete 43-layer network plus
