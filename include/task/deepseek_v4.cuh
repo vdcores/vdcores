@@ -345,6 +345,15 @@ __device__ __forceinline__ void task_dsv4_sparse_attention_512(
 // Select DeepSeek's top-6 routed experts from 256 gate logits.  Hash layers
 // provide the six expert ids directly but still use the transformed scores as
 // routing weights.
+__device__ __forceinline__ bool dsv4_route_score_better(
+    float candidate_score,
+    int candidate_expert,
+    float current_score,
+    int current_expert) {
+  return candidate_score > current_score ||
+      (candidate_score == current_score && candidate_expert < current_expert);
+}
+
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_route_top6(
     bool hash_routing,
@@ -380,6 +389,9 @@ __device__ __forceinline__ void task_dsv4_route_top6(
   const int tid = __compute_tid();
   auto *original_scores = static_cast<float *>(task_scratch);
   auto *selection_scores = original_scores + kExperts;
+  auto *warp_scores = selection_scores + kExperts;
+  auto *warp_indices = reinterpret_cast<int *>(warp_scores + 4);
+  auto *selected_indices = warp_indices + 4;
   for (int expert = tid; expert < kExperts; expert += 128) {
     const float transformed =
         sqrtf(dsv4_softplus(__bfloat162float(logits[expert])));
@@ -388,48 +400,87 @@ __device__ __forceinline__ void task_dsv4_route_top6(
   }
   __sync_compute_group(128);
 
-  if (tid == 0) {
-    int selected_indices[kTopK];
-    if (hash_routing) {
-#pragma unroll
+  if (hash_routing) {
+    if (tid == 0) {
       for (int rank = 0; rank < kTopK; ++rank) {
         selected_indices[rank] = hash_indices[rank];
       }
-    } else {
-      float selected_scores[kTopK];
-#pragma unroll
-      for (int rank = 0; rank < kTopK; ++rank) {
-        selected_scores[rank] = -__int_as_float(0x7f800000);
-        selected_indices[rank] = -1;
+    }
+  } else {
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    int first_expert = tid;
+    int second_expert = tid + 128;
+    float first_score = selection_scores[first_expert];
+    float second_score = selection_scores[second_expert];
+    for (int rank = 0; rank < kTopK; ++rank) {
+      float best_score = first_score;
+      int best_expert = first_expert;
+      if (dsv4_route_score_better(
+              second_score, second_expert, best_score, best_expert)) {
+        best_score = second_score;
+        best_expert = second_expert;
       }
-      for (int expert = 0; expert < kExperts; ++expert) {
-        const float candidate = selection_scores[expert];
-        int insert = kTopK;
-#pragma unroll
-        for (int rank = 0; rank < kTopK; ++rank) {
-          if (candidate > selected_scores[rank]) {
-            insert = rank;
-            break;
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        const float candidate_score = __shfl_down_sync(
+            0xFFFFFFFFU, best_score, offset);
+        const int candidate_expert = __shfl_down_sync(
+            0xFFFFFFFFU, best_expert, offset);
+        if (lane + offset < 32 && dsv4_route_score_better(
+                candidate_score,
+                candidate_expert,
+                best_score,
+                best_expert)) {
+          best_score = candidate_score;
+          best_expert = candidate_expert;
+        }
+      }
+      if (lane == 0) {
+        warp_scores[warp] = best_score;
+        warp_indices[warp] = best_expert;
+      }
+      __sync_compute_group(128);
+
+      if (warp == 0) {
+        best_score = lane < 4
+            ? warp_scores[lane]
+            : -__int_as_float(0x7f800000);
+        best_expert = lane < 4 ? warp_indices[lane] : 0x7fffffff;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          const float candidate_score = __shfl_down_sync(
+              0xFFFFFFFFU, best_score, offset);
+          const int candidate_expert = __shfl_down_sync(
+              0xFFFFFFFFU, best_expert, offset);
+          if (lane + offset < 32 && dsv4_route_score_better(
+                  candidate_score,
+                  candidate_expert,
+                  best_score,
+                  best_expert)) {
+            best_score = candidate_score;
+            best_expert = candidate_expert;
           }
         }
-        if (insert < kTopK) {
-          for (int rank = kTopK - 1; rank > insert; --rank) {
-            selected_scores[rank] = selected_scores[rank - 1];
-            selected_indices[rank] = selected_indices[rank - 1];
-          }
-          selected_scores[insert] = candidate;
-          selected_indices[insert] = expert;
+        if (lane == 0) {
+          selected_indices[rank] = best_expert;
         }
+      }
+      __sync_compute_group(128);
+      const int selected = selected_indices[rank];
+      if (first_expert == selected) {
+        first_score = -__int_as_float(0x7f800000);
+      }
+      if (second_expert == selected) {
+        second_score = -__int_as_float(0x7f800000);
       }
     }
+  }
 
+  if (tid == 0) {
     float weight_sum = 0.0f;
-#pragma unroll
     for (int rank = 0; rank < kTopK; ++rank) {
       weight_sum += original_scores[selected_indices[rank]];
     }
     const float normalization = route_scale / weight_sum;
-#pragma unroll
     for (int rank = 0; rank < kTopK; ++rank) {
       output_indices[rank] = selected_indices[rank];
       output_weights[rank] =

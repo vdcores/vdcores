@@ -13,6 +13,7 @@ from dae.instructions import (
     ComputeInstruction,
     Copy,
     Dsv4Nvfp4QuantUmmaBSm100,
+    Dsv4SiluClampMul128,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     Gemv_M128N8_ROPE_128,
@@ -40,8 +41,10 @@ from dae.launcher import Launcher
 from dae.schedule import (
     Schedule,
     SchedAttentionDecoding,
+    SchedDsv4SwiGluShard128,
     SchedRoutedNvfp4GemvUmmaStream,
     SchedSmemSiLUInterleaved,
+    SubgridSchedule,
 )
 from dae.sequential import (
     LoopedSequentialProgram,
@@ -388,6 +391,31 @@ def test_dsv4_nvfp4_native_quant_encodes_k_tile_count():
     assert instruction.args == [1]
 
 
+def test_dsv4_shard_swiglu_encodes_bound_and_width():
+    instruction = Dsv4SiluClampMul128(1, 10.0)
+
+    assert instruction.opcode == opcode.OP_DSV4_SILU_CLAMP_MUL_128
+    assert instruction.args[0] == 1
+
+
+def test_dsv4_shard_swiglu_consumes_port_local_registers(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    instructions = SchedDsv4SwiGluShard128(
+        1,
+        0,
+        1,
+        1,
+        torch.empty((256,), dtype=torch.bfloat16),
+    ).place(2).schedule(0)
+
+    assert instructions[0].opcode == opcode.OP_DSV4_SILU_CLAMP_MUL_128
+    assert instructions[2].size == instructions[3].size == 1
+    assert not instructions[2].opcode & 32
+    assert instructions[3].opcode & 32
+
+
 def test_routed_address_register_load_encodes_fixed_offset():
     instruction = TmaLoadAddressReg1D(0, 18432, 18432)
 
@@ -451,6 +479,20 @@ def test_routed_native_gemv_gates_both_ldu_ports_on_route(monkeypatch):
     assert all(inst.opcode & 16 for inst in routed_loads)
     assert {inst.num_slots >> 6 for inst in routed_loads} == {7}
     assert {bool(inst.opcode & 32) for inst in routed_loads} == {False, True}
+
+
+def test_subgrid_schedule_keeps_shape_placement_inside_global_stage():
+    class Inner(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [ComputeInstruction(0x1234, [sm])]
+
+    placed = SubgridSchedule(Inner(), 2, 3).place(8)
+
+    assert [len(placed(sm)) for sm in range(8)] == [0, 0, 0, 1, 1, 0, 0, 0]
+    assert placed(3)[0].args == [0]
+    assert placed(4)[0].args == [1]
 
 
 def test_sequential_program_elides_only_same_placement_independent_edge():
@@ -1037,7 +1079,8 @@ def test_profile_event_reserves_kernel_start_and_end_slots():
     instruction = ProfileEvent(17)
 
     assert instruction.opcode == opcode.OP_PROFILE_EVENT
-    assert instruction.args == [17]
+    assert instruction.args == [17, 0]
+    assert ProfileEvent(18, wait_for_memory=True).args == [18, 1]
     with pytest.raises(ValueError, match="slots 0/1"):
         ProfileEvent(1)
 

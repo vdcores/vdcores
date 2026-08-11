@@ -797,6 +797,47 @@ pass. This accepts the adaptive-fusion/routed-address primitives. Six-route
 concurrency, resident replacement, and the complete routed-expert span remain
 the next milestone.
 
+The six-route structural proof is now complete in
+`deepseek_v4_nvfp4_top6.py`. All six expert branches occupy disjoint
+shape-derived 25-SM partitions in one VDCores launch. Each branch has its own
+route-to-input-quant-to-W1/W3-to-SwiGLU-to-middle-quant-to-W2 dependency
+chain, so no top-six-wide barrier separates parallel phases; only the final
+weighted reduction joins all branches. W1 and W3 return their M128 shards to
+port-local shared registers, and a same-SM bounded SwiGLU consumes them. Thus
+gate and up vectors never enter HBM. Only the 4-KiB fused middle vector is
+stored for the required 16-producer to 8-quantizer/25-W2-SM repartition.
+
+The first correct flow, job `20260811T084739Z-4104921`, measured 80.736 us.
+Internal counters in job `20260811T085058Z-4132334` showed both LDU ports
+spending about 54% of the grid envelope on dependency waits and STU waiting
+82.8%. Shared shard fusion reduced the non-instrumented median to 73.632 us in
+job `20260811T085921Z-9836`. Profiling then exposed a VDCores runtime bug:
+`RegStore` marked retained slots as no-writeback, but the completion queue
+still sent 192 useless commands through STU. Honoring that marker reduced
+store commands from 627 to 435; the later `RegLoad` consumer remains solely
+responsible for freeing the shared slots.
+
+The remaining critical-path outlier was routing. A serial thread-zero top-six
+scan took 33.664 us, while hash routing isolated score transformation and I/O
+at 4.064 us in job `20260811T091843Z-173370`. The accepted score route keeps
+two candidates per compute thread and performs six bounded block-wide maximum
+reductions with deterministic expert-id tie breaking. It uses compute-group
+synchronization only, no memory-thread barrier, thread fence, or full expert
+unroll. The route phase fell to 7.680 us in job
+`20260811T092200Z-198349`.
+
+The final non-instrumented dynamic-routing run, job
+`20260811T092223Z-204171`, was exact for native activation layouts, all six
+selected expert projections, fused middle values, W2 outputs, route weights,
+and weighted reduction. It measured 45.056/45.536/46.368 us
+min/median/max, with a 46.816-us whole-kernel median and a 9/75 maximum
+compute/memory instruction image. This is 43.6% below the first 80.736-us
+flow. The selective image uses 62 registers, nine barriers, an 80-byte stack,
+and no spills; 88 focused tests pass. If the 35.2-us delta carries through all
+43 checkpoint layers, the prior 15.222-ms network median projects to about
+13.71 ms, but that remains an estimate until native resident weights and the
+layered route opcodes are integrated and re-profiled.
+
 ## Verified GB200 baselines (2026-08-10)
 
 - NVFP4 CUDA, M2048 K4096, 128 SMs: bit-exact BF16 reference; 8.256 us median

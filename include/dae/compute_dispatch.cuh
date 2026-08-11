@@ -248,6 +248,15 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_2048) {
       smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
+             tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, g_events);
+  task_silu_clamp_smem_1D<128>(
+      inst.args[0],
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      smem_base, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HADAMARD) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
@@ -871,11 +880,14 @@ DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
 
 DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
   DAE_UNUSED(pc, count, finish, smem_base, tmem_base_ptr,
-             tmem_mma_barrier, tmem_mma_phase, scratch_space, st_insts, m2c,
-             c2m);
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, st_insts);
   // Diagnostic-only schedule marker.  Synchronize only the four compute
   // warps: the memory warps are independent VM roles and never join this
   // barrier.  Production images do not select this opcode.
+  int dependency_slots = 0;
+  if (inst.args[1] != 0) {
+    dependency_slots = m2c.template pop<0>();
+  }
   __sync_compute_group(128);
   if (thread_id == 0) {
     const int event_id = inst.args[0];
@@ -883,6 +895,9 @@ DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
       g_events[sm_id * numProfileEvents + event_id] =
           cuda::ptx::get_sreg_globaltimer();
     }
+  }
+  if (inst.args[1] != 0) {
+    c2m.push(thread_id, dependency_slots);
   }
 }
 

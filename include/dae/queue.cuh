@@ -149,8 +149,13 @@ struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE,
   __device__ __forceinline__ void push(int tid, int val) {
     if constexpr (writeback) {
       // -1 is the invalid-allocation sentinel.  Do not reject every negative
-      // int: bit 31 is a valid one-hot completion for special raw slot 31.
+      // int: bit 31 alone is a valid one-hot completion for special raw slot
+      // 31. RegStore combines that marker with normal shared-slot bits to
+      // retain the allocation without sending a command through STU.
       if (val == -1)
+        return;
+      const uint32_t bits = static_cast<uint32_t>(val);
+      if ((bits & 0x80000000U) && (bits & 0x7FFFFFFFU))
         return;
 
       if (tid == ThrPush)

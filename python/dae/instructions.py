@@ -278,6 +278,20 @@ class Dsv4SiluClampMul2048(ComputeInstruction):
         )
 
 
+class Dsv4SiluClampMul128(ComputeInstruction):
+    """Apply bounded SwiGLU to one or more retained M128 shards."""
+
+    def __init__(self, num_token: int, limit: float = 10.0):
+        if num_token <= 0 or num_token > 0xFFFF:
+            raise ValueError("DeepSeek shard SwiGLU token count must fit uint16")
+        if limit <= 0:
+            raise ValueError("DeepSeek shard SwiGLU limit must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_SILU_CLAMP_MUL_128,
+            args=[num_token, encode_bfloat16_u16(limit)],
+        )
+
+
 class Dsv4Hadamard(ComputeInstruction):
     def __init__(self, width: int):
         if width not in (128, 512):
@@ -939,13 +953,16 @@ class Copy(ComputeInstruction):
 class ProfileEvent(ComputeInstruction):
     """Record a compute-warpgroup arrival timestamp in the per-SM profile."""
 
-    def __init__(self, event_id: int):
+    def __init__(self, event_id: int, *, wait_for_memory: bool = False):
         if not 2 <= event_id < config.num_profile_events:
             raise ValueError(
                 "profile event id must leave slots 0/1 for kernel start/end "
                 f"and be below {config.num_profile_events}, got {event_id}"
             )
-        super().__init__(opcode=opcode.OP_PROFILE_EVENT, args=[event_id])
+        super().__init__(
+            opcode=opcode.OP_PROFILE_EVENT,
+            args=[event_id, int(wait_for_memory)],
+        )
 
 
 class LoopC(ComputeInstruction):
@@ -1953,6 +1970,7 @@ __all__ = [
     "Dsv4HcPre",
     "Dsv4HcPost",
     "Dsv4SiluClampMul2048",
+    "Dsv4SiluClampMul128",
     "Dsv4Hadamard",
     "Dsv4GatedPool",
     "Dsv4IndexScore",

@@ -865,6 +865,9 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         *,
         route_ready=False,
         activation_mode="load",
+        output_mode="store",
+        output_register=0,
+        output_port=0,
     ):
         super().__init__()
         self.routing_state = routing_state
@@ -879,6 +882,15 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                 "routed native activation_mode must be stream, load, retain, or reuse"
             )
         self.activation_mode = activation_mode
+        if output_mode not in ("store", "retain"):
+            raise ValueError("routed native output_mode must be store or retain")
+        if not 0 <= output_register < 4:
+            raise ValueError("routed native output register must be in [0, 4)")
+        if output_port not in (0, 1):
+            raise ValueError("routed native output port must be 0 or 1")
+        self.output_mode = output_mode
+        self.output_register = output_register
+        self.output_port = output_port
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
@@ -905,11 +917,18 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             if not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
                 raise ValueError("routed native pointer fields must fit in 13 bits")
         self.rows = self.m_tiles * self.TILE_M
-        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
-            raise ValueError("routed native output must contain M BF16 values")
-        if self.activation_mode in ("retain", "reuse") and self.num_sms != self.m_tiles:
+        if self.output_mode == "store":
+            if (
+                self.output is None
+                or self.output.dtype != torch.bfloat16
+                or self.output.numel() != self.rows
+            ):
+                raise ValueError("routed native output must contain M BF16 values")
+        elif self.output is not None:
+            raise ValueError("retained routed native output must not name HBM storage")
+        if self.output_mode == "retain" and self.num_sms != self.m_tiles:
             raise ValueError(
-                "cross-stage retained activation requires one M128 tile per SM"
+                "retained routed output requires one M128 tile per SM"
             )
 
     def _tile_shard(self, sm):
@@ -931,9 +950,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         ):
             first_output = local_index == 0
             final_output = local_index + 1 == tile_count
-            retain = self.activation_mode == "retain" or (
-                self.activation_mode == "load" and not final_output
-            )
+            retain = self.activation_mode == "retain" or not final_output
             bulk = self.activation_mode != "stream"
             instructions.append(
                 Nvfp4GemvUmmaStreamSm100(
@@ -955,7 +972,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             if self.activation_mode == "stream":
                 activation_kind = "stream"
             elif self.activation_mode == "retain":
-                activation_kind = "retain"
+                activation_kind = "retain" if first_output else "reuse"
             elif self.activation_mode == "reuse":
                 activation_kind = "reuse"
             elif first_output:
@@ -998,14 +1015,76 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                             self.activation_tiles[k_tile].reshape(-1)
                         ).fixed_port(1)
                     )
-            row_start = output_tile * self.TILE_M
-            store = TmaStore1D(
-                self.output[row_start : row_start + self.TILE_M]
-            )
-            if final_output:
-                store.bar(self._bar("output"))
+            if self.output_mode == "store":
+                row_start = output_tile * self.TILE_M
+                store = TmaStore1D(
+                    self.output[row_start : row_start + self.TILE_M]
+                )
+                if final_output:
+                    store.bar(self._bar("output"))
+            else:
+                store = RegStore(
+                    self.output_register,
+                    size=self.TILE_M * 2,
+                ).fixed_port(self.output_port)
             instructions.append(store)
         return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output" or self.output_mode != "store":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4SwiGluShard128(Schedule):
+    """Consume retained gate/up M128 shards and store only their fused result."""
+
+    TILE_K = 128
+
+    def __init__(
+        self,
+        gate_register,
+        gate_port,
+        up_register,
+        up_port,
+        output,
+        *,
+        swiglu_limit=10.0,
+    ):
+        super().__init__()
+        self.gate_register = gate_register
+        self.gate_port = gate_port
+        self.up_register = up_register
+        self.up_port = up_port
+        self.output = output
+        self.swiglu_limit = swiglu_limit
+
+    def _on_place(self):
+        if self.gate_port == self.up_port:
+            raise ValueError("retained gate and up shards require separate LDU ports")
+        if self.gate_port not in (0, 1) or self.up_port not in (0, 1):
+            raise ValueError("retained shard ports must be 0 or 1")
+        if not 0 <= self.gate_register < 4 or not 0 <= self.up_register < 4:
+            raise ValueError("retained shard registers must be in [0, 4)")
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.numel() != self.num_sms * self.TILE_K
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("sharded SwiGLU output must be contiguous BF16 [SM,128]")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        start = sm * self.TILE_K
+        return [
+            Dsv4SiluClampMul128(1, self.swiglu_limit),
+            TmaStore1D(self.output[start : start + self.TILE_K]).bar(
+                self._bar("output")
+            ),
+            RegLoad(self.gate_register).fixed_port(self.gate_port),
+            RegLoad(self.up_register).fixed_port(self.up_port),
+        ]
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -1865,6 +1944,37 @@ class SchedRoutedDsv4Nvfp4Quant16(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SubgridSchedule(Schedule):
+    """Place one schedule on a fixed subgrid of a larger queued stage."""
+
+    def __init__(self, schedule, num_sms: int, base_sm: int = 0):
+        super().__init__()
+        self.inner = schedule
+        self.subgrid_sms = int(num_sms)
+        self.subgrid_base = int(base_sm)
+
+    def _on_place(self):
+        if self.subgrid_sms <= 0:
+            raise ValueError("subgrid schedule requires at least one SM")
+        if (
+            self.subgrid_base < 0
+            or self.subgrid_base + self.subgrid_sms > self.num_sms
+        ):
+            raise ValueError("subgrid placement exceeds its queued stage")
+        inner = self.inner._clone()
+        inner._bars.update(self._bars)
+        self.placed_inner = inner.place(
+            self.subgrid_sms, self.subgrid_base
+        )
+
+    def schedule(self, sm: int):
+        return self.placed_inner(sm)
+
+    def bar_release_count(self, role: str):
+        self._require_placed()
+        return self.placed_inner.bar_release_count(role)
 
 
 class ListSchedule(Schedule):
