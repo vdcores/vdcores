@@ -2297,11 +2297,16 @@ class ResidentOneLaunchDecode:
             int(value)
             for value in profile[:, runtime_config.track_profile_event_base + 25]
         ]
+        profile_layer_ids = (
+            (self.args.single_layer_id,)
+            if self.args.layers == 1
+            else tuple(range(self.args.layers))
+        )
         boundaries = []
         spreads = []
         frontier_vcores = []
-        for layer_id in range(self.args.layers):
-            event_id = runtime_config.layer_profile_event_base + layer_id
+        for profile_index, layer_id in enumerate(profile_layer_ids):
+            event_id = runtime_config.layer_profile_event_base + profile_index
             values = [int(value) for value in profile[:, event_id]]
             if any(value == 0 for value in values):
                 raise RuntimeError(f"layer {layer_id} profile event was not recorded")
@@ -2335,8 +2340,8 @@ class ResidentOneLaunchDecode:
         layer_total = 0
         reload_total = 0
         reload_index = 0
-        for layer_id, (boundary, spread, frontier_vcore) in enumerate(
-            zip(boundaries, spreads, frontier_vcores)
+        for layer_id, boundary, spread, frontier_vcore in zip(
+            profile_layer_ids, boundaries, spreads, frontier_vcores
         ):
             elapsed = boundary - previous
             if elapsed < 0:
