@@ -1232,8 +1232,8 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
         if self.k % self.TILE_K:
             raise ValueError("native FP8 quant K must be K128 aligned")
         self.k_tiles = self.k // self.TILE_K
-        if self.num_sms != self.k_tiles:
-            raise ValueError("native FP8 quant requires one SM per K128 tile")
+        if not 0 < self.num_sms <= self.k_tiles:
+            raise ValueError("native FP8 quant requires 1..K/128 SMs")
         if (
             self.output.dtype != torch.uint8
             or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
@@ -1247,15 +1247,120 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
-        start = sm * self.TILE_K
+        tiles_per_sm, extra = divmod(self.k_tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        tile_stop = tile_start + tile_count
+        start = tile_start * self.TILE_K
+        stop = tile_stop * self.TILE_K
         return [
-            Dsv4Fp8QuantUmmaBSm100(1),
+            Dsv4Fp8QuantUmmaBSm100(tile_count),
             _shared_load_1d(
-                self.input[start : start + self.TILE_K]
+                self.input[start:stop]
             ).fixed_port(1),
-            TmaStore1D(self.output[sm].reshape(-1)).bar(
+            TmaStore1D(self.output[tile_start:tile_stop].reshape(-1)).bar(
                 self._bar("output")
             ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4ZeroFill(Schedule):
+    """Shard an in-queue zero fill over a contiguous tensor."""
+
+    def __init__(self, gate, output):
+        super().__init__()
+        self.gate = gate
+        self.output = output
+
+    def _on_place(self):
+        if not self.output.is_contiguous() or self.output.numel() <= 0:
+            raise ValueError("zero-fill output must be nonempty and contiguous")
+        if (
+            self.gate.dtype != torch.uint32
+            or self.gate.numel() != 1
+            or not self.gate.is_contiguous()
+        ):
+            raise ValueError("zero-fill gate must be one contiguous uint32")
+        element_bytes = self.output.element_size()
+        total_bytes = self.output.numel() * element_bytes
+        if total_bytes % 4 or 4 % element_bytes:
+            raise ValueError("zero-fill output must contain complete uint32 words")
+        self.elements_per_word = 4 // element_bytes
+        self.total_words = total_bytes // 4
+        if self.total_words % 4:
+            raise ValueError("zero-fill output must contain complete 16-byte blocks")
+        self.total_blocks = self.total_words // 4
+        if not 0 < self.num_sms <= self.total_blocks:
+            raise ValueError("zero-fill requires 1..output-block-count SMs")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        blocks_per_sm, extra = divmod(self.total_blocks, self.num_sms)
+        block_start = sm * blocks_per_sm + min(sm, extra)
+        block_count = blocks_per_sm + int(sm < extra)
+        word_start = block_start * 4
+        word_count = block_count * 4
+        element_start = word_start * self.elements_per_word
+        element_stop = (word_start + word_count) * self.elements_per_word
+        output = self.output.reshape(-1)[element_start:element_stop]
+        return [
+            Dsv4ZeroFill(word_count * 4),
+            LduLoad1D(self.gate).bar(self._bar("gate")),
+            TmaStore1D(output).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4Fp32ToBf16(Schedule):
+    """Finalize an FP32 split-K accumulator in model dtype."""
+
+    TILE = 128
+
+    def __init__(self, input, output):
+        super().__init__()
+        self.input = input
+        self.output = output
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.float32
+            or self.output.dtype != torch.bfloat16
+            or self.input.ndim != 1
+            or self.output.ndim != 1
+            or self.input.shape != self.output.shape
+            or not self.input.is_contiguous()
+            or not self.output.is_contiguous()
+            or self.input.numel() % self.TILE
+        ):
+            raise ValueError(
+                "projection finalizer requires matching contiguous FP32/BF16 M128 vectors"
+            )
+        self.tiles = self.input.numel() // self.TILE
+        if not 0 < self.num_sms <= self.tiles:
+            raise ValueError("projection finalizer requires 1..M/128 SMs")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        tiles_per_sm, extra = divmod(self.tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        start = tile_start * self.TILE
+        stop = (tile_start + tile_count) * self.TILE
+        return [
+            Dsv4Fp32ToBf16(stop - start),
+            TmaLoad1D(self.input[start:stop]).fixed_port(0),
+            TmaStore1D(self.output[start:stop]).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):

@@ -73,6 +73,34 @@ DAE_COMPUTE_OP_HANDLER(OP_COPY) {
   }
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ZERO_FILL) {
+  DAE_UNUSED(sm_id, pc, count, finish, scratch_space, st_insts, g_events);
+  const int gate_slot = m2c.template pop<0>();
+  const int output_slot = m2c.template pop<0>();
+  auto *output = static_cast<uint32_t *>(
+      get_slot_address(smem_base, extract(output_slot)));
+  for (int word = thread_id; word < inst.args[0]; word += 128) {
+    output[word] = 0;
+  }
+  c2m.push(thread_id, gate_slot);
+  c2m.template push<0, true>(thread_id, output_slot);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_TO_BF16) {
+  DAE_UNUSED(sm_id, pc, count, finish, scratch_space, st_insts, g_events);
+  const int input_slot = m2c.template pop<0>();
+  const auto *input = static_cast<const float *>(
+      get_slot_address(smem_base, extract(input_slot)));
+  const int output_slot = m2c.template pop<0>();
+  auto *output = static_cast<cutlass::bfloat16_t *>(
+      get_slot_address(smem_base, extract(output_slot)));
+  for (int index = thread_id; index < inst.args[0]; index += 128) {
+    output[index] = cutlass::bfloat16_t(input[index]);
+  }
+  c2m.push(thread_id, input_slot);
+  c2m.template push<0, true>(thread_id, output_slot);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_GEMV_M64N8_MMA) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
   task_gemv_mma<64, 8, 256>(inst.args[0], smem_base, m2c, c2m);

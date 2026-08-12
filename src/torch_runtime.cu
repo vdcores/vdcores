@@ -695,6 +695,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("slot_size") = slotSizeKb * 1024;
   config.attr("num_slots") = numSlots;
   config.attr("max_insts") = numInsts;
+  config.attr("load_instructions") = dae2LoadInstructions;
   config.attr("dynamic_smem_size") = dynamicSmemBytes;
   config.attr("num_profile_events") = numProfileEvents;
   config.attr("layer_profile_event_base") = layerProfileEventBase;

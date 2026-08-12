@@ -87,6 +87,25 @@ class DeepSeekV4ShapePolicy:
             tile_k=128,
         )
 
+    def fp8_umma_split_k(self, rows: int, k: int) -> tuple[int, int]:
+        """Return the first-pass split factor and resident SM count."""
+        if rows % 128 or k % 128:
+            raise ValueError("native split-K FP8 GEMV requires M128/K128 alignment")
+        if k == 1024:
+            split_k = 2
+        elif rows <= 1024 and k == 4096:
+            split_k = 8
+        elif rows == 8192 and k == 4096:
+            split_k = 2
+        elif rows == 4096 and k == 8192:
+            split_k = 4
+        else:
+            raise ValueError(f"no validated split-K policy for M={rows} K={k}")
+        k_tiles = k // 128
+        if k_tiles % split_k or (k_tiles // split_k) % 4:
+            raise ValueError("split-K policy must preserve four-tile activation chunks")
+        return split_k, min(self.resident_sms, rows // 128 * split_k)
+
     def nvfp4_gemv(self, rows: int, k: int) -> ShapeAssignment:
         if k % 256:
             raise ValueError("NVFP4 GEMV K must be divisible by 256")

@@ -1111,6 +1111,24 @@ class Copy(ComputeInstruction):
         super().__init__(opcode=opcode.OP_COPY, args=[iters, size // 4])
 
 
+class Dsv4ZeroFill(ComputeInstruction):
+    """Fill one allocator-owned output span with zero words."""
+
+    def __init__(self, size: int):
+        if size <= 0 or size % 4 or size > 0xFFFF * 4:
+            raise ValueError("zero-fill size must be a positive uint16 word count")
+        super().__init__(opcode=opcode.OP_DSV4_ZERO_FILL, args=[size // 4])
+
+
+class Dsv4Fp32ToBf16(ComputeInstruction):
+    """Convert one shared FP32 projection shard to BF16."""
+
+    def __init__(self, elements: int):
+        if elements <= 0 or elements > 0xFFFF:
+            raise ValueError("FP32-to-BF16 element count must fit uint16")
+        super().__init__(opcode=opcode.OP_DSV4_FP32_TO_BF16, args=[elements])
+
+
 class ProfileEvent(ComputeInstruction):
     """Record a compute-warpgroup arrival timestamp in the per-SM profile."""
 
@@ -2202,6 +2220,8 @@ __all__ = [
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",
+    "Dsv4ZeroFill",
+    "Dsv4Fp32ToBf16",
     "Dsv4Bf16Gemv",
     "Dsv4HcPre",
     "Dsv4HcPost",

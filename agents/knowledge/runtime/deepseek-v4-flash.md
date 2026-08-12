@@ -1644,3 +1644,43 @@ Across the selected shapes, 100-sample medians are 3.552 us (Q_a), 3.488 us
 10.368 us (O_b). Maximum absolute deviation from the BF16 full-K reference is
 at most 0.007812. Accumulator reset is still outside these spans and remains an
 explicit resident integration requirement.
+
+### Projection-wide resident integration
+
+Partial BF16 rounding showed model sensitivity in an early single-layer
+diagnostic, while the exact fallback of FP32 TMA reduction plus a queued
+FP32-to-BF16 finalizer is bitwise equal to the full-K Q_b oracle. The accepted
+policy permits this small drift, so `--fp8-splitk-reduction=bf16` is the default
+split-K endpoint and `fp32` remains an exact diagnostic fallback. All normal
+BF16 projection outputs are disjoint views of one contiguous arena. One
+in-queue zero-fill resets the arena, then Q_a/KV/Q_b/index-Q_b/O_a/O_b reduce
+directly into their consumer-visible model buffers. No projection is fused
+with a producer or consumer, and the BF16 path has no conversion/copy stage.
+
+The complete graph is larger than the shared-memory instruction image. Build
+the selective runtime with `global_insts=1` and
+`DAE_COMPUTE_OPS_FILE=benchmarks/deepseek_v4_resident.ops`; this selects
+`DAE_LOAD_INSTRUCTIONS=0`, keeps the compute and memory programs in HBM, and
+raises the per-SM instruction capacity from 512 to 4096. It remains one
+persistent GPU kernel launch and one unified VDCores instruction queue; HBM is
+only the backing store for instruction fetch.
+
+The exact FP32 fallback job `20260812T204651Z-2823771` queued 218 compute and
+1,101 memory instructions, preserved full-network token 5, and measured a
+15.536512-ms median. BF16-direct one-layer job
+`20260812T205453Z-2920570` exercised all six projection families at context
+128, used 61 compute and 301 memory instructions, and preserved token 2759.
+Its ten-sample 0.407904-ms median is 12.7% below the three-sample FP32/finalizer
+gate. Q_b had maximum absolute error 0.003906, mean absolute error 0.000042,
+and cosine similarity 0.99999577 against the full-K BF16 oracle.
+
+Full BF16-direct job `20260812T205520Z-2926038` loaded 153.364 GiB from the
+durable checkpoint at `/mnt/checkpoints/nvidia/DeepSeek-V4-Flash-NVFP4`, used
+one B300 and one persistent launch, and queued 202 compute plus 1,069 memory
+instructions. It preserved token 5; five samples measured
+14.250208/14.713952/15.006816 ms min/median/max. BF16 direct improves the exact
+FP32 endpoint by 0.822560 ms (5.29%) and the accepted 14.747968-ms fully affine
+VDCores boundary by 0.034016 ms (0.23%). It remains 2.45x the 6.015728-ms vLLM
+median and 2.01x the 7.321974-ms SGLang median. Profile the integrated
+projection frontiers under the same HBM-instruction build before attempting
+fusion.

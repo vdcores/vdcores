@@ -10,6 +10,7 @@ HBM buffer and LDU resolves the selected expert and current layer.
 from __future__ import annotations
 
 import argparse
+import math
 import statistics
 import time
 from dataclasses import dataclass, replace
@@ -28,8 +29,12 @@ from dae.deepseek_v4_checkpoint import (
 )
 from dae.deepseek_v4_flow import build_layer_decode_plan
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy, ShapeAssignment
-from dae.deepseek_v4_quant import quantize_fp8_block128
+from dae.deepseek_v4_quant import (
+    dequantize_fp8_block128,
+    quantize_fp8_block128,
+)
 from dae.launcher import Launcher
+from dae.instructions import TmaTensor
 from dae.routing import RoutedAddressTable
 from dae.runtime import config as runtime_config
 from dae.schedule import (
@@ -40,6 +45,7 @@ from dae.schedule import (
     SchedDsv4ExpertReduce,
     SchedDsv4Fp8QuantUmmaB,
     SchedDsv4Fp32Bf16Gemv,
+    SchedDsv4Fp32ToBf16,
     SchedDsv4Fp8Quant128,
     SchedDsv4GatedPool,
     SchedDsv4GatedPoolPacked8Shard128,
@@ -56,9 +62,11 @@ from dae.schedule import (
     SchedDsv4ContiguousAttention512Block4,
     SchedDsv4SwiGluShard128,
     SchedDsv4TopK512,
+    SchedDsv4ZeroFill,
     SchedFp8Block128Gemv,
     SchedFp8Block128GemvBf16,
     SchedFp8GemvUmmaStream,
+    SchedFp8GemvUmmaSplitK,
     SchedRMS,
     SchedRoutedDsv4Nvfp4QuantUmmaB,
     SchedRoutedNvfp4GemvUmmaStream,
@@ -105,8 +113,35 @@ class ResidentOneLaunchDecode:
             args.sms,
             torch.cuda.get_device_properties(device).multi_processor_count,
         )
+        all_splitk_components = {
+            "q_a", "q_b", "kv", "index_q_b", "o_a", "o_b"
+        }
+        requested_components = {
+            item.strip()
+            for item in args.fp8_splitk_components.split(",")
+            if item.strip()
+        }
+        if requested_components == {"all"}:
+            requested_components = all_splitk_components
+        unknown_components = requested_components - all_splitk_components
+        if unknown_components:
+            raise ValueError(
+                f"unknown split-K projection components: {sorted(unknown_components)}"
+            )
+        self.splitk_components = (
+            frozenset(requested_components)
+            if args.fp8_projection_mode == "splitk"
+            else frozenset()
+        )
+        self.direct_splitk_bf16 = bool(self.splitk_components) and (
+            args.fp8_splitk_reduction == "bf16"
+        )
+        self.splitk_accumulators: list[torch.Tensor] = []
+        self._active_splitk_workspace: torch.Tensor | None = None
+        self._active_splitk_offset = 0
         self.policy = DeepSeekV4ShapePolicy(self.sms)
         self.assignments: dict[tuple, ShapeAssignment] = {}
+        self.launcher = Launcher(self.sms, device=self.device)
         self.checkpoint = self._load_checkpoint()
         self.families = self._families()
         self._routing_tables: dict[int, RoutedAddressTable] = {}
@@ -178,28 +213,40 @@ class ResidentOneLaunchDecode:
                 flush=True,
             )
 
+        native_fp8_prefixes = []
+        for layer_id in resident_layer_ids:
+            attention_prefix = f"layers.{layer_id}.attn"
+            if "q_a" in self.splitk_components:
+                native_fp8_prefixes.append(f"{attention_prefix}.wq_a")
+            if "kv" in self.splitk_components:
+                native_fp8_prefixes.append(f"{attention_prefix}.wkv")
+            if (
+                "q_b" in self.splitk_components
+                or self.args.fp8_qb_mode == "native"
+            ):
+                native_fp8_prefixes.append(f"{attention_prefix}.wq_b")
+            if "o_a" in self.splitk_components:
+                native_fp8_prefixes.append(f"{attention_prefix}.wo_a")
+            if "o_b" in self.splitk_components:
+                native_fp8_prefixes.append(f"{attention_prefix}.wo_b")
+            if (
+                self.config.attention_kind(layer_id) == "csa"
+                and (
+                    "index_q_b" in self.splitk_components
+                    or self.args.fp8_qb_mode == "native"
+                )
+            ):
+                native_fp8_prefixes.append(
+                    f"{attention_prefix}.indexer.wq_b"
+                )
+
         resident = DeepSeekV4ResidentCheckpoint.from_checkpoint(
             disk,
             device=self.device,
             names=names,
             reserve_bytes=int(self.args.resident_reserve_gib * (1 << 30)),
             native_nvfp4=True,
-            native_fp8_prefixes=(
-                tuple(
-                    prefix
-                    for layer_id in resident_layer_ids
-                    for prefix in (
-                        f"layers.{layer_id}.attn.wq_b",
-                        *(
-                            (f"layers.{layer_id}.attn.indexer.wq_b",)
-                            if self.config.attention_kind(layer_id) == "csa"
-                            else ()
-                        ),
-                    )
-                )
-                if self.args.fp8_qb_mode == "native"
-                else ()
-            ),
+            native_fp8_prefixes=tuple(native_fp8_prefixes),
             progress=progress,
         )
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
@@ -331,7 +378,42 @@ class ResidentOneLaunchDecode:
         self.next_residual = torch.empty_like(self.residual)
         self.hidden = torch.empty((cfg.hidden_size,), dtype=torch.bfloat16, device=d)
         self.norm_hidden = torch.empty_like(self.hidden)
-        self.branch = torch.empty_like(self.hidden)
+        direct_projection_views = {}
+        if self.direct_splitk_bf16:
+            projection_rows = (
+                cfg.hidden_size
+                + cfg.q_lora_rank
+                + cfg.head_dim
+                + cfg.num_heads * cfg.head_dim
+                + cfg.index_heads * cfg.index_head_dim
+                + cfg.o_groups * cfg.o_lora_rank
+            )
+            self.splitk_output_arena = torch.empty(
+                (projection_rows,), dtype=torch.bfloat16, device=d
+            )
+            offset = 0
+
+            def direct_view(name, shape):
+                nonlocal offset
+                elements = math.prod(shape)
+                view = self.splitk_output_arena[offset : offset + elements].view(
+                    shape
+                )
+                direct_projection_views[name] = view
+                offset += elements
+
+            direct_view("branch", (cfg.hidden_size,))
+            direct_view("q_rank", (cfg.q_lora_rank,))
+            direct_view("kv", (cfg.head_dim,))
+            direct_view("q", (cfg.num_heads, cfg.head_dim))
+            direct_view("index_q", (cfg.index_heads, cfg.index_head_dim))
+            direct_view("o_rank", (cfg.o_groups, cfg.o_lora_rank))
+            if offset != projection_rows:
+                raise AssertionError("split-K output arena was not carved exactly")
+            self.branch = direct_projection_views["branch"]
+        else:
+            self.splitk_output_arena = None
+            self.branch = torch.empty_like(self.hidden)
         self.mixes = torch.empty((24,), dtype=torch.float32, device=d)
         self.post = torch.empty((4,), dtype=torch.float32, device=d)
         self.comb = torch.empty((4, 4), dtype=torch.float32, device=d)
@@ -403,27 +485,39 @@ class ResidentOneLaunchDecode:
         self.hidden_fp8_scale = torch.empty(
             (cfg.hidden_size // 128,), dtype=torch.float8_e8m0fnu, device=d
         )
-        self.q_rank = torch.empty((cfg.q_lora_rank,), dtype=torch.bfloat16, device=d)
+        if {"q_a", "kv"} & self.splitk_components:
+            self.hidden_native_fp8 = torch.empty(
+                (cfg.hidden_size // 128, 2048), dtype=torch.uint8, device=d
+            )
+        self.q_rank = direct_projection_views.get("q_rank")
+        if self.q_rank is None:
+            self.q_rank = torch.empty(
+                (cfg.q_lora_rank,), dtype=torch.bfloat16, device=d
+            )
         self.q_rank_norm = torch.empty_like(self.q_rank)
-        if self.args.fp8_qb_mode == "native":
-            self.q_rank_native_fp8 = torch.empty(
-                (cfg.q_lora_rank // 128, 2048), dtype=torch.uint8, device=d
-            )
-        else:
-            self.q_rank_fp8 = torch.empty_like(
-                self.q_rank, dtype=torch.float8_e4m3fn
-            )
-            self.q_rank_fp8_scale = torch.empty(
-                (cfg.q_lora_rank // 128,),
-                dtype=torch.float8_e8m0fnu,
-                device=d,
-            )
-        self.q = torch.empty(
-            (cfg.num_heads, cfg.head_dim), dtype=torch.bfloat16, device=d
+        self.q_rank_native_fp8 = torch.empty(
+            (cfg.q_lora_rank // 128, 2048), dtype=torch.uint8, device=d
         )
+        self.q_rank_fp8 = torch.empty_like(
+            self.q_rank, dtype=torch.float8_e4m3fn
+        )
+        self.q_rank_fp8_scale = torch.empty(
+            (cfg.q_lora_rank // 128,),
+            dtype=torch.float8_e8m0fnu,
+            device=d,
+        )
+        self.q = direct_projection_views.get("q")
+        if self.q is None:
+            self.q = torch.empty(
+                (cfg.num_heads, cfg.head_dim), dtype=torch.bfloat16, device=d
+            )
         self.q_norm = torch.empty_like(self.q)
         self.q_rope = torch.empty_like(self.q)
-        self.kv = torch.empty((cfg.head_dim,), dtype=torch.bfloat16, device=d)
+        self.kv = direct_projection_views.get("kv")
+        if self.kv is None:
+            self.kv = torch.empty(
+                (cfg.head_dim,), dtype=torch.bfloat16, device=d
+            )
         self.kv_norm = torch.empty_like(self.kv)
         self.attention_output = torch.empty_like(self.q)
         self.attention_inverse = torch.empty_like(self.q)
@@ -436,15 +530,28 @@ class ResidentOneLaunchDecode:
             dtype=torch.float8_e8m0fnu,
             device=d,
         )
-        self.o_rank = torch.empty(
-            (cfg.o_groups, cfg.o_lora_rank), dtype=torch.bfloat16, device=d
-        )
+        self.o_rank = direct_projection_views.get("o_rank")
+        if self.o_rank is None:
+            self.o_rank = torch.empty(
+                (cfg.o_groups, cfg.o_lora_rank),
+                dtype=torch.bfloat16,
+                device=d,
+            )
         self.o_rank_fp8 = torch.empty_like(
             self.o_rank.reshape(-1), dtype=torch.float8_e4m3fn
         )
         self.o_rank_scale = torch.empty(
             (self.o_rank.numel() // 128,), dtype=torch.float8_e8m0fnu, device=d
         )
+        if {"o_a", "o_b"} & self.splitk_components:
+            self.o_group_native_fp8 = torch.empty(
+                (cfg.o_groups, group_width // 128, 2048),
+                dtype=torch.uint8,
+                device=d,
+            )
+            self.o_rank_native_fp8 = torch.empty(
+                (self.o_rank.numel() // 128, 2048), dtype=torch.uint8, device=d
+            )
 
         self.compress_values = torch.empty((1024,), dtype=torch.float32, device=d)
         self.compress_scores = torch.empty_like(self.compress_values)
@@ -492,9 +599,13 @@ class ResidentOneLaunchDecode:
                 config=cfg,
                 device=d,
             )
-        self.index_q = torch.empty(
-            (cfg.index_heads, cfg.index_head_dim), dtype=torch.bfloat16, device=d
-        )
+        self.index_q = direct_projection_views.get("index_q")
+        if self.index_q is None:
+            self.index_q = torch.empty(
+                (cfg.index_heads, cfg.index_head_dim),
+                dtype=torch.bfloat16,
+                device=d,
+            )
         self.index_q_rope = torch.empty_like(self.index_q)
         self.index_q_hadamard = torch.empty_like(self.index_q)
         self.index_head_weights = torch.empty(
@@ -543,6 +654,9 @@ class ResidentOneLaunchDecode:
         self.route_weights = torch.empty((8,), dtype=torch.float32, device=d)
         self.zero_bias = torch.zeros(
             (cfg.num_experts,), dtype=torch.float32, device=d
+        )
+        self.zero_fill_gate = torch.zeros(
+            (1,), dtype=torch.uint32, device=d
         )
         self.zero_hash = torch.zeros((8,), dtype=torch.int32, device=d)
 
@@ -594,6 +708,7 @@ class ResidentOneLaunchDecode:
         output: torch.Tensor,
         scale: torch.Tensor,
         *,
+        wait_for_previous: bool = True,
         placement: tuple[int, int] | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
@@ -607,6 +722,7 @@ class ResidentOneLaunchDecode:
             name,
             SchedDsv4Fp8Quant128(source.reshape(-1), output.reshape(-1), scale),
             assignment,
+            wait_for_previous=wait_for_previous,
             base_sm=base_sm,
             wait_group=wait_group,
             release_group=release_group,
@@ -618,6 +734,7 @@ class ResidentOneLaunchDecode:
         source: torch.Tensor,
         output: torch.Tensor,
         *,
+        wait_for_previous: bool = True,
         placement: tuple[int, int] | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
@@ -626,16 +743,18 @@ class ResidentOneLaunchDecode:
         base_sm = None
         if placement is not None:
             base_sm, num_sms = placement
-            if num_sms != assignment.num_sms:
+            if not 0 < num_sms <= assignment.num_sms:
                 raise ValueError(
-                    "native FP8 quant placement must match its K128 tiles"
+                    "native FP8 quant placement must fit its K128 tiles"
                 )
+            assignment = replace(assignment, num_sms=num_sms)
         return self._stage(
             name,
             SchedDsv4Fp8QuantUmmaB(
                 source.reshape(-1), output
             ),
             assignment,
+            wait_for_previous=wait_for_previous,
             base_sm=base_sm,
             wait_group=wait_group,
             release_group=release_group,
@@ -797,6 +916,96 @@ class ResidentOneLaunchDecode:
             release_group=release_group,
         )
 
+    def _splitk_fp8_linear_stages(
+        self,
+        name: str,
+        family: LayerFamily,
+        suffix: str,
+        activation: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        row_slice: slice | None = None,
+        base_sm: int = 0,
+        split_k: int | None = None,
+        num_sms: int | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> list[Stage]:
+        linears = tuple(
+            self.checkpoint.load_native_fp8_linear(
+                f"layers.{layer_id}.{suffix}", device=self.device
+            )
+            for layer_id in family.layer_ids
+        )
+        if row_slice is None:
+            weights = tuple(linear.weight_tiles for linear in linears)
+        else:
+            start = 0 if row_slice.start is None else row_slice.start
+            stop = linears[0].weight_tiles.shape[0] * 128 if row_slice.stop is None else row_slice.stop
+            if start % 128 or stop % 128:
+                raise ValueError("native split-K slices must be M128 aligned")
+            weights = tuple(
+                linear.weight_tiles[start // 128 : stop // 128]
+                for linear in linears
+            )
+        rows = weights[0].shape[0] * 128
+        k = activation.shape[0] * 128
+        if output.numel() != rows:
+            raise ValueError("native split-K output size must match selected rows")
+        policy_split, _ = self.policy.fp8_umma_split_k(rows, k)
+        split_k = policy_split if split_k is None else int(split_k)
+        if k // 128 % split_k or (k // 128 // split_k) % 4:
+            raise ValueError("split-K override must preserve four-tile chunks")
+        work_tiles = rows // 128 * split_k
+        num_sms = min(self.sms, work_tiles) if num_sms is None else int(num_sms)
+        if not 0 < num_sms <= work_tiles:
+            raise ValueError("split-K SM override exceeds logical work tiles")
+        output_vector = output.reshape(-1)
+        if self.direct_splitk_bf16:
+            accumulator = output_vector.reshape(1, rows)
+            partial_release_group = release_group
+        else:
+            if self._active_splitk_workspace is None:
+                raise ValueError(
+                    "split-K projection requires an active accumulator workspace"
+                )
+            start = self._active_splitk_offset
+            stop = start + rows
+            if stop > self._active_splitk_workspace.numel():
+                raise ValueError("split-K accumulator workspace is too small")
+            accumulator = self._active_splitk_workspace[start:stop].reshape(
+                1, rows
+            )
+            self._active_splitk_offset = stop
+            partial_release_group = f"{family.name}.{name}.reduce.ready"
+        output_reduce = TmaTensor(
+            self.launcher, accumulator
+        ).rowmajor_2d("reduce", 1, 128)
+        schedule = SchedFp8GemvUmmaSplitK(
+            weights[0], activation, output_reduce, split_k
+        )
+        schedule = self._layered(schedule, family, weights)
+        gemv = self._stage(
+            f"{name}.partial",
+            schedule,
+            num_sms,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=partial_release_group,
+        )
+        if self.direct_splitk_bf16:
+            return [gemv]
+        finalize_sms = min(self.sms, rows // 128)
+        finalize = self._stage(
+            name,
+            SchedDsv4Fp32ToBf16(accumulator.reshape(-1), output_vector),
+            finalize_sms,
+            base_sm=base_sm,
+            wait_group=partial_release_group,
+            release_group=release_group,
+        )
+        return [gemv, finalize]
+
     def _bf16_linear_stage(
         self,
         name: str,
@@ -940,28 +1149,98 @@ class ResidentOneLaunchDecode:
         stages, post = self._hc_stages(
             family, "attn", self.residual, self.next_residual
         )
-        stages.append(
-            self._fp8_quant_stage(
-                "attn.hidden.quant_fp8",
-                self.norm_hidden,
-                self.hidden_fp8,
-                self.hidden_fp8_scale,
-                release_group=qkv_input_ready,
-            )
+        split_q_a = "q_a" in self.splitk_components
+        split_q_b = "q_b" in self.splitk_components
+        split_kv = "kv" in self.splitk_components
+        split_index_q_b = "index_q_b" in self.splitk_components
+        split_o_a = "o_a" in self.splitk_components
+        split_o_b = "o_b" in self.splitk_components
+        run_index_selection = kind == "csa" and (
+            self.args.index_selection_mode == "force"
+            or plan.requires_index_selection
         )
-        stages.append(
-            self._fp8_linear_stage(
-                "attn.q_a",
-                family,
-                "attn.wq_a",
-                self.hidden_fp8,
-                self.hidden_fp8_scale,
-                self.q_rank,
-                placement=q_placement,
-                wait_group=qkv_input_ready,
-                release_group=q_a_ready,
-            )
+        split_index_active = split_index_q_b and run_index_selection
+        workspace_rows = (
+            cfg.q_lora_rank * int(split_q_a)
+            + cfg.head_dim * int(split_kv)
+            + cfg.num_heads * cfg.head_dim * int(split_q_b)
+            + cfg.index_heads * cfg.index_head_dim * int(split_index_active)
+            + cfg.o_groups * cfg.o_lora_rank * int(split_o_a)
+            + cfg.hidden_size * int(split_o_b)
         )
+        if workspace_rows:
+            if self.direct_splitk_bf16:
+                workspace = self.splitk_output_arena
+                if workspace is None:
+                    raise AssertionError("direct split-K output arena is missing")
+                self._active_splitk_workspace = None
+                self._active_splitk_offset = 0
+            else:
+                workspace = torch.empty(
+                    (workspace_rows,), dtype=torch.float32, device=self.device
+                )
+                self.splitk_accumulators.append(workspace)
+                self._active_splitk_workspace = workspace
+                self._active_splitk_offset = 0
+            stages.append(
+                self._stage(
+                    "attn.projections.reset",
+                    SchedDsv4ZeroFill(self.zero_fill_gate, workspace),
+                    min(self.sms, workspace_rows // 4),
+                )
+            )
+        else:
+            self._active_splitk_workspace = None
+            self._active_splitk_offset = 0
+        need_native_hidden = split_q_a or split_kv
+        need_scalar_hidden = not split_q_a or not split_kv
+        if need_native_hidden:
+            stages.append(
+                self._native_fp8_quant_stage(
+                    "attn.hidden.quant_native_fp8",
+                    self.norm_hidden,
+                    self.hidden_native_fp8,
+                    release_group=qkv_input_ready,
+                )
+            )
+        if need_scalar_hidden:
+            stages.append(
+                self._fp8_quant_stage(
+                    "attn.hidden.quant_fp8",
+                    self.norm_hidden,
+                    self.hidden_fp8,
+                    self.hidden_fp8_scale,
+                    wait_for_previous=not need_native_hidden,
+                    release_group=qkv_input_ready,
+                )
+            )
+        if split_q_a:
+            stages.extend(
+                self._splitk_fp8_linear_stages(
+                    "attn.q_a",
+                    family,
+                    "attn.wq_a",
+                    self.hidden_native_fp8,
+                    self.q_rank,
+                    base_sm=q_base,
+                    wait_group=qkv_input_ready,
+                    release_group=q_a_ready,
+                )
+            )
+        else:
+            stages.append(
+                self._fp8_linear_stage(
+                    "attn.q_a",
+                    family,
+                    "attn.wq_a",
+                    self.hidden_fp8,
+                    self.hidden_fp8_scale,
+                    self.q_rank,
+                    placement=q_placement,
+                    wait_group=qkv_input_ready,
+                    release_group=q_a_ready,
+                )
+            )
         stages.append(
             self._rms_stage(
                 "attn.q_norm",
@@ -974,7 +1253,16 @@ class ResidentOneLaunchDecode:
                 release_group=q_norm_ready,
             )
         )
-        if self.args.fp8_qb_mode == "native":
+        need_native_q_rank = (
+            split_q_b
+            or split_index_active
+            or self.args.fp8_qb_mode == "native"
+        )
+        need_scalar_q_rank = (
+            (not split_q_b or not split_index_q_b)
+            and self.args.fp8_qb_mode == "scalar"
+        )
+        if need_native_q_rank:
             stages.append(
                 self._native_fp8_quant_stage(
                     "attn.q_rank.quant_native_fp8",
@@ -985,31 +1273,46 @@ class ResidentOneLaunchDecode:
                     release_group=qkv_prefix_join,
                 )
             )
-        else:
+        if need_scalar_q_rank:
             stages.append(
                 self._fp8_quant_stage(
                     "attn.q_rank.quant_fp8",
                     self.q_rank_norm,
                     self.q_rank_fp8,
                     self.q_rank_fp8_scale,
+                    wait_for_previous=not need_native_q_rank,
                     placement=(q_base, q_quant_sms),
                     wait_group=q_norm_ready,
                     release_group=qkv_prefix_join,
                 )
             )
-        stages.append(
-            self._fp8_linear_stage(
-                "attn.kv",
-                family,
-                "attn.wkv",
-                self.hidden_fp8,
-                self.hidden_fp8_scale,
-                self.kv,
-                placement=kv_placement,
-                wait_group=qkv_input_ready,
-                release_group=kv_ready,
+        if split_kv:
+            stages.extend(
+                self._splitk_fp8_linear_stages(
+                    "attn.kv",
+                    family,
+                    "attn.wkv",
+                    self.hidden_native_fp8,
+                    self.kv,
+                    base_sm=kv_base,
+                    wait_group=qkv_input_ready,
+                    release_group=kv_ready,
+                )
             )
-        )
+        else:
+            stages.append(
+                self._fp8_linear_stage(
+                    "attn.kv",
+                    family,
+                    "attn.wkv",
+                    self.hidden_fp8,
+                    self.hidden_fp8_scale,
+                    self.kv,
+                    placement=kv_placement,
+                    wait_group=qkv_input_ready,
+                    release_group=kv_ready,
+                )
+            )
         stages.append(
             self._rms_stage(
                 "attn.kv_norm",
@@ -1038,7 +1341,18 @@ class ResidentOneLaunchDecode:
                 release_group=qkv_prefix_join,
             )
         )
-        if self.args.fp8_qb_mode == "native":
+        if split_q_b:
+            stages.extend(
+                self._splitk_fp8_linear_stages(
+                    "attn.q_b",
+                    family,
+                    "attn.wq_b",
+                    self.q_rank_native_fp8,
+                    self.q,
+                    wait_group=qkv_prefix_join,
+                )
+            )
+        elif self.args.fp8_qb_mode == "native":
             stages.append(
                 self._native_fp8_linear_stage(
                     "attn.q_b",
@@ -1176,11 +1490,17 @@ class ResidentOneLaunchDecode:
                 )
 
         if kind == "csa":
-            run_index_selection = (
-                self.args.index_selection_mode == "force"
-                or plan.requires_index_selection
-            )
-            if run_index_selection and self.args.fp8_qb_mode == "native":
+            if run_index_selection and split_index_active:
+                stages.extend(
+                    self._splitk_fp8_linear_stages(
+                        "index.q_b",
+                        family,
+                        "attn.indexer.wq_b",
+                        self.q_rank_native_fp8,
+                        self.index_q,
+                    )
+                )
+            elif run_index_selection and self.args.fp8_qb_mode == "native":
                 stages.append(
                     self._native_fp8_linear_stage(
                         "index.q_b",
@@ -1396,42 +1716,105 @@ class ResidentOneLaunchDecode:
         )
         grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
         for group in range(cfg.o_groups):
-            placement = self.policy.parallel_partition(group, cfg.o_groups)
+            placement = (
+                (group * 16, 16)
+                if split_o_a
+                else self.policy.parallel_partition(group, cfg.o_groups)
+            )
             start = group * cfg.o_lora_rank
+            if split_o_a:
+                group_input_ready = (
+                    f"{family.name}.attn.o_a.g{group}.input.ready"
+                )
+                stages.append(
+                    self._native_fp8_quant_stage(
+                        f"attn.o_a.g{group}.quant_native_fp8",
+                        grouped[group],
+                        self.o_group_native_fp8[group],
+                        placement=placement,
+                        wait_group=output_ready_group,
+                        release_group=group_input_ready,
+                    )
+                )
+                stages.extend(
+                    self._splitk_fp8_linear_stages(
+                        f"attn.o_a.g{group}",
+                        family,
+                        "attn.wo_a",
+                        self.o_group_native_fp8[group],
+                        self.o_rank[group],
+                        row_slice=slice(start, start + cfg.o_lora_rank),
+                        base_sm=placement[0],
+                        split_k=2,
+                        num_sms=placement[1],
+                        wait_group=group_input_ready,
+                        release_group=output_join_group,
+                    )
+                )
+            else:
+                stages.append(
+                    self._fp8_bf16_linear_stage(
+                        f"attn.o_a.g{group}",
+                        family,
+                        "attn.wo_a",
+                        grouped[group],
+                        self.o_rank[group],
+                        row_slice=slice(start, start + cfg.o_lora_rank),
+                        placement=placement,
+                        wait_group=output_ready_group,
+                        release_group=output_join_group,
+                        prefetch_before_wait=placement[0] >= cfg.num_heads,
+                    )
+                )
+        if split_o_b:
+            o_rank_ready = f"{family.name}.attn.o_rank.native.ready"
             stages.append(
-                self._fp8_bf16_linear_stage(
-                    f"attn.o_a.g{group}",
-                    family,
-                    "attn.wo_a",
-                    grouped[group],
-                    self.o_rank[group],
-                    row_slice=slice(start, start + cfg.o_lora_rank),
-                    placement=placement,
-                    wait_group=output_ready_group,
-                    release_group=output_join_group,
-                    prefetch_before_wait=placement[0] >= cfg.num_heads,
+                self._native_fp8_quant_stage(
+                    "attn.o_rank.quant_native_fp8",
+                    self.o_rank.reshape(-1),
+                    self.o_rank_native_fp8,
+                    wait_group=output_join_group,
+                    release_group=o_rank_ready,
                 )
             )
-        stages.append(
-            self._fp8_quant_stage(
-                "attn.o_rank.quant_fp8",
-                self.o_rank.reshape(-1),
-                self.o_rank_fp8,
-                self.o_rank_scale,
-                wait_group=output_join_group,
+            stages.extend(
+                self._splitk_fp8_linear_stages(
+                    "attn.o_b",
+                    family,
+                    "attn.wo_b",
+                    self.o_rank_native_fp8,
+                    self.branch,
+                    wait_group=o_rank_ready,
+                )
             )
-        )
-        stages.append(
-            self._fp8_linear_stage(
-                "attn.o_b",
-                family,
-                "attn.wo_b",
-                self.o_rank_fp8,
-                self.o_rank_scale,
-                self.branch,
+        else:
+            stages.append(
+                self._fp8_quant_stage(
+                    "attn.o_rank.quant_fp8",
+                    self.o_rank.reshape(-1),
+                    self.o_rank_fp8,
+                    self.o_rank_scale,
+                    wait_group=output_join_group,
+                )
             )
-        )
+            stages.append(
+                self._fp8_linear_stage(
+                    "attn.o_b",
+                    family,
+                    "attn.wo_b",
+                    self.o_rank_fp8,
+                    self.o_rank_scale,
+                    self.branch,
+                )
+            )
         stages.append(post)
+        if self._active_splitk_workspace is not None:
+            if self._active_splitk_offset != self._active_splitk_workspace.numel():
+                raise ValueError(
+                    "split-K accumulator workspace was not consumed exactly"
+                )
+            self._active_splitk_workspace = None
+            self._active_splitk_offset = 0
         return stages
 
     @staticmethod
@@ -2100,7 +2483,6 @@ class ResidentOneLaunchDecode:
                     )
             return queued_stages
 
-        self.launcher = Launcher(self.sms, device=self.device)
         self.launcher.i(
             SchedDsv4PreloadRopeTables(self.resident_rope_tables).place(
                 self.sms
@@ -2168,9 +2550,15 @@ class ResidentOneLaunchDecode:
         print(
             "DSV4_ONE_LAUNCH_PROGRAM "
             f"model_launches=1 layers={self.args.layers} "
+            f"instruction_storage="
+            f"{'smem' if runtime_config.load_instructions else 'hbm'} "
+            f"instruction_capacity={runtime_config.max_insts} "
             f"context={self.args.context_length} "
             f"position={self.decode_position} "
             f"attention={self.args.attention_mode} "
+            f"fp8_projection_mode={self.args.fp8_projection_mode} "
+            f"fp8_splitk_reduction={self.args.fp8_splitk_reduction} "
+            f"fp8_splitk_components={','.join(sorted(self.splitk_components)) or 'none'} "
             f"index_selection={self.args.index_selection_mode} "
             f"gated_pool={self.args.gated_pool_mode} "
             f"prefix_cache={'current_token' if self.args.context_length == 1 else 'deterministic_seeded'} "
@@ -2272,6 +2660,39 @@ class ResidentOneLaunchDecode:
         print(
             "DSV4_HEAD_REFERENCE status=PASS "
             f"output_token={token}",
+            flush=True,
+        )
+
+    def report_projection_diagnostics(self) -> None:
+        """Compare resident Q_b output with its raw-checkpoint FP8 oracle."""
+        layer_id = self.families[0].representative
+        linear = DeepSeekV4Checkpoint(
+            self.args.checkpoint, self.config
+        ).load_fp8_linear(
+            f"layers.{layer_id}.attn.wq_b", device=str(self.device)
+        )
+        activation, activation_scale = quantize_fp8_block128(
+            self.q_rank_norm
+        )
+        reference = (
+            dequantize_fp8_block128(linear.weight, linear.scale)
+            @ dequantize_fp8_block128(activation, activation_scale)
+        ).to(torch.bfloat16)
+        actual = self.q.reshape(-1)
+        delta = actual.float() - reference.float()
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float(), reference.float(), dim=0
+        )
+        print(
+            "DSV4_PROJECTION_DIAGNOSTIC "
+            f"stage=q_b layer={layer_id} "
+            f"actual_norm={actual.float().norm().item():.6f} "
+            f"reference_norm={reference.float().norm().item():.6f} "
+            f"max_abs={delta.abs().max().item():.6f} "
+            f"mean_abs={delta.abs().mean().item():.6f} "
+            f"cosine={cosine.item():.8f} "
+            f"actual_head={actual[:8].float().cpu().tolist()} "
+            f"reference_head={reference[:8].float().cpu().tolist()}",
             flush=True,
         )
 
@@ -2621,6 +3042,32 @@ def main() -> None:
         help="select the q_b kernel for matched end-to-end A/B profiling",
     )
     parser.add_argument(
+        "--fp8-projection-mode",
+        choices=("legacy", "splitk"),
+        default="legacy",
+        help=(
+            "select legacy attention FP8 projections or native split-K/TMA "
+            "reduction for q_a, q_b, kv, index q_b, o_a, and o_b"
+        ),
+    )
+    parser.add_argument(
+        "--fp8-splitk-components",
+        default="all",
+        help=(
+            "comma-separated diagnostic subset of q_a,q_b,kv,index_q_b,o_a,o_b; "
+            "used only with --fp8-projection-mode=splitk"
+        ),
+    )
+    parser.add_argument(
+        "--fp8-splitk-reduction",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help=(
+            "reduce split-K projections directly to BF16 model outputs or "
+            "use an exact FP32 accumulator plus BF16 finalizer"
+        ),
+    )
+    parser.add_argument(
         "--attention-mode",
         choices=("auto", "contiguous", "scalar"),
         default="auto",
@@ -2642,6 +3089,11 @@ def main() -> None:
         "--profile-layers",
         action="store_true",
         help="record compact per-layer LDU globaltimer frontiers",
+    )
+    parser.add_argument(
+        "--diagnose-projections",
+        action="store_true",
+        help="compare resident projection output with a raw-checkpoint oracle",
     )
     parser.add_argument(
         "--profile-stages",
@@ -2724,6 +3176,8 @@ def main() -> None:
     build_seconds = time.monotonic() - build_started
     prime_token, prime_ms, prime_logits = flow.run_once()
     flow.validate_fp8_head(prime_token)
+    if args.diagnose_projections:
+        flow.report_projection_diagnostics()
     if args.expected_token_id is not None and prime_token != args.expected_token_id:
         raise AssertionError(
             f"prime launch emitted token {prime_token}, "

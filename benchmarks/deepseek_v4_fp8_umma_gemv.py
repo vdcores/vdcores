@@ -12,6 +12,7 @@ from dae.deepseek_v4_quant import (
     dequantize_fp8_block128,
     quantize_fp8_block128,
 )
+from dae.deepseek_v4_checkpoint import DeepSeekV4Checkpoint
 from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
 from dae.schedule import (
@@ -32,6 +33,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--prefix")
     parser.add_argument("--sms", type=int, default=0)
     parser.add_argument("--split-k", type=int, default=1)
     parser.add_argument(
@@ -44,6 +47,8 @@ def main() -> None:
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--zero-input", action="store_true")
     args = parser.parse_args()
+    if bool(args.checkpoint) != bool(args.prefix):
+        parser.error("--checkpoint and --prefix must be supplied together")
     if args.m <= 0 or args.k <= 0 or args.m % 128 or args.k % 128:
         parser.error("M and K must be positive multiples of 128")
     if args.k > 8192:
@@ -65,12 +70,25 @@ def main() -> None:
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260811)
-    weight_source = torch.randn(
-        (args.m, args.k),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    ) * 0.05
+    if args.checkpoint:
+        linear = DeepSeekV4Checkpoint(args.checkpoint).load_fp8_linear(
+            args.prefix, device=str(device)
+        )
+        if tuple(linear.weight.shape) != (args.m, args.k):
+            parser.error(
+                f"checkpoint linear has shape {tuple(linear.weight.shape)}, "
+                f"expected {(args.m, args.k)}"
+            )
+        weight = linear.weight
+        weight_scale = linear.scale
+    else:
+        weight_source = torch.randn(
+            (args.m, args.k),
+            generator=generator,
+            dtype=torch.bfloat16,
+            device=device,
+        ) * 0.05
+        weight, weight_scale = quantize_fp8_block128(weight_source)
     input_source = torch.randn(
         (args.k,),
         generator=generator,
@@ -79,7 +97,6 @@ def main() -> None:
     ) * 0.1
     if args.zero_input:
         input_source.zero_()
-    weight, weight_scale = quantize_fp8_block128(weight_source)
     activation, activation_scale = quantize_fp8_block128(input_source)
 
     packed_weight = torch.empty(

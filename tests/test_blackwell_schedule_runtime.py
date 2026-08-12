@@ -16,6 +16,7 @@ from dae.instructions import (
     Dsv4ContiguousAttention512UmmaTail32Sm100,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
+    Dsv4Fp32ToBf16,
     Dsv4Nvfp4QuantUmmaBSm100,
     Dsv4PreloadRopeTables,
     Dsv4Rope128_64,
@@ -60,6 +61,8 @@ from dae.schedule import (
     SchedDsv4Rope512_64,
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
+    SchedDsv4ZeroFill,
+    SchedDsv4Fp32ToBf16,
     SchedAttentionDecoding,
     SchedDsv4SwiGluShard128,
     SchedRoutedNvfp4GemvUmmaStream,
@@ -466,6 +469,62 @@ def test_fp8_splitk_umma_encodes_local_k_tiles():
 
     assert fp32.args == [16, 4]
     assert bf16.args == [16, 2]
+
+
+def test_dsv4_zero_fill_shards_contiguous_output(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    output = torch.empty((1024,), dtype=torch.bfloat16)
+    gate = torch.zeros((1,), dtype=torch.uint32)
+    schedule = (
+        SchedDsv4ZeroFill(gate, output)
+        .bar("gate", 8)
+        .bar("output", 9)
+        .place(8)
+    )
+
+    first = schedule.schedule(0)
+    last = schedule.schedule(7)
+
+    assert first[0].args == [64]
+    assert last[0].args == [64]
+    assert first[1].size == last[1].size == 4
+    assert first[1].opcode & 16
+    assert first[2].size == last[2].size == 256
+    assert first[2].cords != last[2].cords
+    assert first[2].opcode & 16
+    assert schedule.bar_release_count("output") == 8
+
+
+def test_dsv4_shape_policy_selects_validated_attention_splits():
+    policy = DeepSeekV4ShapePolicy(152)
+
+    assert policy.fp8_umma_split_k(1024, 4096) == (8, 64)
+    assert policy.fp8_umma_split_k(512, 4096) == (8, 32)
+    assert policy.fp8_umma_split_k(32768, 1024) == (2, 152)
+    assert policy.fp8_umma_split_k(8192, 1024) == (2, 128)
+    assert policy.fp8_umma_split_k(8192, 4096) == (2, 128)
+    assert policy.fp8_umma_split_k(4096, 8192) == (4, 128)
+
+
+def test_dsv4_fp32_to_bf16_finalizer_shards_m128_tiles(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    source = torch.empty((32768,), dtype=torch.float32)
+    output = torch.empty((32768,), dtype=torch.bfloat16)
+    schedule = SchedDsv4Fp32ToBf16(source, output).place(152)
+
+    first = schedule.schedule(0)
+    last = schedule.schedule(151)
+
+    assert isinstance(first[0], Dsv4Fp32ToBf16)
+    assert first[0].args == [256]
+    assert last[0].args == [128]
+    assert first[1].size == 256 * 4
+    assert first[2].size == 256 * 2
+    assert first[1].cords != last[1].cords
 
 
 def test_fp8_umma_prepack_encodes_kind_and_k_tile_count():
