@@ -216,7 +216,7 @@ class Fp8GemvUmmaStreamSm100(ComputeInstruction):
 
 
 class Fp8GemvUmmaSplitKSm100(ComputeInstruction):
-    """Emit an FP32 M128N8 partial for STU TMA reduce-add."""
+    """Emit one FP32 M128 partial for STU TMA reduce-add."""
 
     def __init__(self, k_tiles: int):
         if k_tiles <= 0 or k_tiles > 0xFFFF:

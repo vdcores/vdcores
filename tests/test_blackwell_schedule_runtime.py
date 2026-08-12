@@ -562,9 +562,9 @@ def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
 
     weights = torch.empty((8, 32, 16896), dtype=torch.uint8)
     activations = torch.empty((32, 2048), dtype=torch.uint8)
-    accumulator = torch.empty((8, 1024), dtype=torch.float32)
+    accumulator = torch.empty((1, 1024), dtype=torch.float32)
     output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
-        "reduce", 8, 128
+        "reduce", 1, 128
     )
     schedule = SchedFp8GemvUmmaSplitK(
         weights, activations, output_reduce, split_k=2
@@ -591,7 +591,7 @@ def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
     assert first_compute.args == [16]
     assert second_compute.args == [16]
     assert first_store.opcode == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
-    assert first_store.size == 8 * 128 * accumulator.element_size()
+    assert first_store.size == 128 * accumulator.element_size()
     assert first_store.cords[:2] == [0, 0]
     assert second_activation.cords != first[1].cords
     assert schedule.bar_release_count("output") == 0

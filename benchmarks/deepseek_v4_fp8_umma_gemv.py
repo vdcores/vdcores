@@ -174,13 +174,13 @@ def main() -> None:
     accumulator = None
     if args.split_k > 1:
         accumulator = torch.zeros(
-            (SchedFp8GemvUmmaSplitK.UMMA_N, args.m),
+            (SchedFp8GemvUmmaSplitK.OUTPUT_ROWS, args.m),
             dtype=torch.float32,
             device=device,
         )
         output_reduce = TmaTensor(
             gemv_launcher, accumulator
-        ).rowmajor_2d("reduce", SchedFp8GemvUmmaSplitK.UMMA_N, 128)
+        ).rowmajor_2d("reduce", SchedFp8GemvUmmaSplitK.OUTPUT_ROWS, 128)
         gemv_schedule = SchedFp8GemvUmmaSplitK(
             packed_weight,
             packed_activation,

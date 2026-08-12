@@ -1370,7 +1370,7 @@ class SchedFp8GemvUmmaSplitK(Schedule):
     WEIGHT_TILE_BYTES = SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES
     ACTIVATION_TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
     ACTIVATION_TILES_PER_CHUNK = 4
-    UMMA_N = 8
+    OUTPUT_ROWS = 1
 
     def __init__(
         self,
@@ -1417,12 +1417,12 @@ class SchedFp8GemvUmmaSplitK(Schedule):
             getattr(self.output_reduce, "mode", None) != "reduce"
             or output is None
             or output.dtype != torch.float32
-            or tuple(output.shape) != (self.UMMA_N, self.rows)
+            or tuple(output.shape) != (self.OUTPUT_ROWS, self.rows)
             or not output.is_contiguous()
         ):
             raise ValueError(
                 "split-K output must be a row-major TMA reduce tensor "
-                "over contiguous FP32 [8,M]"
+                "over contiguous FP32 [1,M]"
             )
         expected_sms = self.m_tiles * self.split_k
         if self.num_sms != expected_sms:

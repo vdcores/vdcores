@@ -608,42 +608,24 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
   auto coord_c = make_identity_tensor(
       make_shape(Int<kTileM>{}, Int<kTileN>{}));
   auto cta_coord_c = cta_mma.partition_C(coord_c);
-  if constexpr (SplitK) {
-    // Preserve all eight native accumulator columns as FP32. The activation
-    // tile replicates the decode vector across N=8, so every column is the
-    // same logical partial. Keeping the complete M128N8 tile lets STU issue
-    // one native TMA reduce-add instead of introducing a compute reducer.
-    // Physical shared layout is row-major [N=8,M=128].
-    auto output_layout = make_layout(
-        make_shape(Int<kTileM>{}, Int<kTileN>{}),
-        make_stride(Int<1>{}, Int<kTileM>{}));
-    auto s_output = make_tensor(
-        make_smem_ptr(static_cast<Accum *>(output_base)), output_layout);
-    auto cta_output = cta_mma.partition_C(s_output);
-    using TmemLoad = SM100_TMEM_LOAD_32dp32b4x;
-    auto tiled_t2r = make_tmem_copy(TmemLoad{}, tmem_acc);
-    auto thread_t2r = tiled_t2r.get_slice(tid % size(tiled_t2r));
-    auto thread_tmem = thread_t2r.partition_S(tmem_acc);
-    auto thread_output = thread_t2r.partition_D(cta_output);
-    auto r_acc = make_tensor<Accum>(shape(thread_output));
-    copy(tiled_t2r, thread_tmem, r_acc);
-    copy(r_acc, thread_output);
-  } else {
-    auto *output = static_cast<Output *>(output_base);
-    using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
-    auto tAcc = tmem_acc(make_coord(_, _), _0{}, _0{});
-    auto cAcc = cta_coord_c(make_coord(_, _), _0{}, _0{});
-    auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
-    const int thread_idx = tid % size(tiled_t2r);
-    auto thread_t2r = tiled_t2r.get_slice(thread_idx);
-    auto thread_tmem = thread_t2r.partition_S(tAcc);
-    auto thread_coord = thread_t2r.partition_D(cAcc);
-    auto r_acc = make_tensor<Accum>(shape(thread_coord));
-    copy(tiled_t2r, thread_tmem, r_acc);
-    for (int index = 0; index < size(r_acc); ++index) {
-      const int row = int(get<0>(thread_coord(index)));
-      const int col = int(get<1>(thread_coord(index)));
-      if (row < kTileM && col == 0) {
+  using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
+  auto tAcc = tmem_acc(make_coord(_, _), _0{}, _0{});
+  auto cAcc = cta_coord_c(make_coord(_, _), _0{}, _0{});
+  auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
+  const int thread_idx = tid % size(tiled_t2r);
+  auto thread_t2r = tiled_t2r.get_slice(thread_idx);
+  auto thread_tmem = thread_t2r.partition_S(tAcc);
+  auto thread_coord = thread_t2r.partition_D(cAcc);
+  auto r_acc = make_tensor<Accum>(shape(thread_coord));
+  copy(tiled_t2r, thread_tmem, r_acc);
+  for (int index = 0; index < size(r_acc); ++index) {
+    const int row = int(get<0>(thread_coord(index)));
+    const int col = int(get<1>(thread_coord(index)));
+    if (row < kTileM && col == 0) {
+      if constexpr (SplitK) {
+        static_cast<Accum *>(output_base)[row] = r_acc(index);
+      } else {
+        auto *output = static_cast<Output *>(output_base);
         output[row] = Output(r_acc(index));
       }
     }
