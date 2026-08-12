@@ -1740,12 +1740,13 @@ class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
         num_blocks = (self.rows + self.TILE - 1) // self.TILE
         for block in range(num_blocks):
             row = block * self.TILE
-            for tile in range(self.TILES_PER_VECTOR):
-                instructions.append(self.q_tma.cord(0, tile * self.TILE))
-            for tile in range(self.TILES_PER_VECTOR):
-                instructions.append(
-                    self.k_tma.cord(row, tile * self.TILE)
-                )
+            for wave in range(2):
+                for tile in range(2):
+                    column = (wave * 2 + tile) * self.TILE
+                    instructions.append(self.q_tma.cord(0, column))
+                for tile in range(2):
+                    column = (wave * 2 + tile) * self.TILE
+                    instructions.append(self.k_tma.cord(row, column))
             for tile in range(self.TILES_PER_VECTOR):
                 instructions.append(
                     self.v_tma.cord(row, tile * self.TILE)

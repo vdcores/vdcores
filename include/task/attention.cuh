@@ -670,6 +670,7 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
     constexpr int KV = 128;
     constexpr int D_TILE = 128;
     constexpr int D_TILES = 4;
+    constexpr int QK_WAVE_TILES = 2;
     constexpr uint32_t P_HI_OFFSET = 0;
     constexpr uint32_t P_LO_OFFSET = 64;
     constexpr uint32_t O_OFFSET = 128;
@@ -738,45 +739,46 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
     auto cta_o = cta_pv.partition_C(logical_o);
     auto cta_coord_o = cta_pv.partition_C(coord_o);
 
-    int q_slots[D_TILES];
-    data_t *q_ptrs[D_TILES];
-    int k_slots[D_TILES];
-    data_t *k_ptrs[D_TILES];
-#pragma unroll 1
-    for (int tile = 0; tile < D_TILES; ++tile) {
-        q_slots[tile] = m2c.template pop<0>();
-        q_ptrs[tile] = static_cast<data_t *>(
-            get_slot_address(smem_base, extract(q_slots[tile])));
-    }
-#pragma unroll 1
-    for (int tile = 0; tile < D_TILES; ++tile) {
-        k_slots[tile] = m2c.template pop<0>();
-        k_ptrs[tile] = static_cast<data_t *>(
-            get_slot_address(smem_base, extract(k_slots[tile])));
-    }
-
     tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
-    if (tid < numThreadsPerWarp) {
+    for (int wave = 0; wave < D_TILES / QK_WAVE_TILES; ++wave) {
+        int q_slots[QK_WAVE_TILES];
+        data_t *q_ptrs[QK_WAVE_TILES];
+        int k_slots[QK_WAVE_TILES];
+        data_t *k_ptrs[QK_WAVE_TILES];
 #pragma unroll 1
-        for (int tile = 0; tile < D_TILES; ++tile) {
-            auto sQ = make_tensor(make_smem_ptr(q_ptrs[tile]), layout_q);
-            auto sK = make_tensor(make_smem_ptr(k_ptrs[tile]), layout_k);
-            auto frag_q = cta_qk.make_fragment_A(sQ);
-            auto frag_k = cta_qk.make_fragment_B(sK);
-#pragma unroll 1
-            for (int k_block = 0; k_block < size<2>(frag_q); ++k_block) {
-                gemm(tiled_qk, frag_q(_, _, k_block),
-                     frag_k(_, _, k_block), tmem_s);
-                tiled_qk.accumulate_ = UMMA::ScaleOut::One;
-            }
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            q_slots[tile] = m2c.template pop<0>();
+            q_ptrs[tile] = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(q_slots[tile])));
         }
-        cutlass::arch::umma_arrive(tmem_mma_barrier);
-    }
-    cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
-    tmem_mma_phase ^= 1;
 #pragma unroll 1
-    for (int tile = 0; tile < D_TILES; ++tile) {
-        c2m.push(tid, q_slots[tile] | k_slots[tile]);
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            k_slots[tile] = m2c.template pop<0>();
+            k_ptrs[tile] = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(k_slots[tile])));
+        }
+        if (tid < numThreadsPerWarp) {
+#pragma unroll 1
+            for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+                auto sQ = make_tensor(make_smem_ptr(q_ptrs[tile]), layout_q);
+                auto sK = make_tensor(make_smem_ptr(k_ptrs[tile]), layout_k);
+                auto frag_q = cta_qk.make_fragment_A(sQ);
+                auto frag_k = cta_qk.make_fragment_B(sK);
+#pragma unroll 1
+                for (int k_block = 0; k_block < size<2>(frag_q); ++k_block) {
+                    gemm(tiled_qk, frag_q(_, _, k_block),
+                         frag_k(_, _, k_block), tmem_s);
+                    tiled_qk.accumulate_ = UMMA::ScaleOut::One;
+                }
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+#pragma unroll 1
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            c2m.push(tid, q_slots[tile] | k_slots[tile]);
+        }
     }
 
     int v_slots[D_TILES];
