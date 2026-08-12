@@ -1630,7 +1630,17 @@ projections without creating another launch or instruction stream.
 
 All rows are exact against the dequantized FP32 oracle within the benchmark's
 tolerance. They include TMA reduce-add but exclude accumulator reset and the
-FP32-to-model-dtype handoff. The screen also rejected over-splitting: aggregate
+model-dtype handoff. The screen also rejected over-splitting: aggregate
 O_a split-4/split-8 measured 10.912/11.680 us, and O_b split-8/split-16 measured
 10.944/11.680 us. Q_b remains the unresolved kernel gap because its large M
 grid was already saturated before splitting.
+
+Blackwell TMA reduce-add also accepts a BF16 tensor map. The split epilogue can
+therefore convert each FP32 TMEM partial to BF16 in shared memory and reduce it
+directly into the normal model output buffer. This is a GEMM output mode, not a
+consumer fusion, and removes the otherwise-required FP32-to-BF16 copy stage.
+Across the selected shapes, 100-sample medians are 3.552 us (Q_a), 3.488 us
+(KV), 11.744 us (Q_b), 3.648 us (index Q_b), 10.368 us (aggregate O_a), and
+10.368 us (O_b). Maximum absolute deviation from the BF16 full-K reference is
+at most 0.007812. Accumulator reset is still outside these spans and remains an
+explicit resident integration requirement.

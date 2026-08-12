@@ -34,6 +34,11 @@ def main() -> None:
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--sms", type=int, default=0)
     parser.add_argument("--split-k", type=int, default=1)
+    parser.add_argument(
+        "--reduction-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--diagnostic", action="store_true")
@@ -50,6 +55,8 @@ def main() -> None:
     k_tiles = args.k // SchedFp8UmmaPrepack.TILE_K
     if args.split_k <= 0 or k_tiles % args.split_k:
         parser.error("split-k must be positive and divide K/128")
+    if args.split_k == 1 and args.reduction_dtype != "fp32":
+        parser.error("reduction dtype applies only to split-K")
     default_sms = min(m_tiles * args.split_k, 152)
     num_sms = args.sms or default_sms
     max_sms = min(152, m_tiles * args.split_k)
@@ -171,9 +178,14 @@ def main() -> None:
     gemv_launcher = Launcher(num_sms, device=device)
     accumulator = None
     if args.split_k > 1:
+        reduction_dtype = (
+            torch.float32
+            if args.reduction_dtype == "fp32"
+            else torch.bfloat16
+        )
         accumulator = torch.zeros(
             (SchedFp8GemvUmmaSplitK.OUTPUT_ROWS, args.m),
-            dtype=torch.float32,
+            dtype=reduction_dtype,
             device=device,
         )
         output_reduce = TmaTensor(
@@ -240,7 +252,11 @@ def main() -> None:
             f"reference_head={reference[:8].float().cpu().tolist()}",
             flush=True,
         )
-    expected = reference_float if accumulator is not None else reference
+    expected = (
+        reference_float
+        if accumulator is not None and accumulator.dtype == torch.float32
+        else reference
+    )
     torch.testing.assert_close(result, expected, rtol=3.0e-2, atol=1.0e-1)
     max_abs = (result.float() - expected.float()).abs().max().item()
 
@@ -265,6 +281,7 @@ def main() -> None:
     print(
         "DSV4_FP8_UMMA_RESULT "
         f"shape={args.m}x1x{args.k} sms={num_sms} split_k={args.split_k} "
+        f"reduction_dtype={args.reduction_dtype} "
         f"reset_in_span={str(args.split_k == 1).lower()} "
         f"quant_median_us={statistics.median(quant_timings):.6f} "
         f"task_min_us={min(task_timings):.6f} "

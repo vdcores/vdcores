@@ -461,9 +461,11 @@ def test_fp8_streaming_umma_encodes_k_tiles():
 
 
 def test_fp8_splitk_umma_encodes_local_k_tiles():
-    instruction = Fp8GemvUmmaSplitKSm100(16)
+    fp32 = Fp8GemvUmmaSplitKSm100(16)
+    bf16 = Fp8GemvUmmaSplitKSm100(16, 2)
 
-    assert instruction.args == [16]
+    assert fp32.args == [16, 4]
+    assert bf16.args == [16, 2]
 
 
 def test_fp8_umma_prepack_encodes_kind_and_k_tile_count():
@@ -588,8 +590,8 @@ def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
         and inst.size == 4 * 2048
     )
 
-    assert first_compute.args == [16]
-    assert second_compute.args == [16]
+    assert first_compute.args == [16, 4]
+    assert second_compute.args == [16, 4]
     assert first_store.opcode == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
     assert first_store.size == 128 * accumulator.element_size()
     assert first_store.cords[:2] == [0, 0]
@@ -636,7 +638,7 @@ def test_fp8_native_splitk_balances_more_work_tiles_than_sms(monkeypatch):
 
     assert len(first_compute) == 4
     assert len(last_compute) == 3
-    assert all(inst.args == [4] for inst in first_compute + last_compute)
+    assert all(inst.args == [4, 4] for inst in first_compute + last_compute)
     assert len(first_stores) == 4
     assert sum(bool(inst.opcode & 16) for inst in first_stores) == 1
     assert first_stores[-1].opcode & 16

@@ -1416,14 +1416,15 @@ class SchedFp8GemvUmmaSplitK(Schedule):
         if (
             getattr(self.output_reduce, "mode", None) != "reduce"
             or output is None
-            or output.dtype != torch.float32
+            or output.dtype not in (torch.bfloat16, torch.float32)
             or tuple(output.shape) != (self.OUTPUT_ROWS, self.rows)
             or not output.is_contiguous()
         ):
             raise ValueError(
                 "split-K output must be a row-major TMA reduce tensor "
-                "over contiguous FP32 [1,M]"
+                "over contiguous BF16 or FP32 [1,M]"
             )
+        self.reduction_bytes = output.element_size()
         self.work_tiles = self.m_tiles * self.split_k
         if not 0 < self.num_sms <= self.work_tiles:
             raise ValueError(
@@ -1448,7 +1449,9 @@ class SchedFp8GemvUmmaSplitK(Schedule):
             k_start = split * self.k_tiles_per_split
             k_stop = k_start + self.k_tiles_per_split
             instructions.append(
-                Fp8GemvUmmaSplitKSm100(self.k_tiles_per_split)
+                Fp8GemvUmmaSplitKSm100(
+                    self.k_tiles_per_split, self.reduction_bytes
+                )
             )
             for chunk_start in range(
                 k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK

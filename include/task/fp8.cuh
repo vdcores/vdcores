@@ -442,7 +442,8 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
 // records through separate load ports. Each allocation already contains both
 // swizzled FP8 data and its native UE8M0 scale layout, so compute sees only
 // shared addresses and never resolves an HBM pointer.
-template <bool SplitK, typename M2CQueue, typename C2MQueue>
+template <bool SplitK, typename SplitOutput, typename M2CQueue,
+          typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
     int num_k_tiles,
     void *smem_base,
@@ -623,7 +624,8 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
     const int col = int(get<1>(thread_coord(index)));
     if (row < kTileM && col == 0) {
       if constexpr (SplitK) {
-        static_cast<Accum *>(output_base)[row] = r_acc(index);
+        static_cast<SplitOutput *>(output_base)[row] =
+            SplitOutput(r_acc(index));
       } else {
         auto *output = static_cast<Output *>(output_base);
         output[row] = Output(r_acc(index));
@@ -644,12 +646,12 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_sm100(
     uint32_t &tmem_mma_phase,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  task_fp8_gemv_umma_stream_impl_sm100<false>(
+  task_fp8_gemv_umma_stream_impl_sm100<false, float>(
       num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
       tmem_mma_phase, m2c, c2m);
 }
 
-template <typename M2CQueue, typename C2MQueue>
+template <typename SplitOutput, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_splitk_sm100(
     int num_k_tiles,
     void *smem_base,
@@ -658,7 +660,7 @@ __device__ __forceinline__ void task_fp8_gemv_umma_splitk_sm100(
     uint32_t &tmem_mma_phase,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  task_fp8_gemv_umma_stream_impl_sm100<true>(
+  task_fp8_gemv_umma_stream_impl_sm100<true, SplitOutput>(
       num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
       tmem_mma_phase, m2c, c2m);
 }

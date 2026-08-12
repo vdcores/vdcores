@@ -216,14 +216,19 @@ class Fp8GemvUmmaStreamSm100(ComputeInstruction):
 
 
 class Fp8GemvUmmaSplitKSm100(ComputeInstruction):
-    """Emit one FP32 M128 partial for STU TMA reduce-add."""
+    """Emit one M128 partial for STU TMA reduce-add."""
 
-    def __init__(self, k_tiles: int):
+    BF16_BYTES = 2
+    FP32_BYTES = 4
+
+    def __init__(self, k_tiles: int, reduction_bytes: int = FP32_BYTES):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("split-K FP8 UMMA K-tile count must fit uint16")
+        if reduction_bytes not in (self.BF16_BYTES, self.FP32_BYTES):
+            raise ValueError("split-K reduction must use BF16 or FP32")
         super().__init__(
             opcode=opcode.OP_FP8_GEMV_UMMA_SPLITK_SM100,
-            args=[k_tiles],
+            args=[k_tiles, reduction_bytes],
         )
 
 
