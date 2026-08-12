@@ -53,6 +53,7 @@ from dae.schedule import (
     SchedDsv4HcHead,
     SchedDsv4HcPost,
     SchedDsv4HcPre,
+    SchedDsv4HcPreRms,
     SchedDsv4IndexScore,
     SchedDsv4KvProjectCache,
     SchedDsv4PreloadRopeTables,
@@ -1139,24 +1140,44 @@ class ResidentOneLaunchDecode:
             project,
             self.policy.fp32_bf16_gemv(24, residual.numel()),
         )
-        pre = SchedDsv4HcPre(
-            residual,
-            self.mixes,
-            scales[0],
-            bases[0],
-            self.hidden,
-            self.post,
-            self.comb,
+        norm_weights = self._family_tensors(
+            family, f"{branch_name}_norm.weight"
         )
-        pre = self._layered(pre, family, scales, bases)
-        pre_stage = self._stage(f"{branch_name}.hc_pre", pre)
-        norm_stage = self._rms_stage(
-            f"{branch_name}.rms4096",
-            self.hidden,
-            self.norm_hidden,
-            family=family,
-            weight_suffix=f"{branch_name}_norm.weight",
-        )
+        if self.args.hc_hidden_fusion == "retain":
+            pre = SchedDsv4HcPreRms(
+                residual,
+                self.mixes,
+                scales[0],
+                bases[0],
+                norm_weights[0],
+                self.norm_hidden,
+                self.post,
+                self.comb,
+            )
+            pre = self._layered(pre, family, scales, bases, norm_weights)
+            pre_stages = [
+                self._stage(f"{branch_name}.hc_pre_rms", pre)
+            ]
+        else:
+            pre = SchedDsv4HcPre(
+                residual,
+                self.mixes,
+                scales[0],
+                bases[0],
+                self.hidden,
+                self.post,
+                self.comb,
+            )
+            pre = self._layered(pre, family, scales, bases)
+            pre_stage = self._stage(f"{branch_name}.hc_pre", pre)
+            norm_stage = self._rms_stage(
+                f"{branch_name}.rms4096",
+                self.hidden,
+                self.norm_hidden,
+                family=family,
+                weight_suffix=f"{branch_name}_norm.weight",
+            )
+            pre_stages = [pre_stage, norm_stage]
         post_stage = self._stage(
             f"{branch_name}.hc_post",
             SchedDsv4HcPost(
@@ -1170,7 +1191,7 @@ class ResidentOneLaunchDecode:
                 self.config.hidden_size, self.config.hc_mult
             ),
         )
-        return [project_stage, pre_stage, norm_stage], post_stage
+        return [project_stage, *pre_stages], post_stage
 
     def _build_attention(self, family: LayerFamily) -> list[Stage]:
         cfg = self.config
@@ -2467,6 +2488,7 @@ class ResidentOneLaunchDecode:
                 return False
             if name in {
                 "attn.hc_pre",
+                "attn.hc_pre_rms",
                 "attn.hidden.quant_fp8",
                 "attn.q_rope",
                 "attn.kv_rope",
@@ -2488,6 +2510,7 @@ class ResidentOneLaunchDecode:
                 "attn.o_b",
                 "attn.hc_post",
                 "ffn.hc_pre",
+                "ffn.hc_pre_rms",
                 "ffn.route",
                 "ffn.shared.w2",
                 "ffn.expert_reduce",
@@ -2644,6 +2667,7 @@ class ResidentOneLaunchDecode:
             f"fp8_projection_mode={self.args.fp8_projection_mode} "
             f"fp8_splitk_reduction={self.args.fp8_splitk_reduction} "
             f"kv_cache_fusion={self.args.kv_cache_fusion} "
+            f"hc_hidden_fusion={self.args.hc_hidden_fusion} "
             f"fp8_splitk_components={','.join(sorted(self.splitk_components)) or 'none'} "
             f"index_selection={self.args.index_selection_mode} "
             f"gated_pool={self.args.gated_pool_mode} "
@@ -3160,6 +3184,15 @@ def main() -> None:
         help=(
             "fuse split-K KV projection, learned RMS, and RoPE into the "
             "persistent cache-producing schedule"
+        ),
+    )
+    parser.add_argument(
+        "--hc-hidden-fusion",
+        choices=("off", "retain"),
+        default="retain",
+        help=(
+            "retain the mHC-pre BF16 intermediate in VDCores shared memory "
+            "through the following RMS task"
         ),
     )
     parser.add_argument(

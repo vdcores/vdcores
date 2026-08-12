@@ -14,6 +14,7 @@ from dae.instructions import (
     Copy,
     Dsv4ContiguousAttention512UmmaSm100,
     Dsv4ContiguousAttention512UmmaTail32Sm100,
+    Dsv4HcPre,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Fp32ToBf16,
@@ -43,9 +44,11 @@ from dae.instructions import (
     ProfileEvent,
     ProfileStep,
     RepeatM,
+    RMS_NORM_F16_K_4096_SMEM,
     ResetIndirectLayer,
     RoutedTmaLoad1D,
     RegLoad,
+    RegStore,
     TmaLoadAddressReg1D,
     TmaLoadReg1D,
     TmaTensor,
@@ -55,6 +58,7 @@ from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.launcher import Launcher
 from dae.schedule import (
     Schedule,
+    SchedDsv4HcPreRms,
     SchedDsv4HcPost,
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
@@ -606,6 +610,52 @@ def test_fp8_native_stream_bounds_activation_chunks_to_one_slot(monkeypatch):
     assert all(inst.num_slots == 1 for inst in activation_loads)
     assert len(weight_loads) == 16
     assert all(inst.num_slots == 3 for inst in weight_loads)
+
+
+def test_dsv4_hc_pre_rms_retains_bf16_intermediate_on_one_ldu(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedDsv4HcPreRms(
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((3,), dtype=torch.float32),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((4, 4), dtype=torch.float32),
+    ).bar("output", 7).place(1)
+
+    instructions = schedule.schedule(0)
+    compute = [
+        inst for inst in instructions if isinstance(inst, ComputeInstruction)
+    ]
+    retained_store = next(
+        inst for inst in instructions if isinstance(inst, RegStore)
+    )
+    retained_load = next(
+        inst for inst in instructions if isinstance(inst, RegLoad)
+    )
+    marked_tails = [
+        inst
+        for inst in instructions
+        if isinstance(inst, MemoryInstruction)
+        and inst.annotation.get("sequential_dependency_tail", False)
+    ]
+
+    assert [type(inst) for inst in compute] == [
+        Dsv4HcPre,
+        RMS_NORM_F16_K_4096_SMEM,
+    ]
+    assert retained_store.opcode & 0x20
+    assert retained_load.opcode & 0x20
+    assert retained_store.size == retained_load.size == 0
+    assert retained_store.num_slots & 0x3F == 1
+    assert retained_load.num_slots & 0x3F == config.num_slots
+    assert len(marked_tails) == 1
+    assert marked_tails[0].num_slots >> 6 == 7
+    assert schedule.bar_release_count("output") == 1
 
 
 def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):

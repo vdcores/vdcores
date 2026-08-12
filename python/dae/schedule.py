@@ -2537,6 +2537,105 @@ class SchedDsv4HcPre(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4HcPreRms(Schedule):
+    """Keep the mHC-pre vector in one VDCores shared slot through RMS.
+
+    The two existing compute tasks remain in-order on one compute VCore.  A
+    same-port RegStore/RegLoad pair retains the 4096-wide BF16 intermediate,
+    eliminating its HBM write/read without changing either task's arithmetic.
+    The RMS weight may preload independently on the other LDU.
+    """
+
+    HIDDEN_REGISTER = 0
+    HIDDEN_REGISTER_SLOT = 0
+
+    def __init__(
+        self,
+        residual,
+        mixes,
+        scale,
+        base,
+        rms_weight,
+        output,
+        post,
+        comb,
+        sinkhorn_iters=20,
+        epsilon=1.0e-6,
+    ):
+        super().__init__()
+        self.residual = residual
+        self.mixes = mixes
+        self.scale = scale
+        self.base = base
+        self.rms_weight = rms_weight
+        self.output = output
+        self.post = post
+        self.comb = comb
+        self.sinkhorn_iters = sinkhorn_iters
+        self.epsilon = epsilon
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("fused mHC pre/RMS currently uses exactly one SM")
+        if (
+            self.residual.dtype != torch.bfloat16
+            or tuple(self.residual.shape) != (4, 4096)
+        ):
+            raise ValueError("fused mHC residual must be BF16 [4,4096]")
+        if self.mixes.dtype != torch.float32 or self.mixes.numel() != 24:
+            raise ValueError("fused mHC mixes must contain 24 FP32 values")
+        if self.scale.dtype != torch.float32 or self.scale.numel() != 3:
+            raise ValueError("fused mHC scale must contain three FP32 values")
+        if self.base.dtype != torch.float32 or self.base.numel() != 24:
+            raise ValueError("fused mHC base must contain 24 FP32 values")
+        if (
+            self.rms_weight.dtype != torch.bfloat16
+            or self.rms_weight.numel() != 4096
+            or not self.rms_weight.is_contiguous()
+        ):
+            raise ValueError("fused mHC RMS weight must be contiguous BF16[4096]")
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.numel() != 4096
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("fused mHC output must be contiguous BF16[4096]")
+        if self.post.dtype != torch.float32 or self.post.numel() != 4:
+            raise ValueError("fused mHC post coefficients must be FP32[4]")
+        if self.comb.dtype != torch.float32 or tuple(self.comb.shape) != (4, 4):
+            raise ValueError("fused mHC combination matrix must be FP32[4,4]")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        output_store = TmaStore1D(self.output).bar(self._bar("output"))
+        output_store.annotation["sequential_dependency_tail"] = True
+        return [
+            Dsv4HcPre(self.sinkhorn_iters, self.epsilon),
+            RMS_NORM_F16_K_4096_SMEM(1, self.epsilon),
+            TmaLoad1D(self.residual),
+            TmaLoad1D(self.mixes),
+            _shared_load_1d(self.scale),
+            TmaLoad1D(self.base),
+            RegStore(
+                self.HIDDEN_REGISTER, size=4096 * 2
+            ).fixed_port(1),
+            TmaStore1D(self.post),
+            TmaStore1D(self.comb),
+            TmaLoad1D(self.rms_weight).fixed_port(0),
+            RegLoad(
+                self.HIDDEN_REGISTER,
+                slot_id=self.HIDDEN_REGISTER_SLOT,
+            ).fixed_port(1),
+            output_store,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
 class SchedDsv4HcPost(Schedule):
     def __init__(self, branch, residual, post, comb, output):
         super().__init__()
