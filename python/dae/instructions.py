@@ -296,6 +296,16 @@ class Dsv4ContiguousAttention512UmmaSm100(ComputeInstruction):
         )
 
 
+class Dsv4ContiguousAttention512UmmaTail32Sm100(ComputeInstruction):
+    def __init__(self, rows: int):
+        if rows <= 128 or rows > 160:
+            raise ValueError("DeepSeek UMMA tail rows must be in [129,160]")
+        super().__init__(
+            opcode=opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_TAIL32_SM100,
+            args=[rows],
+        )
+
+
 class Dsv4RouteTop6(ComputeInstruction):
     def __init__(self, hash_routing: bool, route_scale: float = 1.5):
         if route_scale <= 0:
@@ -2131,6 +2141,7 @@ __all__ = [
     "Dsv4SparseAttention512",
     "Dsv4ContiguousAttention512Block4",
     "Dsv4ContiguousAttention512UmmaSm100",
+    "Dsv4ContiguousAttention512UmmaTail32Sm100",
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",

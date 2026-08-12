@@ -13,6 +13,7 @@ from dae.instructions import (
     ComputeInstruction,
     Copy,
     Dsv4ContiguousAttention512UmmaSm100,
+    Dsv4ContiguousAttention512UmmaTail32Sm100,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Nvfp4QuantUmmaBSm100,
@@ -95,11 +96,18 @@ def test_kmajor_uint8_coordinates_use_128_byte_blocks():
 
 def test_dsv4_umma_attention_opcode_and_context_gate():
     instruction = Dsv4ContiguousAttention512UmmaSm100(128)
+    tail = Dsv4ContiguousAttention512UmmaTail32Sm100(160)
 
     assert instruction.opcode == opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100
     assert instruction.args == [128]
+    assert tail.opcode == (
+        opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_TAIL32_SM100
+    )
+    assert tail.args == [160]
     with pytest.raises(ValueError, match=r"\[1,128\]"):
         Dsv4ContiguousAttention512UmmaSm100(129)
+    with pytest.raises(ValueError, match=r"\[129,160\]"):
+        Dsv4ContiguousAttention512UmmaTail32Sm100(128)
 
 
 def test_rowmajor_2d_tma_coordinates_preserve_row_and_column():

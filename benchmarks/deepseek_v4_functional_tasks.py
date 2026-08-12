@@ -46,6 +46,7 @@ from dae.schedule import (
     SchedDsv4SparseAttention512,
     SchedDsv4ContiguousAttention512Block4,
     SchedDsv4ContiguousAttention512UmmaSm100,
+    SchedDsv4ContiguousAttention512UmmaTail32Sm100,
     SchedDsv4TopK512,
     SchedRMS,
     SchedSmemSiLUInterleaved,
@@ -258,10 +259,10 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
             latency_us=contiguous_latency,
         )
 
-    if _ATTENTION_IMPLEMENTATION == "umma" and _ATTENTION_TOPK > 128:
-        raise ValueError("UMMA attention currently supports at most 128 rows")
+    if _ATTENTION_IMPLEMENTATION == "umma" and _ATTENTION_TOPK > 160:
+        raise ValueError("UMMA attention currently supports at most 160 rows")
     if (_ATTENTION_IMPLEMENTATION in ("both", "umma") and
-            _ATTENTION_TOPK <= 128):
+            _ATTENTION_TOPK <= 160):
         contiguous_indices = torch.arange(
             _ATTENTION_TOPK, dtype=torch.int32, device=device
         )
@@ -276,9 +277,8 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
         output_tma = TmaTensor(umma_launcher, umma_output).rowmajor_2d(
             "store", 64, 128
         )
-        umma_latency = launch_with_launcher(
-            umma_launcher,
-            SchedDsv4ContiguousAttention512UmmaSm100(
+        if _ATTENTION_TOPK <= 128:
+            umma_schedule = SchedDsv4ContiguousAttention512UmmaSm100(
                 q,
                 kv,
                 _ATTENTION_TOPK,
@@ -288,7 +288,30 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
                 k_tma=k_tma,
                 v_tma=v_tma,
                 output_tma=output_tma,
-            ),
+            )
+        else:
+            tail_k_tma = TmaTensor(umma_launcher, kv).wgmma_load(
+                32, 128, Major.K
+            )
+            tail_v_tma = TmaTensor(umma_launcher, kv).wgmma_load(
+                32, 128, Major.MN
+            )
+            umma_schedule = SchedDsv4ContiguousAttention512UmmaTail32Sm100(
+                q,
+                kv,
+                _ATTENTION_TOPK,
+                sink,
+                umma_output,
+                q_tma=q_tma,
+                prefix_k_tma=k_tma,
+                tail_k_tma=tail_k_tma,
+                prefix_v_tma=v_tma,
+                tail_v_tma=tail_v_tma,
+                output_tma=output_tma,
+            )
+        umma_latency = launch_with_launcher(
+            umma_launcher,
+            umma_schedule,
         )
         umma_diff = (umma_output.float() - contiguous_expected.float()).abs()
         umma_cos = torch.nn.functional.cosine_similarity(

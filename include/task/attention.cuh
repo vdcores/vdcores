@@ -893,6 +893,412 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
     }
 }
 
+// Normalize a dense K128 prefix and a live K<=32 tail in one softmax pass.
+// Both score fragments stay in TMEM until the shared-memory high/residual P
+// tiles are written, so no score or partial-output copy crosses a task stage.
+template <int M, int PREFIX_KV, int TAIL_KV,
+          typename PrefixTmemTensor, typename PrefixCoordTensor,
+          typename TailTmemTensor, typename TailCoordTensor,
+          typename PrefixProbTensor, typename TailProbTensor>
+__device__ __forceinline__ void
+sm100_dsv4_softmax_tmem_smem_prefix_tail_hi_lo(
+    PrefixTmemTensor const& prefix_scores,
+    PrefixCoordTensor const& prefix_coords,
+    TailTmemTensor const& tail_scores,
+    TailCoordTensor const& tail_coords,
+    PrefixProbTensor const& prefix_p_hi,
+    PrefixProbTensor const& prefix_p_lo,
+    TailProbTensor const& tail_p_hi,
+    TailProbTensor const& tail_p_lo,
+    const float *sink,
+    const int tail_tokens,
+    int& logical_row,
+    float& row_sum) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr float kScoreScale =
+        M_LOG2E * 0.04419417382415922f;
+    const int tid = __compute_tid();
+
+    using PrefixLoad = SM100_TMEM_LOAD_16dp32b16x;
+    auto prefix_load = make_tmem_copy(PrefixLoad{}, prefix_scores);
+    auto prefix_thread = prefix_load.get_slice(tid);
+    auto thread_prefix_scores =
+        prefix_thread.partition_S(prefix_scores);
+    auto thread_prefix_coords =
+        prefix_thread.partition_D(prefix_coords);
+    auto r_prefix = make_tensor<accum_t>(shape(thread_prefix_coords));
+    copy(prefix_load, thread_prefix_scores, r_prefix);
+
+    using TailLoad = SM100_TMEM_LOAD_16dp32b16x;
+    auto tail_load = make_tmem_copy(TailLoad{}, tail_scores);
+    auto tail_thread = tail_load.get_slice(tid);
+    auto thread_tail_scores = tail_thread.partition_S(tail_scores);
+    auto thread_tail_coords = tail_thread.partition_D(tail_coords);
+    auto r_tail = make_tensor<accum_t>(shape(thread_tail_coords));
+    copy(tail_load, thread_tail_scores, r_tail);
+
+    logical_row = int(get<0>(thread_prefix_coords(0)));
+    float row_max = sink[logical_row] * M_LOG2E;
+#pragma unroll 1
+    for (int i = 0; i < size(r_prefix); ++i) {
+        r_prefix(i) *= kScoreScale;
+        row_max = fmaxf(row_max, r_prefix(i));
+    }
+#pragma unroll 1
+    for (int i = 0; i < size(r_tail); ++i) {
+        const int col = int(get<1>(thread_tail_coords(i)));
+        r_tail(i) = col < tail_tokens
+            ? r_tail(i) * kScoreScale : -FLT_MAX;
+        row_max = fmaxf(row_max, r_tail(i));
+    }
+    row_max = fmaxf(
+        row_max, __shfl_xor_sync(0xFFFFFFFFU, row_max, 16));
+
+    const float sink_prob =
+        exp2f(sink[logical_row] * M_LOG2E - row_max);
+    float local_sum = 0.0f;
+#pragma unroll 1
+    for (int i = 0; i < size(r_prefix); ++i) {
+        r_prefix(i) = exp2f(r_prefix(i) - row_max);
+        local_sum += r_prefix(i);
+    }
+#pragma unroll 1
+    for (int i = 0; i < size(r_tail); ++i) {
+        r_tail(i) = exp2f(r_tail(i) - row_max);
+        local_sum += r_tail(i);
+    }
+    row_sum = sink_prob + local_sum +
+        __shfl_xor_sync(0xFFFFFFFFU, local_sum, 16);
+
+    cutlass::NumericArrayConverter<data_t, accum_t, 1> convert;
+#pragma unroll 1
+    for (int i = 0; i < size(r_prefix); ++i) {
+        const int row = int(get<0>(thread_prefix_coords(i)));
+        const int col = int(get<1>(thread_prefix_coords(i)));
+        cutlass::Array<accum_t, 1> value{{r_prefix(i)}};
+        const auto high = convert(value);
+        cutlass::Array<accum_t, 1> residual{{
+            r_prefix(i) - static_cast<accum_t>(high[0])}};
+        prefix_p_hi(row + M * col) = high[0];
+        prefix_p_lo(row + M * col) = convert(residual)[0];
+    }
+#pragma unroll 1
+    for (int i = 0; i < size(r_tail); ++i) {
+        const int row = int(get<0>(thread_tail_coords(i)));
+        const int col = int(get<1>(thread_tail_coords(i)));
+        cutlass::Array<accum_t, 1> value{{r_tail(i)}};
+        const auto high = convert(value);
+        cutlass::Array<accum_t, 1> residual{{
+            r_tail(i) - static_cast<accum_t>(high[0])}};
+        tail_p_hi(row + M * col) = high[0];
+        tail_p_lo(row + M * col) = convert(residual)[0];
+    }
+
+    // The same 128 compute threads publish all P fragments. Join once before
+    // the issuer warp consumes them through the asynchronous tensor proxy.
+    __sync_compute_group(128);
+    cutlass::arch::fence_view_async_shared();
+}
+
+// Contexts 129--160 use a native K128 prefix plus a native K32 tail. Q is
+// retained only through both QK products, then its allocator slots are reused
+// in place as shared P storage. Prefix/tail V pairs stream one output tile at
+// a time while four FP32 output tiles remain in TMEM.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void
+task_dsv4_contiguous_attention_512_umma_tail32(
+    int rows,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t& tmem_mma_phase,
+    void *smem_base,
+    M2CQueue& m2c,
+    C2MQueue& c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr int M = 64;
+    constexpr int PREFIX_KV = 128;
+    constexpr int TAIL_KV = 32;
+    constexpr int D_TILE = 128;
+    constexpr int D_TILES = 4;
+    constexpr int QK_WAVE_TILES = 2;
+    constexpr uint32_t TAIL_SCORE_OFFSET = PREFIX_KV;
+
+    using PrefixQKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, PREFIX_KV,
+        UMMA::Major::K, UMMA::Major::K>;
+    using TailQKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, TAIL_KV,
+        UMMA::Major::K, UMMA::Major::K>;
+    using PVAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, D_TILE,
+        UMMA::Major::K, UMMA::Major::MN>;
+
+    const int tid = __compute_tid();
+    const int tail_tokens = rows - PREFIX_KV;
+    auto prefix_qk = make_tiled_mma(PrefixQKAtom{});
+    auto prefix_qk_cta = prefix_qk.get_slice(0);
+    auto tail_qk = make_tiled_mma(TailQKAtom{});
+    auto tail_qk_cta = tail_qk.get_slice(0);
+    auto tiled_pv = make_tiled_mma(PVAtom{});
+    auto pv_cta = tiled_pv.get_slice(0);
+
+    auto prefix_q_shape = partition_shape_A(
+        prefix_qk, make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto prefix_k_shape = partition_shape_B(
+        prefix_qk, make_shape(Int<PREFIX_KV>{}, Int<D_TILE>{}));
+    auto tail_q_shape = partition_shape_A(
+        tail_qk, make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto tail_k_shape = partition_shape_B(
+        tail_qk, make_shape(Int<TAIL_KV>{}, Int<D_TILE>{}));
+    auto prefix_v_shape = partition_shape_B(
+        tiled_pv, make_shape(Int<D_TILE>{}, Int<PREFIX_KV>{}));
+    auto tail_v_shape = partition_shape_B(
+        tiled_pv, make_shape(Int<D_TILE>{}, Int<TAIL_KV>{}));
+    auto prefix_p_shape = partition_shape_A(
+        tiled_pv, make_shape(Int<M>{}, Int<PREFIX_KV>{}));
+    auto tail_p_shape = partition_shape_A(
+        tiled_pv, make_shape(Int<M>{}, Int<TAIL_KV>{}));
+
+    auto prefix_q_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, prefix_q_shape);
+    auto prefix_k_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, prefix_k_shape);
+    auto tail_q_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, tail_q_shape);
+    auto tail_k_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, tail_k_shape);
+    auto prefix_v_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_MN_SW128_Atom<data_t>{}, prefix_v_shape);
+    auto tail_v_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_MN_SW128_Atom<data_t>{}, tail_v_shape);
+    auto prefix_p_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, prefix_p_shape);
+    auto tail_p_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW32_Atom<data_t>{}, tail_p_shape);
+
+    auto prefix_logical_s = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<PREFIX_KV>{}),
+                    make_stride(Int<PREFIX_KV>{}, Int<1>{})));
+    auto prefix_coord_s = make_identity_tensor(
+        make_shape(Int<M>{}, Int<PREFIX_KV>{}));
+    auto prefix_cta_s = prefix_qk_cta.partition_C(prefix_logical_s);
+    auto prefix_cta_coord_s =
+        prefix_qk_cta.partition_C(prefix_coord_s);
+    auto prefix_tmem_s = prefix_qk_cta.make_fragment_C(prefix_cta_s);
+    prefix_tmem_s.data() = tmem_base_ptr;
+
+    auto tail_logical_s = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<TAIL_KV>{}),
+                    make_stride(Int<TAIL_KV>{}, Int<1>{})));
+    auto tail_coord_s = make_identity_tensor(
+        make_shape(Int<M>{}, Int<TAIL_KV>{}));
+    auto tail_cta_s = tail_qk_cta.partition_C(tail_logical_s);
+    auto tail_cta_coord_s = tail_qk_cta.partition_C(tail_coord_s);
+    auto tail_tmem_s = tail_qk_cta.make_fragment_C(tail_cta_s);
+    tail_tmem_s.data() = tmem_base_ptr + TAIL_SCORE_OFFSET;
+
+    auto logical_o = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                    make_stride(Int<D_TILE>{}, Int<1>{})));
+    auto coord_o = make_identity_tensor(
+        make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto cta_o = pv_cta.partition_C(logical_o);
+    auto cta_coord_o = pv_cta.partition_C(coord_o);
+
+    int q_slots[D_TILES];
+    data_t *q_ptrs[D_TILES];
+    prefix_qk.accumulate_ = UMMA::ScaleOut::Zero;
+#pragma unroll 1
+    for (int wave = 0; wave < D_TILES / QK_WAVE_TILES; ++wave) {
+        int k_slots[QK_WAVE_TILES];
+        data_t *k_ptrs[QK_WAVE_TILES];
+#pragma unroll 1
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            const int q_tile = wave * QK_WAVE_TILES + tile;
+            q_slots[q_tile] = m2c.template pop<0>();
+            q_ptrs[q_tile] = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(q_slots[q_tile])));
+        }
+#pragma unroll 1
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            k_slots[tile] = m2c.template pop<0>();
+            k_ptrs[tile] = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(k_slots[tile])));
+        }
+        if (tid < numThreadsPerWarp) {
+#pragma unroll 1
+            for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+                const int q_tile = wave * QK_WAVE_TILES + tile;
+                auto sQ = make_tensor(
+                    make_smem_ptr(q_ptrs[q_tile]), prefix_q_layout);
+                auto sK = make_tensor(
+                    make_smem_ptr(k_ptrs[tile]), prefix_k_layout);
+                auto frag_q = prefix_qk_cta.make_fragment_A(sQ);
+                auto frag_k = prefix_qk_cta.make_fragment_B(sK);
+#pragma unroll 1
+                for (int k_block = 0;
+                     k_block < size<2>(frag_q); ++k_block) {
+                    gemm(prefix_qk, frag_q(_, _, k_block),
+                         frag_k(_, _, k_block), prefix_tmem_s);
+                    prefix_qk.accumulate_ = UMMA::ScaleOut::One;
+                }
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+#pragma unroll 1
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            c2m.push(tid, k_slots[tile]);
+        }
+    }
+
+    int tail_k_slots[D_TILES];
+    data_t *tail_k_ptrs[D_TILES];
+#pragma unroll 1
+    for (int tile = 0; tile < D_TILES; ++tile) {
+        tail_k_slots[tile] = m2c.template pop<0>();
+        tail_k_ptrs[tile] = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(tail_k_slots[tile])));
+    }
+    tail_qk.accumulate_ = UMMA::ScaleOut::Zero;
+    if (tid < numThreadsPerWarp) {
+#pragma unroll 1
+        for (int tile = 0; tile < D_TILES; ++tile) {
+            auto sQ = make_tensor(
+                make_smem_ptr(q_ptrs[tile]), tail_q_layout);
+            auto sK = make_tensor(
+                make_smem_ptr(tail_k_ptrs[tile]), tail_k_layout);
+            auto frag_q = tail_qk_cta.make_fragment_A(sQ);
+            auto frag_k = tail_qk_cta.make_fragment_B(sK);
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(frag_q); ++k_block) {
+                gemm(tail_qk, frag_q(_, _, k_block),
+                     frag_k(_, _, k_block), tail_tmem_s);
+                tail_qk.accumulate_ = UMMA::ScaleOut::One;
+            }
+        }
+        cutlass::arch::umma_arrive(tmem_mma_barrier);
+    }
+    cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+    tmem_mma_phase ^= 1;
+#pragma unroll 1
+    for (int tile = 0; tile < D_TILES; ++tile) {
+        c2m.push(tid, tail_k_slots[tile]);
+    }
+
+    const int sink_slots = m2c.template pop<0>();
+    const auto *sink = static_cast<const float *>(
+        get_slot_address(smem_base, extract(sink_slots)));
+    auto prefix_p_hi = make_tensor(
+        make_smem_ptr(q_ptrs[0]), prefix_p_layout);
+    auto prefix_p_lo = make_tensor(
+        make_smem_ptr(q_ptrs[1]), prefix_p_layout);
+    auto tail_p_hi = make_tensor(
+        make_smem_ptr(q_ptrs[2]), tail_p_layout);
+    auto tail_p_lo = make_tensor(
+        make_smem_ptr(q_ptrs[2] + M * TAIL_KV),
+        tail_p_layout);
+    int logical_row = tid;
+    float row_sum = 0.0f;
+    sm100_dsv4_softmax_tmem_smem_prefix_tail_hi_lo<
+        M, PREFIX_KV, TAIL_KV>(
+        prefix_tmem_s, prefix_cta_coord_s,
+        tail_tmem_s, tail_cta_coord_s,
+        prefix_p_hi, prefix_p_lo, tail_p_hi, tail_p_lo,
+        sink, tail_tokens, logical_row, row_sum);
+    c2m.push(tid, sink_slots | q_slots[3]);
+
+    auto prefix_frag_p_hi = pv_cta.make_fragment_A(prefix_p_hi);
+    auto prefix_frag_p_lo = pv_cta.make_fragment_A(prefix_p_lo);
+    auto tail_frag_p_hi = pv_cta.make_fragment_A(tail_p_hi);
+    auto tail_frag_p_lo = pv_cta.make_fragment_A(tail_p_lo);
+#pragma unroll 1
+    for (int tile = 0; tile < D_TILES; ++tile) {
+        const int prefix_v_slots = m2c.template pop<0>();
+        auto *prefix_v_ptr = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(prefix_v_slots)));
+        const int tail_v_slots = m2c.template pop<0>();
+        auto *tail_v_ptr = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(tail_v_slots)));
+        auto prefix_v = make_tensor(
+            make_smem_ptr(prefix_v_ptr), prefix_v_layout);
+        auto tail_v = make_tensor(
+            make_smem_ptr(tail_v_ptr), tail_v_layout);
+        auto prefix_frag_v = pv_cta.make_fragment_B(prefix_v);
+        auto tail_frag_v = pv_cta.make_fragment_B(tail_v);
+        auto tmem_o = pv_cta.make_fragment_C(cta_o);
+        tmem_o.data() = tmem_base_ptr + tile * D_TILE;
+        tiled_pv.accumulate_ = UMMA::ScaleOut::Zero;
+        if (tid < numThreadsPerWarp) {
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(prefix_frag_p_hi); ++k_block) {
+                gemm(tiled_pv, prefix_frag_p_hi(_, _, k_block),
+                     prefix_frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(prefix_frag_p_lo); ++k_block) {
+                gemm(tiled_pv, prefix_frag_p_lo(_, _, k_block),
+                     prefix_frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(tail_frag_p_hi); ++k_block) {
+                gemm(tiled_pv, tail_frag_p_hi(_, _, k_block),
+                     tail_frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(tail_frag_p_lo); ++k_block) {
+                gemm(tiled_pv, tail_frag_p_lo(_, _, k_block),
+                     tail_frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        c2m.push(tid, prefix_v_slots | tail_v_slots);
+    }
+    c2m.push(tid, q_slots[0] | q_slots[1] | q_slots[2]);
+
+    const float inv_sum =
+        logical_row < M && row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+#pragma unroll 1
+    for (int tile = 0; tile < D_TILES; ++tile) {
+        const int output_slots = m2c.template pop<0>();
+        auto *output_ptr = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(output_slots)));
+        auto sO = make_tensor(
+            make_smem_ptr(output_ptr),
+            make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                        make_stride(Int<D_TILE>{}, Int<1>{})));
+        auto cta_sO = pv_cta.partition_C(sO);
+        auto tmem_o = pv_cta.make_fragment_C(cta_o);
+        tmem_o.data() = tmem_base_ptr + tile * D_TILE;
+        // Each output owns a disjoint TMEM region.  The C2M writeback queue
+        // already collects all 128 compute-thread arrivals after their
+        // shared-proxy fence, so an additional compute-group join here has
+        // no producer/consumer edge to enforce.
+        sm100_attention_store_tmem_rows<M, D_TILE, false>(
+            tmem_o, cta_coord_o, cta_sO, inv_sum, M);
+        c2m.template push<31, true, false>(tid, output_slots);
+    }
+}
+
 template <int M, int KV, typename TmemTensor, typename CoordTensor,
           typename ProbTensor>
 __device__ __forceinline__ void sm100_attention_softmax_tmem_smem_fa4(

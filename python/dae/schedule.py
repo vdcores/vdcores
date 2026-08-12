@@ -1767,6 +1767,79 @@ class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
+    """One-SM native K128 prefix plus native K32 tail attention."""
+
+    TILE = 128
+    TILES_PER_VECTOR = 4
+
+    def __init__(self, q, kv, rows, sink, output, *, q_tma,
+                 prefix_k_tma, tail_k_tma, prefix_v_tma, tail_v_tma,
+                 output_tma):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.rows = int(rows)
+        self.sink = sink
+        self.output = output
+        self.q_tma = q_tma
+        self.prefix_k_tma = prefix_k_tma
+        self.tail_k_tma = tail_k_tma
+        self.prefix_v_tma = prefix_v_tma
+        self.tail_v_tma = tail_v_tma
+        self.output_tma = output_tma
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek UMMA tail attention uses one SM")
+        if (self.q.dtype != torch.bfloat16 or self.q.shape != (64, 512) or
+                not self.q.is_contiguous()):
+            raise ValueError("DeepSeek UMMA Q must be contiguous BF16 [64,512]")
+        if (self.kv.dtype != torch.bfloat16 or self.kv.ndim != 2 or
+                self.kv.shape[1] != 512 or not self.kv.is_contiguous()):
+            raise ValueError("DeepSeek UMMA KV must be contiguous BF16 [rows,512]")
+        if self.rows <= 128 or self.rows > min(160, self.kv.shape[0]):
+            raise ValueError("DeepSeek UMMA tail rows must be in [129,160]")
+        if self.sink.dtype != torch.float32 or self.sink.shape != (64,):
+            raise ValueError("DeepSeek UMMA attention sink must be FP32 [64]")
+        if (self.output.dtype != torch.bfloat16 or
+                self.output.shape != self.q.shape or
+                not self.output.is_contiguous()):
+            raise ValueError("DeepSeek UMMA output must match Q")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        instructions = [Dsv4ContiguousAttention512UmmaTail32Sm100(self.rows)]
+        for wave in range(2):
+            for tile in range(2):
+                column = (wave * 2 + tile) * self.TILE
+                instructions.append(self.q_tma.cord(0, column))
+            for tile in range(2):
+                column = (wave * 2 + tile) * self.TILE
+                instructions.append(self.prefix_k_tma.cord(0, column))
+        for tile in range(self.TILES_PER_VECTOR):
+            instructions.append(
+                self.tail_k_tma.cord(self.TILE, tile * self.TILE)
+            )
+        instructions.append(_shared_load_1d(self.sink))
+        for tile in range(self.TILES_PER_VECTOR):
+            column = tile * self.TILE
+            instructions.append(self.prefix_v_tma.cord(0, column))
+            instructions.append(self.tail_v_tma.cord(self.TILE, column))
+        for tile in range(self.TILES_PER_VECTOR):
+            store = self.output_tma.cord(0, tile * self.TILE)
+            if tile + 1 == self.TILES_PER_VECTOR:
+                store = store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
                  output_weights, hash_routing=False, route_scale=1.5):
