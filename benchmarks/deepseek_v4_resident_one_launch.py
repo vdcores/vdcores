@@ -92,6 +92,7 @@ class Stage:
     base_sm: int | None = None
     wait_group: str | None = None
     release_group: str | None = None
+    prefetch_before_wait: bool = False
 
 
 class ResidentOneLaunchDecode:
@@ -263,6 +264,7 @@ class ResidentOneLaunchDecode:
         base_sm: int | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
+        prefetch_before_wait: bool = False,
     ) -> Stage:
         if isinstance(sms, ShapeAssignment):
             sms = self._remember(sms)
@@ -275,6 +277,7 @@ class ResidentOneLaunchDecode:
             base_sm,
             wait_group,
             release_group,
+            prefetch_before_wait,
         )
 
     @staticmethod
@@ -694,6 +697,7 @@ class ResidentOneLaunchDecode:
         placement: tuple[int, int] | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
+        prefetch_before_wait: bool = False,
     ) -> Stage:
         linears = tuple(
             self.checkpoint.load_fp8_linear(
@@ -733,9 +737,11 @@ class ResidentOneLaunchDecode:
             name,
             schedule,
             assignment,
+            input_role="activation" if prefetch_before_wait else None,
             base_sm=base_sm,
             wait_group=wait_group,
             release_group=release_group,
+            prefetch_before_wait=prefetch_before_wait,
         )
 
     def _native_fp8_linear_stage(
@@ -1367,6 +1373,7 @@ class ResidentOneLaunchDecode:
                     placement=placement,
                     wait_group=output_ready_group,
                     release_group=output_join_group,
+                    prefetch_before_wait=placement[0] >= cfg.num_heads,
                 )
             )
         stages.append(
@@ -2008,6 +2015,7 @@ class ResidentOneLaunchDecode:
                 wait_group=stage.wait_group,
                 release_group=stage.release_group,
                 profile_step_event=profile_step_event,
+                prefetch_before_wait=stage.prefetch_before_wait,
             )
 
         def queued_family(family: LayerFamily) -> list[SequentialStage]:

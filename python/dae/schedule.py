@@ -1493,7 +1493,9 @@ class SchedFp8Block128GemvBf16(Schedule):
                 ),
                 _shared_load_1d(self.weight[tile_start:tile_end]),
                 _shared_load_1d(self.weight_scale[scale_start:scale_end]),
-                _shared_load_1d(self.activation.reshape(-1)),
+                _shared_load_1d(self.activation.reshape(-1)).bar(
+                    self._bar("activation")
+                ),
             ]
             store = _shared_store_1d(self.output[tile_start:tile_end])
             if tile_end == row_end:

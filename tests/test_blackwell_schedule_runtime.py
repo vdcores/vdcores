@@ -886,6 +886,70 @@ def test_sequential_program_binds_model_specific_input_role_to_same_edge():
     assert expert_load.num_slots >> 6 == 0
 
 
+def test_sequential_program_prefetches_static_load_before_explicit_input_gate():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 32
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            return bar_id
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            loads = []
+            for address in (0x1000, 0x2000):
+                loads.append(
+                    MemoryInstruction(
+                        opcode.OP_ALLOC_LDU_LOAD_1D,
+                        num_slots=1,
+                        arg=0,
+                        size=16,
+                        address=address,
+                    )
+                )
+            if self._bar("activation") is not None:
+                loads[1].bar(self._bar("activation"))
+            return [
+                Copy(1, 16),
+                *loads,
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0x3000,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        [
+            SequentialStage("producer", BasicStage(), 1),
+            SequentialStage(
+                "consumer",
+                BasicStage(),
+                1,
+                input_role="activation",
+                prefetch_before_wait=True,
+            ),
+        ],
+    )
+    memory = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+    ]
+    consumer_static, consumer_activation = memory[3:5]
+    assert not consumer_static.opcode & 0x10
+    assert consumer_activation.opcode & 0x10
+    assert consumer_activation.num_slots >> 6 == 0
+
+
 def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     class FakeDevice:
         type = "cuda"

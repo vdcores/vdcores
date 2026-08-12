@@ -38,6 +38,7 @@ class SequentialStage:
     wait_group: str | None = None
     release_group: str | None = None
     profile_step_event: int | None = None
+    prefetch_before_wait: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,30 @@ def _gate_load_ports(per_sm: list[list], bar_id: int, stage: str) -> None:
             )
         for inst in first_load_by_port.values():
             _attach_bar(inst, bar_id, stage=stage)
+    if not active:
+        raise ValueError(f"sequential stage {stage!r} has no active SMs")
+
+
+def _validate_prefetch_gate(per_sm: list[list], bar_id: int, stage: str) -> None:
+    """Require an explicit LDU dependency when earlier loads may prefetch."""
+
+    active = False
+    for instructions in per_sm:
+        if not instructions:
+            continue
+        active = True
+        gated_loads = [
+            inst
+            for inst in instructions
+            if isinstance(inst, MemoryInstruction)
+            and inst.opcode & _MEM_ALLOCATE
+            and not inst.opcode & _MEM_WRITEBACK
+            and _bar_id(inst) == bar_id
+        ]
+        if not gated_loads:
+            raise ValueError(
+                f"prefetching stage {stage!r} has no explicitly gated LDU load"
+            )
     if not active:
         raise ValueError(f"sequential stage {stage!r} has no active SMs")
 
@@ -254,6 +279,10 @@ class SequentialProgram:
                     f"stage {stage.name!r} placement [{stage.base_sm}, "
                     f"{stage.base_sm + stage.num_sms}) exceeds {launcher.num_sms} SMs"
                 )
+            if stage.prefetch_before_wait and stage.input_role is None:
+                raise ValueError(
+                    f"prefetching stage {stage.name!r} requires an input_role"
+                )
 
             input_bar = None
             if stage.wait_group is not None:
@@ -322,7 +351,10 @@ class SequentialProgram:
             if balance_load_ports:
                 _balance_load_ports(rendered)
             if input_bar is not None:
-                _gate_load_ports(rendered, input_bar, stage.name)
+                if stage.prefetch_before_wait:
+                    _validate_prefetch_gate(rendered, input_bar, stage.name)
+                else:
+                    _gate_load_ports(rendered, input_bar, stage.name)
 
             max_compute = max(
                 sum(isinstance(inst, ComputeInstruction) for inst in instructions)
