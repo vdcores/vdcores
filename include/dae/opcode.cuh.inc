@@ -77,6 +77,13 @@ DAE_OP(OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D, MK_MOP(42, MEM_OP_FLAGS_ALLOCATE))
 // only the allocated shared slots.
 DAE_OP(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(43, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(44, MEM_OP_FLAGS_ALLOCATE))
+// Publish one fixed affine expert-arena base to both LDU handlers. The encoded
+// geometry is retained in registers for the complete persistent launch.
+DAE_OP(OP_LDU_SET_AFFINE_EXPERT_BASE, MK_MOP(45, MEM_OP_FLAGS_NONE))
+// Resolve base + layer + selected_expert * fixed_stride + field directly in
+// LDU. No device pointer or per-layer descriptor is read.
+DAE_OP(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_1D, MK_MOP(46, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

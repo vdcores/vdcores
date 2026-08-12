@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from dae.instructions import (
+    AffineRoutedTmaLoad1D,
+    AffineRoutedTmaLoadBase1D,
     ATTN_SPLIT_POST_REDUCE,
     ATTENTION_M64N64K16_F16_F32_64_64_hdim,
     ATTENTION_SM100_BF16_HDIM128_DIRECT,
@@ -33,6 +35,7 @@ from dae.instructions import (
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
     LduProfileLayer,
+    LduSetAffineExpertBase,
     Fp8GemvUmmaStreamSm100,
     Fp8UmmaPrepackSm100,
     Nvfp4GemvSm100,
@@ -191,6 +194,54 @@ def test_routed_tma_load_encodes_l2_lookup_and_shared_span():
     assert instruction.arg == (257 << 3) | 5
     assert instruction.size == 16384
     assert cords2addr(instruction.cords) == FakeRoutingState.data_ptr()
+
+
+def test_affine_routed_load_encodes_rank_refresh_and_layer_stride():
+    load = AffineRoutedTmaLoad1D(
+        0x123456780,
+        5,
+        16384,
+        refresh_route=True,
+    ).bar(9)
+    base = AffineRoutedTmaLoadBase1D(
+        0x123456780,
+        5,
+        16384,
+    )
+
+    assert load.opcode == opcode.OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_1D | 16
+    assert load.num_slots == 2 | (9 << 6)
+    assert load.arg == 8 | 5
+    assert cords2addr(load.cords) == 0x123456780
+    assert base.opcode == opcode.OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_BASE_1D
+    assert base.arg == 5
+
+
+def test_affine_expert_preload_encodes_fixed_base_and_geometry():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeStorage:
+        device = FakeDevice()
+        dtype = torch.uint8
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def data_ptr():
+            return 0x3456789ABC00
+
+    instruction = LduSetAffineExpertBase(
+        FakeStorage(), 14_156_032, 256, initial_layer=42, special_slot=2
+    )
+
+    assert instruction.opcode == opcode.OP_LDU_SET_AFFINE_EXPERT_BASE
+    assert instruction.num_slots == config.num_slots + 2
+    assert instruction.size == 14_156_032 // 256
+    assert instruction.arg == (42 << 9) | 256
+    assert cords2addr(instruction.cords) == FakeStorage.data_ptr()
 
 
 def test_indirect_loads_keep_address_selection_in_ldu():

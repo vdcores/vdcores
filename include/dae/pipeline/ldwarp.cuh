@@ -44,6 +44,13 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
   int regFile[4];
   uint64_t routedBaseAddress = 0;
+  uint64_t affineExpertBaseAddress = 0;
+  uint64_t affineExpertStride = 0;
+  uint64_t affineExpertLayerStride = 0;
+  int affineExpertCount = 0;
+  int affineLayerIndex = -1;
+  uint64_t affineSelectedBaseAddress = 0;
+  int affineSelectedRank = -1;
 #if defined(DAE_TRACK_PROFILE)
   uint64_t dependency_wait_ns = 0;
   uint64_t dependency_contended = 0;
@@ -68,7 +75,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     bool produces_compute_operand = true;
 
     if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS) ||
-        op(opcode) == op(OP_LDU_PROFILE_LAYER))
+        op(opcode) == op(OP_LDU_PROFILE_LAYER) ||
+        op(opcode) == op(OP_LDU_SET_AFFINE_EXPERT_BASE))
       ldu_control_publish_barrier->arrive_and_wait();
 
     __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
@@ -387,6 +395,50 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
         break;
       }
+      case op(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_1D):
+      case op(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_BASE_1D): {
+        constexpr uint16_t kRouteRankMask = 0x7;
+        constexpr uint16_t kRefreshRoute = 0x8;
+        const int route_rank = inst.arg & kRouteRankMask;
+        if (affineExpertBaseAddress == 0 || affineExpertStride == 0 ||
+            route_rank >= 6) {
+          asm volatile("trap;");
+        }
+        if ((inst.arg & kRefreshRoute) || affineSelectedBaseAddress == 0) {
+          if (inst.arg & kRefreshRoute) {
+            ++affineLayerIndex;
+          }
+          const int selected_expert = load_l2(
+              reinterpret_cast<const int *>(affineExpertBaseAddress) + route_rank);
+          if (selected_expert < 0 || selected_expert >= affineExpertCount ||
+              affineLayerIndex < 0) {
+            asm volatile("trap;");
+          }
+          affineSelectedBaseAddress =
+              affineExpertBaseAddress +
+              uint64_t(affineLayerIndex) * affineExpertLayerStride +
+              uint64_t(selected_expert) * affineExpertStride;
+          affineSelectedRank = route_rank;
+        }
+        if (affineSelectedRank != route_rank || affineSelectedBaseAddress == 0) {
+          asm volatile("trap;");
+        }
+        const uint64_t resolved = affineSelectedBaseAddress + inst.address;
+        if (op(inst.opcode) == op(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_BASE_1D)) {
+          routedBaseAddress = resolved;
+        }
+        __ldprint(
+            "Affine routed TMA: rank=%d offset=%lu size=%d resolved=0x%lx",
+            route_rank, inst.address, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
       case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D):
       case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D):
       case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D):
@@ -585,6 +637,21 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           ++profile_layer_counter;
         }
 #endif
+        break;
+      }
+      case op(OP_LDU_SET_AFFINE_EXPERT_BASE): {
+        produces_compute_operand = false;
+        affineExpertBaseAddress = inst.address;
+        affineExpertStride = uint64_t(inst.size) << 8;
+        affineExpertCount = inst.arg & 0x1FF;
+        affineExpertLayerStride = affineExpertStride * affineExpertCount;
+        affineLayerIndex = int(inst.arg >> 9) - 1;
+        affineSelectedBaseAddress = 0;
+        affineSelectedRank = -1;
+        if (affineExpertBaseAddress == 0 || affineExpertStride == 0 ||
+            affineExpertCount == 0 || affineLayerIndex < -1) {
+          asm volatile("trap;");
+        }
         break;
       }
     }

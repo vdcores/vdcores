@@ -11,6 +11,7 @@ from dae.deepseek_v4_checkpoint import (
     expected_inference_tensor_specs,
     read_safetensors_header,
 )
+from dae.expert_affine import AffineExpertArena
 
 
 def _write_index(root, weight_map, total_size=0):
@@ -46,6 +47,25 @@ def test_expected_checkpoint_contract_has_raw_fp8_and_nvfp4_layouts():
     assert specs[f"{expert}.weight"].shape == (4096, 1024)
     assert specs[f"{expert}.weight_scale"].shape == (4096, 128)
     assert specs[f"{expert}.weight_scale_2"].shape == ()
+
+
+def test_affine_expert_geometry_has_one_constant_expert_and_layer_stride():
+    config = DeepSeekV4FlashConfig()
+    weight_bytes = AffineExpertArena._weight_bytes(config)
+    metadata_bytes = (
+        len(AffineExpertArena.TAGS)
+        * len(AffineExpertArena.META_FIELDS)
+        * AffineExpertArena.META_FIELD_BYTES
+    )
+    expert_stride = AffineExpertArena._align(3 * weight_bytes + metadata_bytes)
+    layer_stride = config.num_experts * expert_stride
+
+    assert weight_bytes == 4_718_592
+    assert expert_stride == 14_156_032
+    assert expert_stride % 256 == 0
+    assert AffineExpertArena.storage_bytes(config, 43) == (
+        AffineExpertArena.HEADER_BYTES + 43 * layer_stride
+    )
 
 
 def test_name_only_audit_accepts_mtp_but_rejects_missing_inference(tmp_path):

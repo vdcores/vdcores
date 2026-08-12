@@ -29,8 +29,8 @@ from dae.deepseek_v4_checkpoint import (
 from dae.deepseek_v4_flow import build_layer_decode_plan
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy, ShapeAssignment
 from dae.deepseek_v4_quant import quantize_fp8_block128
+from dae.instructions import LduSetAffineExpertBase
 from dae.launcher import Launcher
-from dae.routing import RoutedAddressTable
 from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayeredSchedule,
@@ -108,9 +108,10 @@ class ResidentOneLaunchDecode:
         self.policy = DeepSeekV4ShapePolicy(self.sms)
         self.assignments: dict[tuple, ShapeAssignment] = {}
         self.checkpoint = self._load_checkpoint()
+        self.expert_arena = self.checkpoint.affine_expert_arena
+        if self.expert_arena is None:
+            raise RuntimeError("resident decode requires the affine expert arena")
         self.families = self._families()
-        self._routing_tables: dict[int, RoutedAddressTable] = {}
-        self._routing_owners: dict[int, tuple[torch.Tensor, ...]] = {}
         self._hash_rows: dict[int, torch.Tensor] = {}
         self._allocate_state()
         rope_tables = [self.main_rope, self.compress_rope]
@@ -184,6 +185,7 @@ class ResidentOneLaunchDecode:
             names=names,
             reserve_bytes=int(self.args.resident_reserve_gib * (1 << 30)),
             native_nvfp4=True,
+            affine_nvfp4_experts=True,
             native_fp8_prefixes=(
                 tuple(
                     prefix
@@ -308,19 +310,6 @@ class ResidentOneLaunchDecode:
             schedule,
             self._groups(*tensor_sets),
             counter_strides=family.counter_strides,
-        )
-
-    def _routed_layered(
-        self,
-        schedule,
-        family: LayerFamily,
-        tables: tuple[RoutedAddressTable, ...],
-    ):
-        return LayeredSchedule(
-            schedule,
-            ((tables[0].state, tuple(table.state for table in tables)),),
-            counter_strides=family.counter_strides,
-            route_indices=self.route_indices,
         )
 
     def _allocate_state(self) -> None:
@@ -539,8 +528,8 @@ class ResidentOneLaunchDecode:
         self.router_logits = torch.empty(
             (cfg.num_experts,), dtype=torch.bfloat16, device=d
         )
-        self.route_indices = torch.empty((8,), dtype=torch.int32, device=d)
-        self.route_weights = torch.empty((8,), dtype=torch.float32, device=d)
+        self.route_indices = self.expert_arena.route_indices
+        self.route_weights = self.expert_arena.route_weights
         self.zero_bias = torch.zeros(
             (cfg.num_experts,), dtype=torch.float32, device=d
         )
@@ -1434,91 +1423,10 @@ class ResidentOneLaunchDecode:
         stages.append(post)
         return stages
 
-    @staticmethod
-    def _row_pointer(tensor: torch.Tensor, row_start: int) -> int:
-        return (
-            tensor.data_ptr()
-            + row_start * tensor.stride(0) * tensor.element_size()
-        )
-
-    def _routing_table(self, layer_id: int) -> RoutedAddressTable:
-        existing = self._routing_tables.get(layer_id)
-        if existing is not None:
-            return existing
-        cfg = self.config
-        shapes = {
-            "w1": (cfg.expert_intermediate_size, cfg.hidden_size),
-            "w3": (cfg.expert_intermediate_size, cfg.hidden_size),
-            "w2": (cfg.hidden_size, cfg.expert_intermediate_size),
-        }
-        columns: dict[str, list[int]] = {}
-        for tag, (rows, _) in shapes.items():
-            for tile in range(rows // 128):
-                columns[f"{tag}.m{tile}"] = []
-
-        linears = {tag: [] for tag in shapes}
-        for expert_id in range(cfg.num_experts):
-            prefix = f"layers.{layer_id}.ffn.experts.{expert_id}"
-            for tag, (rows, k) in shapes.items():
-                linear = self.checkpoint.load_native_nvfp4_linear(
-                    f"{prefix}.{tag}", device=self.device
-                )
-                linears[tag].append(linear)
-                expected_shape = (rows // 128, k // 256, 18432)
-                if tuple(linear.weight_tiles.shape) != expected_shape:
-                    raise ValueError(
-                        f"{linear.prefix} native tiles must be {expected_shape}"
-                    )
-                for tile in range(rows // 128):
-                    columns[f"{tag}.m{tile}"].append(
-                        linear.weight_tiles[tile].data_ptr()
-                    )
-
-        def stack(tag: str, field: str) -> torch.Tensor:
-            return torch.stack(
-                [getattr(linear, field).reshape(()) for linear in linears[tag]]
-            )
-
-        w1_input = stack("w1", "input_scale")
-        w3_input = stack("w3", "input_scale")
-        if not torch.equal(w1_input, w3_input):
-            raise ValueError(f"layer {layer_id} w1/w3 input scales differ")
-        w2_input = stack("w2", "input_scale")
-        alpha = {
-            tag: stack(tag, "weight_scale_2") * stack(tag, "input_scale")
-            for tag in shapes
-        }
-
-        def padded(values: torch.Tensor) -> torch.Tensor:
-            result = torch.zeros(
-                (cfg.num_experts, 4), dtype=torch.float32, device=self.device
-            )
-            result[:, 0].copy_(values)
-            return result
-
-        derived = {
-            "up.input_scale": padded(w1_input),
-            "down.input_scale": padded(w2_input),
-            **{f"{tag}.alpha": padded(values) for tag, values in alpha.items()},
-        }
-        for name, tensor in derived.items():
-            columns[name] = [
-                self._row_pointer(tensor, expert_id)
-                for expert_id in range(cfg.num_experts)
-            ]
-        owners = tuple(derived.values())
-        table = RoutedAddressTable.from_pointer_columns(
-            columns, device=self.device, owners=owners
-        )
-        self._routing_tables[layer_id] = table
-        self._routing_owners[layer_id] = owners
-        return table
-
     def _routed_native_quant_stage(
         self,
         name: str,
         family: LayerFamily,
-        tables: tuple[RoutedAddressTable, ...],
         rank: int,
         field_name: str,
         source: torch.Tensor,
@@ -1528,15 +1436,25 @@ class ResidentOneLaunchDecode:
         wait_group: str | None = None,
         release_group: str | None = None,
     ) -> Stage:
-        representative = tables[0]
+        if field_name == "up.input_scale":
+            field_offset = self.expert_arena.field_offset(
+                family.representative, "w1.input_scale"
+            )
+        elif field_name == "down.input_scale":
+            field_offset = self.expert_arena.field_offset(
+                family.representative, "w2.input_scale"
+            )
+        else:
+            raise KeyError(f"unknown affine quant field {field_name!r}")
         schedule = SchedRoutedDsv4Nvfp4QuantUmmaB(
-            representative.state,
+            self.expert_arena.storage,
             rank,
-            representative.field(field_name),
+            field_offset,
             source.reshape(-1),
             output,
+            affine=True,
+            refresh_route=field_name == "up.input_scale",
         )
-        schedule = self._routed_layered(schedule, family, tables)
         return self._stage(
             name,
             schedule,
@@ -1551,7 +1469,6 @@ class ResidentOneLaunchDecode:
         self,
         name: str,
         family: LayerFamily,
-        tables: tuple[RoutedAddressTable, ...],
         rank: int,
         tag: str,
         rows: int,
@@ -1575,15 +1492,19 @@ class ResidentOneLaunchDecode:
         assignment = replace(
             self.policy.nvfp4_gemv(rows, k), num_sms=num_sms
         )
-        table = tables[0]
         weight_fields = tuple(
-            table.field(f"{tag}.m{tile}") for tile in range(rows // 128)
+            self.expert_arena.field_offset(
+                family.representative, f"{tag}.weight", tile=tile
+            )
+            for tile in range(rows // 128)
         )
         schedule = SchedRoutedNvfp4GemvUmmaStream(
-            table.state,
+            self.expert_arena.storage,
             rank,
             weight_fields,
-            table.field(f"{tag}.alpha"),
+            self.expert_arena.field_offset(
+                family.representative, f"{tag}.alpha"
+            ),
             activation,
             output,
             route_ready=not wait_for_previous,
@@ -1591,8 +1512,9 @@ class ResidentOneLaunchDecode:
             output_mode=output_mode,
             output_register=output_register,
             output_port=output_port,
+            affine=True,
+            refresh_route=tag == "w1",
         )
-        schedule = self._routed_layered(schedule, family, tables)
         return self._stage(
             name,
             schedule,
@@ -1680,7 +1602,6 @@ class ResidentOneLaunchDecode:
             )
         )
 
-        tables = tuple(self._routing_table(layer) for layer in family.layer_ids)
         for rank in range(cfg.experts_per_token):
             placement = (rank * routed_branch_sms, routed_branch_sms)
             base_sm, branch_sms = placement
@@ -1691,7 +1612,6 @@ class ResidentOneLaunchDecode:
                 self._routed_native_quant_stage(
                     f"ffn.expert{rank}.input.quant_nvfp4",
                     family,
-                    tables,
                     rank,
                     "up.input_scale",
                     self.norm_hidden,
@@ -1705,7 +1625,6 @@ class ResidentOneLaunchDecode:
                 self._routed_native_linear_stage(
                     f"ffn.expert{rank}.w1",
                     family,
-                    tables,
                     rank,
                     "w1",
                     cfg.expert_intermediate_size,
@@ -1724,7 +1643,6 @@ class ResidentOneLaunchDecode:
                 self._routed_native_linear_stage(
                     f"ffn.expert{rank}.w3",
                     family,
-                    tables,
                     rank,
                     "w3",
                     cfg.expert_intermediate_size,
@@ -1760,7 +1678,6 @@ class ResidentOneLaunchDecode:
                 self._routed_native_quant_stage(
                     f"ffn.expert{rank}.middle.quant_nvfp4",
                     family,
-                    tables,
                     rank,
                     "down.input_scale",
                     self.routed_middle[rank],
@@ -1774,7 +1691,6 @@ class ResidentOneLaunchDecode:
                 self._routed_native_linear_stage(
                     f"ffn.expert{rank}.w2",
                     family,
-                    tables,
                     rank,
                     "w2",
                     cfg.hidden_size,
@@ -2102,6 +2018,12 @@ class ResidentOneLaunchDecode:
 
         self.launcher = Launcher(self.sms, device=self.device)
         self.launcher.i(
+            LduSetAffineExpertBase(
+                self.expert_arena.storage,
+                self.expert_arena.expert_stride,
+                self.config.num_experts,
+                initial_layer=0,
+            ),
             SchedDsv4PreloadRopeTables(self.resident_rope_tables).place(
                 self.sms
             )

@@ -113,16 +113,17 @@ rendezvous on memory-only `cuda::barrier` objects; no compute thread joins.
 There is no `IssueBarrier`, compute-side synchronization, `__threadfence`, or
 model-data copy in this path.
 
-Real layer weights are not unrolled into 43 instruction bodies.
-`LayeredSchedule` replaces a representative schedule's direct 1D weight loads
-with compact HBM pointer columns. One allocator-owned linear layer index is
-reset before a repeated family and advanced once per body. Every layer-indexed
-dynamic load uses that index directly, avoiding per-load `RepeatM` address
-arithmetic and schedule-specific `loop1`/`loop2` opcodes. LDU resolves the
-checkpoint address. Routed loads use a two-word descriptor containing one
-fixed route-result address plus the current layer's expert pointer table.
-Router output therefore stays in one HBM buffer; no indirect store path exists.
-Persistent cache outputs use ordinary counter-strided STU addresses.
+Real layer weights are not unrolled into 43 instruction bodies. Ordinary
+dense/attention weights still use compact layer columns selected by
+`LayeredSchedule`, but routed experts no longer use pointer columns or a
+pointer table. Their native FP4 weights and scalar metadata live in one fixed
+expert-major arena. Both LDUs receive its base and constant expert/layer
+strides once, retain them in registers, read the selected expert integer from
+the arena's fixed header, and resolve every field as an affine offset. The
+layer epoch is LDU-local and advances once at each routed layer boundary.
+Router output therefore stays at one fixed HBM address; no indirect store,
+queued-address object, or inter-stage address copy exists. Persistent cache
+outputs use ordinary counter-strided STU addresses.
 
 `DeepSeekV4ShapePolicy` supplies the initial functional tile/SM assignment from
 operator shape: FP8 linears expose row tiles, NVFP4 linears expose aligned M8
@@ -133,12 +134,12 @@ subject to end-to-end profiling after the resident flow passes.
 ## Checkpoint-resident one-launch gate
 
 `benchmarks/deepseek_v4_resident_one_launch.py` loads the durable worker-local
-checkpoint into one B300, builds routed pointer tables without copying weight
-payloads, and assembles position zero from four bodies: layers 0-1, layer 2,
-the odd HCA family, and the even CSA family. The odd/even bodies share a 2x10
-loop index while retaining distinct checkpoint pointer columns. The router
-writes one fixed eight-word HBM result, and all six experts resolve weight,
-weight-scale, input-scale, and alpha fields in LDU.
+checkpoint into one B300, directly packs routed native weights and metadata
+into the affine expert arena, and assembles position zero from four bodies:
+layers 0-1, layer 2, the odd HCA family, and the even CSA family. The odd/even
+bodies share a 2x10 loop index while retaining distinct ordinary checkpoint
+columns. The router writes one fixed eight-word arena header, and all six
+experts resolve weight, weight-scale, input-scale, and alpha offsets in LDU.
 
 The 2026-08-10 full gate used 153.379 GiB of resident checkpoint storage and
 left 29.933 GiB free. It represented 3,781 logical stages with 354 queued stage
@@ -930,15 +931,16 @@ one `Launcher.launch()` per decode token.
 
 ## Single-launch routed expert foundation
 
-Routed expert selection no longer needs a host readback to choose checkpoint
-addresses. `RoutedAddressTable` keeps eight padded route-id words (six valid
-ids), routing metadata, and an expert-by-field pointer table in HBM. After the
-router output dependency becomes ready, `OP_ALLOC_ROUTED_TMA_LOAD_1D` reads
-the selected expert and pointer through L2, copies the selected tensor slice
-into normal allocator-owned shared slots, and publishes only the slot mask to
-compute. There is no queued-address compatibility object and no alloc-warp
-issue barrier. The first routed load carries the route dependency; same-port
-LDU ordering covers later expert fields.
+Routed expert selection needs neither a host readback nor a device pointer
+table. `AffineExpertArena` keeps eight padded route IDs (six valid), route
+weights, and equal-stride expert records behind one fixed allocation base.
+`OP_LDU_SET_AFFINE_EXPERT_BASE` publishes the base/geometry once to both LDUs.
+After the route dependency becomes ready, an affine routed load reads the one
+selected-expert integer, forms the record base once per route rank and layer,
+then streams compile-time field offsets into normal allocator-owned shared
+slots. Compute observes only slot masks. There is no queued-address object,
+address copy, or alloc-warp issue barrier; same-port LDU ordering covers later
+expert fields.
 
 Sparse attention uses the same boundary through
 `OP_ALLOC_INDEXED_TMA_LOAD_1D`: LDU reads runtime KV row ids and streams those
@@ -1480,3 +1482,24 @@ shape-derived placement where the per-step counters show idle queues. Keep
 the accepted one-SM-per-head attention placement until a bounded, liveness-
 safe alternative passes repeated launches; do not reuse the abandoned
 grouped multi-SM schedule.
+
+## Affine resident expert addressing (2026-08-12)
+
+The resident loader now replaces the checkpoint's per-expert raw tensors with
+one 256-byte-aligned, expert-major CUDA allocation. Its fixed header contains
+the routing outputs. Every layer has the same stride, every expert has the same
+stride, and every w1/w3/w2 native tile or metadata scalar has a compile-time
+offset. The persistent launch preloads the allocation base and geometry once
+into both LDUs. At each routed layer boundary each LDU reads one selected ID
+per active route rank, caches the fully resolved expert-record base, and uses
+fixed offsets thereafter. The allocator and compute task perform no dynamic
+address arithmetic, pointer-table access, raw-pointer handoff, or address copy.
+
+Seventy-one focused tests pass. The production image stays spill-free at 70
+registers, nine barriers, a 160-byte stack, and 2,448 bytes shared memory. Job
+`20260812T162407Z-4082225` preserved the expected two-layer token 2759 through
+prime, three warmups, and 30 samples; its 0.750480-ms median is 1.2% slower
+than the accepted 0.741824-ms structural gate. Keep the affine mechanism as
+the correct addressing foundation, but do not micro-tune its arithmetic. The
+next gate is shape-derived 128/152-SM shared-expert scheduling that overlaps
+shared-weight admission with route readiness and selected-expert loading.
