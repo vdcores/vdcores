@@ -1001,7 +1001,10 @@ DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
     count[counter_reg] = 0;
     __cprint("LOOPC finished, reg=%d count=%d", counter_reg, count[counter_reg]);
   }
-  __sync_compute_group(128);
+  // pc and count are thread-local and every compute thread executes the same
+  // instruction stream.  The first queue wait in the next iteration provides
+  // the required data dependency; a compute-group rendezvous here protects no
+  // shared state and only delays fast compute warps.
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
