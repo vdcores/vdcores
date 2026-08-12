@@ -1463,6 +1463,7 @@ class ResidentOneLaunchDecode:
             base_sm=base_sm,
             wait_group=wait_group,
             release_group=release_group,
+            prefetch_before_wait=field_name == "up.input_scale",
         )
 
     def _routed_native_linear_stage(

@@ -1503,3 +1503,11 @@ than the accepted 0.741824-ms structural gate. Keep the affine mechanism as
 the correct addressing foundation, but do not micro-tune its arithmetic. The
 next gate is shape-derived 128/152-SM shared-expert scheduling that overlaps
 shared-weight admission with route readiness and selected-expert loading.
+
+The first overlap gate keeps the already-ready normalized BF16 shard on LDU0
+ahead of route completion while the fixed-address selected input scale alone
+waits for the route barrier on LDU1. It changes no compute ordering and does
+not prefetch the later middle activation. Job `20260812T163552Z-15074`
+preserved token 2759 for 30 repeats and measured 0.731184 ms median, 2.57%
+faster than the affine starting point and 1.43% faster than the prior accepted
+0.741824-ms two-layer discriminator.
