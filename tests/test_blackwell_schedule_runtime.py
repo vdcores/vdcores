@@ -1281,7 +1281,7 @@ def test_deepseek_compute_tasks_cannot_escape_shared_memory():
     assert "__threadfence" not in combined
 
 
-def test_resident_loop_control_has_no_compute_group_rendezvous():
+def test_resident_loop_control_uses_only_compute_group_rendezvous():
     source = (
         Path(__file__).resolve().parents[1]
         / "include/dae/compute_dispatch.cuh"
@@ -1290,7 +1290,8 @@ def test_resident_loop_control_has_no_compute_group_rendezvous():
         "DAE_COMPUTE_OP_HANDLER(OP_LOOPC)", 1
     )[1].split("DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC)", 1)[0]
 
-    assert "__sync_compute_group" not in handler
+    assert handler.count("__sync_compute_group(128)") == 1
+    assert "__threadfence" not in handler
 
 
 def test_profile_event_reserves_kernel_start_and_end_slots():

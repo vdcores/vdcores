@@ -1001,10 +1001,12 @@ DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
     count[counter_reg] = 0;
     __cprint("LOOPC finished, reg=%d count=%d", counter_reg, count[counter_reg]);
   }
-  // pc and count are thread-local and every compute thread executes the same
-  // instruction stream.  The first queue wait in the next iteration provides
-  // the required data dependency; a compute-group rendezvous here protects no
-  // shared state and only delays fast compute warps.
+  // Keep all four compute warps on the same repeated-family boundary.  The
+  // loop state itself is thread-local, but allowing warps to enter different
+  // next-iteration queue waits increases resident queue/allocator contention.
+  // Every compute thread reaches this instruction uniformly; memory threads
+  // are independent and do not participate.
+  __sync_compute_group(128);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
