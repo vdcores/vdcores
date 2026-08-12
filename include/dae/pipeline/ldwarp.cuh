@@ -4,6 +4,29 @@
 
 #include "virtualcore.cuh"
 
+__device__ __forceinline__ uint64_t ldu_resolve_routed_address(
+    uint64_t state_address, uint16_t encoded_field_rank) {
+  constexpr int kRouteCount = 6;
+  constexpr int kHeaderInts = 12;
+  const auto *header = reinterpret_cast<const int *>(state_address);
+  const int route_rank = encoded_field_rank & 0x7;
+  const int pointer_field = encoded_field_rank >> 3;
+  if (route_rank < 0 || route_rank >= kRouteCount) {
+    return 0;
+  }
+  const int expert = load_l2(header + route_rank);
+  const int field_stride = load_l2(header + 8);
+  const int expert_count = load_l2(header + 9);
+  if (expert < 0 || expert >= expert_count ||
+      pointer_field < 0 || pointer_field >= field_stride) {
+    return 0;
+  }
+  const auto *pointer_table =
+      reinterpret_cast<const uint64_t *>(header + kHeaderInts);
+  return load_l2_u64(
+      pointer_table + expert * field_stride + pointer_field);
+}
+
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
@@ -21,13 +44,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
   int regFile[4];
   uint64_t routedBaseAddress = 0;
-  uint64_t affineExpertBaseAddress = 0;
-  uint64_t affineExpertStride = 0;
-  uint64_t affineExpertLayerStride = 0;
-  int affineExpertCount = 0;
-  int affineLayerIndex = -1;
-  uint64_t affineSelectedBaseAddress = 0;
-  int affineSelectedRank = -1;
 #if defined(DAE_TRACK_PROFILE)
   uint64_t dependency_wait_ns = 0;
   uint64_t dependency_contended = 0;
@@ -52,8 +68,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     bool produces_compute_operand = true;
 
     if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS) ||
-        op(opcode) == op(OP_LDU_PROFILE_LAYER) ||
-        op(opcode) == op(OP_LDU_SET_AFFINE_EXPERT_BASE))
+        op(opcode) == op(OP_LDU_PROFILE_LAYER))
       ldu_control_publish_barrier->arrive_and_wait();
 
     __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
@@ -314,41 +329,38 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         __ldprint("[REG] load: reg_id=%d bar=%d slotMask=0x%X", inst.size, bar, regFile[inst.size]);
         break;
       }
-      case op(OP_ALLOC_ROUTED_TMA_LOAD_1D):
-      case op(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D): {
-        constexpr uint16_t kRouteRankMask = 0x7;
-        constexpr uint16_t kRefreshRoute = 0x8;
-        const int route_rank = inst.arg & kRouteRankMask;
-        if (affineExpertBaseAddress == 0 || affineExpertStride == 0 ||
-            route_rank >= 6) {
+      case op(OP_ALLOC_ROUTED_TMA_LOAD_1D): {
+        // HBM layout: eight int32 route-id slots, uint32 field stride,
+        // uint32 expert count, two padding words, then row-major uint64
+        // pointer entries. The low three arg bits select the route rank; the
+        // remaining bits select the pointer field.
+        const uint64_t resolved =
+            ldu_resolve_routed_address(inst.address, inst.arg);
+        if (resolved == 0) {
           asm volatile("trap;");
-        }
-        if ((inst.arg & kRefreshRoute) || affineSelectedBaseAddress == 0) {
-          if (inst.arg & kRefreshRoute) {
-            ++affineLayerIndex;
-          }
-          const int selected_expert = load_l2(
-              reinterpret_cast<const int *>(affineExpertBaseAddress) + route_rank);
-          if (selected_expert < 0 || selected_expert >= affineExpertCount ||
-              affineLayerIndex < 0) {
-            asm volatile("trap;");
-          }
-          affineSelectedBaseAddress =
-              affineExpertBaseAddress +
-              uint64_t(affineLayerIndex) * affineExpertLayerStride +
-              uint64_t(selected_expert) * affineExpertStride;
-          affineSelectedRank = route_rank;
-        }
-        if (affineSelectedRank != route_rank || affineSelectedBaseAddress == 0) {
-          asm volatile("trap;");
-        }
-        const uint64_t resolved = affineSelectedBaseAddress + inst.address;
-        if (op(inst.opcode) == op(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D)) {
-          routedBaseAddress = resolved;
         }
         __ldprint(
-            "Affine routed TMA: rank=%d offset=%lu size=%d resolved=0x%lx",
-            route_rank, inst.address, inst.size, resolved);
+            "Routed TMA 1D load: rank=%d field=%d size=%d resolved=0x%lx",
+            inst.arg & 0x7, inst.arg >> 3, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D): {
+        const uint64_t resolved =
+            ldu_resolve_routed_address(inst.address, inst.arg);
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
+        routedBaseAddress = resolved;
+        __ldprint(
+            "Routed TMA base: rank=%d field=%d size=%d resolved=0x%lx",
+            inst.arg & 0x7, inst.arg >> 3, inst.size, resolved);
         cuda::device::memcpy_async_tx(
             static_cast<char *>(get_slot_address(smem_base, slot)),
             reinterpret_cast<const char *>(resolved),
@@ -366,6 +378,58 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         __ldprint(
             "Address-register TMA: reg=%d offset=%lu size=%d resolved=0x%lx",
             inst.arg, inst.address, inst.size, resolved);
+        cuda::device::memcpy_async_tx(
+            static_cast<char *>(get_slot_address(smem_base, slot)),
+            reinterpret_cast<const char *>(resolved),
+            cuda::aligned_size_t<16>(inst.size),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar], cuda::aligned_size_t<16>(inst.size));
+        break;
+      }
+      case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D):
+      case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D):
+      case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D):
+      case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D): {
+        constexpr int kRouteCount = 6;
+        constexpr int kHeaderInts = 12;
+        // HBM descriptor: a fixed route-result pointer followed by the
+        // current layer's ordinary RoutedAddressTable state pointer.
+        const auto *descriptor =
+            reinterpret_cast<const uint64_t *>(inst.address);
+        const uint64_t route_address = load_l2_u64(descriptor + 0);
+        const uint64_t state_address = load_l2_u64(descriptor + 1);
+        if (route_address == 0 || state_address == 0) {
+          asm volatile("trap;");
+        }
+        const auto *header = reinterpret_cast<const int *>(state_address);
+        const auto *route_ids = reinterpret_cast<const int *>(route_address);
+        const int route_rank = inst.arg & 0x7;
+        const int pointer_field = inst.arg >> 3;
+        uint64_t resolved = 0;
+        if (route_rank >= 0 && route_rank < kRouteCount) {
+          const int expert = load_l2(route_ids + route_rank);
+          const int field_stride = load_l2(header + 8);
+          const int expert_count = load_l2(header + 9);
+          if (expert >= 0 && expert < expert_count &&
+              pointer_field >= 0 && pointer_field < field_stride) {
+            const auto *pointer_table =
+                reinterpret_cast<const uint64_t *>(header + kHeaderInts);
+            resolved = load_l2_u64(
+                pointer_table + expert * field_stride + pointer_field);
+          }
+        }
+        if (resolved == 0) {
+          asm volatile("trap;");
+        }
+        if (op(inst.opcode) == op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D) ||
+            op(inst.opcode) == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D)) {
+          routedBaseAddress = resolved;
+        }
+        __ldprint(
+            "Indirect routed TMA 1D load: rank=%d field=%d size=%d "
+            "state=0x%lx resolved=0x%lx",
+            route_rank, pointer_field, inst.size, state_address, resolved);
         cuda::device::memcpy_async_tx(
             static_cast<char *>(get_slot_address(smem_base, slot)),
             reinterpret_cast<const char *>(resolved),
@@ -521,21 +585,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           ++profile_layer_counter;
         }
 #endif
-        break;
-      }
-      case op(OP_LDU_SET_AFFINE_EXPERT_BASE): {
-        produces_compute_operand = false;
-        affineExpertBaseAddress = inst.address;
-        affineExpertStride = uint64_t(inst.size) << 8;
-        affineExpertCount = inst.arg & 0x1FF;
-        affineExpertLayerStride = affineExpertStride * affineExpertCount;
-        affineLayerIndex = int(inst.arg >> 9) - 1;
-        affineSelectedBaseAddress = 0;
-        affineSelectedRank = -1;
-        if (affineExpertBaseAddress == 0 || affineExpertStride == 0 ||
-            affineExpertCount == 0 || affineLayerIndex < -1) {
-          asm volatile("trap;");
-        }
         break;
       }
     }

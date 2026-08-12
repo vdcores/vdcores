@@ -4,8 +4,6 @@ import pytest
 import torch
 
 from dae.instructions import (
-    AffineRoutedTmaLoad1D,
-    AffineRoutedTmaLoadBase1D,
     ATTN_SPLIT_POST_REDUCE,
     ATTENTION_M64N64K16_F16_F32_64_64_hdim,
     ATTENTION_SM100_BF16_HDIM128_DIRECT,
@@ -35,7 +33,6 @@ from dae.instructions import (
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
     LduProfileLayer,
-    LduSetAffineExpertBase,
     Fp8GemvUmmaStreamSm100,
     Fp8UmmaPrepackSm100,
     Nvfp4GemvSm100,
@@ -162,7 +159,7 @@ def test_memory_instruction_accepts_maximum_uint16_address_chunk():
     assert instruction.cords == [0xFFFF] * 4
 
 
-def test_pointer_table_routed_load_is_rejected():
+def test_routed_tma_load_encodes_l2_lookup_and_shared_span():
     class FakeDevice:
         type = "cuda"
 
@@ -185,56 +182,15 @@ def test_pointer_table_routed_load_is_rejected():
         def data_ptr():
             return 0x123456789ABC
 
-    with pytest.raises(RuntimeError, match="pointer-table routed loads were removed"):
-        RoutedTmaLoad1D(FakeRoutingState(), 5, 257, 16384)
-
-
-def test_affine_routed_load_encodes_rank_refresh_and_layer_stride():
-    load = AffineRoutedTmaLoad1D(
-        0x123456780,
-        5,
-        16384,
-        refresh_route=True,
+    instruction = RoutedTmaLoad1D(
+        FakeRoutingState(), 5, 257, 16384
     ).bar(9)
-    base = AffineRoutedTmaLoadBase1D(
-        0x123456780,
-        5,
-        16384,
-    )
 
-    assert load.opcode == opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D | 16
-    assert load.num_slots == 2 | (9 << 6)
-    assert load.arg == 8 | 5
-    assert cords2addr(load.cords) == 0x123456780
-    assert base.opcode == opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D
-    assert base.arg == 5
-
-
-def test_affine_expert_preload_encodes_fixed_base_and_geometry():
-    class FakeDevice:
-        type = "cuda"
-
-    class FakeStorage:
-        device = FakeDevice()
-        dtype = torch.uint8
-
-        @staticmethod
-        def is_contiguous():
-            return True
-
-        @staticmethod
-        def data_ptr():
-            return 0x3456789ABC00
-
-    instruction = LduSetAffineExpertBase(
-        FakeStorage(), 14_156_032, 256, initial_layer=42, special_slot=2
-    )
-
-    assert instruction.opcode == opcode.OP_LDU_SET_AFFINE_EXPERT_BASE
-    assert instruction.num_slots == config.num_slots + 2
-    assert instruction.size == 14_156_032 // 256
-    assert instruction.arg == (42 << 9) | 256
-    assert cords2addr(instruction.cords) == FakeStorage.data_ptr()
+    assert instruction.opcode == opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D | 16
+    assert instruction.num_slots == 2 | (9 << 6)
+    assert instruction.arg == (257 << 3) | 5
+    assert instruction.size == 16384
+    assert cords2addr(instruction.cords) == FakeRoutingState.data_ptr()
 
 
 def test_indirect_loads_keep_address_selection_in_ldu():
@@ -261,18 +217,31 @@ def test_indirect_loads_keep_address_selection_in_ldu():
     layered = IndirectTmaLoad1D(
         FakePointerTable(), 4096, layer_indexed=True
     )
+    routed = IndirectRoutedTmaLoad1D(
+        FakePointerTable(),
+        4,
+        511,
+        16384,
+        layer_indexed=True,
+    )
+    routed_base = IndirectRoutedTmaLoadBase1D(
+        FakePointerTable(),
+        4,
+        511,
+        16384,
+        layer_indexed=True,
+    )
+
     assert direct.opcode == opcode.OP_ALLOC_INDIRECT_TMA_LOAD_1D
     assert layered.opcode == opcode.OP_ALLOC_LAYER_TMA_LOAD_1D
     assert direct.num_slots == 1
     assert cords2addr(direct.cords) == FakePointerTable.data_ptr()
-    with pytest.raises(RuntimeError, match="indirect routed pointer tables were removed"):
-        IndirectRoutedTmaLoad1D(
-            FakePointerTable(), 4, 511, 16384, layer_indexed=True
-        )
-    with pytest.raises(RuntimeError, match="indirect routed pointer tables were removed"):
-        IndirectRoutedTmaLoadBase1D(
-            FakePointerTable(), 4, 511, 16384, layer_indexed=True
-        )
+    assert routed.opcode == opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D
+    assert routed.arg == (511 << 3) | 4
+    assert routed.num_slots == 2
+    assert routed_base.opcode == opcode.OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D
+    assert routed_base.arg == routed.arg
+    assert routed_base.num_slots == routed.num_slots
 
 
 def test_sequential_program_uses_stu_release_and_gates_both_ldu_ports():
@@ -638,7 +607,6 @@ def test_routed_native_gemv_gates_both_ldu_ports_on_route(monkeypatch):
             2,
             torch.empty((2, 3072), dtype=torch.uint8),
             torch.empty((128,), dtype=torch.bfloat16),
-            affine=True,
         )
         .bar("route", 7)
         .place(1)

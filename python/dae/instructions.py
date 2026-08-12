@@ -1588,7 +1588,7 @@ class RawAddress(MemoryInstruction):
 
 
 class RoutedTmaLoad1D(MemoryInstruction):
-    """Removed pointer-table routed load API."""
+    """Resolve one routed field in LDU and copy it into shared memory."""
 
     ROUTE_COUNT = 6
     ROUTE_BITS = 3
@@ -1602,8 +1602,26 @@ class RoutedTmaLoad1D(MemoryInstruction):
         pointer_field: int,
         bytes: int,
     ):
-        raise RuntimeError(
-            "pointer-table routed loads were removed; use AffineRoutedTmaLoad1D"
+        assert routing_state.device.type == "cuda"
+        if not routing_state.is_contiguous():
+            raise ValueError("routing_state must be contiguous")
+        if routing_state.numel() * routing_state.element_size() < self.HEADER_BYTES:
+            raise ValueError("routing_state must contain the 32-byte routing header")
+        if not 0 <= route_rank < self.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not 0 <= pointer_field <= self.MAX_POINTER_FIELD:
+            raise ValueError("pointer_field must fit in 13 bits")
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("routed TMA load size must be a 16-byte-aligned uint16")
+        num_slots = bytes2slots(bytes)
+        if num_slots > config.num_slots:
+            raise ValueError("routed TMA load exceeds the shared-slot arena")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D,
+            num_slots=num_slots,
+            arg=(pointer_field << self.ROUTE_BITS) | route_rank,
+            size=bytes,
+            address=routing_state.data_ptr(),
         )
 
 
@@ -1620,49 +1638,6 @@ class RoutedTmaLoadBase1D(RoutedTmaLoad1D):
         bytes: int,
     ):
         super().__init__(routing_state, route_rank, pointer_field, bytes)
-        self.opcode = opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D
-
-
-class AffineRoutedTmaLoad1D(MemoryInstruction):
-    """Load one selected-expert field from a preloaded affine arena base."""
-
-    ROUTE_COUNT = 6
-    ROUTE_BITS = 3
-    REFRESH_ROUTE = 1 << ROUTE_BITS
-
-    def __init__(
-        self,
-        field_offset: int,
-        route_rank: int,
-        bytes: int,
-        *,
-        refresh_route: bool = False,
-    ):
-        if not 0 <= route_rank < self.ROUTE_COUNT:
-            raise ValueError("route_rank must be in [0, 6)")
-        if field_offset < 0 or field_offset >= (1 << 63):
-            raise ValueError("affine routed field offset must fit in signed int64")
-        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
-            raise ValueError("affine routed TMA load size must be aligned")
-        arg = route_rank
-        if refresh_route:
-            arg |= self.REFRESH_ROUTE
-        super().__init__(
-            opcode=opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D,
-            num_slots=bytes2slots(bytes),
-            arg=arg,
-            size=bytes,
-            address=field_offset,
-        )
-
-
-class AffineRoutedTmaLoadBase1D(AffineRoutedTmaLoad1D):
-    """Load an affine field and retain its resolved address in LDU register 0."""
-
-    ADDRESS_REGISTER = 0
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self.opcode = opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D
 
 
@@ -1770,7 +1745,7 @@ class IndirectLduLoad1D(MemoryInstruction):
 
 
 class IndirectRoutedTmaLoad1D(MemoryInstruction):
-    """Removed indirect pointer-table routed load API."""
+    """Resolve fixed route IDs plus one layer pointer table in LDU."""
 
     def __init__(
         self,
@@ -1781,8 +1756,24 @@ class IndirectRoutedTmaLoad1D(MemoryInstruction):
         *,
         layer_indexed=False,
     ):
-        raise RuntimeError(
-            "indirect routed pointer tables were removed; use affine expert storage"
+        _validate_indirect_pointer_entry(state_descriptor)
+        if state_descriptor.numel() < 2:
+            raise ValueError("indirect routed state descriptor needs two int64 words")
+        if not 0 <= route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("route_rank must be in [0, 6)")
+        if not 0 <= pointer_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+            raise ValueError("pointer_field must fit in 13 bits")
+        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
+            raise ValueError("indirect routed TMA load size must be aligned")
+        super().__init__(
+            opcode=_indirect_layer_opcode(
+                opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D,
+                layer_indexed,
+            ),
+            num_slots=bytes2slots(bytes),
+            arg=(pointer_field << RoutedTmaLoad1D.ROUTE_BITS) | route_rank,
+            size=bytes,
+            address=state_descriptor.data_ptr(),
         )
 
 
@@ -1917,47 +1908,6 @@ class LduProfileLayer(MemoryInstruction):
             arg=event_base,
             size=event_count,
             address=0,
-        )
-
-
-class LduSetAffineExpertBase(MemoryInstruction):
-    """Preload one affine expert base and geometry into both LDU handlers."""
-
-    STRIDE_GRANULARITY = 256
-    EXPERT_COUNT_BITS = 9
-    MAX_EXPERT_COUNT = (1 << EXPERT_COUNT_BITS) - 1
-
-    def __init__(
-        self,
-        storage: torch.Tensor,
-        expert_stride: int,
-        expert_count: int,
-        initial_layer: int = 0,
-        special_slot: int = 0,
-    ):
-        if (
-            storage.device.type != "cuda"
-            or storage.dtype != torch.uint8
-            or not storage.is_contiguous()
-        ):
-            raise ValueError("affine expert base requires contiguous CUDA uint8 storage")
-        if expert_stride <= 0 or expert_stride % self.STRIDE_GRANULARITY:
-            raise ValueError("affine expert stride must be positive and 256-byte aligned")
-        stride_units = expert_stride // self.STRIDE_GRANULARITY
-        if stride_units > 0xFFFF:
-            raise ValueError("affine expert stride does not fit the preload encoding")
-        if not 0 < expert_count <= self.MAX_EXPERT_COUNT:
-            raise ValueError("affine expert count must fit in nine bits")
-        if not 0 <= initial_layer < (1 << (16 - self.EXPERT_COUNT_BITS)):
-            raise ValueError("affine initial layer must fit the preload encoding")
-        if not 0 <= special_slot < config.num_special_slots - 1:
-            raise ValueError("affine expert preload requires two adjacent special slots")
-        super().__init__(
-            opcode=opcode.OP_LDU_SET_AFFINE_EXPERT_BASE,
-            num_slots=config.num_slots + special_slot,
-            arg=(initial_layer << self.EXPERT_COUNT_BITS) | expert_count,
-            size=stride_units,
-            address=storage.data_ptr(),
         )
 
 
@@ -2313,8 +2263,6 @@ __all__ = [
     "RawAddress",
     "RoutedTmaLoad1D",
     "RoutedTmaLoadBase1D",
-    "AffineRoutedTmaLoad1D",
-    "AffineRoutedTmaLoadBase1D",
     "TmaLoadAddressReg1D",
     "IndexedTmaLoad1D",
     "IndirectTmaLoad1D",
@@ -2324,8 +2272,6 @@ __all__ = [
     "IndirectIndexedTmaLoad1D",
     "indirect_1d_from",
     "LduReloadBarriers",
-    "LduProfileLayer",
-    "LduSetAffineExpertBase",
     "LduLoad1D",
     "IssueBarrier",
     "CC0",

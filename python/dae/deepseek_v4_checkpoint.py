@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .deepseek_v4 import DeepSeekV4FlashConfig
-from .expert_affine import AffineExpertArena
 
 
 INDEX_FILENAME = "model.safetensors.index.json"
@@ -125,23 +124,6 @@ def _native_nvfp4_name(prefix: str) -> str:
 
 def _native_fp8_name(prefix: str) -> str:
     return f"{prefix}.__vdcores_native_fp8_weight"
-
-
-_AFFINE_EXPERT_PREFIX = re.compile(
-    r"^layers\.(?P<layer>[0-9]+)\.ffn\.experts\."
-    r"(?P<expert>[0-9]+)\.(?P<tag>w1|w3|w2)$"
-)
-
-
-def _affine_expert_key(prefix: str):
-    match = _AFFINE_EXPERT_PREFIX.fullmatch(prefix)
-    if match is None:
-        return None
-    return (
-        int(match.group("layer")),
-        int(match.group("expert")),
-        match.group("tag"),
-    )
 
 
 def _put(
@@ -678,7 +660,6 @@ class DeepSeekV4ResidentCheckpoint:
         storage_bytes: int,
         native_nvfp4_prefixes: Iterable[str] = (),
         native_fp8_prefixes: Iterable[str] = (),
-        affine_expert_arena: AffineExpertArena | None = None,
     ) -> None:
         self.source = checkpoint
         self.config = checkpoint.config
@@ -691,7 +672,6 @@ class DeepSeekV4ResidentCheckpoint:
         self.storage_bytes = storage_bytes
         self.native_nvfp4_prefixes = frozenset(native_nvfp4_prefixes)
         self.native_fp8_prefixes = frozenset(native_fp8_prefixes)
-        self.affine_expert_arena = affine_expert_arena
 
     @classmethod
     def from_checkpoint(
@@ -703,7 +683,6 @@ class DeepSeekV4ResidentCheckpoint:
         alignment: int = 256,
         reserve_bytes: int = 0,
         native_nvfp4: bool = False,
-        affine_nvfp4_experts: bool = False,
         native_fp8_prefixes: Iterable[str] = (),
         progress: Callable[[int, int, str, int, int], None] | None = None,
     ) -> "DeepSeekV4ResidentCheckpoint":
@@ -731,8 +710,6 @@ class DeepSeekV4ResidentCheckpoint:
         if target_device.type == "cuda" and target_device.index is None:
             target_device = torch.device("cuda", torch.cuda.current_device())
         requested_native_fp8 = frozenset(native_fp8_prefixes)
-        if affine_nvfp4_experts and not native_nvfp4:
-            raise ValueError("affine NVFP4 experts require native NVFP4 packing")
         if (native_nvfp4 or requested_native_fp8) and target_device.type != "cuda":
             raise ValueError("native resident packing requires a CUDA device")
 
@@ -829,79 +806,19 @@ class DeepSeekV4ResidentCheckpoint:
                 (rows // 128, k // 128, 16896),
             )
 
-        affine_pairs = {}
-        affine_source_names = set()
-        affine_layer_filenames: dict[int, str] = {}
-        affine_layer_ids = ()
-        if affine_nvfp4_experts:
-            for prefix, pair in native_pairs.items():
-                key = _affine_expert_key(prefix)
-                if key is None:
-                    continue
-                layer_id, expert_id, tag = key
-                if not 0 <= expert_id < checkpoint.config.num_experts:
-                    raise ValueError(f"affine expert ID is out of range in {prefix}")
-                scale2_name = f"{prefix}.weight_scale_2"
-                input_name = f"{prefix}.input_scale"
-                if scale2_name not in selected_name_set or input_name not in selected_name_set:
-                    raise ValueError(f"affine expert {prefix} is missing scalar metadata")
-                source_names = (pair[0], pair[1], scale2_name, input_name)
-                filenames = {checkpoint.weight_map[name] for name in source_names}
-                if len(filenames) != 1:
-                    raise ValueError(
-                        f"affine expert {prefix} must occupy one checkpoint shard"
-                    )
-                filename = filenames.pop()
-                prior_filename = affine_layer_filenames.setdefault(layer_id, filename)
-                if prior_filename != filename:
-                    raise ValueError(
-                        f"affine layer {layer_id} spans multiple checkpoint shards"
-                    )
-                affine_pairs[(layer_id, expert_id, tag)] = (prefix, *pair)
-                affine_source_names.update(source_names)
-
-            affine_layer_ids = tuple(sorted(affine_layer_filenames))
-            expected_keys = {
-                (layer_id, expert_id, tag)
-                for layer_id in affine_layer_ids
-                for expert_id in range(checkpoint.config.num_experts)
-                for tag in AffineExpertArena.TAGS
-            }
-            if set(affine_pairs) != expected_keys:
-                missing = expected_keys - set(affine_pairs)
-                extra = set(affine_pairs) - expected_keys
-                raise ValueError(
-                    "affine expert arena requires complete layer/expert/tag sets: "
-                    f"missing={len(missing)} extra={len(extra)}"
-                )
-            if not affine_layer_ids:
-                raise ValueError("affine expert packing found no routed experts")
-
-        ordinary_native_pairs = {
-            prefix: pair
-            for prefix, pair in native_pairs.items()
-            if _affine_expert_key(prefix) is None or not affine_nvfp4_experts
-        }
         grouped: dict[str, list[str]] = defaultdict(list)
         for name in selected_names:
-            if name not in affine_source_names:
-                grouped[checkpoint.weight_map[name]].append(name)
+            grouped[checkpoint.weight_map[name]].append(name)
 
-        shard_layouts = {}
-        total_tensor_bytes = sum(spec.nbytes for spec in specs.values())
-        total_storage_bytes = (
-            AffineExpertArena.storage_bytes(
-                checkpoint.config, len(affine_layer_ids)
-            )
-            if affine_layer_ids
-            else 0
-        )
+        shard_layouts = []
+        total_tensor_bytes = 0
+        total_storage_bytes = 0
         for filename in sorted(grouped):
             offset = 0
             entries = []
             weight_to_pair = {
                 weight_name: (scale_name, shape)
-                for weight_name, scale_name, shape in ordinary_native_pairs.values()
+                for weight_name, scale_name, shape in native_pairs.values()
                 if checkpoint.weight_map[weight_name] == filename
             }
             fp8_weight_to_pair = {
@@ -937,11 +854,13 @@ class DeepSeekV4ResidentCheckpoint:
                 offset = (offset + alignment - 1) & -alignment
                 spec = specs[name]
                 entries.append((name, offset, spec))
+                total_tensor_bytes += spec.nbytes
                 if name in fp8_weight_to_pair:
                     scale_name, native_shape = fp8_weight_to_pair[name]
                     scale_spec = specs[scale_name]
                     scale_offset = offset + spec.nbytes
                     entries.append((scale_name, scale_offset, scale_spec))
+                    total_tensor_bytes += scale_spec.nbytes
                     native_bytes = math.prod(native_shape)
                     if spec.nbytes + scale_spec.nbytes > native_bytes:
                         raise ValueError(
@@ -952,7 +871,7 @@ class DeepSeekV4ResidentCheckpoint:
                     continue
                 offset += spec.nbytes
                 index += 1
-            shard_layouts[filename] = (offset, entries)
+            shard_layouts.append((filename, offset, entries))
             total_storage_bytes += offset
 
         if target_device.type == "cuda":
@@ -964,47 +883,13 @@ class DeepSeekV4ResidentCheckpoint:
                     f"free={free_bytes}"
                 )
 
-        affine_layers_by_filename: dict[str, list[int]] = defaultdict(list)
-        for layer_id, filename in affine_layer_filenames.items():
-            affine_layers_by_filename[filename].append(layer_id)
-        all_filenames = tuple(
-            sorted(set(shard_layouts) | set(affine_layers_by_filename))
-        )
-
         resident_tensors: dict[str, object] = {}
-        affine_arena = (
-            AffineExpertArena.allocate(
-                checkpoint.config, affine_layer_ids, device=target_device
-            )
-            if affine_layer_ids
-            else None
-        )
-        storage_buffers: list[object] = (
-            [affine_arena.storage] if affine_arena is not None else []
-        )
-        loaded_storage_bytes = (
-            AffineExpertArena.HEADER_BYTES if affine_arena is not None else 0
-        )
-        for shard_index, filename in enumerate(all_filenames, start=1):
-            shard_bytes, entries = shard_layouts.get(filename, (0, ()))
-            packed = (
-                torch.empty((shard_bytes,), dtype=torch.uint8)
-                if shard_bytes
-                else None
-            )
-            affine_shard_layers = tuple(sorted(affine_layers_by_filename[filename]))
-            if len(affine_shard_layers) > 1:
-                raise ValueError(
-                    f"checkpoint shard {filename} contains multiple affine expert layers"
-                )
-            affine_layer_id = (
-                affine_shard_layers[0] if affine_shard_layers else None
-            )
-            affine_packed = (
-                torch.empty((affine_arena.layer_stride,), dtype=torch.uint8)
-                if affine_layer_id is not None
-                else None
-            )
+        storage_buffers: list[object] = []
+        loaded_storage_bytes = 0
+        for shard_index, (filename, shard_bytes, entries) in enumerate(
+            shard_layouts, start=1
+        ):
+            packed = torch.empty((shard_bytes,), dtype=torch.uint8)
             dtypes = {}
             previous_end = 0
             with safe_open(
@@ -1014,7 +899,9 @@ class DeepSeekV4ResidentCheckpoint:
                     if offset > previous_end:
                         packed[previous_end:offset].zero_()
                     source = shard.get_tensor(name)
-                    source_bytes = source.contiguous().reshape(-1).view(torch.uint8)
+                    source_bytes = (
+                        source.contiguous().reshape(-1).view(torch.uint8)
+                    )
                     if source_bytes.numel() != spec.nbytes:
                         raise ValueError(
                             f"checkpoint tensor {name} payload changed while loading"
@@ -1023,89 +910,15 @@ class DeepSeekV4ResidentCheckpoint:
                     dtypes[name] = source.dtype
                     previous_end = offset + spec.nbytes
 
-                if affine_layer_id is not None:
-                    layer_base = affine_arena.layer_offset(affine_layer_id)
-                    for expert_id in range(checkpoint.config.num_experts):
-                        up_input = None
-                        for tag in AffineExpertArena.TAGS:
-                            prefix, weight_name, scale_name, native_shape = affine_pairs[
-                                (affine_layer_id, expert_id, tag)
-                            ]
-                            weight_spec = specs[weight_name]
-                            scale_spec = specs[scale_name]
-                            weight = shard.get_tensor(weight_name).contiguous()
-                            scale = shard.get_tensor(scale_name).contiguous()
-                            weight_bytes = weight.reshape(-1).view(torch.uint8)
-                            scale_bytes = scale.reshape(-1).view(torch.uint8)
-                            if (
-                                weight_bytes.numel() != weight_spec.nbytes
-                                or scale_bytes.numel() != scale_spec.nbytes
-                                or weight_spec.nbytes + scale_spec.nbytes
-                                != affine_arena.weight_bytes
-                            ):
-                                raise ValueError(
-                                    f"{prefix} does not fill one affine native field"
-                                )
-                            field_offset = (
-                                affine_arena.weight_offset(
-                                    affine_layer_id, expert_id, tag
-                                )
-                                - layer_base
-                            )
-                            affine_packed[
-                                field_offset : field_offset + weight_spec.nbytes
-                            ].copy_(weight_bytes)
-                            affine_packed[
-                                field_offset
-                                + weight_spec.nbytes : field_offset
-                                + affine_arena.weight_bytes
-                            ].copy_(scale_bytes)
-
-                            scale2_name = f"{prefix}.weight_scale_2"
-                            input_name = f"{prefix}.input_scale"
-                            scale2 = shard.get_tensor(scale2_name).reshape(())
-                            input_scale = shard.get_tensor(input_name).reshape(())
-                            if tag == "w1":
-                                up_input = input_scale
-                            elif tag == "w3" and not torch.equal(up_input, input_scale):
-                                raise ValueError(
-                                    f"layer {affine_layer_id} expert {expert_id} "
-                                    "w1/w3 input scales differ"
-                                )
-                            metadata_values = {
-                                "weight_scale_2": scale2,
-                                "input_scale": input_scale,
-                                "alpha": scale2 * input_scale,
-                            }
-                            for field, value in metadata_values.items():
-                                metadata_offset = (
-                                    affine_arena.metadata_offset(
-                                        affine_layer_id, expert_id, tag, field
-                                    )
-                                    - layer_base
-                                )
-                                metadata = affine_packed[
-                                    metadata_offset : metadata_offset
-                                    + AffineExpertArena.META_FIELD_BYTES
-                                ]
-                                metadata.zero_()
-                                metadata[:4].copy_(
-                                    value.to(torch.float32)
-                                    .contiguous()
-                                    .reshape(-1)
-                                    .view(torch.uint8)
-                                )
-
-            storage = packed.to(target_device) if packed is not None else None
-            if storage is not None:
-                storage_buffers.append(storage)
+            storage = packed.to(target_device)
+            storage_buffers.append(storage)
             entry_by_name = {
                 name: (offset, spec) for name, offset, spec in entries
             }
             native_source_names = {
                 name
                 for weight_name, scale_name, _ in (
-                    *ordinary_native_pairs.values(),
+                    *native_pairs.values(),
                     *native_fp8_pairs.values(),
                 )
                 for name in (weight_name, scale_name)
@@ -1115,135 +928,82 @@ class DeepSeekV4ResidentCheckpoint:
                     continue
                 raw = storage[offset : offset + spec.nbytes]
                 resident_tensors[name] = raw.view(dtypes[name]).reshape(spec.shape)
-
-            if ordinary_native_pairs or native_fp8_pairs or affine_layer_id is not None:
+            if native_pairs or native_fp8_pairs:
                 from . import runtime
 
-            temporaries = {}
-            for prefix, (
-                weight_name,
-                scale_name,
-                native_shape,
-            ) in ordinary_native_pairs.items():
-                if checkpoint.weight_map[weight_name] != filename:
-                    continue
-                weight_offset, weight_spec = entry_by_name[weight_name]
-                scale_offset, scale_spec = entry_by_name[scale_name]
-                if scale_offset != weight_offset + weight_spec.nbytes:
-                    raise ValueError(
-                        f"{prefix} resident weight/scale span is not contiguous"
-                    )
-                weight = storage[
-                    weight_offset : weight_offset + weight_spec.nbytes
-                ].view(dtypes[weight_name]).reshape(weight_spec.shape)
-                checkpoint_scale = storage[
-                    scale_offset : scale_offset + scale_spec.nbytes
-                ].view(dtypes[scale_name]).reshape(scale_spec.shape)
-                temporary = temporaries.get(native_shape)
-                if temporary is None:
-                    temporary = torch.empty(
-                        native_shape, dtype=torch.uint8, device=target_device
-                    )
-                    temporaries[native_shape] = temporary
-                runtime.prepack_nvfp4_checkpoint(
-                    weight, checkpoint_scale, temporary
-                )
-                native_bytes = weight_spec.nbytes + scale_spec.nbytes
-                native = storage[
-                    weight_offset : weight_offset + native_bytes
-                ].reshape(native_shape)
-                native.copy_(temporary)
-                resident_tensors[_native_nvfp4_name(prefix)] = native
-
-            fp8_temporaries = {}
-            for prefix, (
-                weight_name,
-                scale_name,
-                native_shape,
-            ) in native_fp8_pairs.items():
-                if checkpoint.weight_map[weight_name] != filename:
-                    continue
-                weight_offset, weight_spec = entry_by_name[weight_name]
-                scale_offset, scale_spec = entry_by_name[scale_name]
-                if scale_offset != weight_offset + weight_spec.nbytes:
-                    raise ValueError(
-                        f"{prefix} resident FP8 weight/scale span is not contiguous"
-                    )
-                weight = storage[
-                    weight_offset : weight_offset + weight_spec.nbytes
-                ].view(dtypes[weight_name]).reshape(weight_spec.shape)
-                checkpoint_scale = storage[
-                    scale_offset : scale_offset + scale_spec.nbytes
-                ].view(dtypes[scale_name]).reshape(scale_spec.shape)
-                temporary = fp8_temporaries.get(native_shape)
-                if temporary is None:
-                    temporary = torch.empty(
-                        native_shape, dtype=torch.uint8, device=target_device
-                    )
-                    fp8_temporaries[native_shape] = temporary
-                runtime.prepack_fp8_checkpoint(
-                    weight, checkpoint_scale, temporary
-                )
-                native_bytes = math.prod(native_shape)
-                native = storage[
-                    weight_offset : weight_offset + native_bytes
-                ].reshape(native_shape)
-                native.copy_(temporary)
-                resident_tensors[_native_fp8_name(prefix)] = native
-
-            if affine_layer_id is not None:
-                affine_arena.layer_storage(affine_layer_id).copy_(affine_packed)
-                affine_temporaries = {}
-                for expert_id in range(checkpoint.config.num_experts):
-                    for tag in AffineExpertArena.TAGS:
-                        prefix, weight_name, scale_name, native_shape = affine_pairs[
-                            (affine_layer_id, expert_id, tag)
-                        ]
-                        weight_spec = specs[weight_name]
-                        scale_spec = specs[scale_name]
-                        field_offset = affine_arena.weight_offset(
-                            affine_layer_id, expert_id, tag
+                temporaries = {}
+                for prefix, (weight_name, scale_name, native_shape) in native_pairs.items():
+                    if checkpoint.weight_map[weight_name] != filename:
+                        continue
+                    weight_offset, weight_spec = entry_by_name[weight_name]
+                    scale_offset, scale_spec = entry_by_name[scale_name]
+                    if scale_offset != weight_offset + weight_spec.nbytes:
+                        raise ValueError(
+                            f"{prefix} resident weight/scale span is not contiguous"
                         )
-                        field = affine_arena.storage[
-                            field_offset : field_offset + affine_arena.weight_bytes
-                        ]
-                        weight = field[: weight_spec.nbytes].reshape(weight_spec.shape)
-                        checkpoint_scale = field[
-                            weight_spec.nbytes : weight_spec.nbytes + scale_spec.nbytes
-                        ].view(torch.float8_e4m3fn).reshape(scale_spec.shape)
-                        temporary = affine_temporaries.get(native_shape)
-                        if temporary is None:
-                            temporary = torch.empty(
-                                native_shape, dtype=torch.uint8, device=target_device
-                            )
-                            affine_temporaries[native_shape] = temporary
-                        runtime.prepack_nvfp4_checkpoint(
-                            weight, checkpoint_scale, temporary
+                    weight = storage[
+                        weight_offset : weight_offset + weight_spec.nbytes
+                    ].view(dtypes[weight_name]).reshape(weight_spec.shape)
+                    checkpoint_scale = storage[
+                        scale_offset : scale_offset + scale_spec.nbytes
+                    ].view(dtypes[scale_name]).reshape(scale_spec.shape)
+                    temporary = temporaries.get(native_shape)
+                    if temporary is None:
+                        temporary = torch.empty(
+                            native_shape, dtype=torch.uint8, device=target_device
                         )
-                        native = field.reshape(native_shape)
-                        native.copy_(temporary)
-                        resident_tensors[_native_nvfp4_name(prefix)] = native
-                        for field_name, tensor_name in (
-                            ("weight_scale_2", f"{prefix}.weight_scale_2"),
-                            ("input_scale", f"{prefix}.input_scale"),
-                        ):
-                            metadata_offset = affine_arena.metadata_offset(
-                                affine_layer_id, expert_id, tag, field_name
-                            )
-                            resident_tensors[tensor_name] = affine_arena.storage[
-                                metadata_offset : metadata_offset + 4
-                            ].view(torch.float32).reshape(())
-
-            effective_shard_bytes = shard_bytes + (
-                affine_arena.layer_stride if affine_layer_id is not None else 0
-            )
-            loaded_storage_bytes += effective_shard_bytes
+                        temporaries[native_shape] = temporary
+                    runtime.prepack_nvfp4_checkpoint(
+                        weight, checkpoint_scale, temporary
+                    )
+                    native_bytes = weight_spec.nbytes + scale_spec.nbytes
+                    native = storage[
+                        weight_offset : weight_offset + native_bytes
+                    ].reshape(native_shape)
+                    native.copy_(temporary)
+                    resident_tensors[_native_nvfp4_name(prefix)] = native
+                fp8_temporaries = {}
+                for prefix, (
+                    weight_name,
+                    scale_name,
+                    native_shape,
+                ) in native_fp8_pairs.items():
+                    if checkpoint.weight_map[weight_name] != filename:
+                        continue
+                    weight_offset, weight_spec = entry_by_name[weight_name]
+                    scale_offset, scale_spec = entry_by_name[scale_name]
+                    if scale_offset != weight_offset + weight_spec.nbytes:
+                        raise ValueError(
+                            f"{prefix} resident FP8 weight/scale span is not contiguous"
+                        )
+                    weight = storage[
+                        weight_offset : weight_offset + weight_spec.nbytes
+                    ].view(dtypes[weight_name]).reshape(weight_spec.shape)
+                    checkpoint_scale = storage[
+                        scale_offset : scale_offset + scale_spec.nbytes
+                    ].view(dtypes[scale_name]).reshape(scale_spec.shape)
+                    temporary = fp8_temporaries.get(native_shape)
+                    if temporary is None:
+                        temporary = torch.empty(
+                            native_shape, dtype=torch.uint8, device=target_device
+                        )
+                        fp8_temporaries[native_shape] = temporary
+                    runtime.prepack_fp8_checkpoint(
+                        weight, checkpoint_scale, temporary
+                    )
+                    native_bytes = math.prod(native_shape)
+                    native = storage[
+                        weight_offset : weight_offset + native_bytes
+                    ].reshape(native_shape)
+                    native.copy_(temporary)
+                    resident_tensors[_native_fp8_name(prefix)] = native
+            loaded_storage_bytes += shard_bytes
             if progress is not None:
                 progress(
                     shard_index,
-                    len(all_filenames),
+                    len(shard_layouts),
                     filename,
-                    effective_shard_bytes,
+                    shard_bytes,
                     loaded_storage_bytes,
                 )
 
@@ -1256,7 +1016,6 @@ class DeepSeekV4ResidentCheckpoint:
             storage_bytes=total_storage_bytes,
             native_nvfp4_prefixes=native_pairs,
             native_fp8_prefixes=native_fp8_pairs,
-            affine_expert_arena=affine_arena,
         )
 
     def _check_device(self, device) -> None:

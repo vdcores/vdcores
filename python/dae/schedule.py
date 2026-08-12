@@ -691,35 +691,20 @@ class SchedRoutedDsv4Nvfp4QuantUmmaB(Schedule):
     TILE_K = SchedDsv4Nvfp4QuantUmmaB.TILE_K
     TILE_BYTES = SchedDsv4Nvfp4QuantUmmaB.TILE_BYTES
 
-    def __init__(
-        self,
-        routing_state,
-        route_rank,
-        scale_field,
-        input,
-        output,
-        *,
-        affine=False,
-        refresh_route=True,
-    ):
+    def __init__(self, routing_state, route_rank, scale_field, input, output):
         super().__init__()
         self.routing_state = routing_state
         self.route_rank = route_rank
         self.scale_field = scale_field
         self.input = input
         self.output = output
-        self.affine = bool(affine)
-        self.refresh_route = bool(refresh_route)
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
             raise ValueError("routing state must be a CUDA tensor")
         if not 0 <= self.route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
             raise ValueError("route_rank must be in [0, 6)")
-        if self.affine:
-            if self.scale_field < 0:
-                raise ValueError("affine routed scale offset must be non-negative")
-        elif not 0 <= self.scale_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+        if not 0 <= self.scale_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
             raise ValueError("routed native scale field must fit in 13 bits")
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
             raise ValueError("routed native NVFP4 input must be a BF16 vector")
@@ -745,25 +730,15 @@ class SchedRoutedDsv4Nvfp4QuantUmmaB(Schedule):
         if route_bar is None:
             raise ValueError("routed native NVFP4 quant requires a route barrier")
         start = sm * self.TILE_K
-        scale_load = (
-            AffineRoutedTmaLoad1D(
-                self.scale_field,
-                self.route_rank,
-                16,
-                refresh_route=self.refresh_route,
-            )
-            if self.affine
-            else RoutedTmaLoad1D(
+        return [
+            Dsv4Nvfp4QuantUmmaBSm100(1),
+            _shared_load_1d(self.input[start : start + self.TILE_K]),
+            RoutedTmaLoad1D(
                 self.routing_state,
                 self.route_rank,
                 self.scale_field,
                 16,
-            )
-        )
-        return [
-            Dsv4Nvfp4QuantUmmaBSm100(1),
-            _shared_load_1d(self.input[start : start + self.TILE_K]),
-            scale_load.fixed_port(1).bar(route_bar),
+            ).bar(route_bar),
             _shared_store_1d(self.output[sm].reshape(-1)).bar(
                 self._bar("output")
             ),
@@ -896,8 +871,6 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         output_mode="store",
         output_register=0,
         output_port=0,
-        affine=False,
-        refresh_route=False,
     ):
         super().__init__()
         self.routing_state = routing_state
@@ -921,8 +894,6 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         self.output_mode = output_mode
         self.output_register = output_register
         self.output_port = output_port
-        self.affine = bool(affine)
-        self.refresh_route = bool(refresh_route)
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
@@ -942,11 +913,11 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         ):
             raise ValueError("routed activation tiles must be [K/256,3072] uint8")
         self.k_tiles = self.activation_tiles.shape[0]
-        for field in (*self.weight_fields, self.alpha_field):
-            if self.affine:
-                if field < 0:
-                    raise ValueError("affine routed field offsets must be non-negative")
-            elif not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+        for field in (
+            *self.weight_fields,
+            self.alpha_field,
+        ):
+            if not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
                 raise ValueError("routed native pointer fields must fit in 13 bits")
         self.rows = self.m_tiles * self.TILE_M
         if self.output_mode == "store":
@@ -991,19 +962,11 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                     bulk_activation=bulk,
                 )
             )
-            alpha_load = (
-                AffineRoutedTmaLoad1D(
-                    self.alpha_field,
-                    self.route_rank,
-                    16,
-                )
-                if self.affine
-                else RoutedTmaLoad1D(
-                    self.routing_state,
-                    self.route_rank,
-                    self.alpha_field,
-                    16,
-                )
+            alpha_load = RoutedTmaLoad1D(
+                self.routing_state,
+                self.route_rank,
+                self.alpha_field,
+                16,
             ).fixed_port(1)
             if first_output and route_bar is not None:
                 alpha_load.bar(route_bar)
@@ -1034,20 +997,12 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
 
             for k_tile in range(self.k_tiles):
                 if k_tile == 0:
-                    if self.affine:
-                        weight_load = AffineRoutedTmaLoadBase1D(
-                            self.weight_fields[output_tile],
-                            self.route_rank,
-                            self.WEIGHT_TILE_BYTES,
-                            refresh_route=self.refresh_route and first_output,
-                        )
-                    else:
-                        weight_load = RoutedTmaLoadBase1D(
-                            self.routing_state,
-                            self.route_rank,
-                            self.weight_fields[output_tile],
-                            self.WEIGHT_TILE_BYTES,
-                        )
+                    weight_load = RoutedTmaLoadBase1D(
+                        self.routing_state,
+                        self.route_rank,
+                        self.weight_fields[output_tile],
+                        self.WEIGHT_TILE_BYTES,
+                    )
                 else:
                     weight_load = TmaLoadAddressReg1D(
                         RoutedTmaLoadBase1D.ADDRESS_REGISTER,
