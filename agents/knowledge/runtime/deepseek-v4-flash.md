@@ -1480,3 +1480,103 @@ shape-derived placement where the per-step counters show idle queues. Keep
 the accepted one-SM-per-head attention placement until a bounded, liveness-
 safe alternative passes repeated launches; do not reuse the abandoned
 grouped multi-SM schedule.
+
+## Matched context-128 per-step gap profile (2026-08-12)
+
+The accepted routed-expert source boundary remains `648fe02`; profiling did
+not rerun or replace its accepted performance gate. Commit `cf579d1` adds only
+the missing SGLang profiler bracket to the fixed-context harness. All three
+runtimes use one GPU. The framework runs execute a real 127-token prefill and
+measure the next decode at context 128 with the complete 129,280-row
+vocabulary. The VDCores resident gate uses its deterministic position-127
+cache and a 4,096-row output gate; applying the separately measured
+full-vocabulary increment is therefore a projection, not a measured
+pointer-era full-vocabulary run.
+
+| Runtime | Accepted median (ms) | Full-vocabulary comparison (ms) | Gap from VDCores (ms) |
+| --- | ---: | ---: | ---: |
+| VDCores, one launch | 14.569616 | 15.005072 projected | - |
+| vLLM 0.23.0 | 6.015728 | 6.015728 measured | 8.989344 |
+| SGLang 0.5.12.post1 | 7.321974 | 7.321974 measured | 7.683098 |
+
+The projected complete VDCores token is 2.494x the vLLM median and 2.049x the
+SGLang median. The strict 10%-below-vLLM target is 5.414155 ms, leaving a
+9.590917-ms projected gap.
+
+For framework attribution, a Torch/Kineto trace brackets prefill plus decode.
+The target decode is isolated by its GPU annotation, and layer boundaries are
+the alternating attention/FFN mHC-pre kernels. Phase time is the union of GPU
+kernels, copies, and memsets between boundaries, so concurrent streams are not
+double counted. The vLLM profile job `20260812T173220Z-627132` measured a
+6.119955-ms three-sample median and stored
+`/tmp/dsv4-vllm-c128-torch/fixed_context_128_dp0_pp0_tp0_dcp0_ep0_rank0.1786556926469320683.pt.trace.json`.
+The SGLang profile job `20260812T175034Z-820778` measured a 7.282197-ms
+three-sample median and stored
+`/tmp/dsv4-sglang-c128-torch/1786557318.1659656-TP-0.trace.json.gz`. Those
+short profiler-run medians are sanity checks only; the 30-sample accepted
+medians above remain authoritative.
+
+The family-level phase split is:
+
+| Family | Layers | VDCores attention / FFN / layer (us) | vLLM GPU-busy (us) | SGLang GPU-busy (us) |
+| --- | ---: | ---: | ---: | ---: |
+| SWA | 2 | 208.768 / 95.872 / 304.640 | 101.410 / 54.978 / 156.388 | 129.813 / 58.305 / 188.118 |
+| HCA | 20 | 232.416 / 103.424 / 335.840 | 79.062 / 55.987 / 135.049 | 94.387 / 59.533 / 153.920 |
+| CSA | 21 | 294.656 / 104.960 / 399.616 | 103.962 / 56.587 / 160.548 | 110.256 / 59.293 / 169.549 |
+
+Across the 43 layers, the VDCores representative-family frontiers sum to
+11.253632 ms of attention and 4.464384 ms of FFN. vLLM's decode trace has
+3.967244 ms and 2.418024 ms respectively; the diagnostic gaps are therefore
+7.286388 ms in attention and 2.046360 ms in FFN. SGLang has 4.462737 ms and
+2.552417 ms, for gaps of 6.790895 ms and 1.911967 ms. Attention accounts for
+78.1% of the layer-body gap to vLLM and 78.0% of the gap to SGLang. The
+framework full-vocabulary head occupies another 0.203814 ms of vLLM GPU-busy
+time and 0.233575 ms of SGLang GPU-busy time.
+
+The VDCores representative per-step natural frontiers are:
+
+| Stage (us) | SWA | HCA | CSA |
+| --- | ---: | ---: | ---: |
+| Attention mHC/hidden/KV/Q preparation | 50.304 | 50.944 | 51.584 |
+| Compressor and indexer | - | 31.872 | 58.752 |
+| Sparse attention | 63.456 | 65.408 | 78.112 |
+| Inverse RoPE | 2.592 | 2.464 | 2.528 |
+| o_a join frontier | 58.624 | 47.072 | 63.456 |
+| o_b | 27.744 | 27.584 | 33.056 |
+| Attention mHC post | 6.048 | 7.072 | 7.168 |
+| FFN mHC pre | 13.408 | 14.304 | 14.688 |
+| Route frontier | 12.768 | 18.336 | 18.752 |
+| Shared+routed expert join | 57.312 | 57.632 | 58.784 |
+| Expert reduction | 6.112 | 6.752 | 5.920 |
+| FFN mHC post | 6.272 | 6.400 | 6.816 |
+
+These VDCores values are representative natural producer frontiers from the
+internal-counter profile, while the framework values are unioned GPU-busy
+time under profiler instrumentation. The 15.718016-ms sum of representative
+VDCores layers and the 6.385268/7.015153-ms framework layer sums must not be
+treated as an exact subtraction of the accepted end-to-end medians: the
+production VDCores loop overlaps adjacent work, and Torch profiling changes
+framework timing. They are a critical-path attribution, not a new TBT result.
+
+The mechanism-level comparison identifies two broad gaps:
+
+- VDCores sparse attention is 60--75 us of active task work and 63--78 us at
+  the natural frontier. The framework FlashMLA split-KV plus combine kernels
+  are about 16.7 us per layer in both traces. Even the matched Triton task is
+  only 26--33 us, leaving a kernel-level gap before queue tuning.
+- VDCores o_a and o_b frontiers are 47--63 us and 28--33 us per layer. The
+  eight o_a branches overlap, so their local waits are not additive, but the
+  final join remains much later than the framework's DeepGEMM/NVJET dense
+  projection kernels, whose individual decode shapes are generally about
+  6--12 us.
+- The complete framework FFN phase is 55--60 us per layer. VDCores spends
+  57--59 us at the shared+routed expert join alone, then pays mHC, routing,
+  reduction, and post work for a 96--105-us FFN. Router arithmetic itself is
+  only 2.6--2.9 us; its 25--29-us local readiness/admission wait confirms that
+  routing arithmetic is not the first target.
+
+The next optimization order is therefore attention mechanism first
+(FlashMLA/FA4-style Blackwell tiling, TMA/data-scale overlap, and fewer dense
+projection queue frontiers), then FFN admission and shared/routed overlap.
+Small router arithmetic, barrier-count, or instruction tuning cannot explain
+the measured gap and stays behind those board-level experiments.
