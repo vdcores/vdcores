@@ -1534,3 +1534,9 @@ Full 43-layer job `20260812T164606Z-131110` preserved token 5 and measured
 14.725120/14.747968/14.849344 ms. That is 0.243104 ms faster than the initial
 affine full gate, but 0.178352 ms (1.22%) above the old 14.569616-ms accepted
 boundary. The fully affine result is the current production boundary.
+
+The corresponding whole-model/full-vocabulary gate is job
+`20260812T165140Z-189332`: one GPU, one persistent launch, 43 layers, context
+128, and all 129,280 output rows. It preserved reference token 5 and measured
+15.126112/15.183424/15.310112 ms min/median/max. The 0.435456-ms difference
+from the 4,096-row gate is the complete FP8 head/argmax cost at this boundary.
