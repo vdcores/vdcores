@@ -1509,13 +1509,44 @@ class SchedFp8Block128GemvBf16(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4PreloadRopeTables(Schedule):
+    """Load immutable RoPE metadata once into fixed per-SM shared scratch."""
+
+    def __init__(self, tables):
+        super().__init__()
+        self.tables = tuple(tables)
+
+    def _on_place(self):
+        if not 1 <= len(self.tables) <= 4:
+            raise ValueError("DeepSeek resident RoPE preload requires 1-4 tables")
+        for table in self.tables:
+            if table.dtype != torch.float32 or tuple(table.shape) != (32, 2):
+                raise ValueError("DeepSeek RoPE table must be FP32 [32,2]")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        return [
+            Dsv4PreloadRopeTables(len(self.tables)),
+            *(TmaLoad1D(table) for table in self.tables),
+        ]
+
+
 class SchedDsv4Rope512_64(Schedule):
-    def __init__(self, input, table, output, inverse=False):
+    def __init__(
+        self,
+        input,
+        table,
+        output,
+        inverse=False,
+        fixed_table_id=None,
+    ):
         super().__init__()
         self.input = input
         self.table = table
         self.output = output
         self.inverse = inverse
+        self.fixed_table_id = fixed_table_id
 
     def _on_place(self):
         if (self.input.dtype != torch.bfloat16 or self.input.ndim != 2 or
@@ -1526,6 +1557,8 @@ class SchedDsv4Rope512_64(Schedule):
         if (self.table.dtype != torch.float32 or
                 tuple(self.table.shape) != (32, 2)):
             raise ValueError("DeepSeek RoPE table must be FP32 [32,2]")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
         self.rows = self.input.shape[0]
         if self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("DeepSeek partial RoPE requires 1 <= num_sms <= rows")
@@ -1535,12 +1568,19 @@ class SchedDsv4Rope512_64(Schedule):
             return []
         instructions = []
         for row in range(sm, self.rows, self.num_sms):
-            instructions += [
-                Dsv4Rope512_64(1, self.inverse),
-                TmaLoad1D(self.input[row]),
-                TmaLoad1D(self.table),
-                TmaStore1D(self.output[row]).bar(self._bar("output")),
-            ]
+            instructions.append(
+                Dsv4Rope512_64(
+                    1,
+                    self.inverse,
+                    fixed_table_id=self.fixed_table_id,
+                )
+            )
+            instructions.append(TmaLoad1D(self.input[row]))
+            if self.fixed_table_id is None:
+                instructions.append(TmaLoad1D(self.table))
+            instructions.append(
+                TmaStore1D(self.output[row]).bar(self._bar("output"))
+            )
         return instructions
 
     def bar_release_count(self, role: str):
@@ -1559,6 +1599,8 @@ class SchedDsv4Rope128_64(SchedDsv4Rope512_64):
         if (self.table.dtype != torch.float32 or
                 tuple(self.table.shape) != (32, 2)):
             raise ValueError("DeepSeek index RoPE table must be FP32 [32,2]")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
         self.rows = self.input.shape[0]
         if self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("DeepSeek index RoPE requires 1 <= num_sms <= rows")
@@ -1568,12 +1610,19 @@ class SchedDsv4Rope128_64(SchedDsv4Rope512_64):
             return []
         instructions = []
         for row in range(sm, self.rows, self.num_sms):
-            instructions += [
-                Dsv4Rope128_64(1, self.inverse),
-                TmaLoad1D(self.input[row]),
-                TmaLoad1D(self.table),
-                TmaStore1D(self.output[row]).bar(self._bar("output")),
-            ]
+            instructions.append(
+                Dsv4Rope128_64(
+                    1,
+                    self.inverse,
+                    fixed_table_id=self.fixed_table_id,
+                )
+            )
+            instructions.append(TmaLoad1D(self.input[row]))
+            if self.fixed_table_id is None:
+                instructions.append(TmaLoad1D(self.table))
+            instructions.append(
+                TmaStore1D(self.output[row]).bar(self._bar("output"))
+            )
         return instructions
 
 

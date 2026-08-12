@@ -183,6 +183,64 @@ __device__ __forceinline__ void task_dsv4_nvfp4_quant16(
   c2m.template push<31, true, false>(tid, scale_slots);
 }
 
+// A resident block keeps immutable RoPE metadata in the high end of its fixed
+// task scratch.  The production image's largest low-end scratch user is the
+// 8-KiB top-k workspace, leaving a wide gap before these four 256-byte tables.
+static constexpr int kDsv4RopeTableElements = 32 * 2;
+static constexpr int kDsv4RopeTableBytes =
+    kDsv4RopeTableElements * sizeof(float);
+static constexpr int kDsv4MaxResidentRopeTables = 4;
+static constexpr int kDsv4ResidentRopeMetadataBytes =
+    kDsv4MaxResidentRopeTables * kDsv4RopeTableBytes;
+static constexpr int kDsv4TaskScratchBytes =
+    dynamicSmemBytes - numSlots * slotSizeKb * 1024;
+static constexpr int kDsv4ResidentRopeMetadataOffset = 16 * 1024;
+static constexpr int kDsv4SmemBaseAlignmentSlack = 1023;
+static_assert(
+    kDsv4TaskScratchBytes >=
+        kDsv4ResidentRopeMetadataOffset +
+        kDsv4ResidentRopeMetadataBytes + kDsv4SmemBaseAlignmentSlack,
+    "DeepSeek resident scratch must fit fixed RoPE metadata after alignment");
+
+__device__ __forceinline__ float *dsv4_resident_rope_table(
+    void *smem_base,
+    int table_id) {
+  auto *task_scratch = static_cast<unsigned char *>(
+      get_slot_address(smem_base, numSlots));
+  return reinterpret_cast<float *>(
+      task_scratch + kDsv4ResidentRopeMetadataOffset +
+      table_id * kDsv4RopeTableBytes);
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_preload_rope_tables(
+    int num_tables,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  if (num_tables <= 0 || num_tables > kDsv4MaxResidentRopeTables) {
+    asm volatile("trap;");
+  }
+
+  const int tid = __compute_tid();
+  int input_slots = 0;
+  for (int table_id = 0; table_id < num_tables; ++table_id) {
+    const int table_slots = m2c.template pop<0>();
+    input_slots |= table_slots;
+    const auto *source = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+    auto *target = dsv4_resident_rope_table(smem_base, table_id);
+    for (int item = tid; item < kDsv4RopeTableElements; item += 128) {
+      target[item] = source[item];
+    }
+  }
+
+  // All four compute warps publish the fixed tables before their source slots
+  // are returned. Memory threads are independent and never join this barrier.
+  __sync_compute_group(128);
+  c2m.push(tid, input_slots);
+}
+
 // Apply the DeepSeek partial rotary embedding to the final 64 dimensions of
 // each attention (512-wide) or indexer (128-wide) row.  The table is float32
 // [32, 2] in (cos, sin) order.
@@ -190,6 +248,7 @@ template <int kHeadDim, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_rope_64(
     int rows,
     bool inverse,
+    int fixed_table_selector,
     void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
@@ -200,10 +259,18 @@ __device__ __forceinline__ void task_dsv4_rope_64(
   const int input_slot = extract(input_slots);
   const auto *input = static_cast<const __nv_bfloat16 *>(
       get_slot_address(smem_base, input_slot));
-  const int table_slots = m2c.template pop<0>();
-  const int table_slot = extract(table_slots);
-  const auto *table = static_cast<const float *>(
-      get_slot_address(smem_base, table_slot));
+  int table_slots = 0;
+  const float *table = nullptr;
+  if (fixed_table_selector == 0) {
+    table_slots = m2c.template pop<0>();
+    table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+  } else {
+    if (fixed_table_selector > kDsv4MaxResidentRopeTables) {
+      asm volatile("trap;");
+    }
+    table = dsv4_resident_rope_table(smem_base, fixed_table_selector - 1);
+  }
   const int output_slots = m2c.template pop<0>();
   const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(

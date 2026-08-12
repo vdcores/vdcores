@@ -209,18 +209,24 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP8_QUANT_UMMA_B_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_PRELOAD_ROPE_TABLES) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_preload_rope_tables(inst.args[0], smem_base, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_512_64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
   task_dsv4_rope_64<512>(
-      inst.args[0], inst.args[1] != 0, smem_base, m2c, c2m);
+      inst.args[0], inst.args[1] != 0, inst.args[2], smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_128_64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
   task_dsv4_rope_64<128>(
-      inst.args[0], inst.args[1] != 0, smem_base, m2c, c2m);
+      inst.args[0], inst.args[1] != 0, inst.args[2], smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_SPARSE_ATTENTION_512) {

@@ -48,6 +48,7 @@ from dae.schedule import (
     SchedDsv4HcPost,
     SchedDsv4HcPre,
     SchedDsv4IndexScore,
+    SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
@@ -112,6 +113,17 @@ class ResidentOneLaunchDecode:
         self._routing_owners: dict[int, tuple[torch.Tensor, ...]] = {}
         self._hash_rows: dict[int, torch.Tensor] = {}
         self._allocate_state()
+        rope_tables = [self.main_rope, self.compress_rope]
+        rope_tables.extend(
+            self.compressed_output_rope[kind]
+            for kind in ("csa", "hca")
+            if kind in self.compressed_output_rope
+        )
+        self.resident_rope_tables = tuple(rope_tables)
+        self.resident_rope_table_ids = {
+            table.data_ptr(): table_id
+            for table_id, table in enumerate(self.resident_rope_tables)
+        }
         self.family_stages = {
             family.representative: self._build_family(family)
             for family in self.families
@@ -1017,6 +1029,9 @@ class ResidentOneLaunchDecode:
                     self.kv_norm.reshape(1, -1),
                     rope_table,
                     self.current_kv_rows[kind],
+                    fixed_table_id=self.resident_rope_table_ids[
+                        rope_table.data_ptr()
+                    ],
                 ),
                 base_sm=kv_base,
                 wait_group=kv_norm_ready,
@@ -1050,7 +1065,14 @@ class ResidentOneLaunchDecode:
         stages.append(
             self._stage(
                 "attn.q_rope",
-                SchedDsv4Rope512_64(self.q_norm, rope_table, self.q_rope),
+                SchedDsv4Rope512_64(
+                    self.q_norm,
+                    rope_table,
+                    self.q_rope,
+                    fixed_table_id=self.resident_rope_table_ids[
+                        rope_table.data_ptr()
+                    ],
+                ),
                 self.policy.attention(cfg.num_heads, cfg.head_dim),
             )
         )
@@ -1146,6 +1168,9 @@ class ResidentOneLaunchDecode:
                             self.attention_pooled_norm[kind].reshape(1, -1),
                             self.compressed_output_rope[kind],
                             self.current_compressed_rows[kind],
+                            fixed_table_id=self.resident_rope_table_ids[
+                                self.compressed_output_rope[kind].data_ptr()
+                            ],
                         ),
                     )
                 )
@@ -1181,7 +1206,12 @@ class ResidentOneLaunchDecode:
                     self._stage(
                         "index.q_rope",
                         SchedDsv4Rope128_64(
-                            self.index_q, self.compress_rope, self.index_q_rope
+                            self.index_q,
+                            self.compress_rope,
+                            self.index_q_rope,
+                            fixed_table_id=self.resident_rope_table_ids[
+                                self.compress_rope.data_ptr()
+                            ],
                         ),
                         cfg.index_heads,
                     )
@@ -1268,6 +1298,9 @@ class ResidentOneLaunchDecode:
                             self.index_pooled_norm.reshape(1, -1),
                             self.compressed_output_rope[kind],
                             self.index_pooled_rope,
+                            fixed_table_id=self.resident_rope_table_ids[
+                                self.compressed_output_rope[kind].data_ptr()
+                            ],
                         ),
                     )
                 )
@@ -1353,6 +1386,9 @@ class ResidentOneLaunchDecode:
                     rope_table,
                     self.attention_inverse,
                     inverse=True,
+                    fixed_table_id=self.resident_rope_table_ids[
+                        rope_table.data_ptr()
+                    ],
                 ),
                 cfg.num_heads,
                 release_group=output_ready_group,
@@ -2065,6 +2101,11 @@ class ResidentOneLaunchDecode:
             return queued_stages
 
         self.launcher = Launcher(self.sms, device=self.device)
+        self.launcher.i(
+            SchedDsv4PreloadRopeTables(self.resident_rope_tables).place(
+                self.sms
+            )
+        )
         if self.args.layers == 1:
             family = self.families[0]
             stages = queued_family(family)
@@ -2137,6 +2178,7 @@ class ResidentOneLaunchDecode:
             f"barriers={len(self.program.barriers)} "
             f"compute_insts={self.program.max_compute_instructions} "
             f"memory_insts={self.program.max_memory_instructions} "
+            f"rope_preload_tables={len(self.resident_rope_tables)} "
             f"layer_profile_events={self.program.profile_event_count} "
             f"step_profile_events={len(self.step_profile_records)}",
             flush=True,

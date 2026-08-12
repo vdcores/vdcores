@@ -244,25 +244,57 @@ class Dsv4Fp8QuantUmmaBSm100(ComputeInstruction):
         )
 
 
+class Dsv4PreloadRopeTables(ComputeInstruction):
+    def __init__(self, num_tables: int):
+        if num_tables <= 0 or num_tables > 4:
+            raise ValueError("DeepSeek resident RoPE table count must be in [1,4]")
+        super().__init__(
+            opcode=opcode.OP_DSV4_PRELOAD_ROPE_TABLES,
+            args=[num_tables],
+        )
+
+
 class Dsv4Rope512_64(ComputeInstruction):
-    def __init__(self, rows: int, inverse: bool = False):
+    def __init__(
+        self,
+        rows: int,
+        inverse: bool = False,
+        fixed_table_id: int | None = None,
+    ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("DeepSeek RoPE rows must fit in a positive uint16")
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
         super().__init__(
             opcode=opcode.OP_DSV4_ROPE_512_64,
-            args=[rows, int(inverse)],
+            args=[
+                rows,
+                int(inverse),
+                0 if fixed_table_id is None else fixed_table_id + 1,
+            ],
         )
 
 
 class Dsv4Rope128_64(ComputeInstruction):
-    def __init__(self, rows: int, inverse: bool = False):
+    def __init__(
+        self,
+        rows: int,
+        inverse: bool = False,
+        fixed_table_id: int | None = None,
+    ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError(
                 "DeepSeek index RoPE rows must fit in a positive uint16"
             )
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
         super().__init__(
             opcode=opcode.OP_DSV4_ROPE_128_64,
-            args=[rows, int(inverse)],
+            args=[
+                rows,
+                int(inverse),
+                0 if fixed_table_id is None else fixed_table_id + 1,
+            ],
         )
 
 
@@ -2140,6 +2172,7 @@ __all__ = [
     "Fp8Block128GemvBf16Sm100",
     "Fp8GemvUmmaStreamSm100",
     "Fp8UmmaPrepackSm100",
+    "Dsv4PreloadRopeTables",
     "Dsv4Rope512_64",
     "Dsv4Rope128_64",
     "Dsv4SparseAttention512",

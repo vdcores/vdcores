@@ -17,6 +17,9 @@ from dae.instructions import (
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Nvfp4QuantUmmaBSm100,
+    Dsv4PreloadRopeTables,
+    Dsv4Rope128_64,
+    Dsv4Rope512_64,
     Dsv4SiluClampMul128,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
@@ -51,6 +54,9 @@ from dae.launcher import Launcher
 from dae.schedule import (
     Schedule,
     SchedDsv4HcPost,
+    SchedDsv4PreloadRopeTables,
+    SchedDsv4Rope128_64,
+    SchedDsv4Rope512_64,
     SchedFp8GemvUmmaStream,
     SchedAttentionDecoding,
     SchedDsv4SwiGluShard128,
@@ -1279,6 +1285,75 @@ def test_deepseek_compute_tasks_cannot_escape_shared_memory():
     assert "slot_2_glob_ptr" not in combined
     assert "const MInst *st_insts" not in combined
     assert "__threadfence" not in combined
+
+
+def test_resident_rope_tables_preload_once_and_fixed_tasks_skip_table_loads(
+    monkeypatch,
+):
+    monkeypatch.setitem(
+        SchedDsv4PreloadRopeTables.schedule.__globals__[
+            "TmaLoad1D"
+        ].__init__.__globals__,
+        "get_tensor_address",
+        lambda tensor: tensor.data_ptr(),
+    )
+    tables = tuple(
+        torch.empty((32, 2), dtype=torch.float32) for _ in range(4)
+    )
+    preload = SchedDsv4PreloadRopeTables(tables).place(2)
+    preload_instructions = preload.schedule(0)
+
+    assert isinstance(preload_instructions[0], Dsv4PreloadRopeTables)
+    assert preload_instructions[0].args == [4]
+    assert len(preload_instructions) == 5
+    assert all(
+        instruction.opcode == opcode.OP_ALLOC_TMA_LOAD_1D
+        for instruction in preload_instructions[1:]
+    )
+
+    input512 = torch.empty((1, 512), dtype=torch.bfloat16)
+    output512 = torch.empty_like(input512)
+    fixed512 = SchedDsv4Rope512_64(
+        input512,
+        tables[2],
+        output512,
+        inverse=True,
+        fixed_table_id=2,
+    ).place(1).schedule(0)
+    assert isinstance(fixed512[0], Dsv4Rope512_64)
+    assert fixed512[0].args == [1, 1, 3]
+    assert len(fixed512) == 3
+
+    input128 = torch.empty((1, 128), dtype=torch.bfloat16)
+    output128 = torch.empty_like(input128)
+    fixed128 = SchedDsv4Rope128_64(
+        input128,
+        tables[1],
+        output128,
+        fixed_table_id=1,
+    ).place(1).schedule(0)
+    assert isinstance(fixed128[0], Dsv4Rope128_64)
+    assert fixed128[0].args == [1, 0, 2]
+    assert len(fixed128) == 3
+
+    dynamic = SchedDsv4Rope512_64(
+        input512, tables[0], output512
+    ).place(1).schedule(0)
+    assert dynamic[0].args == [1, 0, 0]
+    assert len(dynamic) == 4
+
+
+def test_resident_rope_preload_barrier_is_compute_group_only():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "include/task/deepseek_v4.cuh"
+    ).read_text()
+    handler = source.split(
+        "task_dsv4_preload_rope_tables", 1
+    )[1].split("task_dsv4_rope_64", 1)[0]
+
+    assert handler.count("__sync_compute_group(128)") == 1
+    assert "__threadfence" not in handler
 
 
 def test_resident_loop_control_uses_only_compute_group_rendezvous():
