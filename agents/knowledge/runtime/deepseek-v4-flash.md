@@ -1523,3 +1523,14 @@ execute shared compute ahead of routed compute. Both variants were reverted.
 A future wide-shared attempt must separate memory-only retained prefetch from
 compute order so route-dependent loads and shared weights occupy different LDU
 queues without serializing their compute tasks.
+
+The runtime now removes the obsolete direct, indirect, and layer-indexed
+routed pointer-table handlers rather than carrying them as compatibility
+paths. Affine loads reuse the original routed load/base opcodes; attempts to
+construct either pointer-table API fail explicitly in Python. This keeps the
+same queues and 70-register/no-spill footprint but shortens the repeated LDU
+dispatch path. Two-layer job `20260812T164537Z-125306` measured 0.721744 ms.
+Full 43-layer job `20260812T164606Z-131110` preserved token 5 and measured
+14.725120/14.747968/14.849344 ms. That is 0.243104 ms faster than the initial
+affine full gate, but 0.178352 ms (1.22%) above the old 14.569616-ms accepted
+boundary. The fully affine result is the current production boundary.

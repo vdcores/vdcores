@@ -31,8 +31,8 @@ DAE_OP(OP_ALLOC_WB_TMA_REDUCE_ADD_4D, MK_MOP(24, MEM_OP_FLAGS_ALLOCATE | MEM_OP_
 //   2. always write to slot regardless of writeback flag
 
 DAE_OP(OP_ALLOC_WB_RAW_ADDRESS, MK_MOP(23, MEM_OP_FLAGS_ALLOCATE))
-// Resolve the selected expert in LDU and copy its field into normal shared
-// slots. Compute only observes the resulting shared-slot mask.
+// Resolve a selected expert from the one preloaded affine arena base. The
+// low arg bits encode route rank and every address is a fixed field offset.
 DAE_OP(OP_ALLOC_ROUTED_TMA_LOAD_1D, MK_MOP(25, MEM_OP_FLAGS_ALLOCATE))
 // Synchronous memory-core copies for small or non-16-byte-aligned metadata.
 // Compute still consumes allocator-owned shared slots; these are not raw
@@ -67,23 +67,15 @@ DAE_OP(OP_LDU_PROFILE_LAYER, MK_MOP(39, MEM_OP_FLAGS_NONE))
 // in the issuing LDU handler for a later OP_ALLOC_REG_LOAD. This aliases the
 // original shared allocation; it does not copy the operand.
 DAE_OP(OP_ALLOC_TMA_LOAD_REG_1D, MK_MOP(40, MEM_OP_FLAGS_ALLOCATE))
-// Resolve one routed base pointer into a port-local LDU address register while
-// loading its first tile. Later fixed-offset loads reuse that address without
-// rereading route metadata or pointer tables.
+// Cache one affine selected-expert field base in a port-local LDU register
+// while loading its first tile. Later fixed offsets reuse the address.
 DAE_OP(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(41, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_TMA_LOAD_ADDRESS_REG_1D, MK_MOP(42, MEM_OP_FLAGS_ALLOCATE))
-// Indirect/layer forms combine the layer pointer-table selection with routed
-// base caching.  The descriptor remains entirely LDU-owned; compute observes
-// only the allocated shared slots.
 DAE_OP(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(43, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(44, MEM_OP_FLAGS_ALLOCATE))
 // Publish one fixed affine expert-arena base to both LDU handlers. The encoded
 // geometry is retained in registers for the complete persistent launch.
 DAE_OP(OP_LDU_SET_AFFINE_EXPERT_BASE, MK_MOP(45, MEM_OP_FLAGS_NONE))
-// Resolve base + layer + selected_expert * fixed_stride + field directly in
-// LDU. No device pointer or per-layer descriptor is read.
-DAE_OP(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_1D, MK_MOP(46, MEM_OP_FLAGS_ALLOCATE))
-DAE_OP(OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

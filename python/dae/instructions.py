@@ -1588,7 +1588,7 @@ class RawAddress(MemoryInstruction):
 
 
 class RoutedTmaLoad1D(MemoryInstruction):
-    """Resolve one routed field in LDU and copy it into shared memory."""
+    """Removed pointer-table routed load API."""
 
     ROUTE_COUNT = 6
     ROUTE_BITS = 3
@@ -1602,26 +1602,8 @@ class RoutedTmaLoad1D(MemoryInstruction):
         pointer_field: int,
         bytes: int,
     ):
-        assert routing_state.device.type == "cuda"
-        if not routing_state.is_contiguous():
-            raise ValueError("routing_state must be contiguous")
-        if routing_state.numel() * routing_state.element_size() < self.HEADER_BYTES:
-            raise ValueError("routing_state must contain the 32-byte routing header")
-        if not 0 <= route_rank < self.ROUTE_COUNT:
-            raise ValueError("route_rank must be in [0, 6)")
-        if not 0 <= pointer_field <= self.MAX_POINTER_FIELD:
-            raise ValueError("pointer_field must fit in 13 bits")
-        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
-            raise ValueError("routed TMA load size must be a 16-byte-aligned uint16")
-        num_slots = bytes2slots(bytes)
-        if num_slots > config.num_slots:
-            raise ValueError("routed TMA load exceeds the shared-slot arena")
-        super().__init__(
-            opcode=opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D,
-            num_slots=num_slots,
-            arg=(pointer_field << self.ROUTE_BITS) | route_rank,
-            size=bytes,
-            address=routing_state.data_ptr(),
+        raise RuntimeError(
+            "pointer-table routed loads were removed; use AffineRoutedTmaLoad1D"
         )
 
 
@@ -1666,7 +1648,7 @@ class AffineRoutedTmaLoad1D(MemoryInstruction):
         if refresh_route:
             arg |= self.REFRESH_ROUTE
         super().__init__(
-            opcode=opcode.OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_1D,
+            opcode=opcode.OP_ALLOC_ROUTED_TMA_LOAD_1D,
             num_slots=bytes2slots(bytes),
             arg=arg,
             size=bytes,
@@ -1681,7 +1663,7 @@ class AffineRoutedTmaLoadBase1D(AffineRoutedTmaLoad1D):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.opcode = opcode.OP_ALLOC_AFFINE_ROUTED_TMA_LOAD_BASE_1D
+        self.opcode = opcode.OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D
 
 
 class TmaLoadAddressReg1D(MemoryInstruction):
@@ -1788,7 +1770,7 @@ class IndirectLduLoad1D(MemoryInstruction):
 
 
 class IndirectRoutedTmaLoad1D(MemoryInstruction):
-    """Resolve fixed route IDs plus one layer pointer table in LDU."""
+    """Removed indirect pointer-table routed load API."""
 
     def __init__(
         self,
@@ -1799,24 +1781,8 @@ class IndirectRoutedTmaLoad1D(MemoryInstruction):
         *,
         layer_indexed=False,
     ):
-        _validate_indirect_pointer_entry(state_descriptor)
-        if state_descriptor.numel() < 2:
-            raise ValueError("indirect routed state descriptor needs two int64 words")
-        if not 0 <= route_rank < RoutedTmaLoad1D.ROUTE_COUNT:
-            raise ValueError("route_rank must be in [0, 6)")
-        if not 0 <= pointer_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
-            raise ValueError("pointer_field must fit in 13 bits")
-        if bytes <= 0 or bytes > 0xFFFF or bytes % 16:
-            raise ValueError("indirect routed TMA load size must be aligned")
-        super().__init__(
-            opcode=_indirect_layer_opcode(
-                opcode.OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_1D,
-                layer_indexed,
-            ),
-            num_slots=bytes2slots(bytes),
-            arg=(pointer_field << RoutedTmaLoad1D.ROUTE_BITS) | route_rank,
-            size=bytes,
-            address=state_descriptor.data_ptr(),
+        raise RuntimeError(
+            "indirect routed pointer tables were removed; use affine expert storage"
         )
 
 
