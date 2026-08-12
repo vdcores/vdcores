@@ -178,6 +178,26 @@ class Fp8Block128GemvSm100(ComputeInstruction):
         )
 
 
+class Fp8Block128GemvBf16Sm100(ComputeInstruction):
+    """Quantize one BF16 activation in shared memory, then run FP8 GEMV."""
+
+    def __init__(self, rows: int, k: int, row_in_scale_block: int):
+        if rows <= 0 or rows > 0xFFFF:
+            raise ValueError("fused FP8 GEMV rows must fit in a positive uint16")
+        if k <= 0 or k > 0xFFFF or k % 128:
+            raise ValueError(
+                "fused FP8 GEMV K must be a positive uint16 multiple of 128"
+            )
+        if not 0 <= row_in_scale_block < 128:
+            raise ValueError(
+                "fused FP8 GEMV scale-block row offset must be in [0,128)"
+            )
+        super().__init__(
+            opcode=opcode.OP_FP8_BLOCK128_GEMV_BF16_SM100,
+            args=[rows, k, row_in_scale_block],
+        )
+
+
 class Fp8GemvUmmaStreamSm100(ComputeInstruction):
     """Stream combined native MXF8 operands through SM100 UMMA."""
 
@@ -2080,6 +2100,7 @@ __all__ = [
     "Nvfp4GemvUmmaStreamSm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
+    "Fp8Block128GemvBf16Sm100",
     "Fp8GemvUmmaStreamSm100",
     "Fp8UmmaPrepackSm100",
     "Dsv4Rope512_64",

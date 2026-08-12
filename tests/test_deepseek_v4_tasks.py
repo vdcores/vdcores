@@ -30,6 +30,7 @@ from dae.schedule import (
     SchedDsv4Fp8Quant128,
     SchedDsv4Nvfp4Quant16,
     SchedFp8Block128Gemv,
+    SchedFp8Block128GemvBf16,
 )
 
 
@@ -308,6 +309,34 @@ def test_hc_head_reference_reduces_four_streams():
 
     expected = residual.sum(dim=0) * (0.5 + 1.0e-6)
     torch.testing.assert_close(output, expected.to(torch.bfloat16))
+
+
+def test_fused_fp8_gemv_loads_bf16_activation_without_scale_operand(monkeypatch):
+    class FakeTransfer:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def bar(self, _):
+            return self
+
+    globals_ = SchedFp8Block128GemvBf16.schedule.__globals__
+    monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
+    weight = torch.empty((128, 128), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty((1, 1), dtype=torch.float8_e8m0fnu)
+    activation = torch.empty((128,), dtype=torch.bfloat16)
+    output = torch.empty((128,), dtype=torch.bfloat16)
+
+    instructions = SchedFp8Block128GemvBf16(
+        weight, weight_scale, activation, output
+    ).place(1).schedule(0)
+
+    assert instructions[0].opcode == opcode.OP_FP8_BLOCK128_GEMV_BF16_SM100
+    assert instructions[0].args == [128, 128, 0]
+    assert instructions[1].tensor.data_ptr() == weight.data_ptr()
+    assert instructions[2].tensor.data_ptr() == weight_scale.data_ptr()
+    assert instructions[3].tensor.data_ptr() == activation.data_ptr()
+    assert instructions[4].tensor.data_ptr() == output.data_ptr()
 
 
 def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):

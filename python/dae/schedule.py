@@ -1433,6 +1433,80 @@ class SchedFp8Block128Gemv(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedFp8Block128GemvBf16(Schedule):
+    """Fuse BF16 block-128 quantization into each row-sharded FP8 GEMV."""
+
+    def __init__(self, weight, weight_scale, activation, output):
+        super().__init__()
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.activation = activation
+        self.output = output
+
+    def _on_place(self):
+        if self.weight.dtype != torch.float8_e4m3fn or self.weight.ndim != 2:
+            raise ValueError("fused FP8 weight must be a rank-2 E4M3 tensor")
+        self.rows, self.k = self.weight.shape
+        if self.k % 128:
+            raise ValueError("fused FP8 GEMV K must be divisible by 128")
+        scratch_bytes = (
+            config.dynamic_smem_size - config.num_slots * config.slot_size
+        )
+        if self.k + self.k // 128 > scratch_bytes:
+            raise ValueError("fused FP8 activation does not fit special shared scratch")
+        expected_weight_sf = ((self.rows + 127) // 128, self.k // 128)
+        if (
+            self.weight_scale.dtype != torch.float8_e8m0fnu
+            or tuple(self.weight_scale.shape) != expected_weight_sf
+        ):
+            raise ValueError(
+                f"fused weight_scale must be UE8M0 with shape {expected_weight_sf}"
+            )
+        if (
+            self.activation.dtype != torch.bfloat16
+            or self.activation.numel() != self.k
+            or not self.activation.is_contiguous()
+        ):
+            raise ValueError("fused FP8 activation must contain contiguous K BF16 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
+            raise ValueError("fused FP8 output must contain M BF16 values")
+        if self.num_sms <= 0 or self.num_sms > self.rows:
+            raise ValueError("fused FP8 GEMV requires 1 <= num_sms <= M")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + (1 if sm < extra else 0)
+        max_tile_rows = max(1, 65520 // self.k)
+        instructions = []
+        row_end = row_start + row_count
+        for tile_start in range(row_start, row_end, max_tile_rows):
+            tile_end = min(tile_start + max_tile_rows, row_end)
+            tile_rows = tile_end - tile_start
+            scale_start = tile_start // 128
+            scale_end = (tile_end + 127) // 128
+            instructions += [
+                Fp8Block128GemvBf16Sm100(
+                    tile_rows, self.k, tile_start % 128
+                ),
+                _shared_load_1d(self.weight[tile_start:tile_end]),
+                _shared_load_1d(self.weight_scale[scale_start:scale_end]),
+                _shared_load_1d(self.activation.reshape(-1)),
+            ]
+            store = _shared_store_1d(self.output[tile_start:tile_end])
+            if tile_end == row_end:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4Rope512_64(Schedule):
     def __init__(self, input, table, output, inverse=False):
         super().__init__()

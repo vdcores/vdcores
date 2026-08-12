@@ -13,7 +13,7 @@ from dae.deepseek_v4_quant import (
     quantize_fp8_block128,
 )
 from dae.launcher import Launcher
-from dae.schedule import SchedFp8Block128Gemv
+from dae.schedule import SchedFp8Block128Gemv, SchedFp8Block128GemvBf16
 
 
 def main() -> None:
@@ -23,6 +23,11 @@ def main() -> None:
     parser.add_argument("--sms", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--activation-mode",
+        choices=("quantized", "fused"),
+        default="quantized",
+    )
     parser.add_argument("--trace-stages", action="store_true")
     args = parser.parse_args()
 
@@ -48,11 +53,15 @@ def main() -> None:
     device_sms = torch.cuda.get_device_properties(device).multi_processor_count
     num_sms = args.sms or min(args.m, device_sms)
     launcher = Launcher(num_sms, device=device)
-    launcher.s(
-        SchedFp8Block128Gemv(
+    if args.activation_mode == "fused":
+        schedule = SchedFp8Block128GemvBf16(
+            weight, weight_scale, input_source, output
+        )
+    else:
+        schedule = SchedFp8Block128Gemv(
             weight, weight_scale, activation, activation_scale, output
-        ).place(num_sms)
-    )
+        )
+    launcher.s(schedule.place(num_sms))
     stage("launcher_ready")
     launcher.launch()
     torch.cuda.synchronize()
@@ -81,6 +90,7 @@ def main() -> None:
     print(
         "DSV4_FP8_GEMV_RESULT "
         f"shape={args.m}x1x{args.k} sms={num_sms} "
+        f"activation_mode={args.activation_mode} "
         f"min_us={min(timings):.6f} median_us={statistics.median(timings):.6f} "
         f"max_us={max(timings):.6f} max_abs={max_abs:.6f} "
         f"mean_relative={mean_rel:.8f}",

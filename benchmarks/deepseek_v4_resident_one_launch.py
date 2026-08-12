@@ -56,6 +56,7 @@ from dae.schedule import (
     SchedDsv4SwiGluShard128,
     SchedDsv4TopK512,
     SchedFp8Block128Gemv,
+    SchedFp8Block128GemvBf16,
     SchedFp8GemvUmmaStream,
     SchedRMS,
     SchedRoutedDsv4Nvfp4QuantUmmaB,
@@ -681,6 +682,62 @@ class ResidentOneLaunchDecode:
             release_group=release_group,
         )
 
+    def _fp8_bf16_linear_stage(
+        self,
+        name: str,
+        family: LayerFamily,
+        suffix: str,
+        activation: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        row_slice: slice | None = None,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> Stage:
+        linears = tuple(
+            self.checkpoint.load_fp8_linear(
+                f"layers.{layer_id}.{suffix}", device=self.device
+            )
+            for layer_id in family.layer_ids
+        )
+        if row_slice is None:
+            weights = tuple(linear.weight for linear in linears)
+            scales = tuple(linear.scale for linear in linears)
+        else:
+            start = 0 if row_slice.start is None else row_slice.start
+            stop = (
+                linears[0].weight.shape[0]
+                if row_slice.stop is None
+                else row_slice.stop
+            )
+            if start % 128 or stop % 128:
+                raise ValueError("fused FP8 family slices must be 128-row aligned")
+            weights = tuple(linear.weight[row_slice] for linear in linears)
+            scales = tuple(
+                linear.scale[start // 128 : stop // 128] for linear in linears
+            )
+        schedule = SchedFp8Block128GemvBf16(
+            weights[0],
+            scales[0],
+            activation.reshape(-1),
+            output.reshape(-1),
+        )
+        schedule = self._layered(schedule, family, weights, scales)
+        assignment = self.policy.fp8_gemv(output.numel(), activation.numel())
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            assignment = replace(assignment, num_sms=num_sms)
+        return self._stage(
+            name,
+            schedule,
+            assignment,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
     def _native_fp8_linear_stage(
         self,
         name: str,
@@ -1298,30 +1355,17 @@ class ResidentOneLaunchDecode:
         grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
         for group in range(cfg.o_groups):
             placement = self.policy.parallel_partition(group, cfg.o_groups)
-            quant_group = f"{family.name}.attn.output.g{group}.quant"
-            stages.append(
-                self._fp8_quant_stage(
-                    f"attn.o_a.g{group}.quant_fp8",
-                    grouped[group],
-                    self.o_group_fp8[group],
-                    self.o_group_scale[group],
-                    placement=placement,
-                    wait_group=output_ready_group,
-                    release_group=quant_group,
-                )
-            )
             start = group * cfg.o_lora_rank
             stages.append(
-                self._fp8_linear_stage(
+                self._fp8_bf16_linear_stage(
                     f"attn.o_a.g{group}",
                     family,
                     "attn.wo_a",
-                    self.o_group_fp8[group],
-                    self.o_group_scale[group],
+                    grouped[group],
                     self.o_rank[group],
                     row_slice=slice(start, start + cfg.o_lora_rank),
                     placement=placement,
-                    wait_group=quant_group,
+                    wait_group=output_ready_group,
                     release_group=output_join_group,
                 )
             )

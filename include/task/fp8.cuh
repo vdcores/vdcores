@@ -43,14 +43,15 @@ __device__ __forceinline__ auto dae_fp8_get_utccp_smem_desc_tensor(
 // Decode-time FP8 matrix-vector multiply for DeepSeek's native block-128
 // checkpoint tensors.  Weights and activations are E4M3; both scale tensors
 // are UE8M0.  The weight scale is shared by each logical 128x128 weight tile.
-template <typename M2CQueue, typename C2MQueue>
-__device__ __forceinline__ void task_fp8_block128_gemv_sm100(
+__device__ __forceinline__ void fp8_block128_gemv_compute_sm100(
     int rows,
     int k,
     int row_in_scale_block,
-    void *smem_base,
-    M2CQueue &m2c,
-    C2MQueue &c2m) {
+    const cutlass::float_e4m3_t *weight,
+    const cutlass::float_ue8m0_t *weight_scale,
+    const cutlass::float_e4m3_t *input,
+    const cutlass::float_ue8m0_t *input_scale,
+    cutlass::bfloat16_t *output) {
   using Fp8 = cutlass::float_e4m3_t;
   using Scale = cutlass::float_ue8m0_t;
   using InputFragment = cutlass::Array<Fp8, 32>;
@@ -58,28 +59,6 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
 
   static_assert(sizeof(InputFragment) == 32,
                 "32 FP8 values must occupy one 256-bit load");
-
-  const int weight_slots = m2c.template pop<0>();
-  const int weight_slot = extract(weight_slots);
-  const auto *weight = static_cast<const Fp8 *>(
-      get_slot_address(smem_base, weight_slot));
-  const int weight_scale_slots = m2c.template pop<0>();
-  const int weight_scale_slot = extract(weight_scale_slots);
-  const auto *weight_scale = static_cast<const Scale *>(
-      get_slot_address(smem_base, weight_scale_slot));
-  const int input_slots = m2c.template pop<0>();
-  const int input_slot = extract(input_slots);
-  const auto *input = static_cast<const Fp8 *>(
-      get_slot_address(smem_base, input_slot));
-  const int input_scale_slots = m2c.template pop<0>();
-  const int input_scale_slot = extract(input_scale_slots);
-  const auto *input_scale = static_cast<const Scale *>(
-      get_slot_address(smem_base, input_scale_slot));
-  const int output_slots = m2c.template pop<0>();
-  const int output_slot = extract(output_slots);
-  auto *output = static_cast<cutlass::bfloat16_t *>(
-      get_slot_address(smem_base, output_slot));
-
   const int tid = __compute_tid();
   const int lane_in_group = tid & 15;
   const int row_group = tid >> 4;
@@ -129,11 +108,130 @@ __device__ __forceinline__ void task_fp8_block128_gemv_sm100(
       output[local_row] = cutlass::bfloat16_t(partial);
     }
   }
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_block128_gemv_sm100(
+    int rows,
+    int k,
+    int row_in_scale_block,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+  const int weight_slots = m2c.template pop<0>();
+  const int weight_slot = extract(weight_slots);
+  const auto *weight = static_cast<const Fp8 *>(
+      get_slot_address(smem_base, weight_slot));
+  const int weight_scale_slots = m2c.template pop<0>();
+  const int weight_scale_slot = extract(weight_scale_slots);
+  const auto *weight_scale = static_cast<const Scale *>(
+      get_slot_address(smem_base, weight_scale_slot));
+  const int input_slots = m2c.template pop<0>();
+  const int input_slot = extract(input_slots);
+  const auto *input = static_cast<const Fp8 *>(
+      get_slot_address(smem_base, input_slot));
+  const int input_scale_slots = m2c.template pop<0>();
+  const int input_scale_slot = extract(input_scale_slots);
+  const auto *input_scale = static_cast<const Scale *>(
+      get_slot_address(smem_base, input_scale_slot));
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *output = static_cast<cutlass::bfloat16_t *>(
+      get_slot_address(smem_base, output_slot));
+
+  const int tid = __compute_tid();
+  fp8_block128_gemv_compute_sm100(
+      rows, k, row_in_scale_block, weight, weight_scale,
+      input, input_scale, output);
 
   __sync_compute_group(128);
   c2m.push(
       tid,
       weight_slots | weight_scale_slots | input_slots | input_scale_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+// VDCores adaptive fusion for row-sharded FP8 projections. Every projection
+// SM needs the complete activation vector, so quantize the BF16 source once in
+// that SM's special shared scratch and consume it immediately. Four warps
+// cover independent block-128 ranges and rendezvous once before GEMV.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_block128_gemv_bf16_sm100(
+    int rows,
+    int k,
+    int row_in_scale_block,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+  constexpr int kScratchBytes =
+      dynamicSmemBytes - numSlots * slotSizeKb * 1024;
+  if (k <= 0 || k % 128 || k + k / 128 > kScratchBytes) {
+    asm volatile("trap;");
+  }
+
+  const int weight_slots = m2c.template pop<0>();
+  const auto *weight = static_cast<const Fp8 *>(
+      get_slot_address(smem_base, extract(weight_slots)));
+  const int weight_scale_slots = m2c.template pop<0>();
+  const auto *weight_scale = static_cast<const Scale *>(
+      get_slot_address(smem_base, extract(weight_scale_slots)));
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<cutlass::bfloat16_t *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  auto *quantized = static_cast<Fp8 *>(task_scratch);
+  auto *input_scale = reinterpret_cast<Scale *>(quantized + k);
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  constexpr int kValuesPerLane = 4;
+  const int blocks = k / 128;
+
+  for (int block = warp; block < blocks; block += 4) {
+    float values[kValuesPerLane];
+    float maximum = 0.0f;
+#pragma unroll 1
+    for (int item = 0; item < kValuesPerLane; ++item) {
+      values[item] = __bfloat162float(
+          input[block * 128 + lane + item * 32]);
+      maximum = fmaxf(maximum, fabsf(values[item]));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      maximum = fmaxf(
+          maximum,
+          __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+      const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+      const float exponent = ceilf(log2f(requested));
+      scale = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+      input_scale[block] = Scale(scale);
+    }
+    scale = __shfl_sync(0xFFFFFFFFU, scale, 0);
+#pragma unroll 1
+    for (int item = 0; item < kValuesPerLane; ++item) {
+      quantized[block * 128 + lane + item * 32] = Fp8(
+          fminf(fmaxf(values[item] / scale, -448.0f), 448.0f));
+    }
+  }
+  __sync_compute_group(128);
+
+  fp8_block128_gemv_compute_sm100(
+      rows, k, row_in_scale_block, weight, weight_scale,
+      quantized, input_scale, output);
+
+  __sync_compute_group(128);
+  c2m.push(tid, weight_slots | weight_scale_slots | input_slots);
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
