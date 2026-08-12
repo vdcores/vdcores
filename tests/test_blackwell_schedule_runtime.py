@@ -12,6 +12,7 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     ComputeInstruction,
     Copy,
+    Dsv4ContiguousAttention512UmmaSm100,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Nvfp4QuantUmmaBSm100,
@@ -67,6 +68,7 @@ from dae.tma_utils import (
     cord_func_2d_kmajor,
     cord_func_2d_tile_major,
     cord_func_m128n8_grouped_output,
+    cord_func_rowmajor_2d,
     pack_weight_tile_major,
 )
 
@@ -89,6 +91,23 @@ def test_kmajor_uint8_coordinates_use_128_byte_blocks():
     cord = cord_func_2d_kmajor(packed_fp4, 3)
 
     assert cord(0, 128) == [0, 0, 1]
+
+
+def test_dsv4_umma_attention_opcode_and_context_gate():
+    instruction = Dsv4ContiguousAttention512UmmaSm100(128)
+
+    assert instruction.opcode == opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100
+    assert instruction.args == [128]
+    with pytest.raises(ValueError, match=r"\[1,128\]"):
+        Dsv4ContiguousAttention512UmmaSm100(129)
+
+
+def test_rowmajor_2d_tma_coordinates_preserve_row_and_column():
+    output = torch.empty((64, 512), dtype=torch.bfloat16)
+    cord = cord_func_rowmajor_2d(output, 2)
+
+    assert cord(0, 0) == [0, 0]
+    assert cord(32, 384) == [384, 32]
 
 
 def test_dynamic_repeat_encodes_zero_count_skip_window():

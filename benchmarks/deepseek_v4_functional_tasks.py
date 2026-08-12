@@ -25,6 +25,7 @@ from dae.deepseek_v4 import (
     sparse_attention_512_reference,
 )
 from dae.deepseek_v4_quant import quantize_fp8_block128, quantize_nvfp4
+from dae.instructions import TmaTensor
 from dae.launcher import Launcher
 from dae.schedule import (
     SchedDsv4Bf16Gemv,
@@ -44,10 +45,12 @@ from dae.schedule import (
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
     SchedDsv4ContiguousAttention512Block4,
+    SchedDsv4ContiguousAttention512UmmaSm100,
     SchedDsv4TopK512,
     SchedRMS,
     SchedSmemSiLUInterleaved,
 )
+from dae.tma_utils import Major
 
 
 _BENCH_WARMUP = 0
@@ -61,6 +64,20 @@ _HC_POST_SMS = 32
 def launch(schedule, num_sms: int, device: torch.device) -> float:
     launcher = Launcher(num_sms, device=device)
     launcher.s(schedule.place(num_sms))
+    for _ in range(_BENCH_WARMUP):
+        launcher.launch()
+    timings_us = []
+    for _ in range(_BENCH_ITERATIONS):
+        launcher.launch()
+        profile = launcher.profile[:, :2].cpu().numpy()
+        timings_us.append(
+            float(profile[:, 1].max() - profile[:, 0].min()) / 1.0e3
+        )
+    return statistics.median(timings_us)
+
+
+def launch_with_launcher(launcher: Launcher, schedule) -> float:
+    launcher.s(schedule.place(launcher.num_sms))
     for _ in range(_BENCH_WARMUP):
         launcher.launch()
     timings_us = []
@@ -239,6 +256,65 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
             rtol=3.0e-2,
             atol=1.0e-2,
             latency_us=contiguous_latency,
+        )
+
+    if _ATTENTION_IMPLEMENTATION == "umma" and _ATTENTION_TOPK > 128:
+        raise ValueError("UMMA attention currently supports at most 128 rows")
+    if (_ATTENTION_IMPLEMENTATION in ("both", "umma") and
+            _ATTENTION_TOPK <= 128):
+        contiguous_indices = torch.arange(
+            _ATTENTION_TOPK, dtype=torch.int32, device=device
+        )
+        contiguous_expected = sparse_attention_512_reference(
+            q, kv, contiguous_indices, sink
+        )
+        umma_output = torch.empty_like(q)
+        umma_launcher = Launcher(1, device=device)
+        q_tma = TmaTensor(umma_launcher, q).wgmma_load(64, 128, Major.K)
+        k_tma = TmaTensor(umma_launcher, kv).wgmma_load(128, 128, Major.K)
+        v_tma = TmaTensor(umma_launcher, kv).wgmma_load(128, 128, Major.MN)
+        output_tma = TmaTensor(umma_launcher, umma_output).rowmajor_2d(
+            "store", 64, 128
+        )
+        umma_latency = launch_with_launcher(
+            umma_launcher,
+            SchedDsv4ContiguousAttention512UmmaSm100(
+                q,
+                kv,
+                _ATTENTION_TOPK,
+                sink,
+                umma_output,
+                q_tma=q_tma,
+                k_tma=k_tma,
+                v_tma=v_tma,
+                output_tma=output_tma,
+            ),
+        )
+        umma_diff = (umma_output.float() - contiguous_expected.float()).abs()
+        umma_cos = torch.nn.functional.cosine_similarity(
+            umma_output.float().reshape(1, -1),
+            contiguous_expected.float().reshape(1, -1),
+        ).item()
+        per_tile_max = [
+            umma_diff[:, start:start + 128].max().item()
+            for start in range(0, 512, 128)
+        ]
+        print(
+            "DSV4_FUNCTIONAL_DIAGNOSTIC "
+            f"task=attention_contiguous_umma_h64_d512_k{_ATTENTION_TOPK} "
+            f"latency_us={umma_latency:.3f} "
+            f"max_abs={umma_diff.max().item():.8f} "
+            f"mean_abs={umma_diff.mean().item():.8f} "
+            f"cosine={umma_cos:.8f} tile_max={per_tile_max}",
+            flush=True,
+        )
+        report_close(
+            f"attention_contiguous_umma_h64_d512_k{_ATTENTION_TOPK}",
+            umma_output,
+            contiguous_expected,
+            rtol=3.0e-2,
+            atol=1.0e-2,
+            latency_us=umma_latency,
         )
 
 
@@ -695,7 +771,7 @@ def main() -> None:
     parser.add_argument("--attention-topk", type=int, default=512)
     parser.add_argument(
         "--attention-implementation",
-        choices=("both", "scalar", "contiguous"),
+        choices=("both", "scalar", "contiguous", "umma"),
         default="both",
     )
     parser.add_argument("--hc-post-sms", type=int, default=32)

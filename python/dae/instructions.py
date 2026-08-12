@@ -17,6 +17,7 @@ from .tma_utils import (
     Major,
     addr2cords,
     build_tma_1d,
+    build_tma_rowmajor_2d,
     build_tma_wgmma_kmajor,
     build_tma_wgmma_mnmajor,
     build_tma_wgmma_tile_major,
@@ -25,6 +26,7 @@ from .tma_utils import (
     cord_func_2d_mnmajor,
     cord_func_2d_tile_major,
     cord_func_tma_1d,
+    cord_func_rowmajor_2d,
     cords2addr,
     get_tensor_address,
 )
@@ -280,6 +282,16 @@ class Dsv4ContiguousAttention512Block4(ComputeInstruction):
             raise ValueError("DeepSeek attention rows must fit in a positive uint16")
         super().__init__(
             opcode=opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4,
+            args=[rows],
+        )
+
+
+class Dsv4ContiguousAttention512UmmaSm100(ComputeInstruction):
+    def __init__(self, rows: int):
+        if rows <= 0 or rows > 128:
+            raise ValueError("DeepSeek UMMA attention rows must be in [1,128]")
+        super().__init__(
+            opcode=opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100,
             args=[rows],
         )
 
@@ -2064,6 +2076,17 @@ class TmaTensor(MemoryInstruction):
         assert action in actions, f"action must be one of {actions}, got {action}"
         return self._build(action, size, 1, build_tma_1d, cord_func_tma_1d)
 
+    def rowmajor_2d(self, action: str, tile_rows: int, tile_cols: int):
+        if action not in ("load", "store"):
+            raise ValueError("row-major 2D TMA action must be load or store")
+        return self._build(
+            action,
+            tile_rows,
+            tile_cols,
+            build_tma_rowmajor_2d,
+            cord_func_rowmajor_2d,
+        )
+
     def wgmma(self, action: str, tileN: int, tileM: int, major: Major):
         actions = ["load", "store", "reduce"]
         assert action in actions, f"action must be one of {actions}, got {action}"
@@ -2107,6 +2130,7 @@ __all__ = [
     "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
     "Dsv4ContiguousAttention512Block4",
+    "Dsv4ContiguousAttention512UmmaSm100",
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",

@@ -194,6 +194,34 @@ def cord_func_tma_1d(mat: torch.Tensor, rank: int):
         return [0, addr // 64]
     return cord_func
 
+
+def build_tma_rowmajor_2d(
+    mat: torch.Tensor, tile_rows: int, tile_cols: int
+):
+    """Build an unswizzled 2D descriptor for a row-major shared tile."""
+    assert mat.ndim == 2, "row-major 2D TMA requires a rank-2 tensor"
+    rows, cols = mat.shape
+    element_size = mat.element_size()
+    assert 0 < tile_rows <= rows and 0 < tile_cols <= cols
+    return 2, runtime.build_tma_desc(
+        mat,
+        [cols, rows],
+        [cols * element_size],
+        [tile_cols, tile_rows],
+        [1, 1],
+        0,
+        0,
+    )
+
+
+def cord_func_rowmajor_2d(mat: torch.Tensor, rank: int):
+    assert rank == 2
+
+    def cord_func(row: int, col: int):
+        return [col, row]
+
+    return cord_func
+
 # pytorch-major cord functions
 def cord_func_2d_mnmajor(mat: torch.Tensor, rank : int):
     def cord_func(*cords):

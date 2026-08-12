@@ -1696,6 +1696,76 @@ class SchedDsv4ContiguousAttention512Block4(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
+    """One-SM all-head DSV4 attention with native K128 TMA/UMMA tiles."""
+
+    TILE = 128
+    TILES_PER_VECTOR = 4
+
+    def __init__(self, q, kv, rows, sink, output, *, q_tma, k_tma, v_tma,
+                 output_tma):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.rows = int(rows)
+        self.sink = sink
+        self.output = output
+        self.q_tma = q_tma
+        self.k_tma = k_tma
+        self.v_tma = v_tma
+        self.output_tma = output_tma
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("DeepSeek UMMA attention uses exactly one SM")
+        if (self.q.dtype != torch.bfloat16 or self.q.shape != (64, 512) or
+                not self.q.is_contiguous()):
+            raise ValueError("DeepSeek UMMA Q must be contiguous BF16 [64,512]")
+        if (self.kv.dtype != torch.bfloat16 or self.kv.ndim != 2 or
+                self.kv.shape[1] != 512 or not self.kv.is_contiguous()):
+            raise ValueError("DeepSeek UMMA KV must be contiguous BF16 [rows,512]")
+        if self.rows <= 0 or self.rows > min(128, self.kv.shape[0]):
+            raise ValueError("DeepSeek UMMA attention rows must be in [1,128]")
+        if self.sink.dtype != torch.float32 or self.sink.shape != (64,):
+            raise ValueError("DeepSeek UMMA attention sink must be FP32 [64]")
+        if (self.output.dtype != torch.bfloat16 or
+                self.output.shape != self.q.shape or
+                not self.output.is_contiguous()):
+            raise ValueError("DeepSeek UMMA output must match Q")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        instructions = [Dsv4ContiguousAttention512UmmaSm100(self.rows)]
+        num_blocks = (self.rows + self.TILE - 1) // self.TILE
+        for block in range(num_blocks):
+            row = block * self.TILE
+            for tile in range(self.TILES_PER_VECTOR):
+                instructions.append(self.q_tma.cord(0, tile * self.TILE))
+            for tile in range(self.TILES_PER_VECTOR):
+                instructions.append(
+                    self.k_tma.cord(row, tile * self.TILE)
+                )
+            for tile in range(self.TILES_PER_VECTOR):
+                instructions.append(
+                    self.v_tma.cord(row, tile * self.TILE)
+                )
+            if block == 0:
+                instructions.append(_shared_load_1d(self.sink))
+
+        for tile in range(self.TILES_PER_VECTOR):
+            store = self.output_tma.cord(0, tile * self.TILE)
+            if tile == self.TILES_PER_VECTOR - 1:
+                store = store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
                  output_weights, hash_routing=False, route_scale=1.5):

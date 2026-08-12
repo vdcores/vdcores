@@ -237,6 +237,14 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4) {
       inst.args[0], smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
+             g_events);
+  task_dsv4_contiguous_attention_512_umma(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROUTE_TOP6) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
