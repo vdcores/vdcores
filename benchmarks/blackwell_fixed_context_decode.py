@@ -304,6 +304,35 @@ def run_sglang(args: argparse.Namespace) -> None:
                 emit_result(
                     "sglang", sglang.__version__, context, args.batch, samples_ms
                 )
+
+            if context == args.profile_context:
+                profile_options = {}
+                if args.profile_kind == "cuda":
+                    # Start the CUDA profiler in SGLang's scheduler process,
+                    # which owns the GPU context used by the model runner.
+                    profile_options.update(
+                        activities=["CUDA_PROFILER"],
+                        with_stack=False,
+                        record_shapes=False,
+                    )
+                else:
+                    profile_options.update(
+                        output_dir=args.profile_dir,
+                        activities=["CPU", "GPU"],
+                        with_stack=False,
+                        record_shapes=False,
+                    )
+                engine.start_profile(**profile_options)
+                try:
+                    generate_once(input_ids)
+                finally:
+                    engine.stop_profile()
+                print(
+                    "FIXED_CONTEXT_PROFILE "
+                    f"framework=sglang context={context} kind={args.profile_kind} "
+                    f"scope=prefill_plus_one_decode directory={args.profile_dir or '-'}",
+                    flush=True,
+                )
     finally:
         engine.shutdown()
 
@@ -339,7 +368,7 @@ def main() -> None:
     parser.add_argument(
         "--profile-context",
         type=int,
-        help="vLLM context to capture as a one-step torch-profiler trace",
+        help="context to capture as one prefill-plus-one-decode request",
     )
     parser.add_argument(
         "--profile-dir",
@@ -349,7 +378,7 @@ def main() -> None:
         "--profile-kind",
         choices=("torch", "cuda"),
         default="torch",
-        help="profiler used for the selected vLLM decode step",
+        help="profiler used for the selected framework request",
     )
     args = parser.parse_args()
 
@@ -369,8 +398,6 @@ def main() -> None:
             "so engine capacity is identical to the measured row"
         )
     if args.profile_context is not None:
-        if args.framework != "vllm":
-            parser.error("--profile-context currently supports only vLLM")
         if args.profile_context not in args.contexts:
             parser.error("--profile-context must be present in --contexts")
         if args.profile_kind == "torch" and (
