@@ -1424,38 +1424,57 @@ class SchedFp8GemvUmmaSplitK(Schedule):
                 "split-K output must be a row-major TMA reduce tensor "
                 "over contiguous FP32 [1,M]"
             )
-        expected_sms = self.m_tiles * self.split_k
-        if self.num_sms != expected_sms:
+        self.work_tiles = self.m_tiles * self.split_k
+        if not 0 < self.num_sms <= self.work_tiles:
             raise ValueError(
-                f"split-K FP8 GEMV requires exactly {expected_sms} SMs"
+                f"split-K FP8 GEMV requires 1..{self.work_tiles} SMs"
             )
+
+    def _work_shard(self, sm):
+        work_per_sm, extra = divmod(self.work_tiles, self.num_sms)
+        work_start = sm * work_per_sm + min(sm, extra)
+        work_count = work_per_sm + int(sm < extra)
+        return work_start, work_count
 
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
-        split = sm // self.m_tiles
-        output_tile = sm % self.m_tiles
-        k_start = split * self.k_tiles_per_split
-        k_stop = k_start + self.k_tiles_per_split
-        instructions = [Fp8GemvUmmaSplitKSm100(self.k_tiles_per_split)]
-        for chunk_start in range(
-            k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK
-        ):
-            chunk_stop = chunk_start + self.ACTIVATION_TILES_PER_CHUNK
+        work_start, work_count = self._work_shard(sm)
+        work_stop = work_start + work_count
+        instructions = []
+        for work in range(work_start, work_stop):
+            split = work // self.m_tiles
+            output_tile = work % self.m_tiles
+            k_start = split * self.k_tiles_per_split
+            k_stop = k_start + self.k_tiles_per_split
             instructions.append(
-                TmaLoad1D(
-                    self.activation_tiles[chunk_start:chunk_stop].reshape(-1)
-                ).fixed_port(1)
+                Fp8GemvUmmaSplitKSm100(self.k_tiles_per_split)
             )
-            for k_tile in range(chunk_start, chunk_stop):
+            for chunk_start in range(
+                k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK
+            ):
+                chunk_stop = chunk_start + self.ACTIVATION_TILES_PER_CHUNK
                 instructions.append(
                     TmaLoad1D(
-                        self.weight_tiles[output_tile, k_tile].reshape(-1)
-                    ).fixed_port(0)
+                        self.activation_tiles[
+                            chunk_start:chunk_stop
+                        ].reshape(-1)
+                    ).fixed_port(1)
                 )
-        store = self.output_reduce.cord(0, output_tile * self.TILE_M)
-        store.bar(self._bar("output"))
-        instructions.append(store)
+                for k_tile in range(chunk_start, chunk_stop):
+                    instructions.append(
+                        TmaLoad1D(
+                            self.weight_tiles[
+                                output_tile, k_tile
+                            ].reshape(-1)
+                        ).fixed_port(0)
+                    )
+            store = self.output_reduce.cord(
+                0, output_tile * self.TILE_M
+            )
+            if work + 1 == work_stop:
+                store.bar(self._bar("output"))
+            instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):

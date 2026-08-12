@@ -597,6 +597,52 @@ def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
     assert schedule.bar_release_count("output") == 0
 
 
+def test_fp8_native_splitk_balances_more_work_tiles_than_sms(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    weights = torch.empty((256, 8, 16896), dtype=torch.uint8)
+    activations = torch.empty((8, 2048), dtype=torch.uint8)
+    accumulator = torch.empty((1, 32768), dtype=torch.float32)
+    output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
+        "reduce", 1, 128
+    )
+    schedule = SchedFp8GemvUmmaSplitK(
+        weights, activations, output_reduce, split_k=2
+    ).bar("output", 7).place(152)
+
+    first = schedule.schedule(0)
+    last = schedule.schedule(151)
+    first_compute = [
+        inst for inst in first if isinstance(inst, Fp8GemvUmmaSplitKSm100)
+    ]
+    last_compute = [
+        inst for inst in last if isinstance(inst, Fp8GemvUmmaSplitKSm100)
+    ]
+    first_stores = [
+        inst
+        for inst in first
+        if (inst.opcode & ~16) == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
+    ]
+
+    assert len(first_compute) == 4
+    assert len(last_compute) == 3
+    assert all(inst.args == [4] for inst in first_compute + last_compute)
+    assert len(first_stores) == 4
+    assert sum(bool(inst.opcode & 16) for inst in first_stores) == 1
+    assert first_stores[-1].opcode & 16
+    assert schedule.bar_release_count("output") == 152
+
+
 def test_dsv4_shard_swiglu_encodes_bound_and_width():
     instruction = Dsv4SiluClampMul128(1, 10.0)
 

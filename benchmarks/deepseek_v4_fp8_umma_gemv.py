@@ -50,13 +50,11 @@ def main() -> None:
     k_tiles = args.k // SchedFp8UmmaPrepack.TILE_K
     if args.split_k <= 0 or k_tiles % args.split_k:
         parser.error("split-k must be positive and divide K/128")
-    default_sms = m_tiles * args.split_k if args.split_k > 1 else min(m_tiles, 152)
+    default_sms = min(m_tiles * args.split_k, 152)
     num_sms = args.sms or default_sms
     max_sms = min(152, m_tiles * args.split_k)
     if not 0 < num_sms <= max_sms:
         parser.error(f"sms must be in [1,{max_sms}]")
-    if args.split_k > 1 and num_sms != m_tiles * args.split_k:
-        parser.error("split-K uses exactly one SM per (M128,K-shard) tile")
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260811)

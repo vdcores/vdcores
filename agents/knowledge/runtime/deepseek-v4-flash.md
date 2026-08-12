@@ -1609,3 +1609,28 @@ the accumulator every layer. First extend the same shape-derived split-K/TMA
 reduction mechanism to all attention GEMMs and integrate it in the resident
 graph without fusion. Require layer and early full-model gates before treating
 the task gain as TBT progress.
+
+### Projection-wide split policy screen
+
+The split schedule now balances an arbitrary number of `(M128,K-shard)` work
+tiles over at most 152 resident SMs. One SM may issue several bounded tasks;
+only its last reduce store releases the stage barrier, so barrier arrival count
+remains the physical SM count rather than the logical work count. The same
+mechanism can therefore cover both narrow underfilled projections and wide
+projections without creating another launch or instruction stream.
+
+| Projection shape | Split / SMs | Isolated median (us) | Reference |
+|---|---:|---:|---:|
+| Q_a, M1024/K4096 | 8 / 64 | 3.552 | vLLM 5.982 |
+| KV, M512/K4096 | 8 / 32 | 3.488 | resident gate pending |
+| Q_b, M32768/K1024 | 2 / 152 | 11.616 | native unsplit 12.032; vLLM 6.561 |
+| Index Q_b, M8192/K1024 | 2 / 128 | 3.632 | resident gate pending |
+| Eight O_a groups, aggregate M8192/K4096 | 2 / 128 | 10.528 | vLLM 9.589 |
+| O_b, M4096/K8192 | 4 / 128 | 10.464 | vLLM 11.628 |
+
+All rows are exact against the dequantized FP32 oracle within the benchmark's
+tolerance. They include TMA reduce-add but exclude accumulator reset and the
+FP32-to-model-dtype handoff. The screen also rejected over-splitting: aggregate
+O_a split-4/split-8 measured 10.912/11.680 us, and O_b split-8/split-16 measured
+10.944/11.680 us. Q_b remains the unresolved kernel gap because its large M
+grid was already saturated before splitting.
