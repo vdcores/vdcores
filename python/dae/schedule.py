@@ -1363,6 +1363,107 @@ class SchedFp8GemvUmmaStream(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedFp8GemvUmmaSplitK(Schedule):
+    """Split native MXF8 K over SMs and reduce FP32 partials in STU."""
+
+    TILE_M = SchedFp8UmmaPrepack.TILE_M
+    WEIGHT_TILE_BYTES = SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES
+    ACTIVATION_TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+    ACTIVATION_TILES_PER_CHUNK = 4
+    UMMA_N = 8
+
+    def __init__(
+        self,
+        weight_tiles,
+        activation_tiles,
+        output_reduce,
+        split_k: int,
+    ):
+        super().__init__()
+        self.weight_tiles = weight_tiles
+        self.activation_tiles = activation_tiles
+        self.output_reduce = output_reduce
+        self.split_k = int(split_k)
+
+    def _on_place(self):
+        if (
+            self.weight_tiles.dtype != torch.uint8
+            or self.weight_tiles.ndim != 3
+            or self.weight_tiles.shape[2] != self.WEIGHT_TILE_BYTES
+            or not self.weight_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "split-K native FP8 weights must be "
+                "[M/128,K/128,16896] uint8"
+            )
+        self.m_tiles, self.k_tiles, _ = self.weight_tiles.shape
+        if self.split_k <= 1 or self.k_tiles % self.split_k:
+            raise ValueError("split_k must divide K tiles and be greater than one")
+        self.k_tiles_per_split = self.k_tiles // self.split_k
+        if self.k_tiles_per_split % self.ACTIVATION_TILES_PER_CHUNK:
+            raise ValueError("each split-K shard must contain a multiple of four K tiles")
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or tuple(self.activation_tiles.shape)
+            != (self.k_tiles, self.ACTIVATION_TILE_BYTES)
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "split-K native FP8 activations must be [K/128,2048] uint8"
+            )
+        self.rows = self.m_tiles * self.TILE_M
+        output = getattr(self.output_reduce, "mat", None)
+        if (
+            getattr(self.output_reduce, "mode", None) != "reduce"
+            or output is None
+            or output.dtype != torch.float32
+            or tuple(output.shape) != (self.UMMA_N, self.rows)
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "split-K output must be a row-major TMA reduce tensor "
+                "over contiguous FP32 [8,M]"
+            )
+        expected_sms = self.m_tiles * self.split_k
+        if self.num_sms != expected_sms:
+            raise ValueError(
+                f"split-K FP8 GEMV requires exactly {expected_sms} SMs"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        split = sm // self.m_tiles
+        output_tile = sm % self.m_tiles
+        k_start = split * self.k_tiles_per_split
+        k_stop = k_start + self.k_tiles_per_split
+        instructions = [Fp8GemvUmmaSplitKSm100(self.k_tiles_per_split)]
+        for chunk_start in range(
+            k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK
+        ):
+            chunk_stop = chunk_start + self.ACTIVATION_TILES_PER_CHUNK
+            instructions.append(
+                TmaLoad1D(
+                    self.activation_tiles[chunk_start:chunk_stop].reshape(-1)
+                ).fixed_port(1)
+            )
+            for k_tile in range(chunk_start, chunk_stop):
+                instructions.append(
+                    TmaLoad1D(
+                        self.weight_tiles[output_tile, k_tile].reshape(-1)
+                    ).fixed_port(0)
+                )
+        store = self.output_reduce.cord(0, output_tile * self.TILE_M)
+        store.bar(self._bar("output"))
+        instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedFp8Block128Gemv(Schedule):
     """Shard an E4M3/UE8M0 checkpoint GEMV across resident SMs."""
 

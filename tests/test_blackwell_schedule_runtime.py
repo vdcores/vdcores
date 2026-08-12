@@ -33,6 +33,7 @@ from dae.instructions import (
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
     LduProfileLayer,
+    Fp8GemvUmmaSplitKSm100,
     Fp8GemvUmmaStreamSm100,
     Fp8UmmaPrepackSm100,
     Nvfp4GemvSm100,
@@ -58,6 +59,7 @@ from dae.schedule import (
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
     SchedFp8GemvUmmaStream,
+    SchedFp8GemvUmmaSplitK,
     SchedAttentionDecoding,
     SchedDsv4SwiGluShard128,
     SchedRoutedNvfp4GemvUmmaStream,
@@ -458,6 +460,12 @@ def test_fp8_streaming_umma_encodes_k_tiles():
     assert instruction.args == [64]
 
 
+def test_fp8_splitk_umma_encodes_local_k_tiles():
+    instruction = Fp8GemvUmmaSplitKSm100(16)
+
+    assert instruction.args == [16]
+
+
 def test_fp8_umma_prepack_encodes_kind_and_k_tile_count():
     instruction = Fp8UmmaPrepackSm100(
         Fp8UmmaPrepackSm100.ACTIVATION, 32
@@ -537,6 +545,56 @@ def test_fp8_native_stream_bounds_activation_chunks_to_one_slot(monkeypatch):
     assert all(inst.num_slots == 1 for inst in activation_loads)
     assert len(weight_loads) == 16
     assert all(inst.num_slots == 3 for inst in weight_loads)
+
+
+def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    weights = torch.empty((8, 32, 16896), dtype=torch.uint8)
+    activations = torch.empty((32, 2048), dtype=torch.uint8)
+    accumulator = torch.empty((8, 1024), dtype=torch.float32)
+    output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
+        "reduce", 8, 128
+    )
+    schedule = SchedFp8GemvUmmaSplitK(
+        weights, activations, output_reduce, split_k=2
+    ).place(16)
+
+    first = schedule.schedule(0)
+    second_split = schedule.schedule(8)
+    first_compute = next(
+        inst for inst in first if isinstance(inst, Fp8GemvUmmaSplitKSm100)
+    )
+    second_compute = next(
+        inst
+        for inst in second_split
+        if isinstance(inst, Fp8GemvUmmaSplitKSm100)
+    )
+    first_store = first[-1]
+    second_activation = next(
+        inst
+        for inst in second_split
+        if isinstance(inst, MemoryInstruction)
+        and inst.size == 4 * 2048
+    )
+
+    assert first_compute.args == [16]
+    assert second_compute.args == [16]
+    assert first_store.opcode == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
+    assert first_store.size == 8 * 128 * accumulator.element_size()
+    assert first_store.cords[:2] == [0, 0]
+    assert second_activation.cords != first[1].cords
+    assert schedule.bar_release_count("output") == 0
 
 
 def test_dsv4_shard_swiglu_encodes_bound_and_width():

@@ -215,6 +215,18 @@ class Fp8GemvUmmaStreamSm100(ComputeInstruction):
         )
 
 
+class Fp8GemvUmmaSplitKSm100(ComputeInstruction):
+    """Emit an FP32 M128N8 partial for STU TMA reduce-add."""
+
+    def __init__(self, k_tiles: int):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("split-K FP8 UMMA K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_FP8_GEMV_UMMA_SPLITK_SM100,
+            args=[k_tiles],
+        )
+
+
 class Fp8UmmaPrepackSm100(ComputeInstruction):
     """Pack checkpoint FP8 data and block-128 scales for native UMMA."""
 
@@ -2123,8 +2135,10 @@ class TmaTensor(MemoryInstruction):
         return self._build(action, size, 1, build_tma_1d, cord_func_tma_1d)
 
     def rowmajor_2d(self, action: str, tile_rows: int, tile_cols: int):
-        if action not in ("load", "store"):
-            raise ValueError("row-major 2D TMA action must be load or store")
+        if action not in ("load", "store", "reduce"):
+            raise ValueError(
+                "row-major 2D TMA action must be load, store, or reduce"
+            )
         return self._build(
             action,
             tile_rows,
@@ -2171,6 +2185,7 @@ __all__ = [
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",
     "Fp8GemvUmmaStreamSm100",
+    "Fp8GemvUmmaSplitKSm100",
     "Fp8UmmaPrepackSm100",
     "Dsv4PreloadRopeTables",
     "Dsv4Rope512_64",

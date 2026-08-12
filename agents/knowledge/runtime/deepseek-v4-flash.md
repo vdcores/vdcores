@@ -1580,3 +1580,32 @@ The next optimization order is therefore attention mechanism first
 projection queue frontiers), then FFN admission and shared/routed overlap.
 Small router arithmetic, barrier-count, or instruction tuning cannot explain
 the measured gap and stays behind those board-level experiments.
+
+## Native FP8 split-K projection mechanism (2026-08-12)
+
+The output-row-only MXF8 schedule underutilizes the grid at the attention
+projection shapes. The selected split-K policy assigns one SM to each
+`(M128,K-shard)` tile: split-2 for M1024/K4096 and split-4 for M4096/K8192.
+Both policies keep K2048 on each SM. Eight simultaneous `o_a` groups therefore
+occupy 128 SMs, and `o_b` independently occupies 128 SMs.
+
+UMMA accumulates each shard in FP32 TMEM. The epilogue drains the complete
+M128N8 partial to one contiguous FP32 shared tile, and STU performs native 2-D
+TMA reduce-add into a fixed `[8,M]` FP32 accumulator. The N8 columns are valid
+replicas of the decode vector; retaining all eight makes the reduction one TMA
+transaction and avoids a compute reduction task. No global pointer reaches
+compute, and the implementation adds no inter-stage copy, thread fence, issue
+barrier, or full K unroll.
+
+The isolated task, including TMA reduction but excluding accumulator reset,
+measures 10.272 us for M1024/K4096 split-2 and 10.464 us for M4096/K8192
+split-4. Both are exact against the FP32 dequantized reference. Recorded
+unsplit native medians were 18.848 and 39.600 us respectively. Matched vLLM
+DeepGEMM kernels were 9.589 and 11.628 us, so the split task is within 7.1% at
+`o_a` and 10.0% faster at `o_b` before integration.
+
+These are not resident-stage numbers. A repeated one-launch flow must reset
+the accumulator every layer. The intended fusion is to move that reset under
+attention readiness, consume the FP32 `o_a` reduction directly in the output
+quantizer, and feed native `o_b` without BF16/FP8 layout round trips. Require
+layer and early full-model gates before treating the task gain as TBT progress.

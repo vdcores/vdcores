@@ -17,6 +17,7 @@ from dae.launcher import Launcher
 from dae.schedule import (
     SchedDsv4Fp8QuantUmmaB,
     SchedFp8GemvUmmaStream,
+    SchedFp8GemvUmmaSplitK,
     SchedFp8UmmaPrepack,
 )
 from dae.tma_utils import Major
@@ -32,6 +33,7 @@ def main() -> None:
     parser.add_argument("--m", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--sms", type=int, default=0)
+    parser.add_argument("--split-k", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--diagnostic", action="store_true")
@@ -46,9 +48,15 @@ def main() -> None:
 
     m_tiles = args.m // SchedFp8UmmaPrepack.TILE_M
     k_tiles = args.k // SchedFp8UmmaPrepack.TILE_K
-    num_sms = args.sms or min(m_tiles, 152)
-    if not 0 < num_sms <= min(m_tiles, 152):
-        parser.error("sms must be in [1,min(M/128,152)]")
+    if args.split_k <= 0 or k_tiles % args.split_k:
+        parser.error("split-k must be positive and divide K/128")
+    default_sms = m_tiles * args.split_k if args.split_k > 1 else min(m_tiles, 152)
+    num_sms = args.sms or default_sms
+    max_sms = min(152, m_tiles * args.split_k)
+    if not 0 < num_sms <= max_sms:
+        parser.error(f"sms must be in [1,{max_sms}]")
+    if args.split_k > 1 and num_sms != m_tiles * args.split_k:
+        parser.error("split-K uses exactly one SM per (M128,K-shard) tile")
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260811)
@@ -80,7 +88,8 @@ def main() -> None:
         device=device,
     )
 
-    weight_prepack_launcher = Launcher(num_sms, device=device)
+    prepack_sms = min(m_tiles, 152)
+    weight_prepack_launcher = Launcher(prepack_sms, device=device)
     weight_tma = TmaTensor(
         weight_prepack_launcher, weight.view(torch.uint8)
     ).wgmma_load(128, 128, Major.K)
@@ -91,7 +100,7 @@ def main() -> None:
             weight_scale,
             packed_weight,
             weight_tma,
-        ).place(num_sms)
+        ).place(prepack_sms)
     )
     weight_prepack_launcher.launch()
 
@@ -162,11 +171,29 @@ def main() -> None:
 
     output = torch.empty((args.m,), dtype=torch.bfloat16, device=device)
     gemv_launcher = Launcher(num_sms, device=device)
+    accumulator = None
+    if args.split_k > 1:
+        accumulator = torch.zeros(
+            (SchedFp8GemvUmmaSplitK.UMMA_N, args.m),
+            dtype=torch.float32,
+            device=device,
+        )
+        output_reduce = TmaTensor(
+            gemv_launcher, accumulator
+        ).rowmajor_2d("reduce", SchedFp8GemvUmmaSplitK.UMMA_N, 128)
+        gemv_schedule = SchedFp8GemvUmmaSplitK(
+            packed_weight,
+            packed_activation,
+            output_reduce,
+            args.split_k,
+        )
+    else:
+        gemv_schedule = SchedFp8GemvUmmaStream(
+            packed_weight, packed_activation, output
+        )
     gemv_launcher.s(
         ProfileEvent(2),
-        SchedFp8GemvUmmaStream(
-            packed_weight, packed_activation, output
-        ).place(num_sms),
+        gemv_schedule.place(num_sms),
         ProfileEvent(3),
     )
     gemv_launcher.launch()
@@ -176,7 +203,9 @@ def main() -> None:
     activation_dequant = dequantize_fp8_block128(
         activation, activation_scale
     )
-    reference = (weight_dequant @ activation_dequant).to(torch.bfloat16)
+    reference_float = weight_dequant @ activation_dequant
+    reference = reference_float.to(torch.bfloat16)
+    result = accumulator[0] if accumulator is not None else output
     if args.diagnostic:
         contributions = torch.stack(
             [
@@ -188,7 +217,7 @@ def main() -> None:
             ]
         )
         single_tile_errors = (
-            contributions - output.float().unsqueeze(0)
+            contributions - result.float().unsqueeze(0)
         ).abs().amax(dim=1)
         cross_errors = []
         for weight_tile in range(k_tiles):
@@ -200,24 +229,27 @@ def main() -> None:
                     activation_tile * 128 : (activation_tile + 1) * 128
                 ]
                 cross_errors[-1].append(
-                    (cross - output.float()).abs().max().item()
+                    (cross - result.float()).abs().max().item()
                 )
         print(
             "DSV4_FP8_UMMA_DIAGNOSTIC "
-            f"output_norm={output.float().norm().item():.6f} "
+            f"output_norm={result.float().norm().item():.6f} "
             f"reference_norm={reference.float().norm().item():.6f} "
-            f"cosine={torch.nn.functional.cosine_similarity(output.float(), reference.float(), dim=0).item():.8f} "
+            f"cosine={torch.nn.functional.cosine_similarity(result.float(), reference_float, dim=0).item():.8f} "
             f"single_tile_max_abs={single_tile_errors.cpu().tolist()} "
             f"cross_tile_max_abs={cross_errors} "
-            f"output_head={output[:8].float().cpu().tolist()} "
+            f"output_head={result[:8].float().cpu().tolist()} "
             f"reference_head={reference[:8].float().cpu().tolist()}",
             flush=True,
         )
-    torch.testing.assert_close(output, reference, rtol=3.0e-2, atol=1.0e-1)
-    max_abs = (output.float() - reference.float()).abs().max().item()
+    expected = reference_float if accumulator is not None else reference
+    torch.testing.assert_close(result, expected, rtol=3.0e-2, atol=1.0e-1)
+    max_abs = (result.float() - expected.float()).abs().max().item()
 
     for _ in range(args.warmup):
         quant_launcher.launch()
+        if accumulator is not None:
+            accumulator.zero_()
         gemv_launcher.launch()
     torch.cuda.synchronize(device)
     quant_timings = []
@@ -226,13 +258,16 @@ def main() -> None:
     for _ in range(args.iterations):
         quant_launcher.launch()
         quant_timings.append(profile_span_us(quant_launcher, 2, 3))
+        if accumulator is not None:
+            accumulator.zero_()
         gemv_launcher.launch()
         task_timings.append(profile_span_us(gemv_launcher, 2, 3))
         kernel_timings.append(profile_span_us(gemv_launcher, 0, 1))
 
     print(
         "DSV4_FP8_UMMA_RESULT "
-        f"shape={args.m}x1x{args.k} sms={num_sms} "
+        f"shape={args.m}x1x{args.k} sms={num_sms} split_k={args.split_k} "
+        f"reset_in_span={str(args.split_k == 1).lower()} "
         f"quant_median_us={statistics.median(quant_timings):.6f} "
         f"task_min_us={min(task_timings):.6f} "
         f"task_median_us={statistics.median(task_timings):.6f} "

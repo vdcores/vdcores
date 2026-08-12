@@ -442,8 +442,8 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
 // records through separate load ports. Each allocation already contains both
 // swizzled FP8 data and its native UE8M0 scale layout, so compute sees only
 // shared addresses and never resolves an HBM pointer.
-template <typename M2CQueue, typename C2MQueue>
-__device__ __forceinline__ void task_fp8_gemv_umma_stream_sm100(
+template <bool SplitK, typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
     int num_k_tiles,
     void *smem_base,
     uint32_t tmem_base_ptr,
@@ -604,29 +604,79 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_sm100(
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
   const int output_slots = m2c.template pop<0>();
-  auto *output = static_cast<Output *>(
-      get_slot_address(smem_base, extract(output_slots)));
+  auto *output_base = get_slot_address(smem_base, extract(output_slots));
   auto coord_c = make_identity_tensor(
       make_shape(Int<kTileM>{}, Int<kTileN>{}));
   auto cta_coord_c = cta_mma.partition_C(coord_c);
-  using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
-  auto tAcc = tmem_acc(make_coord(_, _), _0{}, _0{});
-  auto cAcc = cta_coord_c(make_coord(_, _), _0{}, _0{});
-  auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
-  const int thread_idx = tid % size(tiled_t2r);
-  auto thread_t2r = tiled_t2r.get_slice(thread_idx);
-  auto thread_tmem = thread_t2r.partition_S(tAcc);
-  auto thread_coord = thread_t2r.partition_D(cAcc);
-  auto r_acc = make_tensor<Accum>(shape(thread_coord));
-  copy(tiled_t2r, thread_tmem, r_acc);
-  for (int index = 0; index < size(r_acc); ++index) {
-    const int row = int(get<0>(thread_coord(index)));
-    const int col = int(get<1>(thread_coord(index)));
-    if (row < kTileM && col == 0) {
-      output[row] = Output(r_acc(index));
+  if constexpr (SplitK) {
+    // Preserve all eight native accumulator columns as FP32. The activation
+    // tile replicates the decode vector across N=8, so every column is the
+    // same logical partial. Keeping the complete M128N8 tile lets STU issue
+    // one native TMA reduce-add instead of introducing a compute reducer.
+    // Physical shared layout is row-major [N=8,M=128].
+    auto output_layout = make_layout(
+        make_shape(Int<kTileM>{}, Int<kTileN>{}),
+        make_stride(Int<1>{}, Int<kTileM>{}));
+    auto s_output = make_tensor(
+        make_smem_ptr(static_cast<Accum *>(output_base)), output_layout);
+    auto cta_output = cta_mma.partition_C(s_output);
+    using TmemLoad = SM100_TMEM_LOAD_32dp32b4x;
+    auto tiled_t2r = make_tmem_copy(TmemLoad{}, tmem_acc);
+    auto thread_t2r = tiled_t2r.get_slice(tid % size(tiled_t2r));
+    auto thread_tmem = thread_t2r.partition_S(tmem_acc);
+    auto thread_output = thread_t2r.partition_D(cta_output);
+    auto r_acc = make_tensor<Accum>(shape(thread_output));
+    copy(tiled_t2r, thread_tmem, r_acc);
+    copy(r_acc, thread_output);
+  } else {
+    auto *output = static_cast<Output *>(output_base);
+    using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
+    auto tAcc = tmem_acc(make_coord(_, _), _0{}, _0{});
+    auto cAcc = cta_coord_c(make_coord(_, _), _0{}, _0{});
+    auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
+    const int thread_idx = tid % size(tiled_t2r);
+    auto thread_t2r = tiled_t2r.get_slice(thread_idx);
+    auto thread_tmem = thread_t2r.partition_S(tAcc);
+    auto thread_coord = thread_t2r.partition_D(cAcc);
+    auto r_acc = make_tensor<Accum>(shape(thread_coord));
+    copy(tiled_t2r, thread_tmem, r_acc);
+    for (int index = 0; index < size(r_acc); ++index) {
+      const int row = int(get<0>(thread_coord(index)));
+      const int col = int(get<1>(thread_coord(index)));
+      if (row < kTileM && col == 0) {
+        output[row] = Output(r_acc(index));
+      }
     }
   }
 
   __sync_compute_group(128);
   c2m.template push<0, true>(tid, output_slots);
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_gemv_umma_stream_sm100(
+    int num_k_tiles,
+    void *smem_base,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  task_fp8_gemv_umma_stream_impl_sm100<false>(
+      num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
+      tmem_mma_phase, m2c, c2m);
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_gemv_umma_splitk_sm100(
+    int num_k_tiles,
+    void *smem_base,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  task_fp8_gemv_umma_stream_impl_sm100<true>(
+      num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
+      tmem_mma_phase, m2c, c2m);
 }
