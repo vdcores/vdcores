@@ -1697,7 +1697,7 @@ class SchedDsv4ContiguousAttention512Block4(Schedule):
 
 
 class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
-    """One-SM all-head DSV4 attention with native K128 TMA/UMMA tiles."""
+    """All-head K128 UMMA attention, optionally sharded by D128 output."""
 
     TILE = 128
     TILES_PER_VECTOR = 4
@@ -1716,8 +1716,8 @@ class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
         self.output_tma = output_tma
 
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek UMMA attention uses exactly one SM")
+        if self.num_sms not in (1, self.TILES_PER_VECTOR):
+            raise ValueError("DeepSeek UMMA attention uses one or four SMs")
         if (self.q.dtype != torch.bfloat16 or self.q.shape != (64, 512) or
                 not self.q.is_contiguous()):
             raise ValueError("DeepSeek UMMA Q must be contiguous BF16 [64,512]")
@@ -1736,7 +1736,15 @@ class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
     def schedule(self, sm):
         if sm < 0:
             return []
-        instructions = [Dsv4ContiguousAttention512UmmaSm100(self.rows)]
+        output_tile = sm if self.num_sms == self.TILES_PER_VECTOR else None
+        output_tiles = (
+            (output_tile,)
+            if output_tile is not None
+            else range(self.TILES_PER_VECTOR)
+        )
+        instructions = [
+            Dsv4ContiguousAttention512UmmaSm100(self.rows, output_tile)
+        ]
         num_blocks = (self.rows + self.TILE - 1) // self.TILE
         for block in range(num_blocks):
             row = block * self.TILE
@@ -1747,16 +1755,16 @@ class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
                 for tile in range(2):
                     column = (wave * 2 + tile) * self.TILE
                     instructions.append(self.k_tma.cord(row, column))
-            for tile in range(self.TILES_PER_VECTOR):
+            for tile in output_tiles:
                 instructions.append(
                     self.v_tma.cord(row, tile * self.TILE)
                 )
             if block == 0:
                 instructions.append(_shared_load_1d(self.sink))
 
-        for tile in range(self.TILES_PER_VECTOR):
+        for output_index, tile in enumerate(output_tiles):
             store = self.output_tma.cord(0, tile * self.TILE)
-            if tile == self.TILES_PER_VECTOR - 1:
+            if output_index + 1 == len(output_tiles):
                 store = store.bar(self._bar("output"))
             instructions.append(store)
         return instructions
@@ -1764,11 +1772,11 @@ class SchedDsv4ContiguousAttention512UmmaSm100(Schedule):
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
-    """One-SM native K128 prefix plus native K32 tail attention."""
+    """Native K128+K32 attention, optionally sharded by D128 output."""
 
     TILE = 128
     TILES_PER_VECTOR = 4
@@ -1790,8 +1798,8 @@ class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
         self.output_tma = output_tma
 
     def _on_place(self):
-        if self.num_sms != 1:
-            raise ValueError("DeepSeek UMMA tail attention uses one SM")
+        if self.num_sms not in (1, self.TILES_PER_VECTOR):
+            raise ValueError("DeepSeek UMMA tail attention uses one or four SMs")
         if (self.q.dtype != torch.bfloat16 or self.q.shape != (64, 512) or
                 not self.q.is_contiguous()):
             raise ValueError("DeepSeek UMMA Q must be contiguous BF16 [64,512]")
@@ -1810,7 +1818,17 @@ class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
     def schedule(self, sm):
         if sm < 0:
             return []
-        instructions = [Dsv4ContiguousAttention512UmmaTail32Sm100(self.rows)]
+        output_tile = sm if self.num_sms == self.TILES_PER_VECTOR else None
+        output_tiles = (
+            (output_tile,)
+            if output_tile is not None
+            else range(self.TILES_PER_VECTOR)
+        )
+        instructions = [
+            Dsv4ContiguousAttention512UmmaTail32Sm100(
+                self.rows, output_tile
+            )
+        ]
         for wave in range(2):
             for tile in range(2):
                 column = (wave * 2 + tile) * self.TILE
@@ -1823,13 +1841,13 @@ class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
                 self.tail_k_tma.cord(self.TILE, tile * self.TILE)
             )
         instructions.append(_shared_load_1d(self.sink))
-        for tile in range(self.TILES_PER_VECTOR):
+        for tile in output_tiles:
             column = tile * self.TILE
             instructions.append(self.prefix_v_tma.cord(0, column))
             instructions.append(self.tail_v_tma.cord(self.TILE, column))
-        for tile in range(self.TILES_PER_VECTOR):
+        for output_index, tile in enumerate(output_tiles):
             store = self.output_tma.cord(0, tile * self.TILE)
-            if tile + 1 == self.TILES_PER_VECTOR:
+            if output_index + 1 == len(output_tiles):
                 store = store.bar(self._bar("output"))
             instructions.append(store)
         return instructions
@@ -1837,7 +1855,7 @@ class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedDsv4RouteTop6(Schedule):

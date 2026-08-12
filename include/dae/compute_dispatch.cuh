@@ -241,7 +241,8 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
              g_events);
   task_dsv4_contiguous_attention_512_umma(
-      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      inst.args[0], inst.args[1],
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
       smem_base, m2c, c2m);
 }
 
@@ -249,7 +250,8 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_TAIL32_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
              g_events);
   task_dsv4_contiguous_attention_512_umma_tail32(
-      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      inst.args[0], inst.args[1],
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
       smem_base, m2c, c2m);
 }
 

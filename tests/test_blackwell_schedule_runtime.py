@@ -97,6 +97,10 @@ def test_kmajor_uint8_coordinates_use_128_byte_blocks():
 def test_dsv4_umma_attention_opcode_and_context_gate():
     instruction = Dsv4ContiguousAttention512UmmaSm100(128)
     tail = Dsv4ContiguousAttention512UmmaTail32Sm100(160)
+    shard0 = Dsv4ContiguousAttention512UmmaSm100(128, output_tile=0)
+    shard3 = Dsv4ContiguousAttention512UmmaTail32Sm100(
+        160, output_tile=3
+    )
 
     assert instruction.opcode == opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100
     assert instruction.args == [128]
@@ -104,10 +108,14 @@ def test_dsv4_umma_attention_opcode_and_context_gate():
         opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_TAIL32_SM100
     )
     assert tail.args == [160]
+    assert shard0.args == [128, 1]
+    assert shard3.args == [160, 4]
     with pytest.raises(ValueError, match=r"\[1,128\]"):
         Dsv4ContiguousAttention512UmmaSm100(129)
     with pytest.raises(ValueError, match=r"\[129,160\]"):
         Dsv4ContiguousAttention512UmmaTail32Sm100(128)
+    with pytest.raises(ValueError, match=r"\[0,3\]"):
+        Dsv4ContiguousAttention512UmmaSm100(128, output_tile=4)
 
 
 def test_rowmajor_2d_tma_coordinates_preserve_row_and_column():

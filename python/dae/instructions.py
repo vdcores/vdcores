@@ -287,22 +287,26 @@ class Dsv4ContiguousAttention512Block4(ComputeInstruction):
 
 
 class Dsv4ContiguousAttention512UmmaSm100(ComputeInstruction):
-    def __init__(self, rows: int):
+    def __init__(self, rows: int, output_tile: int | None = None):
         if rows <= 0 or rows > 128:
             raise ValueError("DeepSeek UMMA attention rows must be in [1,128]")
+        if output_tile is not None and not 0 <= output_tile < 4:
+            raise ValueError("DeepSeek UMMA output tile must be in [0,3]")
         super().__init__(
             opcode=opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_SM100,
-            args=[rows],
+            args=[rows] if output_tile is None else [rows, output_tile + 1],
         )
 
 
 class Dsv4ContiguousAttention512UmmaTail32Sm100(ComputeInstruction):
-    def __init__(self, rows: int):
+    def __init__(self, rows: int, output_tile: int | None = None):
         if rows <= 128 or rows > 160:
             raise ValueError("DeepSeek UMMA tail rows must be in [129,160]")
+        if output_tile is not None and not 0 <= output_tile < 4:
+            raise ValueError("DeepSeek UMMA output tile must be in [0,3]")
         super().__init__(
             opcode=opcode.OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_TAIL32_SM100,
-            args=[rows],
+            args=[rows] if output_tile is None else [rows, output_tile + 1],
         )
 
 

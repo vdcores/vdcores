@@ -657,6 +657,7 @@ __device__ __forceinline__ void sm100_dsv4_softmax_tmem_rows_hi_lo(
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
     int rows,
+    int output_tile_code,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t& tmem_mma_phase,
@@ -675,6 +676,7 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
     constexpr uint32_t P_LO_OFFSET = 64;
     constexpr uint32_t O_OFFSET = 128;
     constexpr uint32_t O_STRIDE = 128;
+    const bool output_sharded = output_tile_code != 0;
 
     using QKAtom = SM100_MMA_F16BF16_SS<
         data_t, data_t, accum_t, M, KV,
@@ -783,8 +785,9 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
 
     int v_slots[D_TILES];
     data_t *v_ptrs[D_TILES];
+    const int active_v_tiles = output_sharded ? 1 : D_TILES;
 #pragma unroll 1
-    for (int tile = 0; tile < D_TILES; ++tile) {
+    for (int tile = 0; tile < active_v_tiles; ++tile) {
         v_slots[tile] = m2c.template pop<0>();
         v_ptrs[tile] = static_cast<data_t *>(
             get_slot_address(smem_base, extract(v_slots[tile])));
@@ -802,6 +805,56 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
         sink, 0, 1, rows, logical_row,
         row_max, row_sum, correction);
     c2m.push(tid, sink_slots);
+
+    const float inv_sum =
+        logical_row < M && row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+
+    // Four-SM mode duplicates QK/softmax but assigns one D128 PV/store tile
+    // to each SM. The branch is uniform for all 128 compute threads. It adds
+    // no compute-group or cross-SM barrier; the ordinary C2M writeback edge
+    // remains the sole shared-to-global publication mechanism.
+    if (output_sharded) {
+        if (tid < numThreadsPerWarp) {
+            auto sV = make_tensor(make_smem_ptr(v_ptrs[0]), layout_v);
+            auto frag_v = cta_pv.make_fragment_B(sV);
+            auto tmem_o = cta_pv.make_fragment_C(cta_o);
+            tmem_o.data() = tmem_base_ptr + O_OFFSET;
+            tiled_pv.accumulate_ = UMMA::ScaleOut::Zero;
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(frag_p_hi); ++k_block) {
+                gemm(tiled_pv, frag_p_hi(_, _, k_block),
+                     frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+#pragma unroll 1
+            for (int k_block = 0;
+                 k_block < size<2>(frag_p_lo); ++k_block) {
+                gemm(tiled_pv, frag_p_lo(_, _, k_block),
+                     frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        c2m.push(tid, v_slots[0]);
+
+        const int output_slots = m2c.template pop<0>();
+        auto *output_ptr = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(output_slots)));
+        auto sO = make_tensor(
+            make_smem_ptr(output_ptr),
+            make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                        make_stride(Int<D_TILE>{}, Int<1>{})));
+        auto cta_sO = cta_pv.partition_C(sO);
+        auto tmem_o = cta_pv.make_fragment_C(cta_o);
+        tmem_o.data() = tmem_base_ptr + O_OFFSET;
+        sm100_attention_store_tmem_rows<M, D_TILE, false>(
+            tmem_o, cta_coord_o, cta_sO, inv_sum, M);
+        c2m.template push<31, true, false>(tid, output_slots);
+        return;
+    }
 
     if (tid < numThreadsPerWarp) {
 #pragma unroll 1
@@ -832,9 +885,6 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_umma(
     for (int tile = 0; tile < D_TILES - 1; ++tile) {
         c2m.push(tid, v_slots[tile]);
     }
-
-    const float inv_sum =
-        logical_row < M && row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
 
     const int first_output_slots = m2c.template pop<0>();
     auto *first_output_ptr = static_cast<data_t *>(
@@ -1010,6 +1060,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_dsv4_contiguous_attention_512_umma_tail32(
     int rows,
+    int output_tile_code,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t& tmem_mma_phase,
@@ -1026,6 +1077,10 @@ task_dsv4_contiguous_attention_512_umma_tail32(
     constexpr int D_TILES = 4;
     constexpr int QK_WAVE_TILES = 2;
     constexpr uint32_t TAIL_SCORE_OFFSET = PREFIX_KV;
+    const bool output_sharded = output_tile_code != 0;
+    const int first_output_tile = output_sharded
+        ? output_tile_code - 1 : 0;
+    const int output_tile_count = output_sharded ? 1 : D_TILES;
 
     using PrefixQKAtom = SM100_MMA_F16BF16_SS<
         data_t, data_t, accum_t, M, PREFIX_KV,
@@ -1222,7 +1277,9 @@ task_dsv4_contiguous_attention_512_umma_tail32(
     auto tail_frag_p_hi = pv_cta.make_fragment_A(tail_p_hi);
     auto tail_frag_p_lo = pv_cta.make_fragment_A(tail_p_lo);
 #pragma unroll 1
-    for (int tile = 0; tile < D_TILES; ++tile) {
+    for (int output_index = 0;
+         output_index < output_tile_count; ++output_index) {
+        const int tile = first_output_tile + output_index;
         const int prefix_v_slots = m2c.template pop<0>();
         auto *prefix_v_ptr = static_cast<data_t *>(
             get_slot_address(smem_base, extract(prefix_v_slots)));
@@ -1278,7 +1335,9 @@ task_dsv4_contiguous_attention_512_umma_tail32(
     const float inv_sum =
         logical_row < M && row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
 #pragma unroll 1
-    for (int tile = 0; tile < D_TILES; ++tile) {
+    for (int output_index = 0;
+         output_index < output_tile_count; ++output_index) {
+        const int tile = first_output_tile + output_index;
         const int output_slots = m2c.template pop<0>();
         auto *output_ptr = static_cast<data_t *>(
             get_slot_address(smem_base, extract(output_slots)));

@@ -259,9 +259,11 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
             latency_us=contiguous_latency,
         )
 
-    if _ATTENTION_IMPLEMENTATION == "umma" and _ATTENTION_TOPK > 160:
+    if (_ATTENTION_IMPLEMENTATION in ("umma", "umma-shard4") and
+            _ATTENTION_TOPK > 160):
         raise ValueError("UMMA attention currently supports at most 160 rows")
-    if (_ATTENTION_IMPLEMENTATION in ("both", "umma") and
+    if (_ATTENTION_IMPLEMENTATION in (
+            "both", "umma", "umma-shard4") and
             _ATTENTION_TOPK <= 160):
         contiguous_indices = torch.arange(
             _ATTENTION_TOPK, dtype=torch.int32, device=device
@@ -270,7 +272,8 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
             q, kv, contiguous_indices, sink
         )
         umma_output = torch.empty_like(q)
-        umma_launcher = Launcher(1, device=device)
+        umma_sms = 4 if _ATTENTION_IMPLEMENTATION == "umma-shard4" else 1
+        umma_launcher = Launcher(umma_sms, device=device)
         q_tma = TmaTensor(umma_launcher, q).wgmma_load(64, 128, Major.K)
         k_tma = TmaTensor(umma_launcher, kv).wgmma_load(128, 128, Major.K)
         v_tma = TmaTensor(umma_launcher, kv).wgmma_load(128, 128, Major.MN)
@@ -324,7 +327,7 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
         ]
         print(
             "DSV4_FUNCTIONAL_DIAGNOSTIC "
-            f"task=attention_contiguous_umma_h64_d512_k{_ATTENTION_TOPK} "
+            f"task=attention_contiguous_umma{umma_sms}_h64_d512_k{_ATTENTION_TOPK} "
             f"latency_us={umma_latency:.3f} "
             f"max_abs={umma_diff.max().item():.8f} "
             f"mean_abs={umma_diff.mean().item():.8f} "
@@ -332,7 +335,7 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
             flush=True,
         )
         report_close(
-            f"attention_contiguous_umma_h64_d512_k{_ATTENTION_TOPK}",
+            f"attention_contiguous_umma{umma_sms}_h64_d512_k{_ATTENTION_TOPK}",
             umma_output,
             contiguous_expected,
             rtol=3.0e-2,
@@ -794,7 +797,9 @@ def main() -> None:
     parser.add_argument("--attention-topk", type=int, default=512)
     parser.add_argument(
         "--attention-implementation",
-        choices=("both", "scalar", "contiguous", "umma"),
+        choices=(
+            "both", "scalar", "contiguous", "umma", "umma-shard4",
+        ),
         default="both",
     )
     parser.add_argument("--hc-post-sms", type=int, default=32)
