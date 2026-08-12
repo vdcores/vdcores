@@ -1511,3 +1511,15 @@ not prefetch the later middle activation. Job `20260812T163552Z-15074`
 preserved token 2759 for 30 repeats and measured 0.731184 ms median, 2.57%
 faster than the affine starting point and 1.43% faster than the prior accepted
 0.741824-ms two-layer discriminator.
+
+Whole-grid shared compute is not the corresponding overlap mechanism. A
+shape-clean 128-SM placement (16 W1/W3 rows and 32 W2 rows per SM, based at
+SM24) put the shared chain before routed branches and allowed immutable shared
+weights to enter before the activation barrier. Job
+`20260812T163751Z-37954` was correct but measured 0.818352 ms. The 152-SM
+variant in `20260812T163819Z-44631` measured 0.768704 ms. These are 11.9% and
+5.13% slower than the retained 0.731184-ms gate because overlapping SMs must
+execute shared compute ahead of routed compute. Both variants were reverted.
+A future wide-shared attempt must separate memory-only retained prefetch from
+compute order so route-dependent loads and shared weights occupy different LDU
+queues without serializing their compute tasks.
