@@ -292,6 +292,18 @@ class Dsv4Rope512_64(ComputeInstruction):
         )
 
 
+class Dsv4KvRmsRope512(ComputeInstruction):
+    """Finalize a BF16 KV projection with learned RMS and partial RoPE."""
+
+    def __init__(self, epsilon: float, fixed_table_id: int):
+        if not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        super().__init__(
+            opcode=opcode.OP_DSV4_KV_RMS_ROPE_512,
+            args=[encode_bfloat16_u16(epsilon), fixed_table_id + 1],
+        )
+
+
 class Dsv4Rope128_64(ComputeInstruction):
     def __init__(
         self,
@@ -2212,6 +2224,7 @@ __all__ = [
     "Fp8UmmaPrepackSm100",
     "Dsv4PreloadRopeTables",
     "Dsv4Rope512_64",
+    "Dsv4KvRmsRope512",
     "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
     "Dsv4ContiguousAttention512Block4",

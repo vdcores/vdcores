@@ -1321,6 +1321,90 @@ class SchedDsv4ZeroFill(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4ZeroFillMany(Schedule):
+    """Shard one existing reset stage over several contiguous HBM spans."""
+
+    BLOCK_BYTES = 16
+
+    def __init__(self, gate, outputs):
+        super().__init__()
+        self.gate = gate
+        self.outputs = tuple(outputs)
+
+    def _on_place(self):
+        if (
+            self.gate.dtype != torch.uint32
+            or self.gate.numel() != 1
+            or not self.gate.is_contiguous()
+        ):
+            raise ValueError("zero-fill gate must be one contiguous uint32")
+        if not self.outputs:
+            raise ValueError("multi-span zero fill requires at least one output")
+        self.regions = []
+        self.total_blocks = 0
+        for output in self.outputs:
+            if not output.is_contiguous() or output.numel() <= 0:
+                raise ValueError(
+                    "multi-span zero-fill outputs must be nonempty and contiguous"
+                )
+            element_bytes = output.element_size()
+            total_bytes = output.numel() * element_bytes
+            if (
+                total_bytes % self.BLOCK_BYTES
+                or self.BLOCK_BYTES % element_bytes
+            ):
+                raise ValueError(
+                    "multi-span zero-fill outputs must contain complete 16-byte blocks"
+                )
+            blocks = total_bytes // self.BLOCK_BYTES
+            self.regions.append(
+                (output.reshape(-1), blocks, self.BLOCK_BYTES // element_bytes)
+            )
+            self.total_blocks += blocks
+        if not 0 < self.num_sms <= self.total_blocks:
+            raise ValueError(
+                "multi-span zero fill requires 1..total-block-count SMs"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        blocks_per_sm, extra = divmod(self.total_blocks, self.num_sms)
+        shard_start = sm * blocks_per_sm + min(sm, extra)
+        shard_stop = shard_start + blocks_per_sm + int(sm < extra)
+        spans = []
+        region_start = 0
+        for output, blocks, elements_per_block in self.regions:
+            region_stop = region_start + blocks
+            block_start = max(shard_start, region_start)
+            block_stop = min(shard_stop, region_stop)
+            if block_start < block_stop:
+                element_start = (block_start - region_start) * elements_per_block
+                element_stop = (block_stop - region_start) * elements_per_block
+                spans.append(output[element_start:element_stop])
+            region_start = region_stop
+
+        instructions = []
+        for index, output in enumerate(spans):
+            output_bytes = output.numel() * output.element_size()
+            store = TmaStore1D(output)
+            if index + 1 == len(spans):
+                store.bar(self._bar("output"))
+            instructions.extend(
+                (
+                    Dsv4ZeroFill(output_bytes),
+                    LduLoad1D(self.gate),
+                    store,
+                )
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4Fp32ToBf16(Schedule):
     """Finalize an FP32 split-K accumulator in model dtype."""
 
@@ -1589,6 +1673,90 @@ class SchedFp8GemvUmmaSplitK(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4KvProjectCache(Schedule):
+    """Split-K KV projection with an in-schedule RMS/RoPE cache epilogue.
+
+    All split-K stores release one memory-only completion counter.  One
+    producer SM then reads the completed BF16 row, performs RMS and partial
+    RoPE, and writes the persistent cache row in place.  Only that final cache
+    store is a dependency tail for downstream attention.
+    """
+
+    def __init__(
+        self,
+        launcher,
+        weight_tiles,
+        activation_tiles,
+        cache_row,
+        rms_weight,
+        split_k: int,
+        epsilon: float,
+        fixed_table_id: int,
+    ):
+        super().__init__()
+        self.launcher = launcher
+        self.weight_tiles = weight_tiles
+        self.activation_tiles = activation_tiles
+        self.cache_row = cache_row
+        self.rms_weight = rms_weight
+        self.split_k = int(split_k)
+        self.epsilon = float(epsilon)
+        self.fixed_table_id = int(fixed_table_id)
+        output_reduce = TmaTensor(
+            launcher, cache_row.reshape(1, -1)
+        ).rowmajor_2d("reduce", 1, 128)
+        self.project = SchedFp8GemvUmmaSplitK(
+            weight_tiles,
+            activation_tiles,
+            output_reduce,
+            self.split_k,
+        )
+
+    def _on_place(self):
+        if (
+            self.cache_row.dtype != torch.bfloat16
+            or self.cache_row.numel() != 512
+            or not self.cache_row.is_contiguous()
+        ):
+            raise ValueError("fused KV cache row must be contiguous BF16[512]")
+        if (
+            self.rms_weight.dtype != torch.bfloat16
+            or self.rms_weight.numel() != 512
+            or not self.rms_weight.is_contiguous()
+        ):
+            raise ValueError("fused KV RMS weight must be contiguous BF16[512]")
+        if not 0 <= self.fixed_table_id < 4:
+            raise ValueError("fused KV RoPE table ID must be in [0,4)")
+        if self.launcher.num_bars >= config.max_bars - 2:
+            raise ValueError("fused KV projection exceeds runtime barrier capacity")
+        self.reduce_bar = self.launcher.new_bar(self.num_sms)
+        project = self.project._clone()
+        project.bar("output", self.reduce_bar)
+        self.placed_project = project.place(self.num_sms)
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = list(self.placed_project.schedule(sm))
+        if sm != 0:
+            return instructions
+
+        cache_store = TmaStore1D(self.cache_row).bar(self._bar("output"))
+        cache_store.annotation["sequential_dependency_tail"] = True
+        instructions.extend([
+            Dsv4KvRmsRope512(self.epsilon, self.fixed_table_id),
+            TmaLoad1D(self.rms_weight).fixed_port(0),
+            TmaLoad1D(self.cache_row).fixed_port(0).bar(self.reduce_bar),
+            cache_store,
+        ])
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
 
 
 class SchedFp8Block128Gemv(Schedule):

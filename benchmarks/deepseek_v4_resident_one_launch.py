@@ -54,6 +54,7 @@ from dae.schedule import (
     SchedDsv4HcPost,
     SchedDsv4HcPre,
     SchedDsv4IndexScore,
+    SchedDsv4KvProjectCache,
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
@@ -63,6 +64,7 @@ from dae.schedule import (
     SchedDsv4SwiGluShard128,
     SchedDsv4TopK512,
     SchedDsv4ZeroFill,
+    SchedDsv4ZeroFillMany,
     SchedFp8Block128Gemv,
     SchedFp8Block128GemvBf16,
     SchedFp8GemvUmmaStream,
@@ -1006,6 +1008,54 @@ class ResidentOneLaunchDecode:
         )
         return [gemv, finalize]
 
+    def _splitk_fp8_kv_cache_stage(
+        self,
+        family: LayerFamily,
+        activation: torch.Tensor,
+        cache_row: torch.Tensor,
+        *,
+        base_sm: int,
+        wait_group: str,
+        release_group: str,
+        fixed_table_id: int,
+    ) -> Stage:
+        linears = tuple(
+            self.checkpoint.load_native_fp8_linear(
+                f"layers.{layer_id}.attn.wkv", device=self.device
+            )
+            for layer_id in family.layer_ids
+        )
+        weights = tuple(linear.weight_tiles for linear in linears)
+        norm_weights = self._family_tensors(
+            family, "attn.kv_norm.weight"
+        )
+        rows = weights[0].shape[0] * 128
+        k = activation.shape[0] * 128
+        if rows != self.config.head_dim or cache_row.numel() != rows:
+            raise ValueError("fused KV projection requires one 512-wide cache row")
+        split_k, num_sms = self.policy.fp8_umma_split_k(rows, k)
+        schedule = SchedDsv4KvProjectCache(
+            self.launcher,
+            weights[0],
+            activation,
+            cache_row,
+            norm_weights[0],
+            split_k,
+            self.config.rms_epsilon,
+            fixed_table_id,
+        )
+        schedule = self._layered(
+            schedule, family, weights, norm_weights
+        )
+        return self._stage(
+            "attn.kv.project_cache",
+            schedule,
+            num_sms,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
     def _bf16_linear_stage(
         self,
         name: str,
@@ -1155,6 +1205,11 @@ class ResidentOneLaunchDecode:
         split_index_q_b = "index_q_b" in self.splitk_components
         split_o_a = "o_a" in self.splitk_components
         split_o_b = "o_b" in self.splitk_components
+        fuse_kv_cache = (
+            split_kv
+            and self.direct_splitk_bf16
+            and self.args.kv_cache_fusion == "project"
+        )
         run_index_selection = kind == "csa" and (
             self.args.index_selection_mode == "force"
             or plan.requires_index_selection
@@ -1182,11 +1237,25 @@ class ResidentOneLaunchDecode:
                 self.splitk_accumulators.append(workspace)
                 self._active_splitk_workspace = workspace
                 self._active_splitk_offset = 0
+            reset_outputs = (
+                (workspace, self.current_kv_rows[kind])
+                if fuse_kv_cache
+                else (workspace,)
+            )
+            reset_schedule = (
+                SchedDsv4ZeroFillMany(self.zero_fill_gate, reset_outputs)
+                if len(reset_outputs) > 1
+                else SchedDsv4ZeroFill(self.zero_fill_gate, workspace)
+            )
             stages.append(
                 self._stage(
                     "attn.projections.reset",
-                    SchedDsv4ZeroFill(self.zero_fill_gate, workspace),
-                    min(self.sms, workspace_rows // 4),
+                    reset_schedule,
+                    min(
+                        self.sms,
+                        sum(output.numel() * output.element_size()
+                            for output in reset_outputs) // 16,
+                    ),
                 )
             )
         else:
@@ -1286,7 +1355,21 @@ class ResidentOneLaunchDecode:
                     release_group=qkv_prefix_join,
                 )
             )
-        if split_kv:
+        if fuse_kv_cache:
+            stages.append(
+                self._splitk_fp8_kv_cache_stage(
+                    family,
+                    self.hidden_native_fp8,
+                    self.current_kv_rows[kind],
+                    base_sm=kv_base,
+                    wait_group=qkv_input_ready,
+                    release_group=qkv_prefix_join,
+                    fixed_table_id=self.resident_rope_table_ids[
+                        rope_table.data_ptr()
+                    ],
+                )
+            )
+        elif split_kv:
             stages.extend(
                 self._splitk_fp8_linear_stages(
                     "attn.kv",
@@ -1313,34 +1396,35 @@ class ResidentOneLaunchDecode:
                     release_group=kv_ready,
                 )
             )
-        stages.append(
-            self._rms_stage(
-                "attn.kv_norm",
-                self.kv,
-                self.kv_norm,
-                family=family,
-                weight_suffix="attn.kv_norm.weight",
-                base_sm=kv_base,
-                wait_group=kv_ready,
-                release_group=kv_norm_ready,
+        if not fuse_kv_cache:
+            stages.append(
+                self._rms_stage(
+                    "attn.kv_norm",
+                    self.kv,
+                    self.kv_norm,
+                    family=family,
+                    weight_suffix="attn.kv_norm.weight",
+                    base_sm=kv_base,
+                    wait_group=kv_ready,
+                    release_group=kv_norm_ready,
+                )
             )
-        )
-        stages.append(
-            self._stage(
-                "attn.kv_rope",
-                SchedDsv4Rope512_64(
-                    self.kv_norm.reshape(1, -1),
-                    rope_table,
-                    self.current_kv_rows[kind],
-                    fixed_table_id=self.resident_rope_table_ids[
-                        rope_table.data_ptr()
-                    ],
-                ),
-                base_sm=kv_base,
-                wait_group=kv_norm_ready,
-                release_group=qkv_prefix_join,
+            stages.append(
+                self._stage(
+                    "attn.kv_rope",
+                    SchedDsv4Rope512_64(
+                        self.kv_norm.reshape(1, -1),
+                        rope_table,
+                        self.current_kv_rows[kind],
+                        fixed_table_id=self.resident_rope_table_ids[
+                            rope_table.data_ptr()
+                        ],
+                    ),
+                    base_sm=kv_base,
+                    wait_group=kv_norm_ready,
+                    release_group=qkv_prefix_join,
+                )
             )
-        )
         if split_q_b:
             stages.extend(
                 self._splitk_fp8_linear_stages(
@@ -2386,6 +2470,7 @@ class ResidentOneLaunchDecode:
                 "attn.hidden.quant_fp8",
                 "attn.q_rope",
                 "attn.kv_rope",
+                "attn.kv.project_cache",
                 "attn.compressor.wgate",
                 "attn.compressor.pool",
                 "attn.compressor.rope",
@@ -2558,6 +2643,7 @@ class ResidentOneLaunchDecode:
             f"attention={self.args.attention_mode} "
             f"fp8_projection_mode={self.args.fp8_projection_mode} "
             f"fp8_splitk_reduction={self.args.fp8_splitk_reduction} "
+            f"kv_cache_fusion={self.args.kv_cache_fusion} "
             f"fp8_splitk_components={','.join(sorted(self.splitk_components)) or 'none'} "
             f"index_selection={self.args.index_selection_mode} "
             f"gated_pool={self.args.gated_pool_mode} "
@@ -3065,6 +3151,15 @@ def main() -> None:
         help=(
             "reduce split-K projections directly to BF16 model outputs or "
             "use an exact FP32 accumulator plus BF16 finalizer"
+        ),
+    )
+    parser.add_argument(
+        "--kv-cache-fusion",
+        choices=("off", "project"),
+        default="project",
+        help=(
+            "fuse split-K KV projection, learned RMS, and RoPE into the "
+            "persistent cache-producing schedule"
         ),
     )
     parser.add_argument(

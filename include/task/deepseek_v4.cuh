@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.cuh"
+#include "rms_norm.cuh"
 #include "type.cuh"
 #include "virtualcore.cuh"
 
@@ -210,6 +211,67 @@ __device__ __forceinline__ float *dsv4_resident_rope_table(
   return reinterpret_cast<float *>(
       task_scratch + kDsv4ResidentRopeMetadataOffset +
       table_id * kDsv4RopeTableBytes);
+}
+
+// Complete a BF16 split-K KV projection without materializing independent
+// RMS or RoPE stages.  The input is the fully reduced 512-wide projection.
+// The existing RMS helper deliberately preserves its BF16 accumulation and
+// multiply boundaries; RoPE then consumes that BF16 result in place.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_kv_rms_rope_512(
+    __nv_bfloat16 epsilon,
+    int fixed_table_selector,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kHeadDim = 512;
+  constexpr int kRopeDim = 64;
+  constexpr int kRopeStart = kHeadDim - kRopeDim;
+
+  if (fixed_table_selector <= 0 ||
+      fixed_table_selector > kDsv4MaxResidentRopeTables) {
+    asm volatile("trap;");
+  }
+
+  const int weight_slots = m2c.template pop<0>();
+  const auto *weight = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(weight_slots)));
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  _rms_helper_one_row<kHeadDim, 128, __nv_bfloat16>(
+      weight,
+      input,
+      output,
+      static_cast<float *>(task_scratch),
+      epsilon);
+
+  // RMS writes the BF16 values that the old RoPE task consumed.  Every
+  // compute thread executes this task, so this is a participant-correct
+  // compute barrier; no memory thread or unrelated SM joins it.
+  __sync_compute_group(128);
+  const int tid = __compute_tid();
+  if (tid < kRopeDim / 2) {
+    const int offset = kRopeStart + tid * 2;
+    const float even = __bfloat162float(output[offset]);
+    const float odd = __bfloat162float(output[offset + 1]);
+    const float *table = dsv4_resident_rope_table(
+        smem_base, fixed_table_selector - 1);
+    const float cosine = table[tid * 2];
+    const float sine = table[tid * 2 + 1];
+    output[offset] = __float2bfloat16(even * cosine - odd * sine);
+    output[offset + 1] = __float2bfloat16(even * sine + odd * cosine);
+  }
+
+  // Publish all in-place rotary writes before the output slot reaches STU.
+  __sync_compute_group(128);
+  c2m.push(tid, input_slots | weight_slots);
+  c2m.template push<0, true>(tid, output_slots);
 }
 
 template <typename M2CQueue, typename C2MQueue>

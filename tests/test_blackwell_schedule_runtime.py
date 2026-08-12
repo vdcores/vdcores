@@ -1023,6 +1023,88 @@ def test_sequential_program_fans_out_and_joins_labeled_stage_groups():
         assert memory[-2].num_slots >> 6 == 1
 
 
+def test_sequential_program_can_select_one_fused_dependency_tail():
+    class FakeLauncher:
+        num_sms = 2
+        num_bars = 0
+        max_insts = 32
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def set_bar(self, bar_id, count):
+            self.bar_values[bar_id] = count
+
+    class FusedStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            store = MemoryInstruction(
+                opcode.OP_ALLOC_WB_STU_STORE_1D,
+                num_slots=1,
+                arg=0,
+                size=16,
+                address=0,
+            )
+            if sm == 0:
+                store.annotation["sequential_dependency_tail"] = True
+            return [Copy(1, 16), store]
+
+    class Consumer(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = SequentialProgram(
+        launcher,
+        (
+            SequentialStage(
+                "fused", FusedStage(), 2, release_group="ready"
+            ),
+            SequentialStage(
+                "consumer", Consumer(), 2, wait_group="ready"
+            ),
+        ),
+    )
+
+    assert launcher.bar_values == {0: 1}
+    producer_stores = [
+        next(
+            inst
+            for inst in program.instructions[sm]
+            if isinstance(inst, MemoryInstruction)
+            and inst.opcode & 0x2
+        )
+        for sm in range(2)
+    ]
+    assert producer_stores[0].opcode & 0x10
+    assert not producer_stores[1].opcode & 0x10
+
+
 def test_sequential_program_rejects_wait_group_without_producer():
     class FakeLauncher:
         num_sms = 1

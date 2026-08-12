@@ -89,6 +89,19 @@ def _attach_bar(inst: MemoryInstruction, bar_id: int, *, stage: str) -> None:
 
 
 def _writeback_tail(per_sm: list[list], stage: str) -> tuple[int, list[MemoryInstruction]]:
+    marked_tails = [
+        inst
+        for instructions in per_sm
+        for inst in instructions
+        if (
+            isinstance(inst, MemoryInstruction)
+            and inst.opcode & _MEM_WRITEBACK
+            and inst.annotation.get("sequential_dependency_tail", False)
+        )
+    ]
+    if marked_tails:
+        return len(marked_tails), marked_tails
+
     tails = []
     for instructions in per_sm:
         if not instructions:
