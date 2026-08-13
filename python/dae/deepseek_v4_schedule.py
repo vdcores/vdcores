@@ -107,8 +107,8 @@ class DeepSeekV4ShapePolicy:
         else:
             raise ValueError(f"no validated split-K policy for M={rows} K={k}")
         k_tiles = k // 128
-        if k_tiles % split_k or (k_tiles // split_k) % 4:
-            raise ValueError("split-K policy must preserve four-tile activation chunks")
+        if k_tiles % split_k:
+            raise ValueError("split-K policy must divide K tiles")
         return split_k, min(self.resident_sms, rows // 128 * split_k)
 
     def nvfp4_gemv(self, rows: int, k: int) -> ShapeAssignment:

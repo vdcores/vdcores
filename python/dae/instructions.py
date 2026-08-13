@@ -265,6 +265,35 @@ class Fp8GemvUmmaSplitKSm100(ComputeInstruction):
         )
 
 
+class Fp8GemvUmmaStreamRawScaleSm100(ComputeInstruction):
+    """Stream compact FP8 weights and populate SFA TMEM from a raw scale."""
+
+    def __init__(self, k_tiles: int):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("FP8 UMMA K-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_FP8_GEMV_UMMA_STREAM_RAW_SCALE_SM100,
+            args=[k_tiles],
+        )
+
+
+class Fp8GemvUmmaSplitKRawScaleSm100(ComputeInstruction):
+    """Emit an M128 partial while compute loads compact weight scales."""
+
+    BF16_BYTES = 2
+    FP32_BYTES = 4
+
+    def __init__(self, k_tiles: int, reduction_bytes: int = FP32_BYTES):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("split-K FP8 UMMA K-tile count must fit uint16")
+        if reduction_bytes not in (self.BF16_BYTES, self.FP32_BYTES):
+            raise ValueError("split-K reduction must use BF16 or FP32")
+        super().__init__(
+            opcode=opcode.OP_FP8_GEMV_UMMA_SPLITK_RAW_SCALE_SM100,
+            args=[k_tiles, reduction_bytes],
+        )
+
+
 class Fp8UmmaPrepackSm100(ComputeInstruction):
     """Pack checkpoint FP8 data and block-128 scales for native UMMA."""
 
@@ -300,6 +329,84 @@ class Dsv4Fp8QuantUmmaBSm100(ComputeInstruction):
         )
 
 
+class Dsv4InverseRopeFp8QuantUmmaBSm100(ComputeInstruction):
+    """Inverse partial RoPE and native N8/K128 FP8 packing for one head."""
+
+    def __init__(self):
+        super().__init__(
+            opcode=opcode.OP_DSV4_INV_ROPE_FP8_QUANT_UMMA_B_SM100,
+            args=[],
+        )
+
+
+class Dsv4RmsFp8QuantUmmaBSm100(ComputeInstruction):
+    """Fuse weighted RMSNorm with native N8/K128 MXF8 packing."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        output_tile_start: int,
+        output_tile_count: int,
+        epsilon: float,
+    ):
+        if not 1 <= k_tiles <= 0xFF:
+            raise ValueError("fused RMS/native-FP8 K-tile count must fit uint8")
+        if not 0 <= output_tile_start < k_tiles:
+            raise ValueError("fused RMS/native-FP8 tile start is out of range")
+        if not 1 <= output_tile_count <= 0xFF:
+            raise ValueError("fused RMS/native-FP8 tile count must fit uint8")
+        if output_tile_start + output_tile_count > k_tiles:
+            raise ValueError("fused RMS/native-FP8 tile shard exceeds K")
+        if epsilon <= 0:
+            raise ValueError("fused RMS/native-FP8 epsilon must be positive")
+        tile_shard = output_tile_start | (output_tile_count << 8)
+        super().__init__(
+            opcode=opcode.OP_DSV4_RMS_FP8_QUANT_UMMA_B_SM100,
+            args=[k_tiles, tile_shard, encode_bfloat16_u16(epsilon)],
+        )
+
+
+class Dsv4Fp32RmsFp8QuantUmmaBSm100(ComputeInstruction):
+    """Normalize an FP32 split-K accumulator and pack native MXF8."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        output_tile_start: int,
+        output_tile_count: int,
+        epsilon: float,
+    ):
+        if not 1 <= k_tiles <= 0xFF:
+            raise ValueError("FP32 RMS/native-FP8 K-tile count must fit uint8")
+        if not 0 <= output_tile_start < k_tiles:
+            raise ValueError("FP32 RMS/native-FP8 tile start is out of range")
+        if not 1 <= output_tile_count <= 0xFF:
+            raise ValueError("FP32 RMS/native-FP8 tile count must fit uint8")
+        if output_tile_start + output_tile_count > k_tiles:
+            raise ValueError("FP32 RMS/native-FP8 tile shard exceeds K")
+        if epsilon <= 0:
+            raise ValueError("FP32 RMS/native-FP8 epsilon must be positive")
+        tile_shard = output_tile_start | (output_tile_count << 8)
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP32_RMS_FP8_QUANT_UMMA_B_SM100,
+            args=[k_tiles, tile_shard, encode_bfloat16_u16(epsilon)],
+        )
+
+
+class Dsv4Bf16GemvGroup4SplitKSm100(ComputeInstruction):
+    """Reuse one BF16 activation across four M128 split-K outputs."""
+
+    def __init__(self, k_tiles: int):
+        if not 1 <= k_tiles <= 0xFFFF or k_tiles % 4:
+            raise ValueError(
+                "grouped BF16 split-K tile count must be a positive multiple of four"
+            )
+        super().__init__(
+            opcode=opcode.OP_DSV4_BF16_GEMV_GROUP4_SPLITK_SM100,
+            args=[k_tiles],
+        )
+
+
 class Dsv4PreloadRopeTables(ComputeInstruction):
     def __init__(self, num_tables: int):
         if num_tables <= 0 or num_tables > 4:
@@ -331,15 +438,63 @@ class Dsv4Rope512_64(ComputeInstruction):
         )
 
 
-class Dsv4KvRmsRope512(ComputeInstruction):
-    """Finalize a BF16 KV projection with learned RMS and partial RoPE."""
+class Dsv4RmsRope512_64(ComputeInstruction):
+    """Fuse one 512-wide RMSNorm row with its 64-wide rotary suffix."""
 
-    def __init__(self, epsilon: float, fixed_table_id: int):
-        if not 0 <= fixed_table_id < 4:
+    def __init__(
+        self,
+        *,
+        weighted: bool,
+        epsilon: float,
+        fixed_table_id: int | None = None,
+    ):
+        if epsilon <= 0:
+            raise ValueError("fused RMS/RoPE epsilon must be positive")
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
             raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
         super().__init__(
-            opcode=opcode.OP_DSV4_KV_RMS_ROPE_512,
-            args=[encode_bfloat16_u16(epsilon), fixed_table_id + 1],
+            opcode=opcode.OP_DSV4_RMS_ROPE_512_64,
+            args=[
+                int(weighted),
+                0 if fixed_table_id is None else fixed_table_id + 1,
+                encode_bfloat16_u16(epsilon),
+            ],
+        )
+
+
+class Dsv4Fp32RmsRope512_64(ComputeInstruction):
+    """Fuse an FP32 split-K finalizer, RMSNorm, and 512/64 RoPE."""
+
+    def __init__(
+        self,
+        *,
+        weighted: bool,
+        epsilon: float,
+        fixed_table_id: int | None = None,
+    ):
+        if epsilon <= 0:
+            raise ValueError("FP32 fused RMS/RoPE epsilon must be positive")
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP32_RMS_ROPE_512_64,
+            args=[
+                int(weighted),
+                0 if fixed_table_id is None else fixed_table_id + 1,
+                encode_bfloat16_u16(epsilon),
+            ],
+        )
+
+
+class Dsv4Fp32RopeHadamard128(ComputeInstruction):
+    """Fuse an FP32 split-K finalizer with index RoPE and Hadamard."""
+
+    def __init__(self, fixed_table_id: int | None = None):
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP32_ROPE_HADAMARD_128,
+            args=[0 if fixed_table_id is None else fixed_table_id + 1],
         )
 
 
@@ -410,6 +565,32 @@ class Dsv4ContiguousAttention512UmmaTail32Sm100(ComputeInstruction):
         )
 
 
+class Dsv4AttentionSplit32UmmaSm100(ComputeInstruction):
+    """Produce one all-head K32 UMMA attention partial."""
+
+    def __init__(self, active_tokens: int):
+        if not 1 <= active_tokens <= 32:
+            raise ValueError("K32 attention split must contain 1..32 tokens")
+        super().__init__(
+            opcode=opcode.OP_DSV4_ATTENTION_SPLIT32_UMMA_SM100,
+            args=[active_tokens],
+        )
+
+
+class Dsv4AttentionSplitReduceFp8Sm100(ComputeInstruction):
+    """Merge attention partials and emit inverse-RoPE native FP8."""
+
+    def __init__(self, num_splits: int, head: int):
+        if not 1 <= num_splits <= 24:
+            raise ValueError("attention reducer split count must be in [1,24]")
+        if not 0 <= head < 64:
+            raise ValueError("attention reducer head must be in [0,64)")
+        super().__init__(
+            opcode=opcode.OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100,
+            args=[num_splits, head],
+        )
+
+
 class Dsv4RouteTop6(ComputeInstruction):
     def __init__(self, hash_routing: bool, route_scale: float = 1.5):
         if route_scale <= 0:
@@ -458,6 +639,29 @@ class Dsv4HcPre(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_DSV4_HC_PRE,
             args=[sinkhorn_iters, encode_bfloat16_u16(epsilon)],
+        )
+
+
+class Dsv4HcPreRms(ComputeInstruction):
+    def __init__(
+        self,
+        sinkhorn_iters: int = 20,
+        epsilon: float = 1.0e-6,
+        rms_epsilon: float = 1.0e-6,
+    ):
+        if sinkhorn_iters <= 0 or sinkhorn_iters > 0xFFFF:
+            raise ValueError(
+                "fused mHC/RMS Sinkhorn iterations must fit uint16"
+            )
+        if epsilon <= 0 or rms_epsilon <= 0:
+            raise ValueError("fused mHC/RMS epsilons must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_HC_PRE_RMS,
+            args=[
+                sinkhorn_iters,
+                encode_bfloat16_u16(epsilon),
+                encode_bfloat16_u16(rms_epsilon),
+            ],
         )
 
 
@@ -516,6 +720,48 @@ class Dsv4GatedPool(ComputeInstruction):
         )
 
 
+class Dsv4GatedPoolRmsRope(ComputeInstruction):
+    """Fuse scalar gated pooling, weighted RMSNorm, RoPE, and Hadamard."""
+
+    def __init__(
+        self,
+        pool_rows: int,
+        width: int,
+        *,
+        tail_bias: bool,
+        hadamard: bool,
+        epsilon: float,
+        fixed_table_id: int | None = None,
+    ):
+        if pool_rows <= 0 or pool_rows > 0xFFFF:
+            raise ValueError("fused gated-pool rows must fit uint16")
+        if width not in (128, 512):
+            raise ValueError("fused gated-pool width must be 128 or 512")
+        if hadamard and width != 128:
+            raise ValueError("fused gated-pool Hadamard requires width 128")
+        if epsilon <= 0:
+            raise ValueError("fused gated-pool RMS epsilon must be positive")
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        fixed_table_selector = (
+            0 if fixed_table_id is None else fixed_table_id + 1
+        )
+        config = (
+            int(width == 512)
+            | (int(tail_bias) << 1)
+            | (int(hadamard) << 2)
+            | (fixed_table_selector << 3)
+        )
+        super().__init__(
+            opcode=opcode.OP_DSV4_GATED_POOL_RMS_ROPE,
+            args=[
+                pool_rows,
+                config,
+                encode_bfloat16_u16(epsilon),
+            ],
+        )
+
+
 class Dsv4GatedPoolPacked8Shard128(ComputeInstruction):
     def __init__(self, history_rows: int):
         if history_rows <= 0 or history_rows > 0xFFFF:
@@ -523,6 +769,66 @@ class Dsv4GatedPoolPacked8Shard128(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_DSV4_GATED_POOL_PACKED8_SHARD128,
             args=[history_rows],
+        )
+
+
+class Dsv4GatedPoolPacked8RmsPartial(ComputeInstruction):
+    def __init__(self, history_rows: int):
+        if history_rows <= 0 or history_rows > 0xFFFF:
+            raise ValueError(
+                "packed pool/RMS history rows must fit uint16"
+            )
+        super().__init__(
+            opcode=opcode.OP_DSV4_GATED_POOL_PACKED8_RMS_PARTIAL,
+            args=[history_rows],
+        )
+
+
+class Dsv4GatedPoolPacked8HistoryState(ComputeInstruction):
+    """Pool immutable packed history into stable FP32 softmax state."""
+
+    def __init__(self, history_rows: int):
+        if history_rows <= 0 or history_rows > 0xFFFF:
+            raise ValueError(
+                "packed history-state rows must fit in uint16"
+            )
+        super().__init__(
+            opcode=opcode.OP_DSV4_GATED_POOL_PACKED8_HISTORY_STATE,
+            args=[history_rows],
+        )
+
+
+class Dsv4GatedPoolTailRmsPartial(ComputeInstruction):
+    """Merge the projected tail and publish pooled FP32 RMS partials."""
+
+    def __init__(self):
+        super().__init__(
+            opcode=opcode.OP_DSV4_GATED_POOL_TAIL_RMS_PARTIAL,
+            args=[],
+        )
+
+
+class Dsv4Fp32RmsRopeShard128(ComputeInstruction):
+    def __init__(
+        self,
+        shard: int,
+        *,
+        epsilon: float,
+        fixed_table_id: int | None = None,
+    ):
+        if not 0 <= shard < 4:
+            raise ValueError("FP32 RMS/RoPE shard must be in [0,4)")
+        if epsilon <= 0:
+            raise ValueError("FP32 RMS/RoPE shard epsilon must be positive")
+        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP32_RMS_ROPE_SHARD128,
+            args=[
+                shard,
+                0 if fixed_table_id is None else fixed_table_id + 1,
+                encode_bfloat16_u16(epsilon),
+            ],
         )
 
 
@@ -2260,15 +2566,24 @@ __all__ = [
     "Fp8Block128GemvBf16Sm100",
     "Fp8GemvUmmaStreamSm100",
     "Fp8GemvUmmaSplitKSm100",
+    "Fp8GemvUmmaStreamRawScaleSm100",
+    "Fp8GemvUmmaSplitKRawScaleSm100",
     "Fp8UmmaPrepackSm100",
+    "Dsv4RmsFp8QuantUmmaBSm100",
+    "Dsv4Fp32RmsFp8QuantUmmaBSm100",
+    "Dsv4Bf16GemvGroup4SplitKSm100",
     "Dsv4PreloadRopeTables",
     "Dsv4Rope512_64",
-    "Dsv4KvRmsRope512",
+    "Dsv4RmsRope512_64",
+    "Dsv4Fp32RmsRope512_64",
+    "Dsv4Fp32RopeHadamard128",
     "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
     "Dsv4ContiguousAttention512Block4",
     "Dsv4ContiguousAttention512UmmaSm100",
     "Dsv4ContiguousAttention512UmmaTail32Sm100",
+    "Dsv4AttentionSplit32UmmaSm100",
+    "Dsv4AttentionSplitReduceFp8Sm100",
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",
@@ -2276,12 +2591,18 @@ __all__ = [
     "Dsv4Fp32ToBf16",
     "Dsv4Bf16Gemv",
     "Dsv4HcPre",
+    "Dsv4HcPreRms",
     "Dsv4HcPost",
     "Dsv4SiluClampMul2048",
     "Dsv4SiluClampMul128",
     "Dsv4Hadamard",
     "Dsv4GatedPool",
+    "Dsv4GatedPoolRmsRope",
     "Dsv4GatedPoolPacked8Shard128",
+    "Dsv4GatedPoolPacked8RmsPartial",
+    "Dsv4GatedPoolPacked8HistoryState",
+    "Dsv4GatedPoolTailRmsPartial",
+    "Dsv4Fp32RmsRopeShard128",
     "Dsv4IndexScore",
     "Dsv4TopK512",
     "Dsv4HcHead",
@@ -2289,6 +2610,7 @@ __all__ = [
     "Dsv4Nvfp4Quant16",
     "Dsv4Nvfp4QuantUmmaBSm100",
     "Dsv4Fp8QuantUmmaBSm100",
+    "Dsv4InverseRopeFp8QuantUmmaBSm100",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
     "Gemv_M128N8Direct4",

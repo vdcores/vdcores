@@ -1,7 +1,6 @@
 #pragma once
 
 #include "context.cuh"
-#include "rms_norm.cuh"
 #include "type.cuh"
 #include "virtualcore.cuh"
 
@@ -213,67 +212,6 @@ __device__ __forceinline__ float *dsv4_resident_rope_table(
       table_id * kDsv4RopeTableBytes);
 }
 
-// Complete a BF16 split-K KV projection without materializing independent
-// RMS or RoPE stages.  The input is the fully reduced 512-wide projection.
-// The existing RMS helper deliberately preserves its BF16 accumulation and
-// multiply boundaries; RoPE then consumes that BF16 result in place.
-template <typename M2CQueue, typename C2MQueue>
-__device__ __forceinline__ void task_dsv4_kv_rms_rope_512(
-    __nv_bfloat16 epsilon,
-    int fixed_table_selector,
-    void *smem_base,
-    void *task_scratch,
-    M2CQueue &m2c,
-    C2MQueue &c2m) {
-  constexpr int kHeadDim = 512;
-  constexpr int kRopeDim = 64;
-  constexpr int kRopeStart = kHeadDim - kRopeDim;
-
-  if (fixed_table_selector <= 0 ||
-      fixed_table_selector > kDsv4MaxResidentRopeTables) {
-    asm volatile("trap;");
-  }
-
-  const int weight_slots = m2c.template pop<0>();
-  const auto *weight = static_cast<const __nv_bfloat16 *>(
-      get_slot_address(smem_base, extract(weight_slots)));
-  const int input_slots = m2c.template pop<0>();
-  const auto *input = static_cast<const __nv_bfloat16 *>(
-      get_slot_address(smem_base, extract(input_slots)));
-  const int output_slots = m2c.template pop<0>();
-  auto *output = static_cast<__nv_bfloat16 *>(
-      get_slot_address(smem_base, extract(output_slots)));
-
-  _rms_helper_one_row<kHeadDim, 128, __nv_bfloat16>(
-      weight,
-      input,
-      output,
-      static_cast<float *>(task_scratch),
-      epsilon);
-
-  // RMS writes the BF16 values that the old RoPE task consumed.  Every
-  // compute thread executes this task, so this is a participant-correct
-  // compute barrier; no memory thread or unrelated SM joins it.
-  __sync_compute_group(128);
-  const int tid = __compute_tid();
-  if (tid < kRopeDim / 2) {
-    const int offset = kRopeStart + tid * 2;
-    const float even = __bfloat162float(output[offset]);
-    const float odd = __bfloat162float(output[offset + 1]);
-    const float *table = dsv4_resident_rope_table(
-        smem_base, fixed_table_selector - 1);
-    const float cosine = table[tid * 2];
-    const float sine = table[tid * 2 + 1];
-    output[offset] = __float2bfloat16(even * cosine - odd * sine);
-    output[offset + 1] = __float2bfloat16(even * sine + odd * cosine);
-  }
-
-  // Publish all in-place rotary writes before the output slot reaches STU.
-  __sync_compute_group(128);
-  c2m.push(tid, input_slots | weight_slots);
-  c2m.template push<0, true>(tid, output_slots);
-}
-
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_preload_rope_tables(
     int num_tables,
@@ -362,6 +300,294 @@ __device__ __forceinline__ void task_dsv4_rope_64(
     output[row * kHeadDim + dim] = input[row * kHeadDim + dim];
   }
 
+  __sync_compute_group(128);
+  c2m.push(tid, input_slots | table_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+// Decode-specialized attention epilogue.  One resident compute group owns one
+// 512-wide row, keeps normalization in FP32 scratch, and applies the partial
+// rotary transform before the only BF16 write.  Q rows omit the weight load;
+// KV/cache rows consume the learned 512-wide RMS weight.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_rms_rope_512_64(
+    bool weighted,
+    int fixed_table_selector,
+    __nv_bfloat16 epsilon,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kHeadDim = 512;
+  constexpr int kRopeDim = 64;
+  constexpr int kRopeStart = kHeadDim - kRopeDim;
+  constexpr int kValuesPerThread = kHeadDim / 128;
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  int weight_slots = 0;
+  const __nv_bfloat16 *weight = nullptr;
+  if (weighted) {
+    weight_slots = m2c.template pop<0>();
+    weight = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(weight_slots)));
+  }
+  int table_slots = 0;
+  const float *table = nullptr;
+  if (fixed_table_selector == 0) {
+    table_slots = m2c.template pop<0>();
+    table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+  } else {
+    if (fixed_table_selector > kDsv4MaxResidentRopeTables) {
+      asm volatile("trap;");
+    }
+    table = dsv4_resident_rope_table(
+        smem_base, fixed_table_selector - 1);
+  }
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *normalized = static_cast<float *>(task_scratch);
+  auto *reduction = normalized + kHeadDim;
+
+  float sum = 0.0f;
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    const float value = __bfloat162float(input[dim]);
+    normalized[dim] = value;
+    sum = fmaf(value, value, sum);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFFU, sum, offset);
+  }
+  if (lane == 0) {
+    reduction[warp] = sum;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    const float total = reduction[0] + reduction[1] +
+                        reduction[2] + reduction[3];
+    reduction[4] = rsqrtf(
+        total / float(kHeadDim) + __bfloat162float(epsilon));
+  }
+  __sync_compute_group(128);
+
+  const float rms_rcp = reduction[4];
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    float value = normalized[dim] * rms_rcp;
+    if (weighted) {
+      value *= __bfloat162float(weight[dim]);
+    }
+    normalized[dim] = value;
+  }
+  __sync_compute_group(128);
+
+  if (tid < kRopeDim / 2) {
+    const int offset = kRopeStart + tid * 2;
+    const float even = normalized[offset];
+    const float odd = normalized[offset + 1];
+    const float cosine = table[tid * 2];
+    const float sine = table[tid * 2 + 1];
+    normalized[offset] = even * cosine - odd * sine;
+    normalized[offset + 1] = even * sine + odd * cosine;
+  }
+  __sync_compute_group(128);
+
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    output[dim] = __float2bfloat16(normalized[dim]);
+  }
+  __sync_compute_group(128);
+
+  c2m.push(tid, input_slots | weight_slots | table_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+// Split-K projection epilogue for Q/KV.  The UMMA task reduces directly into
+// FP32 HBM; this task consumes that accumulator once, performs the complete
+// per-head RMS statistic and rotary transform in FP32, and emits only the
+// attention-ready BF16 row.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_fp32_rms_rope_512_64(
+    bool weighted,
+    int fixed_table_selector,
+    __nv_bfloat16 epsilon,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kHeadDim = 512;
+  constexpr int kRopeDim = 64;
+  constexpr int kRopeStart = kHeadDim - kRopeDim;
+  constexpr int kValuesPerThread = kHeadDim / 128;
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const float *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  int weight_slots = 0;
+  const __nv_bfloat16 *weight = nullptr;
+  if (weighted) {
+    weight_slots = m2c.template pop<0>();
+    weight = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(weight_slots)));
+  }
+  int table_slots = 0;
+  const float *table = nullptr;
+  if (fixed_table_selector == 0) {
+    table_slots = m2c.template pop<0>();
+    table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+  } else {
+    if (fixed_table_selector > kDsv4MaxResidentRopeTables) {
+      asm volatile("trap;");
+    }
+    table = dsv4_resident_rope_table(
+        smem_base, fixed_table_selector - 1);
+  }
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *normalized = static_cast<float *>(task_scratch);
+  auto *reduction = normalized + kHeadDim;
+
+  float sum = 0.0f;
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    const float value = input[dim];
+    normalized[dim] = value;
+    sum = fmaf(value, value, sum);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFFU, sum, offset);
+  }
+  if (lane == 0) {
+    reduction[warp] = sum;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    const float total = reduction[0] + reduction[1] +
+                        reduction[2] + reduction[3];
+    reduction[4] = rsqrtf(
+        total / float(kHeadDim) + __bfloat162float(epsilon));
+  }
+  __sync_compute_group(128);
+
+  const float rms_rcp = reduction[4];
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    float value = normalized[dim] * rms_rcp;
+    if (weighted) {
+      value *= __bfloat162float(weight[dim]);
+    }
+    normalized[dim] = value;
+  }
+  __sync_compute_group(128);
+
+  if (tid < kRopeDim / 2) {
+    const int offset = kRopeStart + tid * 2;
+    const float even = normalized[offset];
+    const float odd = normalized[offset + 1];
+    const float cosine = table[tid * 2];
+    const float sine = table[tid * 2 + 1];
+    normalized[offset] = even * cosine - odd * sine;
+    normalized[offset + 1] = even * sine + odd * cosine;
+  }
+  __sync_compute_group(128);
+
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    output[dim] = __float2bfloat16(normalized[dim]);
+  }
+  __sync_compute_group(128);
+
+  c2m.push(tid, input_slots | weight_slots | table_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+// Index-Q split-K epilogue.  RoPE and the normalized Walsh-Hadamard transform
+// stay in one FP32 scratch tile, so neither the raw nor the rotary-only
+// intermediate is materialized in HBM.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_fp32_rope_hadamard_128(
+    int fixed_table_selector,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kWidth = 128;
+  constexpr int kRopeDim = 64;
+  constexpr int kRopeStart = kWidth - kRopeDim;
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const float *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  int table_slots = 0;
+  const float *table = nullptr;
+  if (fixed_table_selector == 0) {
+    table_slots = m2c.template pop<0>();
+    table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+  } else {
+    if (fixed_table_selector > kDsv4MaxResidentRopeTables) {
+      asm volatile("trap;");
+    }
+    table = dsv4_resident_rope_table(
+        smem_base, fixed_table_selector - 1);
+  }
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  auto *values = static_cast<float *>(task_scratch);
+  values[tid] = input[tid];
+  __sync_compute_group(128);
+
+  if (tid < kRopeDim / 2) {
+    const int offset = kRopeStart + tid * 2;
+    const float even = values[offset];
+    const float odd = values[offset + 1];
+    const float cosine = table[tid * 2];
+    const float sine = table[tid * 2 + 1];
+    values[offset] = even * cosine - odd * sine;
+    values[offset + 1] = even * sine + odd * cosine;
+  }
+  __sync_compute_group(128);
+
+  for (int stride = 1; stride < kWidth; stride <<= 1) {
+    if (tid < kWidth / 2) {
+      const int group = tid / stride;
+      const int offset = tid - group * stride;
+      const int lhs = group * (stride * 2) + offset;
+      const int rhs = lhs + stride;
+      const float lhs_value = values[lhs];
+      const float rhs_value = values[rhs];
+      values[lhs] = lhs_value + rhs_value;
+      values[rhs] = lhs_value - rhs_value;
+    }
+    __sync_compute_group(128);
+  }
+
+  output[tid] = __float2bfloat16(values[tid] * rsqrtf(float(kWidth)));
   __sync_compute_group(128);
   c2m.push(tid, input_slots | table_slots);
   c2m.template push<31, true, false>(tid, output_slots);
@@ -1038,6 +1264,169 @@ __device__ __forceinline__ void task_dsv4_gated_pool(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
+// Ratio-4 compressor epilogue.  Pooling remains FP32 through weighted RMSNorm,
+// RoPE, and the optional index-cache Hadamard transform; only the final cache
+// row is written to HBM.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_gated_pool_rms_rope(
+    int pool_rows,
+    int width,
+    bool tail_bias,
+    bool hadamard,
+    int fixed_table_selector,
+    __nv_bfloat16 epsilon,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  if ((width != 128 && width != 512) || (hadamard && width != 128)) {
+    asm volatile("trap;");
+  }
+  const int tid = __compute_tid();
+  constexpr int kMaxValuesPerThread = 4;
+  constexpr int kRopeDim = 64;
+  float maximum[kMaxValuesPerThread];
+  float denominator[kMaxValuesPerThread];
+  float numerator[kMaxValuesPerThread];
+#pragma unroll
+  for (int item = 0; item < kMaxValuesPerThread; ++item) {
+    maximum[item] = -__int_as_float(0x7f800000);
+    denominator[item] = 0.0f;
+    numerator[item] = 0.0f;
+  }
+
+  for (int row = 0; row < pool_rows; ++row) {
+    const int values_slots = m2c.template pop<0>();
+    const auto *values = static_cast<const float *>(
+        get_slot_address(smem_base, extract(values_slots)));
+    const int scores_slots = m2c.template pop<0>();
+    const auto *scores = static_cast<const float *>(
+        get_slot_address(smem_base, extract(scores_slots)));
+    int bias_slots = 0;
+    const float *bias = nullptr;
+    if (tail_bias && row + 1 == pool_rows) {
+      bias_slots = m2c.template pop<0>();
+      bias = static_cast<const float *>(
+          get_slot_address(smem_base, extract(bias_slots)));
+    }
+#pragma unroll
+    for (int item = 0; item < kMaxValuesPerThread; ++item) {
+      const int dim = tid + item * 128;
+      if (dim < width) {
+        const float score = scores[dim] +
+            (bias == nullptr ? 0.0f : bias[dim]);
+        const float next_max = fmaxf(maximum[item], score);
+        const float old_scale = __expf(maximum[item] - next_max);
+        const float probability = __expf(score - next_max);
+        denominator[item] =
+            denominator[item] * old_scale + probability;
+        numerator[item] =
+            numerator[item] * old_scale + probability * values[dim];
+        maximum[item] = next_max;
+      }
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, values_slots | scores_slots | bias_slots);
+  }
+
+  const int weight_slots = m2c.template pop<0>();
+  const auto *weight = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(weight_slots)));
+  int table_slots = 0;
+  const float *table = nullptr;
+  if (fixed_table_selector == 0) {
+    table_slots = m2c.template pop<0>();
+    table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+  } else {
+    if (fixed_table_selector > kDsv4MaxResidentRopeTables) {
+      asm volatile("trap;");
+    }
+    table = dsv4_resident_rope_table(
+        smem_base, fixed_table_selector - 1);
+  }
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  auto *values = static_cast<float *>(task_scratch);
+  auto *reduction = values + width;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  float sum = 0.0f;
+#pragma unroll
+  for (int item = 0; item < kMaxValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    if (dim < width) {
+      const float value = numerator[item] / denominator[item];
+      values[dim] = value;
+      sum = fmaf(value, value, sum);
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFFU, sum, offset);
+  }
+  if (lane == 0) {
+    reduction[warp] = sum;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    const float total = reduction[0] + reduction[1] +
+                        reduction[2] + reduction[3];
+    reduction[4] = rsqrtf(
+        total / float(width) + __bfloat162float(epsilon));
+  }
+  __sync_compute_group(128);
+
+  const float rms_rcp = reduction[4];
+#pragma unroll
+  for (int item = 0; item < kMaxValuesPerThread; ++item) {
+    const int dim = tid + item * 128;
+    if (dim < width) {
+      values[dim] =
+          values[dim] * rms_rcp * __bfloat162float(weight[dim]);
+    }
+  }
+  __sync_compute_group(128);
+
+  if (tid < kRopeDim / 2) {
+    const int rope_start = width - kRopeDim;
+    const int offset = rope_start + tid * 2;
+    const float even = values[offset];
+    const float odd = values[offset + 1];
+    const float cosine = table[tid * 2];
+    const float sine = table[tid * 2 + 1];
+    values[offset] = even * cosine - odd * sine;
+    values[offset + 1] = even * sine + odd * cosine;
+  }
+  __sync_compute_group(128);
+
+  if (hadamard) {
+    for (int stride = 1; stride < width; stride <<= 1) {
+      if (tid < width / 2) {
+        const int group = tid / stride;
+        const int offset = tid - group * stride;
+        const int lhs = group * (stride * 2) + offset;
+        const int rhs = lhs + stride;
+        const float lhs_value = values[lhs];
+        const float rhs_value = values[rhs];
+        values[lhs] = lhs_value + rhs_value;
+        values[rhs] = lhs_value - rhs_value;
+      }
+      __sync_compute_group(128);
+    }
+  }
+
+  const float output_scale = hadamard ? rsqrtf(float(width)) : 1.0f;
+  for (int dim = tid; dim < width; dim += 128) {
+    output[dim] = __float2bfloat16(values[dim] * output_scale);
+  }
+  __sync_compute_group(128);
+  c2m.push(tid, weight_slots | table_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
 // Dimension-sharded gated pooling over immutable, prepacked history.  One
 // 8-KiB TMA carries eight rows of both values and scores for 128 dimensions.
 // The dynamic tail remains in its producer layout and is loaded separately;
@@ -1108,6 +1497,302 @@ __device__ __forceinline__ void task_dsv4_gated_pool_packed8_shard128(
       get_slot_address(smem_base, output_slot));
   output[tid] = __float2bfloat16(numerator / denominator);
   __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+// Four-way HCA pooling phase.  Each SM owns 128 dimensions, retains pooled
+// values in FP32, and publishes one exact local sum-of-squares.  The tiny
+// four-scalar join lets the following phase normalize all shards in parallel.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void
+task_dsv4_gated_pool_packed8_rms_partial(
+    int history_rows,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kWidth = 128;
+  constexpr int kRowsPerBlock = 8;
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  float maximum = -__int_as_float(0x7f800000);
+  float denominator = 0.0f;
+  float numerator = 0.0f;
+
+  for (int row_start = 0; row_start < history_rows;
+       row_start += kRowsPerBlock) {
+    const int block_slots = m2c.template pop<0>();
+    const auto *block = static_cast<const float *>(
+        get_slot_address(smem_base, extract(block_slots)));
+    const int remaining = history_rows - row_start;
+    const int block_rows =
+        remaining < kRowsPerBlock ? remaining : kRowsPerBlock;
+#pragma unroll 1
+    for (int row = 0; row < block_rows; ++row) {
+      const float value = block[(row * 2) * kWidth + tid];
+      const float score = block[(row * 2 + 1) * kWidth + tid];
+      const float next_max = fmaxf(maximum, score);
+      const float old_scale = __expf(maximum - next_max);
+      const float probability = __expf(score - next_max);
+      denominator = denominator * old_scale + probability;
+      numerator = numerator * old_scale + probability * value;
+      maximum = next_max;
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, block_slots);
+  }
+
+  const int tail_values_slots = m2c.template pop<0>();
+  const auto *tail_values = static_cast<const float *>(
+      get_slot_address(smem_base, extract(tail_values_slots)));
+  const int tail_scores_slots = m2c.template pop<0>();
+  const auto *tail_scores = static_cast<const float *>(
+      get_slot_address(smem_base, extract(tail_scores_slots)));
+  const int tail_bias_slots = m2c.template pop<0>();
+  const auto *tail_bias = static_cast<const float *>(
+      get_slot_address(smem_base, extract(tail_bias_slots)));
+  const float tail_score = tail_scores[tid] + tail_bias[tid];
+  const float next_max = fmaxf(maximum, tail_score);
+  const float old_scale = __expf(maximum - next_max);
+  const float probability = __expf(tail_score - next_max);
+  denominator = denominator * old_scale + probability;
+  numerator = numerator * old_scale + probability * tail_values[tid];
+  const float pooled = numerator / denominator;
+
+  __sync_compute_group(128);
+  c2m.push(
+      tid, tail_values_slots | tail_scores_slots | tail_bias_slots);
+
+  const int pooled_slots = m2c.template pop<0>();
+  auto *pooled_output = static_cast<float *>(
+      get_slot_address(smem_base, extract(pooled_slots)));
+  const int partial_slots = m2c.template pop<0>();
+  auto *partial_output = static_cast<float *>(
+      get_slot_address(smem_base, extract(partial_slots)));
+  pooled_output[tid] = pooled;
+
+  float sum = pooled * pooled;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFFU, sum, offset);
+  }
+  auto *warp_sums = static_cast<float *>(task_scratch);
+  if (lane == 0) {
+    warp_sums[warp] = sum;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    partial_output[0] =
+        warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+  }
+  __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, pooled_slots);
+  c2m.template push<31, true, false>(tid, partial_slots);
+}
+
+// HCA history is immutable for the current decode step and does not depend on
+// the current-token compressor projection.  Preserve its numerically stable
+// online-softmax state so it can run on a disjoint SM band while wkv/wgate is
+// still producing the tail.  Each update needs one exponential: a new maximum
+// makes the new row's probability exactly one, while an old maximum makes the
+// existing accumulator scale exactly one.
+__device__ __forceinline__ void dsv4_gated_pool_online_update(
+    float value,
+    float score,
+    float &maximum,
+    float &denominator,
+    float &numerator) {
+  if (score > maximum) {
+    const float old_scale = __expf(maximum - score);
+    denominator = denominator * old_scale + 1.0f;
+    numerator = numerator * old_scale + value;
+    maximum = score;
+  } else {
+    const float probability = __expf(score - maximum);
+    denominator += probability;
+    numerator = fmaf(probability, value, numerator);
+  }
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void
+task_dsv4_gated_pool_packed8_history_state(
+    int history_rows,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kWidth = 128;
+  constexpr int kRowsPerBlock = 8;
+  const int tid = __compute_tid();
+  float maximum = -__int_as_float(0x7f800000);
+  float denominator = 0.0f;
+  float numerator = 0.0f;
+
+  for (int row_start = 0; row_start < history_rows;
+       row_start += kRowsPerBlock) {
+    const int block_slots = m2c.template pop<0>();
+    const auto *block = static_cast<const float *>(
+        get_slot_address(smem_base, extract(block_slots)));
+    const int remaining = history_rows - row_start;
+    const int block_rows =
+        remaining < kRowsPerBlock ? remaining : kRowsPerBlock;
+#pragma unroll 1
+    for (int row = 0; row < block_rows; ++row) {
+      dsv4_gated_pool_online_update(
+          block[(row * 2) * kWidth + tid],
+          block[(row * 2 + 1) * kWidth + tid],
+          maximum,
+          denominator,
+          numerator);
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, block_slots);
+  }
+
+  const int state_slots = m2c.template pop<0>();
+  auto *state = static_cast<float *>(
+      get_slot_address(smem_base, extract(state_slots)));
+  state[tid] = maximum;
+  state[kWidth + tid] = denominator;
+  state[2 * kWidth + tid] = numerator;
+  __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, state_slots);
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_gated_pool_tail_rms_partial(
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kWidth = 128;
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  const int state_slots = m2c.template pop<0>();
+  const auto *state = static_cast<const float *>(
+      get_slot_address(smem_base, extract(state_slots)));
+  float maximum = state[tid];
+  float denominator = state[kWidth + tid];
+  float numerator = state[2 * kWidth + tid];
+
+  const int tail_values_slots = m2c.template pop<0>();
+  const auto *tail_values = static_cast<const float *>(
+      get_slot_address(smem_base, extract(tail_values_slots)));
+  const int tail_scores_slots = m2c.template pop<0>();
+  const auto *tail_scores = static_cast<const float *>(
+      get_slot_address(smem_base, extract(tail_scores_slots)));
+  const int tail_bias_slots = m2c.template pop<0>();
+  const auto *tail_bias = static_cast<const float *>(
+      get_slot_address(smem_base, extract(tail_bias_slots)));
+  dsv4_gated_pool_online_update(
+      tail_values[tid],
+      tail_scores[tid] + tail_bias[tid],
+      maximum,
+      denominator,
+      numerator);
+  const float pooled = numerator / denominator;
+
+  __sync_compute_group(128);
+  c2m.push(
+      tid,
+      state_slots | tail_values_slots | tail_scores_slots | tail_bias_slots);
+
+  const int pooled_slots = m2c.template pop<0>();
+  auto *pooled_output = static_cast<float *>(
+      get_slot_address(smem_base, extract(pooled_slots)));
+  const int partial_slots = m2c.template pop<0>();
+  auto *partial_output = static_cast<float *>(
+      get_slot_address(smem_base, extract(partial_slots)));
+  pooled_output[tid] = pooled;
+
+  float sum = pooled * pooled;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFFU, sum, offset);
+  }
+  auto *warp_sums = static_cast<float *>(task_scratch);
+  if (lane == 0) {
+    warp_sums[warp] = sum;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    partial_output[0] =
+        warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+  }
+  __sync_compute_group(128);
+  c2m.template push<31, true, false>(tid, pooled_slots);
+  c2m.template push<31, true, false>(tid, partial_slots);
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_fp32_rms_rope_shard128(
+    int shard,
+    int fixed_table_selector,
+    __nv_bfloat16 epsilon,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kShardWidth = 128;
+  constexpr int kFullWidth = 512;
+  constexpr int kRopeDim = 64;
+  if (shard < 0 || shard >= kFullWidth / kShardWidth) {
+    asm volatile("trap;");
+  }
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const float *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int partial_slots = m2c.template pop<0>();
+  const auto *partials = static_cast<const float *>(
+      get_slot_address(smem_base, extract(partial_slots)));
+  const int weight_slots = m2c.template pop<0>();
+  const auto *weight = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(weight_slots)));
+  int table_slots = 0;
+  const float *table = nullptr;
+  if (fixed_table_selector == 0) {
+    table_slots = m2c.template pop<0>();
+    table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+  } else {
+    if (fixed_table_selector > kDsv4MaxResidentRopeTables) {
+      asm volatile("trap;");
+    }
+    table = dsv4_resident_rope_table(
+        smem_base, fixed_table_selector - 1);
+  }
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  const float total =
+      partials[0] + partials[1] + partials[2] + partials[3];
+  const float rms_rcp = rsqrtf(
+      total / float(kFullWidth) + __bfloat162float(epsilon));
+  auto *values = static_cast<float *>(task_scratch);
+  values[tid] =
+      input[tid] * rms_rcp * __bfloat162float(weight[tid]);
+  __sync_compute_group(128);
+
+  if (shard == 3 && tid < kRopeDim / 2) {
+    const int offset = kShardWidth - kRopeDim + tid * 2;
+    const float even = values[offset];
+    const float odd = values[offset + 1];
+    const float cosine = table[tid * 2];
+    const float sine = table[tid * 2 + 1];
+    values[offset] = even * cosine - odd * sine;
+    values[offset + 1] = even * sine + odd * cosine;
+  }
+  __sync_compute_group(128);
+  output[tid] = __float2bfloat16(values[tid]);
+  __sync_compute_group(128);
+
+  c2m.push(tid, input_slots | partial_slots | weight_slots | table_slots);
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
@@ -1197,6 +1882,62 @@ __device__ __forceinline__ void task_dsv4_topk512(
   constexpr int kSortSize = 1024;
   constexpr int kRetained = 512;
   const int tid = __compute_tid();
+  const int lane = tid & 31;
+
+  // Decode starts with at most 32 compressed CSA rows.  Sorting those rows in
+  // the generic 1024-item shared-memory network spends 55 synchronization
+  // phases on padding.  Keep this exact small-row path entirely in one warp;
+  // all four compute warps still participate in the queue hand-off.
+  if (rows <= 32) {
+    const int scores_slots = m2c.template pop<0>();
+    const int scores_slot = extract(scores_slots);
+    const float *scores = static_cast<const float *>(
+        get_slot_address(smem_base, scores_slot));
+    const int output_slots = m2c.template pop<0>();
+    const int output_slot = extract(output_slots);
+    auto *output = static_cast<int *>(
+        get_slot_address(smem_base, output_slot));
+
+    if (tid < 32) {
+      constexpr unsigned kWarpMask = 0xFFFFFFFFU;
+      float score = lane < rows
+          ? scores[lane]
+          : -__int_as_float(0x7f800000);
+      int index = lane < rows ? lane : -1;
+#pragma unroll
+      for (int width = 2; width <= 32; width <<= 1) {
+#pragma unroll
+        for (int stride = width >> 1; stride > 0; stride >>= 1) {
+          const float peer_score = __shfl_xor_sync(
+              kWarpMask, score, stride);
+          const int peer_index = __shfl_xor_sync(
+              kWarpMask, index, stride);
+          const bool peer_less =
+              peer_score < score ||
+              (peer_score == score && peer_index < index);
+          const bool self_less =
+              score < peer_score ||
+              (score == peer_score && index < peer_index);
+          const bool ascending = (lane & width) == 0;
+          const bool lower_lane = (lane & stride) == 0;
+          const bool choose_min = ascending == lower_lane;
+          if ((choose_min && peer_less) || (!choose_min && self_less)) {
+            score = peer_score;
+            index = peer_index;
+          }
+        }
+      }
+      const int selected = __shfl_sync(kWarpMask, index, 31 - lane);
+      if (lane < topk) {
+        output[lane] = selected + index_offset;
+      }
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, scores_slots);
+    c2m.template push<31, true, false>(tid, output_slots);
+    return;
+  }
+
   auto *sort_scores = static_cast<float *>(task_scratch);
   auto *sort_indices = reinterpret_cast<int *>(sort_scores + kSortSize);
 
@@ -1354,10 +2095,11 @@ __device__ __forceinline__ void task_dsv4_hc_head(
 
 // Convert 24 mHC projection values into pre/post/comb coefficients and form
 // the pre-branch 4096-wide hidden vector.  The residual is [4,4096].
-template <typename M2CQueue, typename C2MQueue>
+template <bool FuseRms, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hc_pre(
     int sinkhorn_iters,
     float epsilon,
+    __nv_bfloat16 rms_epsilon,
     void *smem_base,
     void *task_scratch,
     M2CQueue &m2c,
@@ -1381,6 +2123,13 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   const int base_slot = extract(base_slots);
   const auto *base = static_cast<const float *>(
       get_slot_address(smem_base, base_slot));
+  int norm_weight_slots = 0;
+  const __nv_bfloat16 *norm_weight = nullptr;
+  if constexpr (FuseRms) {
+    norm_weight_slots = m2c.template pop<0>();
+    norm_weight = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(norm_weight_slots)));
+  }
   const int output_slots = m2c.template pop<0>();
   const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
@@ -1490,20 +2239,65 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   }
   __sync_compute_group(128);
 
-  for (int dim = tid; dim < kHidden; dim += 128) {
-    float value = 0.0f;
+  if constexpr (FuseRms) {
+    // Retain the model's BF16 mHC output boundary locally, then form the RMS
+    // statistic in FP32.  This exactly removes the HBM round trip without
+    // carrying the unrounded mHC value into normalization.
+    auto *hidden = reinterpret_cast<__nv_bfloat16 *>(shared + 64);
+    float hidden_sum = 0.0f;
+    for (int dim = tid; dim < kHidden; dim += 128) {
+      float value = 0.0f;
 #pragma unroll
-    for (int branch = 0; branch < kHc; ++branch) {
-      value = fmaf(
-          pre[branch],
-          __bfloat162float(residual[branch * kHidden + dim]),
-          value);
+      for (int branch = 0; branch < kHc; ++branch) {
+        value = fmaf(
+            pre[branch],
+            __bfloat162float(residual[branch * kHidden + dim]),
+            value);
+      }
+      const __nv_bfloat16 rounded = __float2bfloat16(value);
+      hidden[dim] = rounded;
+      const float hidden_value = __bfloat162float(rounded);
+      hidden_sum = fmaf(hidden_value, hidden_value, hidden_sum);
     }
-    output[dim] = __float2bfloat16(value);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      hidden_sum += __shfl_down_sync(
+          0xFFFFFFFFU, hidden_sum, offset);
+    }
+    if (lane == 0) {
+      warp_reduce[warp] = hidden_sum;
+    }
+    __sync_compute_group(128);
+    if (tid == 0) {
+      const float total = warp_reduce[0] + warp_reduce[1] +
+                          warp_reduce[2] + warp_reduce[3];
+      warp_reduce[4] = rsqrtf(
+          total / float(kHidden) + __bfloat162float(rms_epsilon));
+    }
+    __sync_compute_group(128);
+    const float rms_rcp = warp_reduce[4];
+    for (int dim = tid; dim < kHidden; dim += 128) {
+      output[dim] = __float2bfloat16(
+          __bfloat162float(hidden[dim]) * rms_rcp *
+          __bfloat162float(norm_weight[dim]));
+    }
+  } else {
+    for (int dim = tid; dim < kHidden; dim += 128) {
+      float value = 0.0f;
+#pragma unroll
+      for (int branch = 0; branch < kHc; ++branch) {
+        value = fmaf(
+            pre[branch],
+            __bfloat162float(residual[branch * kHidden + dim]),
+            value);
+      }
+      output[dim] = __float2bfloat16(value);
+    }
   }
 
   __sync_compute_group(128);
-  c2m.push(tid, residual_slots | mixes_slots | scale_slots | base_slots);
+  c2m.push(
+      tid, residual_slots | mixes_slots | scale_slots | base_slots |
+      norm_weight_slots);
   c2m.template push<31, true, false>(tid, output_slots);
   c2m.template push<31, true, false>(tid, post_slots);
   c2m.template push<31, true, false>(tid, comb_slots);

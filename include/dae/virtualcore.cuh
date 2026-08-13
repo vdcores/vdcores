@@ -105,6 +105,19 @@ static __device__ __forceinline__ void * slot_2_glob_ptr(const MInst *st_insts, 
   return glob_ptr;
 }
 
+// Narrow compute-side resolver for explicitly raw-address task contracts.
+// Keeping VM metadata decoding here prevents task kernels from depending on
+// MInst layout while still allowing compute to issue the requested global
+// loads directly.
+struct ComputeRawAddressSlots {
+  const MInst *st_insts;
+
+  template <typename T>
+  __device__ __forceinline__ T *get(uint8_t slot) const {
+    return static_cast<T *>(slot_2_glob_ptr(st_insts, slot));
+  }
+};
+
 // TODO(zhiyuang): do we want to put barrier index in the command?
 // TODO(zhiyuang): do we want to do int32 or 64?
 union LdCmd {

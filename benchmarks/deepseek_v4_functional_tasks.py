@@ -569,14 +569,15 @@ def run_compression_indexer(
         latency_us=score_latency,
     )
 
-    indices = torch.empty((512,), dtype=torch.int32, device=device)
+    topk = min(512, rows)
+    indices = torch.empty((topk,), dtype=torch.int32, device=device)
     topk_latency = launch(
         SchedDsv4TopK512(scores, indices, index_offset=128), 1, device
     )
-    expected_indices = scores.topk(512).indices.to(torch.int32) + 128
+    expected_indices = scores.topk(topk).indices.to(torch.int32) + 128
     torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
     print(
-        "DSV4_FUNCTIONAL task=index_topk512 status=PASS "
+        f"DSV4_FUNCTIONAL task=index_topk512 rows={rows} topk={topk} status=PASS "
         f"max_abs=0.00000000 latency_us={topk_latency:.3f}",
         flush=True,
     )
@@ -808,8 +809,8 @@ def main() -> None:
         parser.error("warmup must be non-negative and iterations must be positive")
     _BENCH_WARMUP = args.warmup
     _BENCH_ITERATIONS = args.iterations
-    if args.index_rows < 512 or args.index_rows > 0xFFFF:
-        parser.error("index rows must be in [512,65535]")
+    if args.index_rows < 1 or args.index_rows > 0xFFFF:
+        parser.error("index rows must be in [1,65535]")
     _INDEX_ROWS = args.index_rows
     if args.attention_topk <= 0 or args.attention_topk > 768:
         parser.error("attention top-k must be in [1,768]")

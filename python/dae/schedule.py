@@ -1279,6 +1279,361 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4InverseRopeFp8QuantUmmaB(Schedule):
+    """Fuse inverse final-64 RoPE with native O_a activation packing."""
+
+    HEAD_DIM = 512
+    K_TILES = 4
+    SCALE_PACK = 2
+    TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(self, input, table, output):
+        super().__init__()
+        self.input = input
+        self.table = table
+        self.output = output
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.bfloat16
+            or self.input.ndim != 2
+            or self.input.shape[1] != self.HEAD_DIM
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("inverse-RoPE/native-FP8 input must be BF16 [H,512]")
+        self.rows = self.input.shape[0]
+        if not 0 < self.num_sms <= self.rows:
+            raise ValueError("inverse-RoPE/native-FP8 requires 1..H SMs")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("inverse-RoPE table must be FP32 [32,2]")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape)
+            != (self.rows, self.K_TILES, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("native O_a input must be uint8 [H,4,2048]")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        instructions = []
+        for row in range(sm, self.rows, self.num_sms):
+            instructions.extend(
+                (
+                    Dsv4InverseRopeFp8QuantUmmaBSm100(),
+                    TmaLoad1D(self.input[row]),
+                    TmaLoad1D(self.table),
+                    TmaStore1D(self.output[row].reshape(-1)).bar(
+                        self._bar("output")
+                    ),
+                )
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.rows)
+
+
+class SchedDsv4RmsFp8QuantUmmaB(Schedule):
+    """Fuse one weighted RMS row with sharded native MXF8 packing."""
+
+    TILE_K = SchedFp8UmmaPrepack.TILE_K
+    TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+    SCALE_PACK = 2
+
+    def __init__(
+        self, input, weight, output, epsilon: float, scale_pack: int = 2
+    ):
+        super().__init__()
+        self.input = input
+        self.weight = weight
+        self.output = output
+        self.epsilon = epsilon
+        self.scale_pack = int(scale_pack)
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.bfloat16
+            or self.input.ndim != 1
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("fused RMS/native-FP8 input must be a BF16 vector")
+        self.k = self.input.numel()
+        if self.k % self.TILE_K:
+            raise ValueError("fused RMS/native-FP8 K must be K128 aligned")
+        if (
+            self.weight.dtype != torch.bfloat16
+            or tuple(self.weight.shape) != (self.k,)
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("fused RMS/native-FP8 weight must be BF16 [K]")
+        if self.epsilon <= 0:
+            raise ValueError("fused RMS/native-FP8 epsilon must be positive")
+        if self.scale_pack != self.SCALE_PACK:
+            raise ValueError("fused RMS/native-FP8 currently selects static pack-2")
+        self.k_tiles = self.k // self.TILE_K
+        if self.k_tiles % self.scale_pack:
+            raise ValueError("fused RMS/native-FP8 K tiles must fit scale packs")
+        self.scale_groups = self.k_tiles // self.scale_pack
+        if not 0 < self.num_sms <= self.scale_groups:
+            raise ValueError("fused RMS/native-FP8 requires 1..scale-groups SMs")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                "fused RMS/native-FP8 output must be uint8 [K/128,2048]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        groups_per_sm, extra = divmod(self.scale_groups, self.num_sms)
+        group_start = sm * groups_per_sm + min(sm, extra)
+        group_count = groups_per_sm + int(sm < extra)
+        tile_start = group_start * self.scale_pack
+        tile_count = group_count * self.scale_pack
+        tile_stop = tile_start + tile_count
+        return [
+            Dsv4RmsFp8QuantUmmaBSm100(
+                self.k_tiles, tile_start, tile_count, self.epsilon
+            ),
+            TmaLoad1D(self.input).fixed_port(1),
+            TmaLoad1D(self.weight).fixed_port(0),
+            TmaStore1D(
+                self.output[tile_start:tile_stop].reshape(-1)
+            ).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4Fp32RmsFp8QuantUmmaB(SchedDsv4RmsFp8QuantUmmaB):
+    """Consume the FP32 split-K accumulator directly before native packing."""
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.float32
+            or self.input.ndim != 1
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError(
+                "FP32 RMS/native-FP8 input must be a contiguous vector"
+            )
+        self.k = self.input.numel()
+        if self.k % self.TILE_K:
+            raise ValueError("FP32 RMS/native-FP8 K must be K128 aligned")
+        if (
+            self.weight.dtype != torch.bfloat16
+            or tuple(self.weight.shape) != (self.k,)
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("FP32 RMS/native-FP8 weight must be BF16 [K]")
+        if self.epsilon <= 0:
+            raise ValueError("FP32 RMS/native-FP8 epsilon must be positive")
+        if self.scale_pack != self.SCALE_PACK:
+            raise ValueError("FP32 RMS/native-FP8 currently selects static pack-2")
+        self.k_tiles = self.k // self.TILE_K
+        if self.k_tiles % self.scale_pack:
+            raise ValueError("FP32 RMS/native-FP8 K tiles must fit scale packs")
+        self.scale_groups = self.k_tiles // self.scale_pack
+        if not 0 < self.num_sms <= self.scale_groups:
+            raise ValueError("FP32 RMS/native-FP8 requires 1..scale-groups SMs")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                "FP32 RMS/native-FP8 output must be uint8 [K/128,2048]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        groups_per_sm, extra = divmod(self.scale_groups, self.num_sms)
+        group_start = sm * groups_per_sm + min(sm, extra)
+        group_count = groups_per_sm + int(sm < extra)
+        tile_start = group_start * self.scale_pack
+        tile_count = group_count * self.scale_pack
+        tile_stop = tile_start + tile_count
+        return [
+            Dsv4Fp32RmsFp8QuantUmmaBSm100(
+                self.k_tiles, tile_start, tile_count, self.epsilon
+            ),
+            TmaLoad1D(self.input).fixed_port(1),
+            TmaLoad1D(self.weight).fixed_port(0),
+            TmaStore1D(
+                self.output[tile_start:tile_stop].reshape(-1)
+            ).bar(self._bar("output")),
+        ]
+
+
+class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
+    """Shard grouped M512 BF16 projection work across K and TMA-reduce FP32."""
+
+    TILE_M = 128
+    TILE_K = 128
+    OUTPUT_GROUPS = 4
+    ACTIVATION_TILES_PER_CHUNK = 4
+
+    def __init__(
+        self,
+        weight,
+        weight_tma,
+        activation,
+        output_reduce,
+        split_k: int,
+        *,
+        layer_indexed_weight=False,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.weight_tma = weight_tma
+        self.activation = activation
+        self.output_reduce = output_reduce
+        self.split_k = int(split_k)
+        self.layer_indexed_weight = bool(layer_indexed_weight)
+
+    def _on_place(self):
+        if (
+            self.weight.dtype != torch.bfloat16
+            or self.weight.ndim not in (2, 3)
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError(
+                "grouped BF16 weight must be contiguous [M,K] or [L,M,K]"
+            )
+        self.rows, self.k = self.weight.shape[-2:]
+        if self.weight.ndim == 2 and self.layer_indexed_weight:
+            raise ValueError(
+                "rank-2 grouped BF16 weight cannot be layer indexed"
+            )
+        if self.weight.ndim == 3 and not self.layer_indexed_weight:
+            raise ValueError(
+                "rank-3 grouped BF16 weight requires layer indexing"
+            )
+        group_rows = self.TILE_M * self.OUTPUT_GROUPS
+        if self.rows % group_rows or self.k % self.TILE_K:
+            raise ValueError("grouped BF16 projection requires M512/K128 alignment")
+        if (
+            self.activation.dtype != torch.bfloat16
+            or self.activation.numel() != self.k
+            or not self.activation.is_contiguous()
+        ):
+            raise ValueError("grouped BF16 activation must be contiguous BF16 [K]")
+        self.k_tiles = self.k // self.TILE_K
+        if (
+            self.split_k <= 0
+            or self.k_tiles % self.split_k
+            or (self.k_tiles // self.split_k) % self.ACTIVATION_TILES_PER_CHUNK
+        ):
+            raise ValueError(
+                "grouped BF16 split-K must preserve four K128 tiles per shard"
+            )
+        self.k_tiles_per_split = self.k_tiles // self.split_k
+        self.m_groups = self.rows // group_rows
+        self.work_items = self.m_groups * self.split_k
+        if not 0 < self.num_sms <= self.work_items:
+            raise ValueError(
+                f"grouped BF16 split-K requires 1..{self.work_items} SMs"
+            )
+        if (
+            getattr(self.weight_tma, "mode", None) != "load"
+            or getattr(self.weight_tma, "mat", None) is not self.weight
+        ):
+            raise ValueError("grouped BF16 weight TMA must load the schedule matrix")
+        output = getattr(self.output_reduce, "mat", None)
+        if (
+            getattr(self.output_reduce, "mode", None) != "reduce"
+            or output is None
+            or output.dtype != torch.float32
+            or tuple(output.shape) != (self.rows // self.TILE_M, self.TILE_M)
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "grouped BF16 output must be row-major FP32 reduce [M/128,128]"
+            )
+
+    def _work_shard(self, sm):
+        work_per_sm, extra = divmod(self.work_items, self.num_sms)
+        work_start = sm * work_per_sm + min(sm, extra)
+        work_count = work_per_sm + int(sm < extra)
+        return work_start, work_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        work_start, work_count = self._work_shard(sm)
+        work_stop = work_start + work_count
+        group_rows = self.TILE_M * self.OUTPUT_GROUPS
+        instructions = []
+        for work in range(work_start, work_stop):
+            split = work // self.m_groups
+            m_group = work % self.m_groups
+            m_start = m_group * group_rows
+            k_start = split * self.k_tiles_per_split
+            k_stop = k_start + self.k_tiles_per_split
+            instructions.append(
+                Dsv4Bf16GemvGroup4SplitKSm100(self.k_tiles_per_split)
+            )
+            for chunk_start in range(
+                k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK
+            ):
+                chunk_stop = chunk_start + self.ACTIVATION_TILES_PER_CHUNK
+                instructions.append(
+                    TmaLoad1D(
+                        self.activation[
+                            chunk_start * self.TILE_K :
+                            chunk_stop * self.TILE_K
+                        ]
+                    ).fixed_port(1)
+                )
+                for k_tile in range(chunk_start, chunk_stop):
+                    if self.weight.ndim == 2:
+                        weight_load = self.weight_tma.cord(
+                            m_start,
+                            k_tile * self.TILE_K,
+                        ).fixed_port(0)
+                        weight_delta = [0, self.TILE_M, 0]
+                    else:
+                        weight_load = self.weight_tma.cord(
+                            0,
+                            m_start,
+                            k_tile * self.TILE_K,
+                        ).fixed_port(0)
+                        flags = weight_load.opcode & ((1 << 6) - 1)
+                        weight_load.opcode = (
+                            opcode.OP_ALLOC_LAYER_TMA_LOAD_4D | flags
+                        )
+                        weight_delta = [0, self.TILE_M, 0, 0]
+                    instructions.extend(
+                        RepeatM.on(
+                            self.OUTPUT_GROUPS,
+                            (weight_load, weight_delta),
+                        )
+                    )
+            store = self.output_reduce.cord(
+                m_start // self.TILE_M, 0
+            )
+            if work + 1 == work_stop:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4ZeroFill(Schedule):
     """Shard an in-queue zero fill over a contiguous tensor."""
 
@@ -1324,90 +1679,6 @@ class SchedDsv4ZeroFill(Schedule):
             LduLoad1D(self.gate).bar(self._bar("gate")),
             TmaStore1D(output).bar(self._bar("output")),
         ]
-
-    def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, self.num_sms)
-
-
-class SchedDsv4ZeroFillMany(Schedule):
-    """Shard one existing reset stage over several contiguous HBM spans."""
-
-    BLOCK_BYTES = 16
-
-    def __init__(self, gate, outputs):
-        super().__init__()
-        self.gate = gate
-        self.outputs = tuple(outputs)
-
-    def _on_place(self):
-        if (
-            self.gate.dtype != torch.uint32
-            or self.gate.numel() != 1
-            or not self.gate.is_contiguous()
-        ):
-            raise ValueError("zero-fill gate must be one contiguous uint32")
-        if not self.outputs:
-            raise ValueError("multi-span zero fill requires at least one output")
-        self.regions = []
-        self.total_blocks = 0
-        for output in self.outputs:
-            if not output.is_contiguous() or output.numel() <= 0:
-                raise ValueError(
-                    "multi-span zero-fill outputs must be nonempty and contiguous"
-                )
-            element_bytes = output.element_size()
-            total_bytes = output.numel() * element_bytes
-            if (
-                total_bytes % self.BLOCK_BYTES
-                or self.BLOCK_BYTES % element_bytes
-            ):
-                raise ValueError(
-                    "multi-span zero-fill outputs must contain complete 16-byte blocks"
-                )
-            blocks = total_bytes // self.BLOCK_BYTES
-            self.regions.append(
-                (output.reshape(-1), blocks, self.BLOCK_BYTES // element_bytes)
-            )
-            self.total_blocks += blocks
-        if not 0 < self.num_sms <= self.total_blocks:
-            raise ValueError(
-                "multi-span zero fill requires 1..total-block-count SMs"
-            )
-
-    def schedule(self, sm):
-        if sm < 0 or sm >= self.num_sms:
-            return []
-        blocks_per_sm, extra = divmod(self.total_blocks, self.num_sms)
-        shard_start = sm * blocks_per_sm + min(sm, extra)
-        shard_stop = shard_start + blocks_per_sm + int(sm < extra)
-        spans = []
-        region_start = 0
-        for output, blocks, elements_per_block in self.regions:
-            region_stop = region_start + blocks
-            block_start = max(shard_start, region_start)
-            block_stop = min(shard_stop, region_stop)
-            if block_start < block_stop:
-                element_start = (block_start - region_start) * elements_per_block
-                element_stop = (block_stop - region_start) * elements_per_block
-                spans.append(output[element_start:element_stop])
-            region_start = region_stop
-
-        instructions = []
-        for index, output in enumerate(spans):
-            output_bytes = output.numel() * output.element_size()
-            store = TmaStore1D(output)
-            if index + 1 == len(spans):
-                store.bar(self._bar("output"))
-            instructions.extend(
-                (
-                    Dsv4ZeroFill(output_bytes),
-                    LduLoad1D(self.gate),
-                    store,
-                )
-            )
-        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -1496,7 +1767,7 @@ class SchedFp8GemvUmmaStream(Schedule):
             or not self.weight_tiles.is_contiguous()
         ):
             raise ValueError(
-                "native FP8 weights must be [M/128,K/128,16896] uint8"
+                "native FP8 weights must use combined 16896-byte M128/K128 tiles"
             )
         self.m_tiles, self.k_tiles, _ = self.weight_tiles.shape
         if not 0 < self.num_sms <= self.m_tiles:
@@ -1638,8 +1909,8 @@ class SchedFp8GemvUmmaSplitK(Schedule):
             or not self.weight_tiles.is_contiguous()
         ):
             raise ValueError(
-                "split-K native FP8 weights must be "
-                "[M/128,K/128,16896] uint8"
+                "split-K native FP8 weights must be combined "
+                "16896-byte M128/K128 tiles"
             )
         self.m_tiles, self.k_tiles, _ = self.weight_tiles.shape
         if self.split_k <= 1 or self.k_tiles % self.split_k:
@@ -1769,93 +2040,6 @@ class SchedFp8GemvUmmaSplitK(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
-
-
-class SchedDsv4KvProjectCache(Schedule):
-    """Split-K KV projection with an in-schedule RMS/RoPE cache epilogue.
-
-    All split-K stores release one memory-only completion counter.  One
-    producer SM then reads the completed BF16 row, performs RMS and partial
-    RoPE, and writes the persistent cache row in place.  Only that final cache
-    store is a dependency tail for downstream attention.
-    """
-
-    def __init__(
-        self,
-        launcher,
-        weight_tiles,
-        activation_tiles,
-        cache_row,
-        rms_weight,
-        split_k: int,
-        epsilon: float,
-        fixed_table_id: int,
-        scale_pack: int = 1,
-    ):
-        super().__init__()
-        self.launcher = launcher
-        self.weight_tiles = weight_tiles
-        self.activation_tiles = activation_tiles
-        self.cache_row = cache_row
-        self.rms_weight = rms_weight
-        self.split_k = int(split_k)
-        self.epsilon = float(epsilon)
-        self.fixed_table_id = int(fixed_table_id)
-        self.scale_pack = int(scale_pack)
-        output_reduce = TmaTensor(
-            launcher, cache_row.reshape(1, -1)
-        ).rowmajor_2d("reduce", 1, 128)
-        self.project = SchedFp8GemvUmmaSplitK(
-            weight_tiles,
-            activation_tiles,
-            output_reduce,
-            self.split_k,
-            self.scale_pack,
-        )
-
-    def _on_place(self):
-        if (
-            self.cache_row.dtype != torch.bfloat16
-            or self.cache_row.numel() != 512
-            or not self.cache_row.is_contiguous()
-        ):
-            raise ValueError("fused KV cache row must be contiguous BF16[512]")
-        if (
-            self.rms_weight.dtype != torch.bfloat16
-            or self.rms_weight.numel() != 512
-            or not self.rms_weight.is_contiguous()
-        ):
-            raise ValueError("fused KV RMS weight must be contiguous BF16[512]")
-        if not 0 <= self.fixed_table_id < 4:
-            raise ValueError("fused KV RoPE table ID must be in [0,4)")
-        if self.launcher.num_bars >= config.max_bars - 2:
-            raise ValueError("fused KV projection exceeds runtime barrier capacity")
-        self.reduce_bar = self.launcher.new_bar(self.num_sms)
-        project = self.project._clone()
-        project.bar("output", self.reduce_bar)
-        self.placed_project = project.place(self.num_sms)
-
-    def schedule(self, sm):
-        if sm < 0 or sm >= self.num_sms:
-            return []
-        instructions = list(self.placed_project.schedule(sm))
-        if sm != 0:
-            return instructions
-
-        cache_store = TmaStore1D(self.cache_row).bar(self._bar("output"))
-        cache_store.annotation["sequential_dependency_tail"] = True
-        instructions.extend([
-            Dsv4KvRmsRope512(self.epsilon, self.fixed_table_id),
-            TmaLoad1D(self.rms_weight).fixed_port(0),
-            TmaLoad1D(self.cache_row).fixed_port(0).bar(self.reduce_bar),
-            cache_store,
-        ])
-        return instructions
-
-    def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, 1)
 
 
 class SchedFp8Block128Gemv(Schedule):
@@ -2071,6 +2255,228 @@ class SchedDsv4Rope512_64(Schedule):
                 )
             )
             instructions.append(TmaLoad1D(self.input[row]))
+            if self.fixed_table_id is None:
+                instructions.append(TmaLoad1D(self.table))
+            instructions.append(
+                TmaStore1D(self.output[row]).bar(self._bar("output"))
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.rows)
+
+
+class SchedDsv4RmsRope512_64(Schedule):
+    """Fuse per-row 512-wide RMSNorm and the final-64 rotary transform."""
+
+    def __init__(
+        self,
+        input,
+        table,
+        output,
+        *,
+        epsilon: float,
+        weight=None,
+        fixed_table_id=None,
+    ):
+        super().__init__()
+        self.input = input
+        self.table = table
+        self.output = output
+        self.epsilon = epsilon
+        self.weight = weight
+        self.fixed_table_id = fixed_table_id
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.bfloat16
+            or self.input.ndim != 2
+            or self.input.shape[1] != 512
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("fused RMS/RoPE input must be contiguous BF16 [rows,512]")
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.shape != self.input.shape
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("fused RMS/RoPE output must match the input")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("fused RMS/RoPE table must be FP32 [32,2]")
+        if self.weight is not None and (
+            self.weight.dtype != torch.bfloat16
+            or tuple(self.weight.shape) != (512,)
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("fused RMS/RoPE weight must be BF16 [512]")
+        if self.epsilon <= 0:
+            raise ValueError("fused RMS/RoPE epsilon must be positive")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        self.rows = self.input.shape[0]
+        if not 0 < self.num_sms <= self.rows:
+            raise ValueError("fused RMS/RoPE requires 1..rows SMs")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = []
+        for row in range(sm, self.rows, self.num_sms):
+            instructions.extend(
+                (
+                    Dsv4RmsRope512_64(
+                        weighted=self.weight is not None,
+                        epsilon=self.epsilon,
+                        fixed_table_id=self.fixed_table_id,
+                    ),
+                    TmaLoad1D(self.input[row]),
+                )
+            )
+            if self.weight is not None:
+                instructions.append(TmaLoad1D(self.weight))
+            if self.fixed_table_id is None:
+                instructions.append(TmaLoad1D(self.table))
+            instructions.append(
+                TmaStore1D(self.output[row]).bar(self._bar("output"))
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.rows)
+
+
+class SchedDsv4Fp32RmsRope512_64(Schedule):
+    """Finalize FP32 split-K rows directly into attention-ready BF16."""
+
+    def __init__(
+        self,
+        input,
+        table,
+        output,
+        *,
+        epsilon: float,
+        weight=None,
+        fixed_table_id=None,
+    ):
+        super().__init__()
+        self.input = input
+        self.table = table
+        self.output = output
+        self.epsilon = epsilon
+        self.weight = weight
+        self.fixed_table_id = fixed_table_id
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.float32
+            or self.input.ndim != 2
+            or self.input.shape[1] != 512
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError(
+                "FP32 fused RMS/RoPE input must be contiguous [rows,512]"
+            )
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.shape != self.input.shape
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("FP32 fused RMS/RoPE output must match the input")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("FP32 fused RMS/RoPE table must be FP32 [32,2]")
+        if self.weight is not None and (
+            self.weight.dtype != torch.bfloat16
+            or tuple(self.weight.shape) != (512,)
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("FP32 fused RMS/RoPE weight must be BF16 [512]")
+        if self.epsilon <= 0:
+            raise ValueError("FP32 fused RMS/RoPE epsilon must be positive")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        self.rows = self.input.shape[0]
+        if not 0 < self.num_sms <= self.rows:
+            raise ValueError("FP32 fused RMS/RoPE requires 1..rows SMs")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = []
+        for row in range(sm, self.rows, self.num_sms):
+            instructions.extend(
+                (
+                    Dsv4Fp32RmsRope512_64(
+                        weighted=self.weight is not None,
+                        epsilon=self.epsilon,
+                        fixed_table_id=self.fixed_table_id,
+                    ),
+                    TmaLoad1D(self.input[row]),
+                )
+            )
+            if self.weight is not None:
+                instructions.append(TmaLoad1D(self.weight))
+            if self.fixed_table_id is None:
+                instructions.append(TmaLoad1D(self.table))
+            instructions.append(
+                TmaStore1D(self.output[row]).bar(self._bar("output"))
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.rows)
+
+
+class SchedDsv4Fp32RopeHadamard128(Schedule):
+    """Finalize FP32 index-Q rows into their cache-scoring representation."""
+
+    def __init__(self, input, table, output, *, fixed_table_id=None):
+        super().__init__()
+        self.input = input
+        self.table = table
+        self.output = output
+        self.fixed_table_id = fixed_table_id
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.float32
+            or self.input.ndim != 2
+            or self.input.shape[1] != 128
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError(
+                "FP32 RoPE/Hadamard input must be contiguous [rows,128]"
+            )
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.shape != self.input.shape
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("FP32 RoPE/Hadamard output must match the input")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("FP32 RoPE/Hadamard table must be FP32 [32,2]")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        self.rows = self.input.shape[0]
+        if not 0 < self.num_sms <= self.rows:
+            raise ValueError("FP32 RoPE/Hadamard requires 1..rows SMs")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = []
+        for row in range(sm, self.rows, self.num_sms):
+            instructions.extend(
+                (
+                    Dsv4Fp32RopeHadamard128(self.fixed_table_id),
+                    TmaLoad1D(self.input[row]),
+                )
+            )
             if self.fixed_table_id is None:
                 instructions.append(TmaLoad1D(self.table))
             instructions.append(
@@ -2402,6 +2808,203 @@ class SchedDsv4ContiguousAttention512UmmaTail32Sm100(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4AttentionSplit32UmmaSm100(Schedule):
+    """K32 split-KV UMMA producers for all 64 DeepSeek attention heads."""
+
+    TILE = 128
+    KV_TILE = 32
+    HEADS = 64
+
+    def __init__(
+        self,
+        q,
+        kv,
+        rows,
+        partials,
+        metadata,
+        *,
+        q_tma,
+        k_tma,
+        v_tma,
+        partial_tma,
+    ):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.rows = int(rows)
+        self.partials = partials
+        self.metadata = metadata
+        self.q_tma = q_tma
+        self.k_tma = k_tma
+        self.v_tma = v_tma
+        self.partial_tma = partial_tma
+
+    def _on_place(self):
+        if (
+            self.q.dtype != torch.bfloat16
+            or tuple(self.q.shape) != (self.HEADS, 512)
+            or not self.q.is_contiguous()
+        ):
+            raise ValueError("split-KV attention Q must be BF16 [64,512]")
+        if (
+            self.kv.dtype != torch.bfloat16
+            or self.kv.ndim != 2
+            or self.kv.shape[1] != 512
+            or not self.kv.is_contiguous()
+        ):
+            raise ValueError("split-KV attention KV must be BF16 [rows,512]")
+        if self.rows <= 0 or self.rows > self.kv.shape[0]:
+            raise ValueError("split-KV attention row count exceeds its cache")
+        self.num_splits = (self.rows + self.KV_TILE - 1) // self.KV_TILE
+        if self.num_sms != self.num_splits:
+            raise ValueError("split-KV producer requires one SM per K32 split")
+        if (
+            self.partials.dtype != torch.bfloat16
+            or tuple(self.partials.shape)
+            != (self.num_splits, self.HEADS, 512)
+            or not self.partials.is_contiguous()
+        ):
+            raise ValueError("attention partials must be BF16 [splits,64,512]")
+        if (
+            self.metadata.dtype != torch.float32
+            or tuple(self.metadata.shape)
+            != (self.num_splits, self.HEADS, 2)
+            or not self.metadata.is_contiguous()
+        ):
+            raise ValueError("attention metadata must be FP32 [splits,64,2]")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        row = sm * self.KV_TILE
+        active_tokens = min(self.KV_TILE, self.rows - row)
+        instructions = [Dsv4AttentionSplit32UmmaSm100(active_tokens)]
+        for wave in range(2):
+            for tile in range(2):
+                column = (wave * 2 + tile) * self.TILE
+                instructions.append(self.q_tma.cord(0, column))
+            for tile in range(2):
+                column = (wave * 2 + tile) * self.TILE
+                instructions.append(self.k_tma.cord(row, column))
+        for tile in range(4):
+            column = tile * self.TILE
+            instructions.append(self.v_tma.cord(row, column))
+            instructions.append(
+                self.partial_tma.cord(sm * self.HEADS, column)
+            )
+        instructions.append(
+            TmaStore1D(self.metadata[sm].reshape(-1)).bar(
+                self._bar("output")
+            )
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_splits)
+
+
+class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
+    """Merge split-KV partials and directly publish native O_a records."""
+
+    HEADS = 64
+    TILES = 4
+    TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(
+        self,
+        partials,
+        metadata,
+        sink,
+        table,
+        output,
+        *,
+        head_start=0,
+        head_count=64,
+    ):
+        super().__init__()
+        self.partials = partials
+        self.metadata = metadata
+        self.sink = sink
+        self.table = table
+        self.output = output
+        self.head_start = int(head_start)
+        self.head_count = int(head_count)
+
+    def _on_place(self):
+        if (
+            self.partials.dtype != torch.bfloat16
+            or self.partials.ndim != 3
+            or tuple(self.partials.shape[1:]) != (self.HEADS, 512)
+            or not self.partials.is_contiguous()
+        ):
+            raise ValueError("attention partials must be BF16 [splits,64,512]")
+        self.num_splits = self.partials.shape[0]
+        if not 1 <= self.num_splits <= 24:
+            raise ValueError("attention reducer supports 1..24 splits")
+        if (
+            self.metadata.dtype != torch.float32
+            or tuple(self.metadata.shape)
+            != (self.num_splits, self.HEADS, 2)
+            or not self.metadata.is_contiguous()
+        ):
+            raise ValueError("attention metadata must be FP32 [splits,64,2]")
+        if self.sink.dtype != torch.float32 or tuple(self.sink.shape) != (64,):
+            raise ValueError("attention sink must be FP32 [64]")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("inverse-RoPE table must be FP32 [32,2]")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape)
+            != (self.HEADS, self.TILES, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("native O_a output must be uint8 [64,4,2048]")
+        if (
+            self.head_start < 0
+            or self.head_count <= 0
+            or self.head_start + self.head_count > self.HEADS
+        ):
+            raise ValueError("attention reducer head shard exceeds [0,64)")
+        if not 0 < self.num_sms <= self.head_count:
+            raise ValueError("attention reducer SMs exceed its head shard")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        instructions = []
+        head_stop = self.head_start + self.head_count
+        for head in range(
+            self.head_start + sm, head_stop, self.num_sms
+        ):
+            instructions.extend(
+                (
+                    Dsv4AttentionSplitReduceFp8Sm100(
+                        self.num_splits, head
+                    ),
+                    TmaLoad1D(self.metadata.reshape(-1)).bar(
+                        self._bar("partials")
+                    ),
+                    _shared_load_1d(self.sink[head : head + 1]),
+                    TmaLoad1D(self.table),
+                )
+            )
+            for split in range(self.num_splits):
+                instructions.append(TmaLoad1D(self.partials[split, head]))
+            instructions.append(
+                TmaStore1D(self.output[head].reshape(-1)).bar(
+                    self._bar("output")
+                )
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.head_count)
+
+
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
                  output_weights, hash_routing=False, route_scale=1.5):
@@ -2637,16 +3240,7 @@ class SchedDsv4HcPre(Schedule):
 
 
 class SchedDsv4HcPreRms(Schedule):
-    """Keep the mHC-pre vector in one VDCores shared slot through RMS.
-
-    The two existing compute tasks remain in-order on one compute VCore.  A
-    same-port RegStore/RegLoad pair retains the 4096-wide BF16 intermediate,
-    eliminating its HBM write/read without changing either task's arithmetic.
-    The RMS weight may preload independently on the other LDU.
-    """
-
-    HIDDEN_REGISTER = 0
-    HIDDEN_REGISTER_SLOT = 0
+    """Fuse mHC pre mixing with the following learned RMSNorm."""
 
     def __init__(
         self,
@@ -2654,79 +3248,79 @@ class SchedDsv4HcPreRms(Schedule):
         mixes,
         scale,
         base,
-        rms_weight,
+        norm_weight,
         output,
         post,
         comb,
         sinkhorn_iters=20,
         epsilon=1.0e-6,
+        rms_epsilon=1.0e-6,
     ):
         super().__init__()
         self.residual = residual
         self.mixes = mixes
         self.scale = scale
         self.base = base
-        self.rms_weight = rms_weight
+        self.norm_weight = norm_weight
         self.output = output
         self.post = post
         self.comb = comb
         self.sinkhorn_iters = sinkhorn_iters
         self.epsilon = epsilon
+        self.rms_epsilon = rms_epsilon
 
     def _on_place(self):
         if self.num_sms != 1:
-            raise ValueError("fused mHC pre/RMS currently uses exactly one SM")
+            raise ValueError("fused mHC/RMS uses exactly one SM")
         if (
             self.residual.dtype != torch.bfloat16
             or tuple(self.residual.shape) != (4, 4096)
         ):
-            raise ValueError("fused mHC residual must be BF16 [4,4096]")
+            raise ValueError("fused mHC/RMS residual must be BF16 [4,4096]")
         if self.mixes.dtype != torch.float32 or self.mixes.numel() != 24:
-            raise ValueError("fused mHC mixes must contain 24 FP32 values")
+            raise ValueError("fused mHC/RMS mixes must contain 24 FP32 values")
         if self.scale.dtype != torch.float32 or self.scale.numel() != 3:
-            raise ValueError("fused mHC scale must contain three FP32 values")
+            raise ValueError("fused mHC/RMS scale must contain three FP32 values")
         if self.base.dtype != torch.float32 or self.base.numel() != 24:
-            raise ValueError("fused mHC base must contain 24 FP32 values")
+            raise ValueError("fused mHC/RMS base must contain 24 FP32 values")
         if (
-            self.rms_weight.dtype != torch.bfloat16
-            or self.rms_weight.numel() != 4096
-            or not self.rms_weight.is_contiguous()
+            self.norm_weight.dtype != torch.bfloat16
+            or self.norm_weight.numel() != 4096
+            or not self.norm_weight.is_contiguous()
         ):
-            raise ValueError("fused mHC RMS weight must be contiguous BF16[4096]")
+            raise ValueError("fused mHC/RMS weight must be BF16 [4096]")
         if (
             self.output.dtype != torch.bfloat16
             or self.output.numel() != 4096
-            or not self.output.is_contiguous()
         ):
-            raise ValueError("fused mHC output must be contiguous BF16[4096]")
+            raise ValueError("fused mHC/RMS output must contain 4096 BF16 values")
         if self.post.dtype != torch.float32 or self.post.numel() != 4:
-            raise ValueError("fused mHC post coefficients must be FP32[4]")
-        if self.comb.dtype != torch.float32 or tuple(self.comb.shape) != (4, 4):
-            raise ValueError("fused mHC combination matrix must be FP32[4,4]")
+            raise ValueError("fused mHC/RMS post must contain four FP32 values")
+        if (
+            self.comb.dtype != torch.float32
+            or tuple(self.comb.shape) != (4, 4)
+        ):
+            raise ValueError("fused mHC/RMS comb must be FP32 [4,4]")
+        if self.epsilon <= 0 or self.rms_epsilon <= 0:
+            raise ValueError("fused mHC/RMS epsilons must be positive")
 
     def schedule(self, sm):
         if sm != 0:
             return []
-        output_store = TmaStore1D(self.output).bar(self._bar("output"))
-        output_store.annotation["sequential_dependency_tail"] = True
         return [
-            Dsv4HcPre(self.sinkhorn_iters, self.epsilon),
-            RMS_NORM_F16_K_4096_SMEM(1, self.epsilon),
+            Dsv4HcPreRms(
+                self.sinkhorn_iters,
+                self.epsilon,
+                self.rms_epsilon,
+            ),
             TmaLoad1D(self.residual),
             TmaLoad1D(self.mixes),
             _shared_load_1d(self.scale),
             TmaLoad1D(self.base),
-            RegStore(
-                self.HIDDEN_REGISTER, size=4096 * 2
-            ).fixed_port(1),
+            TmaLoad1D(self.norm_weight),
+            TmaStore1D(self.output).bar(self._bar("output")),
             TmaStore1D(self.post),
             TmaStore1D(self.comb),
-            TmaLoad1D(self.rms_weight).fixed_port(0),
-            RegLoad(
-                self.HIDDEN_REGISTER,
-                slot_id=self.HIDDEN_REGISTER_SLOT,
-            ).fixed_port(1),
-            output_store,
         ]
 
     def bar_release_count(self, role: str):
@@ -2928,6 +3522,141 @@ class SchedDsv4GatedPool(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4GatedPoolRmsRope(Schedule):
+    """Pool, weighted-normalize, rotate, and optionally Hadamard one row."""
+
+    def __init__(
+        self,
+        values,
+        scores,
+        weight,
+        table,
+        output,
+        *,
+        epsilon: float,
+        tail_values=None,
+        tail_scores=None,
+        tail_bias=None,
+        hadamard=False,
+        fixed_table_id=None,
+    ):
+        super().__init__()
+        self.values = values
+        self.scores = scores
+        self.weight = weight
+        self.table = table
+        self.output = output
+        self.epsilon = epsilon
+        self.tail_values = tail_values
+        self.tail_scores = tail_scores
+        self.tail_bias = tail_bias
+        self.hadamard = bool(hadamard)
+        self.fixed_table_id = fixed_table_id
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("fused gated-pool epilogue uses exactly one SM")
+        if (
+            self.values.dtype != torch.float32
+            or self.values.ndim != 2
+            or self.values.shape[1] not in (128, 512)
+        ):
+            raise ValueError(
+                "fused gated-pool values must be FP32 [rows,128|512]"
+            )
+        if self.scores.dtype != torch.float32 or self.scores.shape != self.values.shape:
+            raise ValueError("fused gated-pool scores must match the values")
+        history_rows, self.width = self.values.shape
+        if (
+            self.weight.dtype != torch.bfloat16
+            or tuple(self.weight.shape) != (self.width,)
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("fused gated-pool weight must be BF16 [width]")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("fused gated-pool RoPE table must be FP32 [32,2]")
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.numel() != self.width
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("fused gated-pool output must be BF16 [width]")
+        if self.hadamard and self.width != 128:
+            raise ValueError("fused gated-pool Hadamard requires width 128")
+        if self.epsilon <= 0:
+            raise ValueError("fused gated-pool RMS epsilon must be positive")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        if (self.tail_values is None) != (self.tail_scores is None):
+            raise ValueError(
+                "fused gated-pool tail values and scores must be paired"
+            )
+        if self.tail_values is not None:
+            for name, tensor in (
+                ("tail values", self.tail_values),
+                ("tail scores", self.tail_scores),
+            ):
+                if (
+                    tensor.dtype != torch.float32
+                    or tensor.numel() != self.width
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"fused gated-pool {name} must be FP32 [width]"
+                    )
+        if self.tail_bias is not None:
+            if self.tail_values is None:
+                raise ValueError("fused gated-pool bias requires a tail row")
+            if (
+                self.tail_bias.dtype != torch.float32
+                or self.tail_bias.numel() != self.width
+                or not self.tail_bias.is_contiguous()
+            ):
+                raise ValueError("fused gated-pool bias must be FP32 [width]")
+        self.pool_rows = history_rows + int(self.tail_values is not None)
+        if self.pool_rows <= 0:
+            raise ValueError("fused gated pooling needs at least one row")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        row_bytes = self.width * self.values.element_size()
+        instructions = [
+            Dsv4GatedPoolRmsRope(
+                self.pool_rows,
+                self.width,
+                tail_bias=self.tail_bias is not None,
+                hadamard=self.hadamard,
+                epsilon=self.epsilon,
+                fixed_table_id=self.fixed_table_id,
+            )
+        ]
+        if self.values.shape[0]:
+            instructions += RepeatM.on(
+                self.values.shape[0],
+                (TmaLoad1D(self.values[0]), row_bytes),
+                (TmaLoad1D(self.scores[0]), row_bytes),
+            )
+        if self.tail_values is not None:
+            instructions.extend(
+                (TmaLoad1D(self.tail_values), TmaLoad1D(self.tail_scores))
+            )
+            if self.tail_bias is not None:
+                instructions.append(TmaLoad1D(self.tail_bias))
+        instructions.append(TmaLoad1D(self.weight))
+        if self.fixed_table_id is None:
+            instructions.append(TmaLoad1D(self.table))
+        instructions.append(
+            TmaStore1D(self.output.reshape(-1)).bar(self._bar("output"))
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
 class SchedDsv4GatedPoolPacked8Shard128(Schedule):
     """Pool a prepacked history with one independent 128-wide shard per SM."""
 
@@ -3017,6 +3746,377 @@ class SchedDsv4GatedPoolPacked8Shard128(Schedule):
                 self._bar("output")
             ),
         ]
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4GatedPoolPacked8RmsPartial(Schedule):
+    """Pool four 128-wide HCA shards and publish FP32 RMS partials."""
+
+    ROWS_PER_BLOCK = 8
+    SHARD_WIDTH = 128
+
+    def __init__(
+        self,
+        packed_history,
+        history_rows,
+        pooled_output,
+        partial_output,
+        *,
+        tail_values,
+        tail_scores,
+        tail_bias,
+    ):
+        super().__init__()
+        self.packed_history = packed_history
+        self.history_rows = int(history_rows)
+        self.pooled_output = pooled_output
+        self.partial_output = partial_output
+        self.tail_values = tail_values
+        self.tail_scores = tail_scores
+        self.tail_bias = tail_bias
+
+    def _on_place(self):
+        expected_width = (
+            self.packed_history.shape[0] * self.SHARD_WIDTH
+            if self.packed_history.ndim == 5
+            else -1
+        )
+        if (
+            self.packed_history.dtype != torch.float32
+            or self.packed_history.ndim != 5
+            or tuple(self.packed_history.shape[2:])
+            != (self.ROWS_PER_BLOCK, 2, self.SHARD_WIDTH)
+            or not self.packed_history.is_contiguous()
+        ):
+            raise ValueError(
+                "packed pool/RMS history must be contiguous FP32 "
+                "[shards,blocks,8,2,128]"
+            )
+        self.shards, self.blocks = self.packed_history.shape[:2]
+        if self.num_sms != self.shards:
+            raise ValueError("packed pool/RMS uses one SM per width shard")
+        if not 0 < self.history_rows <= self.blocks * self.ROWS_PER_BLOCK:
+            raise ValueError("packed pool/RMS row count exceeds its blocks")
+        for name, tensor in (
+            ("tail values", self.tail_values),
+            ("tail scores", self.tail_scores),
+            ("tail bias", self.tail_bias),
+        ):
+            if (
+                tensor.dtype != torch.float32
+                or tensor.numel() != expected_width
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"packed pool/RMS {name} must be FP32 [width]"
+                )
+        if (
+            self.pooled_output.dtype != torch.float32
+            or tuple(self.pooled_output.shape)
+            != (self.shards, self.SHARD_WIDTH)
+            or not self.pooled_output.is_contiguous()
+        ):
+            raise ValueError(
+                "packed pool/RMS output must be FP32 [shards,128]"
+            )
+        if (
+            self.partial_output.dtype != torch.float32
+            or tuple(self.partial_output.shape) != (self.shards,)
+            or not self.partial_output.is_contiguous()
+        ):
+            raise ValueError(
+                "packed pool/RMS partials must be FP32 [shards]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        block_bytes = (
+            self.ROWS_PER_BLOCK * 2 * self.SHARD_WIDTH
+            * self.packed_history.element_size()
+        )
+        instructions = [
+            Dsv4GatedPoolPacked8RmsPartial(self.history_rows)
+        ]
+        instructions += RepeatM.on(
+            self.blocks,
+            (
+                TmaLoad1D(self.packed_history[sm, 0].reshape(-1)),
+                block_bytes,
+            ),
+        )
+        shard_start = sm * self.SHARD_WIDTH
+        shard_end = shard_start + self.SHARD_WIDTH
+        instructions.extend(
+            (
+                TmaLoad1D(self.tail_values[shard_start:shard_end]),
+                TmaLoad1D(self.tail_scores[shard_start:shard_end]),
+                TmaLoad1D(self.tail_bias[shard_start:shard_end]),
+                TmaStore1D(self.pooled_output[sm]),
+                StuStore1D(self.partial_output[sm : sm + 1]).bar(
+                    self._bar("output")
+                ),
+            )
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4GatedPoolPacked8HistoryState(Schedule):
+    """Pool immutable HCA history into per-dimension FP32 softmax state."""
+
+    ROWS_PER_BLOCK = 8
+    SHARD_WIDTH = 128
+    STATE_COMPONENTS = 3
+
+    def __init__(self, packed_history, history_rows, state_output):
+        super().__init__()
+        self.packed_history = packed_history
+        self.history_rows = int(history_rows)
+        self.state_output = state_output
+
+    def _on_place(self):
+        if (
+            self.packed_history.dtype != torch.float32
+            or self.packed_history.ndim != 5
+            or tuple(self.packed_history.shape[2:])
+            != (self.ROWS_PER_BLOCK, 2, self.SHARD_WIDTH)
+            or not self.packed_history.is_contiguous()
+        ):
+            raise ValueError(
+                "packed history-state input must be contiguous FP32 "
+                "[shards,blocks,8,2,128]"
+            )
+        self.shards, self.blocks = self.packed_history.shape[:2]
+        if self.num_sms != self.shards:
+            raise ValueError("packed history state uses one SM per width shard")
+        if not 0 < self.history_rows <= self.blocks * self.ROWS_PER_BLOCK:
+            raise ValueError("packed history-state row count exceeds its blocks")
+        if (
+            self.state_output.dtype != torch.float32
+            or tuple(self.state_output.shape)
+            != (self.shards, self.STATE_COMPONENTS, self.SHARD_WIDTH)
+            or not self.state_output.is_contiguous()
+        ):
+            raise ValueError(
+                "packed history state must be contiguous FP32 [shards,3,128]"
+            )
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        block_bytes = (
+            self.ROWS_PER_BLOCK * 2 * self.SHARD_WIDTH
+            * self.packed_history.element_size()
+        )
+        instructions = [
+            Dsv4GatedPoolPacked8HistoryState(self.history_rows)
+        ]
+        instructions += RepeatM.on(
+            self.blocks,
+            (
+                TmaLoad1D(self.packed_history[sm, 0].reshape(-1)),
+                block_bytes,
+            ),
+        )
+        instructions.append(
+            TmaStore1D(self.state_output[sm].reshape(-1)).bar(
+                self._bar("output")
+            )
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4GatedPoolTailRmsPartial(Schedule):
+    """Merge a projected HCA tail and emit pooled values plus RMS partials."""
+
+    SHARD_WIDTH = 128
+    STATE_COMPONENTS = 3
+
+    def __init__(
+        self,
+        history_state,
+        pooled_output,
+        partial_output,
+        *,
+        tail_values,
+        tail_scores,
+        tail_bias,
+    ):
+        super().__init__()
+        self.history_state = history_state
+        self.pooled_output = pooled_output
+        self.partial_output = partial_output
+        self.tail_values = tail_values
+        self.tail_scores = tail_scores
+        self.tail_bias = tail_bias
+
+    def _on_place(self):
+        if (
+            self.history_state.dtype != torch.float32
+            or self.history_state.ndim != 3
+            or tuple(self.history_state.shape[1:])
+            != (self.STATE_COMPONENTS, self.SHARD_WIDTH)
+            or not self.history_state.is_contiguous()
+        ):
+            raise ValueError(
+                "tail merge history state must be contiguous FP32 [shards,3,128]"
+            )
+        self.shards = self.history_state.shape[0]
+        if self.num_sms != self.shards:
+            raise ValueError("tail merge uses one SM per width shard")
+        expected_width = self.shards * self.SHARD_WIDTH
+        for name, tensor in (
+            ("tail values", self.tail_values),
+            ("tail scores", self.tail_scores),
+            ("tail bias", self.tail_bias),
+        ):
+            if (
+                tensor.dtype != torch.float32
+                or tensor.numel() != expected_width
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"tail merge {name} must be contiguous FP32 [width]"
+                )
+        if (
+            self.pooled_output.dtype != torch.float32
+            or tuple(self.pooled_output.shape)
+            != (self.shards, self.SHARD_WIDTH)
+            or not self.pooled_output.is_contiguous()
+        ):
+            raise ValueError(
+                "tail merge pooled output must be FP32 [shards,128]"
+            )
+        if (
+            self.partial_output.dtype != torch.float32
+            or tuple(self.partial_output.shape) != (self.shards,)
+            or not self.partial_output.is_contiguous()
+        ):
+            raise ValueError("tail merge RMS partials must be FP32 [shards]")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        shard_start = sm * self.SHARD_WIDTH
+        shard_end = shard_start + self.SHARD_WIDTH
+        return [
+            Dsv4GatedPoolTailRmsPartial(),
+            TmaLoad1D(self.history_state[sm].reshape(-1)),
+            TmaLoad1D(self.tail_values[shard_start:shard_end]),
+            TmaLoad1D(self.tail_scores[shard_start:shard_end]),
+            TmaLoad1D(self.tail_bias[shard_start:shard_end]),
+            TmaStore1D(self.pooled_output[sm]),
+            StuStore1D(self.partial_output[sm : sm + 1]).bar(
+                self._bar("output")
+            ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4Fp32RmsRopeShard128(Schedule):
+    """Normalize four FP32 pooled shards and rotate the final shard."""
+
+    SHARDS = 4
+    SHARD_WIDTH = 128
+
+    def __init__(
+        self,
+        input,
+        partials,
+        weight,
+        table,
+        output,
+        *,
+        epsilon: float,
+        fixed_table_id=None,
+    ):
+        super().__init__()
+        self.input = input
+        self.partials = partials
+        self.weight = weight
+        self.table = table
+        self.output = output
+        self.epsilon = epsilon
+        self.fixed_table_id = fixed_table_id
+
+    def _on_place(self):
+        if self.num_sms != self.SHARDS:
+            raise ValueError("FP32 pooled RMS/RoPE requires four SMs")
+        if (
+            self.input.dtype != torch.float32
+            or tuple(self.input.shape) != (self.SHARDS, self.SHARD_WIDTH)
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("FP32 pooled input must be [4,128]")
+        if (
+            self.partials.dtype != torch.float32
+            or tuple(self.partials.shape) != (self.SHARDS,)
+            or not self.partials.is_contiguous()
+        ):
+            raise ValueError("FP32 pooled RMS partials must be [4]")
+        if (
+            self.weight.dtype != torch.bfloat16
+            or self.weight.numel() != self.SHARDS * self.SHARD_WIDTH
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("FP32 pooled RMS weight must be BF16 [512]")
+        if (
+            self.table.dtype != torch.float32
+            or tuple(self.table.shape) != (32, 2)
+        ):
+            raise ValueError("FP32 pooled RMS/RoPE table must be FP32 [32,2]")
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.numel() != self.SHARDS * self.SHARD_WIDTH
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("FP32 pooled RMS/RoPE output must be BF16 [512]")
+        if self.epsilon <= 0:
+            raise ValueError("FP32 pooled RMS/RoPE epsilon must be positive")
+        if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
+            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        start = sm * self.SHARD_WIDTH
+        stop = start + self.SHARD_WIDTH
+        instructions = [
+            Dsv4Fp32RmsRopeShard128(
+                sm,
+                epsilon=self.epsilon,
+                fixed_table_id=self.fixed_table_id,
+            ),
+            TmaLoad1D(self.input[sm]),
+            TmaLoad1D(self.partials),
+            TmaLoad1D(self.weight[start:stop]),
+        ]
+        if self.fixed_table_id is None:
+            instructions.append(TmaLoad1D(self.table))
+        instructions.append(
+            TmaStore1D(self.output.reshape(-1)[start:stop]).bar(
+                self._bar("output")
+            )
+        )
         return instructions
 
     def bar_release_count(self, role: str):

@@ -14,14 +14,16 @@ from dae.instructions import (
     Copy,
     Dsv4ContiguousAttention512UmmaSm100,
     Dsv4ContiguousAttention512UmmaTail32Sm100,
-    Dsv4HcPre,
+    Dsv4HcPreRms,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
+    Dsv4RmsFp8QuantUmmaBSm100,
     Dsv4Fp32ToBf16,
     Dsv4Nvfp4QuantUmmaBSm100,
     Dsv4PreloadRopeTables,
     Dsv4Rope128_64,
     Dsv4Rope512_64,
+    Dsv4RmsRope512_64,
     Dsv4SiluClampMul128,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
@@ -44,7 +46,6 @@ from dae.instructions import (
     ProfileEvent,
     ProfileStep,
     RepeatM,
-    RMS_NORM_F16_K_4096_SMEM,
     ResetIndirectLayer,
     RoutedTmaLoad1D,
     RegLoad,
@@ -64,6 +65,8 @@ from dae.schedule import (
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
+    SchedDsv4RmsFp8QuantUmmaB,
+    SchedDsv4RmsRope512_64,
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
     SchedDsv4ZeroFill,
@@ -578,6 +581,51 @@ def test_dsv4_fp8_native_quant_encodes_k_tile_count():
     )
 
 
+def test_dsv4_cleanroom_preattention_fusions_encode_shape_shards(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    source = torch.empty((1024,), dtype=torch.bfloat16)
+    weight = torch.empty_like(source)
+    native = torch.empty((8, 2048), dtype=torch.uint8)
+    quant = SchedDsv4RmsFp8QuantUmmaB(
+        source, weight, native, 1.0e-6
+    ).place(4)
+
+    first = quant.schedule(0)
+    last = quant.schedule(3)
+    assert isinstance(first[0], Dsv4RmsFp8QuantUmmaBSm100)
+    assert first[0].args[:2] == [8, 0x200]
+    assert last[0].args[:2] == [8, 0x206]
+    assert len(first) == 4
+    assert first[-1].size == 2 * 2048
+
+    rows = torch.empty((2, 512), dtype=torch.bfloat16)
+    table = torch.empty((32, 2), dtype=torch.float32)
+    fused = SchedDsv4RmsRope512_64(
+        rows,
+        table,
+        torch.empty_like(rows),
+        epsilon=1.0e-6,
+        fixed_table_id=1,
+    ).place(2)
+    q_instructions = fused.schedule(0)
+    assert isinstance(q_instructions[0], Dsv4RmsRope512_64)
+    assert q_instructions[0].args[:2] == [0, 2]
+    assert len(q_instructions) == 3
+
+    weighted = SchedDsv4RmsRope512_64(
+        rows[:1],
+        table,
+        torch.empty_like(rows[:1]),
+        epsilon=1.0e-6,
+        weight=torch.empty((512,), dtype=torch.bfloat16),
+        fixed_table_id=0,
+    ).place(1).schedule(0)
+    assert weighted[0].args[:2] == [1, 1]
+    assert len(weighted) == 4
+
+
 def test_dsv4_hc_post_encodes_local_width():
     instruction = Dsv4HcPost(128)
 
@@ -700,7 +748,7 @@ def test_dsv4_fp8_native_quant_shards_whole_scale_groups(monkeypatch):
     assert first[1].cords != last[1].cords
 
 
-def test_dsv4_hc_pre_rms_retains_bf16_intermediate_on_one_ldu(monkeypatch):
+def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
     monkeypatch.setattr(
         "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
     )
@@ -719,30 +767,18 @@ def test_dsv4_hc_pre_rms_retains_bf16_intermediate_on_one_ldu(monkeypatch):
     compute = [
         inst for inst in instructions if isinstance(inst, ComputeInstruction)
     ]
-    retained_store = next(
-        inst for inst in instructions if isinstance(inst, RegStore)
-    )
-    retained_load = next(
-        inst for inst in instructions if isinstance(inst, RegLoad)
-    )
-    marked_tails = [
+    output_releases = [
         inst
         for inst in instructions
         if isinstance(inst, MemoryInstruction)
-        and inst.annotation.get("sequential_dependency_tail", False)
+        and inst.num_slots >> 6 == 7
     ]
 
-    assert [type(inst) for inst in compute] == [
-        Dsv4HcPre,
-        RMS_NORM_F16_K_4096_SMEM,
-    ]
-    assert retained_store.opcode & 0x20
-    assert retained_load.opcode & 0x20
-    assert retained_store.size == retained_load.size == 0
-    assert retained_store.num_slots & 0x3F == 1
-    assert retained_load.num_slots & 0x3F == config.num_slots
-    assert len(marked_tails) == 1
-    assert marked_tails[0].num_slots >> 6 == 7
+    assert [type(inst) for inst in compute] == [Dsv4HcPreRms]
+    assert not any(
+        isinstance(inst, (RegLoad, RegStore)) for inst in instructions
+    )
+    assert len(output_releases) == 1
     assert schedule.bar_release_count("output") == 1
 
 
@@ -1162,88 +1198,6 @@ def test_sequential_program_fans_out_and_joins_labeled_stage_groups():
         if sm < 2:
             assert memory[1].num_slots >> 6 == 0
         assert memory[-2].num_slots >> 6 == 1
-
-
-def test_sequential_program_can_select_one_fused_dependency_tail():
-    class FakeLauncher:
-        num_sms = 2
-        num_bars = 0
-        max_insts = 32
-
-        def __init__(self):
-            self.bar_values = {}
-
-        def new_bar(self, count):
-            bar_id = self.num_bars
-            self.num_bars += 1
-            self.bar_values[bar_id] = count
-            return bar_id
-
-        def set_bar(self, bar_id, count):
-            self.bar_values[bar_id] = count
-
-    class FusedStage(Schedule):
-        def schedule(self, sm):
-            if sm < 0:
-                return []
-            store = MemoryInstruction(
-                opcode.OP_ALLOC_WB_STU_STORE_1D,
-                num_slots=1,
-                arg=0,
-                size=16,
-                address=0,
-            )
-            if sm == 0:
-                store.annotation["sequential_dependency_tail"] = True
-            return [Copy(1, 16), store]
-
-    class Consumer(Schedule):
-        def schedule(self, sm):
-            if sm < 0:
-                return []
-            return [
-                Copy(1, 16),
-                MemoryInstruction(
-                    opcode.OP_ALLOC_LDU_LOAD_1D,
-                    num_slots=1,
-                    arg=0,
-                    size=16,
-                    address=0,
-                ),
-                MemoryInstruction(
-                    opcode.OP_ALLOC_WB_STU_STORE_1D,
-                    num_slots=1,
-                    arg=0,
-                    size=16,
-                    address=0,
-                ),
-            ]
-
-    launcher = FakeLauncher()
-    program = SequentialProgram(
-        launcher,
-        (
-            SequentialStage(
-                "fused", FusedStage(), 2, release_group="ready"
-            ),
-            SequentialStage(
-                "consumer", Consumer(), 2, wait_group="ready"
-            ),
-        ),
-    )
-
-    assert launcher.bar_values == {0: 1}
-    producer_stores = [
-        next(
-            inst
-            for inst in program.instructions[sm]
-            if isinstance(inst, MemoryInstruction)
-            and inst.opcode & 0x2
-        )
-        for sm in range(2)
-    ]
-    assert producer_stores[0].opcode & 0x10
-    assert not producer_stores[1].opcode & 0x10
 
 
 def test_sequential_program_rejects_wait_group_without_producer():
