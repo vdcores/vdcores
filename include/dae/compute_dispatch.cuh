@@ -27,6 +27,7 @@
   uint32_t tmem_base_ptr, \
   uint64_t *tmem_mma_barrier, \
   uint32_t &tmem_mma_phase, \
+  uint32_t &fp8_umma_pipeline_phase_mask, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
   M2CQueue &m2c, \
@@ -209,63 +210,6 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_BF16_SM100) {
 #endif
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_STREAM_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
-             g_events);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_fp8_gemv_umma_stream_sm100(
-      inst.args[0], smem_base, tmem_base_ptr,
-      tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
-#endif
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_SPLITK_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
-             g_events);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  if (inst.args[1] == 2) {
-    task_fp8_gemv_umma_splitk_sm100<cutlass::bfloat16_t>(
-        inst.args[0], smem_base, tmem_base_ptr,
-        tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
-  } else if (inst.args[1] == 4) {
-    task_fp8_gemv_umma_splitk_sm100<float>(
-        inst.args[0], smem_base, tmem_base_ptr,
-        tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
-  } else {
-    asm volatile("trap;");
-  }
-#endif
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_STREAM_RAW_SCALE_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_fp8_gemv_umma_stream_raw_scale_sm100(
-      inst.args[0], smem_base, tmem_base_ptr,
-      tmem_mma_barrier, tmem_mma_phase,
-      ComputeRawAddressSlots{st_insts}, m2c, c2m);
-#endif
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_SPLITK_RAW_SCALE_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  if (inst.args[1] == 2) {
-    task_fp8_gemv_umma_splitk_raw_scale_sm100<cutlass::bfloat16_t>(
-        inst.args[0], smem_base, tmem_base_ptr,
-        tmem_mma_barrier, tmem_mma_phase,
-        ComputeRawAddressSlots{st_insts}, m2c, c2m);
-  } else if (inst.args[1] == 4) {
-    task_fp8_gemv_umma_splitk_raw_scale_sm100<float>(
-        inst.args[0], smem_base, tmem_base_ptr,
-        tmem_mma_barrier, tmem_mma_phase,
-        ComputeRawAddressSlots{st_insts}, m2c, c2m);
-  } else {
-    asm volatile("trap;");
-  }
-#endif
-}
-
 DAE_COMPUTE_OP_HANDLER(OP_FP8_UMMA_PREPACK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
@@ -275,21 +219,11 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_UMMA_PREPACK_SM100) {
 #endif
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP8_QUANT_UMMA_B_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
-             tmem_mma_barrier, tmem_mma_phase, g_events);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_dsv4_fp8_quant_umma_b_sm100(
-      inst.args[0], smem_base, get_slot_address(smem_base, numSlots), m2c,
-      c2m);
-#endif
-}
-
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_INV_ROPE_FP8_QUANT_UMMA_B_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_dsv4_inverse_rope_fp8_quant_umma_b_sm100(
+  task_dsv4_inverse_rope_fp8_quant_umma_b_sm100<2>(
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 #endif
 }
@@ -300,7 +234,7 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_RMS_FP8_QUANT_UMMA_B_SM100) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   const int output_tile_start = inst.args[1] & 0xFF;
   const int output_tile_count = inst.args[1] >> 8;
-  task_dsv4_rms_fp8_quant_umma_b_sm100<__nv_bfloat16>(
+  task_dsv4_rms_fp8_quant_umma_b_sm100<__nv_bfloat16, 2>(
       inst.args[0], output_tile_start, output_tile_count,
       *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
@@ -313,7 +247,7 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_FP8_QUANT_UMMA_B_SM100) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   const int output_tile_start = inst.args[1] & 0xFF;
   const int output_tile_count = inst.args[1] >> 8;
-  task_dsv4_rms_fp8_quant_umma_b_sm100<float>(
+  task_dsv4_rms_fp8_quant_umma_b_sm100<float, 2>(
       inst.args[0], output_tile_start, output_tile_count,
       *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
@@ -422,7 +356,7 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_dsv4_attention_split_reduce_fp8_sm100(
+  task_dsv4_attention_split_reduce_fp8_sm100<2>(
       inst.args[0], inst.args[1], smem_base,
       get_slot_address(smem_base, numSlots), m2c, c2m);
 #endif
@@ -1276,6 +1210,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint32_t tmem_base_ptr,
   uint64_t *tmem_mma_barrier,
   uint32_t &tmem_mma_phase,
+  uint32_t &fp8_umma_pipeline_phase_mask,
   uint64_t *scratch_space,
   MInst *st_insts,
   M2CQueue &m2c,
@@ -1285,7 +1220,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space, st_insts, m2c, c2m, g_events); \
+        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, scratch_space, st_insts, m2c, c2m, g_events); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP

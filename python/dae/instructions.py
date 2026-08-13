@@ -206,11 +206,25 @@ class Fp8GemvUmmaStreamSm100(ComputeInstruction):
     def __init__(
         self,
         k_tiles: int,
+        scale_pack: int = 1,
+        output_groups: int = 1,
     ):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("FP8 UMMA K-tile count must fit uint16")
+        if scale_pack not in (1, 2, 4) or k_tiles % scale_pack:
+            raise ValueError(
+                "FP8 UMMA scale pack must be 1, 2, or 4 and divide K tiles"
+            )
+        if output_groups not in (1, 2):
+            raise ValueError("FP8 UMMA output groups must be 1 or 2")
+        if output_groups > 1 and scale_pack == 1:
+            raise ValueError("grouped FP8 UMMA requires packed scales")
         super().__init__(
-            opcode=opcode.OP_FP8_GEMV_UMMA_STREAM_SM100,
+            opcode=family_ref(
+                "FP8_GEMV_UMMA_STREAM_SM100",
+                SCALE_PACK=scale_pack,
+                OUTPUT_GROUPS=output_groups,
+            ),
             args=[k_tiles],
         )
 
@@ -221,14 +235,33 @@ class Fp8GemvUmmaSplitKSm100(ComputeInstruction):
     BF16_BYTES = 2
     FP32_BYTES = 4
 
-    def __init__(self, k_tiles: int, reduction_bytes: int = FP32_BYTES):
+    def __init__(
+        self,
+        k_tiles: int,
+        reduction_bytes: int = FP32_BYTES,
+        scale_pack: int = 1,
+        output_groups: int = 1,
+    ):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("split-K FP8 UMMA K-tile count must fit uint16")
         if reduction_bytes not in (self.BF16_BYTES, self.FP32_BYTES):
             raise ValueError("split-K reduction must use BF16 or FP32")
+        if scale_pack not in (1, 2, 4) or k_tiles % scale_pack:
+            raise ValueError(
+                "split-K FP8 scale pack must be 1, 2, or 4 and divide K tiles"
+            )
+        if output_groups not in (1, 2):
+            raise ValueError("split-K FP8 output groups must be 1 or 2")
+        if output_groups > 1 and scale_pack == 1:
+            raise ValueError("grouped split-K FP8 UMMA requires packed scales")
         super().__init__(
-            opcode=opcode.OP_FP8_GEMV_UMMA_SPLITK_SM100,
-            args=[k_tiles, reduction_bytes],
+            opcode=family_ref(
+                "FP8_GEMV_UMMA_SPLITK_SM100",
+                SCALE_PACK=scale_pack,
+                OUTPUT_GROUPS=output_groups,
+                REDUCTION_BYTES=reduction_bytes,
+            ),
+            args=[k_tiles],
         )
 
 
@@ -281,11 +314,17 @@ class Fp8UmmaPrepackSm100(ComputeInstruction):
 class Dsv4Fp8QuantUmmaBSm100(ComputeInstruction):
     """Quantize BF16 K128 tiles into the native N8 MXF8 B layout."""
 
-    def __init__(self, k_tiles: int = 1):
+    def __init__(self, k_tiles: int = 1, scale_pack: int = 1):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("native FP8 quant K-tile count must fit uint16")
+        if scale_pack not in (1, 2, 4) or k_tiles % scale_pack:
+            raise ValueError(
+                "native FP8 quant scale pack must be 1, 2, or 4 and divide K tiles"
+            )
         super().__init__(
-            opcode=opcode.OP_DSV4_FP8_QUANT_UMMA_B_SM100,
+            opcode=family_ref(
+                "DSV4_FP8_QUANT_UMMA_B_SM100", SCALE_PACK=scale_pack
+            ),
             args=[k_tiles],
         )
 

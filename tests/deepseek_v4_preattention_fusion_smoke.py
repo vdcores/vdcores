@@ -194,13 +194,13 @@ def main() -> None:
             q_rank_weight,
             q_rank_native,
             epsilon,
-        ).place(8),
+        ).place(4),
         SchedDsv4Fp32RmsFp8QuantUmmaB(
             q_rank_fp32,
             q_rank_weight,
             q_rank_fp32_native,
             epsilon,
-        ).place(8),
+        ).place(4),
         SchedDsv4Fp32RmsRope512_64(
             q_fp32,
             table,
@@ -317,16 +317,19 @@ def main() -> None:
         atol=0,
     )
     expected_scale_bytes = scales.to(torch.float8_e8m0fnu).view(torch.uint8)
-    for tile in range(8):
-        packed_scales = q_rank_native[tile, 1024:]
+    for group_start in range(0, 8, 2):
+        packed_scales = q_rank_native[group_start, 1024:]
         populated = packed_scales[packed_scales != 0]
-        assert populated.numel() == 32
+        assert populated.numel() == 16
+        expected = expected_scale_bytes[group_start : group_start + 2]
+        expected = expected[:, None].expand(2, 8).reshape(-1)
         torch.testing.assert_close(
-            populated,
-            expected_scale_bytes[tile].expand_as(populated),
+            populated.sort().values,
+            expected.sort().values,
             rtol=0,
             atol=0,
         )
+        assert not bool(q_rank_native[group_start + 1, 1024:].any().item())
     torch.testing.assert_close(
         grouped_output.reshape(-1),
         grouped_weight.float() @ grouped_input.float(),

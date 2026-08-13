@@ -34,7 +34,26 @@ def inverse_rope_float(source: torch.Tensor, table: torch.Tensor) -> torch.Tenso
     return output
 
 
-def unpack_native(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def validate_pack2_scales(
+    packed: torch.Tensor, scale_bits: torch.Tensor
+) -> torch.Tensor:
+    scale_region = packed[:, :, 1024:]
+    expected = torch.zeros_like(scale_region)
+    for group_start in range(0, packed.shape[1], 2):
+        expected[:, group_start, :8] = scale_bits[:, group_start, None]
+        expected[:, group_start, 8:16] = scale_bits[:, group_start + 1, None]
+    torch.testing.assert_close(
+        scale_region.sort(dim=-1).values,
+        expected.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+    return scale_region
+
+
+def unpack_native(
+    packed: torch.Tensor, scale_bits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     heads = packed.shape[0]
     native_data = packed[:, :, :1024].reshape(heads, 4, 8, 8, 16)
     reconstructed = torch.empty_like(native_data)
@@ -44,8 +63,7 @@ def unpack_native(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                 native_data[:, :, row, source_chunk ^ row]
             )
     bits = reconstructed[:, :, 0].reshape(heads, 512)
-    scale_region = packed[:, :, 1024:]
-    scale_bits = scale_region.amax(dim=-1)
+    scale_region = validate_pack2_scales(packed, scale_bits)
     dequant = (
         bits.view(torch.float8_e4m3fn).float()
         * scale_bits.view(torch.float8_e8m0fnu)
@@ -194,6 +212,7 @@ def benchmark_split_attention(
                 grouped_packed[group],
                 output_reduce,
                 2,
+                scale_pack=2,
             )
             stages.append(
                 SequentialStage(
@@ -231,7 +250,8 @@ def benchmark_split_attention(
         reference_q.float().reshape(64, 512)
         * reference_scale.float().reshape(64, 4).repeat_interleave(128, dim=1)
     )
-    actual_dequant, _ = unpack_native(packed)
+    reference_scale_bits = reference_scale.view(torch.uint8).reshape(64, 4)
+    actual_dequant, _ = unpack_native(packed, reference_scale_bits)
     torch.testing.assert_close(
         actual_dequant, reference_dequant, rtol=8.0e-2, atol=8.0e-3
     )
@@ -333,20 +353,21 @@ def main() -> None:
     data_mismatches = int((reconstructed != expected_broadcast).sum().item())
 
     scale_region = packed[:, :, 1024:]
-    expected_scale = reference_scale_bits[:, :, None]
-    scale_nonzero = scale_region != 0
+    expected_scale_region = torch.zeros_like(scale_region)
+    for group_start in range(0, 4, 2):
+        expected_scale_region[:, group_start, :8] = (
+            reference_scale_bits[:, group_start, None]
+        )
+        expected_scale_region[:, group_start, 8:16] = (
+            reference_scale_bits[:, group_start + 1, None]
+        )
     scale_mismatches = int(
         (
-            scale_region[scale_nonzero]
-            != expected_scale.expand_as(scale_region)[scale_nonzero]
+            scale_region.sort(dim=-1).values
+            != expected_scale_region.sort(dim=-1).values
         ).sum().item()
     )
-    scale_counts = scale_nonzero.sum(dim=-1)
-    if not bool((scale_counts == 32).all().item()):
-        raise AssertionError(
-            f"native SFB record expected 32 scales, got {scale_counts.cpu().tolist()}"
-        )
-    actual_dequant, _ = unpack_native(packed)
+    actual_dequant, _ = unpack_native(packed, reference_scale_bits)
     reference_dequant = (
         reference_q.float().reshape(args.heads, 512)
         * reference_scale.float().reshape(args.heads, 4)

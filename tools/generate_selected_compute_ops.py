@@ -234,14 +234,12 @@ def write_opcode_order(path: Path, entries: list[str], source: str) -> None:
 
 def render_dynamic_handler(entry: dict[str, int | str]) -> str:
     name = entry["name"]
-    if not entry["family"].startswith("gemv_"):
-        raise ValueError(f"Unsupported dynamic family in code generation: {entry['family']}")
-
-    prelude = [
-        f"DAE_COMPUTE_OP_HANDLER({name}) {{",
-        "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);",
-    ]
-    if entry["family"] == "gemv_wgmma":
+    family = entry["family"]
+    if family == "gemv_wgmma":
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);",
+        ]
         residual = "true" if entry["residual"] else "false"
         body = [
             "#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)",
@@ -257,12 +255,86 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             ),
             "#endif",
         ]
-    elif entry["family"] == "gemv_mma":
+    elif family == "gemv_mma":
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);",
+        ]
         body = [
             f"  task_gemv_mma<{entry['m']}, {entry['n']}, {entry['k']}>(inst.args[0], smem_base, m2c, c2m);",
         ]
+    elif family in (
+        "fp8_gemv_umma_stream_sm100",
+        "fp8_gemv_umma_splitk_sm100",
+    ):
+        scale_pack = int(entry["scale_pack"])
+        output_groups = int(entry["output_groups"])
+        if scale_pack not in (1, 2, 4):
+            raise ValueError(
+                f"Unsupported native FP8 scale_pack={scale_pack}; expected 1, 2, or 4"
+            )
+        if output_groups not in (1, 2):
+            raise ValueError(
+                f"Unsupported native FP8 output_groups={output_groups}; expected 1 or 2"
+            )
+        if scale_pack == 1 and output_groups != 1:
+            raise ValueError("Grouped native FP8 UMMA requires packed scales")
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space, g_events);",
+        ]
+        if family == "fp8_gemv_umma_stream_sm100":
+            task = (
+                f"  task_fp8_gemv_umma_stream_sm100<{scale_pack}, {output_groups}>"
+                "(inst.args[0], smem_base, tmem_base_ptr, tmem_mma_barrier, "
+                "tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);"
+            )
+        else:
+            reduction_bytes = int(entry["reduction_bytes"])
+            if reduction_bytes == 2:
+                split_output = "cutlass::bfloat16_t"
+            elif reduction_bytes == 4:
+                split_output = "float"
+            else:
+                raise ValueError(
+                    "Native FP8 split-K reduction_bytes must be 2 or 4"
+                )
+            task = (
+                "  task_fp8_gemv_umma_splitk_sm100<"
+                f"{scale_pack}, {output_groups}, {split_output}>"
+                "(inst.args[0], smem_base, tmem_base_ptr, tmem_mma_barrier, "
+                "tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);"
+            )
+        body = [
+            "#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)",
+            task,
+            "#endif",
+        ]
+    elif family == "dsv4_fp8_quant_umma_b_sm100":
+        scale_pack = int(entry["scale_pack"])
+        if scale_pack not in (1, 2, 4):
+            raise ValueError(
+                f"Unsupported native FP8 quant scale_pack={scale_pack}; expected 1, 2, or 4"
+            )
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            (
+                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, "
+                "tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, "
+                "fp8_umma_pipeline_phase_mask, scratch_space, g_events);"
+            ),
+        ]
+        body = [
+            "#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)",
+            (
+                f"  task_dsv4_fp8_quant_umma_b_sm100<{scale_pack}>"
+                "(inst.args[0], smem_base, get_slot_address(smem_base, numSlots), "
+                "m2c, c2m);"
+            ),
+            "#endif",
+        ]
     else:
-        raise ValueError(f"Unsupported GEMV family in code generation: {entry['family']}")
+        raise ValueError(f"Unsupported dynamic family in code generation: {family}")
     return "\n".join(prelude + body + ["}"])
 
 

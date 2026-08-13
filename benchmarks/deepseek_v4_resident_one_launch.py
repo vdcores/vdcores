@@ -261,6 +261,7 @@ class ResidentOneLaunchDecode:
             reserve_bytes=int(self.args.resident_reserve_gib * (1 << 30)),
             native_nvfp4=True,
             native_fp8_prefixes=tuple(native_fp8_prefixes),
+            native_fp8_scale_pack=self.args.fp8_umma_scale_pack,
             progress=progress,
         )
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
@@ -793,18 +794,23 @@ class ResidentOneLaunchDecode:
         release_group: str | None = None,
     ) -> Stage:
         assignment = self.policy.quantize(source.numel(), 128)
+        scale_pack = self.args.fp8_umma_scale_pack
+        scale_groups = source.numel() // (128 * scale_pack)
+        assignment = replace(
+            assignment, num_sms=min(assignment.num_sms, scale_groups)
+        )
         base_sm = None
         if placement is not None:
             base_sm, num_sms = placement
-            if not 0 < num_sms <= assignment.num_sms:
+            if not 0 < num_sms <= scale_groups:
                 raise ValueError(
-                    "native FP8 quant placement must fit its K128 tiles"
+                    "native FP8 quant placement must fit its scale groups"
                 )
             assignment = replace(assignment, num_sms=num_sms)
         return self._stage(
             name,
             SchedDsv4Fp8QuantUmmaB(
-                source.reshape(-1), output
+                source.reshape(-1), output, scale_pack
             ),
             assignment,
             wait_for_previous=wait_for_previous,
@@ -826,20 +832,26 @@ class ResidentOneLaunchDecode:
         release_group: str | None = None,
     ) -> Stage:
         weights = self._family_tensors(family, weight_suffix)
+        scale_pack = self.args.fp8_umma_scale_pack
+        scale_groups = source.numel() // (128 * scale_pack)
         schedule = SchedDsv4RmsFp8QuantUmmaB(
             source.reshape(-1),
             weights[0],
             output,
             self.config.rms_epsilon,
+            scale_pack,
         )
         schedule = self._layered(schedule, family, weights)
         assignment = self.policy.quantize(source.numel(), 128)
+        assignment = replace(
+            assignment, num_sms=min(assignment.num_sms, scale_groups)
+        )
         base_sm = None
         if placement is not None:
             base_sm, num_sms = placement
-            if not 0 < num_sms <= assignment.num_sms:
+            if not 0 < num_sms <= scale_groups:
                 raise ValueError(
-                    "fused RMS/native-FP8 placement must fit its K128 tiles"
+                    "fused RMS/native-FP8 placement must fit its scale groups"
                 )
             assignment = replace(assignment, num_sms=num_sms)
         return self._stage(
@@ -986,8 +998,16 @@ class ResidentOneLaunchDecode:
             for layer_id in family.layer_ids
         )
         weights = tuple(linear.weight_tiles for linear in linears)
+        scale_packs = {linear.scale_pack for linear in linears}
+        if len(scale_packs) != 1:
+            raise ValueError("layered native FP8 weights must share scale packing")
+        scale_pack = scale_packs.pop()
         schedule = SchedFp8GemvUmmaStream(
-            weights[0], activation, output.reshape(-1)
+            weights[0],
+            activation,
+            output.reshape(-1),
+            scale_pack,
+            self.args.fp8_umma_output_group_size,
         )
         schedule = self._layered(schedule, family, weights)
         assignment = self.policy.fp8_umma_gemv(
@@ -1029,6 +1049,10 @@ class ResidentOneLaunchDecode:
             )
             for layer_id in family.layer_ids
         )
+        scale_packs = {linear.scale_pack for linear in linears}
+        if len(scale_packs) != 1:
+            raise ValueError("layered native FP8 weights must share scale packing")
+        scale_pack = scale_packs.pop()
         if row_slice is None:
             weights = tuple(linear.weight_tiles for linear in linears)
         else:
@@ -1044,15 +1068,34 @@ class ResidentOneLaunchDecode:
         k = activation.shape[0] * 128
         if output.numel() != rows:
             raise ValueError("native split-K output size must match selected rows")
-        policy_split, _ = self.policy.fp8_umma_split_k(rows, k)
+        policy_split, policy_sms = self.policy.fp8_umma_split_k(rows, k)
         split_k = policy_split if split_k is None else int(split_k)
         if k // 128 % split_k:
             raise ValueError("split-K override must divide K tiles")
         work_tiles = rows // 128 * split_k
-        num_sms = min(self.sms, work_tiles) if num_sms is None else int(num_sms)
+        num_sms = policy_sms if num_sms is None else int(num_sms)
         if not 0 < num_sms <= work_tiles:
             raise ValueError("split-K SM override exceeds logical work tiles")
         output_vector = output.reshape(-1)
+        if split_k == 1:
+            schedule = SchedFp8GemvUmmaStream(
+                weights[0],
+                activation,
+                output_vector,
+                scale_pack,
+                self.args.fp8_umma_output_group_size,
+            )
+            schedule = self._layered(schedule, family, weights)
+            return [
+                self._stage(
+                    name,
+                    schedule,
+                    num_sms,
+                    base_sm=base_sm,
+                    wait_group=wait_group,
+                    release_group=release_group,
+                )
+            ]
         if self.direct_splitk_bf16:
             if fp32_finalizer is not None:
                 raise ValueError(
@@ -1078,7 +1121,12 @@ class ResidentOneLaunchDecode:
             self.launcher, accumulator
         ).rowmajor_2d("reduce", 1, 128)
         schedule = SchedFp8GemvUmmaSplitK(
-            weights[0], activation, output_reduce, split_k
+            weights[0],
+            activation,
+            output_reduce,
+            split_k,
+            scale_pack,
+            self.args.fp8_umma_output_group_size,
         )
         schedule = self._layered(schedule, family, weights)
         gemv = self._stage(
@@ -1364,6 +1412,10 @@ class ResidentOneLaunchDecode:
             q_sms,
             self.policy.quantize(cfg.q_lora_rank, 128).num_sms,
         )
+        native_q_quant_sms = min(
+            q_quant_sms,
+            cfg.q_lora_rank // (128 * self.args.fp8_umma_scale_pack),
+        )
         qkv_input_ready = f"{family.name}.attn.qkv.input.ready"
         q_a_ready = f"{family.name}.attn.q_a.ready"
         q_norm_ready = f"{family.name}.attn.q_norm.ready"
@@ -1508,11 +1560,12 @@ class ResidentOneLaunchDecode:
                     q_norm_weights[0],
                     self.q_rank_native_fp8,
                     self.config.rms_epsilon,
+                    self.args.fp8_umma_scale_pack,
                 )
                 schedule = self._layered(
                     schedule, family, q_norm_weights
                 )
-                return schedule, q_quant_sms
+                return schedule, native_q_quant_sms
 
         if split_q_a:
             stages.extend(
@@ -1556,7 +1609,7 @@ class ResidentOneLaunchDecode:
                     self.q_rank,
                     self.q_rank_native_fp8,
                     weight_suffix="attn.q_norm.weight",
-                    placement=(q_base, q_quant_sms),
+                    placement=(q_base, native_q_quant_sms),
                     wait_group=q_a_ready,
                     release_group=qkv_prefix_join,
                 )
@@ -1580,7 +1633,7 @@ class ResidentOneLaunchDecode:
                         "attn.q_rank.quant_native_fp8",
                         self.q_rank_norm,
                         self.q_rank_native_fp8,
-                        placement=(q_base, q_quant_sms),
+                        placement=(q_base, native_q_quant_sms),
                         wait_group=q_norm_ready,
                         release_group=qkv_prefix_join,
                     )
@@ -4003,6 +4056,25 @@ def main() -> None:
         help=(
             "reduce split-K projections directly to BF16 model outputs or "
             "use an exact FP32 accumulator plus BF16 finalizer"
+        ),
+    )
+    parser.add_argument(
+        "--fp8-umma-scale-pack",
+        type=int,
+        choices=(2,),
+        default=2,
+        help=(
+            "use the resident image's compile-time pack-2 native UMMA layout"
+        ),
+    )
+    parser.add_argument(
+        "--fp8-umma-output-group-size",
+        type=int,
+        choices=(2,),
+        default=2,
+        help=(
+            "use the resident image's compile-time two-M128 UMMA epilogue "
+            "grouping (split-K tails retain their static one-tile handler)"
         ),
     )
     parser.add_argument(

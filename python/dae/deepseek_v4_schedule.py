@@ -91,6 +91,11 @@ class DeepSeekV4ShapePolicy:
         """Return the first-pass split factor and resident SM count."""
         if rows % 128 or k % 128:
             raise ValueError("native split-K FP8 GEMV requires M128/K128 alignment")
+        if rows == 32768 and k == 1024:
+            # Q_b has exactly two M128 rows per SM at this placement. Keeping
+            # K intact lets the UMMA task reuse its activation and delay both
+            # epilogues without paying split-K reduction traffic.
+            return 1, min(self.resident_sms, 128)
         if k == 1024:
             split_k = 2
         elif rows <= 1024 and k == 4096:

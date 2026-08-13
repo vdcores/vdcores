@@ -1603,7 +1603,7 @@ __device__ __forceinline__ void task_dsv4_attention_split32_umma_sm100(
     c2m.template push<31, true, false>(tid, metadata_slots);
 }
 
-template <typename M2CQueue, typename C2MQueue>
+template <int ScalePack, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_dsv4_attention_split_reduce_fp8_sm100(
     int num_splits,
@@ -1624,6 +1624,8 @@ task_dsv4_attention_split_reduce_fp8_sm100(
     constexpr int kScaleVector = 32;
     constexpr int kBBytes = kTileN * kTileK;
     constexpr int kBTileBytes = 2048;
+    static_assert(ScalePack == 2);
+    static_assert(kTiles % ScalePack == 0);
     using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
     using Atom = SM100_MMA_MXF8F6F4_SS<
         Fp8, Fp8, Accum, Scale, kTileM, kTileN,
@@ -1727,6 +1729,7 @@ task_dsv4_attention_split_reduce_fp8_sm100(
             const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
             const float exponent = ceilf(log2f(requested));
             shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+            shared[16 + tile % ScalePack] = shared[4];
         }
         __sync_compute_group(128);
         const Fp8 quantized = values[tile] == 0.0f
@@ -1742,15 +1745,14 @@ task_dsv4_attention_split_reduce_fp8_sm100(
                 row * kTileK + destination_chunk * 16 + byte_in_chunk] =
                 quantized;
         }
-        auto *packed_scale =
-            reinterpret_cast<Scale *>(tile_output + kBBytes);
-        const Scale block_scale = Scale(shared[4]);
-        for (int index = tid; index < kTileN * (kTileK / kScaleVector);
-             index += 128) {
-            const int row = index / (kTileK / kScaleVector);
-            const int sf = index % (kTileK / kScaleVector);
+        if (tile % ScalePack == ScalePack - 1 &&
+            tid < kTileN * ScalePack) {
+            const int row = tid / ScalePack;
+            const int sf = tid % ScalePack;
+            auto *packed_scale = reinterpret_cast<Scale *>(
+                output + (tile + 1 - ScalePack) * kBTileBytes + kBBytes);
             const int dst = int(logical_sfb(row, sf * kScaleVector));
-            packed_scale[dst] = block_scale;
+            packed_scale[dst] = Scale(shared[16 + sf]);
         }
         __sync_compute_group(128);
     }

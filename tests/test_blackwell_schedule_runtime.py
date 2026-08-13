@@ -14,6 +14,7 @@ from dae.instructions import (
     Copy,
     Dsv4ContiguousAttention512UmmaSm100,
     Dsv4ContiguousAttention512UmmaTail32Sm100,
+    Dsv4HcPreRms,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4RmsFp8QuantUmmaBSm100,
@@ -48,6 +49,7 @@ from dae.instructions import (
     ResetIndirectLayer,
     RoutedTmaLoad1D,
     RegLoad,
+    RegStore,
     TmaLoadAddressReg1D,
     TmaLoadReg1D,
     TmaTensor,
@@ -57,6 +59,8 @@ from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
 from dae.launcher import Launcher
 from dae.schedule import (
     Schedule,
+    SchedDsv4Fp8QuantUmmaB,
+    SchedDsv4HcPreRms,
     SchedDsv4HcPost,
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
@@ -465,14 +469,43 @@ def test_fp8_streaming_umma_encodes_k_tiles():
     instruction = Fp8GemvUmmaStreamSm100(64)
 
     assert instruction.args == [64]
+    assert instruction.compute_operator_name() == (
+        "OP_FP8_GEMV_UMMA_STREAM_SM100__SCALE_PACK_1__OUTPUT_GROUPS_1"
+    )
+
+    packed = Fp8GemvUmmaStreamSm100(64, 4)
+    assert packed.args == [64]
+    assert packed.compute_operator_name() == (
+        "OP_FP8_GEMV_UMMA_STREAM_SM100__SCALE_PACK_4__OUTPUT_GROUPS_1"
+    )
+
+    grouped = Fp8GemvUmmaStreamSm100(8, 2, 2)
+    assert grouped.args == [8]
+    assert grouped.compute_operator_name() == (
+        "OP_FP8_GEMV_UMMA_STREAM_SM100__SCALE_PACK_2__OUTPUT_GROUPS_2"
+    )
 
 
 def test_fp8_splitk_umma_encodes_local_k_tiles():
     fp32 = Fp8GemvUmmaSplitKSm100(16)
     bf16 = Fp8GemvUmmaSplitKSm100(16, 2)
 
-    assert fp32.args == [16, 4]
-    assert bf16.args == [16, 2]
+    assert fp32.args == [16]
+    assert fp32.compute_operator_name() == (
+        "OP_FP8_GEMV_UMMA_SPLITK_SM100__SCALE_PACK_1__"
+        "OUTPUT_GROUPS_1__REDUCTION_BYTES_4"
+    )
+    assert bf16.args == [16]
+    assert bf16.compute_operator_name() == (
+        "OP_FP8_GEMV_UMMA_SPLITK_SM100__SCALE_PACK_1__"
+        "OUTPUT_GROUPS_1__REDUCTION_BYTES_2"
+    )
+
+    grouped = Fp8GemvUmmaSplitKSm100(8, 2, 2, 2)
+    assert grouped.compute_operator_name() == (
+        "OP_FP8_GEMV_UMMA_SPLITK_SM100__SCALE_PACK_2__"
+        "OUTPUT_GROUPS_2__REDUCTION_BYTES_2"
+    )
 
 
 def test_dsv4_zero_fill_shards_contiguous_output(monkeypatch):
@@ -506,7 +539,7 @@ def test_dsv4_shape_policy_selects_validated_attention_splits():
 
     assert policy.fp8_umma_split_k(1024, 4096) == (8, 64)
     assert policy.fp8_umma_split_k(512, 4096) == (8, 32)
-    assert policy.fp8_umma_split_k(32768, 1024) == (2, 152)
+    assert policy.fp8_umma_split_k(32768, 1024) == (1, 128)
     assert policy.fp8_umma_split_k(8192, 1024) == (2, 128)
     assert policy.fp8_umma_split_k(8192, 4096) == (2, 128)
     assert policy.fp8_umma_split_k(4096, 8192) == (4, 128)
@@ -543,6 +576,9 @@ def test_dsv4_fp8_native_quant_encodes_k_tile_count():
     instruction = Dsv4Fp8QuantUmmaBSm100(1)
 
     assert instruction.args == [1]
+    assert instruction.compute_operator_name() == (
+        "OP_DSV4_FP8_QUANT_UMMA_B_SM100__SCALE_PACK_1"
+    )
 
 
 def test_dsv4_cleanroom_preattention_fusions_encode_shape_shards(monkeypatch):
@@ -554,15 +590,15 @@ def test_dsv4_cleanroom_preattention_fusions_encode_shape_shards(monkeypatch):
     native = torch.empty((8, 2048), dtype=torch.uint8)
     quant = SchedDsv4RmsFp8QuantUmmaB(
         source, weight, native, 1.0e-6
-    ).place(8)
+    ).place(4)
 
     first = quant.schedule(0)
-    last = quant.schedule(7)
+    last = quant.schedule(3)
     assert isinstance(first[0], Dsv4RmsFp8QuantUmmaBSm100)
-    assert first[0].args[:2] == [8, 0x100]
-    assert last[0].args[:2] == [8, 0x107]
+    assert first[0].args[:2] == [8, 0x200]
+    assert last[0].args[:2] == [8, 0x206]
     assert len(first) == 4
-    assert first[-1].size == 2048
+    assert first[-1].size == 2 * 2048
 
     rows = torch.empty((2, 512), dtype=torch.bfloat16)
     table = torch.empty((32, 2), dtype=torch.float32)
@@ -657,6 +693,95 @@ def test_fp8_native_stream_bounds_activation_chunks_to_one_slot(monkeypatch):
     assert all(inst.num_slots == 3 for inst in weight_loads)
 
 
+def test_fp8_native_stream_packs_scale_records(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedFp8GemvUmmaStream(
+        torch.empty((1, 8, 16896), dtype=torch.uint8),
+        torch.empty((8, 2048), dtype=torch.uint8),
+        torch.empty((128,), dtype=torch.bfloat16),
+        scale_pack=4,
+    ).place(1)
+
+    instructions = schedule.schedule(0)
+    compute = next(
+        inst for inst in instructions
+        if isinstance(inst, Fp8GemvUmmaStreamSm100)
+    )
+    full_weights = [
+        inst for inst in instructions
+        if isinstance(inst, MemoryInstruction) and inst.size == 16896
+    ]
+    data_only_weights = [
+        inst for inst in instructions
+        if (
+            isinstance(inst, MemoryInstruction)
+            and inst.size == 16384
+            and inst.annotation.get("fixed_port") == 0
+        )
+    ]
+
+    assert compute.args == [8]
+    assert len(full_weights) == 2
+    assert all(inst.num_slots == 3 for inst in full_weights)
+    assert len(data_only_weights) == 6
+    assert all(inst.num_slots == 2 for inst in data_only_weights)
+
+
+def test_dsv4_fp8_native_quant_shards_whole_scale_groups(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedDsv4Fp8QuantUmmaB(
+        torch.empty((1024,), dtype=torch.bfloat16),
+        torch.empty((8, 2048), dtype=torch.uint8),
+        scale_pack=4,
+    ).place(2)
+
+    first = schedule.schedule(0)
+    last = schedule.schedule(1)
+
+    assert first[0].args == last[0].args == [4]
+    assert first[1].size == last[1].size == 4 * 128 * 2
+    assert first[2].size == last[2].size == 4 * 2048
+    assert first[1].cords != last[1].cords
+
+
+def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedDsv4HcPreRms(
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((3,), dtype=torch.float32),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((4, 4), dtype=torch.float32),
+    ).bar("output", 7).place(1)
+
+    instructions = schedule.schedule(0)
+    compute = [
+        inst for inst in instructions if isinstance(inst, ComputeInstruction)
+    ]
+    output_releases = [
+        inst
+        for inst in instructions
+        if isinstance(inst, MemoryInstruction)
+        and inst.num_slots >> 6 == 7
+    ]
+
+    assert [type(inst) for inst in compute] == [Dsv4HcPreRms]
+    assert not any(
+        isinstance(inst, (RegLoad, RegStore)) for inst in instructions
+    )
+    assert len(output_releases) == 1
+    assert schedule.bar_release_count("output") == 1
+
+
 def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
     monkeypatch.setattr(
         "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
@@ -698,8 +823,8 @@ def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):
         and inst.size == 4 * 2048
     )
 
-    assert first_compute.args == [16, 4]
-    assert second_compute.args == [16, 4]
+    assert first_compute.args == [16]
+    assert second_compute.args == [16]
     assert first_store.opcode == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
     assert first_store.size == 128 * accumulator.element_size()
     assert first_store.cords[:2] == [0, 0]
@@ -741,12 +866,15 @@ def test_fp8_native_splitk_balances_more_work_tiles_than_sms(monkeypatch):
     first_stores = [
         inst
         for inst in first
-        if (inst.opcode & ~16) == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
+        if (
+            isinstance(inst, MemoryInstruction)
+            and (inst.opcode & ~16) == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
+        )
     ]
 
     assert len(first_compute) == 4
     assert len(last_compute) == 3
-    assert all(inst.args == [4, 4] for inst in first_compute + last_compute)
+    assert all(inst.args == [4] for inst in first_compute + last_compute)
     assert len(first_stores) == 4
     assert sum(bool(inst.opcode & 16) for inst in first_stores) == 1
     assert first_stores[-1].opcode & 16
