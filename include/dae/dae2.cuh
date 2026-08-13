@@ -120,9 +120,9 @@ void dae2(
   // block per SM, so acquire TMEM once for the lifetime of the megakernel and
   // reuse it across sequential compute tasks.
   __shared__ alignas(16) uint32_t tmem_base_ptr;
-  // Barrier 0 serves ordinary UMMA tasks. Grouped fused-LM-head tasks use
-  // four completion barriers followed by four empty-stage acknowledgements.
-  static constexpr int tmemMmaBarrierCount = 9;
+  // Barrier ownership is declared in context.cuh. The extra FP8 bank is
+  // task-local planning over this resident array; no TMEM/runtime allocation
+  // protocol changes between projection shapes.
   __shared__ alignas(16) uint64_t tmem_mma_barriers[tmemMmaBarrierCount];
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   using TmemAllocator = cute::TMEM::Allocator1Sm;
@@ -171,6 +171,7 @@ void dae2(
       count[i] = initial_loop_counts.values[i];
     }
     uint32_t tmem_mma_phase = 0;
+    uint32_t fp8_umma_pipeline_phase_mask = 0;
     bool finish = false;
 
     while (!finish) {
@@ -188,6 +189,7 @@ void dae2(
         tmem_base_ptr,
         tmem_mma_barriers,
         tmem_mma_phase,
+        fp8_umma_pipeline_phase_mask,
         scratch_space,
         st_insts,
         m2c,

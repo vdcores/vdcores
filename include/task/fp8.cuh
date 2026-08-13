@@ -344,7 +344,7 @@ __device__ __forceinline__ void task_fp8_umma_prepack_sm100(
 }
 
 // Quantize BF16 directly into the combined N8/K128 native MXF8 B layout.
-template <typename M2CQueue, typename C2MQueue>
+template <int ScalePack, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
     int num_k_tiles,
     void *smem_base,
@@ -360,6 +360,7 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
   constexpr int kTileN = 8;
   constexpr int kTileK = 128;
   constexpr int kScaleVector = 32;
+  static_assert(ScalePack == 1 || ScalePack == 2 || ScalePack == 4);
   using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
   using Atom = SM100_MMA_MXF8F6F4_SS<
       Fp8, Fp8, Accum, Scale, kTileM, kTileN,
@@ -387,51 +388,136 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
   const int warp = tid >> 5;
   auto *shared = static_cast<float *>(task_scratch);
 
-  for (int tile = 0; tile < num_k_tiles; ++tile) {
-    auto *tile_output = output + tile * kBTileBytes;
-    const float value = __bfloat162float(input[tile * kTileK + tid]);
-    float maximum = fabsf(value);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      maximum = fmaxf(
-          maximum,
-          __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
-    }
-    if (lane == 0) {
-      shared[warp] = maximum;
-    }
-    for (int offset = tid; offset < kBTileBytes - kBBytes; offset += 128) {
-      tile_output[kBBytes + offset] = 0;
-    }
-    __sync_compute_group(128);
-    if (tid == 0) {
-      maximum = fmaxf(
-          fmaxf(shared[0], shared[1]), fmaxf(shared[2], shared[3]));
-      const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
-      const float exponent = ceilf(log2f(requested));
-      shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
-    }
-    __sync_compute_group(128);
+  if constexpr (ScalePack == 1) {
+    for (int tile = 0; tile < num_k_tiles; ++tile) {
+      auto *tile_output = output + tile * kBTileBytes;
+      const float value = __bfloat162float(input[tile * kTileK + tid]);
+      float maximum = fabsf(value);
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
+      }
+      if (lane == 0) {
+        shared[warp] = maximum;
+      }
+      for (int offset = tid; offset < kBTileBytes - kBBytes; offset += 128) {
+        tile_output[kBBytes + offset] = 0;
+      }
+      __sync_compute_group(128);
+      if (tid == 0) {
+        maximum = fmaxf(
+            fmaxf(shared[0], shared[1]), fmaxf(shared[2], shared[3]));
+        const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+        const float exponent = ceilf(log2f(requested));
+        shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+      }
+      __sync_compute_group(128);
 
-    const Fp8 quantized = value == 0.0f
-        ? Fp8(0.0f)
-        : Fp8(fminf(fmaxf(value / shared[4], -448.0f), 448.0f));
-    const int source_chunk = tid / 16;
-    const int byte_in_chunk = tid % 16;
-    for (int row = 0; row < kTileN; ++row) {
-      const int destination_chunk = source_chunk ^ row;
-      reinterpret_cast<Fp8 *>(tile_output)[
-          row * kTileK + destination_chunk * 16 + byte_in_chunk] = quantized;
+      const Fp8 quantized = value == 0.0f
+          ? Fp8(0.0f)
+          : Fp8(fminf(fmaxf(value / shared[4], -448.0f), 448.0f));
+      const int source_chunk = tid / 16;
+      const int byte_in_chunk = tid % 16;
+      for (int row = 0; row < kTileN; ++row) {
+        const int destination_chunk = source_chunk ^ row;
+        reinterpret_cast<Fp8 *>(tile_output)[
+            row * kTileK + destination_chunk * 16 + byte_in_chunk] = quantized;
+      }
+      auto *packed_scale =
+          reinterpret_cast<Scale *>(tile_output + kBBytes);
+      const Scale block_scale = Scale(shared[4]);
+      for (int index = tid; index < kTileN * (kTileK / kScaleVector);
+           index += 128) {
+        const int row = index / (kTileK / kScaleVector);
+        const int sf = index % (kTileK / kScaleVector);
+        const int dst = int(logical_sfb(row, sf * kScaleVector));
+        packed_scale[dst] = block_scale;
+      }
+      __sync_compute_group(128);
     }
-    auto *packed_scale = reinterpret_cast<Scale *>(tile_output + kBBytes);
-    const Scale block_scale = Scale(shared[4]);
-    for (int index = tid; index < kTileN * (kTileK / kScaleVector);
-         index += 128) {
-      const int row = index / (kTileK / kScaleVector);
-      const int sf = index % (kTileK / kScaleVector);
-      const int dst = int(logical_sfb(row, sf * kScaleVector));
-      packed_scale[dst] = block_scale;
+  } else {
+    constexpr int kThreadsPerTile = 128 / ScalePack;
+    constexpr int kValuesPerThread = ScalePack;
+    constexpr int kWarpsPerTile = kThreadsPerTile / 32;
+    const int tile_in_group = tid / kThreadsPerTile;
+    const int tile_tid = tid % kThreadsPerTile;
+
+    for (int group_start = 0; group_start < num_k_tiles;
+         group_start += ScalePack) {
+      float values[kValuesPerThread];
+      float maximum = 0.0f;
+      #pragma unroll
+      for (int value_id = 0; value_id < kValuesPerThread; ++value_id) {
+        const int element = tile_tid + value_id * kThreadsPerTile;
+        const float value = __bfloat162float(
+            input[(group_start + tile_in_group) * kTileK + element]);
+        values[value_id] = value;
+        maximum = fmaxf(maximum, fabsf(value));
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
+      }
+      if (lane == 0) {
+        shared[warp] = maximum;
+      }
+      #pragma unroll
+      for (int pack_tile = 0; pack_tile < ScalePack; ++pack_tile) {
+        auto *tile_output = output +
+            (group_start + pack_tile) * kBTileBytes;
+        for (int offset = tid; offset < kBTileBytes - kBBytes;
+             offset += 128) {
+          tile_output[kBBytes + offset] = 0;
+        }
+      }
+      __sync_compute_group(128);
+      if (tile_tid == 0) {
+        maximum = 0.0f;
+        #pragma unroll
+        for (int tile_warp = 0; tile_warp < kWarpsPerTile; ++tile_warp) {
+          maximum = fmaxf(
+              maximum,
+              shared[tile_in_group * kWarpsPerTile + tile_warp]);
+        }
+        const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+        const float exponent = ceilf(log2f(requested));
+        shared[16 + tile_in_group] =
+            exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+      }
+      __sync_compute_group(128);
+
+      auto *tile_output = output +
+          (group_start + tile_in_group) * kBTileBytes;
+      const float block_scale = shared[16 + tile_in_group];
+      #pragma unroll
+      for (int value_id = 0; value_id < kValuesPerThread; ++value_id) {
+        const int element = tile_tid + value_id * kThreadsPerTile;
+        const float value = values[value_id];
+        const Fp8 quantized = value == 0.0f
+            ? Fp8(0.0f)
+            : Fp8(fminf(fmaxf(value / block_scale, -448.0f), 448.0f));
+        const int source_chunk = element / 16;
+        const int byte_in_chunk = element % 16;
+        #pragma unroll
+        for (int row = 0; row < kTileN; ++row) {
+          const int destination_chunk = source_chunk ^ row;
+          reinterpret_cast<Fp8 *>(tile_output)[
+              row * kTileK + destination_chunk * 16 + byte_in_chunk] =
+              quantized;
+        }
+      }
+      if (tid < kTileN * ScalePack) {
+        const int row = tid / ScalePack;
+        const int sf = tid % ScalePack;
+        auto *packed_scale = reinterpret_cast<Scale *>(
+            output + group_start * kBTileBytes + kBBytes);
+        const int dst = int(logical_sfb(row, sf * kScaleVector));
+        packed_scale[dst] = Scale(shared[16 + sf]);
+      }
+      __sync_compute_group(128);
     }
-    __sync_compute_group(128);
   }
 
   c2m.push(tid, input_slots);
@@ -442,14 +528,15 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
 // records through separate load ports. Each allocation already contains both
 // swizzled FP8 data and its native UE8M0 scale layout, so compute sees only
 // shared addresses and never resolves an HBM pointer.
-template <bool SplitK, typename SplitOutput, typename M2CQueue,
-          typename C2MQueue>
+template <int ScalePack, int OutputGroups, bool SplitK, typename SplitOutput,
+          typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
     int num_k_tiles,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t &tmem_mma_phase,
+    uint32_t &fp8_umma_pipeline_phase_mask,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using namespace cute;
@@ -462,7 +549,11 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
   constexpr int kTileN = 8;
   constexpr int kTileK = 128;
   constexpr int kScaleVector = 32;
-  constexpr int kActivationTilesPerChunk = 4;
+  constexpr int kActivationTilesPerChunk = ScalePack == 1 ? 4 : 8;
+  static_assert(ScalePack == 1 || ScalePack == 2 || ScalePack == 4);
+  static_assert(OutputGroups == 1 || OutputGroups == 2);
+  static_assert(ScalePack != 1 || OutputGroups == 1);
+  static_assert(kActivationTilesPerChunk % ScalePack == 0);
   using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
   using Atom = SM100_MMA_MXF8F6F4_SS<
       Fp8, Fp8, Accum, Scale, kTileM, kTileN,
@@ -507,13 +598,15 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
   auto cta_c = cta_mma.partition_C(logical_c);
   auto tmem_acc = cta_mma.make_fragment_C(cta_c);
   tmem_acc.data() = tmem_base_ptr;
+  const int accumulator_columns = int(
+      cutlass::detail::find_tmem_tensor_col_offset(tmem_acc));
 
   auto tCtSFA = make_tensor<typename TiledMma::FrgTypeSFA>(
       shape(LayoutSFA{}));
   auto tCtSFB = make_tensor<typename TiledMma::FrgTypeSFB>(
       shape(LayoutSFB{}));
-  tCtSFA.data() = tmem_base_ptr +
-      cutlass::detail::find_tmem_tensor_col_offset(tmem_acc);
+  tCtSFA.data() =
+      tmem_base_ptr + accumulator_columns * OutputGroups;
   tCtSFB.data() = tCtSFA.data().get() +
       cutlass::detail::find_tmem_tensor_col_offset(tCtSFA);
 
@@ -530,137 +623,309 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
   auto copy_sfb_dst = copy_sfb_slice.partition_D(tCtSFB_compact);
 
   const int tid = __compute_tid();
-  for (int chunk_start = 0; chunk_start < num_k_tiles;
-       chunk_start += kActivationTilesPerChunk) {
-    const int activation_slots = m2c.template pop<0>();
-    auto *activation_chunk_base = static_cast<uint8_t *>(
-        get_slot_address(smem_base, extract(activation_slots)));
-    const int remaining = num_k_tiles - chunk_start;
-    const int chunk_tiles = remaining < kActivationTilesPerChunk
-        ? remaining
-        : kActivationTilesPerChunk;
-    for (int tile_in_chunk = 0; tile_in_chunk < chunk_tiles;
-         ++tile_in_chunk) {
-      const int tile = chunk_start + tile_in_chunk;
-      const int weight_slots = m2c.template pop<0>();
-      auto *weight_base = static_cast<uint8_t *>(
-          get_slot_address(smem_base, extract(weight_slots)));
-      auto sA = make_tensor(
-          make_smem_ptr(reinterpret_cast<Fp8 *>(weight_base)), layout_sA);
-      auto tCrA = cta_mma.make_fragment_A(sA);
-      auto tCsSFA = make_tensor(
-          make_smem_ptr(reinterpret_cast<Scale *>(
-              weight_base + kAStorageBytes)),
-          LayoutSFA{});
-      auto tCsSFA_compact = make_tensor(
-          tCsSFA.data(), filter_zeros(tCsSFA.layout()));
-      auto copy_sfa_src_raw = copy_sfa_slice.partition_S(tCsSFA_compact);
-      auto copy_sfa_src =
-          dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfa_src_raw);
+  const int warp = tid / numThreadsPerWarp;
+  if constexpr (ScalePack == 1) {
+    // Preserve the known-good task exactly for compatibility and regression
+    // isolation. Packed variants below use the same operands and epilogue but
+    // split issue from retirement so four K128 groups can remain in flight.
+    for (int chunk_start = 0; chunk_start < num_k_tiles;
+         chunk_start += kActivationTilesPerChunk) {
+      const int activation_slots = m2c.template pop<0>();
+      auto *activation_chunk_base = static_cast<uint8_t *>(
+          get_slot_address(smem_base, extract(activation_slots)));
+      const int remaining = num_k_tiles - chunk_start;
+      const int chunk_tiles = remaining < kActivationTilesPerChunk
+          ? remaining
+          : kActivationTilesPerChunk;
+      for (int tile_in_chunk = 0; tile_in_chunk < chunk_tiles;
+           ++tile_in_chunk) {
+        const int tile = chunk_start + tile_in_chunk;
+        const int weight_slots = m2c.template pop<0>();
+        auto *weight_base = static_cast<uint8_t *>(
+            get_slot_address(smem_base, extract(weight_slots)));
+        auto sA = make_tensor(
+            make_smem_ptr(reinterpret_cast<Fp8 *>(weight_base)), layout_sA);
+        auto tCrA = cta_mma.make_fragment_A(sA);
+        auto tCsSFA = make_tensor(
+            make_smem_ptr(reinterpret_cast<Scale *>(
+                weight_base + kAStorageBytes)),
+            LayoutSFA{});
+        auto tCsSFA_compact = make_tensor(
+            tCsSFA.data(), filter_zeros(tCsSFA.layout()));
+        auto copy_sfa_src_raw = copy_sfa_slice.partition_S(tCsSFA_compact);
+        auto copy_sfa_src =
+            dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfa_src_raw);
 
-      auto *activation_base = activation_chunk_base +
-          tile_in_chunk * kActivationTileBytes;
-      auto sB = make_tensor(
-          make_smem_ptr(reinterpret_cast<Fp8 *>(activation_base)), layout_sB);
-      auto tCrB = cta_mma.make_fragment_B(sB);
-      auto tCsSFB = make_tensor(
-          make_smem_ptr(reinterpret_cast<Scale *>(
-              activation_base + kBStorageBytes)),
-          LayoutSFB{});
-      auto tCsSFB_compact = make_tensor(
-          tCsSFB.data(), filter_zeros(tCsSFB.layout()));
-      auto copy_sfb_src_raw = copy_sfb_slice.partition_S(tCsSFB_compact);
-      auto copy_sfb_src =
-          dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfb_src_raw);
+        auto *activation_base = activation_chunk_base +
+            tile_in_chunk * kActivationTileBytes;
+        auto sB = make_tensor(
+            make_smem_ptr(reinterpret_cast<Fp8 *>(activation_base)), layout_sB);
+        auto tCrB = cta_mma.make_fragment_B(sB);
+        auto tCsSFB = make_tensor(
+            make_smem_ptr(reinterpret_cast<Scale *>(
+                activation_base + kBStorageBytes)),
+            LayoutSFB{});
+        auto tCsSFB_compact = make_tensor(
+            tCsSFB.data(), filter_zeros(tCsSFB.layout()));
+        auto copy_sfb_src_raw = copy_sfb_slice.partition_S(tCsSFB_compact);
+        auto copy_sfb_src =
+            dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfb_src_raw);
 
-      if (tid < 32 && elect_one_sync()) {
-        copy(copy_sfa, copy_sfa_src, copy_sfa_dst);
-        copy(copy_sfb, copy_sfb_src, copy_sfb_dst);
-      }
-      if (tid < 32) {
-        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
-          const auto accumulate = tile == 0 && k_block == 0
-              ? UMMA::ScaleOut::Zero
-              : UMMA::ScaleOut::One;
-          gemm(
-              tiled_mma.with(
-                  accumulate,
-                  tCtSFA(_, _, k_block),
-                  tCtSFB(_, _, k_block)),
-              tCrA(_, _, k_block),
-              tCrB(_, _, k_block),
-              tmem_acc);
+        if (tid < 32 && elect_one_sync()) {
+          copy(copy_sfa, copy_sfa_src, copy_sfa_dst);
+          copy(copy_sfb, copy_sfb_src, copy_sfb_dst);
         }
-        cutlass::arch::umma_arrive(tmem_mma_barrier);
+        if (tid < 32) {
+          for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+            const auto accumulate = tile == 0 && k_block == 0
+                ? UMMA::ScaleOut::Zero
+                : UMMA::ScaleOut::One;
+            gemm(
+                tiled_mma.with(
+                    accumulate,
+                    tCtSFA(_, _, k_block),
+                    tCtSFB(_, _, k_block)),
+                tCrA(_, _, k_block),
+                tCrB(_, _, k_block),
+                tmem_acc);
+          }
+          cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        c2m.push(tid, weight_slots);
       }
-      cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
-      tmem_mma_phase ^= 1;
-      c2m.push(tid, weight_slots);
+      c2m.push(tid, activation_slots);
     }
-    c2m.push(tid, activation_slots);
+  } else {
+    constexpr int kStages = fp8UmmaPipelineStages;
+    constexpr int kFullBarrierBase = fp8UmmaPipelineBarrierBase;
+    constexpr int kEmptyBarrierBase = kFullBarrierBase + kStages;
+
+    int live_activation_slots = 0;
+    int live_group_weight_slots = 0;
+    int pipeline_group = 0;
+    for (int chunk_start = 0; chunk_start < num_k_tiles;
+         chunk_start += kActivationTilesPerChunk) {
+      if (warp < 2) {
+        live_activation_slots = m2c.template pop<0>();
+      } else {
+        m2c.advance();
+      }
+      auto *activation_chunk_base = warp == 0
+          ? static_cast<uint8_t *>(
+                get_slot_address(smem_base, extract(live_activation_slots)))
+          : nullptr;
+      const int remaining = num_k_tiles - chunk_start;
+      const int chunk_tiles = remaining < kActivationTilesPerChunk
+          ? remaining
+          : kActivationTilesPerChunk;
+
+      for (int scale_start = 0; scale_start < chunk_tiles;
+           scale_start += ScalePack) {
+        #pragma unroll
+        for (int output_group = 0; output_group < OutputGroups;
+             ++output_group) {
+          const int stage = pipeline_group % kStages;
+          const int generation = pipeline_group / kStages;
+          for (int scale_id = 0; scale_id < ScalePack; ++scale_id) {
+            const int tile_in_chunk = scale_start + scale_id;
+            const int tile = chunk_start + tile_in_chunk;
+
+            if (warp == 0) {
+              if (scale_id == 0 && generation > 0 && output_group == 0) {
+                const uint32_t stage_phase =
+                    (fp8_umma_pipeline_phase_mask >> stage) & 1U;
+                cute::wait_barrier(
+                    tmem_mma_barrier[kEmptyBarrierBase + stage],
+                    stage_phase ^ uint32_t((generation - 1) & 1));
+              }
+              const int weight_slots = m2c.template pop<0>();
+              auto *weight_base = static_cast<uint8_t *>(
+                  get_slot_address(smem_base, extract(weight_slots)));
+              auto sA = make_tensor(
+                  make_smem_ptr(reinterpret_cast<Fp8 *>(weight_base)),
+                  layout_sA);
+              auto tCrA = cta_mma.make_fragment_A(sA);
+
+              auto *activation_base = activation_chunk_base +
+                  tile_in_chunk * kActivationTileBytes;
+              auto sB = make_tensor(
+                  make_smem_ptr(reinterpret_cast<Fp8 *>(activation_base)),
+                  layout_sB);
+              auto tCrB = cta_mma.make_fragment_B(sB);
+
+              if (scale_id == 0 && elect_one_sync()) {
+                auto tCsSFA = make_tensor(
+                    make_smem_ptr(reinterpret_cast<Scale *>(
+                        weight_base + kAStorageBytes)),
+                    LayoutSFA{});
+                auto tCsSFA_compact = make_tensor(
+                    tCsSFA.data(), filter_zeros(tCsSFA.layout()));
+                auto copy_sfa_src_raw =
+                    copy_sfa_slice.partition_S(tCsSFA_compact);
+                auto copy_sfa_src =
+                    dae_fp8_get_utccp_smem_desc_tensor<Utccp>(
+                        copy_sfa_src_raw);
+                copy(copy_sfa, copy_sfa_src, copy_sfa_dst);
+
+                if (output_group == 0) {
+                  auto tCsSFB = make_tensor(
+                      make_smem_ptr(reinterpret_cast<Scale *>(
+                          activation_base + kBStorageBytes)),
+                      LayoutSFB{});
+                  auto tCsSFB_compact = make_tensor(
+                      tCsSFB.data(), filter_zeros(tCsSFB.layout()));
+                  auto copy_sfb_src_raw =
+                      copy_sfb_slice.partition_S(tCsSFB_compact);
+                  auto copy_sfb_src =
+                      dae_fp8_get_utccp_smem_desc_tensor<Utccp>(
+                          copy_sfb_src_raw);
+                  copy(copy_sfb, copy_sfb_src, copy_sfb_dst);
+                }
+              }
+
+              auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+              group_tmem_acc.data() =
+                  tmem_base_ptr + output_group * accumulator_columns;
+              for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+                const auto accumulate = tile == 0 && k_block == 0
+                    ? UMMA::ScaleOut::Zero
+                    : UMMA::ScaleOut::One;
+                gemm(
+                    tiled_mma.with(
+                        accumulate,
+                        tCtSFA(_, _, scale_id),
+                        tCtSFB(_, _, scale_id)),
+                    tCrA(_, _, k_block),
+                    tCrB(_, _, k_block),
+                    group_tmem_acc);
+              }
+              if (scale_id + 1 == ScalePack &&
+                  output_group + 1 == OutputGroups) {
+                cutlass::arch::umma_arrive(
+                    tmem_mma_barrier + kFullBarrierBase + stage);
+              }
+            } else if (warp == 1) {
+              const int weight_slots = m2c.template pop<0>();
+              live_group_weight_slots |= weight_slots;
+              if (scale_id + 1 == ScalePack &&
+                  output_group + 1 == OutputGroups) {
+                cute::wait_barrier(
+                    tmem_mma_barrier[kFullBarrierBase + stage],
+                    ((fp8_umma_pipeline_phase_mask >> stage) & 1U)
+                        ^ uint32_t(generation & 1));
+                int release_slots = live_group_weight_slots;
+                if (output_group + 1 == OutputGroups &&
+                    tile_in_chunk + 1 == chunk_tiles) {
+                  release_slots |= live_activation_slots;
+                }
+                c2m.template push<numThreadsPerWarp>(tid, release_slots);
+                live_group_weight_slots = 0;
+                if (tid == numThreadsPerWarp) {
+                  cuda::ptx::mbarrier_arrive(
+                      cuda::ptx::sem_release,
+                      cuda::ptx::scope_cta,
+                      cuda::ptx::space_shared,
+                      tmem_mma_barrier + kEmptyBarrierBase + stage);
+                }
+              }
+            } else {
+              m2c.advance();
+            }
+          }
+        }
+        ++pipeline_group;
+      }
+    }
+
+    const int num_groups = num_k_tiles / ScalePack;
+    const int final_group = num_groups - 1;
+    cute::wait_barrier(
+        tmem_mma_barrier[kFullBarrierBase + final_group % kStages],
+        ((fp8_umma_pipeline_phase_mask >> (final_group % kStages)) & 1U)
+            ^ uint32_t((final_group / kStages) & 1));
+    #pragma unroll
+    for (int stage = 0; stage < kStages; ++stage) {
+      const int stage_uses = (num_groups + kStages - 1 - stage) / kStages;
+      if (stage_uses & 1) {
+        fp8_umma_pipeline_phase_mask ^= 1U << stage;
+      }
+    }
   }
 
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __sync_compute_group(128);
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-  const int output_slots = m2c.template pop<0>();
-  auto *output_base = get_slot_address(smem_base, extract(output_slots));
   auto coord_c = make_identity_tensor(
       make_shape(Int<kTileM>{}, Int<kTileN>{}));
   auto cta_coord_c = cta_mma.partition_C(coord_c);
   using TmemLoad = SM100_TMEM_LOAD_32dp32b1x;
-  auto tAcc = tmem_acc(make_coord(_, _), _0{}, _0{});
   auto cAcc = cta_coord_c(make_coord(_, _), _0{}, _0{});
-  auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
-  const int thread_idx = tid % size(tiled_t2r);
-  auto thread_t2r = tiled_t2r.get_slice(thread_idx);
-  auto thread_tmem = thread_t2r.partition_S(tAcc);
-  auto thread_coord = thread_t2r.partition_D(cAcc);
-  auto r_acc = make_tensor<Accum>(shape(thread_coord));
-  copy(tiled_t2r, thread_tmem, r_acc);
-  for (int index = 0; index < size(r_acc); ++index) {
-    const int row = int(get<0>(thread_coord(index)));
-    const int col = int(get<1>(thread_coord(index)));
-    if (row < kTileM && col == 0) {
-      if constexpr (SplitK) {
-        static_cast<SplitOutput *>(output_base)[row] =
-            SplitOutput(r_acc(index));
-      } else {
-        auto *output = static_cast<Output *>(output_base);
-        output[row] = Output(r_acc(index));
+  #pragma unroll
+  for (int output_group = 0; output_group < OutputGroups; ++output_group) {
+    const int output_slots = m2c.template pop<0>();
+    auto *output_base = get_slot_address(smem_base, extract(output_slots));
+    auto group_tmem_acc = cta_mma.make_fragment_C(cta_c);
+    group_tmem_acc.data() =
+        tmem_base_ptr + output_group * accumulator_columns;
+    auto tAcc = group_tmem_acc(make_coord(_, _), _0{}, _0{});
+    auto tiled_t2r = make_tmem_copy(TmemLoad{}, tAcc);
+    const int thread_idx = tid % size(tiled_t2r);
+    auto thread_t2r = tiled_t2r.get_slice(thread_idx);
+    auto thread_tmem = thread_t2r.partition_S(tAcc);
+    auto thread_coord = thread_t2r.partition_D(cAcc);
+    auto r_acc = make_tensor<Accum>(shape(thread_coord));
+    copy(tiled_t2r, thread_tmem, r_acc);
+    for (int index = 0; index < size(r_acc); ++index) {
+      const int row = int(get<0>(thread_coord(index)));
+      const int col = int(get<1>(thread_coord(index)));
+      if (row < kTileM && col == 0) {
+        if constexpr (SplitK) {
+          static_cast<SplitOutput *>(output_base)[row] =
+              SplitOutput(r_acc(index));
+        } else {
+          auto *output = static_cast<Output *>(output_base);
+          output[row] = Output(r_acc(index));
+        }
       }
     }
+    __sync_compute_group(128);
+    c2m.template push<0, true>(tid, output_slots);
   }
-
-  __sync_compute_group(128);
-  c2m.template push<0, true>(tid, output_slots);
 }
 
-template <typename M2CQueue, typename C2MQueue>
+template <int ScalePack, int OutputGroups, typename M2CQueue,
+          typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_stream_sm100(
     int num_k_tiles,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t &tmem_mma_phase,
+    uint32_t &fp8_umma_pipeline_phase_mask,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  task_fp8_gemv_umma_stream_impl_sm100<false, float>(
+  task_fp8_gemv_umma_stream_impl_sm100<
+      ScalePack, OutputGroups, false, float>(
       num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
-      tmem_mma_phase, m2c, c2m);
+      tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);
 }
 
-template <typename SplitOutput, typename M2CQueue, typename C2MQueue>
+template <int ScalePack, int OutputGroups, typename SplitOutput,
+          typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_splitk_sm100(
     int num_k_tiles,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t &tmem_mma_phase,
+    uint32_t &fp8_umma_pipeline_phase_mask,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  task_fp8_gemv_umma_stream_impl_sm100<true, SplitOutput>(
+  task_fp8_gemv_umma_stream_impl_sm100<
+      ScalePack, OutputGroups, true, SplitOutput>(
       num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
-      tmem_mma_phase, m2c, c2m);
+      tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);
 }

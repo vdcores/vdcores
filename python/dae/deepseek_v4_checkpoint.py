@@ -116,6 +116,7 @@ class NativeFp8LinearCheckpointTensors:
 
     prefix: str
     weight_tiles: object
+    scale_pack: int
 
 
 def _native_nvfp4_name(prefix: str) -> str:
@@ -660,6 +661,7 @@ class DeepSeekV4ResidentCheckpoint:
         storage_bytes: int,
         native_nvfp4_prefixes: Iterable[str] = (),
         native_fp8_prefixes: Iterable[str] = (),
+        native_fp8_scale_pack: int = 1,
     ) -> None:
         self.source = checkpoint
         self.config = checkpoint.config
@@ -672,6 +674,7 @@ class DeepSeekV4ResidentCheckpoint:
         self.storage_bytes = storage_bytes
         self.native_nvfp4_prefixes = frozenset(native_nvfp4_prefixes)
         self.native_fp8_prefixes = frozenset(native_fp8_prefixes)
+        self.native_fp8_scale_pack = int(native_fp8_scale_pack)
 
     @classmethod
     def from_checkpoint(
@@ -684,6 +687,7 @@ class DeepSeekV4ResidentCheckpoint:
         reserve_bytes: int = 0,
         native_nvfp4: bool = False,
         native_fp8_prefixes: Iterable[str] = (),
+        native_fp8_scale_pack: int = 1,
         progress: Callable[[int, int, str, int, int], None] | None = None,
     ) -> "DeepSeekV4ResidentCheckpoint":
         """Pack selected tensors into aligned per-shard device storage.
@@ -710,6 +714,9 @@ class DeepSeekV4ResidentCheckpoint:
         if target_device.type == "cuda" and target_device.index is None:
             target_device = torch.device("cuda", torch.cuda.current_device())
         requested_native_fp8 = frozenset(native_fp8_prefixes)
+        native_fp8_scale_pack = int(native_fp8_scale_pack)
+        if native_fp8_scale_pack not in (1, 2, 4):
+            raise ValueError("native FP8 scale pack must be 1, 2, or 4")
         if (native_nvfp4 or requested_native_fp8) and target_device.type != "cuda":
             raise ValueError("native resident packing requires a CUDA device")
 
@@ -790,6 +797,7 @@ class DeepSeekV4ResidentCheckpoint:
             if (
                 rows % 128
                 or k % 128
+                or (k // 128) % native_fp8_scale_pack
                 or scale_spec.dtype != "F8_E8M0"
                 or scale_spec.shape != (rows // 128, k // 128)
             ):
@@ -989,7 +997,10 @@ class DeepSeekV4ResidentCheckpoint:
                         )
                         fp8_temporaries[native_shape] = temporary
                     runtime.prepack_fp8_checkpoint(
-                        weight, checkpoint_scale, temporary
+                        weight,
+                        checkpoint_scale,
+                        temporary,
+                        native_fp8_scale_pack,
                     )
                     native_bytes = math.prod(native_shape)
                     native = storage[
@@ -1016,6 +1027,7 @@ class DeepSeekV4ResidentCheckpoint:
             storage_bytes=total_storage_bytes,
             native_nvfp4_prefixes=native_pairs,
             native_fp8_prefixes=native_fp8_pairs,
+            native_fp8_scale_pack=native_fp8_scale_pack,
         )
 
     def _check_device(self, device) -> None:
@@ -1118,6 +1130,7 @@ class DeepSeekV4ResidentCheckpoint:
         return NativeFp8LinearCheckpointTensors(
             prefix=prefix,
             weight_tiles=tensor,
+            scale_pack=self.native_fp8_scale_pack,
         )
 
 

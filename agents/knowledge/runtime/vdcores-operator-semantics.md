@@ -454,6 +454,34 @@ The checked-in runtime has two declarative compute families in [include/dae/opco
   - task behavior:
     - shared-memory `A/B` tiles in, one shared-memory output tile out
 
+The native FP8 UMMA path uses the same generated-family mechanism rather than
+runtime argument dispatch:
+
+- `FP8_GEMV_UMMA_STREAM_SM100`
+  - family fields:
+    - `SCALE_PACK` = 1, 2, or 4 adjacent K128 scales per native scale record
+    - `OUTPUT_GROUPS` = one or two M128 accumulators sharing one activation
+      stream and delayed epilogues
+  - Python args:
+    - `args[0]` = number of K128 tiles
+- `FP8_GEMV_UMMA_SPLITK_SM100`
+  - family fields:
+    - `SCALE_PACK`
+    - `OUTPUT_GROUPS`
+    - `REDUCTION_BYTES` = 2 for BF16 or 4 for FP32
+  - Python args:
+    - `args[0]` = number of K128 tiles in this shard
+- `DSV4_FP8_QUANT_UMMA_B_SM100`
+  - family fields:
+    - `SCALE_PACK`
+  - Python args:
+    - `args[0]` = number of K128 tiles
+
+Only canonical family instances named in the selected `.ops` manifest receive
+opcodes and generated handlers. Each generated handler calls one fixed C++
+template directly; scale packing, grouped-row count, and reduction type are
+not decoded from `CInst.args` in the persistent kernel.
+
 Static GEMM handlers:
 
 - `OP_GEMM_M64N64`

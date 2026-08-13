@@ -1220,10 +1220,11 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
     TILE_K = SchedFp8UmmaPrepack.TILE_K
     TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
 
-    def __init__(self, input, output):
+    def __init__(self, input, output, scale_pack: int = 1):
         super().__init__()
         self.input = input
         self.output = output
+        self.scale_pack = int(scale_pack)
 
     def _on_place(self):
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
@@ -1232,8 +1233,15 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
         if self.k % self.TILE_K:
             raise ValueError("native FP8 quant K must be K128 aligned")
         self.k_tiles = self.k // self.TILE_K
-        if not 0 < self.num_sms <= self.k_tiles:
-            raise ValueError("native FP8 quant requires 1..K/128 SMs")
+        if self.scale_pack not in (1, 2, 4) or self.k_tiles % self.scale_pack:
+            raise ValueError(
+                "native FP8 quant scale pack must be 1, 2, or 4 and divide K tiles"
+            )
+        self.scale_groups = self.k_tiles // self.scale_pack
+        if not 0 < self.num_sms <= self.scale_groups:
+            raise ValueError(
+                "native FP8 quant requires 1..K/(128*scale_pack) SMs"
+            )
         if (
             self.output.dtype != torch.uint8
             or tuple(self.output.shape) != (self.k_tiles, self.TILE_BYTES)
@@ -1247,14 +1255,16 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
-        tiles_per_sm, extra = divmod(self.k_tiles, self.num_sms)
-        tile_start = sm * tiles_per_sm + min(sm, extra)
-        tile_count = tiles_per_sm + int(sm < extra)
+        groups_per_sm, extra = divmod(self.scale_groups, self.num_sms)
+        group_start = sm * groups_per_sm + min(sm, extra)
+        group_count = groups_per_sm + int(sm < extra)
+        tile_start = group_start * self.scale_pack
+        tile_count = group_count * self.scale_pack
         tile_stop = tile_start + tile_count
         start = tile_start * self.TILE_K
         stop = tile_stop * self.TILE_K
         return [
-            Dsv4Fp8QuantUmmaBSm100(tile_count),
+            Dsv4Fp8QuantUmmaBSm100(tile_count, self.scale_pack),
             _shared_load_1d(
                 self.input[start:stop]
             ).fixed_port(1),
@@ -1458,14 +1468,25 @@ class SchedFp8GemvUmmaStream(Schedule):
 
     TILE_M = SchedFp8UmmaPrepack.TILE_M
     WEIGHT_TILE_BYTES = SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES
+    WEIGHT_DATA_BYTES = SchedFp8UmmaPrepack.TILE_M * SchedFp8UmmaPrepack.TILE_K
     ACTIVATION_TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
     ACTIVATION_TILES_PER_CHUNK = 4
+    PACKED_ACTIVATION_TILES_PER_CHUNK = 8
 
-    def __init__(self, weight_tiles, activation_tiles, output):
+    def __init__(
+        self,
+        weight_tiles,
+        activation_tiles,
+        output,
+        scale_pack: int = 1,
+        output_group_size: int = 1,
+    ):
         super().__init__()
         self.weight_tiles = weight_tiles
         self.activation_tiles = activation_tiles
         self.output = output
+        self.scale_pack = int(scale_pack)
+        self.output_group_size = int(output_group_size)
 
     def _on_place(self):
         if (
@@ -1482,6 +1503,21 @@ class SchedFp8GemvUmmaStream(Schedule):
             raise ValueError("native FP8 GEMV needs 1..M/128 SMs")
         if not 0 < self.k_tiles <= 64:
             raise ValueError("native FP8 GEMV supports 1..64 K128 tiles")
+        if self.scale_pack not in (1, 2, 4) or self.k_tiles % self.scale_pack:
+            raise ValueError(
+                "native FP8 GEMV scale pack must be 1, 2, or 4 and divide K tiles"
+            )
+        if self.ACTIVATION_TILES_PER_CHUNK % self.scale_pack:
+            raise ValueError("native FP8 scale pack must divide the activation chunk")
+        self.activation_tiles_per_chunk = (
+            self.ACTIVATION_TILES_PER_CHUNK
+            if self.scale_pack == 1
+            else self.PACKED_ACTIVATION_TILES_PER_CHUNK
+        )
+        if self.output_group_size not in (1, 2):
+            raise ValueError("native FP8 output group size must be 1 or 2")
+        if self.output_group_size > 1 and self.scale_pack == 1:
+            raise ValueError("grouped native FP8 GEMV requires packed scales")
         if (
             self.activation_tiles.dtype != torch.uint8
             or tuple(self.activation_tiles.shape)
@@ -1510,16 +1546,22 @@ class SchedFp8GemvUmmaStream(Schedule):
             return []
         tile_start, tile_count = self._tile_shard(sm)
         instructions = []
-        for output_tile in range(tile_start, tile_start + tile_count):
-            final_output = output_tile + 1 == tile_start + tile_count
+        tile_stop = tile_start + tile_count
+        for group_start in range(
+            tile_start, tile_stop, self.output_group_size
+        ):
+            group_stop = min(group_start + self.output_group_size, tile_stop)
+            output_tiles = range(group_start, group_stop)
             instructions.append(
-                Fp8GemvUmmaStreamSm100(self.k_tiles)
+                Fp8GemvUmmaStreamSm100(
+                    self.k_tiles, self.scale_pack, group_stop - group_start
+                )
             )
             for chunk_start in range(
-                0, self.k_tiles, self.ACTIVATION_TILES_PER_CHUNK
+                0, self.k_tiles, self.activation_tiles_per_chunk
             ):
                 chunk_stop = min(
-                    chunk_start + self.ACTIVATION_TILES_PER_CHUNK,
+                    chunk_start + self.activation_tiles_per_chunk,
                     self.k_tiles,
                 )
                 instructions.append(
@@ -1529,21 +1571,29 @@ class SchedFp8GemvUmmaStream(Schedule):
                         ].reshape(-1)
                     ).fixed_port(1)
                 )
-                for k_tile in range(chunk_start, chunk_stop):
-                    instructions.append(
-                        TmaLoad1D(
-                            self.weight_tiles[
+                for scale_start in range(
+                    chunk_start, chunk_stop, self.scale_pack
+                ):
+                    for output_tile in output_tiles:
+                        for k_tile in range(
+                            scale_start, scale_start + self.scale_pack
+                        ):
+                            weight = self.weight_tiles[
                                 output_tile, k_tile
                             ].reshape(-1)
-                        ).fixed_port(0)
-                    )
-            row_start = output_tile * self.TILE_M
-            store = TmaStore1D(
-                self.output[row_start : row_start + self.TILE_M]
-            )
-            if final_output:
-                store.bar(self._bar("output"))
-            instructions.append(store)
+                            if k_tile % self.scale_pack:
+                                weight = weight[: self.WEIGHT_DATA_BYTES]
+                            instructions.append(
+                                TmaLoad1D(weight).fixed_port(0)
+                            )
+            for output_tile in output_tiles:
+                row_start = output_tile * self.TILE_M
+                store = TmaStore1D(
+                    self.output[row_start : row_start + self.TILE_M]
+                )
+                if output_tile + 1 == tile_stop:
+                    store.bar(self._bar("output"))
+                instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):
@@ -1557,8 +1607,10 @@ class SchedFp8GemvUmmaSplitK(Schedule):
 
     TILE_M = SchedFp8UmmaPrepack.TILE_M
     WEIGHT_TILE_BYTES = SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES
+    WEIGHT_DATA_BYTES = SchedFp8UmmaPrepack.TILE_M * SchedFp8UmmaPrepack.TILE_K
     ACTIVATION_TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
     ACTIVATION_TILES_PER_CHUNK = 4
+    PACKED_ACTIVATION_TILES_PER_CHUNK = 8
     OUTPUT_ROWS = 1
 
     def __init__(
@@ -1567,12 +1619,16 @@ class SchedFp8GemvUmmaSplitK(Schedule):
         activation_tiles,
         output_reduce,
         split_k: int,
+        scale_pack: int = 1,
+        output_group_size: int = 1,
     ):
         super().__init__()
         self.weight_tiles = weight_tiles
         self.activation_tiles = activation_tiles
         self.output_reduce = output_reduce
         self.split_k = int(split_k)
+        self.scale_pack = int(scale_pack)
+        self.output_group_size = int(output_group_size)
 
     def _on_place(self):
         if (
@@ -1589,8 +1645,24 @@ class SchedFp8GemvUmmaSplitK(Schedule):
         if self.split_k <= 1 or self.k_tiles % self.split_k:
             raise ValueError("split_k must divide K tiles and be greater than one")
         self.k_tiles_per_split = self.k_tiles // self.split_k
-        if self.k_tiles_per_split % self.ACTIVATION_TILES_PER_CHUNK:
-            raise ValueError("each split-K shard must contain a multiple of four K tiles")
+        if (
+            self.scale_pack not in (1, 2, 4)
+            or self.k_tiles_per_split % self.scale_pack
+        ):
+            raise ValueError(
+                "split-K FP8 scale pack must be 1, 2, or 4 and divide each shard"
+            )
+        if self.ACTIVATION_TILES_PER_CHUNK % self.scale_pack:
+            raise ValueError("split-K FP8 scale pack must divide the activation chunk")
+        self.activation_tiles_per_chunk = (
+            self.ACTIVATION_TILES_PER_CHUNK
+            if self.scale_pack == 1
+            else self.PACKED_ACTIVATION_TILES_PER_CHUNK
+        )
+        if self.output_group_size not in (1, 2):
+            raise ValueError("split-K FP8 output group size must be 1 or 2")
+        if self.output_group_size > 1 and self.scale_pack == 1:
+            raise ValueError("grouped split-K FP8 GEMV requires packed scales")
         if (
             self.activation_tiles.dtype != torch.uint8
             or tuple(self.activation_tiles.shape)
@@ -1632,20 +1704,33 @@ class SchedFp8GemvUmmaSplitK(Schedule):
         work_start, work_count = self._work_shard(sm)
         work_stop = work_start + work_count
         instructions = []
-        for work in range(work_start, work_stop):
+        work = work_start
+        while work < work_stop:
             split = work // self.m_tiles
             output_tile = work % self.m_tiles
+            group_count = min(
+                self.output_group_size,
+                work_stop - work,
+                self.m_tiles - output_tile,
+            )
+            output_tiles = range(output_tile, output_tile + group_count)
             k_start = split * self.k_tiles_per_split
             k_stop = k_start + self.k_tiles_per_split
             instructions.append(
                 Fp8GemvUmmaSplitKSm100(
-                    self.k_tiles_per_split, self.reduction_bytes
+                    self.k_tiles_per_split,
+                    self.reduction_bytes,
+                    self.scale_pack,
+                    group_count,
                 )
             )
             for chunk_start in range(
-                k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK
+                k_start, k_stop, self.activation_tiles_per_chunk
             ):
-                chunk_stop = chunk_start + self.ACTIVATION_TILES_PER_CHUNK
+                chunk_stop = min(
+                    k_stop,
+                    chunk_start + self.activation_tiles_per_chunk,
+                )
                 instructions.append(
                     TmaLoad1D(
                         self.activation_tiles[
@@ -1653,20 +1738,31 @@ class SchedFp8GemvUmmaSplitK(Schedule):
                         ].reshape(-1)
                     ).fixed_port(1)
                 )
-                for k_tile in range(chunk_start, chunk_stop):
-                    instructions.append(
-                        TmaLoad1D(
-                            self.weight_tiles[
-                                output_tile, k_tile
+                for scale_start in range(
+                    chunk_start, chunk_stop, self.scale_pack
+                ):
+                    for grouped_output_tile in output_tiles:
+                        for k_tile in range(
+                            scale_start, scale_start + self.scale_pack
+                        ):
+                            weight = self.weight_tiles[
+                                grouped_output_tile, k_tile
                             ].reshape(-1)
-                        ).fixed_port(0)
-                    )
-            store = self.output_reduce.cord(
-                0, output_tile * self.TILE_M
-            )
-            if work + 1 == work_stop:
-                store.bar(self._bar("output"))
-            instructions.append(store)
+                            if k_tile % self.scale_pack:
+                                weight = weight[: self.WEIGHT_DATA_BYTES]
+                            instructions.append(
+                                TmaLoad1D(weight).fixed_port(0)
+                            )
+            for grouped_output_tile in output_tiles:
+                store = self.output_reduce.cord(
+                    0, grouped_output_tile * self.TILE_M
+                )
+                if work + group_count == work_stop and (
+                    grouped_output_tile + 1 == output_tile + group_count
+                ):
+                    store.bar(self._bar("output"))
+                instructions.append(store)
+            work += group_count
         return instructions
 
     def bar_release_count(self, role: str):
@@ -1694,6 +1790,7 @@ class SchedDsv4KvProjectCache(Schedule):
         split_k: int,
         epsilon: float,
         fixed_table_id: int,
+        scale_pack: int = 1,
     ):
         super().__init__()
         self.launcher = launcher
@@ -1704,6 +1801,7 @@ class SchedDsv4KvProjectCache(Schedule):
         self.split_k = int(split_k)
         self.epsilon = float(epsilon)
         self.fixed_table_id = int(fixed_table_id)
+        self.scale_pack = int(scale_pack)
         output_reduce = TmaTensor(
             launcher, cache_row.reshape(1, -1)
         ).rowmajor_2d("reduce", 1, 128)
@@ -1712,6 +1810,7 @@ class SchedDsv4KvProjectCache(Schedule):
             activation_tiles,
             output_reduce,
             self.split_k,
+            self.scale_pack,
         )
 
     def _on_place(self):

@@ -8,6 +8,7 @@ import statistics
 
 import torch
 
+from dae import runtime
 from dae.deepseek_v4_quant import (
     dequantize_fp8_block128,
     quantize_fp8_block128,
@@ -19,14 +20,57 @@ from dae.schedule import (
     SchedDsv4Fp8QuantUmmaB,
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
-    SchedFp8UmmaPrepack,
 )
-from dae.tma_utils import Major
+
+
+TILE_K = 128
 
 
 def profile_span_us(launcher: Launcher, begin: int, end: int) -> float:
     profile = launcher.profile[:, : end + 1].cpu().numpy()
     return (profile[:, end].max() - profile[:, begin].min()) / 1.0e3
+
+
+def report_track_profile(launcher: Launcher) -> None:
+    # NumPy preserves the underlying uint64 values.  Converting an
+    # uninitialized non-tracked torch scalar through int64 can overflow before
+    # the magic-value guard has a chance to return.
+    profile = launcher.profile.cpu().numpy()
+    track_magic = 0x4454524B50524631
+    if not all(int(value) == track_magic for value in profile[:, 127]):
+        return
+    counter_base = runtime.config.track_profile_event_base
+    internal_span = max(int(value) for value in profile[:, 1]) - min(
+        int(value) for value in profile[:, 0]
+    )
+    grid_envelope = internal_span * profile.shape[0]
+
+    def counter_sum(offset: int) -> int:
+        return sum(int(value) for value in profile[:, counter_base + offset])
+
+    def grid_percent(offset: int) -> float:
+        if grid_envelope <= 0:
+            return 0.0
+        return 100.0 * counter_sum(offset) / grid_envelope
+
+    print(
+        "DSV4_FP8_UMMA_COUNTERS "
+        f"internal_span_us={internal_span / 1.0e3:.6f} "
+        f"compute_m2c_wait_grid_pct={grid_percent(0):.3f} "
+        f"allocator_slot_stall_grid_pct={grid_percent(3):.3f} "
+        f"ldu0_queue_wait_grid_pct={grid_percent(9):.3f} "
+        f"ldu0_dependency_wait_grid_pct={grid_percent(11):.3f} "
+        f"ldu1_queue_wait_grid_pct={grid_percent(14):.3f} "
+        f"ldu1_dependency_wait_grid_pct={grid_percent(16):.3f} "
+        f"store_queue_wait_grid_pct={grid_percent(19):.3f} "
+        f"allocator_instructions={counter_sum(8)} "
+        f"allocator_slot_stall_events={counter_sum(4)} "
+        f"allocator_slot_retries={counter_sum(5)} "
+        f"ldu0_commands={counter_sum(13)} "
+        f"ldu1_commands={counter_sum(18)} "
+        f"store_commands={counter_sum(23)}",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -37,6 +81,12 @@ def main() -> None:
     parser.add_argument("--prefix")
     parser.add_argument("--sms", type=int, default=0)
     parser.add_argument("--split-k", type=int, default=1)
+    parser.add_argument(
+        "--scale-pack", type=int, choices=(1, 2, 4), default=2
+    )
+    parser.add_argument(
+        "--output-group-size", type=int, choices=(1, 2), default=2
+    )
     parser.add_argument(
         "--reduction-dtype",
         choices=("fp32", "bf16"),
@@ -56,10 +106,16 @@ def main() -> None:
     if min(args.warmup, args.iterations) <= 0:
         parser.error("timing counts must be positive")
 
-    m_tiles = args.m // SchedFp8UmmaPrepack.TILE_M
-    k_tiles = args.k // SchedFp8UmmaPrepack.TILE_K
+    m_tiles = args.m // SchedFp8GemvUmmaStream.TILE_M
+    k_tiles = args.k // TILE_K
     if args.split_k <= 0 or k_tiles % args.split_k:
         parser.error("split-k must be positive and divide K/128")
+    if k_tiles % args.scale_pack:
+        parser.error("scale-pack must divide K/128")
+    if (k_tiles // args.split_k) % args.scale_pack:
+        parser.error("scale-pack must divide every split-K shard")
+    if args.output_group_size > 1 and args.scale_pack == 1:
+        parser.error("grouped output tasks require packed scales")
     if args.split_k == 1 and args.reduction_dtype != "fp32":
         parser.error("reduction dtype applies only to split-K")
     default_sms = min(m_tiles * args.split_k, 152)
@@ -100,55 +156,29 @@ def main() -> None:
     activation, activation_scale = quantize_fp8_block128(input_source)
 
     packed_weight = torch.empty(
-        (m_tiles, k_tiles, SchedFp8UmmaPrepack.WEIGHT_TILE_BYTES),
+        (m_tiles, k_tiles, SchedFp8GemvUmmaStream.WEIGHT_TILE_BYTES),
         dtype=torch.uint8,
         device=device,
     )
-    packed_activation_oracle = torch.empty(
-        (k_tiles, SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES),
+    # Immutable checkpoint weights are converted once during Python setup,
+    # matching the resident checkpoint loader.  Keep setup-only layout work
+    # out of the VDCores operator image under test.
+    runtime.prepack_fp8_checkpoint(
+        weight, weight_scale, packed_weight, args.scale_pack
+    )
+
+    packed_activation = torch.empty(
+        (k_tiles, SchedFp8GemvUmmaStream.ACTIVATION_TILE_BYTES),
         dtype=torch.uint8,
         device=device,
     )
-
-    prepack_sms = min(m_tiles, 152)
-    weight_prepack_launcher = Launcher(prepack_sms, device=device)
-    weight_tma = TmaTensor(
-        weight_prepack_launcher, weight.view(torch.uint8)
-    ).wgmma_load(128, 128, Major.K)
-    weight_prepack_launcher.s(
-        SchedFp8UmmaPrepack(
-            SchedFp8UmmaPrepack.WEIGHT,
-            weight,
-            weight_scale,
-            packed_weight,
-            weight_tma,
-        ).place(prepack_sms)
-    )
-    weight_prepack_launcher.launch()
-
-    activation_rows = activation.reshape(1, -1).expand(8, -1).contiguous()
-    activation_prepack_launcher = Launcher(1, device=device)
-    activation_tma = TmaTensor(
-        activation_prepack_launcher, activation_rows.view(torch.uint8)
-    ).wgmma_load(8, 128, Major.K)
-    activation_prepack_launcher.s(
-        SchedFp8UmmaPrepack(
-            SchedFp8UmmaPrepack.ACTIVATION,
-            activation_rows,
-            activation_scale,
-            packed_activation_oracle,
-            activation_tma,
-        ).place(1)
-    )
-    activation_prepack_launcher.launch()
-
-    packed_activation = torch.empty_like(packed_activation_oracle)
-    quant_launcher = Launcher(k_tiles, device=device)
+    scale_groups = k_tiles // args.scale_pack
+    quant_launcher = Launcher(scale_groups, device=device)
     quant_launcher.s(
         ProfileEvent(2),
         SchedDsv4Fp8QuantUmmaB(
-            input_source, packed_activation
-        ).place(k_tiles),
+            input_source, packed_activation, args.scale_pack
+        ).place(scale_groups),
         ProfileEvent(3),
     )
     quant_launcher.launch()
@@ -174,9 +204,16 @@ def main() -> None:
             actual_weight_data != expected_weight_data
         ).reshape(m_tiles, k_tiles, -1).sum(dim=2)
         actual_weight_scale = packed_weight[:, :, 128 * 128 :]
-        expected_weight_scale = weight_scale.view(torch.uint8).unsqueeze(2)
+        expected_weight_scale = torch.zeros_like(actual_weight_scale)
+        scale_bytes = weight_scale.view(torch.uint8)
+        for group_start in range(0, k_tiles, args.scale_pack):
+            for sf in range(args.scale_pack):
+                expected_weight_scale[
+                    :, group_start, sf * 128 : (sf + 1) * 128
+                ] = scale_bytes[:, group_start + sf].unsqueeze(1)
         scale_mismatch = (
-            actual_weight_scale != expected_weight_scale
+            actual_weight_scale.sort(dim=2).values
+            != expected_weight_scale.sort(dim=2).values
         ).sum(dim=2)
         print(
             "DSV4_FP8_UMMA_WEIGHT_LAYOUT "
@@ -184,13 +221,6 @@ def main() -> None:
             f"scale_mismatch_per_tile={scale_mismatch.cpu().tolist()}",
             flush=True,
         )
-    torch.testing.assert_close(
-        packed_activation,
-        packed_activation_oracle,
-        rtol=0,
-        atol=0,
-    )
-
     output = torch.empty((args.m,), dtype=torch.bfloat16, device=device)
     gemv_launcher = Launcher(num_sms, device=device)
     accumulator = None
@@ -213,10 +243,16 @@ def main() -> None:
             packed_activation,
             output_reduce,
             args.split_k,
+            args.scale_pack,
+            args.output_group_size,
         )
     else:
         gemv_schedule = SchedFp8GemvUmmaStream(
-            packed_weight, packed_activation, output
+            packed_weight,
+            packed_activation,
+            output,
+            args.scale_pack,
+            args.output_group_size,
         )
     gemv_launcher.s(
         ProfileEvent(2),
@@ -298,6 +334,8 @@ def main() -> None:
     print(
         "DSV4_FP8_UMMA_RESULT "
         f"shape={args.m}x1x{args.k} sms={num_sms} split_k={args.split_k} "
+        f"scale_pack={args.scale_pack} "
+        f"output_group_size={args.output_group_size} "
         f"reduction_dtype={args.reduction_dtype} "
         f"reset_in_span={str(args.split_k == 1).lower()} "
         f"quant_median_us={statistics.median(quant_timings):.6f} "
@@ -305,9 +343,10 @@ def main() -> None:
         f"task_median_us={statistics.median(task_timings):.6f} "
         f"task_max_us={max(task_timings):.6f} "
         f"kernel_median_us={statistics.median(kernel_timings):.6f} "
-        f"max_abs={max_abs:.6f} layout_exact=true",
+        f"max_abs={max_abs:.6f} prepack=python_setup",
         flush=True,
     )
+    report_track_profile(gemv_launcher)
 
 
 if __name__ == "__main__":

@@ -1684,3 +1684,103 @@ VDCores boundary by 0.034016 ms (0.23%). It remains 2.45x the 6.015728-ms vLLM
 median and 2.01x the 7.321974-ms SGLang median. Profile the integrated
 projection frontiers under the same HBM-instruction build before attempting
 fusion.
+
+## Rejected native-FP8 scale-tail FIFO (2026-08-13)
+
+A dedicated 8-KiB, byte-granular FIFO was prototyped after the 24 ordinary
+slots.  It assigned arbitrary 16-byte-aligned spans with monotonic tickets and
+strict FIFO retirement, reducing each native FP8 weight from three ordinary
+slots to two plus a 512-byte FIFO allocation.  This makes an eight-weight
+window fit in 18 ordinary slots, whereas the old combined-record form would
+need 26.  It did not improve any accepted projection schedule.
+
+The tracked bounded Q_b schedule already has zero allocator stalls at its
+13-slot peak.  In a matched prototype image, unsplit M32768/K1024 Q_b measured
+11.584 us with ordinary combined records.  FIFO bulk loads with a shared
+weight/scale barrier measured 26.304 us at an eight-tile window.  Separate
+barriers and the opposite LDU were best at 16.864 us, still 45.6% slower.
+Production split-2 Q_b regressed 12.416 to 18.800 us; aggregate split-2 O_a
+regressed 11.040 to 16.416 us; split-4 O_b regressed 11.072 to 16.416 us.  All
+paths were numerically exact.
+
+Classic `cp.async` was also rejected.  The current LDU handler is single-lane,
+so one 512-byte scale requires 32 separate 16-byte issues; every comparable
+separate-barrier `cp.async` variant was slower than one bulk scale copy.
+Sharing a barrier on one LDU serialized the two discontiguous transfers, while
+separate barriers/LDUs still paid an extra command and readiness token per
+weight.  Increasing the activation window from four to eight did not offset
+that cost.
+
+Keep the contiguous 16,896-byte record and bounded four-weight stream.  Revisit
+a special scale arena only after measuring real ordinary-slot stalls, or when
+one transaction/readiness event can target discontiguous data and scale
+destinations.  The experimental runtime code was removed.
+
+The standalone benchmark now performs immutable weight layout conversion from
+Python setup with `runtime.prepack_fp8_checkpoint`, matching the resident
+checkpoint loader, and omits the setup-only prepack opcode from its selective
+operator image.  Token-time activation quantization remains a VDCores task.
+The Python-owned converter is byte-exact against the prior native layout; the
+final image measured three identical 10.848-us Q_b medians with zero error.
+
+## Staged packed-scale UMMA and static dispatch (2026-08-13)
+
+The accepted packed path keeps the contiguous 16,896-byte checkpoint record,
+but stores two adjacent K128 scale layouts in the first record tail and loads
+the second weight as data-only. Token-time activation quantization emits the
+same pack-2 layout. LDU0 streams weights while LDU1 loads an eight-K128
+activation chunk. A four-stage full/empty barrier ring lets warp 0 issue UMMA
+while warp 1 observes completion and returns exact slot masks; the phase mask
+persists across sequential tasks. Two M128 outputs share each activation
+stream and remain in disjoint TMEM columns until their delayed epilogues.
+
+Scale pack, output-group count, split reduction width, and quant scale pack are
+generated compute-family fields, following the WGMMA operator-family model.
+The production manifest selects only pack-2 handlers with the one/two-row
+shapes needed by its schedules. `CInst` carries only the K128 tile count; the
+inner task has no runtime variant switch. The focused image compiled at 54
+registers, nine barriers, an 80-byte stack, and zero spills, versus 64
+registers for the runtime-dispatched multi-variant image. The broader resident
+image remains spill-free at 70 registers because other selected operators set
+its register bound.
+
+Q_b now uses unsplit K1024 on 128 SMs, exactly two M128 rows per static task.
+The exact standalone job `20260813T172958Z-1391236` measured 9.216/9.376/9.984
+us min/median/max, down 13.6% from the accepted 10.848-us unsplit baseline and
+20.2% from the prior 11.744-us BF16 split endpoint. It remains 42.9% slower
+than the matched 6.5608-us vLLM/DeepGEMM result, so this is a material kernel
+gain but not the requested framework-performance crossover.
+
+The pack-2 static regression sweep was numerically correct. Q_a remained
+3.552 us; KV measured 3.424 us; index Q_b measured 3.680 us; the actual
+per-group O_a shape measured 9.248 us versus 10.368 us; and O_b measured
+9.584 us versus 10.368 us. Maximum BF16-reference error was 0.007812. All 72
+schedule/runtime tests pass.
+
+The public 168,305,308,121-byte checkpoint snapshot was subsequently installed
+in coordinator tmpfs at
+`/dev/shm/checkpoints/nvidia/DeepSeek-V4-Flash-NVFP4`. The 478.4-GiB tmpfs had
+294 GiB free before the install and 137 GiB free afterward; the host retained
+about 1.1 TiB of available RAM. The first resident attempt
+`20260813T174744Z-1579015` loaded the model but caught a graph-construction
+invariant: pack-2 Q-rank quantization has four scale work groups, while its
+explicit placement still requested the unpacked eight SMs. The resident caller
+now caps only that native packed placement at the number of scale groups;
+scalar placement and UMMA GEMV policies are unchanged.
+
+Full-vocabulary job `20260813T175101Z-1613009` then used one coordinator B300,
+one persistent launch, all 43 layers, context 128, and the complete 129,280-row
+head. It loaded 153.364 GiB of tensor payload in 123.172 seconds, retained
+24.467 GiB of GPU memory, queued 223 compute and 1,245 memory instructions, and
+emitted exact token 5. After three warmups, ten samples measured
+15.618624/15.822816/16.658720 ms min/median/max. Reject this as a performance
+milestone: the median is 0.639392 ms (4.21%) slower than the prior
+15.183424-ms full-vocabulary boundary and 2.63x the 6.015728-ms vLLM reference.
+The isolated packed-UMMA gains therefore do not survive the present integrated
+schedule.
+
+The earlier 10.830944-ms report was a context-one, five-sample warp-parallel
+Sinkhorn experiment, not the context-128 end-to-end gate. It was already
+rejected because its coefficient reduction order could alter near-tie routes
+and its matched layer profile regressed; the accepted context-one production
+median remained 11.178160 ms.

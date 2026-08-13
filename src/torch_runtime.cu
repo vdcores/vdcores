@@ -144,7 +144,8 @@ __global__ void prepack_fp8_checkpoint_kernel(
     const cutlass::float_ue8m0_t *__restrict__ checkpoint_scale,
     uint8_t *__restrict__ output,
     int k,
-    int k_tiles) {
+    int k_tiles,
+    int scale_pack) {
   using namespace cute;
   using Fp8 = cutlass::float_e4m3_t;
   using Scale = cutlass::float_ue8m0_t;
@@ -155,44 +156,71 @@ __global__ void prepack_fp8_checkpoint_kernel(
   using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<32>;
   using ScaleProblemShape = Shape<Int<kFp8TileM>, Int<128>, Int<kFp8TileK>>;
 
-  const int m_tile = blockIdx.x / k_tiles;
-  const int k_tile = blockIdx.x - m_tile * k_tiles;
-  auto *tile_output = output + blockIdx.x * kFp8WeightTileBytes;
+  const int scale_groups = k_tiles / scale_pack;
+  const int m_tile = blockIdx.x / scale_groups;
+  const int scale_group = blockIdx.x - m_tile * scale_groups;
+  const int group_start = scale_group * scale_pack;
 
-  for (int index = threadIdx.x; index < kFp8WeightDataBytes;
-       index += blockDim.x) {
-    const int row = index / kFp8TileK;
-    const int destination_column = index - row * kFp8TileK;
-    const int destination_chunk = destination_column / 16;
-    const int byte_in_chunk = destination_column - destination_chunk * 16;
-    const int source_chunk = destination_chunk ^ (row & 7);
-    const int source_column =
-        k_tile * kFp8TileK + source_chunk * 16 + byte_in_chunk;
-    tile_output[index] =
-        weight[(m_tile * kFp8TileM + row) * k + source_column];
+  for (int pack_tile = 0; pack_tile < scale_pack; ++pack_tile) {
+    const int k_tile = group_start + pack_tile;
+    auto *tile_output = output +
+        (m_tile * k_tiles + k_tile) * kFp8WeightTileBytes;
+    for (int index = threadIdx.x; index < kFp8WeightDataBytes;
+         index += blockDim.x) {
+      const int row = index / kFp8TileK;
+      const int destination_column = index - row * kFp8TileK;
+      const int destination_chunk = destination_column / 16;
+      const int byte_in_chunk = destination_column - destination_chunk * 16;
+      const int source_chunk = destination_chunk ^ (row & 7);
+      const int source_column =
+          k_tile * kFp8TileK + source_chunk * 16 + byte_in_chunk;
+      tile_output[index] =
+          weight[(m_tile * kFp8TileM + row) * k + source_column];
+    }
+    for (int index = threadIdx.x;
+         index < kFp8WeightTileBytes - kFp8WeightDataBytes;
+         index += blockDim.x) {
+      tile_output[kFp8WeightDataBytes + index] = 0;
+    }
   }
+  __syncthreads();
 
   TiledMma tiled_mma;
   const auto logical_sfa = ScaleConfig::tile_atom_to_shape_SFA(
       ScaleProblemShape{});
   constexpr int kScaleColumns = kFp8TileK / 32;
   auto *packed_scale = reinterpret_cast<Scale *>(
-      tile_output + kFp8WeightDataBytes);
-  const Scale tile_scale = checkpoint_scale[m_tile * k_tiles + k_tile];
-  for (int index = threadIdx.x;
-       index < kFp8TileM * kScaleColumns;
-       index += blockDim.x) {
-    const int row = index / kScaleColumns;
-    const int sf = index - row * kScaleColumns;
-    const int destination = int(logical_sfa(row, sf * 32));
-    packed_scale[destination] = tile_scale;
+      output + (m_tile * k_tiles + group_start) * kFp8WeightTileBytes +
+      kFp8WeightDataBytes);
+  if (scale_pack == 1) {
+    const Scale tile_scale =
+        checkpoint_scale[m_tile * k_tiles + group_start];
+    for (int index = threadIdx.x;
+         index < kFp8TileM * kScaleColumns;
+         index += blockDim.x) {
+      const int row = index / kScaleColumns;
+      const int sf = index - row * kScaleColumns;
+      const int destination = int(logical_sfa(row, sf * 32));
+      packed_scale[destination] = tile_scale;
+    }
+  } else {
+    for (int index = threadIdx.x;
+         index < kFp8TileM * scale_pack;
+         index += blockDim.x) {
+      const int row = index / scale_pack;
+      const int sf = index - row * scale_pack;
+      const int destination = int(logical_sfa(row, sf * 32));
+      packed_scale[destination] =
+          checkpoint_scale[m_tile * k_tiles + group_start + sf];
+    }
   }
 }
 
 void py_prepack_fp8_checkpoint(
     torch::Tensor weight,
     torch::Tensor checkpoint_scale,
-    torch::Tensor output) {
+    torch::Tensor output,
+    int scale_pack) {
   TORCH_CHECK(weight.is_cuda() && checkpoint_scale.is_cuda() && output.is_cuda(),
               "FP8 prepack tensors must be CUDA tensors");
   TORCH_CHECK(weight.device() == checkpoint_scale.device() &&
@@ -212,6 +240,10 @@ void py_prepack_fp8_checkpoint(
               "FP8 weight must be M128/K128 aligned");
   const int64_t m_tiles = rows / kFp8TileM;
   const int64_t k_tiles = k / kFp8TileK;
+  TORCH_CHECK(
+      (scale_pack == 1 || scale_pack == 2 || scale_pack == 4) &&
+          k_tiles % scale_pack == 0,
+      "FP8 scale pack must be 1, 2, or 4 and divide K/128");
   TORCH_CHECK(checkpoint_scale.size(0) == m_tiles &&
                   checkpoint_scale.size(1) == k_tiles,
               "FP8 checkpoint scale shape does not match the weight");
@@ -223,13 +255,14 @@ void py_prepack_fp8_checkpoint(
 
   const auto stream = at::cuda::getCurrentCUDAStream(weight.device().index());
   prepack_fp8_checkpoint_kernel<<<
-      static_cast<unsigned>(m_tiles * k_tiles), 256, 0, stream>>>(
+      static_cast<unsigned>(m_tiles * k_tiles / scale_pack), 256, 0, stream>>>(
       reinterpret_cast<const uint8_t *>(weight.data_ptr()),
       reinterpret_cast<const cutlass::float_ue8m0_t *>(
           checkpoint_scale.data_ptr()),
       output.data_ptr<uint8_t>(),
       static_cast<int>(k),
-      static_cast<int>(k_tiles));
+      static_cast<int>(k_tiles),
+      scale_pack);
   const cudaError_t error = cudaGetLastError();
   TORCH_CHECK(error == cudaSuccess,
               "FP8 checkpoint prepack failed: ", cudaGetErrorString(error));
@@ -777,5 +810,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("weight"),
             py::arg("checkpoint_scale"),
             py::arg("output"),
+            py::arg("scale_pack") = 1,
             "Convert one raw checkpoint FP8 linear to native SM100 tiles");
 }

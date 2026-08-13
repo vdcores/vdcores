@@ -52,6 +52,21 @@ static_assert(numSlots + numSpecialSlots <= ((2<<6) - 1), "Total number of slots
 static constexpr int numComputeWarps = 4;
 static constexpr int numMemoryWarps = 4;
 
+// The resident SM100 runtime allocates TMEM once and shares a small bank of
+// completion barriers across sequential compute tasks. Barrier zero is the
+// ordinary single-UMMA completion barrier. Grouped BF16 GEMV owns barriers
+// 1..8. Native FP8 uses a disjoint four-stage full/empty ring so its issuer
+// and retire warps can overlap without perturbing either legacy phase state.
+static constexpr int tmemGroupedBarrierBase = 1;
+static constexpr int tmemGroupedBarrierCount = 8;
+static constexpr int fp8UmmaPipelineStages = 4;
+static constexpr int fp8UmmaPipelineBarrierBase =
+    tmemGroupedBarrierBase + tmemGroupedBarrierCount;
+static constexpr int fp8UmmaPipelineBarrierCount =
+    fp8UmmaPipelineStages * 2;
+static constexpr int tmemMmaBarrierCount =
+    fp8UmmaPipelineBarrierBase + fp8UmmaPipelineBarrierCount;
+
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
