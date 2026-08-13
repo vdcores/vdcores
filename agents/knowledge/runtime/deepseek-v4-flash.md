@@ -1684,3 +1684,109 @@ VDCores boundary by 0.034016 ms (0.23%). It remains 2.45x the 6.015728-ms vLLM
 median and 2.01x the 7.321974-ms SGLang median. Profile the integrated
 projection frontiers under the same HBM-instruction build before attempting
 fusion.
+
+## Split-32 UMMA attention and native O_a handoff (2026-08-13)
+
+The clean-room sparse-attention producer splits cache rows into K32 shards.
+Each CTA keeps all 64 query heads in UMMA's M dimension, issues four D128 QK
+products, performs a masked local softmax, and issues four D128 PV products.
+It writes one `[64,512]` BF16 partial plus FP32 `(max,mass)` metadata per
+shard. A stable reducer merges those nonlinear softmax states, includes the
+attention sink as a zero-output candidate, applies inverse RoPE to the last 64
+logical dimensions in registers, and directly emits the native MXF8 operand
+for `O_a`.
+
+The layout is head-major despite the grouped consumer view. The same bytes are
+viewed as `[64,4,2048]` by the reducer and `[8,32,2048]` by the eight `O_a`
+groups. For each head, the four records correspond to consecutive logical
+K128 blocks; inverse RoPE touches offsets 64--127 only in the fourth record.
+For each interleaved pair, the inverse is
+`even'=even*cos+odd*sin`, `odd'=odd*cos-even*sin`. This matches vLLM's
+`fused_inv_rope_fp8_quant` order and avoids an intermediate inverse-RoPE BF16
+tensor. It also removes the previous eight independently materialized and
+quantized group inputs. The only cross-SM materialization is the single native
+MXF8 consumer tensor.
+
+At context 128, SWA/HCA/CSA contain 128/129/160 attention rows. Focused B300
+medians are:
+
+| Rows | Split-32 producer (us) | + merge/inv-RoPE/quant (us) | + grouped O_a (us) |
+| ---: | ---: | ---: | ---: |
+| 128 | 15.184 | 20.080 | 29.920 |
+| 129 | 15.152 | 20.528 | 30.528 |
+| 160 | 15.312 | 20.224 | 30.432 |
+
+The isolated native inverse-RoPE/quant task is 3.664 us versus vLLM's
+6.912-us event median. The producer is 8.3--9.3% below the approximately
+16.7-us FlashMLA split-KV-plus-combine mechanism seen in the framework traces.
+The complete fused attention/epilogue is 20.080/20.528/20.224 us versus
+vLLM's attention-plus-inverse-quant 53.952/55.008/28.416 us for SWA/HCA/CSA.
+After adding `O_a`, the corresponding vLLM event spans are
+70.976/72.128/44.800 us, so the native handoff is 57.8%, 57.7%, and 32.1%
+lower. The isolated BF16-reduction `O_a` kernel remains 10.368 us versus a
+9.589-us raw DeepGEMM kernel; the target is won at the requested fused task
+boundary, not by claiming that isolated subkernel is faster.
+
+The 128/129/160-row output checks have maximum absolute error
+0.003906/0.003906/0.001953, mean absolute error
+0.000199/0.000826/0.000187, and cosine similarity
+0.999308/0.994604/0.999232. TMA reduce-add remains enabled for the BF16 split-K
+`O_a` projections under the accepted rounding policy. The softmax merge is an
+explicit max/mass reduction because it is nonlinear and cannot be represented
+by TMA add without changing the attention result.
+
+The resident schedule first releases the common split partials, then places
+eight 8-head reducers on the first half of eight disjoint 16-SM partitions.
+Each reducer releases only its own native group, allowing that partition's
+16-SM split-K `O_a` stage to start without waiting for the other seven groups.
+A bounded one-layer CSA gate measured a 0.342944-ms median from its first three
+valid timed iterations versus 0.390592 ms for the matched legacy contiguous
+path's first valid iteration. Later replay still hits the pre-existing
+resident barrier-reuse/repeatability failure, so this is not an accepted
+steady-state gate.
+
+The full 43-layer, context-128, 129,280-vocabulary run loaded 153.364 GiB,
+passed its full-head reference, and produced one valid timed sample at
+10.425344 ms (95.92 token/s). That is 2.647040 ms or 20.25% below the prior
+13.072384-ms VDCores endpoint. The next replay hung at the known resident
+barrier-reuse boundary, so no median is reported. The current matched vLLM
+reference is 7.607872 ms (131.44 token/s): this bounded VDCores sample remains
+2.817472 ms, 37.0%, or 1.370x slower end to end even though the targeted
+attention steps are faster.
+
+## Compact FP8 weight-scale experiment (2026-08-13)
+
+The native MXF8 weight record is 16,896 bytes: 16 KiB of swizzled FP8 data and
+a 512-byte expanded UE8M0 SFA image. It therefore occupies three 8-KiB slots.
+The opt-in raw-scale schedule instead TMA-loads only the 16-KiB data record
+into two slots and publishes one raw pointer for the task's contiguous scale
+row. Compute warp 0 loads each one-byte checkpoint scale, expands the uniform
+512-byte SFA image with vector stores into unused padding of the corresponding
+2-KiB activation record, and issues UTCCP to TMEM. No scale payload passes
+through LDU and no extra shared slot is allocated. The raw pointer is consumed
+before normal records, allowing scale production to overlap both LDU ports.
+
+A register-to-TMEM prototype was also tested. TMEM ownership requires all four
+compute warps to store their own 32-row quadrant, and the necessary cross-warp
+rendezvous made that form slower. Reusing activation padding reduced the
+focused image to 56 registers with zero spills, but the packed path still won
+matched task A/B:
+
+| Shape / schedule | Packed SFA (us) | Compact raw SFA (us) |
+| --- | ---: | ---: |
+| Q_a M1024/K4096, split 8 / 64 SMs | 3.888 | 4.192 |
+| Q_a M1024/K4096, split 16 / 128 SMs | 2.912 | 3.232 |
+| O_a aggregate M8192/K4096, split 2 / 128 SMs | 12.160 | 12.352 |
+
+The compact result matches the dequantized oracle (`max_abs <= 0.007812`); a
+diagnostic run measured cosine similarity 0.99999690. It saves one slot and
+3.0% of the weight-record bytes but is not selected by the resident path.
+
+Partial K chunks were retained in the generic split-K scheduler because they
+enable two-tile shards. They are not the production Q_a policy: in a matched
+one-layer/context-1 resident A/B with exact FP32 reduction, split 16 measured
+0.325344 ms versus 0.318128 ms for split 8. Direct BF16 split 16 also failed
+the repeatable-token gate. Split 8 remains the cross-step choice. On this
+narrow probe FP32/fused-finalizer measured 0.318128 ms versus 0.345632 ms for
+BF16 direct reduction; the global default remains BF16 because the existing
+43-layer measurement favors it.

@@ -19,6 +19,7 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 
 #include "context.cuh"
 #include "rms_norm.cuh"
@@ -1356,6 +1357,404 @@ task_dsv4_contiguous_attention_512_umma_tail32(
             tmem_o, cta_coord_o, cta_sO, inv_sum, M);
         c2m.template push<31, true, false>(tid, output_slots);
     }
+}
+
+// A split-KV producer owns one contiguous K32 shard while all 64 attention
+// heads occupy UMMA's M dimension.  The producer emits a locally normalized
+// BF16 partial plus (max, mass) metadata.  A later per-head reducer merges the
+// shards, adds the attention sink, applies inverse RoPE, and writes native O_a
+// FP8 records directly.
+template <int M, int KV, typename ScoreTensor, typename CoordTensor,
+          typename ProbTensor>
+__device__ __forceinline__ void sm100_dsv4_softmax_split32_hi_lo(
+    ScoreTensor const& scores,
+    CoordTensor const& coords,
+    ProbTensor const& p_hi,
+    ProbTensor const& p_lo,
+    const int active_tokens,
+    int& logical_row,
+    float& row_max,
+    float& row_sum) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr float kScoreScale =
+        M_LOG2E * 0.04419417382415922f;
+    const int tid = __compute_tid();
+
+    using ScoreLoad = SM100_TMEM_LOAD_16dp32b16x;
+    auto tiled_load = make_tmem_copy(ScoreLoad{}, scores);
+    auto thread_load = tiled_load.get_slice(tid);
+    auto thread_scores = thread_load.partition_S(scores);
+    auto thread_coords = thread_load.partition_D(coords);
+    auto values = make_tensor<accum_t>(shape(thread_coords));
+    copy(tiled_load, thread_scores, values);
+
+    logical_row = int(get<0>(thread_coords(0)));
+    row_max = -FLT_MAX;
+#pragma unroll 1
+    for (int i = 0; i < size(values); ++i) {
+        const int col = int(get<1>(thread_coords(i)));
+        values(i) = col < active_tokens
+            ? values(i) * kScoreScale : -FLT_MAX;
+        row_max = fmaxf(row_max, values(i));
+    }
+    row_max = fmaxf(
+        row_max, __shfl_xor_sync(0xFFFFFFFFU, row_max, 16));
+
+    float local_sum = 0.0f;
+#pragma unroll 1
+    for (int i = 0; i < size(values); ++i) {
+        values(i) = exp2f(values(i) - row_max);
+        local_sum += values(i);
+    }
+    row_sum = local_sum +
+        __shfl_xor_sync(0xFFFFFFFFU, local_sum, 16);
+
+    cutlass::NumericArrayConverter<data_t, accum_t, 1> convert;
+#pragma unroll 1
+    for (int i = 0; i < size(values); ++i) {
+        const int row = int(get<0>(thread_coords(i)));
+        const int col = int(get<1>(thread_coords(i)));
+        cutlass::Array<accum_t, 1> source{{values(i)}};
+        const auto high = convert(source);
+        cutlass::Array<accum_t, 1> residual{{
+            values(i) - static_cast<accum_t>(high[0])}};
+        p_hi(row + M * col) = high[0];
+        p_lo(row + M * col) = convert(residual)[0];
+    }
+    __sync_compute_group(128);
+    cutlass::arch::fence_view_async_shared();
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_attention_split32_umma_sm100(
+    int active_tokens,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t& tmem_mma_phase,
+    void *smem_base,
+    M2CQueue& m2c,
+    C2MQueue& c2m) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr int M = 64;
+    constexpr int KV = 32;
+    constexpr int D_TILE = 128;
+    constexpr int D_TILES = 4;
+    constexpr int QK_WAVE_TILES = 2;
+    constexpr uint32_t O_OFFSET = 128;
+
+    using QKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, KV,
+        UMMA::Major::K, UMMA::Major::K>;
+    using PVAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, D_TILE,
+        UMMA::Major::K, UMMA::Major::MN>;
+
+    const int tid = __compute_tid();
+    auto tiled_qk = make_tiled_mma(QKAtom{});
+    auto qk_cta = tiled_qk.get_slice(0);
+    auto tiled_pv = make_tiled_mma(PVAtom{});
+    auto pv_cta = tiled_pv.get_slice(0);
+
+    auto q_shape = partition_shape_A(
+        tiled_qk, make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto k_shape = partition_shape_B(
+        tiled_qk, make_shape(Int<KV>{}, Int<D_TILE>{}));
+    auto v_shape = partition_shape_B(
+        tiled_pv, make_shape(Int<D_TILE>{}, Int<KV>{}));
+    auto p_shape = partition_shape_A(
+        tiled_pv, make_shape(Int<M>{}, Int<KV>{}));
+    auto q_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, q_shape);
+    auto k_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW32_Atom<data_t>{}, k_shape);
+    auto v_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_MN_SW128_Atom<data_t>{}, v_shape);
+    auto p_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW32_Atom<data_t>{}, p_shape);
+
+    auto logical_s = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<KV>{}),
+                    make_stride(Int<KV>{}, Int<1>{})));
+    auto coord_s = make_identity_tensor(make_shape(Int<M>{}, Int<KV>{}));
+    auto cta_s = qk_cta.partition_C(logical_s);
+    auto cta_coord_s = qk_cta.partition_C(coord_s);
+    auto tmem_s = qk_cta.make_fragment_C(cta_s);
+    tmem_s.data() = tmem_base_ptr;
+
+    auto logical_o = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                    make_stride(Int<D_TILE>{}, Int<1>{})));
+    auto coord_o = make_identity_tensor(make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto cta_o = pv_cta.partition_C(logical_o);
+    auto cta_coord_o = pv_cta.partition_C(coord_o);
+
+    int q_slots[D_TILES];
+    data_t *q_ptrs[D_TILES];
+    tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
+#pragma unroll 1
+    for (int wave = 0; wave < D_TILES / QK_WAVE_TILES; ++wave) {
+        int k_slots[QK_WAVE_TILES];
+        data_t *k_ptrs[QK_WAVE_TILES];
+#pragma unroll 1
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            const int q_tile = wave * QK_WAVE_TILES + tile;
+            q_slots[q_tile] = m2c.template pop<0>();
+            q_ptrs[q_tile] = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(q_slots[q_tile])));
+        }
+#pragma unroll 1
+        for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+            k_slots[tile] = m2c.template pop<0>();
+            k_ptrs[tile] = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(k_slots[tile])));
+        }
+        if (tid < numThreadsPerWarp) {
+#pragma unroll 1
+            for (int tile = 0; tile < QK_WAVE_TILES; ++tile) {
+                const int q_tile = wave * QK_WAVE_TILES + tile;
+                auto sQ = make_tensor(make_smem_ptr(q_ptrs[q_tile]), q_layout);
+                auto sK = make_tensor(make_smem_ptr(k_ptrs[tile]), k_layout);
+                auto frag_q = qk_cta.make_fragment_A(sQ);
+                auto frag_k = qk_cta.make_fragment_B(sK);
+#pragma unroll 1
+                for (int k_block = 0; k_block < size<2>(frag_q); ++k_block) {
+                    gemm(tiled_qk, frag_q(_, _, k_block),
+                         frag_k(_, _, k_block), tmem_s);
+                    tiled_qk.accumulate_ = UMMA::ScaleOut::One;
+                }
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        c2m.push(tid, k_slots[0] | k_slots[1]);
+    }
+
+    auto p_hi = make_tensor(make_smem_ptr(q_ptrs[0]), p_layout);
+    auto p_lo = make_tensor(make_smem_ptr(q_ptrs[0] + M * KV), p_layout);
+    int logical_row = 0;
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    sm100_dsv4_softmax_split32_hi_lo<M, KV>(
+        tmem_s, cta_coord_s, p_hi, p_lo, active_tokens,
+        logical_row, row_max, row_sum);
+    c2m.push(tid, q_slots[1] | q_slots[2] | q_slots[3]);
+
+    auto frag_p_hi = pv_cta.make_fragment_A(p_hi);
+    auto frag_p_lo = pv_cta.make_fragment_A(p_lo);
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+#pragma unroll 1
+    for (int tile = 0; tile < D_TILES; ++tile) {
+        const int v_slots = m2c.template pop<0>();
+        auto *v_ptr = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(v_slots)));
+        auto sV = make_tensor(make_smem_ptr(v_ptr), v_layout);
+        auto frag_v = pv_cta.make_fragment_B(sV);
+        auto tmem_o = pv_cta.make_fragment_C(cta_o);
+        tmem_o.data() = tmem_base_ptr + O_OFFSET;
+        tiled_pv.accumulate_ = UMMA::ScaleOut::Zero;
+        if (tid < numThreadsPerWarp) {
+#pragma unroll 1
+            for (int k_block = 0; k_block < size<2>(frag_p_hi); ++k_block) {
+                gemm(tiled_pv, frag_p_hi(_, _, k_block),
+                     frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+#pragma unroll 1
+            for (int k_block = 0; k_block < size<2>(frag_p_lo); ++k_block) {
+                gemm(tiled_pv, frag_p_lo(_, _, k_block),
+                     frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        c2m.push(tid, v_slots);
+
+        const int output_slots = m2c.template pop<0>();
+        auto *output_ptr = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(output_slots)));
+        auto sO = make_tensor(
+            make_smem_ptr(output_ptr),
+            make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                        make_stride(Int<D_TILE>{}, Int<1>{})));
+        auto cta_sO = pv_cta.partition_C(sO);
+        sm100_attention_store_tmem_rows<M, D_TILE, false>(
+            tmem_o, cta_coord_o, cta_sO, inv_sum, M);
+        c2m.template push<31, true, false>(tid, output_slots);
+    }
+    c2m.push(tid, q_slots[0]);
+
+    const int metadata_slots = m2c.template pop<0>();
+    auto *metadata = static_cast<float *>(
+        get_slot_address(smem_base, extract(metadata_slots)));
+    if ((tid & 16) == 0) {
+        metadata[logical_row * 2] = row_max;
+        metadata[logical_row * 2 + 1] = row_sum;
+    }
+    __sync_compute_group(128);
+    c2m.template push<31, true, false>(tid, metadata_slots);
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void
+task_dsv4_attention_split_reduce_fp8_sm100(
+    int num_splits,
+    int head,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue& m2c,
+    C2MQueue& c2m) {
+    using namespace cute;
+    using Fp8 = cutlass::float_e4m3_t;
+    using Scale = cutlass::float_ue8m0_t;
+    using Accum = float;
+    constexpr int kHeads = 64;
+    constexpr int kTileM = 128;
+    constexpr int kTileN = 8;
+    constexpr int kTileK = 128;
+    constexpr int kTiles = 4;
+    constexpr int kScaleVector = 32;
+    constexpr int kBBytes = kTileN * kTileK;
+    constexpr int kBTileBytes = 2048;
+    using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+    using Atom = SM100_MMA_MXF8F6F4_SS<
+        Fp8, Fp8, Accum, Scale, kTileM, kTileN,
+        UMMA::Major::K, UMMA::Major::K>;
+    using TiledMma = decltype(make_tiled_mma(Atom{}));
+    using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+    using LayoutSFB = decltype(
+        ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+    using ScaleProblemShape = Shape<Int<kTileM>, Int<128>, Int<kTileK>>;
+    const auto logical_sfb =
+        ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
+
+    const int metadata_slots = m2c.template pop<0>();
+    const auto *metadata = static_cast<const float *>(
+        get_slot_address(smem_base, extract(metadata_slots)));
+    const int sink_slots = m2c.template pop<0>();
+    const auto *sink = static_cast<const float *>(
+        get_slot_address(smem_base, extract(sink_slots)));
+    const int table_slots = m2c.template pop<0>();
+    const auto *table = static_cast<const float *>(
+        get_slot_address(smem_base, extract(table_slots)));
+    const int tid = __compute_tid();
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    auto *shared = static_cast<float *>(task_scratch);
+
+
+    if (tid == 0) {
+        float global_max = sink[0] * M_LOG2E;
+        for (int split = 0; split < num_splits; ++split) {
+            global_max = fmaxf(
+                global_max, metadata[(split * kHeads + head) * 2]);
+        }
+        float denominator = exp2f(sink[0] * M_LOG2E - global_max);
+        for (int split = 0; split < num_splits; ++split) {
+            const float local_max = metadata[(split * kHeads + head) * 2];
+            const float local_mass =
+                metadata[(split * kHeads + head) * 2 + 1];
+            shared[split] = exp2f(local_max - global_max) * local_mass;
+            denominator += shared[split];
+        }
+        const float inv_denominator = 1.0f / denominator;
+        for (int split = 0; split < num_splits; ++split) {
+            shared[split] *= inv_denominator;
+        }
+    }
+    __sync_compute_group(128);
+    c2m.push(tid, metadata_slots | sink_slots);
+
+    float values[kTiles] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+        const int partial_slots = m2c.template pop<0>();
+        const auto *partial = static_cast<const __nv_bfloat16 *>(
+            get_slot_address(smem_base, extract(partial_slots)));
+        const float weight = shared[split];
+#pragma unroll
+        for (int tile = 0; tile < kTiles; ++tile) {
+            values[tile] +=
+                weight * __bfloat162float(partial[tile * kTileK + tid]);
+        }
+        c2m.push(tid, partial_slots);
+    }
+
+    if (tid >= 64) {
+        const int pair = (tid - 64) >> 1;
+        const float partner =
+            __shfl_xor_sync(0xFFFFFFFFU, values[kTiles - 1], 1);
+        const float cosine = table[pair * 2];
+        const float sine = table[pair * 2 + 1];
+        values[kTiles - 1] = (tid & 1)
+            ? values[kTiles - 1] * cosine - partner * sine
+            : values[kTiles - 1] * cosine + partner * sine;
+    }
+    c2m.push(tid, table_slots);
+
+    const int output_slots = m2c.template pop<0>();
+    auto *output = static_cast<uint8_t *>(
+        get_slot_address(smem_base, extract(output_slots)));
+#pragma unroll 1
+    for (int tile = 0; tile < kTiles; ++tile) {
+        auto *tile_output = output + tile * kBTileBytes;
+        float maximum = fabsf(values[tile]);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            maximum = fmaxf(
+                maximum,
+                __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
+        }
+        if (lane == 0) {
+            shared[warp] = maximum;
+        }
+        for (int offset = tid; offset < kBTileBytes - kBBytes;
+             offset += 128) {
+            tile_output[kBBytes + offset] = 0;
+        }
+        __sync_compute_group(128);
+        if (tid == 0) {
+            maximum = fmaxf(
+                fmaxf(shared[0], shared[1]),
+                fmaxf(shared[2], shared[3]));
+            const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+            const float exponent = ceilf(log2f(requested));
+            shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+        }
+        __sync_compute_group(128);
+        const Fp8 quantized = values[tile] == 0.0f
+            ? Fp8(0.0f)
+            : Fp8(fminf(
+                fmaxf(values[tile] / shared[4], -448.0f), 448.0f));
+        const int source_chunk = tid / 16;
+        const int byte_in_chunk = tid % 16;
+#pragma unroll
+        for (int row = 0; row < kTileN; ++row) {
+            const int destination_chunk = source_chunk ^ row;
+            reinterpret_cast<Fp8 *>(tile_output)[
+                row * kTileK + destination_chunk * 16 + byte_in_chunk] =
+                quantized;
+        }
+        auto *packed_scale =
+            reinterpret_cast<Scale *>(tile_output + kBBytes);
+        const Scale block_scale = Scale(shared[4]);
+        for (int index = tid; index < kTileN * (kTileK / kScaleVector);
+             index += 128) {
+            const int row = index / (kTileK / kScaleVector);
+            const int sf = index % (kTileK / kScaleVector);
+            const int dst = int(logical_sfb(row, sf * kScaleVector));
+            packed_scale[dst] = block_scale;
+        }
+        __sync_compute_group(128);
+    }
+    c2m.template push<31, true, false>(tid, output_slots);
 }
 
 template <int M, int KV, typename TmemTensor, typename CoordTensor,

@@ -16,11 +16,13 @@ from dae.instructions import (
     Dsv4ContiguousAttention512UmmaTail32Sm100,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
+    Dsv4RmsFp8QuantUmmaBSm100,
     Dsv4Fp32ToBf16,
     Dsv4Nvfp4QuantUmmaBSm100,
     Dsv4PreloadRopeTables,
     Dsv4Rope128_64,
     Dsv4Rope512_64,
+    Dsv4RmsRope512_64,
     Dsv4SiluClampMul128,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
@@ -59,6 +61,8 @@ from dae.schedule import (
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
+    SchedDsv4RmsFp8QuantUmmaB,
+    SchedDsv4RmsRope512_64,
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
     SchedDsv4ZeroFill,
@@ -539,6 +543,51 @@ def test_dsv4_fp8_native_quant_encodes_k_tile_count():
     instruction = Dsv4Fp8QuantUmmaBSm100(1)
 
     assert instruction.args == [1]
+
+
+def test_dsv4_cleanroom_preattention_fusions_encode_shape_shards(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    source = torch.empty((1024,), dtype=torch.bfloat16)
+    weight = torch.empty_like(source)
+    native = torch.empty((8, 2048), dtype=torch.uint8)
+    quant = SchedDsv4RmsFp8QuantUmmaB(
+        source, weight, native, 1.0e-6
+    ).place(8)
+
+    first = quant.schedule(0)
+    last = quant.schedule(7)
+    assert isinstance(first[0], Dsv4RmsFp8QuantUmmaBSm100)
+    assert first[0].args[:2] == [8, 0x100]
+    assert last[0].args[:2] == [8, 0x107]
+    assert len(first) == 4
+    assert first[-1].size == 2048
+
+    rows = torch.empty((2, 512), dtype=torch.bfloat16)
+    table = torch.empty((32, 2), dtype=torch.float32)
+    fused = SchedDsv4RmsRope512_64(
+        rows,
+        table,
+        torch.empty_like(rows),
+        epsilon=1.0e-6,
+        fixed_table_id=1,
+    ).place(2)
+    q_instructions = fused.schedule(0)
+    assert isinstance(q_instructions[0], Dsv4RmsRope512_64)
+    assert q_instructions[0].args[:2] == [0, 2]
+    assert len(q_instructions) == 3
+
+    weighted = SchedDsv4RmsRope512_64(
+        rows[:1],
+        table,
+        torch.empty_like(rows[:1]),
+        epsilon=1.0e-6,
+        weight=torch.empty((512,), dtype=torch.bfloat16),
+        fixed_table_id=0,
+    ).place(1).schedule(0)
+    assert weighted[0].args[:2] == [1, 1]
+    assert len(weighted) == 4
 
 
 def test_dsv4_hc_post_encodes_local_width():

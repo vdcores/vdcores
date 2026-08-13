@@ -46,6 +46,14 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--zero-input", action="store_true")
+    parser.add_argument(
+        "--raw-weight-scale",
+        action="store_true",
+        help=(
+            "load compact UE8M0 weight scales on compute and write SFA "
+            "directly to TMEM"
+        ),
+    )
     args = parser.parse_args()
     if bool(args.checkpoint) != bool(args.prefix):
         parser.error("--checkpoint and --prefix must be supplied together")
@@ -125,6 +133,11 @@ def main() -> None:
         ).place(prepack_sms)
     )
     weight_prepack_launcher.launch()
+    compact_weight = None
+    if args.raw_weight_scale:
+        # Setup-only extraction for the A/B probe. Resident checkpoint loading
+        # can produce this 16-KiB tile directly once the task wins its gate.
+        compact_weight = packed_weight[:, :, : 128 * 128].contiguous()
 
     activation_rows = activation.reshape(1, -1).expand(8, -1).contiguous()
     activation_prepack_launcher = Launcher(1, device=device)
@@ -209,14 +222,18 @@ def main() -> None:
             gemv_launcher, accumulator
         ).rowmajor_2d("reduce", SchedFp8GemvUmmaSplitK.OUTPUT_ROWS, 128)
         gemv_schedule = SchedFp8GemvUmmaSplitK(
-            packed_weight,
+            compact_weight if compact_weight is not None else packed_weight,
             packed_activation,
             output_reduce,
             args.split_k,
+            weight_scale=weight_scale if args.raw_weight_scale else None,
         )
     else:
         gemv_schedule = SchedFp8GemvUmmaStream(
-            packed_weight, packed_activation, output
+            compact_weight if compact_weight is not None else packed_weight,
+            packed_activation,
+            output,
+            weight_scale=weight_scale if args.raw_weight_scale else None,
         )
     gemv_launcher.s(
         ProfileEvent(2),
@@ -299,6 +316,8 @@ def main() -> None:
         "DSV4_FP8_UMMA_RESULT "
         f"shape={args.m}x1x{args.k} sms={num_sms} split_k={args.split_k} "
         f"reduction_dtype={args.reduction_dtype} "
+        f"raw_weight_scale={str(args.raw_weight_scale).lower()} "
+        f"weight_tile_bytes={16384 if args.raw_weight_scale else 16896} "
         f"reset_in_span={str(args.split_k == 1).lower()} "
         f"quant_median_us={statistics.median(quant_timings):.6f} "
         f"task_min_us={min(task_timings):.6f} "

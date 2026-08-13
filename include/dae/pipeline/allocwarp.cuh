@@ -98,6 +98,9 @@ __device__ __forceinline__ void allocwarp_execute(
         inst.address += uint64_t(indirect_layer_index) * entry_bytes;
       }
     }
+    if (decoded_op == op(OP_ALLOC_LAYER_TMA_LOAD_4D) && lane_id == 0) {
+      inst.coords[3] += indirect_layer_index;
+    }
 
     // A2. shift the arg field for group instructions (usually with tmas and bars)
     if (inst.opcode & MEM_OP_FLAGS_GROUP) {

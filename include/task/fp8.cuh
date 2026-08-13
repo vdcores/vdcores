@@ -16,6 +16,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/detail/sm100_tmem_helper.hpp>
+#include <type_traits>
 
 template <class UtccpOp, class TEngine, class TLayout>
 __device__ __forceinline__ auto dae_fp8_get_utccp_smem_desc_tensor(
@@ -38,6 +39,28 @@ __device__ __forceinline__ auto dae_fp8_get_utccp_smem_desc_tensor(
       make_tensor<UMMA::smem_desc<UMMA::Major::K>>(core_tensor);
   return make_tensor(
       descriptor.data(), recast_layout<Value, uint128_t>(smem_tensor.layout()));
+}
+
+// One FP8 checkpoint scale is shared by every 32-value scale vector in an
+// M128/K128 weight tile.  Warp 0 loads that byte directly from its raw HBM
+// address and expands the uniform 512-byte SFA image with one 128-bit shared
+// store per lane.  The caller places the image in otherwise-unused padding of
+// the already-resident activation record, so no LDU work or extra slot is
+// needed before compute issues the shared-to-TMEM copy.
+__device__ __forceinline__ void dae_fp8_expand_uniform_sfa_smem(
+    const cutlass::float_ue8m0_t *scale,
+    void *sfa_scratch) {
+  const int tid = __compute_tid();
+  if (tid < 32) {
+    uint32_t scale_bits = 0;
+    if (tid == 0) {
+      scale_bits = scale->storage;
+    }
+    scale_bits = __shfl_sync(0xFFFFFFFFU, scale_bits, 0);
+    const uint32_t scale_word = scale_bits * 0x01010101U;
+    reinterpret_cast<uint4 *>(sfa_scratch)[tid] = make_uint4(
+        scale_word, scale_word, scale_word, scale_word);
+  }
 }
 
 // Decode-time FP8 matrix-vector multiply for DeepSeek's native block-128
@@ -438,11 +461,283 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
+// Consume one BF16 attention head, apply inverse partial RoPE to the final
+// 64 values, and publish the four K128 blocks directly in the native N8 MXF8
+// B layout consumed by the O_a UMMA GEMVs.  Keeping the rotary values in
+// registers removes both the BF16 inverse-RoPE tensor and the follow-on
+// quantization input materialization.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void
+task_dsv4_inverse_rope_fp8_quant_umma_b_sm100(
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using namespace cute;
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+  using Accum = float;
+
+  constexpr int kHeadDim = 512;
+  constexpr int kTileM = 128;
+  constexpr int kTileN = 8;
+  constexpr int kTileK = 128;
+  constexpr int kTiles = kHeadDim / kTileK;
+  constexpr int kScaleVector = 32;
+  constexpr int kBBytes = kTileN * kTileK;
+  constexpr int kBTileBytes = 2048;
+  using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+  using Atom = SM100_MMA_MXF8F6F4_SS<
+      Fp8, Fp8, Accum, Scale, kTileM, kTileN,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+  using LayoutSFB = decltype(
+      ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+  using ScaleProblemShape = Shape<Int<kTileM>, Int<128>, Int<kTileK>>;
+  const auto logical_sfb =
+      ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int table_slots = m2c.template pop<0>();
+  const auto *table = static_cast<const float *>(
+      get_slot_address(smem_base, extract(table_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<uint8_t *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *shared = static_cast<float *>(task_scratch);
+
+#pragma unroll 1
+  for (int tile = 0; tile < kTiles; ++tile) {
+    float value = __bfloat162float(input[tile * kTileK + tid]);
+    if (tile == kTiles - 1 && tid >= 64) {
+      const int pair = (tid - 64) >> 1;
+      const float partner = __shfl_xor_sync(0xFFFFFFFFU, value, 1);
+      const float cosine = table[pair * 2];
+      const float sine = table[pair * 2 + 1];
+      value = (tid & 1)
+          ? value * cosine - partner * sine
+          : value * cosine + partner * sine;
+    }
+
+    auto *tile_output = output + tile * kBTileBytes;
+    float maximum = fabsf(value);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      maximum = fmaxf(
+          maximum,
+          __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
+    }
+    if (lane == 0) {
+      shared[warp] = maximum;
+    }
+    for (int offset = tid; offset < kBTileBytes - kBBytes;
+         offset += 128) {
+      tile_output[kBBytes + offset] = 0;
+    }
+    __sync_compute_group(128);
+    if (tid == 0) {
+      maximum = fmaxf(
+          fmaxf(shared[0], shared[1]), fmaxf(shared[2], shared[3]));
+      const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+      const float exponent = ceilf(log2f(requested));
+      shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+    }
+    __sync_compute_group(128);
+
+    const Fp8 quantized = value == 0.0f
+        ? Fp8(0.0f)
+        : Fp8(fminf(fmaxf(value / shared[4], -448.0f), 448.0f));
+    const int source_chunk = tid / 16;
+    const int byte_in_chunk = tid % 16;
+#pragma unroll
+    for (int row = 0; row < kTileN; ++row) {
+      const int destination_chunk = source_chunk ^ row;
+      reinterpret_cast<Fp8 *>(tile_output)[
+          row * kTileK + destination_chunk * 16 + byte_in_chunk] = quantized;
+    }
+    auto *packed_scale = reinterpret_cast<Scale *>(tile_output + kBBytes);
+    const Scale block_scale = Scale(shared[4]);
+    for (int index = tid; index < kTileN * (kTileK / kScaleVector);
+         index += 128) {
+      const int row = index / (kTileK / kScaleVector);
+      const int sf = index % (kTileK / kScaleVector);
+      const int dst = int(logical_sfb(row, sf * kScaleVector));
+      packed_scale[dst] = block_scale;
+    }
+    __sync_compute_group(128);
+  }
+
+  c2m.push(tid, input_slots | table_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
+// Q-rank decode epilogue specialized for native MXF8.  Each work item reads
+// the complete rank vector to form one FP32 RMS statistic, then normalizes and
+// packs a disjoint set of K128 tiles.  Replicating this small reduction across
+// output-tile owners avoids a global intermediate and exposes all eight Q-rank
+// tiles concurrently on the decode schedule.
+template <typename Input, typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_rms_fp8_quant_umma_b_sm100(
+    int num_k_tiles,
+    int output_tile_start,
+    int output_tile_count,
+    __nv_bfloat16 epsilon,
+    void *smem_base,
+    void *task_scratch,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using namespace cute;
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+  using Accum = float;
+
+  constexpr int kTileM = 128;
+  constexpr int kTileN = 8;
+  constexpr int kTileK = 128;
+  constexpr int kScaleVector = 32;
+  constexpr int kBBytes = kTileN * kTileK;
+  constexpr int kBTileBytes = 2048;
+  using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+  using Atom = SM100_MMA_MXF8F6F4_SS<
+      Fp8, Fp8, Accum, Scale, kTileM, kTileN,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+  using LayoutSFB = decltype(
+      ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+  using ScaleProblemShape = Shape<Int<kTileM>, Int<128>, Int<kTileK>>;
+  const auto logical_sfb =
+      ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
+  constexpr int kSFBBytes = cosize_v<LayoutSFB>;
+  static_assert(kBBytes + kSFBBytes <= kBTileBytes);
+
+  if (num_k_tiles <= 0 || output_tile_start < 0 ||
+      output_tile_count <= 0 ||
+      output_tile_start + output_tile_count > num_k_tiles) {
+    asm volatile("trap;");
+  }
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const Input *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int weight_slots = m2c.template pop<0>();
+  const auto *weight = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(weight_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<uint8_t *>(
+      get_slot_address(smem_base, extract(output_slots)));
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *shared = static_cast<float *>(task_scratch);
+
+  float sum = 0.0f;
+#pragma unroll 1
+  for (int tile = 0; tile < num_k_tiles; ++tile) {
+    const float value = [&]() {
+      if constexpr (std::is_same_v<Input, float>) {
+        return input[tile * kTileK + tid];
+      } else {
+        return __bfloat162float(input[tile * kTileK + tid]);
+      }
+    }();
+    sum = fmaf(value, value, sum);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFFU, sum, offset);
+  }
+  if (lane == 0) {
+    shared[warp] = sum;
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    const float total = shared[0] + shared[1] + shared[2] + shared[3];
+    shared[8] = rsqrtf(
+        total / float(num_k_tiles * kTileK) +
+        __bfloat162float(epsilon));
+  }
+  __sync_compute_group(128);
+  const float rms_rcp = shared[8];
+
+#pragma unroll 1
+  for (int local_tile = 0; local_tile < output_tile_count; ++local_tile) {
+    const int source_tile = output_tile_start + local_tile;
+    auto *tile_output = output + local_tile * kBTileBytes;
+    const int source_index = source_tile * kTileK + tid;
+    const float input_value = [&]() {
+      if constexpr (std::is_same_v<Input, float>) {
+        return input[source_index];
+      } else {
+        return __bfloat162float(input[source_index]);
+      }
+    }();
+    const float normalized = input_value * rms_rcp *
+        __bfloat162float(weight[source_index]);
+    float maximum = fabsf(normalized);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      maximum = fmaxf(
+          maximum,
+          __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
+    }
+    if (lane == 0) {
+      shared[warp] = maximum;
+    }
+    for (int offset = tid; offset < kBTileBytes - kBBytes;
+         offset += 128) {
+      tile_output[kBBytes + offset] = 0;
+    }
+    __sync_compute_group(128);
+    if (tid == 0) {
+      maximum = fmaxf(
+          fmaxf(shared[0], shared[1]), fmaxf(shared[2], shared[3]));
+      const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+      const float exponent = ceilf(log2f(requested));
+      shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+    }
+    __sync_compute_group(128);
+
+    const Fp8 quantized = normalized == 0.0f
+        ? Fp8(0.0f)
+        : Fp8(fminf(fmaxf(normalized / shared[4], -448.0f), 448.0f));
+    const int source_chunk = tid / 16;
+    const int byte_in_chunk = tid % 16;
+#pragma unroll
+    for (int row = 0; row < kTileN; ++row) {
+      const int destination_chunk = source_chunk ^ row;
+      reinterpret_cast<Fp8 *>(tile_output)[
+          row * kTileK + destination_chunk * 16 + byte_in_chunk] = quantized;
+    }
+    auto *packed_scale = reinterpret_cast<Scale *>(tile_output + kBBytes);
+    const Scale block_scale = Scale(shared[4]);
+    for (int index = tid; index < kTileN * (kTileK / kScaleVector);
+         index += 128) {
+      const int row = index / (kTileK / kScaleVector);
+      const int sf = index % (kTileK / kScaleVector);
+      const int dst = int(logical_sfb(row, sf * kScaleVector));
+      packed_scale[dst] = block_scale;
+    }
+    __sync_compute_group(128);
+  }
+
+  c2m.push(tid, input_slots | weight_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
 // Decode-time native MXF8 path. LDU streams combined activation and weight
 // records through separate load ports. Each allocation already contains both
 // swizzled FP8 data and its native UE8M0 scale layout, so compute sees only
 // shared addresses and never resolves an HBM pointer.
-template <bool SplitK, typename SplitOutput, typename M2CQueue,
+template <bool SplitK, typename SplitOutput, bool RawWeightScale,
+          typename RawAddressResolver, typename M2CQueue,
           typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
     int num_k_tiles,
@@ -450,6 +745,7 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
     uint32_t &tmem_mma_phase,
+    RawAddressResolver raw_address,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   using namespace cute;
@@ -495,9 +791,14 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
   constexpr int kSFABytes = cosize_v<LayoutSFA>;
   constexpr int kSFBBytes = cosize_v<LayoutSFB>;
   constexpr int kWeightTileBytes = kAStorageBytes + kSFABytes;
+  constexpr int kCompactWeightTileBytes = kAStorageBytes;
   constexpr int kActivationTileBytes = 2048;
+  constexpr int kRawSfaScratchOffset = kActivationTileBytes - kSFABytes;
   static_assert(kWeightTileBytes == 16896);
+  static_assert(kCompactWeightTileBytes == 16384);
+  static_assert(kSFABytes == 512);
   static_assert(kBStorageBytes + kSFBBytes <= kActivationTileBytes);
+  static_assert(kBStorageBytes + kSFBBytes <= kRawSfaScratchOffset);
 
   auto logical_c = make_tensor(
       make_smem_ptr(static_cast<Accum *>(nullptr)),
@@ -530,15 +831,36 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
   auto copy_sfb_dst = copy_sfb_slice.partition_D(tCtSFB_compact);
 
   const int tid = __compute_tid();
+  const Scale *raw_weight_scales = nullptr;
+  if constexpr (RawWeightScale) {
+    // One task owns one contiguous K shard, so a single special-slot record
+    // supplies every compact scale byte consumed by the task.
+    const int scale_address_slot = m2c.template pop<0>();
+    raw_weight_scales = raw_address.template get<const Scale>(
+        scale_address_slot);
+  }
   for (int chunk_start = 0; chunk_start < num_k_tiles;
        chunk_start += kActivationTilesPerChunk) {
-    const int activation_slots = m2c.template pop<0>();
-    auto *activation_chunk_base = static_cast<uint8_t *>(
-        get_slot_address(smem_base, extract(activation_slots)));
     const int remaining = num_k_tiles - chunk_start;
     const int chunk_tiles = remaining < kActivationTilesPerChunk
         ? remaining
         : kActivationTilesPerChunk;
+    const int activation_slots = m2c.template pop<0>();
+    auto *activation_chunk_base = static_cast<uint8_t *>(
+        get_slot_address(smem_base, extract(activation_slots)));
+    if constexpr (RawWeightScale) {
+      if (tid < 32) {
+        for (int tile_in_chunk = 0; tile_in_chunk < chunk_tiles;
+             ++tile_in_chunk) {
+          dae_fp8_expand_uniform_sfa_smem(
+              raw_weight_scales + chunk_start + tile_in_chunk,
+              activation_chunk_base +
+                  tile_in_chunk * kActivationTileBytes +
+                  kRawSfaScratchOffset);
+        }
+        __syncwarp();
+      }
+    }
     for (int tile_in_chunk = 0; tile_in_chunk < chunk_tiles;
          ++tile_in_chunk) {
       const int tile = chunk_start + tile_in_chunk;
@@ -548,15 +870,6 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
       auto sA = make_tensor(
           make_smem_ptr(reinterpret_cast<Fp8 *>(weight_base)), layout_sA);
       auto tCrA = cta_mma.make_fragment_A(sA);
-      auto tCsSFA = make_tensor(
-          make_smem_ptr(reinterpret_cast<Scale *>(
-              weight_base + kAStorageBytes)),
-          LayoutSFA{});
-      auto tCsSFA_compact = make_tensor(
-          tCsSFA.data(), filter_zeros(tCsSFA.layout()));
-      auto copy_sfa_src_raw = copy_sfa_slice.partition_S(tCsSFA_compact);
-      auto copy_sfa_src =
-          dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfa_src_raw);
 
       auto *activation_base = activation_chunk_base +
           tile_in_chunk * kActivationTileBytes;
@@ -574,6 +887,18 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_impl_sm100(
           dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfb_src_raw);
 
       if (tid < 32 && elect_one_sync()) {
+        auto *sfa_base = RawWeightScale
+            ? activation_base + kRawSfaScratchOffset
+            : weight_base + kAStorageBytes;
+        auto tCsSFA = make_tensor(
+            make_smem_ptr(reinterpret_cast<Scale *>(sfa_base)),
+            LayoutSFA{});
+        auto tCsSFA_compact = make_tensor(
+            tCsSFA.data(), filter_zeros(tCsSFA.layout()));
+        auto copy_sfa_src_raw =
+            copy_sfa_slice.partition_S(tCsSFA_compact);
+        auto copy_sfa_src =
+            dae_fp8_get_utccp_smem_desc_tensor<Utccp>(copy_sfa_src_raw);
         copy(copy_sfa, copy_sfa_src, copy_sfa_dst);
         copy(copy_sfb, copy_sfb_src, copy_sfb_dst);
       }
@@ -646,9 +971,9 @@ __device__ __forceinline__ void task_fp8_gemv_umma_stream_sm100(
     uint32_t &tmem_mma_phase,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  task_fp8_gemv_umma_stream_impl_sm100<false, float>(
+  task_fp8_gemv_umma_stream_impl_sm100<false, float, false>(
       num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
-      tmem_mma_phase, m2c, c2m);
+      tmem_mma_phase, 0, m2c, c2m);
 }
 
 template <typename SplitOutput, typename M2CQueue, typename C2MQueue>
@@ -660,7 +985,38 @@ __device__ __forceinline__ void task_fp8_gemv_umma_splitk_sm100(
     uint32_t &tmem_mma_phase,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  task_fp8_gemv_umma_stream_impl_sm100<true, SplitOutput>(
+  task_fp8_gemv_umma_stream_impl_sm100<true, SplitOutput, false>(
       num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
-      tmem_mma_phase, m2c, c2m);
+      tmem_mma_phase, 0, m2c, c2m);
+}
+
+template <typename RawAddressResolver, typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_gemv_umma_stream_raw_scale_sm100(
+    int num_k_tiles,
+    void *smem_base,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    RawAddressResolver raw_address,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  task_fp8_gemv_umma_stream_impl_sm100<false, float, true>(
+      num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
+      tmem_mma_phase, raw_address, m2c, c2m);
+}
+
+template <typename SplitOutput, typename RawAddressResolver,
+          typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_fp8_gemv_umma_splitk_raw_scale_sm100(
+    int num_k_tiles,
+    void *smem_base,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t &tmem_mma_phase,
+    RawAddressResolver raw_address,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  task_fp8_gemv_umma_stream_impl_sm100<true, SplitOutput, true>(
+      num_k_tiles, smem_base, tmem_base_ptr, tmem_mma_barrier,
+      tmem_mma_phase, raw_address, m2c, c2m);
 }

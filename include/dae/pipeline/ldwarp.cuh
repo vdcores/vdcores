@@ -268,6 +268,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           cuda::aligned_size_t<16>(inst.size)
         );
         break; }
+      case op(OP_ALLOC_LAYER_TMA_LOAD_4D):
       case op(OP_ALLOC_TMA_LOAD_4D): {
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 4D Load: desc_idx=%d size=%d cord=(%d,%d,%d,%d)",

@@ -344,7 +344,12 @@ Barrier behavior for writeback ops:
     - the pointer becomes available through `st_insts[special_slot].address`
   - practical meaning:
     - legacy escape hatch for compute kernels that write or read global memory
-      directly; new tasks must not use it
+      directly; new tasks normally must not use it
+    - the opt-in SM100 FP8 compact-scale experiment is a narrow exception:
+      compute captures one immutable scale-row pointer, reads one UE8M0 byte
+      per K tile, expands it in existing activation-slot padding, and issues
+      the TMEM copy itself; the production resident schedule keeps the packed
+      LDU path because the compact task did not win latency
 
 - `OP_ALLOC_ROUTED_TMA_LOAD_1D`
   - fields:

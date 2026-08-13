@@ -5,6 +5,7 @@
 #include "task/argmax.cuh"
 #include "task/attention.cuh"
 #include "task/deepseek_v4.cuh"
+#include "task/deepseek_v4_gemv.cuh"
 #include "task/fp8.cuh"
 #include "task/gemv.cuh"
 #include "task/nvfp4.cuh"
@@ -236,6 +237,35 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_SPLITK_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_STREAM_RAW_SCALE_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_fp8_gemv_umma_stream_raw_scale_sm100(
+      inst.args[0], smem_base, tmem_base_ptr,
+      tmem_mma_barrier, tmem_mma_phase,
+      ComputeRawAddressSlots{st_insts}, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_SPLITK_RAW_SCALE_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  if (inst.args[1] == 2) {
+    task_fp8_gemv_umma_splitk_raw_scale_sm100<cutlass::bfloat16_t>(
+        inst.args[0], smem_base, tmem_base_ptr,
+        tmem_mma_barrier, tmem_mma_phase,
+        ComputeRawAddressSlots{st_insts}, m2c, c2m);
+  } else if (inst.args[1] == 4) {
+    task_fp8_gemv_umma_splitk_raw_scale_sm100<float>(
+        inst.args[0], smem_base, tmem_base_ptr,
+        tmem_mma_barrier, tmem_mma_phase,
+        ComputeRawAddressSlots{st_insts}, m2c, c2m);
+  } else {
+    asm volatile("trap;");
+  }
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_FP8_UMMA_PREPACK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
@@ -255,6 +285,51 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP8_QUANT_UMMA_B_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_INV_ROPE_FP8_QUANT_UMMA_B_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_inverse_rope_fp8_quant_umma_b_sm100(
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_RMS_FP8_QUANT_UMMA_B_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int output_tile_start = inst.args[1] & 0xFF;
+  const int output_tile_count = inst.args[1] >> 8;
+  task_dsv4_rms_fp8_quant_umma_b_sm100<__nv_bfloat16>(
+      inst.args[0], output_tile_start, output_tile_count,
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_FP8_QUANT_UMMA_B_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int output_tile_start = inst.args[1] & 0xFF;
+  const int output_tile_count = inst.args[1] >> 8;
+  task_dsv4_rms_fp8_quant_umma_b_sm100<float>(
+      inst.args[0], output_tile_start, output_tile_count,
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV_GROUP4_SPLITK_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
+             g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_bf16_gemv_group4_splitk_sm100(
+      inst.args[0], smem_base, get_slot_address(smem_base, numSlots),
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_PRELOAD_ROPE_TABLES) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
@@ -268,11 +343,37 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_512_64) {
       inst.args[0], inst.args[1] != 0, inst.args[2], smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_RMS_ROPE_512_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_rms_rope_512_64(
+      inst.args[0] != 0, inst.args[1],
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_ROPE_512_64) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_fp32_rms_rope_512_64(
+      inst.args[0] != 0, inst.args[1],
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_128_64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
   task_dsv4_rope_64<128>(
       inst.args[0], inst.args[1] != 0, inst.args[2], smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_ROPE_HADAMARD_128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_fp32_rope_hadamard_128(
+      inst.args[0], smem_base, get_slot_address(smem_base, numSlots),
+      m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_SPARSE_ATTENTION_512) {
@@ -305,6 +406,26 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_CONTIGUOUS_ATTENTION_512_UMMA_TAIL32_SM100) {
       inst.args[0], inst.args[1],
       tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
       smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT32_UMMA_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
+             g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_attention_split32_umma_sm100(
+      inst.args[0], tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      smem_base, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_attention_split_reduce_fp8_sm100(
+      inst.args[0], inst.args[1], smem_base,
+      get_slot_address(smem_base, numSlots), m2c, c2m);
+#endif
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROUTE_TOP6) {
@@ -342,9 +463,20 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV) {
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_hc_pre(
+  task_dsv4_hc_pre<false>(
       inst.args[0],
       __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      __float2bfloat16(0.0f),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE_RMS) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_hc_pre<true>(
+      inst.args[0],
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
@@ -387,11 +519,54 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL) {
       inst.args[0], inst.args[1], inst.args[2] != 0, smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_RMS_ROPE) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  const int config = inst.args[1];
+  task_dsv4_gated_pool_rms_rope(
+      inst.args[0], (config & 1) ? 512 : 128,
+      ((config >> 1) & 1) != 0, ((config >> 2) & 1) != 0,
+      config >> 3,
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_PACKED8_SHARD128) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
   task_dsv4_gated_pool_packed8_shard128(
       inst.args[0], smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_PACKED8_RMS_PARTIAL) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_gated_pool_packed8_rms_partial(
+      inst.args[0], smem_base, get_slot_address(smem_base, numSlots),
+      m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_PACKED8_HISTORY_STATE) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_gated_pool_packed8_history_state(
+      inst.args[0], smem_base, m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_TAIL_RMS_PARTIAL) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_gated_pool_tail_rms_partial(
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_ROPE_SHARD128) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_fp32_rms_rope_shard128(
+      inst.args[0], inst.args[1],
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_INDEX_SCORE) {

@@ -186,8 +186,11 @@ Compiled-mode note:
 - `st_insts[]` is semantic slot metadata, not a mandatory write on every compiled alloc step.
 - In interpreted alloc, normal shared-memory producers still materialize the full `MInst` into `st_insts[lead_slot]` because later memory-side stages consume that metadata generically.
 - In compiled mode, a producer only needs to write the `st_insts[slot]` fields that some later compiled path still reads.
-- `OP_ALLOC_WB_RAW_ADDRESS` remains only for older operators that have not yet
-  been migrated. DeepSeek/FP8/NVFP4 compute handlers do not consume it.
+- `OP_ALLOC_WB_RAW_ADDRESS` remains primarily for older operators that have
+  not yet been migrated. The opt-in SM100 FP8 compact-scale experiment is one
+  explicit exception: its narrow resolver captures a task-local scale pointer
+  and compute reads one UE8M0 byte per K tile. The normal DeepSeek resident
+  path does not select that contract.
 - Ordinary compiled shared-memory producers and current reg-carrier paths do not need a full `st_insts` materialization once their consumers are lowered from the frozen compiled spec.
 
 ## Allocator Model
@@ -413,8 +416,11 @@ Observed behavior from [python/dae/instructions.py](/home1/11362/depctg/vdcores/
 - the pointer is stored in `st_insts[slot_id].address`
 - compute kernels recover it with `slot_2_glob_ptr(...)`
 
-This is a legacy path. Do not use it for new tasks: LDU must load global input
-into shared slots and STU must store shared outputs.
+This is normally a legacy path: ordinary task data must move through LDU/STU.
+The only current new-task exception is the explicitly opt-in compact FP8
+weight-scale probe, where the payload is one immutable byte per K tile and the
+point of the experiment is to avoid allocating a third weight slot. Its data
+weights still arrive through TMA/LDU and its output still leaves through STU.
 
 ### `RoutedTmaLoad1D`
 

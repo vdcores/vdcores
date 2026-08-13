@@ -41,22 +41,34 @@ from dae.schedule import (
     LayeredSchedule,
     SchedArgmaxSmemPartial,
     SchedArgmaxSmemReduce,
+    SchedDsv4AttentionSplit32UmmaSm100,
+    SchedDsv4AttentionSplitReduceFp8Sm100,
     SchedDsv4Bf16Gemv,
+    SchedDsv4Bf16GemvGroup4SplitK,
     SchedDsv4ExpertReduce,
     SchedDsv4Fp8QuantUmmaB,
+    SchedDsv4Fp32RmsFp8QuantUmmaB,
+    SchedDsv4RmsFp8QuantUmmaB,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp32ToBf16,
     SchedDsv4Fp8Quant128,
     SchedDsv4GatedPool,
+    SchedDsv4GatedPoolRmsRope,
     SchedDsv4GatedPoolPacked8Shard128,
+    SchedDsv4GatedPoolPacked8HistoryState,
+    SchedDsv4GatedPoolTailRmsPartial,
     SchedDsv4Hadamard,
     SchedDsv4HcHead,
     SchedDsv4HcPost,
-    SchedDsv4HcPre,
+    SchedDsv4HcPreRms,
     SchedDsv4IndexScore,
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
+    SchedDsv4Fp32RmsRope512_64,
+    SchedDsv4Fp32RopeHadamard128,
+    SchedDsv4Fp32RmsRopeShard128,
+    SchedDsv4RmsRope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
     SchedDsv4ContiguousAttention512Block4,
@@ -78,6 +90,7 @@ from dae.sequential import (
     SequentialProgram,
     SequentialStage,
 )
+from dae.tma_utils import Major
 
 
 @dataclass(frozen=True)
@@ -147,6 +160,7 @@ class ResidentOneLaunchDecode:
         self._routing_tables: dict[int, RoutedAddressTable] = {}
         self._routing_owners: dict[int, tuple[torch.Tensor, ...]] = {}
         self._hash_rows: dict[int, torch.Tensor] = {}
+        self._fused_bf16_weight_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
         self._allocate_state()
         rope_tables = [self.main_rope, self.compress_rope]
         rope_tables.extend(
@@ -552,13 +566,34 @@ class ResidentOneLaunchDecode:
             self.o_rank_native_fp8 = torch.empty(
                 (self.o_rank.numel() // 128, 2048), dtype=torch.uint8, device=d
             )
+        if "o_a" in self.splitk_components:
+            max_attention_splits = max(
+                (indices.numel() + 31) // 32
+                for indices in self.attention_indices_by_kind.values()
+            )
+            self.attention_partial_workspace = torch.empty(
+                (max_attention_splits, cfg.num_heads, cfg.head_dim),
+                dtype=torch.bfloat16,
+                device=d,
+            )
+            self.attention_metadata_workspace = torch.empty(
+                (max_attention_splits, cfg.num_heads, 2),
+                dtype=torch.float32,
+                device=d,
+            )
 
         self.compress_values = torch.empty((1024,), dtype=torch.float32, device=d)
         self.compress_scores = torch.empty_like(self.compress_values)
+        self.compress_fused_projection = torch.empty(
+            (2048,), dtype=torch.float32, device=d
+        )
         self.attention_pool_history_values = {}
         self.attention_pool_history_scores = {}
         self.attention_pool_history_packed = {}
+        self.attention_pool_history_state = {}
         self.attention_pooled = {}
+        self.attention_pooled_fp32 = {}
+        self.attention_pooled_rms_partials = {}
         self.attention_pooled_norm = {}
         self.compressed_output_rope = {}
         for kind_index, kind in enumerate(("csa", "hca")):
@@ -586,8 +621,23 @@ class ResidentOneLaunchDecode:
             self.attention_pool_history_packed[kind] = pack_gated_pool_history(
                 history_values, history_scores
             )
+            self.attention_pool_history_state[kind] = torch.empty(
+                (cfg.head_dim // 128, 3, 128),
+                dtype=torch.float32,
+                device=d,
+            )
             self.attention_pooled[kind] = torch.empty(
                 (cfg.head_dim,), dtype=torch.bfloat16, device=d
+            )
+            self.attention_pooled_fp32[kind] = torch.empty(
+                (cfg.head_dim // 128, 128),
+                dtype=torch.float32,
+                device=d,
+            )
+            self.attention_pooled_rms_partials[kind] = torch.empty(
+                (cfg.head_dim // 128,),
+                dtype=torch.float32,
+                device=d,
             )
             self.attention_pooled_norm[kind] = torch.empty_like(
                 self.attention_pooled[kind]
@@ -615,6 +665,9 @@ class ResidentOneLaunchDecode:
             (2 * cfg.index_head_dim,), dtype=torch.float32, device=d
         )
         self.index_compress_scores = torch.empty_like(self.index_compress_values)
+        self.index_compress_fused_projection = torch.empty(
+            (4, cfg.index_head_dim), dtype=torch.float32, device=d
+        )
         csa_plan = self.attention_plans["csa"]
         self.index_cache = seeded(
             (csa_plan.compressed_rows, cfg.index_head_dim),
@@ -755,6 +808,44 @@ class ResidentOneLaunchDecode:
             ),
             assignment,
             wait_for_previous=wait_for_previous,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
+    def _rms_native_fp8_quant_stage(
+        self,
+        name: str,
+        family: LayerFamily,
+        source: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        weight_suffix: str,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> Stage:
+        weights = self._family_tensors(family, weight_suffix)
+        schedule = SchedDsv4RmsFp8QuantUmmaB(
+            source.reshape(-1),
+            weights[0],
+            output,
+            self.config.rms_epsilon,
+        )
+        schedule = self._layered(schedule, family, weights)
+        assignment = self.policy.quantize(source.numel(), 128)
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            if not 0 < num_sms <= assignment.num_sms:
+                raise ValueError(
+                    "fused RMS/native-FP8 placement must fit its K128 tiles"
+                )
+            assignment = replace(assignment, num_sms=num_sms)
+        return self._stage(
+            name,
+            schedule,
+            assignment,
             base_sm=base_sm,
             wait_group=wait_group,
             release_group=release_group,
@@ -930,6 +1021,7 @@ class ResidentOneLaunchDecode:
         num_sms: int | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
+        fp32_finalizer=None,
     ) -> list[Stage]:
         linears = tuple(
             self.checkpoint.load_native_fp8_linear(
@@ -954,14 +1046,18 @@ class ResidentOneLaunchDecode:
             raise ValueError("native split-K output size must match selected rows")
         policy_split, _ = self.policy.fp8_umma_split_k(rows, k)
         split_k = policy_split if split_k is None else int(split_k)
-        if k // 128 % split_k or (k // 128 // split_k) % 4:
-            raise ValueError("split-K override must preserve four-tile chunks")
+        if k // 128 % split_k:
+            raise ValueError("split-K override must divide K tiles")
         work_tiles = rows // 128 * split_k
         num_sms = min(self.sms, work_tiles) if num_sms is None else int(num_sms)
         if not 0 < num_sms <= work_tiles:
             raise ValueError("split-K SM override exceeds logical work tiles")
         output_vector = output.reshape(-1)
         if self.direct_splitk_bf16:
+            if fp32_finalizer is not None:
+                raise ValueError(
+                    "custom FP32 finalizer requires FP32 split-K reduction"
+                )
             accumulator = output_vector.reshape(1, rows)
             partial_release_group = release_group
         else:
@@ -995,10 +1091,18 @@ class ResidentOneLaunchDecode:
         )
         if self.direct_splitk_bf16:
             return [gemv]
-        finalize_sms = min(self.sms, rows // 128)
+        if fp32_finalizer is None:
+            finalize_schedule = SchedDsv4Fp32ToBf16(
+                accumulator.reshape(-1), output_vector
+            )
+            finalize_sms = min(self.sms, rows // 128)
+        else:
+            finalize_schedule, finalize_sms = fp32_finalizer(
+                accumulator.reshape(-1)
+            )
         finalize = self._stage(
             name,
-            SchedDsv4Fp32ToBf16(accumulator.reshape(-1), output_vector),
+            finalize_schedule,
             finalize_sms,
             base_sm=base_sm,
             wait_group=partial_release_group,
@@ -1015,6 +1119,9 @@ class ResidentOneLaunchDecode:
         output: torch.Tensor,
         *,
         wait_for_previous: bool = True,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
     ) -> Stage:
         weights = self._family_tensors(family, suffix)
         schedule = SchedDsv4Bf16Gemv(
@@ -1022,11 +1129,86 @@ class ResidentOneLaunchDecode:
         )
         schedule = self._layered(schedule, family, weights)
         assignment = self.policy.bf16_gemv(output.numel(), source.numel())
+        base_sm = None
+        if placement is not None:
+            base_sm, num_sms = placement
+            assignment = replace(assignment, num_sms=num_sms)
         return self._stage(
             name,
             schedule,
             assignment,
             wait_for_previous=wait_for_previous,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
+    def _fused_bf16_weights(
+        self,
+        family: LayerFamily,
+        suffixes: tuple[str, ...],
+    ) -> torch.Tensor:
+        key = (family.representative, family.layer_ids, suffixes)
+        cached = self._fused_bf16_weight_cache.get(key)
+        if cached is not None:
+            return cached
+        columns = tuple(
+            self._family_tensors(family, suffix) for suffix in suffixes
+        )
+        per_layer = tuple(
+            torch.cat(
+                tuple(column[layer_index] for column in columns), dim=0
+            ).contiguous()
+            for layer_index in range(len(family.layer_ids))
+        )
+        fused = (
+            per_layer[0]
+            if len(per_layer) == 1
+            else torch.stack(per_layer, dim=0).contiguous()
+        )
+        self._fused_bf16_weight_cache[key] = fused
+        return fused
+
+    def _grouped_bf16_splitk_stage(
+        self,
+        name: str,
+        family: LayerFamily,
+        suffixes: tuple[str, ...],
+        source: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        split_k: int,
+        base_sm: int,
+        wait_group: str,
+        release_group: str | None = None,
+    ) -> Stage:
+        weights = self._fused_bf16_weights(family, suffixes)
+        rows, k = weights.shape[-2:]
+        if output.numel() != rows:
+            raise ValueError("grouped BF16 projection output must match fused rows")
+        output_matrix = output.reshape(rows // 128, 128)
+        weight_tma = TmaTensor(
+            self.launcher, weights
+        ).wgmma_load(128, 128, Major.K)
+        output_reduce = TmaTensor(
+            self.launcher, output_matrix
+        ).rowmajor_2d("reduce", 4, 128)
+        schedule = SchedDsv4Bf16GemvGroup4SplitK(
+            weights,
+            weight_tma,
+            source.reshape(-1),
+            output_reduce,
+            split_k,
+            layer_indexed_weight=weights.ndim == 3,
+        )
+        work_items = rows // 512 * split_k
+        return self._stage(
+            name,
+            schedule,
+            work_items,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
         )
 
     def _rms_stage(
@@ -1070,6 +1252,48 @@ class ResidentOneLaunchDecode:
             release_group=release_group,
         )
 
+    def _rms_rope_stage(
+        self,
+        name: str,
+        source: torch.Tensor,
+        table: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        family: LayerFamily | None = None,
+        weight_suffix: str | None = None,
+        base_sm: int | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> Stage:
+        rows = source.reshape(-1, 512)
+        out_rows = output.reshape_as(rows)
+        weights = None
+        weight = None
+        if weight_suffix is not None:
+            if family is None:
+                weight = self._tensor(weight_suffix)
+            else:
+                weights = self._family_tensors(family, weight_suffix)
+                weight = weights[0]
+        schedule = SchedDsv4RmsRope512_64(
+            rows,
+            table,
+            out_rows,
+            epsilon=self.config.rms_epsilon,
+            weight=weight,
+            fixed_table_id=self.resident_rope_table_ids[table.data_ptr()],
+        )
+        if weights is not None:
+            schedule = self._layered(schedule, family, weights)
+        return self._stage(
+            name,
+            schedule,
+            rows.shape[0],
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
     def _hc_stages(
         self,
         family: LayerFamily,
@@ -1080,6 +1304,9 @@ class ResidentOneLaunchDecode:
         functions = self._family_tensors(family, f"hc_{branch_name}_fn")
         scales = self._family_tensors(family, f"hc_{branch_name}_scale")
         bases = self._family_tensors(family, f"hc_{branch_name}_base")
+        norm_weights = self._family_tensors(
+            family, f"{branch_name}_norm.weight"
+        )
         project = SchedDsv4Fp32Bf16Gemv(
             functions[0], residual.reshape(-1), self.mixes
         )
@@ -1089,24 +1316,21 @@ class ResidentOneLaunchDecode:
             project,
             self.policy.fp32_bf16_gemv(24, residual.numel()),
         )
-        pre = SchedDsv4HcPre(
+        pre = SchedDsv4HcPreRms(
             residual,
             self.mixes,
             scales[0],
             bases[0],
-            self.hidden,
+            norm_weights[0],
+            self.norm_hidden,
             self.post,
             self.comb,
+            rms_epsilon=self.config.rms_epsilon,
         )
-        pre = self._layered(pre, family, scales, bases)
-        pre_stage = self._stage(f"{branch_name}.hc_pre", pre)
-        norm_stage = self._rms_stage(
-            f"{branch_name}.rms4096",
-            self.hidden,
-            self.norm_hidden,
-            family=family,
-            weight_suffix=f"{branch_name}_norm.weight",
+        pre = self._layered(
+            pre, family, scales, bases, norm_weights
         )
+        pre_stage = self._stage(f"{branch_name}.hc_pre_rms4096", pre)
         post_stage = self._stage(
             f"{branch_name}.hc_post",
             SchedDsv4HcPost(
@@ -1120,7 +1344,7 @@ class ResidentOneLaunchDecode:
                 self.config.hidden_size, self.config.hc_mult
             ),
         )
-        return [project_stage, pre_stage, norm_stage], post_stage
+        return [project_stage, pre_stage], post_stage
 
     def _build_attention(self, family: LayerFamily) -> list[Stage]:
         cfg = self.config
@@ -1146,6 +1370,20 @@ class ResidentOneLaunchDecode:
         kv_ready = f"{family.name}.attn.kv.ready"
         kv_norm_ready = f"{family.name}.attn.kv_norm.ready"
         qkv_prefix_join = f"{family.name}.attn.qkv.prefix.join"
+        attention_input_ready = f"{family.name}.attn.input.ready"
+        compressor_reset_ready = f"{family.name}.attn.compressor.reset.ready"
+        compressor_projection_ready = (
+            f"{family.name}.attn.compressor.projection.ready"
+        )
+        index_compressor_reset_ready = (
+            f"{family.name}.index.compressor.reset.ready"
+        )
+        index_compressor_projection_ready = (
+            f"{family.name}.index.compressor.projection.ready"
+        )
+        index_selection_input_join = (
+            f"{family.name}.index.selection.input.join"
+        )
         stages, post = self._hc_stages(
             family, "attn", self.residual, self.next_residual
         )
@@ -1155,6 +1393,15 @@ class ResidentOneLaunchDecode:
         split_index_q_b = "index_q_b" in self.splitk_components
         split_o_a = "o_a" in self.splitk_components
         split_o_b = "o_b" in self.splitk_components
+        use_grouped_preattention = split_q_a and split_kv and split_q_b
+        if use_grouped_preattention:
+            stages[-1] = replace(
+                stages[-1], release_group=attention_input_ready
+            )
+        compress_values = self.compress_values
+        compress_scores = self.compress_scores
+        index_compress_values = self.index_compress_values
+        index_compress_scores = self.index_compress_scores
         run_index_selection = kind == "csa" and (
             self.args.index_selection_mode == "force"
             or plan.requires_index_selection
@@ -1187,6 +1434,16 @@ class ResidentOneLaunchDecode:
                     "attn.projections.reset",
                     SchedDsv4ZeroFill(self.zero_fill_gate, workspace),
                     min(self.sms, workspace_rows // 4),
+                    wait_group=(
+                        attention_input_ready
+                        if use_grouped_preattention
+                        else None
+                    ),
+                    release_group=(
+                        qkv_input_ready
+                        if use_grouped_preattention
+                        else None
+                    ),
                 )
             )
         else:
@@ -1200,6 +1457,11 @@ class ResidentOneLaunchDecode:
                     "attn.hidden.quant_native_fp8",
                     self.norm_hidden,
                     self.hidden_native_fp8,
+                    wait_group=(
+                        attention_input_ready
+                        if use_grouped_preattention
+                        else None
+                    ),
                     release_group=qkv_input_ready,
                 )
             )
@@ -1211,9 +1473,47 @@ class ResidentOneLaunchDecode:
                     self.hidden_fp8,
                     self.hidden_fp8_scale,
                     wait_for_previous=not need_native_hidden,
+                    wait_group=(
+                        attention_input_ready
+                        if use_grouped_preattention
+                        else None
+                    ),
                     release_group=qkv_input_ready,
                 )
             )
+        need_native_q_rank = (
+            split_q_b
+            or split_index_active
+            or self.args.fp8_qb_mode == "native"
+        )
+        need_scalar_q_rank = (
+            (not split_q_b or not split_index_q_b)
+            and self.args.fp8_qb_mode == "scalar"
+        )
+        fuse_q_rank_splitk_epilogue = (
+            split_q_a
+            and not self.direct_splitk_bf16
+            and need_native_q_rank
+            and not need_scalar_q_rank
+        )
+        q_rank_fp32_finalizer = None
+        if fuse_q_rank_splitk_epilogue:
+            q_norm_weights = self._family_tensors(
+                family, "attn.q_norm.weight"
+            )
+
+            def q_rank_fp32_finalizer(accumulator):
+                schedule = SchedDsv4Fp32RmsFp8QuantUmmaB(
+                    accumulator,
+                    q_norm_weights[0],
+                    self.q_rank_native_fp8,
+                    self.config.rms_epsilon,
+                )
+                schedule = self._layered(
+                    schedule, family, q_norm_weights
+                )
+                return schedule, q_quant_sms
+
         if split_q_a:
             stages.extend(
                 self._splitk_fp8_linear_stages(
@@ -1224,7 +1524,12 @@ class ResidentOneLaunchDecode:
                     self.q_rank,
                     base_sm=q_base,
                     wait_group=qkv_input_ready,
-                    release_group=q_a_ready,
+                    release_group=(
+                        qkv_prefix_join
+                        if fuse_q_rank_splitk_epilogue
+                        else q_a_ready
+                    ),
+                    fp32_finalizer=q_rank_fp32_finalizer,
                 )
             )
         else:
@@ -1241,51 +1546,83 @@ class ResidentOneLaunchDecode:
                     release_group=q_a_ready,
                 )
             )
-        stages.append(
-            self._rms_stage(
-                "attn.q_norm",
-                self.q_rank,
-                self.q_rank_norm,
-                family=family,
-                weight_suffix="attn.q_norm.weight",
-                base_sm=q_base,
-                wait_group=q_a_ready,
-                release_group=q_norm_ready,
-            )
-        )
-        need_native_q_rank = (
-            split_q_b
-            or split_index_active
-            or self.args.fp8_qb_mode == "native"
-        )
-        need_scalar_q_rank = (
-            (not split_q_b or not split_index_q_b)
-            and self.args.fp8_qb_mode == "scalar"
-        )
-        if need_native_q_rank:
+        if fuse_q_rank_splitk_epilogue:
+            pass
+        elif need_native_q_rank and not need_scalar_q_rank:
             stages.append(
-                self._native_fp8_quant_stage(
-                    "attn.q_rank.quant_native_fp8",
-                    self.q_rank_norm,
+                self._rms_native_fp8_quant_stage(
+                    "attn.q_rank.rms_quant_native_fp8",
+                    family,
+                    self.q_rank,
                     self.q_rank_native_fp8,
+                    weight_suffix="attn.q_norm.weight",
                     placement=(q_base, q_quant_sms),
-                    wait_group=q_norm_ready,
+                    wait_group=q_a_ready,
                     release_group=qkv_prefix_join,
                 )
             )
-        if need_scalar_q_rank:
+        else:
             stages.append(
-                self._fp8_quant_stage(
-                    "attn.q_rank.quant_fp8",
+                self._rms_stage(
+                    "attn.q_norm",
+                    self.q_rank,
                     self.q_rank_norm,
-                    self.q_rank_fp8,
-                    self.q_rank_fp8_scale,
-                    wait_for_previous=not need_native_q_rank,
-                    placement=(q_base, q_quant_sms),
-                    wait_group=q_norm_ready,
-                    release_group=qkv_prefix_join,
+                    family=family,
+                    weight_suffix="attn.q_norm.weight",
+                    base_sm=q_base,
+                    wait_group=q_a_ready,
+                    release_group=q_norm_ready,
                 )
             )
+            if need_native_q_rank:
+                stages.append(
+                    self._native_fp8_quant_stage(
+                        "attn.q_rank.quant_native_fp8",
+                        self.q_rank_norm,
+                        self.q_rank_native_fp8,
+                        placement=(q_base, q_quant_sms),
+                        wait_group=q_norm_ready,
+                        release_group=qkv_prefix_join,
+                    )
+                )
+            if need_scalar_q_rank:
+                stages.append(
+                    self._fp8_quant_stage(
+                        "attn.q_rank.quant_fp8",
+                        self.q_rank_norm,
+                        self.q_rank_fp8,
+                        self.q_rank_fp8_scale,
+                        wait_for_previous=not need_native_q_rank,
+                        placement=(q_base, q_quant_sms),
+                        wait_group=q_norm_ready,
+                        release_group=qkv_prefix_join,
+                    )
+                )
+        fuse_kv_splitk_epilogue = (
+            split_kv and not self.direct_splitk_bf16
+        )
+        kv_fp32_finalizer = None
+        if fuse_kv_splitk_epilogue:
+            kv_norm_weights = self._family_tensors(
+                family, "attn.kv_norm.weight"
+            )
+
+            def kv_fp32_finalizer(accumulator):
+                schedule = SchedDsv4Fp32RmsRope512_64(
+                    accumulator.reshape(1, cfg.head_dim),
+                    rope_table,
+                    self.current_kv_rows[kind],
+                    epsilon=cfg.rms_epsilon,
+                    weight=kv_norm_weights[0],
+                    fixed_table_id=self.resident_rope_table_ids[
+                        rope_table.data_ptr()
+                    ],
+                )
+                schedule = self._layered(
+                    schedule, family, kv_norm_weights
+                )
+                return schedule, 1
+
         if split_kv:
             stages.extend(
                 self._splitk_fp8_linear_stages(
@@ -1296,7 +1633,12 @@ class ResidentOneLaunchDecode:
                     self.kv,
                     base_sm=kv_base,
                     wait_group=qkv_input_ready,
-                    release_group=kv_ready,
+                    release_group=(
+                        qkv_prefix_join
+                        if fuse_kv_splitk_epilogue
+                        else kv_ready
+                    ),
+                    fp32_finalizer=kv_fp32_finalizer,
                 )
             )
         else:
@@ -1313,34 +1655,422 @@ class ResidentOneLaunchDecode:
                     release_group=kv_ready,
                 )
             )
-        stages.append(
-            self._rms_stage(
-                "attn.kv_norm",
-                self.kv,
-                self.kv_norm,
-                family=family,
-                weight_suffix="attn.kv_norm.weight",
-                base_sm=kv_base,
-                wait_group=kv_ready,
-                release_group=kv_norm_ready,
-            )
-        )
-        stages.append(
-            self._stage(
-                "attn.kv_rope",
-                SchedDsv4Rope512_64(
-                    self.kv_norm.reshape(1, -1),
+        if not fuse_kv_splitk_epilogue:
+            stages.append(
+                self._rms_rope_stage(
+                    "attn.kv_rms_rope",
+                    self.kv,
                     rope_table,
                     self.current_kv_rows[kind],
-                    fixed_table_id=self.resident_rope_table_ids[
-                        rope_table.data_ptr()
-                    ],
-                ),
-                base_sm=kv_base,
-                wait_group=kv_norm_ready,
-                release_group=qkv_prefix_join,
+                    family=family,
+                    weight_suffix="attn.kv_norm.weight",
+                    base_sm=kv_base,
+                    wait_group=kv_ready,
+                    release_group=qkv_prefix_join,
+                )
             )
+        if use_grouped_preattention and kind in ("csa", "hca"):
+            width = cfg.head_dim * (2 if kind == "csa" else 1)
+            fused_output = self.compress_fused_projection[: 2 * width]
+            compress_values = fused_output[:width]
+            compress_scores = fused_output[width:]
+            _, q_prefix_sms = self.policy.fp8_umma_split_k(
+                cfg.q_lora_rank, cfg.hidden_size
+            )
+            compressor_base = q_base + q_prefix_sms
+            compressor_sms = 2 * width // 512 * 8
+            stages.append(
+                self._stage(
+                    "attn.compressor.projection_reset",
+                    SchedDsv4ZeroFill(self.zero_fill_gate, fused_output),
+                    compressor_sms,
+                    base_sm=compressor_base,
+                    wait_group=attention_input_ready,
+                    release_group=compressor_reset_ready,
+                )
+            )
+            stages.append(
+                self._grouped_bf16_splitk_stage(
+                    "attn.compressor.wkv_wgate_group4",
+                    family,
+                    (
+                        "attn.compressor.wkv.weight",
+                        "attn.compressor.wgate.weight",
+                    ),
+                    self.norm_hidden,
+                    fused_output,
+                    split_k=8,
+                    base_sm=compressor_base,
+                    wait_group=compressor_reset_ready,
+                    release_group=compressor_projection_ready,
+                )
+            )
+        if use_grouped_preattention and kind == "csa":
+            fused_index_output = self.index_compress_fused_projection.reshape(-1)
+            index_compress_values = fused_index_output[: 2 * cfg.index_head_dim]
+            index_compress_scores = fused_index_output[2 * cfg.index_head_dim :]
+            _, kv_prefix_sms = self.policy.fp8_umma_split_k(
+                cfg.head_dim, cfg.hidden_size
+            )
+            index_compressor_base = kv_base + kv_prefix_sms
+            index_compressor_sms = 8
+            stages.append(
+                self._stage(
+                    "index.compressor.projection_reset",
+                    SchedDsv4ZeroFill(
+                        self.zero_fill_gate, fused_index_output
+                    ),
+                    index_compressor_sms,
+                    base_sm=index_compressor_base,
+                    wait_group=attention_input_ready,
+                    release_group=index_compressor_reset_ready,
+                )
+            )
+            stages.append(
+                self._grouped_bf16_splitk_stage(
+                    "index.compressor.wkv_wgate_group4",
+                    family,
+                    (
+                        "attn.indexer.compressor.wkv.weight",
+                        "attn.indexer.compressor.wgate.weight",
+                    ),
+                    self.norm_hidden,
+                    fused_index_output,
+                    split_k=8,
+                    base_sm=index_compressor_base,
+                    wait_group=index_compressor_reset_ready,
+                    release_group=index_compressor_projection_ready,
+                )
+            )
+        if (
+            use_grouped_preattention
+            and kind in ("csa", "hca")
+            and plan.should_compress
+        ):
+            ape_tensors = self._family_tensors(
+                family, "attn.compressor.ape"
+            )
+            tail_offset = cfg.head_dim if plan.compress_ratio == 4 else 0
+            ape_rows = tuple(
+                ape[
+                    self.decode_position % plan.compress_ratio,
+                    tail_offset : tail_offset + cfg.head_dim,
+                ]
+                for ape in ape_tensors
+            )
+            history_values = self.attention_pool_history_values[kind]
+            tail_values = compress_values[
+                tail_offset : tail_offset + cfg.head_dim
+            ]
+            tail_scores = compress_scores[
+                tail_offset : tail_offset + cfg.head_dim
+            ]
+            norm_weights = self._family_tensors(
+                family, "attn.compressor.norm.weight"
+            )
+            use_packed_pool = (
+                self.args.gated_pool_mode == "packed"
+                or (
+                    self.args.gated_pool_mode == "auto"
+                    and plan.compress_ratio == 128
+                )
+            )
+            if use_packed_pool:
+                compressor_pool_partial_ready = (
+                    f"{family.name}.attn.compressor.pool.partial.ready"
+                )
+                history_pool_base = compressor_base + compressor_sms
+                history_pool = SchedDsv4GatedPoolPacked8HistoryState(
+                    self.attention_pool_history_packed[kind],
+                    history_values.shape[0],
+                    self.attention_pool_history_state[kind],
+                )
+                stages.append(
+                    self._stage(
+                        "attn.compressor.history_pool_state",
+                        history_pool,
+                        cfg.head_dim // 128,
+                        base_sm=history_pool_base,
+                        wait_group=attention_input_ready,
+                    )
+                )
+                merge_tail = SchedDsv4GatedPoolTailRmsPartial(
+                    self.attention_pool_history_state[kind],
+                    self.attention_pooled_fp32[kind],
+                    self.attention_pooled_rms_partials[kind],
+                    tail_values=tail_values,
+                    tail_scores=tail_scores,
+                    tail_bias=ape_rows[0],
+                )
+                merge_tail = self._layered(
+                    merge_tail, family, ape_rows
+                )
+                stages.append(
+                    self._stage(
+                        "attn.compressor.tail_rms_partial",
+                        merge_tail,
+                        cfg.head_dim // 128,
+                        base_sm=history_pool_base,
+                        wait_group=compressor_projection_ready,
+                        release_group=compressor_pool_partial_ready,
+                    )
+                )
+                finalize = SchedDsv4Fp32RmsRopeShard128(
+                    self.attention_pooled_fp32[kind],
+                    self.attention_pooled_rms_partials[kind],
+                    norm_weights[0],
+                    self.compressed_output_rope[kind],
+                    self.current_compressed_rows[kind],
+                    epsilon=cfg.rms_epsilon,
+                    fixed_table_id=self.resident_rope_table_ids[
+                        self.compressed_output_rope[kind].data_ptr()
+                    ],
+                )
+                finalize = self._layered(
+                    finalize, family, norm_weights
+                )
+                stages.append(
+                    self._stage(
+                        "attn.compressor.norm_rope_shard4",
+                        finalize,
+                        cfg.head_dim // 128,
+                        base_sm=history_pool_base,
+                        wait_group=compressor_pool_partial_ready,
+                    )
+                )
+            else:
+                pool = SchedDsv4GatedPoolRmsRope(
+                    history_values,
+                    self.attention_pool_history_scores[kind],
+                    norm_weights[0],
+                    self.compressed_output_rope[kind],
+                    self.current_compressed_rows[kind],
+                    epsilon=cfg.rms_epsilon,
+                    tail_values=tail_values,
+                    tail_scores=tail_scores,
+                    tail_bias=ape_rows[0],
+                    fixed_table_id=self.resident_rope_table_ids[
+                        self.compressed_output_rope[kind].data_ptr()
+                    ],
+                )
+                pool = self._layered(
+                    pool, family, ape_rows, norm_weights
+                )
+                stages.append(
+                    self._stage(
+                        "attn.compressor.pool_norm_rope",
+                        pool,
+                        base_sm=compressor_base,
+                        wait_group=compressor_projection_ready,
+                    )
+                )
+        if (
+            use_grouped_preattention
+            and kind == "csa"
+            and plan.should_compress
+        ):
+            index_ape_tensors = self._family_tensors(
+                family, "attn.indexer.compressor.ape"
+            )
+            index_ape_rows = tuple(
+                ape[
+                    self.decode_position % plan.compress_ratio,
+                    cfg.index_head_dim : 2 * cfg.index_head_dim,
+                ]
+                for ape in index_ape_tensors
+            )
+            index_norm_weights = self._family_tensors(
+                family, "attn.indexer.compressor.norm.weight"
+            )
+            index_pool = SchedDsv4GatedPoolRmsRope(
+                self.index_pool_history_values,
+                self.index_pool_history_scores,
+                index_norm_weights[0],
+                self.compressed_output_rope[kind],
+                self.index_cache[-1:],
+                epsilon=cfg.rms_epsilon,
+                tail_values=index_compress_values[
+                    cfg.index_head_dim : 2 * cfg.index_head_dim
+                ],
+                tail_scores=index_compress_scores[
+                    cfg.index_head_dim : 2 * cfg.index_head_dim
+                ],
+                tail_bias=index_ape_rows[0],
+                hadamard=True,
+                fixed_table_id=self.resident_rope_table_ids[
+                    self.compressed_output_rope[kind].data_ptr()
+                ],
+            )
+            index_pool = self._layered(
+                index_pool,
+                family,
+                index_ape_rows,
+                index_norm_weights,
+            )
+            stages.append(
+                self._stage(
+                    "index.compressor.pool_norm_rope_hadamard",
+                    index_pool,
+                    base_sm=index_compressor_base,
+                    wait_group=index_compressor_projection_ready,
+                    release_group=(
+                        index_selection_input_join
+                        if run_index_selection
+                        else None
+                    ),
+                )
+            )
+
+        # The CSA query/weight/selection branch is independent of the main
+        # Q projection once q_a is ready.  Queue it first on a bounded SM band:
+        # those SMs execute the index branch while the compressor bands finish,
+        # and the remaining SMs can enter q_b immediately.  q_b spans the full
+        # grid and therefore provides the attention-ready join for every branch.
+        if kind == "csa" and use_grouped_preattention and run_index_selection:
+            stages.append(
+                self._bf16_linear_stage(
+                    "index.weights",
+                    family,
+                    "attn.indexer.weights_proj.weight",
+                    self.norm_hidden,
+                    self.index_head_weights,
+                    placement=(0, cfg.index_heads),
+                    wait_group=attention_input_ready,
+                    release_group=index_selection_input_join,
+                )
+            )
+            fuse_index_q_splitk_epilogue = (
+                split_index_active and not self.direct_splitk_bf16
+            )
+            index_q_fp32_finalizer = None
+            if fuse_index_q_splitk_epilogue:
+
+                def index_q_fp32_finalizer(accumulator):
+                    return (
+                        SchedDsv4Fp32RopeHadamard128(
+                            accumulator.reshape(
+                                cfg.index_heads, cfg.index_head_dim
+                            ),
+                            self.compress_rope,
+                            self.index_q_hadamard,
+                            fixed_table_id=self.resident_rope_table_ids[
+                                self.compress_rope.data_ptr()
+                            ],
+                        ),
+                        cfg.index_heads,
+                    )
+
+            if split_index_active:
+                stages.extend(
+                    self._splitk_fp8_linear_stages(
+                        "index.q_b",
+                        family,
+                        "attn.indexer.wq_b",
+                        self.q_rank_native_fp8,
+                        self.index_q,
+                        base_sm=0,
+                        num_sms=cfg.index_heads,
+                        wait_group=qkv_prefix_join,
+                        release_group=index_selection_input_join,
+                        fp32_finalizer=index_q_fp32_finalizer,
+                    )
+                )
+            elif self.args.fp8_qb_mode == "native":
+                stages.append(
+                    self._native_fp8_linear_stage(
+                        "index.q_b",
+                        family,
+                        "attn.indexer.wq_b",
+                        self.q_rank_native_fp8,
+                        self.index_q,
+                        placement=(0, cfg.index_heads),
+                        wait_group=qkv_prefix_join,
+                    )
+                )
+            else:
+                stages.append(
+                    self._fp8_linear_stage(
+                        "index.q_b",
+                        family,
+                        "attn.indexer.wq_b",
+                        self.q_rank_fp8,
+                        self.q_rank_fp8_scale,
+                        self.index_q,
+                        placement=(0, cfg.index_heads),
+                        wait_group=qkv_prefix_join,
+                    )
+                )
+            if not fuse_index_q_splitk_epilogue:
+                stages.append(
+                    self._stage(
+                        "index.q_rope",
+                        SchedDsv4Rope128_64(
+                            self.index_q,
+                            self.compress_rope,
+                            self.index_q_rope,
+                            fixed_table_id=self.resident_rope_table_ids[
+                                self.compress_rope.data_ptr()
+                            ],
+                        ),
+                        cfg.index_heads,
+                    )
+                )
+                stages.append(
+                    self._stage(
+                        "index.q_hadamard",
+                        SchedDsv4Hadamard(
+                            self.index_q_rope, self.index_q_hadamard
+                        ),
+                        cfg.index_heads,
+                        release_group=index_selection_input_join,
+                    )
+                )
+            if plan.compressed_rows:
+                stages.append(
+                    self._stage(
+                        "index.score",
+                        SchedDsv4IndexScore(
+                            self.index_q_hadamard,
+                            self.index_cache,
+                            self.index_head_weights,
+                            self.index_scores,
+                        ),
+                        min(plan.compressed_rows, self.sms),
+                        wait_group=index_selection_input_join,
+                    )
+                )
+                stages.append(
+                    self._stage(
+                        "index.topk",
+                        SchedDsv4TopK512(
+                            self.index_scores,
+                            self.attention_indices_by_kind[kind][
+                                -plan.compressed_selected :
+                            ],
+                            index_offset=cfg.sliding_window,
+                        ),
+                    )
+                )
+        fuse_q_splitk_epilogue = (
+            split_q_b and not self.direct_splitk_bf16
         )
+        q_fp32_finalizer = None
+        if fuse_q_splitk_epilogue:
+
+            def q_fp32_finalizer(accumulator):
+                return (
+                    SchedDsv4Fp32RmsRope512_64(
+                        accumulator.reshape(cfg.num_heads, cfg.head_dim),
+                        rope_table,
+                        self.q_rope,
+                        epsilon=cfg.rms_epsilon,
+                        fixed_table_id=self.resident_rope_table_ids[
+                            rope_table.data_ptr()
+                        ],
+                    ),
+                    cfg.num_heads,
+                )
+
         if split_q_b:
             stages.extend(
                 self._splitk_fp8_linear_stages(
@@ -1350,6 +2080,7 @@ class ResidentOneLaunchDecode:
                     self.q_rank_native_fp8,
                     self.q,
                     wait_group=qkv_prefix_join,
+                    fp32_finalizer=q_fp32_finalizer,
                 )
             )
         elif self.args.fp8_qb_mode == "native":
@@ -1375,43 +2106,38 @@ class ResidentOneLaunchDecode:
                     wait_group=qkv_prefix_join,
                 )
             )
-        stages.append(self._rms_stage("attn.q_head_norm", self.q, self.q_norm))
-        stages.append(
-            self._stage(
-                "attn.q_rope",
-                SchedDsv4Rope512_64(
-                    self.q_norm,
+        if not fuse_q_splitk_epilogue:
+            stages.append(
+                self._rms_rope_stage(
+                    "attn.q_head_rms_rope",
+                    self.q,
                     rope_table,
                     self.q_rope,
-                    fixed_table_id=self.resident_rope_table_ids[
-                        rope_table.data_ptr()
-                    ],
-                ),
-                self.policy.attention(cfg.num_heads, cfg.head_dim),
+                )
             )
-        )
 
-        if kind in ("csa", "hca"):
+        if kind in ("csa", "hca") and not use_grouped_preattention:
             width = cfg.head_dim * (2 if kind == "csa" else 1)
-            stages.append(
-                self._bf16_linear_stage(
-                    "attn.compressor.wkv",
-                    family,
-                    "attn.compressor.wkv.weight",
-                    self.norm_hidden,
-                    self.compress_values[:width],
+            if not use_grouped_preattention:
+                stages.append(
+                    self._bf16_linear_stage(
+                        "attn.compressor.wkv",
+                        family,
+                        "attn.compressor.wkv.weight",
+                        self.norm_hidden,
+                        compress_values[:width],
+                    )
                 )
-            )
-            stages.append(
-                self._bf16_linear_stage(
-                    "attn.compressor.wgate",
-                    family,
-                    "attn.compressor.wgate.weight",
-                    self.norm_hidden,
-                    self.compress_scores[:width],
-                    wait_for_previous=False,
+                stages.append(
+                    self._bf16_linear_stage(
+                        "attn.compressor.wgate",
+                        family,
+                        "attn.compressor.wgate.weight",
+                        self.norm_hidden,
+                        compress_scores[:width],
+                        wait_for_previous=False,
+                    )
                 )
-            )
             if plan.should_compress:
                 ape_tensors = self._family_tensors(
                     family, "attn.compressor.ape"
@@ -1425,10 +2151,10 @@ class ResidentOneLaunchDecode:
                     for ape in ape_tensors
                 )
                 history_values = self.attention_pool_history_values[kind]
-                tail_values = self.compress_values[
+                tail_values = compress_values[
                     tail_offset : tail_offset + cfg.head_dim
                 ]
-                tail_scores = self.compress_scores[
+                tail_scores = compress_scores[
                     tail_offset : tail_offset + cfg.head_dim
                 ]
                 use_packed_pool = (
@@ -1438,7 +2164,36 @@ class ResidentOneLaunchDecode:
                         and plan.compress_ratio == 128
                     )
                 )
-                if use_packed_pool:
+                fuse_scalar_pool_epilogue = (
+                    use_grouped_preattention and not use_packed_pool
+                )
+                if fuse_scalar_pool_epilogue:
+                    norm_weights = self._family_tensors(
+                        family, "attn.compressor.norm.weight"
+                    )
+                    pool = SchedDsv4GatedPoolRmsRope(
+                        history_values,
+                        self.attention_pool_history_scores[kind],
+                        norm_weights[0],
+                        self.compressed_output_rope[kind],
+                        self.current_compressed_rows[kind],
+                        epsilon=cfg.rms_epsilon,
+                        tail_values=tail_values,
+                        tail_scores=tail_scores,
+                        tail_bias=ape_rows[0],
+                        fixed_table_id=self.resident_rope_table_ids[
+                            self.compressed_output_rope[kind].data_ptr()
+                        ],
+                    )
+                    pool = self._layered(
+                        pool, family, ape_rows, norm_weights
+                    )
+                    stages.append(
+                        self._stage(
+                            "attn.compressor.pool_norm_rope", pool
+                        )
+                    )
+                elif use_packed_pool:
                     pool = SchedDsv4GatedPoolPacked8Shard128(
                         self.attention_pool_history_packed[kind],
                         history_values.shape[0],
@@ -1462,34 +2217,60 @@ class ResidentOneLaunchDecode:
                         tail_bias=ape_rows[0],
                     )
                     pool_sms = 1
-                pool = self._layered(pool, family, ape_rows)
-                stages.append(
-                    self._stage("attn.compressor.pool", pool, pool_sms)
-                )
-                stages.append(
-                    self._rms_stage(
-                        "attn.compressor.norm",
-                        self.attention_pooled[kind],
-                        self.attention_pooled_norm[kind],
-                        family=family,
-                        weight_suffix="attn.compressor.norm.weight",
+                if not fuse_scalar_pool_epilogue:
+                    pool = self._layered(pool, family, ape_rows)
+                    stages.append(
+                        self._stage(
+                            "attn.compressor.pool", pool, pool_sms
+                        )
                     )
-                )
-                stages.append(
-                    self._stage(
-                        "attn.compressor.rope",
-                        SchedDsv4Rope512_64(
-                            self.attention_pooled_norm[kind].reshape(1, -1),
-                            self.compressed_output_rope[kind],
-                            self.current_compressed_rows[kind],
+                    stages.append(
+                        self._rms_stage(
+                            "attn.compressor.norm",
+                            self.attention_pooled[kind],
+                            self.attention_pooled_norm[kind],
+                            family=family,
+                            weight_suffix="attn.compressor.norm.weight",
+                        )
+                    )
+                    stages.append(
+                        self._stage(
+                            "attn.compressor.rope",
+                            SchedDsv4Rope512_64(
+                                self.attention_pooled_norm[kind].reshape(1, -1),
+                                self.compressed_output_rope[kind],
+                                self.current_compressed_rows[kind],
+                                fixed_table_id=self.resident_rope_table_ids[
+                                    self.compressed_output_rope[kind].data_ptr()
+                                ],
+                            ),
+                        )
+                    )
+
+        if kind == "csa" and not use_grouped_preattention:
+            fuse_index_q_splitk_epilogue = (
+                run_index_selection
+                and split_index_active
+                and not self.direct_splitk_bf16
+            )
+            index_q_fp32_finalizer = None
+            if fuse_index_q_splitk_epilogue:
+
+                def index_q_fp32_finalizer(accumulator):
+                    return (
+                        SchedDsv4Fp32RopeHadamard128(
+                            accumulator.reshape(
+                                cfg.index_heads, cfg.index_head_dim
+                            ),
+                            self.compress_rope,
+                            self.index_q_hadamard,
                             fixed_table_id=self.resident_rope_table_ids[
-                                self.compressed_output_rope[kind].data_ptr()
+                                self.compress_rope.data_ptr()
                             ],
                         ),
+                        cfg.index_heads,
                     )
-                )
 
-        if kind == "csa":
             if run_index_selection and split_index_active:
                 stages.extend(
                     self._splitk_fp8_linear_stages(
@@ -1498,6 +2279,7 @@ class ResidentOneLaunchDecode:
                         "attn.indexer.wq_b",
                         self.q_rank_native_fp8,
                         self.index_q,
+                        fp32_finalizer=index_q_fp32_finalizer,
                     )
                 )
             elif run_index_selection and self.args.fp8_qb_mode == "native":
@@ -1521,7 +2303,7 @@ class ResidentOneLaunchDecode:
                         self.index_q,
                     )
                 )
-            if run_index_selection:
+            if run_index_selection and not fuse_index_q_splitk_epilogue:
                 stages.append(
                     self._stage(
                         "index.q_rope",
@@ -1545,6 +2327,7 @@ class ResidentOneLaunchDecode:
                         cfg.index_heads,
                     )
                 )
+            if run_index_selection:
                 stages.append(
                     self._bf16_linear_stage(
                         "index.weights",
@@ -1554,26 +2337,27 @@ class ResidentOneLaunchDecode:
                         self.index_head_weights,
                     )
                 )
-            stages.append(
-                self._bf16_linear_stage(
-                    "index.compressor.wkv",
-                    family,
-                    "attn.indexer.compressor.wkv.weight",
-                    self.norm_hidden,
-                    self.index_compress_values,
+            if not use_grouped_preattention:
+                stages.append(
+                    self._bf16_linear_stage(
+                        "index.compressor.wkv",
+                        family,
+                        "attn.indexer.compressor.wkv.weight",
+                        self.norm_hidden,
+                        index_compress_values,
+                    )
                 )
-            )
-            stages.append(
-                self._bf16_linear_stage(
-                    "index.compressor.wgate",
-                    family,
-                    "attn.indexer.compressor.wgate.weight",
-                    self.norm_hidden,
-                    self.index_compress_scores,
-                    wait_for_previous=False,
+                stages.append(
+                    self._bf16_linear_stage(
+                        "index.compressor.wgate",
+                        family,
+                        "attn.indexer.compressor.wgate.weight",
+                        self.norm_hidden,
+                        index_compress_scores,
+                        wait_for_previous=False,
+                    )
                 )
-            )
-            if plan.should_compress:
+            if plan.should_compress and not use_grouped_preattention:
                 index_ape_tensors = self._family_tensors(
                     family, "attn.indexer.compressor.ape"
                 )
@@ -1584,55 +2368,92 @@ class ResidentOneLaunchDecode:
                     ]
                     for ape in index_ape_tensors
                 )
-                index_pool = SchedDsv4GatedPool(
-                    self.index_pool_history_values,
-                    self.index_pool_history_scores,
-                    self.index_pooled,
-                    tail_values=self.index_compress_values[
-                        cfg.index_head_dim : 2 * cfg.index_head_dim
-                    ],
-                    tail_scores=self.index_compress_scores[
-                        cfg.index_head_dim : 2 * cfg.index_head_dim
-                    ],
-                    tail_bias=index_ape_rows[0],
-                )
-                index_pool = self._layered(
-                    index_pool, family, index_ape_rows
-                )
-                stages.append(
-                    self._stage("index.compressor.pool", index_pool)
-                )
-                stages.append(
-                    self._rms_stage(
-                        "index.compressor.norm",
+                index_tail_values = index_compress_values[
+                    cfg.index_head_dim : 2 * cfg.index_head_dim
+                ]
+                index_tail_scores = index_compress_scores[
+                    cfg.index_head_dim : 2 * cfg.index_head_dim
+                ]
+                if use_grouped_preattention:
+                    index_norm_weights = self._family_tensors(
+                        family,
+                        "attn.indexer.compressor.norm.weight",
+                    )
+                    index_pool = SchedDsv4GatedPoolRmsRope(
+                        self.index_pool_history_values,
+                        self.index_pool_history_scores,
+                        index_norm_weights[0],
+                        self.compressed_output_rope[kind],
+                        self.index_cache[-1:],
+                        epsilon=cfg.rms_epsilon,
+                        tail_values=index_tail_values,
+                        tail_scores=index_tail_scores,
+                        tail_bias=index_ape_rows[0],
+                        hadamard=True,
+                        fixed_table_id=self.resident_rope_table_ids[
+                            self.compressed_output_rope[kind].data_ptr()
+                        ],
+                    )
+                    index_pool = self._layered(
+                        index_pool,
+                        family,
+                        index_ape_rows,
+                        index_norm_weights,
+                    )
+                    stages.append(
+                        self._stage(
+                            "index.compressor.pool_norm_rope_hadamard",
+                            index_pool,
+                        )
+                    )
+                else:
+                    index_pool = SchedDsv4GatedPool(
+                        self.index_pool_history_values,
+                        self.index_pool_history_scores,
                         self.index_pooled,
-                        self.index_pooled_norm,
-                        family=family,
-                        weight_suffix="attn.indexer.compressor.norm.weight",
+                        tail_values=index_tail_values,
+                        tail_scores=index_tail_scores,
+                        tail_bias=index_ape_rows[0],
                     )
-                )
-                stages.append(
-                    self._stage(
-                        "index.compressor.rope",
-                        SchedDsv4Rope128_64(
-                            self.index_pooled_norm.reshape(1, -1),
-                            self.compressed_output_rope[kind],
-                            self.index_pooled_rope,
-                            fixed_table_id=self.resident_rope_table_ids[
-                                self.compressed_output_rope[kind].data_ptr()
-                            ],
-                        ),
+                    index_pool = self._layered(
+                        index_pool, family, index_ape_rows
                     )
-                )
-                stages.append(
-                    self._stage(
-                        "index.compressor.hadamard",
-                        SchedDsv4Hadamard(
-                            self.index_pooled_rope,
-                            self.index_cache[-1:],
-                        ),
+                    stages.append(
+                        self._stage("index.compressor.pool", index_pool)
                     )
-                )
+                    stages.append(
+                        self._rms_stage(
+                            "index.compressor.norm",
+                            self.index_pooled,
+                            self.index_pooled_norm,
+                            family=family,
+                            weight_suffix=(
+                                "attn.indexer.compressor.norm.weight"
+                            ),
+                        )
+                    )
+                    stages.append(
+                        self._stage(
+                            "index.compressor.rope",
+                            SchedDsv4Rope128_64(
+                                self.index_pooled_norm.reshape(1, -1),
+                                self.compressed_output_rope[kind],
+                                self.index_pooled_rope,
+                                fixed_table_id=self.resident_rope_table_ids[
+                                    self.compressed_output_rope[kind].data_ptr()
+                                ],
+                            ),
+                        )
+                    )
+                    stages.append(
+                        self._stage(
+                            "index.compressor.hadamard",
+                            SchedDsv4Hadamard(
+                                self.index_pooled_rope,
+                                self.index_cache[-1:],
+                            ),
+                        )
+                    )
             if run_index_selection and plan.compressed_rows:
                 stages.append(
                     self._stage(
@@ -1661,81 +2482,98 @@ class ResidentOneLaunchDecode:
 
         sinks = self._family_tensors(family, "attn.attn_sink")
         attention_rows = self.attention_indices_by_kind[kind].numel()
+        use_split_umma_attention = split_o_a and self.args.attention_mode in (
+            "auto",
+            "umma-split",
+        )
+        if self.args.attention_mode == "umma-split" and not split_o_a:
+            raise ValueError(
+                "UMMA split attention requires native split-K O_a"
+            )
+        if use_split_umma_attention and (
+            plan.compressed_selected != plan.compressed_rows
+        ):
+            raise ValueError(
+                "UMMA split attention currently requires exhaustive cache rows"
+            )
         use_contiguous_attention = (
-            self.args.attention_mode == "contiguous"
-            or (
-                self.args.attention_mode == "auto"
-                and attention_rows >= 16
+            not use_split_umma_attention
+            and (
+                self.args.attention_mode == "contiguous"
+                or (
+                    self.args.attention_mode == "auto"
+                    and attention_rows >= 16
+                )
             )
         )
-        if use_contiguous_attention:
-            if plan.compressed_selected != plan.compressed_rows:
-                raise ValueError(
-                    "contiguous attention requires the complete compressed cache"
-                )
-            sparse = SchedDsv4ContiguousAttention512Block4(
+        output_join_group = f"{family.name}.attn.output.join"
+        if use_split_umma_attention:
+            num_splits = (attention_rows + 31) // 32
+            partials = self.attention_partial_workspace[:num_splits]
+            metadata = self.attention_metadata_workspace[:num_splits]
+            q_tma = TmaTensor(
+                self.launcher, self.q_rope
+            ).wgmma_load(64, 128, Major.K)
+            k_tma = TmaTensor(
+                self.launcher, self.attention_cache[kind]
+            ).wgmma_load(32, 128, Major.K)
+            v_tma = TmaTensor(
+                self.launcher, self.attention_cache[kind]
+            ).wgmma_load(32, 128, Major.MN)
+            partial_tma = TmaTensor(
+                self.launcher,
+                partials.reshape(num_splits * cfg.num_heads, cfg.head_dim),
+            ).rowmajor_2d("store", cfg.num_heads, 128)
+            partial_ready_group = (
+                f"{family.name}.attn.split32.partials.ready"
+            )
+            producer = SchedDsv4AttentionSplit32UmmaSm100(
                 self.q_rope,
                 self.attention_cache[kind],
                 attention_rows,
-                sinks[0],
-                self.attention_output,
+                partials,
+                metadata,
+                q_tma=q_tma,
+                k_tma=k_tma,
+                v_tma=v_tma,
+                partial_tma=partial_tma,
             )
-        else:
-            sparse = SchedDsv4SparseAttention512(
-                self.q_rope,
-                self.attention_cache[kind],
-                self.attention_indices_by_kind[kind],
-                sinks[0],
-                self.attention_output,
+            stages.append(
+                self._stage(
+                    f"attn.sparse_{kind}.split32_umma",
+                    producer,
+                    num_splits,
+                    release_group=partial_ready_group,
+                )
             )
-        sparse = self._layered(sparse, family, sinks)
-        stages.append(
-            self._stage(
-                f"attn.sparse_{kind}",
-                sparse,
-                self.policy.attention(cfg.num_heads, cfg.head_dim),
+            native_heads = self.o_group_native_fp8.view(
+                cfg.num_heads, 4, 2048
             )
-        )
-        output_ready_group = f"{family.name}.attn.output.ready"
-        output_join_group = f"{family.name}.attn.output.join"
-        stages.append(
-            self._stage(
-                "attn.inverse_rope",
-                SchedDsv4Rope512_64(
-                    self.attention_output,
-                    rope_table,
-                    self.attention_inverse,
-                    inverse=True,
-                    fixed_table_id=self.resident_rope_table_ids[
-                        rope_table.data_ptr()
-                    ],
-                ),
-                cfg.num_heads,
-                release_group=output_ready_group,
-            )
-        )
-        grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
-        for group in range(cfg.o_groups):
-            placement = (
-                (group * 16, 16)
-                if split_o_a
-                else self.policy.parallel_partition(group, cfg.o_groups)
-            )
-            start = group * cfg.o_lora_rank
-            if split_o_a:
+            for group in range(cfg.o_groups):
                 group_input_ready = (
                     f"{family.name}.attn.o_a.g{group}.input.ready"
                 )
+                reducer = SchedDsv4AttentionSplitReduceFp8Sm100(
+                    partials,
+                    metadata,
+                    sinks[0],
+                    rope_table,
+                    native_heads,
+                    head_start=group * 8,
+                    head_count=8,
+                )
+                reducer = self._layered(reducer, family, sinks)
                 stages.append(
-                    self._native_fp8_quant_stage(
-                        f"attn.o_a.g{group}.quant_native_fp8",
-                        grouped[group],
-                        self.o_group_native_fp8[group],
-                        placement=placement,
-                        wait_group=output_ready_group,
+                    self._stage(
+                        f"attn.sparse_{kind}.reduce_quant_g{group}",
+                        reducer,
+                        8,
+                        base_sm=group * 16,
+                        wait_group=partial_ready_group,
                         release_group=group_input_ready,
                     )
                 )
+                start = group * cfg.o_lora_rank
                 stages.extend(
                     self._splitk_fp8_linear_stages(
                         f"attn.o_a.g{group}",
@@ -1744,28 +2582,113 @@ class ResidentOneLaunchDecode:
                         self.o_group_native_fp8[group],
                         self.o_rank[group],
                         row_slice=slice(start, start + cfg.o_lora_rank),
-                        base_sm=placement[0],
+                        base_sm=group * 16,
                         split_k=2,
-                        num_sms=placement[1],
+                        num_sms=16,
                         wait_group=group_input_ready,
                         release_group=output_join_group,
                     )
                 )
-            else:
-                stages.append(
-                    self._fp8_bf16_linear_stage(
-                        f"attn.o_a.g{group}",
-                        family,
-                        "attn.wo_a",
-                        grouped[group],
-                        self.o_rank[group],
-                        row_slice=slice(start, start + cfg.o_lora_rank),
-                        placement=placement,
-                        wait_group=output_ready_group,
-                        release_group=output_join_group,
-                        prefetch_before_wait=placement[0] >= cfg.num_heads,
+        else:
+            if use_contiguous_attention:
+                if plan.compressed_selected != plan.compressed_rows:
+                    raise ValueError(
+                        "contiguous attention requires the complete compressed cache"
                     )
+                sparse = SchedDsv4ContiguousAttention512Block4(
+                    self.q_rope,
+                    self.attention_cache[kind],
+                    attention_rows,
+                    sinks[0],
+                    self.attention_output,
                 )
+            else:
+                sparse = SchedDsv4SparseAttention512(
+                    self.q_rope,
+                    self.attention_cache[kind],
+                    self.attention_indices_by_kind[kind],
+                    sinks[0],
+                    self.attention_output,
+                )
+            sparse = self._layered(sparse, family, sinks)
+            stages.append(
+                self._stage(
+                    f"attn.sparse_{kind}",
+                    sparse,
+                    self.policy.attention(cfg.num_heads, cfg.head_dim),
+                )
+            )
+            output_ready_group = f"{family.name}.attn.output.ready"
+            stages.append(
+                self._stage(
+                    "attn.inverse_rope",
+                    SchedDsv4Rope512_64(
+                        self.attention_output,
+                        rope_table,
+                        self.attention_inverse,
+                        inverse=True,
+                        fixed_table_id=self.resident_rope_table_ids[
+                            rope_table.data_ptr()
+                        ],
+                    ),
+                    cfg.num_heads,
+                    release_group=output_ready_group,
+                )
+            )
+            grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
+            for group in range(cfg.o_groups):
+                placement = (
+                    (group * 16, 16)
+                    if split_o_a
+                    else self.policy.parallel_partition(group, cfg.o_groups)
+                )
+                start = group * cfg.o_lora_rank
+                if split_o_a:
+                    group_input_ready = (
+                        f"{family.name}.attn.o_a.g{group}.input.ready"
+                    )
+                    stages.append(
+                        self._native_fp8_quant_stage(
+                            f"attn.o_a.g{group}.quant_native_fp8",
+                            grouped[group],
+                            self.o_group_native_fp8[group],
+                            placement=placement,
+                            wait_group=output_ready_group,
+                            release_group=group_input_ready,
+                        )
+                    )
+                    stages.extend(
+                        self._splitk_fp8_linear_stages(
+                            f"attn.o_a.g{group}",
+                            family,
+                            "attn.wo_a",
+                            self.o_group_native_fp8[group],
+                            self.o_rank[group],
+                            row_slice=slice(start, start + cfg.o_lora_rank),
+                            base_sm=placement[0],
+                            split_k=2,
+                            num_sms=placement[1],
+                            wait_group=group_input_ready,
+                            release_group=output_join_group,
+                        )
+                    )
+                else:
+                    stages.append(
+                        self._fp8_bf16_linear_stage(
+                            f"attn.o_a.g{group}",
+                            family,
+                            "attn.wo_a",
+                            grouped[group],
+                            self.o_rank[group],
+                            row_slice=slice(start, start + cfg.o_lora_rank),
+                            placement=placement,
+                            wait_group=output_ready_group,
+                            release_group=output_join_group,
+                            prefetch_before_wait=(
+                                placement[0] >= cfg.num_heads
+                            ),
+                        )
+                    )
         if split_o_b:
             o_rank_ready = f"{family.name}.attn.o_rank.native.ready"
             stages.append(
@@ -2381,9 +3304,16 @@ class ResidentOneLaunchDecode:
         def profile_stage(name: str) -> bool:
             if not self.args.profile_stages:
                 return False
+            if self.args.profile_preattention_only:
+                return name in {
+                    "attn.hc_pre_rms4096",
+                    "attn.q_b",
+                }
             if name in {
                 "attn.hc_pre",
+                "attn.hc_pre_rms4096",
                 "attn.hidden.quant_fp8",
+                "attn.q_b",
                 "attn.q_rope",
                 "attn.kv_rope",
                 "attn.compressor.wgate",
@@ -2671,9 +3601,17 @@ class ResidentOneLaunchDecode:
         ).load_fp8_linear(
             f"layers.{layer_id}.attn.wq_b", device=str(self.device)
         )
-        activation, activation_scale = quantize_fp8_block128(
-            self.q_rank_norm
+        q_norm_weight = self._tensor(
+            f"layers.{layer_id}.attn.q_norm.weight"
         )
+        q_rank_fp32 = self.q_rank.float()
+        rms_rcp = torch.rsqrt(
+            q_rank_fp32.square().mean() + self.config.rms_epsilon
+        )
+        q_rank_norm = (
+            q_rank_fp32 * rms_rcp * q_norm_weight.float()
+        ).to(torch.bfloat16)
+        activation, activation_scale = quantize_fp8_block128(q_rank_norm)
         reference = (
             dequantize_fp8_block128(linear.weight, linear.scale)
             @ dequantize_fp8_block128(activation, activation_scale)
@@ -3069,7 +4007,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--attention-mode",
-        choices=("auto", "contiguous", "scalar"),
+        choices=("auto", "umma-split", "contiguous", "scalar"),
         default="auto",
         help="select the sparse-attention compute mechanism for matched A/B profiling",
     )
@@ -3099,6 +4037,15 @@ def main() -> None:
         "--profile-stages",
         action="store_true",
         help="record selected one-layer stage-group completion frontiers",
+    )
+    parser.add_argument(
+        "--profile-preattention-only",
+        action="store_true",
+        help=(
+            "with --profile-stages, retain only the fused mHC/RMS and "
+            "attention-ready boundaries so auxiliary index probes do not "
+            "serialize the measured DAG"
+        ),
     )
     parser.add_argument(
         "--profile-steps",
@@ -3151,6 +4098,8 @@ def main() -> None:
         parser.error(
             "--profile-layers, --profile-stages, and --profile-steps are mutually exclusive"
         )
+    if args.profile_preattention_only and not args.profile_stages:
+        parser.error("--profile-preattention-only requires --profile-stages")
     if (args.profile_stages or args.profile_steps) and args.layers != 1:
         parser.error("stage/step profiling requires --layers 1")
     step_capacity = (
