@@ -17,6 +17,7 @@ from dae.schedule import (
     SchedDsv4Nvfp4QuantUmmaB,
     SchedNvfp4Gemv,
     SchedNvfp4GemvUmma,
+    SchedNvfp4GemvUmmaSplitK,
     SchedNvfp4GemvUmmaStream,
     SchedNvfp4UmmaPrepack,
     SchedRoutedNvfp4Gemv,
@@ -66,7 +67,30 @@ def main() -> None:
     parser.add_argument(
         "--bulk-activation",
         action="store_true",
-        help="load all native activation K tiles in one shared allocation",
+        help=(
+            "legacy alias for loading all native activation K tiles in one "
+            "shared allocation"
+        ),
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="use the four-stage NVFP4 UMMA K pipeline",
+    )
+    parser.add_argument(
+        "--activation-tiles-per-load",
+        type=int,
+        default=0,
+        help=(
+            "consecutive K256 activation tiles per TMA load; zero selects "
+            "four for the pipeline and one for the legacy path"
+        ),
+    )
+    parser.add_argument(
+        "--split-k",
+        type=int,
+        default=1,
+        help="split native NVFP4 K over this many FP32 TMA-reduce partials",
     )
     parser.add_argument(
         "--reuse-activation-pair",
@@ -120,8 +144,37 @@ def main() -> None:
         parser.error("--native-activation-quant requires --implementation umma_stream")
     if args.bulk_activation and args.implementation != "umma_stream":
         parser.error("--bulk-activation requires --implementation umma_stream")
+    if args.pipeline and args.implementation != "umma_stream":
+        parser.error("--pipeline requires --implementation umma_stream")
+    if args.activation_tiles_per_load < 0:
+        parser.error("--activation-tiles-per-load must be nonnegative")
+    if (
+        args.activation_tiles_per_load
+        and args.implementation != "umma_stream"
+    ):
+        parser.error(
+            "--activation-tiles-per-load requires --implementation umma_stream"
+        )
+    if args.bulk_activation and args.activation_tiles_per_load:
+        parser.error(
+            "--bulk-activation and --activation-tiles-per-load are exclusive"
+        )
     if args.reuse_activation_pair and args.implementation != "umma_stream":
         parser.error("--reuse-activation-pair requires --implementation umma_stream")
+    if args.split_k <= 0:
+        parser.error("--split-k must be positive")
+    if args.split_k > 1 and args.implementation != "umma_stream":
+        parser.error("--split-k requires --implementation umma_stream")
+    if args.split_k > 1 and (
+        args.routed_native
+        or args.reuse_activation_pair
+        or args.pipeline
+        or args.bulk_activation
+        or args.activation_tiles_per_load
+    ):
+        parser.error(
+            "split-K microbenchmark currently uses static full-shard operands"
+        )
     if args.native_activation_quant and (
         args.indexed_activation
         or args.block_indexed_activation
@@ -237,7 +290,10 @@ def main() -> None:
         default_sms = (
             min(args.m, device_sms)
             if args.implementation == "cuda"
-            else (args.m + 127) // 128
+            else min(
+                device_sms,
+                ((args.m + 127) // 128) * args.split_k,
+            )
         )
         sms_values = [args.sms or default_sms]
     if any(value <= 0 or value > device_sms for value in sms_values):
@@ -251,6 +307,7 @@ def main() -> None:
             (args.m * output_columns,), dtype=torch.bfloat16, device=device
         )
         launcher = Launcher(num_sms, device=device)
+        split_accumulator = None
         if args.routed_tiles:
             assignment = DeepSeekV4ShapePolicy(num_sms).nvfp4_gemv(
                 args.m, args.k
@@ -322,7 +379,23 @@ def main() -> None:
                 raise ValueError("streaming UMMA requires M128 and K256 alignment")
             m_tiles = args.m // 128
             k_tiles = args.k // 256
-            if num_sms != m_tiles and not args.routed_native:
+            activation_tiles_per_load = (
+                k_tiles
+                if args.bulk_activation
+                else (
+                    args.activation_tiles_per_load
+                    or (min(4, k_tiles) if args.pipeline else 1)
+                )
+            )
+            if activation_tiles_per_load > k_tiles:
+                raise ValueError(
+                    "activation tiles per load cannot exceed K tiles"
+                )
+            if (
+                args.split_k == 1
+                and num_sms != m_tiles
+                and not args.routed_native
+            ):
                 raise ValueError(
                     "streaming UMMA requires one SM per M128 output tile"
                 )
@@ -494,7 +567,25 @@ def main() -> None:
                     flush=True,
                 )
 
-            if args.routed_native:
+            if args.split_k > 1:
+                split_accumulator = torch.zeros(
+                    (1, args.m), dtype=torch.float32, device=device
+                )
+                split_output_scale = torch.ones(
+                    (1,), dtype=torch.float32, device=device
+                )
+                output_reduce = TmaTensor(
+                    launcher, split_accumulator
+                ).rowmajor_2d("reduce", 1, 128)
+                schedule = SchedNvfp4GemvUmmaSplitK(
+                    packed_weight,
+                    packed_activation,
+                    alpha_storage,
+                    split_output_scale,
+                    output_reduce,
+                    args.split_k,
+                ).place(num_sms)
+            elif args.routed_native:
                 columns = {}
                 native_field_names = []
                 for m_tile in range(m_tiles):
@@ -518,9 +609,9 @@ def main() -> None:
                     packed_activation,
                     output,
                     route_ready=True,
-                    activation_mode=(
-                        "load" if args.bulk_activation else "stream"
-                    ),
+                    activation_mode="load",
+                    activation_tiles_per_load=activation_tiles_per_load,
+                    pipeline=args.pipeline,
                 ).place(num_sms)
             elif args.reuse_activation_pair:
                 reuse_output = torch.empty_like(output)
@@ -531,6 +622,7 @@ def main() -> None:
                         alpha_storage,
                         output,
                         activation_mode="retain",
+                        pipeline=args.pipeline,
                     ).place(num_sms),
                     SchedNvfp4GemvUmmaStream(
                         packed_weight,
@@ -538,6 +630,7 @@ def main() -> None:
                         alpha_storage,
                         reuse_output,
                         activation_mode="reuse",
+                        pipeline=args.pipeline,
                     ).place(num_sms),
                 )
             else:
@@ -546,9 +639,9 @@ def main() -> None:
                     packed_activation,
                     alpha_storage,
                     output,
-                    activation_mode=(
-                        "load" if args.bulk_activation else "stream"
-                    ),
+                    activation_mode="load",
+                    activation_tiles_per_load=activation_tiles_per_load,
+                    pipeline=args.pipeline,
                 ).place(num_sms)
         else:
             schedule_cls = (
@@ -579,9 +672,22 @@ def main() -> None:
         torch.cuda.synchronize()
         stage(f"first_launch_complete_{num_sms}")
 
-        output_matrix = output.reshape(args.m, output_columns)
+        result_storage = (
+            split_accumulator.reshape(-1)
+            if split_accumulator is not None
+            else output
+        )
+        output_matrix = result_storage.reshape(args.m, output_columns)
         comparison = output_matrix[:, 0]
-        expected = reference.reshape(args.m, 1).expand_as(output_matrix)
+        expected_source = (
+            (
+                dequantize_nvfp4(weight, weight_sf, weight_scale2)
+                @ dequantize_nvfp4(activation, activation_sf, input_scale)
+            )
+            if split_accumulator is not None
+            else reference
+        )
+        expected = expected_source.reshape(args.m, 1).expand_as(output_matrix)
         max_abs = (comparison.float() - reference.float()).abs().max().item()
         mean_rel = (
             (comparison.float() - reference.float()).abs().mean()
@@ -631,11 +737,15 @@ def main() -> None:
             )
 
         for _ in range(args.warmup):
+            if split_accumulator is not None:
+                split_accumulator.zero_()
             launcher.launch()
         torch.cuda.synchronize()
         kernel_timings = []
         task_timings = []
         for _ in range(args.iterations):
+            if split_accumulator is not None:
+                split_accumulator.zero_()
             launcher.launch()
             profile = launcher.profile[:, :4].cpu().numpy()
             kernel_timings.append(
@@ -651,6 +761,7 @@ def main() -> None:
             f"addressing={('routed_tiled' if args.routed_tiles else ('routed_native' if args.routed_native else 'static'))} "
             f"shape={args.m}x1x{args.k} sms={num_sms} "
             f"passes={2 if args.reuse_activation_pair else 1} "
+            f"split_k={args.split_k} "
             f"task_min_us={min(task_timings):.6f} "
             f"task_median_us={statistics.median(task_timings):.6f} "
             f"task_max_us={max(task_timings):.6f} "

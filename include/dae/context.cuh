@@ -55,8 +55,9 @@ static constexpr int numMemoryWarps = 4;
 // The resident SM100 runtime allocates TMEM once and shares a small bank of
 // completion barriers across sequential compute tasks. Barrier zero is the
 // ordinary single-UMMA completion barrier. Grouped BF16 GEMV owns barriers
-// 1..8. Native FP8 uses a disjoint four-stage full/empty ring so its issuer
-// and retire warps can overlap without perturbing either legacy phase state.
+// 1..8. Native FP8 and NVFP4 use disjoint four-stage full/empty rings so their
+// issuer and retire warps can overlap without perturbing legacy phase state or
+// each other's persistent barrier parity.
 static constexpr int tmemGroupedBarrierBase = 1;
 static constexpr int tmemGroupedBarrierCount = 8;
 static constexpr int fp8UmmaPipelineStages = 4;
@@ -64,8 +65,13 @@ static constexpr int fp8UmmaPipelineBarrierBase =
     tmemGroupedBarrierBase + tmemGroupedBarrierCount;
 static constexpr int fp8UmmaPipelineBarrierCount =
     fp8UmmaPipelineStages * 2;
-static constexpr int tmemMmaBarrierCount =
+static constexpr int nvfp4UmmaPipelineStages = 4;
+static constexpr int nvfp4UmmaPipelineBarrierBase =
     fp8UmmaPipelineBarrierBase + fp8UmmaPipelineBarrierCount;
+static constexpr int nvfp4UmmaPipelineBarrierCount =
+    nvfp4UmmaPipelineStages * 2;
+static constexpr int tmemMmaBarrierCount =
+    nvfp4UmmaPipelineBarrierBase + nvfp4UmmaPipelineBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);

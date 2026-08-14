@@ -120,7 +120,7 @@ void dae2(
   // block per SM, so acquire TMEM once for the lifetime of the megakernel and
   // reuse it across sequential compute tasks.
   __shared__ alignas(16) uint32_t tmem_base_ptr;
-  // Barrier ownership is declared in context.cuh. The extra FP8 bank is
+  // Barrier ownership is declared in context.cuh. The FP8/NVFP4 banks are
   // task-local planning over this resident array; no TMEM/runtime allocation
   // protocol changes between projection shapes.
   __shared__ alignas(16) uint64_t tmem_mma_barriers[tmemMmaBarrierCount];
@@ -172,6 +172,7 @@ void dae2(
     }
     uint32_t tmem_mma_phase = 0;
     uint32_t fp8_umma_pipeline_phase_mask = 0;
+    uint32_t nvfp4_umma_pipeline_phase_mask = 0;
     bool finish = false;
 
     while (!finish) {
@@ -190,6 +191,7 @@ void dae2(
         tmem_mma_barriers,
         tmem_mma_phase,
         fp8_umma_pipeline_phase_mask,
+        nvfp4_umma_pipeline_phase_mask,
         scratch_space,
         st_insts,
         m2c,

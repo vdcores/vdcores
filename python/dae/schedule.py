@@ -764,18 +764,26 @@ class SchedNvfp4GemvUmmaStream(Schedule):
         alpha,
         output,
         *,
-        activation_mode="stream",
+        activation_mode="load",
+        activation_tiles_per_load=None,
+        pipeline=False,
     ):
         super().__init__()
         self.weight_tiles = weight_tiles
         self.activation_tiles = activation_tiles
         self.alpha = alpha
         self.output = output
-        if activation_mode not in ("stream", "load", "retain", "reuse"):
+        if activation_mode not in ("load", "retain", "reuse"):
             raise ValueError(
-                "native activation_mode must be stream, load, retain, or reuse"
+                "native activation_mode must be load, retain, or reuse"
             )
         self.activation_mode = activation_mode
+        self.activation_tiles_per_load = (
+            None
+            if activation_tiles_per_load is None
+            else int(activation_tiles_per_load)
+        )
+        self.pipeline = bool(pipeline)
 
     def _on_place(self):
         if (
@@ -800,19 +808,51 @@ class SchedNvfp4GemvUmmaStream(Schedule):
             raise ValueError("streaming NVFP4 alpha storage must contain four FP32 values")
         if self.output.dtype != torch.bfloat16 or self.output.numel() != self.rows:
             raise ValueError("streaming NVFP4 output must contain M BF16 values")
+        if self.activation_mode == "load":
+            if self.activation_tiles_per_load is None:
+                self.activation_tiles_per_load = (
+                    min(4, self.k_tiles) if self.pipeline else 1
+                )
+            if not 0 < self.activation_tiles_per_load <= self.k_tiles:
+                raise ValueError(
+                    "NVFP4 activation tiles per load must be in [1,K tiles]"
+                )
+            if (
+                not self.pipeline
+                and self.activation_tiles_per_load not in (1, self.k_tiles)
+            ):
+                raise ValueError(
+                    "legacy NVFP4 UMMA supports one or all activation tiles "
+                    "per load"
+                )
+        else:
+            if self.activation_tiles_per_load not in (None, self.k_tiles):
+                raise ValueError(
+                    "retained/reused NVFP4 activation must cover all K tiles"
+                )
+            self.activation_tiles_per_load = self.k_tiles
 
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
-        instructions = [
-            Nvfp4GemvUmmaStreamSm100(
+        if self.pipeline:
+            compute = Nvfp4GemvUmmaPipelineSm100(
                 self.k_tiles,
                 retain_activation=self.activation_mode == "retain",
-                bulk_activation=self.activation_mode != "stream",
-            ),
-            TmaLoad1D(self.alpha).fixed_port(1),
-        ]
-        if self.activation_mode == "load":
+                activation_tiles_per_load=self.activation_tiles_per_load,
+            )
+        else:
+            compute = Nvfp4GemvUmmaStreamSm100(
+                self.k_tiles,
+                retain_activation=self.activation_mode == "retain",
+                bulk_activation=self.activation_tiles_per_load == self.k_tiles,
+            )
+        instructions = [compute, TmaLoad1D(self.alpha).fixed_port(1)]
+        if (
+            self.activation_mode == "load"
+            and not self.pipeline
+            and self.activation_tiles_per_load == self.k_tiles
+        ):
             instructions.append(
                 TmaLoad1D(self.activation_tiles.reshape(-1)).fixed_port(1)
             )
@@ -824,18 +864,39 @@ class SchedNvfp4GemvUmmaStream(Schedule):
             )
         elif self.activation_mode == "reuse":
             instructions.append(RegLoad(0, slot_id=0).fixed_port(1))
-        for tile in range(self.k_tiles):
+
+        def append_weight(tile):
             instructions.append(
-                TmaLoad1D(
-                    self.weight_tiles[sm, tile].reshape(-1)
-                ).fixed_port(0)
+                TmaLoad1D(self.weight_tiles[sm, tile].reshape(-1)).fixed_port(0)
             )
-            if self.activation_mode == "stream":
+
+        if self.pipeline and self.activation_mode == "load":
+            for chunk_start in range(
+                0, self.k_tiles, self.activation_tiles_per_load
+            ):
+                chunk_stop = min(
+                    chunk_start + self.activation_tiles_per_load,
+                    self.k_tiles,
+                )
                 instructions.append(
                     TmaLoad1D(
-                        self.activation_tiles[tile].reshape(-1)
+                        self.activation_tiles[chunk_start:chunk_stop].reshape(-1)
                     ).fixed_port(1)
                 )
+                for tile in range(chunk_start, chunk_stop):
+                    append_weight(tile)
+        else:
+            for tile in range(self.k_tiles):
+                append_weight(tile)
+                if (
+                    self.activation_mode == "load"
+                    and self.activation_tiles_per_load == 1
+                ):
+                    instructions.append(
+                        TmaLoad1D(
+                            self.activation_tiles[tile].reshape(-1)
+                        ).fixed_port(1)
+                    )
         row_start = sm * self.TILE_M
         instructions.append(
             TmaStore1D(
@@ -871,6 +932,9 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         output_mode="store",
         output_register=0,
         output_port=0,
+        pipeline=False,
+        activation_tiles_per_load=None,
+        output_scale=None,
     ):
         super().__init__()
         self.routing_state = routing_state
@@ -880,13 +944,16 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         self.activation_tiles = activation_tiles
         self.output = output
         self.route_ready = bool(route_ready)
-        if activation_mode not in ("stream", "load", "retain", "reuse"):
+        if activation_mode not in ("load", "retain", "reuse"):
             raise ValueError(
-                "routed native activation_mode must be stream, load, retain, or reuse"
+                "routed native activation_mode must be load, retain, or reuse"
             )
         self.activation_mode = activation_mode
-        if output_mode not in ("store", "retain"):
-            raise ValueError("routed native output_mode must be store or retain")
+        if output_mode not in ("store", "retain", "fp32_store", "reduce"):
+            raise ValueError(
+                "routed native output_mode must be store, retain, "
+                "fp32_store, or reduce"
+            )
         if not 0 <= output_register < 4:
             raise ValueError("routed native output register must be in [0, 4)")
         if output_port not in (0, 1):
@@ -894,6 +961,13 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         self.output_mode = output_mode
         self.output_register = output_register
         self.output_port = output_port
+        self.pipeline = bool(pipeline)
+        self.output_scale = output_scale
+        self.activation_tiles_per_load = (
+            None
+            if activation_tiles_per_load is None
+            else int(activation_tiles_per_load)
+        )
 
     def _on_place(self):
         if self.routing_state.device.type != "cuda":
@@ -913,6 +987,30 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         ):
             raise ValueError("routed activation tiles must be [K/256,3072] uint8")
         self.k_tiles = self.activation_tiles.shape[0]
+        if self.activation_mode == "load":
+            if self.activation_tiles_per_load is None:
+                self.activation_tiles_per_load = (
+                    min(4, self.k_tiles) if self.pipeline else self.k_tiles
+                )
+            if not 0 < self.activation_tiles_per_load <= self.k_tiles:
+                raise ValueError(
+                    "routed NVFP4 activation tiles per load must be in "
+                    "[1,K tiles]"
+                )
+            if (
+                not self.pipeline
+                and self.activation_tiles_per_load not in (1, self.k_tiles)
+            ):
+                raise ValueError(
+                    "legacy routed NVFP4 UMMA supports one or all activation "
+                    "tiles per load"
+                )
+        else:
+            if self.activation_tiles_per_load not in (None, self.k_tiles):
+                raise ValueError(
+                    "retained/reused routed activation must cover all K tiles"
+                )
+            self.activation_tiles_per_load = self.k_tiles
         for field in (
             *self.weight_fields,
             self.alpha_field,
@@ -927,8 +1025,55 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                 or self.output.numel() != self.rows
             ):
                 raise ValueError("routed native output must contain M BF16 values")
-        elif self.output is not None:
-            raise ValueError("retained routed native output must not name HBM storage")
+            if self.output_scale is not None:
+                raise ValueError("stored routed output does not take an output scale")
+        elif self.output_mode == "retain":
+            if self.output is not None:
+                raise ValueError(
+                    "retained routed native output must not name HBM storage"
+                )
+            if self.output_scale is not None:
+                raise ValueError("retained routed output does not take an output scale")
+        elif self.output_mode == "fp32_store":
+            if (
+                self.output is None
+                or self.output.dtype != torch.float32
+                or self.output.numel() != self.rows
+                or not self.output.is_contiguous()
+            ):
+                raise ValueError(
+                    "routed FP32 output must contain one contiguous M vector"
+                )
+            if (
+                self.output_scale is None
+                or self.output_scale.dtype != torch.float32
+                or self.output_scale.numel() < 1
+                or not self.output_scale.is_contiguous()
+            ):
+                raise ValueError(
+                    "routed FP32 output requires a contiguous FP32 scale"
+                )
+        else:
+            reduce_output = getattr(self.output, "mat", None)
+            if (
+                getattr(self.output, "mode", None) != "reduce"
+                or reduce_output is None
+                or reduce_output.dtype != torch.float32
+                or tuple(reduce_output.shape) != (1, self.rows)
+                or not reduce_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "routed reduced output must be row-major FP32 [1,M]"
+                )
+            if (
+                self.output_scale is None
+                or self.output_scale.dtype != torch.float32
+                or self.output_scale.numel() < 1
+                or not self.output_scale.is_contiguous()
+            ):
+                raise ValueError(
+                    "routed reduced output requires a contiguous FP32 scale"
+                )
         if self.output_mode == "retain" and self.num_sms != self.m_tiles:
             raise ValueError(
                 "retained routed output requires one M128 tile per SM"
@@ -948,20 +1093,71 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             raise ValueError("routed native NVFP4 GEMV requires a route barrier")
         tile_start, tile_count = self._tile_shard(sm)
         instructions = []
-        for local_index, output_tile in enumerate(
-            range(tile_start, tile_start + tile_count)
-        ):
-            first_output = local_index == 0
-            final_output = local_index + 1 == tile_count
-            retain = self.activation_mode == "retain" or not final_output
-            bulk = self.activation_mode != "stream"
-            instructions.append(
-                Nvfp4GemvUmmaStreamSm100(
+        local_tiles = tuple(range(tile_start, tile_start + tile_count))
+        for task_start in range(tile_count):
+            task_tiles = (local_tiles[task_start],)
+            output_groups = 1
+            first_output = task_start == 0
+            final_output = task_start + output_groups == tile_count
+            if self.activation_mode == "retain":
+                activation_kind = "retain" if first_output else "reuse"
+            elif self.activation_mode == "reuse":
+                activation_kind = "reuse"
+            elif (
+                self.pipeline
+                and self.activation_tiles_per_load != self.k_tiles
+            ):
+                # A partial activation allocation cannot outlive this task.
+                # Stream the requested number of K tiles for every output tile
+                # instead of silently promoting the parameter to a full-K
+                # retained allocation when an SM owns multiple output tiles.
+                activation_kind = "load"
+            elif first_output:
+                activation_kind = "retain" if not final_output else "load"
+            else:
+                activation_kind = "reuse"
+            retain = activation_kind == "retain"
+            task_activation_tiles_per_load = (
+                self.activation_tiles_per_load
+                if activation_kind == "load"
+                else self.k_tiles
+            )
+            if (
+                self.output_mode in ("fp32_store", "reduce")
+                and self.pipeline
+            ):
+                compute = Nvfp4GemvUmmaPipelineFp32Sm100(
                     self.k_tiles,
                     retain_activation=retain,
-                    bulk_activation=bulk,
+                    activation_tiles_per_load=(
+                        task_activation_tiles_per_load
+                    ),
                 )
-            )
+            elif self.output_mode in ("fp32_store", "reduce"):
+                compute = Nvfp4GemvUmmaFp32Sm100(
+                    self.k_tiles,
+                    retain_activation=retain,
+                    bulk_activation=(
+                        task_activation_tiles_per_load == self.k_tiles
+                    ),
+                )
+            elif self.pipeline:
+                compute = Nvfp4GemvUmmaPipelineSm100(
+                    self.k_tiles,
+                    retain_activation=retain,
+                    activation_tiles_per_load=(
+                        task_activation_tiles_per_load
+                    ),
+                )
+            else:
+                compute = Nvfp4GemvUmmaStreamSm100(
+                    self.k_tiles,
+                    retain_activation=retain,
+                    bulk_activation=(
+                        task_activation_tiles_per_load == self.k_tiles
+                    ),
+                )
+            instructions.append(compute)
             alpha_load = RoutedTmaLoad1D(
                 self.routing_state,
                 self.route_rank,
@@ -971,18 +1167,18 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             if first_output and route_bar is not None:
                 alpha_load.bar(route_bar)
             instructions.append(alpha_load)
+            if self.output_mode in ("fp32_store", "reduce"):
+                instructions.append(
+                    _shared_load_1d(
+                        self.output_scale, bytes=4
+                    ).fixed_port(1)
+                )
 
-            if self.activation_mode == "stream":
-                activation_kind = "stream"
-            elif self.activation_mode == "retain":
-                activation_kind = "retain" if first_output else "reuse"
-            elif self.activation_mode == "reuse":
-                activation_kind = "reuse"
-            elif first_output:
-                activation_kind = "retain" if not final_output else "load"
-            else:
-                activation_kind = "reuse"
-            if activation_kind == "load":
+            if (
+                activation_kind == "load"
+                and not self.pipeline
+                and task_activation_tiles_per_load == self.k_tiles
+            ):
                 instructions.append(
                     TmaLoad1D(self.activation_tiles.reshape(-1)).fixed_port(1)
                 )
@@ -995,7 +1191,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             elif activation_kind == "reuse":
                 instructions.append(RegLoad(0, slot_id=0).fixed_port(1))
 
-            for k_tile in range(self.k_tiles):
+            def append_weight(output_tile, k_tile, output_group):
                 if k_tile == 0:
                     weight_load = RoutedTmaLoadBase1D(
                         self.routing_state,
@@ -1011,30 +1207,549 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                     )
                 if first_output and k_tile == 0 and route_bar is not None:
                     weight_load.bar(route_bar)
-                instructions.append(weight_load.fixed_port(0))
-                if activation_kind == "stream":
+                instructions.append(weight_load.fixed_port(output_group))
+
+            if self.pipeline and activation_kind == "load":
+                for chunk_start in range(
+                    0, self.k_tiles, task_activation_tiles_per_load
+                ):
+                    chunk_stop = min(
+                        chunk_start + task_activation_tiles_per_load,
+                        self.k_tiles,
+                    )
                     instructions.append(
                         TmaLoad1D(
-                            self.activation_tiles[k_tile].reshape(-1)
+                            self.activation_tiles[
+                                chunk_start:chunk_stop
+                            ].reshape(-1)
                         ).fixed_port(1)
                     )
-            if self.output_mode == "store":
-                row_start = output_tile * self.TILE_M
-                store = TmaStore1D(
-                    self.output[row_start : row_start + self.TILE_M]
-                )
-                if final_output:
-                    store.bar(self._bar("output"))
+                    for k_tile in range(chunk_start, chunk_stop):
+                        for output_group, output_tile in enumerate(task_tiles):
+                            append_weight(
+                                output_tile,
+                                k_tile,
+                                output_group,
+                            )
             else:
-                store = RegStore(
-                    self.output_register,
-                    size=self.TILE_M * 2,
-                ).fixed_port(self.output_port)
+                for k_tile in range(self.k_tiles):
+                    for output_group, output_tile in enumerate(task_tiles):
+                        append_weight(
+                            output_tile,
+                            k_tile,
+                            output_group,
+                        )
+                    if (
+                        activation_kind == "load"
+                        and task_activation_tiles_per_load == 1
+                    ):
+                        instructions.append(
+                            TmaLoad1D(
+                                self.activation_tiles[k_tile].reshape(-1)
+                            ).fixed_port(1)
+                        )
+            for output_group, output_tile in enumerate(task_tiles):
+                if self.output_mode == "store":
+                    row_start = output_tile * self.TILE_M
+                    store = TmaStore1D(
+                        self.output[row_start : row_start + self.TILE_M]
+                    )
+                elif self.output_mode == "fp32_store":
+                    row_start = output_tile * self.TILE_M
+                    store = TmaStore1D(
+                        self.output[row_start : row_start + self.TILE_M]
+                    )
+                elif self.output_mode == "reduce":
+                    row_start = output_tile * self.TILE_M
+                    store = self.output.cord(0, row_start)
+                else:
+                    store = RegStore(
+                        self.output_register,
+                        size=self.TILE_M * 2,
+                    ).fixed_port(self.output_port)
+                if final_output and output_group + 1 == output_groups:
+                    store.bar(self._bar("output"))
+                instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output" or self.output_mode == "retain":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedNvfp4GemvUmmaSplitK(Schedule):
+    """Shard native NVFP4 K and TMA-reduce route-scaled FP32 partials."""
+
+    TILE_M = SchedNvfp4UmmaPrepack.TILE_M
+    WEIGHT_TILE_BYTES = SchedNvfp4UmmaPrepack.WEIGHT_TILE_BYTES
+    ACTIVATION_TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(
+        self,
+        weight_tiles,
+        activation_tiles,
+        alpha,
+        output_scale,
+        output_reduce,
+        split_k: int,
+    ):
+        super().__init__()
+        self.weight_tiles = weight_tiles
+        self.activation_tiles = activation_tiles
+        self.alpha = alpha
+        self.output_scale = output_scale
+        self.output_reduce = output_reduce
+        self.split_k = int(split_k)
+
+    def _on_place(self):
+        if (
+            self.weight_tiles.dtype != torch.uint8
+            or self.weight_tiles.ndim != 3
+            or self.weight_tiles.shape[2] != self.WEIGHT_TILE_BYTES
+            or not self.weight_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "split-K NVFP4 weights must be [M/128,K/256,18432] uint8"
+            )
+        self.m_tiles, self.k_tiles, _ = self.weight_tiles.shape
+        if self.split_k <= 1 or self.k_tiles % self.split_k:
+            raise ValueError(
+                "split_k must divide NVFP4 K tiles and be greater than one"
+            )
+        self.k_tiles_per_split = self.k_tiles // self.split_k
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or tuple(self.activation_tiles.shape)
+            != (self.k_tiles, self.ACTIVATION_TILE_BYTES)
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "split-K NVFP4 activations must be [K/256,3072] uint8"
+            )
+        if (
+            self.alpha.dtype != torch.float32
+            or self.alpha.numel() != 4
+            or not self.alpha.is_contiguous()
+        ):
+            raise ValueError("split-K NVFP4 alpha storage must contain four FP32")
+        if (
+            self.output_scale.dtype != torch.float32
+            or self.output_scale.numel() < 1
+            or not self.output_scale.is_contiguous()
+        ):
+            raise ValueError("split-K NVFP4 output scale must contain FP32 data")
+        self.rows = self.m_tiles * self.TILE_M
+        output = getattr(self.output_reduce, "mat", None)
+        if (
+            getattr(self.output_reduce, "mode", None) != "reduce"
+            or output is None
+            or output.dtype != torch.float32
+            or tuple(output.shape) != (1, self.rows)
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "split-K NVFP4 output must be row-major FP32 reduce [1,M]"
+            )
+        self.work_tiles = self.m_tiles * self.split_k
+        if not 0 < self.num_sms <= self.work_tiles:
+            raise ValueError(
+                f"split-K NVFP4 GEMV requires 1..{self.work_tiles} SMs"
+            )
+
+    def _work_shard(self, sm):
+        work_per_sm, extra = divmod(self.work_tiles, self.num_sms)
+        work_start = sm * work_per_sm + min(sm, extra)
+        work_count = work_per_sm + int(sm < extra)
+        return work_start, work_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        work_start, work_count = self._work_shard(sm)
+        work_stop = work_start + work_count
+        instructions = []
+        for work in range(work_start, work_stop):
+            split = work // self.m_tiles
+            output_tile = work % self.m_tiles
+            k_start = split * self.k_tiles_per_split
+            k_stop = k_start + self.k_tiles_per_split
+            instructions.extend(
+                (
+                    Nvfp4GemvUmmaFp32Sm100(self.k_tiles_per_split),
+                    TmaLoad1D(self.alpha).fixed_port(1),
+                    _shared_load_1d(self.output_scale, bytes=4).fixed_port(1),
+                    TmaLoad1D(
+                        self.activation_tiles[k_start:k_stop].reshape(-1)
+                    ).fixed_port(1),
+                )
+            )
+            for k_tile in range(k_start, k_stop):
+                instructions.append(
+                    TmaLoad1D(
+                        self.weight_tiles[output_tile, k_tile].reshape(-1)
+                    ).fixed_port(0)
+                )
+            store = self.output_reduce.cord(
+                0, output_tile * self.TILE_M
+            )
+            if work + 1 == work_stop:
+                store.bar(self._bar("output"))
             instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):
-        if role != "output" or self.output_mode != "store":
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedRoutedNvfp4ExpertGroupSplitK(Schedule):
+    """Wave-shard all routed experts for one projection or a gate/up pair."""
+
+    TILE_M = SchedNvfp4UmmaPrepack.TILE_M
+    WEIGHT_TILE_BYTES = SchedNvfp4UmmaPrepack.WEIGHT_TILE_BYTES
+    ACTIVATION_TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(
+        self,
+        routing_state,
+        weight_field_groups,
+        alpha_fields,
+        activation_tiles,
+        output_reduces,
+        output_scale,
+        split_k: int,
+        *,
+        route_ready=False,
+        pipeline=False,
+        activation_tiles_per_load=None,
+        aggregate_routes=False,
+    ):
+        super().__init__()
+        self.routing_state = routing_state
+        self.weight_field_groups = tuple(
+            tuple(tuple(split_fields) for split_fields in output_fields)
+            for output_fields in weight_field_groups
+        )
+        self.alpha_fields = tuple(alpha_fields)
+        self.activation_tiles = activation_tiles
+        self.output_reduces = tuple(output_reduces)
+        self.output_scale = output_scale
+        self.split_k = int(split_k)
+        self.route_ready = bool(route_ready)
+        self.pipeline = bool(pipeline)
+        self.activation_tiles_per_load = (
+            None
+            if activation_tiles_per_load is None
+            else int(activation_tiles_per_load)
+        )
+        self.aggregate_routes = bool(aggregate_routes)
+
+    def _on_place(self):
+        if self.routing_state.device.type != "cuda":
+            raise ValueError("grouped routed state must be on CUDA")
+        self.output_groups = len(self.weight_field_groups)
+        if self.output_groups not in (1, 2):
+            raise ValueError("grouped routed split-K supports one or two outputs")
+        if len(self.alpha_fields) != self.output_groups:
+            raise ValueError("each grouped output requires one routed alpha field")
+        if len(self.output_reduces) != self.output_groups:
+            raise ValueError("each grouped output requires one TMA reduction tensor")
+        if self.output_groups == 2 and not self.pipeline:
+            raise ValueError("paired gate/up split-K requires the pipelined task")
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or self.activation_tiles.ndim != 3
+            or self.activation_tiles.shape[2] != self.ACTIVATION_TILE_BYTES
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "grouped activations must be contiguous [routes,K/256,3072] uint8"
+            )
+        self.route_count, self.k_tiles, _ = self.activation_tiles.shape
+        if not 0 < self.route_count <= RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("grouped routed split-K requires 1..6 routes")
+        if self.split_k <= 1 or self.k_tiles % self.split_k:
+            raise ValueError("grouped split_k must divide K tiles and exceed one")
+        self.k_tiles_per_split = self.k_tiles // self.split_k
+        if self.activation_tiles_per_load is None:
+            self.activation_tiles_per_load = min(4, self.k_tiles_per_split)
+        if not 0 < self.activation_tiles_per_load <= self.k_tiles_per_split:
+            raise ValueError(
+                "grouped activation tiles per load must be in [1,K/split_k]"
+            )
+        if not self.pipeline:
+            self.activation_tiles_per_load = self.k_tiles_per_split
+        m_tile_counts = {len(group) for group in self.weight_field_groups}
+        if len(m_tile_counts) != 1 or next(iter(m_tile_counts)) <= 0:
+            raise ValueError("grouped outputs must share one nonempty M tiling")
+        self.m_tiles = next(iter(m_tile_counts))
+        for group in self.weight_field_groups:
+            for split_fields in group:
+                if len(split_fields) != self.split_k:
+                    raise ValueError(
+                        "each grouped M tile requires one base field per K split"
+                    )
+                if any(
+                    field < 0 or field > RoutedTmaLoad1D.MAX_POINTER_FIELD
+                    for field in split_fields
+                ):
+                    raise ValueError("grouped routed fields must fit in 13 bits")
+        if any(
+            field < 0 or field > RoutedTmaLoad1D.MAX_POINTER_FIELD
+            for field in self.alpha_fields
+        ):
+            raise ValueError("grouped routed alpha fields must fit in 13 bits")
+        if (
+            self.output_scale.dtype != torch.float32
+            or self.output_scale.numel() not in (1, self.route_count)
+            or not self.output_scale.is_contiguous()
+        ):
+            raise ValueError("grouped output scale must be scalar or one FP32/route")
+        self.rows = self.m_tiles * self.TILE_M
+        expected_rows = 1 if self.aggregate_routes else self.route_count
+        for output_reduce in self.output_reduces:
+            output = getattr(output_reduce, "mat", None)
+            if (
+                getattr(output_reduce, "mode", None) != "reduce"
+                or output is None
+                or output.dtype != torch.float32
+                or tuple(output.shape) != (expected_rows, self.rows)
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    "grouped split-K output must be FP32 TMA reduce "
+                    f"[{expected_rows},{self.rows}]"
+                )
+        self.work_tiles = self.route_count * self.m_tiles * self.split_k
+        if not 0 < self.num_sms <= self.work_tiles:
+            raise ValueError(
+                f"grouped routed split-K requires 1..{self.work_tiles} SMs"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        route_bar = self._bar("route")
+        if route_bar is None and not self.route_ready:
+            raise ValueError("grouped routed split-K requires a route barrier")
+        instructions = []
+        first_work = True
+        for work in range(sm, self.work_tiles, self.num_sms):
+            inner_work, route_rank = divmod(work, self.route_count)
+            split, output_tile = divmod(inner_work, self.m_tiles)
+            k_start = split * self.k_tiles_per_split
+            k_stop = k_start + self.k_tiles_per_split
+            if self.output_groups == 2:
+                compute = Nvfp4GemvUmmaPipelineFp32Group2Sm100(
+                    self.k_tiles_per_split,
+                    activation_tiles_per_load=self.activation_tiles_per_load,
+                )
+            elif self.pipeline:
+                compute = Nvfp4GemvUmmaPipelineFp32Sm100(
+                    self.k_tiles_per_split,
+                    activation_tiles_per_load=self.activation_tiles_per_load,
+                )
+            else:
+                compute = Nvfp4GemvUmmaFp32Sm100(
+                    self.k_tiles_per_split,
+                    bulk_activation=True,
+                )
+            instructions.append(compute)
+            for alpha_field in self.alpha_fields:
+                alpha_load = RoutedTmaLoad1D(
+                    self.routing_state,
+                    route_rank,
+                    alpha_field,
+                    16,
+                ).fixed_port(1)
+                if first_work and route_bar is not None:
+                    alpha_load.bar(route_bar)
+                instructions.append(alpha_load)
+            scale = (
+                self.output_scale.reshape(-1)[:1]
+                if self.output_scale.numel() == 1
+                else self.output_scale[route_rank : route_rank + 1]
+            )
+            instructions.append(
+                _shared_load_1d(scale, bytes=4).fixed_port(1)
+            )
+
+            def append_weight(group, local_k):
+                if local_k == 0:
+                    load = RoutedTmaLoadBase1D(
+                        self.routing_state,
+                        route_rank,
+                        self.weight_field_groups[group][output_tile][split],
+                        self.WEIGHT_TILE_BYTES,
+                    )
+                else:
+                    load = TmaLoadAddressReg1D(
+                        RoutedTmaLoadBase1D.ADDRESS_REGISTER,
+                        local_k * self.WEIGHT_TILE_BYTES,
+                        self.WEIGHT_TILE_BYTES,
+                    )
+                if first_work and local_k == 0 and route_bar is not None:
+                    load.bar(route_bar)
+                instructions.append(load.fixed_port(group))
+
+            if self.pipeline:
+                for chunk_start in range(
+                    0,
+                    self.k_tiles_per_split,
+                    self.activation_tiles_per_load,
+                ):
+                    chunk_stop = min(
+                        chunk_start + self.activation_tiles_per_load,
+                        self.k_tiles_per_split,
+                    )
+                    instructions.append(
+                        TmaLoad1D(
+                            self.activation_tiles[
+                                route_rank,
+                                k_start + chunk_start : k_start + chunk_stop,
+                            ].reshape(-1)
+                        ).fixed_port(0 if self.output_groups == 2 else 1)
+                    )
+                    for local_k in range(chunk_start, chunk_stop):
+                        for group in range(self.output_groups):
+                            append_weight(group, local_k)
+            else:
+                instructions.append(
+                    TmaLoad1D(
+                        self.activation_tiles[
+                            route_rank, k_start:k_stop
+                        ].reshape(-1)
+                    ).fixed_port(1)
+                )
+                for local_k in range(self.k_tiles_per_split):
+                    append_weight(0, local_k)
+
+            output_row = 0 if self.aggregate_routes else route_rank
+            final_work = work + self.num_sms >= self.work_tiles
+            for group, output_reduce in enumerate(self.output_reduces):
+                store = output_reduce.cord(
+                    output_row, output_tile * self.TILE_M
+                )
+                if final_work and group + 1 == self.output_groups:
+                    store.bar(self._bar("output"))
+                instructions.append(store)
+            first_work = False
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedRoutedDsv4Fp32SwiGluNvfp4QuantUmmaB(Schedule):
+    """Fuse FP32 gate/up activation directly into native W2 input tiles."""
+
+    TILE_K = 256
+    TILE_BYTES = SchedNvfp4UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(
+        self,
+        routing_state,
+        scale_field,
+        gate,
+        up,
+        output,
+        *,
+        route_ready=False,
+        swiglu_limit=10.0,
+    ):
+        super().__init__()
+        self.routing_state = routing_state
+        self.scale_field = scale_field
+        self.gate = gate
+        self.up = up
+        self.output = output
+        self.route_ready = bool(route_ready)
+        self.swiglu_limit = swiglu_limit
+
+    def _on_place(self):
+        if self.routing_state.device.type != "cuda":
+            raise ValueError("fused routed activation state must be on CUDA")
+        if not 0 <= self.scale_field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
+            raise ValueError("fused routed activation scale field must fit 13 bits")
+        if (
+            self.gate.dtype != torch.float32
+            or self.up.dtype != torch.float32
+            or self.gate.shape != self.up.shape
+            or self.gate.ndim != 2
+            or self.gate.shape[1] % self.TILE_K
+            or not self.gate.is_contiguous()
+            or not self.up.is_contiguous()
+        ):
+            raise ValueError(
+                "fused FP32 SwiGLU inputs must be contiguous [routes,K256]"
+            )
+        self.route_count, self.rows = self.gate.shape
+        if not 0 < self.route_count <= RoutedTmaLoad1D.ROUTE_COUNT:
+            raise ValueError("fused FP32 SwiGLU requires 1..6 routes")
+        self.k_tiles = self.rows // self.TILE_K
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape)
+            != (self.route_count, self.k_tiles, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                "fused FP32 SwiGLU output must be native uint8 "
+                "[routes,K/256,3072]"
+            )
+        self.work_tiles = self.route_count * self.k_tiles
+        if not 0 < self.num_sms <= self.work_tiles:
+            raise ValueError(
+                f"fused FP32 SwiGLU requires 1..{self.work_tiles} SMs"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        route_bar = self._bar("route")
+        if route_bar is None and not self.route_ready:
+            raise ValueError("fused FP32 SwiGLU requires a route barrier")
+        instructions = []
+        first_work = True
+        for work in range(sm, self.work_tiles, self.num_sms):
+            tile, route_rank = divmod(work, self.route_count)
+            start = tile * self.TILE_K
+            stop = start + self.TILE_K
+            scale = RoutedTmaLoad1D(
+                self.routing_state,
+                route_rank,
+                self.scale_field,
+                16,
+            ).fixed_port(1)
+            if first_work and route_bar is not None:
+                scale.bar(route_bar)
+            store = TmaStore1D(self.output[route_rank, tile].reshape(-1))
+            if work + self.num_sms >= self.work_tiles:
+                store.bar(self._bar("output"))
+            instructions.extend(
+                (
+                    Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100(
+                        1, self.swiglu_limit
+                    ),
+                    TmaLoad1D(
+                        self.gate[route_rank, start:stop]
+                    ).fixed_port(0),
+                    TmaLoad1D(
+                        self.up[route_rank, start:stop]
+                    ).fixed_port(1),
+                    scale,
+                    store,
+                )
+            )
+            first_work = False
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
 
@@ -3086,6 +3801,71 @@ class SchedDsv4ExpertReduce(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4ExpertTmaReduceFp32(Schedule):
+    """TMA reduce route-scaled FP32 expert tiles without cross-SM collisions."""
+
+    TILE = 128
+
+    def __init__(self, experts, output_reduce):
+        super().__init__()
+        self.experts = experts
+        self.output_reduce = output_reduce
+
+    def _on_place(self):
+        if (
+            self.experts.dtype != torch.float32
+            or self.experts.ndim != 2
+            or self.experts.shape[1] % self.TILE
+            or not self.experts.is_contiguous()
+        ):
+            raise ValueError(
+                "FP32 expert TMA reduction requires contiguous [E,M128-aligned]"
+            )
+        self.expert_count, self.rows = self.experts.shape
+        if self.expert_count <= 0:
+            raise ValueError("FP32 expert TMA reduction requires experts")
+        output = getattr(self.output_reduce, "mat", None)
+        if (
+            getattr(self.output_reduce, "mode", None) != "reduce"
+            or output is None
+            or output.dtype != torch.float32
+            or tuple(output.shape) != (1, self.rows)
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "FP32 expert output must be row-major TMA reduce [1,M]"
+            )
+        self.tiles = self.rows // self.TILE
+        if self.num_sms != self.tiles:
+            raise ValueError(
+                "collision-free FP32 expert reduction uses one SM per M128 tile"
+            )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        start = sm * self.TILE
+        stop = start + self.TILE
+        instructions = []
+        for expert in range(self.expert_count):
+            instructions.extend(
+                (
+                    Copy(1, self.TILE * 4),
+                    TmaLoad1D(
+                        self.experts[expert, start:stop]
+                    ).fixed_port(expert & 1),
+                    self.output_reduce.cord(0, start),
+                )
+            )
+        instructions[-1].bar(self._bar("output"))
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4Fp32Bf16Gemv(Schedule):
     TILE_K = 8192
 
@@ -3252,6 +4032,7 @@ class SchedDsv4HcPreRms(Schedule):
         output,
         post,
         comb,
+        zero_fp32_output=None,
         sinkhorn_iters=20,
         epsilon=1.0e-6,
         rms_epsilon=1.0e-6,
@@ -3265,6 +4046,7 @@ class SchedDsv4HcPreRms(Schedule):
         self.output = output
         self.post = post
         self.comb = comb
+        self.zero_fp32_output = zero_fp32_output
         self.sinkhorn_iters = sinkhorn_iters
         self.epsilon = epsilon
         self.rms_epsilon = rms_epsilon
@@ -3301,6 +4083,14 @@ class SchedDsv4HcPreRms(Schedule):
             or tuple(self.comb.shape) != (4, 4)
         ):
             raise ValueError("fused mHC/RMS comb must be FP32 [4,4]")
+        if self.zero_fp32_output is not None and (
+            self.zero_fp32_output.dtype != torch.float32
+            or self.zero_fp32_output.numel() != 4096
+            or not self.zero_fp32_output.is_contiguous()
+        ):
+            raise ValueError(
+                "fused mHC/RMS zero output must be contiguous FP32 [4096]"
+            )
         if self.epsilon <= 0 or self.rms_epsilon <= 0:
             raise ValueError("fused mHC/RMS epsilons must be positive")
 
@@ -3312,6 +4102,7 @@ class SchedDsv4HcPreRms(Schedule):
                 self.sinkhorn_iters,
                 self.epsilon,
                 self.rms_epsilon,
+                zero_fp32_output=self.zero_fp32_output is not None,
             ),
             TmaLoad1D(self.residual),
             TmaLoad1D(self.mixes),
@@ -3321,6 +4112,11 @@ class SchedDsv4HcPreRms(Schedule):
             TmaStore1D(self.output).bar(self._bar("output")),
             TmaStore1D(self.post),
             TmaStore1D(self.comb),
+            *(
+                (TmaStore1D(self.zero_fp32_output),)
+                if self.zero_fp32_output is not None
+                else ()
+            ),
         ]
 
     def bar_release_count(self, role: str):
@@ -3347,8 +4143,14 @@ class SchedDsv4HcPost(Schedule):
             raise ValueError(
                 "DeepSeek mHC post requires 16-byte-aligned equal shards"
             )
-        if self.branch.dtype != torch.bfloat16 or self.branch.numel() != 4096:
-            raise ValueError("mHC branch must contain 4096 BF16 values")
+        if (
+            self.branch.dtype not in (torch.bfloat16, torch.float32)
+            or self.branch.numel() != 4096
+            or not self.branch.is_contiguous()
+        ):
+            raise ValueError(
+                "mHC branch must contain 4096 contiguous BF16 or FP32 values"
+            )
         if self.residual.dtype != torch.bfloat16 or tuple(self.residual.shape) != (4, 4096):
             raise ValueError("mHC residual must be BF16 [4,4096]")
         if self.post.dtype != torch.float32 or self.post.numel() != 4:
@@ -3365,7 +4167,7 @@ class SchedDsv4HcPost(Schedule):
         start = sm * width
         stop = start + width
         instructions = [
-            Dsv4HcPost(width),
+            Dsv4HcPost(width, branch_fp32=self.branch.dtype == torch.float32),
             TmaLoad1D(self.branch[start:stop]),
             *(
                 TmaLoad1D(self.residual[branch, start:stop])

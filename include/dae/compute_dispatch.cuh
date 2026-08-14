@@ -28,6 +28,7 @@
   uint64_t *tmem_mma_barrier, \
   uint32_t &tmem_mma_phase, \
   uint32_t &fp8_umma_pipeline_phase_mask, \
+  uint32_t &nvfp4_umma_pipeline_phase_mask, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
   M2CQueue &m2c, \
@@ -173,6 +174,46 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_STREAM_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_PIPELINE_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
+             g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_nvfp4_gemv_umma_pipeline_sm100(
+      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+      tmem_mma_barrier, nvfp4_umma_pipeline_phase_mask, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_FP32_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
+             g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_nvfp4_gemv_umma_fp32_sm100(
+      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+      tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
+             g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_nvfp4_gemv_umma_pipeline_fp32_sm100(
+      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+      tmem_mma_barrier, nvfp4_umma_pipeline_phase_mask, m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_GROUP2_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
+             g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_nvfp4_gemv_umma_pipeline_fp32_group2_sm100(
+      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+      tmem_mma_barrier, nvfp4_umma_pipeline_phase_mask, m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_NVFP4_UMMA_PREPACK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
@@ -188,6 +229,17 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_NVFP4_QUANT_UMMA_B_SM100) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_dsv4_nvfp4_quant_umma_b_sm100(
       inst.args[0], smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_SWIGLU_NVFP4_QUANT_UMMA_B_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_fp32_swiglu_nvfp4_quant_umma_b_sm100(
+      inst.args[0],
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 #endif
 }
 
@@ -401,6 +453,7 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE) {
       inst.args[0],
       __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
       __float2bfloat16(0.0f),
+      false,
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
@@ -408,9 +461,10 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE_RMS) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
   task_dsv4_hc_pre<true>(
-      inst.args[0],
+      inst.args[0] & 0x7FFF,
       __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
       *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
+      (inst.args[0] & 0x8000) != 0,
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
@@ -418,7 +472,8 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_POST) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
              tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space,
              g_events);
-  task_dsv4_hc_post(inst.args[0], smem_base, m2c, c2m);
+  task_dsv4_hc_post(
+      inst.args[0], inst.args[1] != 0, smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_2048) {
@@ -1211,6 +1266,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint64_t *tmem_mma_barrier,
   uint32_t &tmem_mma_phase,
   uint32_t &fp8_umma_pipeline_phase_mask,
+  uint32_t &nvfp4_umma_pipeline_phase_mask,
   uint64_t *scratch_space,
   MInst *st_insts,
   M2CQueue &m2c,
@@ -1220,7 +1276,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, scratch_space, st_insts, m2c, c2m, g_events); \
+        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, scratch_space, st_insts, m2c, c2m, g_events); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP

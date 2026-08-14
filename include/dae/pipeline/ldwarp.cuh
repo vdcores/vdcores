@@ -4,17 +4,64 @@
 
 #include "virtualcore.cuh"
 
+constexpr int kLduRouteCount = 6;
+
+struct LduRouteExperts {
+  int rank0;
+  int rank1;
+  int rank2;
+  int rank3;
+  int rank4;
+  int rank5;
+};
+
+__device__ __forceinline__ int ldu_route_expert(
+    const LduRouteExperts &route_experts, int rank) {
+  switch (rank) {
+    case 0: return route_experts.rank0;
+    case 1: return route_experts.rank1;
+    case 2: return route_experts.rank2;
+    case 3: return route_experts.rank3;
+    case 4: return route_experts.rank4;
+    case 5: return route_experts.rank5;
+    default: return -1;
+  }
+}
+
+__device__ __forceinline__ void ldu_cache_route_experts(
+    uint64_t route_address, uint64_t &cached_route_address,
+    LduRouteExperts &route_experts) {
+  if (route_address == cached_route_address) {
+    return;
+  }
+  const auto *route_ids = reinterpret_cast<const int *>(route_address);
+  route_experts.rank0 = load_l2(route_ids + 0);
+  route_experts.rank1 = load_l2(route_ids + 1);
+  route_experts.rank2 = load_l2(route_ids + 2);
+  route_experts.rank3 = load_l2(route_ids + 3);
+  route_experts.rank4 = load_l2(route_ids + 4);
+  route_experts.rank5 = load_l2(route_ids + 5);
+  cached_route_address = route_address;
+}
+
+__device__ __forceinline__ void ldu_ensure_route_experts(
+    uint64_t route_address, uint64_t &cached_route_address,
+    LduRouteExperts &route_experts) {
+  ldu_cache_route_experts(
+      route_address, cached_route_address, route_experts);
+}
+
 __device__ __forceinline__ uint64_t ldu_resolve_routed_address(
-    uint64_t state_address, uint16_t encoded_field_rank) {
-  constexpr int kRouteCount = 6;
+    uint64_t state_address, uint16_t encoded_field_rank,
+    const LduRouteExperts &route_experts) {
   constexpr int kHeaderInts = 12;
   const auto *header = reinterpret_cast<const int *>(state_address);
   const int route_rank = encoded_field_rank & 0x7;
   const int pointer_field = encoded_field_rank >> 3;
-  if (route_rank < 0 || route_rank >= kRouteCount) {
+  if (route_rank < 0 || route_rank >= kLduRouteCount) {
     return 0;
   }
-  const int expert = load_l2(header + route_rank);
+  const int expert = ldu_route_expert(route_experts, route_rank);
   const int field_stride = load_l2(header + 8);
   const int expert_count = load_l2(header + 9);
   if (expert < 0 || expert >= expert_count ||
@@ -44,6 +91,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
   int regFile[4];
   uint64_t routedBaseAddress = 0;
+  uint64_t cachedRouteAddress = 0;
+  LduRouteExperts cachedRouteExperts;
 #if defined(DAE_TRACK_PROFILE)
   uint64_t dependency_wait_ns = 0;
   uint64_t dependency_contended = 0;
@@ -335,8 +384,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         // uint32 expert count, two padding words, then row-major uint64
         // pointer entries. The low three arg bits select the route rank; the
         // remaining bits select the pointer field.
-        const uint64_t resolved =
-            ldu_resolve_routed_address(inst.address, inst.arg);
+        ldu_ensure_route_experts(
+            inst.address, cachedRouteAddress, cachedRouteExperts);
+        const uint64_t resolved = ldu_resolve_routed_address(
+            inst.address, inst.arg, cachedRouteExperts);
         if (resolved == 0) {
           asm volatile("trap;");
         }
@@ -353,8 +404,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break;
       }
       case op(OP_ALLOC_ROUTED_TMA_LOAD_BASE_1D): {
-        const uint64_t resolved =
-            ldu_resolve_routed_address(inst.address, inst.arg);
+        ldu_ensure_route_experts(
+            inst.address, cachedRouteAddress, cachedRouteExperts);
+        const uint64_t resolved = ldu_resolve_routed_address(
+            inst.address, inst.arg, cachedRouteExperts);
         if (resolved == 0) {
           asm volatile("trap;");
         }
@@ -392,7 +445,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_1D):
       case op(OP_ALLOC_INDIRECT_ROUTED_TMA_LOAD_BASE_1D):
       case op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D): {
-        constexpr int kRouteCount = 6;
         constexpr int kHeaderInts = 12;
         // HBM descriptor: a fixed route-result pointer followed by the
         // current layer's ordinary RoutedAddressTable state pointer.
@@ -404,12 +456,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           asm volatile("trap;");
         }
         const auto *header = reinterpret_cast<const int *>(state_address);
-        const auto *route_ids = reinterpret_cast<const int *>(route_address);
+        ldu_ensure_route_experts(
+            route_address, cachedRouteAddress, cachedRouteExperts);
         const int route_rank = inst.arg & 0x7;
         const int pointer_field = inst.arg >> 3;
         uint64_t resolved = 0;
-        if (route_rank >= 0 && route_rank < kRouteCount) {
-          const int expert = load_l2(route_ids + route_rank);
+        if (route_rank >= 0 && route_rank < kLduRouteCount) {
+          const int expert = ldu_route_expert(
+              cachedRouteExperts, route_rank);
           const int field_stride = load_l2(header + 8);
           const int expert_count = load_l2(header + 9);
           if (expert >= 0 && expert < expert_count &&
@@ -516,6 +570,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       }
       case op(OP_LDU_RELOAD_BARRIERS): {
         produces_compute_operand = false;
+        // Route results are constant throughout one loop iteration.  Drop the
+        // LDU-local all-rank cache only after both ports have drained so the
+        // next layer/step cannot observe stale expert IDs.
+        cachedRouteAddress = 0;
         // Both LDU lanes reach this point only after all earlier commands on
         // their own ports have drained and the loop-tail STU dependency has
         // reached zero. The first rendezvous therefore makes it safe for each

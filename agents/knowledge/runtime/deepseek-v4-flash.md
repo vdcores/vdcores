@@ -1942,3 +1942,129 @@ all 72 schedule/runtime tests and the clean-room pre-attention smoke. Fused
 attention plus O_a passed at 128/129/160 rows with maximum absolute error
 0.003906/0.003906/0.001953, cosine similarity
 0.999308/0.994604/0.999232, and 28.448/29.280/29.056-us medians.
+
+## NVFP4 FFN K pipeline and grouped scheduling (2026-08-14)
+
+The NVFP4 UMMA family now has a real four-stage K256 pipeline. A task-local
+TMEM allocator reserves independent SFA/SFB columns per in-flight stage and
+independent FP32 accumulator columns per output group. Warp 0 issues UTCCP and
+UMMA without waiting for the preceding stage; warp 1 waits completion, retires
+the matching shared slots, and signals when a ring stage is reusable. Only the
+first K block uses zero accumulation, and the result drains once after the
+last K tile. The same compute task therefore serves split and nonsplit work;
+the following memory instruction determines whether the FP32 result is stored
+or TMA reduce-added. Activation loads carry a configurable number of adjacent
+K256 records, while weights remain tile-streamed.
+
+The paired specialization shares each activation load and SFB stage between
+gate and up while retaining separate routed alphas, SFA stages, and FP32
+accumulators. A grouped scheduler interleaves all six route ranks across each
+work wave and can run gate then up or paired gate/up. After split-K TMA
+reduction, one task applies bounded SwiGLU to the FP32 gate/up sums and emits
+the final native 3072-byte K256 NVFP4 W2 operand directly. It does not create a
+BF16 intermediate or run a repack. This boundary cannot legally move before
+split-K reduction because SwiGLU is nonlinear.
+
+Matched 200-sample top-6 medians were 44.960 us for the retained per-expert
+local schedule, 48.272 us for the best separate grouped schedule (gate/up
+split 4, W2 split 2), and 48.384 us for paired gate/up after balancing the
+shared activation load onto LDU0. Split 2/4/8 separate gate/up measured
+50.272/48.272/57.632 us; W2 split 4 regressed to 52.416 us. The grouped path
+improves W2/join by about 0.9 us but loses more at the FP32 gate/up reduction
+and fused activation boundary, so it remains an experimental benchmark path
+and is not selected for production.
+
+Both LDU lanes cache the complete six-expert routing decision in scalar
+registers, selected by a switch to avoid dynamically indexed local memory.
+The route-address key is invalidated at the barrier-reload boundary after the
+queues drain. The focused cache build moves from 54 to 56 registers without
+spills; the full resident image uses 99 registers, nine barriers, a 224-byte
+stack, and zero spills. Production's shared expert already begins from hidden
+readiness on disjoint SMs 96--151 while routing and routed experts use SMs
+0--95; shared W2 is split-K2, so Python list reordering does not expose an
+earlier dependency frontier.
+
+Framework-first baselines remain the acceptance reference. The vLLM/
+FlashInfer TRTLLM routed-expert graph measured 16.996 us without route packing
+(17.815 us including it); standalone FlashInfer W1/W2 kernels measured
+4.6016/3.6816 us, and DeepGEMM's closest FP8 cases measured 5.4416/4.0048 us.
+The isolated VDCores W1 split-K task reaches 3.808 us, but the 44.960-us full
+top-6 flow does not cross the framework result. Final worker verification
+passed 123 tests, and resident job `20260814T010022Z-2183840` preserved token
+2835 at a 0.330096-ms one-layer median over 20 samples.
+
+An exact two-schedule wave isolation keeps all 152 SMs active, 2,048 logical
+K-tile works, and the same worker-load histogram
+`{K8:32, K10:16, K12:8, K16:96}`. The one-wave form has 152 queue entries.
+The two-wave form has 152 entries carrying 2,000 tiles at queue index zero and
+eight K6 entries carrying 48 tiles at queue index one. Wave index is local
+persistent-SM queue depth, not a global barrier or another kernel launch; the
+second entries begin as their eight workers become free. Matched 20-warmup,
+200-sample jobs `20260814T032101Z-4004556` and
+`20260814T032116Z-4008300` both measured a 14.816-us frontier median. Thus the
+similar time is expected: K6+K6 and K12 give those eight workers the same
+logical load, while the split form differs mainly by one extra task epilogue,
+FP32 TMA-reduce boundary, and task prologue.
+
+This K6+K6 equality is worker-load accounting, not local accumulation: the two
+queued K6 tasks target different shared-expert M tiles. Exact operator counting
+shows 3,008 scheduled operators and 42,679,296 bytes for one wave versus 3,024
+operators and 42,683,392 bytes for two waves. All activation and weight loads
+are identical. The only delta is eight additional FP8 K6 compute-task entries
+and eight 512-byte FP32 TMA reduce-adds. Diagnostic compute markers from jobs
+`20260814T033711Z-29827` and `20260814T033733Z-34839` show the one-wave shared
+K12 class completing at 7.584 us and the two-wave K6 tail completing at 8.160
+us, while the unchanged routed K16 class completes at 13.904/13.920 us. The
+split tail therefore really costs about 0.576 us, but still has roughly 5.76
+us of slack before the routed critical frontier. The diagnostic final
+frontiers were 14.720 and 14.752 us; task markers perturb those values, so use
+the uninstrumented 14.816-us matched medians for the endpoint comparison.
+
+## Linear-1 4,096-tile worker schedule (2026-08-14)
+
+The gate-plus-up-only Linear-1 graph has 4,096 native UMMA tiles: 1,024 shared
+FP8 K128 tiles (`2 projections * 16 M tiles * 32 K tiles`) and 3,072 routed
+NVFP4 K256 tiles (`2 * 6 experts * 16 M * 16 K`). The schedule-only benchmark
+is `benchmarks/deepseek_v4_linear1_queues.py`; it uses the existing group-1
+FP32 UMMA and TMA-reduce handlers without rebuilding the operator image.
+Routing, packing, allocation, and output zeroing are outside its timed
+frontier. Queue validation proves exact K coverage for all 224 output rows.
+
+The best measured graph gives every SM one shared head, retains 152 routed K16
+anchors, and splits exactly 40 routed rows as K6+K5+K5. Thus every queue owns
+one K16 routed task; 40 queues also own K6, 80 also own K5, and 32 have no
+routed tail. The 152 shared heads are the feasible complement: 24 shared rows
+use K12+K6+K6+K4+K4, and eight use K14+K6+K6+K6. Longest routed tails are
+paired with shortest shared heads. Exact queue classes are 40
+`shared K4 + routed K16+K6`, eight `K4 + K16+K5`, 72 `K6 + K16+K5`, 24
+`K12 + K16`, and eight `K14 + K16`. There is no global barrier between the
+shared head and routed tail.
+
+The decisive split-count sweep used round-robin launches on one GPU to remove
+clock-ramp bias. Forty extra routed reductions (K8+K8 shards) measured 25.184
+us, the selected 80-extra plan measured 23.488 us, and 88 extra reductions
+measured 25.824 us. Fewer splits leave K24 routed tails; more splits create
+four-task queues and pay another task/reduction boundary. A mixed-size
+measured-cost search at the same task count was also slower (23.712 versus
+23.424 us in its matched run), so uniform K6+K5+K5 remains selected.
+
+Final 20,000-round warmup and 10,000-sample matched job
+`20260814T045121Z-1067772` measured 29.408 us for unsplit routed K16 and
+22.880 us for the selected schedule, a 6.528-us, 22.2%, or 1.285x improvement.
+Their full persistent-kernel medians were 29.792 and 23.264 us. These numbers
+cover gate and up only: no SiLU, W2, routing operator, or checkpoint conversion
+is included.
+
+The matching framework comparison must distinguish single-step latency from
+graph-amortized throughput. On the same GB200, vLLM 0.27.1 with FlashInfer
+0.6.16.post3 measured 16.9344 us for the full routed-MoE graph at `inner=20`,
+but 22.064 us at `inner=1` in job `20260814T050752Z-1300427`. A 20,000-warmup
+Nsight capture, job `20260814T050533Z-1270278`, measured the fused six-expert
+routed gate+up+SwiGLU kernel itself at 9.536 us. The corresponding shared
+FP8 gate+up DeepGEMM, shape M4096/K4096, measured 9.856 us at `inner=1` in job
+`20260814T050837Z-1311476`. Their serialized component sum is therefore
+19.392 us, 3.488 us or 18.0% below the current 22.880-us combined schedule.
+This is a component comparison rather than an observed fused vLLM frontier:
+FlashInfer excludes the shared expert and includes SwiGLU, while the current
+VDCores graph includes shared plus routed gate/up, stops at FP32 accumulators,
+and excludes SwiGLU.

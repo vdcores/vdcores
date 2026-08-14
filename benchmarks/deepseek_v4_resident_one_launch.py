@@ -149,6 +149,7 @@ class ResidentOneLaunchDecode:
         self.direct_splitk_bf16 = bool(self.splitk_components) and (
             args.fp8_splitk_reduction == "bf16"
         )
+        self.ffn_fp32_tma = args.ffn_reduction == "fp32-tma"
         self.splitk_accumulators: list[torch.Tensor] = []
         self._active_splitk_workspace: torch.Tensor | None = None
         self._active_splitk_offset = 0
@@ -230,6 +231,10 @@ class ResidentOneLaunchDecode:
         native_fp8_prefixes = []
         for layer_id in resident_layer_ids:
             attention_prefix = f"layers.{layer_id}.attn"
+            if self.ffn_fp32_tma:
+                native_fp8_prefixes.append(
+                    f"layers.{layer_id}.ffn.shared_experts.w2"
+                )
             if "q_a" in self.splitk_components:
                 native_fp8_prefixes.append(f"{attention_prefix}.wq_a")
             if "kv" in self.splitk_components:
@@ -751,6 +756,15 @@ class ResidentOneLaunchDecode:
             dtype=torch.float8_e8m0fnu,
             device=d,
         )
+        if self.ffn_fp32_tma:
+            self.shared_middle_native_fp8 = torch.empty(
+                (cfg.expert_intermediate_size // 128, 2048),
+                dtype=torch.uint8,
+                device=d,
+            )
+            self.ffn_accumulator = torch.empty(
+                (1, cfg.hidden_size), dtype=torch.float32, device=d
+            )
         self.shared_output = torch.empty(
             (cfg.hidden_size,), dtype=torch.bfloat16, device=d
         )
@@ -1158,6 +1172,58 @@ class ResidentOneLaunchDecode:
         )
         return [gemv, finalize]
 
+    def _native_fp8_reduce_stage(
+        self,
+        name: str,
+        family: LayerFamily,
+        suffix: str,
+        activation: torch.Tensor,
+        output_reduce,
+        *,
+        split_k: int,
+        placement: tuple[int, int] | None = None,
+        wait_group: str | None = None,
+        release_group: str | None = None,
+    ) -> Stage:
+        """Write native-FP8 UMMA accumulators directly through TMA reduce."""
+
+        linears = tuple(
+            self.checkpoint.load_native_fp8_linear(
+                f"layers.{layer_id}.{suffix}", device=self.device
+            )
+            for layer_id in family.layer_ids
+        )
+        weights = tuple(linear.weight_tiles for linear in linears)
+        scale_packs = {linear.scale_pack for linear in linears}
+        if len(scale_packs) != 1:
+            raise ValueError("layered native FP8 weights must share scale packing")
+        scale_pack = scale_packs.pop()
+        schedule = SchedFp8GemvUmmaSplitK(
+            weights[0],
+            activation,
+            output_reduce,
+            split_k,
+            scale_pack,
+            self.args.fp8_umma_output_group_size,
+        )
+        schedule = self._layered(schedule, family, weights)
+        rows = weights[0].shape[0] * 128
+        if placement is None:
+            k = activation.shape[0] * 128
+            _, policy_sms = self.policy.fp8_umma_split_k(rows, k)
+            base_sm = 0
+            num_sms = min(policy_sms, rows // 128 * split_k)
+        else:
+            base_sm, num_sms = placement
+        return self._stage(
+            name,
+            schedule,
+            num_sms,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+        )
+
     def _bf16_linear_stage(
         self,
         name: str,
@@ -1348,7 +1414,11 @@ class ResidentOneLaunchDecode:
         branch_name: str,
         residual: torch.Tensor,
         output_residual: torch.Tensor,
+        *,
+        branch: torch.Tensor | None = None,
+        zero_fp32_output: torch.Tensor | None = None,
     ) -> tuple[list[Stage], Stage]:
+        branch = self.branch if branch is None else branch
         functions = self._family_tensors(family, f"hc_{branch_name}_fn")
         scales = self._family_tensors(family, f"hc_{branch_name}_scale")
         bases = self._family_tensors(family, f"hc_{branch_name}_base")
@@ -1373,6 +1443,7 @@ class ResidentOneLaunchDecode:
             self.norm_hidden,
             self.post,
             self.comb,
+            zero_fp32_output=zero_fp32_output,
             rms_epsilon=self.config.rms_epsilon,
         )
         pre = self._layered(
@@ -1382,7 +1453,7 @@ class ResidentOneLaunchDecode:
         post_stage = self._stage(
             f"{branch_name}.hc_post",
             SchedDsv4HcPost(
-                self.branch,
+                branch,
                 residual,
                 self.post,
                 self.comb,
@@ -2923,6 +2994,9 @@ class ResidentOneLaunchDecode:
         output_mode: str = "store",
         output_register: int = 0,
         output_port: int = 0,
+        output_scale: torch.Tensor | None = None,
+        pipeline: bool = False,
+        activation_tiles_per_load: int | None = None,
         placement: tuple[int, int] | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
@@ -2950,6 +3024,9 @@ class ResidentOneLaunchDecode:
             output_mode=output_mode,
             output_register=output_register,
             output_port=output_port,
+            output_scale=output_scale,
+            pipeline=pipeline,
+            activation_tiles_per_load=activation_tiles_per_load,
         )
         schedule = self._routed_layered(schedule, family, tables)
         return self._stage(
@@ -2983,8 +3060,29 @@ class ResidentOneLaunchDecode:
         shared_sms = self.sms - routed_sms
         if shared_sms <= 0:
             raise ValueError("FFN placement has no SMs left for the shared expert")
+        w2_routed_sms = self.args.ffn_w2_routed_sms
+        w2_shared_base = cfg.experts_per_token * w2_routed_sms
+        w2_shared_sms = self.sms - w2_shared_base
+        if not 0 < w2_routed_sms <= cfg.hidden_size // 128:
+            raise ValueError("routed W2 placement must use 1..M/128 SMs")
+        if not 0 < w2_shared_sms <= 2 * (cfg.hidden_size // 128):
+            raise ValueError("shared split-K W2 placement must use 1..64 SMs")
+        output_reduce = None
+        ffn_branch = self.branch
+        if self.ffn_fp32_tma:
+            output_reduce = TmaTensor(
+                self.launcher, self.ffn_accumulator
+            ).rowmajor_2d("reduce", 1, 128)
+            ffn_branch = self.ffn_accumulator.reshape(-1)
         stages, post = self._hc_stages(
-            family, "ffn", self.next_residual, self.residual
+            family,
+            "ffn",
+            self.next_residual,
+            self.residual,
+            branch=ffn_branch,
+            zero_fp32_output=(
+                ffn_branch if self.ffn_fp32_tma else None
+            ),
         )
         ffn_input_ready = f"{family.name}.ffn.input.ready"
         stages[-1] = replace(stages[-1], release_group=ffn_input_ready)
@@ -3031,6 +3129,7 @@ class ResidentOneLaunchDecode:
         route = self._layered(route, family, *route_groups)
         experts_ready = f"{family.name}.ffn.experts.ready"
         expert_join = f"{family.name}.ffn.experts.join"
+        deferred_w2: list[Stage] = []
         stages.append(
             self._stage(
                 "ffn.route",
@@ -3129,8 +3228,7 @@ class ResidentOneLaunchDecode:
                     release_group=down_ready,
                 )
             )
-            stages.append(
-                self._routed_native_linear_stage(
+            w2_stage = self._routed_native_linear_stage(
                     f"ffn.expert{rank}.w2",
                     family,
                     tables,
@@ -3139,12 +3237,27 @@ class ResidentOneLaunchDecode:
                     cfg.hidden_size,
                     cfg.expert_intermediate_size,
                     self.routed_middle_packed[rank],
-                    self.routed_output[rank],
-                    placement=(base_sm, branch_sms),
+                    (
+                        output_reduce
+                        if self.ffn_fp32_tma
+                        else self.routed_output[rank]
+                    ),
+                    output_mode=(
+                        "reduce" if self.ffn_fp32_tma else "store"
+                    ),
+                    output_scale=(
+                        self.route_weights[rank : rank + 1]
+                        if self.ffn_fp32_tma
+                        else None
+                    ),
+                    placement=(rank * w2_routed_sms, w2_routed_sms),
                     wait_group=down_ready,
                     release_group=expert_join,
-                )
             )
+            if w2_routed_sms == routed_branch_sms:
+                stages.append(w2_stage)
+            else:
+                deferred_w2.append(w2_stage)
 
         stages.append(
             self._fp8_linear_stage(
@@ -3183,43 +3296,73 @@ class ResidentOneLaunchDecode:
                 base_sm=shared_base,
             )
         )
-        stages.append(
-            self._fp8_quant_stage(
-                "ffn.shared.middle.quant_fp8",
-                self.shared_middle,
-                self.shared_middle_fp8,
-                self.shared_middle_scale,
-                placement=(
-                    shared_base,
-                    cfg.expert_intermediate_size // 128,
-                ),
+        if self.ffn_fp32_tma:
+            shared_down_ready = f"{family.name}.ffn.shared.down.ready"
+            shared_quant_sms = cfg.expert_intermediate_size // (
+                128 * self.args.fp8_umma_scale_pack
             )
-        )
-        stages.append(
-            self._fp8_linear_stage(
-                "ffn.shared.w2",
-                family,
-                "ffn.shared_experts.w2",
-                self.shared_middle_fp8,
-                self.shared_middle_scale,
-                self.shared_output,
-                placement=(shared_base, shared_sms),
-                release_group=expert_join,
+            stages.append(
+                self._native_fp8_quant_stage(
+                    "ffn.shared.middle.quant_native_fp8",
+                    self.shared_middle,
+                    self.shared_middle_native_fp8,
+                    placement=(shared_base, shared_quant_sms),
+                    release_group=shared_down_ready,
+                )
             )
-        )
-        stages.append(
-            self._stage(
-                "ffn.expert_reduce",
-                SchedDsv4ExpertReduce(
-                    self.routed_output,
-                    self.route_weights[: cfg.experts_per_token],
+            stages.extend(deferred_w2)
+            stages.append(
+                self._native_fp8_reduce_stage(
+                    "ffn.shared.w2",
+                    family,
+                    "ffn.shared_experts.w2",
+                    self.shared_middle_native_fp8,
+                    output_reduce,
+                    split_k=2,
+                    placement=(w2_shared_base, w2_shared_sms),
+                    wait_group=shared_down_ready,
+                    release_group=expert_join,
+                )
+            )
+            stages.append(replace(post, wait_group=expert_join))
+        else:
+            stages.append(
+                self._fp8_quant_stage(
+                    "ffn.shared.middle.quant_fp8",
+                    self.shared_middle,
+                    self.shared_middle_fp8,
+                    self.shared_middle_scale,
+                    placement=(
+                        shared_base,
+                        cfg.expert_intermediate_size // 128,
+                    ),
+                )
+            )
+            stages.append(
+                self._fp8_linear_stage(
+                    "ffn.shared.w2",
+                    family,
+                    "ffn.shared_experts.w2",
+                    self.shared_middle_fp8,
+                    self.shared_middle_scale,
                     self.shared_output,
-                    self.branch,
-                ),
-                wait_group=expert_join,
+                    placement=(shared_base, shared_sms),
+                    release_group=expert_join,
+                )
             )
-        )
-        stages.append(post)
+            stages.append(
+                self._stage(
+                    "ffn.expert_reduce",
+                    SchedDsv4ExpertReduce(
+                        self.routed_output,
+                        self.route_weights[: cfg.experts_per_token],
+                        self.shared_output,
+                        self.branch,
+                    ),
+                    wait_group=expert_join,
+                )
+            )
+            stages.append(post)
         return stages
 
     def _build_family(self, family: LayerFamily) -> list[Stage]:
@@ -3541,6 +3684,8 @@ class ResidentOneLaunchDecode:
             f"attention={self.args.attention_mode} "
             f"fp8_projection_mode={self.args.fp8_projection_mode} "
             f"fp8_splitk_reduction={self.args.fp8_splitk_reduction} "
+            f"ffn_reduction={self.args.ffn_reduction} "
+            f"ffn_w2_routed_sms={self.args.ffn_w2_routed_sms} "
             f"fp8_splitk_components={','.join(sorted(self.splitk_components)) or 'none'} "
             f"index_selection={self.args.index_selection_mode} "
             f"gated_pool={self.args.gated_pool_mode} "
@@ -4059,6 +4204,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ffn-reduction",
+        choices=("legacy", "fp32-tma"),
+        default="fp32-tma",
+        help=(
+            "select BF16 expert outputs plus a compute reducer, or direct "
+            "FP32 tensor-core outputs into one TMA reduce accumulator"
+        ),
+    )
+    parser.add_argument(
+        "--ffn-w2-routed-sms",
+        type=int,
+        default=16,
+        help=(
+            "SMs per routed W2 after the fixed 16-SM W1/W3 front half; "
+            "values above 16 defer W2 and repartition the full device"
+        ),
+    )
+    parser.add_argument(
         "--fp8-umma-scale-pack",
         type=int,
         choices=(2,),
@@ -4163,6 +4326,10 @@ def main() -> None:
         parser.error("sms/iterations must be positive and warmup non-negative")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
+    if args.ffn_reduction == "legacy" and args.ffn_w2_routed_sms != 16:
+        parser.error("repartitioned W2 requires --ffn-reduction fp32-tma")
+    if not 16 <= args.ffn_w2_routed_sms <= 25:
+        parser.error("ffn-w2-routed-sms must be in [16,25]")
     profile_modes = sum(
         (args.profile_layers, args.profile_stages, args.profile_steps)
     )
@@ -4274,6 +4441,8 @@ def main() -> None:
         f"layers={args.layers} token_id={args.token_id} "
         f"context={args.context_length} position={args.context_length - 1} "
         f"attention={args.attention_mode} "
+        f"ffn_reduction={args.ffn_reduction} "
+        f"ffn_w2_routed_sms={args.ffn_w2_routed_sms} "
         f"index_selection={args.index_selection_mode} "
         f"gated_pool={args.gated_pool_mode} "
         f"prefix_cache={'current_token' if args.context_length == 1 else 'deterministic_seeded'} "

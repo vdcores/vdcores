@@ -17,6 +17,7 @@ from dae.instructions import (
     Dsv4HcPreRms,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
+    Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100,
     Dsv4RmsFp8QuantUmmaBSm100,
     Dsv4Fp32ToBf16,
     Dsv4Nvfp4QuantUmmaBSm100,
@@ -41,6 +42,10 @@ from dae.instructions import (
     Fp8GemvUmmaStreamSm100,
     Fp8UmmaPrepackSm100,
     Nvfp4GemvSm100,
+    Nvfp4GemvUmmaPipelineSm100,
+    Nvfp4GemvUmmaPipelineFp32Sm100,
+    Nvfp4GemvUmmaPipelineFp32Group2Sm100,
+    Nvfp4GemvUmmaFp32Sm100,
     Nvfp4GemvUmmaStreamSm100,
     Nvfp4UmmaPrepackSm100,
     ProfileEvent,
@@ -51,6 +56,7 @@ from dae.instructions import (
     RegLoad,
     RegStore,
     TmaLoadAddressReg1D,
+    TmaLoad1D,
     TmaLoadReg1D,
     TmaTensor,
 )
@@ -73,6 +79,10 @@ from dae.schedule import (
     SchedDsv4Fp32ToBf16,
     SchedAttentionDecoding,
     SchedDsv4SwiGluShard128,
+    SchedNvfp4GemvUmmaSplitK,
+    SchedNvfp4GemvUmmaStream,
+    SchedRoutedDsv4Fp32SwiGluNvfp4QuantUmmaB,
+    SchedRoutedNvfp4ExpertGroupSplitK,
     SchedRoutedNvfp4GemvUmmaStream,
     SchedSmemSiLUInterleaved,
     SubgridSchedule,
@@ -451,6 +461,299 @@ def test_nvfp4_streaming_umma_encodes_retained_bulk_activation():
     assert instruction.args == [16, 1, 1]
 
 
+def test_nvfp4_pipeline_encodes_activation_tiles_per_load():
+    instruction = Nvfp4GemvUmmaPipelineSm100(
+        16, activation_tiles_per_load=4
+    )
+
+    assert instruction.args == [16, 0, 4]
+    with pytest.raises(ValueError, match="cover the full K operand"):
+        Nvfp4GemvUmmaPipelineSm100(
+            16,
+            retain_activation=True,
+            activation_tiles_per_load=4,
+        )
+
+
+def test_nvfp4_fp32_pipeline_encodes_activation_tiles_per_load():
+    instruction = Nvfp4GemvUmmaPipelineFp32Sm100(
+        8, activation_tiles_per_load=2
+    )
+
+    assert instruction.args == [8, 0, 2]
+
+
+def test_nvfp4_paired_fp32_pipeline_encodes_activation_batch():
+    instruction = Nvfp4GemvUmmaPipelineFp32Group2Sm100(
+        8, activation_tiles_per_load=4
+    )
+
+    assert instruction.opcode == (
+        opcode.OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_GROUP2_SM100
+    )
+    assert instruction.args == [8, 0, 4]
+
+
+def test_dsv4_fp32_swiglu_native_quant_encodes_tile_count_and_bound():
+    instruction = Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100(2, 10.0)
+
+    assert instruction.opcode == (
+        opcode.OP_DSV4_FP32_SWIGLU_NVFP4_QUANT_UMMA_B_SM100
+    )
+    assert instruction.args[0] == 2
+
+
+
+def test_nvfp4_pipeline_schedule_chunks_activation_by_parameter(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    instructions = SchedNvfp4GemvUmmaStream(
+        torch.empty((1, 4, 18432), dtype=torch.uint8),
+        torch.empty((4, 3072), dtype=torch.uint8),
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((128,), dtype=torch.bfloat16),
+        pipeline=True,
+        activation_tiles_per_load=2,
+    ).place(1).schedule(0)
+
+    assert instructions[0].args == [4, 0, 2]
+    assert len(instructions) == 9
+
+def test_routed_nvfp4_fp32_pipeline_keeps_partial_activation_batch(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeRoutingState:
+        device = FakeDevice()
+
+        @staticmethod
+        def data_ptr():
+            return 0x123456789ABC
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 12
+
+        @staticmethod
+        def element_size():
+            return 4
+
+    instructions = SchedRoutedNvfp4GemvUmmaStream(
+        FakeRoutingState(),
+        0,
+        (1, 2),
+        3,
+        torch.empty((4, 3072), dtype=torch.uint8),
+        torch.empty((256,), dtype=torch.float32),
+        output_mode="fp32_store",
+        output_scale=torch.ones((1,), dtype=torch.float32),
+        route_ready=True,
+        pipeline=True,
+        activation_tiles_per_load=2,
+    ).place(1).schedule(0)
+
+    compute = [
+        inst
+        for inst in instructions
+        if isinstance(inst, Nvfp4GemvUmmaPipelineFp32Sm100)
+    ]
+    assert [inst.args for inst in compute] == [[4, 0, 2], [4, 0, 2]]
+
+
+def test_nvfp4_splitk_maps_k_shards_and_tma_reduces_fp32(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    accumulator = torch.empty((1, 256), dtype=torch.float32)
+    output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
+        "reduce", 1, 128
+    )
+    schedule = SchedNvfp4GemvUmmaSplitK(
+        torch.empty((2, 4, 18432), dtype=torch.uint8),
+        torch.empty((4, 3072), dtype=torch.uint8),
+        torch.empty((4,), dtype=torch.float32),
+        torch.ones((1,), dtype=torch.float32),
+        output_reduce,
+        split_k=2,
+    ).place(4)
+
+    first = schedule.schedule(0)
+    second_split = schedule.schedule(2)
+    assert isinstance(first[0], Nvfp4GemvUmmaFp32Sm100)
+    assert first[0].args == second_split[0].args == [2, 0, 1]
+    assert first[-1].opcode == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
+    assert first[-1].size == 128 * accumulator.element_size()
+    assert second_split[3].cords != first[3].cords
+
+
+def test_grouped_routed_splitk_interleaves_routes_and_pairs_gate_up(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeRoutingState:
+        device = FakeDevice()
+
+        @staticmethod
+        def data_ptr():
+            return 0x123456789ABC
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 12
+
+        @staticmethod
+        def element_size():
+            return 4
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    gate = torch.empty((2, 256), dtype=torch.float32)
+    up = torch.empty_like(gate)
+    output_reduces = tuple(
+        TmaTensor(FakeLauncher(), output).rowmajor_2d("reduce", 1, 128)
+        for output in (gate, up)
+    )
+    schedule = SchedRoutedNvfp4ExpertGroupSplitK(
+        FakeRoutingState(),
+        (
+            ((10, 11), (12, 13)),
+            ((20, 21), (22, 23)),
+        ),
+        (30, 31),
+        torch.empty((2, 4, 3072), dtype=torch.uint8),
+        output_reduces,
+        torch.ones((1,), dtype=torch.float32),
+        split_k=2,
+        route_ready=True,
+        pipeline=True,
+        activation_tiles_per_load=2,
+    ).place(4)
+
+    route_zero = schedule.schedule(0)
+    route_one = schedule.schedule(1)
+    compute = [
+        inst
+        for inst in route_zero
+        if isinstance(inst, Nvfp4GemvUmmaPipelineFp32Group2Sm100)
+    ]
+    routed_zero = [
+        inst
+        for inst in route_zero
+        if isinstance(inst, RoutedTmaLoad1D)
+    ]
+    routed_one = [
+        inst
+        for inst in route_one
+        if isinstance(inst, RoutedTmaLoad1D)
+    ]
+    reductions = [
+        inst
+        for inst in route_zero
+        if isinstance(inst, MemoryInstruction)
+        and (inst.opcode & ~0x3F)
+        == (opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D & ~0x3F)
+    ]
+    activation_loads = [
+        inst
+        for inst in route_zero
+        if isinstance(inst, TmaLoad1D)
+        and inst.size == 2 * 3072
+    ]
+
+    assert len(compute) == 2
+    assert all(inst.args == [2, 0, 2] for inst in compute)
+    assert {inst.arg & 7 for inst in routed_zero} == {0}
+    assert {inst.arg & 7 for inst in routed_one} == {1}
+    assert len(reductions) == 4
+    assert len(activation_loads) == 2
+    assert all(not inst.opcode & 32 for inst in activation_loads)
+
+
+def test_grouped_fused_swiglu_stores_native_nvfp4_tiles(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeRoutingState:
+        device = FakeDevice()
+
+        @staticmethod
+        def data_ptr():
+            return 0x123456789ABC
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 12
+
+        @staticmethod
+        def element_size():
+            return 4
+
+    gate = torch.empty((2, 256), dtype=torch.float32)
+    up = torch.empty_like(gate)
+    output = torch.empty((2, 1, 3072), dtype=torch.uint8)
+    schedule = SchedRoutedDsv4Fp32SwiGluNvfp4QuantUmmaB(
+        FakeRoutingState(),
+        42,
+        gate,
+        up,
+        output,
+        route_ready=True,
+    ).place(2)
+
+    route_zero = schedule.schedule(0)
+    route_one = schedule.schedule(1)
+
+    assert isinstance(
+        route_zero[0], Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100
+    )
+    assert route_zero[0].args[0] == 1
+    assert route_zero[-1].size == route_one[-1].size == 3072
+    assert route_zero[3].arg == (42 << 3)
+    assert route_one[3].arg == (42 << 3) | 1
+
+
 def test_nvfp4_umma_prepack_encodes_kind_and_k_tile_count():
     instruction = Nvfp4UmmaPrepackSm100(
         Nvfp4UmmaPrepackSm100.ACTIVATION, 16
@@ -628,8 +931,10 @@ def test_dsv4_cleanroom_preattention_fusions_encode_shape_shards(monkeypatch):
 
 def test_dsv4_hc_post_encodes_local_width():
     instruction = Dsv4HcPost(128)
+    fp32_instruction = Dsv4HcPost(128, branch_fp32=True)
 
-    assert instruction.args == [128]
+    assert instruction.args == [128, 0]
+    assert fp32_instruction.args == [128, 1]
 
 
 def test_dsv4_hc_post_uses_shape_aligned_shared_shards(monkeypatch):
@@ -650,12 +955,23 @@ def test_dsv4_hc_post_uses_shape_aligned_shared_shards(monkeypatch):
         inst for inst in instructions if isinstance(inst, MemoryInstruction)
     ]
 
-    assert [inst.args for inst in compute] == [[128]]
+    assert [inst.args for inst in compute] == [[128, 0]]
     assert len(memory) == 11
     assert all(inst.num_slots == 1 for inst in memory)
     assignment = DeepSeekV4ShapePolicy(152).hc_post(4096, 4)
     assert assignment.num_sms == 32
     assert assignment.row_alignment == 128
+
+    fp32 = SchedDsv4HcPost(
+        torch.empty((4096,), dtype=torch.float32),
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((4, 4), dtype=torch.float32),
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+    ).place(32).schedule(0)
+    assert isinstance(fp32[0], Dsv4HcPost)
+    assert fp32[0].args == [128, 1]
+    assert fp32[1].size == 128 * 4
 
 
 def test_fp8_native_stream_bounds_activation_chunks_to_one_slot(monkeypatch):
@@ -780,6 +1096,21 @@ def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
     )
     assert len(output_releases) == 1
     assert schedule.bar_release_count("output") == 1
+
+    zeroed = SchedDsv4HcPreRms(
+        torch.empty((4, 4096), dtype=torch.bfloat16),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((3,), dtype=torch.float32),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((4, 4), dtype=torch.float32),
+        zero_fp32_output=torch.empty((4096,), dtype=torch.float32),
+    ).place(1).schedule(0)
+    assert isinstance(zeroed[0], Dsv4HcPreRms)
+    assert zeroed[0].args[0] & 0x8000
+    assert zeroed[-1].size == 4096 * 4
 
 
 def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):

@@ -147,6 +147,112 @@ class Nvfp4GemvUmmaStreamSm100(ComputeInstruction):
         )
 
 
+class Nvfp4GemvUmmaPipelineSm100(Nvfp4GemvUmmaStreamSm100):
+    """Pipeline native K256 loads, scale staging, and UMMA issue."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        *,
+        retain_activation: bool = False,
+        activation_tiles_per_load: int = 4,
+    ):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("NVFP4 pipelined UMMA K-tile count must fit uint16")
+        if (
+            activation_tiles_per_load <= 0
+            or activation_tiles_per_load > k_tiles
+        ):
+            raise ValueError(
+                "NVFP4 activation tiles per load must be in [1,K tiles]"
+            )
+        if retain_activation and activation_tiles_per_load != k_tiles:
+            raise ValueError("retained activation must cover the full K operand")
+        ComputeInstruction.__init__(
+            self,
+            opcode=opcode.OP_NVFP4_GEMV_UMMA_PIPELINE_SM100,
+            args=[k_tiles, int(retain_activation), activation_tiles_per_load],
+        )
+
+
+class Nvfp4GemvUmmaFp32Sm100(ComputeInstruction):
+    """Emit one route-scaled FP32 M128 result for the supplied K stream."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        *,
+        retain_activation: bool = False,
+        bulk_activation: bool = True,
+    ):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("NVFP4 FP32 UMMA K-tile count must fit uint16")
+        if retain_activation and not bulk_activation:
+            raise ValueError("retained FP32 activation must use one bulk load")
+        super().__init__(
+            opcode=opcode.OP_NVFP4_GEMV_UMMA_FP32_SM100,
+            args=[k_tiles, int(retain_activation), int(bulk_activation)],
+        )
+
+
+class Nvfp4GemvUmmaPipelineFp32Sm100(Nvfp4GemvUmmaPipelineSm100):
+    """Pipeline native K256 operands and emit one or two FP32 M128 tiles."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        *,
+        retain_activation: bool = False,
+        activation_tiles_per_load: int = 4,
+    ):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("NVFP4 pipelined FP32 K-tile count must fit uint16")
+        if (
+            activation_tiles_per_load <= 0
+            or activation_tiles_per_load > k_tiles
+        ):
+            raise ValueError(
+                "NVFP4 activation tiles per load must be in [1,K tiles]"
+            )
+        if retain_activation and activation_tiles_per_load != k_tiles:
+            raise ValueError("retained activation must cover the full K operand")
+        ComputeInstruction.__init__(
+            self,
+            opcode=opcode.OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_SM100,
+            args=[
+                k_tiles,
+                int(retain_activation),
+                activation_tiles_per_load,
+            ],
+        )
+
+
+class Nvfp4GemvUmmaPipelineFp32Group2Sm100(
+    Nvfp4GemvUmmaPipelineFp32Sm100
+):
+    """Share each activation K tile across paired FP32 gate/up UMMAs."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        *,
+        activation_tiles_per_load: int = 4,
+    ):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("paired NVFP4 K-tile count must fit uint16")
+        if not 0 < activation_tiles_per_load <= k_tiles:
+            raise ValueError(
+                "paired NVFP4 activation tiles per load must be in [1,K tiles]"
+            )
+        ComputeInstruction.__init__(
+            self,
+            opcode=(
+                opcode.OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_GROUP2_SM100
+            ),
+            args=[k_tiles, 0, activation_tiles_per_load],
+        )
+
+
 class Nvfp4UmmaPrepackSm100(ComputeInstruction):
     """Prepack direct-TMA NVFP4 data and raw scales into one native tile."""
 
@@ -648,17 +754,18 @@ class Dsv4HcPreRms(ComputeInstruction):
         sinkhorn_iters: int = 20,
         epsilon: float = 1.0e-6,
         rms_epsilon: float = 1.0e-6,
+        zero_fp32_output: bool = False,
     ):
-        if sinkhorn_iters <= 0 or sinkhorn_iters > 0xFFFF:
+        if sinkhorn_iters <= 0 or sinkhorn_iters > 0x7FFF:
             raise ValueError(
-                "fused mHC/RMS Sinkhorn iterations must fit uint16"
+                "fused mHC/RMS Sinkhorn iterations must fit 15 bits"
             )
         if epsilon <= 0 or rms_epsilon <= 0:
             raise ValueError("fused mHC/RMS epsilons must be positive")
         super().__init__(
             opcode=opcode.OP_DSV4_HC_PRE_RMS,
             args=[
-                sinkhorn_iters,
+                sinkhorn_iters | (int(bool(zero_fp32_output)) << 15),
                 encode_bfloat16_u16(epsilon),
                 encode_bfloat16_u16(rms_epsilon),
             ],
@@ -666,10 +773,13 @@ class Dsv4HcPreRms(ComputeInstruction):
 
 
 class Dsv4HcPost(ComputeInstruction):
-    def __init__(self, width: int):
+    def __init__(self, width: int, branch_fp32: bool = False):
         if width <= 0 or width > 4096:
             raise ValueError("DeepSeek mHC post width must be in [1,4096]")
-        super().__init__(opcode=opcode.OP_DSV4_HC_POST, args=[width])
+        super().__init__(
+            opcode=opcode.OP_DSV4_HC_POST,
+            args=[width, int(bool(branch_fp32))],
+        )
 
 
 class Dsv4SiluClampMul2048(ComputeInstruction):
@@ -695,6 +805,20 @@ class Dsv4SiluClampMul128(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_DSV4_SILU_CLAMP_MUL_128,
             args=[num_token, encode_bfloat16_u16(limit)],
+        )
+
+
+class Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100(ComputeInstruction):
+    """Fuse FP32 gate/up activation into the native NVFP4 W2 input."""
+
+    def __init__(self, k_tiles: int, limit: float = 10.0):
+        if k_tiles <= 0 or k_tiles > 0xFFFF:
+            raise ValueError("fused FP32 SwiGLU K-tile count must fit uint16")
+        if limit <= 0:
+            raise ValueError("FP32 SwiGLU limit must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_FP32_SWIGLU_NVFP4_QUANT_UMMA_B_SM100,
+            args=[k_tiles, encode_bfloat16_u16(limit)],
         )
 
 
@@ -2561,6 +2685,10 @@ __all__ = [
     "Nvfp4GemvSm100",
     "Nvfp4GemvUmmaSm100",
     "Nvfp4GemvUmmaStreamSm100",
+    "Nvfp4GemvUmmaPipelineSm100",
+    "Nvfp4GemvUmmaFp32Sm100",
+    "Nvfp4GemvUmmaPipelineFp32Sm100",
+    "Nvfp4GemvUmmaPipelineFp32Group2Sm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",
@@ -2595,6 +2723,7 @@ __all__ = [
     "Dsv4HcPost",
     "Dsv4SiluClampMul2048",
     "Dsv4SiluClampMul128",
+    "Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100",
     "Dsv4Hadamard",
     "Dsv4GatedPool",
     "Dsv4GatedPoolRmsRope",
