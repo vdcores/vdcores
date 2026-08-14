@@ -810,7 +810,8 @@ torch::Tensor py_build_tma_desc(
     std::vector<int64_t> box_dim,          // length R
     std::vector<int64_t> elem_strides,     // length R
     int64_t swizzle_bytes,
-    int64_t interleave_bytes
+    int64_t interleave_bytes,
+    bool unpack_fp4 = false
 ) {
   TORCH_CHECK(base.defined(), "base must be defined");
   TORCH_CHECK(base.is_cuda(), "base must be a CUDA tensor");
@@ -847,7 +848,9 @@ torch::Tensor py_build_tma_desc(
       gstride[i] = (cuuint64_t)0; // last stride is not used by hardware, can be 0
   }
 
-  CUtensorMapDataType dtype = to_dtype(base.scalar_type());
+  CUtensorMapDataType dtype = unpack_fp4
+      ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
+      : to_dtype(base.scalar_type());
   CUtensorMapSwizzle swz = to_swizzle(swizzle_bytes);
   CUtensorMapInterleave interleave = to_interleave(interleave_bytes);
 
@@ -1027,6 +1030,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("synchronize") = true,
             "Launch a sequence of independent DAE2 kernels with one host dispatch");
   m.def("build_tma_desc", &py_build_tma_desc,
+            py::arg("base"),
+            py::arg("shape"),
+            py::arg("strides_bytes"),
+            py::arg("box_dim"),
+            py::arg("elem_strides"),
+            py::arg("swizzle_bytes"),
+            py::arg("interleave_bytes"),
+            py::arg("unpack_fp4") = false,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("reset_cache_policy", &py_reset_cache_policy,
             py::arg("stream"),

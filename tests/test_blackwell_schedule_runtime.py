@@ -41,6 +41,8 @@ from dae.instructions import (
     Fp8GemvUmmaSplitKSm100,
     Fp8GemvUmmaStreamSm100,
     Fp8UmmaPrepackSm100,
+    Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100,
+    Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100,
     Nvfp4GemvSm100,
     Nvfp4GemvUmmaK512Fp32Sm100,
     Nvfp4GemvUmmaPipelineSm100,
@@ -76,6 +78,7 @@ from dae.schedule import (
     SchedDsv4RmsRope512_64,
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
+    SchedMxfp4Mxfp8GemvUmmaK512,
     SchedDsv4ZeroFill,
     SchedDsv4Fp32ToBf16,
     SchedAttentionDecoding,
@@ -820,6 +823,103 @@ def test_fp8_splitk_umma_encodes_local_k_tiles():
         "OP_FP8_GEMV_UMMA_SPLITK_SM100__SCALE_PACK_2__"
         "OUTPUT_GROUPS_2__REDUCTION_BYTES_2"
     )
+
+
+def test_mxfp4_mxfp8_k512_instructions_encode_activation_batch():
+    tma = Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(4)
+    metadata_address = 0x1234_5678_9AB0
+    metadata = Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(
+        metadata_address, 2
+    )
+
+    assert tma.args == [4]
+    packed = metadata_address | 1
+    assert metadata.args == [
+        packed & 0xFFFF,
+        (packed >> 16) & 0xFFFF,
+        (packed >> 32) & 0xFFFF,
+    ]
+    assert tma.compute_operator_name() == (
+        "OP_MXFP4_MXFP8_GEMV_UMMA_K512_TMA_SCALE_FP32_SM100"
+    )
+    assert metadata.compute_operator_name() == (
+        "OP_MXFP4_MXFP8_GEMV_UMMA_K512_META_SCALE_FP32_SM100"
+    )
+    with pytest.raises(ValueError, match="1, 2, 4, or 8"):
+        Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(3)
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(0x1235, 2)
+
+
+def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
+    tma_load = SchedMxfp4Mxfp8GemvUmmaK512.schedule.__globals__["TmaLoad1D"]
+    monkeypatch.setitem(
+        tma_load.__init__.__globals__,
+        "get_tensor_address",
+        lambda tensor: tensor.data_ptr(),
+    )
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 7
+
+    weight_data = torch.empty((1, 8, 4, 128, 64), dtype=torch.uint8)
+    weight_tma = TmaTensor(FakeLauncher(), weight_data).mxfp4_k512_load()
+    weight_scale = torch.empty((1, 8, 2048), dtype=torch.uint8)
+    activation_data = torch.empty((8, 4096), dtype=torch.uint8)
+    activation_scale = torch.empty((8, 2048), dtype=torch.uint8)
+    metadata = torch.empty((1, 128), dtype=torch.uint8)
+    output = torch.empty((128,), dtype=torch.float32)
+
+    tma = SchedMxfp4Mxfp8GemvUmmaK512(
+        weight_data,
+        weight_scale,
+        activation_data,
+        activation_scale,
+        output,
+        weight_tma,
+        scale_mode="tma",
+        activation_stages_per_load=4,
+    ).place(1)
+    tma_insts = tma.schedule(0)
+    assert isinstance(
+        tma_insts[0], Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100
+    )
+    assert [inst.size for inst in tma_insts[1:6]] == [
+        8 * 2048,
+        8 * 2048,
+        4 * 4096,
+        32768,
+        32768,
+    ]
+    assert tma_insts[4].num_slots == 8
+    assert len(tma_insts) == 14
+
+    direct = SchedMxfp4Mxfp8GemvUmmaK512(
+        weight_data,
+        weight_scale,
+        activation_data,
+        activation_scale,
+        output,
+        weight_tma,
+        scale_mode="metadata",
+        metadata=metadata,
+        activation_stages_per_load=4,
+    ).place(1)
+    direct_insts = direct.schedule(0)
+    assert isinstance(
+        direct_insts[0], Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100
+    )
+    assert [inst.size for inst in direct_insts[1:4]] == [
+        4 * 4096,
+        32768,
+        32768,
+    ]
+    assert len(direct_insts) == 12
 
 
 def test_dsv4_zero_fill_shards_contiguous_output(monkeypatch):

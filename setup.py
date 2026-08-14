@@ -45,6 +45,8 @@ if os.environ.get("DAE_NVFP4_SCALE_COPY_STAGES"):
     )
 if os.environ.get("DAE_NUM_INSTS"):
     cuda_defines.append("-DDAE_NUM_INSTS=" + os.environ["DAE_NUM_INSTS"])
+if os.environ.get("DAE_NUM_SLOTS"):
+    cuda_defines.append("-DDAE_NUM_SLOTS=" + os.environ["DAE_NUM_SLOTS"])
 if os.environ.get("DAE_DYNAMIC_SMEM_KB"):
     cuda_defines.append(
         "-DDAE_DYNAMIC_SMEM_KB=" + os.environ["DAE_DYNAMIC_SMEM_KB"]

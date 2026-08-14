@@ -492,3 +492,49 @@ def build_tma_wgmma_tile_major(mat: torch.Tensor, tileK: int, tileN: int):
         128,
         0,
     )
+
+
+def build_tma_mxfp4_k512(mat: torch.Tensor, tile_m: int, tile_k: int):
+    """Load one packed M128/K512 MXFP4 tile into its 64 KiB UMMA image.
+
+    HBM is tile-major ``[M/128, K/512, 4, 128, 64]``.  The innermost
+    64 bytes hold 128 packed E2M1 values.  CUDA's 16U4-align16B TMA format
+    inserts the required 8-byte hole after every 8-byte packed group while
+    applying the 128-byte SMEM swizzle, so no compute-side repack is needed.
+    """
+    assert mat.dim() == 5
+    m_tiles, k_tiles, k128_tiles, rows, packed_k128 = mat.shape
+    assert tile_m == rows == 128
+    assert tile_k == 512
+    assert k128_tiles == 4 and packed_k128 == 64
+    global_dims = [128, rows, k128_tiles, k_tiles, m_tiles]
+    global_strides = [
+        packed_k128,
+        rows * packed_k128,
+        k128_tiles * rows * packed_k128,
+        k_tiles * k128_tiles * rows * packed_k128,
+    ]
+    box_dims = [128, rows, k128_tiles, 1, 1]
+    return 5, runtime.build_tma_desc(
+        mat,
+        global_dims,
+        global_strides,
+        box_dims,
+        [1] * 5,
+        128,
+        0,
+        True,
+    )
+
+
+def cord_func_mxfp4_k512(mat: torch.Tensor, rank: int):
+    assert rank == 5
+
+    def cord_func(m_tile: int, k_tile: int):
+        assert 0 <= m_tile < mat.shape[0]
+        assert 0 <= k_tile < mat.shape[1]
+        # The 5D allocator opcode hardcodes dimension zero to zero and stores
+        # coordinates for dimensions one through four.
+        return [0, 0, k_tile, m_tile]
+
+    return cord_func

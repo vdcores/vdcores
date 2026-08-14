@@ -2449,6 +2449,194 @@ class SchedDsv4Fp32ToBf16(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
+    """M128/N8/K4096 native MXFP4 x MXFP8 projection."""
+
+    TILE_M = 128
+    K512_TILES = 8
+    WEIGHT_DATA_BYTES = 32768
+    WEIGHT_K128_TILES = 4
+    WEIGHT_PACKED_K128_BYTES = 64
+    WEIGHT_SCALE_BYTES = 2048
+    ACTIVATION_DATA_BYTES = 4096
+    ACTIVATION_SCALE_BYTES = 2048
+    METADATA_BYTES = 128
+
+    def __init__(
+        self,
+        weight_data,
+        weight_scale,
+        activation_data,
+        activation_scale,
+        output,
+        weight_tma,
+        *,
+        scale_mode: str,
+        metadata=None,
+        activation_stages_per_load: int = 4,
+    ):
+        super().__init__()
+        self.weight_data = weight_data
+        self.weight_scale = weight_scale
+        self.activation_data = activation_data
+        self.activation_scale = activation_scale
+        self.output = output
+        self.weight_tma = weight_tma
+        self.scale_mode = scale_mode
+        self.metadata = metadata
+        self.activation_stages_per_load = int(activation_stages_per_load)
+
+    def _on_place(self):
+        if self.scale_mode not in ("tma", "metadata"):
+            raise ValueError("MXFP4/MXFP8 scale mode must be tma or metadata")
+        if self.activation_stages_per_load not in (1, 2, 4, 8):
+            raise ValueError(
+                "MXFP4/MXFP8 activation stages per load must be 1, 2, 4, or 8"
+            )
+        if (
+            self.weight_data.dtype != torch.uint8
+            or self.weight_data.ndim != 5
+            or self.weight_data.shape[1:] != (
+                self.K512_TILES,
+                self.WEIGHT_K128_TILES,
+                self.TILE_M,
+                self.WEIGHT_PACKED_K128_BYTES,
+            )
+            or not self.weight_data.is_contiguous()
+        ):
+            raise ValueError(
+                "MXFP4 weight data must be packed contiguous uint8 "
+                "[M/128,8,4,128,64]"
+            )
+        self.m_tiles = self.weight_data.shape[0]
+        if not 0 < self.num_sms <= self.m_tiles:
+            raise ValueError("MXFP4/MXFP8 projection needs 1..M/128 SMs")
+        if (
+            self.weight_tma is None
+            or getattr(self.weight_tma, "rank", None) != 5
+            or getattr(self.weight_tma, "size", None) != self.WEIGHT_DATA_BYTES
+            or getattr(self.weight_tma, "num_slots", None) != 8
+        ):
+            raise ValueError(
+                "MXFP4 weight TMA must be a packed K512 5D load"
+            )
+        if (
+            self.weight_scale.dtype != torch.uint8
+            or tuple(self.weight_scale.shape) != (
+                self.m_tiles, self.K512_TILES, self.WEIGHT_SCALE_BYTES
+            )
+            or not self.weight_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "MXFP4 scales must be native uint8 [M/128,8,2048]"
+            )
+        if (
+            self.activation_data.dtype != torch.uint8
+            or tuple(self.activation_data.shape) != (
+                self.K512_TILES, self.ACTIVATION_DATA_BYTES
+            )
+            or not self.activation_data.is_contiguous()
+        ):
+            raise ValueError(
+                "MXFP8 activation data must be native uint8 [8,4096]"
+            )
+        if (
+            self.activation_scale.dtype != torch.uint8
+            or tuple(self.activation_scale.shape) != (
+                self.K512_TILES, self.ACTIVATION_SCALE_BYTES
+            )
+            or not self.activation_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "MXFP8 scales must be native uint8 [8,2048]"
+            )
+        if (
+            self.output.dtype != torch.float32
+            or self.output.numel() != self.m_tiles * self.TILE_M
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("MXFP4/MXFP8 output must be contiguous FP32 [M]")
+        tensors = (
+            self.weight_data,
+            self.weight_scale,
+            self.activation_data,
+            self.activation_scale,
+            self.output,
+        )
+        if any(tensor.device != self.output.device for tensor in tensors):
+            raise ValueError("MXFP4/MXFP8 tensors must share one CUDA device")
+        if self.scale_mode == "metadata":
+            if (
+                self.metadata is None
+                or self.metadata.dtype != torch.uint8
+                or tuple(self.metadata.shape) != (
+                    self.m_tiles, self.METADATA_BYTES
+                )
+                or not self.metadata.is_contiguous()
+                or self.metadata.device != self.output.device
+            ):
+                raise ValueError(
+                    "metadata scale mode requires uint8 [M/128,128] records"
+                )
+
+    def _tile_shard(self, sm):
+        tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        return tile_start, tile_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        tile_start, tile_count = self._tile_shard(sm)
+        instructions = []
+        tile_stop = tile_start + tile_count
+        for output_tile in range(tile_start, tile_stop):
+            if self.scale_mode == "tma":
+                instructions.extend((
+                    Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(
+                        self.activation_stages_per_load
+                    ),
+                    TmaLoad1D(
+                        self.weight_scale[output_tile].reshape(-1)
+                    ).fixed_port(0),
+                    TmaLoad1D(self.activation_scale.reshape(-1)).fixed_port(1),
+                ))
+            else:
+                instructions.extend((
+                    Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(
+                        self.metadata[output_tile].data_ptr(),
+                        self.activation_stages_per_load
+                    ),
+                ))
+            for chunk_start in range(
+                0, self.K512_TILES, self.activation_stages_per_load
+            ):
+                chunk_stop = chunk_start + self.activation_stages_per_load
+                instructions.append(
+                    TmaLoad1D(
+                        self.activation_data[chunk_start:chunk_stop].reshape(-1)
+                    ).fixed_port(1)
+                )
+                for k_tile in range(chunk_start, chunk_stop):
+                    instructions.append(
+                        self.weight_tma.cord(output_tile, k_tile).fixed_port(0)
+                    )
+            row_start = output_tile * self.TILE_M
+            store = TmaStore1D(
+                self.output[row_start : row_start + self.TILE_M]
+            )
+            if output_tile + 1 == tile_stop:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedFp8GemvUmmaStream(Schedule):
     """Shape-sharded M128/K128 native MXF8 projection."""
 

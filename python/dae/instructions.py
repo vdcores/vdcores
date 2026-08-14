@@ -18,6 +18,7 @@ from .tma_utils import (
     addr2cords,
     build_tma_1d,
     build_tma_rowmajor_2d,
+    build_tma_mxfp4_k512,
     build_tma_wgmma_kmajor,
     build_tma_wgmma_mnmajor,
     build_tma_wgmma_tile_major,
@@ -27,6 +28,7 @@ from .tma_utils import (
     cord_func_2d_tile_major,
     cord_func_tma_1d,
     cord_func_rowmajor_2d,
+    cord_func_mxfp4_k512,
     cords2addr,
     get_tensor_address,
 )
@@ -281,6 +283,52 @@ class Nvfp4GemvUmmaK512Fp32Sm100(ComputeInstruction):
                 k_tiles,
                 scale_stages,
                 weight_tiles_per_load | (int(retain_activation) << 8),
+            ],
+        )
+
+
+class Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(ComputeInstruction):
+    """Native W4A8 K4096 task with allocator-owned scale TMA loads."""
+
+    def __init__(self, activation_stages_per_load: int = 4):
+        if activation_stages_per_load not in (1, 2, 4, 8):
+            raise ValueError(
+                "MXFP4/MXFP8 activation stages per load must be 1, 2, 4, or 8"
+            )
+        super().__init__(
+            opcode=(
+                opcode.OP_MXFP4_MXFP8_GEMV_UMMA_K512_TMA_SCALE_FP32_SM100
+            ),
+            args=[activation_stages_per_load],
+        )
+
+
+class Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(ComputeInstruction):
+    """Native W4A8 K4096 task with compute-side metadata scale loads."""
+
+    def __init__(
+        self,
+        metadata_address: int,
+        activation_stages_per_load: int = 4,
+    ):
+        if activation_stages_per_load not in (1, 2, 4, 8):
+            raise ValueError(
+                "MXFP4/MXFP8 activation stages per load must be 1, 2, 4, or 8"
+            )
+        if metadata_address < 0 or metadata_address >= 1 << 48:
+            raise ValueError("MXFP4/MXFP8 metadata pointer must fit in 48 bits")
+        if metadata_address & 0x3:
+            raise ValueError("MXFP4/MXFP8 metadata pointer must be 4-byte aligned")
+        stage_code = {1: 0, 2: 1, 4: 2, 8: 3}[activation_stages_per_load]
+        packed = metadata_address | stage_code
+        super().__init__(
+            opcode=(
+                opcode.OP_MXFP4_MXFP8_GEMV_UMMA_K512_META_SCALE_FP32_SM100
+            ),
+            args=[
+                packed & 0xFFFF,
+                (packed >> 16) & 0xFFFF,
+                (packed >> 32) & 0xFFFF,
             ],
         )
 
@@ -2721,6 +2769,21 @@ class TmaTensor(MemoryInstruction):
             cord_func_2d_tile_major,
         )
 
+    def mxfp4_k512_load(self):
+        """Packed W4 HBM load with TMA expansion into a 64 KiB UMMA tile."""
+        inst = self._build(
+            "load",
+            128,
+            512,
+            build_tma_mxfp4_k512,
+            cord_func_mxfp4_k512,
+        )
+        # TMA moves 32 KiB of packed U4 values but writes a 64 KiB shared
+        # image because ALIGN16B inserts one 8-byte gap per packed 8 bytes.
+        inst.size = 32 * 1024
+        inst.num_slots = 8
+        return inst
+
     def wgmma_store(self, tileN: int, tileM: int, major: Major):
         return self.wgmma("store", tileN, tileM, major)
 
@@ -2741,6 +2804,8 @@ __all__ = [
     "Nvfp4GemvUmmaPipelineFp32Sm100",
     "Nvfp4GemvUmmaPipelineFp32Group2Sm100",
     "Nvfp4GemvUmmaK512Fp32Sm100",
+    "Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100",
+    "Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",

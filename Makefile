@@ -62,6 +62,11 @@ ifneq ($(num_insts),)
 	export DAE_NUM_INSTS := $(num_insts)
 endif
 
+ifneq ($(num_slots),)
+	NVCC_FLAGS += -DDAE_NUM_SLOTS=$(num_slots)
+	export DAE_NUM_SLOTS := $(num_slots)
+endif
+
 ifneq ($(dynamic_smem_kb),)
 	NVCC_FLAGS += -DDAE_DYNAMIC_SMEM_KB=$(dynamic_smem_kb)
 	export DAE_DYNAMIC_SMEM_KB := $(dynamic_smem_kb)

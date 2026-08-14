@@ -2135,3 +2135,63 @@ gate/up/SwiGLU at 9.536 us plus DeepGEMM shared gate/up at 9.856 us, or 19.392
 us serialized. The 16.608-us VDCores result is 2.784 us (14.4%) lower, but it
 still stops at FP32 gate/up accumulators and excludes SwiGLU, while the
 FlashInfer component includes routed SwiGLU and excludes the shared expert.
+
+## Native MXFP4-weight / MXFP8-activation UMMA (2026-08-14)
+
+The SM100 mixed `MXF8F6F4` family consumes MXFP4 weights and MXFP8
+activations directly; there is no FP8 conversion in the kernel. The weight
+type must be `cutlass::detail::float_e2m1_unpacksmem_t`, not the ordinary
+`float_e2m1_t`: the former selects mixed-family E2M1 format code 5 after the
+TMA unpack transform, while the latter selects standalone format code 1,
+which this instruction family interprets as E5M2. The fixed atom is
+M128/N8/K128 with UE8M0 block scales and an FP32 accumulator.
+
+Token-time HBM is already native. Weight data is packed uint8
+`[M/128,8 K512,4 K128,128,64]`, so one K512 record is 32 KiB. A custom 5-D
+tensor map uses `CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B` plus SW128 to expand
+that transaction into four 16-KiB K128 SMEM descriptors (64 KiB destination).
+One activation K512 record is 4 KiB. Weight and activation scale images are
+native uint8 `[M/128,8,2048]` and `[8,2048]`; all duplication and swizzling is
+checkpoint/token preparation outside the measured path.
+
+Both requested scale-delivery strategies are implemented. The TMA strategy
+performs exactly two persistent 16-KiB loads, one complete weight-scale image
+and one complete activation-scale image. The faster metadata strategy encodes
+an aligned 48-bit metadata-record pointer plus the two-bit activation-batch
+code in the compute instruction. Compute warps dereference record offsets 16
+and 24 directly, so the metadata record consumes no allocator slot and no
+memory instruction. Warp 2 and warp 3 then issue coalesced 16-byte `cp.async`
+copies into a four-stage shared scale ring; warp 0 performs dependent UTCCP
+copies to its task-local TMEM scale columns and queues consecutive UMMAs, and
+warp 1 retires each expanded weight allocation after its completion barrier.
+The FP32 accumulator remains resident for all 32 K128 UMMAs and drains once,
+directly to FP32. Activation K512 records per TMA load remain a parameter with
+legal values 1, 2, 4, and 8; batch 2 wins the metadata path because the
+25-slot arena can keep its small activation allocation and deeper weight
+movement in flight.
+
+The final selective image uses 25 allocator slots, 64 instruction entries,
+220 KiB dynamic shared memory, 104 registers, 16 barriers, and zero spills.
+GB200 job `20260814T184635Z-1816638` verified exact 4096.0 FP32 output for all
+eight scale-strategy/batch combinations. The direct metadata path at batch 2
+measured 9.504 us task median and 9.984 us full resident-kernel envelope. The
+two-TMA strategy reached 14.272 us at batch 8. FlashInfer 0.6.16.post3 / vLLM
+0.27.1 job `20260814T184205Z-1730615`, using the correct
+`group_gemm_mxfp8_mxfp4_nt_groupwise` backend at rows=4, N=128, K=4096,
+tile-N=64, tile-K=128, measured 9.6208 us per CUDA-graph inner call with
+quantized sanity `mean_relative=0.12491284`, `cosine=0.99230981`. Thus the
+VDCores task frontier was 1.2% lower; its full envelope was 3.8% higher. The
+comparison is intentionally explicit: FlashInfer's legal API minimum is four
+activation rows and tile-N=64 launches two output CTAs, while VDCores owns one
+SM, replicates one logical activation to hardware N8, and writes 128 FP32
+outputs.
+
+Rejected variants are useful boundaries. A blocking global-to-shared scale
+copy was about 0.32 us slower than `cp.async`; preloading both complete 16-KiB
+scale images serialized the prologue and regressed metadata to 14.624 us; a
+future `cp.async` group (`wait_group 1`) regressed to 9.728 us; a 32-byte LDU
+metadata copy regressed to 9.952 us; and a 26-slot shaped allocator regressed
+to 10.496 us. Splitting weight movement into K256 commands removed measured
+allocator stalls but increased command overhead and reached only 12.06 us in
+the instrumented build. Keep the K512 expanded transaction and one completed
+async scale stage at a time.
