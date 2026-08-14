@@ -352,9 +352,12 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
         prelude = [
             f"DAE_COMPUTE_OP_HANDLER({name}) {{",
             (
-                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, "
-                "scratch_space, g_events, nvfp4_umma_pipeline_phase_mask);"
+                "  DAE_UNUSED(thread_id, pc, count, finish, st_insts, "
+                "scratch_space, nvfp4_umma_pipeline_phase_mask);"
             ),
+            "#if !defined(DAE_TRACK_MXFP_TIMELINE)",
+            "  DAE_UNUSED(sm_id, g_events);",
+            "#endif",
         ]
         metadata_lines = []
         if from_metadata:
@@ -373,8 +376,12 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
                 "  task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<"
                 f"{metadata_flag}, {tile_k}, {bload}>("
                 "smem_base, tmem_base_ptr, tmem_mma_barrier, metadata, "
-                "tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);"
+                "tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m"
             ),
+            "#if defined(DAE_TRACK_MXFP_TIMELINE)",
+            "      , sm_id, g_events",
+            "#endif",
+            "      );",
             "#endif",
         ]
     else:

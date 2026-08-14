@@ -60,6 +60,8 @@ from dae.instructions import (
     RegStore,
     TmaLoadAddressReg1D,
     TmaLoad1D,
+    TmaLoadMxfpScaleBase1D,
+    TmaLoadMxfpScale1D,
     TmaLoadReg1D,
     TmaTensor,
 )
@@ -890,15 +892,55 @@ def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
     assert isinstance(
         tma_insts[0], Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100
     )
-    assert [inst.size for inst in tma_insts[1:6]] == [
-        8 * 2048,
-        8 * 2048,
-        4 * 4096,
-        32768,
-        32768,
-    ]
+    assert [inst.size for inst in tma_insts[1:-1]] == (
+        [4 * 4096]
+        + [0, 0, 32768] * 4
+        + [4 * 4096]
+        + [0, 0, 32768] * 4
+    )
+    assert isinstance(tma_insts[2], TmaLoadMxfpScaleBase1D)
+    assert isinstance(tma_insts[3], TmaLoadMxfpScaleBase1D)
+    assert tma_insts[2].num_slots == config.num_slots + 6
+    assert tma_insts[3].num_slots == config.num_slots + 7
+    assert isinstance(tma_insts[5], TmaLoadMxfpScale1D)
+    assert isinstance(tma_insts[6], TmaLoadMxfpScale1D)
+    assert tma_insts[5].num_slots == config.num_slots + 1
+    assert tma_insts[6].num_slots == (
+        config.num_slots + config.mxfp4_mxfp8_tma_scale_stages + 1
+    )
+    assert tma_insts[2].annotation["fixed_port"] == 0
+    assert tma_insts[3].annotation["fixed_port"] == 1
     assert tma_insts[4].num_slots == 8
-    assert len(tma_insts) == 14
+    assert len(tma_insts) == 28
+    compact_scales = [
+        inst for inst in tma_insts if isinstance(inst, TmaLoadMxfpScale1D)
+    ]
+    assert [inst.num_slots for inst in compact_scales] == [
+        config.num_slots
+        + operand * config.mxfp4_mxfp8_tma_scale_stages
+        + tile % config.mxfp4_mxfp8_tma_scale_stages
+        for tile in range(1, 8)
+        for operand in (
+            TmaLoadMxfpScale1D.WEIGHT,
+            TmaLoadMxfpScale1D.ACTIVATION,
+        )
+    ]
+    assert [inst.annotation["fixed_port"] for inst in compact_scales] == [
+        port for _tile in range(1, 8) for port in (0, 1)
+    ]
+
+    with pytest.raises(ValueError, match="SFA on LDU0"):
+        SchedMxfp4Mxfp8GemvUmmaK512(
+            weight_data,
+            weight_scale,
+            activation_data,
+            activation_scale,
+            output,
+            weight_tma,
+            scale_mode="tma",
+            activation_tiles_per_load=4,
+            tma_scale_ports=(1, 1),
+        ).place(1)
 
     direct = SchedMxfp4Mxfp8GemvUmmaK512(
         weight_data,

@@ -24,6 +24,10 @@ if re.fullmatch(r"[0-9]{2,3}[af]?", cuda_arch) is None:
     )
 cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
 cuda_defines = []
+if os.environ.get("DAE_TRACK_PROFILE"):
+    cuda_defines.append("-DDAE_TRACK_PROFILE")
+if os.environ.get("DAE_TRACK_MXFP_TIMELINE"):
+    cuda_defines.append("-DDAE_TRACK_MXFP_TIMELINE")
 if os.environ.get("DAE_GLOBAL_INSTRUCTIONS"):
     cuda_defines.append("-DDAE_LOAD_INSTRUCTIONS=0")
 if os.environ.get("DAE_AUX_SLOTS"):
@@ -51,6 +55,18 @@ if os.environ.get("DAE_DYNAMIC_SMEM_KB"):
     cuda_defines.append(
         "-DDAE_DYNAMIC_SMEM_KB=" + os.environ["DAE_DYNAMIC_SMEM_KB"]
     )
+if os.environ.get("DAE_DSV4_ROPE_METADATA_OFFSET_KB"):
+    cuda_defines.append(
+        "-DDAE_DSV4_ROPE_METADATA_OFFSET_KB="
+        + os.environ["DAE_DSV4_ROPE_METADATA_OFFSET_KB"]
+    )
+if os.environ.get("DAE_MXFP4_MXFP8_TMA_SCALE_STAGES"):
+    cuda_defines.append(
+        "-DDAE_MXFP4_MXFP8_TMA_SCALE_STAGES="
+        + os.environ["DAE_MXFP4_MXFP8_TMA_SCALE_STAGES"]
+    )
+if os.environ.get("DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA"):
+    cuda_defines.append("-DDAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA=1")
 include_dirs = [
     os.path.join(this_dir, "include"),
     os.path.join(this_dir, "include", "dae"),

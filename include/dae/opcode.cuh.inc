@@ -80,6 +80,13 @@ DAE_OP(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D, MK_MOP(44, MEM_OP_FLAGS_ALLOCATE)
 // Rank-4 tensor loads whose final coordinate is the allocator-owned logical
 // layer index. This keeps stacked TMA descriptors compact inside loop bodies.
 DAE_OP(OP_ALLOC_LAYER_TMA_LOAD_4D, MK_MOP(45, MEM_OP_FLAGS_ALLOCATE))
+// Load one native MX scale half directly into the dedicated tail ring. The
+// encoded slot is a special mailbox, not an allocator allocation; compute
+// consumes only the M2C completion token.
+DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_1D, MK_MOP(46, MEM_OP_FLAGS_ALLOCATE))
+// Seed one LDU-local native scale base and issue that operand's first scale
+// TMA. Subsequent compact commands derive addresses without a mailbox read.
+DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

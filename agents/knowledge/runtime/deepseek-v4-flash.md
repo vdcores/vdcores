@@ -2154,17 +2154,30 @@ One activation K512 record is 4 KiB. Weight and activation scale images are
 native uint8 `[M/128,8,2048]` and `[8,2048]`; all duplication and swizzling is
 checkpoint/token preparation outside the measured path.
 
-Both requested scale-delivery strategies are implemented. The TMA strategy
-performs exactly two persistent 16-KiB loads, one complete weight-scale image
-and one complete activation-scale image. The faster metadata strategy encodes
-the complete 48-bit metadata-record pointer in the compute instruction.
-Compute warps dereference record offsets 16 and 24 directly, so the metadata
-record consumes no allocator slot and no memory instruction. Warp 2 and warp
-3 then issue coalesced 16-byte `cp.async` copies into a four-stage shared scale
-ring; warp 0 performs dependent UTCCP copies to its task-local TMEM scale
-columns and queues consecutive UMMAs, and warp 1 retires each expanded weight
-allocation after its completion barrier. The FP32 accumulator remains
-resident for all 32 K128 UMMAs and drains once, directly to FP32.
+Both requested scale-delivery strategies are implemented. The direct-TMA
+strategy caches the complete SFA and SFB base addresses once in LDU0 and LDU1,
+respectively. It then loads one 2-KiB SFA half and one 2-KiB SFB half per K512
+tile directly into a dedicated task-tail ring; these records never consume or
+free normal allocator slots. The winning selective image uses three 4-KiB
+stages. Both LDUs observe one shared empty-phase barrier for each physical
+stage, and compute warp 1 releases that stage only after the dependent UMMA
+completes. Each operand's first scale-TMA command also seeds its LDU-local
+base, so there are no standalone setup commands. The two base-address
+mailboxes are distinct; each LDU acknowledges after copying its mailbox, and
+the allocator rendezvous is deferred until a later output task is about to
+reuse them. A single-tile task therefore pays no publication wait. This
+machinery is compiled only with `mxfp_direct_tma=1`, so it adds no LDU state,
+branches, or barriers to the metadata-only production image.
+
+The faster metadata strategy encodes the complete 48-bit metadata-record
+pointer in the compute instruction. Compute warps dereference record offsets
+16 and 24 directly, so the metadata record consumes no allocator slot and no
+memory instruction. Warp 2 and warp 3 then issue coalesced 16-byte `cp.async`
+copies into a four-stage shared scale ring; warp 0 performs dependent UTCCP
+copies to its task-local TMEM scale columns and queues consecutive UMMAs, and
+warp 1 retires each expanded weight allocation after its completion barrier.
+The FP32 accumulator remains resident for all 32 K128 UMMAs and drains once,
+directly to FP32.
 
 The mixed task now follows the WGMMA compute-family contract instead of
 encoding activation packing in runtime arguments. Its generated families have
@@ -2207,3 +2220,60 @@ to 10.496 us. Splitting weight movement into K256 commands removed measured
 allocator stalls but increased command overhead and reached only 12.06 us in
 the instrumented build. Keep the K512 expanded transaction and one completed
 async scale stage at a time.
+
+## Direct-TMA versus raw-address phase trace (2026-08-14)
+
+Fine-grained timestamps are optional and separate from the normal aggregate
+profiler. Build with `mxfp_timeline=1` to record task entry, activation TMA
+issue/visibility, both scale-producer intervals, scale visibility, weight TMA
+issue/visibility, UMMA issue/completion, output readiness, and task exit for
+each of the eight K512 tiles. A normal `track_profile=1` build does not execute
+these event stores.
+
+The final matched timestamp runs were direct-TMA BLOAD8 job
+`20260814T220444Z-1093699` and raw-address BLOAD2 job
+`20260814T213244Z-489815`. All times below are microseconds from compute-task
+entry. `Scale section` is the interval exposed on the issuer's critical path,
+not the producer's total lifetime.
+
+| K512 tile | raw scale section | TMA scale section | raw UMMA issue | TMA UMMA issue |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.064 | 0.640 | 2.656 | 3.328 |
+| 1 | 0.032 | 0.192 | 3.424 | 4.384 |
+| 2 | 0.032 | 0.192 | 4.864 | 5.696 |
+| 3 | 0.032 | 0.192 | 5.696 | 6.752 |
+| 4 | 0.064 | 0.224 | 7.040 | 8.128 |
+| 5 | 0.096 | 0.192 | 7.872 | 9.472 |
+| 6 | 0.064 | 0.192 | 9.280 | 10.784 |
+| 7 | 0.064 | 0.192 | 10.144 | 11.872 |
+
+The direct path now issues activation TMA at 0.640 us and observes it at 1.056
+us, ahead of raw address at 0.960 and 1.280 us. Nevertheless, its first UMMA
+is 0.672 us later because tile-0 scale and weight visibility consume 0.640 and
+1.024 us after activation readiness. Raw scale producers are already
+1.760--3.552 us ahead when the issuer consumes their records. Direct TMA
+instead places two scale completion tokens before every streamed weight token,
+so later tiles expose 0.192--0.224 us in their scale section versus
+0.032--0.096 us for raw address. Direct output becomes ready at 12.032 us
+versus 10.304 us for raw address. UMMA itself is not the exposed blocker:
+measured issue-to-completion deltas are only 0--0.064 us in both traces.
+
+Clean timestamp-disabled controls on the same worker state measured 12.544 us
+task / 13.024 us kernel for three-stage direct TMA in job
+`20260814T220219Z-1048033`, versus 9.952 / 10.592 us for raw address in final
+control job `20260814T221041Z-1205454`. The direct path is therefore 2.592 us
+(26.0%) slower at the task frontier. Immediate paired publication with two
+stages measured
+14.176 us; adding the third stage reached 13.056 us, and deferred publication
+plus first-scale fusion reached 12.544 us. The pre-change direct BLOAD8 path
+was 14.624 us. The historical
+9.216-us raw result was rechecked by compiling exact revision `3d0b9af`; that
+binary also measured 9.984 us in the current worker state, so the older number
+is retained as a historical clock/runtime result rather than used for this
+phase comparison.
+
+The clean aggregate counters point to the same cause. Direct TMA spends 43.0%
+of its internal span in compute-side M2C waits and 0% in allocator-slot stalls;
+raw address spends 31.0% in M2C waits despite 16.3% allocator-slot stalls.
+Removing ordinary slot pressure therefore does not compensate for putting two
+additional scale-completion dependencies on every K512 consumer frontier.

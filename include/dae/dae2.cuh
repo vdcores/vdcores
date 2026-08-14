@@ -135,6 +135,16 @@ void dae2(
     for (int i = 0; i < tmemMmaBarrierCount; ++i) {
       cute::initialize_barrier(tmem_mma_barriers[i], 1);
     }
+    // Direct scale stages begin empty. Both LDU streams observe this phase;
+    // the completion warp produces each subsequent empty phase.
+    #pragma unroll
+    for (int i = 0; i < mxfp4Mxfp8TmaScaleBarrierCount; ++i) {
+      cuda::ptx::mbarrier_arrive(
+          cuda::ptx::sem_release,
+          cuda::ptx::scope_cta,
+          cuda::ptx::space_shared,
+          tmem_mma_barriers + mxfp4Mxfp8TmaScaleBarrierBase + i);
+    }
   }
 #else
   if (thread_id == 0) {
@@ -236,7 +246,11 @@ void dae2(
           m2ld[port_id], m2c,
           st_insts,
           smem_base, tma_descs, bars, &ldu_control_barrier,
-          &ldu_control_publish_barrier, port_id
+          &ldu_control_publish_barrier,
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+          tmem_mma_barriers,
+#endif
+          port_id
 #if defined(DAE_TRACK_PROFILE)
           , sm_id, g_events
 #endif

@@ -2474,6 +2474,7 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         scale_mode: str,
         metadata=None,
         activation_tiles_per_load: int = 4,
+        tma_scale_ports: tuple[int, int] = (0, 1),
     ):
         super().__init__()
         self.weight_data = weight_data
@@ -2485,6 +2486,7 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         self.scale_mode = scale_mode
         self.metadata = metadata
         self.activation_tiles_per_load = int(activation_tiles_per_load)
+        self.tma_scale_ports = tuple(int(port) for port in tma_scale_ports)
 
     def _on_place(self):
         if self.scale_mode not in ("tma", "metadata"):
@@ -2492,6 +2494,14 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         if self.activation_tiles_per_load not in (1, 2, 4, 8):
             raise ValueError(
                 "MXFP4/MXFP8 activation tiles per load must be 1, 2, 4, or 8"
+            )
+        if len(self.tma_scale_ports) != 2 or any(
+            port not in (0, 1) for port in self.tma_scale_ports
+        ):
+            raise ValueError("MXFP4/MXFP8 TMA scale ports must be a pair of LDU IDs")
+        if self.scale_mode == "tma" and self.tma_scale_ports != (0, 1):
+            raise ValueError(
+                "direct MXFP4/MXFP8 TMA requires SFA on LDU0 and SFB on LDU1"
             )
         if (
             self.weight_data.dtype != torch.uint8
@@ -2593,15 +2603,11 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         tile_stop = tile_start + tile_count
         for output_tile in range(tile_start, tile_stop):
             if self.scale_mode == "tma":
-                instructions.extend((
+                instructions.append(
                     Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(
                         self.activation_tiles_per_load
-                    ),
-                    TmaLoad1D(
-                        self.weight_scale[output_tile].reshape(-1)
-                    ).fixed_port(0),
-                    TmaLoad1D(self.activation_scale.reshape(-1)).fixed_port(1),
-                ))
+                    )
+                )
             else:
                 instructions.extend((
                     Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(
@@ -2619,6 +2625,30 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
                     ).fixed_port(1)
                 )
                 for k_tile in range(chunk_start, chunk_stop):
+                    if self.scale_mode == "tma":
+                        scale_stage = k_tile % TmaLoadMxfpScale1D.STAGES
+                        if k_tile == 0:
+                            instructions.extend((
+                                TmaLoadMxfpScaleBase1D(
+                                    self.weight_scale[output_tile].reshape(-1),
+                                    operand=TmaLoadMxfpScale1D.WEIGHT,
+                                ).fixed_port(self.tma_scale_ports[0]),
+                                TmaLoadMxfpScaleBase1D(
+                                    self.activation_scale.reshape(-1),
+                                    operand=TmaLoadMxfpScale1D.ACTIVATION,
+                                ).fixed_port(self.tma_scale_ports[1]),
+                            ))
+                        else:
+                            instructions.extend((
+                                TmaLoadMxfpScale1D(
+                                    stage=scale_stage,
+                                    operand=TmaLoadMxfpScale1D.WEIGHT,
+                                ).fixed_port(self.tma_scale_ports[0]),
+                                TmaLoadMxfpScale1D(
+                                    stage=scale_stage,
+                                    operand=TmaLoadMxfpScale1D.ACTIVATION,
+                                ).fixed_port(self.tma_scale_ports[1]),
+                            ))
                     instructions.append(
                         self.weight_tma.cord(output_tile, k_tile).fixed_port(0)
                     )

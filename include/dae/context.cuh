@@ -81,19 +81,60 @@ static constexpr int nvfp4ScaleCopyBarrierCount =
     DAE_NVFP4_SCALE_COPY_STAGES;
 static constexpr int nvfp4ScaleCopyBarrierBase =
     nvfp4UmmaPipelineBarrierBase + nvfp4UmmaPipelineBarrierCount;
-static constexpr int tmemMmaBarrierCount =
+// Direct MXFP4/MXFP8 TMA scales use a dedicated tail ring of 4-KiB stages.
+// Each stage barrier is initialized empty, observed by both LDU scale streams,
+// and released once by the UMMA completion warp.
+#ifndef DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+#define DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA 0
+#endif
+static constexpr bool mxfp4Mxfp8DirectTmaEnabled =
+    DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA != 0;
+#ifndef DAE_MXFP4_MXFP8_TMA_SCALE_STAGES
+#define DAE_MXFP4_MXFP8_TMA_SCALE_STAGES 2
+#endif
+static constexpr int mxfp4Mxfp8TmaScaleStages =
+    DAE_MXFP4_MXFP8_TMA_SCALE_STAGES;
+static_assert(
+    mxfp4Mxfp8TmaScaleStages == 2 || mxfp4Mxfp8TmaScaleStages == 3,
+    "direct MXFP4/MXFP8 TMA scale ring supports two or three stages");
+static constexpr int mxfp4Mxfp8TmaScaleBarrierBase =
     nvfp4ScaleCopyBarrierBase + nvfp4ScaleCopyBarrierCount;
+static constexpr int mxfp4Mxfp8TmaScaleBarrierCount =
+    mxfp4Mxfp8DirectTmaEnabled ? mxfp4Mxfp8TmaScaleStages : 0;
+static constexpr int tmemMmaBarrierCount =
+    mxfp4Mxfp8TmaScaleBarrierBase + mxfp4Mxfp8TmaScaleBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
+#if defined(DAE_TRACK_MXFP_TIMELINE) && !defined(DAE_TRACK_PROFILE)
+#error "DAE_TRACK_MXFP_TIMELINE requires DAE_TRACK_PROFILE"
+#endif
 static constexpr int layerProfileEventBase = 2;
 static constexpr int reloadProfileEventBase = 64;
 static constexpr int trackProfileEventBase = 96;
 static_assert(layerProfileEventBase < reloadProfileEventBase);
 static_assert(reloadProfileEventBase < trackProfileEventBase);
 static_assert(trackProfileEventBase < numProfileEvents);
+// Diagnostic MXFP4/MXFP8 per-tile timeline. Events 2/3 remain the external
+// task frontier; 4..94 are overwritten only by a DAE_TRACK_MXFP_TIMELINE
+// build and are intentionally below the aggregate-counter bank at 96.
+static constexpr int mxfpProfileTaskEntry = 4;
+static constexpr int mxfpProfileActivationReadyBase = 5;
+static constexpr int mxfpProfileScaleReadyBase = 13;
+static constexpr int mxfpProfileWeightReadyBase = 21;
+static constexpr int mxfpProfileUmmaIssueBase = 29;
+static constexpr int mxfpProfileUmmaCompleteBase = 37;
+static constexpr int mxfpProfileSfaProducerStartBase = 45;
+static constexpr int mxfpProfileSfaProducerReadyBase = 53;
+static constexpr int mxfpProfileSfbProducerStartBase = 61;
+static constexpr int mxfpProfileSfbProducerReadyBase = 69;
+static constexpr int mxfpProfileWeightTmaIssueBase = 77;
+static constexpr int mxfpProfileActivationTmaIssueBase = 85;
+static constexpr int mxfpProfileOutputReady = 93;
+static constexpr int mxfpProfileTaskEnd = 94;
+static_assert(mxfpProfileTaskEnd < trackProfileEventBase);
 static constexpr int numComputeLoopCounters = 4;
 static constexpr int lduBarrierReloadArrival = numBars - 2;
 static constexpr int lduBarrierReloadDone = numBars - 1;

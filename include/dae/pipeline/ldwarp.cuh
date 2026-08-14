@@ -81,6 +81,9 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     const void *smem_base, const CUtensorMap *tma_descs, int *bars,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_barrier,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_publish_barrier,
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+    uint64_t *tmem_mma_barriers,
+#endif
     const int port_id
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
@@ -93,12 +96,23 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   uint64_t routedBaseAddress = 0;
   uint64_t cachedRouteAddress = 0;
   LduRouteExperts cachedRouteExperts;
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+  // SFA and SFB may be assigned independently to either LDU. Track the
+  // observed empty phase per (operand, shared stage), not merely per port.
+  uint32_t mxScalePhaseMask = 0;
+  uint64_t mxScaleBase[2] = {};
+  uint32_t mxScaleTile[2] = {};
+#endif
 #if defined(DAE_TRACK_PROFILE)
   uint64_t dependency_wait_ns = 0;
   uint64_t dependency_contended = 0;
   uint64_t commands = 0;
   uint32_t profile_layer_counter = 0;
   uint32_t profile_reload_counter = 0;
+#endif
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+  uint32_t profile_mx_weight_tma_counter = 0;
+  uint32_t profile_mx_activation_tma_counter = 0;
 #endif
   m2ld.wait();
   LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
@@ -108,11 +122,23 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     ++commands;
 #endif
     auto &slot = cmd.slot;
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+    auto &opcode = cmd.opcode;
+    MInst inst{};
+    // Compact direct-scale commands carry their operand/stage in LdCmd::slot
+    // and derive the source from LDU-local state. Their repeatedly overwritten
+    // special MInst mailboxes are intentionally never read.
+    if (op(opcode) != op(OP_ALLOC_TMA_LOAD_MX_SCALE_1D))
+      inst = st_insts[slot];
+#else
     auto inst = st_insts[slot];
+#endif
 
     m2ld.advance();
 
+#if !DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
     auto &opcode = cmd.opcode;
+#endif
     auto &bar = cmd.bar;
     bool produces_compute_operand = true;
 
@@ -169,6 +195,16 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         if (transfer_size == 0) {
           asm volatile("trap;");
         }
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        if (op(opcode) == op(OP_ALLOC_TMA_LOAD_1D) &&
+            profile_mx_activation_tma_counter < 8) {
+          g_events[sm_id * numProfileEvents +
+                   mxfpProfileActivationTmaIssueBase +
+                   profile_mx_activation_tma_counter] =
+              cuda::ptx::get_sreg_globaltimer();
+          ++profile_mx_activation_tma_counter;
+        }
+#endif
         __ldprint("TMA 1D Load: size=%u", transfer_size);
         // We need to get a slot ID first, as we will use its barrier
         cuda::device::memcpy_async_tx(
@@ -191,6 +227,84 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               inst.arg, slot, inst.nslot(), regFile[inst.arg]);
         }
         break; }
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+      case op(OP_ALLOC_TMA_LOAD_MX_SCALE_1D):
+      case op(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D): {
+        constexpr uint32_t kScaleHalfBytes = 2048;
+        constexpr uint32_t kScaleStageBytes = 2 * kScaleHalfBytes;
+        int operand = 0;
+        int stage = 0;
+        if (op(opcode) == op(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D)) {
+          operand = inst.arg;
+          if (operand >= 2 || operand != port_id ||
+              slot != numSlots + 6 + operand || inst.address == 0) {
+            asm volatile("trap;");
+          }
+          mxScaleBase[operand] = inst.address;
+          mxScaleTile[operand] = 0;
+          static_cast<void>(ldu_control_publish_barrier->arrive());
+        } else {
+          const int encoded = int(slot) - numSlots;
+          if (encoded < 0 || encoded >= 2 * mxfp4Mxfp8TmaScaleStages) {
+            asm volatile("trap;");
+          }
+          operand = encoded / mxfp4Mxfp8TmaScaleStages;
+          stage = encoded % mxfp4Mxfp8TmaScaleStages;
+        }
+        const int phase_index = operand * mxfp4Mxfp8TmaScaleStages + stage;
+        const uint32_t scale_tile = mxScaleTile[operand];
+        if (mxScaleBase[operand] == 0 ||
+            scale_tile >= 8 ||
+            stage != int(scale_tile % mxfp4Mxfp8TmaScaleStages)) {
+          asm volatile("trap;");
+        }
+
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        const int producer_start_base = operand == 0
+            ? mxfpProfileSfaProducerStartBase
+            : mxfpProfileSfbProducerStartBase;
+        g_events[sm_id * numProfileEvents + producer_start_base + scale_tile] =
+            cuda::ptx::get_sreg_globaltimer();
+#endif
+        const uint32_t phase = (mxScalePhaseMask >> phase_index) & 1U;
+        bool empty = cuda::ptx::mbarrier_try_wait_parity(
+            cuda::ptx::sem_acquire,
+            cuda::ptx::scope_cta,
+            tmem_mma_barriers + mxfp4Mxfp8TmaScaleBarrierBase + stage,
+            phase);
+        while (!empty) {
+          __nanosleep(barrierPollSleepCycles);
+          empty = cuda::ptx::mbarrier_try_wait_parity(
+              cuda::ptx::sem_acquire,
+              cuda::ptx::scope_cta,
+              tmem_mma_barriers + mxfp4Mxfp8TmaScaleBarrierBase + stage,
+              phase);
+        }
+        mxScalePhaseMask ^= 1U << phase_index;
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        const int producer_ready_base = operand == 0
+            ? mxfpProfileSfaProducerReadyBase
+            : mxfpProfileSfbProducerReadyBase;
+        g_events[sm_id * numProfileEvents + producer_ready_base + scale_tile] =
+            cuda::ptx::get_sreg_globaltimer();
+#endif
+
+        auto *destination = static_cast<char *>(
+            get_slot_address(smem_base, numSlots));
+        destination += stage * kScaleStageBytes + operand * kScaleHalfBytes;
+        cuda::device::memcpy_async_tx(
+            destination,
+            reinterpret_cast<const char *>(
+                mxScaleBase[operand] +
+                uint64_t(scale_tile) * kScaleHalfBytes),
+            cuda::aligned_size_t<16>(kScaleHalfBytes),
+            m2c.barriers[bar]);
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar],
+            cuda::aligned_size_t<16>(kScaleHalfBytes));
+        ++mxScaleTile[operand];
+        break; }
+#endif
       case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):
       case op(OP_ALLOC_LAYER_TMA_LOAD_1D): {
         const uint64_t resolved = load_l2_u64(
@@ -358,6 +472,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break; }
       case op(OP_ALLOC_TMA_LOAD_5D_FIX0): {
         const uint16_t *cord = inst.coords;
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        if (profile_mx_weight_tma_counter < 8) {
+          g_events[sm_id * numProfileEvents + mxfpProfileWeightTmaIssueBase +
+                   profile_mx_weight_tma_counter] =
+              cuda::ptx::get_sreg_globaltimer();
+          ++profile_mx_weight_tma_counter;
+        }
+#endif
         // hardcode first coord to be 0
         __ldprint("TMA 5D Load: desc_idx=%d size=%d cord=(0,%d,%d,%d,%d)",
           inst.arg, inst.size, cord[0], cord[1], cord[2], cord[3]);

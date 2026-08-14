@@ -1515,7 +1515,13 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_k512_fp32_sm100(
   constexpr int kScaleBarrierBase = nvfp4ScaleCopyBarrierBase;
   constexpr int kScaleEmptyBarrierBase = 11;
   constexpr int kScratchStageBytes = 8 * 1024;
-  constexpr int kScratchStages = nvfp4ScaleCopyBarrierCount;
+  // Keep the scratch requirement dependent on the selected task family. This
+  // lets a selective non-NVFP image use a different task-tail geometry without
+  // an unused template rejecting the whole build at definition time.
+  constexpr int kScratchStages = StaticScaleStages > 0
+      ? StaticScaleStages
+      : nvfp4ScaleCopyBarrierCount;
+  static_assert(kScratchStages <= nvfp4ScaleCopyBarrierCount);
   constexpr int kScaleScratchBytes = kScratchStages * kScratchStageBytes;
   constexpr int kTaskScratchBytes =
       dynamicSmemBytes - numSlots * slotSizeKb * 1024;

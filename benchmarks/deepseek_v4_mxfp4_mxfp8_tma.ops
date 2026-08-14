@@ -1,0 +1,4 @@
+# Selective image for direct staged-TMA scale profiling.
+OP_MXFP4_MXFP8_GEMV_UMMA_TMA_SCALE_FP32_SM100__K_512__BLOAD_8
+OP_PROFILE_EVENT
+OP_TERMINATEC

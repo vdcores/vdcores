@@ -194,7 +194,11 @@ static constexpr int kDsv4ResidentRopeMetadataBytes =
     kDsv4MaxResidentRopeTables * kDsv4RopeTableBytes;
 static constexpr int kDsv4TaskScratchBytes =
     dynamicSmemBytes - numSlots * slotSizeKb * 1024;
-static constexpr int kDsv4ResidentRopeMetadataOffset = 16 * 1024;
+#ifndef DAE_DSV4_ROPE_METADATA_OFFSET_KB
+#define DAE_DSV4_ROPE_METADATA_OFFSET_KB 16
+#endif
+static constexpr int kDsv4ResidentRopeMetadataOffset =
+    DAE_DSV4_ROPE_METADATA_OFFSET_KB * 1024;
 static constexpr int kDsv4SmemBaseAlignmentSlack = 1023;
 static_assert(
     kDsv4TaskScratchBytes >=

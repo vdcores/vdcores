@@ -2577,6 +2577,50 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+class TmaLoadMxfpScale1D(MemoryInstruction):
+    """Compact TMA of one native scale half from an LDU-cached base."""
+
+    WEIGHT = 0
+    ACTIVATION = 1
+    STAGES = config.mxfp4_mxfp8_tma_scale_stages
+    BYTES = 2048
+
+    def __init__(self, *, stage: int, operand: int):
+        if not 0 <= stage < self.STAGES:
+            raise ValueError(
+                f"direct MX scale stage must be in [0,{self.STAGES})"
+            )
+        if operand not in (self.WEIGHT, self.ACTIVATION):
+            raise ValueError("direct MX scale operand must be weight or activation")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_MX_SCALE_1D,
+            # Operand/stage are carried in LdCmd::slot. The corresponding
+            # special MInst entry is not read by LDU and owns no payload bytes.
+            num_slots=config.num_slots + operand * self.STAGES + stage,
+            arg=0,
+            size=0,
+            address=0,
+        )
+
+
+class TmaLoadMxfpScaleBase1D(MemoryInstruction):
+    """Seed one LDU-local scale base and issue its first direct TMA."""
+
+    def __init__(self, src: torch.Tensor, *, operand: int):
+        if operand not in (
+            TmaLoadMxfpScale1D.WEIGHT,
+            TmaLoadMxfpScale1D.ACTIVATION,
+        ):
+            raise ValueError("MX scale base operand must be weight or activation")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D,
+            num_slots=config.num_slots + 6 + operand,
+            arg=operand,
+            size=0,
+            address=get_tensor_address(src),
+        )
+
+
 class TmaLoad64K1D(TmaLoad1D):
     """Allocator TMA load for the one-byte-past-uint16 64 KiB case."""
 
@@ -2938,6 +2982,8 @@ __all__ = [
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
+    "TmaLoadMxfpScale1D",
+    "TmaLoadMxfpScaleBase1D",
     "TmaLoad64K1D",
     "TmaLoadReg1D",
     "TmaStore1D",

@@ -37,6 +37,12 @@ ifneq ($(track_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE
 endif
 
+ifneq ($(mxfp_timeline),)
+	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_TRACK_MXFP_TIMELINE
+	export DAE_TRACK_PROFILE := 1
+	export DAE_TRACK_MXFP_TIMELINE := 1
+endif
+
 ifneq ($(global_insts),)
 	NVCC_FLAGS += -DDAE_LOAD_INSTRUCTIONS=0
 	export DAE_GLOBAL_INSTRUCTIONS := 1
@@ -70,6 +76,21 @@ endif
 ifneq ($(dynamic_smem_kb),)
 	NVCC_FLAGS += -DDAE_DYNAMIC_SMEM_KB=$(dynamic_smem_kb)
 	export DAE_DYNAMIC_SMEM_KB := $(dynamic_smem_kb)
+endif
+
+ifneq ($(dsv4_rope_metadata_offset_kb),)
+	NVCC_FLAGS += -DDAE_DSV4_ROPE_METADATA_OFFSET_KB=$(dsv4_rope_metadata_offset_kb)
+	export DAE_DSV4_ROPE_METADATA_OFFSET_KB := $(dsv4_rope_metadata_offset_kb)
+endif
+
+ifneq ($(mxfp_tma_scale_stages),)
+	NVCC_FLAGS += -DDAE_MXFP4_MXFP8_TMA_SCALE_STAGES=$(mxfp_tma_scale_stages)
+	export DAE_MXFP4_MXFP8_TMA_SCALE_STAGES := $(mxfp_tma_scale_stages)
+endif
+
+ifneq ($(mxfp_direct_tma),)
+	NVCC_FLAGS += -DDAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA=1
+	export DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA := 1
 endif
 
 # Directories

@@ -43,6 +43,9 @@ __device__ __forceinline__ void allocwarp_execute(
     di.jmp_cnt = initial_loop_counts.values[lane_id];
   }
   SharedMemoryAllocator<numSlots> alloc;
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+  bool mx_scale_bases_inflight = false;
+#endif
 
 #if defined(DAE_TRACK_PROFILE)
   uint64_t slot_stall_ns = 0;
@@ -112,6 +115,28 @@ __device__ __forceinline__ void allocwarp_execute(
       // __smprint(0, lane_id, "[Group] Updated: shift %x: bar=%d arg=%d nslot=%d bar=%d",
       //   shift, inst.bar(), inst.arg, inst.nslot(), inst.opcode & MEM_OP_FLAGS_BARRIER);
     }
+
+#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
+    if (decoded_op == op(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D)) {
+      const int operand = inst.arg;
+      const int special_slot = inst.nslot();
+      if (operand >= 2 || di.port != operand ||
+          special_slot != numSlots + 6 + operand ||
+          special_slot >= numSlots + numSpecialSlots) {
+        asm volatile("trap;");
+      }
+      // Both LDUs acknowledge after copying their base mailbox. Delay all 32
+      // allocator arrivals until a later task is about to overwrite operand
+      // zero; a single-tile schedule pays no reuse rendezvous.
+      if (operand == 0 && mx_scale_bases_inflight) {
+        ldu_control_publish_barrier->arrive_and_wait();
+        mx_scale_bases_inflight = false;
+      }
+      if (operand == 1) {
+        mx_scale_bases_inflight = true;
+      }
+    }
+#endif
 
     // TODO(zhiyuang): let the allocator decide whether to stall
     // ID.C: resource allocation

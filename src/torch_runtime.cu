@@ -980,6 +980,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("instructions_in_shared") = dae2LoadInstructions;
   config.attr("nvfp4_umma_pipeline_stages") = nvfp4UmmaPipelineStages;
   config.attr("nvfp4_scale_copy_stages") = nvfp4ScaleCopyBarrierCount;
+  config.attr("mxfp4_mxfp8_tma_scale_stages") =
+      mxfp4Mxfp8TmaScaleStages;
+  config.attr("mxfp4_mxfp8_direct_tma_enabled") =
+      mxfp4Mxfp8DirectTmaEnabled;
 
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");
   // flag.attr("jump") = MEM_OP_FLAGS_JUMP;
