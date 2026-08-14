@@ -33,6 +33,22 @@ if os.environ.get("DAE_AUX_SLOTS"):
         "-DDAE_DYNAMIC_SMEM_KB=219",
         "-DDAE_PACKED_SWAP_ATTENTION_SCRATCH=1",
     ])
+if os.environ.get("DAE_NVFP4_UMMA_PIPELINE_STAGES"):
+    cuda_defines.append(
+        "-DDAE_NVFP4_UMMA_PIPELINE_STAGES="
+        + os.environ["DAE_NVFP4_UMMA_PIPELINE_STAGES"]
+    )
+if os.environ.get("DAE_NVFP4_SCALE_COPY_STAGES"):
+    cuda_defines.append(
+        "-DDAE_NVFP4_SCALE_COPY_STAGES="
+        + os.environ["DAE_NVFP4_SCALE_COPY_STAGES"]
+    )
+if os.environ.get("DAE_NUM_INSTS"):
+    cuda_defines.append("-DDAE_NUM_INSTS=" + os.environ["DAE_NUM_INSTS"])
+if os.environ.get("DAE_DYNAMIC_SMEM_KB"):
+    cuda_defines.append(
+        "-DDAE_DYNAMIC_SMEM_KB=" + os.environ["DAE_DYNAMIC_SMEM_KB"]
+    )
 include_dirs = [
     os.path.join(this_dir, "include"),
     os.path.join(this_dir, "include", "dae"),

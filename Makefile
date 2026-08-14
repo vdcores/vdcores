@@ -47,6 +47,26 @@ ifneq ($(aux_slots),)
 	export DAE_AUX_SLOTS := 1
 endif
 
+ifneq ($(nvfp4_stages),)
+	NVCC_FLAGS += -DDAE_NVFP4_UMMA_PIPELINE_STAGES=$(nvfp4_stages)
+	export DAE_NVFP4_UMMA_PIPELINE_STAGES := $(nvfp4_stages)
+endif
+
+ifneq ($(nvfp4_scale_stages),)
+	NVCC_FLAGS += -DDAE_NVFP4_SCALE_COPY_STAGES=$(nvfp4_scale_stages)
+	export DAE_NVFP4_SCALE_COPY_STAGES := $(nvfp4_scale_stages)
+endif
+
+ifneq ($(num_insts),)
+	NVCC_FLAGS += -DDAE_NUM_INSTS=$(num_insts)
+	export DAE_NUM_INSTS := $(num_insts)
+endif
+
+ifneq ($(dynamic_smem_kb),)
+	NVCC_FLAGS += -DDAE_DYNAMIC_SMEM_KB=$(dynamic_smem_kb)
+	export DAE_DYNAMIC_SMEM_KB := $(dynamic_smem_kb)
+endif
+
 # Directories
 ifeq ($(debug),)
 	NVCC_FLAGS += -DNDEBUG

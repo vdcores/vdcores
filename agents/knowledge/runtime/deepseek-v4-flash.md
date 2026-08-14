@@ -2068,3 +2068,34 @@ This is a component comparison rather than an observed fused vLLM frontier:
 FlashInfer excludes the shared expert and includes SwiGLU, while the current
 VDCores graph includes shared plus routed gate/up, stops at FP32 accumulators,
 and excludes SwiGLU.
+
+## Shape-specialized NVFP4 K512 mainloop (2026-08-14)
+
+The routed M128/K4096 experiment now uses eight K512 stages, each containing
+two independently described K256 SM100 operands. Weight data remains streamed
+through allocator-owned M2C slots, while a preloaded 128-byte metadata record
+supplies the FP32 alpha and the compact weight/activation-scale addresses.
+Checkpoint preprocessing stores each K512 weight as 32 KiB of data plus a
+separate 4-KiB native SFA record; each K512 activation is 2 KiB of data plus
+32 compact SFB scale bytes. The production raw-address instruction form is
+still deferred.
+
+Warp 2 bulk-copies weight scales through a two-stage shared-memory ring, warp
+3 reads and expands only the live compact SFB bytes, warp 0 performs UTCCP and
+submits consecutive UMMAs without waiting for the preceding completion, and
+warp 1 retires allocator records after their completion barriers. One task-
+local TMEM allocator reserves the accumulator and scale pipeline. The FP32
+accumulator remains resident across all eight K512 stages, uses zero only for
+the first UMMA, and drains once after the full K reduction. Scratch reuse is
+generation-safe: it is released after dependent UTCCP/UMMA submission but not
+before the submitted UMMA has captured the scale record.
+
+On one allocated GB200 GPU in Conda `base`, job
+`20260814T132634Z-671385` measured 6.816 us for one M128/K4096 result with zero
+FP32 reference error, down from 14.368 us for the prior resident K256 task.
+The image uses 80 registers, 13 barriers, 14,624 bytes static plus 210 KiB
+dynamic shared memory, and has no spills. FlashInfer 0.6.16 measured 4.462 us
+in job `20260814T132918Z-718546`, but used a two-SM CTA pair; normalized by SM
+budget this is 8.924 SM-us/result versus 6.816 for VDCores. The next acceptance
+gate is the complete 4,096-tile Linear-1 worker schedule, not the isolated
+single-SM result.

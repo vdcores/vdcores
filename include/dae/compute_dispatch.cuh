@@ -214,6 +214,22 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_GROUP2_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_K512_FP32_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
+             g_events, tmem_mma_phase, fp8_umma_pipeline_phase_mask);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  if (inst.args[0] == 8 && inst.args[1] == 2 && inst.args[2] == 1) {
+    task_nvfp4_gemv_umma_k512_fp32_sm100<8, 2, 1>(
+        inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+        tmem_mma_barrier, nvfp4_umma_pipeline_phase_mask, m2c, c2m);
+  } else {
+    task_nvfp4_gemv_umma_k512_fp32_sm100(
+        inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
+        tmem_mma_barrier, nvfp4_umma_pipeline_phase_mask, m2c, c2m);
+  }
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_NVFP4_UMMA_PREPACK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);

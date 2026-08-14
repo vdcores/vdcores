@@ -25,6 +25,50 @@ __device__ __forceinline__ void __sync_barrier(int BarrierID) {
     );
 }
 
+// Unaligned named-barrier forms allow producer and consumer warps to execute
+// different operations on the same barrier.  In particular, producers can
+// arrive without waiting while a consumer arrives-and-waits for the complete
+// participating thread count.
+template<int BarrierID, int Count>
+__device__ __forceinline__ void __arrive_barrier_unaligned() {
+    asm volatile(
+        "barrier.cta.arrive %0, %1;"
+        :
+        : "n"(BarrierID), "n"(Count)
+        : "memory"
+    );
+}
+
+template<int Count>
+__device__ __forceinline__ void __arrive_barrier_unaligned(int BarrierID) {
+    asm volatile(
+        "barrier.cta.arrive %0, %1;"
+        :
+        : "r"(BarrierID), "n"(Count)
+        : "memory"
+    );
+}
+
+template<int BarrierID, int Count>
+__device__ __forceinline__ void __sync_barrier_unaligned() {
+    asm volatile(
+        "barrier.cta.sync %0, %1;"
+        :
+        : "n"(BarrierID), "n"(Count)
+        : "memory"
+    );
+}
+
+template<int Count>
+__device__ __forceinline__ void __sync_barrier_unaligned(int BarrierID) {
+    asm volatile(
+        "barrier.cta.sync %0, %1;"
+        :
+        : "r"(BarrierID), "n"(Count)
+        : "memory"
+    );
+}
+
 __device__ __forceinline__ int load_l2(const int* addr) {
     int val;
     asm volatile(

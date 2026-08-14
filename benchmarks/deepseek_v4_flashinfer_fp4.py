@@ -20,6 +20,11 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--graph-inner", type=int, default=20)
+    parser.add_argument(
+        "--cuda-profiler-capture",
+        action="store_true",
+        help="bracket one warmed GEMM with cudaProfilerStart/Stop",
+    )
     args = parser.parse_args()
 
     import flashinfer
@@ -102,6 +107,11 @@ def main() -> None:
     for _ in range(args.warmup):
         gemm()
     torch.cuda.synchronize()
+    if args.cuda_profiler_capture:
+        torch.cuda.cudart().cudaProfilerStart()
+        gemm()
+        torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.synchronize()
     hot_event_ms = bench_gpu_time(
         gemm_tensors,
         dry_run_iters=args.warmup,

@@ -154,17 +154,32 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     switch(op(opcode)) {
       case op(OP_ALLOC_TMA_LOAD_REG_1D):
       case op(OP_ALLOC_TMA_LOAD_1D): {
-        __ldprint("TMA 1D Load: size=%d", inst.size);
+        // MInst::size is uint16_t.  Reserve the otherwise-invalid
+        // size=0/arg=0xffff combination for one 64 KiB allocator load so a
+        // shaped task can move two adjacent 32 KiB K512 records with one M2C
+        // command.  Keep the retained-register form untouched because its
+        // arg field names the destination register.
+        constexpr uint16_t kTmaLoad64KMarker = 0xffff;
+        const uint32_t transfer_size =
+            op(opcode) == op(OP_ALLOC_TMA_LOAD_1D) &&
+                    inst.size == 0 && inst.arg == kTmaLoad64KMarker &&
+                    inst.nslot() == 8
+                ? 64U * 1024U
+                : uint32_t(inst.size);
+        if (transfer_size == 0) {
+          asm volatile("trap;");
+        }
+        __ldprint("TMA 1D Load: size=%u", transfer_size);
         // We need to get a slot ID first, as we will use its barrier
         cuda::device::memcpy_async_tx(
             (char *)(get_slot_address(smem_base, slot)),
             (char *)(inst.address),
-            cuda::aligned_size_t<16>(inst.size),
+            cuda::aligned_size_t<16>(transfer_size),
             m2c.barriers[bar]
         );
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar],
-          cuda::aligned_size_t<16>(inst.size)
+          cuda::aligned_size_t<16>(transfer_size)
         );
         if (op(opcode) == op(OP_ALLOC_TMA_LOAD_REG_1D)) {
           if (inst.arg >= 4) {

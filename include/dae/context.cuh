@@ -65,13 +65,24 @@ static constexpr int fp8UmmaPipelineBarrierBase =
     tmemGroupedBarrierBase + tmemGroupedBarrierCount;
 static constexpr int fp8UmmaPipelineBarrierCount =
     fp8UmmaPipelineStages * 2;
-static constexpr int nvfp4UmmaPipelineStages = 4;
+#ifndef DAE_NVFP4_UMMA_PIPELINE_STAGES
+#define DAE_NVFP4_UMMA_PIPELINE_STAGES 4
+#endif
+static constexpr int nvfp4UmmaPipelineStages =
+    DAE_NVFP4_UMMA_PIPELINE_STAGES;
 static constexpr int nvfp4UmmaPipelineBarrierBase =
     fp8UmmaPipelineBarrierBase + fp8UmmaPipelineBarrierCount;
 static constexpr int nvfp4UmmaPipelineBarrierCount =
     nvfp4UmmaPipelineStages * 2;
-static constexpr int tmemMmaBarrierCount =
+#ifndef DAE_NVFP4_SCALE_COPY_STAGES
+#define DAE_NVFP4_SCALE_COPY_STAGES 2
+#endif
+static constexpr int nvfp4ScaleCopyBarrierCount =
+    DAE_NVFP4_SCALE_COPY_STAGES;
+static constexpr int nvfp4ScaleCopyBarrierBase =
     nvfp4UmmaPipelineBarrierBase + nvfp4UmmaPipelineBarrierCount;
+static constexpr int tmemMmaBarrierCount =
+    nvfp4ScaleCopyBarrierBase + nvfp4ScaleCopyBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);

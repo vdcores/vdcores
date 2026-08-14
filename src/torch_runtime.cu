@@ -31,6 +31,13 @@ constexpr int kNvfp4TileK = 256;
 constexpr int kNvfp4PackedK = kNvfp4TileK / 2;
 constexpr int kNvfp4WeightDataBytes = kNvfp4TileM * kNvfp4PackedK;
 constexpr int kNvfp4WeightTileBytes = 18432;
+constexpr int kNvfp4K512TileK = 512;
+constexpr int kNvfp4K512PackedK = kNvfp4K512TileK / 2;
+constexpr int kNvfp4K512WeightDataBytes =
+    kNvfp4TileM * kNvfp4K512PackedK;
+constexpr int kNvfp4K512WeightScaleBytes = 4096;
+constexpr int kNvfp4K512ActivationDataBytes = 8 * kNvfp4K512PackedK;
+constexpr int kNvfp4K512ActivationScaleBytes = 32;
 constexpr int kFp8TileM = 128;
 constexpr int kFp8TileK = 128;
 constexpr int kFp8WeightDataBytes = kFp8TileM * kFp8TileK;
@@ -137,6 +144,235 @@ void py_prepack_nvfp4_checkpoint(
   const cudaError_t error = cudaGetLastError();
   TORCH_CHECK(error == cudaSuccess,
               "NVFP4 checkpoint prepack failed: ", cudaGetErrorString(error));
+}
+
+__global__ void prepack_nvfp4_checkpoint_k512_split_kernel(
+    const uint8_t *__restrict__ weight,
+    const cutlass::float_e4m3_t *__restrict__ checkpoint_scale,
+    uint8_t *__restrict__ output_data,
+    uint8_t *__restrict__ output_scale,
+    int packed_k,
+    int k_tiles) {
+  using namespace cute;
+  using Fp4 = cutlass::float_e2m1_t;
+  using Scale = cutlass::float_ue4m3_t;
+  using Atom = SM100_MMA_MXF4_SS<
+      Fp4, Fp4, float, Scale,
+      kNvfp4TileM, 8, 16,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+  using ScaleProblemShape =
+      Shape<Int<kNvfp4TileM>, Int<128>, Int<kNvfp4TileK>>;
+
+  const int m_tile = blockIdx.x / k_tiles;
+  const int k_tile = blockIdx.x - m_tile * k_tiles;
+  auto *tile_data =
+      output_data + blockIdx.x * kNvfp4K512WeightDataBytes;
+  auto *tile_scale = reinterpret_cast<Scale *>(
+      output_scale + blockIdx.x * kNvfp4K512WeightScaleBytes);
+
+  for (int index = threadIdx.x; index < kNvfp4K512WeightDataBytes;
+       index += blockDim.x) {
+    const int subtile = index / kNvfp4WeightDataBytes;
+    const int local_index = index - subtile * kNvfp4WeightDataBytes;
+    const int row = local_index / kNvfp4PackedK;
+    const int destination_column = local_index - row * kNvfp4PackedK;
+    const int destination_chunk = destination_column / 16;
+    const int byte_in_chunk = destination_column - destination_chunk * 16;
+    const int source_chunk = destination_chunk ^ (row & 7);
+    const int source_column =
+        (k_tile * 2 + subtile) * kNvfp4PackedK +
+        source_chunk * 16 + byte_in_chunk;
+    tile_data[index] =
+        weight[(m_tile * kNvfp4TileM + row) * packed_k + source_column];
+  }
+
+  TiledMma tiled_mma;
+  const auto logical_sfa = ScaleConfig::tile_atom_to_shape_SFA(
+      ScaleProblemShape{});
+  cutlass::NumericConverter<Scale, cutlass::float_e4m3_t> convert_scale;
+  constexpr int kScaleColumns = kNvfp4TileK / 16;
+  const int source_scale_columns = packed_k / 8;
+  for (int index = threadIdx.x;
+       index < 2 * kNvfp4TileM * kScaleColumns;
+       index += blockDim.x) {
+    const int subtile = index / (kNvfp4TileM * kScaleColumns);
+    const int local_index =
+        index - subtile * kNvfp4TileM * kScaleColumns;
+    const int row = local_index / kScaleColumns;
+    const int sf = local_index - row * kScaleColumns;
+    const int destination = subtile * (kNvfp4TileM * kScaleColumns) +
+        int(logical_sfa(row, sf * 16));
+    tile_scale[destination] = convert_scale(
+        checkpoint_scale[
+            (m_tile * kNvfp4TileM + row) * source_scale_columns +
+            (k_tile * 2 + subtile) * kScaleColumns + sf]);
+  }
+}
+
+void py_prepack_nvfp4_checkpoint_k512_split(
+    torch::Tensor weight,
+    torch::Tensor checkpoint_scale,
+    torch::Tensor output_data,
+    torch::Tensor output_scale) {
+  TORCH_CHECK(
+      weight.is_cuda() && checkpoint_scale.is_cuda() &&
+          output_data.is_cuda() && output_scale.is_cuda(),
+      "K512 NVFP4 prepack tensors must be CUDA tensors");
+  TORCH_CHECK(
+      weight.device() == checkpoint_scale.device() &&
+          weight.device() == output_data.device() &&
+          weight.device() == output_scale.device(),
+      "K512 NVFP4 prepack tensors must share one CUDA device");
+  TORCH_CHECK(
+      weight.scalar_type() == at::ScalarType::Byte && weight.dim() == 2 &&
+          weight.is_contiguous(),
+      "K512 NVFP4 weight must be contiguous rank-2 uint8");
+  TORCH_CHECK(
+      checkpoint_scale.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+          checkpoint_scale.dim() == 2 && checkpoint_scale.is_contiguous(),
+      "K512 NVFP4 scale must be contiguous rank-2 E4M3");
+  const int64_t rows = weight.size(0);
+  const int64_t packed_k = weight.size(1);
+  TORCH_CHECK(
+      rows % kNvfp4TileM == 0 && packed_k % kNvfp4K512PackedK == 0,
+      "K512 NVFP4 weight must be M128/K512 aligned");
+  TORCH_CHECK(
+      checkpoint_scale.size(0) == rows &&
+          checkpoint_scale.size(1) == packed_k / 8,
+      "K512 NVFP4 checkpoint scale shape does not match the weight");
+  const int64_t m_tiles = rows / kNvfp4TileM;
+  const int64_t k_tiles = packed_k / kNvfp4K512PackedK;
+  TORCH_CHECK(
+      output_data.scalar_type() == at::ScalarType::Byte &&
+          output_data.is_contiguous() && output_data.dim() == 3 &&
+          output_data.size(0) == m_tiles &&
+          output_data.size(1) == k_tiles &&
+          output_data.size(2) == kNvfp4K512WeightDataBytes,
+      "K512 NVFP4 data output must be [M/128,K/512,32768] uint8");
+  TORCH_CHECK(
+      output_scale.scalar_type() == at::ScalarType::Byte &&
+          output_scale.is_contiguous() && output_scale.dim() == 3 &&
+          output_scale.size(0) == m_tiles &&
+          output_scale.size(1) == k_tiles &&
+          output_scale.size(2) == kNvfp4K512WeightScaleBytes,
+      "K512 NVFP4 scale output must be [M/128,K/512,4096] uint8");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(weight.device().index());
+  prepack_nvfp4_checkpoint_k512_split_kernel<<<
+      static_cast<unsigned>(m_tiles * k_tiles), 256, 0, stream>>>(
+      weight.data_ptr<uint8_t>(),
+      reinterpret_cast<const cutlass::float_e4m3_t *>(
+          checkpoint_scale.data_ptr()),
+      output_data.data_ptr<uint8_t>(),
+      output_scale.data_ptr<uint8_t>(),
+      static_cast<int>(packed_k),
+      static_cast<int>(k_tiles));
+  const cudaError_t error = cudaGetLastError();
+  TORCH_CHECK(
+      error == cudaSuccess,
+      "K512 NVFP4 checkpoint prepack failed: ", cudaGetErrorString(error));
+}
+
+__global__ void prepack_nvfp4_activation_k512_split_kernel(
+    const uint8_t *__restrict__ activation,
+    const cutlass::float_e4m3_t *__restrict__ checkpoint_scale,
+    uint8_t *__restrict__ output_data,
+    uint8_t *__restrict__ output_scale) {
+  using namespace cute;
+  using Fp4 = cutlass::float_e2m1_t;
+  using Scale = cutlass::float_ue4m3_t;
+  using Atom = SM100_MMA_MXF4_SS<
+      Fp4, Fp4, float, Scale,
+      kNvfp4TileM, 8, 16,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+  const int k_tile = blockIdx.x;
+  auto *tile_data =
+      output_data + k_tile * kNvfp4K512ActivationDataBytes;
+  auto *tile_scale_bytes =
+      output_scale + k_tile * kNvfp4K512ActivationScaleBytes;
+  for (int index = threadIdx.x;
+       index < kNvfp4K512ActivationDataBytes;
+       index += blockDim.x) {
+    constexpr int kActivationK256DataBytes = 8 * kNvfp4PackedK;
+    const int subtile = index / kActivationK256DataBytes;
+    const int local_index = index - subtile * kActivationK256DataBytes;
+    const int row = local_index / kNvfp4PackedK;
+    const int destination_column = local_index - row * kNvfp4PackedK;
+    const int destination_chunk = destination_column / 16;
+    const int byte_in_chunk = destination_column - destination_chunk * 16;
+    const int source_chunk = destination_chunk ^ row;
+    const int source_column =
+        (k_tile * 2 + subtile) * kNvfp4PackedK +
+        source_chunk * 16 + byte_in_chunk;
+    tile_data[index] = activation[source_column];
+  }
+  cutlass::NumericConverter<Scale, cutlass::float_e4m3_t> convert_scale;
+  auto *tile_scale = reinterpret_cast<Scale *>(tile_scale_bytes);
+  constexpr int kScaleColumns = kNvfp4K512TileK / 16;
+  for (int index = threadIdx.x; index < kScaleColumns;
+       index += blockDim.x) {
+    tile_scale[index] = convert_scale(
+        checkpoint_scale[k_tile * kScaleColumns + index]);
+  }
+}
+
+void py_prepack_nvfp4_activation_k512_split(
+    torch::Tensor activation,
+    torch::Tensor checkpoint_scale,
+    torch::Tensor output_data,
+    torch::Tensor output_scale) {
+  TORCH_CHECK(
+      activation.is_cuda() && checkpoint_scale.is_cuda() &&
+          output_data.is_cuda() && output_scale.is_cuda(),
+      "K512 NVFP4 activation prepack tensors must be CUDA tensors");
+  TORCH_CHECK(
+      activation.device() == checkpoint_scale.device() &&
+          activation.device() == output_data.device() &&
+          activation.device() == output_scale.device(),
+      "K512 NVFP4 activation prepack tensors must share one CUDA device");
+  TORCH_CHECK(
+      activation.scalar_type() == at::ScalarType::Byte &&
+          activation.dim() == 1 && activation.is_contiguous(),
+      "K512 NVFP4 activation must be contiguous rank-1 uint8");
+  TORCH_CHECK(
+      checkpoint_scale.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+          checkpoint_scale.dim() == 1 && checkpoint_scale.is_contiguous(),
+      "K512 NVFP4 activation scale must be contiguous rank-1 E4M3");
+  TORCH_CHECK(
+      activation.numel() % kNvfp4K512PackedK == 0 &&
+          checkpoint_scale.numel() == activation.numel() / 8,
+      "K512 NVFP4 activation and scale shapes do not match");
+  const int64_t k_tiles = activation.numel() / kNvfp4K512PackedK;
+  TORCH_CHECK(
+      output_data.scalar_type() == at::ScalarType::Byte &&
+          output_data.is_contiguous() && output_data.dim() == 2 &&
+          output_data.size(0) == k_tiles &&
+          output_data.size(1) == kNvfp4K512ActivationDataBytes,
+      "K512 activation data output must be [K/512,2048] uint8");
+  TORCH_CHECK(
+      output_scale.scalar_type() == at::ScalarType::Byte &&
+          output_scale.is_contiguous() && output_scale.dim() == 2 &&
+          output_scale.size(0) == k_tiles &&
+          output_scale.size(1) == kNvfp4K512ActivationScaleBytes,
+      "K512 activation scale output must be [K/512,32] uint8");
+
+  const auto stream =
+      at::cuda::getCurrentCUDAStream(activation.device().index());
+  prepack_nvfp4_activation_k512_split_kernel<<<
+      static_cast<unsigned>(k_tiles), 256, 0, stream>>>(
+      activation.data_ptr<uint8_t>(),
+      reinterpret_cast<const cutlass::float_e4m3_t *>(
+          checkpoint_scale.data_ptr()),
+      output_data.data_ptr<uint8_t>(),
+      output_scale.data_ptr<uint8_t>());
+  const cudaError_t error = cudaGetLastError();
+  TORCH_CHECK(
+      error == cudaSuccess,
+      "K512 activation prepack failed: ", cudaGetErrorString(error));
 }
 
 __global__ void prepack_fp8_checkpoint_kernel(
@@ -739,6 +975,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;
   config.attr("instructions_in_shared") = dae2LoadInstructions;
+  config.attr("nvfp4_umma_pipeline_stages") = nvfp4UmmaPipelineStages;
+  config.attr("nvfp4_scale_copy_stages") = nvfp4ScaleCopyBarrierCount;
 
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");
   // flag.attr("jump") = MEM_OP_FLAGS_JUMP;
@@ -806,6 +1044,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("checkpoint_scale"),
             py::arg("output"),
             "Convert one raw checkpoint NVFP4 linear to native SM100 tiles");
+  m.def("prepack_nvfp4_checkpoint_k512_split",
+            &py_prepack_nvfp4_checkpoint_k512_split,
+            py::arg("weight"),
+            py::arg("checkpoint_scale"),
+            py::arg("output_data"),
+            py::arg("output_scale"),
+            "Pack one NVFP4 linear into split K512 data and scale records");
+  m.def("prepack_nvfp4_activation_k512_split",
+            &py_prepack_nvfp4_activation_k512_split,
+            py::arg("activation"),
+            py::arg("checkpoint_scale"),
+            py::arg("output_data"),
+            py::arg("output_scale"),
+            "Pack one NVFP4 activation into split K512 data and scale records");
   m.def("prepack_fp8_checkpoint", &py_prepack_fp8_checkpoint,
             py::arg("weight"),
             py::arg("checkpoint_scale"),

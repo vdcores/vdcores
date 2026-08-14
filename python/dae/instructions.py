@@ -253,6 +253,33 @@ class Nvfp4GemvUmmaPipelineFp32Group2Sm100(
         )
 
 
+class Nvfp4GemvUmmaK512Fp32Sm100(ComputeInstruction):
+    """K512 native UMMA with allocator-free, compute-warp scale staging."""
+
+    def __init__(
+        self,
+        k_tiles: int,
+        *,
+        scale_stages: int = 2,
+        weight_tiles_per_load: int = 1,
+    ):
+        if k_tiles <= 0 or k_tiles > 8:
+            raise ValueError("K512 NVFP4 tile count must be in [1,8]")
+        if not 1 <= scale_stages <= config.nvfp4_scale_copy_stages:
+            raise ValueError(
+                "K512 NVFP4 scale stages must be in [1,"
+                f"{config.nvfp4_scale_copy_stages}]"
+            )
+        if weight_tiles_per_load not in (1, 2):
+            raise ValueError("K512 NVFP4 weight tiles per load must be one or two")
+        if k_tiles % weight_tiles_per_load:
+            raise ValueError("K512 NVFP4 weight load must divide the K tiles")
+        super().__init__(
+            opcode=opcode.OP_NVFP4_GEMV_UMMA_K512_FP32_SM100,
+            args=[k_tiles, scale_stages, weight_tiles_per_load],
+        )
+
+
 class Nvfp4UmmaPrepackSm100(ComputeInstruction):
     """Prepack direct-TMA NVFP4 data and raw scales into one native tile."""
 
@@ -2497,6 +2524,25 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+class TmaLoad64K1D(TmaLoad1D):
+    """Allocator TMA load for the one-byte-past-uint16 64 KiB case."""
+
+    SIZE_MARKER = 0xFFFF
+
+    def __init__(self, src: torch.Tensor):
+        bytes = src.numel() * src.element_size()
+        if bytes != 64 * 1024:
+            raise ValueError(f"TmaLoad64K1D requires exactly 64 KiB, got {bytes}")
+        MemoryInstruction.__init__(
+            self,
+            opcode=opcode.OP_ALLOC_TMA_LOAD_1D,
+            num_slots=8,
+            arg=self.SIZE_MARKER,
+            size=0,
+            address=get_tensor_address(src),
+        )
+
+
 class TmaLoadReg1D(TmaLoad1D):
     """TMA-load into shared slots retained for a later same-LDU RegLoad."""
 
@@ -2689,6 +2735,7 @@ __all__ = [
     "Nvfp4GemvUmmaFp32Sm100",
     "Nvfp4GemvUmmaPipelineFp32Sm100",
     "Nvfp4GemvUmmaPipelineFp32Group2Sm100",
+    "Nvfp4GemvUmmaK512Fp32Sm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",
@@ -2821,6 +2868,7 @@ __all__ = [
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
+    "TmaLoad64K1D",
     "TmaLoadReg1D",
     "TmaStore1D",
     "StuStore1D",
