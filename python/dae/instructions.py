@@ -262,6 +262,7 @@ class Nvfp4GemvUmmaK512Fp32Sm100(ComputeInstruction):
         *,
         scale_stages: int = 2,
         weight_tiles_per_load: int = 1,
+        retain_activation: bool = False,
     ):
         if k_tiles <= 0 or k_tiles > 8:
             raise ValueError("K512 NVFP4 tile count must be in [1,8]")
@@ -276,7 +277,11 @@ class Nvfp4GemvUmmaK512Fp32Sm100(ComputeInstruction):
             raise ValueError("K512 NVFP4 weight load must divide the K tiles")
         super().__init__(
             opcode=opcode.OP_NVFP4_GEMV_UMMA_K512_FP32_SM100,
-            args=[k_tiles, scale_stages, weight_tiles_per_load],
+            args=[
+                k_tiles,
+                scale_stages,
+                weight_tiles_per_load | (int(retain_activation) << 8),
+            ],
         )
 
 

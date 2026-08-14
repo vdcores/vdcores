@@ -1478,6 +1478,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_k512_fp32_sm100(
     int num_k_tiles,
     int scale_stages,
     int weight_tiles_per_load,
+    int retain_activation,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
@@ -1545,7 +1546,8 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_k512_fp32_sm100(
   if (num_k_tiles <= 0 || num_k_tiles > 8 ||
       scale_stages <= 0 || scale_stages > kScratchStages ||
       weight_tiles_per_load <= 0 || weight_tiles_per_load > 2 ||
-      num_k_tiles % weight_tiles_per_load) {
+      num_k_tiles % weight_tiles_per_load ||
+      (retain_activation != 0 && retain_activation != 1)) {
     asm volatile("trap;");
   }
 
@@ -1887,7 +1889,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_k512_fp32_sm100(
       if ((tile + 1) % weight_tiles_per_load == 0 ||
           tile + 1 == num_k_tiles) {
         int release_slots = live_weight_slots;
-        if (tile + 1 == num_k_tiles) {
+        if (tile + 1 == num_k_tiles && !retain_activation) {
           release_slots |= activation_slots;
         }
         c2m.template push<numThreadsPerWarp>(tid, release_slots);

@@ -487,6 +487,29 @@ opcodes and generated handlers. Each generated handler calls one fixed C++
 template directly; scale packing, grouped-row count, and reduction type are
 not decoded from `CInst.args` in the persistent kernel.
 
+The shaped routed NVFP4 handler is runtime-packed rather than a generated
+family:
+
+- `OP_NVFP4_GEMV_UMMA_K512_FP32_SM100`
+  - Python args:
+    - `args[0]` = number of K512 stages in `[1,8]`
+    - `args[1]` = task-local shared scale-ring stages
+    - low eight bits of `args[2]` = adjacent weight stages per M2C load
+    - bit eight of `args[2]` = retain the activation slot span after the task
+  - input tokens:
+    - one 128-byte metadata record containing FP32 alpha and compact SFA/SFB
+      base addresses
+    - one contiguous activation-data span covering the complete K shard
+    - streamed 32-KiB K512 weight-data records
+  - effect:
+    - copies compact scales through task-local shared/TMEM staging
+    - accumulates every K512 stage into one resident FP32 TMEM accumulator
+    - drains FP32 once after the full shard and queues the output token
+    - normally releases the activation with the final weight record
+    - when the retain bit is set, leaves that normal-slot mask allocated so a
+      same-LDU `RegLoad` can republish it to the adjacent task; the eventual
+      non-retaining consumer must release it
+
 Static GEMM handlers:
 
 - `OP_GEMM_M64N64`

@@ -42,6 +42,7 @@ from dae.instructions import (
     Fp8GemvUmmaStreamSm100,
     Fp8UmmaPrepackSm100,
     Nvfp4GemvSm100,
+    Nvfp4GemvUmmaK512Fp32Sm100,
     Nvfp4GemvUmmaPipelineSm100,
     Nvfp4GemvUmmaPipelineFp32Sm100,
     Nvfp4GemvUmmaPipelineFp32Group2Sm100,
@@ -492,6 +493,16 @@ def test_nvfp4_paired_fp32_pipeline_encodes_activation_batch():
         opcode.OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_GROUP2_SM100
     )
     assert instruction.args == [8, 0, 4]
+
+
+def test_nvfp4_k512_pipeline_packs_activation_retention():
+    ordinary = Nvfp4GemvUmmaK512Fp32Sm100(8)
+    retained = Nvfp4GemvUmmaK512Fp32Sm100(
+        8, retain_activation=True
+    )
+
+    assert ordinary.args == [8, 2, 1]
+    assert retained.args == [8, 2, 0x101]
 
 
 def test_dsv4_fp32_swiglu_native_quant_encodes_tile_count_and_bound():

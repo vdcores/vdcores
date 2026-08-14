@@ -3,14 +3,16 @@
 
 The timed graph is deliberately limited to gate and up.  It contains the two
 FP8 shared-expert projections (1,024 K128 tiles) and the two NVFP4 projections
-for six routed experts (3,072 K256 tiles).  Routing, packing, allocation, and
-zeroing happen before the timed frontier.  Candidate plans change only the
-worker queues and routed split-K spans; the already-compiled group-1 UMMA
-handlers are used unchanged.
+for six routed experts (3,072 K256-equivalent tiles).  The selected routed
+backend groups those into 1,536 K512 stages while preserving the exact 4,096-
+tile logical graph.  Routing, checkpoint packing, allocation, output zeroing,
+and Python reference conversion happen before the timed frontier.
 
 Every one of the 152 queues starts with exactly one shared task.  This gives
 shared work strict queue priority without a global barrier: each worker can
-start its routed tail as soon as its own shared head finishes.
+start its routed tail as soon as its own shared head finishes.  The selected
+unsplit plan pairs gate/up for one route on each double-tail worker and retains
+their common activation allocation across that local boundary.
 """
 
 from __future__ import annotations
@@ -25,14 +27,18 @@ from dataclasses import dataclass
 import torch
 
 from dae import runtime
+from dae.deepseek_v4_quant import dequantize_nvfp4
 from dae.instructions import (
     Fp8GemvUmmaSplitKSm100,
+    Nvfp4GemvUmmaK512Fp32Sm100,
     Nvfp4GemvUmmaPipelineFp32Sm100,
     ProfileEvent,
+    RegLoad,
     RoutedTmaLoad1D,
     RoutedTmaLoadBase1D,
     TmaLoad1D,
     TmaLoadAddressReg1D,
+    TmaLoadReg1D,
     TmaTensor,
 )
 from dae.launcher import Launcher
@@ -50,8 +56,10 @@ HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 2048
 M_TILES = INTERMEDIATE_SIZE // 128
 ROUTED_K_TILES = HIDDEN_SIZE // 256
+ROUTED_K512_TILES = HIDDEN_SIZE // 512
 SHARED_K_TILES = HIDDEN_SIZE // 128
 SCALE_PACK = 2
+ROUTE_EXPERTS = (5, 2, 4, 1, 3, 0)
 
 SHARED_ATOMIC_TILES = PROJECTIONS * M_TILES * SHARED_K_TILES
 ROUTED_ATOMIC_TILES = (
@@ -60,6 +68,11 @@ ROUTED_ATOMIC_TILES = (
 TOTAL_ATOMIC_TILES = SHARED_ATOMIC_TILES + ROUTED_ATOMIC_TILES
 
 NVFP4_WEIGHT_TILE_BYTES = 18432
+NVFP4_K512_WEIGHT_DATA_BYTES = 32768
+NVFP4_K512_WEIGHT_SCALE_BYTES = 4096
+NVFP4_K512_ACTIVATION_DATA_BYTES = 2048
+NVFP4_K512_ACTIVATION_SCALE_BYTES = 32
+NVFP4_K512_METADATA_BYTES = 128
 FP8_WEIGHT_DATA_BYTES = 128 * 128
 FP8_WEIGHT_SCALE_BYTES = 512
 TASK_PROFILE_EVENT_BASE = 4
@@ -85,15 +98,29 @@ MEASURED_ROUTED_COST_US = {
     6: 4.704,
     16: 13.056,
 }
+MEASURED_K512_ROUTED_COST_US = {
+    # Keys retain the graph's K256-equivalent units.  K16 selects the static
+    # eight-stage specialization and is intentionally faster than K14.
+    2: 3.744,
+    4: 4.384,
+    6: 5.056,
+    8: 5.568,
+    10: 6.176,
+    12: 6.784,
+    14: 7.504,
+    16: 6.720,
+}
 
 
 @dataclass(frozen=True)
 class Linear1Inputs:
     table: RoutedAddressTable
     activation_nvfp4: torch.Tensor
+    activation_nvfp4_k512_data: torch.Tensor
     alpha_fields: tuple[int, ...]
     weight_fp8: torch.Tensor
     activation_fp8: torch.Tensor
+    reference_k512: torch.Tensor
     owners: tuple[object, ...]
 
 
@@ -153,6 +180,8 @@ class BuiltPlan:
     spec: PlanSpec
     shared_plan: str
     placement: str
+    routed_backend: str
+    retain_paired_activation: bool
     queues: tuple[tuple[TileChunk, ...], ...]
     launcher: Launcher
     accumulator: torch.Tensor
@@ -178,11 +207,60 @@ def _make_inputs(device: torch.device, seed: int) -> Linear1Inputs:
         print(f"DSV4_LINEAR1_SETUP_STAGE name={name}", flush=True)
 
     generator = torch.Generator(device=device).manual_seed(seed)
+    alpha_host = torch.linspace(
+        0.025,
+        0.035,
+        ROUTED_EXPERTS,
+        dtype=torch.float32,
+    ).repeat(PROJECTIONS, 1)
     activation_nvfp4 = torch.zeros(
         (ROUTED_EXPERTS, ROUTED_K_TILES, 3072),
         dtype=torch.uint8,
         device=device,
     )
+    activation_nvfp4_k512_data = torch.empty(
+        (
+            ROUTED_EXPERTS,
+            ROUTED_K512_TILES,
+            NVFP4_K512_ACTIVATION_DATA_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    activation_nvfp4_k512_scale = torch.empty(
+        (
+            ROUTED_EXPERTS,
+            ROUTED_K512_TILES,
+            NVFP4_K512_ACTIVATION_SCALE_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    checkpoint_activation = torch.randint(
+        0,
+        256,
+        (ROUTED_EXPERTS, HIDDEN_SIZE // 2),
+        generator=generator,
+        dtype=torch.uint8,
+        device=device,
+    )
+    activation_scale_exponents = torch.randint(
+        -2,
+        3,
+        (ROUTED_EXPERTS, HIDDEN_SIZE // 16),
+        generator=generator,
+        device=device,
+    )
+    checkpoint_activation_scale = torch.pow(
+        2.0, activation_scale_exponents.float()
+    ).to(torch.float8_e4m3fn)
+    for route_rank in range(ROUTED_EXPERTS):
+        runtime.prepack_nvfp4_activation_k512_split(
+            checkpoint_activation[route_rank],
+            checkpoint_activation_scale[route_rank],
+            activation_nvfp4_k512_data[route_rank],
+            activation_nvfp4_k512_scale[route_rank],
+        )
     activation_fp8 = torch.zeros(
         (SHARED_K_TILES, 2048), dtype=torch.uint8, device=device
     )
@@ -199,11 +277,43 @@ def _make_inputs(device: torch.device, seed: int) -> Linear1Inputs:
         dtype=torch.uint8,
         device=device,
     )
+    packed_nvfp4_k512_data = torch.empty(
+        (
+            PROJECTIONS,
+            ROUTED_EXPERTS,
+            M_TILES,
+            ROUTED_K512_TILES,
+            NVFP4_K512_WEIGHT_DATA_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    packed_nvfp4_k512_scale = torch.empty(
+        (
+            PROJECTIONS,
+            ROUTED_EXPERTS,
+            M_TILES,
+            ROUTED_K512_TILES,
+            NVFP4_K512_WEIGHT_SCALE_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
     checkpoint_scale = torch.ones(
         (INTERMEDIATE_SIZE, HIDDEN_SIZE // 16),
         dtype=torch.float32,
         device=device,
     ).to(torch.float8_e4m3fn)
+    dequant_activation = dequantize_nvfp4(
+        checkpoint_activation,
+        checkpoint_activation_scale,
+        1.0,
+    )
+    reference_k512 = torch.zeros(
+        (PROJECTIONS * (ROUTED_EXPERTS + 1), INTERMEDIATE_SIZE),
+        dtype=torch.float32,
+        device=device,
+    )
     for projection in range(PROJECTIONS):
         for expert in range(ROUTED_EXPERTS):
             checkpoint_weight = torch.randint(
@@ -219,6 +329,24 @@ def _make_inputs(device: torch.device, seed: int) -> Linear1Inputs:
                 checkpoint_scale,
                 packed_nvfp4[projection, expert],
             )
+            runtime.prepack_nvfp4_checkpoint_k512_split(
+                checkpoint_weight,
+                checkpoint_scale,
+                packed_nvfp4_k512_data[projection, expert],
+                packed_nvfp4_k512_scale[projection, expert],
+            )
+            route_rank = ROUTE_EXPERTS.index(expert)
+            dequant_weight = dequantize_nvfp4(
+                checkpoint_weight,
+                checkpoint_scale,
+                1.0,
+            )
+            reference_k512[
+                projection * (ROUTED_EXPERTS + 1) + route_rank
+            ].copy_(
+                torch.mv(dequant_weight, dequant_activation[route_rank])
+                * float(alpha_host[projection, expert])
+            )
         stage(f"routed_projection_{projection}_ready")
 
     alpha = torch.zeros(
@@ -226,13 +354,60 @@ def _make_inputs(device: torch.device, seed: int) -> Linear1Inputs:
         dtype=torch.float32,
         device=device,
     )
-    alpha[:, :, 0] = torch.linspace(
-        0.025,
-        0.035,
-        ROUTED_EXPERTS,
-        dtype=torch.float32,
-        device=device,
+    alpha[:, :, 0].copy_(alpha_host.to(device))
+
+    weight_scale_pointers = torch.empty(
+        (
+            PROJECTIONS,
+            ROUTED_EXPERTS,
+            M_TILES,
+            ROUTED_K512_TILES,
+        ),
+        dtype=torch.int64,
     )
+    for projection in range(PROJECTIONS):
+        for expert in range(ROUTED_EXPERTS):
+            for m_tile in range(M_TILES):
+                for k_tile in range(ROUTED_K512_TILES):
+                    weight_scale_pointers[
+                        projection, expert, m_tile, k_tile
+                    ] = packed_nvfp4_k512_scale[
+                        projection, expert, m_tile, k_tile
+                    ].data_ptr()
+    activation_scale_pointers = torch.empty(
+        (ROUTED_EXPERTS, ROUTED_K512_TILES), dtype=torch.int64
+    )
+    for route_rank in range(ROUTED_EXPERTS):
+        for k_tile in range(ROUTED_K512_TILES):
+            activation_scale_pointers[route_rank, k_tile] = (
+                activation_nvfp4_k512_scale[route_rank, k_tile].data_ptr()
+            )
+
+    # One routed 128-byte record gives the task its projection/expert alpha,
+    # selected weight-scale base, and route-rank activation-scale base.  The
+    # pointer values are assembled on the Python side because this is the
+    # explicit preloaded-address verification path; no conversion runs in the
+    # timed graph.
+    metadata_k512_host = torch.zeros(
+        (
+            PROJECTIONS,
+            ROUTED_EXPERTS,
+            ROUTED_EXPERTS,
+            M_TILES,
+            ROUTED_K512_TILES,
+            NVFP4_K512_METADATA_BYTES,
+        ),
+        dtype=torch.uint8,
+    )
+    metadata_f32 = metadata_k512_host.view(torch.float32)
+    metadata_i64 = metadata_k512_host.view(torch.int64)
+    metadata_f32[..., :4] = alpha_host[:, None, :, None, None, None]
+    metadata_i64[..., 2] = weight_scale_pointers[:, None, :, :, :]
+    metadata_i64[..., 3] = activation_scale_pointers[
+        None, :, None, None, :
+    ]
+    metadata_k512 = metadata_k512_host.to(device)
+
     columns: dict[str, list[int]] = {}
     for projection in range(PROJECTIONS):
         for m_tile in range(M_TILES):
@@ -243,15 +418,47 @@ def _make_inputs(device: torch.device, seed: int) -> Linear1Inputs:
                     ].data_ptr()
                     for expert in range(ROUTED_EXPERTS)
                 ]
+            for k_tile in range(ROUTED_K512_TILES):
+                columns[f"k512.p{projection}.m{m_tile}.k{k_tile}"] = [
+                    packed_nvfp4_k512_data[
+                        projection, expert, m_tile, k_tile
+                    ].data_ptr()
+                    for expert in range(ROUTED_EXPERTS)
+                ]
         columns[f"p{projection}.alpha"] = [
             _row_pointer(alpha, projection, expert)
             for expert in range(ROUTED_EXPERTS)
         ]
+        for route_rank in range(ROUTED_EXPERTS):
+            for m_tile in range(M_TILES):
+                for k_tile in range(ROUTED_K512_TILES):
+                    columns[
+                        f"k512meta.p{projection}.r{route_rank}."
+                        f"m{m_tile}.k{k_tile}"
+                    ] = [
+                        metadata_k512[
+                            projection,
+                            route_rank,
+                            expert,
+                            m_tile,
+                            k_tile,
+                        ].data_ptr()
+                        for expert in range(ROUTED_EXPERTS)
+                    ]
     table = RoutedAddressTable.from_pointer_columns(
-        columns, device=device, owners=(packed_nvfp4, alpha)
+        columns,
+        device=device,
+        owners=(
+            packed_nvfp4,
+            packed_nvfp4_k512_data,
+            packed_nvfp4_k512_scale,
+            activation_nvfp4_k512_scale,
+            metadata_k512,
+            alpha,
+        ),
     )
     table.route_indices_storage[:ROUTED_EXPERTS].copy_(
-        torch.tensor([5, 2, 4, 1, 3, 0], dtype=torch.int32, device=device)
+        torch.tensor(ROUTE_EXPERTS, dtype=torch.int32, device=device)
     )
     stage("routing_ready")
 
@@ -291,20 +498,30 @@ def _make_inputs(device: torch.device, seed: int) -> Linear1Inputs:
     return Linear1Inputs(
         table=table,
         activation_nvfp4=activation_nvfp4,
+        activation_nvfp4_k512_data=activation_nvfp4_k512_data,
         alpha_fields=tuple(
             table.field(f"p{projection}.alpha")
             for projection in range(PROJECTIONS)
         ),
         weight_fp8=weight_fp8,
         activation_fp8=activation_fp8,
+        reference_k512=reference_k512,
         owners=(
             packed_nvfp4,
+            packed_nvfp4_k512_data,
+            packed_nvfp4_k512_scale,
+            metadata_k512,
             alpha,
             weight_fp8,
             activation_nvfp4,
+            activation_nvfp4_k512_data,
+            activation_nvfp4_k512_scale,
             activation_fp8,
+            checkpoint_activation,
+            checkpoint_activation_scale,
             checkpoint_scale,
             checkpoint_fp8_scale,
+            reference_k512,
         ),
     )
 
@@ -388,6 +605,18 @@ def _shared_chunks(plan: str) -> list[TileChunk]:
                     spans = (4, 4, 6, 6, 6, 6)
                 else:
                     spans = (4, 4, 4, 4, 4, 4, 4, 4)
+            elif plan == "k512u16":
+                # The unsplit K512 routed backend leaves 40 workers with two
+                # static K8 tasks and 112 workers with one.  Give exactly the
+                # 40 double-tail workers a K2 shared head; use wider heads on
+                # every single-tail worker.  Twenty-four five-way rows plus
+                # eight four-way rows preserve the required 152 shared tasks.
+                if row < 16:
+                    spans = (2, 2, 8, 10, 10)
+                elif row < 24:
+                    spans = (2, 6, 8, 8, 8)
+                else:
+                    spans = (8, 8, 8, 8)
             elif plan == "jointmix":
                 row_spans = (
                     *((2, 2, 4, 12, 12),) * 3,
@@ -477,8 +706,20 @@ def _routed_chunks(spec: PlanSpec) -> list[TileChunk]:
 
 
 def _routed_cost(
-    chunk: TileChunk, routed_overhead_us: float, routed_tile_us: float
+    chunk: TileChunk,
+    routed_backend: str,
+    routed_overhead_us: float,
+    routed_tile_us: float,
 ) -> float:
+    if routed_backend == "k512":
+        try:
+            return MEASURED_K512_ROUTED_COST_US[chunk.k_tiles]
+        except KeyError:
+            raise ValueError(
+                "K512 routed chunks must use an even K256-equivalent span"
+            ) from None
+    if routed_backend != "k256":
+        raise ValueError(f"unknown routed backend: {routed_backend}")
     return MEASURED_ROUTED_COST_US.get(
         chunk.k_tiles,
         routed_overhead_us + routed_tile_us * chunk.k_tiles,
@@ -488,6 +729,7 @@ def _routed_cost(
 def _pack_queues(
     spec: PlanSpec,
     *,
+    routed_backend: str,
     shared_plan: str,
     placement: str,
     routed_overhead_us: float,
@@ -506,41 +748,109 @@ def _pack_queues(
     if placement == "head_lpt":
         queues: list[list[TileChunk]] = [[chunk] for chunk in shared]
         loads = [DEFAULT_SHARED_COST_US[chunk.k_tiles] for chunk in shared]
-    elif placement == "joint":
+    elif placement in ("joint", "joint_route", "joint_m"):
         queues = [[] for _ in range(WORKERS)]
         loads = [0.0] * WORKERS
     else:
         raise ValueError(f"unknown placement: {placement}")
-    heap = [(load, worker) for worker, load in enumerate(loads)]
-    heapq.heapify(heap)
-    used_workers: dict[tuple[int, int, int], set[int]] = defaultdict(set)
     routed = sorted(
         _routed_chunks(spec),
         key=lambda chunk: (
-            -_routed_cost(chunk, routed_overhead_us, routed_tile_us),
+            -_routed_cost(
+                chunk,
+                routed_backend,
+                routed_overhead_us,
+                routed_tile_us,
+            ),
             chunk.projection,
             chunk.route_rank,
             chunk.m_tile,
             chunk.k_start,
         ),
     )
-    for chunk in routed:
-        skipped: list[tuple[float, int]] = []
-        used = used_workers[chunk.row_key]
-        while True:
-            load, worker = heapq.heappop(heap)
-            if worker not in used:
-                break
-            skipped.append((load, worker))
-        for item in skipped:
-            heapq.heappush(heap, item)
-        queues[worker].append(chunk)
-        used.add(worker)
-        load += _routed_cost(chunk, routed_overhead_us, routed_tile_us)
-        loads[worker] = load
-        heapq.heappush(heap, (load, worker))
+    if placement in ("joint_route", "joint_m"):
+        if (
+            routed_backend != "k512"
+            or spec.routed_extra_reductions != 0
+            or len(routed) != PROJECTIONS * ROUTED_EXPERTS * M_TILES
+        ):
+            raise ValueError(
+                f"{placement} requires unsplit K512 routed rows"
+            )
+        pair_groups: dict[tuple[int, int, int], list[TileChunk]] = defaultdict(
+            list
+        )
+        for chunk in routed:
+            key = (
+                (-1, chunk.route_rank, chunk.m_tile)
+                if placement == "joint_route"
+                else (
+                    chunk.projection,
+                    chunk.route_rank,
+                    chunk.m_tile // 2,
+                )
+            )
+            pair_groups[key].append(chunk)
+        pair_keys = sorted(pair_groups)
+        if any(len(pair_groups[key]) != 2 for key in pair_keys):
+            raise AssertionError("routed locality pairing is incomplete")
+        pair_count = len(routed) - WORKERS
+        paired_indices = {
+            (index * len(pair_keys)) // pair_count
+            for index in range(pair_count)
+        }
+        if len(paired_indices) != pair_count:
+            raise AssertionError("failed to spread gate/up route pairs")
+        queues = []
+        for index, key in enumerate(pair_keys):
+            chunks = sorted(
+                pair_groups[key],
+                key=lambda chunk: (chunk.projection, chunk.m_tile),
+            )
+            if index in paired_indices:
+                queues.append(chunks)
+            else:
+                queues.extend([[chunk] for chunk in chunks])
+        if len(queues) != WORKERS:
+            raise AssertionError("route-paired tails must fill 152 workers")
+        loads = [
+            sum(
+                _routed_cost(
+                    chunk,
+                    routed_backend,
+                    routed_overhead_us,
+                    routed_tile_us,
+                )
+                for chunk in queue
+            )
+            for queue in queues
+        ]
+    else:
+        heap = [(load, worker) for worker, load in enumerate(loads)]
+        heapq.heapify(heap)
+        used_workers: dict[tuple[int, int, int], set[int]] = defaultdict(set)
+        for chunk in routed:
+            skipped: list[tuple[float, int]] = []
+            used = used_workers[chunk.row_key]
+            while True:
+                load, worker = heapq.heappop(heap)
+                if worker not in used:
+                    break
+                skipped.append((load, worker))
+            for item in skipped:
+                heapq.heappush(heap, item)
+            queues[worker].append(chunk)
+            used.add(worker)
+            load += _routed_cost(
+                chunk,
+                routed_backend,
+                routed_overhead_us,
+                routed_tile_us,
+            )
+            loads[worker] = load
+            heapq.heappush(heap, (load, worker))
 
-    if placement == "joint":
+    if placement in ("joint", "joint_route", "joint_m"):
         # First make the routed-only bins as equal as possible.  Then exploit
         # the freedom to assign any shared output shard to any worker: pair
         # the longest routed tail with the shortest shared head.  This avoids
@@ -622,6 +932,8 @@ class SchedLinear1Workers(Schedule):
         output_scale: torch.Tensor,
         queues: tuple[tuple[TileChunk, ...], ...],
         *,
+        routed_backend: str,
+        retain_paired_activation: bool,
         profile_tasks: bool = False,
     ):
         super().__init__()
@@ -629,6 +941,10 @@ class SchedLinear1Workers(Schedule):
         self.output_reduce = output_reduce
         self.output_scale = output_scale
         self.queues = queues
+        if routed_backend not in ("k256", "k512"):
+            raise ValueError(f"unknown routed backend: {routed_backend}")
+        self.routed_backend = routed_backend
+        self.retain_paired_activation = bool(retain_paired_activation)
         self.profile_tasks = bool(profile_tasks)
 
     def _on_place(self) -> None:
@@ -644,7 +960,7 @@ class SchedLinear1Workers(Schedule):
         ):
             raise ValueError("Linear-1 requires FP32 reduce [14,2048]")
 
-    def _routed_task(self, chunk: TileChunk) -> list[object]:
+    def _routed_task_k256(self, chunk: TileChunk) -> list[object]:
         batch = min(4, chunk.k_tiles)
         instructions: list[object] = [
             Nvfp4GemvUmmaPipelineFp32Sm100(
@@ -695,6 +1011,86 @@ class SchedLinear1Workers(Schedule):
         )
         return instructions
 
+    def _routed_task_k512(
+        self,
+        chunk: TileChunk,
+        *,
+        retain_activation: bool,
+        reuse_activation: bool,
+    ) -> list[object]:
+        if chunk.k_start % 2 or chunk.k_tiles % 2:
+            raise ValueError(
+                "K512 routed chunks require even K256-equivalent boundaries"
+            )
+        k_start = chunk.k_start // 2
+        k_tiles = chunk.k_tiles // 2
+        instructions: list[object] = [
+            Nvfp4GemvUmmaK512Fp32Sm100(
+                k_tiles,
+                scale_stages=2,
+                weight_tiles_per_load=1,
+                retain_activation=retain_activation,
+            ),
+            RoutedTmaLoad1D(
+                self.inputs.table.state,
+                chunk.route_rank,
+                self.inputs.table.field(
+                    f"k512meta.p{chunk.projection}.r{chunk.route_rank}."
+                    f"m{chunk.m_tile}.k{k_start}"
+                ),
+                NVFP4_K512_METADATA_BYTES,
+            ).fixed_port(1),
+        ]
+        activation = self.inputs.activation_nvfp4_k512_data[
+            chunk.route_rank, k_start : k_start + k_tiles
+        ].reshape(-1)
+        if reuse_activation:
+            instructions.append(RegLoad(0).fixed_port(1))
+        elif retain_activation:
+            instructions.append(TmaLoadReg1D(activation, 0, 1))
+        else:
+            instructions.append(TmaLoad1D(activation).fixed_port(1))
+        for local_k in range(k_tiles):
+            if local_k == 0:
+                load = RoutedTmaLoadBase1D(
+                    self.inputs.table.state,
+                    chunk.route_rank,
+                    self.inputs.table.field(
+                        f"k512.p{chunk.projection}.m{chunk.m_tile}."
+                        f"k{k_start}"
+                    ),
+                    NVFP4_K512_WEIGHT_DATA_BYTES,
+                )
+            else:
+                load = TmaLoadAddressReg1D(
+                    RoutedTmaLoadBase1D.ADDRESS_REGISTER,
+                    local_k * NVFP4_K512_WEIGHT_DATA_BYTES,
+                    NVFP4_K512_WEIGHT_DATA_BYTES,
+                )
+            instructions.append(load.fixed_port(0))
+        output_row = (
+            chunk.projection * (ROUTED_EXPERTS + 1) + chunk.route_rank
+        )
+        instructions.append(
+            self.output_reduce.cord(output_row, chunk.m_tile * 128)
+        )
+        return instructions
+
+    def _routed_task(
+        self,
+        chunk: TileChunk,
+        *,
+        retain_activation: bool = False,
+        reuse_activation: bool = False,
+    ) -> list[object]:
+        if self.routed_backend == "k512":
+            return self._routed_task_k512(
+                chunk,
+                retain_activation=retain_activation,
+                reuse_activation=reuse_activation,
+            )
+        return self._routed_task_k256(chunk)
+
     def _shared_task(self, chunk: TileChunk) -> list[object]:
         if chunk.k_start % SCALE_PACK or chunk.k_tiles % SCALE_PACK:
             raise ValueError("shared chunks must preserve scale-pack pairs")
@@ -740,11 +1136,32 @@ class SchedLinear1Workers(Schedule):
         instructions: list[object] = []
         queue = self.queues[sm]
         for task_index, chunk in enumerate(queue):
-            task = (
-                self._shared_task(chunk)
-                if chunk.kind == "shared"
-                else self._routed_task(chunk)
-            )
+            if chunk.kind == "shared":
+                task = self._shared_task(chunk)
+            else:
+                previous = queue[task_index - 1] if task_index else None
+                following = (
+                    queue[task_index + 1]
+                    if task_index + 1 < len(queue)
+                    else None
+                )
+
+                def same_activation(other: TileChunk | None) -> bool:
+                    return bool(
+                        self.routed_backend == "k512"
+                        and self.retain_paired_activation
+                        and other is not None
+                        and other.kind == "routed"
+                        and other.route_rank == chunk.route_rank
+                        and other.k_start == chunk.k_start
+                        and other.k_tiles == chunk.k_tiles
+                    )
+
+                task = self._routed_task(
+                    chunk,
+                    retain_activation=same_activation(following),
+                    reuse_activation=same_activation(previous),
+                )
             if task_index + 1 == len(queue):
                 task[-1].bar(self._bar("output"))
             instructions.extend(task)
@@ -771,12 +1188,18 @@ def _profile_times_us(launcher: Launcher, marker_sm: int) -> tuple[float, float]
 
 def _predicted_cost(
     queue: tuple[TileChunk, ...],
+    routed_backend: str,
     routed_overhead_us: float,
     routed_tile_us: float,
 ) -> float:
     value = DEFAULT_SHARED_COST_US[queue[0].k_tiles]
     return value + sum(
-        _routed_cost(chunk, routed_overhead_us, routed_tile_us)
+        _routed_cost(
+            chunk,
+            routed_backend,
+            routed_overhead_us,
+            routed_tile_us,
+        )
         for chunk in queue[1:]
     )
 
@@ -785,6 +1208,8 @@ def _print_plan(
     spec: PlanSpec,
     queues: tuple[tuple[TileChunk, ...], ...],
     *,
+    routed_backend: str,
+    retain_paired_activation: bool,
     shared_plan: str,
     placement: str,
     routed_overhead_us: float,
@@ -800,12 +1225,19 @@ def _print_plan(
         for queue in queues
     ]
     predicted = [
-        _predicted_cost(queue, routed_overhead_us, routed_tile_us)
+        _predicted_cost(
+            queue,
+            routed_backend,
+            routed_overhead_us,
+            routed_tile_us,
+        )
         for queue in queues
     ]
     print(
         "DSV4_LINEAR1_PLAN "
-        f"name={spec.name} shared_plan={shared_plan} placement={placement} "
+        f"name={spec.name} routed_backend={routed_backend} "
+        f"activation_reuse={int(retain_paired_activation)} "
+        f"shared_plan={shared_plan} placement={placement} "
         f"workers={WORKERS} "
         f"atomic_tiles={TOTAL_ATOMIC_TILES} "
         f"shared_atomic_tiles={SHARED_ATOMIC_TILES} "
@@ -824,7 +1256,9 @@ def _print_plan(
         for worker, queue in enumerate(queues):
             print(
                 "DSV4_LINEAR1_QUEUE "
-                f"name={spec.name} shared_plan={shared_plan} "
+                f"name={spec.name} routed_backend={routed_backend} "
+                f"activation_reuse={int(retain_paired_activation)} "
+                f"shared_plan={shared_plan} "
                 f"placement={placement} worker={worker} "
                 f"predicted_us={predicted[worker]:.3f} "
                 f"tasks={','.join(chunk.label for chunk in queue)}",
@@ -852,6 +1286,8 @@ def _build_plan(
     inputs: Linear1Inputs,
     device: torch.device,
     *,
+    routed_backend: str,
+    retain_paired_activation: bool,
     shared_plan: str,
     placement: str,
     routed_overhead_us: float,
@@ -861,6 +1297,7 @@ def _build_plan(
 ) -> BuiltPlan:
     queues = _pack_queues(
         spec,
+        routed_backend=routed_backend,
         shared_plan=shared_plan,
         placement=placement,
         routed_overhead_us=routed_overhead_us,
@@ -869,6 +1306,8 @@ def _build_plan(
     _print_plan(
         spec,
         queues,
+        routed_backend=routed_backend,
+        retain_paired_activation=retain_paired_activation,
         shared_plan=shared_plan,
         placement=placement,
         routed_overhead_us=routed_overhead_us,
@@ -890,6 +1329,8 @@ def _build_plan(
         output_reduce,
         output_scale,
         queues,
+        routed_backend=routed_backend,
+        retain_paired_activation=retain_paired_activation,
         profile_tasks=profile_tasks,
     )
     marker_operand = torch.zeros((16,), dtype=torch.uint8, device=device)
@@ -926,6 +1367,8 @@ def _build_plan(
         spec,
         shared_plan,
         placement,
+        routed_backend,
+        retain_paired_activation,
         queues,
         launcher,
         accumulator,
@@ -934,6 +1377,22 @@ def _build_plan(
     built.reset_and_launch()
     if not bool(torch.isfinite(accumulator).all().item()):
         raise AssertionError("Linear-1 output contains non-finite values")
+    if routed_backend == "k512":
+        torch.testing.assert_close(
+            accumulator,
+            inputs.reference_k512,
+            rtol=2e-4,
+            atol=2e-3,
+        )
+        print(
+            "DSV4_LINEAR1_CORRECTNESS "
+            f"name={spec.name} routed_backend={routed_backend} "
+            f"activation_reuse={int(retain_paired_activation)} "
+            f"shared_plan={shared_plan} placement={placement} "
+            "max_abs_error="
+            f"{float((accumulator - inputs.reference_k512).abs().max()):.6f}",
+            flush=True,
+        )
     return built
 
 
@@ -946,12 +1405,16 @@ def _report_plan_samples(
     spec = built.spec
     shared_plan = built.shared_plan
     placement = built.placement
+    routed_backend = built.routed_backend
+    activation_reuse = built.retain_paired_activation
     ordered = sorted(frontier_samples)
     median = statistics.median(frontier_samples)
     kernel_median = statistics.median(kernel_samples)
     print(
         "DSV4_LINEAR1_RESULT "
-        f"name={spec.name} shared_plan={shared_plan} placement={placement} "
+        f"name={spec.name} routed_backend={routed_backend} "
+        f"activation_reuse={int(activation_reuse)} "
+        f"shared_plan={shared_plan} placement={placement} "
         f"frontier_median_us={median:.6f} "
         f"frontier_p10_us={ordered[max(0, len(ordered) // 10 - 1)]:.6f} "
         f"frontier_min_us={min(frontier_samples):.6f} "
@@ -964,7 +1427,9 @@ def _report_plan_samples(
             samples = task_samples[key]
             print(
                 "DSV4_LINEAR1_TASK_PROFILE "
-                f"name={spec.name} shared_plan={shared_plan} "
+                f"name={spec.name} routed_backend={routed_backend} "
+                f"activation_reuse={int(activation_reuse)} "
+                f"shared_plan={shared_plan} "
                 f"placement={placement} "
                 f"queue_index={task_index} kind={kind} "
                 f"k_tiles={k_tiles} samples={len(samples)} "
@@ -979,6 +1444,8 @@ def _run_plan(
     inputs: Linear1Inputs,
     device: torch.device,
     *,
+    routed_backend: str,
+    retain_paired_activation: bool,
     shared_plan: str,
     placement: str,
     warmup: int,
@@ -992,6 +1459,8 @@ def _run_plan(
         spec,
         inputs,
         device,
+        routed_backend=routed_backend,
+        retain_paired_activation=retain_paired_activation,
         shared_plan=shared_plan,
         placement=placement,
         routed_overhead_us=routed_overhead_us,
@@ -1023,6 +1492,17 @@ def _run_plan(
     )
 
 
+def _backend_accepts_spec(spec: PlanSpec, routed_backend: str) -> bool:
+    if routed_backend == "k256":
+        return True
+    if routed_backend != "k512":
+        return False
+    return all(
+        chunk.k_start % 2 == 0 and chunk.k_tiles % 2 == 0
+        for chunk in _routed_chunks(spec)
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=20)
@@ -1030,8 +1510,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260814)
     parser.add_argument(
         "--plans",
-        default="n40_p6-5-5",
+        default="u16",
         help="comma-separated u16 or n<split rows>_p<K spans>",
+    )
+    parser.add_argument(
+        "--routed-backends",
+        default="k512",
+        help="comma-separated k256 and/or k512 implementations",
     )
     parser.add_argument(
         "--routed-overhead-us",
@@ -1043,14 +1528,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--shared-plans",
-        default="comp655",
+        default="k512u16",
         help=(
             "comma-separated uniform68, comp664, comp655, comp44, "
-            "or jointmix"
+            "k512u16, or jointmix"
         ),
     )
     parser.add_argument(
-        "--placement", choices=("joint", "head_lpt"), default="joint"
+        "--placement",
+        default="joint_route",
+        help=(
+            "comma-separated joint, joint_route, joint_m, and/or head_lpt"
+        ),
     )
     parser.add_argument(
         "--interleave",
@@ -1059,6 +1548,17 @@ def main() -> None:
     )
     parser.add_argument("--profile-tasks", action="store_true")
     parser.add_argument("--print-queues", action="store_true")
+    parser.add_argument(
+        "--retain-paired-activation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="retain one K512 activation slot span across adjacent pairs",
+    )
+    parser.add_argument(
+        "--compare-activation-reuse",
+        action="store_true",
+        help="build both activation-reuse choices for interleaved comparison",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("warmup must be nonnegative and iterations positive")
@@ -1066,6 +1566,16 @@ def main() -> None:
         parser.error("routed cost coefficients must be nonnegative/positive")
     if args.interleave and args.profile_tasks:
         parser.error("task profiling and candidate interleave are exclusive")
+    placements = tuple(
+        name.strip() for name in args.placement.split(",") if name.strip()
+    )
+    if not placements or any(
+        name not in ("joint", "joint_route", "joint_m", "head_lpt")
+        for name in placements
+    ):
+        parser.error(
+            "placements must be joint, joint_route, joint_m, and/or head_lpt"
+        )
     try:
         specs = tuple(
             _parse_plan(name.strip())
@@ -1076,17 +1586,33 @@ def main() -> None:
         parser.error(str(error))
     if not specs:
         parser.error("at least one plan is required")
+    routed_backends = tuple(
+        name.strip()
+        for name in args.routed_backends.split(",")
+        if name.strip()
+    )
+    if not routed_backends or any(
+        name not in ("k256", "k512") for name in routed_backends
+    ):
+        parser.error("routed backends must be k256 and/or k512")
     shared_plans = tuple(
         name.strip() for name in args.shared_plans.split(",") if name.strip()
     )
     if not shared_plans or any(
         name
-        not in ("uniform68", "comp664", "comp655", "comp44", "jointmix")
+        not in (
+            "uniform68",
+            "comp664",
+            "comp655",
+            "comp44",
+            "k512u16",
+            "jointmix",
+        )
         for name in shared_plans
     ):
         parser.error(
             "shared plans must be uniform68, comp664, comp655, comp44, "
-            "and/or jointmix"
+            "k512u16, and/or jointmix"
         )
 
     device = torch.device("cuda")
@@ -1098,25 +1624,72 @@ def main() -> None:
         parser.error(f"this schedule requires 152 SMs, got {device_sms}")
     inputs = _make_inputs(device, args.seed)
     results = []
-    candidate_keys = [
-        (spec, shared_plan)
-        for shared_plan in shared_plans
-        for spec in specs
-    ]
+    candidate_keys = []
+    activation_reuse_options = (
+        (False, True)
+        if args.compare_activation_reuse
+        else (args.retain_paired_activation,)
+    )
+    for activation_reuse in activation_reuse_options:
+        for placement in placements:
+            for routed_backend in routed_backends:
+                for shared_plan in shared_plans:
+                    for spec in specs:
+                        if not _backend_accepts_spec(spec, routed_backend):
+                            print(
+                                "DSV4_LINEAR1_SKIP "
+                                f"name={spec.name} "
+                                f"routed_backend={routed_backend} "
+                                f"placement={placement} "
+                                "reason=unaligned_k512_split",
+                                flush=True,
+                            )
+                        elif placement in ("joint_route", "joint_m") and (
+                            routed_backend != "k512"
+                            or spec.routed_extra_reductions != 0
+                        ):
+                            print(
+                                "DSV4_LINEAR1_SKIP "
+                                f"name={spec.name} "
+                                f"routed_backend={routed_backend} "
+                                f"placement={placement} "
+                                "reason=route_pairing_requires_unsplit_k512",
+                                flush=True,
+                            )
+                        else:
+                            candidate_keys.append(
+                                (
+                                    spec,
+                                    shared_plan,
+                                    routed_backend,
+                                    placement,
+                                    activation_reuse,
+                                )
+                            )
+    if not candidate_keys:
+        parser.error("no plan/backend combinations have legal K boundaries")
     if args.interleave:
         built_plans = [
             _build_plan(
                 spec,
                 inputs,
                 device,
+                routed_backend=routed_backend,
+                retain_paired_activation=activation_reuse,
                 shared_plan=shared_plan,
-                placement=args.placement,
+                placement=placement,
                 routed_overhead_us=args.routed_overhead_us,
                 routed_tile_us=args.routed_tile_us,
                 profile_tasks=False,
                 print_queues=args.print_queues,
             )
-            for spec, shared_plan in candidate_keys
+            for (
+                spec,
+                shared_plan,
+                routed_backend,
+                placement,
+                activation_reuse,
+            ) in candidate_keys
         ]
         # One round is one launch of every candidate.  This keeps clock,
         # thermal, and cache-state drift common to all candidates.
@@ -1143,18 +1716,28 @@ def main() -> None:
                     built.spec.routed_extra_reductions,
                     built.spec.name,
                     built.shared_plan,
+                    built.routed_backend,
+                    built.retain_paired_activation,
                     built.placement,
                     kernel_median,
                 )
             )
     else:
-        for spec, shared_plan in candidate_keys:
+        for (
+            spec,
+            shared_plan,
+            routed_backend,
+            placement,
+            activation_reuse,
+        ) in candidate_keys:
             median, kernel_median = _run_plan(
                 spec,
                 inputs,
                 device,
+                routed_backend=routed_backend,
+                retain_paired_activation=activation_reuse,
                 shared_plan=shared_plan,
-                placement=args.placement,
+                placement=placement,
                 warmup=args.warmup,
                 iterations=args.iterations,
                 routed_overhead_us=args.routed_overhead_us,
@@ -1168,7 +1751,9 @@ def main() -> None:
                     spec.routed_extra_reductions,
                     spec.name,
                     shared_plan,
-                    args.placement,
+                    routed_backend,
+                    activation_reuse,
+                    placement,
                     kernel_median,
                 )
             )
@@ -1178,6 +1763,8 @@ def main() -> None:
         extra,
         name,
         shared_plan,
+        routed_backend,
+        activation_reuse,
         placement,
         kernel_median,
     ) in enumerate(
@@ -1185,7 +1772,9 @@ def main() -> None:
     ):
         print(
             "DSV4_LINEAR1_RANK "
-            f"rank={rank} name={name} shared_plan={shared_plan} "
+            f"rank={rank} name={name} routed_backend={routed_backend} "
+            f"activation_reuse={int(activation_reuse)} "
+            f"shared_plan={shared_plan} "
             f"placement={placement} "
             f"frontier_median_us={median:.6f} "
             f"routed_extra_reductions={extra} "

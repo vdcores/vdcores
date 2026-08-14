@@ -2099,3 +2099,39 @@ in job `20260814T132918Z-718546`, but used a two-SM CTA pair; normalized by SM
 budget this is 8.924 SM-us/result versus 6.816 for VDCores. The next acceptance
 gate is the complete 4,096-tile Linear-1 worker schedule, not the isolated
 single-SM result.
+
+## K512 Linear-1 worker integration (2026-08-14)
+
+The 4,096-tile gate-plus-up benchmark now selects the K512 routed task while
+preserving the original accounting: 1,024 shared K128 tiles plus 3,072 routed
+K256-equivalent tiles. The routed work becomes 1,536 K512 stages. Python
+checkpoint setup creates separate 32-KiB data and 4-KiB SFA records, compact
+2-KiB activation data and 32-byte scale records, and routed 128-byte metadata
+containing alpha plus the selected scale bases. Random packed activations and
+random per-block scales are checked against Python dequantization outside the
+timed frontier.
+
+The selected worker plan does not split routed K. It assigns 192 static K8
+tasks over 152 workers, so 40 queues receive two routed tasks and 112 receive
+one. The 152 strict-priority shared heads have histogram
+`{K2:40,K6:8,K8:72,K10:32}`: every double routed tail receives a K2 head.
+Those 40 tails pair gate then up for the same route rank and M tile. The first
+task retains the common 16-KiB activation allocation in an LDU register; the
+second republishes the same slot mask and finally releases it. A packed retain
+bit in the K512 instruction controls slot lifetime without changing its UMMA
+mainloop. Legal even-boundary split-K sweeps were all slower because they lose
+the static eight-stage specialization and add task/reduction boundaries.
+
+On one allocated GB200 GPU in Conda `base`, matched activation-reuse job
+`20260814T144518Z-1973483` measured 16.864 us without retention and 16.128 us
+with retention; both had zero maximum FP32 error. The final 20,000-warmup,
+10,000-sample retained run `20260814T144543Z-1980577` measured 16.608 us for
+the Linear-1 frontier and 17.056 us for the complete persistent kernel. The
+fresh selected K256 control `20260814T143232Z-1759294` measured 22.432 us, so
+K512 plus the new queue plan saves 5.824 us (26.0%) and is 1.351x faster.
+
+The same-scope external component reference remains FlashInfer routed
+gate/up/SwiGLU at 9.536 us plus DeepGEMM shared gate/up at 9.856 us, or 19.392
+us serialized. The 16.608-us VDCores result is 2.784 us (14.4%) lower, but it
+still stops at FP32 gate/up accumulators and excludes SwiGLU, while the
+FlashInfer component includes routed SwiGLU and excludes the shared expert.
