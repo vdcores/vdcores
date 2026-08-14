@@ -69,12 +69,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, default=128)
     parser.add_argument(
-        "--scale-mode", choices=("tma", "metadata", "both"), default="both"
+        "--scale-mode",
+        choices=("tma", "metadata", "both"),
+        default="metadata",
     )
     parser.add_argument(
-        "--activation-stages",
-        default="4",
-        help="comma-separated K512 activation stages per load",
+        "--activation-tiles",
+        default="2",
+        help="comma-separated K512 activation tiles per allocator load",
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
@@ -86,11 +88,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.m <= 0 or args.m % 128:
         parser.error("--m must be a positive multiple of 128")
-    activation_stage_values = [
-        int(value) for value in args.activation_stages.split(",")
+    activation_tile_values = [
+        int(value) for value in args.activation_tiles.split(",")
     ]
-    if any(value not in (1, 2, 4, 8) for value in activation_stage_values):
-        parser.error("activation stages must be selected from 1,2,4,8")
+    if any(value not in (1, 2, 4, 8) for value in activation_tile_values):
+        parser.error("activation tiles must be selected from 1,2,4,8")
 
     device = torch.device("cuda")
     m_tiles = args.m // 128
@@ -143,7 +145,7 @@ def main() -> None:
     modes = ("tma", "metadata") if args.scale_mode == "both" else (
         args.scale_mode,
     )
-    for activation_stages in activation_stage_values:
+    for activation_tiles in activation_tile_values:
         for mode in modes:
             output = torch.full(
                 (args.m,), float("nan"), dtype=torch.float32, device=device
@@ -159,7 +161,7 @@ def main() -> None:
                 weight_tma,
                 scale_mode=mode,
                 metadata=metadata if mode == "metadata" else None,
-                activation_stages_per_load=activation_stages,
+                activation_tiles_per_load=activation_tiles,
             ).place(m_tiles)
             launcher.s(ProfileEvent(2), schedule, ProfileEvent(3))
 
@@ -199,7 +201,7 @@ def main() -> None:
             print(
                 "DSV4_MXFP4_MXFP8_GEMV_RESULT "
                 f"shape={args.m}x1x4096 scale_mode={mode} "
-                f"activation_stages_per_load={activation_stages} "
+                f"activation_tiles_per_load={activation_tiles} "
                 f"task_min_us={min(task_timings):.6f} "
                 f"task_median_us={statistics.median(task_timings):.6f} "
                 f"task_max_us={max(task_timings):.6f} "

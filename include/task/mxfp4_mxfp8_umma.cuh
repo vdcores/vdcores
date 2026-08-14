@@ -71,9 +71,13 @@ static constexpr int mxfp4Mxfp8ScaleReadyBarrierBase = 12;
 static constexpr int mxfp4Mxfp8ScaleReadyThreads = 3 * numThreadsPerWarp;
 
 // Fixed-shape W4A8 projection. One task owns M128, one logical activation row
-// replicated to N8, and eight K512 stages (K4096). HBM already contains the
+// replicated to N8, and eight K512 tiles (K4096). HBM already contains the
 // exact native layouts. Packed FP4 weights are expanded/swizzled by TMA into
 // four concatenated 16 KiB K128 SMEM records inside each K512 allocation.
+// K is the independently streamed weight/compute tile and BLoad is the number
+// of consecutive activation tiles in one allocation, matching GEMV_WGMMA's
+// K/BLOAD contract. BLoad=8 is one full-activation load; 1/2/4 are tiled
+// streaming points. Weight allocations remain one K512 tile in every case.
 //
 // ScaleFromMetadata=false token order:
 //   all weight scales, all activation scales,
@@ -82,7 +86,7 @@ static constexpr int mxfp4Mxfp8ScaleReadyThreads = 3 * numThreadsPerWarp;
 // ScaleFromMetadata=true token order:
 //   per activation chunk: activation data, then per K512 stage: weight data
 // Metadata byte offsets 16 and 24 hold the weight- and activation-scale bases.
-template <bool ScaleFromMetadata, int ActivationStagesPerLoad,
+template <bool ScaleFromMetadata, int K, int BLoad,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
@@ -105,15 +109,14 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
   using Scale = cutlass::float_ue8m0_t;
   using Accum = float;
 
-  static_assert(
-      ActivationStagesPerLoad == 1 || ActivationStagesPerLoad == 2 ||
-      ActivationStagesPerLoad == 4 || ActivationStagesPerLoad == 8);
-  constexpr int kNumK512Stages = 8;
-  static_assert(kNumK512Stages % ActivationStagesPerLoad == 0);
+  static_assert(K == 512, "native MXFP4/MXFP8 currently supports K512 tiles");
+  static_assert(BLoad == 1 || BLoad == 2 || BLoad == 4 || BLoad == 8);
+  constexpr int kNumWeightTiles = 4096 / K;
+  static_assert(kNumWeightTiles % BLoad == 0);
   constexpr int kTileM = 128;
   constexpr int kTileN = 8;
   constexpr int kTileK = 128;
-  constexpr int kK128PerStage = 4;
+  constexpr int kK128PerWeightTile = K / kTileK;
   constexpr int kScaleVector = 32;
   constexpr int kStages = fp8UmmaPipelineStages;
   constexpr int kFullBarrierBase = fp8UmmaPipelineBarrierBase;
@@ -155,19 +158,20 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
       -kDescriptorAlignment;
   constexpr int kSfaK128Bytes = cosize_v<LayoutSFA>;
   constexpr int kSfbK128Bytes = cosize_v<LayoutSFB>;
-  constexpr int kWeightK512Bytes = kK128PerStage * kWeightK128Bytes;
-  constexpr int kActivationK512Bytes =
-      kK128PerStage * kActivationK128Bytes;
-  constexpr int kSfaK512Bytes = kK128PerStage * kSfaK128Bytes;
-  constexpr int kSfbK512Bytes = kK128PerStage * kSfbK128Bytes;
+  constexpr int kWeightTileBytes =
+      kK128PerWeightTile * kWeightK128Bytes;
+  constexpr int kActivationTileBytes =
+      kK128PerWeightTile * kActivationK128Bytes;
+  constexpr int kSfaTileBytes = kK128PerWeightTile * kSfaK128Bytes;
+  constexpr int kSfbTileBytes = kK128PerWeightTile * kSfbK128Bytes;
   static_assert(kWeightK128Bytes == 16384);
   static_assert(kActivationK128Bytes == 1024);
   static_assert(kSfaK128Bytes == 512);
   static_assert(kSfbK128Bytes == 512);
-  static_assert(kWeightK512Bytes == 65536);
-  static_assert(kActivationK512Bytes == 4096);
-  static_assert(kSfaK512Bytes == 2048);
-  static_assert(kSfbK512Bytes == 2048);
+  static_assert(kWeightTileBytes == 65536);
+  static_assert(kActivationTileBytes == 4096);
+  static_assert(kSfaTileBytes == 2048);
+  static_assert(kSfbTileBytes == 2048);
 
   auto logical_c = make_tensor(
       make_smem_ptr(static_cast<Accum *>(nullptr)),
@@ -227,7 +231,7 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
   }
 
   constexpr int kScaleScratchStageBytes =
-      kSfaK512Bytes + kSfbK512Bytes;
+      kSfaTileBytes + kSfbTileBytes;
   constexpr int kScaleScratchBytes = kStages * kScaleScratchStageBytes;
   constexpr int kTaskScratchBytes =
       dynamicSmemBytes - numSlots * slotSizeKb * 1024;
@@ -241,8 +245,8 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
       get_slot_address(smem_base, numSlots));
 
   #pragma unroll
-  for (int chunk_start = 0; chunk_start < kNumK512Stages;
-       chunk_start += ActivationStagesPerLoad) {
+  for (int chunk_start = 0; chunk_start < kNumWeightTiles;
+       chunk_start += BLoad) {
     int activation_data_slots = 0;
     uint8_t *activation_data_base = nullptr;
 
@@ -257,7 +261,7 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
     }
     #pragma unroll
     for (int local_stage = 0;
-         local_stage < ActivationStagesPerLoad;
+         local_stage < BLoad;
          ++local_stage) {
       const int tile = chunk_start + local_stage;
       const int stage = tile % kStages;
@@ -291,12 +295,12 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
           auto *stage_scratch =
               scale_scratch + stage * kScaleScratchStageBytes;
           const uint8_t *global_source = warp == 2
-              ? weight_scale_global + tile * kSfaK512Bytes
-              : activation_scale_global + tile * kSfbK512Bytes;
+              ? weight_scale_global + tile * kSfaTileBytes
+              : activation_scale_global + tile * kSfbTileBytes;
           auto *shared_destination = warp == 2
               ? stage_scratch
-              : stage_scratch + kSfaK512Bytes;
-          dae_mxfp_cp_async_scale_stage<kSfaK512Bytes>(
+              : stage_scratch + kSfaTileBytes;
+          dae_mxfp_cp_async_scale_stage<kSfaTileBytes>(
               global_source, shared_destination, lane);
           asm volatile("cp.async.wait_group 0;" ::: "memory");
           __syncwarp();
@@ -316,10 +320,10 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
           auto *stage_scratch =
               scale_scratch + stage * kScaleScratchStageBytes;
           sfa_source = stage_scratch;
-          sfb_source = stage_scratch + kSfaK512Bytes;
+          sfb_source = stage_scratch + kSfaTileBytes;
         } else {
-          sfa_source = weight_scale_global + tile * kSfaK512Bytes;
-          sfb_source = activation_scale_global + tile * kSfbK512Bytes;
+          sfa_source = weight_scale_global + tile * kSfaTileBytes;
+          sfb_source = activation_scale_global + tile * kSfbTileBytes;
         }
 
         // UMMA issue and commit are warp-collective even though their PTX
@@ -327,7 +331,7 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
         // same control path. Interleave each K128 scale copy with its dependent
         // UMMA bundle, exactly matching CUTLASS's TCGEN ordering contract.
         #pragma unroll
-        for (int subtile = 0; subtile < kK128PerStage; ++subtile) {
+        for (int subtile = 0; subtile < kK128PerWeightTile; ++subtile) {
           auto sA = make_tensor(
               make_smem_ptr(reinterpret_cast<uint8_t *>(
                   weight_data_base + subtile * kWeightK128Bytes)),
@@ -335,7 +339,7 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
           auto sB = make_tensor(
               make_smem_ptr(reinterpret_cast<Activation *>(
                   activation_data_base +
-                  local_stage * kActivationK512Bytes +
+                  local_stage * kActivationTileBytes +
                   subtile * kActivationK128Bytes)),
               layout_sB);
           auto tCrA = cta_mma.make_fragment_A(sA);
@@ -403,7 +407,7 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
             ((pipeline_phase_mask >> stage) & 1U) ^
                 uint32_t(generation & 1));
         int release_slots = weight_data_slots;
-        if (local_stage + 1 == ActivationStagesPerLoad) {
+        if (local_stage + 1 == BLoad) {
           release_slots |= activation_data_slots;
         }
         c2m.template push<numThreadsPerWarp>(tid, release_slots);
@@ -424,7 +428,7 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
   #pragma unroll
   for (int stage = 0; stage < kStages; ++stage) {
     const int stage_uses =
-        (kNumK512Stages + kStages - 1 - stage) / kStages;
+        (kNumWeightTiles + kStages - 1 - stage) / kStages;
     if (stage_uses & 1) {
       pipeline_phase_mask ^= 1U << stage;
     }
@@ -460,46 +464,4 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
     c2m.push(tid, persistent_scale_slots);
   }
   c2m.template push<0, true>(tid, output_slots);
-}
-
-template <bool ScaleFromMetadata, typename M2CQueue, typename C2MQueue>
-__device__ __forceinline__ void
-dispatch_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
-    int activation_stages_per_load,
-    const uint8_t *metadata,
-    void *smem_base,
-    uint32_t tmem_base_ptr,
-    uint64_t *tmem_mma_barrier,
-    uint32_t &tmem_mma_phase,
-    uint32_t &pipeline_phase_mask,
-    M2CQueue &m2c,
-    C2MQueue &c2m) {
-  switch (activation_stages_per_load) {
-    case 1:
-      task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<
-          ScaleFromMetadata, 1>(
-          smem_base, tmem_base_ptr, tmem_mma_barrier, metadata,
-          tmem_mma_phase, pipeline_phase_mask, m2c, c2m);
-      break;
-    case 2:
-      task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<
-          ScaleFromMetadata, 2>(
-          smem_base, tmem_base_ptr, tmem_mma_barrier, metadata,
-          tmem_mma_phase, pipeline_phase_mask, m2c, c2m);
-      break;
-    case 4:
-      task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<
-          ScaleFromMetadata, 4>(
-          smem_base, tmem_base_ptr, tmem_mma_barrier, metadata,
-          tmem_mma_phase, pipeline_phase_mask, m2c, c2m);
-      break;
-    case 8:
-      task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<
-          ScaleFromMetadata, 8>(
-          smem_base, tmem_base_ptr, tmem_mma_barrier, metadata,
-          tmem_mma_phase, pipeline_phase_mask, m2c, c2m);
-      break;
-    default:
-      asm volatile("trap;");
-  }
 }

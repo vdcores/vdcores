@@ -2157,30 +2157,42 @@ checkpoint/token preparation outside the measured path.
 Both requested scale-delivery strategies are implemented. The TMA strategy
 performs exactly two persistent 16-KiB loads, one complete weight-scale image
 and one complete activation-scale image. The faster metadata strategy encodes
-an aligned 48-bit metadata-record pointer plus the two-bit activation-batch
-code in the compute instruction. Compute warps dereference record offsets 16
-and 24 directly, so the metadata record consumes no allocator slot and no
-memory instruction. Warp 2 and warp 3 then issue coalesced 16-byte `cp.async`
-copies into a four-stage shared scale ring; warp 0 performs dependent UTCCP
-copies to its task-local TMEM scale columns and queues consecutive UMMAs, and
-warp 1 retires each expanded weight allocation after its completion barrier.
-The FP32 accumulator remains resident for all 32 K128 UMMAs and drains once,
-directly to FP32. Activation K512 records per TMA load remain a parameter with
-legal values 1, 2, 4, and 8; batch 2 wins the metadata path because the
-25-slot arena can keep its small activation allocation and deeper weight
-movement in flight.
+the complete 48-bit metadata-record pointer in the compute instruction.
+Compute warps dereference record offsets 16 and 24 directly, so the metadata
+record consumes no allocator slot and no memory instruction. Warp 2 and warp
+3 then issue coalesced 16-byte `cp.async` copies into a four-stage shared scale
+ring; warp 0 performs dependent UTCCP copies to its task-local TMEM scale
+columns and queues consecutive UMMAs, and warp 1 retires each expanded weight
+allocation after its completion barrier. The FP32 accumulator remains
+resident for all 32 K128 UMMAs and drains once, directly to FP32.
 
-The final selective image uses 25 allocator slots, 64 instruction entries,
-220 KiB dynamic shared memory, 104 registers, 16 barriers, and zero spills.
-GB200 job `20260814T184635Z-1816638` verified exact 4096.0 FP32 output for all
-eight scale-strategy/batch combinations. The direct metadata path at batch 2
-measured 9.504 us task median and 9.984 us full resident-kernel envelope. The
-two-TMA strategy reached 14.272 us at batch 8. FlashInfer 0.6.16.post3 / vLLM
-0.27.1 job `20260814T184205Z-1730615`, using the correct
+The mixed task now follows the WGMMA compute-family contract instead of
+encoding activation packing in runtime arguments. Its generated families have
+independent `K` and `BLOAD` fields. `K=512` means every weight command carries
+one packed K512 tile (32 KiB from HBM, 64 KiB after TMA expansion), while
+`BLOAD` is the number of consecutive 4-KiB activation K512 tiles in one
+allocator load. `BLOAD=1/2/4` are tiled streaming schedules and `BLOAD=8` is
+the full K4096 activation allocation; all cases still stream one weight tile
+at a time. The schedule emits one activation allocation followed by `BLOAD`
+independent weight allocations per chunk. Legal BLOAD values are 1, 2, 4,
+and 8 for both TMA-scale and metadata-scale families.
+
+GB200 sweep job `20260814T190142Z-2059079` verified exact 4096.0 FP32 output
+for all eight scale-family/BLOAD combinations. Compiling all eight variants
+into one persistent image distorted the short-task latency, so that manifest
+is retained only as `deepseek_v4_mxfp4_mxfp8_sweep.ops`. The latency-critical
+default manifest selects only metadata K512/BLOAD2 plus profiling and
+termination. Its 25-slot, 64-instruction, 220-KiB image uses 115 registers,
+16 barriers, an 80-byte stack, and zero spills. Job
+`20260814T190952Z-2193068` measured 9.216 us task median and 9.696 us full
+resident-kernel envelope over 500 samples with exact output. This improves the
+pre-family 9.504/9.984-us milestone while keeping activation packing a true
+compile-time family parameter. FlashInfer 0.6.16.post3 / vLLM 0.27.1 job
+`20260814T184205Z-1730615`, using the correct
 `group_gemm_mxfp8_mxfp4_nt_groupwise` backend at rows=4, N=128, K=4096,
 tile-N=64, tile-K=128, measured 9.6208 us per CUDA-graph inner call with
 quantized sanity `mean_relative=0.12491284`, `cosine=0.99230981`. Thus the
-VDCores task frontier was 1.2% lower; its full envelope was 3.8% higher. The
+VDCores task frontier is 4.2% lower; its full envelope is 0.8% higher. The
 comparison is intentionally explicit: FlashInfer's legal API minimum is four
 activation rows and tile-N=64 launches two output CTAs, while VDCores owns one
 SM, replicates one logical activation to hardware N8, and writes 128 FP32

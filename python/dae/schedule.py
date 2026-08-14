@@ -2473,7 +2473,7 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         *,
         scale_mode: str,
         metadata=None,
-        activation_stages_per_load: int = 4,
+        activation_tiles_per_load: int = 4,
     ):
         super().__init__()
         self.weight_data = weight_data
@@ -2484,14 +2484,14 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         self.weight_tma = weight_tma
         self.scale_mode = scale_mode
         self.metadata = metadata
-        self.activation_stages_per_load = int(activation_stages_per_load)
+        self.activation_tiles_per_load = int(activation_tiles_per_load)
 
     def _on_place(self):
         if self.scale_mode not in ("tma", "metadata"):
             raise ValueError("MXFP4/MXFP8 scale mode must be tma or metadata")
-        if self.activation_stages_per_load not in (1, 2, 4, 8):
+        if self.activation_tiles_per_load not in (1, 2, 4, 8):
             raise ValueError(
-                "MXFP4/MXFP8 activation stages per load must be 1, 2, 4, or 8"
+                "MXFP4/MXFP8 activation tiles per load must be 1, 2, 4, or 8"
             )
         if (
             self.weight_data.dtype != torch.uint8
@@ -2595,7 +2595,7 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
             if self.scale_mode == "tma":
                 instructions.extend((
                     Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(
-                        self.activation_stages_per_load
+                        self.activation_tiles_per_load
                     ),
                     TmaLoad1D(
                         self.weight_scale[output_tile].reshape(-1)
@@ -2606,13 +2606,13 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
                 instructions.extend((
                     Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(
                         self.metadata[output_tile].data_ptr(),
-                        self.activation_stages_per_load
+                        self.activation_tiles_per_load
                     ),
                 ))
             for chunk_start in range(
-                0, self.K512_TILES, self.activation_stages_per_load
+                0, self.K512_TILES, self.activation_tiles_per_load
             ):
-                chunk_stop = chunk_start + self.activation_stages_per_load
+                chunk_stop = chunk_start + self.activation_tiles_per_load
                 instructions.append(
                     TmaLoad1D(
                         self.activation_data[chunk_start:chunk_stop].reshape(-1)

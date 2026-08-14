@@ -825,30 +825,31 @@ def test_fp8_splitk_umma_encodes_local_k_tiles():
     )
 
 
-def test_mxfp4_mxfp8_k512_instructions_encode_activation_batch():
+def test_mxfp4_mxfp8_k512_instructions_encode_family_bload():
     tma = Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(4)
     metadata_address = 0x1234_5678_9AB0
     metadata = Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(
         metadata_address, 2
     )
 
-    assert tma.args == [4]
-    packed = metadata_address | 1
+    assert tma.args == []
     assert metadata.args == [
-        packed & 0xFFFF,
-        (packed >> 16) & 0xFFFF,
-        (packed >> 32) & 0xFFFF,
+        metadata_address & 0xFFFF,
+        (metadata_address >> 16) & 0xFFFF,
+        (metadata_address >> 32) & 0xFFFF,
     ]
     assert tma.compute_operator_name() == (
-        "OP_MXFP4_MXFP8_GEMV_UMMA_K512_TMA_SCALE_FP32_SM100"
+        "OP_MXFP4_MXFP8_GEMV_UMMA_TMA_SCALE_FP32_SM100__"
+        "K_512__BLOAD_4"
     )
     assert metadata.compute_operator_name() == (
-        "OP_MXFP4_MXFP8_GEMV_UMMA_K512_META_SCALE_FP32_SM100"
+        "OP_MXFP4_MXFP8_GEMV_UMMA_META_SCALE_FP32_SM100__"
+        "K_512__BLOAD_2"
     )
     with pytest.raises(ValueError, match="1, 2, 4, or 8"):
         Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(3)
-    with pytest.raises(ValueError, match="4-byte aligned"):
-        Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(0x1235, 2)
+    with pytest.raises(ValueError, match="fit in 48 bits"):
+        Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(1 << 48, 2)
 
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
@@ -883,7 +884,7 @@ def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
         output,
         weight_tma,
         scale_mode="tma",
-        activation_stages_per_load=4,
+        activation_tiles_per_load=4,
     ).place(1)
     tma_insts = tma.schedule(0)
     assert isinstance(
@@ -908,7 +909,7 @@ def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
         weight_tma,
         scale_mode="metadata",
         metadata=metadata,
-        activation_stages_per_load=4,
+        activation_tiles_per_load=4,
     ).place(1)
     direct_insts = direct.schedule(0)
     assert isinstance(
@@ -920,6 +921,37 @@ def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
         32768,
     ]
     assert len(direct_insts) == 12
+
+    streamed = SchedMxfp4Mxfp8GemvUmmaK512(
+        weight_data,
+        weight_scale,
+        activation_data,
+        activation_scale,
+        output,
+        weight_tma,
+        scale_mode="metadata",
+        metadata=metadata,
+        activation_tiles_per_load=1,
+    ).place(1).schedule(0)
+    assert [inst.size for inst in streamed[1:-1]] == [
+        size for _ in range(8) for size in (4096, 32768)
+    ]
+    assert len(streamed) == 18
+
+    full = SchedMxfp4Mxfp8GemvUmmaK512(
+        weight_data,
+        weight_scale,
+        activation_data,
+        activation_scale,
+        output,
+        weight_tma,
+        scale_mode="metadata",
+        metadata=metadata,
+        activation_tiles_per_load=8,
+    ).place(1).schedule(0)
+    assert full[1].size == 8 * 4096
+    assert [inst.size for inst in full[2:-1]] == [32768] * 8
+    assert len(full) == 11
 
 
 def test_dsv4_zero_fill_shards_contiguous_output(monkeypatch):

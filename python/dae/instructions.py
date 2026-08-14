@@ -288,18 +288,20 @@ class Nvfp4GemvUmmaK512Fp32Sm100(ComputeInstruction):
 
 
 class Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(ComputeInstruction):
-    """Native W4A8 K4096 task with allocator-owned scale TMA loads."""
+    """Native W4A8 task with K512 weights and compile-time activation BLOAD."""
 
-    def __init__(self, activation_stages_per_load: int = 4):
-        if activation_stages_per_load not in (1, 2, 4, 8):
+    def __init__(self, activation_tiles_per_load: int = 4):
+        if activation_tiles_per_load not in (1, 2, 4, 8):
             raise ValueError(
-                "MXFP4/MXFP8 activation stages per load must be 1, 2, 4, or 8"
+                "MXFP4/MXFP8 activation tiles per load must be 1, 2, 4, or 8"
             )
         super().__init__(
-            opcode=(
-                opcode.OP_MXFP4_MXFP8_GEMV_UMMA_K512_TMA_SCALE_FP32_SM100
+            opcode=family_ref(
+                "MXFP4_MXFP8_GEMV_UMMA_TMA_SCALE_FP32_SM100",
+                K=512,
+                BLOAD=activation_tiles_per_load,
             ),
-            args=[activation_stages_per_load],
+            args=[],
         )
 
 
@@ -309,26 +311,24 @@ class Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(ComputeInstruction):
     def __init__(
         self,
         metadata_address: int,
-        activation_stages_per_load: int = 4,
+        activation_tiles_per_load: int = 4,
     ):
-        if activation_stages_per_load not in (1, 2, 4, 8):
+        if activation_tiles_per_load not in (1, 2, 4, 8):
             raise ValueError(
-                "MXFP4/MXFP8 activation stages per load must be 1, 2, 4, or 8"
+                "MXFP4/MXFP8 activation tiles per load must be 1, 2, 4, or 8"
             )
         if metadata_address < 0 or metadata_address >= 1 << 48:
             raise ValueError("MXFP4/MXFP8 metadata pointer must fit in 48 bits")
-        if metadata_address & 0x3:
-            raise ValueError("MXFP4/MXFP8 metadata pointer must be 4-byte aligned")
-        stage_code = {1: 0, 2: 1, 4: 2, 8: 3}[activation_stages_per_load]
-        packed = metadata_address | stage_code
         super().__init__(
-            opcode=(
-                opcode.OP_MXFP4_MXFP8_GEMV_UMMA_K512_META_SCALE_FP32_SM100
+            opcode=family_ref(
+                "MXFP4_MXFP8_GEMV_UMMA_META_SCALE_FP32_SM100",
+                K=512,
+                BLOAD=activation_tiles_per_load,
             ),
             args=[
-                packed & 0xFFFF,
-                (packed >> 16) & 0xFFFF,
-                (packed >> 32) & 0xFFFF,
+                metadata_address & 0xFFFF,
+                (metadata_address >> 16) & 0xFFFF,
+                (metadata_address >> 32) & 0xFFFF,
             ],
         )
 

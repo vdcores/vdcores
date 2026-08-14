@@ -236,33 +236,6 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_K512_FP32_SM100) {
 #endif
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_GEMV_UMMA_K512_TMA_SCALE_FP32_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
-             g_events, nvfp4_umma_pipeline_phase_mask);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  dispatch_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<false>(
-      inst.args[0], nullptr, smem_base, tmem_base_ptr, tmem_mma_barrier,
-      tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);
-#endif
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_GEMV_UMMA_K512_META_SCALE_FP32_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
-             g_events, nvfp4_umma_pipeline_phase_mask);
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  const uint64_t metadata_config = uint64_t(inst.args[0]) |
-      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
-  const int activation_stages_per_load =
-      1 << int(metadata_config & 0x3U);
-  const auto *metadata = reinterpret_cast<const uint8_t *>(
-      metadata_config & ~uint64_t(0x3U));
-  dispatch_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<true>(
-      activation_stages_per_load, metadata, smem_base,
-      tmem_base_ptr, tmem_mma_barrier,
-      tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);
-#endif
-}
-
 DAE_COMPUTE_OP_HANDLER(OP_NVFP4_UMMA_PREPACK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);

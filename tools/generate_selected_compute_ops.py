@@ -333,6 +333,50 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             ),
             "#endif",
         ]
+    elif family in (
+        "mxfp4_mxfp8_gemv_umma_tma_scale_fp32_sm100",
+        "mxfp4_mxfp8_gemv_umma_meta_scale_fp32_sm100",
+    ):
+        tile_k = int(entry["k"])
+        bload = int(entry["bload"])
+        if tile_k != 512:
+            raise ValueError(
+                f"Unsupported native MXFP4/MXFP8 K tile={tile_k}; expected 512"
+            )
+        if bload not in (1, 2, 4, 8):
+            raise ValueError(
+                f"Unsupported native MXFP4/MXFP8 BLOAD={bload}; "
+                "expected 1, 2, 4, or 8"
+            )
+        from_metadata = family.endswith("meta_scale_fp32_sm100")
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            (
+                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, "
+                "scratch_space, g_events, nvfp4_umma_pipeline_phase_mask);"
+            ),
+        ]
+        metadata_lines = []
+        if from_metadata:
+            metadata_lines = [
+                "  const uint64_t metadata_address = uint64_t(inst.args[0]) |",
+                "      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);",
+                "  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);",
+            ]
+        else:
+            metadata_lines = ["  const uint8_t *metadata = nullptr;"]
+        metadata_flag = "true" if from_metadata else "false"
+        body = [
+            "#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)",
+            *metadata_lines,
+            (
+                "  task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100<"
+                f"{metadata_flag}, {tile_k}, {bload}>("
+                "smem_base, tmem_base_ptr, tmem_mma_barrier, metadata, "
+                "tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m);"
+            ),
+            "#endif",
+        ]
     else:
         raise ValueError(f"Unsupported dynamic family in code generation: {family}")
     return "\n".join(prelude + body + ["}"])
