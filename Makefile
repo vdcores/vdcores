@@ -78,6 +78,11 @@ ifneq ($(dynamic_smem_kb),)
 	export DAE_DYNAMIC_SMEM_KB := $(dynamic_smem_kb)
 endif
 
+ifneq ($(ffn_specialized),)
+	NVCC_FLAGS += -DDAE_FFN_SPECIALIZED_KERNELS=1
+	export DAE_FFN_SPECIALIZED_KERNELS := 1
+endif
+
 ifneq ($(dsv4_rope_metadata_offset_kb),)
 	NVCC_FLAGS += -DDAE_DSV4_ROPE_METADATA_OFFSET_KB=$(dsv4_rope_metadata_offset_kb)
 	export DAE_DSV4_ROPE_METADATA_OFFSET_KB := $(dsv4_rope_metadata_offset_kb)
@@ -111,6 +116,16 @@ endif
 ifneq ($(mxfp_gate_up_direct_output),)
 	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_OUTPUT=$(mxfp_gate_up_direct_output)
 	export DAE_MXFP_GATE_UP_DIRECT_OUTPUT := $(mxfp_gate_up_direct_output)
+endif
+
+ifneq ($(mxfp_gate_up_direct_activation),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION=$(mxfp_gate_up_direct_activation)
+	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION := $(mxfp_gate_up_direct_activation)
+endif
+
+ifneq ($(mxfp_gate_up_direct_activation_tiles),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES=$(mxfp_gate_up_direct_activation_tiles)
+	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES := $(mxfp_gate_up_direct_activation_tiles)
 endif
 
 ifneq ($(mxfp_gate_up_fixed_output_rows),)

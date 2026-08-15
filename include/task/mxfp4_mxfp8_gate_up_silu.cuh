@@ -10,6 +10,7 @@
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/detail/sm100_tmem_helper.hpp>
 #include <cutlass/numeric_types.h>
+#include <cuda/atomic>
 #include <cuda_bf16.h>
 
 #include <type_traits>
@@ -106,13 +107,16 @@ __device__ __forceinline__ void dae_mxfp_gate_up_issue_raw_umma(
 // producer, warp 0 is the raw UMMA issuer, and warps 2/3 produce native scales.
 // Gate is completed first; the scale warps evaluate gate SiLU while warp 1
 // starts filling the up-weight half of the stream.
-template <int K, int RingStages, typename M2CQueue, typename C2MQueue>
+template <
+    int K, int RingStages, int TileN, bool PublishReady,
+    typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     void *smem_base,
     uint32_t tmem_base_ptr,
     const CUtensorMap *tma_descs,
     const uint8_t *metadata,
+    int *global_bars,
     M2CQueue &m2c,
     C2MQueue &c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
@@ -129,10 +133,21 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   static_assert(K == 128 || K == 512, "fixed-ring K must be 128 or 512");
   static_assert(
       (K == 128 && (RingStages == 10 || RingStages == 11)) ||
-          (K == 512 && RingStages == 2),
+          (K == 512 && (RingStages == 2 || RingStages == 3)),
       "fixed-ring stage count does not match streamed K");
+  constexpr bool kStreamDirectActivation =
+      mxfpGateUpDirectActivationEnabled &&
+      mxfpGateUpDirectActivationTiles == 1;
+  static_assert(
+      !kStreamDirectActivation || (K == 512 && RingStages == 3),
+      "streamed direct activation requires the K512 three-stage image");
   constexpr int kTileM = 128;
-  constexpr int kTileN = 8;
+  constexpr int kTileN = TileN;
+  constexpr int kNativeActivationRows = 8;
+  static_assert(kTileN == 8 || kTileN == 16);
+  static_assert(
+      !kStreamDirectActivation || kTileN == kNativeActivationRows,
+      "streamed activation currently requires the native N8 UMMA tile");
   constexpr int kTileK = 128;
   constexpr int kK128PerTile = K / kTileK;
   constexpr int kNumKTiles = 4096 / K;
@@ -168,9 +183,16 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   constexpr int kWeightStageBytes = kK128PerTile * kWeightK128Bytes;
   constexpr int kActivationStageBytes =
       kK128PerTile * kActivationK128Bytes;
+  constexpr int kActivationGlobalStageBytes =
+      K * kNativeActivationRows;
   constexpr int kSfaStageBytes = kK128PerTile * kSfaK128Bytes;
   constexpr int kSfbStageBytes = kK128PerTile * kSfbK128Bytes;
   constexpr int kScaleStageBytes = kSfaStageBytes + kSfbStageBytes;
+  constexpr int kActivationBytes = kNumKTiles * kActivationStageBytes;
+  constexpr int kActivationGlobalBytes =
+      kNumKTiles * kActivationGlobalStageBytes;
+  static_assert(kActivationBytes == kTileN * 4096);
+  static_assert(kActivationGlobalBytes == 32 * 1024);
   static_assert(kWeightStageBytes == K * kTileM);
   static_assert(kActivationStageBytes == K * kTileN);
   static_assert(kSfaStageBytes == K * 4 && kSfbStageBytes == K * 4);
@@ -227,26 +249,31 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   }
 #endif
   int activation_slots = 0;
-  uint8_t *activation_base = nullptr;
-  if (warp < 2) {
-    activation_slots = m2c.template pop<0>();
-    if (warp == 0) {
-      activation_base = static_cast<uint8_t *>(
-          get_slot_address(smem_base, extract(activation_slots)));
+  uint8_t *activation_base = static_cast<uint8_t *>(smem_base);
+  if constexpr (!mxfpGateUpDirectActivationEnabled) {
+    activation_base = nullptr;
+    if (warp < 2) {
+      activation_slots = m2c.template pop<0>();
+      if (warp == 0) {
+        activation_base = static_cast<uint8_t *>(
+            get_slot_address(smem_base, extract(activation_slots)));
+      }
+    } else {
+      m2c.advance();
     }
-  } else {
-    m2c.advance();
-  }
 #if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    const uint64_t ready = cuda::ptx::get_sreg_globaltimer();
-    #pragma unroll
-    for (int tile = 0; tile < kNumKTiles; ++tile) {
-      profile_events[mxfpProfileActivationReadyBase + tile] = ready;
+    if (tid == 0) {
+      const uint64_t ready = cuda::ptx::get_sreg_globaltimer();
+      #pragma unroll
+      for (int tile = 0; tile < kNumKTiles; ++tile) {
+        profile_events[mxfpProfileActivationReadyBase + tile] = ready;
+      }
     }
-  }
 #endif
+  }
 
+  const auto *activation_data_global = reinterpret_cast<const uint8_t *>(
+      *reinterpret_cast<const uint64_t *>(metadata + 0));
   const uint64_t tma_info =
       *reinterpret_cast<const uint64_t *>(metadata + 40);
   const uint16_t gate_tma_index = uint16_t(tma_info);
@@ -260,33 +287,58 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       *reinterpret_cast<const uint64_t *>(metadata + 32));
   auto *direct_output_global = reinterpret_cast<uint8_t *>(
       *reinterpret_cast<const uint64_t *>(metadata + 48));
+  const uint64_t layout_info =
+      *reinterpret_cast<const uint64_t *>(metadata + 56);
+  const uint32_t weight_scale_tile_stride = uint32_t(layout_info) != 0
+      ? uint32_t(layout_info)
+      : uint32_t(kSfaStageBytes);
+  const bool weight_k_tile_major = uint32_t(layout_info >> 32) != 0;
+  const uint32_t ready_bar =
+      *reinterpret_cast<const uint32_t *>(metadata + 64);
 
   constexpr int kWeightRingBytes = RingStages * kWeightStageBytes;
   constexpr int kScaleRingBytes = RingStages * kScaleStageBytes;
-  constexpr int kBarrierBytes = 4 * RingStages * int(sizeof(TxBarrier));
+  constexpr int kActivationRingBytes = kStreamDirectActivation
+      ? RingStages * kActivationStageBytes
+      : 0;
+  constexpr int kBarrierBytes =
+      (4 * RingStages + (kStreamDirectActivation ? 0 : 1)) *
+      int(sizeof(TxBarrier));
   constexpr int kOutputRows = mxfpGateUpFixedOutputRows;
   using GateSilu = std::conditional_t<
       mxfpGateUpFixedBf16Epilogue, __nv_bfloat16, float>;
   constexpr int kGateSiluBytes =
       kTileM * kOutputRows * int(sizeof(GateSilu));
   constexpr int kFixedScratchBytes =
-      kWeightRingBytes + kScaleRingBytes + kBarrierBytes + kGateSiluBytes;
+      kWeightRingBytes + kScaleRingBytes + kActivationRingBytes +
+      kBarrierBytes + kGateSiluBytes;
+  constexpr int kAllocatorArenaBytes = numSlots * slotSizeKb * 1024;
+  constexpr int kFixedOffset = kStreamDirectActivation
+      ? 0
+      : (mxfpGateUpDirectActivationEnabled &&
+                 kActivationBytes > kAllocatorArenaBytes
+             ? kActivationBytes
+             : kAllocatorArenaBytes);
   constexpr int kTaskScratchBytes =
-      dynamicSmemBytes - numSlots * slotSizeKb * 1024;
+      dynamicSmemBytes - kFixedOffset;
   static_assert(
       kTaskScratchBytes >= kFixedScratchBytes + 1023,
       "fixed K128 ring does not fit behind the configured allocator arena");
-  auto *fixed_base = static_cast<uint8_t *>(
-      get_slot_address(smem_base, numSlots));
+  auto *fixed_base = kStreamDirectActivation
+      ? static_cast<uint8_t *>(smem_base)
+      : static_cast<uint8_t *>(smem_base) + kFixedOffset;
   // Put the compact scale ring first; every task-local operand retains at
   // least the 1-KiB alignment required by its native descriptor.
   auto *scale_ring = fixed_base;
-  auto *weight_ring = scale_ring + kScaleRingBytes;
+  auto *activation_ring = scale_ring + kScaleRingBytes;
+  auto *weight_ring = activation_ring + kActivationRingBytes;
   auto *weight_full = reinterpret_cast<TxBarrier *>(weight_ring + kWeightRingBytes);
   auto *scale_full = weight_full + RingStages;
   auto *umma_full = scale_full + RingStages;
   auto *stage_empty = umma_full + RingStages;
-  auto *gate_silu = reinterpret_cast<GateSilu *>(stage_empty + RingStages);
+  auto *activation_full = stage_empty + RingStages;
+  auto *gate_silu = reinterpret_cast<GateSilu *>(
+      activation_full + (kStreamDirectActivation ? 0 : 1));
 
   if (warp == 1 && lane == 0) {
     #pragma unroll
@@ -296,9 +348,61 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       umma_full[stage].init(1);
       stage_empty[stage].init(1);
     }
+    if constexpr (!kStreamDirectActivation) {
+      activation_full->init(1);
+    }
     cutlass::arch::fence_barrier_init();
   }
   __sync_compute_group(128);
+
+  if constexpr (
+      mxfpGateUpDirectActivationEnabled && !kStreamDirectActivation) {
+    if (warp == 1 && lane == 0) {
+      activation_full->arrive_and_expect_tx(kActivationGlobalBytes);
+      if constexpr (kTileN == kNativeActivationRows) {
+        #pragma unroll
+        for (int chunk = 0; chunk < kActivationBytes / (16 * 1024); ++chunk) {
+          cuda::ptx::cp_async_bulk(
+              cuda::ptx::space_shared,
+              cuda::ptx::space_global,
+              activation_base + chunk * 16 * 1024,
+              activation_data_global + chunk * 16 * 1024,
+              uint32_t(16 * 1024),
+              reinterpret_cast<uint64_t *>(activation_full));
+        }
+      } else {
+        #pragma unroll
+        for (int tile = 0; tile < kNumKTiles; ++tile) {
+          #pragma unroll
+          for (int subtile = 0; subtile < kK128PerTile; ++subtile) {
+            constexpr int kNativeActivationK128Bytes =
+                kNativeActivationRows * kTileK;
+            cuda::ptx::cp_async_bulk(
+                cuda::ptx::space_shared,
+                cuda::ptx::space_global,
+                activation_base + tile * kActivationStageBytes +
+                    subtile * kActivationK128Bytes,
+                activation_data_global + tile * kActivationGlobalStageBytes +
+                    subtile * kNativeActivationK128Bytes,
+                uint32_t(kNativeActivationK128Bytes),
+                reinterpret_cast<uint64_t *>(activation_full));
+          }
+        }
+      }
+    }
+    if (warp == 0) {
+      activation_full->wait(0);
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+      if (tid == 0) {
+        const uint64_t ready = cuda::ptx::get_sreg_globaltimer();
+        #pragma unroll
+        for (int tile = 0; tile < kNumKTiles; ++tile) {
+          profile_events[mxfpProfileActivationReadyBase + tile] = ready;
+        }
+      }
+#endif
+    }
+  }
 
   using Utccp = SM100_UTCCP_4x32dp128bit_1cta;
   auto coord_c = make_identity_tensor(
@@ -332,17 +436,32 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
                   weight_ring + stage * kWeightStageBytes));
           const uint32_t barrier = static_cast<uint32_t>(
               __cvta_generic_to_shared(weight_full + stage));
+          const int weight_coord3 =
+              weight_k_tile_major ? int(output_tile) : tile;
+          const int weight_coord4 =
+              weight_k_tile_major ? tile : int(output_tile);
           asm volatile(
               "cp.async.bulk.tensor.5d.shared::cluster.global."
               "mbarrier::complete_tx::bytes "
               "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
               :: "r"(destination), "l"(tma_descs + descriptor_index),
-                 "r"(0), "r"(0), "r"(tile), "r"(output_tile),
+                 "r"(0), "r"(0), "r"(weight_coord3), "r"(weight_coord4),
                  "r"(barrier)
               : "memory");
+          if constexpr (kStreamDirectActivation) {
+            cuda::ptx::cp_async_bulk(
+                cuda::ptx::space_shared,
+                cuda::ptx::space_global,
+                activation_ring + stage * kActivationStageBytes,
+                activation_data_global + tile * kActivationGlobalStageBytes,
+                uint32_t(kActivationGlobalStageBytes),
+                reinterpret_cast<uint64_t *>(weight_full + stage));
+          }
           // TMA transaction accounting follows packed HBM bytes even though
           // the 16U4 transform expands the shared-memory image.
-          weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
+          weight_full[stage].arrive_and_expect_tx(
+              kWeightPackedBytes +
+              (kStreamDirectActivation ? kActivationGlobalStageBytes : 0));
         }
       }
       if (projection == 1) {
@@ -398,7 +517,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
                 cuda::ptx::space_shared,
                 cuda::ptx::space_global,
                 stage_scale,
-                weight_scale_global + tile * kSfaStageBytes,
+                weight_scale_global + tile * weight_scale_tile_stride,
                 uint32_t(kSfaStageBytes),
                 reinterpret_cast<uint64_t *>(scale_full + stage));
             cuda::ptx::cp_async_bulk(
@@ -411,7 +530,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
           }
         } else {
           const uint8_t *source = warp == 2
-              ? weight_scale_global + tile * kSfaStageBytes
+              ? weight_scale_global + tile * weight_scale_tile_stride
               : activation_scale_global + tile * kSfbStageBytes;
           auto *destination = warp == 2
               ? stage_scale
@@ -530,7 +649,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
               layout_sA);
           auto sB = make_tensor(
               make_smem_ptr(reinterpret_cast<Activation *>(
-                  activation_base + tile * kActivationStageBytes +
+                  (kStreamDirectActivation
+                       ? activation_ring + stage * kActivationStageBytes
+                       : activation_base + tile * kActivationStageBytes) +
                   subtile * kActivationK128Bytes)),
               layout_sB);
           auto frag_a = cta_mma.make_fragment_A(sA);
@@ -657,7 +778,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   if (warp == 1) {
     __syncwarp();
     stage_empty[kLastStage].wait(kLastPhase);
-    c2m.template push<numThreadsPerWarp>(tid, activation_slots);
+    if constexpr (!mxfpGateUpDirectActivationEnabled) {
+      c2m.template push<numThreadsPerWarp>(tid, activation_slots);
+    }
   }
 
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
@@ -692,7 +815,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       -1024;
   static_assert(
       kScaleRingBytes >=
-          kOutputScratchOffset + kTileM * kTileN + kSfbK128Bytes,
+          kOutputScratchOffset + kTileM * kOutputRows + kSfbK128Bytes,
       "fixed gate/up scale ring cannot hold the full N8 epilogue");
   int output_slots = 0;
   uint8_t *data_output = nullptr;
@@ -709,7 +832,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   // The fixed-ring schedule allocates one contiguous native output record.
   // Keeping data and scales in the same allocator slot removes a second
   // allocation/store rendezvous from the post-UMMA critical path.
-  auto *scale_output = data_output + kTileM * kTileN;
+  auto *scale_output = data_output + kTileM * kOutputRows;
 
   float swiglu_values[kOutputRows];
   #pragma unroll
@@ -829,11 +952,20 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
           cuda::ptx::space_shared,
           direct_output_global,
           data_output,
-          uint32_t(kTileM * kTileN + kSfbK128Bytes));
+          uint32_t(kTileM * kOutputRows + kSfbK128Bytes));
       cuda::ptx::cp_async_bulk_commit_group();
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+      cuda::ptx::fence_proxy_async();
+      if constexpr (PublishReady) {
+        if (ready_bar != 0xFFFFFFFFU) {
+          asm volatile("fence.release.gpu;" ::: "memory");
+          *reinterpret_cast<volatile int *>(global_bars + ready_bar) = 0;
+        }
+      }
     }
-    __sync_compute_group(128);
+    if constexpr (PublishReady) {
+      __sync_compute_group(128);
+    }
   } else {
     c2m.template push<31, true, false>(tid, output_slots);
   }

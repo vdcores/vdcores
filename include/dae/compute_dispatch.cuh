@@ -9,6 +9,7 @@
 #include "task/fp8.cuh"
 #include "task/gemv.cuh"
 #include "task/mxfp4_mxfp8_gate_up_silu.cuh"
+#include "task/mxfp4_mxfp8_ffn.cuh"
 #include "task/mxfp4_mxfp8_umma.cuh"
 #include "task/nvfp4.cuh"
 #include "task/nvfp4_umma.cuh"
@@ -34,6 +35,7 @@
   uint64_t *scratch_space, \
   MInst *st_insts, \
   const CUtensorMap *tma_descs, \
+  int *global_bars, \
   M2CQueue &m2c, \
   C2MQueue &c2m, \
   uint64_t *g_events
@@ -90,6 +92,32 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ZERO_FILL) {
   }
   c2m.push(thread_id, gate_slot);
   c2m.template push<0, true>(thread_id, output_slot);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
+             tmem_mma_barrier, tmem_mma_phase,
+             fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask,
+             scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const uint64_t metadata_address = uint64_t(inst.args[0]) |
+      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
+  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);
+  if constexpr (
+      dynamicSmemBytes - numSlots * slotSizeKb * 1024 >= 160 * 1024) {
+    task_mxfp4_mxfp8_down_fixed_ring_sm100<
+        4, 2, 512, __bar_cgroup, 512,
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes>(
+        smem_base, tmem_base_ptr, tma_descs, metadata, global_bars,
+        m2c, c2m
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        , sm_id, g_events
+#endif
+        );
+  } else {
+    asm volatile("trap;");
+  }
+#endif
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_TO_BF16) {
@@ -1295,6 +1323,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint64_t *scratch_space,
   MInst *st_insts,
   const CUtensorMap *tma_descs,
+  int *global_bars,
   M2CQueue &m2c,
   C2MQueue &c2m,
   uint64_t *g_events
@@ -1302,7 +1331,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, scratch_space, st_insts, tma_descs, m2c, c2m, g_events); \
+        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP

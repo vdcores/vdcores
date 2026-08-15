@@ -159,15 +159,20 @@ def build_metadata(
     gate_scale: torch.Tensor,
     activation_scale: torch.Tensor,
     up_scale: torch.Tensor,
+    activation_data: torch.Tensor | None = None,
     output_record: torch.Tensor | None = None,
     *,
     gate_tma_index: int | None = None,
     up_tma_index: int | None = None,
+    ready_bars: list[int] | None = None,
 ) -> torch.Tensor:
     records = torch.zeros(
         (gate_scale.shape[0], 16), dtype=torch.int64, device="cpu"
     )
+    records[:, 8] = -1
     for tile in range(gate_scale.shape[0]):
+        if activation_data is not None:
+            records[tile, 0] = activation_data.data_ptr()
         records[tile, 2] = gate_scale[tile, 0].data_ptr()
         records[tile, 3] = activation_scale[0].data_ptr()
         records[tile, 4] = up_scale[tile, 0].data_ptr()
@@ -179,6 +184,8 @@ def build_metadata(
             )
         if output_record is not None:
             records[tile, 6] = output_record[tile].data_ptr()
+        if ready_bars is not None:
+            records[tile, 8] = ready_bars[tile]
     return records.view(torch.uint8).to(gate_scale.device)
 
 
@@ -194,6 +201,8 @@ def main() -> None:
     parser.add_argument("--routed-experts", type=int, default=6)
     parser.add_argument("--slices-per-expert", type=int, default=16)
     parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--publish-ready", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--tile-k", type=int, choices=(128, 512), default=512)
     parser.add_argument("--diagnostic-output", action="store_true")
     parser.add_argument("--warmup", type=int, default=30)
@@ -304,15 +313,22 @@ def main() -> None:
     output_data = output_record[:, : schedule_type.OUTPUT_DATA_BYTES]
     output_scale = output_record[:, schedule_type.OUTPUT_DATA_BYTES :]
     launcher = Launcher(workers, device=device)
+    ready_bars = (
+        [launcher.new_bar(1) for _ in range(args.tasks)]
+        if args.publish_ready
+        else None
+    )
     gate_tma = TmaTensor(launcher, gate_weight).mxfp4_load(args.tile_k)
     up_tma = TmaTensor(launcher, up_weight).mxfp4_load(args.tile_k)
     metadata = build_metadata(
         gate_scale,
         activation_scale,
         up_scale,
+        activation_data,
         output_record,
         gate_tma_index=gate_tma.arg,
         up_tma_index=up_tma.arg,
+        ready_bars=ready_bars,
     )
     schedule = schedule_type(
         gate_weight,
@@ -420,13 +436,20 @@ def main() -> None:
         atol=0,
     )
 
+    if args.cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launcher.launch(synchronize=False)
+        launch_once = graph.replay
+    else:
+        launch_once = launcher.launch
     for _ in range(args.warmup):
-        launcher.launch()
+        launch_once()
     torch.cuda.synchronize()
     task_times = []
     kernel_times = []
     for _ in range(args.iterations):
-        launcher.launch()
+        launch_once()
         profile = launcher.profile[:, :4].cpu().numpy()
         task_times.append(
             (profile[:, 3].max() - profile[:, 2].min()) / 1.0e3

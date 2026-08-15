@@ -1,6 +1,10 @@
 #include "dae2.cuh"
 #include "runtime.cuh"
 
+#if defined(DAE_FFN_SPECIALIZED_KERNELS)
+#include "ffn_direct_kernels.cuh"
+#endif
+
 #include <cuda.h>
 
 size_t set_smem_size(size_t smem_size) {
@@ -9,6 +13,20 @@ size_t set_smem_size(size_t smem_size) {
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_size
     );
+#if defined(DAE_FFN_SPECIALIZED_KERNELS)
+    if (err == cudaSuccess) {
+      err = cudaFuncSetAttribute(
+          dae_ffn_linear1_direct_kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          smem_size);
+    }
+    if (err == cudaSuccess) {
+      err = cudaFuncSetAttribute(
+          dae_ffn_down_direct_kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          smem_size);
+    }
+#endif
     if (err != cudaSuccess) {
         std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
         return 0;
@@ -48,6 +66,31 @@ cudaError_t launch_dae(
 
   return cudaGetLastError();
 }
+
+#if defined(DAE_FFN_SPECIALIZED_KERNELS)
+cudaError_t launch_dae_ffn_linear1_direct(
+    int num_blocks, size_t smem_size, const uint8_t *metadata,
+    CUtensorMap *tma_descs, int *bars, int reduction_bar_base,
+    int reduction_tiles, uint64_t *profile, int64_t stream) {
+  dae_ffn_linear1_direct_kernel<<<
+      num_blocks, 128, smem_size,
+      reinterpret_cast<cudaStream_t>(stream)>>>(
+          metadata, tma_descs, bars, reduction_bar_base, reduction_tiles,
+          profile);
+  return cudaGetLastError();
+}
+
+cudaError_t launch_dae_ffn_down_direct(
+    int num_blocks, size_t smem_size, const uint8_t *metadata,
+    CUtensorMap *tma_descs, int *bars, uint64_t *profile, int64_t stream) {
+  dae_ffn_down_direct_kernel<<<
+      num_blocks, 128, smem_size,
+      reinterpret_cast<cudaStream_t>(stream)>>>(
+          metadata, tma_descs, bars, profile);
+  return cudaGetLastError();
+}
+
+#endif
 
 cudaError_t launch_dae_sequence(
   int numSMs,

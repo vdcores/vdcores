@@ -387,7 +387,9 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
     elif family == "mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100":
         tile_k = int(entry["k"])
         stages = int(entry["stages"])
-        if (tile_k, stages) not in ((128, 10), (128, 11), (512, 2)):
+        if (tile_k, stages) not in (
+            (128, 10), (128, 11), (512, 2), (512, 3)
+        ):
             raise ValueError(
                 f"Unsupported fused MXFP4/MXFP8 fixed K/ring={tile_k}/{stages}"
             )
@@ -406,8 +408,9 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             "  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);",
             (
                 "  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<"
-                f"{tile_k}, {stages}>(smem_base, tmem_base_ptr, tma_descs, "
-                "metadata, m2c, c2m"
+                f"{tile_k}, {stages}, 8, true>("
+                "smem_base, tmem_base_ptr, tma_descs, "
+                "metadata, global_bars, m2c, c2m"
             ),
             "#if defined(DAE_TRACK_MXFP_TIMELINE)",
             "      , sm_id, g_events",

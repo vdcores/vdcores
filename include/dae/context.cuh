@@ -110,6 +110,20 @@ static constexpr int mxfp4Mxfp8TmaScaleBarrierCount =
 #endif
 static constexpr bool mxfpGateUpDirectOutputEnabled =
     DAE_MXFP_GATE_UP_DIRECT_OUTPUT != 0;
+#ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
+#define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION 1
+#endif
+static constexpr bool mxfpGateUpDirectActivationEnabled =
+    DAE_MXFP_GATE_UP_DIRECT_ACTIVATION != 0;
+#ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES
+#define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES 8
+#endif
+static constexpr int mxfpGateUpDirectActivationTiles =
+    DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES;
+static_assert(
+    mxfpGateUpDirectActivationTiles == 1 ||
+        mxfpGateUpDirectActivationTiles == 8,
+    "focused gate/up direct activation supports one streamed or eight resident tiles");
 #ifndef DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS
 #define DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS 8
 #endif

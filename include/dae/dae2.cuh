@@ -190,25 +190,10 @@ void dae2(
     
       __cprint("Executing instruction at PC %d: opcode=%04x", pc - 1, inst.opcode);
       dispatch_compute_instruction(
-        sm_id,
-        thread_id,
-        pc,
-        count,
-        finish,
-        inst,
-        smem_base,
-        tmem_base_ptr,
-        tmem_mma_barriers,
-        tmem_mma_phase,
-        fp8_umma_pipeline_phase_mask,
-        nvfp4_umma_pipeline_phase_mask,
-        scratch_space,
-        st_insts,
-        tma_descs,
-        m2c,
-        c2m,
-        g_events
-      );
+        sm_id, thread_id, pc, count, finish, inst, smem_base,
+        tmem_base_ptr, tmem_mma_barriers, tmem_mma_phase,
+        fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask,
+        scratch_space, st_insts, tma_descs, bars, m2c, c2m, g_events);
       // if (blockIdx.x == 0 && threadIdx.x == 0) {
       //   printf("[COMP] after execution: pc=%d, opcode=%04x\n", pc-1, inst.opcode);
       // }

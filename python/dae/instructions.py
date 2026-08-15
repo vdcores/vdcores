@@ -19,6 +19,7 @@ from .tma_utils import (
     build_tma_1d,
     build_tma_rowmajor_2d,
     build_tma_mxfp4,
+    build_tma_mxfp4_kmajor,
     build_tma_mxfp4_k512,
     build_tma_wgmma_kmajor,
     build_tma_wgmma_mnmajor,
@@ -30,6 +31,7 @@ from .tma_utils import (
     cord_func_tma_1d,
     cord_func_rowmajor_2d,
     cord_func_mxfp4,
+    cord_func_mxfp4_kmajor,
     cord_func_mxfp4_k512,
     cords2addr,
     get_tensor_address,
@@ -348,8 +350,14 @@ class Mxfp4Mxfp8GateUpSiluFixedRingSm100(ComputeInstruction):
         if tile_k not in (128, 512):
             raise ValueError("fused MXFP4/MXFP8 fixed ring requires K128 or K512")
         if stages is None:
-            stages = 10 if tile_k == 128 else 2
-        if (tile_k, stages) not in ((128, 10), (128, 11), (512, 2)):
+            stages = (
+                10
+                if tile_k == 128
+                else (3 if config.mxfp_gate_up_direct_activation_tiles == 1 else 2)
+            )
+        if (tile_k, stages) not in (
+            (128, 10), (128, 11), (512, 2), (512, 3)
+        ):
             raise ValueError("invalid fused MXFP4/MXFP8 fixed-ring shape")
         if metadata_address < 0 or metadata_address >= 1 << 48:
             raise ValueError("fixed-ring MXFP4/MXFP8 metadata pointer must fit in 48 bits")
@@ -359,6 +367,22 @@ class Mxfp4Mxfp8GateUpSiluFixedRingSm100(ComputeInstruction):
                 K=tile_k,
                 STAGES=stages,
             ),
+            args=[
+                metadata_address & 0xFFFF,
+                (metadata_address >> 16) & 0xFFFF,
+                (metadata_address >> 32) & 0xFFFF,
+            ],
+        )
+
+
+class Mxfp4Mxfp8DownFixedRingSm100(ComputeInstruction):
+    """K2048 down projection consuming native fused-Linear1 records."""
+
+    def __init__(self, metadata_address: int):
+        if metadata_address < 0 or metadata_address >= 1 << 48:
+            raise ValueError("fixed-ring MXFP4/MXFP8 down metadata pointer must fit in 48 bits")
+        super().__init__(
+            opcode=opcode.OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100,
             args=[
                 metadata_address & 0xFFFF,
                 (metadata_address >> 16) & 0xFFFF,
@@ -2879,6 +2903,21 @@ class TmaTensor(MemoryInstruction):
         inst.num_slots = (128 * tile_k) // (8 * 1024)
         return inst
 
+    def mxfp4_kmajor_load(self, tile_k: int):
+        """Packed MXFP4 load from K-tile-major HBM."""
+        if tile_k not in (128, 256, 512):
+            raise ValueError("MXFP4 TMA tile K must be 128, 256, or 512")
+        inst = self._build(
+            "load",
+            128,
+            tile_k,
+            build_tma_mxfp4_kmajor,
+            cord_func_mxfp4_kmajor,
+        )
+        inst.size = 128 * tile_k // 2
+        inst.num_slots = (128 * tile_k) // (8 * 1024)
+        return inst
+
     def mxfp4_k128_load(self):
         return self.mxfp4_load(128)
 
@@ -2905,6 +2944,7 @@ __all__ = [
     "Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100",
     "Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100",
     "Mxfp4Mxfp8GateUpSiluFixedRingSm100",
+    "Mxfp4Mxfp8DownFixedRingSm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",

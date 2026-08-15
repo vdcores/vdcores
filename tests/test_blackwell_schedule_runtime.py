@@ -949,6 +949,7 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
     assert schedule._tile_shard(1) == (2, 1)
 
     monkeypatch.setattr(config, "mxfp_gate_up_direct_output", True)
+    monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", False)
     direct = schedule.schedule(0)
     assert len(direct) == 4
     assert all(
@@ -957,6 +958,15 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
     )
     assert [direct[index].size for index in (1, 3)] == [32768, 32768]
 
+    monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", True)
+    direct_activation = schedule.schedule(0)
+    assert len(direct_activation) == 2
+    assert all(
+        isinstance(inst, Mxfp4Mxfp8GateUpSiluFixedRingSm100)
+        for inst in direct_activation
+    )
+
+    monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", False)
     monkeypatch.setattr(config, "mxfp_gate_up_direct_output", False)
     queued = schedule.schedule(1)
     assert len(queued) == 3

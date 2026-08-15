@@ -533,6 +533,49 @@ def build_tma_mxfp4_k512(mat: torch.Tensor, tile_m: int, tile_k: int):
     return build_tma_mxfp4(mat, tile_m, tile_k)
 
 
+def build_tma_mxfp4_kmajor(mat: torch.Tensor, tile_m: int, tile_k: int):
+    """Packed MXFP4 with contiguous M tiles inside each K tile.
+
+    HBM is [K/tile_k, M/128, tile_k/128, 128, 64] so a full CTA wave
+    reads adjacent 32-KiB records instead of task-strided records.
+    """
+    assert mat.dim() == 5
+    k_tiles, m_tiles, k128_tiles, rows, packed_k128 = mat.shape
+    assert tile_m == rows == 128
+    assert tile_k in (128, 256, 512)
+    assert k128_tiles == tile_k // 128 and packed_k128 == 64
+    global_dims = [128, rows, k128_tiles, m_tiles, k_tiles]
+    tile_bytes = k128_tiles * rows * packed_k128
+    global_strides = [
+        packed_k128,
+        rows * packed_k128,
+        tile_bytes,
+        m_tiles * tile_bytes,
+    ]
+    box_dims = [128, rows, k128_tiles, 1, 1]
+    return 5, runtime.build_tma_desc(
+        mat,
+        global_dims,
+        global_strides,
+        box_dims,
+        [1] * 5,
+        128,
+        0,
+        True,
+    )
+
+
+def cord_func_mxfp4_kmajor(mat: torch.Tensor, rank: int):
+    assert rank == 5
+
+    def cord_func(m_tile: int, k_tile: int):
+        assert 0 <= m_tile < mat.shape[1]
+        assert 0 <= k_tile < mat.shape[0]
+        return [0, 0, m_tile, k_tile]
+
+    return cord_func
+
+
 def cord_func_mxfp4(mat: torch.Tensor, rank: int):
     assert rank == 5
 

@@ -55,6 +55,8 @@ if os.environ.get("DAE_DYNAMIC_SMEM_KB"):
     cuda_defines.append(
         "-DDAE_DYNAMIC_SMEM_KB=" + os.environ["DAE_DYNAMIC_SMEM_KB"]
     )
+if os.environ.get("DAE_FFN_SPECIALIZED_KERNELS"):
+    cuda_defines.append("-DDAE_FFN_SPECIALIZED_KERNELS=1")
 if os.environ.get("DAE_DSV4_ROPE_METADATA_OFFSET_KB"):
     cuda_defines.append(
         "-DDAE_DSV4_ROPE_METADATA_OFFSET_KB="
@@ -86,6 +88,16 @@ if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_OUTPUT"):
     cuda_defines.append(
         "-DDAE_MXFP_GATE_UP_DIRECT_OUTPUT="
         + os.environ["DAE_MXFP_GATE_UP_DIRECT_OUTPUT"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_ACTIVATION"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION="
+        + os.environ["DAE_MXFP_GATE_UP_DIRECT_ACTIVATION"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES="
+        + os.environ["DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES"]
     )
 if os.environ.get("DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS"):
     cuda_defines.append(

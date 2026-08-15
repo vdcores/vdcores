@@ -2391,3 +2391,86 @@ padding difference is part of each framework's legal shape contract and is
 stated explicitly rather than normalized away. Only the fixed-ring fused
 family is retained: all 112 unsplit slices fit in one wave and the fused path
 meets the framework acceptance target without another HBM or kernel boundary.
+
+## Native MXFP4/MXFP8 full FFN (2026-08-15)
+
+The selected full-FFN frontier is two stream-ordered focused kernels for one
+shared and six routed experts, eight useful rows, hidden size 4096, and expert
+intermediate size 2048. Linear-1 launches 112 CTAs: 16 M128 slices for the
+shared expert first, followed by 16 slices for each routed expert. Every CTA
+reduces the complete K4096 gate and up projections in FP32 TMEM, applies SiLU
+and multiplication, and stores one native 1,536-byte MXFP8 record:
+`[1024-byte E4M3 8x128 data | 512-byte UE8M0 scale image]`. Linear-2 consumes
+these records in place. There is no conversion, repack, row replication, or
+FP32 Linear-1 write/read boundary in the timed graph.
+
+Linear-1 weight HBM uses K-tile-major
+`[8 K512,112 tasks,4 K128,128,64 packed bytes]`, so a CTA wave reads adjacent
+weight records for each K tile. Its scale planes use the matching K-tile-major
+task stride. Activation data and scales are already native, duplicated, and
+swizzled in HBM. The retained family parameter independently selects one
+streamed K512 activation tile or all eight batched tiles; the full-FFN image
+selects eight. TMA descriptors use 256-byte L2 promotion by default.
+
+Linear-2 launches all 224 expert/M128 output tasks as independent CTAs. Each
+CTA computes one M128/N8/K2048 projection with eight K256 bundles and a
+two-stage shared-memory ring. Warp 1 streams packed weights with TMA, warp 2
+copies weight scales and retires completed stages, warp 3 copies native MXFP8
+data and scales, and warp 0 performs UTCCP plus raw UMMA issue. The issuer
+commits the next bundle without waiting at the preceding issue point; the
+retire warp bounds the two-bundle window. Only the first K128 UMMA uses
+accumulator-zero. All later UMMAs accumulate into the same FP32 TMEM fragment,
+which drains once after the full K dimension.
+
+The focused down kernel allocates 64 TMEM columns and relinquishes the TMEM
+allocation permit immediately after allocation. The permit protects
+allocation, not subsequent use of disjoint columns, so two down CTAs can
+reside on one SM. Its direct task-local scratch starts at offset zero and fits
+in an 80-KiB dynamic-shared-memory launch; generic allocator scratch remains
+independent. This changes the 224-task launch from two serialized CTA waves to
+all task starts within one scheduling wave. The final compile reports 111
+registers, one barrier, and zero spills for down; focused Linear-1 reports 220
+registers, nine barriers, and zero spills.
+
+The shared-expert CTA for each M128 output block zeros the final FP32 tile and
+publishes a release edge. All seven expert CTAs apply their route scale in the
+FP32 shared epilogue, wait for that edge, and issue direct FP32 TMA reduce-add.
+The two kernels are ordered on one CUDA stream, so selected Linear-2 does not
+scan 16 Linear-1 readiness flags. The task still supports a block-wise
+readiness edge for alternative schedules, but the measured sequential path
+avoids that polling and its dependency stalls.
+
+The final matched runs used the same GB300 GPU, vLLM 0.27.1 with its vendored
+DeepGEMM backend, 20 FFNs per CUDA graph, 200 warmups, and 2,000 timed samples.
+Route packing and input/checkpoint preparation are outside both timed
+frontiers.
+
+| implementation | FC1 | activation/quant | FC2 | reduce | full FFN |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vLLM/DeepGEMM | 10.6176 us | 2.4256 us | 6.9312 us | 3.8608 us | 30.4800 us |
+| VDCores focused | fused | fused | fused down + TMA reduce | fused | **24.8720 us** |
+
+The vLLM result is job `20260815T113724Z-1449985`; the immediately following
+VDCores result is job `20260815T113749Z-1459095`. VDCores is 1.2255x faster,
+or 18.399% lower latency, exceeding the 10% acceptance target. The VDCores
+minimum/median/maximum were 24.6688/24.8720/33.6944 us. Linear-1 native data
+and active scale bytes pass exact equality checks, and the final FP32 output
+passes `torch.testing.assert_close`; maximum relative error is 1.4e-7. The
+reported 64.0 maximum absolute difference occurs on the deliberately large
+uniform-value fixture and is covered by that relative tolerance.
+
+Rejected schedules were removed from the implementation surface. A
+dependency-driven resident/concurrent launch stretched the down span to about
+21.8 us and full FFN to 30.24 us. Paired-M down took 24.096 us by itself;
+split-K2, N16, and cooperative two-CTA variants added work or unused output
+lanes. Establishing the final output with a shared copy instead of zero plus
+seven TMA reduce-adds regressed full FFN to 31.088 us. TMA L2 promotion 128
+also lost to 256. The retained source therefore contains only the one-CTA N8
+task used by the K512 generic schedule and K256 focused kernel.
+
+The selected build uses
+`benchmarks/deepseek_v4_mxfp4_mxfp8_full_ffn_two_kernel.ops`, one generic
+allocator slot, 64 instruction entries, 223 KiB configured shared memory, and
+`ffn_specialized=1`. Build and benchmark inside the worker Conda environment;
+GPU execution must go through the cluster allocator. The host schedule suite
+passes 86 tests after evaluating it with the normal 24-slot schedule capacity.

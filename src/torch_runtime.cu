@@ -758,6 +758,84 @@ int py_launch_dae_legacy(
   );
 }
 
+#if defined(DAE_FFN_SPECIALIZED_KERNELS)
+int py_launch_dae_ffn_linear1_direct(
+    int64_t num_blocks,
+    size_t smem_size,
+    torch::Tensor metadata_bytes,
+    torch::Tensor tma_descs_bytes,
+    torch::Tensor bars_int32,
+    int64_t reduction_bar_base,
+    int64_t reduction_tiles,
+    torch::Tensor profile_u64,
+    int64_t stream) {
+  const cudaDeviceProp prop = current_device_prop();
+  TORCH_CHECK(
+      num_blocks > 0 && num_blocks <= prop.multiProcessorCount,
+      "direct Linear-1 block count must fit the physical SM count");
+  TORCH_CHECK(
+      smem_size <= static_cast<size_t>(prop.sharedMemPerBlockOptin),
+      "smem_size exceeds this device's per-block opt-in shared-memory limit");
+  auto metadata = check_tensor_ptr<uint8_t>(metadata_bytes, "metadata_bytes");
+  TORCH_CHECK(
+      metadata_bytes.numel() >= num_blocks * 128,
+      "direct Linear-1 requires one 128-byte metadata record per block");
+  auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
+  auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
+  TORCH_CHECK(
+      reduction_bar_base >= 0 && reduction_tiles >= 0 &&
+          reduction_bar_base + reduction_tiles <= bars_int32.size(0),
+      "reduction barrier range is outside bars_int32");
+  auto profile = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+  TORCH_CHECK(
+      profile_u64.size(0) >= num_blocks * numProfileEvents,
+      "direct Linear-1 profile buffer is too small");
+  const cudaError_t status = launch_dae_ffn_linear1_direct(
+      static_cast<int>(num_blocks), smem_size, metadata, tma, bars,
+      static_cast<int>(reduction_bar_base), static_cast<int>(reduction_tiles),
+      profile, stream);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "direct Linear-1 launch failed: ", cudaGetErrorString(status));
+  return 0;
+}
+
+int py_launch_dae_ffn_down_direct(
+    int64_t num_blocks,
+    size_t smem_size,
+    torch::Tensor metadata_bytes,
+    torch::Tensor tma_descs_bytes,
+    torch::Tensor bars_int32,
+    torch::Tensor profile_u64,
+    int64_t stream) {
+  const cudaDeviceProp prop = current_device_prop();
+  TORCH_CHECK(
+      num_blocks > 0 && num_blocks <= 2 * prop.multiProcessorCount,
+      "direct down block count must fit two resident blocks per physical SM");
+  TORCH_CHECK(
+      smem_size <= static_cast<size_t>(prop.sharedMemPerBlockOptin),
+      "smem_size exceeds this device's per-block opt-in shared-memory limit");
+  auto metadata = check_tensor_ptr<uint8_t>(metadata_bytes, "metadata_bytes");
+  TORCH_CHECK(
+      metadata_bytes.numel() >= num_blocks * 128,
+      "direct down requires one 128-byte metadata record per block");
+  auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
+  auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
+  auto profile = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
+  TORCH_CHECK(
+      profile_u64.size(0) >= num_blocks * numProfileEvents,
+      "direct down profile buffer is too small");
+  const cudaError_t status = launch_dae_ffn_down_direct(
+      static_cast<int>(num_blocks), smem_size, metadata, tma, bars,
+      profile, stream);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "direct down launch failed: ", cudaGetErrorString(status));
+  return 0;
+}
+
+#endif
+
 // function 3: build TMA descriptors
 static inline CUtensorMapInterleave to_interleave(int64_t interleave) {
   switch (interleave) {
@@ -986,6 +1064,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfp4Mxfp8DirectTmaEnabled;
   config.attr("mxfp_gate_up_direct_output") =
       mxfpGateUpDirectOutputEnabled;
+  config.attr("mxfp_gate_up_direct_activation") =
+      mxfpGateUpDirectActivationEnabled;
+  config.attr("mxfp_gate_up_direct_activation_tiles") =
+      mxfpGateUpDirectActivationTiles;
   config.attr("mxfp_gate_up_fixed_output_rows") =
       mxfpGateUpFixedOutputRows;
   config.attr("mxfp_gate_up_fixed_bf16_epilogue") =
@@ -1017,6 +1099,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("stream"),
             py::arg("synchronize") = true,
             "Launch DAE2 kernel with given parameters");
+#if defined(DAE_FFN_SPECIALIZED_KERNELS)
+  m.def("launch_dae_ffn_linear1_direct",
+            &py_launch_dae_ffn_linear1_direct,
+            py::arg("num_blocks"), py::arg("smem_size"),
+            py::arg("metadata_bytes"), py::arg("tma_descs_bytes"),
+            py::arg("bars_int32"), py::arg("reduction_bar_base"),
+            py::arg("reduction_tiles"), py::arg("profile_u64"),
+            py::arg("stream"),
+            "Launch the focused native-record FFN Linear-1 entrypoint");
+  m.def("launch_dae_ffn_down_direct",
+            &py_launch_dae_ffn_down_direct,
+            py::arg("num_blocks"), py::arg("smem_size"),
+            py::arg("metadata_bytes"), py::arg("tma_descs_bytes"),
+            py::arg("bars_int32"), py::arg("profile_u64"),
+            py::arg("stream"),
+            "Launch the focused native-record FFN down entrypoint");
+#endif
   m.def("launch_dae", &py_launch_dae_legacy,
             py::arg("num_sms"),
             py::arg("smem_size"),

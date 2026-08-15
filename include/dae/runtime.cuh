@@ -20,6 +20,18 @@ cudaError_t launch_dae(
   bool synchronize = true
 );
 
+#if defined(DAE_FFN_SPECIALIZED_KERNELS)
+cudaError_t launch_dae_ffn_linear1_direct(
+  int num_blocks, size_t smem_size, const uint8_t *metadata,
+  CUtensorMap *tma_descs, int *bars, int reduction_bar_base,
+  int reduction_tiles, uint64_t *profile, int64_t stream = 0);
+
+cudaError_t launch_dae_ffn_down_direct(
+  int num_blocks, size_t smem_size, const uint8_t *metadata,
+  CUtensorMap *tma_descs, int *bars, uint64_t *profile, int64_t stream = 0);
+
+#endif
+
 cudaError_t launch_dae_sequence(
   int numSMs,
   size_t smem_size,

@@ -2708,12 +2708,16 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
         self.tile_k = int(tile_k)
         if self.tile_k not in (128, 512):
             raise ValueError("fixed-ring fused gate/up supports K128 or K512")
-        self.ring_stages = 10 if self.tile_k == 128 else 2
+        self.ring_stages = (
+            10
+            if self.tile_k == 128
+            else (3 if config.mxfp_gate_up_direct_activation_tiles == 1 else 2)
+        )
         self.k_tiles = 4096 // self.tile_k
         self.weight_k128_tiles = self.tile_k // 128
         self.weight_data_bytes = self.TILE_M * self.tile_k // 2
         self.weight_scale_bytes = self.weight_k128_tiles * 512
-        self.activation_data_bytes = self.weight_k128_tiles * 1024
+        self.activation_data_bytes = self.weight_k128_tiles * 8 * 128
         self.activation_scale_bytes = self.weight_k128_tiles * 512
         self.weight_slots = self.TILE_M * self.tile_k // (8 * 1024)
         self.gate_weight_data = gate_weight_data
@@ -2869,25 +2873,183 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
         tile_stop = tile_start + tile_count
         instructions = []
         for output_tile in range(tile_start, tile_stop):
-            instructions.extend((
-                Mxfp4Mxfp8GateUpSiluFixedRingSm100(
-                    self.metadata[output_tile].data_ptr(),
-                    tile_k=self.tile_k,
-                    stages=self.ring_stages,
-                ),
-                TmaLoad1D(self.activation_data.reshape(-1)).fixed_port(1),
-            ))
-            if not config.mxfp_gate_up_direct_output:
-                store = TmaStore1D(self.output_record[output_tile])
-                if output_tile + 1 == tile_stop:
-                    store.bar(self._bar("output"))
-                instructions.append(store)
+            tile_instructions = self._task_instructions(output_tile)
+            if (
+                not config.mxfp_gate_up_direct_output
+                and output_tile + 1 == tile_stop
+            ):
+                tile_instructions[-1].bar(self._bar("output"))
+            instructions.extend(tile_instructions)
+        return instructions
+
+    def _task_instructions(self, output_tile):
+        instructions = [
+            Mxfp4Mxfp8GateUpSiluFixedRingSm100(
+                self.metadata[output_tile].data_ptr(),
+                tile_k=self.tile_k,
+                stages=self.ring_stages,
+            )
+        ]
+        if not config.mxfp_gate_up_direct_activation:
+            instructions.append(
+                TmaLoad1D(self.activation_data.reshape(-1)).fixed_port(1)
+            )
+        if not config.mxfp_gate_up_direct_output:
+            instructions.append(TmaStore1D(self.output_record[output_tile]))
         return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedMxfp4Mxfp8DownFixedRing(Schedule):
+    """K2048 Linear-2 over native Linear-1 MXFP8 records."""
+
+    TILE_M = 128
+    TILE_N = 8
+    TILE_K = 512
+    K_TILES = 4
+    K128_PER_TILE = 4
+    INTERMEDIATE = 2048
+    HIDDEN = 4096
+    DOWN_TILES_PER_EXPERT = HIDDEN // TILE_M
+    ACTIVATION_TILES_PER_EXPERT = INTERMEDIATE // 128
+    ACTIVATION_RECORD_BYTES = 1536
+    WEIGHT_PACKED_K128_BYTES = 64
+    WEIGHT_DATA_BYTES = TILE_M * TILE_K // 2
+    WEIGHT_SCALE_BYTES = K128_PER_TILE * 512
+    METADATA_BYTES = 128
+
+    def __init__(
+        self,
+        weight_data,
+        weight_scale,
+        activation_records,
+        final_output,
+        weight_tma,
+        metadata,
+    ):
+        super().__init__()
+        self.weight_data = weight_data
+        self.weight_scale = weight_scale
+        self.activation_records = activation_records
+        self.final_output = final_output
+        self.weight_tma = weight_tma
+        self.metadata = metadata
+
+    def _on_place(self):
+        if (
+            self.weight_data.dtype != torch.uint8
+            or self.weight_data.ndim != 5
+            or tuple(self.weight_data.shape[1:])
+            != (
+                self.K_TILES,
+                self.K128_PER_TILE,
+                self.TILE_M,
+                self.WEIGHT_PACKED_K128_BYTES,
+            )
+            or not self.weight_data.is_contiguous()
+        ):
+            raise ValueError(
+                "down MXFP4 data must be packed contiguous uint8 "
+                "[tasks,4,4,128,64]"
+            )
+        self.tasks = self.weight_data.shape[0]
+        if self.tasks % self.DOWN_TILES_PER_EXPERT:
+            raise ValueError("down task count must contain complete experts")
+        self.experts = self.tasks // self.DOWN_TILES_PER_EXPERT
+        if not 0 < self.num_sms <= self.tasks:
+            raise ValueError("down projection needs 1..task-count SMs")
+        if (
+            self.weight_scale.dtype != torch.uint8
+            or tuple(self.weight_scale.shape)
+            != (self.tasks, self.K_TILES, self.WEIGHT_SCALE_BYTES)
+            or not self.weight_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "down MXFP4 scales must be native uint8 [tasks,4,2048]"
+            )
+        if (
+            self.activation_records.dtype != torch.uint8
+            or tuple(self.activation_records.shape)
+            != (
+                self.experts,
+                self.ACTIVATION_TILES_PER_EXPERT,
+                self.ACTIVATION_RECORD_BYTES,
+            )
+            or not self.activation_records.is_contiguous()
+        ):
+            raise ValueError(
+                "down activation must be native contiguous uint8 "
+                "[experts,16,1536]"
+            )
+        if (
+            self.final_output.dtype != torch.float32
+            or tuple(self.final_output.shape)
+            != (self.DOWN_TILES_PER_EXPERT, self.TILE_M, self.TILE_N)
+            or not self.final_output.is_contiguous()
+        ):
+            raise ValueError(
+                "down final output must be contiguous FP32 [32,128,8]"
+            )
+        if (
+            self.metadata.dtype != torch.uint8
+            or tuple(self.metadata.shape) != (self.tasks, self.METADATA_BYTES)
+            or not self.metadata.is_contiguous()
+        ):
+            raise ValueError("down metadata must be contiguous uint8 [tasks,128]")
+        if (
+            self.weight_tma is None
+            or getattr(self.weight_tma, "rank", None) != 5
+            or getattr(self.weight_tma, "size", None) != self.WEIGHT_DATA_BYTES
+        ):
+            raise ValueError("down MXFP4 TMA must match packed M128/K512")
+        tensors = (
+            self.weight_data,
+            self.weight_scale,
+            self.activation_records,
+            self.final_output,
+            self.metadata,
+        )
+        if any(tensor.device != self.weight_data.device for tensor in tensors):
+            raise ValueError("down MXFP4/MXFP8 tensors must share one device")
+
+        if self.num_sms < self.DOWN_TILES_PER_EXPERT:
+            raise ValueError(
+                "shared-first down scheduling requires at least 32 workers"
+            )
+        self.task_queues = [[] for _ in range(self.num_sms)]
+        for task in range(self.DOWN_TILES_PER_EXPERT):
+            self.task_queues[task].append(task)
+        for task in range(self.DOWN_TILES_PER_EXPERT, self.tasks):
+            worker = min(
+                range(self.num_sms),
+                key=lambda index: (len(self.task_queues[index]), index),
+            )
+            self.task_queues[worker].append(task)
+
+    def _tile_shard(self, sm):
+        tiles_per_sm, extra = divmod(self.tasks, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        return tile_start, tile_count
+
+    def _task_instructions(self, task):
+        return [
+            Mxfp4Mxfp8DownFixedRingSm100(
+                self.metadata[task].data_ptr()
+            )
+        ]
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = []
+        for task in self.task_queues[sm]:
+            instructions.extend(self._task_instructions(task))
+        return instructions
 
 
 class SchedFp8GemvUmmaStream(Schedule):
