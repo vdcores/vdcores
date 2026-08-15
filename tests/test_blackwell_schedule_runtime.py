@@ -43,6 +43,7 @@ from dae.instructions import (
     Fp8UmmaPrepackSm100,
     Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100,
     Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100,
+    Mxfp4Mxfp8GateUpSiluFixedRingSm100,
     Nvfp4GemvSm100,
     Nvfp4GemvUmmaK512Fp32Sm100,
     Nvfp4GemvUmmaPipelineSm100,
@@ -63,6 +64,7 @@ from dae.instructions import (
     TmaLoadMxfpScaleBase1D,
     TmaLoadMxfpScale1D,
     TmaLoadReg1D,
+    TmaStore1D,
     TmaTensor,
 )
 from dae.runtime import config, opcode
@@ -81,6 +83,7 @@ from dae.schedule import (
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
     SchedMxfp4Mxfp8GemvUmmaK512,
+    SchedMxfp4Mxfp8GateUpSiluFixedRing,
     SchedDsv4ZeroFill,
     SchedDsv4Fp32ToBf16,
     SchedAttentionDecoding,
@@ -852,6 +855,115 @@ def test_mxfp4_mxfp8_k512_instructions_encode_family_bload():
         Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100(3)
     with pytest.raises(ValueError, match="fit in 48 bits"):
         Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(1 << 48, 2)
+
+
+def test_mxfp4_mxfp8_gate_up_silu_instructions_encode_selected_families():
+    metadata_address = 0x1234_5678_9AB0
+    fixed_k128 = Mxfp4Mxfp8GateUpSiluFixedRingSm100(
+        metadata_address, tile_k=128
+    )
+    fixed_k512 = Mxfp4Mxfp8GateUpSiluFixedRingSm100(
+        metadata_address, tile_k=512
+    )
+
+    encoded_pointer = [
+        metadata_address & 0xFFFF,
+        (metadata_address >> 16) & 0xFFFF,
+        (metadata_address >> 32) & 0xFFFF,
+    ]
+    assert fixed_k128.args == encoded_pointer
+    assert fixed_k512.args == encoded_pointer
+    assert fixed_k128.compute_operator_name() == (
+        "OP_MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100__"
+        "K_128__STAGES_10"
+    )
+    assert fixed_k512.compute_operator_name() == (
+        "OP_MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100__"
+        "K_512__STAGES_2"
+    )
+
+    with pytest.raises(ValueError, match="K128 or K512"):
+        Mxfp4Mxfp8GateUpSiluFixedRingSm100(
+            metadata_address, tile_k=256
+        )
+    with pytest.raises(ValueError, match="fit in 48 bits"):
+        Mxfp4Mxfp8GateUpSiluFixedRingSm100(1 << 48)
+
+
+def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
+    tma_load = SchedMxfp4Mxfp8GateUpSiluFixedRing.schedule.__globals__[
+        "TmaLoad1D"
+    ]
+    monkeypatch.setitem(
+        tma_load.__init__.__globals__,
+        "get_tensor_address",
+        lambda tensor: tensor.data_ptr(),
+    )
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def __init__(self):
+            self.next_tma = 5
+
+        def new_tma(self, _desc):
+            result = self.next_tma
+            self.next_tma += 1
+            return result
+
+    tasks = 3
+    k_tiles = 8
+    gate_weight = torch.empty(
+        (tasks, k_tiles, 4, 128, 64), dtype=torch.uint8
+    )
+    up_weight = torch.empty_like(gate_weight)
+    gate_scale = torch.empty((tasks, k_tiles, 2048), dtype=torch.uint8)
+    up_scale = torch.empty_like(gate_scale)
+    activation_data = torch.empty((k_tiles, 4096), dtype=torch.uint8)
+    activation_scale = torch.empty((k_tiles, 2048), dtype=torch.uint8)
+    output_record = torch.empty((tasks, 1536), dtype=torch.uint8)
+    output_data = output_record[:, :1024]
+    output_scale = output_record[:, 1024:]
+    metadata = torch.empty((tasks, 128), dtype=torch.uint8)
+    fake_launcher = FakeLauncher()
+    gate_tma = TmaTensor(fake_launcher, gate_weight).mxfp4_load(512)
+    up_tma = TmaTensor(fake_launcher, up_weight).mxfp4_load(512)
+
+    schedule = SchedMxfp4Mxfp8GateUpSiluFixedRing(
+        gate_weight,
+        gate_scale,
+        up_weight,
+        up_scale,
+        activation_data,
+        activation_scale,
+        output_data,
+        output_scale,
+        gate_tma,
+        up_tma,
+        metadata,
+        tile_k=512,
+    ).place(2)
+    assert schedule._tile_shard(0) == (0, 2)
+    assert schedule._tile_shard(1) == (2, 1)
+
+    monkeypatch.setattr(config, "mxfp_gate_up_direct_output", True)
+    direct = schedule.schedule(0)
+    assert len(direct) == 4
+    assert all(
+        isinstance(direct[index], Mxfp4Mxfp8GateUpSiluFixedRingSm100)
+        for index in (0, 2)
+    )
+    assert [direct[index].size for index in (1, 3)] == [32768, 32768]
+
+    monkeypatch.setattr(config, "mxfp_gate_up_direct_output", False)
+    queued = schedule.schedule(1)
+    assert len(queued) == 3
+    assert isinstance(queued[0], Mxfp4Mxfp8GateUpSiluFixedRingSm100)
+    assert queued[1].size == 32768
+    assert isinstance(queued[2], TmaStore1D)
+    assert queued[2].size == 1536
 
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):

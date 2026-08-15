@@ -8,6 +8,7 @@
 #include "task/deepseek_v4_gemv.cuh"
 #include "task/fp8.cuh"
 #include "task/gemv.cuh"
+#include "task/mxfp4_mxfp8_gate_up_silu.cuh"
 #include "task/mxfp4_mxfp8_umma.cuh"
 #include "task/nvfp4.cuh"
 #include "task/nvfp4_umma.cuh"
@@ -32,6 +33,7 @@
   uint32_t &nvfp4_umma_pipeline_phase_mask, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
+  const CUtensorMap *tma_descs, \
   M2CQueue &m2c, \
   C2MQueue &c2m, \
   uint64_t *g_events
@@ -698,6 +700,7 @@ static __device__ __forceinline__ void handle_attention_common(
   void *smem_base,
   uint64_t *scratch_space,
   MInst *st_insts,
+  const CUtensorMap *tma_descs,
   M2CQueue &m2c,
   C2MQueue &c2m
 ) {
@@ -1291,6 +1294,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint32_t &nvfp4_umma_pipeline_phase_mask,
   uint64_t *scratch_space,
   MInst *st_insts,
+  const CUtensorMap *tma_descs,
   M2CQueue &m2c,
   C2MQueue &c2m,
   uint64_t *g_events
@@ -1298,7 +1302,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, scratch_space, st_insts, m2c, c2m, g_events); \
+        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, scratch_space, st_insts, tma_descs, m2c, c2m, g_events); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP

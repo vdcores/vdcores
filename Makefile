@@ -93,6 +93,36 @@ ifneq ($(mxfp_direct_tma),)
 	export DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA := 1
 endif
 
+ifneq ($(mxfp_gate_up_raw_umma),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_RAW_UMMA=$(mxfp_gate_up_raw_umma)
+	export DAE_MXFP_GATE_UP_RAW_UMMA := $(mxfp_gate_up_raw_umma)
+endif
+
+ifneq ($(mxfp_gate_up_fixed_bulk_scale),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_FIXED_BULK_SCALE=$(mxfp_gate_up_fixed_bulk_scale)
+	export DAE_MXFP_GATE_UP_FIXED_BULK_SCALE := $(mxfp_gate_up_fixed_bulk_scale)
+endif
+
+ifneq ($(mxfp_gate_up_subtile_scale_slots),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS=$(mxfp_gate_up_subtile_scale_slots)
+	export DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS := $(mxfp_gate_up_subtile_scale_slots)
+endif
+
+ifneq ($(mxfp_gate_up_direct_output),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_OUTPUT=$(mxfp_gate_up_direct_output)
+	export DAE_MXFP_GATE_UP_DIRECT_OUTPUT := $(mxfp_gate_up_direct_output)
+endif
+
+ifneq ($(mxfp_gate_up_fixed_output_rows),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS=$(mxfp_gate_up_fixed_output_rows)
+	export DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS := $(mxfp_gate_up_fixed_output_rows)
+endif
+
+ifneq ($(mxfp_gate_up_fixed_bf16_epilogue),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE=$(mxfp_gate_up_fixed_bf16_epilogue)
+	export DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE := $(mxfp_gate_up_fixed_bf16_epilogue)
+endif
+
 # Directories
 ifeq ($(debug),)
 	NVCC_FLAGS += -DNDEBUG

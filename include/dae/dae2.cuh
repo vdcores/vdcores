@@ -204,6 +204,7 @@ void dae2(
         nvfp4_umma_pipeline_phase_mask,
         scratch_space,
         st_insts,
+        tma_descs,
         m2c,
         c2m,
         g_events

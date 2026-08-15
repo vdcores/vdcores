@@ -984,6 +984,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfp4Mxfp8TmaScaleStages;
   config.attr("mxfp4_mxfp8_direct_tma_enabled") =
       mxfp4Mxfp8DirectTmaEnabled;
+  config.attr("mxfp_gate_up_direct_output") =
+      mxfpGateUpDirectOutputEnabled;
+  config.attr("mxfp_gate_up_fixed_output_rows") =
+      mxfpGateUpFixedOutputRows;
+  config.attr("mxfp_gate_up_fixed_bf16_epilogue") =
+      mxfpGateUpFixedBf16Epilogue;
 
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");
   // flag.attr("jump") = MEM_OP_FLAGS_JUMP;

@@ -2208,8 +2208,9 @@ quantized sanity `mean_relative=0.12491284`, `cosine=0.99230981`. Thus the
 VDCores task frontier is 4.2% lower; its full envelope is 0.8% higher. The
 comparison is intentionally explicit: FlashInfer's legal API minimum is four
 activation rows and tile-N=64 launches two output CTAs, while VDCores owns one
-SM, replicates one logical activation to hardware N8, and writes 128 FP32
-outputs.
+SM and receives an N8 activation tile already laid out in HBM. That historical
+single-row check used eight equal setup rows; the UMMA kernel itself did not
+create the input rows.
 
 Rejected variants are useful boundaries. A blocking global-to-shared scale
 copy was about 0.32 us slower than `cp.async`; preloading both complete 16-KiB
@@ -2277,3 +2278,116 @@ of its internal span in compute-side M2C waits and 0% in allocator-slot stalls;
 raw address spends 31.0% in M2C waits despite 16.3% allocator-slot stalls.
 Removing ordinary slot pressure therefore does not compensate for putting two
 additional scale-completion dependencies on every K512 consumer frontier.
+
+## Fused mixed-expert MXFP4 gate/up/SiLU (2026-08-15)
+
+Linear-1 now has an unsplit task that owns one expert's M128 intermediate
+slice for the complete K4096 reduction. Gate and up accumulate independently
+in FP32 TMEM; neither accumulator is written after each K tile. The selected
+mixed graph places the 16 shared-expert slices first, followed by 16 slices
+for each of six routed experts. Thus one eight-row activation tile produces
+112 independent tasks on 112 workers, with routing and native operand
+preparation outside the timed frontier.
+
+The selected mainloop uses two task-local K512 stages. Warp 1 streams packed
+gate then up weights through direct TMA, warps 2 and 3 copy native SFA/SFB
+records, and warp 0 issues raw `tcgen05.mma` instructions. Every K512 bundle
+contains four K128 UMMAs. Each K128 member has disjoint task-local TMEM scale
+columns, so its UTCCP scale copy can execute while the preceding UMMA still
+reads its own columns. The issuer calls `umma_arrive` once per bundle and does
+not wait for the preceding bundle before submitting the next; warp 2 retires
+the bounded in-flight window and releases each full/empty stage. The first
+K128 UMMA of each projection uses accumulator-zero and all later UMMAs use
+accumulator-one.
+
+Gate SiLU is distributed across the four compute warps at the gate-to-up
+transition. The scale warps drain their gate rows while the weight producer
+prefetches up stages; warp 1 drains its rows after filling that ring; warp 0
+drains its rows after committing the final up bundle, overlapping those TMEM
+loads and SFU operations with the last in-flight UMMA. After the one final
+compute-group join, each thread retains its eight independent SwiGLU values in
+registers through block-32 power-of-two scale reduction and native E4M3
+packing. It then publishes one contiguous 1,536-byte
+`[1024-byte data | 512-byte UE8M0]` record. The production path sends that
+record directly from task-local shared memory to HBM. Compiling
+`DAE_MXFP_GATE_UP_DIRECT_OUTPUT=0` retains the allocator-queued store.
+Only active data rows and native scale locations are initialized. Scale
+padding, and inactive rows when the compile-time row count is below eight,
+are intentionally unspecified; clearing them added stores and a
+compute-group barrier without changing any consumed value.
+
+The task metadata is one 128-byte record per M128 slice. Offsets 16, 24, and
+32 contain the gate-weight, activation, and up-weight scale base addresses.
+Offset 40 packs the gate/up tensor-map indices plus output-tile index; offset
+48 contains the direct output-record address. Weight HBM is task-major
+`[task,8 K512,4 K128,128,64 packed bytes]`; gate/up scale HBM is
+`[task,8,2048]`; the shared activation data/scales are `[8,4096]` and
+`[8,2048]`. These are already scale-expanded and swizzled native images, so
+the timed kernel performs no format conversion, repack, or row replication.
+
+The optimization controls establish the retained boundaries. Raw UMMA issue
+is the default and the CUTE issue form remains build-selectable. Per-lane
+asynchronous scale copies beat a warp-2 bulk-copy variant at full occupancy.
+Independent TMEM scale columns removed the UTCCP/previous-UMMA write-after-read
+dependency; the image remains one CTA per SM because 223 KiB dynamic shared
+memory, rather than its 246 registers, is the occupancy limit. K128 is exact
+but measured 28.704 us at the task frontier and 29.248 us for the kernel in
+job `20260815T050714Z-864015`, so the two-stage K512 family remains selected.
+
+The profiling-free production image has five allocator slots, 64 instruction
+entries, 223 KiB dynamic shared memory, 246 registers, nine barriers, an
+80-byte stack, and no spills. The correctness fixture supplies eight distinct
+physical activation rows `[0x60,...,0x67]`; the kernel must return the eight
+Python-derived output rows `[0x78,0x7a,0x7c,0x77,0x79,0x7b,0x7c,0x76]` plus
+32 row-specific scale entries at native offsets `row * 16 + [0,1,2,3]`.
+This makes a column-zero replication fail byte-for-byte while leaving padding
+outside the contract. Single-task job `20260815T054352Z-1632466` measured
+12.224 us. Final selected-only job `20260815T060507Z-2082799` passed the full
+check over 2,000 timed iterations; the 112-task mixed wave measured 12.448 us
+at the task frontier and 13.088 us for the persistent kernel.
+
+Output-row count remains a useful compile parameter. The selected
+`DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS=8` preserves all eight UMMA columns.
+Setting it below eight emits only the requested real columns; it never
+replicates column zero and does not clear inactive record bytes. The final
+zero-free row sweep was:
+
+| output rows | epilogue | task median (us) | kernel median (us) | job |
+| ---: | --- | ---: | ---: | --- |
+| 1 | BF16 scalar tail | 11.904 | 12.544 | `20260815T053454Z-1436127` |
+| 2 | BF162 | 12.032 | 12.704 | `20260815T053726Z-1501078` |
+| 4 | BF162 | 12.000 | 12.608 | `20260815T053239Z-1382827` |
+| 8 | BF162 | 12.480 | 13.152 | `20260815T054000Z-1556257` |
+| 8 | FP32 | **12.448** | **13.088** | `20260815T060507Z-2082799` |
+
+Removing inactive-data and scale-padding clears improved the matched four-row
+kernel from 12.704 to 12.608 us. The row-count switch is therefore retained,
+while ROWS=8 remains the default contract.
+
+The optional BF16 epilogue is genuinely vectorized: disassembly contains
+`F2FP.BF16.F32.PACK_AB`, `HMUL2.BF16_V2`, and `HFMA2.BF16_V2`. SiLU's
+exponential remains scalar/SFU, while paired conversion and multiply use
+BF162. It is not the default. A Python-only sweep of 765,952 finite
+representative cases found 21,158 serialized MXFP8 data-byte changes and
+7,568 scale-byte changes versus FP32, with 0.601% maximum relative pre-quant
+error. Full-row BF162 was also 0.128 us slower than FP32. The deterministic
+performance fixture happens to serialize identically and has zero pre-quant
+error, so that fixture alone is not used to justify BF16 accuracy.
+
+Matched kernel-level framework results used vLLM 0.27.1 and FlashInfer
+0.6.16.post3 in the worker Conda environment:
+
+| implementation | legal decode layout | GEMM (us) | activation/quant (us) | chained Linear-1 (us) |
+| --- | --- | ---: | ---: | ---: |
+| VDCores fused | 7 experts x 8 useful rows, no row replication | fused | fused | **13.088** |
+| vLLM/DeepGEMM | 56 logical rows padded to 288 | 10.603 | 2.410 | 13.865 |
+| FlashInfer + vLLM | 7 groups x 8 useful rows | 31.818 | 1.814 + 1.508 | 36.530 |
+
+The DeepGEMM result is job `20260815T050239Z-775889`; the FlashInfer result is
+job `20260815T050618Z-847378`. VDCores is 0.777 us or 5.6% lower latency than
+the production vLLM/DeepGEMM chain and 2.79x faster than the legal FlashInfer
+chain. Its task frontier alone is 10.2% below the DeepGEMM chained result. The
+padding difference is part of each framework's legal shape contract and is
+stated explicitly rather than normalized away. Only the fixed-ring fused
+family is retained: all 112 unsplit slices fit in one wave and the fused path
+meets the framework acceptance target without another HBM or kernel boundary.

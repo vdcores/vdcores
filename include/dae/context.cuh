@@ -101,6 +101,31 @@ static constexpr int mxfp4Mxfp8TmaScaleBarrierBase =
     nvfp4ScaleCopyBarrierBase + nvfp4ScaleCopyBarrierCount;
 static constexpr int mxfp4Mxfp8TmaScaleBarrierCount =
     mxfp4Mxfp8DirectTmaEnabled ? mxfp4Mxfp8TmaScaleStages : 0;
+
+// The fused gate/up task normally publishes its compact native MXFP8 record
+// directly from task-local shared memory. A queued allocator/STU handoff is
+// retained as a build-time control with DAE_MXFP_GATE_UP_DIRECT_OUTPUT=0.
+#ifndef DAE_MXFP_GATE_UP_DIRECT_OUTPUT
+#define DAE_MXFP_GATE_UP_DIRECT_OUTPUT 1
+#endif
+static constexpr bool mxfpGateUpDirectOutputEnabled =
+    DAE_MXFP_GATE_UP_DIRECT_OUTPUT != 0;
+#ifndef DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS
+#define DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS 8
+#endif
+static constexpr int mxfpGateUpFixedOutputRows =
+    DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS;
+static_assert(
+    mxfpGateUpFixedOutputRows == 1 ||
+        mxfpGateUpFixedOutputRows == 2 ||
+        mxfpGateUpFixedOutputRows == 4 ||
+        mxfpGateUpFixedOutputRows == 8,
+    "fixed gate/up output rows must be 1, 2, 4, or 8");
+#ifndef DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE
+#define DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE 0
+#endif
+static constexpr bool mxfpGateUpFixedBf16Epilogue =
+    DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE != 0;
 static constexpr int tmemMmaBarrierCount =
     mxfp4Mxfp8TmaScaleBarrierBase + mxfp4Mxfp8TmaScaleBarrierCount;
 

@@ -67,6 +67,36 @@ if os.environ.get("DAE_MXFP4_MXFP8_TMA_SCALE_STAGES"):
     )
 if os.environ.get("DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA"):
     cuda_defines.append("-DDAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA=1")
+if os.environ.get("DAE_MXFP_GATE_UP_RAW_UMMA"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_RAW_UMMA="
+        + os.environ["DAE_MXFP_GATE_UP_RAW_UMMA"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_FIXED_BULK_SCALE"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_FIXED_BULK_SCALE="
+        + os.environ["DAE_MXFP_GATE_UP_FIXED_BULK_SCALE"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS="
+        + os.environ["DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_OUTPUT"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_DIRECT_OUTPUT="
+        + os.environ["DAE_MXFP_GATE_UP_DIRECT_OUTPUT"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS="
+        + os.environ["DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE="
+        + os.environ["DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE"]
+    )
 include_dirs = [
     os.path.join(this_dir, "include"),
     os.path.join(this_dir, "include", "dae"),

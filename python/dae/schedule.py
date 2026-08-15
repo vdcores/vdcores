@@ -2667,6 +2667,229 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
+    """Task-local fixed weight ring fused through native MXFP8 publication."""
+
+    TILE_M = SchedMxfp4Mxfp8GemvUmmaK512.TILE_M
+    K512_TILES = SchedMxfp4Mxfp8GemvUmmaK512.K512_TILES
+    WEIGHT_K128_TILES = SchedMxfp4Mxfp8GemvUmmaK512.WEIGHT_K128_TILES
+    WEIGHT_PACKED_K128_BYTES = (
+        SchedMxfp4Mxfp8GemvUmmaK512.WEIGHT_PACKED_K128_BYTES
+    )
+    WEIGHT_DATA_BYTES = SchedMxfp4Mxfp8GemvUmmaK512.WEIGHT_DATA_BYTES
+    WEIGHT_SCALE_BYTES = SchedMxfp4Mxfp8GemvUmmaK512.WEIGHT_SCALE_BYTES
+    ACTIVATION_DATA_BYTES = (
+        SchedMxfp4Mxfp8GemvUmmaK512.ACTIVATION_DATA_BYTES
+    )
+    ACTIVATION_SCALE_BYTES = (
+        SchedMxfp4Mxfp8GemvUmmaK512.ACTIVATION_SCALE_BYTES
+    )
+    OUTPUT_DATA_BYTES = 8 * TILE_M
+    OUTPUT_SCALE_BYTES = 512
+    METADATA_BYTES = 128
+
+    def __init__(
+        self,
+        gate_weight_data,
+        gate_weight_scale,
+        up_weight_data,
+        up_weight_scale,
+        activation_data,
+        activation_scale,
+        output_data,
+        output_scale,
+        gate_weight_tma,
+        up_weight_tma,
+        metadata,
+        *,
+        tile_k: int = 512,
+    ):
+        super().__init__()
+        self.tile_k = int(tile_k)
+        if self.tile_k not in (128, 512):
+            raise ValueError("fixed-ring fused gate/up supports K128 or K512")
+        self.ring_stages = 10 if self.tile_k == 128 else 2
+        self.k_tiles = 4096 // self.tile_k
+        self.weight_k128_tiles = self.tile_k // 128
+        self.weight_data_bytes = self.TILE_M * self.tile_k // 2
+        self.weight_scale_bytes = self.weight_k128_tiles * 512
+        self.activation_data_bytes = self.weight_k128_tiles * 1024
+        self.activation_scale_bytes = self.weight_k128_tiles * 512
+        self.weight_slots = self.TILE_M * self.tile_k // (8 * 1024)
+        self.gate_weight_data = gate_weight_data
+        self.gate_weight_scale = gate_weight_scale
+        self.up_weight_data = up_weight_data
+        self.up_weight_scale = up_weight_scale
+        self.activation_data = activation_data
+        self.activation_scale = activation_scale
+        self.output_data = output_data
+        self.output_scale = output_scale
+        self.gate_weight_tma = gate_weight_tma
+        self.up_weight_tma = up_weight_tma
+        self.metadata = metadata
+
+    def _validate_tensors(self):
+        expected_weight_tail = (
+            self.k_tiles,
+            self.weight_k128_tiles,
+            self.TILE_M,
+            self.WEIGHT_PACKED_K128_BYTES,
+        )
+        for name, tensor in (
+            ("gate", self.gate_weight_data),
+            ("up", self.up_weight_data),
+        ):
+            if (
+                tensor.dtype != torch.uint8
+                or tensor.ndim != 5
+                or tuple(tensor.shape[1:]) != expected_weight_tail
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} MXFP4 data must be packed contiguous uint8 "
+                    "[M/128,K/tile_k,tile_k/128,128,64]"
+                )
+        if self.gate_weight_data.shape != self.up_weight_data.shape:
+            raise ValueError("fused gate/up MXFP4 data shapes must match")
+        self.m_tiles = self.gate_weight_data.shape[0]
+        if not 0 < self.num_sms <= self.m_tiles:
+            raise ValueError("fused gate/up projection needs 1..M-slices SMs")
+        for name, descriptor in (
+            ("gate", self.gate_weight_tma),
+            ("up", self.up_weight_tma),
+        ):
+            if (
+                descriptor is None
+                or getattr(descriptor, "rank", None) != 5
+                or getattr(descriptor, "size", None) != self.weight_data_bytes
+                or getattr(descriptor, "num_slots", None) != self.weight_slots
+            ):
+                raise ValueError(
+                    f"{name} MXFP4 TMA must match packed K{self.tile_k}"
+                )
+        expected_scale_shape = (
+            self.m_tiles,
+            self.k_tiles,
+            self.weight_scale_bytes,
+        )
+        for name, tensor in (
+            ("gate", self.gate_weight_scale),
+            ("up", self.up_weight_scale),
+        ):
+            if (
+                tensor.dtype != torch.uint8
+                or tuple(tensor.shape) != expected_scale_shape
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} MXFP4 scales must be native uint8 "
+                    "[M/128,K/tile_k,tile_k/128*512]"
+                )
+        if (
+            self.activation_data.dtype != torch.uint8
+            or tuple(self.activation_data.shape)
+            != (self.k_tiles, self.activation_data_bytes)
+            or not self.activation_data.is_contiguous()
+        ):
+            raise ValueError("MXFP8 activation data shape does not match tile K")
+        if (
+            self.activation_scale.dtype != torch.uint8
+            or tuple(self.activation_scale.shape)
+            != (self.k_tiles, self.activation_scale_bytes)
+            or not self.activation_scale.is_contiguous()
+        ):
+            raise ValueError("MXFP8 activation scale shape does not match tile K")
+        if (
+            self.output_data.dtype != torch.uint8
+            or tuple(self.output_data.shape)
+            != (self.m_tiles, self.OUTPUT_DATA_BYTES)
+            or self.output_data.stride(-1) != 1
+        ):
+            raise ValueError(
+                "fused MXFP8 data output must have contiguous uint8 rows "
+                "[M/128,1024]"
+            )
+        if (
+            self.output_scale.dtype != torch.uint8
+            or tuple(self.output_scale.shape)
+            != (self.m_tiles, self.OUTPUT_SCALE_BYTES)
+            or self.output_scale.stride(-1) != 1
+        ):
+            raise ValueError(
+                "fused MXFP8 scale output must have contiguous uint8 rows "
+                "[M/128,512]"
+            )
+        if (
+            self.metadata.dtype != torch.uint8
+            or tuple(self.metadata.shape) != (self.m_tiles, self.METADATA_BYTES)
+            or not self.metadata.is_contiguous()
+        ):
+            raise ValueError("fused raw scales require uint8 [M/128,128] metadata")
+        tensors = (
+            self.gate_weight_data,
+            self.gate_weight_scale,
+            self.up_weight_data,
+            self.up_weight_scale,
+            self.activation_data,
+            self.activation_scale,
+            self.output_data,
+            self.output_scale,
+            self.metadata,
+        )
+        if any(tensor.device != self.output_data.device for tensor in tensors):
+            raise ValueError("fused MXFP4/MXFP8 tensors must share one CUDA device")
+
+    def _tile_shard(self, sm):
+        tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
+        tile_start = sm * tiles_per_sm + min(sm, extra)
+        tile_count = tiles_per_sm + int(sm < extra)
+        return tile_start, tile_count
+
+    def _on_place(self):
+        self._validate_tensors()
+        record_bytes = self.OUTPUT_DATA_BYTES + self.OUTPUT_SCALE_BYTES
+        if (
+            self.output_data.stride(0) != record_bytes
+            or self.output_scale.stride(0) != record_bytes
+            or self.output_scale.data_ptr()
+            != self.output_data.data_ptr() + self.OUTPUT_DATA_BYTES
+        ):
+            raise ValueError(
+                "fixed-ring output must be one [data|scale] HBM record per tile"
+            )
+        self.output_record = self.output_data.as_strided(
+            (self.output_data.shape[0], record_bytes),
+            (record_bytes, 1),
+        )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        tile_start, tile_count = self._tile_shard(sm)
+        tile_stop = tile_start + tile_count
+        instructions = []
+        for output_tile in range(tile_start, tile_stop):
+            instructions.extend((
+                Mxfp4Mxfp8GateUpSiluFixedRingSm100(
+                    self.metadata[output_tile].data_ptr(),
+                    tile_k=self.tile_k,
+                    stages=self.ring_stages,
+                ),
+                TmaLoad1D(self.activation_data.reshape(-1)).fixed_port(1),
+            ))
+            if not config.mxfp_gate_up_direct_output:
+                store = TmaStore1D(self.output_record[output_tile])
+                if output_tile + 1 == tile_stop:
+                    store.bar(self._bar("output"))
+                instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedFp8GemvUmmaStream(Schedule):
     """Shape-sharded M128/K128 native MXF8 projection."""
 

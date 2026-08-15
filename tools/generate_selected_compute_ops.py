@@ -384,6 +384,37 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             "      );",
             "#endif",
         ]
+    elif family == "mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100":
+        tile_k = int(entry["k"])
+        stages = int(entry["stages"])
+        if (tile_k, stages) not in ((128, 10), (128, 11), (512, 2)):
+            raise ValueError(
+                f"Unsupported fused MXFP4/MXFP8 fixed K/ring={tile_k}/{stages}"
+            )
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            (
+                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, "
+                "tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events, "
+                "fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask);"
+            ),
+        ]
+        body = [
+            "#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)",
+            "  const uint64_t metadata_address = uint64_t(inst.args[0]) |",
+            "      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);",
+            "  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);",
+            (
+                "  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<"
+                f"{tile_k}, {stages}>(smem_base, tmem_base_ptr, tma_descs, "
+                "metadata, m2c, c2m"
+            ),
+            "#if defined(DAE_TRACK_MXFP_TIMELINE)",
+            "      , sm_id, g_events",
+            "#endif",
+            "      );",
+            "#endif",
+        ]
     else:
         raise ValueError(f"Unsupported dynamic family in code generation: {family}")
     return "\n".join(prelude + body + ["}"])

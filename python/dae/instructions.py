@@ -18,6 +18,7 @@ from .tma_utils import (
     addr2cords,
     build_tma_1d,
     build_tma_rowmajor_2d,
+    build_tma_mxfp4,
     build_tma_mxfp4_k512,
     build_tma_wgmma_kmajor,
     build_tma_wgmma_mnmajor,
@@ -28,6 +29,7 @@ from .tma_utils import (
     cord_func_2d_tile_major,
     cord_func_tma_1d,
     cord_func_rowmajor_2d,
+    cord_func_mxfp4,
     cord_func_mxfp4_k512,
     cords2addr,
     get_tensor_address,
@@ -324,6 +326,38 @@ class Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100(ComputeInstruction):
                 "MXFP4_MXFP8_GEMV_UMMA_META_SCALE_FP32_SM100",
                 K=512,
                 BLOAD=activation_tiles_per_load,
+            ),
+            args=[
+                metadata_address & 0xFFFF,
+                (metadata_address >> 16) & 0xFFFF,
+                (metadata_address >> 32) & 0xFFFF,
+            ],
+        )
+
+
+class Mxfp4Mxfp8GateUpSiluFixedRingSm100(ComputeInstruction):
+    """Task-local K128- or K512-member gate/up/SiLU weight pipeline."""
+
+    def __init__(
+        self,
+        metadata_address: int,
+        *,
+        tile_k: int = 512,
+        stages: int | None = None,
+    ):
+        if tile_k not in (128, 512):
+            raise ValueError("fused MXFP4/MXFP8 fixed ring requires K128 or K512")
+        if stages is None:
+            stages = 10 if tile_k == 128 else 2
+        if (tile_k, stages) not in ((128, 10), (128, 11), (512, 2)):
+            raise ValueError("invalid fused MXFP4/MXFP8 fixed-ring shape")
+        if metadata_address < 0 or metadata_address >= 1 << 48:
+            raise ValueError("fixed-ring MXFP4/MXFP8 metadata pointer must fit in 48 bits")
+        super().__init__(
+            opcode=family_ref(
+                "MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100",
+                K=tile_k,
+                STAGES=stages,
             ),
             args=[
                 metadata_address & 0xFFFF,
@@ -2828,6 +2862,26 @@ class TmaTensor(MemoryInstruction):
         inst.num_slots = 8
         return inst
 
+    def mxfp4_load(self, tile_k: int):
+        """Packed W4 HBM load expanded into a native M128/K-tile image."""
+        if tile_k not in (128, 256, 512):
+            raise ValueError("MXFP4 TMA tile K must be 128, 256, or 512")
+        inst = self._build(
+            "load",
+            128,
+            tile_k,
+            build_tma_mxfp4,
+            cord_func_mxfp4,
+        )
+        # HBM contributes half a byte/value; the 16U4 transform writes one
+        # full byte/value into the UMMA shared-memory allocation.
+        inst.size = 128 * tile_k // 2
+        inst.num_slots = (128 * tile_k) // (8 * 1024)
+        return inst
+
+    def mxfp4_k128_load(self):
+        return self.mxfp4_load(128)
+
     def wgmma_store(self, tileN: int, tileM: int, major: Major):
         return self.wgmma("store", tileN, tileM, major)
 
@@ -2850,6 +2904,7 @@ __all__ = [
     "Nvfp4GemvUmmaK512Fp32Sm100",
     "Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100",
     "Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100",
+    "Mxfp4Mxfp8GateUpSiluFixedRingSm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",

@@ -494,10 +494,10 @@ def build_tma_wgmma_tile_major(mat: torch.Tensor, tileK: int, tileN: int):
     )
 
 
-def build_tma_mxfp4_k512(mat: torch.Tensor, tile_m: int, tile_k: int):
-    """Load one packed M128/K512 MXFP4 tile into its 64 KiB UMMA image.
+def build_tma_mxfp4(mat: torch.Tensor, tile_m: int, tile_k: int):
+    """Load one packed M128 MXFP4 K tile into its expanded UMMA image.
 
-    HBM is tile-major ``[M/128, K/512, 4, 128, 64]``.  The innermost
+    HBM is tile-major ``[M/128, K/tile_k, tile_k/128, 128, 64]``. The innermost
     64 bytes hold 128 packed E2M1 values.  CUDA's 16U4-align16B TMA format
     inserts the required 8-byte hole after every 8-byte packed group while
     applying the 128-byte SMEM swizzle, so no compute-side repack is needed.
@@ -505,8 +505,8 @@ def build_tma_mxfp4_k512(mat: torch.Tensor, tile_m: int, tile_k: int):
     assert mat.dim() == 5
     m_tiles, k_tiles, k128_tiles, rows, packed_k128 = mat.shape
     assert tile_m == rows == 128
-    assert tile_k == 512
-    assert k128_tiles == 4 and packed_k128 == 64
+    assert tile_k in (128, 256, 512)
+    assert k128_tiles == tile_k // 128 and packed_k128 == 64
     global_dims = [128, rows, k128_tiles, k_tiles, m_tiles]
     global_strides = [
         packed_k128,
@@ -527,7 +527,13 @@ def build_tma_mxfp4_k512(mat: torch.Tensor, tile_m: int, tile_k: int):
     )
 
 
-def cord_func_mxfp4_k512(mat: torch.Tensor, rank: int):
+def build_tma_mxfp4_k512(mat: torch.Tensor, tile_m: int, tile_k: int):
+    """Backward-compatible K512 wrapper for packed MXFP4 TMA."""
+    assert tile_k == 512
+    return build_tma_mxfp4(mat, tile_m, tile_k)
+
+
+def cord_func_mxfp4(mat: torch.Tensor, rank: int):
     assert rank == 5
 
     def cord_func(m_tile: int, k_tile: int):
@@ -538,3 +544,6 @@ def cord_func_mxfp4_k512(mat: torch.Tensor, rank: int):
         return [0, 0, k_tile, m_tile]
 
     return cord_func
+
+
+cord_func_mxfp4_k512 = cord_func_mxfp4
