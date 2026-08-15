@@ -8,7 +8,7 @@
 // conversion, row replication, or intermediate repack occurs.
 template <int KBundles, int RingStages, int BundleK,
           int SyncBarrierId, int TmemColumns,
-          int ScratchOffsetBytes, int ScratchCapacityBytes,
+          int ScratchOffsetBytes, int ScratchCapacityBytes, int ThreadOffset,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_down_fixed_ring_sm100(
@@ -120,7 +120,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     asm volatile("trap;");
   }
 
-  const int tid = __compute_tid();
+  const int tid = __compute_tid() - ThreadOffset;
   const int warp = tid / numThreadsPerWarp;
   const int lane = tid & (numThreadsPerWarp - 1);
   (void)m2c;

@@ -810,15 +810,15 @@ int py_launch_dae_ffn_down_direct(
     int64_t stream) {
   const cudaDeviceProp prop = current_device_prop();
   TORCH_CHECK(
-      num_blocks > 0 && num_blocks <= 2 * prop.multiProcessorCount,
-      "direct down block count must fit two resident blocks per physical SM");
+      num_blocks > 0 && num_blocks <= prop.multiProcessorCount,
+      "paired direct down block count must fit one block per physical SM");
   TORCH_CHECK(
       smem_size <= static_cast<size_t>(prop.sharedMemPerBlockOptin),
       "smem_size exceeds this device's per-block opt-in shared-memory limit");
   auto metadata = check_tensor_ptr<uint8_t>(metadata_bytes, "metadata_bytes");
   TORCH_CHECK(
-      metadata_bytes.numel() >= num_blocks * 128,
-      "direct down requires one 128-byte metadata record per block");
+      metadata_bytes.numel() >= num_blocks * 2 * 128,
+      "paired direct down requires two 128-byte metadata records per block");
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto profile = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");

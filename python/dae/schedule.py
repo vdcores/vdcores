@@ -2909,9 +2909,11 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
 
     TILE_M = 128
     TILE_N = 8
-    TILE_K = 512
-    K_TILES = 4
-    K128_PER_TILE = 4
+    # Match the accepted full-FFN task: two K256 stages keep the fixed ring at
+    # 80 KiB while preserving the allocator arena in front of the scratchpad.
+    TILE_K = 256
+    K_TILES = 8
+    K128_PER_TILE = 2
     INTERMEDIATE = 2048
     HIDDEN = 4096
     DOWN_TILES_PER_EXPERT = HIDDEN // TILE_M
@@ -2954,7 +2956,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         ):
             raise ValueError(
                 "down MXFP4 data must be packed contiguous uint8 "
-                "[tasks,4,4,128,64]"
+                "[tasks,8,2,128,64]"
             )
         self.tasks = self.weight_data.shape[0]
         if self.tasks % self.DOWN_TILES_PER_EXPERT:
@@ -2969,7 +2971,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
             or not self.weight_scale.is_contiguous()
         ):
             raise ValueError(
-                "down MXFP4 scales must be native uint8 [tasks,4,2048]"
+                "down MXFP4 scales must be native uint8 [tasks,8,1024]"
             )
         if (
             self.activation_records.dtype != torch.uint8
@@ -3005,7 +3007,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
             or getattr(self.weight_tma, "rank", None) != 5
             or getattr(self.weight_tma, "size", None) != self.WEIGHT_DATA_BYTES
         ):
-            raise ValueError("down MXFP4 TMA must match packed M128/K512")
+            raise ValueError("down MXFP4 TMA must match packed M128/K256")
         tensors = (
             self.weight_data,
             self.weight_scale,

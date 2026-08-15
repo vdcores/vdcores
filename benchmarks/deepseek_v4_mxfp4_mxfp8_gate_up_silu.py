@@ -471,6 +471,7 @@ def main() -> None:
         f"activation_rows={activation_row_bytes.tolist()} "
         f"output_row_count={output_rows} "
         f"bf16_epilogue={str(bf16_epilogue).lower()} "
+        "tmem_epilogue=late_register "
         f"serialized_matches_fp32={str(serialized_matches_fp32).lower()} "
         f"epilogue_max_abs_error={epilogue_abs_error:.6f} "
         f"epilogue_max_rel_error={epilogue_rel_error:.8f} "

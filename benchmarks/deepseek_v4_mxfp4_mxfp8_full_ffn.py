@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Native-record MXFP4/MXFP8 full-FFN benchmark.
+"""Allocator-compatible native-record MXFP4/MXFP8 full-FFN benchmark.
 
 Linear-1 publishes sixteen 1536-byte MXFP8 records per expert. The stream-
 ordered down projection consumes them directly and reduces all seven expert
-outputs into FP32 with TMA reduce-add. Focused entrypoints dispatch the selected
-VCore task bodies without generic instruction decoding. The timed graph
-contains no conversion, repack, or row replication.
+outputs into FP32 with TMA reduce-add. Task-local scratch is disjoint from the
+normal allocator layout; the focused down launch gives that scratch a standalone
+arena. The down kernel runs two disjoint four-warp tasks inside one resident CTA
+per SM. The timed graph contains no conversion, repack, or row replication.
 """
 
 from __future__ import annotations
@@ -102,8 +103,9 @@ def main() -> None:
     k_tiles = 4096 // tile_k
     k128_per_tile = tile_k // 128
 
+    workers = 124
     linear1_launcher = Launcher(linear1_tasks, device=device)
-    down_launcher = Launcher(down_tasks, device=device)
+    down_launcher = Launcher(workers, device=device)
     zero_ready = [down_launcher.new_bar(1) for _ in range(down_slices)]
     # Both stream-ordered kernels share the reduction-sense barrier arena.
     linear1_launcher.bars = down_launcher.bars
@@ -199,10 +201,19 @@ def main() -> None:
         down_records[task, 6] = final_output[m_tile].data_ptr()
         # Offset 68 selects zero-initialized all-expert TMA reduce-add.
         down_records[task, 8] = 1 << 32
-    down_metadata = down_records.view(torch.uint8).to(device)
-    # Materialize descriptors. K256 reduces the direct down task's SMEM and
-    # TMEM footprint enough for two resident CTAs per SM, so all 224 expert
-    # tiles launch directly instead of serializing a second task in 72 queues.
+    # Bank zero holds tasks 0..123. Its first 24 workers stay single-group;
+    # bank one maps tasks 124..223 to workers 24..123.
+    down_launch_records = torch.zeros(
+        (2 * workers, 16), dtype=torch.int64, device="cpu"
+    )
+    down_launch_records[:workers].copy_(down_records[:workers])
+    dual_group_workers = down_tasks - workers
+    single_group_workers = workers - dual_group_workers
+    down_launch_records[
+        workers + single_group_workers :
+        workers + single_group_workers + dual_group_workers
+    ].copy_(down_records[workers:])
+    down_metadata = down_launch_records.view(torch.uint8).to(device)
     _, _, linear1_tmas = linear1_launcher.prepare_launch()
     _, _, down_tmas = down_launcher.prepare_launch()
     linear1_metadata_bytes = linear1_metadata.reshape(-1, 1)
@@ -229,8 +240,8 @@ def main() -> None:
     def launch_down() -> None:
         stream = torch.cuda.current_stream().cuda_stream
         runtime.launch_dae_ffn_down_direct(
-            down_tasks,
-            80 * 1024,
+            workers,
+            160 * 1024,
             down_metadata_bytes,
             down_tmas,
             down_launcher.bars,
@@ -326,7 +337,14 @@ def main() -> None:
         f"experts={experts} shared=1 routed=6 rows=8 "
         "native_handoff=true conversion=false repack=false replication=false "
         "reduction=tma_fp32 kernels=2 focused_entrypoints=true "
-        "stream_ordered=true blockwise_release=false "
+        "allocator_compatible=true one_cta_per_sm=true "
+        "linear1_tmem_epilogue=late_register "
+        f"workers={workers} allocator_slots={runtime.config.num_slots} "
+        f"slot_bytes={runtime.config.slot_size} "
+        f"dual_group_workers={dual_group_workers} "
+        f"single_group_workers={single_group_workers} "
+        f"shared_publishers_single_group={min(single_group_workers, down_slices)} "
+        "down_compute_groups=2 "
         f"tma_l2_promotion={args.tma_l2_promotion} graph=true "
         f"graph_inner={args.graph_inner} "
         f"linear1_kernel_us={kernel_span_us(linear1_launcher):.6f} "

@@ -40,12 +40,12 @@ static constexpr bool mxfpGateUpDirectOutput =
 template <
     int OutputRows, class GateSilu, class TiledT2R,
     class GateTmem, class CoordTensor>
-__device__ __forceinline__ void dae_mxfp_gate_silu_rows(
+__device__ __forceinline__ void dae_mxfp_gate_silu_registers(
     int tid,
     const TiledT2R &tiled_t2r,
     const GateTmem &gate_tmem,
     const CoordTensor &c_acc,
-    GateSilu *gate_silu) {
+    GateSilu (&gate_silu)[OutputRows]) {
   using namespace cute;
   auto thread_t2r = tiled_t2r.get_slice(tid);
   auto thread_tmem = thread_t2r.partition_S(gate_tmem);
@@ -62,11 +62,10 @@ __device__ __forceinline__ void dae_mxfp_gate_silu_rows(
       if constexpr (std::is_same_v<GateSilu, __nv_bfloat16>) {
         const float rounded_gate =
             __bfloat162float(__float2bfloat16_rn(gate));
-        gate_silu[row * OutputRows + column] = __float2bfloat16_rn(
+        gate_silu[column] = __float2bfloat16_rn(
             rounded_gate / (1.0f + __expf(-rounded_gate)));
       } else {
-        gate_silu[row * OutputRows + column] =
-            gate / (1.0f + __expf(-gate));
+        gate_silu[column] = gate / (1.0f + __expf(-gate));
       }
     }
   }
@@ -105,8 +104,9 @@ __device__ __forceinline__ void dae_mxfp_gate_up_issue_raw_umma(
 // still crosses M2C/C2M, but packed weights use a task-local direct-TMA ring
 // instead of generic allocator commands. Warp 1 is the TMA
 // producer, warp 0 is the raw UMMA issuer, and warps 2/3 produce native scales.
-// Gate is completed first; the scale warps evaluate gate SiLU while warp 1
-// starts filling the up-weight half of the stream.
+// Gate is completed first and remains in TMEM while most of the up stream is
+// prepared. Each warp converts its gate fragment to lane-local SiLU registers
+// late enough to overlap the remaining up work without a shared-memory image.
 template <
     int K, int RingStages, int TileN, bool PublishReady,
     typename M2CQueue, typename C2MQueue>
@@ -307,11 +307,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   constexpr int kOutputRows = mxfpGateUpFixedOutputRows;
   using GateSilu = std::conditional_t<
       mxfpGateUpFixedBf16Epilogue, __nv_bfloat16, float>;
-  constexpr int kGateSiluBytes =
-      kTileM * kOutputRows * int(sizeof(GateSilu));
   constexpr int kFixedScratchBytes =
       kWeightRingBytes + kScaleRingBytes + kActivationRingBytes +
-      kBarrierBytes + kGateSiluBytes;
+      kBarrierBytes;
   constexpr int kAllocatorArenaBytes = numSlots * slotSizeKb * 1024;
   constexpr int kFixedOffset = kStreamDirectActivation
       ? 0
@@ -337,8 +335,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   auto *umma_full = scale_full + RingStages;
   auto *stage_empty = umma_full + RingStages;
   auto *activation_full = stage_empty + RingStages;
-  auto *gate_silu = reinterpret_cast<GateSilu *>(
-      activation_full + (kStreamDirectActivation ? 0 : 1));
+  GateSilu register_gate_silu[kOutputRows];
 
   if (warp == 1 && lane == 0) {
     #pragma unroll
@@ -469,34 +466,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         // stages has retired the complete gate stream. Drain warp 1's TMEM
         // datapath while warp 0 consumes the prefetched up weights.
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        dae_mxfp_gate_silu_rows<kOutputRows>(
-            tid, tiled_t2r, gate_tmem, c_acc, gate_silu);
+        dae_mxfp_gate_silu_registers<kOutputRows>(
+            tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
       }
     } else if (warp >= 2) {
-      // Gate SiLU is deliberately placed between the two streams. The TMA
-      // producer can already fill up-weight stages while these warps drain
-      // the completed gate accumulator.
-      if (projection == 1) {
-        constexpr int kGateLastOperation = kNumKTiles - 1;
-        constexpr int kGateLastStage = kGateLastOperation % RingStages;
-        constexpr int kGateLastPhase =
-            (kGateLastOperation / RingStages) & 1;
-        stage_empty[kGateLastStage].wait(kGateLastPhase);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (tid == 2 * numThreadsPerWarp) {
-          profile_events[77] = cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        dae_mxfp_gate_silu_rows<kOutputRows>(
-            tid, tiled_t2r, gate_tmem, c_acc, gate_silu);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (tid == 2 * numThreadsPerWarp) {
-          profile_events[78] = cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
-      }
-
       #pragma unroll 4
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
@@ -569,6 +542,32 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
           if (lane == 0) {
             stage_empty[retire_stage].arrive();
           }
+        }
+        // Preserve the gate accumulator in TMEM while six of the eight up
+        // scale tiles are prepared. The final two scale tiles and the UMMA
+        // issuer then overlap this warp-local TMEM drain and SiLU work.
+        constexpr int kLateGateDrainTile = kNumKTiles - 3;
+        if (projection == 1 && tile == kLateGateDrainTile) {
+          constexpr int kGateLastOperation = kNumKTiles - 1;
+          constexpr int kGateLastStage =
+              kGateLastOperation % RingStages;
+          constexpr int kGateLastPhase =
+              (kGateLastOperation / RingStages) & 1;
+          stage_empty[kGateLastStage].wait(kGateLastPhase);
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+          if (tid == 2 * numThreadsPerWarp) {
+            profile_events[77] = cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
+          asm volatile(
+              "tcgen05.fence::after_thread_sync;" ::: "memory");
+          dae_mxfp_gate_silu_registers<kOutputRows>(
+              tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+          if (tid == 2 * numThreadsPerWarp) {
+            profile_events[78] = cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
         }
       }
       if (warp == 2) {
@@ -766,8 +765,8 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         // allocation, so warp 0 can evaluate its gate rows in the shadow of
         // the last up bundle without perturbing the up issue stream.
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        dae_mxfp_gate_silu_rows<kOutputRows>(
-            tid, tiled_t2r, gate_tmem, c_acc, gate_silu);
+        dae_mxfp_gate_silu_registers<kOutputRows>(
+            tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
       }
     }
   }
@@ -846,38 +845,19 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     auto up_registers = make_tensor<Accum>(shape(thread_coord));
     copy(tiled_t2r, thread_up_tmem, up_registers);
     cutlass::arch::fence_view_async_tmem_load();
-    int thread_row = 0;
     #pragma unroll
     for (int index = 0; index < size(up_registers); ++index) {
       const int row = int(get<0>(thread_coord(index)));
       const int column = int(get<1>(thread_coord(index)));
       if (row < kTileM && column < kOutputRows) {
-        thread_row = row;
-        swiglu_values[column] = up_registers(index);
-      }
-    }
-    if constexpr (mxfpGateUpFixedBf16Epilogue) {
-      #pragma unroll
-      for (int column = 0; column + 1 < kOutputRows; column += 2) {
-        const auto gate_pair = *reinterpret_cast<const __nv_bfloat162 *>(
-            gate_silu + thread_row * kOutputRows + column);
-        const auto up_pair = __floats2bfloat162_rn(
-            swiglu_values[column], swiglu_values[column + 1]);
-        const float2 product = __bfloat1622float2(__hmul2(gate_pair, up_pair));
-        swiglu_values[column] = product.x;
-        swiglu_values[column + 1] = product.y;
-      }
-      if constexpr ((kOutputRows & 1) != 0) {
-        const int column = kOutputRows - 1;
-        swiglu_values[column] = __bfloat162float(__hmul(
-            gate_silu[thread_row * kOutputRows + column],
-            __float2bfloat16_rn(swiglu_values[column])));
-      }
-    } else {
-      #pragma unroll
-      for (int column = 0; column < kOutputRows; ++column) {
-        swiglu_values[column] *=
-            float(gate_silu[thread_row * kOutputRows + column]);
+        if constexpr (mxfpGateUpFixedBf16Epilogue) {
+          swiglu_values[column] = __bfloat162float(__hmul(
+              register_gate_silu[column],
+              __float2bfloat16_rn(up_registers(index))));
+        } else {
+          swiglu_values[column] =
+              float(register_gate_silu[column]) * up_registers(index);
+        }
       }
     }
   }

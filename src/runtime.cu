@@ -84,7 +84,7 @@ cudaError_t launch_dae_ffn_down_direct(
     int num_blocks, size_t smem_size, const uint8_t *metadata,
     CUtensorMap *tma_descs, int *bars, uint64_t *profile, int64_t stream) {
   dae_ffn_down_direct_kernel<<<
-      num_blocks, 128, smem_size,
+      num_blocks, 256, smem_size,
       reinterpret_cast<cudaStream_t>(stream)>>>(
           metadata, tma_descs, bars, profile);
   return cudaGetLastError();
