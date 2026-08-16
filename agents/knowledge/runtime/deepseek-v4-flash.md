@@ -2485,12 +2485,67 @@ lets `ffn.route` wait on activation quantization without a router-completion
 edge, so Top-6 may consume incomplete router logits. Restore that dependency
 before accepting either correctness or performance from this path.
 
+| release flow | CUDA TBT (ms) | first token | qualification |
+| --- | ---: | ---: | --- |
+| cleanroom baseline | **10.793312** | 14 | correct |
+| fused resident integration | 14.770304 | 0 | performance-only, incorrect |
+| delta | **+3.976992 (+36.85%)** | - | +92.488 us/layer |
+
 Lightweight per-SM aggregation preserves the release register and stack
 footprints. Identically instrumented 43-layer samples measured 13.407872 ms
 for the baseline and 17.235617 ms for the fused integration, a 3.827745-ms
 delta versus the 3.976992-ms release delta. Passive phase windows are not
 additive: the current FFN tail spills into the next attention window on SMs
 that do not execute HC-post.
+
+| matched lightweight profile | baseline (ms) | fused integration (ms) | delta (ms) |
+| --- | ---: | ---: | ---: |
+| CUDA sample | 13.407872 | 17.235617 | **+3.827745** |
+| internal resident span | 13.195168 | 16.982592 | +3.787424 |
+
+The identical-marker CUDA delta accounts for 96.25% of the release delta.
+Absolute marker-enabled times are not release TBT. The phase entries below
+are passive queue windows on different slowest SMs; they overlap and must not
+be added.
+
+| passive queue window | baseline total (ms) | baseline mean (us/layer) | fused total (ms) | fused mean (us/layer) | mean delta (us/layer) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| attention / prior-tail wait | 8.528640 | 198.340 | 12.097824 | 281.345 | **+83.005** |
+| FFN-local | 9.702368 | 225.636 | 5.299232 | 123.238 | -102.398 |
+
+The attention-window increase is not an attention-math regression. On SMs
+without the final HC-post task, the passive FFN-end marker can advance before
+the true expert join. Their following attention window then includes the
+previous FFN's outstanding tail.
+
+The FFN table reports the mean duration on the slowest participating SM over
+43 layers. The old grouped entries are sums along the corresponding local
+expert queue. Expert branches and independent stages can overlap, so the
+rows are diagnostic components rather than an additive TBT decomposition.
+
+| FFN component | baseline (us) | fused integration (us) | delta (us) |
+| --- | ---: | ---: | ---: |
+| HC project | 6.148 | 5.629 | -0.519 |
+| HC pre/RMS | 14.650 | 15.472 | +0.822 |
+| hidden activation quantization | 25.746 | 17.852 | -7.894 |
+| router compute-queue interval | 169.708 | 198.181 | +28.473 |
+| Top-6 queue interval | 36.824 | 8.376 | -28.448 |
+| routed input quant + W1 + W3 + SiLU | 70.654 | fused Linear-1: 54.203 | **-16.451** |
+| routed middle quant + W2/down | 23.903 | fused down: 71.365 | **+47.462** |
+| shared W1 + W3 + SiLU + middle quant | 57.961 | fused Linear-1: 52.467 | -5.494 |
+| shared W2/down | 23.783 | 17.656 | -6.127 |
+| HC post | 12.374 | 11.083 | -1.291 |
+
+The router entry is not GEMV arithmetic time. Its begin marker is ahead of
+the input-barrier-gated loads; its end marker follows the local compute task's
+C2M output push but not STU completion or a grid-wide router barrier. A
+representative layer-3 per-step trace separates it as follows:
+
+| router local trace | baseline (us) | fused integration (us) |
+| --- | ---: | ---: |
+| compute-queue interval | 141.760 | 131.328 |
+| M2C / input and data wait | 138.592 | 127.520 |
+| compute-active portion | **3.168** | **3.808** |
 
 The structural bottleneck is fused routed down. Its 192 tasks are placed over
 152 SM queues, leaving 40 queues with two tasks and 112 with one. The grid
@@ -2501,3 +2556,8 @@ saves about 16.451 us per layer, while fused down costs about 47.462 us,
 leaving a 31.011-us local regression that is amplified by the all-SM join and
 cross-layer barriers. Fix the route dependency and repeat this same breakdown
 before changing the down schedule.
+
+| fused routed stage | grid mean (us) | slowest-SM mean (us) | maximum occurrence (us) | slowest/grid |
+| --- | ---: | ---: | ---: | ---: |
+| Linear-1 | 52.536 | 54.203 | 55.360 | 1.03x |
+| down | 31.944 | **71.365** | 74.272 | **2.23x** |
