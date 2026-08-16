@@ -2474,3 +2474,30 @@ allocator slot, 64 instruction entries, 223 KiB configured shared memory, and
 `ffn_specialized=1`. Build and benchmark inside the worker Conda environment;
 GPU execution must go through the cluster allocator. The host schedule suite
 passes 86 tests after evaluating it with the normal 24-slot schedule capacity.
+
+## Resident fused-FFN profiling checkpoint (2026-08-16)
+
+The first resident integration checkpoint is diagnostic, not correctness
+qualified. The cleanroom release baseline emitted token 14 in 10.793312 ms;
+the fused integration measured 14.770304 ms but a fresh uninstrumented run
+(`20260816T022900Z-3275374`) emitted token 0. The integrated schedule currently
+lets `ffn.route` wait on activation quantization without a router-completion
+edge, so Top-6 may consume incomplete router logits. Restore that dependency
+before accepting either correctness or performance from this path.
+
+Lightweight per-SM aggregation preserves the release register and stack
+footprints. Identically instrumented 43-layer samples measured 13.407872 ms
+for the baseline and 17.235617 ms for the fused integration, a 3.827745-ms
+delta versus the 3.976992-ms release delta. Passive phase windows are not
+additive: the current FFN tail spills into the next attention window on SMs
+that do not execute HC-post.
+
+The structural bottleneck is fused routed down. Its 192 tasks are placed over
+152 SM queues, leaving 40 queues with two tasks and 112 with one. The grid
+mean is 31.944 us while the slowest-SM mean is 71.365 us (maximum occurrence
+74.272 us). Fused routed Linear-1 is balanced at 52.536-us grid mean and
+54.203-us slowest-SM mean. Relative to the old routed path, fused Linear-1
+saves about 16.451 us per layer, while fused down costs about 47.462 us,
+leaving a 31.011-us local regression that is amplified by the all-SM join and
+cross-layer barriers. Fix the route dependency and repeat this same breakdown
+before changing the down schedule.

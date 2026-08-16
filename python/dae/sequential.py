@@ -11,6 +11,7 @@ from .instructions import (
     LoopC,
     LoopM,
     MemoryInstruction,
+    ProfileAggregate,
     ProfileStep,
     ResetIndirectLayer,
 )
@@ -38,6 +39,9 @@ class SequentialStage:
     wait_group: str | None = None
     release_group: str | None = None
     profile_step_event: int | None = None
+    profile_aggregate_events: tuple[int, int] | None = None
+    profile_span_begin: tuple[int, int] | None = None
+    profile_span_end: tuple[int, int] | None = None
     prefetch_before_wait: bool = False
 
 
@@ -91,7 +95,9 @@ def _attach_bar(inst: MemoryInstruction, bar_id: int, *, stage: str) -> None:
 def _writeback_tail(per_sm: list[list], stage: str) -> tuple[int, list[MemoryInstruction]]:
     tails = []
     for instructions in per_sm:
-        if not instructions:
+        if not any(
+            not isinstance(inst, ProfileAggregate) for inst in instructions
+        ):
             continue
         writebacks = [
             inst
@@ -111,7 +117,9 @@ def _writeback_tail(per_sm: list[list], stage: str) -> tuple[int, list[MemoryIns
 def _gate_load_ports(per_sm: list[list], bar_id: int, stage: str) -> None:
     active = False
     for instructions in per_sm:
-        if not instructions:
+        if not any(
+            not isinstance(inst, ProfileAggregate) for inst in instructions
+        ):
             continue
         active = True
         first_load_by_port = {}
@@ -137,7 +145,9 @@ def _validate_prefetch_gate(per_sm: list[list], bar_id: int, stage: str) -> None
 
     active = False
     for instructions in per_sm:
-        if not instructions:
+        if not any(
+            not isinstance(inst, ProfileAggregate) for inst in instructions
+        ):
             continue
         active = True
         gated_loads = [
@@ -228,6 +238,25 @@ class SequentialProgram:
             for event in step_events
         ):
             raise ValueError("step profile events exceed the layer-profile range")
+        aggregate_events = [
+            event
+            for stage in self.stages
+            for pair in (
+                stage.profile_aggregate_events,
+                stage.profile_span_begin,
+                stage.profile_span_end,
+            )
+            if pair is not None
+            for event in pair
+        ]
+        if any(
+            event < config.layer_profile_event_base
+            or event >= config.reload_profile_event_base
+            for event in aggregate_events
+        ):
+            raise ValueError(
+                "aggregate profile events exceed the layer-profile range"
+            )
 
         self.instructions = [[] for _ in range(launcher.num_sms)]
         self.barriers = []
@@ -346,6 +375,42 @@ class SequentialProgram:
                     )
                     instructions.append(
                         ProfileStep(stage.profile_step_event, begin=False)
+                    )
+                if (
+                    stage.profile_aggregate_events is not None
+                    and any(
+                        isinstance(inst, ComputeInstruction)
+                        for inst in instructions
+                    )
+                ):
+                    begin_event, aggregate_event = (
+                        stage.profile_aggregate_events
+                    )
+                    instructions.insert(
+                        0,
+                        ProfileAggregate(
+                            begin_event, aggregate_event, begin=True
+                        ),
+                    )
+                    instructions.append(
+                        ProfileAggregate(
+                            begin_event, aggregate_event, begin=False
+                        )
+                    )
+                if stage.profile_span_begin is not None:
+                    begin_event, aggregate_event = stage.profile_span_begin
+                    instructions.insert(
+                        0,
+                        ProfileAggregate(
+                            begin_event, aggregate_event, begin=True
+                        ),
+                    )
+                if stage.profile_span_end is not None:
+                    begin_event, aggregate_event = stage.profile_span_end
+                    instructions.append(
+                        ProfileAggregate(
+                            begin_event, aggregate_event, begin=False
+                        )
                     )
                 rendered.append(instructions)
             if balance_load_ports:

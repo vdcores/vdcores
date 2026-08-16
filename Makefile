@@ -37,6 +37,11 @@ ifneq ($(track_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE
 endif
 
+ifneq ($(aggregate_profile),)
+	NVCC_FLAGS += -DDAE_AGGREGATE_PROFILE
+	export DAE_AGGREGATE_PROFILE := 1
+endif
+
 ifneq ($(mxfp_timeline),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_TRACK_MXFP_TIMELINE
 	export DAE_TRACK_PROFILE := 1

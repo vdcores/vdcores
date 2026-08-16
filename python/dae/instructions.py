@@ -1789,6 +1789,32 @@ class ProfileStep(ComputeInstruction):
         )
 
 
+class ProfileAggregate(ComputeInstruction):
+    """Passively aggregate one repeated compute-stage duration per SM.
+
+    The begin slot is temporary. The aggregate slot packs total nanoseconds,
+    the maximum duration in 32-ns units, and the occurrence count. No memory
+    dependency or task barrier is introduced.
+    """
+
+    def __init__(self, begin_event: int, aggregate_event: int, *, begin: bool):
+        for event in (begin_event, aggregate_event):
+            if not (
+                config.layer_profile_event_base
+                <= event
+                < config.reload_profile_event_base
+            ):
+                raise ValueError(
+                    "aggregate profile event must fit the layer-profile range"
+                )
+        if begin_event == aggregate_event:
+            raise ValueError("aggregate profile begin/output events must differ")
+        super().__init__(
+            opcode=opcode.OP_PROFILE_EVENT,
+            args=[begin_event, 4 if begin else 5, aggregate_event],
+        )
+
+
 class LoopC(ComputeInstruction):
     def __init__(self, count: int, pc: int, reg: int = 0):
         assert 0 <= reg < config.num_loop_counters, (
@@ -3052,6 +3078,7 @@ __all__ = [
     "Copy",
     "ProfileEvent",
     "ProfileStep",
+    "ProfileAggregate",
     "LoopC",
     "MemoryInstruction",
     "TerminateM",

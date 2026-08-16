@@ -1254,6 +1254,30 @@ DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
         event = (static_cast<uint64_t>(wait) << 32) | elapsed;
       } else
 #endif
+#if defined(DAE_TRACK_PROFILE) || defined(DAE_AGGREGATE_PROFILE)
+      if (mode == 4) {
+        event = cuda::ptx::get_sreg_globaltimer();
+      } else if (mode == 5) {
+        const uint32_t elapsed =
+            static_cast<uint32_t>(cuda::ptx::get_sreg_globaltimer()) -
+            static_cast<uint32_t>(event);
+        const int aggregate_id = inst.args[2];
+        if (aggregate_id >= 2 && aggregate_id < numProfileEvents) {
+          uint64_t &aggregate =
+              g_events[sm_id * numProfileEvents + aggregate_id];
+          const uint32_t total = static_cast<uint32_t>(aggregate) + elapsed;
+          const uint32_t elapsed_q32 = min(0xFFFFU, (elapsed + 31U) / 32U);
+          const uint32_t maximum = max(
+              static_cast<uint32_t>((aggregate >> 32) & 0xFFFFU),
+              elapsed_q32);
+          const uint32_t count = min(
+              0xFFFFU,
+              static_cast<uint32_t>(aggregate >> 48) + 1U);
+          aggregate = (static_cast<uint64_t>(count) << 48) |
+              (static_cast<uint64_t>(maximum) << 32) | total;
+        }
+      } else
+#endif
       {
         event = cuda::ptx::get_sreg_globaltimer();
       }
@@ -1299,6 +1323,8 @@ DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
     g_events[event_base + DAE_TRACK_COMPUTE_M2C_CONTENDED] =
         m2c.track_contended_waits;
     g_events[event_base + DAE_TRACK_MAGIC] = daeTrackProfileMagic;
+#elif defined(DAE_AGGREGATE_PROFILE)
+    g_events[event_base + 127] = 0x4454524b50524631ULL;
 #endif
   }
   __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);

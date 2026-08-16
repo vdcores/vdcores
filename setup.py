@@ -26,6 +26,8 @@ cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
 cuda_defines = []
 if os.environ.get("DAE_TRACK_PROFILE"):
     cuda_defines.append("-DDAE_TRACK_PROFILE")
+if os.environ.get("DAE_AGGREGATE_PROFILE"):
+    cuda_defines.append("-DDAE_AGGREGATE_PROFILE")
 if os.environ.get("DAE_TRACK_MXFP_TIMELINE"):
     cuda_defines.append("-DDAE_TRACK_MXFP_TIMELINE")
 if os.environ.get("DAE_GLOBAL_INSTRUCTIONS"):

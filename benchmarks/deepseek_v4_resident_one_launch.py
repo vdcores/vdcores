@@ -3496,6 +3496,73 @@ class ResidentOneLaunchDecode:
         self.stage_profile_labels: list[str] = []
         self.step_profile_records: list[tuple[int, str, int, int, int]] = []
         self.step_profile_total = 0
+        aggregate_labels = (
+            "hc_project",
+            "hc_pre_rms",
+            "hidden_quant",
+            "router",
+            "route_top6",
+            "routed_input_quant",
+            "routed_w1",
+            "routed_w3",
+            "routed_swiglu",
+            "routed_middle_quant",
+            "routed_w2",
+            "shared_w1",
+            "shared_w3",
+            "shared_swiglu",
+            "shared_middle_quant",
+            "shared_w2",
+            "hc_post",
+        )
+        aggregate_base = runtime_config.layer_profile_event_base
+        self.ffn_aggregate_events = {
+            label: (aggregate_base + 2 * index, aggregate_base + 2 * index + 1)
+            for index, label in enumerate(aggregate_labels)
+        }
+        self.ffn_aggregate_used: set[str] = set()
+        self.phase_aggregate_events = {
+            "attention": (
+                runtime_config.layer_profile_event_base,
+                runtime_config.layer_profile_event_base + 1,
+            ),
+            "ffn": (
+                runtime_config.layer_profile_event_base + 2,
+                runtime_config.layer_profile_event_base + 3,
+            ),
+        }
+
+        def aggregate_category(name: str) -> str | None:
+            exact = {
+                "ffn.hc_project": "hc_project",
+                "ffn.hc_pre_rms4096": "hc_pre_rms",
+                "ffn.hidden.quant_fp8": "hidden_quant",
+                "ffn.hidden.quant_native_fp8": "hidden_quant",
+                "ffn.router": "router",
+                "ffn.route": "route_top6",
+                "ffn.shared.w1": "shared_w1",
+                "ffn.shared.w3": "shared_w3",
+                "ffn.shared.swiglu": "shared_swiglu",
+                "ffn.shared.middle.quant_native_fp8": "shared_middle_quant",
+                "ffn.shared.middle.quant_fp8": "shared_middle_quant",
+                "ffn.shared.w2": "shared_w2",
+                "ffn.hc_post": "hc_post",
+            }
+            category = exact.get(name)
+            if category is not None:
+                return category
+            if name.startswith("ffn.expert"):
+                for suffix, routed_category in (
+                    (".input.quant_nvfp4", "routed_input_quant"),
+                    (".middle.quant_nvfp4", "routed_middle_quant"),
+                    (".w1", "routed_w1"),
+                    (".w3", "routed_w3"),
+                    (".swiglu", "routed_swiglu"),
+                    (".w2", "routed_w2"),
+                ):
+                    if name.endswith(suffix):
+                        return routed_category
+            return None
 
         def profile_stage(name: str) -> bool:
             if not self.args.profile_stages:
@@ -3543,6 +3610,9 @@ class ResidentOneLaunchDecode:
             *,
             profile_after: bool = False,
             profile_step_event: int | None = None,
+            profile_aggregate_events: tuple[int, int] | None = None,
+            profile_span_begin: tuple[int, int] | None = None,
+            profile_span_end: tuple[int, int] | None = None,
         ) -> SequentialStage:
             nonlocal serial_sm
             base_sm = 0 if stage.base_sm is None else stage.base_sm
@@ -3560,6 +3630,9 @@ class ResidentOneLaunchDecode:
                 wait_group=stage.wait_group,
                 release_group=stage.release_group,
                 profile_step_event=profile_step_event,
+                profile_aggregate_events=profile_aggregate_events,
+                profile_span_begin=profile_span_begin,
+                profile_span_end=profile_span_end,
                 prefetch_before_wait=stage.prefetch_before_wait,
             )
 
@@ -3588,6 +3661,23 @@ class ResidentOneLaunchDecode:
                         + index
                         - self.args.profile_step_start
                     )
+                aggregate_events = None
+                if self.args.profile_ffn_aggregate:
+                    category = aggregate_category(stage.name)
+                    if category is not None:
+                        aggregate_events = self.ffn_aggregate_events[category]
+                        self.ffn_aggregate_used.add(category)
+                span_begin = None
+                span_end = None
+                if self.args.profile_phase_aggregate:
+                    if stage.name == "attn.hc_project":
+                        span_begin = self.phase_aggregate_events["attention"]
+                    elif stage.name == "attn.hc_post":
+                        span_end = self.phase_aggregate_events["attention"]
+                    elif stage.name == "ffn.hc_project":
+                        span_begin = self.phase_aggregate_events["ffn"]
+                    elif stage.name == "ffn.hc_post":
+                        span_end = self.phase_aggregate_events["ffn"]
                 queued_stage = queued(
                     stage,
                     f"{family.name}.",
@@ -3595,6 +3685,9 @@ class ResidentOneLaunchDecode:
                         self.args.profile_layers and index + 1 == len(stages)
                     ) or stage_profile_after,
                     profile_step_event=step_event,
+                    profile_aggregate_events=aggregate_events,
+                    profile_span_begin=span_begin,
+                    profile_span_end=span_end,
                 )
                 queued_stages.append(queued_stage)
                 if step_event is not None:
@@ -3754,7 +3847,12 @@ class ResidentOneLaunchDecode:
 
     def run_once(self) -> tuple[int, float, torch.Tensor]:
         self.residual.copy_(self.initial_residual)
-        if self.args.profile_layers or self.args.profile_stages:
+        if (
+            self.args.profile_layers
+            or self.args.profile_stages
+            or self.args.profile_ffn_aggregate
+            or self.args.profile_phase_aggregate
+        ):
             self.launcher.profile.zero_()
         torch.cuda.synchronize(self.device)
         start = torch.cuda.Event(enable_timing=True)
@@ -4143,6 +4241,110 @@ class ResidentOneLaunchDecode:
             flush=True,
         )
 
+    def report_ffn_aggregate_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_ffn_aggregate:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "aggregate FFN profiling requires aggregate_profile=1"
+            )
+        for label, (_, aggregate_event) in self.ffn_aggregate_events.items():
+            if label not in self.ffn_aggregate_used:
+                continue
+            samples = []
+            for sm, value in enumerate(profile[:, aggregate_event]):
+                packed = int(value)
+                count = (packed >> 48) & 0xFFFF
+                if count == 0:
+                    continue
+                total_ns = packed & 0xFFFFFFFF
+                maximum_ns = ((packed >> 32) & 0xFFFF) * 32
+                samples.append((sm, count, total_ns, maximum_ns))
+            if not samples:
+                raise RuntimeError(
+                    f"aggregate FFN profile category {label!r} was not recorded"
+                )
+            total_occurrences = sum(sample[1] for sample in samples)
+            total_ns = sum(sample[2] for sample in samples)
+            critical = max(samples, key=lambda sample: sample[2] / sample[1])
+            print(
+                "DSV4_FFN_AGGREGATE_TIME "
+                f"name={label} active_sms={len(samples)} "
+                f"occurrences={total_occurrences} "
+                f"grid_mean_us={total_ns / total_occurrences / 1.0e3:.3f} "
+                f"slowest_sm={critical[0]} "
+                f"slowest_sm_mean_us={critical[2] / critical[1] / 1.0e3:.3f} "
+                f"max_occurrence_us={max(sample[3] for sample in samples) / 1.0e3:.3f}",
+                flush=True,
+            )
+        start_frontier = max(int(value) for value in profile[:, 0])
+        end_frontier = max(int(value) for value in profile[:, 1])
+        print(
+            "DSV4_FFN_AGGREGATE_SUMMARY "
+            f"categories={len(self.ffn_aggregate_used)} "
+            f"internal_span_ms={(end_frontier - start_frontier) / 1.0e6:.6f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
+    def report_phase_aggregate_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_phase_aggregate:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "aggregate phase profiling requires aggregate_profile=1"
+            )
+        for label, (_, aggregate_event) in self.phase_aggregate_events.items():
+            samples = []
+            for sm, value in enumerate(profile[:, aggregate_event]):
+                packed = int(value)
+                count = (packed >> 48) & 0xFFFF
+                if count == 0:
+                    continue
+                total_ns = packed & 0xFFFFFFFF
+                maximum_ns = ((packed >> 32) & 0xFFFF) * 32
+                samples.append((sm, count, total_ns, maximum_ns))
+            if not samples:
+                raise RuntimeError(f"phase profile {label!r} was not recorded")
+            critical = max(samples, key=lambda sample: sample[2])
+            print(
+                "DSV4_PHASE_AGGREGATE_TIME "
+                f"name={label} active_sms={len(samples)} "
+                f"layers={critical[1]} slowest_sm={critical[0]} "
+                f"slowest_sm_total_ms={critical[2] / 1.0e6:.6f} "
+                f"slowest_sm_mean_us={critical[2] / critical[1] / 1.0e3:.3f} "
+                f"max_occurrence_us={max(sample[3] for sample in samples) / 1.0e3:.3f}",
+                flush=True,
+            )
+        start_frontier = max(int(value) for value in profile[:, 0])
+        end_frontier = max(int(value) for value in profile[:, 1])
+        print(
+            "DSV4_PHASE_AGGREGATE_SUMMARY "
+            f"internal_span_ms={(end_frontier - start_frontier) / 1.0e6:.6f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -4291,6 +4493,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--profile-ffn-aggregate",
+        action="store_true",
+        help=(
+            "passively aggregate per-SM FFN stage durations across the full "
+            "resident loop without adding dependency barriers"
+        ),
+    )
+    parser.add_argument(
+        "--profile-phase-aggregate",
+        action="store_true",
+        help="passively aggregate whole attention and FFN spans",
+    )
+    parser.add_argument(
         "--profile-step-start",
         type=int,
         default=0,
@@ -4331,12 +4546,16 @@ def main() -> None:
     if not 16 <= args.ffn_w2_routed_sms <= 25:
         parser.error("ffn-w2-routed-sms must be in [16,25]")
     profile_modes = sum(
-        (args.profile_layers, args.profile_stages, args.profile_steps)
+        (
+            args.profile_layers,
+            args.profile_stages,
+            args.profile_steps,
+            args.profile_ffn_aggregate,
+            args.profile_phase_aggregate,
+        )
     )
     if profile_modes > 1:
-        parser.error(
-            "--profile-layers, --profile-stages, and --profile-steps are mutually exclusive"
-        )
+        parser.error("profiling modes are mutually exclusive")
     if args.profile_preattention_only and not args.profile_stages:
         parser.error("--profile-preattention-only requires --profile-stages")
     if (args.profile_stages or args.profile_steps) and args.layers != 1:
@@ -4429,6 +4648,10 @@ def main() -> None:
                 reporter = flow.report_layer_profile
             elif args.profile_stages:
                 reporter = flow.report_stage_profile
+            elif args.profile_ffn_aggregate:
+                reporter = flow.report_ffn_aggregate_profile
+            elif args.profile_phase_aggregate:
+                reporter = flow.report_phase_aggregate_profile
             else:
                 reporter = flow.report_step_profile
             reporter(
