@@ -466,6 +466,8 @@ def main() -> None:
         f"routed_experts={args.routed_experts} "
         f"slices_per_expert={args.slices_per_expert} "
         "fixed_ring=true "
+        "ldu_weight_ring="
+        f"{str(bool(runtime.config.mxfp_gate_up_ldu_weight_ring)).lower()} "
         f"tile_k={args.tile_k} "
         f"activation_tiles_per_load={k_tiles} "
         f"activation_rows={activation_row_bytes.tolist()} "

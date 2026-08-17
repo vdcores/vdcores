@@ -393,11 +393,16 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             raise ValueError(
                 f"Unsupported fused MXFP4/MXFP8 fixed K/ring={tile_k}/{stages}"
             )
+        use_ldu_weight_ring = (
+            "mxfpGateUpLduWeightRingEnabled"
+            if (tile_k, stages) == (512, 2)
+            else "false"
+        )
         prelude = [
             f"DAE_COMPUTE_OP_HANDLER({name}) {{",
             (
                 "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, "
-                "tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events, "
+                "tmem_mma_phase, scratch_space, g_events, "
                 "fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask);"
             ),
         ]
@@ -408,8 +413,8 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             "  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);",
             (
                 "  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<"
-                f"{tile_k}, {stages}, 8, true>("
-                "smem_base, tmem_base_ptr, tma_descs, "
+                f"{tile_k}, {stages}, 8, true, {use_ldu_weight_ring}>("
+                "smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs, "
                 "metadata, global_bars, m2c, c2m"
             ),
             "#if defined(DAE_TRACK_MXFP_TIMELINE)",

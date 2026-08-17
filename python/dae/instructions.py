@@ -2661,6 +2661,60 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+class TmaLoadMxfpWeightRing5D(MemoryInstruction):
+    """Retained two-stage K512 weight ring for fused Linear-1.
+
+    The allocating command names the gate and up TMA descriptors plus their
+    common output tile. LDU0 consumes a compact continuation between the two
+    projections while retaining the original 16-slot lease.
+    """
+
+    RING_SLOTS = 16
+    CONTINUATION_SPECIAL_SLOT = 8
+    PACKED_TILE_BYTES = 32 * 1024
+
+    def __init__(self, gate_tma, up_tma, output_tile: int):
+        expected_base = [0, 0, 0, int(output_tile)]
+        expected_next = [0, 0, 1, int(output_tile)]
+        for name, descriptor in (("gate", gate_tma), ("up", up_tma)):
+            if (
+                descriptor is None
+                or getattr(descriptor, "rank", None) != 5
+                or getattr(descriptor, "size", None) != self.PACKED_TILE_BYTES
+                or getattr(descriptor, "num_slots", None) != 8
+            ):
+                raise ValueError(
+                    f"{name} retained weight ring requires a K512 MXFP4 TMA"
+                )
+            if (
+                descriptor.cord2tma(output_tile, 0) != expected_base
+                or descriptor.cord2tma(output_tile, 1) != expected_next
+            ):
+                raise ValueError(
+                    "retained weight ring requires task-major "
+                    "[M tile,K tile] TMA coordinates"
+                )
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D,
+            num_slots=self.RING_SLOTS,
+            size=gate_tma.arg,
+            arg=up_tma.arg,
+            cords=expected_base,
+        )
+        self.fixed_port(0)
+
+    @classmethod
+    def continuation(cls):
+        inst = MemoryInstruction(
+            opcode=opcode.OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D,
+            num_slots=config.num_slots + cls.CONTINUATION_SPECIAL_SLOT,
+            arg=0,
+            size=0,
+            address=0,
+        )
+        return inst.fixed_port(0)
+
+
 class TmaLoadMxfpScale1D(MemoryInstruction):
     """Compact TMA of one native scale half from an LDU-cached base."""
 
@@ -3104,6 +3158,7 @@ __all__ = [
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
+    "TmaLoadMxfpWeightRing5D",
     "TmaLoadMxfpScale1D",
     "TmaLoadMxfpScaleBase1D",
     "TmaLoad64K1D",

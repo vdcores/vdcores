@@ -128,6 +128,11 @@ ifneq ($(mxfp_gate_up_direct_activation),)
 	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION := $(mxfp_gate_up_direct_activation)
 endif
 
+ifneq ($(mxfp_gate_up_ldu_weight_ring),)
+	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_LDU_WEIGHT_RING=$(mxfp_gate_up_ldu_weight_ring)
+	export DAE_MXFP_GATE_UP_LDU_WEIGHT_RING := $(mxfp_gate_up_ldu_weight_ring)
+endif
+
 ifneq ($(mxfp_gate_up_direct_activation_tiles),)
 	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES=$(mxfp_gate_up_direct_activation_tiles)
 	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES := $(mxfp_gate_up_direct_activation_tiles)

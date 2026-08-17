@@ -111,10 +111,22 @@ static constexpr int mxfp4Mxfp8TmaScaleBarrierCount =
 static constexpr bool mxfpGateUpDirectOutputEnabled =
     DAE_MXFP_GATE_UP_DIRECT_OUTPUT != 0;
 #ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
-#define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION 1
+#define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION 0
 #endif
 static constexpr bool mxfpGateUpDirectActivationEnabled =
     DAE_MXFP_GATE_UP_DIRECT_ACTIVATION != 0;
+#ifndef DAE_MXFP_GATE_UP_LDU_WEIGHT_RING
+#define DAE_MXFP_GATE_UP_LDU_WEIGHT_RING 1
+#endif
+// Standalone Linear-1 allocates one 16-slot transformed-weight ring. LDU0
+// retains the lease across gate and up, while compute owns only the resident
+// full/empty barrier phases and never returns the allocation through C2M.
+static constexpr bool mxfpGateUpLduWeightRingEnabled =
+    DAE_MXFP_GATE_UP_LDU_WEIGHT_RING != 0 &&
+    !mxfpGateUpDirectActivationEnabled;
+static_assert(
+    !mxfpGateUpLduWeightRingEnabled || numSlots >= 20,
+    "retained LDU weight ring needs 16 weight and four activation slots");
 #ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES
 #define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES 8
 #endif
@@ -140,8 +152,17 @@ static_assert(
 #endif
 static constexpr bool mxfpGateUpFixedBf16Epilogue =
     DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE != 0;
-static constexpr int tmemMmaBarrierCount =
+static constexpr int mxfpLduWeightRingStages = 2;
+static constexpr int mxfpLduWeightRingBarrierBase =
     mxfp4Mxfp8TmaScaleBarrierBase + mxfp4Mxfp8TmaScaleBarrierCount;
+static constexpr int mxfpLduWeightRingBarrierCount =
+    mxfpGateUpLduWeightRingEnabled ? 2 * mxfpLduWeightRingStages : 0;
+static constexpr int mxfpLduWeightRingFullBarrierBase =
+    mxfpLduWeightRingBarrierBase;
+static constexpr int mxfpLduWeightRingEmptyBarrierBase =
+    mxfpLduWeightRingBarrierBase + mxfpLduWeightRingStages;
+static constexpr int tmemMmaBarrierCount =
+    mxfpLduWeightRingBarrierBase + mxfpLduWeightRingBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
@@ -171,6 +192,7 @@ static constexpr int mxfpProfileSfbProducerStartBase = 61;
 static constexpr int mxfpProfileSfbProducerReadyBase = 69;
 static constexpr int mxfpProfileWeightTmaIssueBase = 77;
 static constexpr int mxfpProfileActivationTmaIssueBase = 85;
+static constexpr int mxfpProfileWeightRingRelease = 89;
 static constexpr int mxfpProfileOutputReady = 93;
 static constexpr int mxfpProfileTaskEnd = 94;
 static_assert(mxfpProfileTaskEnd < trackProfileEventBase);

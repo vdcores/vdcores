@@ -61,6 +61,7 @@ from dae.instructions import (
     RegStore,
     TmaLoadAddressReg1D,
     TmaLoad1D,
+    TmaLoadMxfpWeightRing5D,
     TmaLoadMxfpScaleBase1D,
     TmaLoadMxfpScale1D,
     TmaLoadReg1D,
@@ -950,6 +951,7 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
 
     monkeypatch.setattr(config, "mxfp_gate_up_direct_output", True)
     monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", False)
+    monkeypatch.setattr(config, "mxfp_gate_up_ldu_weight_ring", False)
     direct = schedule.schedule(0)
     assert len(direct) == 4
     assert all(
@@ -974,6 +976,30 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
     assert queued[1].size == 32768
     assert isinstance(queued[2], TmaStore1D)
     assert queued[2].size == 1536
+
+    monkeypatch.setattr(config, "mxfp_gate_up_direct_output", True)
+    monkeypatch.setattr(config, "mxfp_gate_up_ldu_weight_ring", True)
+    retained = schedule.schedule(0)
+    assert len(retained) == 8
+    for task, output_tile in enumerate((0, 1)):
+        compute, activation, ring, continuation = retained[
+            task * 4 : (task + 1) * 4
+        ]
+        assert isinstance(compute, Mxfp4Mxfp8GateUpSiluFixedRingSm100)
+        assert activation.size == 32768
+        assert isinstance(ring, TmaLoadMxfpWeightRing5D)
+        assert ring.opcode == opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D
+        assert ring.num_slots == TmaLoadMxfpWeightRing5D.RING_SLOTS
+        assert ring.size == gate_tma.arg
+        assert ring.arg == up_tma.arg
+        assert ring.cords == [0, 0, 0, output_tile]
+        assert ring.annotation["fixed_port"] == 0
+        assert (
+            continuation.opcode
+            == opcode.OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D
+        )
+        assert continuation.num_slots == config.num_slots + 8
+        assert continuation.annotation["fixed_port"] == 0
 
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):

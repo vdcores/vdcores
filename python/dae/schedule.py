@@ -2668,7 +2668,7 @@ class SchedMxfp4Mxfp8GemvUmmaK512(Schedule):
 
 
 class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
-    """Task-local fixed weight ring fused through native MXFP8 publication."""
+    """Fused Linear-1 with an optional allocator-owned retained LDU ring."""
 
     TILE_M = SchedMxfp4Mxfp8GemvUmmaK512.TILE_M
     K512_TILES = SchedMxfp4Mxfp8GemvUmmaK512.K512_TILES
@@ -2733,6 +2733,19 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
         self.metadata = metadata
 
     def _validate_tensors(self):
+        if config.mxfp_gate_up_ldu_weight_ring:
+            if self.tile_k != 512 or self.ring_stages != 2:
+                raise ValueError(
+                    "retained LDU weight ring requires K512 with two stages"
+                )
+            if config.mxfp_gate_up_direct_activation:
+                raise ValueError(
+                    "retained LDU weight ring requires allocator-owned activation"
+                )
+            if config.num_slots < 20:
+                raise ValueError(
+                    "retained LDU weight ring requires at least 20 allocator slots"
+                )
         expected_weight_tail = (
             self.k_tiles,
             self.weight_k128_tiles,
@@ -2894,6 +2907,15 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
             instructions.append(
                 TmaLoad1D(self.activation_data.reshape(-1)).fixed_port(1)
             )
+        if config.mxfp_gate_up_ldu_weight_ring:
+            instructions.extend((
+                TmaLoadMxfpWeightRing5D(
+                    self.gate_weight_tma,
+                    self.up_weight_tma,
+                    output_tile,
+                ),
+                TmaLoadMxfpWeightRing5D.continuation(),
+            ))
         if not config.mxfp_gate_up_direct_output:
             instructions.append(TmaStore1D(self.output_record[output_tile]))
         return instructions

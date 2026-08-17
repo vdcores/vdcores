@@ -2,6 +2,8 @@
 
 #include <cuda/atomic>
 
+#include <cutlass/arch/barrier.h>
+
 #include "virtualcore.cuh"
 
 constexpr int kLduRouteCount = 6;
@@ -79,11 +81,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     MInst *st_insts,
     const void *smem_base, const CUtensorMap *tma_descs, int *bars,
+    int *slot_avail,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_barrier,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_publish_barrier,
-#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
     uint64_t *tmem_mma_barriers,
-#endif
     const int port_id
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
@@ -303,6 +304,79 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             m2c.barriers[bar],
             cuda::aligned_size_t<16>(kScaleHalfBytes));
         ++mxScaleTile[operand];
+        break; }
+#endif
+#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
+    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
+      case op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D): {
+        using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+        constexpr int kStages = mxfpLduWeightRingStages;
+        constexpr int kTilesPerProjection = 8;
+        constexpr int kWeightPackedBytes = 32 * 1024;
+        constexpr int kWeightStageBytes = 64 * 1024;
+
+        // Allocation publication is independent of weight readiness. Compute
+        // learns the ring base now, then each UMMA stage waits on weight_full.
+        // The handler owns the lease until every final consumer has produced
+        // the matching resident empty phase.
+        static_cast<void>(m2c.barriers[bar].arrive());
+        produces_compute_operand = false;
+        auto *weight_full = reinterpret_cast<TxBarrier *>(
+            tmem_mma_barriers + mxfpLduWeightRingFullBarrierBase);
+        auto *stage_empty = reinterpret_cast<TxBarrier *>(
+            tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+        auto *weight_ring = static_cast<uint8_t *>(
+            get_slot_address(smem_base, slot));
+        uint32_t empty_phase[kStages] = {};
+
+        #pragma unroll
+        for (int projection = 0; projection < 2; ++projection) {
+          if (projection == 1) {
+            // Keep the lease, barrier phases, and descriptor state in this
+            // LDU invocation. Only the compact queue marker is consumed.
+            m2ld.wait();
+            const LdCmd continuation {
+                .raw = m2ld.data[m2ld.ptr]
+            };
+            static_cast<void>(continuation);
+            m2ld.advance();
+#if defined(DAE_TRACK_PROFILE)
+            ++commands;
+#endif
+          }
+          const uint16_t descriptor_index =
+              projection == 0 ? inst.size : inst.arg;
+          #pragma unroll
+          for (int tile = 0; tile < kTilesPerProjection; ++tile) {
+            const int stage = tile % kStages;
+            stage_empty[stage].wait(empty_phase[stage]);
+            empty_phase[stage] ^= 1U;
+            const uint32_t destination = static_cast<uint32_t>(
+                __cvta_generic_to_shared(
+                    weight_ring + stage * kWeightStageBytes));
+            const uint32_t barrier = static_cast<uint32_t>(
+                __cvta_generic_to_shared(weight_full + stage));
+            asm volatile(
+                "cp.async.bulk.tensor.5d.shared::cluster.global."
+                "mbarrier::complete_tx::bytes "
+                "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
+                :: "r"(destination), "l"(tma_descs + descriptor_index),
+                   "r"(0), "r"(0), "r"(tile), "r"(int(inst.coords[3])),
+                   "r"(barrier)
+                : "memory");
+            weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
+          }
+        }
+
+        #pragma unroll
+        for (int stage = 0; stage < kStages; ++stage) {
+          stage_empty[stage].wait(empty_phase[stage]);
+        }
+        atomicOr(slot_avail, int(mkSlotMask(slot, 16)));
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        g_events[sm_id * numProfileEvents + mxfpProfileWeightRingRelease] =
+            cuda::ptx::get_sreg_globaltimer();
+#endif
         break; }
 #endif
       case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):

@@ -64,8 +64,8 @@ void dae_ffn_linear1_direct_kernel(
   // the allocator arena; the direct task never addresses it.
   task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
       512, mxfpGateUpDirectActivationTiles == 1 ? 3 : 2,
-      8, false>(
-      smem_base, tmem_base_ptr, tma_descs,
+      8, false, false>(
+      smem_base, tmem_base_ptr, nullptr, tma_descs,
       metadata + worker * 128, bars, m2c, c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
       , worker, profile

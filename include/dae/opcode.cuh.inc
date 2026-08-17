@@ -87,6 +87,11 @@ DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_1D, MK_MOP(46, MEM_OP_FLAGS_ALLOCATE))
 // Seed one LDU-local native scale base and issue that operand's first scale
 // TMA. Subsequent compact commands derive addresses without a mailbox read.
 DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
+// Allocate one two-stage, 128-KiB weight ring. LDU0 retains the lease while
+// it streams the gate projection and the following compact continuation
+// streams the up projection through the same local state.
+DAE_OP(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D, MK_MOP(48, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D, MK_MOP(49, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

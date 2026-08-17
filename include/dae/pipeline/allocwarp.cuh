@@ -306,6 +306,20 @@ __device__ __forceinline__ void allocwarp_execute(
           ldu_control_publish_barrier->arrive_and_wait();
         }
         break;
+        case op(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D): {
+          // This compact command carries no allocator lease and no M2C
+          // operand. It stays on LDU0's FIFO so the active retained-ring
+          // handler can consume it as the gate-to-up continuation without
+          // returning through the allocator loop.
+          if (lane_id == 0) {
+            LdCmd ld;
+            ld.init(inst.nslot(), 0, inst.opcode);
+            curld.put(ld.raw);
+            curld.commit();
+            curld.advance();
+          }
+        }
+        break;
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();

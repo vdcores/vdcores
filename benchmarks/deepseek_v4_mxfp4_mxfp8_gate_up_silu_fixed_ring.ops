@@ -1,6 +1,5 @@
-# Ten-stage compute-side weight TMA ring leaves five ordinary allocator slots
-# for one resident 32-KiB activation plus output handoff.
-OP_MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100__K_128__STAGES_10
+# Default standalone Linear-1: allocator activation plus one retained LDU0
+# K512 weight ring shared by gate and up.
 OP_MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100__K_512__STAGES_2
 OP_PROFILE_EVENT
 OP_TERMINATEC

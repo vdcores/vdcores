@@ -145,6 +145,20 @@ void dae2(
           cuda::ptx::space_shared,
           tmem_mma_barriers + mxfp4Mxfp8TmaScaleBarrierBase + i);
     }
+    // The retained LDU weight stages begin empty. LDU0 observes this initial
+    // phase before its first overwrite; compute produces every later empty
+    // phase when the corresponding UMMA bundle retires.
+#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
+    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
+    #pragma unroll
+    for (int i = 0; i < mxfpLduWeightRingStages; ++i) {
+      cuda::ptx::mbarrier_arrive(
+          cuda::ptx::sem_release,
+          cuda::ptx::scope_cta,
+          cuda::ptx::space_shared,
+          tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase + i);
+    }
+#endif
   }
 #else
   if (thread_id == 0) {
@@ -231,11 +245,9 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars, &ldu_control_barrier,
+          smem_base, tma_descs, bars, &slot_avail, &ldu_control_barrier,
           &ldu_control_publish_barrier,
-#if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
           tmem_mma_barriers,
-#endif
           port_id
 #if defined(DAE_TRACK_PROFILE)
           , sm_id, g_events
