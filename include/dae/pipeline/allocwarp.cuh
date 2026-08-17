@@ -49,6 +49,9 @@ __device__ __forceinline__ void allocwarp_execute(
 #if DAE_MXFP_DOWN_LDU_WEIGHT_RING
   uint32_t mx_down_weight_ring_mask = 0;
 #endif
+#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && DAE_MXFP_DOWN_LDU_WEIGHT_RING
+  uint32_t mx_weight_ring_handoff_mask = 0;
+#endif
 
 #if defined(DAE_TRACK_PROFILE)
   uint64_t slot_stall_ns = 0;
@@ -197,6 +200,14 @@ __device__ __forceinline__ void allocwarp_execute(
       mx_down_weight_ring_mask = uint32_t(alloc_mask);
     }
 #endif
+#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && DAE_MXFP_DOWN_LDU_WEIGHT_RING
+    if (di.pred_allocate &&
+        decoded_op == op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D)) {
+      // The allocator keeps the source lease live. The following target is a
+      // non-allocating publication of this same mask to Linear-2 compute.
+      mx_weight_ring_handoff_mask = uint32_t(alloc_mask);
+    }
+#endif
 
     // store the instruction into the slot
     if (di.pred_allocate) {
@@ -343,6 +354,28 @@ __device__ __forceinline__ void allocwarp_execute(
             m2c.put(int(mx_down_weight_ring_mask));
             LdCmd ld;
             ld.init(uint8_t(inst.num_slots), m2c.ptr, inst.opcode);
+            curld.put(ld.raw);
+            m2c.advance();
+            curld.commit();
+            curld.advance();
+          }
+        }
+        break;
+#endif
+#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && DAE_MXFP_DOWN_LDU_WEIGHT_RING
+        case op(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D): {
+          // Preserve the complete target descriptor/task command in the
+          // special mailbox consumed by the still-running LDU0 source. The
+          // down compute consumes the original lease mask. Its persistent
+          // down barrier bank remains separate from the still-retiring gate
+          // stage, so no barrier objects are recreated at the transition.
+          if (lane_id == 0) {
+            const int special_slot = inst.nslot();
+            st_insts[special_slot] = inst;
+            mx_down_weight_ring_mask = mx_weight_ring_handoff_mask;
+            m2c.put(int(mx_down_weight_ring_mask));
+            LdCmd ld;
+            ld.init(uint8_t(special_slot), m2c.ptr, inst.opcode);
             curld.put(ld.raw);
             m2c.advance();
             curld.commit();

@@ -33,6 +33,10 @@ DEFAULT_COMPUTE_OPS_FILE = "dae_compute_ops.vdcore.build"
 COMPUTE_OPS_ENV = "DAE_COMPUTE_OPS"
 COMPUTE_OPS_FILE_ENV = "DAE_COMPUTE_OPS_FILE"
 COMPUTE_OPCODE_BASE = 0x7000
+MXFP_GATE_UP_FIXED_RING_OP = (
+    "OP_MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100__K_512__STAGES_2"
+)
+MXFP_DOWN_FIXED_RING_OP = "OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100"
 
 
 def load_comp_family_definitions(path: Path) -> dict[str, ComputeFamilyDefinition]:
@@ -196,6 +200,26 @@ def select_entries(
             raise ValueError(f"Unknown compute operator {name!r}. Valid compute operators: {valid_names}")
         selected_names.append(name)
     return selected_names, dynamic_entries
+
+
+def order_selected_entries(entries: list[str]) -> list[str]:
+    """Apply measured SASS-layout hints to dispatch and build-local opcodes."""
+    ordered = list(entries)
+    if (
+        MXFP_GATE_UP_FIXED_RING_OP in ordered
+        and MXFP_DOWN_FIXED_RING_OP in ordered
+    ):
+        gate_index = ordered.index(MXFP_GATE_UP_FIXED_RING_OP)
+        down_index = ordered.index(MXFP_DOWN_FIXED_RING_OP)
+        if gate_index < down_index:
+            # ptxas lays the higher-numbered case next to the dispatch loop.
+            # Number down first so the hotter Linear-1 handler remains in the
+            # near block instead of moving behind the large Linear-2 body.
+            ordered[gate_index], ordered[down_index] = (
+                ordered[down_index],
+                ordered[gate_index],
+            )
+    return ordered
 
 
 def build_opcode_order(all_compute_ops: list[str], selected_ops: list[str], dynamic_entries: list[dict[str, int | str]]) -> list[str]:
@@ -460,6 +484,7 @@ def main() -> int:
         family_definitions = load_comp_family_definitions(opcode_registry_path)
         all_compute_ops = load_all_compute_ops(opcode_registry_path)
         selected, dynamic_entries = select_entries(supported_ops, requested_ops, family_definitions)
+        selected = order_selected_entries(selected)
         opcode_order = build_opcode_order(all_compute_ops, selected, dynamic_entries)
         write_selection(output_path, selected, source)
         write_opcode_order(opcode_output_path, opcode_order, source)

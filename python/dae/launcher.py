@@ -65,6 +65,37 @@ class SMInstructionBuilder:
     def add_memory(self, inst : MemoryInstruction):
         self.minsts.append(inst)
 
+    def rewrite_retained_weight_ring_handoffs(self):
+        """Transfer adjacent Linear-1/Linear-2 retained-ring leases.
+
+        Linear-1's compact gate-to-up continuation is part of its one logical
+        ring command. Only the exact ``allocate, continuation, allocate``
+        sequence is eligible; any intervening memory command leaves both
+        operators independently allocated.
+        """
+        flag_mask = (1 << 6) - 1
+        linear1_allocate = (
+            opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D & ~flag_mask
+        )
+        linear1_continue = (
+            opcode.OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D & ~flag_mask
+        )
+        down_allocate = (
+            opcode.OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D & ~flag_mask
+        )
+        for index in range(len(self.minsts) - 2):
+            source, continuation, target = self.minsts[index:index + 3]
+            if (
+                source.opcode & ~flag_mask == linear1_allocate
+                and continuation.opcode & ~flag_mask == linear1_continue
+                and target.opcode & ~flag_mask == down_allocate
+                and source.annotation.get("fixed_port") == 0
+                and continuation.annotation.get("fixed_port") == 0
+                and target.annotation.get("fixed_port") == 0
+            ):
+                self.minsts[index] = source.handoff_source()
+                self.minsts[index + 2] = target.handoff_target()
+
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],
         mtensor : torch.Tensor, mptrs: list[int]):
@@ -254,6 +285,9 @@ class Launcher:
         self._cache_window_requests = []
         self._launch_buffers = None
         self._bar_sources_initialized = False
+        # Lease transfer remains opt-in until it beats independent retained
+        # rings in the complete one-launch FFN schedule.
+        self.rewrite_retained_weight_ring_handoffs = False
 
         runtime.set_smem_size(self.smem_size)
 
@@ -306,6 +340,8 @@ class Launcher:
     def build_instructions(self):
         if self.need_instruction_build:
             for i in range(self.num_sms):
+                if self.rewrite_retained_weight_ring_handoffs:
+                    self.builder[i].rewrite_retained_weight_ring_handoffs()
                 self.builder[i].build(
                     self.cinsts[i,...],
                     self.cptrs,

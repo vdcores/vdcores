@@ -2714,6 +2714,16 @@ class TmaLoadMxfpWeightRing5D(MemoryInstruction):
         )
         return inst.fixed_port(0)
 
+    def handoff_source(self):
+        """Mark this allocating ring as the source of an adjacent transfer."""
+        inst = self.copy()
+        flags = inst.opcode & ((1 << 6) - 1)
+        inst.opcode = (
+            opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D | flags
+        )
+        inst.annotation["weight_ring_handoff"] = "source"
+        return inst
+
 
 class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
     """Retained two-stage K256 weight ring for Linear-2.
@@ -2726,6 +2736,7 @@ class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
     RING_SLOTS = 8
     PACKED_TILE_BYTES = 16 * 1024
     MAX_OUTPUT_TASK = 0xFF
+    HANDOFF_SPECIAL_SLOT = 8
 
     def __init__(self, weight_tma, output_task: int, task_count: int = 1):
         output_task = int(output_task)
@@ -2776,6 +2787,21 @@ class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
             address=0,
         )
         return inst.fixed_port(0)
+
+    def handoff_target(self):
+        """Reuse the preceding lease without recreating resident barriers."""
+        inst = self.copy()
+        flags = inst.opcode & ((1 << 6) - 1)
+        # The complete down command is published through one stable special
+        # mailbox. Its ordinary num_slots field is otherwise an allocation
+        # count, which is intentionally absent for the transfer target.
+        inst.opcode = (
+            opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D
+            | (flags & ~1)
+        )
+        inst.num_slots = config.num_slots + self.HANDOFF_SPECIAL_SLOT
+        inst.annotation["weight_ring_handoff"] = "target"
+        return inst
 
 
 class TmaLoadMxfpScale1D(MemoryInstruction):

@@ -82,12 +82,15 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
     M2LD_Type &m2ld, M2C_Type &m2c,
     const MInst inst, const uint8_t slot, const uint8_t bar,
     const void *smem_base, const CUtensorMap *tma_descs,
-    int *slot_avail, uint64_t *tmem_mma_barriers
+    int *slot_avail,
+    cutlass::arch::ClusterTransactionBarrier *weight_full,
+    cutlass::arch::ClusterTransactionBarrier *stage_empty,
+    uint32_t *empty_phase,
+    const int release_slots
 #if defined(DAE_TRACK_PROFILE)
     , uint64_t &commands
 #endif
     ) {
-  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages = mxfpDownLduWeightRingStages;
   constexpr int kTilesPerTask = 8;
   constexpr int kWeightPackedBytes = 16 * 1024;
@@ -96,13 +99,8 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
   // Publish allocation visibility independently of tile readiness. Each
   // compute task waits on the resident weight-full phases before UMMA.
   static_cast<void>(m2c.barriers[bar].arrive());
-  auto *weight_full = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
-  auto *stage_empty = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
   auto *weight_ring = static_cast<uint8_t *>(
       get_slot_address(smem_base, slot));
-  uint32_t empty_phase[kStages] = {};
   uint8_t output_task = uint8_t(inst.coords[3]);
 
   for (int task = 0; task < int(inst.size); ++task) {
@@ -150,7 +148,9 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
   for (int stage = 0; stage < kStages; ++stage) {
     stage_empty[stage].wait(empty_phase[stage]);
   }
-  atomicOr(slot_avail, int(mkSlotMask(slot, 8)));
+  if (release_slots != 0) {
+    atomicOr(slot_avail, int(mkSlotMask(slot, release_slots)));
+  }
 }
 #endif
 
@@ -386,7 +386,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #endif
 #if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
     !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
-      case op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D): {
+      case op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D):
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+      case op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D):
+#endif
+      {
         using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
         constexpr int kStages = mxfpLduWeightRingStages;
         constexpr int kTilesPerProjection = 8;
@@ -446,11 +450,56 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           }
         }
 
-        #pragma unroll
-        for (int stage = 0; stage < kStages; ++stage) {
-          stage_empty[stage].wait(empty_phase[stage]);
+        const bool transfer_to_down =
+            op(opcode) == op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D);
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+        if (transfer_to_down) {
+          // The following logical ring command is already queued on this
+          // same LDU. Transfer the lease locally and preserve the target's
+          // descriptor/task chain without another allocator transaction.
+          m2ld.wait();
+          const LdCmd handoff {
+              .raw = m2ld.data[m2ld.ptr]
+          };
+          m2ld.advance();
+          const MInst down_inst = st_insts[handoff.slot];
+#if defined(DAE_TRACK_PROFILE)
+          ++commands;
+#endif
+          // A K256 down ring needs only the first 64 KiB of this lease. Wait
+          // for both Linear-1 physical stages before starting its traffic:
+          // issuing after stage 0 alone contends with the gate/up tail and is
+          // measurably slower even though the address ranges are disjoint.
+          #pragma unroll
+          for (int stage = 0; stage < kStages; ++stage) {
+            stage_empty[stage].wait(empty_phase[stage]);
+          }
+          auto *down_weight_full = reinterpret_cast<TxBarrier *>(
+              tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+          auto *down_stage_empty = reinterpret_cast<TxBarrier *>(
+              tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+          uint32_t down_empty_phase[mxfpDownLduWeightRingStages] = {};
+          ldu_execute_mxfp_down_weight_ring(
+              m2ld, m2c, down_inst, slot, handoff.bar,
+              smem_base, tma_descs, slot_avail,
+              down_weight_full, down_stage_empty, down_empty_phase,
+              0
+#if defined(DAE_TRACK_PROFILE)
+              , commands
+#endif
+              );
+          // Down consumed only the first half, but allocator ownership remains
+          // the original 16-slot lease until its last resident phase retires.
+          atomicOr(slot_avail, int(mkSlotMask(slot, 16)));
+        } else
+#endif
+        {
+          #pragma unroll
+          for (int stage = 0; stage < kStages; ++stage) {
+            stage_empty[stage].wait(empty_phase[stage]);
+          }
+          atomicOr(slot_avail, int(mkSlotMask(slot, 16)));
         }
-        atomicOr(slot_avail, int(mkSlotMask(slot, 16)));
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         g_events[sm_id * numProfileEvents + mxfpProfileWeightRingRelease] =
             cuda::ptx::get_sreg_globaltimer();
@@ -459,10 +508,18 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #endif
 #if DAE_MXFP_DOWN_LDU_WEIGHT_RING
       case op(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D): {
+        using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
         produces_compute_operand = false;
+        auto *weight_full = reinterpret_cast<TxBarrier *>(
+            tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+        auto *stage_empty = reinterpret_cast<TxBarrier *>(
+            tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+        uint32_t empty_phase[mxfpDownLduWeightRingStages] = {};
         ldu_execute_mxfp_down_weight_ring(
             m2ld, m2c, inst, slot, bar,
-            smem_base, tma_descs, slot_avail, tmem_mma_barriers
+            smem_base, tma_descs, slot_avail,
+            weight_full, stage_empty, empty_phase,
+            8
 #if defined(DAE_TRACK_PROFILE)
             , commands
 #endif

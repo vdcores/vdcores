@@ -525,7 +525,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
             tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
       }
     } else if (warp >= 2) {
-      #pragma unroll 4
+      #pragma unroll 2
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;
@@ -649,7 +649,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         }
       }
     } else if (warp == 0) {
-      #pragma unroll 4
+      #pragma unroll 2
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;

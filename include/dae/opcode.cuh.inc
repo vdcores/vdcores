@@ -97,6 +97,12 @@ DAE_OP(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D, MK_MOP(49, MEM_OP_FLAGS_NONE))
 // directly in LdCmd::slot; no shared mailbox or issue barrier is involved.
 DAE_OP(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D, MK_MOP(50, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D, MK_MOP(51, MEM_OP_FLAGS_NONE))
+// Python rewrites an adjacent Linear-1 ring followed by a Linear-2 ring into
+// this pair. The first command still allocates; the second transfers that
+// lease inside LDU0 without returning slots to the allocator. Linear-2 uses
+// its already-resident barrier bank, so the transition initializes nothing.
+DAE_OP(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D, MK_MOP(52, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D, MK_MOP(53, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

@@ -72,7 +72,7 @@ from dae.instructions import (
 )
 from dae.runtime import config, opcode
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
-from dae.launcher import Launcher
+from dae.launcher import Launcher, SMInstructionBuilder
 from dae.schedule import (
     Schedule,
     SchedDsv4Fp8QuantUmmaB,
@@ -1069,6 +1069,50 @@ def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
         for index in (1, 3)
     )
     assert [per_task[index].size for index in (1, 3)] == [1, 1]
+
+    gate_weight = torch.empty((1, 8, 4, 128, 64), dtype=torch.uint8)
+    gate_tma = TmaTensor(FakeLauncher(), gate_weight).mxfp4_load(512)
+    source = TmaLoadMxfpWeightRing5D(gate_tma, gate_tma, 0)
+    gate_to_up = TmaLoadMxfpWeightRing5D.continuation()
+    target = ring
+    builder = SMInstructionBuilder(0)
+    builder.add(source)
+    builder.add(gate_to_up)
+    builder.add(target)
+    builder.rewrite_retained_weight_ring_handoffs()
+    rewritten_source, unchanged_continuation, rewritten_target = (
+        builder.minsts
+    )
+    assert (
+        rewritten_source.opcode
+        == opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D
+    )
+    assert rewritten_source.annotation["weight_ring_handoff"] == "source"
+    assert unchanged_continuation is gate_to_up
+    assert (
+        rewritten_target.opcode
+        == opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D
+    )
+    assert rewritten_target.num_slots == config.num_slots + 8
+    assert rewritten_target.size == ring.size
+    assert rewritten_target.arg == ring.arg
+    assert rewritten_target.cords == ring.cords
+    assert rewritten_target.annotation["weight_ring_handoff"] == "target"
+
+    separated = SMInstructionBuilder(0)
+    separated.add(source)
+    separated.add(gate_to_up)
+    separated.add(MemoryInstruction(
+        opcode=opcode.OP_ISSUE_BARRIER,
+        num_slots=0,
+        arg=0,
+        size=0,
+        address=0,
+    ))
+    separated.add(target)
+    separated.rewrite_retained_weight_ring_handoffs()
+    assert separated.minsts[0].opcode == source.opcode
+    assert separated.minsts[-1].opcode == target.opcode
 
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
