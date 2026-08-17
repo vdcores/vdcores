@@ -35,6 +35,26 @@ Primary references:
   - `bar()`
     - upper bits of `num_slots`
 
+### `CommInst`
+
+- independent 16-byte communication format:
+  - `opcode`
+  - `size`
+  - `arg0`
+  - `arg1`
+  - `address`
+- the first four fields are `uint16`; `address` is `uint64`
+- communication opcodes have no memory flags and are consumed only by the
+  optional communication warp
+
+### `PoolInst`
+
+- independent 16-byte pool format with the same field widths as `CommInst`;
+- stored in a separate instruction array and never decoded by the ordinary
+  communication interpreter;
+- each wire opcode selects one compile-time execute-warp type during host
+  kernel assembly.
+
 ## Memory-Opcode Flags
 
 The low 6 opcode bits are flags:
@@ -286,12 +306,99 @@ Barrier behavior for writeback ops:
   - observed effect:
     - allocator bypasses normal slot allocation
     - the pointer becomes available through `st_insts[special_slot].address`
+    - when a schedule adds `WRITEBACK | BARRIER`, compute returns the special
+      slot as an ordinary one-hot `c2m` mask; the store warp performs no copy
+      and decrements the encoded normal barrier
+    - writeback is supported for special slots `24..30`; slots `31..32` are
+      input-only because their one-hot values are not positive signed `c2m`
+      payloads
   - practical meaning:
     - carry raw global pointers through the VM for compute kernels that write or read global memory directly
+
+## Communication Operators
+
+The registry is `include/dae/communication_opcode.cuh.inc`. Python classes are
+`CommunicationInstruction` subclasses. The ordinary runtime exposes the ABI
+but rejects nonempty communication streams because it has no consumer warp.
+
+- `COMM_TERMINATE`: stop the communication PC loop.
+- `COMM_WAIT_BARRIER`: `size` is a local `bars[]` id; wait for zero.
+- `COMM_RECORD_EVENT`: `size` is a per-block profile index; lane 0 records
+  `globaltimer`.
+- `COMM_NVSHMEM_PUT`:
+  - `address` is the same symmetric source/destination address;
+  - `size | arg0 << 16` is bytes;
+  - `arg1[7:0]` is target PE and `arg1[15:8]` is signal id;
+  - warp put-with-signal followed by quiet.
+- `COMM_NVSHMEM_WAIT`: `size` is signal id and `address` is the expected value.
+- `COMM_MEMORY_POOL_SUBMIT`:
+  - `address` is a 128-byte request, `size` its submit signal, `arg0` pool PE;
+  - warp put-with-signal and quiet publishes the mailbox.
+- `COMM_MEMORY_POOL_WAIT`: `address` is the request whose completion sequence
+  is awaited; `arg0` identifies the pool PE, selecting a GPU-scope atomic
+  acquire for a local completion or an NVSHMEM wait for a remote completion.
+- `COMM_MEMORY_POOL_RUN`:
+  - `address` is `MemoryPoolConfig`;
+  - `size | arg0 << 16` is the expected completion count;
+  - lanes poll distinct mailboxes, ballot ready requests, execute one selected
+    request cooperatively, then advance its dependency/completion state.
+## Pool Operators
+
+The registry is `include/dae/pool_opcode.cuh.inc`. Pool operators are
+`PoolInstruction` subclasses and execute only in a kernel assembly containing
+their registered execute-warp type.
+
+- `POOL_SLICE_EXCHANGE` and `POOL_SLICE_WEIGHTED_EXCHANGE` are eight-warp
+  PoolInst program headers:
+  - `address` is a `PoolSliceConfig` pointer;
+  - `size` is the first source-writer chunk barrier;
+  - `arg0` is the first contiguous reader-dispatch barrier;
+  - `arg1` is the first contiguous reader-compute barrier;
+  - host dispatch instantiates the matching generic or weighted execute-warp
+    type and every thread enters it before ordinary VM state is allocated;
+  - following PoolInst slots contain one `DynamicRead<Copy>` for each local
+    expert (`size=local_reader`, `arg0=write barrier`, `arg1=dispatch barrier
+    base`) and, in a weighted program, one `DynamicRead<ReduceAdd>` per static
+    combine plan (`size=plan rank`, `arg0=compute barrier base`);
+  - remote dispatch queue `DATA` metadata is unchanged; the central scheduler
+    maps each ready reader/message pair to its persistent
+    `DynamicRead<Copy>` PoolInst and publishes a stateless HBM-ring job;
+  - for weighted combine, dispatch-derived route metadata is converted locally
+    by `RESERVE_ROUTES` into immutable `DynamicRead<ReduceAdd>` plans while
+    activation DATA is still in flight; every plan names its ordinary
+    compute-barrier subset and static source-row shard, so combine sends no
+    second metadata packet;
+  - Copy and ReduceAdd enter the same stateless pool worker implementation.
+    Copy uses runtime-sized ring batches; after dispatch retirement the central
+    scheduler appends every immutable ReduceAdd plan and a STOP suffix to that
+    same ring. The worker decodes one CTA-uniform PoolInst opcode and calls the
+    narrow copy/reducer helper, so no row loop contains a transform branch;
+  - exact per-reader DATA counters release ordinary dispatch barriers before
+    unrelated queue `END` instructions retire;
+  - it directly PUTs source rows, executes the typed dynamic reads, publishes
+    payload-coupled return groups, and source-scatters/reduces the result;
+  - a fixed pool assembly contains no compute/memory/communication
+    interpreters; a mixed assembly may run them only on other blocks.
+- `POOL_SLICE_GIN_WEIGHTED_EXCHANGE` has the same instruction fields,
+  metadata ABI, `DynamicRead<Copy>`, and `DynamicRead<ReduceAdd>` semantics as
+  the weighted operator. Its execute-warp type is present only in the
+  compile-time NCCL GIN assembly; all remotely accessed objects must be views
+  of its registered HBM window. The raw build changes dispatch WQE formation,
+  not the PoolInst dependency semantics.
+
+Generic dependency semantics are in `memory-pool-protocol.md`. The batched gathered
+read ABI, warp roles, and ordering rules are in `pool-slice-dynamic-read.md`
+and `vdcores-communication-core.md`.
 
 ## Compute Operators
 
 The compute-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/depctg/vdcores/include/dae/opcode.cuh.inc) is larger than the checked-in handler set. The checked-in control-flow opcodes are:
+
+Task device functions under `include/task/` must never use `noinline`, including
+configuration-dependent aliases of it. Keep task entry points force-inlined so
+the selected operator specializes into its VDCores interpreter; isolate large
+runtime roles through compile-time core assembly rather than device calls.
+`tests/test_task_inlining.py` enforces this source contract.
 
 - `OP_TERMINATEC`
 - `OP_LOOPC`

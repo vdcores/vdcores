@@ -1,0 +1,13 @@
+diff --git a/third_party/nvidia/backend/compiler.py b/third_party/nvidia/backend/compiler.py
+index 13bb131..1409ac4 100644
+--- a/third_party/nvidia/backend/compiler.py
++++ b/third_party/nvidia/backend/compiler.py
+@@ -56,6 +56,8 @@ def ptx_get_version(cuda_version) -> int:
+     '''
+     assert isinstance(cuda_version, str)
+     major, minor = map(int, cuda_version.split('.'))
++    if major == 13:
++        return 90 + minor
+     if major == 12:
+         if minor < 6:
+             return 80 + minor

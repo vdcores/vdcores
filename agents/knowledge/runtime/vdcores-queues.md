@@ -37,6 +37,12 @@ If a path pops extra slots and forgets to return them, the allocator eventually 
 - Writeback slots:
   - `c2m.template push<0, true>(thread_id, slot_id)`
 
+Direct-global `RawAddress` inputs arrive from `m2c` as special-slot ids. A
+compute operator that directly writes through one of those pointers converts
+the output id to a one-hot mask before returning it through `c2m`. Writeback
+special slots are therefore limited to `24..30`; slots `31..32` remain usable
+as input pointer carriers only.
+
 The writeback form is required for slots that correspond to `OP_ALLOC_WB_*` memory instructions. Without it, the slot may be freed without the store warp executing the actual global write.
 
 ## Why This Matters In Attention

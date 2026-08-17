@@ -89,7 +89,8 @@ __device__ __forceinline__ void task_rms_norm_f16_from_glob(
     data_t* output_ptr = base_out_ptr + token_id * HIDDIM_SIZE;
     _rms_helper_one_row<HIDDIM_SIZE, nThreads>(base_weights_addr, input_ptr, output_ptr, smem_reduce, epsilon);
   }
-  c2m.template push<31, true, false>(__compute_tid(), out_addr_slot);
+  c2m.template push<31, true, false>(
+      __compute_tid(), 1U << out_addr_slot);
 }
 
 template<int HIDDIM_SIZE, typename data_t,
@@ -131,4 +132,3 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
   c2m.template push<0, true>(thread_id, out_addr_slot);
   c2m.push(thread_id, in_addr_slot | weights_slot);
 }
-

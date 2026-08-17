@@ -273,6 +273,19 @@ DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_64_SW128) {
   task_silu_smem<64>(num_token, layout_sv, smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  task_rms_norm_f16_from_glob<4096, __nv_bfloat16>(
+    smem_base,
+    st_insts,
+    inst.args[0],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
   task_rms_norm_f16_from_smem<4096, __nv_bfloat16>(
