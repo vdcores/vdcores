@@ -2954,6 +2954,8 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         final_output,
         weight_tma,
         metadata,
+        *,
+        retain_weight_ring_between_tasks: bool = True,
     ):
         super().__init__()
         self.weight_data = weight_data
@@ -2962,6 +2964,9 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         self.final_output = final_output
         self.weight_tma = weight_tma
         self.metadata = metadata
+        self.retain_weight_ring_between_tasks = bool(
+            retain_weight_ring_between_tasks
+        )
 
     def _on_place(self):
         if (
@@ -2984,6 +2989,26 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         if self.tasks % self.DOWN_TILES_PER_EXPERT:
             raise ValueError("down task count must contain complete experts")
         self.experts = self.tasks // self.DOWN_TILES_PER_EXPERT
+        self.ldu_weight_ring = bool(
+            getattr(config, "mxfp_down_ldu_weight_ring", False)
+        )
+        if self.ldu_weight_ring:
+            if self.tasks > TmaLoadMxfpDownWeightRing5D.MAX_OUTPUT_TASK + 1:
+                raise ValueError(
+                    "retained down weight ring supports at most 256 tasks"
+                )
+            if config.num_slots < TmaLoadMxfpDownWeightRing5D.RING_SLOTS:
+                raise ValueError(
+                    "retained down weight ring requires eight allocator slots"
+                )
+            scratch_bytes = (
+                config.dynamic_smem_size
+                - config.num_slots * config.slot_size
+            )
+            if scratch_bytes < 16 * 1024:
+                raise ValueError(
+                    "retained down task requires 16 KiB after the allocator"
+                )
         if not 0 < self.num_sms <= self.tasks:
             raise ValueError("down projection needs 1..task-count SMs")
         if (
@@ -3060,19 +3085,45 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         tile_count = tiles_per_sm + int(sm < extra)
         return tile_start, tile_count
 
-    def _task_instructions(self, task):
-        return [
+    def _task_instructions(self, task, weight_command=None):
+        instructions = [
             Mxfp4Mxfp8DownFixedRingSm100(
                 self.metadata[task].data_ptr()
             )
         ]
+        if weight_command is not None:
+            instructions.append(weight_command)
+        return instructions
 
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
         instructions = []
-        for task in self.task_queues[sm]:
-            instructions.extend(self._task_instructions(task))
+        task_queue = self.task_queues[sm]
+        for task_index, task in enumerate(task_queue):
+            weight_command = None
+            if self.ldu_weight_ring:
+                if (
+                    self.retain_weight_ring_between_tasks
+                    and task_index != 0
+                ):
+                    weight_command = (
+                        TmaLoadMxfpDownWeightRing5D.continuation(task)
+                    )
+                else:
+                    task_count = (
+                        len(task_queue)
+                        if self.retain_weight_ring_between_tasks
+                        else 1
+                    )
+                    weight_command = TmaLoadMxfpDownWeightRing5D(
+                        self.weight_tma,
+                        task,
+                        task_count=task_count,
+                    )
+            instructions.extend(
+                self._task_instructions(task, weight_command)
+            )
         return instructions
 
 

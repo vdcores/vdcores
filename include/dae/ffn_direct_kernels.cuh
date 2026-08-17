@@ -123,10 +123,10 @@ void dae_ffn_down_direct_kernel(
   const auto *second_metadata =
       metadata + (worker + int(gridDim.x)) * 128;
   if (threadIdx.x < 128) {
-    task_mxfp4_mxfp8_down_fixed_ring_sm100<
-        8, 2, 256, 1, kDownTmemColumnsPerTask,
-        0, kDownScratchBytes, 0>(
-        smem_base, tmem_base_ptr, tma_descs,
+      task_mxfp4_mxfp8_down_fixed_ring_sm100<
+          8, 2, 256, 1, kDownTmemColumnsPerTask,
+          0, kDownScratchBytes, 0, false>(
+          smem_base, tmem_base_ptr, nullptr, tma_descs,
         first_metadata, bars, m2c, c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         , worker, profile
@@ -134,10 +134,11 @@ void dae_ffn_down_direct_kernel(
     );
   } else {
     if (*reinterpret_cast<const uint64_t *>(second_metadata) != 0) {
-      task_mxfp4_mxfp8_down_fixed_ring_sm100<
-          8, 2, 256, 2, kDownTmemColumnsPerTask,
-          kDownScratchBytes, 2 * kDownScratchBytes, 128>(
-          smem_base, tmem_base_ptr + kDownTmemColumnsPerTask, tma_descs,
+        task_mxfp4_mxfp8_down_fixed_ring_sm100<
+            8, 2, 256, 2, kDownTmemColumnsPerTask,
+            kDownScratchBytes, 2 * kDownScratchBytes, 128, false>(
+            smem_base, tmem_base_ptr + kDownTmemColumnsPerTask,
+            nullptr, tma_descs,
           second_metadata, bars, m2c, c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
           , worker, profile

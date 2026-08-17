@@ -9,11 +9,13 @@
 template <int KBundles, int RingStages, int BundleK,
           int SyncBarrierId, int TmemColumns,
           int ScratchOffsetBytes, int ScratchCapacityBytes, int ThreadOffset,
+          bool UseLduWeightRing,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_down_fixed_ring_sm100(
     void *smem_base,
     uint32_t tmem_base_ptr,
+    uint64_t *resident_mma_barriers,
     const CUtensorMap *tma_descs,
     const uint8_t *metadata,
     int *global_bars,
@@ -39,6 +41,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   static_assert(KBundles == 2 || KBundles == 4 || KBundles == 8);
   static_assert(RingStages == 1 || RingStages == 2);
   static_assert(BundleK == 256 || BundleK == 512);
+  static_assert(!UseLduWeightRing || (RingStages == 2 && BundleK == 256));
   constexpr int kTotalK = KBundles * kBundleK;
   constexpr int kNumKTiles = kTotalK / kBundleK;
   constexpr int kRingStages = RingStages;
@@ -123,7 +126,6 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   const int tid = __compute_tid() - ThreadOffset;
   const int warp = tid / numThreadsPerWarp;
   const int lane = tid & (numThreadsPerWarp - 1);
-  (void)m2c;
   (void)c2m;
 
   const auto *weight_scale_global = reinterpret_cast<const uint8_t *>(
@@ -206,10 +208,13 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   constexpr int kActivationRingBytes =
       kRingStages * kActivationStageBytes;
   constexpr int kScaleRingBytes = kRingStages * kScaleStageBytes;
-  constexpr int kBarrierBytes =
-      4 * kRingStages * int(sizeof(TxBarrier));
+  constexpr int kLocalWeightRingBytes =
+      UseLduWeightRing ? 0 : kWeightRingBytes;
+  constexpr int kLocalBarrierArrays = UseLduWeightRing ? 2 : 4;
+  constexpr int kBarrierBytes = kLocalBarrierArrays * kRingStages *
+      int(sizeof(TxBarrier));
   constexpr int kOutputOffsetUnaligned =
-      kScaleRingBytes + kActivationRingBytes + kWeightRingBytes +
+      kScaleRingBytes + kActivationRingBytes + kLocalWeightRingBytes +
       kBarrierBytes;
   constexpr int kOutputOffset =
       (kOutputOffsetUnaligned + 127) & ~127;
@@ -223,54 +228,77 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       static_cast<uint8_t *>(smem_base) + ScratchOffsetBytes;
   auto *scale_ring = fixed_base;
   auto *activation_ring = scale_ring + kScaleRingBytes;
-  auto *weight_ring = activation_ring + kActivationRingBytes;
-  auto *weight_full = reinterpret_cast<TxBarrier *>(
-      weight_ring + kWeightRingBytes);
-  auto *operand_full = weight_full + kRingStages;
-  auto *umma_full = operand_full + kRingStages;
-  auto *stage_empty = umma_full + kRingStages;
+  auto *local_weight_ring = activation_ring + kActivationRingBytes;
+  auto *local_barriers = reinterpret_cast<TxBarrier *>(
+      local_weight_ring + kLocalWeightRingBytes);
+  uint8_t *weight_ring;
+  TxBarrier *weight_full;
+  TxBarrier *operand_full;
+  TxBarrier *umma_full;
+  TxBarrier *stage_empty;
+  if constexpr (UseLduWeightRing) {
+    const int weight_slot_mask = m2c.template pop<0>();
+    weight_ring = static_cast<uint8_t *>(
+        get_slot_address(smem_base, extract(weight_slot_mask)));
+    weight_full = reinterpret_cast<TxBarrier *>(
+        resident_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+    operand_full = local_barriers;
+    umma_full = operand_full + kRingStages;
+    stage_empty = reinterpret_cast<TxBarrier *>(
+        resident_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+  } else {
+    weight_ring = local_weight_ring;
+    weight_full = local_barriers;
+    operand_full = weight_full + kRingStages;
+    umma_full = operand_full + kRingStages;
+    stage_empty = umma_full + kRingStages;
+  }
   auto *output_smem = reinterpret_cast<float *>(fixed_base + kOutputOffset);
 
   if (warp == 1 && lane == 0) {
     #pragma unroll
     for (int stage = 0; stage < kRingStages; ++stage) {
-      weight_full[stage].init(1);
+      if constexpr (!UseLduWeightRing) {
+        weight_full[stage].init(1);
+        stage_empty[stage].init(1);
+      }
       operand_full[stage].init(2);
       umma_full[stage].init(1);
-      stage_empty[stage].init(1);
     }
     cutlass::arch::fence_barrier_init();
   }
   __sync_barrier<SyncBarrierId, 128>();
 
   if (warp == 1) {
-    if (elect_one_sync()) {
-      #pragma unroll
-      for (int tile = 0; tile < kNumKTiles; ++tile) {
-        const int stage = tile % kRingStages;
-        const int phase = (tile / kRingStages) & 1;
-        if (tile >= kRingStages) {
-          stage_empty[stage].wait(phase ^ 1);
+    if constexpr (!UseLduWeightRing) {
+      if (elect_one_sync()) {
+        #pragma unroll
+        for (int tile = 0; tile < kNumKTiles; ++tile) {
+          const int stage = tile % kRingStages;
+          const int phase = (tile / kRingStages) & 1;
+          if (tile >= kRingStages) {
+            stage_empty[stage].wait(phase ^ 1);
+          }
+          const uint32_t destination = static_cast<uint32_t>(
+              __cvta_generic_to_shared(
+                  weight_ring + stage * kWeightStageBytes));
+          const uint32_t barrier = static_cast<uint32_t>(
+              __cvta_generic_to_shared(weight_full + stage));
+          const int weight_coord3 =
+              weight_k_tile_major ? int(output_task) : k_start_tile + tile;
+          const int weight_coord4 =
+              weight_k_tile_major ? k_start_tile + tile : int(output_task);
+          asm volatile(
+              "cp.async.bulk.tensor.5d.shared::cluster.global."
+              "mbarrier::complete_tx::bytes "
+              "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
+              :: "r"(destination), "l"(tma_descs + weight_tma_index),
+                 "r"(0), "r"(0), "r"(weight_coord3),
+                 "r"(weight_coord4),
+                 "r"(barrier)
+              : "memory");
+          weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
         }
-        const uint32_t destination = static_cast<uint32_t>(
-            __cvta_generic_to_shared(
-                weight_ring + stage * kWeightStageBytes));
-        const uint32_t barrier = static_cast<uint32_t>(
-            __cvta_generic_to_shared(weight_full + stage));
-        const int weight_coord3 =
-            weight_k_tile_major ? int(output_task) : k_start_tile + tile;
-        const int weight_coord4 =
-            weight_k_tile_major ? k_start_tile + tile : int(output_task);
-        asm volatile(
-            "cp.async.bulk.tensor.5d.shared::cluster.global."
-            "mbarrier::complete_tx::bytes "
-            "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
-            :: "r"(destination), "l"(tma_descs + weight_tma_index),
-               "r"(0), "r"(0), "r"(weight_coord3),
-               "r"(weight_coord4),
-               "r"(barrier)
-            : "memory");
-        weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
       }
     }
   } else if (warp == 2) {
@@ -288,7 +316,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
         }
       }
       if (tile >= kRingStages) {
-        stage_empty[stage].wait(phase ^ 1);
+        stage_empty[stage].wait(
+            phase ^ (UseLduWeightRing ? 0 : 1));
       }
       dae_mxfp_cp_async_scale_stage<kSfaStageBytes>(
           weight_scale_global + tile * weight_scale_tile_stride,
@@ -328,7 +357,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       const int stage = tile % kRingStages;
       const int phase = (tile / kRingStages) & 1;
       if (tile >= kRingStages) {
-        stage_empty[stage].wait(phase ^ 1);
+        stage_empty[stage].wait(
+            phase ^ (UseLduWeightRing ? 0 : 1));
       }
       if (blockwise_ready && ready_bar != 0xFFFFFFFFU) {
         if (lane == 0) {
@@ -464,8 +494,10 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   constexpr int kLastTile = kNumKTiles - 1;
   constexpr int kLastStage = kLastTile % kRingStages;
   constexpr int kLastPhase = (kLastTile / kRingStages) & 1;
-  if (warp == 1) {
-    stage_empty[kLastStage].wait(kLastPhase);
+  if constexpr (!UseLduWeightRing) {
+    if (warp == 1) {
+      stage_empty[kLastStage].wait(kLastPhase);
+    }
   }
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __sync_barrier<SyncBarrierId, 128>();

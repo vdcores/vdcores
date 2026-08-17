@@ -76,6 +76,84 @@ __device__ __forceinline__ uint64_t ldu_resolve_routed_address(
       pointer_table + expert * field_stride + pointer_field);
 }
 
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+template<typename M2LD_Type, typename M2C_Type>
+__device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
+    M2LD_Type &m2ld, M2C_Type &m2c,
+    const MInst inst, const uint8_t slot, const uint8_t bar,
+    const void *smem_base, const CUtensorMap *tma_descs,
+    int *slot_avail, uint64_t *tmem_mma_barriers
+#if defined(DAE_TRACK_PROFILE)
+    , uint64_t &commands
+#endif
+    ) {
+  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+  constexpr int kStages = mxfpDownLduWeightRingStages;
+  constexpr int kTilesPerTask = 8;
+  constexpr int kWeightPackedBytes = 16 * 1024;
+  constexpr int kWeightStageBytes = 32 * 1024;
+
+  // Publish allocation visibility independently of tile readiness. Each
+  // compute task waits on the resident weight-full phases before UMMA.
+  static_cast<void>(m2c.barriers[bar].arrive());
+  auto *weight_full = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+  auto *stage_empty = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+  auto *weight_ring = static_cast<uint8_t *>(
+      get_slot_address(smem_base, slot));
+  uint32_t empty_phase[kStages] = {};
+  uint8_t output_task = uint8_t(inst.coords[3]);
+
+  for (int task = 0; task < int(inst.size); ++task) {
+    if (task != 0) {
+      // The allocator warp reserved this task's M2C entry and embedded its
+      // output tile directly in the command. Descriptor, ring, and phase state
+      // remain local to this long-running LDU invocation.
+      m2ld.wait();
+      const LdCmd continuation {
+          .raw = m2ld.data[m2ld.ptr]
+      };
+      m2ld.advance();
+      output_task = continuation.slot;
+      static_cast<void>(m2c.barriers[continuation.bar].arrive());
+#if defined(DAE_TRACK_PROFILE)
+      ++commands;
+#endif
+    }
+
+    #pragma unroll
+    for (int tile = 0; tile < kTilesPerTask; ++tile) {
+      const int stage = tile % kStages;
+      stage_empty[stage].wait(empty_phase[stage]);
+      empty_phase[stage] ^= 1U;
+      const uint32_t destination = static_cast<uint32_t>(
+          __cvta_generic_to_shared(
+              weight_ring + stage * kWeightStageBytes));
+      const uint32_t barrier = static_cast<uint32_t>(
+          __cvta_generic_to_shared(weight_full + stage));
+      asm volatile(
+          "cp.async.bulk.tensor.5d.shared::cluster.global."
+          "mbarrier::complete_tx::bytes "
+          "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
+          :: "r"(destination), "l"(tma_descs + inst.arg),
+             "r"(0), "r"(0), "r"(tile), "r"(int(output_task)),
+             "r"(barrier)
+          : "memory");
+      weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
+    }
+  }
+
+  // This is the lease's true last-use point: both final stage-empty phases
+  // prove that no UMMA can still read either 32-KiB half.
+  #pragma unroll
+  for (int stage = 0; stage < kStages; ++stage) {
+    stage_empty[stage].wait(empty_phase[stage]);
+  }
+  atomicOr(slot_avail, int(mkSlotMask(slot, 8)));
+}
+#endif
+
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
@@ -377,6 +455,18 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         g_events[sm_id * numProfileEvents + mxfpProfileWeightRingRelease] =
             cuda::ptx::get_sreg_globaltimer();
 #endif
+        break; }
+#endif
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+      case op(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D): {
+        produces_compute_operand = false;
+        ldu_execute_mxfp_down_weight_ring(
+            m2ld, m2c, inst, slot, bar,
+            smem_base, tma_descs, slot_avail, tmem_mma_barriers
+#if defined(DAE_TRACK_PROFILE)
+            , commands
+#endif
+            );
         break; }
 #endif
       case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):

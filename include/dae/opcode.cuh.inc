@@ -92,6 +92,11 @@ DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
 // streams the up projection through the same local state.
 DAE_OP(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D, MK_MOP(48, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D, MK_MOP(49, MEM_OP_FLAGS_NONE))
+// Allocate one two-stage, 64-KiB Linear-2 weight ring. Continuations publish
+// the retained lease to the next compute task and carry its output tile ID
+// directly in LdCmd::slot; no shared mailbox or issue barrier is involved.
+DAE_OP(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D, MK_MOP(50, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D, MK_MOP(51, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

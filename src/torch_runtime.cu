@@ -1068,6 +1068,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfpGateUpDirectActivationEnabled;
   config.attr("mxfp_gate_up_ldu_weight_ring") =
       mxfpGateUpLduWeightRingEnabled;
+  config.attr("mxfp_down_ldu_weight_ring") =
+      mxfpDownLduWeightRingEnabled;
   config.attr("mxfp_gate_up_direct_activation_tiles") =
       mxfpGateUpDirectActivationTiles;
   config.attr("mxfp_gate_up_fixed_output_rows") =

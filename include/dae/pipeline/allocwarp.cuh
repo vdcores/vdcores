@@ -46,6 +46,9 @@ __device__ __forceinline__ void allocwarp_execute(
 #if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
   bool mx_scale_bases_inflight = false;
 #endif
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+  uint32_t mx_down_weight_ring_mask = 0;
+#endif
 
 #if defined(DAE_TRACK_PROFILE)
   uint64_t slot_stall_ns = 0;
@@ -185,6 +188,16 @@ __device__ __forceinline__ void allocwarp_execute(
     // if not stall we continue to execute memory or compute insts
     next_pc = pc + 1;
 
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+    if (di.pred_allocate &&
+        decoded_op == op(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D)) {
+      // Continuations do not allocate. Keep the original lease mask in the
+      // allocator warp so each compact command can publish that same storage
+      // to its matching compute task while LDU0 retains ownership.
+      mx_down_weight_ring_mask = uint32_t(alloc_mask);
+    }
+#endif
+
     // store the instruction into the slot
     if (di.pred_allocate) {
       // parallel_copy<sizeof(MInst)>(lane_id, &inst, &st_insts[di.slot_alloc]);
@@ -320,6 +333,24 @@ __device__ __forceinline__ void allocwarp_execute(
           }
         }
         break;
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+        case op(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D): {
+          // Reserve one ordinary M2C publication for the next compute task,
+          // but keep the eight physical slots leased to the active LDU0
+          // handler. The next output-task coordinate travels directly in the
+          // compact LdCmd slot byte, so no special mailbox is rewritten.
+          if (lane_id == 0) {
+            m2c.put(int(mx_down_weight_ring_mask));
+            LdCmd ld;
+            ld.init(uint8_t(inst.num_slots), m2c.ptr, inst.opcode);
+            curld.put(ld.raw);
+            m2c.advance();
+            curld.commit();
+            curld.advance();
+          }
+        }
+        break;
+#endif
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();

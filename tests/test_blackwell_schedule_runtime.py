@@ -44,6 +44,7 @@ from dae.instructions import (
     Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100,
     Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100,
     Mxfp4Mxfp8GateUpSiluFixedRingSm100,
+    Mxfp4Mxfp8DownFixedRingSm100,
     Nvfp4GemvSm100,
     Nvfp4GemvUmmaK512Fp32Sm100,
     Nvfp4GemvUmmaPipelineSm100,
@@ -62,6 +63,7 @@ from dae.instructions import (
     TmaLoadAddressReg1D,
     TmaLoad1D,
     TmaLoadMxfpWeightRing5D,
+    TmaLoadMxfpDownWeightRing5D,
     TmaLoadMxfpScaleBase1D,
     TmaLoadMxfpScale1D,
     TmaLoadReg1D,
@@ -85,6 +87,7 @@ from dae.schedule import (
     SchedFp8GemvUmmaSplitK,
     SchedMxfp4Mxfp8GemvUmmaK512,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
+    SchedMxfp4Mxfp8DownFixedRing,
     SchedDsv4ZeroFill,
     SchedDsv4Fp32ToBf16,
     SchedAttentionDecoding,
@@ -1000,6 +1003,72 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
         )
         assert continuation.num_slots == config.num_slots + 8
         assert continuation.annotation["fixed_port"] == 0
+
+
+def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        config, "mxfp_down_ldu_weight_ring", True, raising=False
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 11
+
+    experts = 2
+    tasks = experts * 32
+    weight = torch.empty((tasks, 8, 2, 128, 64), dtype=torch.uint8)
+    scale = torch.empty((tasks, 8, 1024), dtype=torch.uint8)
+    activation = torch.empty((experts, 16, 1536), dtype=torch.uint8)
+    output = torch.empty((32, 128, 8), dtype=torch.float32)
+    metadata = torch.empty((tasks, 128), dtype=torch.uint8)
+    weight_tma = TmaTensor(FakeLauncher(), weight).mxfp4_load(256)
+
+    retained = SchedMxfp4Mxfp8DownFixedRing(
+        weight,
+        scale,
+        activation,
+        output,
+        weight_tma,
+        metadata,
+        retain_weight_ring_between_tasks=True,
+    ).place(32)
+    instructions = retained.schedule(0)
+    assert len(instructions) == 4
+    first_compute, ring, second_compute, continuation = instructions
+    assert isinstance(first_compute, Mxfp4Mxfp8DownFixedRingSm100)
+    assert isinstance(second_compute, Mxfp4Mxfp8DownFixedRingSm100)
+    assert isinstance(ring, TmaLoadMxfpDownWeightRing5D)
+    assert ring.num_slots == TmaLoadMxfpDownWeightRing5D.RING_SLOTS
+    assert ring.size == 2
+    assert ring.arg == weight_tma.arg
+    assert ring.cords == [0, 0, 0, 0]
+    assert ring.annotation["fixed_port"] == 0
+    assert (
+        continuation.opcode
+        == opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D
+    )
+    assert continuation.num_slots == 32
+    assert continuation.annotation["fixed_port"] == 0
+
+    per_task = SchedMxfp4Mxfp8DownFixedRing(
+        weight,
+        scale,
+        activation,
+        output,
+        weight_tma,
+        metadata,
+        retain_weight_ring_between_tasks=False,
+    ).place(32).schedule(0)
+    assert len(per_task) == 4
+    assert all(
+        isinstance(per_task[index], TmaLoadMxfpDownWeightRing5D)
+        for index in (1, 3)
+    )
+    assert [per_task[index].size for index in (1, 3)] == [1, 1]
 
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):

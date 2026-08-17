@@ -2715,6 +2715,69 @@ class TmaLoadMxfpWeightRing5D(MemoryInstruction):
         return inst.fixed_port(0)
 
 
+class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
+    """Retained two-stage K256 weight ring for Linear-2.
+
+    One allocating command owns the 64-KiB ring for ``task_count`` sequential
+    down tasks on the same worker. Compact continuations publish that same
+    lease to compute and carry the next task coordinate directly to LDU0.
+    """
+
+    RING_SLOTS = 8
+    PACKED_TILE_BYTES = 16 * 1024
+    MAX_OUTPUT_TASK = 0xFF
+
+    def __init__(self, weight_tma, output_task: int, task_count: int = 1):
+        output_task = int(output_task)
+        task_count = int(task_count)
+        expected_base = [0, 0, 0, output_task]
+        expected_next = [0, 0, 1, output_task]
+        if not 0 <= output_task <= self.MAX_OUTPUT_TASK:
+            raise ValueError("retained down output task must fit uint8")
+        if not 1 <= task_count <= 0xFFFF:
+            raise ValueError("retained down task count must fit positive uint16")
+        if (
+            weight_tma is None
+            or getattr(weight_tma, "rank", None) != 5
+            or getattr(weight_tma, "size", None) != self.PACKED_TILE_BYTES
+            or getattr(weight_tma, "num_slots", None) != 4
+        ):
+            raise ValueError(
+                "retained down weight ring requires a K256 MXFP4 TMA"
+            )
+        if (
+            weight_tma.cord2tma(output_task, 0) != expected_base
+            or weight_tma.cord2tma(output_task, 1) != expected_next
+        ):
+            raise ValueError(
+                "retained down weight ring requires task-major "
+                "[M tile,K tile] TMA coordinates"
+            )
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D,
+            num_slots=self.RING_SLOTS,
+            size=task_count,
+            arg=weight_tma.arg,
+            cords=expected_base,
+        )
+        self.fixed_port(0)
+
+    @classmethod
+    def continuation(cls, output_task: int):
+        output_task = int(output_task)
+        if not 0 <= output_task <= cls.MAX_OUTPUT_TASK:
+            raise ValueError("retained down output task must fit uint8")
+        inst = MemoryInstruction(
+            opcode=opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D,
+            # This is a compact command payload, not an allocation request.
+            num_slots=output_task,
+            arg=0,
+            size=0,
+            address=0,
+        )
+        return inst.fixed_port(0)
+
+
 class TmaLoadMxfpScale1D(MemoryInstruction):
     """Compact TMA of one native scale half from an LDU-cached base."""
 
@@ -3159,6 +3222,7 @@ __all__ = [
     "RegLoad",
     "TmaLoad1D",
     "TmaLoadMxfpWeightRing5D",
+    "TmaLoadMxfpDownWeightRing5D",
     "TmaLoadMxfpScale1D",
     "TmaLoadMxfpScaleBase1D",
     "TmaLoad64K1D",

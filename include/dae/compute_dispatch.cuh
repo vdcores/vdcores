@@ -96,30 +96,42 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ZERO_FILL) {
 
 DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
-             tmem_mma_barrier, tmem_mma_phase,
+             tmem_mma_phase,
              fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask,
              scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   const uint64_t metadata_address = uint64_t(inst.args[0]) |
       (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
   const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);
-  // Keep the allocator's physical slot arena intact and place the optimized
-  // K256 task-local ring behind it.  Movement remains task-owned, but the
-  // task can now execute in the resident one-CTA-per-SM scheduler without
-  // aliasing allocator slots or changing their ownership protocol.
-  if constexpr (
-      dynamicSmemBytes - numSlots * slotSizeKb * 1024 >= 80 * 1024) {
+  if constexpr (mxfpDownLduWeightRingEnabled) {
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
-        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0>(
-        smem_base, tmem_base_ptr, tma_descs, metadata, global_bars,
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true>(
+        smem_base, tmem_base_ptr, tmem_mma_barrier,
+        tma_descs, metadata, global_bars,
         m2c, c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         , sm_id, g_events
 #endif
         );
   } else {
-    asm volatile("trap;");
+    // Keep the allocator's physical slot arena intact and place the complete
+    // task-owned K256 ring behind it for the A/B control build.
+    if constexpr (
+        dynamicSmemBytes - numSlots * slotSizeKb * 1024 >= 80 * 1024) {
+      task_mxfp4_mxfp8_down_fixed_ring_sm100<
+          8, 2, 256, __bar_cgroup, 512,
+          numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, false>(
+          smem_base, tmem_base_ptr, tmem_mma_barrier,
+          tma_descs, metadata, global_bars,
+          m2c, c2m
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+          , sm_id, g_events
+#endif
+          );
+    } else {
+      asm volatile("trap;");
+    }
   }
 #endif
 }

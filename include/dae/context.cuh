@@ -161,8 +161,27 @@ static constexpr int mxfpLduWeightRingFullBarrierBase =
     mxfpLduWeightRingBarrierBase;
 static constexpr int mxfpLduWeightRingEmptyBarrierBase =
     mxfpLduWeightRingBarrierBase + mxfpLduWeightRingStages;
-static constexpr int tmemMmaBarrierCount =
+// Linear-2 uses a smaller two-stage M128/K256 ring. Its weights are delivered
+// by LDU0 while scales and native Linear-1 activation records stay task-owned.
+#ifndef DAE_MXFP_DOWN_LDU_WEIGHT_RING
+#define DAE_MXFP_DOWN_LDU_WEIGHT_RING 1
+#endif
+static constexpr bool mxfpDownLduWeightRingEnabled =
+    DAE_MXFP_DOWN_LDU_WEIGHT_RING != 0;
+static constexpr int mxfpDownLduWeightRingStages = 2;
+static constexpr int mxfpDownLduWeightRingBarrierBase =
     mxfpLduWeightRingBarrierBase + mxfpLduWeightRingBarrierCount;
+static constexpr int mxfpDownLduWeightRingBarrierCount =
+    mxfpDownLduWeightRingEnabled ? 2 * mxfpDownLduWeightRingStages : 0;
+static constexpr int mxfpDownLduWeightRingFullBarrierBase =
+    mxfpDownLduWeightRingBarrierBase;
+static constexpr int mxfpDownLduWeightRingEmptyBarrierBase =
+    mxfpDownLduWeightRingBarrierBase + mxfpDownLduWeightRingStages;
+static_assert(
+    !mxfpDownLduWeightRingEnabled || numSlots >= 8,
+    "retained LDU down weight ring needs eight allocator slots");
+static constexpr int tmemMmaBarrierCount =
+    mxfpDownLduWeightRingBarrierBase + mxfpDownLduWeightRingBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);

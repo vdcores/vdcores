@@ -159,6 +159,19 @@ void dae2(
           tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase + i);
     }
 #endif
+#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+    // The retained Linear-2 stages use the same ownership protocol: LDU0
+    // waits for an empty phase before overwriting and compute returns that
+    // phase immediately after the corresponding UMMA bundle retires.
+    #pragma unroll
+    for (int i = 0; i < mxfpDownLduWeightRingStages; ++i) {
+      cuda::ptx::mbarrier_arrive(
+          cuda::ptx::sem_release,
+          cuda::ptx::scope_cta,
+          cuda::ptx::space_shared,
+          tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase + i);
+    }
+#endif
   }
 #else
   if (thread_id == 0) {

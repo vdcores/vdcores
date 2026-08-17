@@ -101,6 +101,11 @@ if os.environ.get("DAE_MXFP_GATE_UP_LDU_WEIGHT_RING"):
         "-DDAE_MXFP_GATE_UP_LDU_WEIGHT_RING="
         + os.environ["DAE_MXFP_GATE_UP_LDU_WEIGHT_RING"]
     )
+if os.environ.get("DAE_MXFP_DOWN_LDU_WEIGHT_RING"):
+    cuda_defines.append(
+        "-DDAE_MXFP_DOWN_LDU_WEIGHT_RING="
+        + os.environ["DAE_MXFP_DOWN_LDU_WEIGHT_RING"]
+    )
 if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES"):
     cuda_defines.append(
         "-DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES="
