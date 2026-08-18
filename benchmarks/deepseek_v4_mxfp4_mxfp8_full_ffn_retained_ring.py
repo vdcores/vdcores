@@ -416,6 +416,9 @@ def main() -> None:
     resident_down_split_ldu = bool(
         runtime.config.mxfp_resident_down_split_ldu
     )
+    resident_fast_queue_init = bool(
+        runtime.config.mxfp_resident_fast_queue_init
+    )
     fast_memory_dispatch = bool(
         runtime.config.mxfp_resident_ffn_fast_memory_dispatch
     )
@@ -883,6 +886,7 @@ def main() -> None:
         f"overlap_down_prefetch={str(overlap_down_prefetch).lower()} "
         f"resident_down_pair_zero={str(resident_down_pair_zero).lower()} "
         f"resident_down_split_ldu={str(resident_down_split_ldu).lower()} "
+        f"resident_fast_queue_init={str(resident_fast_queue_init).lower()} "
         f"fast_memory_dispatch={str(fast_memory_dispatch).lower()} "
         f"ldu1_zero={str(ldu1_zero).lower()} "
         f"ring_handoff={str(args.ring_handoff).lower()} "

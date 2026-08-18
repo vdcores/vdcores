@@ -88,15 +88,26 @@ void dae2(
   __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_barrier;
   __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_publish_barrier;
   assert(numQueueElements <= blockDim.x && "Too many slots for barriers");
-  if (threadIdx.x < numQueueElements) {
-    init(&barriers[0][threadIdx.x], numThreadsM2CBarrier);
-    init(&barriers[1][threadIdx.x], numThreadsC2MBarrier);
-    init(&barriers[2][threadIdx.x], numThreadsLDBarrier);
-    init(&barriers[3][threadIdx.x], numThreadsLDBarrier);
-  }
-  if (threadIdx.x == 0) {
-    init(&ldu_control_barrier, 2);
-    init(&ldu_control_publish_barrier, numThreadsPerWarp + 2);
+  if constexpr (mxfpResidentFastQueueInitEnabled) {
+    if (threadIdx.x == 0) {
+      init(&barriers[1][0], numThreadsC2MBarrier);
+      init(&barriers[2][0], numThreadsLDBarrier);
+      init(&barriers[3][0], numThreadsLDBarrier);
+    } else if (threadIdx.x == 1) {
+      init(&barriers[2][1], numThreadsLDBarrier);
+      init(&barriers[3][1], numThreadsLDBarrier);
+    }
+  } else {
+    if (threadIdx.x < numQueueElements) {
+      init(&barriers[0][threadIdx.x], numThreadsM2CBarrier);
+      init(&barriers[1][threadIdx.x], numThreadsC2MBarrier);
+      init(&barriers[2][threadIdx.x], numThreadsLDBarrier);
+      init(&barriers[3][threadIdx.x], numThreadsLDBarrier);
+    }
+    if (threadIdx.x == 0) {
+      init(&ldu_control_barrier, 2);
+      init(&ldu_control_publish_barrier, numThreadsPerWarp + 2);
+    }
   }
 
   __shared__ int m2c_data[numQueueElements];
