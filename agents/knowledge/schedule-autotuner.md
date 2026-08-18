@@ -6,7 +6,7 @@ fold, operator grouping, overlap boundary) instead of tuning them by hand.
 ## Milestones
 
 1. Knob configuration layer, and port `app/python/qwen3_1p7b/sched.py` to it. **done**
-2. `tools/autotune.py` with static + dry-build legality filtering only. No GPU needed.
+2. `tools/autotune.py` with static + dry-build legality filtering only. **done**
 3. Timed runs plus a noise-aware objective.
 4. Coordinate-descent search, presets, correctness gate.
 5. Extend to `app/python/llama3/sched.py`, which first needs a `--dry-build` mode.
@@ -98,4 +98,65 @@ runs on a host with no CUDA and no PyTorch:
 
 ```bash
 python tests/test_tune.py
+```
+
+## Driver
+
+[tools/autotune.py](tools/autotune.py) answers "is this candidate buildable",
+not yet "is it fast". Everything it knows about a target comes from that
+target's knob dump, so adding a tunable schedule does not mean editing the
+driver.
+
+```bash
+python tools/autotune.py discover --target qwen3_1p7b -o tuning/qwen3_1p7b.knobs.json
+python tools/autotune.py check --knobs tuning/qwen3_1p7b.knobs.json -o tuning/qwen3_1p7b.legality.json
+python tools/autotune.py report tuning/qwen3_1p7b.legality.json
+```
+
+Two filters, cheapest first:
+
+- **static**: rules evaluated from candidate values alone, no subprocess.
+  Currently SM count positive, `base_sm + sms <= full_sms`, and `mlp.low`
+  inside the layer. Each rule is skipped when the note it needs is absent, so
+  the driver never invents a device geometry it was not told about.
+- **dry-build**: run the target with `--dry-build` under `DAE_TUNE_CONFIG` and
+  read the exit status. The rejection reason is lifted out of the target's own
+  `AssertionError`, so the report explains *why* in the schedule's own words.
+
+`check --static-only` skips the subprocess entirely and needs no GPU.
+`check` exits non-zero if the baseline itself fails to build, because every
+other result in that run is then measured against a broken reference.
+
+Candidates come from a coordinate sweep: one candidate per off-baseline choice,
+varying a single knob at a time, so a rejection can be attributed to one knob.
+
+## Legality Map Is Conditional On The Baseline
+
+A one-knob-at-a-time sweep reports what is legal *given the other knobs sit at
+baseline*, which is not the same as what is reachable overall. Concretely, in
+the fixture run, `up_low.sms=128` is rejected only because the baseline puts
+`up_low.base_sm=64`, so the range runs off the device. With
+`up_low.base_sm=0` it is legal.
+
+So the milestone 4 search cannot move one knob at a time for placement. SM
+count and base SM of a stage have to move as a pair, or wide placements are
+unreachable from the current baseline.
+
+## Fixture
+
+[tests/fake_sched.py](tests/fake_sched.py) is a stand-in target that declares
+the same 23-knob surface and reimplements the subset of `SchedGemv.validate()`
+that knob values can violate, for the Qwen3 1.7B geometry. It reproduces the
+documented result that `down_proj` is legal on 96 SMs and rejected on 128 with
+`k_per_fold=1536`, so the driver is exercised against real rejections on a host
+with no GPU.
+
+Sweeping all 23 knobs against the fixture produced 107 candidates, of which 40
+build: 29 static-rejected and 38 build-rejected. Most knobs turn out to have
+only one or two legal alternatives to their current value, which is a useful
+early signal that the search space is far smaller than the raw knob count
+suggests.
+
+```bash
+python tests/test_autotune.py
 ```

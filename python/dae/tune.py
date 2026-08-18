@@ -156,6 +156,7 @@ class TuneConfig:
         self._file_values = dict(file_values or {})
         self._inline_values = dict(inline_values or {})
         self._specs = {}
+        self._notes = {}
 
     # -- declaration ------------------------------------------------------
 
@@ -221,7 +222,21 @@ class TuneConfig:
             legacy_env=legacy_env,
         )
 
+    def note(self, key, value):
+        """Publish a non-tunable fact a driver needs to reason about candidates.
+
+        Notes describe the shape a schedule was built for, such as `full_sms`
+        or `intermediate`. They are read-only context, not knobs, and they let
+        a driver check things like "does this SM range fit on the device"
+        without hardcoding a second copy of the model or GPU geometry.
+        """
+        self._notes[key] = _jsonable(value)
+        return value
+
     # -- introspection ----------------------------------------------------
+
+    def notes(self):
+        return dict(self._notes)
 
     def specs(self):
         return dict(self._specs)
@@ -239,6 +254,7 @@ class TuneConfig:
         return {
             "namespace": self.namespace,
             "source": self.source,
+            "notes": self.notes(),
             "knobs": self.values(),
             "specs": {name: spec.as_json() for name, spec in self._specs.items()},
         }

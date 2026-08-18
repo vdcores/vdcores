@@ -82,6 +82,12 @@ DEBUG_STAGE_ORDER = (
 
 
 tune = dae_tune.load("qwen3_1p7b")
+tune.note("full_sms", full_sms)
+tune.note("num_sms", num_sms)
+tune.note("rms_sms", rms_sms)
+tune.note("hidden", HIDDEN)
+tune.note("intermediate", INTERMIDIATE)
+tune.note("gemv_tile_m", Gemv_M64N8.MNK[0])
 
 # Candidate values only; illegal combinations are rejected by the schedule's
 # own place()/validate() path rather than being enumerated here.
