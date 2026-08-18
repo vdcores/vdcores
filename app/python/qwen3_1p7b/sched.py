@@ -1,7 +1,7 @@
-import os
 from functools import partial
 
 import torch
+from dae import tune as dae_tune
 from dae.launcher import *
 from dae.model import *
 from dae.schedule import *
@@ -81,28 +81,48 @@ DEBUG_STAGE_ORDER = (
 )
 
 
-def env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    return default if value is None else int(value)
+tune = dae_tune.load("qwen3_1p7b")
 
+# Candidate values only; illegal combinations are rejected by the schedule's
+# own place()/validate() path rather than being enumerated here.
+GEMV_SMS_CHOICES = [16, 32, 48, 64, 80, 96, 112, 128]
+BASE_SM_CHOICES = [0, 32, 64, 96]
 
-def env_prefetch_overrides() -> set[str]:
-    raw = os.environ.get("QWEN1P7B_NO_PREFETCH", "")
-    return {token.strip() for token in raw.split(",") if token.strip()}
+PREFETCH_OFF = tune.str_set_knob(
+    "no_prefetch",
+    (),
+    choices=["q_proj", "k_proj", "v_proj", "out_proj", "gate_low", "gate_high",
+             "up_low", "up_high", "down_proj", "logits", "all"],
+    doc="Stages to build without weight prefetch",
+    legacy_env="QWEN1P7B_NO_PREFETCH",
+)
+QPROJ_SMS = tune.sms("q_proj", 64, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_QPROJ_SMS")
+KPROJ_SMS = tune.sms("k_proj", 32, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_KPROJ_SMS")
+VPROJ_SMS = tune.sms("v_proj", 32, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_VPROJ_SMS")
+OUTPROJ_SMS = tune.sms("out_proj", 64, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_OUTPROJ_SMS")
+GATE_LOW_SMS = tune.sms("gate_low", 64, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_GATE_LOW_SMS")
+GATE_HIGH_SMS = tune.sms("gate_high", 64, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_GATE_HIGH_SMS")
+UP_LOW_SMS = tune.sms("up_low", 64, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_UP_LOW_SMS")
+UP_HIGH_SMS = tune.sms("up_high", 64, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_UP_HIGH_SMS")
+SILU_SMS = tune.sms("silu", 4, [1, 2, 4, 8], legacy_env="QWEN1P7B_SILU_SMS")
+DOWNPROJ_SMS = tune.sms("down_proj", 96, GEMV_SMS_CHOICES, legacy_env="QWEN1P7B_DOWNPROJ_SMS")
 
+QPROJ_BASE_SM = tune.base_sm("q_proj", 0, BASE_SM_CHOICES)
+KPROJ_BASE_SM = tune.base_sm("k_proj", 64, BASE_SM_CHOICES)
+VPROJ_BASE_SM = tune.base_sm("v_proj", 96, BASE_SM_CHOICES)
+OUTPROJ_BASE_SM = tune.base_sm("out_proj", 0, BASE_SM_CHOICES)
+GATE_LOW_BASE_SM = tune.base_sm("gate_low", 0, BASE_SM_CHOICES)
+GATE_HIGH_BASE_SM = tune.base_sm("gate_high", 0, BASE_SM_CHOICES)
+UP_LOW_BASE_SM = tune.base_sm("up_low", 64, BASE_SM_CHOICES)
+UP_HIGH_BASE_SM = tune.base_sm("up_high", 64, BASE_SM_CHOICES)
+DOWNPROJ_BASE_SM = tune.base_sm("down_proj", 0, BASE_SM_CHOICES)
+SILU_BASE_SM = tune.base_sm("silu", 128, [128, 129, 130])
 
-PREFETCH_OFF = env_prefetch_overrides()
-QPROJ_SMS = env_int("QWEN1P7B_QPROJ_SMS", 64)
-KPROJ_SMS = env_int("QWEN1P7B_KPROJ_SMS", 32)
-VPROJ_SMS = env_int("QWEN1P7B_VPROJ_SMS", 32)
-OUTPROJ_SMS = env_int("QWEN1P7B_OUTPROJ_SMS", 64)
-GATE_LOW_SMS = env_int("QWEN1P7B_GATE_LOW_SMS", 64)
-GATE_HIGH_SMS = env_int("QWEN1P7B_GATE_HIGH_SMS", 64)
-UP_LOW_SMS = env_int("QWEN1P7B_UP_LOW_SMS", 64)
-UP_HIGH_SMS = env_int("QWEN1P7B_UP_HIGH_SMS", 64)
-SILU_SMS = env_int("QWEN1P7B_SILU_SMS", 4)
-DOWNPROJ_SMS = env_int("QWEN1P7B_DOWNPROJ_SMS", 96)
-LOGITS_SPLIT_M = env_int("QWEN1P7B_LOGITS_SPLIT_M", 6)
+LOGITS_SPLIT_M = tune.int_knob(
+    "logits.split_m", 6, choices=[2, 3, 4, 6, 8, 12],
+    doc="split_M factor for the logits projection",
+    legacy_env="QWEN1P7B_LOGITS_SPLIT_M",
+)
 
 
 def maybe_no_prefetch(name: str, sched):
@@ -156,7 +176,10 @@ def bind_late_barriers_with_default(dae, *insts, unresolved_count=None):
                 )
             raise ValueError(f"Could not infer release count for barrier {group.name}.{name}")
 
-MLP_LOW = 4096
+MLP_LOW = tune.int_knob(
+    "mlp.low", 4096, choices=[2048, 3072, 4096, 5120],
+    doc="Width of the store-backed low MLP slice; the rest runs reduce-backed",
+)
 MLP_HIGH = INTERMIDIATE - MLP_LOW
 if MLP_HIGH <= 0:
     raise ValueError(f"Expected intermediate size larger than {MLP_LOW}, got {INTERMIDIATE}")
@@ -400,17 +423,17 @@ def schedule_single_token(token_offset: int, token_pos: int):
     clear_gateout = clear_gateout.place(1, base_sm=129)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    QProj = QProj.place(QPROJ_SMS)
-    KProj = KProj.place(KPROJ_SMS, base_sm=64)
-    VProj = VProj.place(VPROJ_SMS, base_sm=96)
+    QProj = QProj.place(QPROJ_SMS, base_sm=QPROJ_BASE_SM)
+    KProj = KProj.place(KPROJ_SMS, base_sm=KPROJ_BASE_SM)
+    VProj = VProj.place(VPROJ_SMS, base_sm=VPROJ_BASE_SM)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
-    OutProj = OutProj.place(OUTPROJ_SMS)
-    gate_proj_low = gate_proj_low.place(GATE_LOW_SMS)
-    gate_proj_high = gate_proj_high.place(GATE_HIGH_SMS)
-    up_proj_low = up_proj_low.place(UP_LOW_SMS, base_sm=64)
-    up_proj_high = up_proj_high.place(UP_HIGH_SMS, base_sm=64)
-    silu1 = silu1.place(SILU_SMS, base_sm=128)
-    down_proj = down_proj.place(DOWNPROJ_SMS)
+    OutProj = OutProj.place(OUTPROJ_SMS, base_sm=OUTPROJ_BASE_SM)
+    gate_proj_low = gate_proj_low.place(GATE_LOW_SMS, base_sm=GATE_LOW_BASE_SM)
+    gate_proj_high = gate_proj_high.place(GATE_HIGH_SMS, base_sm=GATE_HIGH_BASE_SM)
+    up_proj_low = up_proj_low.place(UP_LOW_SMS, base_sm=UP_LOW_BASE_SM)
+    up_proj_high = up_proj_high.place(UP_HIGH_SMS, base_sm=UP_HIGH_BASE_SM)
+    silu1 = silu1.place(SILU_SMS, base_sm=SILU_BASE_SM)
+    down_proj = down_proj.place(DOWNPROJ_SMS, base_sm=DOWNPROJ_BASE_SM)
     argmax = argmax.place(full_sms)
     if restore_bars_low is not None:
         restore_bars_low = restore_bars_low.place(1, base_sm=128)
@@ -535,6 +558,7 @@ if ctx.parsed_args.correctness and (
 ):
     raise ValueError("Single-token correctness requires the full schedule and full layer count")
 
+print(tune.summary())
 if ctx.parsed_args.dry_build:
     print(
         f"[dry-build] built qwen3-1.7b schedule with hidden={HIDDEN}, intermediate={INTERMIDIATE}, "
