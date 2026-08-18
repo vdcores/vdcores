@@ -147,7 +147,33 @@ void dae2(
   if (thread_id / numThreadsPerWarp == 0) {
     tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
   }
-  if (thread_id == 0) {
+  if constexpr (mxfpResidentFastQueueInitEnabled) {
+    // The focused resident image has only a small, fixed barrier bank. Let
+    // independent lanes initialize it while warp 0 acquires TMEM instead of
+    // serializing every mbarrier.init behind the allocation on lane 0.
+    if (thread_id < tmemMmaBarrierCount) {
+      cute::initialize_barrier(tmem_mma_barriers[thread_id], 1);
+      const bool begins_empty =
+          (thread_id >= mxfp4Mxfp8TmaScaleBarrierBase &&
+           thread_id < mxfp4Mxfp8TmaScaleBarrierBase +
+               mxfp4Mxfp8TmaScaleBarrierCount) ||
+          (mxfpGateUpLduWeightRingEnabled &&
+           thread_id >= mxfpLduWeightRingEmptyBarrierBase &&
+           thread_id < mxfpLduWeightRingEmptyBarrierBase +
+               mxfpLduWeightRingStages) ||
+          (mxfpDownLduWeightRingEnabled &&
+           thread_id >= mxfpDownLduWeightRingEmptyBarrierBase &&
+           thread_id < mxfpDownLduWeightRingEmptyBarrierBase +
+               mxfpDownLduWeightRingStages);
+      if (begins_empty) {
+        cuda::ptx::mbarrier_arrive(
+            cuda::ptx::sem_release,
+            cuda::ptx::scope_cta,
+            cuda::ptx::space_shared,
+            tmem_mma_barriers + thread_id);
+      }
+    }
+  } else if (thread_id == 0) {
     #pragma unroll
     for (int i = 0; i < tmemMmaBarrierCount; ++i) {
       cute::initialize_barrier(tmem_mma_barriers[i], 1);
