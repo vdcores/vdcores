@@ -12,13 +12,25 @@ import torch
 from dae import runtime
 from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
-from dae.schedule import SchedMxfp4Mxfp8DownFixedRing
+from dae.schedule import (
+    SchedMxfp4Mxfp8DownFixedRing,
+    SchedMxfp4Mxfp8DownResident,
+)
 
 
 FP4_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 )
+
+
+def percentile(samples: list[float], fraction: float) -> float:
+    ordered = sorted(samples)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def f32_bits(value: float) -> int:
@@ -32,6 +44,38 @@ def profile_span_us(profile: torch.Tensor, start: int, stop: int) -> float:
     return (int(values[:, stop].max()) - int(values[:, start].min())) / 1.0e3
 
 
+def report_track_profile(profile: torch.Tensor) -> None:
+    values = profile.cpu().numpy()
+    if not all(int(value) == 0x4454524B50524631 for value in values[:, 127]):
+        return
+    base = runtime.config.track_profile_event_base
+    span = max(int(value) for value in values[:, 1]) - min(
+        int(value) for value in values[:, 0]
+    )
+    envelope = span * values.shape[0]
+
+    def total(offset: int) -> int:
+        return sum(int(value) for value in values[:, base + offset])
+
+    def percent(offset: int) -> float:
+        return 100.0 * total(offset) / envelope if envelope > 0 else 0.0
+
+    print(
+        "DSV4_MXFP4_MXFP8_DOWN_COUNTERS "
+        f"internal_span_us={span / 1.0e3:.6f} "
+        f"compute_m2c_wait_pct={percent(0):.3f} "
+        f"allocator_slot_stall_pct={percent(3):.3f} "
+        f"ldu0_queue_wait_pct={percent(9):.3f} "
+        f"ldu0_dependency_wait_pct={percent(11):.3f} "
+        f"ldu1_queue_wait_pct={percent(14):.3f} "
+        f"ldu1_dependency_wait_pct={percent(16):.3f} "
+        f"allocator_instructions={total(8)} "
+        f"allocator_slot_stall_events={total(4)} "
+        f"ldu0_commands={total(13)} ldu1_commands={total(18)}",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=20)
@@ -39,12 +83,22 @@ def main() -> None:
     parser.add_argument("--graph-inner", type=int, default=20)
     parser.add_argument("--workers", type=int)
     parser.add_argument(
+        "--resident-all-tma",
+        action="store_true",
+        help="use one fixed-layout resident LDU plan per worker",
+    )
+    parser.add_argument(
         "--dependency-bars",
         action="store_true",
         help=(
-            "wait on an already-ready per-expert activation barrier while "
+            "wait on already-ready per-record activation barriers while "
             "leaving retained-weight commands independent"
         ),
+    )
+    parser.add_argument(
+        "--blockwise-ready",
+        action="store_true",
+        help="check each K256 bundle's two activation-record barriers",
     )
     parser.add_argument(
         "--weight-ring-chain",
@@ -68,6 +122,8 @@ def main() -> None:
     os.environ["DAE_TMA_L2_PROMOTION"] = args.tma_l2_promotion
     if args.graph_inner <= 0:
         parser.error("--graph-inner must be positive")
+    if args.blockwise_ready and not args.dependency_bars:
+        parser.error("--blockwise-ready requires --dependency-bars")
     for name, value in (
         ("weight-byte", args.weight_byte),
         ("weight-scale", args.weight_scale),
@@ -99,7 +155,10 @@ def main() -> None:
 
     launcher = Launcher(workers, device=device)
     dependency_bars = (
-        [launcher.new_bar(0) for _ in range(experts)]
+        [
+            launcher.new_bar(0)
+            for _ in range(experts * activation_slices)
+        ]
         if args.dependency_bars
         else None
     )
@@ -143,21 +202,27 @@ def main() -> None:
             weight_tma.arg | (output_tma.arg << 16) | (task << 32)
         )
         activation_bar = (
-            dependency_bars[expert]
+            dependency_bars[expert * activation_slices]
             if dependency_bars is not None
             else 0xFFFFFFFF
         )
         records[task, 4] = activation_bar | (zero_ready[output_tile] << 32)
         records[task, 5] = f32_bits(route_scales[expert])
         records[task, 6] = final_output[output_tile].data_ptr()
-        records[task, 8] = 1 << 32
+        flags = 1 | (4 if args.blockwise_ready else 0)
+        records[task, 8] = flags << 32
     metadata = records.view(torch.uint8).to(device)
     schedule_args = {}
     if ldu_weight_ring:
         schedule_args["retain_weight_ring_between_tasks"] = (
             weight_ring_chain
         )
-    schedule = SchedMxfp4Mxfp8DownFixedRing(
+    schedule_type = (
+        SchedMxfp4Mxfp8DownResident
+        if args.resident_all_tma
+        else SchedMxfp4Mxfp8DownFixedRing
+    )
+    schedule = schedule_type(
         weight_data,
         weight_scales,
         activation_records,
@@ -222,18 +287,41 @@ def main() -> None:
 
     torch.testing.assert_close(final_output.float(), expected, rtol=rtol, atol=atol)
     profile = launcher.profile
+    profile_values = profile.cpu().numpy()
+    task_local_us = (profile_values[:, 3] - profile_values[:, 2]) / 1.0e3
+    task_local_samples = [float(value) for value in task_local_us]
+    task_local_median = statistics.median(task_local_samples)
+    task_local_p95 = percentile(task_local_samples, 0.95)
     error = (final_output.float() - expected).abs()
     queue_depths = [len(queue) for queue in schedule.task_queues]
+    report_track_profile(profile)
     print(
         "DSV4_MXFP4_MXFP8_DOWN_RETAINED_RING_RESULT "
         f"workers={workers} tasks={tasks} max_tasks_per_worker={max(queue_depths)} "
         "cuda_kernel_launches=1 vdcores_launches=1 persistent=true "
+        f"resident_all_tma={str(args.resident_all_tma).lower()} "
         f"down_ldu_weight_ring={str(ldu_weight_ring).lower()} "
-        "down_scales_task_owned=true "
+        "down_ring_stages="
+        f"{int(runtime.config.mxfp_down_ldu_weight_ring_stages)} "
+        "weight_scale_tma="
+        f"{str(bool(runtime.config.mxfp_weight_scale_tma)).lower()} "
+        "weight_scale_separate_barrier="
+        f"{str(bool(runtime.config.mxfp_down_weight_scale_separate_barrier)).lower()} "
+        "activation_scales_task_owned="
+        f"{str(not args.resident_all_tma).lower()} "
         f"weight_ring_chain={str(weight_ring_chain).lower()} "
-        f"dependency={'activation_task_ready_zero' if args.dependency_bars else 'none'} "
+        f"dependency={'activation_records_ready_zero' if args.dependency_bars else 'none'} "
+        f"blockwise_ready={str(args.blockwise_ready).lower()} "
         f"allocator_slots={runtime.config.num_slots} "
         f"task_us={profile_span_us(profile, 2, 3):.6f} "
+        f"task_local_min_us={float(task_local_us.min()):.6f} "
+        f"task_local_median_us={task_local_median:.6f} "
+        f"task_local_stddev_us="
+        f"{statistics.pstdev(task_local_samples):.6f} "
+        f"task_local_p95_us={task_local_p95:.6f} "
+        f"task_local_p95_tail_us="
+        f"{task_local_p95 - task_local_median:.6f} "
+        f"task_local_max_us={float(task_local_us.max()):.6f} "
         f"kernel_us={profile_span_us(profile, 0, 1):.6f} "
         f"end_to_end_min_us={min(times):.6f} "
         f"end_to_end_median_us={statistics.median(times):.6f} "

@@ -9,7 +9,7 @@
 template <int KBundles, int RingStages, int BundleK,
           int SyncBarrierId, int TmemColumns,
           int ScratchOffsetBytes, int ScratchCapacityBytes, int ThreadOffset,
-          bool UseLduWeightRing,
+          bool UseLduWeightRing, bool ResidentAllTma,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_down_fixed_ring_sm100(
@@ -30,6 +30,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   using Activation = cutlass::float_e4m3_t;
   using Scale = cutlass::float_ue8m0_t;
   using Accum = float;
+  using Output = std::conditional_t<
+      mxfpDownBf16ReductionEnabled, cutlass::bfloat16_t, float>;
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
 
   constexpr int kTileM = 128;
@@ -39,9 +41,23 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   constexpr int kBundleK = BundleK;
   constexpr int kK128PerBundle = kBundleK / kTileK;
   static_assert(KBundles == 2 || KBundles == 4 || KBundles == 8);
-  static_assert(RingStages == 1 || RingStages == 2);
+  static_assert(
+      RingStages == 1 || RingStages == 2 || RingStages == 3 ||
+          RingStages == 4);
   static_assert(BundleK == 256 || BundleK == 512);
-  static_assert(!UseLduWeightRing || (RingStages == 2 && BundleK == 256));
+  static_assert(
+      !UseLduWeightRing ||
+          ((RingStages == 2 || RingStages == 3 || RingStages == 4) &&
+           BundleK == 256));
+  static_assert(
+      !ResidentAllTma || UseLduWeightRing,
+      "resident all-TMA Down requires the LDU ring protocol");
+  constexpr bool kLduWeightScaleTma =
+      UseLduWeightRing &&
+      (mxfpWeightScaleTmaEnabled || ResidentAllTma);
+  constexpr bool kSeparateWeightScaleBarrier =
+      kLduWeightScaleTma && !ResidentAllTma &&
+      mxfpDownWeightScaleSeparateBarrierEnabled;
   constexpr int kTotalK = KBundles * kBundleK;
   constexpr int kNumKTiles = kTotalK / kBundleK;
   constexpr int kRingStages = RingStages;
@@ -52,7 +68,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   constexpr int kActivationRecordScaleBytes = 512;
   constexpr int kDownTilesPerExpert = 4096 / kTileM;
   constexpr int kOutputElements = kTileM * kNativeOutputRows;
-  constexpr int kOutputBytes = kOutputElements * int(sizeof(float));
+  constexpr int kOutputBytes = kOutputElements * int(sizeof(Output));
 
   using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
   using Atom = cute::SM100_MMA_MXF8F6F4_SS<
@@ -148,8 +164,14 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   const bool reduce_from_zero = (resident_flags & 1U) != 0;
   const int ready_bar_stride = (resident_flags & 2U) != 0 ? 8 : 1;
   const bool blockwise_ready = (resident_flags & 4U) != 0;
-  auto *final_output_global = reinterpret_cast<float *>(
+  const bool prezero_pair = (resident_flags & 8U) != 0;
+  const bool zero_already_prepared = (resident_flags & 16U) != 0;
+  auto *final_output_global = reinterpret_cast<Output *>(
       *reinterpret_cast<const uint64_t *>(metadata + 48));
+  auto *paired_output_global = reinterpret_cast<Output *>(
+      *reinterpret_cast<const uint64_t *>(metadata + 72));
+  const uint32_t paired_reduce_bar =
+      *reinterpret_cast<const uint32_t *>(metadata + 80);
   const uint64_t layout_info =
       *reinterpret_cast<const uint64_t *>(metadata + 56);
   const uint32_t weight_scale_tile_stride = uint32_t(layout_info) != 0
@@ -170,19 +192,22 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
 
   // The shared-expert CTA initializes its FP32 destination and publishes the
   // zero-ready edge used by all seven TMA reduce-add producers.
-  if (reduce_from_zero && expert == 0) {
-    for (int index = tid; index < kOutputElements; index += 128) {
-      final_output_global[index] = 0.0f;
+  if constexpr (!ResidentAllTma) {
+    if (reduce_from_zero && expert == 0) {
+      for (int index = tid; index < kOutputElements; index += 128) {
+        final_output_global[index] = Output(0.0f);
+      }
+      __sync_barrier<SyncBarrierId, 128>();
+      if (tid == 0) {
+        asm volatile("fence.release.gpu;" ::: "memory");
+        *reinterpret_cast<volatile int *>(global_bars + reduce_bar) = 0;
+      }
+      __sync_barrier<SyncBarrierId, 128>();
     }
-    __sync_barrier<SyncBarrierId, 128>();
-    if (tid == 0) {
-      asm volatile("fence.release.gpu;" ::: "memory");
-      *reinterpret_cast<volatile int *>(global_bars + reduce_bar) = 0;
-    }
-    __sync_barrier<SyncBarrierId, 128>();
   }
 
-  if (!blockwise_ready && tid == 0 && ready_bar != 0xFFFFFFFFU) {
+  if (!ResidentAllTma && !blockwise_ready && tid == 0 &&
+      ready_bar != 0xFFFFFFFFU) {
     volatile int *ready = global_bars + ready_bar;
     bool pending = true;
     while (pending) {
@@ -208,13 +233,16 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   constexpr int kActivationRingBytes =
       kRingStages * kActivationStageBytes;
   constexpr int kScaleRingBytes = kRingStages * kScaleStageBytes;
+  constexpr int kLocalScaleRingBytes = kLduWeightScaleTma
+      ? 0
+      : kScaleRingBytes;
   constexpr int kLocalWeightRingBytes =
       UseLduWeightRing ? 0 : kWeightRingBytes;
   constexpr int kLocalBarrierArrays = UseLduWeightRing ? 2 : 4;
   constexpr int kBarrierBytes = kLocalBarrierArrays * kRingStages *
       int(sizeof(TxBarrier));
   constexpr int kOutputOffsetUnaligned =
-      kScaleRingBytes + kActivationRingBytes + kLocalWeightRingBytes +
+      kLocalScaleRingBytes + kActivationRingBytes + kLocalWeightRingBytes +
       kBarrierBytes;
   constexpr int kOutputOffset =
       (kOutputOffsetUnaligned + 127) & ~127;
@@ -226,34 +254,63 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       "fixed MXFP4/MXFP8 down ring does not fit task-local shared memory");
   auto *fixed_base =
       static_cast<uint8_t *>(smem_base) + ScratchOffsetBytes;
-  auto *scale_ring = fixed_base;
-  auto *activation_ring = scale_ring + kScaleRingBytes;
+  auto *local_scale_ring = fixed_base;
+  auto *activation_ring = local_scale_ring + kLocalScaleRingBytes;
   auto *local_weight_ring = activation_ring + kActivationRingBytes;
   auto *local_barriers = reinterpret_cast<TxBarrier *>(
       local_weight_ring + kLocalWeightRingBytes);
   uint8_t *weight_ring;
+  uint8_t *scale_ring;
   TxBarrier *weight_full;
+  TxBarrier *weight_scale_full;
   TxBarrier *operand_full;
   TxBarrier *umma_full;
   TxBarrier *stage_empty;
-  if constexpr (UseLduWeightRing) {
+  if constexpr (ResidentAllTma) {
+    auto *resident_base = static_cast<uint8_t *>(smem_base);
+    weight_ring = resident_base +
+        dae_mxfp_resident_ffn::kDownWeightRingOffset;
+    scale_ring = resident_base +
+        dae_mxfp_resident_ffn::kDownScaleRingOffset;
+    activation_ring = resident_base +
+        dae_mxfp_resident_ffn::kDownActivationRingOffset;
+    weight_full = reinterpret_cast<TxBarrier *>(
+        resident_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+    weight_scale_full = weight_full;
+    operand_full = reinterpret_cast<TxBarrier *>(
+        resident_mma_barriers + mxfpDownResidentOperandFullBarrierBase);
+    umma_full = local_barriers;
+    stage_empty = reinterpret_cast<TxBarrier *>(
+        resident_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+  } else if constexpr (UseLduWeightRing) {
     const int weight_slot_mask = m2c.template pop<0>();
     weight_ring = static_cast<uint8_t *>(
         get_slot_address(smem_base, extract(weight_slot_mask)));
+    scale_ring = kLduWeightScaleTma
+        ? weight_ring + kWeightRingBytes
+        : local_scale_ring;
     weight_full = reinterpret_cast<TxBarrier *>(
         resident_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+    weight_scale_full = reinterpret_cast<TxBarrier *>(
+        resident_mma_barriers + mxfpDownLduWeightScaleFullBarrierBase);
     operand_full = local_barriers;
     umma_full = operand_full + kRingStages;
     stage_empty = reinterpret_cast<TxBarrier *>(
         resident_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
   } else {
     weight_ring = local_weight_ring;
+    scale_ring = local_scale_ring;
     weight_full = local_barriers;
+    weight_scale_full = weight_full;
     operand_full = weight_full + kRingStages;
     umma_full = operand_full + kRingStages;
     stage_empty = umma_full + kRingStages;
   }
-  auto *output_smem = reinterpret_cast<float *>(fixed_base + kOutputOffset);
+  auto *output_smem = reinterpret_cast<Output *>(
+      ResidentAllTma
+          ? static_cast<uint8_t *>(smem_base) +
+              dae_mxfp_resident_ffn::kDownOutputOffset
+          : fixed_base + kOutputOffset);
 
   if (warp == 1 && lane == 0) {
     #pragma unroll
@@ -262,7 +319,9 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
         weight_full[stage].init(1);
         stage_empty[stage].init(1);
       }
-      operand_full[stage].init(2);
+      if constexpr (!ResidentAllTma) {
+        operand_full[stage].init(kLduWeightScaleTma ? 1 : 2);
+      }
       umma_full[stage].init(1);
     }
     cutlass::arch::fence_barrier_init();
@@ -319,14 +378,16 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
         stage_empty[stage].wait(
             phase ^ (UseLduWeightRing ? 0 : 1));
       }
-      dae_mxfp_cp_async_scale_stage<kSfaStageBytes>(
-          weight_scale_global + tile * weight_scale_tile_stride,
-          scale_ring + stage * kScaleStageBytes, lane);
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
-      __syncwarp();
-      cutlass::arch::fence_view_async_shared();
-      if (lane == 0) {
-        operand_full[stage].arrive();
+      if constexpr (!kLduWeightScaleTma) {
+        dae_mxfp_cp_async_scale_stage<kSfaStageBytes>(
+            weight_scale_global + tile * weight_scale_tile_stride,
+            scale_ring + stage * kScaleStageBytes, lane);
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncwarp();
+        cutlass::arch::fence_view_async_shared();
+        if (lane == 0) {
+          operand_full[stage].arrive();
+        }
       }
 
       // Keep two K bundles in flight. Retiring tile n-1 after publishing
@@ -352,55 +413,93 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       stage_empty[kLastStage].arrive();
     }
   } else if (warp == 3) {
-    #pragma unroll
-    for (int tile = 0; tile < kNumKTiles; ++tile) {
-      const int stage = tile % kRingStages;
-      const int phase = (tile / kRingStages) & 1;
-      if (tile >= kRingStages) {
-        stage_empty[stage].wait(
-            phase ^ (UseLduWeightRing ? 0 : 1));
-      }
-      if (blockwise_ready && ready_bar != 0xFFFFFFFFU) {
-        if (lane == 0) {
-          volatile int *ready = global_bars + ready_bar;
-          bool pending = true;
-          while (pending) {
-            pending = false;
-            #pragma unroll
-            for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
-              const int record =
-                  (k_start_tile + tile) * kK128PerBundle + subtile;
-              pending |= ready[record * ready_bar_stride] != 0;
+    if constexpr (!ResidentAllTma) {
+      #pragma unroll
+      for (int tile = 0; tile < kNumKTiles; ++tile) {
+        const int stage = tile % kRingStages;
+        const int phase = (tile / kRingStages) & 1;
+        if (tile >= kRingStages) {
+          stage_empty[stage].wait(
+              phase ^ (UseLduWeightRing ? 0 : 1));
+        }
+        if (blockwise_ready && ready_bar != 0xFFFFFFFFU) {
+          if (lane == 0) {
+            volatile int *ready = global_bars + ready_bar;
+            bool pending = true;
+            while (pending) {
+              pending = false;
+              #pragma unroll
+              for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
+                const int record =
+                    (k_start_tile + tile) * kK128PerBundle + subtile;
+                pending |= ready[record * ready_bar_stride] != 0;
+              }
+              if (pending) {
+                __nanosleep(256);
+              }
             }
-            if (pending) {
-              __nanosleep(256);
+            asm volatile("fence.acquire.gpu;" ::: "memory");
+          }
+          __syncwarp();
+        }
+        #pragma unroll
+        for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
+          const auto *record = activation_records_global +
+              ((k_start_tile + tile) * kK128PerBundle + subtile) *
+                  kActivationRecordBytes;
+          dae_mxfp_cp_async_scale_stage<kActivationRecordDataBytes>(
+              record,
+              activation_ring + stage * kActivationStageBytes +
+                  subtile * kActivationK128Bytes,
+              lane);
+          dae_mxfp_cp_async_scale_stage<kActivationRecordScaleBytes>(
+              record + kActivationRecordDataBytes,
+              scale_ring + stage * kScaleStageBytes + kSfaStageBytes +
+                  subtile * kSfbK128Bytes,
+              lane);
+        }
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncwarp();
+        cutlass::arch::fence_view_async_shared();
+        if (lane == 0) {
+          operand_full[stage].arrive();
+        }
+      }
+    } else {
+      // Resident operands leave this warp idle.  Hide the shared expert's
+      // destination clears under the UMMA mainloop. In the paired form, the
+      // first task also prepares its worker's second output tile so routed
+      // experts never wait for expert 0's second-task entry.
+      if constexpr (!mxfpResidentDownLdu1ZeroEnabled) {
+        if (reduce_from_zero && expert == 0) {
+          const bool clear_current =
+              !mxfpResidentDownPairZeroEnabled || !zero_already_prepared;
+          const bool clear_pair =
+              mxfpResidentDownPairZeroEnabled && prezero_pair;
+          if (clear_current || clear_pair) {
+            if (clear_current) {
+              for (int index = lane; index < kOutputElements; index += 32) {
+                final_output_global[index] = Output(0.0f);
+              }
+            }
+            if (clear_pair) {
+              for (int index = lane; index < kOutputElements; index += 32) {
+                paired_output_global[index] = Output(0.0f);
+              }
+            }
+            __syncwarp();
+            if (lane == 0) {
+              asm volatile("fence.release.gpu;" ::: "memory");
+              if (clear_current) {
+                *reinterpret_cast<volatile int *>(global_bars + reduce_bar) = 0;
+              }
+              if (clear_pair) {
+                *reinterpret_cast<volatile int *>(
+                    global_bars + paired_reduce_bar) = 0;
+              }
             }
           }
-          asm volatile("fence.acquire.gpu;" ::: "memory");
         }
-        __syncwarp();
-      }
-      #pragma unroll
-      for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
-        const auto *record = activation_records_global +
-            ((k_start_tile + tile) * kK128PerBundle + subtile) *
-                kActivationRecordBytes;
-        dae_mxfp_cp_async_scale_stage<kActivationRecordDataBytes>(
-            record,
-            activation_ring + stage * kActivationStageBytes +
-                subtile * kActivationK128Bytes,
-            lane);
-        dae_mxfp_cp_async_scale_stage<kActivationRecordScaleBytes>(
-            record + kActivationRecordDataBytes,
-            scale_ring + stage * kScaleStageBytes + kSfaStageBytes +
-                subtile * kSfbK128Bytes,
-            lane);
-      }
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
-      __syncwarp();
-      cutlass::arch::fence_view_async_shared();
-      if (lane == 0) {
-        operand_full[stage].arrive();
       }
     }
   } else if (warp == 0) {
@@ -409,8 +508,26 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     for (int tile = 0; tile < kNumKTiles; ++tile) {
       const int stage = tile % kRingStages;
       const int phase = (tile / kRingStages) & 1;
-      weight_full[stage].wait(phase);
-      operand_full[stage].wait(phase);
+      if constexpr (kSeparateWeightScaleBarrier) {
+        weight_scale_full[stage].wait(phase);
+        operand_full[stage].wait(phase);
+        #pragma unroll
+        for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
+          const uint32_t scale_subtile_base =
+              scale_tmem_base + stage * scale_tmem_stage_columns +
+              subtile * scale_tmem_subtile_columns;
+          dae_mxfp_copy_scale_subtile_to_tmem<
+              kSfaStageBytes, kSfaK128Bytes, kSfbK128Bytes,
+              Utccp, Scale, typename TiledMma::FrgTypeSFA,
+              typename TiledMma::FrgTypeSFB, LayoutSFA, LayoutSFB>(
+                  scale_ring + stage * kScaleStageBytes,
+                  subtile, scale_subtile_base, sfb_column_offset);
+        }
+        weight_full[stage].wait(phase);
+      } else {
+        weight_full[stage].wait(phase);
+        operand_full[stage].wait(phase);
+      }
       #pragma unroll
       for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
         const uint32_t scale_subtile_base =
@@ -435,37 +552,13 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
         auto frag_a = TiledMma::make_fragment_A(sA);
         auto frag_b = TiledMma::make_fragment_B(sB);
 
-        if (elect_one_sync()) {
-          auto compact_sfa = make_tensor(
-              stage_tmem_sfa.data(), filter_zeros(stage_tmem_sfa.layout()));
-          auto compact_sfb = make_tensor(
-              stage_tmem_sfb.data(), filter_zeros(stage_tmem_sfb.layout()));
-          auto copy_sfa = make_utccp_copy(Utccp{}, compact_sfa);
-          auto copy_sfb = make_utccp_copy(Utccp{}, compact_sfb);
-          auto copy_sfa_slice = copy_sfa.get_slice(0);
-          auto copy_sfb_slice = copy_sfb.get_slice(0);
-          auto *stage_scale = scale_ring + stage * kScaleStageBytes;
-          auto smem_sfa = make_tensor(
-              make_smem_ptr(reinterpret_cast<Scale *>(
-                  stage_scale + subtile * kSfaK128Bytes)),
-              LayoutSFA{});
-          auto smem_sfb = make_tensor(
-              make_smem_ptr(reinterpret_cast<Scale *>(
-                  stage_scale + kSfaStageBytes +
-                  subtile * kSfbK128Bytes)),
-              LayoutSFB{});
-          auto smem_sfa_compact = make_tensor(
-              smem_sfa.data(), filter_zeros(smem_sfa.layout()));
-          auto smem_sfb_compact = make_tensor(
-              smem_sfb.data(), filter_zeros(smem_sfb.layout()));
-          auto copy_sfa_src = dae_mxfp_get_utccp_smem_desc_tensor<Utccp>(
-              copy_sfa_slice.partition_S(smem_sfa_compact));
-          auto copy_sfb_src = dae_mxfp_get_utccp_smem_desc_tensor<Utccp>(
-              copy_sfb_slice.partition_S(smem_sfb_compact));
-          copy(copy_sfa, copy_sfa_src,
-               copy_sfa_slice.partition_D(compact_sfa));
-          copy(copy_sfb, copy_sfb_src,
-               copy_sfb_slice.partition_D(compact_sfb));
+        if constexpr (!kSeparateWeightScaleBarrier) {
+          dae_mxfp_copy_scale_subtile_to_tmem<
+              kSfaStageBytes, kSfaK128Bytes, kSfbK128Bytes,
+              Utccp, Scale, typename TiledMma::FrgTypeSFA,
+              typename TiledMma::FrgTypeSFB, LayoutSFA, LayoutSFB>(
+                  scale_ring + stage * kScaleStageBytes,
+                  subtile, scale_subtile_base, sfb_column_offset);
         }
 
         #pragma unroll
@@ -528,7 +621,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       const int column = int(get<1>(thread_coord(index)));
       if (row < kTileM && column < kNativeOutputRows) {
         output_smem[row * kNativeOutputRows + column] =
-            registers(index) * route_scale;
+            Output(registers(index) * route_scale);
       }
     }
   }
@@ -540,13 +633,22 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
 #endif
 
   if (tid == 0 && (reduce_from_zero || expert != 0)) {
-    cuda::atomic_ref<int, cuda::thread_scope_device> shared_ready(
-        global_bars[reduce_bar]);
-    while (shared_ready.load(cuda::memory_order_acquire) != 0) {
-      __nanosleep(128);
+    if constexpr (ResidentAllTma && mxfpResidentDownLdu1ZeroEnabled) {
+      auto *reduction_ready = reinterpret_cast<TxBarrier *>(
+          resident_mma_barriers +
+          mxfpDownResidentReductionReadyBarrierBase);
+      reduction_ready[output_m_tile >= kDownTilesPerExpert / 2].wait(0);
+    } else {
+      cuda::atomic_ref<int, cuda::thread_scope_device> shared_ready(
+          global_bars[reduce_bar]);
+      while (shared_ready.load(cuda::memory_order_acquire) != 0) {
+        __nanosleep(128);
+      }
     }
   }
-  __sync_barrier<SyncBarrierId, 128>();
+  if constexpr (!(ResidentAllTma && mxfpResidentDownLdu1ZeroEnabled)) {
+    __sync_barrier<SyncBarrierId, 128>();
+  }
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
     profile_events[13] = cuda::ptx::get_sreg_globaltimer();
@@ -555,8 +657,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
 
   // The shared expert can establish the FP32 destination with a bulk copy, or
   // all seven experts can reduce-add after the shared CTA publishes zero.
-  // Both paths consume this FP32 shared epilogue directly: no expert-output
-  // write/read round trip and no conversion are present.
+  // Both paths consume the selected FP32/BF16 shared epilogue directly: no
+  // expert-output write/read round trip is present.
   if (tid == 0) {
     const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
     const int row = output_m_tile * kTileM;

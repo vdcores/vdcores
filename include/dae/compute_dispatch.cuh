@@ -94,6 +94,25 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ZERO_FILL) {
   c2m.template push<0, true>(thread_id, output_slot);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_GATE_UP_SILU_RESIDENT_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
+             tmem_mma_phase, fp8_umma_pipeline_phase_mask,
+             nvfp4_umma_pipeline_phase_mask, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const uint64_t metadata_address = uint64_t(inst.args[0]) |
+      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
+  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);
+  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
+      512, 2, 8, true, true, true>(
+      smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs,
+      metadata, global_bars, m2c, c2m
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+      , sm_id, g_events
+#endif
+      );
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
              tmem_mma_phase,
@@ -105,8 +124,8 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
   const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);
   if constexpr (mxfpDownLduWeightRingEnabled) {
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
-        8, 2, 256, __bar_cgroup, 512,
-        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true>(
+        8, mxfpDownLduWeightRingStages, 256, __bar_cgroup, 512,
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, metadata, global_bars,
         m2c, c2m
@@ -121,7 +140,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
         dynamicSmemBytes - numSlots * slotSizeKb * 1024 >= 80 * 1024) {
       task_mxfp4_mxfp8_down_fixed_ring_sm100<
           8, 2, 256, __bar_cgroup, 512,
-          numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, false>(
+          numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, false, false>(
           smem_base, tmem_base_ptr, tmem_mma_barrier,
           tma_descs, metadata, global_bars,
           m2c, c2m
@@ -132,6 +151,81 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
     } else {
       asm volatile("trap;");
     }
+  }
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_RESIDENT_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
+             tmem_mma_phase, fp8_umma_pipeline_phase_mask,
+             nvfp4_umma_pipeline_phase_mask, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const uint64_t plan_address = uint64_t(inst.args[0]) |
+      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
+  const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+  const int task_count = load_l2(reinterpret_cast<const int *>(plan + 2));
+  for (int task = 0; task < task_count; ++task) {
+    const auto *metadata = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + task));
+    task_mxfp4_mxfp8_down_fixed_ring_sm100<
+        8, 2, 256, __bar_cgroup, 512,
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, true>(
+        smem_base, tmem_base_ptr, tmem_mma_barrier,
+        tma_descs, metadata, global_bars, m2c, c2m
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        , sm_id, g_events
+#endif
+        );
+  }
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100) {
+  DAE_UNUSED(pc, count, finish, st_insts, tmem_mma_phase,
+             fp8_umma_pipeline_phase_mask,
+             nvfp4_umma_pipeline_phase_mask, scratch_space);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const uint64_t plan_address = uint64_t(inst.args[0]) |
+      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
+  const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + 2] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  const auto *linear1_metadata = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + 0));
+  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
+      512, 2, 8, true, true, true>(
+      smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs,
+      linear1_metadata, global_bars, m2c, c2m
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+      , sm_id, g_events
+#endif
+      );
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + 4] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+
+  const int down_task_count = load_l2(
+      reinterpret_cast<const int *>(plan + 3));
+  for (int task = 0; task < down_task_count; ++task) {
+    const auto *down_metadata = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 1 + task));
+    task_mxfp4_mxfp8_down_fixed_ring_sm100<
+        8, 2, 256, __bar_cgroup, 512,
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, true>(
+        smem_base, tmem_base_ptr, tmem_mma_barrier,
+        tma_descs, down_metadata, global_bars, m2c, c2m
+#if defined(DAE_TRACK_MXFP_TIMELINE)
+        , sm_id, g_events
+#endif
+        );
+  }
+  if (thread_id == 0) {
+    const uint64_t finish_time = cuda::ptx::get_sreg_globaltimer();
+    g_events[sm_id * numProfileEvents + 5] = finish_time;
+    g_events[sm_id * numProfileEvents + 3] = finish_time;
   }
 #endif
 }

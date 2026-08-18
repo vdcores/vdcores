@@ -895,6 +895,9 @@ def test_mxfp4_mxfp8_gate_up_silu_instructions_encode_selected_families():
 
 
 def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
+    monkeypatch.setattr(
+        config, "mxfp_weight_scale_tma", False, raising=False
+    )
     tma_load = SchedMxfp4Mxfp8GateUpSiluFixedRing.schedule.__globals__[
         "TmaLoad1D"
     ]
@@ -1004,6 +1007,24 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
         assert continuation.num_slots == config.num_slots + 8
         assert continuation.annotation["fixed_port"] == 0
 
+    monkeypatch.setattr(config, "mxfp_weight_scale_tma", True)
+    retained_scale_tma = SchedMxfp4Mxfp8GateUpSiluFixedRing(
+        gate_weight,
+        gate_scale,
+        up_weight,
+        up_scale,
+        activation_data,
+        activation_scale,
+        output_data,
+        output_scale,
+        gate_tma,
+        up_tma,
+        metadata,
+        tile_k=512,
+    ).place(2).schedule(0)
+    assert retained_scale_tma[2].cords == [7, 8, 0, 0]
+    assert retained_scale_tma[6].cords == [7, 8, 0, 1]
+
 
 def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
     monkeypatch.setattr(
@@ -1013,7 +1034,9 @@ def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
     monkeypatch.setattr(
         config, "mxfp_down_ldu_weight_ring", True, raising=False
     )
-
+    monkeypatch.setattr(
+        config, "mxfp_weight_scale_tma", False, raising=False
+    )
     class FakeLauncher:
         def new_tma(self, _desc):
             return 11
@@ -1023,7 +1046,12 @@ def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
     weight = torch.empty((tasks, 8, 2, 128, 64), dtype=torch.uint8)
     scale = torch.empty((tasks, 8, 1024), dtype=torch.uint8)
     activation = torch.empty((experts, 16, 1536), dtype=torch.uint8)
-    output = torch.empty((32, 128, 8), dtype=torch.float32)
+    output_dtype = (
+        torch.bfloat16
+        if getattr(config, "mxfp_down_bf16_reduction", False)
+        else torch.float32
+    )
+    output = torch.empty((32, 128, 8), dtype=output_dtype)
     metadata = torch.empty((tasks, 128), dtype=torch.uint8)
     weight_tma = TmaTensor(FakeLauncher(), weight).mxfp4_load(256)
 
@@ -1053,6 +1081,19 @@ def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
     )
     assert continuation.num_slots == 32
     assert continuation.annotation["fixed_port"] == 0
+
+    monkeypatch.setattr(config, "mxfp_weight_scale_tma", True)
+    retained_scale_tma = SchedMxfp4Mxfp8DownFixedRing(
+        weight,
+        scale,
+        activation,
+        output,
+        weight_tma,
+        metadata,
+        retain_weight_ring_between_tasks=True,
+    ).place(32).schedule(0)
+    assert retained_scale_tma[1].cords == [11, 0, 0, 0]
+    monkeypatch.setattr(config, "mxfp_weight_scale_tma", False)
 
     per_task = SchedMxfp4Mxfp8DownFixedRing(
         weight,

@@ -375,6 +375,24 @@ class Mxfp4Mxfp8GateUpSiluFixedRingSm100(ComputeInstruction):
         )
 
 
+class Mxfp4Mxfp8GateUpSiluResidentSm100(ComputeInstruction):
+    """Dedicated K512 Linear-1 compute over fixed resident operands."""
+
+    def __init__(self, metadata_address: int):
+        if metadata_address < 0 or metadata_address >= 1 << 48:
+            raise ValueError(
+                "resident MXFP4/MXFP8 metadata pointer must fit in 48 bits"
+            )
+        super().__init__(
+            opcode=opcode.OP_MXFP4_MXFP8_GATE_UP_SILU_RESIDENT_SM100,
+            args=[
+                metadata_address & 0xFFFF,
+                (metadata_address >> 16) & 0xFFFF,
+                (metadata_address >> 32) & 0xFFFF,
+            ],
+        )
+
+
 class Mxfp4Mxfp8DownFixedRingSm100(ComputeInstruction):
     """K2048 down projection consuming native fused-Linear1 records."""
 
@@ -387,6 +405,40 @@ class Mxfp4Mxfp8DownFixedRingSm100(ComputeInstruction):
                 metadata_address & 0xFFFF,
                 (metadata_address >> 16) & 0xFFFF,
                 (metadata_address >> 32) & 0xFFFF,
+            ],
+        )
+
+
+class Mxfp4Mxfp8DownResidentSm100(ComputeInstruction):
+    """Dedicated K256 Down compute over fixed resident operands."""
+
+    def __init__(self, metadata_address: int):
+        if metadata_address < 0 or metadata_address >= 1 << 48:
+            raise ValueError(
+                "resident Down metadata pointer must fit in 48 bits"
+            )
+        super().__init__(
+            opcode=opcode.OP_MXFP4_MXFP8_DOWN_RESIDENT_SM100,
+            args=[
+                metadata_address & 0xFFFF,
+                (metadata_address >> 16) & 0xFFFF,
+                (metadata_address >> 32) & 0xFFFF,
+            ],
+        )
+
+
+class Mxfp4Mxfp8ResidentFfnSm100(ComputeInstruction):
+    """One dedicated Linear-1 plus Down resident compute plan."""
+
+    def __init__(self, plan_address: int):
+        if plan_address < 0 or plan_address >= 1 << 48:
+            raise ValueError("resident FFN plan pointer must fit in 48 bits")
+        super().__init__(
+            opcode=opcode.OP_MXFP4_MXFP8_RESIDENT_FFN_SM100,
+            args=[
+                plan_address & 0xFFFF,
+                (plan_address >> 16) & 0xFFFF,
+                (plan_address >> 32) & 0xFFFF,
             ],
         )
 
@@ -2661,19 +2713,43 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+def register_ldu_global_address(launcher, tensor: torch.Tensor) -> int:
+    """Add one raw CUDA address to the launcher's 128-byte entry table."""
+    if not tensor.is_contiguous():
+        raise ValueError("LDU raw-address source must be contiguous")
+    address = tensor.data_ptr()
+    record = torch.zeros((128,), dtype=torch.uint8)
+    record[:8] = torch.tensor(
+        list(address.to_bytes(8, byteorder="little")), dtype=torch.uint8
+    )
+    return launcher.new_tma(record)
+
+
 class TmaLoadMxfpWeightRing5D(MemoryInstruction):
     """Retained two-stage K512 weight ring for fused Linear-1.
 
     The allocating command names the gate and up TMA descriptors plus their
     common output tile. LDU0 consumes a compact continuation between the two
-    projections while retaining the original 16-slot lease.
+    projections while retaining one 16-slot weight lease, extended by one
+    slot for both scale stages when scale TMA is enabled.
     """
 
-    RING_SLOTS = 16
+    RING_SLOTS = 16 + int(
+        getattr(config, "mxfp_weight_scale_tma", False)
+    )
     CONTINUATION_SPECIAL_SLOT = 8
     PACKED_TILE_BYTES = 32 * 1024
+    SCALE_TILE_BYTES = 2048
+    K_TILES = 8
 
-    def __init__(self, gate_tma, up_tma, output_tile: int):
+    def __init__(
+        self,
+        gate_tma,
+        up_tma,
+        output_tile: int,
+        gate_scale_address=None,
+        up_scale_address=None,
+    ):
         expected_base = [0, 0, 0, int(output_tile)]
         expected_next = [0, 0, 1, int(output_tile)]
         for name, descriptor in (("gate", gate_tma), ("up", up_tma)):
@@ -2694,12 +2770,26 @@ class TmaLoadMxfpWeightRing5D(MemoryInstruction):
                     "retained weight ring requires task-major "
                     "[M tile,K tile] TMA coordinates"
                 )
+        scale_indices = [0, 0]
+        if getattr(config, "mxfp_weight_scale_tma", False):
+            for index, (name, address_index) in enumerate((
+                ("gate", gate_scale_address),
+                ("up", up_scale_address),
+            )):
+                if not isinstance(address_index, int) or not (
+                    0 <= address_index < 2**16
+                ):
+                    raise ValueError(
+                        f"{name} retained scale ring requires a raw-address "
+                        "table index"
+                    )
+                scale_indices[index] = address_index
         super().__init__(
             opcode=opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D,
             num_slots=self.RING_SLOTS,
             size=gate_tma.arg,
             arg=up_tma.arg,
-            cords=expected_base,
+            cords=[*scale_indices, 0, int(output_tile)],
         )
         self.fixed_port(0)
 
@@ -2725,20 +2815,87 @@ class TmaLoadMxfpWeightRing5D(MemoryInstruction):
         return inst
 
 
-class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
-    """Retained two-stage K256 weight ring for Linear-2.
+class TmaLoadMxfpGateUpResident(MemoryInstruction):
+    """Run one fixed-layout Linear-1 LDU plan without allocator/M2C traffic."""
 
-    One allocating command owns the 64-KiB ring for ``task_count`` sequential
-    down tasks on the same worker. Compact continuations publish that same
-    lease to compute and carry the next task coordinate directly to LDU0.
+    SPECIAL_SLOT = 8
+
+    def __init__(self, metadata_address: int):
+        if metadata_address <= 0 or metadata_address >= 1 << 64:
+            raise ValueError("resident Linear-1 metadata address must fit uint64")
+        super().__init__(
+            opcode=opcode.OP_TMA_LOAD_MX_GATE_UP_RESIDENT,
+            num_slots=config.num_slots + self.SPECIAL_SLOT,
+            arg=0,
+            size=0,
+            address=metadata_address,
+        )
+        self.fixed_port(0)
+
+
+class TmaLoadMxfpDownResident(MemoryInstruction):
+    """Run one fixed-layout Down LDU plan without allocator/M2C traffic."""
+
+    SPECIAL_SLOT = 8
+
+    def __init__(self, metadata_address: int):
+        if metadata_address <= 0 or metadata_address >= 1 << 64:
+            raise ValueError("resident Down metadata address must fit uint64")
+        super().__init__(
+            opcode=opcode.OP_TMA_LOAD_MX_DOWN_RESIDENT,
+            num_slots=config.num_slots + self.SPECIAL_SLOT,
+            arg=0,
+            size=0,
+            address=metadata_address,
+        )
+        self.fixed_port(0)
+
+
+class TmaLoadMxfpResidentFfn(MemoryInstruction):
+    """Run one complete resident FFN LDU plan from a stable mailbox."""
+
+    SPECIAL_SLOT = 8
+
+    def __init__(self, plan_address: int):
+        if plan_address <= 0 or plan_address >= 1 << 64:
+            raise ValueError("resident FFN plan address must fit uint64")
+        super().__init__(
+            opcode=opcode.OP_TMA_LOAD_MX_RESIDENT_FFN,
+            num_slots=config.num_slots + self.SPECIAL_SLOT,
+            arg=0,
+            size=0,
+            address=plan_address,
+        )
+        self.fixed_port(0)
+
+
+class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
+    """Retained K256 weight ring for Linear-2.
+
+    One allocating command owns a two- or four-stage ring for ``task_count``
+    sequential down tasks on the same worker. Compact continuations publish
+    that same lease to compute and carry the next task coordinate to LDU0.
     """
 
-    RING_SLOTS = 8
+    RING_STAGES = int(
+        getattr(config, "mxfp_down_ldu_weight_ring_stages", 2)
+    )
+    RING_SLOTS = 4 * RING_STAGES + int(
+        getattr(config, "mxfp_weight_scale_tma", False)
+    )
     PACKED_TILE_BYTES = 16 * 1024
+    SCALE_TILE_BYTES = 1024
+    K_TILES = 8
     MAX_OUTPUT_TASK = 0xFF
     HANDOFF_SPECIAL_SLOT = 8
 
-    def __init__(self, weight_tma, output_task: int, task_count: int = 1):
+    def __init__(
+        self,
+        weight_tma,
+        output_task: int,
+        task_count: int = 1,
+        weight_scale_address=None,
+    ):
         output_task = int(output_task)
         task_count = int(task_count)
         expected_base = [0, 0, 0, output_task]
@@ -2764,12 +2921,22 @@ class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
                 "retained down weight ring requires task-major "
                 "[M tile,K tile] TMA coordinates"
             )
+        scale_index = 0
+        if getattr(config, "mxfp_weight_scale_tma", False):
+            if not isinstance(weight_scale_address, int) or not (
+                0 <= weight_scale_address < 2**16
+            ):
+                raise ValueError(
+                    "retained down scale ring requires a raw-address table "
+                    "index"
+                )
+            scale_index = weight_scale_address
         super().__init__(
             opcode=opcode.OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D,
             num_slots=self.RING_SLOTS,
             size=task_count,
             arg=weight_tma.arg,
-            cords=expected_base,
+            cords=[scale_index, 0, 0, output_task],
         )
         self.fixed_port(0)
 
@@ -3113,7 +3280,10 @@ __all__ = [
     "Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100",
     "Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100",
     "Mxfp4Mxfp8GateUpSiluFixedRingSm100",
+    "Mxfp4Mxfp8GateUpSiluResidentSm100",
     "Mxfp4Mxfp8DownFixedRingSm100",
+    "Mxfp4Mxfp8DownResidentSm100",
+    "Mxfp4Mxfp8ResidentFfnSm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",
@@ -3247,7 +3417,11 @@ __all__ = [
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
+    "register_ldu_global_address",
     "TmaLoadMxfpWeightRing5D",
+    "TmaLoadMxfpGateUpResident",
+    "TmaLoadMxfpDownResident",
+    "TmaLoadMxfpResidentFfn",
     "TmaLoadMxfpDownWeightRing5D",
     "TmaLoadMxfpScale1D",
     "TmaLoadMxfpScaleBase1D",

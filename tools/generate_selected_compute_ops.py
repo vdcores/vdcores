@@ -437,7 +437,7 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             "  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);",
             (
                 "  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<"
-                f"{tile_k}, {stages}, 8, true, {use_ldu_weight_ring}>("
+                f"{tile_k}, {stages}, 8, true, {use_ldu_weight_ring}, false>("
                 "smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs, "
                 "metadata, global_bars, m2c, c2m"
             ),

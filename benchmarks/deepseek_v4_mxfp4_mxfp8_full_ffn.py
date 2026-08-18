@@ -181,8 +181,12 @@ def main() -> None:
     down_weight.fill_(args.down_weight_byte)
     down_weight_scale = weight_scale_arena[2].view(down_tasks, 8, 1024)
     down_weight_scale.fill_(args.down_weight_scale)
+    reduction_bf16 = bool(
+        getattr(runtime.config, "mxfp_down_bf16_reduction", False)
+    )
+    reduction_dtype = torch.bfloat16 if reduction_bf16 else torch.float32
     final_output = torch.empty(
-        (down_slices, 128, 8), dtype=torch.float32, device=device
+        (down_slices, 128, 8), dtype=reduction_dtype, device=device
     )
     down_tma = TmaTensor(down_launcher, down_weight).mxfp4_load(256)
     output_tma = TmaTensor(
@@ -306,7 +310,11 @@ def main() -> None:
         .expand(down_slices, 128, 8)
         .to(device)
     )
-    torch.testing.assert_close(final_output, expected_final, rtol=2e-5, atol=1e-3)
+    rtol = 3e-2 if reduction_bf16 else 2e-5
+    atol = 1e-1 if reduction_bf16 else 1e-3
+    torch.testing.assert_close(
+        final_output.float(), expected_final, rtol=rtol, atol=atol
+    )
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=root_stream):
@@ -336,20 +344,24 @@ def main() -> None:
             l2_scrub_mib=args.cold_l2_scrub_mib,
         )
 
-    torch.testing.assert_close(final_output, expected_final, rtol=2e-5, atol=1e-3)
+    torch.testing.assert_close(
+        final_output.float(), expected_final, rtol=rtol, atol=atol
+    )
     median_us = statistics.median(times)
     speedup = args.vllm_us / median_us
     improvement = (args.vllm_us - median_us) / args.vllm_us * 100.0
-    max_abs_error = float((final_output - expected_final).abs().max())
+    output_fp32 = final_output.float()
+    max_abs_error = float((output_fp32 - expected_final).abs().max())
     max_rel_error = float(
-        ((final_output - expected_final).abs() /
+        ((output_fp32 - expected_final).abs() /
          expected_final.abs().clamp_min(torch.finfo(torch.float32).tiny)).max()
     )
     print(
         "DSV4_MXFP4_MXFP8_FULL_FFN_RESULT "
         f"experts={experts} shared=1 routed=6 rows=8 "
         "native_handoff=true conversion=false repack=false replication=false "
-        "reduction=tma_fp32 kernels=2 focused_entrypoints=true "
+        f"reduction={'tma_bf16' if reduction_bf16 else 'tma_fp32'} "
+        "kernels=2 focused_entrypoints=true "
         "allocator_compatible=true one_cta_per_sm=true "
         "linear1_tmem_epilogue=late_register "
         f"workers={workers} allocator_slots={runtime.config.num_slots} "

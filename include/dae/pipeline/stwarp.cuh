@@ -2,6 +2,29 @@
 
 #include "virtualcore.cuh"
 
+template<typename C2M_Type>
+__device__ __forceinline__ void stwarp_execute_terminate_only(
+    C2M_Type &c2m
+#if defined(DAE_TRACK_PROFILE)
+    , const int sm_id, uint64_t *g_events
+#endif
+) {
+  // The resident FFN writes its final output directly; its only C2M message is
+  // the compute terminator. Preserve the queue rendezvous without instantiating
+  // the generic writeback decoder in this focused image.
+  (void)c2m.template pop<>();
+#if defined(DAE_TRACK_PROFILE)
+  const int event_base = sm_id * numProfileEvents;
+  g_events[event_base + DAE_TRACK_STORE_QUEUE_WAIT_NS] = c2m.track_wait_ns;
+  g_events[event_base + DAE_TRACK_STORE_QUEUE_WAIT_CALLS] =
+      c2m.track_wait_calls;
+  g_events[event_base + DAE_TRACK_STORE_SERVICE_NS] = 0;
+  g_events[event_base + DAE_TRACK_STORE_BARRIER_SERVICE_NS] = 0;
+  g_events[event_base + DAE_TRACK_STORE_COMMANDS] = 0;
+  g_events[event_base + DAE_TRACK_STORE_BARRIER_COMMANDS] = 0;
+#endif
+}
+
 // TODO(zhiyuang): attach bars to the writeback
 template<typename C2M_Type>
 __device__ __forceinline__ void stwarp_execute_singlethread(

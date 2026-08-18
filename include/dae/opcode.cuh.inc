@@ -103,6 +103,15 @@ DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D, MK_MOP(51, MEM_OP_FLAGS_NONE
 // its already-resident barrier bank, so the transition initializes nothing.
 DAE_OP(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D, MK_MOP(52, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D, MK_MOP(53, MEM_OP_FLAGS_NONE))
+// Dedicated resident Linear-1 plan. The command occupies one stable special
+// mailbox and drives fixed shared-memory weight/scale/activation regions; it
+// owns no allocator slots and publishes no per-operand M2C token.
+DAE_OP(OP_TMA_LOAD_MX_GATE_UP_RESIDENT, MK_MOP(54, MEM_OP_FLAGS_NONE))
+// Standalone diagnostic form of the fixed-layout resident Down plan.
+DAE_OP(OP_TMA_LOAD_MX_DOWN_RESIDENT, MK_MOP(55, MEM_OP_FLAGS_NONE))
+// Complete per-worker FFN plan: one Linear-1 record followed by up to two
+// Down records, all serviced by one long-running fixed-layout LDU command.
+DAE_OP(OP_TMA_LOAD_MX_RESIDENT_FFN, MK_MOP(56, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 
@@ -205,6 +214,9 @@ DAE_DEFINE_COMP_FAMILY(MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100, FIELDS=K|STAGE
   DAE_OP(OP_DSV4_FP32_SWIGLU_NVFP4_QUANT_UMMA_B_SM100, 0x7169)
   DAE_OP(OP_NVFP4_GEMV_UMMA_K512_FP32_SM100, 0x716a)
   DAE_OP(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100, 0x716b)
+  DAE_OP(OP_MXFP4_MXFP8_GATE_UP_SILU_RESIDENT_SM100, 0x716c)
+  DAE_OP(OP_MXFP4_MXFP8_DOWN_RESIDENT_SM100, 0x716d)
+  DAE_OP(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100, 0x716e)
   DAE_OP(OP_FP8_UMMA_PREPACK_SM100, 0x7149)
   DAE_OP(OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4, 0x714b)
   DAE_OP(OP_DSV4_GATED_POOL_PACKED8_SHARD128, 0x714c)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mxfp_resident_ffn.cuh"
 #include "mxfp4_mxfp8_umma.cuh"
 
 #include <cute/algorithm/gemm.hpp>
@@ -36,6 +37,48 @@ static constexpr bool mxfpGateUpSubtileScaleSlots =
     DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS != 0;
 static constexpr bool mxfpGateUpDirectOutput =
     mxfpGateUpDirectOutputEnabled;
+
+template <
+    int SfaStageBytes, int SfaK128Bytes, int SfbK128Bytes,
+    class Utccp, class Scale, class FrgSFA, class FrgSFB,
+    class LayoutSFA, class LayoutSFB>
+__device__ __forceinline__ void dae_mxfp_copy_scale_subtile_to_tmem(
+    uint8_t *stage_scale, int subtile, uint32_t scale_subtile_base,
+    int sfb_column_offset) {
+  using namespace cute;
+  auto stage_tmem_sfa = make_tensor<FrgSFA>(shape(LayoutSFA{}));
+  auto stage_tmem_sfb = make_tensor<FrgSFB>(shape(LayoutSFB{}));
+  stage_tmem_sfa.data() = scale_subtile_base;
+  stage_tmem_sfb.data() = scale_subtile_base + sfb_column_offset;
+  if (elect_one_sync()) {
+    auto compact_sfa = make_tensor(
+        stage_tmem_sfa.data(), filter_zeros(stage_tmem_sfa.layout()));
+    auto compact_sfb = make_tensor(
+        stage_tmem_sfb.data(), filter_zeros(stage_tmem_sfb.layout()));
+    auto copy_sfa = make_utccp_copy(Utccp{}, compact_sfa);
+    auto copy_sfb = make_utccp_copy(Utccp{}, compact_sfb);
+    auto copy_sfa_slice = copy_sfa.get_slice(0);
+    auto copy_sfb_slice = copy_sfb.get_slice(0);
+    auto smem_sfa = make_tensor(
+        make_smem_ptr(reinterpret_cast<Scale *>(
+            stage_scale + subtile * SfaK128Bytes)),
+        LayoutSFA{});
+    auto smem_sfb = make_tensor(
+        make_smem_ptr(reinterpret_cast<Scale *>(
+            stage_scale + SfaStageBytes + subtile * SfbK128Bytes)),
+        LayoutSFB{});
+    auto smem_sfa_compact = make_tensor(
+        smem_sfa.data(), filter_zeros(smem_sfa.layout()));
+    auto smem_sfb_compact = make_tensor(
+        smem_sfb.data(), filter_zeros(smem_sfb.layout()));
+    auto copy_sfa_src = dae_mxfp_get_utccp_smem_desc_tensor<Utccp>(
+        copy_sfa_slice.partition_S(smem_sfa_compact));
+    auto copy_sfb_src = dae_mxfp_get_utccp_smem_desc_tensor<Utccp>(
+        copy_sfb_slice.partition_S(smem_sfb_compact));
+    copy(copy_sfa, copy_sfa_src, copy_sfa_slice.partition_D(compact_sfa));
+    copy(copy_sfb, copy_sfb_src, copy_sfb_slice.partition_D(compact_sfb));
+  }
+}
 
 template <
     int OutputRows, class GateSilu, class TiledT2R,
@@ -109,7 +152,7 @@ __device__ __forceinline__ void dae_mxfp_gate_up_issue_raw_umma(
 // late enough to overlap the remaining up work without a shared-memory image.
 template <
     int K, int RingStages, int TileN, bool PublishReady,
-    bool UseLduWeightRing,
+    bool UseLduWeightRing, bool ResidentAllTma,
     typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
@@ -141,10 +184,20 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       !UseLduWeightRing || (K == 512 && RingStages == 2),
       "retained LDU weight ring requires the K512 two-stage task");
   static_assert(
-      !UseLduWeightRing || !mxfpGateUpDirectActivationEnabled,
+      !UseLduWeightRing || ResidentAllTma ||
+          !mxfpGateUpDirectActivationEnabled,
       "retained LDU weights require allocator-owned activation storage");
+  static_assert(
+      !ResidentAllTma || UseLduWeightRing,
+      "resident all-TMA Linear-1 requires the LDU ring protocol");
+  constexpr bool kLduWeightScaleTma =
+      UseLduWeightRing &&
+      (mxfpWeightScaleTmaEnabled || ResidentAllTma);
+  constexpr bool kSeparateWeightScaleBarrier =
+      kLduWeightScaleTma && !ResidentAllTma &&
+      mxfpGateUpWeightScaleSeparateBarrierEnabled;
   constexpr bool kStreamDirectActivation =
-      mxfpGateUpDirectActivationEnabled &&
+      !ResidentAllTma && mxfpGateUpDirectActivationEnabled &&
       mxfpGateUpDirectActivationTiles == 1;
   static_assert(
       !kStreamDirectActivation || (K == 512 && RingStages == 3),
@@ -258,7 +311,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
 #endif
   int activation_slots = 0;
   uint8_t *activation_base = static_cast<uint8_t *>(smem_base);
-  if constexpr (!mxfpGateUpDirectActivationEnabled) {
+  if constexpr (ResidentAllTma) {
+    activation_base = static_cast<uint8_t *>(smem_base) +
+        dae_mxfp_resident_ffn::kLinear1ActivationOffset;
+  } else if constexpr (!mxfpGateUpDirectActivationEnabled) {
     activation_base = nullptr;
     if (warp < 2) {
       activation_slots = m2c.template pop<0>();
@@ -281,13 +337,22 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   }
 
   uint8_t *ldu_weight_ring = nullptr;
-  if constexpr (UseLduWeightRing) {
-    if (warp == 0) {
+  if constexpr (ResidentAllTma) {
+    ldu_weight_ring = static_cast<uint8_t *>(smem_base) +
+        dae_mxfp_resident_ffn::kLinear1WeightRingOffset;
+  } else if constexpr (UseLduWeightRing) {
+    if constexpr (kLduWeightScaleTma) {
       const int weight_slots = m2c.template pop<0>();
       ldu_weight_ring = static_cast<uint8_t *>(
           get_slot_address(smem_base, extract(weight_slots)));
     } else {
-      m2c.advance();
+      if (warp == 0) {
+        const int weight_slots = m2c.template pop<0>();
+        ldu_weight_ring = static_cast<uint8_t *>(
+            get_slot_address(smem_base, extract(weight_slots)));
+      } else {
+        m2c.advance();
+      }
     }
   }
 
@@ -319,6 +384,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       ? 0
       : RingStages * kWeightStageBytes;
   constexpr int kScaleRingBytes = RingStages * kScaleStageBytes;
+  constexpr int kTaskScaleRingBytes = kLduWeightScaleTma
+      ? 0
+      : kScaleRingBytes;
   constexpr int kActivationRingBytes = kStreamDirectActivation
       ? RingStages * kActivationStageBytes
       : 0;
@@ -331,7 +399,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   using GateSilu = std::conditional_t<
       mxfpGateUpFixedBf16Epilogue, __nv_bfloat16, float>;
   constexpr int kFixedScratchBytes =
-      kTaskWeightRingBytes + kScaleRingBytes + kActivationRingBytes +
+      kTaskWeightRingBytes + kTaskScaleRingBytes + kActivationRingBytes +
       kBarrierBytes;
   constexpr int kAllocatorArenaBytes = numSlots * slotSizeKb * 1024;
   constexpr int kFixedOffset = kStreamDirectActivation
@@ -348,16 +416,23 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   auto *fixed_base = kStreamDirectActivation
       ? static_cast<uint8_t *>(smem_base)
       : static_cast<uint8_t *>(smem_base) + kFixedOffset;
-  // Put the compact scale ring first; every task-local operand retains at
-  // least the 1-KiB alignment required by its native descriptor.
-  auto *scale_ring = fixed_base;
-  auto *activation_ring = scale_ring + kScaleRingBytes;
+  // Without LDU scale TMA, keep the compact task-owned scale ring first. In
+  // combined mode it instead occupies the final slot of the retained lease.
+  auto *task_scale_ring = fixed_base;
+  auto *activation_ring = task_scale_ring + kTaskScaleRingBytes;
   auto *task_weight_ring = activation_ring + kActivationRingBytes;
   auto *local_barrier_base = task_weight_ring + kTaskWeightRingBytes;
   auto *weight_ring = UseLduWeightRing
       ? ldu_weight_ring
       : task_weight_ring;
+  auto *scale_ring = ResidentAllTma
+      ? static_cast<uint8_t *>(smem_base) +
+          dae_mxfp_resident_ffn::kLinear1ScaleRingOffset
+      : (kLduWeightScaleTma
+          ? ldu_weight_ring + RingStages * kWeightStageBytes
+          : task_scale_ring);
   TxBarrier *weight_full;
+  TxBarrier *weight_scale_full;
   TxBarrier *scale_full;
   TxBarrier *umma_full;
   TxBarrier *stage_empty;
@@ -366,6 +441,8 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   if constexpr (UseLduWeightRing) {
     weight_full = reinterpret_cast<TxBarrier *>(
         tmem_mma_barriers + mxfpLduWeightRingFullBarrierBase);
+    weight_scale_full = reinterpret_cast<TxBarrier *>(
+        tmem_mma_barriers + mxfpLduWeightScaleFullBarrierBase);
     stage_empty = reinterpret_cast<TxBarrier *>(
         tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
     scale_full = reinterpret_cast<TxBarrier *>(local_barrier_base);
@@ -373,6 +450,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     activation_full = umma_full + RingStages;
   } else {
     weight_full = reinterpret_cast<TxBarrier *>(local_barrier_base);
+    weight_scale_full = weight_full;
     scale_full = weight_full + RingStages;
     umma_full = scale_full + RingStages;
     stage_empty = umma_full + RingStages;
@@ -392,7 +470,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         weight_full[stage].init(1);
         stage_empty[stage].init(1);
       }
-      scale_full[stage].init(mxfpGateUpFixedBulkScale ? 1 : 2);
+      scale_full[stage].init(
+          kLduWeightScaleTma ? 1 :
+          (mxfpGateUpFixedBulkScale ? 1 : 2));
       umma_full[stage].init(1);
     }
     if constexpr (!kStreamDirectActivation) {
@@ -405,7 +485,8 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   __sync_compute_group(128);
 
   if constexpr (
-      mxfpGateUpDirectActivationEnabled && !kStreamDirectActivation) {
+      !ResidentAllTma && mxfpGateUpDirectActivationEnabled &&
+      !kStreamDirectActivation) {
     if (warp == 1 && lane == 0) {
       activation_full->arrive_and_expect_tx(kActivationGlobalBytes);
       if constexpr (kTileN == kNativeActivationRows) {
@@ -535,7 +616,25 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
               phase ^ (UseLduWeightRing ? 0 : 1));
         }
         auto *stage_scale = scale_ring + stage * kScaleStageBytes;
-        if constexpr (mxfpGateUpFixedBulkScale) {
+        if constexpr (ResidentAllTma) {
+          // LDU0 attached SFA and SFB to the same resident transaction as
+          // the transformed weight. These warps only retire completed UMMA
+          // stages; they submit no memory operations in this path.
+        } else if constexpr (kLduWeightScaleTma) {
+          // LDU0 attached SFA to the resident weight-full transaction. Keep
+          // only producer-dependent activation scale on the compute side.
+          if (warp == 3) {
+            dae_mxfp_cp_async_scale_stage<kSfbStageBytes>(
+                activation_scale_global + tile * kSfbStageBytes,
+                stage_scale + kSfaStageBytes, lane);
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncwarp();
+            cutlass::arch::fence_view_async_shared();
+            if (lane == 0) {
+              scale_full[stage].arrive();
+            }
+          }
+        } else if constexpr (mxfpGateUpFixedBulkScale) {
           // One producer submits both scale records to the bulk engine. The
           // transaction barrier flips only after all 4 KiB are visible, so
           // warp 0 can UTCCP directly without a producer-side wait. Warp 3 is
@@ -654,8 +753,34 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;
         const int phase = (operation / RingStages) & 1;
-        weight_full[stage].wait(phase);
-        scale_full[stage].wait(phase);
+        if constexpr (kSeparateWeightScaleBarrier) {
+          weight_scale_full[stage].wait(phase);
+          scale_full[stage].wait(phase);
+          #pragma unroll
+          for (int subtile = 0; subtile < kK128PerTile; ++subtile) {
+            const int scale_subtile =
+                mxfpGateUpSubtileScaleSlots ? subtile : 0;
+            const uint32_t scale_subtile_base =
+                scale_tmem_base + stage * scale_tmem_stage_columns +
+                scale_subtile * scale_tmem_subtile_columns;
+            dae_mxfp_copy_scale_subtile_to_tmem<
+                kSfaStageBytes, kSfaK128Bytes, kSfbK128Bytes,
+                Utccp, Scale, typename TiledMma::FrgTypeSFA,
+                typename TiledMma::FrgTypeSFB, LayoutSFA, LayoutSFB>(
+                    scale_ring + stage * kScaleStageBytes,
+                    subtile, scale_subtile_base, sfb_column_offset);
+          }
+          // Scale UTCCP is now in flight/complete in TMEM while the much
+          // larger transformed-weight transaction reaches visibility.
+          weight_full[stage].wait(phase);
+        } else if constexpr (ResidentAllTma) {
+          // The single resident token covers transformed weight, SFA, SFB,
+          // and (for gate tile zero) the immutable full activation image.
+          weight_full[stage].wait(phase);
+        } else {
+          weight_full[stage].wait(phase);
+          scale_full[stage].wait(phase);
+        }
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         if (lane == 0) {
           const int event_base = projection == 0
@@ -719,37 +844,13 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
                 accumulator_columns, sfa_columns, sfb_columns);
           }
 #endif
-          if (elect_one_sync()) {
-            auto compact_sfa = make_tensor(
-                stage_tmem_sfa.data(), filter_zeros(stage_tmem_sfa.layout()));
-            auto compact_sfb = make_tensor(
-                stage_tmem_sfb.data(), filter_zeros(stage_tmem_sfb.layout()));
-            auto copy_sfa = make_utccp_copy(Utccp{}, compact_sfa);
-            auto copy_sfb = make_utccp_copy(Utccp{}, compact_sfb);
-            auto copy_sfa_slice = copy_sfa.get_slice(0);
-            auto copy_sfb_slice = copy_sfb.get_slice(0);
-            auto *stage_scale = scale_ring + stage * kScaleStageBytes;
-            auto smem_sfa = make_tensor(
-                make_smem_ptr(reinterpret_cast<Scale *>(
-                    stage_scale + subtile * kSfaK128Bytes)),
-                LayoutSFA{});
-            auto smem_sfb = make_tensor(
-                make_smem_ptr(reinterpret_cast<Scale *>(
-                    stage_scale + kSfaStageBytes +
-                    subtile * kSfbK128Bytes)),
-                LayoutSFB{});
-            auto smem_sfa_compact = make_tensor(
-                smem_sfa.data(), filter_zeros(smem_sfa.layout()));
-            auto smem_sfb_compact = make_tensor(
-                smem_sfb.data(), filter_zeros(smem_sfb.layout()));
-            auto copy_sfa_src = dae_mxfp_get_utccp_smem_desc_tensor<Utccp>(
-                copy_sfa_slice.partition_S(smem_sfa_compact));
-            auto copy_sfb_src = dae_mxfp_get_utccp_smem_desc_tensor<Utccp>(
-                copy_sfb_slice.partition_S(smem_sfb_compact));
-            copy(copy_sfa, copy_sfa_src,
-                 copy_sfa_slice.partition_D(compact_sfa));
-            copy(copy_sfb, copy_sfb_src,
-                 copy_sfb_slice.partition_D(compact_sfb));
+          if constexpr (!kSeparateWeightScaleBarrier) {
+            dae_mxfp_copy_scale_subtile_to_tmem<
+                kSfaStageBytes, kSfaK128Bytes, kSfbK128Bytes,
+                Utccp, Scale, typename TiledMma::FrgTypeSFA,
+                typename TiledMma::FrgTypeSFB, LayoutSFA, LayoutSFB>(
+                    scale_ring + stage * kScaleStageBytes,
+                    subtile, scale_subtile_base, sfb_column_offset);
           }
           #pragma unroll
           for (int k_block = 0; k_block < size<2>(frag_a); ++k_block) {
@@ -828,7 +929,8 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   if (warp == 1) {
     __syncwarp();
     projection_ready[1].wait(0);
-    if constexpr (!mxfpGateUpDirectActivationEnabled) {
+    if constexpr (
+        !ResidentAllTma && !mxfpGateUpDirectActivationEnabled) {
       c2m.template push<numThreadsPerWarp>(tid, activation_slots);
     }
   }

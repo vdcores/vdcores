@@ -42,6 +42,12 @@ void dae2(
   int warp_id = (thread_id % 128) / 32;
   int lane_id = thread_id % 32;
 
+#if defined(DAE_TRACK_PROFILE)
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + DAE_TRACK_KERNEL_ENTRY] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
 
   __kprint("[DAE2 SM %d] Kernel launched with %d threads (%d warps)\n", sm_id, blockDim.x, blockDim.x / 32);
 
@@ -214,7 +220,7 @@ void dae2(
 
     while (!finish) {
       inst = cinsts[(pc++) % numInsts];
-    
+
       __cprint("Executing instruction at PC %d: opcode=%04x", pc - 1, inst.opcode);
       dispatch_compute_instruction(
         sm_id, thread_id, pc, count, finish, inst, smem_base,
@@ -232,29 +238,74 @@ void dae2(
 
     // TODO(zhiyuang): change this to threadIdx.x predicates. will be faster than lane_id based?
     if (warp_id == 0) {
-      allocwarp_execute(
-        lane_id,
-        m2c, m2ld, minsts, &slot_avail,
-        st_insts, smem_base, tma_descs, bars,
-        &ldu_control_publish_barrier,
-        initial_loop_counts
+      if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
+        allocwarp_execute_mxfp_resident_ffn_fast(
+          lane_id, m2ld, minsts, st_insts
 #if defined(DAE_TRACK_PROFILE)
-        , sm_id, g_events
+          , sm_id, g_events
 #endif
-      );
-    } else if (warp_id == 1) {
-      if (lane_id == 0) {
-        stwarp_execute_singlethread(
-          c2m, st_insts,
-          smem_base, tma_descs, bars
+        );
+      } else {
+        allocwarp_execute(
+          lane_id,
+          m2c, m2ld, minsts, &slot_avail,
+          st_insts, smem_base, tma_descs, bars,
+          &ldu_control_publish_barrier,
+          initial_loop_counts
 #if defined(DAE_TRACK_PROFILE)
           , sm_id, g_events
 #endif
         );
       }
-    } else if (warp_id >= 2) { // LD Warps 0-1
+    } else if (warp_id == 1) {
       if (lane_id == 0) {
-        int port_id = warp_id - 2;
+        if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
+          stwarp_execute_terminate_only(
+            c2m
+#if defined(DAE_TRACK_PROFILE)
+            , sm_id, g_events
+#endif
+          );
+        } else {
+          stwarp_execute_singlethread(
+            c2m, st_insts,
+            smem_base, tma_descs, bars
+#if defined(DAE_TRACK_PROFILE)
+            , sm_id, g_events
+#endif
+          );
+        }
+      }
+    } else if (warp_id >= 2) { // LD Warps 0-1
+      int port_id = warp_id - 2;
+      if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
+        if (port_id == 0 && lane_id == 0) {
+          ldwarp_execute_mxfp_resident_ffn_fast(
+            m2ld[port_id], st_insts, smem_base, tma_descs, bars,
+            tmem_mma_barriers, port_id
+#if defined(DAE_TRACK_PROFILE)
+            , sm_id, g_events
+#endif
+          );
+        } else if (port_id == 1) {
+          if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
+            ldwarp_execute_mxfp_resident_ffn_zero_fast(
+              lane_id, m2ld[port_id], st_insts, bars, tmem_mma_barriers
+#if defined(DAE_TRACK_PROFILE)
+              , sm_id, g_events
+#endif
+            );
+          } else if (lane_id == 0) {
+            ldwarp_execute_mxfp_resident_ffn_fast(
+              m2ld[port_id], st_insts, smem_base, tma_descs, bars,
+              tmem_mma_barriers, port_id
+#if defined(DAE_TRACK_PROFILE)
+              , sm_id, g_events
+#endif
+            );
+          }
+        }
+      } else if (lane_id == 0) {
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
@@ -272,10 +323,22 @@ void dae2(
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   __syncthreads();
+#if defined(DAE_TRACK_PROFILE)
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + DAE_TRACK_FINAL_ROLE_JOIN] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
   if (thread_id / numThreadsPerWarp == 0) {
     tmem_allocator.release_allocation_lock();
     tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
   }
+#if defined(DAE_TRACK_PROFILE)
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + DAE_TRACK_POST_TMEM_FREE] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
 #endif
 
   // end of megakernel

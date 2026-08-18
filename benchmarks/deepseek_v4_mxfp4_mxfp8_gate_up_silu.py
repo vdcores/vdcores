@@ -20,7 +20,10 @@ import torch
 from dae import runtime
 from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
-from dae.schedule import SchedMxfp4Mxfp8GateUpSiluFixedRing
+from dae.schedule import (
+    SchedMxfp4Mxfp8GateUpSiluFixedRing,
+    SchedMxfp4Mxfp8GateUpSiluResident,
+)
 
 
 FP4_VALUES = (
@@ -41,6 +44,15 @@ FP4_VALUES = (
     -4.0,
     -6.0,
 )
+
+
+def percentile(samples: list[float], fraction: float) -> float:
+    ordered = sorted(samples)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def expected_uniform_row_output(
@@ -202,6 +214,11 @@ def main() -> None:
     parser.add_argument("--slices-per-expert", type=int, default=16)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--publish-ready", action="store_true")
+    parser.add_argument(
+        "--resident-all-tma",
+        action="store_true",
+        help="use the fixed-layout non-allocating resident LDU plan",
+    )
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--tile-k", type=int, choices=(128, 512), default=512)
     parser.add_argument("--diagnostic-output", action="store_true")
@@ -253,7 +270,11 @@ def main() -> None:
         flush=True,
     )
 
-    schedule_type = SchedMxfp4Mxfp8GateUpSiluFixedRing
+    schedule_type = (
+        SchedMxfp4Mxfp8GateUpSiluResident
+        if args.resident_all_tma
+        else SchedMxfp4Mxfp8GateUpSiluFixedRing
+    )
     k_tiles = 4096 // args.tile_k
     weight_k128_tiles = args.tile_k // 128
     weight_scale_bytes = weight_k128_tiles * 512
@@ -458,6 +479,11 @@ def main() -> None:
             (profile[:, 1].max() - profile[:, 0].min()) / 1.0e3
         )
 
+    task_local_us = (profile[:, 3] - profile[:, 2]) / 1.0e3
+    task_local_samples = [float(value) for value in task_local_us]
+    task_local_median = statistics.median(task_local_samples)
+    task_local_p95 = percentile(task_local_samples, 0.95)
+
     print(
         "DSV4_MXFP4_MXFP8_GATE_UP_SILU_RESULT "
         f"tasks={args.tasks} workers={workers} "
@@ -466,8 +492,14 @@ def main() -> None:
         f"routed_experts={args.routed_experts} "
         f"slices_per_expert={args.slices_per_expert} "
         "fixed_ring=true "
+        f"resident_all_tma={str(args.resident_all_tma).lower()} "
         "ldu_weight_ring="
         f"{str(bool(runtime.config.mxfp_gate_up_ldu_weight_ring)).lower()} "
+        "weight_scale_tma="
+        f"{str(bool(runtime.config.mxfp_weight_scale_tma)).lower()} "
+        "weight_scale_separate_barrier="
+        f"{str(bool(runtime.config.mxfp_gate_up_weight_scale_separate_barrier)).lower()} "
+        "activation_scales_task_owned=true "
         f"tile_k={args.tile_k} "
         f"activation_tiles_per_load={k_tiles} "
         f"activation_rows={activation_row_bytes.tolist()} "
@@ -481,6 +513,14 @@ def main() -> None:
         f"task_min_us={min(task_times):.6f} "
         f"task_median_us={statistics.median(task_times):.6f} "
         f"task_max_us={max(task_times):.6f} "
+        f"task_local_min_us={float(task_local_us.min()):.6f} "
+        f"task_local_median_us={task_local_median:.6f} "
+        f"task_local_stddev_us="
+        f"{statistics.pstdev(task_local_samples):.6f} "
+        f"task_local_p95_us={task_local_p95:.6f} "
+        f"task_local_p95_tail_us="
+        f"{task_local_p95 - task_local_median:.6f} "
+        f"task_local_max_us={float(task_local_us.max()):.6f} "
         f"kernel_median_us={statistics.median(kernel_times):.6f} "
         "output_exact=true",
         flush=True,

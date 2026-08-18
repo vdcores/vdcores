@@ -64,7 +64,7 @@ void dae_ffn_linear1_direct_kernel(
   // the allocator arena; the direct task never addresses it.
   task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
       512, mxfpGateUpDirectActivationTiles == 1 ? 3 : 2,
-      8, false, false>(
+      8, false, false, false>(
       smem_base, tmem_base_ptr, nullptr, tma_descs,
       metadata + worker * 128, bars, m2c, c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
@@ -125,7 +125,7 @@ void dae_ffn_down_direct_kernel(
   if (threadIdx.x < 128) {
       task_mxfp4_mxfp8_down_fixed_ring_sm100<
           8, 2, 256, 1, kDownTmemColumnsPerTask,
-          0, kDownScratchBytes, 0, false>(
+          0, kDownScratchBytes, 0, false, false>(
           smem_base, tmem_base_ptr, nullptr, tma_descs,
         first_metadata, bars, m2c, c2m
 #if defined(DAE_TRACK_MXFP_TIMELINE)
@@ -136,7 +136,7 @@ void dae_ffn_down_direct_kernel(
     if (*reinterpret_cast<const uint64_t *>(second_metadata) != 0) {
         task_mxfp4_mxfp8_down_fixed_ring_sm100<
             8, 2, 256, 2, kDownTmemColumnsPerTask,
-            kDownScratchBytes, 2 * kDownScratchBytes, 128, false>(
+            kDownScratchBytes, 2 * kDownScratchBytes, 128, false, false>(
             smem_base, tmem_base_ptr + kDownTmemColumnsPerTask,
             nullptr, tma_descs,
           second_metadata, bars, m2c, c2m

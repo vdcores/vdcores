@@ -2718,3 +2718,130 @@ The selected retained image still compiles at 204 registers, nine barriers,
 an 80-byte stack frame, zero spills, and 3,936 bytes static shared memory.
 Exact exploratory jobs are recorded in
 `.agentlog/2026-08-18-retained-ring-issue-prefetch.md`.
+
+## Coupled weight-scale TMA versus DeepGEMM (2026-08-18)
+
+Moving retained-ring weight scales from the task-owned `cp.async` warp into
+the LDU weight loop is not inherently incompatible with a fast kernel.
+DeepGEMM's SM100 FP8-by-FP4 1D1D kernel does exactly this: one TMA producer
+issues A, B, SFA, and SFB into the same stage, then accounts every transaction
+on one `full_barrier`. It prefetches all five tensor-map descriptors at kernel
+entry. A separate warp waits for that barrier, transposes the scale-factor
+shared-memory image for UTCCP, and publishes a secondary scale-ready barrier.
+
+The exact vLLM/DeepGEMM JIT specializations used by the H4096/I2048 benchmark
+explain why that coupling is cheap there. Both FC1 and FC2 select K128,
+M32/N128, two-CTA multicast, swap-AB, and **11 TMA stages**. With FP8 A and
+unpack-in-SMEM FP4 B, each CTA stage reserves 2 KiB A, 16 KiB B, 512 B SFA,
+and 512 B SFB. DeepGEMM's heuristic explicitly spends the remaining shared
+memory on as many producer stages as fit. FC2 has sixteen K128 iterations, so
+the producer can make eleven resident before recycling a stage. The two-CTA
+UMMA covers up to 256 output channels by 32 decode rows per K128 iteration.
+
+VDCores Down instead has two K256 stages, M128/N8 UMMA, and eight K256
+iterations. Only two bundles (the equivalent of four K128 blocks) can be
+resident before the LDU waits for consumer retirement. Its coupled path issues
+the 16-KiB packed-weight tensor TMA, then a descriptorless 1-KiB scale bulk
+copy, and makes the one weight-full barrier expect both. The original
+task-owned scale producer executes two warp-wide 16-byte `cp.async` issue
+iterations for that 1 KiB and can run independently of the LDU weight TMA.
+Consequently, moving the small copy into the two-stage LDU pipeline exposes
+TMA request admission/completion latency that DeepGEMM hides behind a much
+deeper producer window and substantially more UMMA work per stage.
+
+The measured isolated Down control supports this distinction: task-owned
+scales measured 12.608 us, coupled LDU TMA scales 13.472 us (+0.864 us,
++6.9%), a separate scale barrier 13.760 us, and a second TMA LDU 13.952 us.
+Splitting the barrier or issuer did not create more lookahead or more work
+between stage waits, so neither addressed the exposed fixed latency.
+
+DeepGEMM also retires a producer stage directly with
+`umma_arrive(empty_barrier)`. VDCores commits UMMA to `umma_full`; a completion
+warp waits on that barrier and then arrives `stage_empty`. That relay adds a
+small stage-reuse bubble precisely where a two-stage pipeline is sensitive.
+DeepGEMM's descriptor-backed, host-prepacked scale layout is a secondary
+difference, not the main explanation: its kernel still performs a 32-thread
+SMEM transpose and UTCCP before UMMA, while the VDCores scale image is already
+in its native UTCCP layout.
+
+The focused next controls are therefore (1) increase retained Down from two
+to four K256 stages while keeping the coupled barrier, and then (2) make UMMA
+arrive directly on the resident `stage_empty` barrier. Only after those should
+a descriptor-backed scale tensor TMA be compared with the current 1-D bulk
+copy. The coupled-barrier design itself should not be rejected based on the
+current two-stage result.
+
+## DeepGEMM structure transplant controls (2026-08-18)
+
+Follow-up controls rejected the two most literal pipeline transplants. Four
+K256 Down stages increased isolated latency from 13.280 to 14.592 us and full
+hot latency from 33.437 to 34.965 us; the ring-handoff form also failed
+correctness. A constexpr direct-retirement image then made UMMA completion
+arrive directly on each resident `stage_empty`, with only a final task-local
+completion token. It preserved the 162-register/9-barrier resource footprint
+but measured 13.600/14.752 us Linear-1 task/kernel, 14.112 us Down kernel, and
+33.457/66.304 us full hot/cold. The relay control was 13.616/14.752,
+14.080, and 33.437/66.304 us respectively. Direct retirement is therefore
+off the critical path here, and the experiment was removed.
+
+The more fundamental source difference is geometry and ownership. The exact
+DeepGEMM specialization dedicates about 217 KiB shared memory to one GEMM,
+uses a two-CTA M256/N32 UMMA with one cluster leader, runs one common scheduler
+across TMA/MMA/scale-transpose/epilogue roles, and pipelines two output stages.
+VDCores uses independent M128/N8 issuers and reserves most dynamic shared
+memory for its general allocator. Moving only DeepGEMM's TMA block to an LDU
+would omit the clustered instruction footprint and shared scheduler while
+adding command publication around it.
+
+A temporary 152-worker placement, intended to copy DeepGEMM's all-SM
+scheduling instead of the existing 112-worker/112-Linear-1-task placement,
+failed correctness with one missing/NaN Down region in job
+`20260818T044740Z-3082907`. Extra Down-only workers need an explicit phase and
+reduction-ownership protocol; the placement relaxation was removed.
+
+The architectural direction is now a specialized resident FFN operator, not a
+literal DeepGEMM fork split into generic commands. Keep the task-direct fused
+math and epilogues—which already measure 26.293 us hot versus fresh DeepGEMM
+at 29.768 us—and, if LDU residency is mandatory, make one long-running LDU
+producer share a compile-time stage machine with that compute path. Detailed
+commands and job IDs are in
+`.agentlog/2026-08-18-deepgemm-architecture-compare.md`.
+
+## Specialized DAE2 resident FFN result (2026-08-18)
+
+The specialized resident implementation now stays fully inside VDCores: one
+Python enqueue, one persistent `dae2` launch, one queued compute task, and one
+queued resident memory task per worker. The fixed two-instruction memory
+dispatcher preserves allocator-warp -> LDU queue publication but omits generic
+decoder/allocation/M2C work that cannot occur in this image. LDU0 owns the
+Linear-1 and two Down weight/scale pipelines; it does not wait on an issue
+gate or activation barrier.
+
+LDU1 receives the same queued memory command and prepares the paired expert-0
+BF16 reduction destinations. A local pause prevents its readiness traffic from
+interfering with Linear-1: LDU1 performs the required clears, then waits on a
+CTA-local token; LDU0 releases that token after its Linear-1 stream retires and
+immediately continues into Down loading. LDU1 resolves both global
+zero-readiness dependencies and publishes two one-shot local tokens consumed
+by the two Down epilogues. This keeps the weight stream independent while
+moving the actual output-data dependency to the memory side.
+
+The final image uses 246 registers, nine barriers, a 48-byte stack, zero
+spills, and 2,208 bytes static shared memory. Hot medians are 28.1936 and
+28.1872 us; the 100-sample cold median/P90 are 42.144/43.456 us. All output
+checks passed. Against the fresh vLLM/DeepGEMM 29.768-us hot and 44.816-us
+cold baselines, this is 5.29-5.31% faster hot and 5.96% faster cold. Jobs are
+`20260818T091618Z-3239526`, `20260818T091636Z-3239758`, and
+`20260818T091654Z-3239920`.
+
+Nsight Compute confirms that the change removes rather than relocates the
+tail dependency. Before local publication, 188 samples were attributed to the
+Down epilogue's device-scope readiness load. In the paused version that
+hotspot is absent, remaining Down epilogue synchronization accounts for ten
+samples, and final-role-join samples drop from 708 to 439. An unpaused control
+increased Linear-1 local standard deviation from roughly 0.17 to 0.88 us,
+which is direct evidence that even a small second-LDU polling workload can
+interfere when all resident warps become runnable at kernel entry.
+
+Full implementation, rejected placement controls, commands, and job IDs are
+recorded in `.agentlog/2026-08-18-dae2-resident-ffn.md`.

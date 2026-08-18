@@ -106,10 +106,55 @@ if os.environ.get("DAE_MXFP_DOWN_LDU_WEIGHT_RING"):
         "-DDAE_MXFP_DOWN_LDU_WEIGHT_RING="
         + os.environ["DAE_MXFP_DOWN_LDU_WEIGHT_RING"]
     )
+if os.environ.get("DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES"):
+    cuda_defines.append(
+        "-DDAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES="
+        + os.environ["DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES"]
+    )
 if os.environ.get("DAE_MXFP_WEIGHT_PREFETCH"):
     cuda_defines.append(
         "-DDAE_MXFP_WEIGHT_PREFETCH="
         + os.environ["DAE_MXFP_WEIGHT_PREFETCH"]
+    )
+if os.environ.get("DAE_MXFP_WEIGHT_SCALE_TMA"):
+    cuda_defines.append(
+        "-DDAE_MXFP_WEIGHT_SCALE_TMA="
+        + os.environ["DAE_MXFP_WEIGHT_SCALE_TMA"]
+    )
+if os.environ.get("DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER"):
+    cuda_defines.append(
+        "-DDAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER="
+        + os.environ["DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER"]
+    )
+if os.environ.get("DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER"):
+    cuda_defines.append(
+        "-DDAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER="
+        + os.environ["DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER"]
+    )
+if os.environ.get("DAE_MXFP_DOWN_BF16_REDUCTION"):
+    cuda_defines.append(
+        "-DDAE_MXFP_DOWN_BF16_REDUCTION="
+        + os.environ["DAE_MXFP_DOWN_BF16_REDUCTION"]
+    )
+if os.environ.get("DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH"):
+    cuda_defines.append(
+        "-DDAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH="
+        + os.environ["DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH"]
+    )
+if os.environ.get("DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO"):
+    cuda_defines.append(
+        "-DDAE_MXFP_RESIDENT_DOWN_PAIR_ZERO="
+        + os.environ["DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO"]
+    )
+if os.environ.get("DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH"):
+    cuda_defines.append(
+        "-DDAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH="
+        + os.environ["DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH"]
+    )
+if os.environ.get("DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO"):
+    cuda_defines.append(
+        "-DDAE_MXFP_RESIDENT_DOWN_LDU1_ZERO="
+        + os.environ["DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO"]
     )
 if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES"):
     cuda_defines.append(

@@ -17,6 +17,52 @@ static constexpr uint16_t repeatSkipCountMask = 0x1F00U;
 static constexpr int repeatSkipCountShift = 8;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
+template<typename M2LD_Type>
+__device__ __forceinline__ void
+allocwarp_execute_mxfp_resident_ffn_fast(
+    const int lane_id, M2LD_Type m2ld[2], const MInst *minsts,
+    MInst *st_insts
+#if defined(DAE_TRACK_PROFILE)
+    , const int sm_id, uint64_t *g_events
+#endif
+) {
+  static_assert(
+      !mxfpResidentFfnFastMemoryDispatchEnabled || numInsts == 2,
+      "resident FFN fast memory dispatch requires command + terminate");
+
+  if (lane_id == 0) {
+    // This remains a normal queued VDCores memory task: the allocator warp
+    // publishes the immutable mailbox and LDU0 acquires/dequeues the command.
+    // Only the generic decoder for the fixed two-command image is omitted.
+    const MInst inst = minsts[0];
+    const uint8_t special_slot = uint8_t(inst.nslot());
+    st_insts[special_slot] = inst;
+
+    LdCmd ld;
+    ld.init(special_slot, 0, inst.opcode);
+    m2ld[0].put(ld.raw);
+    m2ld[0].commit();
+    m2ld[0].advance();
+    if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
+      m2ld[1].put(ld.raw);
+      m2ld[1].commit();
+      m2ld[1].advance();
+    }
+    m2ld[0].push(SLOT_END);
+    m2ld[1].push(SLOT_END);
+
+#if defined(DAE_TRACK_PROFILE)
+    const int event_base = sm_id * numProfileEvents;
+    g_events[event_base + DAE_TRACK_ALLOC_SLOT_STALL_NS] = 0;
+    g_events[event_base + DAE_TRACK_ALLOC_SLOT_STALL_EVENTS] = 0;
+    g_events[event_base + DAE_TRACK_ALLOC_SLOT_RETRIES] = 0;
+    g_events[event_base + DAE_TRACK_ALLOC_ISSUE_BARRIER_NS] = 0;
+    g_events[event_base + DAE_TRACK_ALLOC_ISSUE_BARRIER_CONTENDED] = 0;
+    g_events[event_base + DAE_TRACK_ALLOC_INSTRUCTIONS] = 0;
+#endif
+  }
+}
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -328,6 +374,25 @@ __device__ __forceinline__ void allocwarp_execute(
           // Do not allow a later control command to overwrite the shared
           // metadata slots until both LDU handlers have copied this command.
           ldu_control_publish_barrier->arrive_and_wait();
+        }
+        break;
+        case op(OP_TMA_LOAD_MX_GATE_UP_RESIDENT):
+        case op(OP_TMA_LOAD_MX_DOWN_RESIDENT):
+        case op(OP_TMA_LOAD_MX_RESIDENT_FFN): {
+          // A dedicated resident plan owns fixed shared-memory addresses, so
+          // this command bypasses both slot allocation and M2C publication.
+          // The isolated Linear-1 schedule submits exactly one such command
+          // per worker; its special mailbox remains immutable until LDU0 has
+          // consumed the complete plan.
+          if (lane_id == 0) {
+            const int special_slot = inst.nslot();
+            st_insts[special_slot] = inst;
+            LdCmd ld;
+            ld.init(uint8_t(special_slot), 0, inst.opcode);
+            curld.put(ld.raw);
+            curld.commit();
+            curld.advance();
+          }
         }
         break;
         case op(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D): {

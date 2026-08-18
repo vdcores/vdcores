@@ -16,6 +16,7 @@ from dae.runtime import opcode
 from dae.schedule import (
     SchedMxfp4Mxfp8DownFixedRing,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
+    SchedMxfp4Mxfp8ResidentFfn,
 )
 from deepseek_v4_cold_timing import cold_graph_timings_us, percentile_us
 
@@ -136,6 +137,22 @@ def report_track_counters(profile: torch.Tensor) -> None:
         )
         if int(timer_end) > int(timer_start)
     ]
+    startup_us = [
+        (int(post_init) - int(entry)) / 1.0e3
+        for entry, post_init in zip(values[:, 124], values[:, 0])
+    ]
+    join_tail_us = [
+        (int(join) - int(compute_end)) / 1.0e3
+        for compute_end, join in zip(values[:, 1], values[:, 125])
+    ]
+    free_us = [
+        (int(post_free) - int(join)) / 1.0e3
+        for join, post_free in zip(values[:, 125], values[:, 126])
+    ]
+    device_envelope_us = [
+        (int(post_free) - int(entry)) / 1.0e3
+        for entry, post_free in zip(values[:, 124], values[:, 126])
+    ]
 
     print(
         "DSV4_MXFP4_MXFP8_FULL_FFN_RETAINED_RING_COUNTERS "
@@ -150,6 +167,11 @@ def report_track_counters(profile: torch.Tensor) -> None:
         f"ldu1_queue_wait_pct={percent(14):.3f} "
         f"ldu1_dependency_wait_pct={percent(16):.3f} "
         f"ldu1_commands={total(18)} "
+        f"startup_median_us={statistics.median(startup_us):.6f} "
+        f"join_tail_median_us={statistics.median(join_tail_us):.6f} "
+        f"tmem_free_median_us={statistics.median(free_us):.6f} "
+        "device_envelope_median_us="
+        f"{statistics.median(device_envelope_us):.6f} "
         f"effective_sm_clock_median_ghz="
         f"{statistics.median(effective_ghz):.6f}",
         flush=True,
@@ -220,6 +242,11 @@ def main() -> None:
     parser.add_argument("--cold-l2-scrub-mib", type=int, default=260)
     parser.add_argument("--workers", type=int, default=112)
     parser.add_argument(
+        "--resident-all-tma",
+        action="store_true",
+        help="use one fixed-layout compute/LDU FFN plan per worker",
+    )
+    parser.add_argument(
         "--down-task-limit",
         type=int,
         default=224,
@@ -277,6 +304,23 @@ def main() -> None:
     if not 32 <= args.workers <= 112:
         parser.error("--workers must be in [32,112]")
     weight_prefetch = bool(runtime.config.mxfp_weight_prefetch)
+    weight_scale_tma = bool(runtime.config.mxfp_weight_scale_tma)
+    gate_up_weight_scale_separate_barrier = bool(
+        runtime.config.mxfp_gate_up_weight_scale_separate_barrier
+    )
+    down_weight_scale_separate_barrier = bool(
+        runtime.config.mxfp_down_weight_scale_separate_barrier
+    )
+    overlap_down_prefetch = bool(
+        runtime.config.mxfp_resident_ffn_overlap_down_prefetch
+    )
+    resident_down_pair_zero = bool(
+        runtime.config.mxfp_resident_down_pair_zero
+    )
+    fast_memory_dispatch = bool(
+        runtime.config.mxfp_resident_ffn_fast_memory_dispatch
+    )
+    ldu1_zero = bool(runtime.config.mxfp_resident_down_ldu1_zero)
     if not 0 <= args.down_task_limit <= 224:
         parser.error("--down-task-limit must be in [0,224]")
     for name, value in (
@@ -296,7 +340,10 @@ def main() -> None:
         and bool(runtime.config.mxfp_down_ldu_weight_ring)
     ):
         parser.error("--ring-handoff requires both retained LDU ring paths")
-
+    if args.resident_all_tma and args.ring_handoff:
+        parser.error("resident all-TMA FFN does not use allocator ring handoff")
+    if args.resident_all_tma and args.down_task_limit != 224:
+        parser.error("resident all-TMA FFN currently requires all 224 Down tasks")
     device = torch.device("cuda")
     experts, linear1_slices, down_slices = 7, 16, 32
     linear1_tasks = experts * linear1_slices
@@ -401,8 +448,12 @@ def main() -> None:
         dtype=torch.uint8,
         device=device,
     )
+    reduction_bf16 = bool(
+        getattr(runtime.config, "mxfp_down_bf16_reduction", False)
+    )
+    reduction_dtype = torch.bfloat16 if reduction_bf16 else torch.float32
     final_output = torch.empty(
-        (down_slices, 128, 8), dtype=torch.float32, device=device
+        (down_slices, 128, 8), dtype=reduction_dtype, device=device
     )
     down_tma = TmaTensor(launcher, down_weight).mxfp4_load(256)
     output_tma = TmaTensor(
@@ -432,10 +483,20 @@ def main() -> None:
         down_records[task, 5] = f32_bits(route_scales[expert])
         down_records[task, 6] = final_output[output_tile].data_ptr()
         flags = 1 | (4 if args.blockwise_ready else 0)
+        if resident_down_pair_zero and expert == 0:
+            if output_tile < down_slices // 2:
+                paired_output_tile = output_tile + down_slices // 2
+                down_records[task, 9] = final_output[
+                    paired_output_tile
+                ].data_ptr()
+                down_records[task, 10] = zero_ready[paired_output_tile]
+                flags |= 8
+            else:
+                flags |= 16
         down_records[task, 8] = flags << 32
     down_metadata = down_records.view(torch.uint8).to(device)
 
-    linear1_schedule = SchedMxfp4Mxfp8GateUpSiluFixedRing(
+    linear1_schedule_base = SchedMxfp4Mxfp8GateUpSiluFixedRing(
         gate_weight,
         gate_scale,
         up_weight,
@@ -448,8 +509,8 @@ def main() -> None:
         up_tma,
         linear1_metadata,
         tile_k=tile_k,
-    ).place(args.workers)
-    down_schedule = SchedMxfp4Mxfp8DownFixedRing(
+    )
+    down_schedule_base = SchedMxfp4Mxfp8DownFixedRing(
         down_weight,
         down_scale,
         down_activation_records,
@@ -457,26 +518,38 @@ def main() -> None:
         down_tma,
         down_metadata,
         retain_weight_ring_between_tasks=True,
-    ).place(args.workers)
-    if args.down_task_limit != down_tasks:
-        for queue in down_schedule.task_queues:
-            queue[:] = [
-                task for task in queue if task < args.down_task_limit
-            ]
+    )
+    if args.resident_all_tma:
+        resident_schedule = SchedMxfp4Mxfp8ResidentFfn(
+            linear1_schedule_base, down_schedule_base
+        ).place(args.workers)
+        linear1_schedule = resident_schedule.placed_linear1
+        down_schedule = resident_schedule.placed_down
+    else:
+        linear1_schedule = linear1_schedule_base.place(args.workers)
+        down_schedule = down_schedule_base.place(args.workers)
+        if args.down_task_limit != down_tasks:
+            for queue in down_schedule.task_queues:
+                queue[:] = [
+                    task for task in queue if task < args.down_task_limit
+                ]
     queued_down_tasks = [
         task for queue in down_schedule.task_queues for task in queue
     ]
     down_active_workers = sum(
         bool(queue) for queue in down_schedule.task_queues
     )
-    launcher.s(
-        ProfileEvent(2),
-        linear1_schedule,
-        ProfileEvent(4),
-        down_schedule,
-        ProfileEvent(5),
-        ProfileEvent(3),
-    )
+    if args.resident_all_tma:
+        launcher.s(resident_schedule)
+    else:
+        launcher.s(
+            ProfileEvent(2),
+            linear1_schedule,
+            ProfileEvent(4),
+            down_schedule,
+            ProfileEvent(5),
+            ProfileEvent(3),
+        )
     launcher.build_instructions()
     flag_mask = (1 << 6) - 1
     handoff_source = (
@@ -559,10 +632,10 @@ def main() -> None:
     checked_outputs_device = checked_outputs.to(device)
     if bool(checked_outputs.any()):
         torch.testing.assert_close(
-            final_output[checked_outputs_device],
+            final_output[checked_outputs_device].float(),
             expected_final[checked_outputs_device],
-            rtol=2e-5,
-            atol=1e-3,
+            rtol=3e-2 if reduction_bf16 else 2e-5,
+            atol=1e-1 if reduction_bf16 else 1e-3,
         )
 
     graph = torch.cuda.CUDAGraph()
@@ -594,10 +667,10 @@ def main() -> None:
 
     if bool(checked_outputs.any()):
         torch.testing.assert_close(
-            final_output[checked_outputs_device],
+            final_output[checked_outputs_device].float(),
             expected_final[checked_outputs_device],
-            rtol=2e-5,
-            atol=1e-3,
+            rtol=3e-2 if reduction_bf16 else 2e-5,
+            atol=1e-1 if reduction_bf16 else 1e-3,
         )
     profile = launcher.profile
     linear1_finish = relative_finish_us(profile, 2, 4)
@@ -609,7 +682,7 @@ def main() -> None:
     down_tail = local_tail_us(profile, 4, 5)
     if bool(checked_outputs.any()):
         error = (
-            final_output[checked_outputs_device]
+            final_output[checked_outputs_device].float()
             - expected_final[checked_outputs_device]
         ).abs()
         relative_error = error / expected_final[
@@ -669,6 +742,11 @@ def main() -> None:
             f"l2_scrub_mib={args.cold_l2_scrub_mib} "
             f"samples={args.cold_samples} "
             f"weight_prefetch={str(weight_prefetch).lower()} "
+            f"weight_scale_tma={str(weight_scale_tma).lower()} "
+            "gate_up_weight_scale_separate_barrier="
+            f"{str(gate_up_weight_scale_separate_barrier).lower()} "
+            "down_weight_scale_separate_barrier="
+            f"{str(down_weight_scale_separate_barrier).lower()} "
             f"min_us={min(cold_times):.6f} "
             f"median_us={statistics.median(cold_times):.6f} "
             f"p90_us={percentile_us(cold_times, 0.90):.6f} "
@@ -683,12 +761,29 @@ def main() -> None:
         f"down_tasks={down_tasks} down_tasks_queued={len(queued_down_tasks)} "
         f"down_active_workers={down_active_workers} "
         "cuda_kernel_launches=1 vdcores_launches=1 "
-        "persistent=true linear1_ldu_weight_ring=true "
-        "down_ldu_weight_ring=true down_scales_task_owned=true "
+        "persistent=true "
+        f"resident_all_tma={str(args.resident_all_tma).lower()} "
+        "kernel=dae2 "
+        "linear1_ldu_weight_ring=true "
+        "down_ldu_weight_ring=true "
+        "down_ring_stages="
+        f"{int(runtime.config.mxfp_down_ldu_weight_ring_stages)} "
+        "activation_scales_task_owned="
+        f"{str(not args.resident_all_tma).lower()} "
+        f"down_bf16_reduction={str(reduction_bf16).lower()} "
+        f"overlap_down_prefetch={str(overlap_down_prefetch).lower()} "
+        f"resident_down_pair_zero={str(resident_down_pair_zero).lower()} "
+        f"fast_memory_dispatch={str(fast_memory_dispatch).lower()} "
+        f"ldu1_zero={str(ldu1_zero).lower()} "
         f"ring_handoff={str(args.ring_handoff).lower()} "
         f"handoff_sources={source_count} handoff_targets={target_count} "
         f"blockwise_ready={str(args.blockwise_ready).lower()} "
         f"weight_prefetch={str(weight_prefetch).lower()} "
+        f"weight_scale_tma={str(weight_scale_tma).lower()} "
+        "gate_up_weight_scale_separate_barrier="
+        f"{str(gate_up_weight_scale_separate_barrier).lower()} "
+        "down_weight_scale_separate_barrier="
+        f"{str(down_weight_scale_separate_barrier).lower()} "
         f"down_input={'prebuilt' if args.prebuilt_down_input else 'linear1'} "
         f"allocator_slots={runtime.config.num_slots} "
         f"linear1_span_us={span_us(profile, 2, 4):.6f} "

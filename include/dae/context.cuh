@@ -115,18 +115,78 @@ static constexpr bool mxfpGateUpDirectOutputEnabled =
 #endif
 static constexpr bool mxfpGateUpDirectActivationEnabled =
     DAE_MXFP_GATE_UP_DIRECT_ACTIVATION != 0;
+#ifndef DAE_MXFP_WEIGHT_SCALE_TMA
+#define DAE_MXFP_WEIGHT_SCALE_TMA 0
+#endif
+// Experimental retained-ring mode: LDU0 issues the weight-scale TMA in the
+// same stage loop. The default accounts it on the resident weight-full
+// barrier; phase-specific experiments may give SFA its own completion phase.
+static constexpr bool mxfpWeightScaleTmaEnabled =
+    DAE_MXFP_WEIGHT_SCALE_TMA != 0;
+#ifndef DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER
+#define DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER 0
+#endif
+// Let LDU publish SFA independently so compute can move both scale operands
+// into TMEM while the much larger transformed-weight transaction is pending.
+static constexpr bool mxfpGateUpWeightScaleSeparateBarrierEnabled =
+    mxfpWeightScaleTmaEnabled &&
+    DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER != 0;
+#ifndef DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER
+#define DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER 0
+#endif
+// Linear-2 is independently selectable: its shorter weight transaction did
+// not benefit from paying an extra resident-barrier wait in the issuer path.
+static constexpr bool mxfpDownWeightScaleSeparateBarrierEnabled =
+    mxfpWeightScaleTmaEnabled &&
+    DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER != 0;
+#ifndef DAE_MXFP_DOWN_BF16_REDUCTION
+#define DAE_MXFP_DOWN_BF16_REDUCTION 0
+#endif
+static constexpr bool mxfpDownBf16ReductionEnabled =
+    DAE_MXFP_DOWN_BF16_REDUCTION != 0;
+#ifndef DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH
+#define DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH 0
+#endif
+static constexpr bool mxfpResidentFfnOverlapDownPrefetchEnabled =
+    DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH != 0;
+#ifndef DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO
+#define DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO 0
+#endif
+static constexpr bool mxfpResidentDownPairZeroEnabled =
+    DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO != 0;
+#ifndef DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH
+#define DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH 0
+#endif
+// The focused resident FFN image has exactly one queued memory task followed
+// by termination. Keep the allocator-warp -> LDU queue boundary, but allow
+// that fixed image to skip the generic memory virtual-core decoder.
+static constexpr bool mxfpResidentFfnFastMemoryDispatchEnabled =
+    DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH != 0;
+#ifndef DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO
+#define DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO 0
+#endif
+// The focused resident FFN can use its otherwise idle second LDU to prepare
+// shared-expert reduction destinations before routed Down epilogues arrive.
+static constexpr bool mxfpResidentDownLdu1ZeroEnabled =
+    DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO != 0;
+static_assert(
+    !mxfpResidentDownLdu1ZeroEnabled ||
+        (mxfpResidentFfnFastMemoryDispatchEnabled &&
+         mxfpResidentDownPairZeroEnabled),
+    "resident LDU1 zeroing requires fast dispatch and paired destinations");
 #ifndef DAE_MXFP_GATE_UP_LDU_WEIGHT_RING
 #define DAE_MXFP_GATE_UP_LDU_WEIGHT_RING 1
 #endif
-// Standalone Linear-1 allocates one 16-slot transformed-weight ring. LDU0
-// retains the lease across gate and up, while compute owns only the resident
-// full/empty barrier phases and never returns the allocation through C2M.
+// Standalone Linear-1 allocates one 16-slot transformed-weight ring, extended
+// to 17 slots when the final slot holds both scale stages. LDU0 retains the
+// lease across gate and up; compute receives one base through M2C.
 static constexpr bool mxfpGateUpLduWeightRingEnabled =
     DAE_MXFP_GATE_UP_LDU_WEIGHT_RING != 0 &&
     !mxfpGateUpDirectActivationEnabled;
 static_assert(
-    !mxfpGateUpLduWeightRingEnabled || numSlots >= 20,
-    "retained LDU weight ring needs 16 weight and four activation slots");
+    !mxfpGateUpLduWeightRingEnabled ||
+        numSlots >= 20 + (mxfpWeightScaleTmaEnabled ? 1 : 0),
+    "retained LDU ring needs 16/17 weight-scale and four activation slots");
 #ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES
 #define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES 8
 #endif
@@ -156,11 +216,18 @@ static constexpr int mxfpLduWeightRingStages = 2;
 static constexpr int mxfpLduWeightRingBarrierBase =
     mxfp4Mxfp8TmaScaleBarrierBase + mxfp4Mxfp8TmaScaleBarrierCount;
 static constexpr int mxfpLduWeightRingBarrierCount =
-    mxfpGateUpLduWeightRingEnabled ? 2 * mxfpLduWeightRingStages : 0;
+    mxfpGateUpLduWeightRingEnabled
+        ? (2 + (mxfpGateUpWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
+              mxfpLduWeightRingStages
+        : 0;
 static constexpr int mxfpLduWeightRingFullBarrierBase =
     mxfpLduWeightRingBarrierBase;
-static constexpr int mxfpLduWeightRingEmptyBarrierBase =
+static constexpr int mxfpLduWeightScaleFullBarrierBase =
     mxfpLduWeightRingBarrierBase + mxfpLduWeightRingStages;
+static constexpr int mxfpLduWeightRingEmptyBarrierBase =
+    mxfpLduWeightRingBarrierBase +
+    (1 + (mxfpGateUpWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
+        mxfpLduWeightRingStages;
 // Linear-2 uses a smaller two-stage M128/K256 ring. Its weights are delivered
 // by LDU0 while scales and native Linear-1 activation records stay task-owned.
 #ifndef DAE_MXFP_DOWN_LDU_WEIGHT_RING
@@ -173,20 +240,57 @@ static constexpr bool mxfpDownLduWeightRingEnabled =
 #endif
 static constexpr bool mxfpWeightPrefetchEnabled =
     DAE_MXFP_WEIGHT_PREFETCH != 0;
-static constexpr int mxfpDownLduWeightRingStages = 2;
+#ifndef DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES
+#define DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES 2
+#endif
+static constexpr int mxfpDownLduWeightRingStages =
+    DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES;
+static_assert(
+    mxfpDownLduWeightRingStages == 2 ||
+        mxfpDownLduWeightRingStages == 3 ||
+        mxfpDownLduWeightRingStages == 4,
+    "retained down weight ring supports two, three, or four K256 stages");
 static constexpr int mxfpDownLduWeightRingBarrierBase =
     mxfpLduWeightRingBarrierBase + mxfpLduWeightRingBarrierCount;
 static constexpr int mxfpDownLduWeightRingBarrierCount =
-    mxfpDownLduWeightRingEnabled ? 2 * mxfpDownLduWeightRingStages : 0;
+    mxfpDownLduWeightRingEnabled
+        ? (2 + (mxfpDownWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
+              mxfpDownLduWeightRingStages
+        : 0;
 static constexpr int mxfpDownLduWeightRingFullBarrierBase =
     mxfpDownLduWeightRingBarrierBase;
-static constexpr int mxfpDownLduWeightRingEmptyBarrierBase =
+static constexpr int mxfpDownLduWeightScaleFullBarrierBase =
     mxfpDownLduWeightRingBarrierBase + mxfpDownLduWeightRingStages;
+static constexpr int mxfpDownLduWeightRingEmptyBarrierBase =
+    mxfpDownLduWeightRingBarrierBase +
+    (1 + (mxfpDownWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
+        mxfpDownLduWeightRingStages;
 static_assert(
-    !mxfpDownLduWeightRingEnabled || numSlots >= 8,
-    "retained LDU down weight ring needs eight allocator slots");
-static constexpr int tmemMmaBarrierCount =
+    !mxfpDownLduWeightRingEnabled ||
+        numSlots >= 4 * mxfpDownLduWeightRingStages +
+            (mxfpWeightScaleTmaEnabled ? 1 : 0),
+    "retained LDU down ring exceeds allocator slots");
+// The resident all-TMA Down path keeps producer-dependent activation data and
+// SFB on a distinct full barrier. The ordinary weight-full/empty bank remains
+// independent, allowing weights to issue before a Linear-1 readiness edge.
+static constexpr int mxfpDownResidentOperandFullBarrierBase =
     mxfpDownLduWeightRingBarrierBase + mxfpDownLduWeightRingBarrierCount;
+static constexpr int mxfpDownResidentOperandFullBarrierCount =
+    mxfpDownLduWeightRingEnabled ? mxfpDownLduWeightRingStages : 0;
+// LDU1 resolves the two device-scope reduction-destination dependencies while
+// compute is still in Linear-1/UMMA. The Down epilogues consume these one-shot
+// CTA-local tokens instead of loading the global readiness word on the tail.
+static constexpr int mxfpDownResidentReductionReadyBarrierBase =
+    mxfpDownResidentOperandFullBarrierBase +
+    mxfpDownResidentOperandFullBarrierCount;
+static constexpr int mxfpDownResidentReductionReadyBarrierCount =
+    mxfpResidentDownLdu1ZeroEnabled ? 3 : 0;
+static constexpr int mxfpDownResidentLdu1PollStartBarrier =
+    mxfpDownResidentReductionReadyBarrierBase + 2;
+
+static constexpr int tmemMmaBarrierCount =
+    mxfpDownResidentReductionReadyBarrierBase +
+    mxfpDownResidentReductionReadyBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
@@ -257,6 +361,9 @@ enum DAETrackProfileEvent : int {
   DAE_TRACK_PHYSICAL_SM_ID = 121,
   DAE_TRACK_SM_CLOCK_START = 122,
   DAE_TRACK_SM_CLOCK_END = 123,
+  DAE_TRACK_KERNEL_ENTRY = 124,
+  DAE_TRACK_FINAL_ROLE_JOIN = 125,
+  DAE_TRACK_POST_TMEM_FREE = 126,
   DAE_TRACK_MAGIC = 127,
 };
 static constexpr uint64_t daeTrackProfileMagic = 0x4454524b50524631ULL;

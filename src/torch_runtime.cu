@@ -1070,8 +1070,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfpGateUpLduWeightRingEnabled;
   config.attr("mxfp_down_ldu_weight_ring") =
       mxfpDownLduWeightRingEnabled;
+  config.attr("mxfp_down_ldu_weight_ring_stages") =
+      mxfpDownLduWeightRingStages;
   config.attr("mxfp_weight_prefetch") =
       mxfpWeightPrefetchEnabled;
+  config.attr("mxfp_weight_scale_tma") =
+      mxfpWeightScaleTmaEnabled;
+  config.attr("mxfp_gate_up_weight_scale_separate_barrier") =
+      mxfpGateUpWeightScaleSeparateBarrierEnabled;
+  config.attr("mxfp_down_weight_scale_separate_barrier") =
+      mxfpDownWeightScaleSeparateBarrierEnabled;
+  config.attr("mxfp_down_bf16_reduction") =
+      mxfpDownBf16ReductionEnabled;
+  config.attr("mxfp_resident_ffn_overlap_down_prefetch") =
+      mxfpResidentFfnOverlapDownPrefetchEnabled;
+  config.attr("mxfp_resident_down_pair_zero") =
+      mxfpResidentDownPairZeroEnabled;
+  config.attr("mxfp_resident_ffn_fast_memory_dispatch") =
+      mxfpResidentFfnFastMemoryDispatchEnabled;
+  config.attr("mxfp_resident_down_ldu1_zero") =
+      mxfpResidentDownLdu1ZeroEnabled;
   config.attr("mxfp_gate_up_direct_activation_tiles") =
       mxfpGateUpDirectActivationTiles;
   config.attr("mxfp_gate_up_fixed_output_rows") =
