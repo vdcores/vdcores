@@ -1070,6 +1070,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfpGateUpLduWeightRingEnabled;
   config.attr("mxfp_down_ldu_weight_ring") =
       mxfpDownLduWeightRingEnabled;
+  config.attr("mxfp_weight_prefetch") =
+      mxfpWeightPrefetchEnabled;
   config.attr("mxfp_gate_up_direct_activation_tiles") =
       mxfpGateUpDirectActivationTiles;
   config.attr("mxfp_gate_up_fixed_output_rows") =

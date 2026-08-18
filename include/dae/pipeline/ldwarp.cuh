@@ -76,6 +76,51 @@ __device__ __forceinline__ uint64_t ldu_resolve_routed_address(
       pointer_table + expert * field_stride + pointer_field);
 }
 
+__device__ __forceinline__ uint64_t ldu_mxfp_streaming_cache_policy() {
+  uint64_t policy;
+  asm volatile(
+      "createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
+      : "=l"(policy));
+  return policy;
+}
+
+template<bool Streaming>
+__device__ __forceinline__ void ldu_issue_mxfp_weight_tma(
+    const uint32_t destination, const CUtensorMap *descriptor,
+    const int tile, const int output_task, const uint32_t barrier,
+    const uint64_t cache_policy) {
+  if constexpr (Streaming) {
+    asm volatile(
+        "cp.async.bulk.tensor.5d.shared::cluster.global."
+        "mbarrier::complete_tx::bytes.L2::cache_hint "
+        "[%0], [%1, {0, %2, %3, %4, %5}], [%6], %7;"
+        :: "r"(destination), "l"(descriptor),
+           "r"(0), "r"(0), "r"(tile), "r"(output_task),
+           "r"(barrier), "l"(cache_policy)
+        : "memory");
+  } else {
+    asm volatile(
+        "cp.async.bulk.tensor.5d.shared::cluster.global."
+        "mbarrier::complete_tx::bytes "
+        "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
+        :: "r"(destination), "l"(descriptor),
+           "r"(0), "r"(0), "r"(tile), "r"(output_task),
+           "r"(barrier)
+        : "memory");
+  }
+}
+
+__device__ __forceinline__ void ldu_prefetch_mxfp_weight_tma(
+    const CUtensorMap *descriptor, const int tile, const int output_task,
+    const uint64_t cache_policy) {
+  asm volatile(
+      "cp.async.bulk.prefetch.tensor.5d.L2.global.tile.L2::cache_hint "
+      "[%0, {0, %1, %2, %3, %4}], %5;"
+      :: "l"(descriptor), "r"(0), "r"(0), "r"(tile), "r"(output_task),
+         "l"(cache_policy)
+      : "memory");
+}
+
 #if DAE_MXFP_DOWN_LDU_WEIGHT_RING
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
@@ -95,6 +140,11 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
   constexpr int kTilesPerTask = 8;
   constexpr int kWeightPackedBytes = 16 * 1024;
   constexpr int kWeightStageBytes = 32 * 1024;
+
+  uint64_t cache_policy = 0;
+  if constexpr (mxfpWeightPrefetchEnabled) {
+    cache_policy = ldu_mxfp_streaming_cache_policy();
+  }
 
   // Publish allocation visibility independently of tile readiness. Each
   // compute task waits on the resident weight-full phases before UMMA.
@@ -130,15 +180,16 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
               weight_ring + stage * kWeightStageBytes));
       const uint32_t barrier = static_cast<uint32_t>(
           __cvta_generic_to_shared(weight_full + stage));
-      asm volatile(
-          "cp.async.bulk.tensor.5d.shared::cluster.global."
-          "mbarrier::complete_tx::bytes "
-          "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
-          :: "r"(destination), "l"(tma_descs + inst.arg),
-             "r"(0), "r"(0), "r"(tile), "r"(int(output_task)),
-             "r"(barrier)
-          : "memory");
+      ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
+          destination, tma_descs + inst.arg, tile, int(output_task), barrier,
+          cache_policy);
       weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
+      if constexpr (mxfpWeightPrefetchEnabled) {
+        if (tile + 1 < kTilesPerTask) {
+          ldu_prefetch_mxfp_weight_tma(
+              tma_descs + inst.arg, tile + 1, int(output_task), cache_policy);
+        }
+      }
     }
   }
 
@@ -410,6 +461,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         auto *weight_ring = static_cast<uint8_t *>(
             get_slot_address(smem_base, slot));
         uint32_t empty_phase[kStages] = {};
+        uint64_t cache_policy = 0;
+        if constexpr (mxfpWeightPrefetchEnabled) {
+          cache_policy = ldu_mxfp_streaming_cache_policy();
+        }
 
         #pragma unroll
         for (int projection = 0; projection < 2; ++projection) {
@@ -438,15 +493,17 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
                     weight_ring + stage * kWeightStageBytes));
             const uint32_t barrier = static_cast<uint32_t>(
                 __cvta_generic_to_shared(weight_full + stage));
-            asm volatile(
-                "cp.async.bulk.tensor.5d.shared::cluster.global."
-                "mbarrier::complete_tx::bytes "
-                "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
-                :: "r"(destination), "l"(tma_descs + descriptor_index),
-                   "r"(0), "r"(0), "r"(tile), "r"(int(inst.coords[3])),
-                   "r"(barrier)
-                : "memory");
+            ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
+                destination, tma_descs + descriptor_index, tile,
+                int(inst.coords[3]), barrier, cache_policy);
             weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
+            if constexpr (mxfpWeightPrefetchEnabled) {
+              if (tile + 1 < kTilesPerProjection) {
+                ldu_prefetch_mxfp_weight_tma(
+                    tma_descs + descriptor_index, tile + 1,
+                    int(inst.coords[3]), cache_policy);
+              }
+            }
           }
         }
 

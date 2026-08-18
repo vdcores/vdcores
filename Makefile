@@ -138,6 +138,11 @@ ifneq ($(mxfp_down_ldu_weight_ring),)
 	export DAE_MXFP_DOWN_LDU_WEIGHT_RING := $(mxfp_down_ldu_weight_ring)
 endif
 
+ifneq ($(mxfp_weight_prefetch),)
+	NVCC_FLAGS += -DDAE_MXFP_WEIGHT_PREFETCH=$(mxfp_weight_prefetch)
+	export DAE_MXFP_WEIGHT_PREFETCH := $(mxfp_weight_prefetch)
+endif
+
 ifneq ($(mxfp_gate_up_direct_activation_tiles),)
 	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES=$(mxfp_gate_up_direct_activation_tiles)
 	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES := $(mxfp_gate_up_direct_activation_tiles)

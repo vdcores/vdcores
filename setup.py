@@ -106,6 +106,11 @@ if os.environ.get("DAE_MXFP_DOWN_LDU_WEIGHT_RING"):
         "-DDAE_MXFP_DOWN_LDU_WEIGHT_RING="
         + os.environ["DAE_MXFP_DOWN_LDU_WEIGHT_RING"]
     )
+if os.environ.get("DAE_MXFP_WEIGHT_PREFETCH"):
+    cuda_defines.append(
+        "-DDAE_MXFP_WEIGHT_PREFETCH="
+        + os.environ["DAE_MXFP_WEIGHT_PREFETCH"]
+    )
 if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES"):
     cuda_defines.append(
         "-DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES="

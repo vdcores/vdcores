@@ -15,6 +15,8 @@ import statistics
 
 import torch
 
+from deepseek_v4_cold_timing import cold_graph_timings_us, percentile_us
+
 
 def median_us(values: list[float]) -> float:
     return statistics.median(values) * 1.0e3
@@ -29,6 +31,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--graph-inner", type=int, default=20)
+    parser.add_argument("--cold-samples", type=int, default=0)
+    parser.add_argument("--cold-l2-scrub-mib", type=int, default=260)
     args = parser.parse_args()
     if args.experts != 7:
         parser.error("the matched shared+routed comparison requires seven experts")
@@ -230,6 +234,28 @@ def main() -> None:
         f"full_ffn_us={median_us(full_ms):.6f}",
         flush=True,
     )
+    if args.cold_samples:
+        cold_times = cold_graph_timings_us(
+            full_ffn,
+            stream=torch.cuda.Stream(),
+            warmup=args.warmup,
+            samples=args.cold_samples,
+            l2_scrub_mib=args.cold_l2_scrub_mib,
+        )
+        print(
+            "DSV4_DEEPGEMM_MXFP4_FULL_FFN_COLD_RESULT "
+            f"vllm={vllm.__version__} experts={e} rows={rows} "
+            f"logical_rows={e * rows} padded_rows={padded_rows} "
+            "timing=cold_data_one_ffn_graph "
+            f"l2_scrub_mib={args.cold_l2_scrub_mib} "
+            f"samples={args.cold_samples} "
+            f"min_us={min(cold_times):.6f} "
+            f"median_us={statistics.median(cold_times):.6f} "
+            f"p90_us={percentile_us(cold_times, 0.90):.6f} "
+            f"stddev_us={statistics.pstdev(cold_times):.6f} "
+            f"max_us={max(cold_times):.6f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

@@ -2561,3 +2561,160 @@ before changing the down schedule.
 | --- | ---: | ---: | ---: | ---: |
 | Linear-1 | 52.536 | 54.203 | 55.360 | 1.03x |
 | down | 31.944 | **71.365** | 74.272 | **2.23x** |
+
+## Retained-ring one-launch phase isolation (2026-08-17)
+
+Isolated Linear-1 and Linear-2 must be measured with the same selected-op
+image as the one-launch FFN. Doing so keeps the 204-register, nine-barrier
+compute-dispatch footprint identical and separates command-stream integration
+from kernel-size effects. Protocol matching also matters: isolated Linear-1
+must publish its ready records, and isolated Linear-2 must execute already
+satisfied per-record, per-K256 readiness checks.
+
+Matched release job `20260817T222707Z-2955717` used 112 workers on one GB300.
+The isolated local medians were 12.384 us for Linear-1 and 12.416 us for
+Linear-2; their kernel spans were 13.920 and 13.120 us. Two prebuilt-input
+one-launch controls measured 15.008--15.136 us local Linear-1,
+12.608--12.752 us local Linear-2, and 29.792--30.464 us for the kernel. Thus
+Linear-1 is about 22% slower inside the combined command stream even when
+Down reads an independent, already-ready activation tensor. Linear-2's
+prebuilt median is close to isolated, but its tail is wider.
+
+With the real Linear-1-to-Down readiness edge, two samples measured
+15.680--15.856 us local Linear-1, 13.600--16.752 us local Linear-2, and
+32.128--34.144 us kernel spans. The variable Down time is a producer-tail and
+placement effect; a global phase span must not be interpreted as one SM's
+compute duration. Use the per-worker event-2-to-4 and event-4-to-5 deltas.
+
+Track-profile job `20260817T222940Z-2956490` found zero slot stalls in either
+isolated phase but exactly one stalled allocation on every worker in both
+full controls. Linear-1 owns a 16-slot retained weight ring plus its four-slot
+activation allocation; the allocator runs ahead to the following eight-slot
+Down ring before the old ring reaches UMMA last use. The resulting roughly
+37% grid-envelope slot-stall counter is overlapping allocator-warp wait, not
+a 37% latency attribution. LDU0 queue wait stayed near 9%, compute M2C wait
+stayed in the 4--7% range, and LDU dependency wait was zero. In particular,
+LDU queue-wait counters measure time waiting for another command, not slow
+memory service.
+
+The existing lease-handoff control removed all 112 stalls and reduced
+allocator instructions from 336 to 224 in job
+`20260817T223150Z-2957240`, but recovered only 0.352--0.384 us of
+instrumented Linear-1 time and did not consistently improve the full kernel.
+Allocator lookahead is therefore a measured secondary interference source,
+not the entire integration gap. Whole-kernel Nsight Compute profiles also
+showed full HBM read traffic and executed instructions close to the isolated
+sum; do not attribute the remaining gap to extra memory bytes or to a
+different compute-handler image without a more local trace.
+
+The Down-prefix sweep and address-alias control refine that conclusion. In
+release job `20260817T224459Z-2960877`, adding 0/112/224 prebuilt-input Down
+tasks changed Linear-1 local median from 12.240 to 13.216 to 15.568 us,
+standard deviation from 0.312 to 0.492 to 0.690 us, and P95 from 12.925 to
+14.173 to 16.526 us. A single exposed worker was about 1.18 us slower than
+the 111 unexposed workers in the same launch, proving a local memory-command
+lookahead effect.
+
+Temporary global-timer trace `20260817T224929Z-2962217` showed the first Down
+weight TMA starting about 0.9--1.1 us before the same worker's Linear-1 end,
+after its Linear-1 ring reached last use. At full load the earliest Down TMA
+can overlap the latest worker's Linear-1 weight stream by less than 1 us.
+However, the second Down TMA starts at least 3--5.8 us after every Linear-1
+worker finishes, so it cannot directly explain the large 112-to-224 change.
+
+The large steady-state difference is cache-history/working-set interference
+across repeated FFN invocations. Effective clocks remain equal near 1.96 GHz;
+cold first-shot Linear-1 does not show a consistent 224-task penalty. In
+`20260817T225431Z-2963692`, 224 commands with unchanged TMA byte count but
+second-wave coordinates aliased onto the first 112 uniform weight records
+reduced steady-state Linear-1 from 16.096/16.224 us to 13.440/13.408 us.
+Thus an isolated repeated Linear-1 keeps its own weights resident, whereas a
+repeated full FFN lets the unique Down weight working set displace them before
+the next replay. Treat isolated-versus-full phase timing as a cache-state
+comparison unless both paths receive an equivalent preceding weight stream.
+The temporary alias and timestamp hooks were removed after this proof.
+
+## Full-FFN cold-data comparison (2026-08-17)
+
+Cold here means cold operand data, not first-process JIT. Code and one-FFN
+CUDA graphs are warm. Before every timed replay, the same stream performs a
+read/modify/write traversal of a 260-MiB buffer and records the start event
+after that traversal. GB200 L2 measured 135,528,448 bytes (129.25 MiB), so the
+scrub exceeds twice L2 while remaining outside the timed interval. All paths
+use one shared plus six routed experts, eight rows, H4096/I2048, 20 warmups,
+and 100 measured one-FFN replays; input/checkpoint quantization and routing
+preparation remain setup-only.
+
+| implementation | min | median | P90 | stddev | max (us) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vLLM/DeepGEMM | 43.264 | **44.016** | 45.536 | 0.768 | 47.872 |
+| VDCores task-direct | 43.712 | **44.512** | 45.792 | 0.903 | 47.872 |
+| VDCores retained ring | 64.256 | **66.976** | 69.376 | 1.605 | 76.608 |
+| FlashInfer grouped composed | 82.624 | **85.696** | 85.760 | 0.933 | 86.816 |
+
+The jobs are `20260817T233055Z-2974569`,
+`20260817T233608Z-2976354`, `20260817T233143Z-2974827`, and
+`20260817T233118Z-2974712`, respectively, all on worker GPU ordinal 3.
+Task-direct is only 0.496 us (1.13%) above DeepGEMM and should be treated as
+tied at this run-to-run precision. Retained ring is 22.464 us (50.47%) above
+task-direct, while remaining 18.720 us (21.84%) below the FlashInfer
+composition.
+
+The FlashInfer number is the legal seven-group composition—grouped FC1,
+vLLM SwiGLU, per-expert MXFP8 quantization/packing, grouped FC2, and routed
+reduction—not its fused TRTLLM MoE entrypoint. Correctness reruns bracketed the
+paired result at 83.680--89.824 us, with mean-relative error 0.2051 and cosine
+0.97886 against a BF16 reference. Bounded 300-s/top-7 and 120-s/top-6 attempts
+at the fused TRTLLM entrypoint did not finish first tactic setup, so no fused
+FlashInfer latency is claimed.
+
+After the task-direct measurement, the installed release image was restored
+to the retained-ring full-FFN build. Its compile again reports 204 registers,
+nine barriers, an 80-byte stack frame, zero spills, and 3,936 bytes static
+shared memory.
+
+## Retained-ring issue-gate rejection and weight prefetch (2026-08-18)
+
+A temporary memory-side issue gate made each worker decrement a device atomic
+only after its final Linear-1 gate/up weight TMA issue, then delayed the first
+Down ring until 32, 16, 8, or zero issuers remained. It did not improve cold
+latency: medians stayed at 66.704--66.944 us versus 66.784--66.928 us for
+bracketed ungated baselines. Hot medians were 34.450, 35.586, 35.587, and
+36.778 us respectively, versus a 34.625--35.362-us baseline range. The strict
+gate loses useful overlap and cannot repair cross-replay cache displacement.
+The experiment, including its build option, command encoding, scheduler state,
+and device atomics, was removed from the milestone.
+
+The retained implementation instead gives weight TMAs an L2 evict-first
+policy and issues `cp.async.bulk.prefetch.tensor` for tile `k+1` after tile
+`k`. This is the default; `DAE_MXFP_WEIGHT_PREFETCH=0` remains a constexpr A/B
+control. The cleaned release job `20260818T002921Z-2993479` measured a
+32.470-us hot median and a 51.824-us cold median (67.296-us P90). Earlier
+prefetch runs measured 32.334/32.394 us hot and 49.920/51.984 us cold, versus
+34.625--35.362 us hot and 66.784--66.928 us cold without prefetch. Thus the
+repeatable hot improvement is 6.2--8.2%, and the cleaned cold median is about
+22.5% lower. The cold tail remains bimodal, so the hint has not proven a
+stable P90 improvement.
+
+The same 100-warmup, 500-sample, 20-FFN graph hot protocol and 100-sample
+one-FFN cold protocol produced this final comparison on worker GPU ordinal 3:
+
+| implementation | hot median | cold median | cold P90 (us) |
+| --- | ---: | ---: | ---: |
+| VDCores task-direct, two kernels | **26.293** | **45.808** | 46.819 |
+| vLLM/DeepGEMM | 30.776 | **44.256** | **45.043** |
+| VDCores retained-ring prefetch, one persistent kernel | 32.470 | 51.824 | 67.296 |
+| FlashInfer grouped composition | not measured | 84.928 | 85.763 |
+
+The jobs are `20260818T003115Z-2994064`,
+`20260818T003158Z-2994351`, `20260818T002921Z-2993479`, and
+`20260818T003223Z-2994509`, respectively. Retained prefetch is 6.178 us
+(23.5%) slower than task-direct hot and 6.016 us (13.1%) slower cold. It is
+1.694 us (5.5%) slower than DeepGEMM hot and 7.568 us (17.1%) slower cold,
+while its cold median is 33.104 us (39.0%) below the legal FlashInfer grouped
+composition. Every result passed its correctness check.
+
+The selected retained image still compiles at 204 registers, nine barriers,
+an 80-byte stack frame, zero spills, and 3,936 bytes static shared memory.
+Exact exploratory jobs are recorded in
+`.agentlog/2026-08-18-retained-ring-issue-prefetch.md`.

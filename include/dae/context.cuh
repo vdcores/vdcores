@@ -168,6 +168,11 @@ static constexpr int mxfpLduWeightRingEmptyBarrierBase =
 #endif
 static constexpr bool mxfpDownLduWeightRingEnabled =
     DAE_MXFP_DOWN_LDU_WEIGHT_RING != 0;
+#ifndef DAE_MXFP_WEIGHT_PREFETCH
+#define DAE_MXFP_WEIGHT_PREFETCH 1
+#endif
+static constexpr bool mxfpWeightPrefetchEnabled =
+    DAE_MXFP_WEIGHT_PREFETCH != 0;
 static constexpr int mxfpDownLduWeightRingStages = 2;
 static constexpr int mxfpDownLduWeightRingBarrierBase =
     mxfpLduWeightRingBarrierBase + mxfpLduWeightRingBarrierCount;

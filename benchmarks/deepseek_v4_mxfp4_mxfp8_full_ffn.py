@@ -20,6 +20,7 @@ import torch
 from dae import runtime
 from dae.instructions import TmaTensor
 from dae.launcher import Launcher
+from deepseek_v4_cold_timing import cold_graph_timings_us, percentile_us
 
 
 FP4_VALUES = (
@@ -67,6 +68,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--graph-inner", type=int, default=20)
+    parser.add_argument("--cold-samples", type=int, default=0)
+    parser.add_argument("--cold-l2-scrub-mib", type=int, default=260)
     parser.add_argument("--weight-byte", type=lambda value: int(value, 0), default=0x66)
     parser.add_argument("--weight-scale", type=int, default=125)
     parser.add_argument("--down-weight-byte", type=lambda value: int(value, 0), default=0x22)
@@ -323,6 +326,16 @@ def main() -> None:
         stop.synchronize()
         times.append(start.elapsed_time(stop) * 1.0e3 / args.graph_inner)
 
+    cold_times = None
+    if args.cold_samples:
+        cold_times = cold_graph_timings_us(
+            enqueue_full_ffn,
+            stream=root_stream,
+            warmup=args.warmup,
+            samples=args.cold_samples,
+            l2_scrub_mib=args.cold_l2_scrub_mib,
+        )
+
     torch.testing.assert_close(final_output, expected_final, rtol=2e-5, atol=1e-3)
     median_us = statistics.median(times)
     speedup = args.vllm_us / median_us
@@ -358,6 +371,22 @@ def main() -> None:
         "output_correct=true",
         flush=True,
     )
+    if cold_times is not None:
+        print(
+            "DSV4_MXFP4_MXFP8_FULL_FFN_COLD_RESULT "
+            f"experts={experts} shared=1 routed=6 rows=8 "
+            "implementation=task_direct kernels=2 "
+            "timing=cold_data_one_ffn_graph "
+            f"l2_scrub_mib={args.cold_l2_scrub_mib} "
+            f"samples={args.cold_samples} "
+            f"min_us={min(cold_times):.6f} "
+            f"median_us={statistics.median(cold_times):.6f} "
+            f"p90_us={percentile_us(cold_times, 0.90):.6f} "
+            f"stddev_us={statistics.pstdev(cold_times):.6f} "
+            f"max_us={max(cold_times):.6f} "
+            "output_correct=true",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
