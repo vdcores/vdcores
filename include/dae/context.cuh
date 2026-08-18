@@ -165,15 +165,16 @@ static constexpr bool mxfpResidentFfnFastMemoryDispatchEnabled =
 #ifndef DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO
 #define DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO 0
 #endif
-// The focused resident FFN can use its otherwise idle second LDU to prepare
-// shared-expert reduction destinations before routed Down epilogues arrive.
+// The focused resident FFN uses its otherwise idle second LDU for the Down
+// activation/SFB stream. Destination initialization is an independent policy;
+// the performance-only no-zero control publishes reduction readiness without
+// touching the output allocation.
 static constexpr bool mxfpResidentDownLdu1ZeroEnabled =
     DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO != 0;
 static_assert(
     !mxfpResidentDownLdu1ZeroEnabled ||
-        (mxfpResidentFfnFastMemoryDispatchEnabled &&
-         mxfpResidentDownPairZeroEnabled),
-    "resident LDU1 zeroing requires fast dispatch and paired destinations");
+        mxfpResidentFfnFastMemoryDispatchEnabled,
+    "resident LDU1 producer requires fast memory dispatch");
 #ifndef DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU
 #define DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU 0
 #endif
@@ -185,19 +186,6 @@ static_assert(
     !mxfpResidentDownSplitLduEnabled ||
         mxfpResidentDownLdu1ZeroEnabled,
     "resident split-LDU Down requires the paused LDU1 protocol");
-#ifndef DAE_MXFP_RESIDENT_FAST_QUEUE_INIT
-#define DAE_MXFP_RESIDENT_FAST_QUEUE_INIT \
-  DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH
-#endif
-// The fixed resident image touches only C2M[0] and M2LD[0..1] on each port.
-// Initializing that constexpr subset avoids constructing 123 unused queue
-// barriers before the first compute and memory tasks can start.
-static constexpr bool mxfpResidentFastQueueInitEnabled =
-    DAE_MXFP_RESIDENT_FAST_QUEUE_INIT != 0;
-static_assert(
-    !mxfpResidentFastQueueInitEnabled ||
-        mxfpResidentFfnFastMemoryDispatchEnabled,
-    "resident fast queue init requires the fixed memory dispatcher");
 #ifndef DAE_MXFP_GATE_UP_LDU_WEIGHT_RING
 #define DAE_MXFP_GATE_UP_LDU_WEIGHT_RING 1
 #endif

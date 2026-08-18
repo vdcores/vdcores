@@ -193,11 +193,6 @@ ifneq ($(mxfp_resident_down_split_ldu),)
 	export DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU := $(mxfp_resident_down_split_ldu)
 endif
 
-ifneq ($(mxfp_resident_fast_queue_init),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_FAST_QUEUE_INIT=$(mxfp_resident_fast_queue_init)
-	export DAE_MXFP_RESIDENT_FAST_QUEUE_INIT := $(mxfp_resident_fast_queue_init)
-endif
-
 ifneq ($(mxfp_gate_up_direct_activation_tiles),)
 	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES=$(mxfp_gate_up_direct_activation_tiles)
 	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES := $(mxfp_gate_up_direct_activation_tiles)

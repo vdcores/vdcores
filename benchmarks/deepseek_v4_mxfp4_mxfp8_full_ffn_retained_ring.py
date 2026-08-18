@@ -18,7 +18,7 @@ from dae.schedule import (
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
     SchedMxfp4Mxfp8ResidentFfn,
 )
-from deepseek_v4_cold_timing import cold_graph_timings_us, percentile_us
+from deepseek_v4_cold_timing import percentile_us
 
 
 FP4_VALUES = (
@@ -73,6 +73,57 @@ def span_us(profile: torch.Tensor, start: int, stop: int) -> float:
     return (
         int(values[:, stop].max()) - int(values[:, start].min())
     ) / 1.0e3
+
+
+def device_counter_span_us(profile: torch.Tensor) -> float:
+    """Return dae2 event-0 to event-1 grid span from GPU globaltimer."""
+
+    values = profile[:, :2].cpu().numpy()
+    return (int(values[:, 1].max()) - int(values[:, 0].min())) / 1.0e3
+
+
+def cold_graph_counter_timings_us(
+    run,
+    *,
+    profile: torch.Tensor,
+    stream: torch.cuda.Stream,
+    warmup: int,
+    samples: int,
+    l2_scrub_mib: int,
+) -> tuple[list[float], list[float]]:
+    """Collect cold CUDA-event and in-dae2 globaltimer spans together."""
+
+    current = torch.cuda.current_stream()
+    stream.wait_stream(current)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
+            graph.replay()
+    current.wait_stream(stream)
+    torch.cuda.synchronize()
+
+    scrub = torch.zeros(
+        l2_scrub_mib * 1024 * 1024,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    stream.wait_stream(current)
+    event_times: list[float] = []
+    counter_times: list[float] = []
+    for _ in range(samples):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(stream):
+            scrub.add_(1)
+            start.record(stream)
+            graph.replay()
+            stop.record(stream)
+        stop.synchronize()
+        event_times.append(start.elapsed_time(stop) * 1.0e3)
+        counter_times.append(device_counter_span_us(profile))
+    return event_times, counter_times
 
 
 def relative_finish_us(
@@ -416,13 +467,11 @@ def main() -> None:
     resident_down_split_ldu = bool(
         runtime.config.mxfp_resident_down_split_ldu
     )
-    resident_fast_queue_init = bool(
-        runtime.config.mxfp_resident_fast_queue_init
-    )
     fast_memory_dispatch = bool(
         runtime.config.mxfp_resident_ffn_fast_memory_dispatch
     )
     ldu1_zero = bool(runtime.config.mxfp_resident_down_ldu1_zero)
+    python_output_zero = ldu1_zero
     if not 0 <= args.down_task_limit <= 224:
         parser.error("--down-task-limit must be in [0,224]")
     for name, value in (
@@ -584,6 +633,8 @@ def main() -> None:
         )
         down_records[task, 5] = f32_bits(route_scales[expert])
         down_records[task, 6] = final_output[output_tile].data_ptr()
+        # This benchmark control deliberately permits reduce-add into the
+        # destination's existing contents when LDU1 output zeroing is omitted.
         flags = 1 | (4 if args.blockwise_ready else 0)
         if resident_down_pair_zero and expert == 0:
             if output_tile < down_slices // 2:
@@ -682,6 +733,8 @@ def main() -> None:
 
     def enqueue() -> None:
         with torch.cuda.stream(stream):
+            if python_output_zero:
+                final_output.zero_()
             launcher.launch(synchronize=False)
 
     stream.wait_stream(torch.cuda.current_stream())
@@ -748,6 +801,7 @@ def main() -> None:
         graph.replay()
     torch.cuda.synchronize()
     times = []
+    device_counter_times = []
     for _ in range(args.iterations):
         start = torch.cuda.Event(enable_timing=True)
         stop = torch.cuda.Event(enable_timing=True)
@@ -756,11 +810,16 @@ def main() -> None:
         stop.record()
         stop.synchronize()
         times.append(start.elapsed_time(stop) * 1.0e3 / args.graph_inner)
+        device_counter_times.append(device_counter_span_us(launcher.profile))
+
+    hot_profile = launcher.profile.clone()
 
     cold_times = None
+    cold_device_counter_times = None
     if args.cold_samples:
-        cold_times = cold_graph_timings_us(
+        cold_times, cold_device_counter_times = cold_graph_counter_timings_us(
             enqueue,
+            profile=launcher.profile,
             stream=stream,
             warmup=args.warmup,
             samples=args.cold_samples,
@@ -774,7 +833,7 @@ def main() -> None:
             rtol=3e-2 if reduction_bf16 else 2e-5,
             atol=1e-1 if reduction_bf16 else 1e-3,
         )
-    profile = launcher.profile
+    profile = hot_profile
     linear1_profile = profile[:linear1_tasks]
     linear1_finish = relative_finish_us(linear1_profile, 2, 4)
     down_finish = relative_finish_us(profile, 2, 5)
@@ -864,6 +923,15 @@ def main() -> None:
             f"p90_us={percentile_us(cold_times, 0.90):.6f} "
             f"stddev_us={statistics.pstdev(cold_times):.6f} "
             f"max_us={max(cold_times):.6f} "
+            "device_counter_scope=post_queue_init_to_compute_terminate "
+            f"device_counter_min_us={min(cold_device_counter_times):.6f} "
+            "device_counter_median_us="
+            f"{statistics.median(cold_device_counter_times):.6f} "
+            "device_counter_p90_us="
+            f"{percentile_us(cold_device_counter_times, 0.90):.6f} "
+            "device_counter_stddev_us="
+            f"{statistics.pstdev(cold_device_counter_times):.6f} "
+            f"device_counter_max_us={max(cold_device_counter_times):.6f} "
             "output_correct=true",
             flush=True,
         )
@@ -886,9 +954,11 @@ def main() -> None:
         f"overlap_down_prefetch={str(overlap_down_prefetch).lower()} "
         f"resident_down_pair_zero={str(resident_down_pair_zero).lower()} "
         f"resident_down_split_ldu={str(resident_down_split_ldu).lower()} "
-        f"resident_fast_queue_init={str(resident_fast_queue_init).lower()} "
+        "queue_init=generic "
         f"fast_memory_dispatch={str(fast_memory_dispatch).lower()} "
-        f"ldu1_zero={str(ldu1_zero).lower()} "
+        f"ldu1_enabled={str(ldu1_zero).lower()} "
+        f"ldu1_output_zero={str(resident_down_pair_zero).lower()} "
+        f"python_output_zero={str(python_output_zero).lower()} "
         f"ring_handoff={str(args.ring_handoff).lower()} "
         f"handoff_sources={source_count} handoff_targets={target_count} "
         f"blockwise_ready={str(args.blockwise_ready).lower()} "
@@ -929,6 +999,14 @@ def main() -> None:
         f"end_to_end_min_us={min(times):.6f} "
         f"end_to_end_median_us={statistics.median(times):.6f} "
         f"end_to_end_max_us={max(times):.6f} "
+        "device_counter_scope=post_queue_init_to_compute_terminate "
+        f"device_counter_min_us={min(device_counter_times):.6f} "
+        "device_counter_median_us="
+        f"{statistics.median(device_counter_times):.6f} "
+        f"device_counter_p90_us={percentile(device_counter_times, 0.90):.6f} "
+        "device_counter_stddev_us="
+        f"{statistics.pstdev(device_counter_times):.6f} "
+        f"device_counter_max_us={max(device_counter_times):.6f} "
         f"max_abs_error={max_abs_error:.8f} "
         f"max_rel_error={max_rel_error:.8f} "
         f"down_output_checked={str(bool(checked_outputs.any())).lower()} "

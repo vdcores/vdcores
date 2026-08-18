@@ -734,11 +734,7 @@ ldwarp_execute_mxfp_resident_ffn_zero_fast(
   }
   plan_address = __shfl_sync(ALL_THREADS, plan_address, 0);
 
-  uint64_t output_address = 0;
-  uint64_t paired_output_address = 0;
   uint32_t reduce_bar = 0;
-  uint32_t paired_reduce_bar = 0;
-  uint32_t resident_flags = 0;
   uint32_t output_task = ~0U;
   uint32_t second_reduce_bar = 0;
   if (lane_id == 0) {
@@ -753,63 +749,16 @@ ldwarp_execute_mxfp_resident_ffn_zero_fast(
         reinterpret_cast<const uint64_t *>(metadata + 32));
     output_task = uint32_t(tma_info >> 32);
     reduce_bar = uint32_t(barrier_info >> 32);
-    output_address = load_l2_u64(
-        reinterpret_cast<const uint64_t *>(metadata + 48));
-    resident_flags = uint32_t(load_l2(
-        reinterpret_cast<const int *>(metadata + 68)));
-    paired_output_address = load_l2_u64(
-        reinterpret_cast<const uint64_t *>(metadata + 72));
-    paired_reduce_bar = uint32_t(load_l2(
-        reinterpret_cast<const int *>(metadata + 80)));
     second_reduce_bar = uint32_t(load_l2_u64(
         reinterpret_cast<const uint64_t *>(second_metadata + 32)) >> 32);
   }
-  output_address = __shfl_sync(ALL_THREADS, output_address, 0);
-  paired_output_address =
-      __shfl_sync(ALL_THREADS, paired_output_address, 0);
-  reduce_bar = __shfl_sync(ALL_THREADS, reduce_bar, 0);
-  paired_reduce_bar =
-      __shfl_sync(ALL_THREADS, paired_reduce_bar, 0);
-  resident_flags = __shfl_sync(ALL_THREADS, resident_flags, 0);
-  output_task = __shfl_sync(ALL_THREADS, output_task, 0);
-
-  constexpr int kOutputElements = 128 * 8;
-  constexpr int kOutputBytes = kOutputElements *
-      (mxfpDownBf16ReductionEnabled ? 2 : 4);
-  const bool shared_expert = output_task < 32;
-  const bool clear_current =
-      shared_expert && (resident_flags & 1U) != 0 &&
-      (resident_flags & 16U) == 0;
-  const bool clear_pair =
-      shared_expert && (resident_flags & 8U) != 0;
-  const uint4 zero = make_uint4(0, 0, 0, 0);
-  if (clear_current) {
-    auto *output = reinterpret_cast<uint4 *>(output_address);
-    #pragma unroll
-    for (int index = lane_id; index < kOutputBytes / int(sizeof(uint4));
-         index += numThreadsPerWarp) {
-      output[index] = zero;
-    }
-  }
-  if (clear_pair) {
-    auto *output = reinterpret_cast<uint4 *>(paired_output_address);
-    #pragma unroll
-    for (int index = lane_id; index < kOutputBytes / int(sizeof(uint4));
-         index += numThreadsPerWarp) {
-      output[index] = zero;
-    }
-  }
-  if (clear_current || clear_pair) {
-    __syncwarp();
-    if (lane_id == 0) {
-      asm volatile("fence.release.gpu;" ::: "memory");
-      if (clear_current) {
-        *reinterpret_cast<volatile int *>(bars + reduce_bar) = 0;
-      }
-      if (clear_pair) {
-        *reinterpret_cast<volatile int *>(bars + paired_reduce_bar) = 0;
-      }
-    }
+  if (lane_id == 0 && output_task < 32) {
+    // Performance-only control: publish both destinations without clearing
+    // them. Every expert, including expert 0, executes reduce-add against
+    // whatever bytes already occupy the output allocation.
+    asm volatile("fence.release.gpu;" ::: "memory");
+    *reinterpret_cast<volatile int *>(bars + reduce_bar) = 0;
+    *reinterpret_cast<volatile int *>(bars + second_reduce_bar) = 0;
   }
 
   if (lane_id == 0) {
