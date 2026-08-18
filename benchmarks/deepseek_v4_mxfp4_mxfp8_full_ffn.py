@@ -20,7 +20,7 @@ import torch
 from dae import runtime
 from dae.instructions import TmaTensor
 from dae.launcher import Launcher
-from deepseek_v4_cold_timing import cold_graph_timings_us, percentile_us
+from deepseek_v4_cold_timing import percentile_us
 
 
 FP4_VALUES = (
@@ -61,6 +61,88 @@ def uniform_linear1_reference(
 def kernel_span_us(launcher: Launcher) -> float:
     profile = launcher.profile[:, :2].cpu().numpy()
     return (int(profile[:, 1].max()) - int(profile[:, 0].min())) / 1.0e3
+
+
+def direct_counter_spans_us(
+    linear1_profile: torch.Tensor,
+    down_profile: torch.Tensor,
+) -> tuple[float, float, float, float]:
+    """Return both kernels, their launch gap, and the combined grid envelope."""
+
+    linear1 = linear1_profile[:, :2].cpu().numpy()
+    down = down_profile[:, :2].cpu().numpy()
+    linear1_start = int(linear1[:, 0].min())
+    linear1_end = int(linear1[:, 1].max())
+    down_start = int(down[:, 0].min())
+    down_end = int(down[:, 1].max())
+    return (
+        (linear1_end - linear1_start) / 1.0e3,
+        (down_start - linear1_end) / 1.0e3,
+        (down_end - down_start) / 1.0e3,
+        (down_end - linear1_start) / 1.0e3,
+    )
+
+
+def cold_graph_direct_counter_timings_us(
+    run,
+    *,
+    linear1_profile: torch.Tensor,
+    down_profile: torch.Tensor,
+    stream: torch.cuda.Stream,
+    warmup: int,
+    samples: int,
+    l2_scrub_mib: int,
+) -> tuple[list[float], list[float], list[float], list[float], list[float]]:
+    """Collect cold CUDA-event and both direct-kernel counter spans."""
+
+    current = torch.cuda.current_stream()
+    stream.wait_stream(current)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
+            graph.replay()
+    current.wait_stream(stream)
+    torch.cuda.synchronize()
+
+    scrub = torch.zeros(
+        l2_scrub_mib * 1024 * 1024,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    stream.wait_stream(current)
+    event_times: list[float] = []
+    linear1_counter_times: list[float] = []
+    inter_kernel_gap_times: list[float] = []
+    down_counter_times: list[float] = []
+    combined_counter_times: list[float] = []
+    for _ in range(samples):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(stream):
+            scrub.add_(1)
+            start.record(stream)
+            graph.replay()
+            stop.record(stream)
+        stop.synchronize()
+        event_times.append(start.elapsed_time(stop) * 1.0e3)
+        linear1_us, inter_kernel_gap_us, down_us, combined_us = (
+            direct_counter_spans_us(
+                linear1_profile, down_profile
+            )
+        )
+        linear1_counter_times.append(linear1_us)
+        inter_kernel_gap_times.append(inter_kernel_gap_us)
+        down_counter_times.append(down_us)
+        combined_counter_times.append(combined_us)
+    return (
+        event_times,
+        linear1_counter_times,
+        inter_kernel_gap_times,
+        down_counter_times,
+        combined_counter_times,
+    )
 
 
 def main() -> None:
@@ -325,6 +407,10 @@ def main() -> None:
         graph.replay()
     torch.cuda.synchronize()
     times = []
+    linear1_counter_times = []
+    inter_kernel_gap_times = []
+    down_counter_times = []
+    combined_counter_times = []
     for _ in range(args.iterations):
         start = torch.cuda.Event(enable_timing=True)
         stop = torch.cuda.Event(enable_timing=True)
@@ -333,11 +419,32 @@ def main() -> None:
         stop.record()
         stop.synchronize()
         times.append(start.elapsed_time(stop) * 1.0e3 / args.graph_inner)
+        linear1_us, inter_kernel_gap_us, down_us, combined_us = (
+            direct_counter_spans_us(
+                linear1_launcher.profile, down_launcher.profile
+            )
+        )
+        linear1_counter_times.append(linear1_us)
+        inter_kernel_gap_times.append(inter_kernel_gap_us)
+        down_counter_times.append(down_us)
+        combined_counter_times.append(combined_us)
 
     cold_times = None
+    cold_linear1_counter_times = None
+    cold_inter_kernel_gap_times = None
+    cold_down_counter_times = None
+    cold_combined_counter_times = None
     if args.cold_samples:
-        cold_times = cold_graph_timings_us(
+        (
+            cold_times,
+            cold_linear1_counter_times,
+            cold_inter_kernel_gap_times,
+            cold_down_counter_times,
+            cold_combined_counter_times,
+        ) = cold_graph_direct_counter_timings_us(
             enqueue_full_ffn,
+            linear1_profile=linear1_launcher.profile,
+            down_profile=down_launcher.profile,
             stream=root_stream,
             warmup=args.warmup,
             samples=args.cold_samples,
@@ -374,6 +481,32 @@ def main() -> None:
         f"graph_inner={args.graph_inner} "
         f"linear1_kernel_us={kernel_span_us(linear1_launcher):.6f} "
         f"down_kernel_us={kernel_span_us(down_launcher):.6f} "
+        "device_counter_scope=linear1_kernel_entry_to_down_kernel_exit "
+        f"linear1_device_counter_min_us={min(linear1_counter_times):.6f} "
+        "linear1_device_counter_median_us="
+        f"{statistics.median(linear1_counter_times):.6f} "
+        "linear1_device_counter_p90_us="
+        f"{percentile_us(linear1_counter_times, 0.90):.6f} "
+        "linear1_device_counter_stddev_us="
+        f"{statistics.pstdev(linear1_counter_times):.6f} "
+        f"linear1_device_counter_max_us={max(linear1_counter_times):.6f} "
+        f"inter_kernel_gap_min_us={min(inter_kernel_gap_times):.6f} "
+        f"inter_kernel_gap_median_us={statistics.median(inter_kernel_gap_times):.6f} "
+        "inter_kernel_gap_p90_us="
+        f"{percentile_us(inter_kernel_gap_times, 0.90):.6f} "
+        f"inter_kernel_gap_stddev_us={statistics.pstdev(inter_kernel_gap_times):.6f} "
+        f"inter_kernel_gap_max_us={max(inter_kernel_gap_times):.6f} "
+        f"down_device_counter_min_us={min(down_counter_times):.6f} "
+        "down_device_counter_median_us="
+        f"{statistics.median(down_counter_times):.6f} "
+        f"down_device_counter_p90_us={percentile_us(down_counter_times, 0.90):.6f} "
+        f"down_device_counter_stddev_us={statistics.pstdev(down_counter_times):.6f} "
+        f"down_device_counter_max_us={max(down_counter_times):.6f} "
+        f"device_counter_min_us={min(combined_counter_times):.6f} "
+        f"device_counter_median_us={statistics.median(combined_counter_times):.6f} "
+        f"device_counter_p90_us={percentile_us(combined_counter_times, 0.90):.6f} "
+        f"device_counter_stddev_us={statistics.pstdev(combined_counter_times):.6f} "
+        f"device_counter_max_us={max(combined_counter_times):.6f} "
         f"end_to_end_min_us={min(times):.6f} "
         f"end_to_end_median_us={median_us:.6f} "
         f"end_to_end_max_us={max(times):.6f} "
@@ -396,6 +529,41 @@ def main() -> None:
             f"p90_us={percentile_us(cold_times, 0.90):.6f} "
             f"stddev_us={statistics.pstdev(cold_times):.6f} "
             f"max_us={max(cold_times):.6f} "
+            "device_counter_scope=linear1_kernel_entry_to_down_kernel_exit "
+            "linear1_device_counter_min_us="
+            f"{min(cold_linear1_counter_times):.6f} "
+            "linear1_device_counter_median_us="
+            f"{statistics.median(cold_linear1_counter_times):.6f} "
+            "linear1_device_counter_p90_us="
+            f"{percentile_us(cold_linear1_counter_times, 0.90):.6f} "
+            "linear1_device_counter_stddev_us="
+            f"{statistics.pstdev(cold_linear1_counter_times):.6f} "
+            "linear1_device_counter_max_us="
+            f"{max(cold_linear1_counter_times):.6f} "
+            f"inter_kernel_gap_min_us={min(cold_inter_kernel_gap_times):.6f} "
+            "inter_kernel_gap_median_us="
+            f"{statistics.median(cold_inter_kernel_gap_times):.6f} "
+            "inter_kernel_gap_p90_us="
+            f"{percentile_us(cold_inter_kernel_gap_times, 0.90):.6f} "
+            "inter_kernel_gap_stddev_us="
+            f"{statistics.pstdev(cold_inter_kernel_gap_times):.6f} "
+            f"inter_kernel_gap_max_us={max(cold_inter_kernel_gap_times):.6f} "
+            f"down_device_counter_min_us={min(cold_down_counter_times):.6f} "
+            "down_device_counter_median_us="
+            f"{statistics.median(cold_down_counter_times):.6f} "
+            "down_device_counter_p90_us="
+            f"{percentile_us(cold_down_counter_times, 0.90):.6f} "
+            "down_device_counter_stddev_us="
+            f"{statistics.pstdev(cold_down_counter_times):.6f} "
+            f"down_device_counter_max_us={max(cold_down_counter_times):.6f} "
+            f"device_counter_min_us={min(cold_combined_counter_times):.6f} "
+            "device_counter_median_us="
+            f"{statistics.median(cold_combined_counter_times):.6f} "
+            "device_counter_p90_us="
+            f"{percentile_us(cold_combined_counter_times, 0.90):.6f} "
+            "device_counter_stddev_us="
+            f"{statistics.pstdev(cold_combined_counter_times):.6f} "
+            f"device_counter_max_us={max(cold_combined_counter_times):.6f} "
             "output_correct=true",
             flush=True,
         )

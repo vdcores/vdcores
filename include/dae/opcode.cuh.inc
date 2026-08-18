@@ -109,13 +109,14 @@ DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D, MK_MOP(53, MEM_OP_FLAGS_NONE)
 DAE_OP(OP_TMA_LOAD_MX_GATE_UP_RESIDENT, MK_MOP(54, MEM_OP_FLAGS_NONE))
 // Standalone diagnostic form of the fixed-layout resident Down plan.
 DAE_OP(OP_TMA_LOAD_MX_DOWN_RESIDENT, MK_MOP(55, MEM_OP_FLAGS_NONE))
-// Complete per-worker FFN plan: one Linear-1 record followed by up to two
-// Down records, all serviced by one long-running fixed-layout LDU command.
-DAE_OP(OP_TMA_LOAD_MX_RESIDENT_FFN, MK_MOP(56, MEM_OP_FLAGS_NONE))
-// Auxiliary half of the resident FFN plan.  The normal memory virtual core
-// routes this distinct command to LDU1, which produces Down activation/SFB;
-// LDU0 continues to own the independent weight/SFA stream above.
-DAE_OP(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX, MK_MOP(57, MEM_OP_FLAGS_NONE))
+// Parameterized fixed-area coupled stream.  Every instance carries a stream
+// kind, pipeline depth, and shared-area size.  Adjacent instances targeting
+// the same area and LDU may be Python-rewritten into an LDU-local chain: both
+// commands remain visible to the normal memory VM, but the first handler
+// dequeues the second without an allocator transaction or dispatcher return.
+DAE_OP(OP_TMA_LOAD_MX_COUPLED_STREAM, MK_MOP(56, MEM_OP_FLAGS_NONE))
+// Opcode 57 was the monolithic resident-FFN auxiliary command.  Keep the
+// numeric hole stable while the unified stream operator above replaces it.
 // following ops must have a slot to be loaded, but not the full slot
 
 

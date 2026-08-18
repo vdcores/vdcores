@@ -2,6 +2,7 @@
 
 #include <cuda/atomic>
 
+#include "mxfp_resident_ffn.cuh"
 #include "virtualcore.cuh"
 
 static __device__ __forceinline__ void prefetch_inst_window(
@@ -364,13 +365,12 @@ __device__ __forceinline__ void allocwarp_execute(
         break;
         case op(OP_TMA_LOAD_MX_GATE_UP_RESIDENT):
         case op(OP_TMA_LOAD_MX_DOWN_RESIDENT):
-        case op(OP_TMA_LOAD_MX_RESIDENT_FFN):
-        case op(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX): {
+        case op(OP_TMA_LOAD_MX_COUPLED_STREAM): {
           // A dedicated resident plan owns fixed shared-memory addresses, so
           // this command bypasses both slot allocation and M2C publication.
-          // The isolated Linear-1 schedule submits exactly one such command
-          // per worker; its special mailbox remains immutable until LDU0 has
-          // consumed the complete plan.
+          // Each in-flight stream has an immutable special mailbox. Chained
+          // streams still publish distinct mailboxes before the first LDU
+          // handler consumes the next queue entry locally.
           if (lane_id == 0) {
             const int special_slot = inst.nslot();
             st_insts[special_slot] = inst;
@@ -379,7 +379,9 @@ __device__ __forceinline__ void allocwarp_execute(
             curld.put(ld.raw);
             curld.commit();
             curld.advance();
-            if (decoded_op == op(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX)) {
+            if (decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
+                (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+                    dae_mxfp_resident_ffn::kCoupledDownActivation) {
               allocwarp_observe_mxfp_resident_down_ready(
                   inst, bars, tmem_mma_barriers);
             }

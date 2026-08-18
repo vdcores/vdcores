@@ -2862,3 +2862,57 @@ Down metadata fetch. The selected normal image builds at 244 registers, nine
 barriers, a 112-byte stack, zero spills, and 2,368 bytes static shared memory.
 The default-off STU Down-reduction control is separate from the deleted fast
 runtime and remains available for the previously measured handoff experiment.
+
+## Unified coupled-stream normal operator (2026-08-18)
+
+The normal runtime now represents all resident MXFP loads with one
+parameterized memory opcode. Linear-1 uses a homogeneous 16-operation
+gate/up-weight-plus-SFA stream on LDU0; Down weight-plus-SFA follows on the
+same LDU and fixed allocation area; Down activation-plus-SFB uses the same
+opcode on LDU1. Python encodes the fixed-area slot count and stage depth in
+each command and rewrites the adjacent same-LDU/same-area pair into a local
+chain. The allocator still publishes both immutable commands, but LDU0
+dequeues the second command inline and reuses the existing slots and barriers
+without a release/reallocation round trip.
+
+The four-instruction selected image builds at 243 registers, nine barriers, a
+64-byte stack, zero spills, and 2,400 bytes static shared memory. A correctness
+smoke passed, and the single bounded performance job
+`20260818T225318Z-4092865` measured 31.056 us hot end-to-end and 48.224/48.256
+us cold median/P90; device-counter medians were 26.112 us hot and 36.576 us
+cold. Output passed the existing BF16 cross-split-K tolerance. This is 4.3%
+hot and 7.6% cold slower than the existing 29.768/44.816-us vLLM/DeepGEMM
+reference, and 10.2% hot and 14.4% cold slower than the prior specialized
+resident image. The result establishes functional genericity and local lease
+reuse, not a performance win over the specialized dispatcher.
+
+## VDCores full-FFN device-counter comparison (2026-08-18)
+
+Matched GPU-globaltimer distributions are now recorded for all VDCores FFN
+ownership paths. The protocol was 100 warmups, 500 hot samples with 20 FFNs
+per graph, and 100 one-FFN cold samples after a 260-MiB L2 scrub. Resident
+counters span post-queue-initialization through compute termination. The
+task-direct combined counter spans the first Linear-1 kernel entry through the
+last Down kernel exit, including the stream-ordered kernel gap.
+
+| path | hot counter median/P90 | cold counter median/P90 | hot/cold CUDA-event median (us) |
+| --- | ---: | ---: | ---: |
+| task-direct, task-owned loads | 23.840 / 24.128 | 37.568 / 38.253 | 25.492 / 45.184 |
+| specialized resident executor | 24.000 / 24.672 | **31.968 / 32.419** | 28.708 / 44.176 |
+| unified normal-runtime LDU | 26.112 / 26.560 | 36.576 / 37.408 | 31.056 / 48.224 |
+
+The direct component medians are 14.176 us Linear-1, a 0.960-us inter-kernel
+gap, and 8.704 us Down when hot, and 21.952, 1.632, and 14.032 us when cold.
+The per-sample combined medians are 23.840 and 37.568 us; medians of correlated
+components do not necessarily sum to the combined median. Thus task ownership
+remains best hot, by 0.160 us versus the specialized resident executor and
+2.272 us versus unified normal LDU. The specialized resident executor is best
+cold; unified normal LDU is 4.608 us higher and task-direct is 5.600 us higher.
+
+Jobs are `20260818T225318Z-4092865` (unified),
+`20260818T232543Z-207900` (specialized commit `4ae375e`), and
+`20260818T234108Z-350610` (task-direct). All passed output checks. The direct
+benchmark permanently reports min/median/P90/stddev/max for Linear-1, the
+inter-kernel gap, Down, and their combined device envelope. The installed
+worker runtime was restored to the four-command unified resident image after
+the controls.

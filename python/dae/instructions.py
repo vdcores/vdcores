@@ -2851,40 +2851,63 @@ class TmaLoadMxfpDownResident(MemoryInstruction):
         self.fixed_port(0)
 
 
-class TmaLoadMxfpResidentFfn(MemoryInstruction):
-    """Run one complete resident FFN LDU plan from a stable mailbox."""
+class TmaLoadMxfpCoupledStream(MemoryInstruction):
+    """Produce one fixed-area data/scale stream through either LDU.
 
-    SPECIAL_SLOT = 8
+    ``area_slots`` is the physical shared-memory footprint, independent of the
+    special mailbox used to publish this non-allocating command.  The Python
+    builder may chain adjacent commands with the same ``area_id`` and port so
+    their persistent LDU state is handed over locally.
+    """
 
-    def __init__(self, plan_address: int):
+    LINEAR1 = 0
+    DOWN_WEIGHT = 1
+    DOWN_ACTIVATION = 2
+    KIND_MASK = 0x000F
+    STAGES_SHIFT = 4
+    STAGES_MASK = 0x00F0
+    LOCAL_CHAIN = 0x0100
+
+    def __init__(
+        self,
+        plan_address: int,
+        *,
+        kind: int,
+        stages: int,
+        area_slots: int,
+        area_id: int,
+        mailbox: int,
+        port: int,
+    ):
         if plan_address <= 0 or plan_address >= 1 << 64:
-            raise ValueError("resident FFN plan address must fit uint64")
+            raise ValueError("coupled-stream plan address must fit uint64")
+        if kind not in (self.LINEAR1, self.DOWN_WEIGHT, self.DOWN_ACTIVATION):
+            raise ValueError("unknown MXFP coupled-stream kind")
+        if not 1 <= int(stages) <= 0xF:
+            raise ValueError("coupled-stream pipeline depth must fit four bits")
+        if not 1 <= int(area_slots) <= 0xFFFF:
+            raise ValueError("coupled-stream area size must fit uint16")
+        if not 0 <= int(area_id) <= 0xFFFF:
+            raise ValueError("coupled-stream area id must fit uint16")
+        if not 0 <= int(mailbox) < config.num_special_slots:
+            raise ValueError("coupled-stream mailbox is outside special slots")
         super().__init__(
-            opcode=opcode.OP_TMA_LOAD_MX_RESIDENT_FFN,
-            num_slots=config.num_slots + self.SPECIAL_SLOT,
-            arg=0,
-            size=0,
+            opcode=opcode.OP_TMA_LOAD_MX_COUPLED_STREAM,
+            num_slots=config.num_slots + int(mailbox),
+            arg=int(kind) | (int(stages) << self.STAGES_SHIFT),
+            size=int(area_slots),
             address=plan_address,
         )
-        self.fixed_port(0)
+        self.annotation["coupled_stream_area"] = int(area_id)
+        self.annotation["coupled_stream_kind"] = int(kind)
+        self.annotation["coupled_stream_mailbox"] = int(mailbox)
+        self.fixed_port(port)
 
-
-class TmaLoadMxfpResidentFfnAux(MemoryInstruction):
-    """Run the LDU1 half of a resident FFN plan through normal dispatch."""
-
-    SPECIAL_SLOT = 7
-
-    def __init__(self, plan_address: int):
-        if plan_address <= 0 or plan_address >= 1 << 64:
-            raise ValueError("resident FFN plan address must fit uint64")
-        super().__init__(
-            opcode=opcode.OP_TMA_LOAD_MX_RESIDENT_FFN_AUX,
-            num_slots=config.num_slots + self.SPECIAL_SLOT,
-            arg=0,
-            size=0,
-            address=plan_address,
-        )
-        self.fixed_port(1)
+    def local_chain_source(self):
+        inst = self.copy()
+        inst.arg |= self.LOCAL_CHAIN
+        inst.annotation["coupled_stream_local_chain"] = "source"
+        return inst
 
 
 class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
@@ -3439,8 +3462,7 @@ __all__ = [
     "TmaLoadMxfpWeightRing5D",
     "TmaLoadMxfpGateUpResident",
     "TmaLoadMxfpDownResident",
-    "TmaLoadMxfpResidentFfn",
-    "TmaLoadMxfpResidentFfnAux",
+    "TmaLoadMxfpCoupledStream",
     "TmaLoadMxfpDownWeightRing5D",
     "TmaLoadMxfpScale1D",
     "TmaLoadMxfpScaleBase1D",

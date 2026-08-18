@@ -10,7 +10,7 @@ import statistics
 import torch
 
 from dae import runtime
-from dae.instructions import ProfileEvent, TmaTensor
+from dae.instructions import ProfileEvent, TmaLoadMxfpCoupledStream, TmaTensor
 from dae.launcher import Launcher
 from dae.runtime import opcode
 from dae.schedule import (
@@ -729,6 +729,30 @@ def main() -> None:
             f"sources={source_count} targets={target_count} "
             f"expected={expected_handoffs}"
         )
+    coupled_opcode = opcode.OP_TMA_LOAD_MX_COUPLED_STREAM & ~flag_mask
+    coupled_commands = [
+        inst
+        for builder in launcher.builder
+        for inst in builder.built_minsts
+        if (inst.opcode & ~flag_mask) == coupled_opcode
+    ]
+    coupled_chain_sources = sum(
+        bool(inst.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN)
+        for inst in coupled_commands
+    )
+    expected_coupled_commands = 3 * args.workers if args.resident_all_tma else 0
+    expected_coupled_chains = args.workers if args.resident_all_tma else 0
+    if (
+        len(coupled_commands) != expected_coupled_commands
+        or coupled_chain_sources != expected_coupled_chains
+    ):
+        raise RuntimeError(
+            "unexpected coupled-stream lowering: "
+            f"commands={len(coupled_commands)} "
+            f"chains={coupled_chain_sources} "
+            f"expected_commands={expected_coupled_commands} "
+            f"expected_chains={expected_coupled_chains}"
+        )
 
     stream = torch.cuda.Stream()
 
@@ -944,6 +968,9 @@ def main() -> None:
         "cuda_kernel_launches=1 vdcores_launches=1 "
         "persistent=true "
         f"resident_all_tma={str(args.resident_all_tma).lower()} "
+        "resident_load_operator=coupled_stream "
+        f"coupled_stream_commands={len(coupled_commands)} "
+        f"coupled_stream_local_chains={coupled_chain_sources} "
         "kernel=dae2 "
         "linear1_ldu_weight_ring=true "
         "down_ldu_weight_ring=true "

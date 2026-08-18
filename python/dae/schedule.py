@@ -3230,7 +3230,7 @@ class SchedMxfp4Mxfp8DownResident(SchedMxfp4Mxfp8DownFixedRing):
 
 
 class SchedMxfp4Mxfp8ResidentFfn(Schedule):
-    """One compute command and one LDU command for a complete FFN worker."""
+    """One compute command and three coupled streams per FFN worker."""
 
     def __init__(self, linear1, down):
         super().__init__()
@@ -3269,7 +3269,33 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
                     [expert_base + local_slice, expert_base + 16 + local_slice]
                 )
 
-        plans = torch.zeros((self.num_sms, 4), dtype=torch.int64, device="cpu")
+        # Gate and up are one homogeneous operation stream for the memory
+        # virtual core. One descriptor addresses 16 task-major K512 records,
+        # and the matching SFA records have the same order. SFB remains one
+        # shared 16-KiB tensor instead of being replicated into every worker's
+        # prepacked stream, preserving its cold-cache reuse.
+        self.linear1_stream_weights = torch.cat(
+            (
+                self.placed_linear1.gate_weight_data,
+                self.placed_linear1.up_weight_data,
+            ),
+            dim=1,
+        ).contiguous()
+        self.linear1_stream_scales = torch.cat(
+            (
+                self.placed_linear1.gate_weight_scale,
+                self.placed_linear1.up_weight_scale,
+            ),
+            dim=1,
+        ).contiguous()
+        launcher = getattr(self.placed_linear1.gate_weight_tma, "launcher", None)
+        if launcher is None:
+            raise ValueError("resident FFN stream prepack requires one launcher")
+        self.linear1_stream_tma = TmaTensor(
+            launcher, self.linear1_stream_weights
+        ).mxfp4_load(512)
+
+        plans = torch.zeros((self.num_sms, 8), dtype=torch.int64, device="cpu")
         for worker, task_queue in enumerate(self.placed_down.task_queues):
             plans[worker, 0] = self.placed_linear1.metadata[worker].data_ptr()
             for index, task in enumerate(task_queue):
@@ -3277,6 +3303,18 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
                     self.placed_down.metadata[task].data_ptr()
                 )
             plans[worker, 3] = len(task_queue)
+            plans[worker, 4] = self.linear1_stream_scales[
+                worker, 0
+            ].data_ptr()
+            plans[worker, 5] = (
+                self.linear1_stream_tma.arg | (worker << 32)
+            )
+            plans[worker, 6] = (
+                self.placed_linear1.activation_data.data_ptr()
+            )
+            plans[worker, 7] = (
+                self.placed_linear1.activation_scale.data_ptr()
+            )
         self.resident_plans = plans.to(self.placed_linear1.metadata.device)
         self.task_queues = self.placed_down.task_queues
 
@@ -3286,12 +3324,42 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
         plan_address = self.resident_plans[sm].data_ptr()
         instructions = [
             Mxfp4Mxfp8ResidentFfnSm100(plan_address),
-            TmaLoadMxfpResidentFfn(plan_address),
+            TmaLoadMxfpCoupledStream(
+                plan_address,
+                kind=TmaLoadMxfpCoupledStream.LINEAR1,
+                stages=self.placed_linear1.ring_stages,
+                area_slots=(168 * 1024) // config.slot_size,
+                area_id=0,
+                mailbox=8,
+                port=0,
+            ),
+            TmaLoadMxfpCoupledStream(
+                plan_address,
+                kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
+                stages=int(config.mxfp_down_ldu_weight_ring_stages),
+                area_slots=(76 * 1024 + config.slot_size - 1)
+                    // config.slot_size,
+                area_id=0,
+                mailbox=6,
+                port=0,
+            ),
         ]
-        # The normal memory runtime receives an explicit command on each LDU
-        # FIFO, with independent immutable mailbox slots.
+        # The second LDU receives the same operator with activation/SFB
+        # geometry. Its mailbox is immutable while LDU0 locally chains the two
+        # commands above through their shared area-zero ownership.
         if config.mxfp_resident_down_ldu1_zero:
-            instructions.append(TmaLoadMxfpResidentFfnAux(plan_address))
+            instructions.append(
+                TmaLoadMxfpCoupledStream(
+                    plan_address,
+                    kind=TmaLoadMxfpCoupledStream.DOWN_ACTIVATION,
+                    stages=int(config.mxfp_down_ldu_weight_ring_stages),
+                    area_slots=(76 * 1024 + config.slot_size - 1)
+                        // config.slot_size,
+                    area_id=0,
+                    mailbox=7,
+                    port=1,
+                )
+            )
         return instructions
 
 

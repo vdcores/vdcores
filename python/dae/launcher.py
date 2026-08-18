@@ -96,6 +96,25 @@ class SMInstructionBuilder:
                 self.minsts[index] = source.handoff_source()
                 self.minsts[index + 2] = target.handoff_target()
 
+    def rewrite_coupled_stream_local_chains(self):
+        """Keep adjacent same-area stream commands inside one LDU handler."""
+        flag_mask = (1 << 6) - 1
+        coupled_stream = opcode.OP_TMA_LOAD_MX_COUPLED_STREAM & ~flag_mask
+        for index in range(len(self.minsts) - 1):
+            source, target = self.minsts[index:index + 2]
+            if (
+                source.opcode & ~flag_mask == coupled_stream
+                and target.opcode & ~flag_mask == coupled_stream
+                and source.annotation.get("fixed_port")
+                    == target.annotation.get("fixed_port")
+                and source.annotation.get("coupled_stream_area")
+                    == target.annotation.get("coupled_stream_area")
+                and source.annotation.get("coupled_stream_mailbox")
+                    != target.annotation.get("coupled_stream_mailbox")
+                and not source.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+            ):
+                self.minsts[index] = source.local_chain_source()
+
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],
         mtensor : torch.Tensor, mptrs: list[int]):
@@ -340,6 +359,7 @@ class Launcher:
     def build_instructions(self):
         if self.need_instruction_build:
             for i in range(self.num_sms):
+                self.builder[i].rewrite_coupled_stream_local_chains()
                 if self.rewrite_retained_weight_ring_handoffs:
                     self.builder[i].rewrite_retained_weight_ring_handoffs()
                 self.builder[i].build(

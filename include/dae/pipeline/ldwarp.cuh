@@ -247,7 +247,7 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
 
 #if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
     !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
-__device__ __noinline__ void ldu_execute_mxfp_resident_linear1(
+__device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
     uint64_t *tmem_mma_barriers
 #if defined(DAE_TRACK_MXFP_TIMELINE)
@@ -256,30 +256,27 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_linear1(
     ) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages = dae_mxfp_resident_ffn::kLinear1Stages;
-  constexpr int kTilesPerProjection = 8;
+  constexpr int kOperations = 16;
   constexpr int kWeightPackedBytes = 32 * 1024;
   constexpr int kWeightStageBytes =
       dae_mxfp_resident_ffn::kLinear1WeightStageBytes;
-  constexpr int kScalePackedBytes = 2048;
+  constexpr int kWeightScaleBytes = 2 * 1024;
+  constexpr int kActivationScaleBytes = 2 * 1024;
   constexpr int kScaleStageBytes =
       dae_mxfp_resident_ffn::kLinear1ScaleStageBytes;
   constexpr int kActivationBytes =
       dae_mxfp_resident_ffn::kLinear1ActivationBytes;
   constexpr int kActivationChunkBytes = 16 * 1024;
 
-  const auto *metadata = reinterpret_cast<const uint8_t *>(inst.address);
+  const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
   const auto *activation_global = reinterpret_cast<const uint8_t *>(
-      load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 0)));
-  const auto *gate_scale_global = reinterpret_cast<const uint8_t *>(
-      load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 16)));
+      load_l2_u64(plan + 6));
+  const auto *scale_stream_global = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + 4));
   const auto *activation_scale_global = reinterpret_cast<const uint8_t *>(
-      load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 24)));
-  const auto *up_scale_global = reinterpret_cast<const uint8_t *>(
-      load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 32)));
-  const uint64_t tma_info = load_l2_u64(
-      reinterpret_cast<const uint64_t *>(metadata + 40));
-  const uint16_t gate_descriptor_index = uint16_t(tma_info);
-  const uint16_t up_descriptor_index = uint16_t(tma_info >> 16);
+      load_l2_u64(plan + 7));
+  const uint64_t tma_info = load_l2_u64(plan + 5);
+  const uint16_t descriptor_index = uint16_t(tma_info);
   const int output_tile = int(uint32_t(tma_info >> 32));
 
   auto *resident_base = reinterpret_cast<uint8_t *>(
@@ -301,66 +298,57 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_linear1(
   }
 
   #pragma unroll
-  for (int projection = 0; projection < 2; ++projection) {
-    const auto *weight_scale_global = projection == 0
-        ? gate_scale_global
-        : up_scale_global;
-    const uint16_t descriptor_index = projection == 0
-        ? gate_descriptor_index
-        : up_descriptor_index;
-    #pragma unroll
-    for (int tile = 0; tile < kTilesPerProjection; ++tile) {
-      const int operation = projection * kTilesPerProjection + tile;
-      const int stage = operation % kStages;
-      stage_empty[stage].wait(empty_phase[stage]);
-      empty_phase[stage] ^= 1U;
+  for (int operation = 0; operation < kOperations; ++operation) {
+    const int stage = operation % kStages;
+    stage_empty[stage].wait(empty_phase[stage]);
+    empty_phase[stage] ^= 1U;
 
-      const uint32_t destination = static_cast<uint32_t>(
-          __cvta_generic_to_shared(
-              weight_ring + stage * kWeightStageBytes));
-      const uint32_t barrier = static_cast<uint32_t>(
-          __cvta_generic_to_shared(weight_full + stage));
-      ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
-          destination, tma_descs + descriptor_index, tile, output_tile,
-          barrier, cache_policy);
-      cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          scale_ring + stage * kScaleStageBytes,
-          weight_scale_global + tile * kScalePackedBytes,
-          uint32_t(kScalePackedBytes),
-          reinterpret_cast<uint64_t *>(weight_full + stage));
-      cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          scale_ring + stage * kScaleStageBytes + kScalePackedBytes,
-          activation_scale_global + tile * kScalePackedBytes,
-          uint32_t(kScalePackedBytes),
-          reinterpret_cast<uint64_t *>(weight_full + stage));
+    const uint32_t destination = static_cast<uint32_t>(
+        __cvta_generic_to_shared(
+            weight_ring + stage * kWeightStageBytes));
+    const uint32_t barrier = static_cast<uint32_t>(
+        __cvta_generic_to_shared(weight_full + stage));
+    ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
+        destination, tma_descs + descriptor_index, operation, output_tile,
+        barrier, cache_policy);
+    cuda::ptx::cp_async_bulk(
+        cuda::ptx::space_shared,
+        cuda::ptx::space_global,
+        scale_ring + stage * kScaleStageBytes,
+        scale_stream_global + operation * kWeightScaleBytes,
+        uint32_t(kWeightScaleBytes),
+        reinterpret_cast<uint64_t *>(weight_full + stage));
+    cuda::ptx::cp_async_bulk(
+        cuda::ptx::space_shared,
+        cuda::ptx::space_global,
+        scale_ring + stage * kScaleStageBytes + kWeightScaleBytes,
+        activation_scale_global + (operation & 7) * kActivationScaleBytes,
+        uint32_t(kActivationScaleBytes),
+        reinterpret_cast<uint64_t *>(weight_full + stage));
 
-      int transaction_bytes = kWeightPackedBytes + 2 * kScalePackedBytes;
-      if (projection == 0 && tile == 0) {
-        #pragma unroll
-        for (int chunk = 0;
-             chunk < kActivationBytes / kActivationChunkBytes; ++chunk) {
-          cuda::ptx::cp_async_bulk(
-              cuda::ptx::space_shared,
-              cuda::ptx::space_global,
-              activation + chunk * kActivationChunkBytes,
-              activation_global + chunk * kActivationChunkBytes,
-              uint32_t(kActivationChunkBytes),
-              reinterpret_cast<uint64_t *>(weight_full + stage));
-        }
-        transaction_bytes += kActivationBytes;
+    int transaction_bytes =
+        kWeightPackedBytes + kWeightScaleBytes + kActivationScaleBytes;
+    if (operation == 0) {
+      #pragma unroll
+      for (int chunk = 0;
+           chunk < kActivationBytes / kActivationChunkBytes; ++chunk) {
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_shared,
+            cuda::ptx::space_global,
+            activation + chunk * kActivationChunkBytes,
+            activation_global + chunk * kActivationChunkBytes,
+            uint32_t(kActivationChunkBytes),
+            reinterpret_cast<uint64_t *>(weight_full + stage));
       }
-      weight_full[stage].arrive_and_expect_tx(transaction_bytes);
+      transaction_bytes += kActivationBytes;
+    }
+    weight_full[stage].arrive_and_expect_tx(transaction_bytes);
 
-      if constexpr (mxfpWeightPrefetchEnabled) {
-        if (tile + 1 < kTilesPerProjection) {
-          ldu_prefetch_mxfp_weight_tma(
-              tma_descs + descriptor_index, tile + 1, output_tile,
-              cache_policy);
-        }
+    if constexpr (mxfpWeightPrefetchEnabled) {
+      if (operation + 1 < kOperations) {
+        ldu_prefetch_mxfp_weight_tma(
+            tma_descs + descriptor_index, operation + 1, output_tile,
+            cache_policy);
       }
     }
   }
@@ -950,54 +938,75 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
     !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION && \
     DAE_MXFP_DOWN_LDU_WEIGHT_RING
-      case op(OP_TMA_LOAD_MX_RESIDENT_FFN): {
+      case op(OP_TMA_LOAD_MX_COUPLED_STREAM): {
         produces_compute_operand = false;
-        const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
-        MInst task_inst = inst;
-        task_inst.address = load_l2_u64(plan + 0);
-        ldu_execute_mxfp_resident_linear1(
-            task_inst, smem_base, tma_descs, tmem_mma_barriers
+        MInst stream_inst = inst;
+        while (true) {
+          const uint16_t stream_kind =
+              stream_inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask;
+          if (stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
+            ldu_execute_mxfp_coupled_linear1(
+                stream_inst, smem_base, tma_descs, tmem_mma_barriers
 #if defined(DAE_TRACK_MXFP_TIMELINE)
-            , sm_id, g_events
+                , sm_id, g_events
 #endif
-            );
-        if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
-          auto *poll_start = reinterpret_cast<
-              cutlass::arch::ClusterTransactionBarrier *>(
-              tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
-          poll_start->arrive();
+                );
+            if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
+              auto *poll_start = reinterpret_cast<
+                  cutlass::arch::ClusterTransactionBarrier *>(
+                  tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+              poll_start->arrive();
+            }
+          } else if (
+              stream_kind == dae_mxfp_resident_ffn::kCoupledDownWeight) {
+            const auto *plan = reinterpret_cast<const uint64_t *>(
+                stream_inst.address);
+            const int down_task_count = load_l2(
+                reinterpret_cast<const int *>(plan + 3));
+            const uint64_t down_task_address0 = down_task_count > 0
+                ? load_l2_u64(plan + 1)
+                : 0;
+            const uint64_t down_task_address1 = down_task_count > 1
+                ? load_l2_u64(plan + 2)
+                : 0;
+            if constexpr (mxfpResidentDownSplitLduEnabled) {
+              auto *linear1_empty = reinterpret_cast<
+                  cutlass::arch::ClusterTransactionBarrier *>(
+                  tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+              linear1_empty[0].wait(0);
+            }
+            MInst task_inst = stream_inst;
+            for (int task = 0; task < down_task_count; ++task) {
+              task_inst.address = task == 0
+                  ? down_task_address0
+                  : down_task_address1;
+              ldu_execute_mxfp_resident_down<
+                  !mxfpResidentDownSplitLduEnabled>(
+                  task_inst, smem_base, tma_descs, bars,
+                  tmem_mma_barriers);
+            }
+          } else {
+            ldu_execute_mxfp_resident_ffn_aux(
+                stream_inst, smem_base, bars, tmem_mma_barriers);
+          }
+
+          if (!(stream_inst.arg &
+                dae_mxfp_resident_ffn::kCoupledLocalChain)) {
+            break;
+          }
+          // Python proved adjacency, same LDU, and same shared area. Consume
+          // the next immutable command locally; persistent barrier phase and
+          // ring ownership never return to the allocator or outer dispatcher.
+          m2ld.wait();
+          const LdCmd next_stream {
+              .raw = m2ld.data[m2ld.ptr]
+          };
+          m2ld.advance();
+          stream_inst = st_insts[next_stream.slot];
+#if defined(DAE_TRACK_PROFILE)
+          ++commands;
+#endif
         }
-        // The resident plan contains at most two Down tasks. Fetch their
-        // immutable metadata while Linear-1's last stage is still retiring,
-        // then consume the cached pointers after ownership transfers. This
-        // is software interleaving only: command order and barriers are
-        // unchanged.
-        const int down_task_count = load_l2(
-            reinterpret_cast<const int *>(plan + 3));
-        const uint64_t down_task_address0 = down_task_count > 0
-            ? load_l2_u64(plan + 1)
-            : 0;
-        const uint64_t down_task_address1 = down_task_count > 1
-            ? load_l2_u64(plan + 2)
-            : 0;
-        if constexpr (mxfpResidentDownSplitLduEnabled) {
-          auto *linear1_empty = reinterpret_cast<
-              cutlass::arch::ClusterTransactionBarrier *>(
-              tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-          linear1_empty[0].wait(0);
-        }
-        for (int task = 0; task < down_task_count; ++task) {
-          task_inst.address = task == 0
-              ? down_task_address0
-              : down_task_address1;
-          ldu_execute_mxfp_resident_down<!mxfpResidentDownSplitLduEnabled>(
-              task_inst, smem_base, tma_descs, bars, tmem_mma_barriers);
-        }
-        break; }
-      case op(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX): {
-        produces_compute_operand = false;
-        ldu_execute_mxfp_resident_ffn_aux(
-            inst, smem_base, bars, tmem_mma_barriers);
         break; }
 #endif
 #if DAE_MXFP_DOWN_LDU_WEIGHT_RING
