@@ -7,7 +7,7 @@ fold, operator grouping, overlap boundary) instead of tuning them by hand.
 
 1. Knob configuration layer, and port `app/python/qwen3_1p7b/sched.py` to it. **done**
 2. `tools/autotune.py` with static + dry-build legality filtering only. **done**
-3. Timed runs plus a noise-aware objective.
+3. Timed runs plus a noise-aware objective. **done**
 4. Coordinate-descent search, presets, correctness gate.
 5. Extend to `app/python/llama3/sched.py`, which first needs a `--dry-build` mode.
 
@@ -160,3 +160,65 @@ suggests.
 ```bash
 python tests/test_autotune.py
 ```
+
+## Measurement
+
+```bash
+python tools/autotune.py noise   --knobs tuning/qwen3_1p7b.knobs.json --repeats 30
+python tools/autotune.py measure --knobs tuning/qwen3_1p7b.knobs.json -o tuning/qwen3_1p7b.timing.json
+```
+
+Run `noise` first. It times the baseline repeatedly and reports the spread and
+a suggested `--min-effect-pct`. If the spread is wider than the effects being
+searched for, no amount of searching will find a real winner, and that has to
+be fixed before tuning means anything.
+
+Each measurement is a fresh process, run through
+[tests/script/run_with_launch_timeout.py](tests/script/run_with_launch_timeout.py)
+so a schedule that builds and then deadlocks is recorded as `hang` instead of
+stalling the sweep. `--kill-stale` is available for the documented stale-worker
+problem, but it `pkill`s only the target script path. A blanket `killall python`
+would take the driver down with it.
+
+Candidates are measured round-robin, one sample each per round, in an order
+reshuffled every round. Measuring all repeats of one candidate before starting
+the next would charge any slow drift in the host to whichever candidate
+happened to run during it.
+
+### Why The Objective Is Not A Threshold
+
+The first implementation compared medians against a threshold derived from the
+baseline spread. Against the fixture it promoted `silu.sms=1`, a knob the
+fixture's cost model does not use at all, on a -1.3% difference. A direct
+60-run-per-side check put the true difference at +0.4%, so that verdict was
+pure luck.
+
+Three things replaced it:
+
+- **Bootstrap intervals.** The interval for the difference of medians is built
+  by resampling, so a small number of runs produces a wide interval rather than
+  a confident wrong answer. Resampling also survives the bimodal timing this
+  host shows, which a mean-and-standard-deviation test would not.
+- **Multiple-comparison correction.** A 95% interval is wrong one time in
+  twenty by construction, so a 40-candidate sweep should be expected to crown
+  about two winners that are noise. The error budget is spread across the
+  comparisons. `--no-correction` opts out.
+- **A confirmation pass.** Apparent winners are re-measured on separately
+  collected samples and reported only if they win twice. Anything that does not
+  survive is reported as `unconfirmed`.
+
+A candidate is called `faster` only when the interval excludes zero *and* the
+effect clears `--min-effect-pct`. Statistical significance on a 0.1% effect is
+not a reason to change a schedule.
+
+The cost of this is power: on a noisy host, a real but small effect will be
+reported as `same` until enough rounds are collected. That is the intended
+trade. The fixture's true -1.2% `gate_low` effect is detected immediately with
+noise off, and correctly withheld at 15 rounds with 3% per-run noise.
+
+### Fixed: Dropped Tail Output In The Timeout Wrapper
+
+`run_with_launch_timeout.py` stopped reading as soon as the child exited, which
+left buffered output unread. A fast-exiting run lost its final lines, and those
+are the lines carrying the benchmark block and `[perf]`. It now drains the pipe
+after the loop. This affected any use of the wrapper, not just the autotuner.

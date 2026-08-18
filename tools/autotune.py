@@ -23,12 +23,18 @@ Typical use:
 import argparse
 import json
 import os
+import random
+import re
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TIMEOUT_WRAPPER = os.path.join("tests", "script", "run_with_launch_timeout.py")
+HANG_RETURNCODE = 124
+BENCH_MARKER = "[bench]"
 
 TARGETS = {
     "qwen3_1p7b": {
@@ -211,6 +217,218 @@ def run_dry_build(target, values, timeout, workdir):
     return True, None, elapsed
 
 
+# -------------------------------------------------------------- timed runs
+
+BENCH_LINE = re.compile(r"^(Min|Median|Average|Max) execution time \(ns\):\s*([0-9.]+)", re.M)
+
+
+def parse_bench_output(text):
+    """Pull the timing block printed by `dae.bench` out of a run's output."""
+    found = {match.group(1).lower(): float(match.group(2)) for match in BENCH_LINE.finditer(text)}
+    return found if "median" in found else None
+
+
+def write_config(target, values):
+    handle, path = tempfile.mkstemp(prefix="autotune-", suffix=".json")
+    with os.fdopen(handle, "w", encoding="utf-8") as config_file:
+        json.dump({"namespace": target["namespace"], "knobs": values}, config_file)
+    return path
+
+
+def clean_env(extra=None):
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    # A stale export would silently outrank the config file we write.
+    env.pop("DAE_TUNE_SET", None)
+    env.pop("DAE_TUNE_DUMP", None)
+    env.pop("DAE_TUNE_CONFIG", None)
+    env.update(extra or {})
+    return env
+
+
+def kill_stale(target, workdir):
+    """Kill leftover runs of *this target only*.
+
+    Deliberately not a blanket `killall python`: the driver is itself a python
+    process, and so is anything else the user happens to be running.
+    """
+    subprocess.run(["pkill", "-f", target["script"]], cwd=workdir,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def run_timed(target, values, args, workdir):
+    """Time one candidate in a fresh process. Returns (status, ns, reason)."""
+    if args.kill_stale:
+        kill_stale(target, workdir)
+
+    config_path = write_config(target, values)
+    env = clean_env({
+        "DAE_TUNE_CONFIG": config_path,
+        "DAE_BENCH_WARMUP": str(args.warmup),
+    })
+
+    command = [
+        sys.executable, TIMEOUT_WRAPPER,
+        "--launch-pattern", BENCH_MARKER,
+        "--post-launch-timeout", str(args.post_launch_timeout),
+        "--post-launch-idle-timeout", str(args.idle_timeout),
+        "--", sys.executable, target["script"], "-b", str(args.iterations),
+    ]
+
+    try:
+        proc = subprocess.run(
+            command, cwd=workdir, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=args.hard_timeout, text=True,
+        )
+        output = proc.stdout or ""
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired as expired:
+        output = expired.stdout or ""
+        returncode = HANG_RETURNCODE
+    finally:
+        os.unlink(config_path)
+
+    if returncode == HANG_RETURNCODE:
+        return "hang", None, "no progress after launch; likely a barrier deadlock"
+    if returncode != 0:
+        return "fail", None, classify_failure(output)
+
+    timings = parse_bench_output(output)
+    if timings is None:
+        return "fail", None, "run succeeded but printed no benchmark results"
+    return "ok", timings["median"], None
+
+
+# ------------------------------------------------------- noise-aware stats
+
+
+def percentile(values, fraction):
+    """Linear-interpolated percentile, safe for the small samples we collect."""
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    if len(ordered) == 1:
+        return ordered[0]
+    position = fraction * (len(ordered) - 1)
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def summarize_samples(samples):
+    if not samples:
+        return None
+    p25 = percentile(samples, 0.25)
+    p75 = percentile(samples, 0.75)
+    return {
+        "n": len(samples),
+        "min": min(samples),
+        "median": statistics.median(samples),
+        "max": max(samples),
+        "p25": p25,
+        "p75": p75,
+        "iqr": p75 - p25,
+    }
+
+
+def bootstrap_delta_ci(candidate_samples, baseline_samples, rounds, confidence, rng):
+    """Confidence interval for the difference of medians, by resampling.
+
+    A fixed threshold on the raw spread is not enough: with a handful of runs
+    per configuration the medians themselves are uncertain, and a comparison
+    that ignores that will keep promoting lucky runs. Resampling turns the
+    sample count into the width of the interval, so too few repeats produces
+    an interval that straddles zero rather than a confident wrong answer.
+
+    Resampling also survives the bimodal timing this host shows, which a
+    mean-and-standard-deviation test would not.
+    """
+    deltas = []
+    for _ in range(rounds):
+        candidate = statistics.median(
+            [rng.choice(candidate_samples) for _ in candidate_samples])
+        baseline = statistics.median(
+            [rng.choice(baseline_samples) for _ in baseline_samples])
+        deltas.append(candidate - baseline)
+    tail = (1.0 - confidence) / 2.0
+    return percentile(deltas, tail), percentile(deltas, 1.0 - tail)
+
+
+def corrected_confidence(confidence, comparisons, enabled=True):
+    """Bonferroni-style correction for testing many candidates at once.
+
+    A 95% interval is wrong one time in twenty by construction, so a sweep of
+    forty candidates should be expected to crown roughly two winners that are
+    nothing but luck. Spreading the error budget across the comparisons keeps
+    the sweep-level false positive rate at the level the user asked for.
+    """
+    if not enabled or comparisons <= 1:
+        return confidence
+    return 1.0 - (1.0 - confidence) / comparisons
+
+
+def decide(candidate_samples, baseline_samples, min_effect_ns, args, rng, confidence=None):
+    """Verdict, observed delta, and the confidence interval behind it."""
+    delta = statistics.median(candidate_samples) - statistics.median(baseline_samples)
+
+    if len(candidate_samples) < 2 or len(baseline_samples) < 2:
+        return "insufficient", delta, (None, None)
+
+    low, high = bootstrap_delta_ci(
+        candidate_samples, baseline_samples,
+        args.bootstrap, args.confidence if confidence is None else confidence, rng,
+    )
+    # Two conditions, both required: the interval must exclude zero, and the
+    # effect must be big enough to be worth acting on.
+    if high < 0 and delta < -min_effect_ns:
+        verdict = "faster"
+    elif low > 0 and delta > min_effect_ns:
+        verdict = "slower"
+    else:
+        verdict = "same"
+    return verdict, delta, (low, high)
+
+
+def measure_rounds(target, candidates, args, workdir, on_sample=None):
+    """Measure every candidate once per round, in shuffled order.
+
+    Round-robin rather than all-repeats-of-A-then-all-of-B, so that slow drift
+    in the host spreads across every candidate instead of penalizing whichever
+    one happened to be measured last.
+    """
+    rng = random.Random(args.seed)
+    samples = {candidate.label: [] for candidate in candidates}
+    failures = {}
+
+    for round_index in range(args.repeats):
+        order = list(candidates)
+        rng.shuffle(order)
+        for candidate in order:
+            status, ns, reason = run_timed(target, candidate.values, args, workdir)
+            if status == "ok":
+                samples[candidate.label].append(ns)
+            else:
+                failures.setdefault(candidate.label, (status, reason))
+            if on_sample is not None:
+                on_sample(round_index, candidate, status, ns, reason)
+    return samples, failures
+
+
+def drift_report(baseline_samples):
+    """Compare the first half of baseline samples against the second half."""
+    if len(baseline_samples) < 4:
+        return None
+    half = len(baseline_samples) // 2
+    first = summarize_samples(baseline_samples[:half])
+    second = summarize_samples(baseline_samples[half:])
+    return {
+        "first_half_median": first["median"],
+        "second_half_median": second["median"],
+        "shift": second["median"] - first["median"],
+    }
+
+
 # ------------------------------------------------------------- subcommands
 
 
@@ -269,18 +487,21 @@ def cmd_enumerate(args):
     return 0
 
 
-def cmd_check(args):
-    registry = KnobRegistry.from_file(args.knobs)
+def target_for_registry(registry, args):
+    known = TARGETS.get(registry.namespace, {})
     target = {
         "namespace": registry.namespace,
-        "script": args.script or TARGETS.get(registry.namespace, {}).get("script"),
-        "dry_build_args": args.dry_build_arg or
-                          TARGETS.get(registry.namespace, {}).get("dry_build_args", []),
+        "script": getattr(args, "script", None) or known.get("script"),
+        "dry_build_args": getattr(args, "dry_build_arg", None) or known.get("dry_build_args", []),
     }
     if not target["script"]:
-        raise SystemExit(
-            f"no script known for namespace {registry.namespace!r}; pass --script"
-        )
+        raise SystemExit(f"no script known for namespace {registry.namespace!r}; pass --script")
+    return target
+
+
+def cmd_check(args):
+    registry = KnobRegistry.from_file(args.knobs)
+    target = target_for_registry(registry, args)
 
     candidates = sweep_candidates(registry, only=set(args.knob or []))
     if args.max is not None:
@@ -380,9 +601,287 @@ def print_summary(payload):
             print(f"  {count:3}x {reason}")
 
 
+def cmd_noise(args):
+    """Measure the same configuration repeatedly and report the spread.
+
+    Run this before trusting any tuning result. If the spread is wider than
+    the effect being searched for, the search cannot distinguish a better
+    schedule from a lucky run, and that has to be fixed first.
+    """
+    registry = KnobRegistry.from_file(args.knobs)
+    target = target_for_registry(registry, args)
+    baseline = Candidate(dict(registry.baseline), {}, "baseline")
+
+    def progress(round_index, candidate, status, ns, reason):
+        detail = f"{ns / 1e6:.3f} ms" if status == "ok" else f"{status}: {reason}"
+        print(f"[{round_index + 1}/{args.repeats}] {detail}", flush=True)
+
+    samples, failures = measure_rounds(target, [baseline], args, args.workdir, progress)
+    values = samples["baseline"]
+    if not values:
+        status, reason = failures.get("baseline", ("fail", "no samples"))
+        raise SystemExit(f"baseline never produced a timing ({status}: {reason})")
+
+    stats = summarize_samples(values)
+    spread_pct = stats["iqr"] / stats["median"] * 100
+    range_pct = (stats["max"] - stats["min"]) / stats["median"] * 100
+    drift = drift_report(values)
+
+    print(f"\nRepeatability over {stats['n']} fresh runs of the baseline:")
+    print(f"  min    {stats['min'] / 1e6:.3f} ms")
+    print(f"  p25    {stats['p25'] / 1e6:.3f} ms")
+    print(f"  median {stats['median'] / 1e6:.3f} ms")
+    print(f"  p75    {stats['p75'] / 1e6:.3f} ms")
+    print(f"  max    {stats['max'] / 1e6:.3f} ms")
+    print(f"  IQR    {stats['iqr'] / 1e6:.3f} ms  ({spread_pct:.1f}% of median)")
+    print(f"  range  {range_pct:.1f}% of median")
+    if failures:
+        print(f"  failed runs: {failures}")
+    if drift:
+        print(f"  drift  first half {drift['first_half_median'] / 1e6:.3f} ms -> "
+              f"second half {drift['second_half_median'] / 1e6:.3f} ms")
+
+    print(
+        f"\nSuggested --min-effect-pct for this host: {max(spread_pct, 1.0):.1f}\n"
+        "Improvements smaller than that cannot be told apart from noise here."
+    )
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump({
+                "namespace": registry.namespace,
+                "samples_ns": values,
+                "stats": stats,
+                "spread_pct": spread_pct,
+                "drift": drift,
+            }, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"[noise] wrote {len(values)} samples to {args.out}")
+    return 0
+
+
+def cmd_measure(args):
+    registry = KnobRegistry.from_file(args.knobs)
+    target = target_for_registry(registry, args)
+
+    candidates = sweep_candidates(registry, only=set(args.knob or []))
+    if args.max is not None:
+        candidates = candidates[: args.max]
+
+    kept, skipped = [], []
+    for candidate in candidates:
+        reason = static_reject_reason(registry, candidate.values)
+        if reason is None and not args.no_prebuild and candidate.label != "baseline":
+            ok, build_reason, _ = run_dry_build(
+                target, candidate.values, args.build_timeout, args.workdir
+            )
+            reason = None if ok else build_reason
+        if reason is None:
+            kept.append(candidate)
+        else:
+            skipped.append({"label": candidate.label, "reason": reason})
+
+    print(f"[measure] {len(kept)} candidates to time, {len(skipped)} rejected before timing")
+    print(f"[measure] {args.repeats} rounds x {len(kept)} candidates = "
+          f"{args.repeats * len(kept)} runs\n")
+
+    def progress(round_index, candidate, status, ns, reason):
+        detail = f"{ns / 1e6:.3f} ms" if status == "ok" else f"{status}: {reason}"
+        print(f"[round {round_index + 1}/{args.repeats}] {candidate.label:24} {detail}", flush=True)
+
+    samples, failures = measure_rounds(target, kept, args, args.workdir, progress)
+
+    baseline_samples = samples.get("baseline", [])
+    if not baseline_samples:
+        raise SystemExit("baseline never produced a timing; fix that before trusting anything else")
+
+    baseline_stats = summarize_samples(baseline_samples)
+    min_effect_ns = args.min_effect_pct / 100.0 * baseline_stats["median"]
+    rng = random.Random(args.seed + 1)
+    comparisons = max(len(kept) - 1, 1)
+    confidence = corrected_confidence(args.confidence, comparisons, not args.no_correction)
+
+    results = []
+    for candidate in kept:
+        if candidate.label == "baseline":
+            continue
+        candidate_samples = samples[candidate.label]
+        if not candidate_samples:
+            status, reason = failures.get(candidate.label, ("fail", "no samples"))
+            results.append({
+                "label": candidate.label, "overrides": candidate.overrides,
+                "verdict": status, "reason": reason, "stats": None,
+            })
+            continue
+        stats = summarize_samples(candidate_samples)
+        verdict, delta, (low, high) = decide(
+            candidate_samples, baseline_samples, min_effect_ns, args, rng, confidence)
+        results.append({
+            "label": candidate.label,
+            "overrides": candidate.overrides,
+            "verdict": verdict,
+            "reason": None,
+            "stats": stats,
+            "delta_ns": delta,
+            "delta_pct": delta / baseline_stats["median"] * 100,
+            "ci_low_ns": low,
+            "ci_high_ns": high,
+        })
+
+    confirmations = confirm_winners(
+        target, kept, results, baseline_stats, min_effect_ns, args, rng)
+
+    payload = {
+        "comparisons": comparisons,
+        "corrected_confidence": confidence,
+        "confirmations": confirmations,
+        "namespace": registry.namespace,
+        "baseline": registry.baseline,
+        "baseline_stats": baseline_stats,
+        "min_effect_ns": min_effect_ns,
+        "min_effect_pct": args.min_effect_pct,
+        "confidence": args.confidence,
+        "repeats": args.repeats,
+        "iterations": args.iterations,
+        "drift": drift_report(baseline_samples),
+        "skipped": skipped,
+        "results": results,
+    }
+
+    print_timing_summary(payload)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"\n[measure] wrote {len(results)} results to {args.out}")
+    return 0
+
+
+def confirm_winners(target, kept, results, baseline_stats, min_effect_ns, args, rng):
+    """Re-measure apparent winners in a second independent pass.
+
+    Correcting the confidence level lowers the false positive rate but does not
+    remove it, and a schedule that only looks fast once is not a result. A
+    winner has to win twice, on separately collected samples, before it is
+    reported as one.
+    """
+    if args.confirm_rounds <= 0:
+        return None
+    winners = [result["label"] for result in results if result["verdict"] == "faster"]
+    if not winners:
+        return None
+
+    by_label = {candidate.label: candidate for candidate in kept}
+    retest = [by_label["baseline"]] + [by_label[label] for label in winners]
+    print(f"\n[confirm] re-measuring {len(winners)} apparent winner(s) "
+          f"over {args.confirm_rounds} fresh rounds")
+
+    confirm_args = argparse.Namespace(**vars(args))
+    confirm_args.repeats = args.confirm_rounds
+    confirm_args.seed = args.seed + 1000
+
+    def progress(round_index, candidate, status, ns, reason):
+        detail = f"{ns / 1e6:.3f} ms" if status == "ok" else f"{status}: {reason}"
+        print(f"[confirm {round_index + 1}/{args.confirm_rounds}] "
+              f"{candidate.label:24} {detail}", flush=True)
+
+    samples, _ = measure_rounds(target, retest, confirm_args, args.workdir, progress)
+    baseline_samples = samples.get("baseline", [])
+    if len(baseline_samples) < 2:
+        return {"error": "confirmation baseline produced too few samples"}
+
+    confidence = corrected_confidence(
+        args.confidence, len(winners), not args.no_correction)
+    confirmations = {}
+    for label in winners:
+        candidate_samples = samples.get(label, [])
+        if len(candidate_samples) < 2:
+            confirmations[label] = {"verdict": "insufficient"}
+            continue
+        verdict, delta, (low, high) = decide(
+            candidate_samples, baseline_samples, min_effect_ns,
+            confirm_args, rng, confidence)
+        confirmations[label] = {
+            "verdict": verdict,
+            "delta_pct": delta / statistics.median(baseline_samples) * 100,
+            "ci_low_ns": low,
+            "ci_high_ns": high,
+        }
+
+    for result in results:
+        confirmation = confirmations.get(result["label"])
+        if confirmation is None:
+            continue
+        result["confirmed"] = confirmation["verdict"] == "faster"
+        if not result["confirmed"]:
+            result["verdict"] = "unconfirmed"
+    return confirmations
+
+
+def print_timing_summary(payload):
+    baseline_stats = payload["baseline_stats"]
+    print(
+        f"\nBaseline: {baseline_stats['median'] / 1e6:.3f} ms median over "
+        f"{baseline_stats['n']} runs, IQR {baseline_stats['iqr'] / 1e6:.3f} ms"
+    )
+    print(
+        f"A candidate wins only if its bootstrap interval excludes zero and the effect "
+        f"clears --min-effect-pct {payload['min_effect_pct']} "
+        f"({payload['min_effect_ns'] / 1e6:.3f} ms)"
+    )
+    if payload.get("corrected_confidence"):
+        print(
+            f"Confidence {payload['confidence']:.0%} spread across "
+            f"{payload['comparisons']} comparisons -> {payload['corrected_confidence']:.4%} "
+            "per candidate"
+        )
+
+    drift = payload.get("drift")
+    if drift and abs(drift["shift"]) > payload["min_effect_ns"]:
+        print(
+            f"\nWARNING: the baseline drifted by {drift['shift'] / 1e6:+.3f} ms between the "
+            "first and second half of this session, which is more than the threshold. "
+            "Treat these verdicts as unreliable and rerun on a quieter host."
+        )
+
+    timed = [result for result in payload["results"] if result["stats"]]
+    ranked = sorted(timed, key=lambda result: result["stats"]["median"])
+    print(f"\n{'candidate':26} {'median':>10} {'delta':>9} {'interval':>20}  verdict")
+    for result in ranked:
+        low, high = result.get("ci_low_ns"), result.get("ci_high_ns")
+        interval = (
+            f"[{low / 1e6:+.3f}, {high / 1e6:+.3f}]" if low is not None else "n/a"
+        )
+        print(
+            f"  {result['label']:24} {result['stats']['median'] / 1e6:>8.3f} ms "
+            f"{result['delta_pct']:>+7.1f}% {interval:>20}  {result['verdict']}"
+        )
+
+    broken = [result for result in payload["results"] if not result["stats"]]
+    if broken:
+        print("\nDid not produce a timing:")
+        for result in broken:
+            print(f"  {result['label']:24} {result['verdict']}: {result['reason']}")
+
+    unconfirmed = [result for result in timed if result["verdict"] == "unconfirmed"]
+    if unconfirmed:
+        print("\nWon the first pass but not the confirmation pass, so not a result:")
+        for result in unconfirmed:
+            print(f"  {result['label']}")
+
+    faster = [result for result in timed if result["verdict"] == "faster"]
+    print(f"\n{len(faster)} candidate(s) beat the baseline")
+    if not faster and timed:
+        print("Nothing cleared the noise floor; the hand-tuned baseline stands for now.")
+
+
 def cmd_report(args):
     with open(args.results, "r", encoding="utf-8") as handle:
-        print_summary(json.load(handle))
+        payload = json.load(handle)
+    if "baseline_stats" in payload:
+        print_timing_summary(payload)
+    else:
+        print_summary(payload)
     return 0
 
 
@@ -416,6 +915,49 @@ def main(argv=None):
     check.add_argument("--timeout", type=float, default=600.0)
     check.add_argument("-o", "--out")
     check.set_defaults(func=cmd_check)
+
+    def add_timing_args(parser_):
+        parser_.add_argument("--knobs", required=True)
+        parser_.add_argument("--script", help="Override the target script")
+        parser_.add_argument("--repeats", type=int, default=5,
+                             help="Fresh processes per candidate")
+        parser_.add_argument("--iterations", type=int, default=20,
+                             help="In-process bench iterations, passed as -b")
+        parser_.add_argument("--warmup", type=int, default=1,
+                             help="DAE_BENCH_WARMUP launches before timing")
+        parser_.add_argument("--seed", type=int, default=0,
+                             help="Seed for the per-round shuffle")
+        parser_.add_argument("--kill-stale", action="store_true",
+                             help="pkill leftover runs of this target between measurements")
+        parser_.add_argument("--post-launch-timeout", type=float, default=120.0)
+        parser_.add_argument("--idle-timeout", type=float, default=30.0)
+        parser_.add_argument("--hard-timeout", type=float, default=900.0)
+        parser_.add_argument("-o", "--out")
+
+    noise = sub.add_parser(
+        "noise", help="Measure the baseline repeatedly and report the spread")
+    add_timing_args(noise)
+    noise.set_defaults(func=cmd_noise, dry_build_arg=None)
+
+    measure = sub.add_parser("measure", help="Time candidates against the baseline")
+    add_timing_args(measure)
+    measure.add_argument("--knob", action="append", help="Restrict to these knobs")
+    measure.add_argument("--dry-build-arg", action="append")
+    measure.add_argument("--no-prebuild", action="store_true",
+                         help="Skip the dry-build prefilter before timing")
+    measure.add_argument("--build-timeout", type=float, default=600.0)
+    measure.add_argument("--max", type=int, help="Stop after this many candidates")
+    measure.add_argument("--min-effect-pct", type=float, default=1.0,
+                         help="Smallest improvement worth acting on, as a percent")
+    measure.add_argument("--bootstrap", type=int, default=2000,
+                         help="Resamples used for the confidence interval")
+    measure.add_argument("--confidence", type=float, default=0.95,
+                         help="Sweep-level confidence, 0-1")
+    measure.add_argument("--no-correction", action="store_true",
+                         help="Do not spread the error budget across candidates")
+    measure.add_argument("--confirm-rounds", type=int, default=10,
+                         help="Fresh rounds used to re-test winners; 0 disables")
+    measure.set_defaults(func=cmd_measure)
 
     report = sub.add_parser("report", help="Print a saved results file")
     report.add_argument("results")

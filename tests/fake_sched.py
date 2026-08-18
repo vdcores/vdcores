@@ -17,7 +17,9 @@ exercised against realistic rejections rather than invented ones.
 import argparse
 import importlib.util
 import os
+import random
 import sys
+import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TUNE_PATH = os.path.join(REPO_ROOT, "python", "dae", "tune.py")
@@ -61,9 +63,66 @@ def validate_gemv(stage, M, K, num_sms):
     )
 
 
+# Idealized per-stage work, used only to give the fake a knob-dependent time.
+STAGE_WORK_NS = {
+    "q_proj": 24_000_000,
+    "k_proj": 12_000_000,
+    "v_proj": 12_000_000,
+    "out_proj": 24_000_000,
+    "gate_low": 24_000_000,
+    "gate_high": 12_000_000,
+    "up_low": 24_000_000,
+    "up_high": 12_000_000,
+    "down_proj": 36_000_000,
+}
+FIXED_NS = 900_000
+
+
+def synthetic_ns(values, rng):
+    """A knob-dependent execution time, plus optional host-like noise.
+
+    More SMs on a stage means less time on that stage, with a small
+    per-stage launch cost so the ideal is not simply "everything at 128".
+    """
+    total = FIXED_NS
+    for stage, work in STAGE_WORK_NS.items():
+        sms = values.get(stage, 1)
+        total += work / max(sms, 1) + 2_000 * sms
+
+    noise = float(os.environ.get("FAKE_SCHED_NOISE", "0"))
+    if noise > 0:
+        total *= 1.0 + rng.gauss(0.0, noise)
+        # The real host is bimodal: a minority of fresh processes land in a
+        # much slower mode. Reproduce that so the driver is tested against it.
+        if rng.random() < float(os.environ.get("FAKE_SCHED_SLOW_PROB", "0.15")):
+            total *= 1.7
+    return max(total, 1.0)
+
+
+def run_bench(iterations, values):
+    if os.environ.get("FAKE_SCHED_HANG"):
+        print(f"[bench] VDCores with {NUM_SMS} SMs...", flush=True)
+        while True:  # simulate a barrier deadlock after launch
+            time.sleep(1)
+
+    seed = os.environ.get("FAKE_SCHED_SEED")
+    rng = random.Random(int(seed) if seed is not None else None)
+
+    print(f"[bench] VDCores with {NUM_SMS} SMs...")
+    samples = sorted(synthetic_ns(values, rng) for _ in range(max(iterations, 1)))
+    mid = len(samples) // 2
+    median = samples[mid] if len(samples) % 2 else (samples[mid - 1] + samples[mid]) / 2
+    print(f"Benchmark Results on {NUM_SMS} SMs and {iterations} iterations:")
+    print(f"Min execution time (ns): {samples[0]:.2f}")
+    print(f"Median execution time (ns): {median:.2f}")
+    print(f"Average execution time (ns): {sum(samples) / len(samples):.2f}")
+    print(f"Max execution time (ns): {samples[-1]:.2f}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-build", action="store_true")
+    parser.add_argument("-b", "--bench", type=int, nargs="?", const=1, default=None)
     args = parser.parse_args()
 
     tune = dae_tune.load("fake_sched")
@@ -120,6 +179,12 @@ def main():
     print(tune.summary())
     if args.dry_build:
         print(f"[dry-build] built fake schedule with mlp_low={mlp_low}, mlp_high={mlp_high}")
+    if args.bench is not None:
+        run_bench(args.bench, {
+            "q_proj": q_sms, "k_proj": k_sms, "v_proj": v_sms, "out_proj": out_sms,
+            "gate_low": gate_low_sms, "gate_high": gate_high_sms,
+            "up_low": up_low_sms, "up_high": up_high_sms, "down_proj": down_sms,
+        })
     return 0
 
 

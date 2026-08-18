@@ -167,6 +167,14 @@ def main():
                 break
     finally:
         selector.unregister(proc.stdout)
+        # The loop above stops as soon as the child has exited, which can leave
+        # buffered output unread. Drain it, or a fast-exiting run loses its
+        # final lines, and those are the ones carrying benchmark and [perf]
+        # results.
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            recent_lines.append(line)
+            print(line, flush=True)
         proc.stdout.close()
 
     return proc.wait()

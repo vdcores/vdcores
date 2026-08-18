@@ -249,6 +249,184 @@ def test_check_flags_a_broken_baseline():
         assert rc == 1, "a failing baseline must be reported as a failure"
 
 
+# --------------------------------------------------------- timing helpers
+
+
+BENCH_OUTPUT = """
+[bench] VDCores with 128 SMs...
+Benchmark Results on 128 SMs and 20 iterations:
+Min execution time (ns): 2010000.00
+Median execution time (ns): 2280000.00
+Average execution time (ns): 2350000.50
+Max execution time (ns): 3910000.00
+"""
+
+
+def stats_args(**overrides):
+    import argparse
+    defaults = {"bootstrap": 400, "confidence": 0.95}
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_parse_bench_output_reads_all_four_lines():
+    timings = autotune.parse_bench_output(BENCH_OUTPUT)
+    assert timings["median"] == 2280000.0
+    assert timings["min"] == 2010000.0
+    assert timings["max"] == 3910000.0
+
+
+def test_parse_bench_output_returns_none_without_a_median():
+    assert autotune.parse_bench_output("[bench] started\nthen nothing\n") is None
+
+
+def test_percentile_handles_small_samples():
+    assert autotune.percentile([], 0.5) is None
+    assert autotune.percentile([7.0], 0.5) == 7.0
+    assert autotune.percentile([0.0, 10.0], 0.5) == 5.0
+    assert autotune.percentile([0.0, 1.0, 2.0, 3.0], 0.25) == 0.75
+
+
+def test_summarize_samples_reports_spread():
+    stats = autotune.summarize_samples([1.0, 2.0, 3.0, 4.0])
+    assert stats["n"] == 4
+    assert stats["median"] == 2.5
+    assert stats["iqr"] == stats["p75"] - stats["p25"]
+
+
+def test_correction_spreads_the_error_budget():
+    assert autotune.corrected_confidence(0.95, 1) == 0.95
+    assert abs(autotune.corrected_confidence(0.95, 20) - 0.9975) < 1e-9
+    # opting out leaves the level untouched
+    assert autotune.corrected_confidence(0.95, 20, enabled=False) == 0.95
+
+
+def test_decide_calls_a_clear_win_faster():
+    import random as _random
+    baseline = [5.00e6] * 8
+    candidate = [4.50e6] * 8
+    verdict, delta, (low, high) = autotune.decide(
+        candidate, baseline, min_effect_ns=0.05e6,
+        args=stats_args(), rng=_random.Random(0))
+    assert verdict == "faster", (verdict, delta, low, high)
+    assert delta == -0.5e6
+    assert high < 0
+
+
+def test_decide_calls_an_overlapping_difference_same():
+    import random as _random
+    # Same distribution, offset by far less than the spread.
+    baseline = [5.0e6, 5.2e6, 4.8e6, 5.1e6, 4.9e6, 5.3e6]
+    candidate = [5.1e6, 4.9e6, 5.2e6, 4.8e6, 5.0e6, 5.2e6]
+    verdict, _, _ = autotune.decide(
+        candidate, baseline, min_effect_ns=0.05e6,
+        args=stats_args(), rng=_random.Random(0))
+    assert verdict == "same", verdict
+
+
+def test_decide_refuses_to_judge_a_single_sample():
+    import random as _random
+    verdict, _, interval = autotune.decide(
+        [4.0e6], [5.0e6], min_effect_ns=0.0,
+        args=stats_args(), rng=_random.Random(0))
+    assert verdict == "insufficient"
+    assert interval == (None, None)
+
+
+def test_decide_respects_the_minimum_effect_floor():
+    import random as _random
+    # A tiny but perfectly consistent win must still be called uninteresting.
+    verdict, _, _ = autotune.decide(
+        [4.999e6] * 8, [5.0e6] * 8, min_effect_ns=0.05e6,
+        args=stats_args(), rng=_random.Random(0))
+    assert verdict == "same", verdict
+
+
+def test_drift_report_measures_first_half_against_second():
+    drift = autotune.drift_report([1.0, 1.0, 2.0, 2.0])
+    assert drift["first_half_median"] == 1.0
+    assert drift["second_half_median"] == 2.0
+    assert drift["shift"] == 1.0
+    assert autotune.drift_report([1.0, 2.0]) is None
+
+
+# --------------------------------------------------- timing, end to end
+
+
+def measure_args(**overrides):
+    import argparse
+    defaults = {
+        "workdir": REPO_ROOT, "script": FAKE_SCHED, "dry_build_arg": ["--dry-build"],
+        "repeats": 3, "iterations": 3, "warmup": 0, "seed": 0, "kill_stale": False,
+        "post_launch_timeout": 60.0, "idle_timeout": 20.0, "hard_timeout": 120.0,
+        "knob": None, "no_prebuild": False, "build_timeout": 60.0, "max": None,
+        "min_effect_pct": 1.0, "bootstrap": 400, "confidence": 0.95,
+        "no_correction": False, "confirm_rounds": 2, "out": None,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_measure_finds_a_real_effect_on_a_quiet_host():
+    with tempfile.TemporaryDirectory() as tmp:
+        knobs = discover_fake(tmp)
+        out = os.path.join(tmp, "timing.json")
+        args = measure_args(knobs=knobs, knob=["gate_low.sms", "silu.sms"], out=out)
+        assert autotune.cmd_measure(args) == 0
+
+        with open(out, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        by_label = {result["label"]: result for result in payload["results"]}
+        # gate_low benefits from more SMs in the fixture's cost model
+        assert by_label["gate_low.sms=128"]["verdict"] == "faster", by_label
+        # silu does not appear in that cost model at all, so it must not win
+        assert by_label["silu.sms=1"]["verdict"] == "same"
+        assert by_label["silu.sms=2"]["verdict"] == "same"
+        assert payload["corrected_confidence"] > payload["confidence"]
+
+
+def test_measure_does_not_crown_a_winner_out_of_pure_noise():
+    previous = os.environ.get("FAKE_SCHED_NOISE")
+    os.environ["FAKE_SCHED_NOISE"] = "0.05"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            knobs = discover_fake(tmp)
+            out = os.path.join(tmp, "noise-timing.json")
+            # silu has no effect, so every verdict here should be "same".
+            args = measure_args(knobs=knobs, knob=["silu.sms"], repeats=4, out=out)
+            assert autotune.cmd_measure(args) == 0
+
+            with open(out, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+
+            for result in payload["results"]:
+                assert result["verdict"] in ("same", "unconfirmed"), result
+    finally:
+        if previous is None:
+            os.environ.pop("FAKE_SCHED_NOISE", None)
+        else:
+            os.environ["FAKE_SCHED_NOISE"] = previous
+
+
+def test_run_timed_reports_a_hang_rather_than_waiting_forever():
+    previous = os.environ.get("FAKE_SCHED_HANG")
+    os.environ["FAKE_SCHED_HANG"] = "1"
+    try:
+        target = {"namespace": "fake_sched", "script": FAKE_SCHED, "dry_build_args": []}
+        args = measure_args(knobs=None, post_launch_timeout=4.0, idle_timeout=2.0,
+                            hard_timeout=30.0)
+        status, ns, reason = autotune.run_timed(target, {}, args, REPO_ROOT)
+        assert status == "hang", (status, reason)
+        assert ns is None
+        assert "deadlock" in reason
+    finally:
+        if previous is None:
+            os.environ.pop("FAKE_SCHED_HANG", None)
+        else:
+            os.environ["FAKE_SCHED_HANG"] = previous
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0
