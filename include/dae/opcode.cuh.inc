@@ -112,6 +112,10 @@ DAE_OP(OP_TMA_LOAD_MX_DOWN_RESIDENT, MK_MOP(55, MEM_OP_FLAGS_NONE))
 // Complete per-worker FFN plan: one Linear-1 record followed by up to two
 // Down records, all serviced by one long-running fixed-layout LDU command.
 DAE_OP(OP_TMA_LOAD_MX_RESIDENT_FFN, MK_MOP(56, MEM_OP_FLAGS_NONE))
+// Auxiliary half of the resident FFN plan.  The normal memory virtual core
+// routes this distinct command to LDU1, which produces Down activation/SFB;
+// LDU0 continues to own the independent weight/SFA stream above.
+DAE_OP(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX, MK_MOP(57, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

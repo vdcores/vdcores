@@ -19,77 +19,32 @@ static constexpr uint16_t repeatSkipCountMask = 0x1F00U;
 static constexpr int repeatSkipCountShift = 8;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
-template<typename M2LD_Type>
-__device__ __forceinline__ void
-allocwarp_execute_mxfp_resident_ffn_fast(
-    const int lane_id, M2LD_Type m2ld[2], const MInst *minsts,
-    MInst *st_insts, int *bars, uint64_t *tmem_mma_barriers
-#if defined(DAE_TRACK_PROFILE)
-    , const int sm_id, uint64_t *g_events
-#endif
-) {
-  static_assert(
-      !mxfpResidentFfnFastMemoryDispatchEnabled || numInsts == 2,
-      "resident FFN fast memory dispatch requires command + terminate");
-
-  if (lane_id == 0) {
-    // This remains a normal queued VDCores memory task: the allocator warp
-    // publishes the immutable mailbox and LDU0 acquires/dequeues the command.
-    // Only the generic decoder for the fixed two-command image is omitted.
-    const MInst inst = minsts[0];
-    const uint8_t special_slot = uint8_t(inst.nslot());
-    st_insts[special_slot] = inst;
-
-    LdCmd ld;
-    ld.init(special_slot, 0, inst.opcode);
-    m2ld[0].put(ld.raw);
-    m2ld[0].commit();
-    m2ld[0].advance();
-    if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
-      m2ld[1].put(ld.raw);
-      m2ld[1].commit();
-      m2ld[1].advance();
-    }
-    m2ld[0].push(SLOT_END);
-    m2ld[1].push(SLOT_END);
-
-    if constexpr (mxfpResidentDownSplitLduEnabled) {
-      using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-      // This warp has finished its only queued dispatch. Pause it until LDU0
-      // has issued the complete Linear-1 stream, then make it the dedicated
-      // observer for the two global reduction dependencies. LDU0 and LDU1
-      // remain free to produce Down weight/SFA and activation/SFB.
-      auto *poll_start = reinterpret_cast<TxBarrier *>(
-          tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
-      auto *reduction_ready = reinterpret_cast<TxBarrier *>(
-          tmem_mma_barriers +
-          mxfpDownResidentReductionReadyBarrierBase);
-      poll_start->wait(0);
-      const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
-      #pragma unroll
-      for (int task = 0; task < 2; ++task) {
-        const auto *metadata = reinterpret_cast<const uint8_t *>(
-            load_l2_u64(plan + 1 + task));
-        const uint32_t task_bar = uint32_t(load_l2_u64(
-            reinterpret_cast<const uint64_t *>(metadata + 32)) >> 32);
-        cuda::atomic_ref<int, cuda::thread_scope_device> ready(
-            bars[task_bar]);
-        while (ready.load(cuda::memory_order_acquire) != 0) {
-          __nanosleep(128);
-        }
-        reduction_ready[task].arrive();
+static __device__ __forceinline__ void
+allocwarp_observe_mxfp_resident_down_ready(
+    const MInst &inst, int *bars, uint64_t *tmem_mma_barriers) {
+  if constexpr (mxfpResidentDownSplitLduEnabled) {
+    using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+    // The allocator has published both resident LDU commands and has no more
+    // useful issue work.  Keep the existing overlap by observing the two
+    // device-scope reduction dependencies while LDU0 and LDU1 produce Down.
+    auto *poll_start = reinterpret_cast<TxBarrier *>(
+        tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+    auto *reduction_ready = reinterpret_cast<TxBarrier *>(
+        tmem_mma_barriers + mxfpDownResidentReductionReadyBarrierBase);
+    poll_start->wait(0);
+    const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
+    #pragma unroll
+    for (int task = 0; task < 2; ++task) {
+      const auto *metadata = reinterpret_cast<const uint8_t *>(
+          load_l2_u64(plan + 1 + task));
+      const uint32_t task_bar = uint32_t(load_l2_u64(
+          reinterpret_cast<const uint64_t *>(metadata + 32)) >> 32);
+      cuda::atomic_ref<int, cuda::thread_scope_device> ready(bars[task_bar]);
+      while (ready.load(cuda::memory_order_acquire) != 0) {
+        __nanosleep(128);
       }
+      reduction_ready[task].arrive();
     }
-
-#if defined(DAE_TRACK_PROFILE)
-    const int event_base = sm_id * numProfileEvents;
-    g_events[event_base + DAE_TRACK_ALLOC_SLOT_STALL_NS] = 0;
-    g_events[event_base + DAE_TRACK_ALLOC_SLOT_STALL_EVENTS] = 0;
-    g_events[event_base + DAE_TRACK_ALLOC_SLOT_RETRIES] = 0;
-    g_events[event_base + DAE_TRACK_ALLOC_ISSUE_BARRIER_NS] = 0;
-    g_events[event_base + DAE_TRACK_ALLOC_ISSUE_BARRIER_CONTENDED] = 0;
-    g_events[event_base + DAE_TRACK_ALLOC_INSTRUCTIONS] = 0;
-#endif
   }
 }
 
@@ -99,7 +54,8 @@ __device__ __forceinline__ void allocwarp_execute(
     M2C_Type &m2c, M2LD_Type m2ld[2], const MInst* smem_minsts, int *flags,
     MInst *st_insts, const void *smem_base, const CUtensorMap *tma_descs, int *bars,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_publish_barrier,
-    const LoopCounters &initial_loop_counts
+    const LoopCounters &initial_loop_counts,
+    uint64_t *tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
 #endif
@@ -408,7 +364,8 @@ __device__ __forceinline__ void allocwarp_execute(
         break;
         case op(OP_TMA_LOAD_MX_GATE_UP_RESIDENT):
         case op(OP_TMA_LOAD_MX_DOWN_RESIDENT):
-        case op(OP_TMA_LOAD_MX_RESIDENT_FFN): {
+        case op(OP_TMA_LOAD_MX_RESIDENT_FFN):
+        case op(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX): {
           // A dedicated resident plan owns fixed shared-memory addresses, so
           // this command bypasses both slot allocation and M2C publication.
           // The isolated Linear-1 schedule submits exactly one such command
@@ -422,6 +379,10 @@ __device__ __forceinline__ void allocwarp_execute(
             curld.put(ld.raw);
             curld.commit();
             curld.advance();
+            if (decoded_op == op(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX)) {
+              allocwarp_observe_mxfp_resident_down_ready(
+                  inst, bars, tmem_mma_barriers);
+            }
           }
         }
         break;

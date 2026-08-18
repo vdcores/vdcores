@@ -128,7 +128,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, metadata, global_bars,
-        m2c, c2m
+        m2c, c2m, -1
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         , sm_id, g_events
 #endif
@@ -143,7 +143,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
           numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, false, false>(
           smem_base, tmem_base_ptr, tmem_mma_barrier,
           tma_descs, metadata, global_bars,
-          m2c, c2m
+          m2c, c2m, -1
 #if defined(DAE_TRACK_MXFP_TIMELINE)
           , sm_id, g_events
 #endif
@@ -171,7 +171,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_RESIDENT_SM100) {
         8, 2, 256, __bar_cgroup, 512,
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, true>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
-        tma_descs, metadata, global_bars, m2c, c2m
+        tma_descs, metadata, global_bars, m2c, c2m, task
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         , sm_id, g_events
 #endif
@@ -216,7 +216,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100) {
         8, 2, 256, __bar_cgroup, 512,
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, true>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
-        tma_descs, down_metadata, global_bars, m2c, c2m
+        tma_descs, down_metadata, global_bars, m2c, c2m, task
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         , sm_id, g_events
 #endif

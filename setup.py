@@ -146,10 +146,10 @@ if os.environ.get("DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO"):
         "-DDAE_MXFP_RESIDENT_DOWN_PAIR_ZERO="
         + os.environ["DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO"]
     )
-if os.environ.get("DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH"):
+if os.environ.get("DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION"):
     cuda_defines.append(
-        "-DDAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH="
-        + os.environ["DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH"]
+        "-DDAE_MXFP_RESIDENT_DOWN_STU_REDUCTION="
+        + os.environ["DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION"]
     )
 if os.environ.get("DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO"):
     cuda_defines.append(

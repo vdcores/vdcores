@@ -3284,10 +3284,15 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
         if sm < 0 or sm >= self.num_sms:
             return []
         plan_address = self.resident_plans[sm].data_ptr()
-        return [
+        instructions = [
             Mxfp4Mxfp8ResidentFfnSm100(plan_address),
             TmaLoadMxfpResidentFfn(plan_address),
         ]
+        # The normal memory runtime receives an explicit command on each LDU
+        # FIFO, with independent immutable mailbox slots.
+        if config.mxfp_resident_down_ldu1_zero:
+            instructions.append(TmaLoadMxfpResidentFfnAux(plan_address))
+        return instructions
 
 
 class SchedFp8GemvUmmaStream(Schedule):

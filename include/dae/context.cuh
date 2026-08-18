@@ -154,14 +154,15 @@ static constexpr bool mxfpResidentFfnOverlapDownPrefetchEnabled =
 #endif
 static constexpr bool mxfpResidentDownPairZeroEnabled =
     DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO != 0;
-#ifndef DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH
-#define DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH 0
+#ifndef DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION
+#define DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION 0
 #endif
-// The focused resident FFN image has exactly one queued memory task followed
-// by termination. Keep the allocator-warp -> LDU queue boundary, but allow
-// that fixed image to skip the generic memory virtual-core decoder.
-static constexpr bool mxfpResidentFfnFastMemoryDispatchEnabled =
-    DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH != 0;
+// Profiling control: hand each resident Down output tile from compute to the
+// store warp, which issues the same bulk TMA copy/reduce and acknowledges its
+// completion through a CTA-local barrier. The default keeps the accepted
+// direct compute-warp issue path.
+static constexpr bool mxfpResidentDownStuReductionEnabled =
+    DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION != 0;
 #ifndef DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO
 #define DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO 0
 #endif
@@ -171,10 +172,6 @@ static constexpr bool mxfpResidentFfnFastMemoryDispatchEnabled =
 // touching the output allocation.
 static constexpr bool mxfpResidentDownLdu1ZeroEnabled =
     DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO != 0;
-static_assert(
-    !mxfpResidentDownLdu1ZeroEnabled ||
-        mxfpResidentFfnFastMemoryDispatchEnabled,
-    "resident LDU1 producer requires fast memory dispatch");
 #ifndef DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU
 #define DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU 0
 #endif
@@ -299,10 +296,20 @@ static constexpr int mxfpDownResidentReductionReadyBarrierCount =
     mxfpResidentDownLdu1ZeroEnabled ? 3 : 0;
 static constexpr int mxfpDownResidentLdu1PollStartBarrier =
     mxfpDownResidentReductionReadyBarrierBase + 2;
-
-static constexpr int tmemMmaBarrierCount =
+static constexpr int mxfpDownResidentStoreReadyBarrierBase =
     mxfpDownResidentReductionReadyBarrierBase +
     mxfpDownResidentReductionReadyBarrierCount;
+static constexpr int mxfpDownResidentStoreReadyBarrierCount =
+    mxfpResidentDownStuReductionEnabled ? 2 : 0;
+static constexpr int mxfpDownResidentStoreDoneBarrierBase =
+    mxfpDownResidentStoreReadyBarrierBase +
+    mxfpDownResidentStoreReadyBarrierCount;
+static constexpr int mxfpDownResidentStoreDoneBarrierCount =
+    mxfpResidentDownStuReductionEnabled ? 2 : 0;
+
+static constexpr int tmemMmaBarrierCount =
+    mxfpDownResidentStoreDoneBarrierBase +
+    mxfpDownResidentStoreDoneBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);

@@ -2869,6 +2869,24 @@ class TmaLoadMxfpResidentFfn(MemoryInstruction):
         self.fixed_port(0)
 
 
+class TmaLoadMxfpResidentFfnAux(MemoryInstruction):
+    """Run the LDU1 half of a resident FFN plan through normal dispatch."""
+
+    SPECIAL_SLOT = 7
+
+    def __init__(self, plan_address: int):
+        if plan_address <= 0 or plan_address >= 1 << 64:
+            raise ValueError("resident FFN plan address must fit uint64")
+        super().__init__(
+            opcode=opcode.OP_TMA_LOAD_MX_RESIDENT_FFN_AUX,
+            num_slots=config.num_slots + self.SPECIAL_SLOT,
+            arg=0,
+            size=0,
+            address=plan_address,
+        )
+        self.fixed_port(1)
+
+
 class TmaLoadMxfpDownWeightRing5D(MemoryInstruction):
     """Retained K256 weight ring for Linear-2.
 
@@ -3422,6 +3440,7 @@ __all__ = [
     "TmaLoadMxfpGateUpResident",
     "TmaLoadMxfpDownResident",
     "TmaLoadMxfpResidentFfn",
+    "TmaLoadMxfpResidentFfnAux",
     "TmaLoadMxfpDownWeightRing5D",
     "TmaLoadMxfpScale1D",
     "TmaLoadMxfpScaleBase1D",

@@ -218,6 +218,9 @@ def report_track_counters(profile: torch.Tensor) -> None:
         f"ldu1_queue_wait_pct={percent(14):.3f} "
         f"ldu1_dependency_wait_pct={percent(16):.3f} "
         f"ldu1_commands={total(18)} "
+        f"store_queue_wait_pct={percent(19):.3f} "
+        f"store_service_pct={percent(21):.3f} "
+        f"store_commands={total(23)} "
         f"startup_median_us={statistics.median(startup_us):.6f} "
         f"join_tail_median_us={statistics.median(join_tail_us):.6f} "
         f"tmem_free_median_us={statistics.median(free_us):.6f} "
@@ -467,9 +470,7 @@ def main() -> None:
     resident_down_split_ldu = bool(
         runtime.config.mxfp_resident_down_split_ldu
     )
-    fast_memory_dispatch = bool(
-        runtime.config.mxfp_resident_ffn_fast_memory_dispatch
-    )
+    stu_reduction = bool(runtime.config.mxfp_resident_down_stu_reduction)
     ldu1_zero = bool(runtime.config.mxfp_resident_down_ldu1_zero)
     python_output_zero = ldu1_zero
     if not 0 <= args.down_task_limit <= 224:
@@ -955,7 +956,7 @@ def main() -> None:
         f"resident_down_pair_zero={str(resident_down_pair_zero).lower()} "
         f"resident_down_split_ldu={str(resident_down_split_ldu).lower()} "
         "queue_init=generic "
-        f"fast_memory_dispatch={str(fast_memory_dispatch).lower()} "
+        f"stu_reduction={str(stu_reduction).lower()} "
         f"ldu1_enabled={str(ldu1_zero).lower()} "
         f"ldu1_output_zero={str(resident_down_pair_zero).lower()} "
         f"python_output_zero={str(python_output_zero).lower()} "

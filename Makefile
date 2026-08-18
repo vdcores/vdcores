@@ -178,9 +178,9 @@ ifneq ($(mxfp_resident_down_pair_zero),)
 	export DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO := $(mxfp_resident_down_pair_zero)
 endif
 
-ifneq ($(mxfp_resident_ffn_fast_memory_dispatch),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH=$(mxfp_resident_ffn_fast_memory_dispatch)
-	export DAE_MXFP_RESIDENT_FFN_FAST_MEMORY_DISPATCH := $(mxfp_resident_ffn_fast_memory_dispatch)
+ifneq ($(mxfp_resident_down_stu_reduction),)
+	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_DOWN_STU_REDUCTION=$(mxfp_resident_down_stu_reduction)
+	export DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION := $(mxfp_resident_down_stu_reduction)
 endif
 
 ifneq ($(mxfp_resident_down_ldu1_zero),)

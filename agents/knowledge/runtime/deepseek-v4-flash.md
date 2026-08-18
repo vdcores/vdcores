@@ -2845,3 +2845,20 @@ interfere when all resident warps become runnable at kernel entry.
 
 Full implementation, rejected placement controls, commands, and job IDs are
 recorded in `.agentlog/2026-08-18-dae2-resident-ffn.md`.
+
+## Normal-runtime-only resident FFN execution (2026-08-18)
+
+The retained-ring FFN now has one memory-runtime implementation. `dae2`
+always enters the generic allocator, store, and single-thread LDU executors;
+the fixed fast allocator/LDU dispatchers, runtime LDU selector, terminate-only
+store executor, and their build/Python configuration surface were removed.
+The resident Linear-1 and auxiliary Down commands remain ordinary memory
+instructions: Python emits one immutable command for each LDU FIFO, the
+allocator publishes both through M2LD, and each LDU decodes its resident
+operator inside the normal loop.
+
+The cleanup preserves the 248-register kernel cap and the software-interleaved
+Down metadata fetch. The selected normal image builds at 244 registers, nine
+barriers, a 112-byte stack, zero spills, and 2,368 bytes static shared memory.
+The default-off STU Down-reduction control is separate from the deleted fast
+runtime and remains available for the previously measured handoff experiment.

@@ -20,7 +20,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     const uint8_t *metadata,
     int *global_bars,
     M2CQueue &m2c,
-    C2MQueue &c2m
+    C2MQueue &c2m,
+    int resident_task_index
 #if defined(DAE_TRACK_MXFP_TIMELINE)
     , int sm_id, uint64_t *g_events
 #endif
@@ -143,6 +144,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   const int warp = tid / numThreadsPerWarp;
   const int lane = tid & (numThreadsPerWarp - 1);
   (void)c2m;
+  (void)resident_task_index;
 
   const auto *weight_scale_global = reinterpret_cast<const uint8_t *>(
       *reinterpret_cast<const uint64_t *>(metadata + 0));
@@ -661,34 +663,43 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   // all seven experts can reduce-add after the shared CTA publishes zero.
   // Both paths consume the selected FP32/BF16 shared epilogue directly: no
   // expert-output write/read round trip is present.
-  if (tid == 0) {
-    const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
-    const int row = output_m_tile * kTileM;
-    if (expert == 0 && !reduce_from_zero) {
-      asm volatile(
-          "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
-          "[%0, {%1, %2}], [%3];\n"
-          :
-          : "l"((void *)(tma_descs + output_tma_index)),
-            "r"(0), "r"(row), "r"(source)
-          : "memory");
-    } else {
-      asm volatile(
-          "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group "
-          "[%0, {%1, %2}], [%3];\n"
-          :
-          : "l"((void *)(tma_descs + output_tma_index)),
-            "r"(0), "r"(row), "r"(source)
-          : "memory");
+  if constexpr (ResidentAllTma && mxfpResidentDownStuReductionEnabled) {
+    if (tid == 0) {
+      auto *store_ready = reinterpret_cast<TxBarrier *>(
+          resident_mma_barriers + mxfpDownResidentStoreReadyBarrierBase);
+      auto *store_done = reinterpret_cast<TxBarrier *>(
+          resident_mma_barriers + mxfpDownResidentStoreDoneBarrierBase);
+      store_ready[resident_task_index].arrive();
+      store_done[resident_task_index].wait(0);
     }
-    cuda::ptx::cp_async_bulk_commit_group();
-    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-    cuda::ptx::fence_proxy_async();
-    if (expert == 0 && !reduce_from_zero) {
-      cuda::atomic_ref<int, cuda::thread_scope_device> shared_ready(
-          global_bars[reduce_bar]);
-      shared_ready.fetch_sub(1, cuda::memory_order_release);
-    }
+  } else if (tid == 0) {
+      const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
+      const int row = output_m_tile * kTileM;
+      if (expert == 0 && !reduce_from_zero) {
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
+            "[%0, {%1, %2}], [%3];\n"
+            :
+            : "l"((void *)(tma_descs + output_tma_index)),
+              "r"(0), "r"(row), "r"(source)
+            : "memory");
+      } else {
+        asm volatile(
+            "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group "
+            "[%0, {%1, %2}], [%3];\n"
+            :
+            : "l"((void *)(tma_descs + output_tma_index)),
+              "r"(0), "r"(row), "r"(source)
+            : "memory");
+      }
+      cuda::ptx::cp_async_bulk_commit_group();
+      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+      cuda::ptx::fence_proxy_async();
+      if (expert == 0 && !reduce_from_zero) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> shared_ready(
+            global_bars[reduce_bar]);
+        shared_ready.fetch_sub(1, cuda::memory_order_release);
+      }
   }
   __sync_barrier<SyncBarrierId, 128>();
 #if defined(DAE_TRACK_MXFP_TIMELINE)

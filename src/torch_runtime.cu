@@ -1086,8 +1086,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfpResidentFfnOverlapDownPrefetchEnabled;
   config.attr("mxfp_resident_down_pair_zero") =
       mxfpResidentDownPairZeroEnabled;
-  config.attr("mxfp_resident_ffn_fast_memory_dispatch") =
-      mxfpResidentFfnFastMemoryDispatchEnabled;
+  config.attr("mxfp_resident_down_stu_reduction") =
+      mxfpResidentDownStuReductionEnabled;
   config.attr("mxfp_resident_down_ldu1_zero") =
       mxfpResidentDownLdu1ZeroEnabled;
   config.attr("mxfp_resident_down_split_ldu") =

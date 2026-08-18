@@ -655,161 +655,67 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down_activation(
 
 #endif
 
-template<typename M2LD_Type>
-__device__ __forceinline__ void
-ldwarp_execute_mxfp_resident_ffn_fast(
-    M2LD_Type &m2ld, MInst *st_insts, const void *smem_base,
-    const CUtensorMap *tma_descs, int *bars, uint64_t *tmem_mma_barriers,
-    const int port_id
-#if defined(DAE_TRACK_PROFILE)
-    , const int sm_id, uint64_t *g_events
-#endif
-) {
+#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
+    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION && \
+    DAE_MXFP_DOWN_LDU_WEIGHT_RING
+__device__ __forceinline__ void ldu_execute_mxfp_resident_ffn_aux(
+    const MInst inst, const void *smem_base, int *bars,
+    uint64_t *tmem_mma_barriers) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-  if (port_id == 0) {
-    const LdCmd cmd { .raw = m2ld.template pop<>() };
-    MInst task_inst = st_insts[cmd.slot];
-    const auto *plan = reinterpret_cast<const uint64_t *>(task_inst.address);
-    task_inst.address = load_l2_u64(plan + 0);
-    ldu_execute_mxfp_resident_linear1(
-        task_inst, smem_base, tma_descs, tmem_mma_barriers
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        , sm_id, g_events
-#endif
-        );
-    if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
-      auto *poll_start = reinterpret_cast<TxBarrier *>(
-          tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
-      poll_start->arrive();
-    }
-    if constexpr (mxfpResidentDownSplitLduEnabled) {
-      // Down weight/SFA occupies [0,64 KiB), exactly Linear-1 stage 0.
-      // The final issue has already happened; this memory-side last-use wait
-      // transfers only that half while LDU1 independently takes stage 1.
-      auto *linear1_empty = reinterpret_cast<TxBarrier *>(
-          tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-      linear1_empty[0].wait(0);
-    }
-    const int down_task_count = load_l2(
-        reinterpret_cast<const int *>(plan + 3));
-    for (int task = 0; task < down_task_count; ++task) {
-      task_inst.address = load_l2_u64(plan + 1 + task);
-      ldu_execute_mxfp_resident_down<!mxfpResidentDownSplitLduEnabled>(
-          task_inst, smem_base, tma_descs, bars, tmem_mma_barriers);
-    }
-    // Consume the allocator-warp terminator through the same queue protocol.
-    (void)m2ld.template pop<>();
-  } else {
-    // The fixed resident image assigns no memory task to LDU1.
-    (void)m2ld.template pop<>();
-  }
+  const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
+  const auto *metadata = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + 1));
+  const auto *second_metadata = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + 2));
+  const uint64_t tma_info = load_l2_u64(
+      reinterpret_cast<const uint64_t *>(metadata + 24));
+  const uint64_t barrier_info = load_l2_u64(
+      reinterpret_cast<const uint64_t *>(metadata + 32));
+  const uint32_t output_task = uint32_t(tma_info >> 32);
+  const uint32_t reduce_bar = uint32_t(barrier_info >> 32);
+  const uint32_t second_reduce_bar = uint32_t(load_l2_u64(
+      reinterpret_cast<const uint64_t *>(second_metadata + 32)) >> 32);
 
-#if defined(DAE_TRACK_PROFILE)
-  const int event_base = sm_id * numProfileEvents;
-  const int port_base = port_id == 0
-      ? DAE_TRACK_LDU0_QUEUE_WAIT_NS
-      : DAE_TRACK_LDU1_QUEUE_WAIT_NS;
-  g_events[event_base + port_base + 0] = m2ld.track_wait_ns;
-  g_events[event_base + port_base + 1] = m2ld.track_wait_calls;
-  g_events[event_base + port_base + 2] = 0;
-  g_events[event_base + port_base + 3] = 0;
-  g_events[event_base + port_base + 4] = port_id == 0 ? 1 : 0;
-#endif
-}
-
-template<typename M2LD_Type>
-__device__ __forceinline__ void
-ldwarp_execute_mxfp_resident_ffn_zero_fast(
-    const int lane_id, M2LD_Type &m2ld, MInst *st_insts,
-    const void *smem_base, int *bars, uint64_t *tmem_mma_barriers
-#if defined(DAE_TRACK_PROFILE)
-    , const int sm_id, uint64_t *g_events
-#endif
-) {
-  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-  uint64_t plan_address = 0;
-  if (lane_id == 0) {
-    const LdCmd cmd { .raw = m2ld.template pop<>() };
-    plan_address = st_insts[cmd.slot].address;
-  }
-  plan_address = __shfl_sync(ALL_THREADS, plan_address, 0);
-
-  uint32_t reduce_bar = 0;
-  uint32_t output_task = ~0U;
-  uint32_t second_reduce_bar = 0;
-  if (lane_id == 0) {
-    const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
-    const auto *metadata = reinterpret_cast<const uint8_t *>(
-        load_l2_u64(plan + 1));
-    const auto *second_metadata = reinterpret_cast<const uint8_t *>(
-        load_l2_u64(plan + 2));
-    const uint64_t tma_info = load_l2_u64(
-        reinterpret_cast<const uint64_t *>(metadata + 24));
-    const uint64_t barrier_info = load_l2_u64(
-        reinterpret_cast<const uint64_t *>(metadata + 32));
-    output_task = uint32_t(tma_info >> 32);
-    reduce_bar = uint32_t(barrier_info >> 32);
-    second_reduce_bar = uint32_t(load_l2_u64(
-        reinterpret_cast<const uint64_t *>(second_metadata + 32)) >> 32);
-  }
-  if (lane_id == 0 && output_task < 32) {
-    // Performance-only control: publish both destinations without clearing
-    // them. Every expert, including expert 0, executes reduce-add against
-    // whatever bytes already occupy the output allocation.
+  if (output_task < 32) {
+    // Python has initialized both destinations. Publish their device-scope
+    // reduction dependencies without doing any output work in the LDU.
     asm volatile("fence.release.gpu;" ::: "memory");
     *reinterpret_cast<volatile int *>(bars + reduce_bar) = 0;
     *reinterpret_cast<volatile int *>(bars + second_reduce_bar) = 0;
   }
 
-  if (lane_id == 0) {
-    auto *reduction_ready = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers +
-        mxfpDownResidentReductionReadyBarrierBase);
-    auto *poll_start = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
-    poll_start->wait(0);
-    if constexpr (mxfpResidentDownSplitLduEnabled) {
-      // Down scale/activation occupies [64,72 KiB), inside Linear-1 stage 1.
-      // Wait on that stage's final empty phase before its first overwrite.
-      auto *linear1_empty = reinterpret_cast<TxBarrier *>(
-          tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-      linear1_empty[1].wait(0);
-      const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
-      MInst task_inst {};
-      #pragma unroll
-      for (int task = 0; task < 2; ++task) {
-        task_inst.address = load_l2_u64(plan + 1 + task);
-        ldu_execute_mxfp_resident_down_activation(
-            task_inst, smem_base, bars, tmem_mma_barriers);
+  auto *reduction_ready = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownResidentReductionReadyBarrierBase);
+  auto *poll_start = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+  poll_start->wait(0);
+  if constexpr (mxfpResidentDownSplitLduEnabled) {
+    // LDU1 owns only activation/SFB. The normal allocator command that
+    // dispatched this operator observes reduction readiness independently.
+    auto *linear1_empty = reinterpret_cast<TxBarrier *>(
+        tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+    linear1_empty[1].wait(0);
+    MInst task_inst {};
+    #pragma unroll
+    for (int task = 0; task < 2; ++task) {
+      task_inst.address = load_l2_u64(plan + 1 + task);
+      ldu_execute_mxfp_resident_down_activation(
+          task_inst, smem_base, bars, tmem_mma_barriers);
+    }
+  } else {
+    const uint32_t task_bars[2] = {reduce_bar, second_reduce_bar};
+    #pragma unroll
+    for (int task = 0; task < 2; ++task) {
+      cuda::atomic_ref<int, cuda::thread_scope_device> ready(
+          bars[task_bars[task]]);
+      while (ready.load(cuda::memory_order_acquire) != 0) {
+        __nanosleep(128);
       }
-    } else {
-      const uint32_t task_bars[2] = {reduce_bar, second_reduce_bar};
-      #pragma unroll
-      for (int task = 0; task < 2; ++task) {
-        cuda::atomic_ref<int, cuda::thread_scope_device> ready(
-            bars[task_bars[task]]);
-        while (ready.load(cuda::memory_order_acquire) != 0) {
-          __nanosleep(128);
-        }
-        reduction_ready[task].arrive();
-      }
+      reduction_ready[task].arrive();
     }
   }
-
-  if (lane_id == 0) {
-    (void)m2ld.template pop<>();
-#if defined(DAE_TRACK_PROFILE)
-    const int event_base = sm_id * numProfileEvents;
-    g_events[event_base + DAE_TRACK_LDU1_QUEUE_WAIT_NS] =
-        m2ld.track_wait_ns;
-    g_events[event_base + DAE_TRACK_LDU1_QUEUE_WAIT_CALLS] =
-        m2ld.track_wait_calls;
-    g_events[event_base + DAE_TRACK_LDU1_DEPENDENCY_WAIT_NS] = 0;
-    g_events[event_base + DAE_TRACK_LDU1_DEPENDENCY_CONTENDED] = 0;
-    g_events[event_base + DAE_TRACK_LDU1_COMMANDS] = 1;
-#endif
-  }
 }
+#endif
 
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
@@ -1055,13 +961,43 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             , sm_id, g_events
 #endif
             );
+        if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
+          auto *poll_start = reinterpret_cast<
+              cutlass::arch::ClusterTransactionBarrier *>(
+              tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+          poll_start->arrive();
+        }
+        // The resident plan contains at most two Down tasks. Fetch their
+        // immutable metadata while Linear-1's last stage is still retiring,
+        // then consume the cached pointers after ownership transfers. This
+        // is software interleaving only: command order and barriers are
+        // unchanged.
         const int down_task_count = load_l2(
             reinterpret_cast<const int *>(plan + 3));
+        const uint64_t down_task_address0 = down_task_count > 0
+            ? load_l2_u64(plan + 1)
+            : 0;
+        const uint64_t down_task_address1 = down_task_count > 1
+            ? load_l2_u64(plan + 2)
+            : 0;
+        if constexpr (mxfpResidentDownSplitLduEnabled) {
+          auto *linear1_empty = reinterpret_cast<
+              cutlass::arch::ClusterTransactionBarrier *>(
+              tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+          linear1_empty[0].wait(0);
+        }
         for (int task = 0; task < down_task_count; ++task) {
-          task_inst.address = load_l2_u64(plan + 1 + task);
-          ldu_execute_mxfp_resident_down(
+          task_inst.address = task == 0
+              ? down_task_address0
+              : down_task_address1;
+          ldu_execute_mxfp_resident_down<!mxfpResidentDownSplitLduEnabled>(
               task_inst, smem_base, tma_descs, bars, tmem_mma_barriers);
         }
+        break; }
+      case op(OP_TMA_LOAD_MX_RESIDENT_FFN_AUX): {
+        produces_compute_operand = false;
+        ldu_execute_mxfp_resident_ffn_aux(
+            inst, smem_base, bars, tmem_mma_barriers);
         break; }
 #endif
 #if DAE_MXFP_DOWN_LDU_WEIGHT_RING

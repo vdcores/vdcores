@@ -127,7 +127,7 @@ void dae_ffn_down_direct_kernel(
           8, 2, 256, 1, kDownTmemColumnsPerTask,
           0, kDownScratchBytes, 0, false, false>(
           smem_base, tmem_base_ptr, nullptr, tma_descs,
-        first_metadata, bars, m2c, c2m
+        first_metadata, bars, m2c, c2m, -1
 #if defined(DAE_TRACK_MXFP_TIMELINE)
         , worker, profile
 #endif
@@ -139,7 +139,7 @@ void dae_ffn_down_direct_kernel(
             kDownScratchBytes, 2 * kDownScratchBytes, 128, false, false>(
             smem_base, tmem_base_ptr + kDownTmemColumnsPerTask,
             nullptr, tma_descs,
-          second_metadata, bars, m2c, c2m
+          second_metadata, bars, m2c, c2m, -1
 #if defined(DAE_TRACK_MXFP_TIMELINE)
           , worker, profile
 #endif

@@ -25,9 +25,11 @@ static __device__ __forceinline__ void * align_to(void *ptr, size_t align) {
   return (void*)aligned;
 }
 
-// TODO(zhiyuang): decide this maxnreg size.
-// Also with setnreg for computation and memory separately?
-static __global__
+// Keep the generic megakernel below the top register-allocation bucket. The
+// resident FFN image schedules at 244 registers under this 248-register cap
+// with no spills. Dynamic setmaxnreg would add a warpgroup rendezvous without
+// increasing occupancy because this runtime intentionally keeps one CTA/SM.
+static __global__ __maxnreg__(248)
 void dae2(
   const CInst* __restrict__ compute_instructions,
   const MInst* __restrict__ memory_instructions,
@@ -136,33 +138,7 @@ void dae2(
   if (thread_id / numThreadsPerWarp == 0) {
     tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
   }
-  if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
-    // The focused resident image has only a small, fixed barrier bank. Let
-    // independent lanes initialize it while warp 0 acquires TMEM instead of
-    // serializing every mbarrier.init behind the allocation on lane 0.
-    if (thread_id < tmemMmaBarrierCount) {
-      cute::initialize_barrier(tmem_mma_barriers[thread_id], 1);
-      const bool begins_empty =
-          (thread_id >= mxfp4Mxfp8TmaScaleBarrierBase &&
-           thread_id < mxfp4Mxfp8TmaScaleBarrierBase +
-               mxfp4Mxfp8TmaScaleBarrierCount) ||
-          (mxfpGateUpLduWeightRingEnabled &&
-           thread_id >= mxfpLduWeightRingEmptyBarrierBase &&
-           thread_id < mxfpLduWeightRingEmptyBarrierBase +
-               mxfpLduWeightRingStages) ||
-          (mxfpDownLduWeightRingEnabled &&
-           thread_id >= mxfpDownLduWeightRingEmptyBarrierBase &&
-           thread_id < mxfpDownLduWeightRingEmptyBarrierBase +
-               mxfpDownLduWeightRingStages);
-      if (begins_empty) {
-        cuda::ptx::mbarrier_arrive(
-            cuda::ptx::sem_release,
-            cuda::ptx::scope_cta,
-            cuda::ptx::space_shared,
-            tmem_mma_barriers + thread_id);
-      }
-    }
-  } else if (thread_id == 0) {
+  if (thread_id == 0) {
     #pragma unroll
     for (int i = 0; i < tmemMmaBarrierCount; ++i) {
       cute::initialize_barrier(tmem_mma_barriers[i], 1);
@@ -264,30 +240,23 @@ void dae2(
 
     // TODO(zhiyuang): change this to threadIdx.x predicates. will be faster than lane_id based?
     if (warp_id == 0) {
-      if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
-        allocwarp_execute_mxfp_resident_ffn_fast(
-          lane_id, m2ld, minsts, st_insts, bars, tmem_mma_barriers
+      allocwarp_execute(
+        lane_id,
+        m2c, m2ld, minsts, &slot_avail,
+        st_insts, smem_base, tma_descs, bars,
+        &ldu_control_publish_barrier,
+        initial_loop_counts,
+        tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
-          , sm_id, g_events
+        , sm_id, g_events
 #endif
-        );
-      } else {
-        allocwarp_execute(
-          lane_id,
-          m2c, m2ld, minsts, &slot_avail,
-          st_insts, smem_base, tma_descs, bars,
-          &ldu_control_publish_barrier,
-          initial_loop_counts
-#if defined(DAE_TRACK_PROFILE)
-          , sm_id, g_events
-#endif
-        );
-      }
+      );
     } else if (warp_id == 1) {
       if (lane_id == 0) {
-        if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
-          stwarp_execute_terminate_only(
-            c2m
+        if constexpr (mxfpResidentDownStuReductionEnabled) {
+          stwarp_execute_mxfp_resident_down_reduction(
+            c2m, minsts, smem_base, tma_descs, bars,
+            tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
             , sm_id, g_events
 #endif
@@ -304,35 +273,7 @@ void dae2(
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
       int port_id = warp_id - 2;
-      if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
-        if (port_id == 0 && lane_id == 0) {
-          ldwarp_execute_mxfp_resident_ffn_fast(
-            m2ld[port_id], st_insts, smem_base, tma_descs, bars,
-            tmem_mma_barriers, port_id
-#if defined(DAE_TRACK_PROFILE)
-            , sm_id, g_events
-#endif
-          );
-        } else if (port_id == 1) {
-          if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
-            ldwarp_execute_mxfp_resident_ffn_zero_fast(
-              lane_id, m2ld[port_id], st_insts, smem_base, bars,
-              tmem_mma_barriers
-#if defined(DAE_TRACK_PROFILE)
-              , sm_id, g_events
-#endif
-            );
-          } else if (lane_id == 0) {
-            ldwarp_execute_mxfp_resident_ffn_fast(
-              m2ld[port_id], st_insts, smem_base, tma_descs, bars,
-              tmem_mma_barriers, port_id
-#if defined(DAE_TRACK_PROFILE)
-              , sm_id, g_events
-#endif
-            );
-          }
-        }
-      } else if (lane_id == 0) {
+      if (lane_id == 0) {
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
