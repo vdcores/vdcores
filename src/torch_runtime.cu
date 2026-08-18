@@ -1090,6 +1090,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfpResidentFfnFastMemoryDispatchEnabled;
   config.attr("mxfp_resident_down_ldu1_zero") =
       mxfpResidentDownLdu1ZeroEnabled;
+  config.attr("mxfp_resident_down_split_ldu") =
+      mxfpResidentDownSplitLduEnabled;
   config.attr("mxfp_gate_up_direct_activation_tiles") =
       mxfpGateUpDirectActivationTiles;
   config.attr("mxfp_gate_up_fixed_output_rows") =

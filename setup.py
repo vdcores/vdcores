@@ -156,6 +156,11 @@ if os.environ.get("DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO"):
         "-DDAE_MXFP_RESIDENT_DOWN_LDU1_ZERO="
         + os.environ["DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO"]
     )
+if os.environ.get("DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU"):
+    cuda_defines.append(
+        "-DDAE_MXFP_RESIDENT_DOWN_SPLIT_LDU="
+        + os.environ["DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU"]
+    )
 if os.environ.get("DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES"):
     cuda_defines.append(
         "-DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES="

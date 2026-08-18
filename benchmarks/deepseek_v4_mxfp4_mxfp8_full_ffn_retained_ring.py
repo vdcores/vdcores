@@ -218,6 +218,29 @@ def report_sm_timeline(
             flush=True,
         )
 
+    # Down traverses K in Linear-1 record order, two records per K256 tile.
+    # Group producer finishes by record index so a persistently late pair is
+    # visible independently of the expert and physical worker placement.
+    for local_slice in range(slices_per_expert):
+        workers = range(local_slice, values.shape[0], slices_per_expert)
+        local_samples = [
+            (int(values[worker, 4]) - int(values[worker, 2])) / 1.0e3
+            for worker in workers
+        ]
+        finish_samples = [
+            (int(values[worker, 4]) - origin) / 1.0e3
+            for worker in workers
+        ]
+        print(
+            "DSV4_MXFP4_MXFP8_LINEAR1_RECORD_FINISH "
+            f"record={local_slice} samples={len(local_samples)} "
+            f"local_median_us={statistics.median(local_samples):.6f} "
+            f"local_max_us={max(local_samples):.6f} "
+            f"finish_median_us={statistics.median(finish_samples):.6f} "
+            f"finish_max_us={max(finish_samples):.6f}",
+            flush=True,
+        )
+
     for worker, linear1_local, down_local, task_local, finish in sorted(
         rows, key=lambda row: row[3], reverse=True
     )[:16]:
@@ -231,6 +254,74 @@ def report_sm_timeline(
             f"finish_us={finish:.6f}",
             flush=True,
         )
+
+
+def down_task_timeline_samples(
+    values, base: int
+) -> list[list[float]]:
+    samples = []
+    for worker in range(values.shape[0]):
+        entry = int(values[worker, base])
+        end = int(values[worker, base + 14])
+        if entry <= 0 or end < entry:
+            continue
+        samples.append(
+            [
+                (int(values[worker, event]) - entry) / 1.0e3
+                for event in range(base, base + 15)
+            ]
+        )
+    return samples
+
+
+def report_down_task_timeline(profile: torch.Tensor) -> None:
+    values = profile.cpu().numpy()
+    first_samples = down_task_timeline_samples(values, 35)
+    second_samples = down_task_timeline_samples(values, 20)
+    if not first_samples or not second_samples:
+        raise RuntimeError("Down timeline events were not populated")
+
+    labels = [
+        "entry",
+        "compute_start",
+        *[f"umma_issue_{tile}" for tile in range(8)],
+        "umma_complete",
+        "output_smem_ready",
+        "reduction_ready",
+        "reduce_complete",
+        "task_end",
+    ]
+    for task_name, samples in (
+        ("first", first_samples),
+        ("second", second_samples),
+    ):
+        medians = [
+            statistics.median(sample[index] for sample in samples)
+            for index in range(len(labels))
+        ]
+        p95s = [
+            percentile_us([sample[index] for sample in samples], 0.95)
+            for index in range(len(labels))
+        ]
+        print(
+            "DSV4_MXFP4_MXFP8_DOWN_TIMELINE "
+            f"task={task_name} workers={len(samples)} "
+            + " ".join(
+                f"{label}_median_us={median:.6f} {label}_p95_us={p95:.6f}"
+                for label, median, p95 in zip(labels, medians, p95s)
+            ),
+            flush=True,
+        )
+    handoff = [
+        (int(values[worker, 20]) - int(values[worker, 49])) / 1.0e3
+        for worker in range(values.shape[0])
+    ]
+    print(
+        "DSV4_MXFP4_MXFP8_DOWN_TASK_HANDOFF "
+        f"median_us={statistics.median(handoff):.6f} "
+        f"p95_us={percentile_us(handoff, 0.95):.6f}",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -259,6 +350,11 @@ def main() -> None:
         "--report-sm-timeline",
         action="store_true",
         help="report producer-group summaries and the 16 slowest workers",
+    )
+    parser.add_argument(
+        "--report-down-task-timeline",
+        action="store_true",
+        help="report diagnostic second-Down-task stage timestamps",
     )
     parser.add_argument(
         "--ring-handoff",
@@ -316,6 +412,9 @@ def main() -> None:
     )
     resident_down_pair_zero = bool(
         runtime.config.mxfp_resident_down_pair_zero
+    )
+    resident_down_split_ldu = bool(
+        runtime.config.mxfp_resident_down_split_ldu
     )
     fast_memory_dispatch = bool(
         runtime.config.mxfp_resident_ffn_fast_memory_dispatch
@@ -673,12 +772,13 @@ def main() -> None:
             atol=1e-1 if reduction_bf16 else 1e-3,
         )
     profile = launcher.profile
-    linear1_finish = relative_finish_us(profile, 2, 4)
+    linear1_profile = profile[:linear1_tasks]
+    linear1_finish = relative_finish_us(linear1_profile, 2, 4)
     down_finish = relative_finish_us(profile, 2, 5)
-    linear1_local = local_duration_us(profile, 2, 4)
+    linear1_local = local_duration_us(linear1_profile, 2, 4)
     down_local = local_duration_us(profile, 4, 5)
     task_local = local_duration_us(profile, 2, 3)
-    linear1_tail = local_tail_us(profile, 2, 4)
+    linear1_tail = local_tail_us(linear1_profile, 2, 4)
     down_tail = local_tail_us(profile, 4, 5)
     if bool(checked_outputs.any()):
         error = (
@@ -696,19 +796,28 @@ def main() -> None:
     report_track_counters(profile)
     if args.report_sm_timeline:
         report_sm_timeline(profile, down_schedule)
+    if args.report_down_task_timeline:
+        report_down_task_timeline(profile)
     profile_values = profile.cpu().numpy()
     linear1_samples = [
         (int(end) - int(begin)) / 1.0e3
-        for begin, end in zip(profile_values[:, 2], profile_values[:, 4])
+        for begin, end in zip(
+            profile_values[:linear1_tasks, 2],
+            profile_values[:linear1_tasks, 4],
+        )
     ]
     exposed_linear1 = [
         value
-        for value, queue in zip(linear1_samples, down_schedule.task_queues)
+        for value, queue in zip(
+            linear1_samples, down_schedule.task_queues[:linear1_tasks]
+        )
         if queue
     ]
     unexposed_linear1 = [
         value
-        for value, queue in zip(linear1_samples, down_schedule.task_queues)
+        for value, queue in zip(
+            linear1_samples, down_schedule.task_queues[:linear1_tasks]
+        )
         if not queue
     ]
 
@@ -773,6 +882,7 @@ def main() -> None:
         f"down_bf16_reduction={str(reduction_bf16).lower()} "
         f"overlap_down_prefetch={str(overlap_down_prefetch).lower()} "
         f"resident_down_pair_zero={str(resident_down_pair_zero).lower()} "
+        f"resident_down_split_ldu={str(resident_down_split_ldu).lower()} "
         f"fast_memory_dispatch={str(fast_memory_dispatch).lower()} "
         f"ldu1_zero={str(ldu1_zero).lower()} "
         f"ring_handoff={str(args.ring_handoff).lower()} "
@@ -786,11 +896,11 @@ def main() -> None:
         f"{str(down_weight_scale_separate_barrier).lower()} "
         f"down_input={'prebuilt' if args.prebuilt_down_input else 'linear1'} "
         f"allocator_slots={runtime.config.num_slots} "
-        f"linear1_span_us={span_us(profile, 2, 4):.6f} "
+        f"linear1_span_us={span_us(linear1_profile, 2, 4):.6f} "
         f"down_span_us={span_us(profile, 4, 5):.6f} "
         f"task_span_us={span_us(profile, 2, 3):.6f} "
         f"kernel_us={span_us(profile, 0, 1):.6f} "
-        f"linear1_start_skew_us={event_skew_us(profile, 2):.6f} "
+        f"linear1_start_skew_us={event_skew_us(linear1_profile, 2):.6f} "
         f"linear1_local_min_us={linear1_local[0]:.6f} "
         f"linear1_local_median_us={linear1_local[1]:.6f} "
         f"linear1_local_stddev_us={linear1_tail[0]:.6f} "

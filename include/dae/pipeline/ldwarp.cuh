@@ -382,6 +382,7 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_linear1(
 #endif
 
 #if DAE_MXFP_DOWN_LDU_WEIGHT_RING
+template<bool ProduceActivation = true>
 __device__ __noinline__ void ldu_execute_mxfp_resident_down(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
     int *bars, uint64_t *tmem_mma_barriers) {
@@ -434,20 +435,22 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down(
     cache_policy = ldu_mxfp_streaming_cache_policy();
   }
 
-  if (!blockwise_ready && ready_bar != 0xFFFFFFFFU) {
-    volatile int *ready = bars + ready_bar;
-    bool pending = true;
-    while (pending) {
-      pending = false;
-      #pragma unroll
-      for (int record = 0; record < 16; ++record) {
-        pending |= ready[record * ready_bar_stride] != 0;
+  if constexpr (ProduceActivation) {
+    if (!blockwise_ready && ready_bar != 0xFFFFFFFFU) {
+      volatile int *ready = bars + ready_bar;
+      bool pending = true;
+      while (pending) {
+        pending = false;
+        #pragma unroll
+        for (int record = 0; record < 16; ++record) {
+          pending |= ready[record * ready_bar_stride] != 0;
+        }
+        if (pending) {
+          __nanosleep(256);
+        }
       }
-      if (pending) {
-        __nanosleep(256);
-      }
+      asm volatile("fence.acquire.gpu;" ::: "memory");
     }
-    asm volatile("fence.acquire.gpu;" ::: "memory");
   }
 
   #pragma unroll
@@ -482,6 +485,120 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down(
             int(k_start_tile) + tile + 1, output_task, cache_policy);
       }
     }
+
+    if constexpr (ProduceActivation) {
+      if (blockwise_ready && ready_bar != 0xFFFFFFFFU) {
+        volatile int *ready = bars + ready_bar;
+        bool pending = true;
+        while (pending) {
+          pending = false;
+          #pragma unroll
+          for (int subtile = 0; subtile < kK128PerTile; ++subtile) {
+            const int record =
+                (int(k_start_tile) + tile) * kK128PerTile + subtile;
+            pending |= ready[record * ready_bar_stride] != 0;
+          }
+          if (pending) {
+            __nanosleep(256);
+          }
+        }
+        asm volatile("fence.acquire.gpu;" ::: "memory");
+      }
+
+      #pragma unroll
+      for (int subtile = 0; subtile < kK128PerTile; ++subtile) {
+        const int record_index =
+            (int(k_start_tile) + tile) * kK128PerTile + subtile;
+        const auto *record = activation_records_global +
+            record_index * kActivationRecordBytes;
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_shared,
+            cuda::ptx::space_global,
+            activation_ring + stage *
+                dae_mxfp_resident_ffn::kDownActivationStageBytes +
+                subtile * kActivationDataBytes,
+            record,
+            uint32_t(kActivationDataBytes),
+            reinterpret_cast<uint64_t *>(operand_full + stage));
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_shared,
+            cuda::ptx::space_global,
+            scale_ring + stage *
+                dae_mxfp_resident_ffn::kDownScaleStageBytes +
+                kWeightScaleBytes + subtile * kActivationScaleBytes,
+            record + kActivationDataBytes,
+            uint32_t(kActivationScaleBytes),
+            reinterpret_cast<uint64_t *>(operand_full + stage));
+      }
+      operand_full[stage].arrive_and_expect_tx(
+          kK128PerTile * (kActivationDataBytes + kActivationScaleBytes));
+    }
+  }
+
+  #pragma unroll
+  for (int stage = 0; stage < kStages; ++stage) {
+    stage_empty[stage].wait(empty_phase[stage]);
+  }
+}
+
+__device__ __noinline__ void ldu_execute_mxfp_resident_down_activation(
+    const MInst inst, const void *smem_base, int *bars,
+    uint64_t *tmem_mma_barriers) {
+  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+  constexpr int kStages = dae_mxfp_resident_ffn::kDownStages;
+  constexpr int kTiles = 8;
+  constexpr int kK128PerTile = 2;
+  constexpr int kWeightScaleBytes = 1024;
+  constexpr int kActivationRecordBytes = 1536;
+  constexpr int kActivationDataBytes = 1024;
+  constexpr int kActivationScaleBytes = 512;
+
+  const auto *metadata = reinterpret_cast<const uint8_t *>(inst.address);
+  const auto *activation_records_global = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 8)));
+  const uint64_t barrier_info = load_l2_u64(
+      reinterpret_cast<const uint64_t *>(metadata + 32));
+  const uint32_t ready_bar = uint32_t(barrier_info);
+  const uint32_t k_start_tile = uint32_t(load_l2(
+      reinterpret_cast<const int *>(metadata + 64)));
+  const uint32_t resident_flags = uint32_t(load_l2(
+      reinterpret_cast<const int *>(metadata + 68)));
+  const int ready_bar_stride = (resident_flags & 2U) != 0 ? 8 : 1;
+  const bool blockwise_ready = (resident_flags & 4U) != 0;
+
+  auto *resident_base = reinterpret_cast<uint8_t *>(
+      const_cast<void *>(smem_base));
+  auto *scale_ring = resident_base +
+      dae_mxfp_resident_ffn::kDownScaleRingOffset;
+  auto *activation_ring = resident_base +
+      dae_mxfp_resident_ffn::kDownActivationRingOffset;
+  auto *operand_full = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownResidentOperandFullBarrierBase);
+  auto *stage_empty = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+  uint32_t empty_phase[kStages] = {};
+
+  if (!blockwise_ready && ready_bar != 0xFFFFFFFFU) {
+    volatile int *ready = bars + ready_bar;
+    bool pending = true;
+    while (pending) {
+      pending = false;
+      #pragma unroll
+      for (int record = 0; record < 16; ++record) {
+        pending |= ready[record * ready_bar_stride] != 0;
+      }
+      if (pending) {
+        __nanosleep(256);
+      }
+    }
+    asm volatile("fence.acquire.gpu;" ::: "memory");
+  }
+
+  #pragma unroll
+  for (int tile = 0; tile < kTiles; ++tile) {
+    const int stage = tile % kStages;
+    stage_empty[stage].wait(empty_phase[stage]);
+    empty_phase[stage] ^= 1U;
 
     if (blockwise_ready && ready_bar != 0xFFFFFFFFU) {
       volatile int *ready = bars + ready_bar;
@@ -565,11 +682,19 @@ ldwarp_execute_mxfp_resident_ffn_fast(
           tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
       poll_start->arrive();
     }
+    if constexpr (mxfpResidentDownSplitLduEnabled) {
+      // Down weight/SFA occupies [0,64 KiB), exactly Linear-1 stage 0.
+      // The final issue has already happened; this memory-side last-use wait
+      // transfers only that half while LDU1 independently takes stage 1.
+      auto *linear1_empty = reinterpret_cast<TxBarrier *>(
+          tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+      linear1_empty[0].wait(0);
+    }
     const int down_task_count = load_l2(
         reinterpret_cast<const int *>(plan + 3));
     for (int task = 0; task < down_task_count; ++task) {
       task_inst.address = load_l2_u64(plan + 1 + task);
-      ldu_execute_mxfp_resident_down(
+      ldu_execute_mxfp_resident_down<!mxfpResidentDownSplitLduEnabled>(
           task_inst, smem_base, tma_descs, bars, tmem_mma_barriers);
     }
     // Consume the allocator-warp terminator through the same queue protocol.
@@ -595,8 +720,8 @@ ldwarp_execute_mxfp_resident_ffn_fast(
 template<typename M2LD_Type>
 __device__ __forceinline__ void
 ldwarp_execute_mxfp_resident_ffn_zero_fast(
-    const int lane_id, M2LD_Type &m2ld, MInst *st_insts, int *bars,
-    uint64_t *tmem_mma_barriers
+    const int lane_id, M2LD_Type &m2ld, MInst *st_insts,
+    const void *smem_base, int *bars, uint64_t *tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
 #endif
@@ -694,15 +819,31 @@ ldwarp_execute_mxfp_resident_ffn_zero_fast(
     auto *poll_start = reinterpret_cast<TxBarrier *>(
         tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
     poll_start->wait(0);
-    const uint32_t task_bars[2] = {reduce_bar, second_reduce_bar};
-    #pragma unroll
-    for (int task = 0; task < 2; ++task) {
-      cuda::atomic_ref<int, cuda::thread_scope_device> ready(
-          bars[task_bars[task]]);
-      while (ready.load(cuda::memory_order_acquire) != 0) {
-        __nanosleep(128);
+    if constexpr (mxfpResidentDownSplitLduEnabled) {
+      // Down scale/activation occupies [64,72 KiB), inside Linear-1 stage 1.
+      // Wait on that stage's final empty phase before its first overwrite.
+      auto *linear1_empty = reinterpret_cast<TxBarrier *>(
+          tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+      linear1_empty[1].wait(0);
+      const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+      MInst task_inst {};
+      #pragma unroll
+      for (int task = 0; task < 2; ++task) {
+        task_inst.address = load_l2_u64(plan + 1 + task);
+        ldu_execute_mxfp_resident_down_activation(
+            task_inst, smem_base, bars, tmem_mma_barriers);
       }
-      reduction_ready[task].arrive();
+    } else {
+      const uint32_t task_bars[2] = {reduce_bar, second_reduce_bar};
+      #pragma unroll
+      for (int task = 0; task < 2; ++task) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> ready(
+            bars[task_bars[task]]);
+        while (ready.load(cuda::memory_order_acquire) != 0) {
+          __nanosleep(128);
+        }
+        reduction_ready[task].arrive();
+      }
     }
   }
 

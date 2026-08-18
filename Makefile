@@ -188,6 +188,11 @@ ifneq ($(mxfp_resident_down_ldu1_zero),)
 	export DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO := $(mxfp_resident_down_ldu1_zero)
 endif
 
+ifneq ($(mxfp_resident_down_split_ldu),)
+	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_DOWN_SPLIT_LDU=$(mxfp_resident_down_split_ldu)
+	export DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU := $(mxfp_resident_down_split_ldu)
+endif
+
 ifneq ($(mxfp_gate_up_direct_activation_tiles),)
 	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES=$(mxfp_gate_up_direct_activation_tiles)
 	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES := $(mxfp_gate_up_direct_activation_tiles)

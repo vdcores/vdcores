@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda/atomic>
+
 #include "virtualcore.cuh"
 
 static __device__ __forceinline__ void prefetch_inst_window(
@@ -21,7 +23,7 @@ template<typename M2LD_Type>
 __device__ __forceinline__ void
 allocwarp_execute_mxfp_resident_ffn_fast(
     const int lane_id, M2LD_Type m2ld[2], const MInst *minsts,
-    MInst *st_insts
+    MInst *st_insts, int *bars, uint64_t *tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
     , const int sm_id, uint64_t *g_events
 #endif
@@ -50,6 +52,34 @@ allocwarp_execute_mxfp_resident_ffn_fast(
     }
     m2ld[0].push(SLOT_END);
     m2ld[1].push(SLOT_END);
+
+    if constexpr (mxfpResidentDownSplitLduEnabled) {
+      using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+      // This warp has finished its only queued dispatch. Pause it until LDU0
+      // has issued the complete Linear-1 stream, then make it the dedicated
+      // observer for the two global reduction dependencies. LDU0 and LDU1
+      // remain free to produce Down weight/SFA and activation/SFB.
+      auto *poll_start = reinterpret_cast<TxBarrier *>(
+          tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+      auto *reduction_ready = reinterpret_cast<TxBarrier *>(
+          tmem_mma_barriers +
+          mxfpDownResidentReductionReadyBarrierBase);
+      poll_start->wait(0);
+      const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
+      #pragma unroll
+      for (int task = 0; task < 2; ++task) {
+        const auto *metadata = reinterpret_cast<const uint8_t *>(
+            load_l2_u64(plan + 1 + task));
+        const uint32_t task_bar = uint32_t(load_l2_u64(
+            reinterpret_cast<const uint64_t *>(metadata + 32)) >> 32);
+        cuda::atomic_ref<int, cuda::thread_scope_device> ready(
+            bars[task_bar]);
+        while (ready.load(cuda::memory_order_acquire) != 0) {
+          __nanosleep(128);
+        }
+        reduction_ready[task].arrive();
+      }
+    }
 
 #if defined(DAE_TRACK_PROFILE)
     const int event_base = sm_id * numProfileEvents;

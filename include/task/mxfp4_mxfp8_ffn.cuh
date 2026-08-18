@@ -185,8 +185,9 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   auto *profile_events = g_events + sm_id * numProfileEvents;
   const bool track_down_tail = true;
+  const int timeline_base = output_m_tile < kDownTilesPerExpert / 2 ? 35 : 20;
   if (tid == 0 && track_down_tail) {
-    profile_events[5] = cuda::ptx::get_sreg_globaltimer();
+    profile_events[timeline_base + 0] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 
@@ -225,7 +226,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   __sync_barrier<SyncBarrierId, 128>();
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
-    profile_events[6] = cuda::ptx::get_sreg_globaltimer();
+    profile_events[timeline_base + 1] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 
@@ -578,7 +579,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
           reinterpret_cast<uint64_t *>(umma_full + stage));
 #if defined(DAE_TRACK_MXFP_TIMELINE)
       if (lane == 0 && track_down_tail) {
-        profile_events[7 + tile] = cuda::ptx::get_sreg_globaltimer();
+        profile_events[timeline_base + 2 + tile] =
+            cuda::ptx::get_sreg_globaltimer();
       }
 #endif
     }
@@ -597,7 +599,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
-    profile_events[11] = cuda::ptx::get_sreg_globaltimer();
+    profile_events[timeline_base + 10] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 
@@ -628,7 +630,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   __sync_barrier<SyncBarrierId, 128>();
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
-    profile_events[12] = cuda::ptx::get_sreg_globaltimer();
+    profile_events[timeline_base + 11] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 
@@ -651,7 +653,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   }
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
-    profile_events[13] = cuda::ptx::get_sreg_globaltimer();
+    profile_events[timeline_base + 12] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 
@@ -691,13 +693,12 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   __sync_barrier<SyncBarrierId, 128>();
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
-    profile_events[14] = cuda::ptx::get_sreg_globaltimer();
-    profile_events[15] = profile_events[14];
+    profile_events[timeline_base + 13] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 #if defined(DAE_TRACK_MXFP_TIMELINE)
   if (tid == 0 && track_down_tail) {
-    profile_events[16] = cuda::ptx::get_sreg_globaltimer();
+    profile_events[timeline_base + 14] = cuda::ptx::get_sreg_globaltimer();
   }
 #endif
 }

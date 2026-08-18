@@ -240,7 +240,7 @@ void dae2(
     if (warp_id == 0) {
       if constexpr (mxfpResidentFfnFastMemoryDispatchEnabled) {
         allocwarp_execute_mxfp_resident_ffn_fast(
-          lane_id, m2ld, minsts, st_insts
+          lane_id, m2ld, minsts, st_insts, bars, tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
           , sm_id, g_events
 #endif
@@ -290,7 +290,8 @@ void dae2(
         } else if (port_id == 1) {
           if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
             ldwarp_execute_mxfp_resident_ffn_zero_fast(
-              lane_id, m2ld[port_id], st_insts, bars, tmem_mma_barriers
+              lane_id, m2ld[port_id], st_insts, smem_base, bars,
+              tmem_mma_barriers
 #if defined(DAE_TRACK_PROFILE)
               , sm_id, g_events
 #endif

@@ -174,6 +174,17 @@ static_assert(
         (mxfpResidentFfnFastMemoryDispatchEnabled &&
          mxfpResidentDownPairZeroEnabled),
     "resident LDU1 zeroing requires fast dispatch and paired destinations");
+#ifndef DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU
+#define DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU 0
+#endif
+// In the focused full-FFN image, LDU0 can produce Down weight/SFA while the
+// already-paused LDU1 independently waits for and produces activation/SFB.
+static constexpr bool mxfpResidentDownSplitLduEnabled =
+    DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU != 0;
+static_assert(
+    !mxfpResidentDownSplitLduEnabled ||
+        mxfpResidentDownLdu1ZeroEnabled,
+    "resident split-LDU Down requires the paused LDU1 protocol");
 #ifndef DAE_MXFP_GATE_UP_LDU_WEIGHT_RING
 #define DAE_MXFP_GATE_UP_LDU_WEIGHT_RING 1
 #endif
