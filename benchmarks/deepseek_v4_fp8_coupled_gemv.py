@@ -41,6 +41,14 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--validate-router", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument(
+        "--kernel-envelope-only",
+        action="store_true",
+        help=(
+            "measure with the runtime's built-in device start/end counters "
+            "without selecting the diagnostic profile compute operator"
+        ),
+    )
     args = parser.parse_args()
     if args.m <= 0 or args.k <= 0 or args.m % 256 or args.k % 256:
         parser.error("coupled MXFP8 requires positive M256/K256 shapes")
@@ -109,14 +117,15 @@ def main() -> None:
         (args.batch, k_tiles, 2048), dtype=torch.uint8, device=device
     )
     quant_launcher = Launcher(k_tiles // 2, device=device)
-    quant_items = [ProfileEvent(2)]
+    quant_items = [] if args.kernel_envelope_only else [ProfileEvent(2)]
     for batch in range(args.batch):
         quant_items.append(
             SchedDsv4Fp8QuantUmmaB(
                 input_source[batch], packed_activation[batch], 2
             ).place(k_tiles // 2)
         )
-    quant_items.append(ProfileEvent(3))
+    if not args.kernel_envelope_only:
+        quant_items.append(ProfileEvent(3))
     quant_launcher.s(*quant_items)
 
     launcher = Launcher(num_sms, device=device)
@@ -148,7 +157,10 @@ def main() -> None:
         balanced_k=args.balanced_k,
     )
     placed_schedule = schedule.place(num_sms)
-    launcher.s(ProfileEvent(2), placed_schedule, ProfileEvent(3))
+    if args.kernel_envelope_only:
+        launcher.s(placed_schedule)
+    else:
+        launcher.s(ProfileEvent(2), placed_schedule, ProfileEvent(3))
 
     quant_launcher.launch()
     torch.cuda.synchronize(device)
@@ -178,6 +190,7 @@ def main() -> None:
         accumulator.zero_()
     launcher.launch()
     torch.cuda.synchronize(device)
+    cold_device_us = profile_span_us(launcher, 0, 1)
 
     weight_dequant = dequantize_fp8_block128(
         weight, weight_scale
@@ -251,12 +264,23 @@ def main() -> None:
     kernel_timings = []
     for _ in range(args.iterations):
         quant_launcher.launch()
-        quant_timings.append(profile_span_us(quant_launcher, 2, 3))
+        quant_timings.append(
+            profile_span_us(
+                quant_launcher,
+                0 if args.kernel_envelope_only else 2,
+                1 if args.kernel_envelope_only else 3,
+            )
+        )
         if accumulator is not None:
             accumulator.zero_()
         launcher.launch()
-        task_timings.append(profile_span_us(launcher, 2, 3))
-        kernel_timings.append(profile_span_us(launcher, 0, 1))
+        kernel_time = profile_span_us(launcher, 0, 1)
+        kernel_timings.append(kernel_time)
+        task_timings.append(
+            kernel_time
+            if args.kernel_envelope_only
+            else profile_span_us(launcher, 2, 3)
+        )
 
     max_abs = (result.float() - expected.float()).abs().max().item()
     print(
@@ -268,11 +292,39 @@ def main() -> None:
         f"task_min_us={min(task_timings):.6f} "
         f"task_median_us={statistics.median(task_timings):.6f} "
         f"task_max_us={max(task_timings):.6f} "
+        f"cold_device_us={cold_device_us:.6f} "
         f"kernel_median_us={statistics.median(kernel_timings):.6f} "
+        f"timing_scope={'kernel_envelope' if args.kernel_envelope_only else 'profile_markers'} "
         f"max_abs={max_abs:.6f} prepack=python_setup",
         flush=True,
     )
-
-
+    if args.diagnostic:
+        tracked = launcher.profile[:num_sms].cpu()
+        magic = 0x4454524B50524631
+        if all(int(value) == magic for value in tracked[:, 127]):
+            fields = {
+                "compute_m2c_wait": 96,
+                "alloc_slot_stall": 99,
+                "ldu0_queue_wait": 105,
+                "ldu0_dependency_wait": 107,
+                "ldu1_queue_wait": 110,
+                "ldu1_dependency_wait": 112,
+                "store_queue_wait": 115,
+                "store_service": 117,
+                "store_barrier_service": 118,
+            }
+            values = []
+            for label, event in fields.items():
+                samples = [int(value) / 1.0e3 for value in tracked[:, event]]
+                values.extend(
+                    (
+                        f"{label}_median_us={statistics.median(samples):.6f}",
+                        f"{label}_max_us={max(samples):.6f}",
+                    )
+                )
+            print(
+                "DSV4_FP8_COUPLED_RUNTIME_PROFILE " + " ".join(values),
+                flush=True,
+            )
 if __name__ == "__main__":
     main()

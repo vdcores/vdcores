@@ -135,6 +135,17 @@ __device__ __forceinline__ void allocwarp_execute(
     if (decoded_op == op(OP_ALLOC_LAYER_TMA_LOAD_4D) && lane_id == 0) {
       inst.coords[3] += indirect_layer_index;
     }
+    if (decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
+        (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+            dae_mxfp_resident_ffn::kCoupledFp8Gemv &&
+        (inst.size & dae_mxfp_resident_ffn::kCoupledLayerIndexedSize)) {
+      if (lane_id == 0) {
+        inst.address +=
+            uint64_t(indirect_layer_index) *
+            2 * sizeof(uint64_t);
+        inst.size &= dae_mxfp_resident_ffn::kCoupledStreamLengthMask;
+      }
+    }
 
     // A2. shift the arg field for group instructions (usually with tmas and bars)
     if (inst.opcode & MEM_OP_FLAGS_GROUP) {
@@ -222,15 +233,15 @@ __device__ __forceinline__ void allocwarp_execute(
       // TODO(zhiyuang): do we need this syncwarp here?
       // __syncwarp();
       if (lane_id == 0) {
+        const bool dual_port_coupled =
+            decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
+            (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+                dae_mxfp_resident_ffn::kCoupledFp8Gemv;
         st_insts[di.slot_alloc] = inst;
         m2c.put(alloc_mask);
 
         LdCmd ld;
         ld.init(di.slot_alloc, m2c.ptr, inst.opcode);
-        const bool dual_port_coupled =
-            decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
-            (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
-                dae_mxfp_resident_ffn::kCoupledFp8Gemv;
         const bool direct_writeback_publication =
             (inst.opcode & MEM_OP_FLAGS_WRITEBACK) != 0;
         if (dual_port_coupled || direct_writeback_publication) {

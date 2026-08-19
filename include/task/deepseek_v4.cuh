@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.cuh"
+#include "rms_norm.cuh"
 #include "type.cuh"
 #include "virtualcore.cuh"
 
@@ -248,16 +249,17 @@ __device__ __forceinline__ void task_dsv4_preload_rope_tables(
 // Apply the DeepSeek partial rotary embedding to the final 64 dimensions of
 // each attention (512-wide) or indexer (128-wide) row.  The table is float32
 // [32, 2] in (cos, sin) order.
-template <int kHeadDim, typename M2CQueue, typename C2MQueue>
+template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_rope_64(
     int rows,
+    int head_dim,
     bool inverse,
     int fixed_table_selector,
     void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kRopeDim = 64;
-  constexpr int kRopeStart = kHeadDim - kRopeDim;
+  const int rope_start = head_dim - kRopeDim;
 
   const int input_slots = m2c.template pop<0>();
   const int input_slot = extract(input_slots);
@@ -285,7 +287,7 @@ __device__ __forceinline__ void task_dsv4_rope_64(
   for (int item = tid; item < rows * kPairsPerRow; item += 128) {
     const int row = item / kPairsPerRow;
     const int pair = item % kPairsPerRow;
-    const int offset = row * kHeadDim + kRopeStart + pair * 2;
+    const int offset = row * head_dim + rope_start + pair * 2;
     const float even = __bfloat162float(input[offset]);
     const float odd = __bfloat162float(input[offset + 1]);
     const float cosine = table[pair * 2];
@@ -298,10 +300,10 @@ __device__ __forceinline__ void task_dsv4_rope_64(
   }
 
   // Preserve the non-rotary dimensions when input and output do not alias.
-  for (int item = tid; item < rows * kRopeStart; item += 128) {
-    const int row = item / kRopeStart;
-    const int dim = item % kRopeStart;
-    output[row * kHeadDim + dim] = input[row * kHeadDim + dim];
+  for (int item = tid; item < rows * rope_start; item += 128) {
+    const int row = item / rope_start;
+    const int dim = item % rope_start;
+    output[row * head_dim + dim] = input[row * head_dim + dim];
   }
 
   __sync_compute_group(128);
@@ -2016,9 +2018,10 @@ __device__ __forceinline__ void task_dsv4_topk512(
 
 // Final/MTP hyper-connection head: normalize the four raw projection values,
 // form sigmoid pre coefficients, and reduce [4,4096] to one hidden vector.
-template <typename M2CQueue, typename C2MQueue>
+template <bool FuseRms, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hc_head(
     float epsilon,
+    __nv_bfloat16 rms_epsilon,
     void *smem_base,
     void *task_scratch,
     M2CQueue &m2c,
@@ -2042,6 +2045,13 @@ __device__ __forceinline__ void task_dsv4_hc_head(
   const int base_slot = extract(base_slots);
   const auto *base = static_cast<const float *>(
       get_slot_address(smem_base, base_slot));
+  int rms_weight_slots = 0;
+  const __nv_bfloat16 *rms_weight = nullptr;
+  if constexpr (FuseRms) {
+    rms_weight_slots = m2c.template pop<0>();
+    rms_weight = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(rms_weight_slots)));
+  }
   const int output_slots = m2c.template pop<0>();
   const int output_slot = extract(output_slots);
   auto *output = static_cast<__nv_bfloat16 *>(
@@ -2094,6 +2104,12 @@ __device__ __forceinline__ void task_dsv4_hc_head(
 
   __sync_compute_group(128);
   c2m.push(tid, residual_slots | mixes_slots | scale_slots | base_slots);
+  if constexpr (FuseRms) {
+    _rms_helper_one_row<kHidden, 128>(
+        rms_weight, output, output, shared, rms_epsilon);
+    __sync_compute_group(128);
+    c2m.push(tid, rms_weight_slots);
+  }
   c2m.template push<31, true, false>(tid, output_slots);
 }
 

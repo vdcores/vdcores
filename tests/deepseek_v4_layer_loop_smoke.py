@@ -7,7 +7,7 @@ import torch
 
 from dae.instructions import (
     CounterOffsetMemoryInstruction,
-    Dsv4Rope128_64,
+    Dsv4Rope64,
     TmaLoad1D,
     TmaStore1D,
 )
@@ -32,7 +32,7 @@ class IdentityRope(Schedule):
         if sm != 0:
             return []
         return [
-            Dsv4Rope128_64(1, False),
+            Dsv4Rope64(1, 128, False),
             TmaLoad1D(self.source),
             TmaLoad1D(self.table),
             CounterOffsetMemoryInstruction(

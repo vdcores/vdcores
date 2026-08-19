@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from dae import runtime
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
     deepseek_v4_rope_table,
@@ -58,7 +59,7 @@ from dae.schedule import (
     SchedDsv4GatedPoolPacked8HistoryState,
     SchedDsv4GatedPoolTailRmsPartial,
     SchedDsv4Hadamard,
-    SchedDsv4HcHead,
+    SchedDsv4HcHeadRms,
     SchedDsv4HcPost,
     SchedDsv4HcPreRms,
     SchedDsv4IndexScore,
@@ -72,17 +73,14 @@ from dae.schedule import (
     SchedDsv4RouteTop6,
     SchedDsv4SparseAttention512,
     SchedDsv4ContiguousAttention512Block4,
-    SchedDsv4SwiGluShard128,
     SchedDsv4TopK512,
     SchedDsv4ZeroFill,
     SchedFp8Block128Gemv,
-    SchedFp8Block128GemvBf16,
-    SchedFp8GemvUmmaStream,
-    SchedFp8GemvUmmaSplitK,
+    SchedFp8Block128GateUpSwiGlu,
+    SchedFp8GemvUmmaCoupled,
     SchedRMS,
     SchedRoutedDsv4Nvfp4QuantUmmaB,
     SchedRoutedNvfp4GemvUmmaStream,
-    SchedSmemSiLUInterleaved,
 )
 from dae.sequential import (
     LoopedSequentialProgram,
@@ -743,11 +741,9 @@ class ResidentOneLaunchDecode:
             dtype=torch.bfloat16,
             device=d,
         )
-        self.shared_gate = torch.empty(
+        self.shared_middle = torch.empty(
             (cfg.expert_intermediate_size,), dtype=torch.bfloat16, device=d
         )
-        self.shared_up = torch.empty_like(self.shared_gate)
-        self.shared_middle = torch.empty_like(self.shared_gate)
         self.shared_middle_fp8 = torch.empty_like(
             self.shared_middle, dtype=torch.float8_e4m3fn
         )
@@ -933,49 +929,50 @@ class ResidentOneLaunchDecode:
             release_group=release_group,
         )
 
-    def _fp8_bf16_linear_stage(
+    def _fp8_gate_up_swiglu_stage(
         self,
         name: str,
         family: LayerFamily,
-        suffix: str,
+        gate_suffix: str,
+        up_suffix: str,
         activation: torch.Tensor,
+        activation_scale: torch.Tensor,
         output: torch.Tensor,
         *,
-        row_slice: slice | None = None,
         placement: tuple[int, int] | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
-        prefetch_before_wait: bool = False,
     ) -> Stage:
-        linears = tuple(
+        gate_linears = tuple(
             self.checkpoint.load_fp8_linear(
-                f"layers.{layer_id}.{suffix}", device=self.device
+                f"layers.{layer_id}.{gate_suffix}", device=self.device
             )
             for layer_id in family.layer_ids
         )
-        if row_slice is None:
-            weights = tuple(linear.weight for linear in linears)
-            scales = tuple(linear.scale for linear in linears)
-        else:
-            start = 0 if row_slice.start is None else row_slice.start
-            stop = (
-                linears[0].weight.shape[0]
-                if row_slice.stop is None
-                else row_slice.stop
+        up_linears = tuple(
+            self.checkpoint.load_fp8_linear(
+                f"layers.{layer_id}.{up_suffix}", device=self.device
             )
-            if start % 128 or stop % 128:
-                raise ValueError("fused FP8 family slices must be 128-row aligned")
-            weights = tuple(linear.weight[row_slice] for linear in linears)
-            scales = tuple(
-                linear.scale[start // 128 : stop // 128] for linear in linears
-            )
-        schedule = SchedFp8Block128GemvBf16(
-            weights[0],
-            scales[0],
-            activation.reshape(-1),
-            output.reshape(-1),
+            for layer_id in family.layer_ids
         )
-        schedule = self._layered(schedule, family, weights, scales)
+        schedule = SchedFp8Block128GateUpSwiGlu(
+            gate_linears[0].weight,
+            gate_linears[0].scale,
+            up_linears[0].weight,
+            up_linears[0].scale,
+            activation.reshape(-1),
+            activation_scale.reshape(-1),
+            output.reshape(-1),
+            swiglu_limit=self.config.swiglu_limit,
+        )
+        schedule = self._layered(
+            schedule,
+            family,
+            tuple(linear.weight for linear in gate_linears),
+            tuple(linear.scale for linear in gate_linears),
+            tuple(linear.weight for linear in up_linears),
+            tuple(linear.scale for linear in up_linears),
+        )
         assignment = self.policy.fp8_gemv(output.numel(), activation.numel())
         base_sm = None
         if placement is not None:
@@ -985,11 +982,9 @@ class ResidentOneLaunchDecode:
             name,
             schedule,
             assignment,
-            input_role="activation" if prefetch_before_wait else None,
             base_sm=base_sm,
             wait_group=wait_group,
             release_group=release_group,
-            prefetch_before_wait=prefetch_before_wait,
         )
 
     def _native_fp8_linear_stage(
@@ -1016,21 +1011,35 @@ class ResidentOneLaunchDecode:
         if len(scale_packs) != 1:
             raise ValueError("layered native FP8 weights must share scale packing")
         scale_pack = scale_packs.pop()
-        schedule = SchedFp8GemvUmmaStream(
+        if scale_pack != SchedFp8GemvUmmaCoupled.SCALE_PACK:
+            raise ValueError("common coupled FP8 projections require scale pack 2")
+        rows = weights[0].shape[0] * 128
+        schedule = SchedFp8GemvUmmaCoupled(
             weights[0],
             activation,
             output.reshape(-1),
-            scale_pack,
-            self.args.fp8_umma_output_group_size,
+            weight_layers=weights,
         )
-        schedule = self._layered(schedule, family, weights)
         assignment = self.policy.fp8_umma_gemv(
             output.numel(), activation.shape[0] * 128
+        )
+        task_rows = (
+            SchedFp8GemvUmmaCoupled.OUTPUT_TILES
+            * SchedFp8GemvUmmaCoupled.TILE_M
+        )
+        assignment = replace(
+            assignment,
+            num_sms=min(assignment.num_sms, rows // task_rows),
+            row_alignment=task_rows,
+            tile_rows=task_rows,
+            tile_k=256,
         )
         base_sm = None
         if placement is not None:
             base_sm, num_sms = placement
-            assignment = replace(assignment, num_sms=num_sms)
+            assignment = replace(
+                assignment, num_sms=min(num_sms, rows // task_rows)
+            )
         return self._stage(
             name,
             schedule,
@@ -1067,13 +1076,21 @@ class ResidentOneLaunchDecode:
         if len(scale_packs) != 1:
             raise ValueError("layered native FP8 weights must share scale packing")
         scale_pack = scale_packs.pop()
+        if scale_pack != SchedFp8GemvUmmaCoupled.SCALE_PACK:
+            raise ValueError("common coupled FP8 projections require scale pack 2")
         if row_slice is None:
             weights = tuple(linear.weight_tiles for linear in linears)
         else:
             start = 0 if row_slice.start is None else row_slice.start
             stop = linears[0].weight_tiles.shape[0] * 128 if row_slice.stop is None else row_slice.stop
-            if start % 128 or stop % 128:
-                raise ValueError("native split-K slices must be M128 aligned")
+            task_rows = (
+                SchedFp8GemvUmmaCoupled.OUTPUT_TILES
+                * SchedFp8GemvUmmaCoupled.TILE_M
+            )
+            if start % task_rows or stop % task_rows:
+                raise ValueError(
+                    "coupled split-K slices must be task-row aligned"
+                )
             weights = tuple(
                 linear.weight_tiles[start // 128 : stop // 128]
                 for linear in linears
@@ -1084,22 +1101,25 @@ class ResidentOneLaunchDecode:
             raise ValueError("native split-K output size must match selected rows")
         policy_split, policy_sms = self.policy.fp8_umma_split_k(rows, k)
         split_k = policy_split if split_k is None else int(split_k)
-        if k // 128 % split_k:
-            raise ValueError("split-K override must divide K tiles")
-        work_tiles = rows // 128 * split_k
+        if k // 256 % split_k:
+            raise ValueError("split-K override must divide K256 pairs")
+        task_rows = (
+            SchedFp8GemvUmmaCoupled.OUTPUT_TILES
+            * SchedFp8GemvUmmaCoupled.TILE_M
+        )
+        work_tiles = rows // task_rows * split_k
         num_sms = policy_sms if num_sms is None else int(num_sms)
+        num_sms = min(num_sms, work_tiles)
         if not 0 < num_sms <= work_tiles:
             raise ValueError("split-K SM override exceeds logical work tiles")
         output_vector = output.reshape(-1)
         if split_k == 1:
-            schedule = SchedFp8GemvUmmaStream(
+            schedule = SchedFp8GemvUmmaCoupled(
                 weights[0],
                 activation,
                 output_vector,
-                scale_pack,
-                self.args.fp8_umma_output_group_size,
+                weight_layers=weights,
             )
-            schedule = self._layered(schedule, family, weights)
             return [
                 self._stage(
                     name,
@@ -1134,15 +1154,13 @@ class ResidentOneLaunchDecode:
         output_reduce = TmaTensor(
             self.launcher, accumulator
         ).rowmajor_2d("reduce", 1, 128)
-        schedule = SchedFp8GemvUmmaSplitK(
+        schedule = SchedFp8GemvUmmaCoupled(
             weights[0],
             activation,
             output_reduce,
-            split_k,
-            scale_pack,
-            self.args.fp8_umma_output_group_size,
+            split_k=split_k,
+            weight_layers=weights,
         )
-        schedule = self._layered(schedule, family, weights)
         gemv = self._stage(
             f"{name}.partial",
             schedule,
@@ -1181,6 +1199,7 @@ class ResidentOneLaunchDecode:
         output_reduce,
         *,
         split_k: int,
+        balanced_k: bool = False,
         placement: tuple[int, int] | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
@@ -1198,23 +1217,33 @@ class ResidentOneLaunchDecode:
         if len(scale_packs) != 1:
             raise ValueError("layered native FP8 weights must share scale packing")
         scale_pack = scale_packs.pop()
-        schedule = SchedFp8GemvUmmaSplitK(
+        if scale_pack != SchedFp8GemvUmmaCoupled.SCALE_PACK:
+            raise ValueError("common coupled FP8 projections require scale pack 2")
+        schedule = SchedFp8GemvUmmaCoupled(
             weights[0],
             activation,
             output_reduce,
-            split_k,
-            scale_pack,
-            self.args.fp8_umma_output_group_size,
+            split_k=1 if balanced_k else split_k,
+            balanced_k=balanced_k,
+            weight_layers=weights,
         )
-        schedule = self._layered(schedule, family, weights)
         rows = weights[0].shape[0] * 128
+        k_pairs = activation.shape[0] // 2
+        task_rows = (
+            SchedFp8GemvUmmaCoupled.OUTPUT_TILES
+            * SchedFp8GemvUmmaCoupled.TILE_M
+        )
+        work_tiles = rows // task_rows * (
+            k_pairs if balanced_k else split_k
+        )
         if placement is None:
             k = activation.shape[0] * 128
             _, policy_sms = self.policy.fp8_umma_split_k(rows, k)
             base_sm = 0
-            num_sms = min(policy_sms, rows // 128 * split_k)
+            num_sms = min(policy_sms, work_tiles)
         else:
             base_sm, num_sms = placement
+            num_sms = min(num_sms, work_tiles)
         return self._stage(
             name,
             schedule,
@@ -2289,7 +2318,7 @@ class ResidentOneLaunchDecode:
                     )
                 )
                 fuse_scalar_pool_epilogue = (
-                    use_grouped_preattention and not use_packed_pool
+                    not use_packed_pool
                 )
                 if fuse_scalar_pool_epilogue:
                     norm_weights = self._family_tensors(
@@ -2349,25 +2378,13 @@ class ResidentOneLaunchDecode:
                         )
                     )
                     stages.append(
-                        self._rms_stage(
-                            "attn.compressor.norm",
+                        self._rms_rope_stage(
+                            "attn.compressor.norm_rope",
                             self.attention_pooled[kind],
-                            self.attention_pooled_norm[kind],
+                            self.compressed_output_rope[kind],
+                            self.current_compressed_rows[kind],
                             family=family,
                             weight_suffix="attn.compressor.norm.weight",
-                        )
-                    )
-                    stages.append(
-                        self._stage(
-                            "attn.compressor.rope",
-                            SchedDsv4Rope512_64(
-                                self.attention_pooled_norm[kind].reshape(1, -1),
-                                self.compressed_output_rope[kind],
-                                self.current_compressed_rows[kind],
-                                fixed_table_id=self.resident_rope_table_ids[
-                                    self.compressed_output_rope[kind].data_ptr()
-                                ],
-                            ),
                         )
                     )
 
@@ -2498,86 +2515,37 @@ class ResidentOneLaunchDecode:
                 index_tail_scores = index_compress_scores[
                     cfg.index_head_dim : 2 * cfg.index_head_dim
                 ]
-                if use_grouped_preattention:
-                    index_norm_weights = self._family_tensors(
-                        family,
-                        "attn.indexer.compressor.norm.weight",
-                    )
-                    index_pool = SchedDsv4GatedPoolRmsRope(
-                        self.index_pool_history_values,
-                        self.index_pool_history_scores,
-                        index_norm_weights[0],
-                        self.compressed_output_rope[kind],
-                        self.index_cache[-1:],
-                        epsilon=cfg.rms_epsilon,
-                        tail_values=index_tail_values,
-                        tail_scores=index_tail_scores,
-                        tail_bias=index_ape_rows[0],
-                        hadamard=True,
-                        fixed_table_id=self.resident_rope_table_ids[
-                            self.compressed_output_rope[kind].data_ptr()
-                        ],
-                    )
-                    index_pool = self._layered(
+                index_norm_weights = self._family_tensors(
+                    family,
+                    "attn.indexer.compressor.norm.weight",
+                )
+                index_pool = SchedDsv4GatedPoolRmsRope(
+                    self.index_pool_history_values,
+                    self.index_pool_history_scores,
+                    index_norm_weights[0],
+                    self.compressed_output_rope[kind],
+                    self.index_cache[-1:],
+                    epsilon=cfg.rms_epsilon,
+                    tail_values=index_tail_values,
+                    tail_scores=index_tail_scores,
+                    tail_bias=index_ape_rows[0],
+                    hadamard=True,
+                    fixed_table_id=self.resident_rope_table_ids[
+                        self.compressed_output_rope[kind].data_ptr()
+                    ],
+                )
+                index_pool = self._layered(
+                    index_pool,
+                    family,
+                    index_ape_rows,
+                    index_norm_weights,
+                )
+                stages.append(
+                    self._stage(
+                        "index.compressor.pool_norm_rope_hadamard",
                         index_pool,
-                        family,
-                        index_ape_rows,
-                        index_norm_weights,
                     )
-                    stages.append(
-                        self._stage(
-                            "index.compressor.pool_norm_rope_hadamard",
-                            index_pool,
-                        )
-                    )
-                else:
-                    index_pool = SchedDsv4GatedPool(
-                        self.index_pool_history_values,
-                        self.index_pool_history_scores,
-                        self.index_pooled,
-                        tail_values=index_tail_values,
-                        tail_scores=index_tail_scores,
-                        tail_bias=index_ape_rows[0],
-                    )
-                    index_pool = self._layered(
-                        index_pool, family, index_ape_rows
-                    )
-                    stages.append(
-                        self._stage("index.compressor.pool", index_pool)
-                    )
-                    stages.append(
-                        self._rms_stage(
-                            "index.compressor.norm",
-                            self.index_pooled,
-                            self.index_pooled_norm,
-                            family=family,
-                            weight_suffix=(
-                                "attn.indexer.compressor.norm.weight"
-                            ),
-                        )
-                    )
-                    stages.append(
-                        self._stage(
-                            "index.compressor.rope",
-                            SchedDsv4Rope128_64(
-                                self.index_pooled_norm.reshape(1, -1),
-                                self.compressed_output_rope[kind],
-                                self.index_pooled_rope,
-                                fixed_table_id=self.resident_rope_table_ids[
-                                    self.compressed_output_rope[kind].data_ptr()
-                                ],
-                            ),
-                        )
-                    )
-                    stages.append(
-                        self._stage(
-                            "index.compressor.hadamard",
-                            SchedDsv4Hadamard(
-                                self.index_pooled_rope,
-                                self.index_cache[-1:],
-                            ),
-                        )
-                    )
+                )
             if run_index_selection and plan.compressed_rows:
                 stages.append(
                     self._stage(
@@ -2761,6 +2729,9 @@ class ResidentOneLaunchDecode:
             )
             grouped = self.attention_inverse.reshape(cfg.o_groups, -1)
             for group in range(cfg.o_groups):
+                group_input_ready = (
+                    f"{family.name}.attn.o_a.g{group}.input.ready"
+                )
                 placement = (
                     (group * 16, 16)
                     if split_o_a
@@ -2768,9 +2739,6 @@ class ResidentOneLaunchDecode:
                 )
                 start = group * cfg.o_lora_rank
                 if split_o_a:
-                    group_input_ready = (
-                        f"{family.name}.attn.o_a.g{group}.input.ready"
-                    )
                     stages.append(
                         self._native_fp8_quant_stage(
                             f"attn.o_a.g{group}.quant_native_fp8",
@@ -2798,19 +2766,28 @@ class ResidentOneLaunchDecode:
                     )
                 else:
                     stages.append(
-                        self._fp8_bf16_linear_stage(
+                        self._fp8_quant_stage(
+                            f"attn.o_a.g{group}.quant_fp8",
+                            grouped[group],
+                            self.o_group_fp8[group],
+                            self.o_group_scale[group],
+                            placement=placement,
+                            wait_group=output_ready_group,
+                            release_group=group_input_ready,
+                        )
+                    )
+                    stages.append(
+                        self._fp8_linear_stage(
                             f"attn.o_a.g{group}",
                             family,
                             "attn.wo_a",
-                            grouped[group],
+                            self.o_group_fp8[group],
+                            self.o_group_scale[group],
                             self.o_rank[group],
                             row_slice=slice(start, start + cfg.o_lora_rank),
                             placement=placement,
-                            wait_group=output_ready_group,
+                            wait_group=group_input_ready,
                             release_group=output_join_group,
-                            prefetch_before_wait=(
-                                placement[0] >= cfg.num_heads
-                            ),
                         )
                     )
         if split_o_b:
@@ -2995,6 +2972,7 @@ class ResidentOneLaunchDecode:
         output_register: int = 0,
         output_port: int = 0,
         output_scale: torch.Tensor | None = None,
+        swiglu_limit: float | None = None,
         pipeline: bool = False,
         activation_tiles_per_load: int | None = None,
         placement: tuple[int, int] | None = None,
@@ -3025,6 +3003,7 @@ class ResidentOneLaunchDecode:
             output_register=output_register,
             output_port=output_port,
             output_scale=output_scale,
+            swiglu_limit=swiglu_limit,
             pipeline=pipeline,
             activation_tiles_per_load=activation_tiles_per_load,
         )
@@ -3188,29 +3167,14 @@ class ResidentOneLaunchDecode:
                     cfg.expert_intermediate_size,
                     cfg.hidden_size,
                     self.routed_input[rank],
-                    None,
+                    self.routed_middle[rank],
                     wait_for_previous=False,
                     activation_mode="reuse",
-                    output_mode="retain",
+                    output_mode="silu_store",
                     output_register=1,
-                    output_port=1,
+                    output_port=0,
+                    swiglu_limit=cfg.swiglu_limit,
                     placement=(base_sm, cfg.expert_intermediate_size // 128),
-                )
-            )
-            stages.append(
-                self._stage(
-                    f"ffn.expert{rank}.swiglu",
-                    SchedDsv4SwiGluShard128(
-                        1,
-                        0,
-                        1,
-                        1,
-                        self.routed_middle[rank],
-                        swiglu_limit=cfg.swiglu_limit,
-                    ),
-                    cfg.expert_intermediate_size // 128,
-                    base_sm=base_sm,
-                    wait_for_previous=False,
                     release_group=middle_ready,
                 )
             )
@@ -3259,41 +3223,19 @@ class ResidentOneLaunchDecode:
             else:
                 deferred_w2.append(w2_stage)
 
+        shared_middle_ready = f"{family.name}.ffn.shared.middle.ready"
         stages.append(
-            self._fp8_linear_stage(
-                "ffn.shared.w1",
+            self._fp8_gate_up_swiglu_stage(
+                "ffn.shared.gate_up_swiglu",
                 family,
                 "ffn.shared_experts.w1",
-                self.hidden_fp8,
-                self.hidden_fp8_scale,
-                self.shared_gate,
-                placement=(shared_base, shared_sms),
-                wait_group=shared_ready,
-            )
-        )
-        stages.append(
-            self._fp8_linear_stage(
-                "ffn.shared.w3",
-                family,
                 "ffn.shared_experts.w3",
                 self.hidden_fp8,
                 self.hidden_fp8_scale,
-                self.shared_up,
-                wait_for_previous=False,
+                self.shared_middle,
                 placement=(shared_base, shared_sms),
-            )
-        )
-        stages.append(
-            self._stage(
-                "ffn.shared.swiglu",
-                SchedSmemSiLUInterleaved(
-                    1,
-                    self.shared_gate.reshape(1, -1),
-                    self.shared_up.reshape(1, -1),
-                    self.shared_middle.reshape(1, -1),
-                    swiglu_limit=cfg.swiglu_limit,
-                ),
-                base_sm=shared_base,
+                wait_group=shared_ready,
+                release_group=shared_middle_ready,
             )
         )
         if self.ffn_fp32_tma:
@@ -3307,6 +3249,7 @@ class ResidentOneLaunchDecode:
                     self.shared_middle,
                     self.shared_middle_native_fp8,
                     placement=(shared_base, shared_quant_sms),
+                    wait_group=shared_middle_ready,
                     release_group=shared_down_ready,
                 )
             )
@@ -3336,6 +3279,7 @@ class ResidentOneLaunchDecode:
                         shared_base,
                         cfg.expert_intermediate_size // 128,
                     ),
+                    wait_group=shared_middle_ready,
                 )
             )
             stages.append(
@@ -3374,10 +3318,9 @@ class ResidentOneLaunchDecode:
         head_scale = self._tensor("hc_head_scale")
         head_base = self._tensor("hc_head_base")
         self.head_mixes = torch.empty((4,), dtype=torch.float32, device=self.device)
-        self.head_hidden = torch.empty(
+        self.head_norm = torch.empty(
             (cfg.hidden_size,), dtype=torch.bfloat16, device=self.device
         )
-        self.head_norm = torch.empty_like(self.head_hidden)
         self.fp8_head = self.args.vocab_size == cfg.vocab_size
         self.logits = torch.empty(
             (self.args.vocab_size,), dtype=torch.bfloat16, device=self.device
@@ -3391,43 +3334,57 @@ class ResidentOneLaunchDecode:
                 self.policy.fp32_bf16_gemv(4, self.residual.numel()),
             ),
             self._stage(
-                "head.hc",
-                SchedDsv4HcHead(
+                "head.hc_rms",
+                SchedDsv4HcHeadRms(
                     self.residual,
                     self.head_mixes,
                     head_scale,
                     head_base,
-                    self.head_hidden,
+                    self._tensor("norm.weight"),
+                    self.head_norm,
+                    rms_epsilon=cfg.rms_epsilon,
                 ),
-            ),
-            self._rms_stage(
-                "head.rms4096",
-                self.head_hidden,
-                self.head_norm,
-                weight_suffix="norm.weight",
             ),
         ]
         head_weight = self._tensor("head.weight")[: self.args.vocab_size]
         if self.fp8_head:
             print(
                 "DSV4_HEAD_PREPROCESS status=START "
-                f"rows={self.args.vocab_size} k={cfg.hidden_size} format=fp8_block128",
+                f"rows={self.args.vocab_size} k={cfg.hidden_size} "
+                "format=native_fp8_coupled",
                 flush=True,
             )
             preprocess_started = time.monotonic()
-            self.head_weight_fp8, self.head_weight_scale = (
-                quantize_fp8_block128(head_weight)
+            head_weight_fp8, head_weight_scale = quantize_fp8_block128(
+                head_weight
             )
-            self.head_input_fp8 = torch.empty(
-                (cfg.hidden_size,), dtype=torch.float8_e4m3fn, device=self.device
-            )
-            self.head_input_scale = torch.empty(
-                (cfg.hidden_size // 128,),
-                dtype=torch.float8_e8m0fnu,
+            head_m_tiles = self.args.vocab_size // 128
+            head_k_tiles = cfg.hidden_size // 128
+            self.head_weight_native_fp8 = torch.empty(
+                (head_m_tiles, head_k_tiles, 16896),
+                dtype=torch.uint8,
                 device=self.device,
             )
-            head_assignment = self.policy.fp8_gemv(
+            runtime.prepack_fp8_checkpoint(
+                head_weight_fp8,
+                head_weight_scale,
+                self.head_weight_native_fp8,
+                SchedFp8GemvUmmaCoupled.SCALE_PACK,
+            )
+            self.head_input_native_fp8 = torch.empty(
+                (head_k_tiles, SchedFp8GemvUmmaCoupled.ACTIVATION_TILE_BYTES),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            head_assignment = self.policy.fp8_umma_gemv(
                 self.args.vocab_size, cfg.hidden_size
+            )
+            head_assignment = replace(
+                head_assignment,
+                num_sms=min(head_assignment.num_sms, head_m_tiles // 2),
+                row_alignment=256,
+                tile_rows=256,
+                tile_k=256,
             )
             self.head_argmax_partial = torch.empty(
                 (head_assignment.num_sms, 16),
@@ -3439,19 +3396,16 @@ class ResidentOneLaunchDecode:
             )
             stages.extend(
                 (
-                    self._fp8_quant_stage(
-                        "head.quant_fp8",
+                    self._native_fp8_quant_stage(
+                        "head.quant_native_fp8",
                         self.head_norm,
-                        self.head_input_fp8,
-                        self.head_input_scale,
+                        self.head_input_native_fp8,
                     ),
                     self._stage(
-                        "head.logits.fp8",
-                        SchedFp8Block128Gemv(
-                            self.head_weight_fp8,
-                            self.head_weight_scale,
-                            self.head_input_fp8,
-                            self.head_input_scale,
+                        "head.logits.fp8_coupled",
+                        SchedFp8GemvUmmaCoupled(
+                            self.head_weight_native_fp8,
+                            self.head_input_native_fp8,
                             self.logits,
                         ),
                         head_assignment,
@@ -3474,7 +3428,7 @@ class ResidentOneLaunchDecode:
             )
             print(
                 "DSV4_HEAD_PREPROCESS status=PASS "
-                f"weight_gib={self.head_weight_fp8.numel() * self.head_weight_fp8.element_size() / (1 << 30):.3f} "
+                f"weight_gib={self.head_weight_native_fp8.numel() / (1 << 30):.3f} "
                 f"elapsed_s={time.monotonic() - preprocess_started:.3f}",
                 flush=True,
             )
@@ -3891,7 +3845,9 @@ class ResidentOneLaunchDecode:
 
     def report_projection_diagnostics(self) -> None:
         """Compare resident Q_b output with its raw-checkpoint FP8 oracle."""
-        layer_id = self.families[0].representative
+        # The resident buffers contain the final executed layer after a
+        # multi-layer launch, so diagnose them against that layer's weights.
+        layer_id = self.families[-1].layer_ids[-1]
         linear = DeepSeekV4Checkpoint(
             self.args.checkpoint, self.config
         ).load_fp8_linear(

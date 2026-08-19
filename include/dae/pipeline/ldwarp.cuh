@@ -130,7 +130,6 @@ __device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
   constexpr int kBulkBytes = 16 * 1024;
   static_assert(
       dae_mxfp_resident_ffn::kFp8CoupledWeightDataBytes % kBulkBytes == 0);
-
   const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
   const auto *source = reinterpret_cast<const uint8_t *>(
       load_l2_u64(plan + port_id));
@@ -142,9 +141,9 @@ __device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
       tmem_mma_barriers +
       (port_id == 0 ? mxfp8CoupledWeightFullBarrierBase
                     : mxfp8CoupledActivationFullBarrierBase));
-  const int phase_base =
+  const int phase_base = int(
       (inst.arg & dae_mxfp_resident_ffn::kCoupledPhaseBaseMask) >>
-      dae_mxfp_resident_ffn::kCoupledPhaseBaseShift;
+      dae_mxfp_resident_ffn::kCoupledPhaseBaseShift);
 
   for (int pair = 0; pair < int(inst.size); ++pair) {
     const int global_pair = phase_base + pair;
@@ -162,11 +161,12 @@ __device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
                dae_mxfp_resident_ffn::kFp8CoupledWeightDataBytes /
                    kBulkBytes;
            ++chunk) {
+        const int offset = chunk * kBulkBytes;
         cuda::ptx::cp_async_bulk(
             cuda::ptx::space_shared,
             cuda::ptx::space_global,
-            destination + chunk * kBulkBytes,
-            record + chunk * kBulkBytes,
+            destination + offset,
+            record + offset,
             uint32_t(kBulkBytes),
             reinterpret_cast<uint64_t *>(stage_full + stage));
       }
@@ -746,8 +746,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               stream_inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask;
           if (stream_kind == dae_mxfp_resident_ffn::kCoupledFp8Gemv) {
             ldu_execute_mxfp8_coupled_stream(
-                stream_inst, slot, port_id, smem_base,
-                tmem_mma_barriers);
+                stream_inst, slot, port_id, smem_base, tmem_mma_barriers);
           } else if (
               stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
             ldu_execute_mxfp_coupled_linear1(

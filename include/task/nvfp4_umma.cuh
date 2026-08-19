@@ -738,6 +738,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_impl_sm100(
     int num_k_tiles,
     int retain_activation,
     int bulk_activation,
+    float swiglu_limit,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
@@ -931,6 +932,13 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_impl_sm100(
   __sync_compute_group(128);
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
+  int gate_slots = 0;
+  const cutlass::bfloat16_t *gate = nullptr;
+  if (swiglu_limit > 0.0f) {
+    gate_slots = m2c.template pop<0>();
+    gate = static_cast<const cutlass::bfloat16_t *>(
+        get_slot_address(smem_base, extract(gate_slots)));
+  }
   const int output_slots = m2c.template pop<0>();
   const int output_slot = extract(output_slots);
   auto *output = static_cast<Output *>(
@@ -953,7 +961,13 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_impl_sm100(
     const int row = int(get<0>(thread_coord(index)));
     const int col = int(get<1>(thread_coord(index)));
     if (row < kTileM && col == 0) {
-      output[row] = Output(r_acc(index) * alpha * output_scale);
+      float value = r_acc(index) * alpha * output_scale;
+      if (swiglu_limit > 0.0f) {
+        const float gate_value = fminf(float(gate[row]), swiglu_limit);
+        value = gate_value / (1.0f + expf(-gate_value)) *
+            fminf(fmaxf(value, -swiglu_limit), swiglu_limit);
+      }
+      output[row] = Output(value);
     }
   }
 
@@ -961,6 +975,9 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_impl_sm100(
   c2m.push(tid, alpha_slots);
   if constexpr (LoadOutputScale) {
     c2m.push(tid, output_scale_slots);
+  }
+  if (gate_slots != 0) {
+    c2m.push(tid, gate_slots);
   }
   c2m.template push<0, true>(tid, output_slots);
 }
@@ -970,6 +987,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
     int num_k_tiles,
     int retain_activation,
     int bulk_activation,
+    float swiglu_limit,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barrier,
@@ -978,7 +996,7 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_stream_sm100(
     C2MQueue &c2m) {
   task_nvfp4_gemv_umma_stream_impl_sm100<
       cutlass::bfloat16_t, false>(
-      num_k_tiles, retain_activation, bulk_activation, smem_base,
+      num_k_tiles, retain_activation, bulk_activation, swiglu_limit, smem_base,
       tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
 }
 
@@ -999,8 +1017,8 @@ __device__ __forceinline__ void task_nvfp4_gemv_umma_fp32_sm100(
     M2CQueue &m2c,
     C2MQueue &c2m) {
   task_nvfp4_gemv_umma_stream_impl_sm100<float, true>(
-      num_k_tiles, retain_activation, bulk_activation, smem_base, tmem_base_ptr,
-      tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
+      num_k_tiles, retain_activation, bulk_activation, 0.0f, smem_base,
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
 }
 
 // A task-local K256 stage ring keeps the LDU stream ahead of UMMA. Its depth is

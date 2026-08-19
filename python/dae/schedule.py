@@ -935,6 +935,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         pipeline=False,
         activation_tiles_per_load=None,
         output_scale=None,
+        swiglu_limit=None,
     ):
         super().__init__()
         self.routing_state = routing_state
@@ -949,10 +950,12 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                 "routed native activation_mode must be load, retain, or reuse"
             )
         self.activation_mode = activation_mode
-        if output_mode not in ("store", "retain", "fp32_store", "reduce"):
+        if output_mode not in (
+            "store", "retain", "silu_store", "fp32_store", "reduce"
+        ):
             raise ValueError(
                 "routed native output_mode must be store, retain, "
-                "fp32_store, or reduce"
+                "silu_store, fp32_store, or reduce"
             )
         if not 0 <= output_register < 4:
             raise ValueError("routed native output register must be in [0, 4)")
@@ -963,6 +966,9 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
         self.output_port = output_port
         self.pipeline = bool(pipeline)
         self.output_scale = output_scale
+        self.swiglu_limit = (
+            None if swiglu_limit is None else float(swiglu_limit)
+        )
         self.activation_tiles_per_load = (
             None
             if activation_tiles_per_load is None
@@ -1018,7 +1024,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             if not 0 <= field <= RoutedTmaLoad1D.MAX_POINTER_FIELD:
                 raise ValueError("routed native pointer fields must fit in 13 bits")
         self.rows = self.m_tiles * self.TILE_M
-        if self.output_mode == "store":
+        if self.output_mode in ("store", "silu_store"):
             if (
                 self.output is None
                 or self.output.dtype != torch.bfloat16
@@ -1078,6 +1084,19 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             raise ValueError(
                 "retained routed output requires one M128 tile per SM"
             )
+        if self.output_mode == "silu_store":
+            if self.swiglu_limit is None or self.swiglu_limit <= 0:
+                raise ValueError("fused routed SwiGLU requires a positive limit")
+            if self.pipeline:
+                raise ValueError(
+                    "fused routed SwiGLU currently uses the normal stream task"
+                )
+            if self.num_sms != self.m_tiles:
+                raise ValueError(
+                    "fused routed SwiGLU requires one M128 tile per SM"
+                )
+        elif self.swiglu_limit is not None:
+            raise ValueError("SwiGLU limit requires silu_store output mode")
 
     def _tile_shard(self, sm):
         tiles_per_sm, extra = divmod(self.m_tiles, self.num_sms)
@@ -1093,12 +1112,11 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             raise ValueError("routed native NVFP4 GEMV requires a route barrier")
         tile_start, tile_count = self._tile_shard(sm)
         instructions = []
-        local_tiles = tuple(range(tile_start, tile_start + tile_count))
-        for task_start in range(tile_count):
-            task_tiles = (local_tiles[task_start],)
-            output_groups = 1
-            first_output = task_start == 0
-            final_output = task_start + output_groups == tile_count
+        for local_tile, output_tile in enumerate(
+            range(tile_start, tile_start + tile_count)
+        ):
+            first_output = local_tile == 0
+            final_output = local_tile + 1 == tile_count
             if self.activation_mode == "retain":
                 activation_kind = "retain" if first_output else "reuse"
             elif self.activation_mode == "reuse":
@@ -1116,7 +1134,9 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                 activation_kind = "retain" if not final_output else "load"
             else:
                 activation_kind = "reuse"
-            retain = activation_kind == "retain"
+            retain = activation_kind == "retain" or (
+                activation_kind == "reuse" and not final_output
+            )
             task_activation_tiles_per_load = (
                 self.activation_tiles_per_load
                 if activation_kind == "load"
@@ -1156,6 +1176,11 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                     bulk_activation=(
                         task_activation_tiles_per_load == self.k_tiles
                     ),
+                    swiglu_limit=(
+                        self.swiglu_limit
+                        if self.output_mode == "silu_store"
+                        else None
+                    ),
                 )
             instructions.append(compute)
             alpha_load = RoutedTmaLoad1D(
@@ -1191,7 +1216,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
             elif activation_kind == "reuse":
                 instructions.append(RegLoad(0, slot_id=0).fixed_port(1))
 
-            def append_weight(output_tile, k_tile, output_group):
+            def append_weight(k_tile):
                 if k_tile == 0:
                     weight_load = RoutedTmaLoadBase1D(
                         self.routing_state,
@@ -1207,7 +1232,7 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                     )
                 if first_output and k_tile == 0 and route_bar is not None:
                     weight_load.bar(route_bar)
-                instructions.append(weight_load.fixed_port(output_group))
+                instructions.append(weight_load.fixed_port(0))
 
             if self.pipeline and activation_kind == "load":
                 for chunk_start in range(
@@ -1225,20 +1250,10 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                         ).fixed_port(1)
                     )
                     for k_tile in range(chunk_start, chunk_stop):
-                        for output_group, output_tile in enumerate(task_tiles):
-                            append_weight(
-                                output_tile,
-                                k_tile,
-                                output_group,
-                            )
+                        append_weight(k_tile)
             else:
                 for k_tile in range(self.k_tiles):
-                    for output_group, output_tile in enumerate(task_tiles):
-                        append_weight(
-                            output_tile,
-                            k_tile,
-                            output_group,
-                        )
+                    append_weight(k_tile)
                     if (
                         activation_kind == "load"
                         and task_activation_tiles_per_load == 1
@@ -1248,28 +1263,31 @@ class SchedRoutedNvfp4GemvUmmaStream(Schedule):
                                 self.activation_tiles[k_tile].reshape(-1)
                             ).fixed_port(1)
                         )
-            for output_group, output_tile in enumerate(task_tiles):
-                if self.output_mode == "store":
-                    row_start = output_tile * self.TILE_M
-                    store = TmaStore1D(
-                        self.output[row_start : row_start + self.TILE_M]
-                    )
-                elif self.output_mode == "fp32_store":
-                    row_start = output_tile * self.TILE_M
-                    store = TmaStore1D(
-                        self.output[row_start : row_start + self.TILE_M]
-                    )
-                elif self.output_mode == "reduce":
-                    row_start = output_tile * self.TILE_M
-                    store = self.output.cord(0, row_start)
-                else:
-                    store = RegStore(
-                        self.output_register,
-                        size=self.TILE_M * 2,
-                    ).fixed_port(self.output_port)
-                if final_output and output_group + 1 == output_groups:
-                    store.bar(self._bar("output"))
-                instructions.append(store)
+            if self.output_mode == "silu_store":
+                instructions.append(
+                    RegLoad(self.output_register).fixed_port(self.output_port)
+                )
+            if self.output_mode in ("store", "silu_store"):
+                row_start = output_tile * self.TILE_M
+                store = TmaStore1D(
+                    self.output[row_start : row_start + self.TILE_M]
+                )
+            elif self.output_mode == "fp32_store":
+                row_start = output_tile * self.TILE_M
+                store = TmaStore1D(
+                    self.output[row_start : row_start + self.TILE_M]
+                )
+            elif self.output_mode == "reduce":
+                row_start = output_tile * self.TILE_M
+                store = self.output.cord(0, row_start)
+            else:
+                store = RegStore(
+                    self.output_register,
+                    size=self.TILE_M * 2,
+                ).fixed_port(self.output_port)
+            if final_output:
+                store.bar(self._bar("output"))
+            instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):
@@ -1796,7 +1814,7 @@ class SchedDsv4SwiGluShard128(Schedule):
             return []
         start = sm * self.TILE_K
         return [
-            Dsv4SiluClampMul128(1, self.swiglu_limit),
+            Dsv4SiluClampMul(1, self.TILE_K, self.swiglu_limit),
             TmaStore1D(self.output[start : start + self.TILE_K]).bar(
                 self._bar("output")
             ),
@@ -3501,30 +3519,52 @@ class SchedFp8GemvUmmaCoupled(Schedule):
         *,
         split_k: int = 1,
         balanced_k: bool = False,
+        weight_layers=None,
     ):
         super().__init__()
         self.weight_tiles = weight_tiles
+        self.weight_layers = (
+            (weight_tiles,)
+            if weight_layers is None
+            else tuple(weight_layers)
+        )
         self.activation_tiles = activation_tiles
         self.output = output
         self.split_k = int(split_k)
         self.balanced_k = bool(balanced_k)
 
     def _on_place(self):
-        if (
-            self.weight_tiles.dtype != torch.uint8
-            or self.weight_tiles.ndim not in (3, 4)
-            or self.weight_tiles.shape[-1] != self.WEIGHT_TILE_BYTES
-            or not self.weight_tiles.is_contiguous()
-        ):
+        if not self.weight_layers:
+            raise ValueError("coupled FP8 requires at least one weight layer")
+        for layer_weight in self.weight_layers:
+            if (
+                not isinstance(layer_weight, torch.Tensor)
+                or layer_weight.dtype != torch.uint8
+                or layer_weight.ndim not in (3, 4)
+                or layer_weight.shape[-1] != self.WEIGHT_TILE_BYTES
+                or not layer_weight.is_contiguous()
+            ):
+                raise ValueError(
+                    "coupled FP8 weights must be contiguous uint8 "
+                    "[M/128,K/128,16896] or [B,M/128,K/128,16896]"
+                )
+            if (
+                layer_weight.device != self.weight_tiles.device
+                or layer_weight.shape != self.weight_tiles.shape
+            ):
+                raise ValueError(
+                    "coupled FP8 weight layers must share device and shape"
+                )
+        if self.weight_layers[0].data_ptr() != self.weight_tiles.data_ptr():
             raise ValueError(
-                "coupled FP8 weights must be contiguous uint8 "
-                "[M/128,K/128,16896] or [B,M/128,K/128,16896]"
+                "the first coupled FP8 weight layer must be the representative"
             )
-        self.weight_batches = (
-            self.weight_tiles.unsqueeze(0)
-            if self.weight_tiles.ndim == 3
-            else self.weight_tiles
+        self.weight_batches_by_layer = tuple(
+            weight.unsqueeze(0) if weight.ndim == 3 else weight
+            for weight in self.weight_layers
         )
+        self.weight_batches = self.weight_batches_by_layer[0]
+        self.layer_count = len(self.weight_batches_by_layer)
         self.batch_size, self.m_tiles, self.k_tiles, _ = (
             self.weight_batches.shape
         )
@@ -3583,7 +3623,6 @@ class SchedFp8GemvUmmaCoupled(Schedule):
                 raise ValueError(
                     "coupled FP8 placement exceeds its per-SM phase window"
                 )
-
         self.rows = self.m_tiles * self.TILE_M
         self.total_rows = self.batch_size * self.rows
         self.uses_reduction = self.split_k > 1 or self.balanced_k
@@ -3622,6 +3661,19 @@ class SchedFp8GemvUmmaCoupled(Schedule):
                 tuple(output_mat.shape) == tiled_reduce_shape
             )
             self.reduction_bytes = output_mat.element_size()
+            # The common task writes both adjacent M128 accumulators into one
+            # allocator lease, so its store descriptor must cover the paired
+            # M256 result as one transaction.
+            if self.tiled_reduce_output:
+                self.paired_reduce_output = TmaTensor(
+                    self.output.launcher, output_mat
+                ).rowmajor_2d("reduce", self.OUTPUT_TILES, self.TILE_M)
+            else:
+                self.paired_reduce_output = TmaTensor(
+                    self.output.launcher, output_mat
+                ).rowmajor_2d(
+                    "reduce", 1, self.OUTPUT_TILES * self.TILE_M
+                )
 
         # Offline layout conversion: data for the four M128/K128 products is
         # contiguous, followed by one packed SFA image per output.  The
@@ -3629,61 +3681,69 @@ class SchedFp8GemvUmmaCoupled(Schedule):
         # their producer-written two-tile layout; LDU1 gathers the two data
         # images and the packed SFB image directly so placement never snapshots
         # a dynamic activation before its producer runs.
-        weight_data = (
-            self.weight_batches[..., : self.WEIGHT_DATA_BYTES]
-            .contiguous()
-            .reshape(
-                self.batch_size,
-                self.m_pairs,
-                self.OUTPUT_TILES,
-                self.k_pairs,
-                self.SCALE_PACK,
-                self.WEIGHT_DATA_BYTES,
+        def compact_weight(weight_batches):
+            weight_data = (
+                weight_batches[..., : self.WEIGHT_DATA_BYTES]
+                .contiguous()
+                .reshape(
+                    self.batch_size,
+                    self.m_pairs,
+                    self.OUTPUT_TILES,
+                    self.k_pairs,
+                    self.SCALE_PACK,
+                    self.WEIGHT_DATA_BYTES,
+                )
+                .permute(0, 1, 3, 2, 4, 5)
+                .contiguous()
+                .reshape(self.batch_size, self.m_pairs, self.k_pairs, -1)
             )
-            .permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .reshape(self.batch_size, self.m_pairs, self.k_pairs, -1)
-        )
-        weight_scale = (
-            self.weight_batches[
-                ..., :: self.SCALE_PACK, self.WEIGHT_DATA_BYTES :
-            ]
-            .contiguous()
-            .reshape(
-                self.batch_size,
-                self.m_pairs,
-                self.OUTPUT_TILES,
-                self.k_pairs,
-                self.WEIGHT_SCALE_BYTES,
+            weight_scale = (
+                weight_batches[
+                    ..., :: self.SCALE_PACK, self.WEIGHT_DATA_BYTES :
+                ]
+                .contiguous()
+                .reshape(
+                    self.batch_size,
+                    self.m_pairs,
+                    self.OUTPUT_TILES,
+                    self.k_pairs,
+                    self.WEIGHT_SCALE_BYTES,
+                )
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+                .reshape(self.batch_size, self.m_pairs, self.k_pairs, -1)
             )
-            .permute(0, 1, 3, 2, 4)
-            .contiguous()
-            .reshape(self.batch_size, self.m_pairs, self.k_pairs, -1)
-        )
-        weight_stream_m_major = torch.cat(
-            (weight_data, weight_scale), dim=3
-        ).contiguous()
-        if weight_stream_m_major.shape[3] != self.WEIGHT_STREAM_BYTES:
-            raise ValueError("internal coupled FP8 weight layout mismatch")
-        self.weight_stream = weight_stream_m_major
+            stream = torch.cat((weight_data, weight_scale), dim=3).contiguous()
+            if stream.shape[3] != self.WEIGHT_STREAM_BYTES:
+                raise ValueError("internal coupled FP8 weight layout mismatch")
+            return stream
 
+        self.weight_stream_layers = tuple(
+            compact_weight(weight_batches)
+            for weight_batches in self.weight_batches_by_layer
+        )
+        self.weight_stream = self.weight_stream_layers[0]
         if self.balanced_k:
             self._build_balanced_tasks()
         else:
             plans = torch.empty(
-                (self.work_tiles, 2), dtype=torch.int64, device="cpu"
+                (self.work_tiles, self.layer_count, 2),
+                dtype=torch.int64,
+                device="cpu",
             )
             for work in range(self.work_tiles):
                 batch, batch_work = divmod(work, self.work_per_batch)
                 split, m_pair = divmod(batch_work, self.m_pairs)
                 pair_start = split * self.k_pairs_per_split
-                plans[work, 0] = self.weight_stream[
-                    batch, m_pair, pair_start
-                ].data_ptr()
-                plans[work, 1] = self.activation_batches[
-                    batch,
-                    pair_start * self.SCALE_PACK
-                ].data_ptr()
+                for layer, weight_stream in enumerate(
+                    self.weight_stream_layers
+                ):
+                    plans[work, layer, 0] = weight_stream[
+                        batch, m_pair, pair_start
+                    ].data_ptr()
+                    plans[work, layer, 1] = self.activation_batches[
+                        batch, pair_start * self.SCALE_PACK
+                    ].data_ptr()
             self.stream_plans = plans.to(self.weight_tiles.device)
 
     def _build_balanced_tasks(self):
@@ -3748,16 +3808,20 @@ class SchedFp8GemvUmmaCoupled(Schedule):
                     (batch, m_pair, pair_start, pair_count, plan_index)
                 )
         self.work_tiles = len(plan_specs)
+        self.active_sms = sum(bool(sm_tasks) for sm_tasks in tasks)
         plans = torch.empty(
-            (self.work_tiles, 2), dtype=torch.int64, device="cpu"
+            (self.work_tiles, self.layer_count, 2),
+            dtype=torch.int64,
+            device="cpu",
         )
         for plan_index, (batch, m_pair, pair_start) in enumerate(plan_specs):
-            plans[plan_index, 0] = self.weight_stream[
-                batch, m_pair, pair_start
-            ].data_ptr()
-            plans[plan_index, 1] = self.activation_batches[
-                batch, pair_start * self.SCALE_PACK
-            ].data_ptr()
+            for layer, weight_stream in enumerate(self.weight_stream_layers):
+                plans[plan_index, layer, 0] = weight_stream[
+                    batch, m_pair, pair_start
+                ].data_ptr()
+                plans[plan_index, layer, 1] = self.activation_batches[
+                    batch, pair_start * self.SCALE_PACK
+                ].data_ptr()
         self.stream_plans = plans.to(self.weight_tiles.device)
 
     def _work_shard(self, sm):
@@ -3805,48 +3869,46 @@ class SchedFp8GemvUmmaCoupled(Schedule):
             )
             instructions.append(
                 TmaLoadMxfpCoupledStream(
-                    self.stream_plans[plan_index].data_ptr(),
+                    self.stream_plans[plan_index, 0].data_ptr(),
                     kind=TmaLoadMxfpCoupledStream.FP8_GEMV,
                     stages=TmaLoadMxfpCoupledStream.FP8_STAGES,
                     area_slots=self.AREA_SLOTS,
                     area_id=local_work,
                     stream_length=pair_count,
                     phase_base=phase_base,
+                    layer_indexed=self.layer_count > 1,
                 )
             )
-            for output_group in range(self.OUTPUT_TILES):
-                output_tile = (
-                    (batch * self.m_pairs + m_pair) * self.OUTPUT_TILES
-                    + output_group
+            output_tile = (
+                (batch * self.m_pairs + m_pair) * self.OUTPUT_TILES
+            )
+            if not self.uses_reduction:
+                row_start = output_tile * self.TILE_M
+                store = TmaStore1D(
+                    self.direct_output[
+                        row_start : row_start
+                        + self.OUTPUT_TILES * self.TILE_M
+                    ]
                 )
-                if not self.uses_reduction:
-                    row_start = output_tile * self.TILE_M
-                    store = TmaStore1D(
-                        self.direct_output[
-                            row_start : row_start + self.TILE_M
-                        ]
-                    )
-                else:
-                    store = (
-                        self.output.cord(output_tile, 0)
-                        if self.tiled_reduce_output
-                        else self.output.cord(
-                            0, output_tile * self.TILE_M
-                        )
-                    )
-                if (
-                    local_work + 1 == work_count
-                    and output_group + 1 == self.OUTPUT_TILES
-                ):
-                    store.bar(self._bar("output"))
-                instructions.append(store)
+            elif self.tiled_reduce_output:
+                store = self.paired_reduce_output.cord(output_tile, 0)
+            else:
+                store = self.paired_reduce_output.cord(
+                    0, output_tile * self.TILE_M
+                )
+            if local_work + 1 == work_count:
+                store.bar(self._bar("output"))
+            instructions.append(store)
             phase_base += pair_count
         return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, self.num_sms)
+        release_sms = (
+            self.active_sms if self.balanced_k else self.num_sms
+        )
+        return self._bar_release_if_present(role, release_sms)
 
 
 class SchedFp8Block128Gemv(Schedule):
@@ -3907,6 +3969,119 @@ class SchedFp8Block128Gemv(Schedule):
                 _shared_load_1d(self.activation.reshape(-1)),
                 _shared_load_1d(self.activation_scale.reshape(-1)),
             ]
+            store = _shared_store_1d(self.output[tile_start:tile_end])
+            if tile_end == row_end:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedFp8Block128GateUpSwiGlu(Schedule):
+    """Interleave gate/up row shards and apply SwiGLU in the up epilogue."""
+
+    def __init__(
+        self,
+        gate_weight,
+        gate_scale,
+        up_weight,
+        up_scale,
+        activation,
+        activation_scale,
+        output,
+        *,
+        swiglu_limit=10.0,
+    ):
+        super().__init__()
+        self.gate_weight = gate_weight
+        self.gate_scale = gate_scale
+        self.up_weight = up_weight
+        self.up_scale = up_scale
+        self.activation = activation
+        self.activation_scale = activation_scale
+        self.output = output
+        self.swiglu_limit = float(swiglu_limit)
+
+    def _on_place(self):
+        if (
+            self.gate_weight.dtype != torch.float8_e4m3fn
+            or self.gate_weight.ndim != 2
+            or self.up_weight.dtype != self.gate_weight.dtype
+            or self.up_weight.shape != self.gate_weight.shape
+        ):
+            raise ValueError("gate/up FP8 weights must have one matching shape")
+        self.rows, self.k = self.gate_weight.shape
+        if self.k % 128:
+            raise ValueError("gate/up FP8 GEMV K must be divisible by 128")
+        expected_scale_shape = ((self.rows + 127) // 128, self.k // 128)
+        for scale in (self.gate_scale, self.up_scale):
+            if (
+                scale.dtype != torch.float8_e8m0fnu
+                or tuple(scale.shape) != expected_scale_shape
+            ):
+                raise ValueError(
+                    "gate/up weight scales must match block-128 weight shape"
+                )
+        if (
+            self.activation.dtype != torch.float8_e4m3fn
+            or self.activation.numel() != self.k
+            or self.activation_scale.dtype != torch.float8_e8m0fnu
+            or self.activation_scale.numel() != self.k // 128
+        ):
+            raise ValueError("gate/up activation must use one scale per K128")
+        if (
+            self.output.dtype != torch.bfloat16
+            or self.output.numel() != self.rows
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("gate/up SwiGLU output must be contiguous M BF16")
+        if not 0 < self.num_sms <= self.rows:
+            raise ValueError("gate/up FP8 GEMV requires 1..M SMs")
+        if self.swiglu_limit <= 0:
+            raise ValueError("bounded SwiGLU limit must be positive")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows_per_sm, extra = divmod(self.rows, self.num_sms)
+        row_start = sm * rows_per_sm + min(sm, extra)
+        row_count = rows_per_sm + int(sm < extra)
+        row_end = row_start + row_count
+        max_tile_rows = max(1, 65520 // self.k)
+        instructions = []
+        for tile_start in range(row_start, row_end, max_tile_rows):
+            tile_end = min(tile_start + max_tile_rows, row_end)
+            tile_rows = tile_end - tile_start
+            scale_start = tile_start // 128
+            scale_end = (tile_end + 127) // 128
+            row_in_scale_block = tile_start % 128
+            instructions.extend(
+                (
+                    Fp8Block128GemvSm100(
+                        tile_rows, self.k, row_in_scale_block
+                    ),
+                    _shared_load_1d(self.gate_weight[tile_start:tile_end]),
+                    _shared_load_1d(self.gate_scale[scale_start:scale_end]),
+                    _shared_load_1d(self.activation.reshape(-1)),
+                    _shared_load_1d(self.activation_scale.reshape(-1)),
+                    RegStore(1, size=tile_rows * 2).fixed_port(0),
+                    Fp8Block128GemvSm100(
+                        tile_rows,
+                        self.k,
+                        row_in_scale_block,
+                        swiglu_limit=self.swiglu_limit,
+                    ),
+                    _shared_load_1d(self.up_weight[tile_start:tile_end]),
+                    _shared_load_1d(self.up_scale[scale_start:scale_end]),
+                    _shared_load_1d(self.activation.reshape(-1)),
+                    _shared_load_1d(self.activation_scale.reshape(-1)),
+                    RegLoad(1).fixed_port(0),
+                )
+            )
             store = _shared_store_1d(self.output[tile_start:tile_end])
             if tile_end == row_end:
                 store.bar(self._bar("output"))
@@ -4055,8 +4230,9 @@ class SchedDsv4Rope512_64(Schedule):
         instructions = []
         for row in range(sm, self.rows, self.num_sms):
             instructions.append(
-                Dsv4Rope512_64(
+                Dsv4Rope64(
                     1,
+                    512,
                     self.inverse,
                     fixed_table_id=self.fixed_table_id,
                 )
@@ -4319,8 +4495,9 @@ class SchedDsv4Rope128_64(SchedDsv4Rope512_64):
         instructions = []
         for row in range(sm, self.rows, self.num_sms):
             instructions.append(
-                Dsv4Rope128_64(
+                Dsv4Rope64(
                     1,
+                    128,
                     self.inverse,
                     fixed_table_id=self.fixed_table_id,
                 )
@@ -6158,6 +6335,69 @@ class SchedDsv4HcHead(Schedule):
         return self._bar_release_if_present(role, 1)
 
 
+class SchedDsv4HcHeadRms(Schedule):
+    def __init__(
+        self,
+        residual,
+        mixes,
+        scale,
+        base,
+        rms_weight,
+        output,
+        epsilon=1.0e-6,
+        rms_epsilon=1.0e-6,
+    ):
+        super().__init__()
+        self.residual = residual
+        self.mixes = mixes
+        self.scale = scale
+        self.base = base
+        self.rms_weight = rms_weight
+        self.output = output
+        self.epsilon = epsilon
+        self.rms_epsilon = rms_epsilon
+
+    def _on_place(self):
+        if self.num_sms != 1:
+            raise ValueError("fused DeepSeek mHC head/RMS uses exactly one SM")
+        if (
+            self.residual.dtype != torch.bfloat16
+            or tuple(self.residual.shape) != (4, 4096)
+        ):
+            raise ValueError("mHC head residual must be BF16 [4,4096]")
+        if self.mixes.dtype != torch.float32 or self.mixes.numel() != 4:
+            raise ValueError("mHC head mixes must contain four FP32 values")
+        if self.scale.dtype != torch.float32 or self.scale.numel() != 1:
+            raise ValueError("mHC head scale must contain one FP32 value")
+        if self.base.dtype != torch.float32 or self.base.numel() != 4:
+            raise ValueError("mHC head base must contain four FP32 values")
+        if (
+            self.rms_weight.dtype != torch.bfloat16
+            or self.rms_weight.numel() != 4096
+        ):
+            raise ValueError("mHC head RMS weight must contain 4096 BF16 values")
+        if self.output.dtype != torch.bfloat16 or self.output.numel() != 4096:
+            raise ValueError("mHC head/RMS output must contain 4096 BF16 values")
+
+    def schedule(self, sm):
+        if sm != 0:
+            return []
+        return [
+            Dsv4HcHeadRms(self.epsilon, self.rms_epsilon),
+            TmaLoad1D(self.residual),
+            TmaLoad1D(self.mixes),
+            _shared_load_1d(self.scale),
+            TmaLoad1D(self.base),
+            TmaLoad1D(self.rms_weight),
+            TmaStore1D(self.output).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, 1)
+
+
 class SchedDsv4Fp8Quant128(Schedule):
     def __init__(self, input, output, scale):
         super().__init__()
@@ -7776,7 +8016,7 @@ class SchedSmemSiLUInterleaved(Schedule):
             input_bar = fine_input if fine_input is not None else self._bar("input")
             output_bar = fine_output if fine_output is not None else self._bar("output")
             return [
-                (Dsv4SiluClampMul2048(1, self.swiglu_limit)
+                (Dsv4SiluClampMul(1, shard_width, self.swiglu_limit)
                  if self.swiglu_limit > 0
                  else SILU_MUL_SHARED_BF16_K_2048_INTER(1)),
                 TmaStore1D(self.out_glob[token_id, shard_start:shard_end])
@@ -7797,7 +8037,7 @@ class SchedSmemSiLUInterleaved(Schedule):
             width = self.gate_glob.shape[-1]
             if width == 2048:
                 silu = (
-                    Dsv4SiluClampMul2048(1, self.swiglu_limit)
+                    Dsv4SiluClampMul(1, width, self.swiglu_limit)
                     if self.swiglu_limit > 0
                     else SILU_MUL_SHARED_BF16_K_2048_INTER(1)
                 )

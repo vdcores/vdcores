@@ -242,9 +242,11 @@ DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_UMMA_STREAM_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
              g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int retain_activation = inst.args[1] & 1;
+  const float swiglu_limit = float(inst.args[1] >> 1) * (1.0f / 16.0f);
   task_nvfp4_gemv_umma_stream_sm100(
-      inst.args[0], inst.args[1], inst.args[2], smem_base, tmem_base_ptr,
-      tmem_mma_barrier,
+      inst.args[0], retain_activation, inst.args[2], swiglu_limit,
+      smem_base, tmem_base_ptr, tmem_mma_barrier,
       tmem_mma_phase, m2c, c2m);
 #endif
 }
@@ -343,8 +345,11 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_fp8_block128_gemv_sm100(inst.args[0], inst.args[1], inst.args[2],
-                               smem_base, m2c, c2m);
+  const int row_in_scale_block = inst.args[2] & 0x7F;
+  const float swiglu_limit = float(inst.args[2] >> 7) * (1.0f / 16.0f);
+  task_fp8_block128_gemv_sm100(
+      inst.args[0], inst.args[1], row_in_scale_block, swiglu_limit,
+      smem_base, m2c, c2m);
 #endif
 }
 
@@ -430,11 +435,12 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_PRELOAD_ROPE_TABLES) {
   task_dsv4_preload_rope_tables(inst.args[0], smem_base, m2c, c2m);
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_512_64) {
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_64) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_rope_64<512>(
-      inst.args[0], inst.args[1] != 0, inst.args[2], smem_base, m2c, c2m);
+  task_dsv4_rope_64(
+      inst.args[0], inst.args[1], inst.args[2] & 1, inst.args[2] >> 1,
+      smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_RMS_ROPE_512_64) {
@@ -453,13 +459,6 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_ROPE_512_64) {
       inst.args[0] != 0, inst.args[1],
       *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_128_64) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
-             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_rope_64<128>(
-      inst.args[0], inst.args[1] != 0, inst.args[2], smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_ROPE_HADAMARD_128) {
@@ -584,21 +583,12 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_POST) {
       inst.args[0], inst.args[1] != 0, smem_base, m2c, c2m);
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_2048) {
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
              tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, g_events);
-  task_silu_clamp_smem_1D<2048>(
-      inst.args[0],
-      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
-      smem_base, m2c, c2m);
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL_128) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts,
-             tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, g_events);
-  task_silu_clamp_smem_1D<128>(
-      inst.args[0],
-      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
+  task_silu_clamp_smem_1D(
+      inst.args[0], inst.args[1],
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2)),
       smem_base, m2c, c2m);
 }
 
@@ -684,8 +674,18 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_TOPK_512) {
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_HEAD) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_hc_head(
+  task_dsv4_hc_head<false>(
       __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args)),
+      __float2bfloat16(0.0f),
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_HEAD_RMS) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_hc_head<true>(
+      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args)),
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
@@ -1167,60 +1167,13 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {
   );
 }
 
-DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_2048_SMEM) {
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<2048, __nv_bfloat16>(
+  task_rms_norm_f16_from_smem_runtime(
     smem_base,
     inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
-    (float *)scratch_space,
-    m2c,
-    c2m
-  );
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_512_SMEM) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<512, __nv_bfloat16>(
-    smem_base,
-    inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
-    (float *)scratch_space,
-    m2c,
-    c2m
-  );
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_1024_SMEM) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<1024, __nv_bfloat16>(
-    smem_base,
-    inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
-    (float *)scratch_space,
-    m2c,
-    c2m
-  );
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_5120_SMEM) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<5120, __nv_bfloat16>(
-    smem_base,
-    inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
-    (float *)scratch_space,
-    m2c,
-    c2m
-  );
-}
-
-DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_128_SMEM) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<128, __nv_bfloat16>(
-    smem_base,
-    inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    inst.args[1],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
     (float *)scratch_space,
     m2c,
     c2m

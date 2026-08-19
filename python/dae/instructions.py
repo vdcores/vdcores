@@ -142,14 +142,26 @@ class Nvfp4GemvUmmaStreamSm100(ComputeInstruction):
         *,
         retain_activation: bool = False,
         bulk_activation: bool = False,
+        swiglu_limit: float | None = None,
     ):
         if k_tiles <= 0 or k_tiles > 0xFFFF:
             raise ValueError("NVFP4 streaming UMMA K-tile count must fit uint16")
         if retain_activation and not bulk_activation:
             raise ValueError("retained native activation must use one bulk allocation")
+        swiglu_limit_q4 = 0
+        if swiglu_limit is not None:
+            swiglu_limit_q4 = round(float(swiglu_limit) * 16.0)
+            if not 0 < swiglu_limit_q4 <= 0x7FFF:
+                raise ValueError(
+                    "bounded SwiGLU limit must fit positive unsigned Q4"
+                )
         super().__init__(
             opcode=opcode.OP_NVFP4_GEMV_UMMA_STREAM_SM100,
-            args=[k_tiles, int(retain_activation), int(bulk_activation)],
+            args=[
+                k_tiles,
+                int(retain_activation) | (swiglu_limit_q4 << 1),
+                int(bulk_activation),
+            ],
         )
 
 
@@ -202,7 +214,7 @@ class Nvfp4GemvUmmaFp32Sm100(ComputeInstruction):
 
 
 class Nvfp4GemvUmmaPipelineFp32Sm100(Nvfp4GemvUmmaPipelineSm100):
-    """Pipeline native K256 operands and emit one or two FP32 M128 tiles."""
+    """Pipeline native K256 operands and emit one FP32 M128 tile."""
 
     def __init__(
         self,
@@ -236,7 +248,7 @@ class Nvfp4GemvUmmaPipelineFp32Sm100(Nvfp4GemvUmmaPipelineSm100):
 class Nvfp4GemvUmmaPipelineFp32Group2Sm100(
     Nvfp4GemvUmmaPipelineFp32Sm100
 ):
-    """Share each activation K tile across paired FP32 gate/up UMMAs."""
+    """Share each activation K tile across two FP32 M128 outputs."""
 
     def __init__(
         self,
@@ -255,7 +267,11 @@ class Nvfp4GemvUmmaPipelineFp32Group2Sm100(
             opcode=(
                 opcode.OP_NVFP4_GEMV_UMMA_PIPELINE_FP32_GROUP2_SM100
             ),
-            args=[k_tiles, 0, activation_tiles_per_load],
+            args=[
+                k_tiles,
+                0,
+                activation_tiles_per_load,
+            ],
         )
 
 
@@ -423,16 +439,30 @@ class Nvfp4UmmaPrepackSm100(ComputeInstruction):
 class Fp8Block128GemvSm100(ComputeInstruction):
     """E4M3/UE8M0 block-128 decode GEMV over one output-row shard."""
 
-    def __init__(self, rows: int, k: int, row_in_scale_block: int):
+    def __init__(
+        self,
+        rows: int,
+        k: int,
+        row_in_scale_block: int,
+        *,
+        swiglu_limit: float | None = None,
+    ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("FP8 GEMV rows must fit in a positive uint16")
         if k <= 0 or k > 0xFFFF or k % 128:
             raise ValueError("FP8 GEMV K must be a positive uint16 multiple of 128")
         if not 0 <= row_in_scale_block < 128:
             raise ValueError("FP8 GEMV scale-block row offset must be in [0,128)")
+        swiglu_limit_q4 = 0
+        if swiglu_limit is not None:
+            swiglu_limit_q4 = round(float(swiglu_limit) * 16.0)
+            if not 0 < swiglu_limit_q4 < (1 << 9):
+                raise ValueError(
+                    "block-128 SwiGLU limit must fit positive unsigned Q4"
+                )
         super().__init__(
             opcode=opcode.OP_FP8_BLOCK128_GEMV_SM100,
-            args=[rows, k, row_in_scale_block],
+            args=[rows, k, row_in_scale_block | (swiglu_limit_q4 << 7)],
         )
 
 
@@ -697,23 +727,29 @@ class Dsv4PreloadRopeTables(ComputeInstruction):
         )
 
 
-class Dsv4Rope512_64(ComputeInstruction):
+class Dsv4Rope64(ComputeInstruction):
     def __init__(
         self,
         rows: int,
+        head_dim: int,
         inverse: bool = False,
         fixed_table_id: int | None = None,
     ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("DeepSeek RoPE rows must fit in a positive uint16")
+        if head_dim <= 64 or head_dim > 0xFFFF or head_dim % 2:
+            raise ValueError(
+                "DeepSeek RoPE head width must be an even uint16 above 64"
+            )
         if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
             raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        table_selector = 0 if fixed_table_id is None else fixed_table_id + 1
         super().__init__(
-            opcode=opcode.OP_DSV4_ROPE_512_64,
+            opcode=opcode.OP_DSV4_ROPE_64,
             args=[
                 rows,
-                int(inverse),
-                0 if fixed_table_id is None else fixed_table_id + 1,
+                head_dim,
+                (table_selector << 1) | int(inverse),
             ],
         )
 
@@ -775,29 +811,6 @@ class Dsv4Fp32RopeHadamard128(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_DSV4_FP32_ROPE_HADAMARD_128,
             args=[0 if fixed_table_id is None else fixed_table_id + 1],
-        )
-
-
-class Dsv4Rope128_64(ComputeInstruction):
-    def __init__(
-        self,
-        rows: int,
-        inverse: bool = False,
-        fixed_table_id: int | None = None,
-    ):
-        if rows <= 0 or rows > 0xFFFF:
-            raise ValueError(
-                "DeepSeek index RoPE rows must fit in a positive uint16"
-            )
-        if fixed_table_id is not None and not 0 <= fixed_table_id < 4:
-            raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
-        super().__init__(
-            opcode=opcode.OP_DSV4_ROPE_128_64,
-            args=[
-                rows,
-                int(inverse),
-                0 if fixed_table_id is None else fixed_table_id + 1,
-            ],
         )
 
 
@@ -956,29 +969,21 @@ class Dsv4HcPost(ComputeInstruction):
         )
 
 
-class Dsv4SiluClampMul2048(ComputeInstruction):
-    def __init__(self, num_token: int, limit: float = 10.0):
+class Dsv4SiluClampMul(ComputeInstruction):
+    """Apply bounded SwiGLU to ordinary BF16 vectors."""
+
+    def __init__(self, num_token: int, width: int, limit: float = 10.0):
         if num_token <= 0 or num_token > 0xFFFF:
             raise ValueError("DeepSeek SwiGLU token count must fit in uint16")
+        if width <= 0 or width > 0xFFFF or width % 8:
+            raise ValueError(
+                "DeepSeek SwiGLU width must be an 8-aligned positive uint16"
+            )
         if limit <= 0:
             raise ValueError("DeepSeek SwiGLU limit must be positive")
         super().__init__(
-            opcode=opcode.OP_DSV4_SILU_CLAMP_MUL_2048,
-            args=[num_token, encode_bfloat16_u16(limit)],
-        )
-
-
-class Dsv4SiluClampMul128(ComputeInstruction):
-    """Apply bounded SwiGLU to one or more retained M128 shards."""
-
-    def __init__(self, num_token: int, limit: float = 10.0):
-        if num_token <= 0 or num_token > 0xFFFF:
-            raise ValueError("DeepSeek shard SwiGLU token count must fit uint16")
-        if limit <= 0:
-            raise ValueError("DeepSeek shard SwiGLU limit must be positive")
-        super().__init__(
-            opcode=opcode.OP_DSV4_SILU_CLAMP_MUL_128,
-            args=[num_token, encode_bfloat16_u16(limit)],
+            opcode=opcode.OP_DSV4_SILU_CLAMP_MUL,
+            args=[num_token, width, encode_bfloat16_u16(limit)],
         )
 
 
@@ -1158,6 +1163,21 @@ class Dsv4HcHead(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_DSV4_HC_HEAD,
             args=[encode_bfloat16_u16(epsilon)],
+        )
+
+
+class Dsv4HcHeadRms(ComputeInstruction):
+    def __init__(
+        self, epsilon: float = 1.0e-6, rms_epsilon: float = 1.0e-6
+    ):
+        if epsilon <= 0 or rms_epsilon <= 0:
+            raise ValueError("DeepSeek mHC-head/RMS epsilons must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_HC_HEAD_RMS,
+            args=[
+                encode_bfloat16_u16(epsilon),
+                encode_bfloat16_u16(rms_epsilon),
+            ],
         )
 
 
@@ -1615,29 +1635,16 @@ class RMS_NORM_F16_K_4096_SMEM(ComputeInstruction):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_4096_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
 
-class RMS_NORM_F16_K_128_SMEM(ComputeInstruction):
-    def __init__(self, num_token: int, epsilon: float):
-        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_128_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
-
-
-class RMS_NORM_F16_K_2048_SMEM(ComputeInstruction):
-    def __init__(self, num_token: int, epsilon: float):
-        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_2048_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
-
-
-class RMS_NORM_F16_K_512_SMEM(ComputeInstruction):
-    def __init__(self, num_token: int, epsilon: float):
-        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_512_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
-
-
-class RMS_NORM_F16_K_1024_SMEM(ComputeInstruction):
-    def __init__(self, num_token: int, epsilon: float):
-        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_1024_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
-
-
-class RMS_NORM_F16_K_5120_SMEM(ComputeInstruction):
-    def __init__(self, num_token: int, epsilon: float):
-        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_5120_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
+class RMS_NORM_F16_SMEM(ComputeInstruction):
+    def __init__(self, num_token: int, hidden_size: int, epsilon: float):
+        if num_token <= 0 or num_token > 0xFFFF:
+            raise ValueError("RMS token count must fit in a positive uint16")
+        if hidden_size <= 0 or hidden_size > 0xFFFF or hidden_size % 2:
+            raise ValueError("RMS hidden size must be a positive even uint16")
+        super().__init__(
+            opcode=opcode.OP_RMS_NORM_F16_SMEM,
+            args=[num_token, hidden_size, encode_bfloat16_u16(epsilon)],
+        )
 
 
 def select_attention_decode_instruction(head_dim: int, direct_output: bool = False):
@@ -1665,16 +1672,10 @@ def select_rms_glob_instruction(hidden_size: int):
 def select_rms_smem_instruction(hidden_size: int):
     if hidden_size == 4096:
         return RMS_NORM_F16_K_4096_SMEM
-    if hidden_size == 2048:
-        return RMS_NORM_F16_K_2048_SMEM
-    if hidden_size == 1024:
-        return RMS_NORM_F16_K_1024_SMEM
-    if hidden_size == 512:
-        return RMS_NORM_F16_K_512_SMEM
-    if hidden_size == 5120:
-        return RMS_NORM_F16_K_5120_SMEM
-    if hidden_size == 128:
-        return RMS_NORM_F16_K_128_SMEM
+    if hidden_size in (128, 512, 1024, 2048, 5120):
+        return lambda num_token, epsilon: RMS_NORM_F16_SMEM(
+            num_token, hidden_size, epsilon
+        )
     raise NotImplementedError(f"Missing shared-memory RMS kernel support for hidden_size={hidden_size}. Add a dedicated opcode/instruction path before launching this model.")
 
 
@@ -2719,6 +2720,8 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
     MAX_PHASE_BASE = 0x7F
     FP8_STAGES = 2
     FP8_AREA_SLOTS = 17
+    LAYER_INDEXED_SIZE = 0x8000
+    STREAM_LENGTH_MASK = LAYER_INDEXED_SIZE - 1
 
     def __init__(
         self,
@@ -2732,6 +2735,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         port: int | None = None,
         stream_length: int | None = None,
         phase_base: int = 0,
+        layer_indexed: bool = False,
     ):
         if plan_address <= 0 or plan_address >= 1 << 64:
             raise ValueError("coupled-stream plan address must fit uint64")
@@ -2757,10 +2761,14 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
                 raise ValueError(
                     "allocator-owned coupled FP8 stream dispatches both LDUs"
                 )
-            if not 1 <= int(stream_length or 0) <= 0xFFFF:
-                raise ValueError("coupled FP8 stream length must fit uint16")
+            if not 1 <= int(stream_length or 0) <= self.STREAM_LENGTH_MASK:
+                raise ValueError(
+                    "coupled FP8 stream length must fit the indexed uint15 field"
+                )
             if not 0 <= int(phase_base) <= self.MAX_PHASE_BASE:
-                raise ValueError("coupled FP8 memory phase base must fit seven bits")
+                raise ValueError(
+                    "coupled FP8 memory phase base must fit seven bits"
+                )
             super().__init__(
                 opcode=opcode.OP_TMA_LOAD_MX_COUPLED_STREAM | 1,
                 num_slots=int(area_slots),
@@ -2769,14 +2777,24 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
                     | (int(stages) << self.STAGES_SHIFT)
                     | (int(phase_base) << self.PHASE_BASE_SHIFT)
                 ),
-                size=int(stream_length),
+                size=(
+                    int(stream_length)
+                    | (self.LAYER_INDEXED_SIZE if layer_indexed else 0)
+                ),
                 address=plan_address,
             )
             self.annotation["coupled_stream_area"] = int(area_id)
             self.annotation["coupled_stream_kind"] = int(kind)
             self.annotation["coupled_stream_allocator_lease"] = True
             self.annotation["coupled_stream_dual_port"] = True
+            self.annotation["coupled_stream_layer_indexed"] = bool(
+                layer_indexed
+            )
             return
+        if layer_indexed:
+            raise ValueError(
+                "only allocator-owned coupled FP8 plans may be layer indexed"
+            )
         if mailbox is None or not 0 <= int(mailbox) < config.num_special_slots:
             raise ValueError("coupled-stream mailbox is outside special slots")
         if port not in (0, 1):
@@ -3124,11 +3142,10 @@ __all__ = [
     "Dsv4Fp32RmsFp8QuantUmmaBSm100",
     "Dsv4Bf16GemvGroup4SplitKSm100",
     "Dsv4PreloadRopeTables",
-    "Dsv4Rope512_64",
+    "Dsv4Rope64",
     "Dsv4RmsRope512_64",
     "Dsv4Fp32RmsRope512_64",
     "Dsv4Fp32RopeHadamard128",
-    "Dsv4Rope128_64",
     "Dsv4SparseAttention512",
     "Dsv4ContiguousAttention512Block4",
     "Dsv4ContiguousAttention512UmmaSm100",
@@ -3144,8 +3161,7 @@ __all__ = [
     "Dsv4HcPre",
     "Dsv4HcPreRms",
     "Dsv4HcPost",
-    "Dsv4SiluClampMul2048",
-    "Dsv4SiluClampMul128",
+    "Dsv4SiluClampMul",
     "Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100",
     "Dsv4Hadamard",
     "Dsv4GatedPool",
@@ -3158,6 +3174,7 @@ __all__ = [
     "Dsv4IndexScore",
     "Dsv4TopK512",
     "Dsv4HcHead",
+    "Dsv4HcHeadRms",
     "Dsv4Fp8Quant128",
     "Dsv4Nvfp4Quant16",
     "Dsv4Nvfp4QuantUmmaBSm100",
@@ -3200,10 +3217,7 @@ __all__ = [
     "SILU_MUL_SHARED_BF16_K_64_SW128",
     "RMS_NORM_F16_K_4096",
     "RMS_NORM_F16_K_4096_SMEM",
-    "RMS_NORM_F16_K_128_SMEM",
-    "RMS_NORM_F16_K_2048_SMEM",
-    "RMS_NORM_F16_K_512_SMEM",
-    "RMS_NORM_F16_K_1024_SMEM",
+    "RMS_NORM_F16_SMEM",
     "select_attention_decode_instruction",
     "select_rms_glob_instruction",
     "select_rms_smem_instruction",

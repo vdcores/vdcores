@@ -82,15 +82,19 @@ void dae2(
   __shared__ cuda::barrier<cuda::thread_scope_block> barriers[4][numQueueElements];
   __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_barrier;
   __shared__ cuda::barrier<cuda::thread_scope_block> ldu_control_publish_barrier;
-  assert(numQueueElements <= blockDim.x && "Too many slots for barriers");
+  constexpr int numQueueBarriers = 4 * numQueueElements;
+  assert(numQueueBarriers + 2 <= blockDim.x && "Too many queue barriers");
   if (threadIdx.x < numQueueElements) {
     init(&barriers[0][threadIdx.x], numThreadsM2CBarrier);
-    init(&barriers[1][threadIdx.x], numThreadsC2MBarrier);
-    init(&barriers[2][threadIdx.x], numThreadsLDBarrier);
-    init(&barriers[3][threadIdx.x], numThreadsLDBarrier);
-  }
-  if (threadIdx.x == 0) {
+  } else if (threadIdx.x < 2 * numQueueElements) {
+    init(&barriers[1][threadIdx.x - numQueueElements], numThreadsC2MBarrier);
+  } else if (threadIdx.x < 3 * numQueueElements) {
+    init(&barriers[2][threadIdx.x - 2 * numQueueElements], numThreadsLDBarrier);
+  } else if (threadIdx.x < numQueueBarriers) {
+    init(&barriers[3][threadIdx.x - 3 * numQueueElements], numThreadsLDBarrier);
+  } else if (threadIdx.x == numQueueBarriers) {
     init(&ldu_control_barrier, 2);
+  } else if (threadIdx.x == numQueueBarriers + 1) {
     init(&ldu_control_publish_barrier, numThreadsPerWarp + 2);
   }
 
@@ -131,55 +135,36 @@ void dae2(
   if (thread_id / numThreadsPerWarp == 0) {
     tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
   }
-  if (thread_id == 0) {
-    #pragma unroll
-    for (int i = 0; i < tmemMmaBarrierCount; ++i) {
-      cute::initialize_barrier(tmem_mma_barriers[i], 1);
-    }
-    // Direct scale stages begin empty. Both LDU streams observe this phase;
-    // the completion warp produces each subsequent empty phase.
-    #pragma unroll
-    for (int i = 0; i < mxfp4Mxfp8TmaScaleBarrierCount; ++i) {
+  // Every barrier is independent.  Initialize its complete state—including
+  // the initial empty-stage arrival—on one distinct block thread instead of
+  // serializing all resident task families on thread zero at every launch.
+  for (int i = thread_id; i < tmemMmaBarrierCount; i += blockDim.x) {
+    cute::initialize_barrier(tmem_mma_barriers[i], 1);
+    const bool initially_empty =
+        (i >= mxfp4Mxfp8TmaScaleBarrierBase &&
+         i < mxfp4Mxfp8TmaScaleBarrierBase +
+             mxfp4Mxfp8TmaScaleBarrierCount) ||
+        (i >= mxfpResidentLinear1EmptyBarrierBase &&
+         i < mxfpResidentLinear1EmptyBarrierBase +
+             mxfpResidentLinear1Stages) ||
+        (i >= mxfpResidentDownEmptyBarrierBase &&
+         i < mxfpResidentDownEmptyBarrierBase + mxfpResidentDownStages) ||
+        (i >= mxfp8CoupledEmptyBarrierBase &&
+         i < mxfp8CoupledEmptyBarrierBase + mxfp8CoupledStages);
+    if (initially_empty) {
       cuda::ptx::mbarrier_arrive(
           cuda::ptx::sem_release,
           cuda::ptx::scope_cta,
           cuda::ptx::space_shared,
-          tmem_mma_barriers + mxfp4Mxfp8TmaScaleBarrierBase + i);
-    }
-    // The resident FFN stages begin empty. The LDUs observe this initial phase
-    // before their first overwrite; compute returns each later empty phase.
-    #pragma unroll
-    for (int i = 0; i < mxfpResidentLinear1Stages; ++i) {
-      cuda::ptx::mbarrier_arrive(
-          cuda::ptx::sem_release,
-          cuda::ptx::scope_cta,
-          cuda::ptx::space_shared,
-          tmem_mma_barriers + mxfpResidentLinear1EmptyBarrierBase + i);
-    }
-    #pragma unroll
-    for (int i = 0; i < mxfpResidentDownStages; ++i) {
-      cuda::ptx::mbarrier_arrive(
-          cuda::ptx::sem_release,
-          cuda::ptx::scope_cta,
-          cuda::ptx::space_shared,
-          tmem_mma_barriers + mxfpResidentDownEmptyBarrierBase + i);
-    }
-    #pragma unroll
-    for (int i = 0; i < mxfp8CoupledStages; ++i) {
-      cuda::ptx::mbarrier_arrive(
-          cuda::ptx::sem_release,
-          cuda::ptx::scope_cta,
-          cuda::ptx::space_shared,
-          tmem_mma_barriers + mxfp8CoupledEmptyBarrierBase + i);
+          tmem_mma_barriers + i);
     }
   }
 #else
   if (thread_id == 0) {
     tmem_base_ptr = 0;
-    #pragma unroll
-    for (int i = 0; i < tmemMmaBarrierCount; ++i) {
-      tmem_mma_barriers[i] = 0;
-    }
+  }
+  for (int i = thread_id; i < tmemMmaBarrierCount; i += blockDim.x) {
+    tmem_mma_barriers[i] = 0;
   }
 #endif
 

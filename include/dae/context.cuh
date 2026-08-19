@@ -131,7 +131,7 @@ static constexpr int mxfpDownResidentLdu1PollStartBarrier =
 
 // The allocator-owned common MXFP8 stream uses independent weight,
 // activation, UMMA-completion, and empty barriers for each of its two ring
-// stages.  These barriers persist across sequential generic projection tasks;
+// stages. These barriers persist across sequential generic projection tasks;
 // Python supplies each task's cumulative K-pair phase base.
 static constexpr int mxfp8CoupledStages = 2;
 static constexpr int mxfp8CoupledWeightFullBarrierBase =

@@ -25,5 +25,7 @@ Then pull in narrower notes as needed:
   SM100/SM103 build targeting, device-derived launch limits, and the Blackwell runtime smoke test
 - [deepseek-v4-flash.md](deepseek-v4-flash.md):
   single-GPU model shape, NVFP4/FP8 checkpoint contracts, task coverage, and verified baselines
+- [deepseek-v4-nongemm-consolidation.md](deepseek-v4-nongemm-consolidation.md):
+  production non-GEMM fusion, MXFP8 conversion ownership, and full-image acceptance gates
 - [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md):
   queue protocol and deadlock-oriented guidance

@@ -15,6 +15,7 @@ from dae.instructions import (
     Dsv4ContiguousAttention512UmmaSm100,
     Dsv4ContiguousAttention512UmmaTail32Sm100,
     Dsv4HcPreRms,
+    Dsv4HcHeadRms,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100,
@@ -22,10 +23,9 @@ from dae.instructions import (
     Dsv4Fp32ToBf16,
     Dsv4Nvfp4QuantUmmaBSm100,
     Dsv4PreloadRopeTables,
-    Dsv4Rope128_64,
-    Dsv4Rope512_64,
+    Dsv4Rope64,
     Dsv4RmsRope512_64,
-    Dsv4SiluClampMul128,
+    Dsv4SiluClampMul,
     Gemv_M128N8Argmax4,
     Gemv_M128N8Direct4,
     Gemv_M128N8_ROPE_128,
@@ -57,6 +57,7 @@ from dae.instructions import (
     Nvfp4UmmaPrepackSm100,
     ProfileEvent,
     ProfileStep,
+    RMS_NORM_F16_SMEM,
     RepeatM,
     ResetIndirectLayer,
     RoutedTmaLoad1D,
@@ -68,6 +69,7 @@ from dae.instructions import (
     TmaLoadMxfpScale1D,
     TmaLoadReg1D,
     TmaTensor,
+    select_rms_smem_instruction,
 )
 from dae.runtime import config, opcode
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy
@@ -474,6 +476,14 @@ def test_nvfp4_streaming_umma_encodes_retained_bulk_activation():
     assert instruction.args == [16, 1, 1]
 
 
+def test_nvfp4_streaming_umma_encodes_normal_swiglu_epilogue():
+    instruction = Nvfp4GemvUmmaStreamSm100(
+        8, bulk_activation=True, swiglu_limit=10.0
+    )
+
+    assert instruction.args == [8, 320, 1]
+
+
 def test_nvfp4_pipeline_encodes_activation_tiles_per_load():
     instruction = Nvfp4GemvUmmaPipelineSm100(
         16, activation_tiles_per_load=4
@@ -590,6 +600,57 @@ def test_routed_nvfp4_fp32_pipeline_keeps_partial_activation_batch(monkeypatch):
         if isinstance(inst, Nvfp4GemvUmmaPipelineFp32Sm100)
     ]
     assert [inst.args for inst in compute] == [[4, 0, 2], [4, 0, 2]]
+
+
+def test_routed_nvfp4_retains_activation_until_true_last_output(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeRoutingState:
+        device = FakeDevice()
+
+        @staticmethod
+        def data_ptr():
+            return 0x123456789ABC
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 12
+
+        @staticmethod
+        def element_size():
+            return 4
+
+    instructions = SchedRoutedNvfp4GemvUmmaStream(
+        FakeRoutingState(),
+        0,
+        (1, 2, 3),
+        4,
+        torch.empty((4, 3072), dtype=torch.uint8),
+        torch.empty((384,), dtype=torch.float32),
+        output_mode="fp32_store",
+        output_scale=torch.ones((1,), dtype=torch.float32),
+        route_ready=True,
+    ).place(1).schedule(0)
+
+    compute = [
+        inst
+        for inst in instructions
+        if isinstance(inst, Nvfp4GemvUmmaFp32Sm100)
+    ]
+    assert [inst.args for inst in compute] == [
+        [4, 1, 1],
+        [4, 1, 1],
+        [4, 0, 1],
+    ]
 
 
 def test_nvfp4_splitk_maps_k_shards_and_tma_reduces_fp32(monkeypatch):
@@ -1610,6 +1671,45 @@ def test_fp8_coupled_batch_flattens_independent_projection_work(monkeypatch):
     assert second_address == schedule.stream_plans[1].data_ptr()
 
 
+def test_fp8_coupled_layer_plans_use_the_resident_layer_index(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    first_weights = torch.empty((2, 2, 16896), dtype=torch.uint8)
+    second_weights = torch.empty((2, 2, 16896), dtype=torch.uint8)
+    activations = torch.empty((2, 2048), dtype=torch.uint8)
+    output = torch.empty((256,), dtype=torch.bfloat16)
+    schedule = SchedFp8GemvUmmaCoupled(
+        first_weights,
+        activations,
+        output,
+        weight_layers=(first_weights, second_weights),
+    ).place(1)
+
+    load = next(
+        inst
+        for inst in schedule.schedule(0)
+        if isinstance(inst, TmaLoadMxfpCoupledStream)
+    )
+    address = sum(
+        value << (16 * index) for index, value in enumerate(load.cords)
+    )
+
+    assert load.size == TmaLoadMxfpCoupledStream.LAYER_INDEXED_SIZE | 1
+    assert load.annotation["coupled_stream_layer_indexed"]
+    assert schedule.stream_plans.shape == (1, 2, 2)
+    assert address == schedule.stream_plans[0, 0].data_ptr()
+    assert schedule.stream_plans[0, 0, 0].item() == (
+        schedule.weight_stream_layers[0][0, 0, 0].data_ptr()
+    )
+    assert schedule.stream_plans[0, 1, 0].item() == (
+        schedule.weight_stream_layers[1][0, 0, 0].data_ptr()
+    )
+    assert schedule.stream_plans[0, 0, 1].item() == (
+        schedule.stream_plans[0, 1, 1].item()
+    )
+
+
 def test_fp8_coupled_balanced_k_splits_only_the_placement_tail(monkeypatch):
     monkeypatch.setattr(
         "dae.runtime.build_tma_desc",
@@ -1648,6 +1748,42 @@ def test_fp8_coupled_balanced_k_splits_only_the_placement_tail(monkeypatch):
     assert sum(pair_loads) == 5 * 4
     assert max(pair_loads) == 7
     assert max(task_counts) == 3
+
+
+def test_fp8_coupled_balanced_k_releases_only_work_owning_sms(monkeypatch):
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    weights = torch.empty((32, 16, 16896), dtype=torch.uint8)
+    activations = torch.empty((16, 2048), dtype=torch.uint8)
+    accumulator = torch.empty((32, 128), dtype=torch.float32)
+    output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
+        "reduce", 1, 128
+    )
+    schedule = (
+        SchedFp8GemvUmmaCoupled(
+            weights,
+            activations,
+            output_reduce,
+            balanced_k=True,
+        )
+        .bar("output", 17)
+        .place(56)
+    )
+
+    # M4096/K2048 has 128 M256/K256 products. Balancing its 16 output pairs
+    # over 56 SMs creates 48 shards; only those work-owning SMs release the
+    # dependency.
+    assert schedule.work_tiles == 48
+    assert schedule.active_sms == 48
+    assert schedule.bar_release_count("output") == 48
+    assert schedule.collect_barrier_release_counts() == {17: 48}
 
 
 def test_fp8_coupled_splitk_keeps_one_common_compute_shape(monkeypatch):
@@ -1690,18 +1826,39 @@ def test_fp8_coupled_splitk_keeps_one_common_compute_shape(monkeypatch):
     ]
     assert [inst.size for inst in coupled] == [8, 8]
     assert all(inst.num_slots == 17 for inst in coupled)
-    assert len(stores) == 4
+    assert [inst.arg & 0xFE00 for inst in coupled] == [
+        0,
+        8 << 9,
+    ]
+    assert len(stores) == 2
     assert all(
         (inst.opcode & ~16) == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
         for inst in stores
     )
+    assert all(inst.size == 2 * 128 * 4 for inst in stores)
 
 
-def test_dsv4_shard_swiglu_encodes_bound_and_width():
-    instruction = Dsv4SiluClampMul128(1, 10.0)
+def test_dsv4_swiglu_encodes_bound_and_width():
+    instruction = Dsv4SiluClampMul(1, 128, 10.0)
 
-    assert instruction.opcode == opcode.OP_DSV4_SILU_CLAMP_MUL_128
+    assert instruction.opcode == opcode.OP_DSV4_SILU_CLAMP_MUL
     assert instruction.args[0] == 1
+    assert instruction.args[1] == 128
+
+
+def test_runtime_width_rms_instruction_replaces_small_shape_variants():
+    instruction = select_rms_smem_instruction(512)(1, 1.0e-6)
+
+    assert isinstance(instruction, RMS_NORM_F16_SMEM)
+    assert instruction.opcode == opcode.OP_RMS_NORM_F16_SMEM
+    assert instruction.args[:2] == [1, 512]
+
+
+def test_fused_hc_head_rms_encodes_both_epsilons():
+    instruction = Dsv4HcHeadRms(1.0e-5, 1.0e-6)
+
+    assert instruction.opcode == opcode.OP_DSV4_HC_HEAD_RMS
+    assert len(instruction.args) == 2
 
 
 def test_dsv4_shard_swiglu_consumes_port_local_registers(monkeypatch):
@@ -1716,7 +1873,8 @@ def test_dsv4_shard_swiglu_consumes_port_local_registers(monkeypatch):
         torch.empty((256,), dtype=torch.bfloat16),
     ).place(2).schedule(0)
 
-    assert instructions[0].opcode == opcode.OP_DSV4_SILU_CLAMP_MUL_128
+    assert instructions[0].opcode == opcode.OP_DSV4_SILU_CLAMP_MUL
+    assert instructions[0].args[1] == 128
     assert instructions[2].size == instructions[3].size == 1
     assert not instructions[2].opcode & 32
     assert instructions[3].opcode & 32
@@ -2478,8 +2636,8 @@ def test_resident_rope_tables_preload_once_and_fixed_tasks_skip_table_loads(
         inverse=True,
         fixed_table_id=2,
     ).place(1).schedule(0)
-    assert isinstance(fixed512[0], Dsv4Rope512_64)
-    assert fixed512[0].args == [1, 1, 3]
+    assert isinstance(fixed512[0], Dsv4Rope64)
+    assert fixed512[0].args == [1, 512, 7]
     assert len(fixed512) == 3
 
     input128 = torch.empty((1, 128), dtype=torch.bfloat16)
@@ -2490,14 +2648,14 @@ def test_resident_rope_tables_preload_once_and_fixed_tasks_skip_table_loads(
         output128,
         fixed_table_id=1,
     ).place(1).schedule(0)
-    assert isinstance(fixed128[0], Dsv4Rope128_64)
-    assert fixed128[0].args == [1, 0, 2]
+    assert isinstance(fixed128[0], Dsv4Rope64)
+    assert fixed128[0].args == [1, 128, 4]
     assert len(fixed128) == 3
 
     dynamic = SchedDsv4Rope512_64(
         input512, tables[0], output512
     ).place(1).schedule(0)
-    assert dynamic[0].args == [1, 0, 0]
+    assert dynamic[0].args == [1, 512, 0]
     assert len(dynamic) == 4
 
 

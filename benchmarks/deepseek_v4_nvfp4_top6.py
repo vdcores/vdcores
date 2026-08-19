@@ -25,7 +25,6 @@ from dae.schedule import (
     SchedDsv4Fp32ToBf16,
     SchedDsv4Nvfp4QuantUmmaB,
     SchedDsv4RouteTop6,
-    SchedDsv4SwiGluShard128,
     SchedDsv4ZeroFill,
     SchedNvfp4UmmaPrepack,
     SchedRoutedDsv4Fp32SwiGluNvfp4QuantUmmaB,
@@ -594,30 +593,14 @@ def main() -> None:
                             ),
                             table.field("w3.alpha"),
                             native_input[rank],
-                            None,
+                            middle[rank],
                             route_ready=True,
                             activation_mode="reuse",
-                            output_mode="retain",
+                            output_mode="silu_store",
                             output_register=1,
-                            output_port=1,
-                            pipeline=args.umma_pipeline,
-                        ),
-                        cfg.expert_intermediate_size // 128,
-                        base,
-                    ),
-                    queued_sms,
-                    wait_for_previous=False,
-                ),
-                SequentialStage(
-                    f"expert{rank}.swiglu_shards",
-                    lane(
-                        SchedDsv4SwiGluShard128(
-                            1,
-                            0,
-                            1,
-                            1,
-                            middle[rank],
+                            output_port=0,
                             swiglu_limit=cfg.swiglu_limit,
+                            pipeline=args.umma_pipeline,
                         ),
                         cfg.expert_intermediate_size // 128,
                         base,
@@ -949,11 +932,14 @@ def main() -> None:
     program = SequentialProgram(
         launcher, stages, balance_load_ports=True
     )
-    launcher.s(
-        _BarrierProfileSchedule(2, profile_operand).place(device_sms),
-        program,
-        ProfileEvent(3),
-    )
+    if args.profile_phases:
+        launcher.s(
+            _BarrierProfileSchedule(2, profile_operand).place(device_sms),
+            program,
+            ProfileEvent(3),
+        )
+    else:
+        launcher.s(program)
     setup_stage("launcher_ready")
 
     def reset_external_accumulators():
@@ -1060,6 +1046,8 @@ def main() -> None:
         )
         flow_timings.append(
             (profile[:, 3].max() - profile[:, 2].min()) / 1.0e3
+            if args.profile_phases
+            else kernel_timings[-1]
         )
 
     max_compute = program.max_compute_instructions

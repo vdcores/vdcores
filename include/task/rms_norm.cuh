@@ -136,6 +136,57 @@ __device__ __forceinline__ void _rms_helper_one_row(
   }
 }
 
+// The non-4096 resident RMS shapes have identical work and synchronization;
+// only the number of BF16 pairs differs. Keep 4096's register-cached fast
+// path templated and use this one compact runtime loop for the other widths.
+__device__ __forceinline__ void _rms_helper_one_row_runtime_bf16(
+    const __nv_bfloat16* weights,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    float* smem_reduce,
+    int hidden_size,
+    __nv_bfloat16 epsilon
+) {
+  constexpr int kThreads = 128;
+  const int thread_id = __compute_tid();
+  const int lane_id = thread_id % 32;
+  const int pair_count = hidden_size / 2;
+  const auto* input2 = reinterpret_cast<const __nv_bfloat162*>(input);
+  const auto* weights2 = reinterpret_cast<const __nv_bfloat162*>(weights);
+  auto* output2 = reinterpret_cast<__nv_bfloat162*>(output);
+
+  __nv_bfloat162 sum2 = make_bfloat162(0, 0);
+  for (int i = thread_id; i < pair_count; i += kThreads) {
+    const __nv_bfloat162 value = input2[i];
+    sum2 = __hfma2(value, value, sum2);
+  }
+  float sum = __bfloat162float(sum2.x) + __bfloat162float(sum2.y);
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
+  }
+  if (lane_id == 0) {
+    smem_reduce[thread_id / 32] = sum;
+  }
+  __sync_compute_group(kThreads);
+
+  if (thread_id == 0) {
+    #pragma unroll
+    for (int warp = 1; warp < kThreads / 32; ++warp) {
+      sum += smem_reduce[warp];
+    }
+    smem_reduce[0] = sum;
+  }
+  __sync_compute_group(kThreads);
+
+  const float rms_rcp = rsqrtf(
+      smem_reduce[0] / float(hidden_size) + __bfloat162float(epsilon));
+  const __nv_bfloat162 scale2 = make_bfloat162(rms_rcp, rms_rcp);
+  for (int i = thread_id; i < pair_count; i += kThreads) {
+    output2[i] = __hmul2(__hmul2(input2[i], scale2), weights2[i]);
+  }
+}
+
 __device__ __forceinline__ void _rms_helper_two_rows_4096_bf16(
     const __nv_bfloat16* weights,
     const __nv_bfloat16* input,
@@ -300,4 +351,39 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
 
   c2m.template push<0, true>(thread_id, out_addr_slot);
   c2m.push(thread_id, in_addr_slot | weights_slot);
+}
+
+template<typename M2C_Type, typename C2M_Type>
+__device__ __forceinline__ void task_rms_norm_f16_from_smem_runtime(
+    void *base,
+    int num_token,
+    int hidden_size,
+    __nv_bfloat16 epsilon,
+    float *smem_reduce,
+    M2C_Type& m2c,
+    C2M_Type& c2m
+) {
+  const int thread_id = __compute_tid();
+  const int weights_slot = m2c.template pop<0>();
+  const auto* weights_ptr = reinterpret_cast<const __nv_bfloat16*>(
+      get_slot_address(base, extract(weights_slot)));
+  const int input_slot = m2c.template pop<0>();
+  const auto* input_ptr = reinterpret_cast<const __nv_bfloat16*>(
+      get_slot_address(base, extract(input_slot)));
+  const int output_slot = m2c.template pop<0>();
+  auto* output_ptr = reinterpret_cast<__nv_bfloat16*>(
+      get_slot_address(base, extract(output_slot)));
+
+  for (int token_id = 0; token_id < num_token; ++token_id) {
+    _rms_helper_one_row_runtime_bf16(
+        weights_ptr,
+        input_ptr + token_id * hidden_size,
+        output_ptr + token_id * hidden_size,
+        smem_reduce,
+        hidden_size,
+        epsilon);
+  }
+
+  c2m.template push<0, true>(thread_id, output_slot);
+  c2m.push(thread_id, input_slot | weights_slot);
 }

@@ -1,6 +1,12 @@
 import torch
 
-from dae.instructions import ArgmaxSmemPartialBf16, ArgmaxSmemReduceBf16
+from dae.instructions import (
+    ArgmaxSmemPartialBf16,
+    ArgmaxSmemReduceBf16,
+    Fp8Block128GemvSm100,
+    RegLoad,
+    RegStore,
+)
 
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
@@ -29,6 +35,7 @@ from dae.schedule import (
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4Fp8Quant128,
     SchedDsv4Nvfp4Quant16,
+    SchedFp8Block128GateUpSwiGlu,
     SchedFp8Block128Gemv,
     SchedFp8Block128GemvBf16,
 )
@@ -337,6 +344,47 @@ def test_fused_fp8_gemv_loads_bf16_activation_without_scale_operand(monkeypatch)
     assert instructions[2].tensor.data_ptr() == weight_scale.data_ptr()
     assert instructions[3].tensor.data_ptr() == activation.data_ptr()
     assert instructions[4].tensor.data_ptr() == output.data_ptr()
+
+
+def test_fp8_gate_up_swiglu_retains_gate_until_up_epilogue(monkeypatch):
+    class FakeTransfer:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def bar(self, _):
+            return self
+
+    globals_ = SchedFp8Block128GateUpSwiGlu.schedule.__globals__
+    monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
+    gate_weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
+    gate_scale = torch.empty((2, 1), dtype=torch.float8_e8m0fnu)
+    up_weight = torch.empty_like(gate_weight)
+    up_scale = torch.empty_like(gate_scale)
+    activation = torch.empty((128,), dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty((1,), dtype=torch.float8_e8m0fnu)
+    output = torch.empty((256,), dtype=torch.bfloat16)
+
+    instructions = SchedFp8Block128GateUpSwiGlu(
+        gate_weight,
+        gate_scale,
+        up_weight,
+        up_scale,
+        activation,
+        activation_scale,
+        output,
+        swiglu_limit=10.0,
+    ).place(2).schedule(0)
+
+    assert isinstance(instructions[0], Fp8Block128GemvSm100)
+    assert instructions[0].args == [128, 128, 0]
+    assert isinstance(instructions[5], RegStore)
+    assert instructions[5].annotation["fixed_port"] == 0
+    assert isinstance(instructions[6], Fp8Block128GemvSm100)
+    assert instructions[6].args == [128, 128, 160 << 7]
+    assert isinstance(instructions[11], RegLoad)
+    assert instructions[11].annotation["fixed_port"] == 0
+    assert instructions[12].tensor.data_ptr() == output[:128].data_ptr()
 
 
 def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):

@@ -21,6 +21,11 @@ static constexpr uint16_t kCoupledStagesMask = 0x00f0;
 static constexpr uint16_t kCoupledLocalChain = 0x0100;
 static constexpr int kCoupledPhaseBaseShift = 9;
 static constexpr uint16_t kCoupledPhaseBaseMask = 0xfe00;
+// The common plan is two uint64 pointers. A size-field flag asks the allocator
+// to select the current resident layer's 16-byte plan record before publishing
+// the otherwise unchanged command to both LDUs.
+static constexpr uint16_t kCoupledLayerIndexedSize = 0x8000;
+static constexpr uint16_t kCoupledStreamLengthMask = 0x7fff;
 
 // Common native MXFP8 x MXFP8 ring. Each retained K256 stage carries both
 // M128 output groups, their packed SFA images, and the shared activation/SFB.

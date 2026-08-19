@@ -199,10 +199,10 @@ __device__ __forceinline__ void task_silu_smem_1D(
     c2m.template push<0>(threadIdx.x, slot_gate | slot_up);
 }
 
-template<int K,
-         typename M2C_Type, typename C2M_Type>
+template<typename M2C_Type, typename C2M_Type>
 __device__ __forceinline__ void task_silu_clamp_smem_1D(
     const int N,
+    const int K,
     const float limit,
     void *base,
     M2C_Type& m2c,
@@ -214,8 +214,6 @@ __device__ __forceinline__ void task_silu_clamp_smem_1D(
     struct alignas(16) Pack128 {
         fetch_t values[4];
     };
-    static_assert(K % 8 == 0, "128-bit BF16 vector path requires K divisible by 8");
-
     const int slot_out = m2c.pop();
     auto *sOut = static_cast<Pack128 *>(get_slot_address(base, extract(slot_out)));
     const int slot_gate = m2c.pop();
@@ -226,7 +224,7 @@ __device__ __forceinline__ void task_silu_clamp_smem_1D(
         get_slot_address(base, extract(slot_up)));
 
     constexpr int kComputeThreads = numComputeWarps * numThreadsPerWarp;
-    constexpr int kPacksPerToken = K / 8;
+    const int kPacksPerToken = K / 8;
     for (int i = threadIdx.x; i < kPacksPerToken * N; i += kComputeThreads) {
         const Pack128 gate = sGate[i];
         const Pack128 up = sUp[i];
