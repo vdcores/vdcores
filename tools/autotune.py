@@ -41,6 +41,7 @@ TARGETS = {
         "namespace": "qwen3_1p7b",
         "script": "app/python/qwen3_1p7b/sched.py",
         "dry_build_args": ["--dry-build"],
+        "correctness_args": ["--correctness"],
     },
 }
 
@@ -63,6 +64,30 @@ class KnobRegistry:
     def from_file(cls, path):
         with open(path, "r", encoding="utf-8") as handle:
             return cls(json.load(handle))
+
+    def apply_preset(self, path):
+        """Start from a saved configuration instead of the schedule's defaults.
+
+        A search that stops early, or one run per knob group on separate days,
+        is only useful if the next run can pick up where the last one left off.
+        A preset is just a config file, so the same artifact also feeds
+        `DAE_TUNE_CONFIG` directly.
+        """
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        knobs = payload.get("knobs", payload) if "knobs" in payload else payload
+        namespace = payload.get("namespace") if isinstance(payload, dict) else None
+        if namespace and self.namespace and namespace != self.namespace:
+            raise SystemExit(
+                f"preset is for namespace {namespace!r}, but these knobs are "
+                f"{self.namespace!r}"
+            )
+        knobs = {key: value for key, value in knobs.items() if key != "namespace"}
+        unknown = sorted(name for name in knobs if name not in self.specs)
+        if unknown:
+            raise SystemExit(f"preset sets knobs this target does not have: {', '.join(unknown)}")
+        self.baseline.update(knobs)
+        return len(knobs)
 
     def choices(self, name):
         return self.specs.get(name, {}).get("choices") or []
@@ -164,6 +189,83 @@ def sweep_candidates(registry, only=None, skip_baseline=False):
             values[name] = choice
             candidates.append(Candidate(values, {name: choice}, f"{name}={choice}"))
     return candidates
+
+
+# ---------------------------------------------------------- knob groups
+
+
+class KnobGroup:
+    """Knobs that have to move together, plus their legal combinations.
+
+    A stage's SM count and its base SM are one group. Moving them one at a
+    time makes wide placements unreachable: `up_low.sms=128` only becomes
+    legal once `up_low.base_sm` drops to 0, and a single-knob sweep never
+    tries that pair, so it reports the value as illegal when it is merely
+    unreachable from the current baseline.
+    """
+
+    def __init__(self, name, knobs):
+        self.name = name
+        self.knobs = knobs
+
+    def combinations(self, registry):
+        """Cross product of every member knob's choices."""
+        combos = [{}]
+        for knob in self.knobs:
+            choices = registry.choices(knob) or [registry.baseline.get(knob)]
+            combos = [
+                dict(combo, **{knob: choice})
+                for combo in combos
+                for choice in choices
+            ]
+        return combos
+
+    def size(self, registry):
+        total = 1
+        for knob in self.knobs:
+            total *= max(len(registry.choices(knob)), 1)
+        return total
+
+
+def knob_groups(registry, only=None):
+    """Placement pairs first, then every remaining knob on its own."""
+    groups = []
+    grouped = set()
+    for stage in registry.stages():
+        knobs = [f"{stage}.sms", f"{stage}.base_sm"]
+        groups.append(KnobGroup(stage, knobs))
+        grouped.update(knobs)
+    for name in registry.specs:
+        if name in grouped or len(registry.choices(name)) <= 1:
+            continue
+        groups.append(KnobGroup(name, [name]))
+    if only:
+        known = {group.name for group in groups}
+        unknown = sorted(set(only) - known)
+        if unknown:
+            raise SystemExit(
+                f"unknown group(s): {', '.join(unknown)}; known: {', '.join(sorted(known))}"
+            )
+        groups = [group for group in groups if group.name in only]
+    return groups
+
+
+def group_candidates(registry, group, current):
+    """Vary one group across its combinations, holding everything else at `current`."""
+    candidates = []
+    for combo in group.combinations(registry):
+        if all(current.get(knob) == value for knob, value in combo.items()):
+            continue
+        values = dict(current)
+        values.update(combo)
+        label = " ".join(f"{knob}={value}" for knob, value in combo.items())
+        candidates.append(Candidate(values, dict(combo), label))
+    return candidates
+
+
+def config_key(values):
+    """Hashable identity for one configuration, for caching build results."""
+    return json.dumps(values, sort_keys=True, default=str)
 
 
 # ------------------------------------------------------------ dry-build run
@@ -298,6 +400,84 @@ def run_timed(target, values, args, workdir):
     if timings is None:
         return "fail", None, "run succeeded but printed no benchmark results"
     return "ok", timings["median"], None
+
+
+def filter_legal(registry, target, candidates, args, cache=None):
+    """Static rules first, then a dry build. Returns (kept, skipped).
+
+    The static rules are free, so they run first and keep the subprocess count
+    down. `cache` memoizes dry-build verdicts across passes of a search, where
+    the same configuration is otherwise rebuilt every pass.
+    """
+    kept, skipped = [], []
+    for candidate in candidates:
+        reason = static_reject_reason(registry, candidate.values)
+        if reason is None and not getattr(args, "no_prebuild", False):
+            key = config_key(candidate.values)
+            if cache is not None and key in cache:
+                reason = cache[key]
+            else:
+                ok, build_reason, _ = run_dry_build(
+                    target, candidate.values, args.build_timeout, args.workdir
+                )
+                reason = None if ok else build_reason
+                if cache is not None:
+                    cache[key] = reason
+        if reason is None:
+            kept.append(candidate)
+        else:
+            skipped.append({"label": candidate.label, "reason": reason})
+    return kept, skipped
+
+
+def run_correctness(target, values, args):
+    """Run the target's own correctness check under one configuration.
+
+    Returns (True, None), (False, reason), or (None, reason) when the target
+    declares no correctness check. A schedule that is fast but wrong is not an
+    improvement, and timing alone cannot tell the difference, so a search must
+    not adopt a configuration it has not verified.
+    """
+    correctness_args = target.get("correctness_args")
+    if not correctness_args:
+        return None, "target declares no correctness check"
+
+    config_path = write_config(target, values)
+    env = clean_env({"DAE_TUNE_CONFIG": config_path})
+    command = [sys.executable, target["script"], *correctness_args]
+    try:
+        proc = subprocess.run(
+            command, cwd=args.workdir, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=args.correctness_timeout, text=True,
+        )
+        output, returncode = proc.stdout or "", proc.returncode
+    except subprocess.TimeoutExpired as expired:
+        output, returncode = expired.stdout or "", HANG_RETURNCODE
+    finally:
+        os.unlink(config_path)
+
+    if returncode == HANG_RETURNCODE:
+        return False, f"correctness run timed out after {args.correctness_timeout}s"
+    if returncode != 0:
+        return False, classify_failure(output)
+    return True, None
+
+
+def save_preset(path, target, values, meta=None):
+    """Write a configuration in the format `DAE_TUNE_CONFIG` already accepts.
+
+    `tune._load_config_file` ignores top-level keys other than `knobs` and
+    `namespace`, so the provenance block rides along without breaking the
+    round trip.
+    """
+    payload = {"namespace": target["namespace"], "knobs": values}
+    if meta:
+        payload["search"] = meta
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return path
 
 
 # ------------------------------------------------------- noise-aware stats
@@ -493,6 +673,9 @@ def target_for_registry(registry, args):
         "namespace": registry.namespace,
         "script": getattr(args, "script", None) or known.get("script"),
         "dry_build_args": getattr(args, "dry_build_arg", None) or known.get("dry_build_args", []),
+        "correctness_args": (
+            getattr(args, "correctness_arg", None) or known.get("correctness_args", [])
+        ),
     }
     if not target["script"]:
         raise SystemExit(f"no script known for namespace {registry.namespace!r}; pass --script")
@@ -501,6 +684,9 @@ def target_for_registry(registry, args):
 
 def cmd_check(args):
     registry = KnobRegistry.from_file(args.knobs)
+    if getattr(args, "preset", None):
+        registry.apply_preset(args.preset)
+        print(f"[check] baseline taken from preset {args.preset}")
     target = target_for_registry(registry, args)
 
     candidates = sweep_candidates(registry, only=set(args.knob or []))
@@ -609,6 +795,9 @@ def cmd_noise(args):
     schedule from a lucky run, and that has to be fixed first.
     """
     registry = KnobRegistry.from_file(args.knobs)
+    if getattr(args, "preset", None):
+        registry.apply_preset(args.preset)
+        print(f"[noise] measuring preset {args.preset}")
     target = target_for_registry(registry, args)
     baseline = Candidate(dict(registry.baseline), {}, "baseline")
 
@@ -662,6 +851,9 @@ def cmd_noise(args):
 
 def cmd_measure(args):
     registry = KnobRegistry.from_file(args.knobs)
+    if getattr(args, "preset", None):
+        registry.apply_preset(args.preset)
+        print(f"[measure] baseline taken from preset {args.preset}")
     target = target_for_registry(registry, args)
 
     candidates = sweep_candidates(registry, only=set(args.knob or []))
@@ -875,6 +1067,309 @@ def print_timing_summary(payload):
         print("Nothing cleared the noise floor; the hand-tuned baseline stands for now.")
 
 
+def _timing_progress(prefix, total_rounds):
+    def progress(round_index, candidate, status, ns, reason):
+        detail = f"{ns / 1e6:.3f} ms" if status == "ok" else f"{status}: {reason}"
+        print(f"  [{prefix} {round_index + 1}/{total_rounds}] "
+              f"{candidate.label:32} {detail}", flush=True)
+    return progress
+
+
+def head_to_head(target, origin_values, current_values, args, rng):
+    """Time the original baseline against the searched config, directly.
+
+    Greedy descent adopts each step against the configuration that preceded
+    it, so a chain of individually-justified steps can still add up to less
+    than it looks. The only honest number for the whole search is a fresh
+    measurement of where it started against where it ended.
+    """
+    arms = [
+        Candidate(dict(origin_values), {}, "origin"),
+        Candidate(dict(current_values), {}, "searched"),
+    ]
+    final_args = argparse.Namespace(**vars(args))
+    final_args.repeats = args.final_rounds
+    final_args.seed = args.seed + 5000
+
+    samples, _ = measure_rounds(
+        target, arms, final_args, args.workdir,
+        _timing_progress("final", args.final_rounds),
+    )
+    origin_samples = samples.get("origin", [])
+    searched_samples = samples.get("searched", [])
+    if len(origin_samples) < 2 or len(searched_samples) < 2:
+        return {"verdict": "insufficient"}
+
+    origin_median = statistics.median(origin_samples)
+    min_effect_ns = args.min_effect_pct / 100.0 * origin_median
+    verdict, delta, (low, high) = decide(
+        searched_samples, origin_samples, min_effect_ns, final_args, rng)
+    return {
+        "verdict": verdict,
+        "origin_median_ns": origin_median,
+        "searched_median_ns": statistics.median(searched_samples),
+        "delta_ns": delta,
+        "delta_pct": delta / origin_median * 100,
+        "ci_low_ns": low,
+        "ci_high_ns": high,
+        "rounds": args.final_rounds,
+    }
+
+
+def cmd_search(args):
+    """Coordinate descent over knob groups.
+
+    One group is optimized at a time, against the configuration reached so far
+    rather than against the original baseline, and a step is only taken when
+    it wins the same noise-aware test `measure` uses, wins it twice, and
+    survives the correctness gate.
+    """
+    registry = KnobRegistry.from_file(args.knobs)
+    if args.preset:
+        applied = registry.apply_preset(args.preset)
+        print(f"[search] starting from preset {args.preset} ({applied} knob(s))")
+    target = target_for_registry(registry, args)
+
+    origin = dict(registry.baseline)
+    current = dict(origin)
+    groups = knob_groups(registry, only=set(args.group or []))
+    if not groups:
+        raise SystemExit("no knob groups to search")
+
+    total_space = 1
+    for group in groups:
+        total_space *= group.size(registry)
+    print(f"[search] {len(groups)} group(s): {', '.join(g.name for g in groups)}")
+    print(f"[search] product of group sizes is {total_space:,} configurations; "
+          f"coordinate descent visits a small fraction of that")
+    print(f"[search] up to {args.max_passes} pass(es), {args.repeats} rounds per group\n")
+
+    rng = random.Random(args.seed + 7)
+    build_cache = {}
+    trace = []
+    adopted = []
+    runs = 0
+
+    for pass_index in range(args.max_passes):
+        improved = False
+        print(f"===== pass {pass_index + 1}/{args.max_passes} =====")
+        for group in groups:
+            candidates = group_candidates(registry, group, current)
+            kept, skipped = filter_legal(registry, target, candidates, args, build_cache)
+            entry = {
+                "pass": pass_index + 1,
+                "group": group.name,
+                "considered": len(candidates),
+                "legal": len(kept),
+                "rejected": skipped,
+                "adopted": None,
+            }
+            if not kept:
+                print(f"[{group.name}] no legal alternative to the current value, skipping")
+                trace.append(entry)
+                continue
+
+            reference = Candidate(dict(current), {}, "current")
+            arms = [reference] + kept
+            print(f"[{group.name}] timing {len(kept)} legal alternative(s), "
+                  f"{len(skipped)} rejected")
+            samples, failures = measure_rounds(
+                target, arms, args, args.workdir,
+                _timing_progress(group.name, args.repeats),
+            )
+            runs += args.repeats * len(arms)
+
+            ref_samples = samples.get("current", [])
+            if len(ref_samples) < 2:
+                print(f"[{group.name}] the current config produced too few timings, skipping")
+                entry["error"] = "reference produced too few samples"
+                trace.append(entry)
+                continue
+
+            ref_median = statistics.median(ref_samples)
+            min_effect_ns = args.min_effect_pct / 100.0 * ref_median
+            confidence = corrected_confidence(
+                args.confidence, len(kept), not args.no_correction)
+
+            scored = []
+            for candidate in kept:
+                candidate_samples = samples.get(candidate.label, [])
+                if len(candidate_samples) < 2:
+                    status, reason = failures.get(candidate.label, ("fail", "no samples"))
+                    scored.append({"label": candidate.label, "verdict": status,
+                                   "reason": reason, "delta_pct": None})
+                    continue
+                verdict, delta, (low, high) = decide(
+                    candidate_samples, ref_samples, min_effect_ns, args, rng, confidence)
+                scored.append({
+                    "label": candidate.label,
+                    "overrides": candidate.overrides,
+                    "verdict": verdict,
+                    "median_ns": statistics.median(candidate_samples),
+                    "delta_ns": delta,
+                    "delta_pct": delta / ref_median * 100,
+                    "ci_low_ns": low,
+                    "ci_high_ns": high,
+                })
+            entry["results"] = scored
+            entry["reference_median_ns"] = ref_median
+
+            winners = sorted(
+                (item for item in scored if item["verdict"] == "faster"),
+                key=lambda item: item["delta_ns"],
+            )
+            if not winners:
+                print(f"[{group.name}] nothing beat the current config")
+                trace.append(entry)
+                continue
+
+            best_label = winners[0]["label"]
+            best = next(c for c in kept if c.label == best_label)
+
+            if args.confirm_rounds > 0:
+                print(f"  [confirm] re-measuring {best.label} over "
+                      f"{args.confirm_rounds} fresh round(s)")
+                confirm_args = argparse.Namespace(**vars(args))
+                confirm_args.repeats = args.confirm_rounds
+                confirm_args.seed = args.seed + 1000 + pass_index
+                confirm_samples, _ = measure_rounds(
+                    target, [reference, best], confirm_args, args.workdir,
+                    _timing_progress("confirm", args.confirm_rounds),
+                )
+                runs += args.confirm_rounds * 2
+                confirm_ref = confirm_samples.get("current", [])
+                confirm_best = confirm_samples.get(best.label, [])
+                if len(confirm_ref) < 2 or len(confirm_best) < 2:
+                    confirm_verdict = "insufficient"
+                else:
+                    confirm_verdict, _, _ = decide(
+                        confirm_best, confirm_ref, min_effect_ns, confirm_args, rng)
+                if confirm_verdict != "faster":
+                    print(f"  [confirm] {best.label} did not win twice "
+                          f"({confirm_verdict}); not adopting")
+                    entry["unconfirmed"] = best.label
+                    trace.append(entry)
+                    continue
+
+            if not args.no_correctness_gate:
+                ok, reason = run_correctness(target, best.values, args)
+                if ok is None:
+                    print(f"  [correctness] skipped: {reason}")
+                elif not ok:
+                    print(f"  [correctness] {best.label} FAILED: {reason}")
+                    print(f"  [correctness] not adopting a schedule that computes "
+                          f"the wrong answer")
+                    entry["correctness_failed"] = reason
+                    trace.append(entry)
+                    continue
+                else:
+                    print(f"  [correctness] {best.label} ok")
+
+            current = dict(best.values)
+            improved = True
+            entry["adopted"] = best.overrides
+            adopted.append({
+                "pass": pass_index + 1,
+                "group": group.name,
+                "overrides": best.overrides,
+                "delta_pct": winners[0]["delta_pct"],
+            })
+            print(f"[{group.name}] ADOPTED {best.label} "
+                  f"({winners[0]['delta_pct']:+.1f}% against the config before it)")
+            trace.append(entry)
+
+        if not improved:
+            print(f"\n[search] pass {pass_index + 1} adopted nothing; converged")
+            break
+    else:
+        print(f"\n[search] hit the {args.max_passes}-pass limit; "
+              f"there may be more to find")
+
+    final = None
+    if adopted and args.final_rounds > 0:
+        print(f"\n[search] final head-to-head: original baseline vs searched config, "
+              f"{args.final_rounds} rounds each")
+        final = head_to_head(target, origin, current, args, rng)
+
+    changed = {name: value for name, value in current.items() if origin.get(name) != value}
+    payload = {
+        "namespace": registry.namespace,
+        "origin": origin,
+        "final_config": current,
+        "changed": changed,
+        "adopted": adopted,
+        "head_to_head": final,
+        "passes": len({entry["pass"] for entry in trace}),
+        "timed_runs": runs,
+        "min_effect_pct": args.min_effect_pct,
+        "confidence": args.confidence,
+        "repeats": args.repeats,
+        "trace": trace,
+    }
+
+    print_search_summary(payload)
+
+    if args.preset_out and changed:
+        meta = {
+            "adopted": adopted,
+            "head_to_head": final,
+            "min_effect_pct": args.min_effect_pct,
+        }
+        save_preset(args.preset_out, target, current, meta)
+        print(f"\n[search] wrote preset to {args.preset_out}")
+        print(f"  reuse it with: DAE_TUNE_CONFIG={args.preset_out} "
+              f"python {target['script']}")
+    elif args.preset_out:
+        print(f"\n[search] nothing changed, so no preset written to {args.preset_out}")
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"[search] wrote the full trace to {args.out}")
+    return 0
+
+
+def print_search_summary(payload):
+    changed = payload["changed"]
+    print("\n" + "=" * 62)
+    if not changed:
+        print("Search finished without changing anything.")
+        print("Every group was already at the best value the objective could "
+              "distinguish, so the starting schedule stands.")
+        return
+
+    print(f"Search changed {len(changed)} knob(s) over {payload['passes']} pass(es), "
+          f"{payload['timed_runs']} timed runs:")
+    for step in payload["adopted"]:
+        overrides = ", ".join(f"{k}={v}" for k, v in step["overrides"].items())
+        print(f"  pass {step['pass']}  {step['group']:14} {overrides:36} "
+              f"{step['delta_pct']:+.1f}%")
+
+    final = payload.get("head_to_head")
+    if not final:
+        print("\nNo head-to-head was run, so the combined effect is unverified.")
+        return
+    if final.get("verdict") == "insufficient":
+        print("\nThe head-to-head did not collect enough samples to judge the "
+              "combined effect.")
+        return
+
+    print(f"\nHead-to-head over {final['rounds']} fresh rounds each:")
+    print(f"  original baseline  {final['origin_median_ns'] / 1e6:.3f} ms")
+    print(f"  searched config    {final['searched_median_ns'] / 1e6:.3f} ms")
+    print(f"  difference         {final['delta_pct']:+.1f}%  "
+          f"[{final['ci_low_ns'] / 1e6:+.3f}, {final['ci_high_ns'] / 1e6:+.3f}] ms  "
+          f"-> {final['verdict']}")
+    if final["verdict"] == "faster":
+        print("\nThe searched schedule beats the original end to end.")
+    else:
+        print("\nWARNING: the individual steps won against the config that "
+              "preceded them, but the combined result does not beat the "
+              "original baseline on a fresh measurement. Treat the steps as "
+              "noise that survived, not as a result.")
+
+
 def cmd_report(args):
     with open(args.results, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -914,6 +1409,8 @@ def main(argv=None):
     check.add_argument("--max", type=int, help="Stop after this many candidates")
     check.add_argument("--timeout", type=float, default=600.0)
     check.add_argument("-o", "--out")
+    check.add_argument("--preset",
+                       help="Filter against this saved config instead of the defaults")
     check.set_defaults(func=cmd_check)
 
     def add_timing_args(parser_):
@@ -934,30 +1431,59 @@ def main(argv=None):
         parser_.add_argument("--hard-timeout", type=float, default=900.0)
         parser_.add_argument("-o", "--out")
 
+    def add_objective_args(parser_):
+        parser_.add_argument("--min-effect-pct", type=float, default=1.0,
+                             help="Smallest improvement worth acting on, as a percent")
+        parser_.add_argument("--bootstrap", type=int, default=2000,
+                             help="Resamples used for the confidence interval")
+        parser_.add_argument("--confidence", type=float, default=0.95,
+                             help="Sweep-level confidence, 0-1")
+        parser_.add_argument("--no-correction", action="store_true",
+                             help="Do not spread the error budget across candidates")
+        parser_.add_argument("--confirm-rounds", type=int, default=10,
+                             help="Fresh rounds used to re-test winners; 0 disables")
+        parser_.add_argument("--build-timeout", type=float, default=600.0)
+        parser_.add_argument("--no-prebuild", action="store_true",
+                             help="Skip the dry-build prefilter before timing")
+        parser_.add_argument("--dry-build-arg", action="append")
+        parser_.add_argument("--preset",
+                             help="Start from this saved config instead of the defaults")
+
     noise = sub.add_parser(
         "noise", help="Measure the baseline repeatedly and report the spread")
     add_timing_args(noise)
+    noise.add_argument("--preset",
+                       help="Measure this saved config instead of the defaults")
     noise.set_defaults(func=cmd_noise, dry_build_arg=None)
 
     measure = sub.add_parser("measure", help="Time candidates against the baseline")
     add_timing_args(measure)
+    add_objective_args(measure)
     measure.add_argument("--knob", action="append", help="Restrict to these knobs")
-    measure.add_argument("--dry-build-arg", action="append")
-    measure.add_argument("--no-prebuild", action="store_true",
-                         help="Skip the dry-build prefilter before timing")
-    measure.add_argument("--build-timeout", type=float, default=600.0)
     measure.add_argument("--max", type=int, help="Stop after this many candidates")
-    measure.add_argument("--min-effect-pct", type=float, default=1.0,
-                         help="Smallest improvement worth acting on, as a percent")
-    measure.add_argument("--bootstrap", type=int, default=2000,
-                         help="Resamples used for the confidence interval")
-    measure.add_argument("--confidence", type=float, default=0.95,
-                         help="Sweep-level confidence, 0-1")
-    measure.add_argument("--no-correction", action="store_true",
-                         help="Do not spread the error budget across candidates")
-    measure.add_argument("--confirm-rounds", type=int, default=10,
-                         help="Fresh rounds used to re-test winners; 0 disables")
     measure.set_defaults(func=cmd_measure)
+
+    search = sub.add_parser(
+        "search",
+        help="Coordinate descent over knob groups, moving SM count and base SM together",
+    )
+    add_timing_args(search)
+    add_objective_args(search)
+    search.add_argument("--group", action="append",
+                        help="Restrict the search to these groups (stage name or knob name)")
+    search.add_argument("--max-passes", type=int, default=3,
+                        help="Stop after this many sweeps over the groups")
+    search.add_argument("--final-rounds", type=int, default=10,
+                        help="Rounds for the original-vs-searched head-to-head; 0 disables")
+    search.add_argument("--preset-out",
+                        help="Write the winning configuration here as a reusable config")
+    search.add_argument("--no-correctness-gate", action="store_true",
+                        help="Adopt steps without verifying the schedule still computes "
+                             "the right answer")
+    search.add_argument("--correctness-arg", action="append",
+                        help="Override the target's correctness invocation")
+    search.add_argument("--correctness-timeout", type=float, default=1800.0)
+    search.set_defaults(func=cmd_search)
 
     report = sub.add_parser("report", help="Print a saved results file")
     report.add_argument("results")

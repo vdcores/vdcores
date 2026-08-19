@@ -8,7 +8,7 @@ fold, operator grouping, overlap boundary) instead of tuning them by hand.
 1. Knob configuration layer, and port `app/python/qwen3_1p7b/sched.py` to it. **done**
 2. `tools/autotune.py` with static + dry-build legality filtering only. **done**
 3. Timed runs plus a noise-aware objective. **done**
-4. Coordinate-descent search, presets, correctness gate.
+4. Coordinate-descent search, presets, correctness gate. **done**
 5. Extend to `app/python/llama3/sched.py`, which first needs a `--dry-build` mode.
 
 ## Knob Configuration Layer
@@ -158,6 +158,15 @@ documented result that `down_proj` is legal on 96 SMs and rejected on 128 with
 `k_per_fold=1536`, so the driver is exercised against real rejections on a host
 with no GPU.
 
+The fixture also charges for contention: stages whose SM ranges overlap pay
+`OVERLAP_NS_PER_SM` per shared SM, which is about 39% of its baseline time.
+Without that term the fake has no opinion about `base_sm` at all, and a search
+over `(sms, base_sm)` pairs would have nothing to find. The constant is tuned so
+that both effects are real: more SMs on a stage still helps, and de-overlapping
+also helps. Critically, the best paired move for `gate_high` (`sms=32,
+base_sm=96`, -5.3%) beats the best single-knob move (`sms=32`, -3.9%), so the
+fixture can tell a paired search apart from a coordinate one.
+
 Sweeping all 23 knobs against the fixture produced 107 candidates, of which 40
 build: 29 static-rejected and 38 build-rejected. Most knobs turn out to have
 only one or two legal alternatives to their current value, which is a useful
@@ -220,6 +229,75 @@ and `include/dae/runtime.cuh` rely on `<cfloat>` and `<array>` arriving as
 transitive includes from CUTLASS 3.x, so on 4.x they need
 `NVCC_PREPEND_FLAGS="-include cfloat -include array"` until those includes are
 added properly.
+
+## Search
+
+[tools/autotune.py](tools/autotune.py) `search` is coordinate descent over knob
+**groups**, not knobs.
+
+```bash
+python tools/autotune.py search --knobs tuning/qwen3_1p7b.knobs.json \
+    --repeats 8 --min-effect-pct 1.8 \
+    --preset-out tuning/qwen3_1p7b.preset.json -o tuning/qwen3_1p7b.search.json
+```
+
+### Groups, Because Single Knobs Cannot Reach The Interesting Placements
+
+A group is a set of knobs that must move together. A stage's `.sms` and
+`.base_sm` are one group; every other knob is a group of one. This is the whole
+reason milestone 4 exists: `up_low.sms=128` is illegal only because the baseline
+pins `up_low.base_sm=64`, so a single-knob sweep reports it as illegal when it
+is merely *unreachable*. Groups enumerate the cross product, so the pair is
+reachable.
+
+`--group` restricts the search to named groups, which is how to spend a limited
+timing budget on the stages that matter.
+
+### What It Takes To Adopt A Step
+
+Each group is optimized against the configuration reached so far, not against
+the original baseline. A step is adopted only if it clears three bars:
+
+1. it wins the same noise-aware test `measure` uses, with the error budget
+   spread across that group's candidates;
+2. it wins **again** on separately collected samples (`--confirm-rounds`);
+3. it passes the **correctness gate**.
+
+### The Correctness Gate
+
+Timing cannot tell a fast schedule from a fast *wrong* schedule. Before adopting
+a step, the driver runs the target's own correctness check under the candidate
+configuration and refuses the step if it fails. The invocation comes from the
+target entry (`correctness_args`, `--correctness` for qwen3_1p7b) or from
+`--correctness-arg`. A target that declares no check reports that rather than
+silently passing. `--no-correctness-gate` opts out.
+
+### The Head-To-Head Is The Only Honest Number
+
+Greedy descent adopts each step against the config that preceded it, so a chain
+of individually-justified steps can add up to less than the sum of its parts.
+After the search converges, the original baseline is timed directly against the
+final configuration on fresh samples. If that comparison does not come out
+`faster`, the summary says so in as many words and tells the reader to treat the
+steps as noise that survived, not as a result.
+
+### Presets
+
+`--preset-out` writes the winning configuration in the format
+`DAE_TUNE_CONFIG` already accepts, with a `search` provenance block that
+`tune._load_config_file` ignores. So the same artifact both re-runs the tuned
+schedule and seeds the next search through `--preset`, which `check`, `noise`,
+and `measure` also accept. A search that is interrupted, or run one group per
+day, can pick up where it left off.
+
+### Verified Against The Fixture
+
+A full-surface search on `tests/fake_sched.py` (seeded, noise off) adopts three
+paired moves, converges on the second pass, and the head-to-head confirms
+-10.5% end to end. With `FAKE_SCHED_WRONG_IF` set to the winning placement, the
+same search adopts nothing and records the correctness rejection; with
+`--no-correctness-gate` it takes the wrong config, which is what makes that a
+test of the gate rather than of legality.
 
 ## Verified On Real Hardware
 
@@ -337,8 +415,8 @@ not a reason to change a schedule.
 
 The cost of this is power: on a noisy host, a real but small effect will be
 reported as `same` until enough rounds are collected. That is the intended
-trade. The fixture's true -1.2% `gate_low` effect is detected immediately with
-noise off, and correctly withheld at 15 rounds with 3% per-run noise.
+trade. The fixture's true `gate_high` effect is detected immediately with noise off,
+and correctly withheld at 15 rounds with 3% per-run noise.
 
 ### Fixed: Dropped Tail Output In The Timeout Wrapper
 

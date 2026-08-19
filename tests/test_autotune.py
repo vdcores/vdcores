@@ -11,9 +11,11 @@ Run with:
     python tests/test_autotune.py
 """
 
+import argparse
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -371,15 +373,16 @@ def test_measure_finds_a_real_effect_on_a_quiet_host():
     with tempfile.TemporaryDirectory() as tmp:
         knobs = discover_fake(tmp)
         out = os.path.join(tmp, "timing.json")
-        args = measure_args(knobs=knobs, knob=["gate_low.sms", "silu.sms"], out=out)
+        args = measure_args(knobs=knobs, knob=["gate_high.sms", "silu.sms"], out=out)
         assert autotune.cmd_measure(args) == 0
 
         with open(out, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
 
         by_label = {result["label"]: result for result in payload["results"]}
-        # gate_low benefits from more SMs in the fixture's cost model
-        assert by_label["gate_low.sms=128"]["verdict"] == "faster", by_label
+        # A narrower gate_high contends with fewer stages, which the fixture's
+        # overlap term charges for, so this is a real -3.9% effect.
+        assert by_label["gate_high.sms=32"]["verdict"] == "faster", by_label
         # silu does not appear in that cost model at all, so it must not win
         assert by_label["silu.sms=1"]["verdict"] == "same"
         assert by_label["silu.sms=2"]["verdict"] == "same"
@@ -425,6 +428,314 @@ def test_run_timed_reports_a_hang_rather_than_waiting_forever():
             os.environ.pop("FAKE_SCHED_HANG", None)
         else:
             os.environ["FAKE_SCHED_HANG"] = previous
+
+
+# ------------------------------------------------- milestone 4: groups
+
+
+def test_knob_groups_pair_sms_with_base_sm():
+    groups = autotune.knob_groups(sample_registry())
+    by_name = {group.name: group for group in groups}
+    assert by_name["q_proj"].knobs == ["q_proj.sms", "q_proj.base_sm"]
+    # a knob with no partner stays on its own
+    assert by_name["mlp.low"].knobs == ["mlp.low"]
+    # a knob with a single choice is not worth a group
+    assert "fixed.sms" not in by_name
+
+
+def test_group_combinations_are_the_cross_product():
+    registry = sample_registry()
+    group = next(g for g in autotune.knob_groups(registry) if g.name == "q_proj")
+    combos = group.combinations(registry)
+    assert len(combos) == 4 * 2 == group.size(registry)
+    assert {"q_proj.sms": 128, "q_proj.base_sm": 64} in combos
+
+
+def test_group_candidates_hold_every_other_knob_at_current():
+    registry = sample_registry()
+    group = next(g for g in autotune.knob_groups(registry) if g.name == "q_proj")
+    current = dict(registry.baseline)
+    current["mlp.low"] = 2048
+
+    candidates = autotune.group_candidates(registry, group, current)
+    # the cross product minus the combination already in `current`
+    assert len(candidates) == 4 * 2 - 1
+    for candidate in candidates:
+        assert candidate.values["mlp.low"] == 2048
+        assert set(candidate.overrides) == {"q_proj.sms", "q_proj.base_sm"}
+
+
+def test_paired_move_reaches_a_placement_a_single_knob_sweep_cannot():
+    """The whole reason milestone 4 exists.
+
+    With `q_proj.base_sm` pinned at 64, a 128-SM q projection runs off the end
+    of a 132-SM device. Moving both knobs together reaches it.
+    """
+    registry = sample_registry()
+    registry.baseline["q_proj.base_sm"] = 64
+
+    single = [
+        candidate for candidate in autotune.sweep_candidates(registry)
+        if candidate.overrides.get("q_proj.sms") == 128
+    ]
+    assert single, "expected a single-knob candidate to exist"
+    assert all(
+        autotune.static_reject_reason(registry, candidate.values) is not None
+        for candidate in single
+    ), "a single-knob sweep should not be able to reach sms=128 from base_sm=64"
+
+    group = next(g for g in autotune.knob_groups(registry) if g.name == "q_proj")
+    paired = [
+        candidate
+        for candidate in autotune.group_candidates(registry, group, dict(registry.baseline))
+        if candidate.overrides == {"q_proj.sms": 128, "q_proj.base_sm": 0}
+    ]
+    assert len(paired) == 1
+    assert autotune.static_reject_reason(registry, paired[0].values) is None
+
+
+# ------------------------------------------------ milestone 4: presets
+
+
+def test_preset_overrides_the_registry_baseline():
+    registry = sample_registry()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "preset.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"namespace": "sample", "knobs": {"q_proj.sms": 96}}, handle)
+        assert registry.apply_preset(path) == 1
+    assert registry.baseline["q_proj.sms"] == 96
+    # knobs the preset did not mention keep their dumped values
+    assert registry.baseline["mlp.low"] == 4096
+
+
+def test_preset_rejects_a_foreign_namespace():
+    registry = sample_registry()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "preset.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"namespace": "someone_else", "knobs": {"q_proj.sms": 96}}, handle)
+        try:
+            registry.apply_preset(path)
+        except SystemExit as exc:
+            assert "someone_else" in str(exc)
+        else:
+            raise AssertionError("expected a foreign namespace to be rejected")
+
+
+def test_preset_rejects_unknown_knobs():
+    registry = sample_registry()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "preset.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"knobs": {"not_a_knob": 1}}, handle)
+        try:
+            registry.apply_preset(path)
+        except SystemExit as exc:
+            assert "not_a_knob" in str(exc)
+        else:
+            raise AssertionError("expected an unknown knob to be rejected")
+
+
+def test_saved_preset_is_accepted_as_a_config_file():
+    """The preset a search writes has to be usable as DAE_TUNE_CONFIG."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "preset.json")
+        autotune.save_preset(
+            path,
+            {"namespace": "fake_sched"},
+            {"q_proj.sms": 32, "q_proj.base_sm": 0},
+            meta={"adopted": []},
+        )
+        env = dict(os.environ, DAE_TUNE_CONFIG=path)
+        env.pop("DAE_TUNE_SET", None)
+        proc = subprocess.run(
+            [sys.executable, FAKE_SCHED, "--dry-build"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "q_proj.sms = 32" in proc.stdout
+
+
+# ---------------------------------------- milestone 4: correctness gate
+
+
+def test_correctness_gate_passes_a_good_config():
+    args = argparse.Namespace(workdir=REPO_ROOT, correctness_timeout=120.0)
+    target = {
+        "namespace": "fake_sched",
+        "script": FAKE_SCHED,
+        "correctness_args": ["--correctness"],
+    }
+    ok, reason = autotune.run_correctness(target, {"q_proj.sms": 64}, args)
+    assert ok is True, reason
+
+
+def test_correctness_gate_catches_a_wrong_config():
+    args = argparse.Namespace(workdir=REPO_ROOT, correctness_timeout=120.0)
+    target = {
+        "namespace": "fake_sched",
+        "script": FAKE_SCHED,
+        "correctness_args": ["--correctness"],
+    }
+    previous = os.environ.get("FAKE_SCHED_WRONG_IF")
+    os.environ["FAKE_SCHED_WRONG_IF"] = "q_proj.sms=32"
+    try:
+        ok, reason = autotune.run_correctness(target, {"q_proj.sms": 32}, args)
+    finally:
+        if previous is None:
+            os.environ.pop("FAKE_SCHED_WRONG_IF", None)
+        else:
+            os.environ["FAKE_SCHED_WRONG_IF"] = previous
+    assert ok is False
+    assert "tolerance" in reason
+
+
+def test_correctness_gate_reports_when_a_target_has_no_check():
+    args = argparse.Namespace(workdir=REPO_ROOT, correctness_timeout=120.0)
+    ok, reason = autotune.run_correctness(
+        {"namespace": "fake_sched", "script": FAKE_SCHED}, {}, args)
+    assert ok is None
+    assert "no correctness check" in reason
+
+
+# ----------------------------------------------- milestone 4: the search
+
+
+def search_argv(knobs, extra):
+    return [
+        "search",
+        "--knobs", knobs,
+        "--script", FAKE_SCHED,
+        "--dry-build-arg=--dry-build",
+        "--correctness-arg=--correctness",
+        "--min-effect-pct", "0.5",
+        *extra,
+    ]
+
+
+def test_search_adopts_a_paired_move_and_confirms_it_end_to_end():
+    previous = os.environ.get("FAKE_SCHED_SEED")
+    os.environ["FAKE_SCHED_SEED"] = "1"  # quiet host, deterministic timings
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            knobs = discover_fake(tmp)
+            out = os.path.join(tmp, "search.json")
+            preset = os.path.join(tmp, "preset.json")
+            rc = autotune.main(search_argv(knobs, [
+                "--group", "gate_high",
+                "--repeats", "3", "--confirm-rounds", "2", "--final-rounds", "3",
+                "--max-passes", "2",
+                "--preset-out", preset, "-o", out,
+            ]))
+            assert rc == 0
+            with open(out, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            assert os.path.exists(preset)
+    finally:
+        if previous is None:
+            os.environ.pop("FAKE_SCHED_SEED", None)
+        else:
+            os.environ["FAKE_SCHED_SEED"] = previous
+
+    # The fixture charges for overlapping SM ranges, so moving gate_high off
+    # the crowded low SMs is a real win that needs both knobs to move.
+    assert payload["adopted"], "expected the search to adopt at least one step"
+    assert "gate_high.base_sm" in payload["changed"]
+    assert payload["head_to_head"]["verdict"] == "faster"
+    assert payload["head_to_head"]["delta_pct"] < 0
+
+
+def test_search_refuses_a_fast_but_wrong_configuration():
+    """A schedule that is legal, builds, and is fast can still be wrong."""
+    saved = {key: os.environ.get(key) for key in ("FAKE_SCHED_SEED", "FAKE_SCHED_WRONG_IF")}
+    os.environ["FAKE_SCHED_SEED"] = "1"
+    os.environ["FAKE_SCHED_WRONG_IF"] = "gate_high.base_sm=96"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            knobs = discover_fake(tmp)
+            out = os.path.join(tmp, "search.json")
+            rc = autotune.main(search_argv(knobs, [
+                "--group", "gate_high",
+                "--repeats", "3", "--confirm-rounds", "2", "--final-rounds", "0",
+                "--max-passes", "1", "-o", out,
+            ]))
+            assert rc == 0
+            with open(out, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert payload["adopted"] == [], "a wrong schedule must not be adopted"
+    failures = [entry for entry in payload["trace"] if entry.get("correctness_failed")]
+    assert failures, "expected the correctness gate to record the rejection"
+    assert "tolerance" in failures[0]["correctness_failed"]
+
+
+def test_search_with_the_gate_disabled_would_have_taken_it():
+    """Shows the previous test is really testing the gate, not legality."""
+    saved = {key: os.environ.get(key) for key in ("FAKE_SCHED_SEED", "FAKE_SCHED_WRONG_IF")}
+    os.environ["FAKE_SCHED_SEED"] = "1"
+    os.environ["FAKE_SCHED_WRONG_IF"] = "gate_high.base_sm=96"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            knobs = discover_fake(tmp)
+            out = os.path.join(tmp, "search.json")
+            rc = autotune.main(search_argv(knobs, [
+                "--group", "gate_high", "--no-correctness-gate",
+                "--repeats", "3", "--confirm-rounds", "2", "--final-rounds", "0",
+                "--max-passes", "1", "-o", out,
+            ]))
+            assert rc == 0
+            with open(out, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert payload["changed"].get("gate_high.base_sm") == 96
+
+
+def test_search_converges_instead_of_running_every_pass():
+    previous = os.environ.get("FAKE_SCHED_SEED")
+    os.environ["FAKE_SCHED_SEED"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            knobs = discover_fake(tmp)
+            out = os.path.join(tmp, "search.json")
+            rc = autotune.main(search_argv(knobs, [
+                "--group", "v_proj",
+                "--repeats", "3", "--confirm-rounds", "2", "--final-rounds", "0",
+                "--max-passes", "5", "-o", out,
+            ]))
+            assert rc == 0
+            with open(out, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+    finally:
+        if previous is None:
+            os.environ.pop("FAKE_SCHED_SEED", None)
+        else:
+            os.environ["FAKE_SCHED_SEED"] = previous
+
+    # It should stop as soon as a pass adopts nothing, not burn all five.
+    assert payload["passes"] < 5
+
+
+def test_unknown_group_is_rejected():
+    registry = sample_registry()
+    try:
+        autotune.knob_groups(registry, only={"not_a_stage"})
+    except SystemExit as exc:
+        assert "not_a_stage" in str(exc)
+    else:
+        raise AssertionError("expected an unknown group name to be rejected")
 
 
 def main():

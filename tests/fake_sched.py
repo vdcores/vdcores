@@ -76,18 +76,42 @@ STAGE_WORK_NS = {
     "down_proj": 36_000_000,
 }
 FIXED_NS = 900_000
+# Charged per SM shared between two stages, so a placement that piles every
+# stage onto the same SMs is worse than one that spreads them out. Without
+# this the fake has no opinion about base_sm at all, and a search over
+# (sms, base_sm) pairs would have nothing to find.
+OVERLAP_NS_PER_SM = 3_500
 
 
-def synthetic_ns(values, rng):
+def overlap_ns(placements):
+    """Contention cost for stages whose SM ranges overlap."""
+    total = 0
+    names = sorted(placements)
+    for index, first in enumerate(names):
+        first_base, first_sms = placements[first]
+        for second in names[index + 1:]:
+            second_base, second_sms = placements[second]
+            low = max(first_base, second_base)
+            high = min(first_base + first_sms, second_base + second_sms)
+            if high > low:
+                total += (high - low) * OVERLAP_NS_PER_SM
+    return total
+
+
+def synthetic_ns(values, rng, placements=None):
     """A knob-dependent execution time, plus optional host-like noise.
 
     More SMs on a stage means less time on that stage, with a small
-    per-stage launch cost so the ideal is not simply "everything at 128".
+    per-stage launch cost so the ideal is not simply "everything at 128",
+    and a contention term so where a stage sits matters as well as how big
+    it is.
     """
     total = FIXED_NS
     for stage, work in STAGE_WORK_NS.items():
         sms = values.get(stage, 1)
         total += work / max(sms, 1) + 2_000 * sms
+    if placements:
+        total += overlap_ns(placements)
 
     noise = float(os.environ.get("FAKE_SCHED_NOISE", "0"))
     if noise > 0:
@@ -99,7 +123,7 @@ def synthetic_ns(values, rng):
     return max(total, 1.0)
 
 
-def run_bench(iterations, values):
+def run_bench(iterations, values, placements=None):
     if os.environ.get("FAKE_SCHED_HANG"):
         print(f"[bench] VDCores with {NUM_SMS} SMs...", flush=True)
         while True:  # simulate a barrier deadlock after launch
@@ -109,7 +133,9 @@ def run_bench(iterations, values):
     rng = random.Random(int(seed) if seed is not None else None)
 
     print(f"[bench] VDCores with {NUM_SMS} SMs...")
-    samples = sorted(synthetic_ns(values, rng) for _ in range(max(iterations, 1)))
+    samples = sorted(
+        synthetic_ns(values, rng, placements) for _ in range(max(iterations, 1))
+    )
     mid = len(samples) // 2
     median = samples[mid] if len(samples) % 2 else (samples[mid - 1] + samples[mid]) / 2
     print(f"Benchmark Results on {NUM_SMS} SMs and {iterations} iterations:")
@@ -119,9 +145,34 @@ def run_bench(iterations, values):
     print(f"Max execution time (ns): {samples[-1]:.2f}")
 
 
+def check_correctness(values):
+    """Stand in for the target's own numerical check.
+
+    `FAKE_SCHED_WRONG_IF="gate_high.base_sm=64"` makes this configuration
+    report a wrong answer, so a driver's correctness gate can be tested
+    against a schedule that is legal, builds, runs fast, and is wrong.
+    """
+    condition = os.environ.get("FAKE_SCHED_WRONG_IF", "").strip()
+    if condition:
+        for clause in condition.split(","):
+            if "=" not in clause:
+                continue
+            name, _, expected = clause.partition("=")
+            actual = values.get(name.strip())
+            if str(actual) == expected.strip():
+                print(
+                    f"[correctness] FAILED: max abs diff 4.2e-01 exceeds tolerance "
+                    f"with {name.strip()}={expected.strip()}"
+                )
+                return False
+    print("[correctness] ok")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-build", action="store_true")
+    parser.add_argument("--correctness", action="store_true")
     parser.add_argument("-b", "--bench", type=int, nargs="?", const=1, default=None)
     args = parser.parse_args()
 
@@ -147,15 +198,17 @@ def main():
     down_sms = tune.sms("down_proj", 96, sms_choices)
     tune.sms("silu", 4, [1, 2, 4, 8])
 
-    tune.base_sm("q_proj", 0, base_choices)
-    tune.base_sm("k_proj", 64, base_choices)
-    tune.base_sm("v_proj", 96, base_choices)
-    tune.base_sm("out_proj", 0, base_choices)
-    tune.base_sm("gate_low", 0, base_choices)
-    tune.base_sm("gate_high", 0, base_choices)
-    tune.base_sm("up_low", 64, base_choices)
-    tune.base_sm("up_high", 64, base_choices)
-    tune.base_sm("down_proj", 0, base_choices)
+    base = {
+        "q_proj": tune.base_sm("q_proj", 0, base_choices),
+        "k_proj": tune.base_sm("k_proj", 64, base_choices),
+        "v_proj": tune.base_sm("v_proj", 96, base_choices),
+        "out_proj": tune.base_sm("out_proj", 0, base_choices),
+        "gate_low": tune.base_sm("gate_low", 0, base_choices),
+        "gate_high": tune.base_sm("gate_high", 0, base_choices),
+        "up_low": tune.base_sm("up_low", 64, base_choices),
+        "up_high": tune.base_sm("up_high", 64, base_choices),
+        "down_proj": tune.base_sm("down_proj", 0, base_choices),
+    }
     tune.base_sm("silu", 128, [128, 129, 130])
 
     tune.int_knob("logits.split_m", 6, choices=[2, 3, 4, 6, 8, 12])
@@ -176,15 +229,20 @@ def main():
     validate_gemv("up_high", mlp_high, HIDDEN, up_high_sms)
     validate_gemv("down_proj", HIDDEN, INTERMIDIATE, down_sms)
 
+    stage_sms = {
+        "q_proj": q_sms, "k_proj": k_sms, "v_proj": v_sms, "out_proj": out_sms,
+        "gate_low": gate_low_sms, "gate_high": gate_high_sms,
+        "up_low": up_low_sms, "up_high": up_high_sms, "down_proj": down_sms,
+    }
+    placements = {stage: (base[stage], sms) for stage, sms in stage_sms.items()}
+
     print(tune.summary())
     if args.dry_build:
         print(f"[dry-build] built fake schedule with mlp_low={mlp_low}, mlp_high={mlp_high}")
+    if args.correctness:
+        return 0 if check_correctness(tune.values()) else 1
     if args.bench is not None:
-        run_bench(args.bench, {
-            "q_proj": q_sms, "k_proj": k_sms, "v_proj": v_sms, "out_proj": out_sms,
-            "gate_low": gate_low_sms, "gate_high": gate_high_sms,
-            "up_low": up_low_sms, "up_high": up_high_sms, "down_proj": down_sms,
-        })
+        run_bench(args.bench, stage_sms, placements)
     return 0
 
 
