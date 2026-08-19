@@ -900,14 +900,14 @@ class Dsv4ExpertReduce(ComputeInstruction):
 
 
 class Dsv4Fp32Bf16Gemv(ComputeInstruction):
-    def __init__(self, k: int, tile_k: int):
+    def __init__(self, k: int, tile_k: int, emit_square_sum: bool = False):
         if k <= 0 or k > 0xFFFF:
             raise ValueError("DeepSeek FP32 GEMV K must fit in uint16")
         if tile_k <= 0 or tile_k > 0xFFFF:
             raise ValueError("DeepSeek FP32 GEMV tile K must fit in uint16")
         super().__init__(
             opcode=opcode.OP_DSV4_FP32_BF16_GEMV,
-            args=[k, tile_k],
+            args=[k, tile_k, int(bool(emit_square_sum))],
         )
 
 
@@ -936,26 +936,21 @@ class Dsv4HcPre(ComputeInstruction):
 
 
 class Dsv4HcPreRms(ComputeInstruction):
+    ZERO_FP32_OUTPUT = 1 << 0
+    OUTPUT_FP8 = 1 << 1
+
     def __init__(
         self,
-        sinkhorn_iters: int = 20,
-        epsilon: float = 1.0e-6,
-        rms_epsilon: float = 1.0e-6,
         zero_fp32_output: bool = False,
+        output_fp8: bool = False,
     ):
-        if sinkhorn_iters <= 0 or sinkhorn_iters > 0x7FFF:
-            raise ValueError(
-                "fused mHC/RMS Sinkhorn iterations must fit 15 bits"
-            )
-        if epsilon <= 0 or rms_epsilon <= 0:
-            raise ValueError("fused mHC/RMS epsilons must be positive")
+        flags = (
+            self.ZERO_FP32_OUTPUT * int(bool(zero_fp32_output))
+            | self.OUTPUT_FP8 * int(bool(output_fp8))
+        )
         super().__init__(
             opcode=opcode.OP_DSV4_HC_PRE_RMS,
-            args=[
-                sinkhorn_iters | (int(bool(zero_fp32_output)) << 15),
-                encode_bfloat16_u16(epsilon),
-                encode_bfloat16_u16(rms_epsilon),
-            ],
+            args=[flags],
         )
 
 

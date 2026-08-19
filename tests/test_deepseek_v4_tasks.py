@@ -3,6 +3,7 @@ import torch
 from dae.instructions import (
     ArgmaxSmemPartialBf16,
     ArgmaxSmemReduceBf16,
+    Dsv4Fp32Bf16Gemv,
     Fp8Block128GemvSm100,
     RegLoad,
     RegStore,
@@ -429,7 +430,7 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
         fp32_weight, fp32_input, fp32_output
     ).place(num_sms)
     fp32_instructions = fp32_schedule.schedule(sm)
-    assert fp32_instructions[0].args == [1, 8192]
+    assert fp32_instructions[0].args == [1, 8192, 0]
     assert fp32_instructions[1].tensor.data_ptr() == fp32_weight[row_start].data_ptr()
     assert fp32_instructions[3].tensor.data_ptr() == fp32_output[row_start].data_ptr()
 
@@ -448,6 +449,55 @@ def test_linear_schedules_address_rows_above_uint16_limit(monkeypatch):
         bf16_weight, fp32_input, fp32_from_bf16
     ).place(num_sms)
     assert fp32_from_bf16_schedule.schedule(sm)[0].args == [1, 16384, 1]
+
+
+def test_hc_projection_publishes_packed_metadata_before_stage_release(monkeypatch):
+    class FakeTransfer:
+        def __init__(self, tensor):
+            self.tensor = tensor
+            self.bar_id = None
+
+        def bar(self, bar_id):
+            self.bar_id = bar_id
+            return self
+
+    globals_ = SchedDsv4Fp32Bf16Gemv.schedule.__globals__
+    monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
+
+    packed = torch.empty((56,), dtype=torch.float32)
+    square_sum = packed[:1]
+    mixes = packed[1:25]
+    metadata_tail = packed[28:56]
+    scale = torch.empty((3,), dtype=torch.float32)
+    base = torch.empty((24,), dtype=torch.float32)
+    schedule = SchedDsv4Fp32Bf16Gemv(
+        torch.empty((24, 32), dtype=torch.float32),
+        torch.empty((32,), dtype=torch.bfloat16),
+        mixes,
+        square_sum_output=square_sum,
+        metadata_scale=scale,
+        metadata_base=base,
+        metadata_tail_output=metadata_tail,
+    ).bar("output", 7).place(24)
+
+    row_zero = schedule.schedule(0)
+    assert isinstance(row_zero[0], Dsv4Fp32Bf16Gemv)
+    assert row_zero[0].args == [32, 8192, 1]
+    assert [item.tensor.data_ptr() for item in row_zero[3:]] == [
+        mixes[:1].data_ptr(),
+        square_sum.data_ptr(),
+        scale.data_ptr(),
+        base.data_ptr(),
+        metadata_tail.data_ptr(),
+    ]
+    assert row_zero[3].bar_id is None
+    assert row_zero[-1].bar_id == 7
+
+    ordinary_row = schedule.schedule(1)
+    assert ordinary_row[0].args == [32, 8192, 0]
+    assert ordinary_row[-1].bar_id == 7
+    assert schedule.bar_release_count("output") == 24
 
 
 def test_activation_quant_schedules_shard_whole_scale_blocks(monkeypatch):

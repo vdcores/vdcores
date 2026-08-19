@@ -5138,11 +5138,24 @@ class SchedDsv4ExpertTmaReduceFp32(Schedule):
 class SchedDsv4Fp32Bf16Gemv(Schedule):
     TILE_K = 8192
 
-    def __init__(self, weight, input, output):
+    def __init__(
+        self,
+        weight,
+        input,
+        output,
+        square_sum_output=None,
+        metadata_scale=None,
+        metadata_base=None,
+        metadata_tail_output=None,
+    ):
         super().__init__()
         self.weight = weight
         self.input = input
         self.output = output
+        self.square_sum_output = square_sum_output
+        self.metadata_scale = metadata_scale
+        self.metadata_base = metadata_base
+        self.metadata_tail_output = metadata_tail_output
 
     def _on_place(self):
         if self.weight.dtype != torch.float32 or self.weight.ndim != 2:
@@ -5152,6 +5165,62 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
             raise ValueError("DeepSeek mHC input must be BF16 [K]")
         if self.output.dtype != torch.float32 or self.output.numel() != self.rows:
             raise ValueError("DeepSeek mHC GEMV output must be FP32 [rows]")
+        metadata_items = (
+            self.square_sum_output,
+            self.metadata_scale,
+            self.metadata_base,
+            self.metadata_tail_output,
+        )
+        if any(item is not None for item in metadata_items):
+            if not all(item is not None for item in metadata_items):
+                raise ValueError(
+                    "DeepSeek mHC GEMV metadata outputs must be provided together"
+                )
+            if self.rows != 24:
+                raise ValueError(
+                    "DeepSeek mHC GEMV metadata producer requires 24 output rows"
+                )
+            if (
+                self.square_sum_output.dtype != torch.float32
+                or self.square_sum_output.numel() != 1
+                or not self.square_sum_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek mHC GEMV square-sum output must be contiguous FP32 [1]"
+                )
+            if (
+                self.metadata_scale.dtype != torch.float32
+                or self.metadata_scale.numel() != 3
+                or not self.metadata_scale.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek mHC GEMV metadata scale must be contiguous FP32 [3]"
+                )
+            if (
+                self.metadata_base.dtype != torch.float32
+                or self.metadata_base.numel() != 24
+                or not self.metadata_base.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek mHC GEMV metadata base must be contiguous FP32 [24]"
+                )
+            if (
+                self.metadata_tail_output.dtype != torch.float32
+                or self.metadata_tail_output.numel() != 28
+                or not self.metadata_tail_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "DeepSeek mHC GEMV metadata tail must be contiguous FP32 [28]"
+                )
+            record_address = self.square_sum_output.data_ptr()
+            if self.output.data_ptr() != record_address + 4:
+                raise ValueError(
+                    "DeepSeek mHC GEMV output must follow the packed square sum"
+                )
+            if self.metadata_tail_output.data_ptr() != record_address + 28 * 4:
+                raise ValueError(
+                    "DeepSeek mHC GEMV metadata tail must start at packed offset 28"
+                )
         if self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("DeepSeek mHC GEMV requires 1 <= num_sms <= rows")
 
@@ -5163,7 +5232,10 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         row_count = rows_per_sm + (1 if sm < extra else 0)
         instructions = []
         for local_row, row in enumerate(range(row_start, row_start + row_count)):
-            instructions.append(Dsv4Fp32Bf16Gemv(self.k, self.TILE_K))
+            emit_square_sum = self.square_sum_output is not None and row == 0
+            instructions.append(Dsv4Fp32Bf16Gemv(
+                self.k, self.TILE_K, emit_square_sum=emit_square_sum
+            ))
             for column in range(0, self.k, self.TILE_K):
                 end = min(column + self.TILE_K, self.k)
                 instructions += [
@@ -5171,9 +5243,18 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                     _shared_load_1d(self.input[column:end]),
                 ]
             store = _shared_store_1d(self.output[row:row + 1])
-            if local_row + 1 == row_count:
+            is_last_row = local_row + 1 == row_count
+            if is_last_row and not emit_square_sum:
                 store.bar(self._bar("output"))
             instructions.append(store)
+            if emit_square_sum:
+                instructions.append(_shared_store_1d(self.square_sum_output))
+                instructions.append(_shared_load_1d(self.metadata_scale))
+                instructions.append(_shared_load_1d(self.metadata_base))
+                metadata_store = _shared_store_1d(self.metadata_tail_output)
+                if is_last_row:
+                    metadata_store.bar(self._bar("output"))
+                instructions.append(metadata_store)
         return instructions
 
     def bar_release_count(self, role: str):
@@ -5289,7 +5370,19 @@ class SchedDsv4HcPre(Schedule):
 
 
 class SchedDsv4HcPreRms(Schedule):
-    """Fuse mHC pre mixing with the following learned RMSNorm."""
+    """Fuse mHC pre mixing with learned RMSNorm using packed raw metadata.
+
+    The transport contract matches the single compile-time specialization in
+    ``deepseek_v4.cuh``: one 56-float input record uses a fixed raw-address
+    slot.  Its four padding floats are intentionally unspecified.  Post/comb
+    follow the selected primary output, so its existing STU lease also carries
+    their global address without another mailbox transaction.
+
+    The primary output is mutually exclusive: either ``output`` publishes the
+    canonical BF16 vector, or ``fp8_output`` plus ``fp8_scale`` publishes its
+    block-128 E4M3/UE8M0 representation.  The FP8 path still performs the
+    model-required internal BF16 rounding before quantization.
+    """
 
     def __init__(
         self,
@@ -5301,10 +5394,12 @@ class SchedDsv4HcPreRms(Schedule):
         output,
         post,
         comb,
+        residual_square_sum=None,
+        packed_metadata=None,
+        packed_output=None,
         zero_fp32_output=None,
-        sinkhorn_iters=20,
-        epsilon=1.0e-6,
-        rms_epsilon=1.0e-6,
+        fp8_output=None,
+        fp8_scale=None,
     ):
         super().__init__()
         self.residual = residual
@@ -5315,10 +5410,12 @@ class SchedDsv4HcPreRms(Schedule):
         self.output = output
         self.post = post
         self.comb = comb
+        self.residual_square_sum = residual_square_sum
+        self.packed_metadata = packed_metadata
+        self.packed_output = packed_output
         self.zero_fp32_output = zero_fp32_output
-        self.sinkhorn_iters = sinkhorn_iters
-        self.epsilon = epsilon
-        self.rms_epsilon = rms_epsilon
+        self.fp8_output = fp8_output
+        self.fp8_scale = fp8_scale
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -5340,11 +5437,6 @@ class SchedDsv4HcPreRms(Schedule):
             or not self.norm_weight.is_contiguous()
         ):
             raise ValueError("fused mHC/RMS weight must be BF16 [4096]")
-        if (
-            self.output.dtype != torch.bfloat16
-            or self.output.numel() != 4096
-        ):
-            raise ValueError("fused mHC/RMS output must contain 4096 BF16 values")
         if self.post.dtype != torch.float32 or self.post.numel() != 4:
             raise ValueError("fused mHC/RMS post must contain four FP32 values")
         if (
@@ -5352,6 +5444,23 @@ class SchedDsv4HcPreRms(Schedule):
             or tuple(self.comb.shape) != (4, 4)
         ):
             raise ValueError("fused mHC/RMS comb must be FP32 [4,4]")
+        if (
+            self.residual_square_sum is None
+            or self.residual_square_sum.dtype != torch.float32
+            or self.residual_square_sum.numel() != 1
+        ):
+            raise ValueError(
+                "fused mHC/RMS residual square sum must contain one FP32 value"
+            )
+        if (
+            self.packed_metadata is None
+            or self.packed_metadata.dtype != torch.float32
+            or self.packed_metadata.numel() != 56
+            or not self.packed_metadata.is_contiguous()
+        ):
+            raise ValueError(
+                "packed mHC/RMS input metadata must be contiguous FP32 [56]"
+            )
         if self.zero_fp32_output is not None and (
             self.zero_fp32_output.dtype != torch.float32
             or self.zero_fp32_output.numel() != 4096
@@ -5360,33 +5469,97 @@ class SchedDsv4HcPreRms(Schedule):
             raise ValueError(
                 "fused mHC/RMS zero output must be contiguous FP32 [4096]"
             )
-        if self.epsilon <= 0 or self.rms_epsilon <= 0:
-            raise ValueError("fused mHC/RMS epsilons must be positive")
+        if (self.fp8_output is None) != (self.fp8_scale is None):
+            raise ValueError(
+                "fused mHC/RMS FP8 output and scale must be provided together"
+            )
+        if self.fp8_output is not None and (
+            self.fp8_output.dtype != torch.float8_e4m3fn
+            or self.fp8_output.numel() != 4096
+            or not self.fp8_output.is_contiguous()
+        ):
+            raise ValueError(
+                "fused mHC/RMS FP8 output must be contiguous E4M3 [4096]"
+            )
+        if self.fp8_scale is not None and (
+            self.fp8_scale.dtype != torch.float8_e8m0fnu
+            or self.fp8_scale.numel() != 32
+            or not self.fp8_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "fused mHC/RMS FP8 scale must be contiguous UE8M0 [32]"
+            )
+        has_bf16_output = self.output is not None
+        has_fp8_output = self.fp8_output is not None
+        if has_bf16_output == has_fp8_output:
+            raise ValueError(
+                "fused mHC/RMS must output either BF16 or FP8, not both"
+            )
+        if has_bf16_output:
+            if (
+                self.output.dtype != torch.bfloat16
+                or self.output.numel() != 4096
+                or not self.output.is_contiguous()
+            ):
+                raise ValueError(
+                    "fused mHC/RMS BF16 output must be contiguous BF16 [4096]"
+                )
+            if (
+                self.packed_output is None
+                or self.packed_output.dtype != torch.bfloat16
+                or self.packed_output.numel() != 4136
+                or not self.packed_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "packed BF16 mHC/RMS output must be contiguous storage [4136]"
+                )
+            if self.output.data_ptr() != self.packed_output.data_ptr():
+                raise ValueError("mHC BF16 output must start the packed output")
+            metadata_address = self.packed_output.data_ptr() + 4096 * 2
+        else:
+            if (
+                self.packed_output is None
+                or self.packed_output.dtype != torch.uint8
+                or self.packed_output.numel() != 4176
+                or not self.packed_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "packed FP8 mHC/RMS output must be contiguous byte storage [4176]"
+                )
+            if self.fp8_output.data_ptr() != self.packed_output.data_ptr():
+                raise ValueError("mHC FP8 output must start the packed output")
+            metadata_address = self.packed_output.data_ptr() + 4096
+        if self.post.data_ptr() != metadata_address:
+            raise ValueError("mHC post output must follow the primary output")
+        if self.comb.data_ptr() != metadata_address + 4 * 4:
+            raise ValueError("mHC comb output must follow post in the packed output")
 
     def schedule(self, sm):
         if sm != 0:
             return []
-        return [
+        instructions = [
             Dsv4HcPreRms(
-                self.sinkhorn_iters,
-                self.epsilon,
-                self.rms_epsilon,
                 zero_fp32_output=self.zero_fp32_output is not None,
+                output_fp8=self.fp8_output is not None,
             ),
-            TmaLoad1D(self.residual),
-            TmaLoad1D(self.mixes),
-            _shared_load_1d(self.scale),
-            TmaLoad1D(self.base),
-            TmaLoad1D(self.norm_weight),
-            TmaStore1D(self.output).bar(self._bar("output")),
-            TmaStore1D(self.post),
-            TmaStore1D(self.comb),
-            *(
-                (TmaStore1D(self.zero_fp32_output),)
-                if self.zero_fp32_output is not None
-                else ()
-            ),
+            RawAddress(
+                self.packed_metadata, config.num_slots
+            ).fixed_port(1),
+            TmaLoad1D(self.residual).fixed_port(0),
+            TmaLoad1D(self.norm_weight).fixed_port(1),
         ]
+        if self.fp8_output is not None:
+            instructions.extend(
+                (
+                    _shared_store_1d(self.fp8_output),
+                    _shared_store_1d(self.fp8_scale).bar(self._bar("output")),
+                )
+            )
+        else:
+            instructions.append(TmaStore1D(self.output).bar(self._bar("output")))
+        if self.zero_fp32_output is not None:
+            instructions.append(TmaStore1D(self.zero_fp32_output))
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":

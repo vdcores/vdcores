@@ -540,9 +540,15 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_EXPERT_REDUCE) {
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_fp32_bf16_gemv(
-      inst.args[0], inst.args[1], smem_base,
-      get_slot_address(smem_base, numSlots), m2c, c2m);
+  if (inst.args[2] != 0) {
+    task_dsv4_fp32_bf16_gemv<true>(
+        inst.args[0], inst.args[1], smem_base,
+        get_slot_address(smem_base, numSlots), m2c, c2m);
+  } else {
+    task_dsv4_fp32_bf16_gemv<false>(
+        inst.args[0], inst.args[1], smem_base,
+        get_slot_address(smem_base, numSlots), m2c, c2m);
+  }
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV) {
@@ -565,14 +571,30 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE_RMS) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_hc_pre<true>(
-      inst.args[0] & 0x7FFF,
-      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
-      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
-      (inst.args[0] & 0x8000) != 0,
-      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+  switch (inst.args[0] & 3U) {
+  case 0:
+    task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, false, false>(
+        smem_base, get_slot_address(smem_base, numSlots), st_insts,
+        sm_id, g_events, m2c, c2m);
+    break;
+  case 1:
+    task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, true, false>(
+        smem_base, get_slot_address(smem_base, numSlots), st_insts,
+        sm_id, g_events, m2c, c2m);
+    break;
+  case 2:
+    task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, false, true>(
+        smem_base, get_slot_address(smem_base, numSlots), st_insts,
+        sm_id, g_events, m2c, c2m);
+    break;
+  default:
+    task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, true, true>(
+        smem_base, get_slot_address(smem_base, numSlots), st_insts,
+        sm_id, g_events, m2c, c2m);
+    break;
+  }
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_POST) {

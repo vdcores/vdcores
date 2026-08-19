@@ -350,6 +350,10 @@ Barrier behavior for writeback ops:
       per K tile, expands it in existing activation-slot padding, and issues
       the TMEM copy itself; the production resident schedule keeps the packed
       LDU path because the compact task did not win latency
+    - DeepSeek-V4 mHC-pre/RMS is a second narrow exception: compute reads one
+      56-FP32 packed coefficient record whose projection-stage STU barrier is
+      the global visibility boundary; its bulk residual/weight inputs and
+      output remain allocator-backed
 
 - `OP_ALLOC_ROUTED_TMA_LOAD_1D`
   - fields:

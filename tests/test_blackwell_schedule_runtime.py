@@ -1461,15 +1461,31 @@ def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
     monkeypatch.setattr(
         "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
     )
+    monkeypatch.setattr(
+        "dae.schedule.RawAddress",
+        lambda tensor, slot_id: MemoryInstruction(
+            opcode=opcode.OP_ALLOC_WB_RAW_ADDRESS,
+            num_slots=slot_id,
+            arg=slot_id,
+            size=0,
+            address=tensor.data_ptr(),
+        ),
+    )
+    residual = torch.empty((4, 4096), dtype=torch.bfloat16)
+    packed_output = torch.empty((4136,), dtype=torch.bfloat16)
+    output_metadata = packed_output[4096:].view(torch.float32)
     schedule = SchedDsv4HcPreRms(
-        torch.empty((4, 4096), dtype=torch.bfloat16),
+        residual,
         torch.empty((24,), dtype=torch.float32),
         torch.empty((3,), dtype=torch.float32),
         torch.empty((24,), dtype=torch.float32),
         torch.empty((4096,), dtype=torch.bfloat16),
-        torch.empty((4096,), dtype=torch.bfloat16),
-        torch.empty((4,), dtype=torch.float32),
-        torch.empty((4, 4), dtype=torch.float32),
+        packed_output[:4096],
+        output_metadata[:4],
+        output_metadata[4:].view(4, 4),
+        residual_square_sum=torch.empty((1,), dtype=torch.float32),
+        packed_metadata=torch.empty((56,), dtype=torch.float32),
+        packed_output=packed_output,
     ).bar("output", 7).place(1)
 
     instructions = schedule.schedule(0)
@@ -1490,20 +1506,66 @@ def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
     assert len(output_releases) == 1
     assert schedule.bar_release_count("output") == 1
 
+    zeroed_residual = torch.empty((4, 4096), dtype=torch.bfloat16)
+    zeroed_packed_output = torch.empty((4136,), dtype=torch.bfloat16)
+    zeroed_output_metadata = zeroed_packed_output[4096:].view(torch.float32)
     zeroed = SchedDsv4HcPreRms(
+        zeroed_residual,
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((3,), dtype=torch.float32),
+        torch.empty((24,), dtype=torch.float32),
+        torch.empty((4096,), dtype=torch.bfloat16),
+        zeroed_packed_output[:4096],
+        zeroed_output_metadata[:4],
+        zeroed_output_metadata[4:].view(4, 4),
+        residual_square_sum=torch.empty((1,), dtype=torch.float32),
+        packed_metadata=torch.empty((56,), dtype=torch.float32),
+        packed_output=zeroed_packed_output,
+        zero_fp32_output=torch.empty((4096,), dtype=torch.float32),
+    ).place(1).schedule(0)
+    assert isinstance(zeroed[0], Dsv4HcPreRms)
+    assert zeroed[0].args == [1]
+    assert zeroed[-1].size == 4096 * 4
+
+    fp8_packed_output = torch.empty((4176,), dtype=torch.uint8)
+    fp8_output = fp8_packed_output[:4096].view(torch.float8_e4m3fn)
+    fp8_output_metadata = fp8_packed_output[4096:].view(torch.float32)
+    fp8 = SchedDsv4HcPreRms(
         torch.empty((4, 4096), dtype=torch.bfloat16),
         torch.empty((24,), dtype=torch.float32),
         torch.empty((3,), dtype=torch.float32),
         torch.empty((24,), dtype=torch.float32),
         torch.empty((4096,), dtype=torch.bfloat16),
-        torch.empty((4096,), dtype=torch.bfloat16),
-        torch.empty((4,), dtype=torch.float32),
-        torch.empty((4, 4), dtype=torch.float32),
-        zero_fp32_output=torch.empty((4096,), dtype=torch.float32),
-    ).place(1).schedule(0)
-    assert isinstance(zeroed[0], Dsv4HcPreRms)
-    assert zeroed[0].args[0] & 0x8000
-    assert zeroed[-1].size == 4096 * 4
+        None,
+        fp8_output_metadata[:4],
+        fp8_output_metadata[4:].view(4, 4),
+        residual_square_sum=torch.empty((1,), dtype=torch.float32),
+        packed_metadata=torch.empty((56,), dtype=torch.float32),
+        packed_output=fp8_packed_output,
+        fp8_output=fp8_output,
+        fp8_scale=torch.empty((32,), dtype=torch.float8_e8m0fnu),
+    ).bar("output", 9).place(1).schedule(0)
+    assert isinstance(fp8[0], Dsv4HcPreRms)
+    assert fp8[0].args == [Dsv4HcPreRms.OUTPUT_FP8]
+    assert [inst.size for inst in fp8[-2:]] == [4096, 32]
+    assert fp8[-1].num_slots >> 6 == 9
+
+    with pytest.raises(ValueError, match="either BF16 or FP8, not both"):
+        SchedDsv4HcPreRms(
+            residual,
+            torch.empty((24,), dtype=torch.float32),
+            torch.empty((3,), dtype=torch.float32),
+            torch.empty((24,), dtype=torch.float32),
+            torch.empty((4096,), dtype=torch.bfloat16),
+            packed_output[:4096],
+            output_metadata[:4],
+            output_metadata[4:].view(4, 4),
+            residual_square_sum=torch.empty((1,), dtype=torch.float32),
+            packed_metadata=torch.empty((56,), dtype=torch.float32),
+            packed_output=packed_output,
+            fp8_output=torch.empty((4096,), dtype=torch.float8_e4m3fn),
+            fp8_scale=torch.empty((32,), dtype=torch.float8_e8m0fnu),
+        ).place(1)
 
 
 def test_fp8_native_splitk_maps_k_shards_and_tma_reduces(monkeypatch):

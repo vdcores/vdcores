@@ -804,3 +804,58 @@ The reproducible harnesses are
 `benchmarks/deepseek_v4_nongemm_framework_baselines.py`; raw logs are
 `.agentlog/2026-08-19-nongemm-full-image-results.txt` and
 `.agentlog/2026-08-19-nongemm-framework-baselines.txt`.
+
+## mHC pre-RMS compile-time specialization (2026-08-19)
+
+The optimized one-SM task uses a fixed compile-time transport/math contract:
+one raw 56-float input record (including four uninitialized alignment floats),
+20 fully unrolled Sinkhorn rounds, fixed
+epsilons, BF16x8 residual/normalization vectors, and one allocator-backed
+BF16 output lease. `post` and `comb` occupy the packed output tail and are
+written directly using the existing output lease's global address. Warp 0
+runs Sinkhorn while three worker warps mix the hidden row, reduce its RMS,
+and normalize it. The square-sum producer and optional FP32 clear are template
+specializations, so their inner loops have no runtime option predicates.
+
+The exact generated 24-handler image uses 141 registers and has no spills.
+The initial compact-record milestone measured 7.680 us cold / 4.608 us hot
+median in job `20260819T160441Z-3926456`; the clear-enabled form measured
+7.040 / 4.768 us in job `20260819T160504Z-3930942`. After integrating the
+aligned 56-float producer/consumer record, jobs
+`20260819T161819Z-4052932` and `20260819T161835Z-4054964` measured
+7.264 / 4.640 us and 7.360 / 4.800 us, respectively. The current exact path
+is 55.9% faster than the original 10.528-us VDcores result, but remains 12.0%
+slower than vLLM TileLang's 4.1432 us and does not satisfy the 3.72888-us
+strict target. One-launch projection-to-pre-RMS correctness passed in job
+`20260819T161954Z-4066047`.
+
+A 10-round compile-time diagnostic measured 3.776 us and passed the focused
+test tolerance against 20 rounds, but remains an unaccepted numerical
+approximation. Keep exact 20 rounds as production unless an explicit error
+budget is adopted. Also keep the allocator-backed TMA/STU output: direct
+global output measured 4.640 us, split early C2M arrivals measured 13.312 us,
+and a non-unrolled counted Sinkhorn loop measured 4.800 us.
+
+## Alternative mHC pre-RMS scalar FP8 output (2026-08-19)
+
+`OP_DSV4_HC_PRE_RMS` has two mutually exclusive primary-output
+specializations: canonical BF16, or block-128 E4M3 plus one UE8M0 scale per
+block. The FP8 specialization does not allocate or store a BF16 output. It
+still rounds each normalized value to BF16 internally before quantization,
+preserving the model/reference boundary. Eight 16-lane groups form eight K128
+blocks concurrently, and the selected primary output lease carries the
+following FP32 `post`/`comb` metadata address.
+
+In the 24-handler production image, BF16 output measured 6.528 us cold /
+4.448 us hot median. FP8-only output measured 8.768 / 5.616 us and matched
+`quantize_fp8_block128` byte-for-byte. BF16 followed by the separate 32-SM
+FP8 quantizer totals 11.520 / 6.848 us, so selecting FP8 directly saves
+2.752 us (23.9%) cold and 1.232 us (18.0%) hot at this boundary. With the
+optional FP32 clear, FP8-only measured 8.832 / 5.856 us versus a composed
+12.672 / 7.008 us, saving 30.3% cold and 16.4% hot.
+
+The resident FFN continues to select BF16 and then quantize separately: its
+router consumes BF16 while shared-expert GEMVs consume FP8, so both
+representations are genuinely live. The FP8-only specialization is for a
+schedule whose downstream consumers all accept FP8. The exact image remains
+at 141 registers, zero spills, and nine barriers.

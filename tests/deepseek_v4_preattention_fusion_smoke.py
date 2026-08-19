@@ -516,11 +516,23 @@ def main() -> None:
     hc_hidden = torch.empty(
         (4096,), dtype=torch.bfloat16, device=device
     )
-    hc_output = torch.empty_like(hc_hidden)
     hc_post = torch.empty((4,), dtype=torch.float32, device=device)
     hc_comb = torch.empty((4, 4), dtype=torch.float32, device=device)
-    hc_fused_post = torch.empty_like(hc_post)
-    hc_fused_comb = torch.empty_like(hc_comb)
+    hc_residual_square_sum = hc_residual.float().square().sum().reshape(1)
+    hc_packed_metadata = torch.empty(
+        (56,), dtype=torch.float32, device=device
+    )
+    hc_packed_metadata[:1].copy_(hc_residual_square_sum)
+    hc_packed_metadata[1:25].copy_(hc_mixes)
+    hc_packed_metadata[28:31].copy_(hc_scale)
+    hc_packed_metadata[31:55].copy_(hc_base)
+    hc_packed_output = torch.empty(
+        (4136,), dtype=torch.bfloat16, device=device
+    )
+    hc_output = hc_packed_output[:4096]
+    hc_output_metadata = hc_packed_output[4096:].view(torch.float32)
+    hc_fused_post = hc_output_metadata[:4]
+    hc_fused_comb = hc_output_metadata[4:].view(4, 4)
     hc_reference_launcher = Launcher(1, device=device)
     hc_reference_launcher.s(
         SchedDsv4HcPre(
@@ -544,7 +556,9 @@ def main() -> None:
             hc_output,
             hc_fused_post,
             hc_fused_comb,
-            rms_epsilon=epsilon,
+            residual_square_sum=hc_residual_square_sum,
+            packed_metadata=hc_packed_metadata,
+            packed_output=hc_packed_output,
         ).place(1)
     )
     hc_reference_launcher.launch()

@@ -395,7 +395,13 @@ class ResidentOneLaunchDecode:
         self.residual = torch.empty_like(self.initial_residual)
         self.next_residual = torch.empty_like(self.residual)
         self.hidden = torch.empty((cfg.hidden_size,), dtype=torch.bfloat16, device=d)
-        self.norm_hidden = torch.empty_like(self.hidden)
+        self.mhc_packed_output = torch.empty(
+            (cfg.hidden_size + 40,), dtype=torch.bfloat16, device=d
+        )
+        self.norm_hidden = self.mhc_packed_output[:cfg.hidden_size]
+        mhc_output_metadata = self.mhc_packed_output[cfg.hidden_size:].view(
+            torch.float32
+        )
         direct_projection_views = {}
         if self.direct_splitk_bf16:
             projection_rows = (
@@ -432,9 +438,14 @@ class ResidentOneLaunchDecode:
         else:
             self.splitk_output_arena = None
             self.branch = torch.empty_like(self.hidden)
-        self.mixes = torch.empty((24,), dtype=torch.float32, device=d)
-        self.post = torch.empty((4,), dtype=torch.float32, device=d)
-        self.comb = torch.empty((4, 4), dtype=torch.float32, device=d)
+        self.mhc_packed_metadata = torch.empty(
+            (56,), dtype=torch.float32, device=d
+        )
+        self.mhc_residual_square_sum = self.mhc_packed_metadata[:1]
+        self.mixes = self.mhc_packed_metadata[1:25]
+        self.mhc_metadata_tail = self.mhc_packed_metadata[28:56]
+        self.post = mhc_output_metadata[:4]
+        self.comb = mhc_output_metadata[4:].view(4, 4)
 
         self.decode_position = self.args.context_length - 1
         self.main_rope = deepseek_v4_rope_table(
@@ -1455,9 +1466,15 @@ class ResidentOneLaunchDecode:
             family, f"{branch_name}_norm.weight"
         )
         project = SchedDsv4Fp32Bf16Gemv(
-            functions[0], residual.reshape(-1), self.mixes
+            functions[0],
+            residual.reshape(-1),
+            self.mixes,
+            square_sum_output=self.mhc_residual_square_sum,
+            metadata_scale=scales[0],
+            metadata_base=bases[0],
+            metadata_tail_output=self.mhc_metadata_tail,
         )
-        project = self._layered(project, family, functions)
+        project = self._layered(project, family, functions, scales, bases)
         project_stage = self._stage(
             f"{branch_name}.hc_project",
             project,
@@ -1472,12 +1489,12 @@ class ResidentOneLaunchDecode:
             self.norm_hidden,
             self.post,
             self.comb,
+            residual_square_sum=self.mhc_residual_square_sum,
+            packed_metadata=self.mhc_packed_metadata,
+            packed_output=self.mhc_packed_output,
             zero_fp32_output=zero_fp32_output,
-            rms_epsilon=self.config.rms_epsilon,
         )
-        pre = self._layered(
-            pre, family, scales, bases, norm_weights
-        )
+        pre = self._layered(pre, family, norm_weights)
         pre_stage = self._stage(f"{branch_name}.hc_pre_rms4096", pre)
         post_stage = self._stage(
             f"{branch_name}.hc_post",

@@ -222,6 +222,7 @@ def cord_func_rowmajor_2d(mat: torch.Tensor, rank: int):
 
     return cord_func
 
+
 # pytorch-major cord functions
 def cord_func_2d_mnmajor(mat: torch.Tensor, rank : int):
     def cord_func(*cords):

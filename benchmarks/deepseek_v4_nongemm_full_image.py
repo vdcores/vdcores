@@ -162,6 +162,7 @@ def build_hc_pre_rms(
     generator: torch.Generator,
     *,
     zero_output: bool,
+    output_fp8: bool = False,
 ) -> Case:
     residual = torch.randn(
         (4, 4096), generator=generator, dtype=torch.bfloat16, device=device
@@ -170,6 +171,7 @@ def build_hc_pre_rms(
         (24,), generator=generator, dtype=torch.float32, device=device
     ) * 0.1
     scale = torch.tensor((0.5, 0.75, 1.25), dtype=torch.float32, device=device)
+    residual_square_sum = residual.float().square().sum().reshape(1)
     base = torch.randn(
         (24,), generator=generator, dtype=torch.float32, device=device
     ) * 0.05
@@ -180,12 +182,35 @@ def build_hc_pre_rms(
         * 0.05
         + 1.0
     )
-    output = torch.empty((4096,), dtype=torch.bfloat16, device=device)
-    post = torch.empty((4,), dtype=torch.float32, device=device)
-    comb = torch.empty((4, 4), dtype=torch.float32, device=device)
+    packed_metadata = torch.empty(
+        (56,), dtype=torch.float32, device=device
+    )
+    packed_metadata[:1].copy_(residual_square_sum)
+    packed_metadata[1:25].copy_(mixes)
+    packed_metadata[28:31].copy_(scale)
+    packed_metadata[31:55].copy_(base)
+    if output_fp8:
+        packed_output = torch.empty((4176,), dtype=torch.uint8, device=device)
+        output = None
+        fp8_output = packed_output[:4096].view(torch.float8_e4m3fn)
+        output_metadata = packed_output[4096:].view(torch.float32)
+    else:
+        packed_output = torch.empty(
+            (4136,), dtype=torch.bfloat16, device=device
+        )
+        output = packed_output[:4096]
+        fp8_output = None
+        output_metadata = packed_output[4096:].view(torch.float32)
+    post = output_metadata[:4]
+    comb = output_metadata[4:].view(4, 4)
     zero = (
         torch.full((4096,), 7.0, dtype=torch.float32, device=device)
         if zero_output
+        else None
+    )
+    fp8_scale = (
+        torch.empty((32,), dtype=torch.float8_e8m0fnu, device=device)
+        if output_fp8
         else None
     )
     schedule = SchedDsv4HcPreRms(
@@ -197,27 +222,43 @@ def build_hc_pre_rms(
         output,
         post,
         comb,
+        residual_square_sum=residual_square_sum,
+        packed_metadata=packed_metadata,
+        packed_output=packed_output,
         zero_fp32_output=zero,
+        fp8_output=fp8_output,
+        fp8_scale=fp8_scale,
     )
     launcher = _launcher(device, 1, schedule.place(1))
 
     def validate() -> float:
         hidden, expected_post, expected_comb = hc_pre_reference(
-            residual, mixes, scale, base
+            residual, mixes, scale, base, sinkhorn_iters=20
         )
         expected = _rms(hidden, weight, 1.0e-6).to(torch.bfloat16)
-        torch.testing.assert_close(output, expected, rtol=2.0e-2, atol=1.0e-2)
+        if output is not None:
+            torch.testing.assert_close(
+                output, expected, rtol=2.0e-2, atol=1.0e-2
+            )
         torch.testing.assert_close(post, expected_post, rtol=2.0e-5, atol=2.0e-5)
         torch.testing.assert_close(comb, expected_comb, rtol=2.0e-5, atol=2.0e-5)
         if zero is not None:
             torch.testing.assert_close(zero, torch.zeros_like(zero), rtol=0, atol=0)
+        if fp8_output is not None:
+            expected_fp8, expected_fp8_scale = quantize_fp8_block128(expected)
+            torch.testing.assert_close(fp8_output, expected_fp8, rtol=0, atol=0)
+            torch.testing.assert_close(
+                fp8_scale, expected_fp8_scale, rtol=0, atol=0
+            )
+            return 0.0
         return _max_abs(output, expected)
 
     return Case(
         launcher,
         validate,
         "OP_DSV4_HC_PRE_RMS",
-        f"residual4x4096_zero_fp32={int(zero_output)}",
+        f"residual4x4096_zero_fp32={int(zero_output)}_"
+        f"output={'fp8' if output_fp8 else 'bf16'}_sinkhorn=20",
     )
 
 
@@ -811,6 +852,12 @@ CASES: dict[str, Callable[[torch.device, torch.Generator], Case]] = {
     "preload_rope4": build_preload,
     "hc_pre_rms": lambda d, g: build_hc_pre_rms(d, g, zero_output=False),
     "hc_pre_rms_zero": lambda d, g: build_hc_pre_rms(d, g, zero_output=True),
+    "hc_pre_rms_fp8": lambda d, g: build_hc_pre_rms(
+        d, g, zero_output=False, output_fp8=True
+    ),
+    "hc_pre_rms_zero_fp8": lambda d, g: build_hc_pre_rms(
+        d, g, zero_output=True, output_fp8=True
+    ),
     "fp8_quant128_k4096": build_fp8_quant128,
     "rms_fp8_native_k1024": build_rms_fp8_native,
     "rms_rope_q64": lambda d, g: build_rms_rope(d, g, weighted=False),

@@ -16,6 +16,91 @@ __device__ __forceinline__ float dsv4_softplus(float value) {
   return fmaxf(value, 0.0f) + log1pf(__expf(-fabsf(value)));
 }
 
+struct Dsv4Bf16x8 {
+  uint4 raw;
+};
+
+enum class Dsv4HcPreRmsMetadataMode : int {
+  SeparateShared = 0,
+  PackedShared = 1,
+  PackedRaw = 2,
+};
+
+// The production image has one mHC-pre/RMS transport contract.  Keep the
+// choice compile-time so alternate experiments do not leave a mode branch in
+// the resident compute handler.
+inline constexpr Dsv4HcPreRmsMetadataMode dsv4HcPreRmsMetadataMode =
+    Dsv4HcPreRmsMetadataMode::PackedRaw;
+inline constexpr int dsv4HcPreRmsSinkhornIters = 20;
+inline constexpr float dsv4HcPreRmsEpsilon = 1.0e-6f;
+inline constexpr float dsv4HcPreRmsNormEpsilon = 1.0e-6f;
+inline constexpr int dsv4HcPreRmsScaleOffset = 28;
+inline constexpr int dsv4HcPreRmsBaseOffset = 31;
+
+__device__ __forceinline__ Dsv4Bf16x8 dsv4_load_bf16x8(
+    const __nv_bfloat16 *pointer) {
+  Dsv4Bf16x8 value;
+  value.raw = *reinterpret_cast<const uint4 *>(pointer);
+  return value;
+}
+
+__device__ __forceinline__ __nv_bfloat162 dsv4_bf16x8_pair(
+    const Dsv4Bf16x8 &value,
+    int pair) {
+  const uint32_t bits = pair == 0 ? value.raw.x :
+                        pair == 1 ? value.raw.y :
+                        pair == 2 ? value.raw.z : value.raw.w;
+  __nv_bfloat162 result;
+  *reinterpret_cast<uint32_t *>(&result) = bits;
+  return result;
+}
+
+__device__ __forceinline__ void dsv4_store_bf16x8(
+    __nv_bfloat16 *pointer,
+    const Dsv4Bf16x8 &value) {
+  *reinterpret_cast<uint4 *>(pointer) = value.raw;
+}
+
+__device__ __forceinline__ float dsv4_hc_mix_hidden_vector(
+    const __nv_bfloat16 *residual,
+    const float *pre,
+    __nv_bfloat16 *hidden,
+    int dim) {
+  constexpr int kHc = 4;
+  constexpr int kHidden = 4096;
+  constexpr int kVectorWidth = 8;
+  float values[kVectorWidth] = {};
+#pragma unroll
+  for (int branch = 0; branch < kHc; ++branch) {
+    const Dsv4Bf16x8 packed = dsv4_load_bf16x8(
+        residual + branch * kHidden + dim);
+#pragma unroll
+    for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+      const float2 branch_values = __bfloat1622float2(
+          dsv4_bf16x8_pair(packed, pair));
+      values[pair * 2] = fmaf(
+          pre[branch], branch_values.x, values[pair * 2]);
+      values[pair * 2 + 1] = fmaf(
+          pre[branch], branch_values.y, values[pair * 2 + 1]);
+    }
+  }
+  Dsv4Bf16x8 rounded;
+  auto *rounded_pairs = reinterpret_cast<__nv_bfloat162 *>(&rounded.raw);
+  float sum_squares = 0.0f;
+#pragma unroll
+  for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+    rounded_pairs[pair] = __float22bfloat162_rn(
+        make_float2(values[pair * 2], values[pair * 2 + 1]));
+    const float2 rounded_values = __bfloat1622float2(rounded_pairs[pair]);
+    sum_squares = fmaf(
+        rounded_values.x, rounded_values.x, sum_squares);
+    sum_squares = fmaf(
+        rounded_values.y, rounded_values.y, sum_squares);
+  }
+  dsv4_store_bf16x8(hidden + dim, rounded);
+  return sum_squares;
+}
+
 __device__ __forceinline__ float dsv4_div_rn(
     float numerator, float denominator) {
   float result;
@@ -1037,7 +1122,7 @@ __device__ __forceinline__ void task_dsv4_expert_reduce(
 
 // FP32-weight/BF16-input GEMV for the small mHC mixing projections.  It is
 // deliberately scalar and correctness-oriented; one SM owns one or more rows.
-template <typename M2CQueue, typename C2MQueue>
+template <bool EmitPreRmsMetadata, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     int k,
     int tile_k,
@@ -1050,6 +1135,10 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
   const int warp = tid >> 5;
   auto *warp_reduce = static_cast<float *>(task_scratch);
   float partial = 0.0f;
+  float square_partial;
+  if constexpr (EmitPreRmsMetadata) {
+    square_partial = 0.0f;
+  }
   for (int column_start = 0; column_start < k; column_start += tile_k) {
     const int columns = min(tile_k, k - column_start);
     const int weight_slots = m2c.template pop<0>();
@@ -1061,10 +1150,14 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     const auto *input = static_cast<const __nv_bfloat16 *>(
         get_slot_address(smem_base, input_slot));
     for (int column = tid; column < columns; column += 128) {
+      const float input_value = __bfloat162float(input[column]);
       partial = fmaf(
           weight[column],
-          __bfloat162float(input[column]),
+          input_value,
           partial);
+      if constexpr (EmitPreRmsMetadata) {
+        square_partial = fmaf(input_value, input_value, square_partial);
+      }
     }
     __sync_compute_group(128);
     c2m.push(tid, weight_slots | input_slots);
@@ -1073,20 +1166,67 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
   const int output_slot = extract(output_slots);
   auto *output = static_cast<float *>(
       get_slot_address(smem_base, output_slot));
+  int square_output_slots;
+  float *square_output;
+  int scale_slots;
+  const float *scale;
+  int base_slots;
+  const float *base;
+  int metadata_tail_slots;
+  float *metadata_tail;
+  if constexpr (EmitPreRmsMetadata) {
+    square_output_slots = m2c.template pop<0>();
+    square_output = static_cast<float *>(
+        get_slot_address(smem_base, extract(square_output_slots)));
+    scale_slots = m2c.template pop<0>();
+    scale = static_cast<const float *>(
+        get_slot_address(smem_base, extract(scale_slots)));
+    base_slots = m2c.template pop<0>();
+    base = static_cast<const float *>(
+        get_slot_address(smem_base, extract(base_slots)));
+    metadata_tail_slots = m2c.template pop<0>();
+    metadata_tail = static_cast<float *>(
+        get_slot_address(smem_base, extract(metadata_tail_slots)));
+  }
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
+    if constexpr (EmitPreRmsMetadata) {
+      square_partial += __shfl_down_sync(
+          0xFFFFFFFFU, square_partial, offset);
+    }
   }
   if (lane == 0) {
     warp_reduce[warp] = partial;
+    if constexpr (EmitPreRmsMetadata) {
+      warp_reduce[4 + warp] = square_partial;
+    }
   }
   __sync_compute_group(128);
   if (tid == 0) {
     output[0] = warp_reduce[0] + warp_reduce[1] +
                 warp_reduce[2] + warp_reduce[3];
+    if constexpr (EmitPreRmsMetadata) {
+      square_output[0] = warp_reduce[4] + warp_reduce[5] +
+                         warp_reduce[6] + warp_reduce[7];
+    }
+  }
+  if constexpr (EmitPreRmsMetadata) {
+    if (tid < 3) {
+      metadata_tail[tid] = scale[tid];
+    }
+    if (tid < 24) {
+      metadata_tail[3 + tid] = base[tid];
+    }
+    // metadata_tail[27] is alignment padding and intentionally uninitialized.
   }
   __sync_compute_group(128);
   c2m.template push<31, true, false>(tid, output_slots);
+  if constexpr (EmitPreRmsMetadata) {
+    c2m.template push<31, true, false>(tid, square_output_slots);
+    c2m.push(tid, scale_slots | base_slots);
+    c2m.template push<31, true, false>(tid, metadata_tail_slots);
+  }
 }
 
 // BF16-weight/input/output GEMV for checkpoint linears that are intentionally
@@ -2132,44 +2272,22 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   const int residual_slot = extract(residual_slots);
   const auto *residual = static_cast<const __nv_bfloat16 *>(
       get_slot_address(smem_base, residual_slot));
-  const int mixes_slots = m2c.template pop<0>();
-  const int mixes_slot = extract(mixes_slots);
-  const auto *mixes = static_cast<const float *>(
-      get_slot_address(smem_base, mixes_slot));
-  const int scale_slots = m2c.template pop<0>();
-  const int scale_slot = extract(scale_slots);
-  const auto *scale = static_cast<const float *>(
-      get_slot_address(smem_base, scale_slot));
-  const int base_slots = m2c.template pop<0>();
-  const int base_slot = extract(base_slots);
-  const auto *base = static_cast<const float *>(
-      get_slot_address(smem_base, base_slot));
+  int mixes_slots = 0;
+  const float *mixes = nullptr;
+  int scale_slots = 0;
+  const float *scale = nullptr;
+  int base_slots = 0;
+  const float *base = nullptr;
   int norm_weight_slots = 0;
   const __nv_bfloat16 *norm_weight = nullptr;
-  if constexpr (FuseRms) {
-    norm_weight_slots = m2c.template pop<0>();
-    norm_weight = static_cast<const __nv_bfloat16 *>(
-        get_slot_address(smem_base, extract(norm_weight_slots)));
-  }
-  const int output_slots = m2c.template pop<0>();
-  const int output_slot = extract(output_slots);
-  auto *output = static_cast<__nv_bfloat16 *>(
-      get_slot_address(smem_base, output_slot));
-  const int post_slots = m2c.template pop<0>();
-  const int post_slot = extract(post_slots);
-  auto *post_output = static_cast<float *>(
-      get_slot_address(smem_base, post_slot));
-  const int comb_slots = m2c.template pop<0>();
-  const int comb_slot = extract(comb_slots);
-  auto *comb_output = static_cast<float *>(
-      get_slot_address(smem_base, comb_slot));
+  int output_slots = 0;
+  __nv_bfloat16 *output = nullptr;
+  int post_slots = 0;
+  float *post_output = nullptr;
+  int comb_slots = 0;
+  float *comb_output = nullptr;
   int zero_output_slots = 0;
   float *zero_output = nullptr;
-  if (zero_fp32_output) {
-    zero_output_slots = m2c.template pop<0>();
-    zero_output = static_cast<float *>(
-        get_slot_address(smem_base, extract(zero_output_slots)));
-  }
 
   const int tid = __compute_tid();
   const int lane = tid & 31;
@@ -2177,13 +2295,21 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   auto *shared = static_cast<float *>(task_scratch);
   auto *warp_reduce = shared;
   auto *pre = shared + 4;
-  auto *post = pre + kHc;
-  auto *comb = post + kHc;
+  auto *post_values = shared + 9;
+  auto *comb_values = shared + 13;
 
   float sum_squares = 0.0f;
-  for (int item = tid; item < kHc * kHidden; item += 128) {
-    const float value = __bfloat162float(residual[item]);
-    sum_squares = fmaf(value, value, sum_squares);
+  constexpr int kVectorWidth = 8;
+  for (int item = tid * kVectorWidth; item < kHc * kHidden;
+       item += 128 * kVectorWidth) {
+    const Dsv4Bf16x8 packed = dsv4_load_bf16x8(residual + item);
+#pragma unroll
+    for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+      const float2 values = __bfloat1622float2(
+          dsv4_bf16x8_pair(packed, pair));
+      sum_squares = fmaf(values.x, values.x, sum_squares);
+      sum_squares = fmaf(values.y, values.y, sum_squares);
+    }
   }
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -2194,121 +2320,187 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   }
   __sync_compute_group(128);
 
+  mixes_slots = m2c.template pop<0>();
+  mixes = static_cast<const float *>(
+      get_slot_address(smem_base, extract(mixes_slots)));
+  scale_slots = m2c.template pop<0>();
+  scale = static_cast<const float *>(
+      get_slot_address(smem_base, extract(scale_slots)));
+  base_slots = m2c.template pop<0>();
+  base = static_cast<const float *>(
+      get_slot_address(smem_base, extract(base_slots)));
+
   if (tid == 0) {
     const float total = warp_reduce[0] + warp_reduce[1] +
                         warp_reduce[2] + warp_reduce[3];
     const float rsqrt = rsqrtf(total / float(kHc * kHidden) + 1.0e-6f);
+    shared[8] = rsqrt;
 #pragma unroll
     for (int index = 0; index < kHc; ++index) {
       pre[index] = dsv4_sigmoid(
           mixes[index] * rsqrt * scale[0] + base[index]) + epsilon;
-      post[index] = 2.0f * dsv4_sigmoid(
-          mixes[kHc + index] * rsqrt * scale[1] + base[kHc + index]);
-      post_output[index] = post[index];
-    }
-
-#pragma unroll
-    for (int row = 0; row < kHc; ++row) {
-      float row_max = -__int_as_float(0x7f800000);
-#pragma unroll
-      for (int column = 0; column < kHc; ++column) {
-        const int index = row * kHc + column;
-        comb[index] = mixes[2 * kHc + index] * rsqrt * scale[2] +
-                      base[2 * kHc + index];
-        row_max = fmaxf(row_max, comb[index]);
-      }
-      float row_sum = 0.0f;
-#pragma unroll
-      for (int column = 0; column < kHc; ++column) {
-        const int index = row * kHc + column;
-        comb[index] = __expf(comb[index] - row_max);
-        row_sum += comb[index];
-      }
-#pragma unroll
-      for (int column = 0; column < kHc; ++column) {
-        comb[row * kHc + column] =
-            comb[row * kHc + column] / row_sum + epsilon;
-      }
-    }
-
-    for (int iteration = 0; iteration < sinkhorn_iters; ++iteration) {
-#pragma unroll
-      for (int column = 0; column < kHc; ++column) {
-        float column_sum = 0.0f;
-#pragma unroll
-        for (int row = 0; row < kHc; ++row) {
-          column_sum += comb[row * kHc + column];
-        }
-#pragma unroll
-        for (int row = 0; row < kHc; ++row) {
-          comb[row * kHc + column] /= column_sum + epsilon;
-        }
-      }
-      if (iteration + 1 == sinkhorn_iters) {
-        break;
-      }
-#pragma unroll
-      for (int row = 0; row < kHc; ++row) {
-        float row_sum = 0.0f;
-#pragma unroll
-        for (int column = 0; column < kHc; ++column) {
-          row_sum += comb[row * kHc + column];
-        }
-#pragma unroll
-        for (int column = 0; column < kHc; ++column) {
-          comb[row * kHc + column] /= row_sum + epsilon;
-        }
-      }
-    }
-#pragma unroll
-    for (int index = 0; index < kHc * kHc; ++index) {
-      comb_output[index] = comb[index];
     }
   }
   __sync_compute_group(128);
 
-  if constexpr (FuseRms) {
-    // Retain the model's BF16 mHC output boundary locally, then form the RMS
-    // statistic in FP32.  This exactly removes the HBM round trip without
-    // carrying the unrounded mHC value into normalization.
-    auto *hidden = reinterpret_cast<__nv_bfloat16 *>(shared + 64);
-    float hidden_sum = 0.0f;
-    for (int dim = tid; dim < kHidden; dim += 128) {
-      float value = 0.0f;
+  if (warp == 0 && lane < kHc) {
+    const float rsqrt = shared[8];
+    post_values[lane] = 2.0f * dsv4_sigmoid(
+        mixes[kHc + lane] * rsqrt * scale[1] + base[kHc + lane]);
+    float comb[kHc];
+    float row_max = -__int_as_float(0x7f800000);
 #pragma unroll
-      for (int branch = 0; branch < kHc; ++branch) {
-        value = fmaf(
-            pre[branch],
-            __bfloat162float(residual[branch * kHidden + dim]),
-            value);
+    for (int column = 0; column < kHc; ++column) {
+      const int index = lane * kHc + column;
+      comb[column] = mixes[2 * kHc + index] * rsqrt * scale[2] +
+                     base[2 * kHc + index];
+      row_max = fmaxf(row_max, comb[column]);
+    }
+    float row_sum = 0.0f;
+#pragma unroll
+    for (int column = 0; column < kHc; ++column) {
+      comb[column] = __expf(comb[column] - row_max);
+      row_sum += comb[column];
+    }
+#pragma unroll
+    for (int column = 0; column < kHc; ++column) {
+      comb[column] = comb[column] / row_sum + epsilon;
+    }
+    constexpr unsigned kHcMask = (1U << kHc) - 1U;
+#pragma unroll
+    for (int column = 0; column < kHc; ++column) {
+      float column_sum = comb[column];
+      column_sum += __shfl_xor_sync(kHcMask, column_sum, 1);
+      column_sum += __shfl_xor_sync(kHcMask, column_sum, 2);
+      comb[column] /= column_sum + epsilon;
+    }
+    for (int iteration = 1; iteration < sinkhorn_iters; ++iteration) {
+      row_sum = comb[0] + comb[1] + comb[2] + comb[3] + epsilon;
+#pragma unroll
+      for (int column = 0; column < kHc; ++column) {
+        comb[column] /= row_sum;
       }
-      const __nv_bfloat16 rounded = __float2bfloat16(value);
-      hidden[dim] = rounded;
-      const float hidden_value = __bfloat162float(rounded);
-      hidden_sum = fmaf(hidden_value, hidden_value, hidden_sum);
+#pragma unroll
+      for (int column = 0; column < kHc; ++column) {
+        float column_sum = comb[column];
+        column_sum += __shfl_xor_sync(kHcMask, column_sum, 1);
+        column_sum += __shfl_xor_sync(kHcMask, column_sum, 2);
+        comb[column] /= column_sum + epsilon;
+      }
     }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      hidden_sum += __shfl_down_sync(
-          0xFFFFFFFFU, hidden_sum, offset);
+#pragma unroll
+    for (int column = 0; column < kHc; ++column) {
+      comb_values[lane * kHc + column] = comb[column];
     }
-    if (lane == 0) {
-      warp_reduce[warp] = hidden_sum;
+  }
+
+  auto *hidden = reinterpret_cast<__nv_bfloat16 *>(shared + 64);
+  if constexpr (FuseRms) {
+    float hidden_sum = 0.0f;
+    if (warp != 0) {
+      constexpr int kWorkers = 128 - 32;
+      const int worker = tid - 32;
+      for (int dim = worker * kVectorWidth; dim < kHidden;
+           dim += kWorkers * kVectorWidth) {
+        float values[kVectorWidth] = {};
+#pragma unroll
+        for (int branch = 0; branch < kHc; ++branch) {
+          const Dsv4Bf16x8 packed = dsv4_load_bf16x8(
+              residual + branch * kHidden + dim);
+#pragma unroll
+          for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+            const float2 branch_values = __bfloat1622float2(
+                dsv4_bf16x8_pair(packed, pair));
+            values[pair * 2] = fmaf(
+                pre[branch], branch_values.x, values[pair * 2]);
+            values[pair * 2 + 1] = fmaf(
+                pre[branch], branch_values.y, values[pair * 2 + 1]);
+          }
+        }
+        Dsv4Bf16x8 rounded;
+        auto *rounded_pairs = reinterpret_cast<__nv_bfloat162 *>(&rounded.raw);
+#pragma unroll
+        for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+          rounded_pairs[pair] = __float22bfloat162_rn(
+              make_float2(values[pair * 2], values[pair * 2 + 1]));
+          const float2 rounded_values = __bfloat1622float2(rounded_pairs[pair]);
+          hidden_sum = fmaf(
+              rounded_values.x, rounded_values.x, hidden_sum);
+          hidden_sum = fmaf(
+              rounded_values.y, rounded_values.y, hidden_sum);
+        }
+        dsv4_store_bf16x8(hidden + dim, rounded);
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        hidden_sum += __shfl_down_sync(
+            0xFFFFFFFFU, hidden_sum, offset);
+      }
+      if (lane == 0) {
+        warp_reduce[warp - 1] = hidden_sum;
+      }
     }
     __sync_compute_group(128);
+  } else {
+    __sync_compute_group(128);
+  }
+
+  if constexpr (FuseRms) {
+    norm_weight_slots = m2c.template pop<0>();
+    norm_weight = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(norm_weight_slots)));
+  }
+  output_slots = m2c.template pop<0>();
+  output = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(output_slots)));
+  post_slots = m2c.template pop<0>();
+  post_output = static_cast<float *>(
+      get_slot_address(smem_base, extract(post_slots)));
+  comb_slots = m2c.template pop<0>();
+  comb_output = static_cast<float *>(
+      get_slot_address(smem_base, extract(comb_slots)));
+  if (zero_fp32_output) {
+    zero_output_slots = m2c.template pop<0>();
+    zero_output = static_cast<float *>(
+        get_slot_address(smem_base, extract(zero_output_slots)));
+  }
+  if (tid < kHc) {
+    post_output[tid] = post_values[tid];
+  }
+  if (tid < kHc * kHc) {
+    comb_output[tid] = comb_values[tid];
+  }
+
+  if constexpr (FuseRms) {
     if (tid == 0) {
-      const float total = warp_reduce[0] + warp_reduce[1] +
-                          warp_reduce[2] + warp_reduce[3];
-      warp_reduce[4] = rsqrtf(
+      const float total = warp_reduce[0] + warp_reduce[1] + warp_reduce[2];
+      warp_reduce[3] = rsqrtf(
           total / float(kHidden) + __bfloat162float(rms_epsilon));
     }
     __sync_compute_group(128);
-    const float rms_rcp = warp_reduce[4];
-    for (int dim = tid; dim < kHidden; dim += 128) {
-      output[dim] = __float2bfloat16(
-          __bfloat162float(hidden[dim]) * rms_rcp *
-          __bfloat162float(norm_weight[dim]));
+    const float rms_rcp = warp_reduce[3];
+    for (int dim = tid * kVectorWidth; dim < kHidden;
+         dim += 128 * kVectorWidth) {
+      const Dsv4Bf16x8 hidden_values = dsv4_load_bf16x8(hidden + dim);
+      const Dsv4Bf16x8 weight_values = dsv4_load_bf16x8(norm_weight + dim);
+      Dsv4Bf16x8 normalized;
+      auto *normalized_pairs =
+          reinterpret_cast<__nv_bfloat162 *>(&normalized.raw);
+#pragma unroll
+      for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+        const float2 hidden_pair = __bfloat1622float2(
+            dsv4_bf16x8_pair(hidden_values, pair));
+        const float2 weight_pair = __bfloat1622float2(
+            dsv4_bf16x8_pair(weight_values, pair));
+        normalized_pairs[pair] = __float22bfloat162_rn(make_float2(
+            hidden_pair.x * rms_rcp * weight_pair.x,
+            hidden_pair.y * rms_rcp * weight_pair.y));
+      }
+      dsv4_store_bf16x8(output + dim, normalized);
       if (zero_fp32_output) {
-        zero_output[dim] = 0.0f;
+        auto *zero_vectors = reinterpret_cast<uint4 *>(zero_output + dim);
+        zero_vectors[0] = make_uint4(0, 0, 0, 0);
+        zero_vectors[1] = make_uint4(0, 0, 0, 0);
       }
     }
   } else {
@@ -2336,6 +2528,368 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   c2m.template push<31, true, false>(tid, post_slots);
   c2m.template push<31, true, false>(tid, comb_slots);
   if (zero_fp32_output) {
+    c2m.template push<31, true, false>(tid, zero_output_slots);
+  }
+}
+
+template <Dsv4HcPreRmsMetadataMode MetadataMode, bool ZeroFp32Output,
+          bool OutputFp8,
+          typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_hc_pre_rms(
+    void *smem_base,
+    void *task_scratch,
+    const MInst *st_insts,
+    int sm_id,
+    uint64_t *g_events,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  constexpr int kHc = 4;
+  constexpr int kHidden = 4096;
+  constexpr int kVectorWidth = 8;
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+#if !defined(DAE_TRACK_PROFILE)
+  (void)sm_id;
+  (void)g_events;
+#endif
+
+  int square_sum_slots;
+  int mixes_slots;
+  int scale_slots;
+  int base_slots;
+  int packed_metadata_slot;
+  int norm_weight_slots;
+  const __nv_bfloat16 *norm_weight;
+  const float *square_sum;
+  const float *mixes;
+  const float *scale;
+  const float *base;
+  if constexpr (MetadataMode == Dsv4HcPreRmsMetadataMode::SeparateShared) {
+    square_sum_slots = m2c.template pop<0>();
+    square_sum = static_cast<const float *>(
+        get_slot_address(smem_base, extract(square_sum_slots)));
+    mixes_slots = m2c.template pop<0>();
+    mixes = static_cast<const float *>(
+        get_slot_address(smem_base, extract(mixes_slots)));
+    scale_slots = m2c.template pop<0>();
+    scale = static_cast<const float *>(
+        get_slot_address(smem_base, extract(scale_slots)));
+    base_slots = m2c.template pop<0>();
+    base = static_cast<const float *>(
+        get_slot_address(smem_base, extract(base_slots)));
+  } else {
+    packed_metadata_slot = m2c.template pop<0>();
+    const float *metadata = nullptr;
+    if constexpr (MetadataMode == Dsv4HcPreRmsMetadataMode::PackedShared) {
+      metadata = static_cast<const float *>(get_slot_address(
+          smem_base, extract(packed_metadata_slot)));
+    } else {
+      static_assert(MetadataMode == Dsv4HcPreRmsMetadataMode::PackedRaw);
+      metadata = static_cast<const float *>(slot_2_glob_ptr(
+          st_insts, packed_metadata_slot));
+    }
+    square_sum = metadata;
+    mixes = metadata + 1;
+    scale = metadata + dsv4HcPreRmsScaleOffset;
+    base = metadata + dsv4HcPreRmsBaseOffset;
+  }
+
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *shared = static_cast<float *>(task_scratch);
+  auto *warp_reduce = shared;
+  auto *pre = shared + 4;
+  auto *post_values = shared + 9;
+  auto *comb_values = shared + 13;
+
+  if (warp == 0) {
+    float coefficient_rstd = 0.0f;
+    if (lane == 0) {
+      coefficient_rstd = rsqrtf(
+          square_sum[0] / float(kHc * kHidden) + 1.0e-6f);
+    }
+    coefficient_rstd = __shfl_sync(
+        0xFFFFFFFFU, coefficient_rstd, 0);
+    if (lane < kHc) {
+      pre[lane] = dsv4_sigmoid(
+          mixes[lane] * coefficient_rstd * scale[0] + base[lane]) +
+          dsv4HcPreRmsEpsilon;
+    }
+    if (lane == 0) {
+      shared[8] = coefficient_rstd;
+      *reinterpret_cast<int *>(shared + 29) = 0;
+      *reinterpret_cast<int *>(shared + 30) = 0;
+    }
+  }
+  __sync_compute_group(128);
+
+  const int residual_slots = m2c.template pop<0>();
+  const auto *residual = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(residual_slots)));
+#if defined(DAE_TRACK_PROFILE)
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 125] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
+  auto *hidden = reinterpret_cast<__nv_bfloat16 *>(shared + 64);
+
+  // Warp zero owns the coefficient transform while the other three warps
+  // consume the already-published pre coefficients.  One element per lane
+  // turns each 4x4 row/column normalization into two shuffles instead of four
+  // serial scalar normalizations in each of four lanes.
+  if (warp == 0) {
+    const float coefficient_rstd = shared[8];
+    if (lane < kHc) {
+      post_values[lane] = 2.0f * dsv4_sigmoid(
+          mixes[kHc + lane] * coefficient_rstd * scale[1] +
+          base[kHc + lane]);
+    }
+    if (lane < kHc * kHc) {
+      float comb = mixes[2 * kHc + lane] * coefficient_rstd * scale[2] +
+                   base[2 * kHc + lane];
+      constexpr unsigned kCombMask = (1U << (kHc * kHc)) - 1U;
+      float row_max = comb;
+      row_max = fmaxf(
+          row_max, __shfl_xor_sync(kCombMask, row_max, 1));
+      row_max = fmaxf(
+          row_max, __shfl_xor_sync(kCombMask, row_max, 2));
+      comb = __expf(comb - row_max);
+      float row_sum = comb;
+      row_sum += __shfl_xor_sync(kCombMask, row_sum, 1);
+      row_sum += __shfl_xor_sync(kCombMask, row_sum, 2);
+      comb = comb / row_sum + dsv4HcPreRmsEpsilon;
+      float column_sum = comb;
+      column_sum += __shfl_xor_sync(kCombMask, column_sum, 4);
+      column_sum += __shfl_xor_sync(kCombMask, column_sum, 8);
+      comb /= column_sum + dsv4HcPreRmsEpsilon;
+#pragma unroll
+      for (int iteration = 1;
+           iteration < dsv4HcPreRmsSinkhornIters;
+           ++iteration) {
+        row_sum = comb;
+        row_sum += __shfl_xor_sync(kCombMask, row_sum, 1);
+        row_sum += __shfl_xor_sync(kCombMask, row_sum, 2);
+        comb /= row_sum + dsv4HcPreRmsEpsilon;
+        column_sum = comb;
+        column_sum += __shfl_xor_sync(kCombMask, column_sum, 4);
+        column_sum += __shfl_xor_sync(kCombMask, column_sum, 8);
+        comb /= column_sum + dsv4HcPreRmsEpsilon;
+      }
+      comb_values[lane] = comb;
+    }
+#if defined(DAE_TRACK_PROFILE)
+    if (tid == 0) {
+      g_events[sm_id * numProfileEvents + 124] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+#endif
+  }
+
+  auto *worker_count = reinterpret_cast<int *>(shared + 29);
+  auto *rms_ready = reinterpret_cast<int *>(shared + 30);
+  auto *worker_rms_rcp = shared + 31;
+  if (warp != 0) {
+    constexpr int kWorkerThreads = 96;
+    const int worker = tid - 32;
+    float hidden_sum = 0.0f;
+    for (int dim = worker * kVectorWidth; dim < kHidden;
+         dim += kWorkerThreads * kVectorWidth) {
+      hidden_sum += dsv4_hc_mix_hidden_vector(
+          residual, pre, hidden, dim);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      hidden_sum += __shfl_down_sync(0xFFFFFFFFU, hidden_sum, offset);
+    }
+    if (lane == 0) {
+      warp_reduce[warp] = hidden_sum;
+      __threadfence_block();
+      atomicAdd(worker_count, 1);
+      while (atomicAdd(worker_count, 0) < 3) {
+      }
+    }
+    __syncwarp();
+    if (tid == 32) {
+      const float total =
+          warp_reduce[1] + warp_reduce[2] + warp_reduce[3];
+      *worker_rms_rcp = rsqrtf(
+          total / float(kHidden) + dsv4HcPreRmsNormEpsilon);
+      __threadfence_block();
+      atomicExch(rms_ready, 1);
+    }
+    if (lane == 0) {
+      while (atomicAdd(rms_ready, 0) == 0) {
+      }
+    }
+    __syncwarp();
+  }
+
+  norm_weight_slots = m2c.template pop<0>();
+  norm_weight = static_cast<const __nv_bfloat16 *>(get_slot_address(
+      smem_base, extract(norm_weight_slots)));
+  const int output_slots = m2c.template pop<0>();
+  __nv_bfloat16 *output;
+  Fp8 *fp8_output;
+  if constexpr (OutputFp8) {
+    fp8_output = static_cast<Fp8 *>(
+        get_slot_address(smem_base, extract(output_slots)));
+  } else {
+    output = static_cast<__nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(output_slots)));
+  }
+  auto *global_output = static_cast<uint8_t *>(slot_2_glob_ptr(
+      st_insts, extract(output_slots)));
+  constexpr int kPrimaryOutputBytes = OutputFp8 ? kHidden : kHidden * 2;
+  auto *post_output = reinterpret_cast<float *>(
+      global_output + kPrimaryOutputBytes);
+  auto *comb_output = post_output + kHc;
+  int fp8_scale_slots;
+  Scale *fp8_scale;
+  if constexpr (OutputFp8) {
+    fp8_scale_slots = m2c.template pop<0>();
+    fp8_scale = static_cast<Scale *>(get_slot_address(
+        smem_base, extract(fp8_scale_slots)));
+  }
+  int zero_output_slots;
+  float *zero_output;
+  if constexpr (ZeroFp32Output) {
+    zero_output_slots = m2c.template pop<0>();
+    zero_output = static_cast<float *>(
+        get_slot_address(smem_base, extract(zero_output_slots)));
+  }
+
+  if (warp == 0) {
+    if (lane < kHc) {
+      post_output[lane] = post_values[lane];
+    }
+    if (lane < kHc * kHc) {
+      comb_output[lane] = comb_values[lane];
+    }
+  } else if constexpr (!OutputFp8) {
+    constexpr int kWorkerThreads = 96;
+    const int worker = tid - 32;
+    const float rms_rcp = *worker_rms_rcp;
+    for (int dim = worker * kVectorWidth; dim < kHidden;
+         dim += kWorkerThreads * kVectorWidth) {
+      const Dsv4Bf16x8 hidden_values = dsv4_load_bf16x8(hidden + dim);
+      const Dsv4Bf16x8 weight_values = dsv4_load_bf16x8(norm_weight + dim);
+      Dsv4Bf16x8 normalized;
+      auto *normalized_pairs =
+          reinterpret_cast<__nv_bfloat162 *>(&normalized.raw);
+#pragma unroll
+      for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+        const float2 hidden_pair = __bfloat1622float2(
+            dsv4_bf16x8_pair(hidden_values, pair));
+        const float2 weight_pair = __bfloat1622float2(
+            dsv4_bf16x8_pair(weight_values, pair));
+        normalized_pairs[pair] = __float22bfloat162_rn(make_float2(
+            hidden_pair.x * rms_rcp * weight_pair.x,
+            hidden_pair.y * rms_rcp * weight_pair.y));
+      }
+      dsv4_store_bf16x8(output + dim, normalized);
+      if constexpr (ZeroFp32Output) {
+        auto *zero_vectors = reinterpret_cast<uint4 *>(zero_output + dim);
+        zero_vectors[0] = make_uint4(0, 0, 0, 0);
+        zero_vectors[1] = make_uint4(0, 0, 0, 0);
+      }
+    }
+#if defined(DAE_TRACK_PROFILE)
+    if (tid == 32) {
+      g_events[sm_id * numProfileEvents + 126] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+#endif
+  }
+
+  if constexpr (OutputFp8) {
+    // Eight 16-lane groups quantize eight independent K128 blocks at once.
+    // Each lane owns one aligned BF16x8 vector. The BF16 rounding remains part
+    // of the model math, but only the selected E4M3 representation is written.
+    constexpr int kBlock = 128;
+    constexpr int kGroups = 128 / (kBlock / kVectorWidth);
+    constexpr int kLanesPerGroup = kBlock / kVectorWidth;
+    constexpr int kBlocks = kHidden / kBlock;
+    const int group = tid / kLanesPerGroup;
+    const int group_lane = tid % kLanesPerGroup;
+    const unsigned group_mask =
+        (tid & 16) == 0 ? 0x0000FFFFU : 0xFFFF0000U;
+    const float rms_rcp = *worker_rms_rcp;
+    for (int block_base = 0; block_base < kBlocks; block_base += kGroups) {
+      const int block = block_base + group;
+      const int dim = block * kBlock + group_lane * kVectorWidth;
+      const Dsv4Bf16x8 hidden_values = dsv4_load_bf16x8(hidden + dim);
+      const Dsv4Bf16x8 weight_values = dsv4_load_bf16x8(norm_weight + dim);
+      Dsv4Bf16x8 normalized;
+      auto *normalized_pairs =
+          reinterpret_cast<__nv_bfloat162 *>(&normalized.raw);
+      float normalized_values[kVectorWidth];
+      float maximum = 0.0f;
+#pragma unroll
+      for (int pair = 0; pair < kVectorWidth / 2; ++pair) {
+        const float2 hidden_pair = __bfloat1622float2(
+            dsv4_bf16x8_pair(hidden_values, pair));
+        const float2 weight_pair = __bfloat1622float2(
+            dsv4_bf16x8_pair(weight_values, pair));
+        normalized_pairs[pair] = __float22bfloat162_rn(make_float2(
+            hidden_pair.x * rms_rcp * weight_pair.x,
+            hidden_pair.y * rms_rcp * weight_pair.y));
+        const float2 rounded = __bfloat1622float2(normalized_pairs[pair]);
+        normalized_values[pair * 2] = rounded.x;
+        normalized_values[pair * 2 + 1] = rounded.y;
+        maximum = fmaxf(maximum, fabsf(rounded.x));
+        maximum = fmaxf(maximum, fabsf(rounded.y));
+      }
+#pragma unroll
+      for (int offset = kLanesPerGroup / 2; offset > 0; offset >>= 1) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(group_mask, maximum, offset, kLanesPerGroup));
+      }
+      float block_scale = 0.0f;
+      if (group_lane == 0) {
+        const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+        const float exponent = ceilf(log2f(requested));
+        block_scale = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+        fp8_scale[block] = Scale(block_scale);
+      }
+      block_scale = __shfl_sync(
+          group_mask, block_scale, 0, kLanesPerGroup);
+#pragma unroll
+      for (int element = 0; element < kVectorWidth; ++element) {
+        fp8_output[dim + element] = Fp8(fminf(
+            fmaxf(normalized_values[element] / block_scale, -448.0f),
+            448.0f));
+      }
+      if constexpr (ZeroFp32Output) {
+        auto *zero_vectors = reinterpret_cast<uint4 *>(zero_output + dim);
+        zero_vectors[0] = make_uint4(0, 0, 0, 0);
+        zero_vectors[1] = make_uint4(0, 0, 0, 0);
+      }
+    }
+#if defined(DAE_TRACK_PROFILE)
+    if (tid == 0) {
+      g_events[sm_id * numProfileEvents + 126] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+#endif
+  }
+
+  __sync_compute_group(128);
+  int input_slots = residual_slots | norm_weight_slots;
+  if constexpr (MetadataMode == Dsv4HcPreRmsMetadataMode::SeparateShared) {
+    input_slots |= square_sum_slots | mixes_slots | scale_slots | base_slots;
+  } else if constexpr (
+      MetadataMode == Dsv4HcPreRmsMetadataMode::PackedShared) {
+    input_slots |= packed_metadata_slot;
+  }
+  c2m.push(tid, input_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+  if constexpr (OutputFp8) {
+    c2m.template push<31, true, false>(tid, fp8_scale_slots);
+  }
+  if constexpr (ZeroFp32Output) {
     c2m.template push<31, true, false>(tid, zero_output_slots);
   }
 }
