@@ -2,7 +2,9 @@
 
 import argparse
 import os
-import selectors
+import queue
+import signal
+import threading
 import subprocess
 import sys
 import time
@@ -67,16 +69,39 @@ def parse_args():
 
 
 def terminate_process(proc: subprocess.Popen, grace_kill_secs: float):
+    """Terminate the child and everything in its process group.
+
+    Signalling only the child leaks whatever it spawned. For a GPU target
+    that orphan keeps its device memory until someone notices, and a few of
+    them are enough to make every later run fail out of memory.
+    """
     if proc.poll() is not None:
         return
-    proc.terminate()
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        pgid = None
+
+    def signal_all(sig):
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    signal_all(signal.SIGTERM)
     deadline = time.monotonic() + grace_kill_secs
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return
         time.sleep(0.1)
     if proc.poll() is None:
-        proc.kill()
+        signal_all(signal.SIGKILL)
 
 
 def main():
@@ -84,6 +109,9 @@ def main():
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
 
+    # Own session, so a hung child can be killed along with anything it
+    # spawned. Without this a timed-out run leaves the real worker alive
+    # holding its device memory.
     proc = subprocess.Popen(
         args.command,
         stdout=subprocess.PIPE,
@@ -91,11 +119,34 @@ def main():
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
     assert proc.stdout is not None
 
-    selector = selectors.DefaultSelector()
-    selector.register(proc.stdout, selectors.EVENT_READ)
+    # A reader thread rather than a selector on the pipe.
+    #
+    # `selectors` reports readiness of the *OS pipe*, but `readline()` reads
+    # through a userspace buffer. When a child flushes several lines at once
+    # they arrive as one chunk: the first readline() consumes the whole chunk,
+    # the remaining lines sit in the buffer, and the pipe then looks idle to
+    # the selector. The loop waits forever on a child that has already spoken.
+    #
+    # That is not hypothetical. It stalled this wrapper before the launch
+    # pattern was seen, so no post-launch timeout applied, and the caller's
+    # hard timeout eventually killed the wrapper and orphaned the worker. Five
+    # such orphans, each holding ~19GB, filled a 94GB GPU and turned a whole
+    # autotuning run into out-of-memory noise.
+    lines_q = queue.Queue()
+
+    def read_lines():
+        try:
+            for line in proc.stdout:
+                lines_q.put(line)
+        finally:
+            lines_q.put(None)
+
+    reader = threading.Thread(target=read_lines, daemon=True)
+    reader.start()
 
     launch_seen = False
     launch_time = None
@@ -135,47 +186,46 @@ def main():
                 terminate_process(proc, args.grace_kill_secs)
                 return 124
 
-            events = selector.select(timeout=0.2)
-            if not events:
-                if proc.poll() is not None:
-                    break
+            try:
+                line = lines_q.get(timeout=0.2)
+            except queue.Empty:
                 continue
 
-            for key, _ in events:
-                line = key.fileobj.readline()
-                if line == "":
-                    if proc.poll() is not None:
-                        break
-                    continue
-
-                line = line.rstrip("\n")
-                recent_lines.append(line)
-                print(line, flush=True)
-
-                last_output_time = time.monotonic()
-                if (not launch_seen) and args.launch_pattern in line:
-                    launch_seen = True
-                    launch_time = last_output_time
-                    print(
-                        f"[timeout] launch detected; enforcing post-launch timeout of "
-                        f"{args.post_launch_timeout:.1f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-
-            if proc.poll() is not None:
+            if line is None:  # reader hit EOF; the child is done talking
                 break
-    finally:
-        selector.unregister(proc.stdout)
-        # The loop above stops as soon as the child has exited, which can leave
-        # buffered output unread. Drain it, or a fast-exiting run loses its
-        # final lines, and those are the ones carrying benchmark and [perf]
-        # results.
-        for line in proc.stdout:
+
             line = line.rstrip("\n")
             recent_lines.append(line)
             print(line, flush=True)
-        proc.stdout.close()
+
+            last_output_time = time.monotonic()
+            if (not launch_seen) and args.launch_pattern in line:
+                launch_seen = True
+                launch_time = last_output_time
+                print(
+                    f"[timeout] launch detected; enforcing post-launch timeout of "
+                    f"{args.post_launch_timeout:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    finally:
+        # Drain whatever the reader already queued. A fast-exiting run would
+        # otherwise lose its final lines, and those are the ones carrying the
+        # benchmark block and [perf] results.
+        while True:
+            try:
+                line = lines_q.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                continue
+            line = line.rstrip("\n")
+            recent_lines.append(line)
+            print(line, flush=True)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
 
     return proc.wait()
 

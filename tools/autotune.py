@@ -25,6 +25,7 @@ import json
 import os
 import random
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -206,6 +207,77 @@ def sweep_candidates(registry, only=None, skip_baseline=False):
     return candidates
 
 
+# --------------------------------------------------- subprocess plumbing
+
+INFRA_MARKERS = (
+    "CUDA out of memory",
+    "OutOfMemoryError",
+    "no CUDA-capable device",
+    "all CUDA-capable devices are busy",
+    "CUDA driver version is insufficient",
+)
+
+
+class InfrastructureError(RuntimeError):
+    """The host, not the candidate, is what failed.
+
+    Kept distinct from a legality rejection on purpose. An out-of-memory
+    device makes every candidate look illegal and every timing look absent,
+    and reporting that as "nothing beat the baseline" would dress a broken
+    run up as a scientific result.
+    """
+
+
+def is_infrastructure_failure(reason):
+    return bool(reason) and any(marker in reason for marker in INFRA_MARKERS)
+
+
+def kill_process_group(proc):
+    """SIGTERM then SIGKILL the child's whole process group."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_child(command, cwd, env, timeout):
+    """Run a child in its own session, killing the whole group on timeout.
+
+    `subprocess.run(timeout=...)` kills only the direct child. Targets run
+    under a timeout wrapper, so the process actually holding ~19GB of device
+    memory is a *grandchild* and survives. Five such orphans filled a 94GB
+    device, after which every run failed out-of-memory and the driver
+    reported it as "no legal alternative to the current value".
+
+    Returns (returncode, output).
+    """
+    proc = subprocess.Popen(
+        command, cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, output or ""
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc)
+        try:
+            output, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            output = ""
+        return HANG_RETURNCODE, output or ""
+
+
 # ---------------------------------------------------------- knob groups
 
 
@@ -326,23 +398,15 @@ def run_dry_build(target, values, timeout, workdir):
 
     started = time.monotonic()
     try:
-        proc = subprocess.run(
-            command,
-            cwd=workdir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            text=True,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"dry-build timed out after {timeout}s", time.monotonic() - started
+        returncode, output = run_child(command, workdir, env, timeout)
     finally:
         os.unlink(config_path)
 
     elapsed = time.monotonic() - started
-    if proc.returncode != 0:
-        return False, classify_failure(proc.stdout or ""), elapsed
+    if returncode == HANG_RETURNCODE:
+        return False, f"dry-build timed out after {timeout}s", elapsed
+    if returncode != 0:
+        return False, classify_failure(output), elapsed
     return True, None, elapsed
 
 
@@ -405,16 +469,7 @@ def run_timed(target, values, args, workdir):
     ]
 
     try:
-        proc = subprocess.run(
-            command, cwd=workdir, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=args.hard_timeout, text=True,
-        )
-        output = proc.stdout or ""
-        returncode = proc.returncode
-    except subprocess.TimeoutExpired as expired:
-        output = expired.stdout or ""
-        returncode = HANG_RETURNCODE
+        returncode, output = run_child(command, workdir, env, args.hard_timeout)
     finally:
         os.unlink(config_path)
 
@@ -447,6 +502,11 @@ def filter_legal(registry, target, candidates, args, cache=None):
                 ok, build_reason, _ = run_dry_build(
                     target, candidate.values, args.build_timeout, args.workdir
                 )
+                if not ok and is_infrastructure_failure(build_reason):
+                    raise InfrastructureError(
+                        f"dry build of {candidate.label} failed for a host "
+                        f"reason, not a schedule reason: {build_reason}"
+                    )
                 reason = None if ok else build_reason
                 if cache is not None:
                     cache[key] = reason
@@ -473,14 +533,8 @@ def run_correctness(target, values, args):
     env = clean_env({"DAE_TUNE_CONFIG": config_path})
     command = [sys.executable, target["script"], *correctness_args]
     try:
-        proc = subprocess.run(
-            command, cwd=args.workdir, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=args.correctness_timeout, text=True,
-        )
-        output, returncode = proc.stdout or "", proc.returncode
-    except subprocess.TimeoutExpired as expired:
-        output, returncode = expired.stdout or "", HANG_RETURNCODE
+        returncode, output = run_child(
+            command, args.workdir, env, args.correctness_timeout)
     finally:
         os.unlink(config_path)
 
@@ -1163,6 +1217,25 @@ def head_to_head(target, origin_values, current_values, args, rng):
 
 
 def cmd_search(args):
+    """Entry point: run the descent, and fail loudly if the host gives out."""
+    try:
+        return _search(args)
+    except InfrastructureError as exc:
+        print("\n" + "=" * 62)
+        print("SEARCH ABORTED -- the host failed, so there is no result here.")
+        print(f"\n  {exc}\n")
+        print("This is deliberately not reported as 'nothing beat the baseline'.")
+        print("A full device or a dead worker makes every candidate look")
+        print("illegal and every timing look absent, which is indistinguishable")
+        print("from a real null result unless it is called out.")
+        print("\nCheck for orphaned workers holding device memory:")
+        print("  nvidia-smi --query-compute-apps=pid,used_memory --format=csv")
+        print("  pkill -f <target script>")
+        print("and consider re-running with --kill-stale.")
+        return 2
+
+
+def _search(args):
     """Coordinate descent over knob groups.
 
     One group is optimized at a time, against the configuration reached so far
@@ -1227,10 +1300,15 @@ def cmd_search(args):
 
             ref_samples = samples.get("current", [])
             if len(ref_samples) < 2:
-                print(f"[{group.name}] the current config produced too few timings, skipping")
-                entry["error"] = "reference produced too few samples"
-                trace.append(entry)
-                continue
+                # Not a skip. The reference is the configuration we already
+                # know works; if it cannot be timed, the host is broken and
+                # every later verdict would be measured against nothing.
+                status, reason = failures.get("current", ("fail", "no samples"))
+                raise InfrastructureError(
+                    f"the current configuration produced fewer than 2 timings "
+                    f"in group {group.name} ({status}: {reason}). The host, not "
+                    f"the schedule, is what failed."
+                )
 
             ref_median = statistics.median(ref_samples)
             min_effect_ns = args.min_effect_pct / 100.0 * ref_median

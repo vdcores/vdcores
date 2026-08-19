@@ -332,6 +332,49 @@ worth fixing before spending a night on it:
    all. The reference arm is never dropped. On the observed failure rate this
    is roughly an hour saved per pass.
 
+### How A Whole Run Was Lost, And What Changed
+
+The first Llama3 search ran to completion, converged on pass 1, and reported:
+
+```
+Search finished without changing anything.
+Every group was already at the best value the objective could distinguish.
+```
+
+That was false. The host had run out of device memory. Five orphaned workers,
+each holding ~19GB, filled the 94GB GPU; every later run failed
+`torch.OutOfMemoryError`, every later dry build failed the same way, and the
+driver dutifully reported each group as "no legal alternative to the current
+value". **A broken run is indistinguishable from a real null result unless the
+driver goes out of its way to say so.**
+
+The chain, from root cause outward:
+
+1. **The timeout wrapper stalled on buffered output.**
+   `run_with_launch_timeout.py` used `selectors` on the child's pipe but
+   `readline()` through a userspace buffer. A child that flushes several lines
+   at once delivers them as one chunk: the first `readline()` consumes the
+   chunk, the rest sit in the buffer, and the pipe then looks idle to the
+   selector. The wrapper waited forever on a child that had already spoken,
+   before the launch pattern was seen -- so no post-launch timeout applied.
+   Replaced with a reader thread, which has no such interaction.
+2. **Killing the wrapper orphaned the worker.** The driver's `hard_timeout`
+   (900s, matching the observed 900s spacing between orphans) killed the
+   wrapper via `subprocess.run(timeout=...)`, which signals only the direct
+   child. Children are now spawned with `start_new_session=True` and the whole
+   process group is signalled, in both the wrapper and `run_child`.
+3. **An out-of-memory host was reported as a legality result.** `filter_legal`
+   now raises `InfrastructureError` when a dry build fails for a host reason
+   (`INFRA_MARKERS`), instead of recording "illegal".
+4. **A dead reference was treated as a skip.** If the current configuration
+   cannot be timed, there is nothing to measure against, so `search` now aborts
+   rather than continuing and reporting a null result. It exits 2 and prints
+   what to check.
+
+The lesson worth keeping: for a search whose headline output is "we found
+nothing", every infrastructure failure must be loud, because the quiet version
+of that failure looks exactly like the answer.
+
 ### One Environment Trap
 
 Do not set `HF_HOME` when running a gated target. `hf auth login` stores its

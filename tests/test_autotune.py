@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUTOTUNE_PATH = os.path.join(REPO_ROOT, "tools", "autotune.py")
@@ -842,6 +843,73 @@ def test_measure_rounds_never_drops_the_reference():
     finally:
         autotune.run_timed = original
     assert len(calls) == 4
+
+
+def count_fixture_processes():
+    out = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True).stdout
+    return sum(1 for line in out.splitlines() if "fake_sched.py" in line and "grep" not in line)
+
+
+def test_a_hung_run_does_not_leak_the_worker():
+    """The failure that wrecked a real autotuning run.
+
+    The wrapper used `selectors` on the pipe but `readline()` through a
+    userspace buffer. A child that flushed several lines at once had the
+    remainder sitting in that buffer while the pipe looked idle, so the launch
+    pattern was never seen, no post-launch timeout applied, and the caller's
+    hard timeout killed the wrapper and orphaned the worker. Five orphans
+    holding ~19GB each filled a 94GB GPU, after which every candidate failed
+    out of memory and the search reported "nothing beat the baseline".
+    """
+    before = count_fixture_processes()
+    env = dict(os.environ, FAKE_SCHED_HANG="1")
+    proc = subprocess.run(
+        [sys.executable, os.path.join("tests", "script", "run_with_launch_timeout.py"),
+         "--launch-pattern", "[bench]",
+         "--post-launch-timeout", "3", "--post-launch-idle-timeout", "3",
+         "--", sys.executable, FAKE_SCHED, "-b", "3"],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+    )
+    # the hang is detected, not waited out by an outer timeout
+    assert proc.returncode == 124, proc.returncode
+    assert "launch detected" in proc.stderr, proc.stderr
+    assert "post-launch" in proc.stderr, proc.stderr
+
+    time.sleep(2)
+    assert count_fixture_processes() <= before, (
+        "the hung worker outlived the wrapper; it would hold its device memory"
+    )
+
+
+def test_infrastructure_failures_are_not_legality_rejections():
+    assert autotune.is_infrastructure_failure(
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB")
+    assert autotune.is_infrastructure_failure("RuntimeError: no CUDA-capable device")
+    # a real schedule rejection must not be swallowed as an infra problem
+    assert not autotune.is_infrastructure_failure(
+        "AssertionError: SMS must be multiple of M tiles, got SMS=48")
+    assert not autotune.is_infrastructure_failure(
+        "RuntimeError: launch_dae failed: misaligned address")
+    assert not autotune.is_infrastructure_failure(None)
+
+
+def test_filter_legal_aborts_rather_than_calling_an_oom_illegal():
+    """An out-of-memory device makes every candidate look illegal."""
+    registry = sample_registry()
+    candidates = autotune.sweep_candidates(registry, only={"mlp.low"}, skip_baseline=True)
+
+    original = autotune.run_dry_build
+    autotune.run_dry_build = lambda *a, **k: (
+        False, "torch.OutOfMemoryError: CUDA out of memory", 0.1)
+    args = argparse.Namespace(workdir=".", build_timeout=1.0, no_prebuild=False)
+    try:
+        autotune.filter_legal(registry, {"namespace": "sample"}, candidates, args)
+    except autotune.InfrastructureError as exc:
+        assert "host reason" in str(exc)
+    else:
+        raise AssertionError("expected an OOM to abort rather than reject")
+    finally:
+        autotune.run_dry_build = original
 
 
 def main():
