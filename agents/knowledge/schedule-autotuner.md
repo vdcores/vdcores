@@ -261,12 +261,54 @@ Two things stand out against Qwen3:
 - `no_prefetch` is a Qwen3 knob only. Llama3 has no `maybe_no_prefetch` helper,
   and adding one is a separate change.
 
-### Not Yet Verified
+### Verified On Real Hardware
 
-Everything above is the build path. No Llama3 schedule has been **run** here,
-because that needs `HF_TOKEN` and the weights. In particular the correctness
-gate is registered (`--correctness`) but unexercised on this target, and the
-required compute ops have not been compiled into a runtime.
+Run on the GH200 with a Hugging Face credential in place.
+
+| Check | Result |
+| --- | --- |
+| stub geometry vs published `config.json` | all 8 fields match |
+| one timed run, `-N 1 -b 10` | 4.577 ms median, 218 tok/s |
+| one timed run, default 128-step decode | 600 ms median, TBT 4.72 ms, 212 tok/s, **12s wall per run** |
+| `noise --repeats 12 --iterations 10` | IQR **0.4%** of median, range 2.0%, drift negligible |
+| correctness gate through the driver | passes |
+| qwen3 after the shared rebuild | 1.524 ms, unchanged within noise |
+
+**Llama3 is the better tuning target of the two.** Its noise floor is 0.4%
+against Qwen3's 1.8%, because a run averages 128 decode steps instead of
+timing a single token. Effects around 1% are detectable here that are invisible
+on Qwen3. The default workload also lands at 12s per profiled run, which is the
+budget the original proposal asked for, so no workload shaping was needed.
+
+### The Correctness Gate Needs `-N 8`, Not The Default
+
+The default `--correctness` run compares the **final** decode position against a
+greedy reference over 128 steps, and it **fails on the unmodified baseline**:
+
+```
+[correctness] FAIL v_proj: 141.261% <= 5.000%
+[correctness] FAIL final_hidden: 98.839% <= 5.000%
+[correctness] FAIL logits_low: 102.385% <= 10.000%
+```
+
+Errors near 100% are not numerical drift, they are two runs decoding different
+sequences. A sub-ulp difference eventually flips one greedy token, and
+everything after that is incomparable. At `-N 8` all eight generated tokens
+match exactly, so the schedule is fine and the check is simply not meaningful at
+128 steps.
+
+The target entry therefore pins `["--correctness", "-N", "8"]`. This matters
+more than it sounds: a gate that fails on the baseline would make `search`
+refuse to adopt *anything*, and it would look like "the search found nothing"
+rather than "the gate is broken".
+
+### One Environment Trap
+
+Do not set `HF_HOME` when running a gated target. `hf auth login` stores its
+token under `~/.cache/huggingface/`, and `HF_HOME` relocates that lookup, so the
+credential silently stops resolving and the run fails as though the account had
+no access. The schedules take their weight cache from `--hf-cache-dir`, which is
+independent, so `HF_HOME` is never needed here.
 
 ## Building A Runnable Runtime
 
@@ -304,8 +346,15 @@ Two traps worth knowing:
   python -c "from dae.runtime import opcode; print([n for n in vars(opcode) if 'GEMV' in n])"
   ```
 
+Qwen3 needs 9 operators and Llama3 needs 11, sharing only 6: the two models
+differ in hidden size (so a different RMS norm) and vocabulary (so a different
+argmax pair), and Llama3 additionally needs RoPE and a second SiLU. Building
+with the **union of 14** produces one runtime that runs both, which is what is
+installed here.
+
 For the current knob surface this costs nothing at search time: the union of
-required ops across all 41 legal candidates is identical to the baseline's 9.
+required ops across all 41 legal Qwen3 candidates is identical to the
+baseline's 9.
 The knob that would have changed it, `mlp.low`, drives
 `OP_SILU_MUL_SHARED_BF16_K_4096_INTER`, but every non-default `mlp.low` value is
 rejected as illegal anyway. **Re-check this whenever the knob surface or a

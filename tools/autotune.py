@@ -47,8 +47,16 @@ TARGETS = {
         "namespace": "llama3_8b",
         "script": "app/python/llama3/sched.py",
         "dry_build_args": ["--dry-build"],
-        # Needs HF_TOKEN and real weights; --dry-build does not.
-        "correctness_args": ["--correctness"],
+        # Needs a Hugging Face credential and real weights; --dry-build does not.
+        #
+        # -N 8 on purpose. The default 128-step check compares the *final*
+        # decode position against a greedy reference, and over that many steps
+        # a sub-ulp difference eventually flips one token, after which the two
+        # runs are decoding different sequences entirely and every tensor
+        # differs by ~100%. That is divergence, not a wrong schedule. Eight
+        # tokens still match exactly, so it is a real end-to-end check of every
+        # projection, attention, the MLP, logits and argmax, and it is stable.
+        "correctness_args": ["--correctness", "-N", "8"],
     },
 }
 
