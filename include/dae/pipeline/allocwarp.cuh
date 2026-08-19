@@ -23,29 +23,27 @@ static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 static __device__ __forceinline__ void
 allocwarp_observe_mxfp_resident_down_ready(
     const MInst &inst, int *bars, uint64_t *tmem_mma_barriers) {
-  if constexpr (mxfpResidentDownSplitLduEnabled) {
-    using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-    // The allocator has published both resident LDU commands and has no more
-    // useful issue work.  Keep the existing overlap by observing the two
-    // device-scope reduction dependencies while LDU0 and LDU1 produce Down.
-    auto *poll_start = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
-    auto *reduction_ready = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpDownResidentReductionReadyBarrierBase);
-    poll_start->wait(0);
-    const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
-    #pragma unroll
-    for (int task = 0; task < 2; ++task) {
-      const auto *metadata = reinterpret_cast<const uint8_t *>(
-          load_l2_u64(plan + 1 + task));
-      const uint32_t task_bar = uint32_t(load_l2_u64(
-          reinterpret_cast<const uint64_t *>(metadata + 32)) >> 32);
-      cuda::atomic_ref<int, cuda::thread_scope_device> ready(bars[task_bar]);
-      while (ready.load(cuda::memory_order_acquire) != 0) {
-        __nanosleep(128);
-      }
-      reduction_ready[task].arrive();
+  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+  // The allocator has published both resident LDU commands and has no more
+  // useful issue work. Keep the existing overlap by observing the two
+  // device-scope reduction dependencies while LDU0 and LDU1 produce Down.
+  auto *poll_start = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+  auto *reduction_ready = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpDownResidentReductionReadyBarrierBase);
+  poll_start->wait(0);
+  const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
+  #pragma unroll
+  for (int task = 0; task < 2; ++task) {
+    const auto *metadata = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 1 + task));
+    const uint32_t task_bar = uint32_t(load_l2_u64(
+        reinterpret_cast<const uint64_t *>(metadata + 32)) >> 32);
+    cuda::atomic_ref<int, cuda::thread_scope_device> ready(bars[task_bar]);
+    while (ready.load(cuda::memory_order_acquire) != 0) {
+      __nanosleep(128);
     }
+    reduction_ready[task].arrive();
   }
 }
 
@@ -78,12 +76,6 @@ __device__ __forceinline__ void allocwarp_execute(
   SharedMemoryAllocator<numSlots> alloc;
 #if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
   bool mx_scale_bases_inflight = false;
-#endif
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-  uint32_t mx_down_weight_ring_mask = 0;
-#endif
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && DAE_MXFP_DOWN_LDU_WEIGHT_RING
-  uint32_t mx_weight_ring_handoff_mask = 0;
 #endif
 
 #if defined(DAE_TRACK_PROFILE)
@@ -224,24 +216,6 @@ __device__ __forceinline__ void allocwarp_execute(
     // if not stall we continue to execute memory or compute insts
     next_pc = pc + 1;
 
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-    if (di.pred_allocate &&
-        decoded_op == op(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D)) {
-      // Continuations do not allocate. Keep the original lease mask in the
-      // allocator warp so each compact command can publish that same storage
-      // to its matching compute task while LDU0 retains ownership.
-      mx_down_weight_ring_mask = uint32_t(alloc_mask);
-    }
-#endif
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && DAE_MXFP_DOWN_LDU_WEIGHT_RING
-    if (di.pred_allocate &&
-        decoded_op == op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D)) {
-      // The allocator keeps the source lease live. The following target is a
-      // non-allocating publication of this same mask to Linear-2 compute.
-      mx_weight_ring_handoff_mask = uint32_t(alloc_mask);
-    }
-#endif
-
     // store the instruction into the slot
     if (di.pred_allocate) {
       // parallel_copy<sizeof(MInst)>(lane_id, &inst, &st_insts[di.slot_alloc]);
@@ -363,8 +337,6 @@ __device__ __forceinline__ void allocwarp_execute(
           ldu_control_publish_barrier->arrive_and_wait();
         }
         break;
-        case op(OP_TMA_LOAD_MX_GATE_UP_RESIDENT):
-        case op(OP_TMA_LOAD_MX_DOWN_RESIDENT):
         case op(OP_TMA_LOAD_MX_COUPLED_STREAM): {
           // A dedicated resident plan owns fixed shared-memory addresses, so
           // this command bypasses both slot allocation and M2C publication.
@@ -379,8 +351,7 @@ __device__ __forceinline__ void allocwarp_execute(
             curld.put(ld.raw);
             curld.commit();
             curld.advance();
-            if (decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
-                (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+            if ((inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
                     dae_mxfp_resident_ffn::kCoupledDownActivation) {
               allocwarp_observe_mxfp_resident_down_ready(
                   inst, bars, tmem_mma_barriers);
@@ -388,60 +359,6 @@ __device__ __forceinline__ void allocwarp_execute(
           }
         }
         break;
-        case op(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D): {
-          // This compact command carries no allocator lease and no M2C
-          // operand. It stays on LDU0's FIFO so the active retained-ring
-          // handler can consume it as the gate-to-up continuation without
-          // returning through the allocator loop.
-          if (lane_id == 0) {
-            LdCmd ld;
-            ld.init(inst.nslot(), 0, inst.opcode);
-            curld.put(ld.raw);
-            curld.commit();
-            curld.advance();
-          }
-        }
-        break;
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-        case op(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D): {
-          // Reserve one ordinary M2C publication for the next compute task,
-          // but keep the eight physical slots leased to the active LDU0
-          // handler. The next output-task coordinate travels directly in the
-          // compact LdCmd slot byte, so no special mailbox is rewritten.
-          if (lane_id == 0) {
-            m2c.put(int(mx_down_weight_ring_mask));
-            LdCmd ld;
-            ld.init(uint8_t(inst.num_slots), m2c.ptr, inst.opcode);
-            curld.put(ld.raw);
-            m2c.advance();
-            curld.commit();
-            curld.advance();
-          }
-        }
-        break;
-#endif
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && DAE_MXFP_DOWN_LDU_WEIGHT_RING
-        case op(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D): {
-          // Preserve the complete target descriptor/task command in the
-          // special mailbox consumed by the still-running LDU0 source. The
-          // down compute consumes the original lease mask. Its persistent
-          // down barrier bank remains separate from the still-retiring gate
-          // stage, so no barrier objects are recreated at the transition.
-          if (lane_id == 0) {
-            const int special_slot = inst.nslot();
-            st_insts[special_slot] = inst;
-            mx_down_weight_ring_mask = mx_weight_ring_handoff_mask;
-            m2c.put(int(mx_down_weight_ring_mask));
-            LdCmd ld;
-            ld.init(uint8_t(special_slot), m2c.ptr, inst.opcode);
-            curld.put(ld.raw);
-            m2c.advance();
-            curld.commit();
-            curld.advance();
-          }
-        }
-        break;
-#endif
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
             volatile int *bar = bars + inst.bar();

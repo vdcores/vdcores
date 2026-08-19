@@ -87,36 +87,14 @@ DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_1D, MK_MOP(46, MEM_OP_FLAGS_ALLOCATE))
 // Seed one LDU-local native scale base and issue that operand's first scale
 // TMA. Subsequent compact commands derive addresses without a mailbox read.
 DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
-// Allocate one two-stage, 128-KiB weight ring. LDU0 retains the lease while
-// it streams the gate projection and the following compact continuation
-// streams the up projection through the same local state.
-DAE_OP(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D, MK_MOP(48, MEM_OP_FLAGS_ALLOCATE))
-DAE_OP(OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D, MK_MOP(49, MEM_OP_FLAGS_NONE))
-// Allocate one two-stage, 64-KiB Linear-2 weight ring. Continuations publish
-// the retained lease to the next compute task and carry its output tile ID
-// directly in LdCmd::slot; no shared mailbox or issue barrier is involved.
-DAE_OP(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D, MK_MOP(50, MEM_OP_FLAGS_ALLOCATE))
-DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D, MK_MOP(51, MEM_OP_FLAGS_NONE))
-// Python rewrites an adjacent Linear-1 ring followed by a Linear-2 ring into
-// this pair. The first command still allocates; the second transfers that
-// lease inside LDU0 without returning slots to the allocator. Linear-2 uses
-// its already-resident barrier bank, so the transition initializes nothing.
-DAE_OP(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D, MK_MOP(52, MEM_OP_FLAGS_ALLOCATE))
-DAE_OP(OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D, MK_MOP(53, MEM_OP_FLAGS_NONE))
-// Dedicated resident Linear-1 plan. The command occupies one stable special
-// mailbox and drives fixed shared-memory weight/scale/activation regions; it
-// owns no allocator slots and publishes no per-operand M2C token.
-DAE_OP(OP_TMA_LOAD_MX_GATE_UP_RESIDENT, MK_MOP(54, MEM_OP_FLAGS_NONE))
-// Standalone diagnostic form of the fixed-layout resident Down plan.
-DAE_OP(OP_TMA_LOAD_MX_DOWN_RESIDENT, MK_MOP(55, MEM_OP_FLAGS_NONE))
 // Parameterized fixed-area coupled stream.  Every instance carries a stream
 // kind, pipeline depth, and shared-area size.  Adjacent instances targeting
 // the same area and LDU may be Python-rewritten into an LDU-local chain: both
 // commands remain visible to the normal memory VM, but the first handler
 // dequeues the second without an allocator transaction or dispatcher return.
+// Opcodes 48--55 held superseded FFN experiments; see commit 79022cc if those
+// allocator-ring and standalone-resident controls are ever needed again.
 DAE_OP(OP_TMA_LOAD_MX_COUPLED_STREAM, MK_MOP(56, MEM_OP_FLAGS_NONE))
-// Opcode 57 was the monolithic resident-FFN auxiliary command.  Keep the
-// numeric hole stable while the unified stream operator above replaces it.
 // following ops must have a slot to be loaded, but not the full slot
 
 
@@ -219,8 +197,6 @@ DAE_DEFINE_COMP_FAMILY(MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100, FIELDS=K|STAGE
   DAE_OP(OP_DSV4_FP32_SWIGLU_NVFP4_QUANT_UMMA_B_SM100, 0x7169)
   DAE_OP(OP_NVFP4_GEMV_UMMA_K512_FP32_SM100, 0x716a)
   DAE_OP(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100, 0x716b)
-  DAE_OP(OP_MXFP4_MXFP8_GATE_UP_SILU_RESIDENT_SM100, 0x716c)
-  DAE_OP(OP_MXFP4_MXFP8_DOWN_RESIDENT_SM100, 0x716d)
   DAE_OP(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100, 0x716e)
   DAE_OP(OP_FP8_UMMA_PREPACK_SM100, 0x7149)
   DAE_OP(OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4, 0x714b)

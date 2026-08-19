@@ -99,9 +99,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
     uint32_t &pipeline_phase_mask,
     M2CQueue &m2c,
     C2MQueue &c2m
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-    , int sm_id, uint64_t *g_events
-#endif
     ) {
   using namespace cute;
   // The mixed F8/F6/F4 family consumes FP4 after TMA's unpack-to-SMEM
@@ -214,13 +211,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
   const int tid = __compute_tid();
   const int warp = tid / numThreadsPerWarp;
   const int lane = tid & (numThreadsPerWarp - 1);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  auto *profile_events = g_events + sm_id * numProfileEvents;
-  if (tid == 0) {
-    profile_events[mxfpProfileTaskEntry] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   const uint8_t *weight_scale_global = nullptr;
   const uint8_t *activation_scale_global = nullptr;
@@ -270,17 +260,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
     } else {
       m2c.advance();
     }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-    if (tid == 0) {
-      const uint64_t activation_ready = cuda::ptx::get_sreg_globaltimer();
-      #pragma unroll
-      for (int profile_tile = chunk_start;
-           profile_tile < chunk_start + BLoad; ++profile_tile) {
-        profile_events[mxfpProfileActivationReadyBase + profile_tile] =
-            activation_ready;
-      }
-    }
-#endif
     #pragma unroll
     for (int local_stage = 0;
          local_stage < BLoad;
@@ -291,17 +270,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
       int weight_data_slots = 0;
       uint8_t *weight_data_base = nullptr;
 
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-      if constexpr (ScaleFromMetadata) {
-        if (tid == 2 * numThreadsPerWarp) {
-          profile_events[mxfpProfileSfaProducerStartBase + tile] =
-              cuda::ptx::get_sreg_globaltimer();
-        } else if (tid == 3 * numThreadsPerWarp) {
-          profile_events[mxfpProfileSfbProducerStartBase + tile] =
-              cuda::ptx::get_sreg_globaltimer();
-        }
-      }
-#endif
 
       if constexpr (!ScaleFromMetadata) {
         // Only the issuer needs the TMA acquire. Other compute warps retain
@@ -309,12 +277,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
         if (warp == 0) {
           (void)m2c.template pop<0>();
           (void)m2c.template pop<0>();
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (tid == 0) {
-            profile_events[mxfpProfileScaleReadyBase + tile] =
-                cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
         } else {
           m2c.advance_by(2);
         }
@@ -329,12 +291,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
       } else {
         m2c.advance();
       }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-      if (tid == 0) {
-        profile_events[mxfpProfileWeightReadyBase + tile] =
-            cuda::ptx::get_sreg_globaltimer();
-      }
-#endif
       // The issuer protects every TMEM scale stage before reuse. Metadata
       // producers observe the same completion so they can safely refill the
       // corresponding shared scratch stage in parallel.
@@ -362,26 +318,11 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
           asm volatile("cp.async.wait_group 0;" ::: "memory");
           __syncwarp();
           cutlass::arch::fence_view_async_shared();
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (lane == 0) {
-            const int event_base = warp == 2
-                ? mxfpProfileSfaProducerReadyBase
-                : mxfpProfileSfbProducerReadyBase;
-            profile_events[event_base + tile] =
-                cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
           __arrive_barrier_unaligned<mxfp4Mxfp8ScaleReadyThreads>(
               mxfp4Mxfp8ScaleReadyBarrierBase + stage);
         } else if (warp == 0) {
           __sync_barrier_unaligned<mxfp4Mxfp8ScaleReadyThreads>(
               mxfp4Mxfp8ScaleReadyBarrierBase + stage);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (tid == 0) {
-            profile_events[mxfpProfileScaleReadyBase + tile] =
-                cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
         }
       }
 
@@ -476,23 +417,11 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
         }
         cutlass::arch::umma_arrive(
             tmem_mma_barrier + kFullBarrierBase + stage);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (tid == 0) {
-          profile_events[mxfpProfileUmmaIssueBase + tile] =
-              cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
       } else if (warp == 1) {
         cute::wait_barrier(
             tmem_mma_barrier[kFullBarrierBase + stage],
             ((pipeline_phase_mask >> stage) & 1U) ^
                 uint32_t(generation & 1));
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (tid == numThreadsPerWarp) {
-          profile_events[mxfpProfileUmmaCompleteBase + tile] =
-              cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
         int release_slots = weight_data_slots;
         if (local_stage + 1 == BLoad) {
           release_slots |= activation_data_slots;
@@ -530,12 +459,6 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
   }
 
   const int output_slots = m2c.template pop<0>();
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    profile_events[mxfpProfileOutputReady] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
   auto *output = static_cast<float *>(
       get_slot_address(smem_base, extract(output_slots)));
   auto coord_c = make_identity_tensor(
@@ -562,10 +485,4 @@ task_mxfp4_mxfp8_gemv_umma_k512_fp32_sm100(
 
   __sync_compute_group(128);
   c2m.template push<0, true>(tid, output_slots);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    profile_events[mxfpProfileTaskEnd] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 }

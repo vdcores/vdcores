@@ -102,247 +102,47 @@ static constexpr int mxfp4Mxfp8TmaScaleBarrierBase =
 static constexpr int mxfp4Mxfp8TmaScaleBarrierCount =
     mxfp4Mxfp8DirectTmaEnabled ? mxfp4Mxfp8TmaScaleStages : 0;
 
-// The fused gate/up task normally publishes its compact native MXFP8 record
-// directly from task-local shared memory. A queued allocator/STU handoff is
-// retained as a build-time control with DAE_MXFP_GATE_UP_DIRECT_OUTPUT=0.
-#ifndef DAE_MXFP_GATE_UP_DIRECT_OUTPUT
-#define DAE_MXFP_GATE_UP_DIRECT_OUTPUT 1
-#endif
-static constexpr bool mxfpGateUpDirectOutputEnabled =
-    DAE_MXFP_GATE_UP_DIRECT_OUTPUT != 0;
-#ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
-#define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION 0
-#endif
-static constexpr bool mxfpGateUpDirectActivationEnabled =
-    DAE_MXFP_GATE_UP_DIRECT_ACTIVATION != 0;
-#ifndef DAE_MXFP_WEIGHT_SCALE_TMA
-#define DAE_MXFP_WEIGHT_SCALE_TMA 0
-#endif
-// Experimental retained-ring mode: LDU0 issues the weight-scale TMA in the
-// same stage loop. The default accounts it on the resident weight-full
-// barrier; phase-specific experiments may give SFA its own completion phase.
-static constexpr bool mxfpWeightScaleTmaEnabled =
-    DAE_MXFP_WEIGHT_SCALE_TMA != 0;
-#ifndef DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER
-#define DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER 0
-#endif
-// Let LDU publish SFA independently so compute can move both scale operands
-// into TMEM while the much larger transformed-weight transaction is pending.
-static constexpr bool mxfpGateUpWeightScaleSeparateBarrierEnabled =
-    mxfpWeightScaleTmaEnabled &&
-    DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER != 0;
-#ifndef DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER
-#define DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER 0
-#endif
-// Linear-2 is independently selectable: its shorter weight transaction did
-// not benefit from paying an extra resident-barrier wait in the issuer path.
-static constexpr bool mxfpDownWeightScaleSeparateBarrierEnabled =
-    mxfpWeightScaleTmaEnabled &&
-    DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER != 0;
-#ifndef DAE_MXFP_DOWN_BF16_REDUCTION
-#define DAE_MXFP_DOWN_BF16_REDUCTION 0
-#endif
-static constexpr bool mxfpDownBf16ReductionEnabled =
-    DAE_MXFP_DOWN_BF16_REDUCTION != 0;
-#ifndef DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH
-#define DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH 0
-#endif
-static constexpr bool mxfpResidentFfnOverlapDownPrefetchEnabled =
-    DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH != 0;
-#ifndef DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO
-#define DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO 0
-#endif
-static constexpr bool mxfpResidentDownPairZeroEnabled =
-    DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO != 0;
-#ifndef DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION
-#define DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION 0
-#endif
-// Profiling control: hand each resident Down output tile from compute to the
-// store warp, which issues the same bulk TMA copy/reduce and acknowledges its
-// completion through a CTA-local barrier. The default keeps the accepted
-// direct compute-warp issue path.
-static constexpr bool mxfpResidentDownStuReductionEnabled =
-    DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION != 0;
-#ifndef DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO
-#define DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO 0
-#endif
-// The focused resident FFN uses its otherwise idle second LDU for the Down
-// activation/SFB stream. Destination initialization is an independent policy;
-// the performance-only no-zero control publishes reduction readiness without
-// touching the output allocation.
-static constexpr bool mxfpResidentDownLdu1ZeroEnabled =
-    DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO != 0;
-#ifndef DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU
-#define DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU 0
-#endif
-// In the focused full-FFN image, LDU0 can produce Down weight/SFA while the
-// already-paused LDU1 independently waits for and produces activation/SFB.
-static constexpr bool mxfpResidentDownSplitLduEnabled =
-    DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU != 0;
-static_assert(
-    !mxfpResidentDownSplitLduEnabled ||
-        mxfpResidentDownLdu1ZeroEnabled,
-    "resident split-LDU Down requires the paused LDU1 protocol");
-#ifndef DAE_MXFP_GATE_UP_LDU_WEIGHT_RING
-#define DAE_MXFP_GATE_UP_LDU_WEIGHT_RING 1
-#endif
-// Standalone Linear-1 allocates one 16-slot transformed-weight ring, extended
-// to 17 slots when the final slot holds both scale stages. LDU0 retains the
-// lease across gate and up; compute receives one base through M2C.
-static constexpr bool mxfpGateUpLduWeightRingEnabled =
-    DAE_MXFP_GATE_UP_LDU_WEIGHT_RING != 0 &&
-    !mxfpGateUpDirectActivationEnabled;
-static_assert(
-    !mxfpGateUpLduWeightRingEnabled ||
-        numSlots >= 20 + (mxfpWeightScaleTmaEnabled ? 1 : 0),
-    "retained LDU ring needs 16/17 weight-scale and four activation slots");
-#ifndef DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES
-#define DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES 8
-#endif
-static constexpr int mxfpGateUpDirectActivationTiles =
-    DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES;
-static_assert(
-    mxfpGateUpDirectActivationTiles == 1 ||
-        mxfpGateUpDirectActivationTiles == 8,
-    "focused gate/up direct activation supports one streamed or eight resident tiles");
-#ifndef DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS
-#define DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS 8
-#endif
-static constexpr int mxfpGateUpFixedOutputRows =
-    DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS;
-static_assert(
-    mxfpGateUpFixedOutputRows == 1 ||
-        mxfpGateUpFixedOutputRows == 2 ||
-        mxfpGateUpFixedOutputRows == 4 ||
-        mxfpGateUpFixedOutputRows == 8,
-    "fixed gate/up output rows must be 1, 2, 4, or 8");
-#ifndef DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE
-#define DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE 0
-#endif
-static constexpr bool mxfpGateUpFixedBf16Epilogue =
-    DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE != 0;
-static constexpr int mxfpLduWeightRingStages = 2;
-static constexpr int mxfpLduWeightRingBarrierBase =
+// The production resident FFN uses one fixed two-stage pipeline per operand
+// family. Weight and scale transactions share one full barrier; activation/SFB
+// has an independent Down full barrier so its producer dependency never gates
+// the weight stream. Python initializes the BF16 reduction destination.
+static constexpr int mxfpResidentLinear1Stages = 2;
+static constexpr int mxfpResidentLinear1FullBarrierBase =
     mxfp4Mxfp8TmaScaleBarrierBase + mxfp4Mxfp8TmaScaleBarrierCount;
-static constexpr int mxfpLduWeightRingBarrierCount =
-    mxfpGateUpLduWeightRingEnabled
-        ? (2 + (mxfpGateUpWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
-              mxfpLduWeightRingStages
-        : 0;
-static constexpr int mxfpLduWeightRingFullBarrierBase =
-    mxfpLduWeightRingBarrierBase;
-static constexpr int mxfpLduWeightScaleFullBarrierBase =
-    mxfpLduWeightRingBarrierBase + mxfpLduWeightRingStages;
-static constexpr int mxfpLduWeightRingEmptyBarrierBase =
-    mxfpLduWeightRingBarrierBase +
-    (1 + (mxfpGateUpWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
-        mxfpLduWeightRingStages;
-// Linear-2 uses a smaller two-stage M128/K256 ring. Its weights are delivered
-// by LDU0 while scales and native Linear-1 activation records stay task-owned.
-#ifndef DAE_MXFP_DOWN_LDU_WEIGHT_RING
-#define DAE_MXFP_DOWN_LDU_WEIGHT_RING 1
-#endif
-static constexpr bool mxfpDownLduWeightRingEnabled =
-    DAE_MXFP_DOWN_LDU_WEIGHT_RING != 0;
-#ifndef DAE_MXFP_WEIGHT_PREFETCH
-#define DAE_MXFP_WEIGHT_PREFETCH 1
-#endif
-static constexpr bool mxfpWeightPrefetchEnabled =
-    DAE_MXFP_WEIGHT_PREFETCH != 0;
-#ifndef DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES
-#define DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES 2
-#endif
-static constexpr int mxfpDownLduWeightRingStages =
-    DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES;
-static_assert(
-    mxfpDownLduWeightRingStages == 2 ||
-        mxfpDownLduWeightRingStages == 3 ||
-        mxfpDownLduWeightRingStages == 4,
-    "retained down weight ring supports two, three, or four K256 stages");
-static constexpr int mxfpDownLduWeightRingBarrierBase =
-    mxfpLduWeightRingBarrierBase + mxfpLduWeightRingBarrierCount;
-static constexpr int mxfpDownLduWeightRingBarrierCount =
-    mxfpDownLduWeightRingEnabled
-        ? (2 + (mxfpDownWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
-              mxfpDownLduWeightRingStages
-        : 0;
-static constexpr int mxfpDownLduWeightRingFullBarrierBase =
-    mxfpDownLduWeightRingBarrierBase;
-static constexpr int mxfpDownLduWeightScaleFullBarrierBase =
-    mxfpDownLduWeightRingBarrierBase + mxfpDownLduWeightRingStages;
-static constexpr int mxfpDownLduWeightRingEmptyBarrierBase =
-    mxfpDownLduWeightRingBarrierBase +
-    (1 + (mxfpDownWeightScaleSeparateBarrierEnabled ? 1 : 0)) *
-        mxfpDownLduWeightRingStages;
-static_assert(
-    !mxfpDownLduWeightRingEnabled ||
-        numSlots >= 4 * mxfpDownLduWeightRingStages +
-            (mxfpWeightScaleTmaEnabled ? 1 : 0),
-    "retained LDU down ring exceeds allocator slots");
-// The resident all-TMA Down path keeps producer-dependent activation data and
-// SFB on a distinct full barrier. The ordinary weight-full/empty bank remains
-// independent, allowing weights to issue before a Linear-1 readiness edge.
+static constexpr int mxfpResidentLinear1EmptyBarrierBase =
+    mxfpResidentLinear1FullBarrierBase + mxfpResidentLinear1Stages;
+static constexpr int mxfpResidentDownStages = 2;
+static constexpr int mxfpResidentDownWeightFullBarrierBase =
+    mxfpResidentLinear1EmptyBarrierBase + mxfpResidentLinear1Stages;
+static constexpr int mxfpResidentDownEmptyBarrierBase =
+    mxfpResidentDownWeightFullBarrierBase + mxfpResidentDownStages;
 static constexpr int mxfpDownResidentOperandFullBarrierBase =
-    mxfpDownLduWeightRingBarrierBase + mxfpDownLduWeightRingBarrierCount;
-static constexpr int mxfpDownResidentOperandFullBarrierCount =
-    mxfpDownLduWeightRingEnabled ? mxfpDownLduWeightRingStages : 0;
+    mxfpResidentDownEmptyBarrierBase + mxfpResidentDownStages;
+static constexpr int mxfpDownResidentOperandFullBarrierCount = 2;
 // LDU1 resolves the two device-scope reduction-destination dependencies while
 // compute is still in Linear-1/UMMA. The Down epilogues consume these one-shot
 // CTA-local tokens instead of loading the global readiness word on the tail.
 static constexpr int mxfpDownResidentReductionReadyBarrierBase =
     mxfpDownResidentOperandFullBarrierBase +
     mxfpDownResidentOperandFullBarrierCount;
-static constexpr int mxfpDownResidentReductionReadyBarrierCount =
-    mxfpResidentDownLdu1ZeroEnabled ? 3 : 0;
+static constexpr int mxfpDownResidentReductionReadyBarrierCount = 3;
 static constexpr int mxfpDownResidentLdu1PollStartBarrier =
     mxfpDownResidentReductionReadyBarrierBase + 2;
-static constexpr int mxfpDownResidentStoreReadyBarrierBase =
-    mxfpDownResidentReductionReadyBarrierBase +
-    mxfpDownResidentReductionReadyBarrierCount;
-static constexpr int mxfpDownResidentStoreReadyBarrierCount =
-    mxfpResidentDownStuReductionEnabled ? 2 : 0;
-static constexpr int mxfpDownResidentStoreDoneBarrierBase =
-    mxfpDownResidentStoreReadyBarrierBase +
-    mxfpDownResidentStoreReadyBarrierCount;
-static constexpr int mxfpDownResidentStoreDoneBarrierCount =
-    mxfpResidentDownStuReductionEnabled ? 2 : 0;
 
 static constexpr int tmemMmaBarrierCount =
-    mxfpDownResidentStoreDoneBarrierBase +
-    mxfpDownResidentStoreDoneBarrierCount;
+    mxfpDownResidentReductionReadyBarrierBase +
+    mxfpDownResidentReductionReadyBarrierCount;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);
 // one warpgroup + 1 memory warp
 static constexpr int numProfileEvents = 128;
-#if defined(DAE_TRACK_MXFP_TIMELINE) && !defined(DAE_TRACK_PROFILE)
-#error "DAE_TRACK_MXFP_TIMELINE requires DAE_TRACK_PROFILE"
-#endif
 static constexpr int layerProfileEventBase = 2;
 static constexpr int reloadProfileEventBase = 64;
 static constexpr int trackProfileEventBase = 96;
 static_assert(layerProfileEventBase < reloadProfileEventBase);
 static_assert(reloadProfileEventBase < trackProfileEventBase);
 static_assert(trackProfileEventBase < numProfileEvents);
-// Diagnostic MXFP4/MXFP8 per-tile timeline. Events 2/3 remain the external
-// task frontier; 4..94 are overwritten only by a DAE_TRACK_MXFP_TIMELINE
-// build and are intentionally below the aggregate-counter bank at 96.
-static constexpr int mxfpProfileTaskEntry = 4;
-static constexpr int mxfpProfileActivationReadyBase = 5;
-static constexpr int mxfpProfileScaleReadyBase = 13;
-static constexpr int mxfpProfileWeightReadyBase = 21;
-static constexpr int mxfpProfileUmmaIssueBase = 29;
-static constexpr int mxfpProfileUmmaCompleteBase = 37;
-static constexpr int mxfpProfileSfaProducerStartBase = 45;
-static constexpr int mxfpProfileSfaProducerReadyBase = 53;
-static constexpr int mxfpProfileSfbProducerStartBase = 61;
-static constexpr int mxfpProfileSfbProducerReadyBase = 69;
-static constexpr int mxfpProfileWeightTmaIssueBase = 77;
-static constexpr int mxfpProfileActivationTmaIssueBase = 85;
-static constexpr int mxfpProfileWeightRingRelease = 89;
-static constexpr int mxfpProfileOutputReady = 93;
-static constexpr int mxfpProfileTaskEnd = 94;
-static_assert(mxfpProfileTaskEnd < trackProfileEventBase);
 static constexpr int numComputeLoopCounters = 4;
 static constexpr int lduBarrierReloadArrival = numBars - 2;
 static constexpr int lduBarrierReloadDone = numBars - 1;
@@ -380,9 +180,6 @@ enum DAETrackProfileEvent : int {
   DAE_TRACK_PHYSICAL_SM_ID = 121,
   DAE_TRACK_SM_CLOCK_START = 122,
   DAE_TRACK_SM_CLOCK_END = 123,
-  DAE_TRACK_KERNEL_ENTRY = 124,
-  DAE_TRACK_FINAL_ROLE_JOIN = 125,
-  DAE_TRACK_POST_TMEM_FREE = 126,
   DAE_TRACK_MAGIC = 127,
 };
 static constexpr uint64_t daeTrackProfileMagic = 0x4454524b50524631ULL;

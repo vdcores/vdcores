@@ -2708,11 +2708,7 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
         self.tile_k = int(tile_k)
         if self.tile_k not in (128, 512):
             raise ValueError("fixed-ring fused gate/up supports K128 or K512")
-        self.ring_stages = (
-            10
-            if self.tile_k == 128
-            else (3 if config.mxfp_gate_up_direct_activation_tiles == 1 else 2)
-        )
+        self.ring_stages = 10 if self.tile_k == 128 else 2
         self.k_tiles = 4096 // self.tile_k
         self.weight_k128_tiles = self.tile_k // 128
         self.weight_data_bytes = self.TILE_M * self.tile_k // 2
@@ -2730,47 +2726,9 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
         self.output_scale = output_scale
         self.gate_weight_tma = gate_weight_tma
         self.up_weight_tma = up_weight_tma
-        self.gate_weight_scale_address = None
-        self.up_weight_scale_address = None
-        if (
-            getattr(config, "mxfp_weight_scale_tma", False)
-            and config.mxfp_gate_up_ldu_weight_ring
-        ):
-            launcher = getattr(gate_weight_tma, "launcher", None)
-            if (
-                launcher is None
-                or getattr(up_weight_tma, "launcher", None) is not launcher
-            ):
-                raise ValueError(
-                    "retained weights and scale-address entries must share "
-                    "one launcher"
-                )
-            self.gate_weight_scale_address = register_ldu_global_address(
-                launcher, gate_weight_scale
-            )
-            self.up_weight_scale_address = register_ldu_global_address(
-                launcher, up_weight_scale
-            )
         self.metadata = metadata
 
     def _validate_tensors(self):
-        if config.mxfp_gate_up_ldu_weight_ring:
-            if self.tile_k != 512 or self.ring_stages != 2:
-                raise ValueError(
-                    "retained LDU weight ring requires K512 with two stages"
-                )
-            if config.mxfp_gate_up_direct_activation:
-                raise ValueError(
-                    "retained LDU weight ring requires allocator-owned activation"
-                )
-            required_slots = 20 + int(
-                getattr(config, "mxfp_weight_scale_tma", False)
-            )
-            if config.num_slots < required_slots:
-                raise ValueError(
-                    "retained LDU weight ring requires at least "
-                    f"{required_slots} allocator slots"
-                )
         expected_weight_tail = (
             self.k_tiles,
             self.weight_k128_tiles,
@@ -2911,72 +2869,20 @@ class SchedMxfp4Mxfp8GateUpSiluFixedRing(Schedule):
         tile_stop = tile_start + tile_count
         instructions = []
         for output_tile in range(tile_start, tile_stop):
-            tile_instructions = self._task_instructions(output_tile)
-            if (
-                not config.mxfp_gate_up_direct_output
-                and output_tile + 1 == tile_stop
-            ):
-                tile_instructions[-1].bar(self._bar("output"))
-            instructions.extend(tile_instructions)
+            instructions.extend(self._task_instructions(output_tile))
         return instructions
 
     def _task_instructions(self, output_tile):
-        instructions = [
+        return [
             Mxfp4Mxfp8GateUpSiluFixedRingSm100(
                 self.metadata[output_tile].data_ptr(),
                 tile_k=self.tile_k,
                 stages=self.ring_stages,
             )
         ]
-        if not config.mxfp_gate_up_direct_activation:
-            instructions.append(
-                TmaLoad1D(self.activation_data.reshape(-1)).fixed_port(1)
-            )
-        if config.mxfp_gate_up_ldu_weight_ring:
-            instructions.extend((
-                TmaLoadMxfpWeightRing5D(
-                    self.gate_weight_tma,
-                    self.up_weight_tma,
-                    output_tile,
-                    self.gate_weight_scale_address,
-                    self.up_weight_scale_address,
-                ),
-                TmaLoadMxfpWeightRing5D.continuation(),
-            ))
-        if not config.mxfp_gate_up_direct_output:
-            instructions.append(TmaStore1D(self.output_record[output_tile]))
-        return instructions
 
     def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, self.num_sms)
-
-
-class SchedMxfp4Mxfp8GateUpSiluResident(
-    SchedMxfp4Mxfp8GateUpSiluFixedRing
-):
-    """One-task-per-worker Linear-1 over a fixed all-TMA LDU plan."""
-
-    def _on_place(self):
-        super()._on_place()
-        if self.tile_k != 512 or self.ring_stages != 2:
-            raise ValueError("resident Linear-1 requires the K512 two-stage image")
-        if self.num_sms != self.m_tiles:
-            raise ValueError(
-                "resident Linear-1 currently requires exactly one task per worker"
-            )
-        if not config.mxfp_gate_up_ldu_weight_ring:
-            raise ValueError("resident Linear-1 requires the compiled LDU ring bank")
-        if not config.mxfp_gate_up_direct_output:
-            raise ValueError("resident Linear-1 currently requires direct TMA output")
-
-    def _task_instructions(self, output_tile):
-        metadata_address = self.metadata[output_tile].data_ptr()
-        return [
-            Mxfp4Mxfp8GateUpSiluResidentSm100(metadata_address),
-            TmaLoadMxfpGateUpResident(metadata_address),
-        ]
+        return 0
 
 
 class SchedMxfp4Mxfp8DownFixedRing(Schedule):
@@ -3007,8 +2913,6 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         final_output,
         weight_tma,
         metadata,
-        *,
-        retain_weight_ring_between_tasks: bool = True,
     ):
         super().__init__()
         self.weight_data = weight_data
@@ -3016,24 +2920,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         self.activation_records = activation_records
         self.final_output = final_output
         self.weight_tma = weight_tma
-        self.weight_scale_address = None
-        if (
-            getattr(config, "mxfp_weight_scale_tma", False)
-            and getattr(config, "mxfp_down_ldu_weight_ring", False)
-        ):
-            launcher = getattr(weight_tma, "launcher", None)
-            if launcher is None:
-                raise ValueError(
-                    "retained down weights and scale-address entry require "
-                    "one launcher"
-                )
-            self.weight_scale_address = register_ldu_global_address(
-                launcher, weight_scale
-            )
         self.metadata = metadata
-        self.retain_weight_ring_between_tasks = bool(
-            retain_weight_ring_between_tasks
-        )
 
     def _on_place(self):
         if (
@@ -3056,26 +2943,6 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         if self.tasks % self.DOWN_TILES_PER_EXPERT:
             raise ValueError("down task count must contain complete experts")
         self.experts = self.tasks // self.DOWN_TILES_PER_EXPERT
-        self.ldu_weight_ring = bool(
-            getattr(config, "mxfp_down_ldu_weight_ring", False)
-        )
-        if self.ldu_weight_ring:
-            if self.tasks > TmaLoadMxfpDownWeightRing5D.MAX_OUTPUT_TASK + 1:
-                raise ValueError(
-                    "retained down weight ring supports at most 256 tasks"
-                )
-            if config.num_slots < TmaLoadMxfpDownWeightRing5D.RING_SLOTS:
-                raise ValueError(
-                    "retained down weight ring exceeds allocator slots"
-                )
-            scratch_bytes = (
-                config.dynamic_smem_size
-                - config.num_slots * config.slot_size
-            )
-            if scratch_bytes < 16 * 1024:
-                raise ValueError(
-                    "retained down task requires 16 KiB after the allocator"
-                )
         if not 0 < self.num_sms <= self.tasks:
             raise ValueError("down projection needs 1..task-count SMs")
         if (
@@ -3101,20 +2968,14 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
                 "down activation must be native contiguous uint8 "
                 "[experts,16,1536]"
             )
-        expected_output_dtype = (
-            torch.bfloat16
-            if getattr(config, "mxfp_down_bf16_reduction", False)
-            else torch.float32
-        )
         if (
-            self.final_output.dtype != expected_output_dtype
+            self.final_output.dtype != torch.bfloat16
             or tuple(self.final_output.shape)
             != (self.DOWN_TILES_PER_EXPERT, self.TILE_M, self.TILE_N)
             or not self.final_output.is_contiguous()
         ):
             raise ValueError(
-                "down final output dtype must match the compiled reduction "
-                "mode and be contiguous [32,128,8]"
+                "down final output must be BF16 contiguous [32,128,8]"
             )
         if (
             self.metadata.dtype != torch.uint8
@@ -3158,75 +3019,21 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         tile_count = tiles_per_sm + int(sm < extra)
         return tile_start, tile_count
 
-    def _task_instructions(self, task, weight_command=None):
-        instructions = [
+    def _task_instructions(self, task):
+        return [
             Mxfp4Mxfp8DownFixedRingSm100(
                 self.metadata[task].data_ptr()
             )
         ]
-        if weight_command is not None:
-            instructions.append(weight_command)
-        return instructions
 
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
             return []
         instructions = []
         task_queue = self.task_queues[sm]
-        for task_index, task in enumerate(task_queue):
-            weight_command = None
-            if self.ldu_weight_ring:
-                if (
-                    self.retain_weight_ring_between_tasks
-                    and task_index != 0
-                ):
-                    weight_command = (
-                        TmaLoadMxfpDownWeightRing5D.continuation(task)
-                    )
-                else:
-                    task_count = (
-                        len(task_queue)
-                        if self.retain_weight_ring_between_tasks
-                        else 1
-                    )
-                    weight_command = TmaLoadMxfpDownWeightRing5D(
-                        self.weight_tma,
-                        task,
-                        task_count=task_count,
-                        weight_scale_address=self.weight_scale_address,
-                    )
-            instructions.extend(
-                self._task_instructions(task, weight_command)
-            )
+        for task in task_queue:
+            instructions.extend(self._task_instructions(task))
         return instructions
-
-
-class SchedMxfp4Mxfp8DownResident(SchedMxfp4Mxfp8DownFixedRing):
-    """Fixed-layout all-TMA Down plan with up to two tasks per worker."""
-
-    def _on_place(self):
-        super()._on_place()
-        if not config.mxfp_down_ldu_weight_ring:
-            raise ValueError("resident Down requires the compiled LDU ring bank")
-        if int(config.mxfp_down_ldu_weight_ring_stages) != 2:
-            raise ValueError("resident Down requires the two-stage K256 ring")
-        if max(map(len, self.task_queues)) > 2:
-            raise ValueError("resident Down supports at most two tasks per worker")
-        plans = torch.zeros((self.num_sms, 4), dtype=torch.int64, device="cpu")
-        for worker, task_queue in enumerate(self.task_queues):
-            for index, task in enumerate(task_queue):
-                plans[worker, index] = self.metadata[task].data_ptr()
-            plans[worker, 2] = len(task_queue)
-        self.resident_plans = plans.to(self.metadata.device)
-
-    def schedule(self, sm):
-        if sm < 0 or sm >= self.num_sms:
-            return []
-        plan_address = self.resident_plans[sm].data_ptr()
-        return [
-            Mxfp4Mxfp8DownResidentSm100(plan_address),
-            TmaLoadMxfpDownResident(plan_address),
-        ]
 
 
 class SchedMxfp4Mxfp8ResidentFfn(Schedule):
@@ -3244,15 +3051,6 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
             raise ValueError("resident FFN requires one Linear-1 task per worker")
         if max(map(len, self.placed_down.task_queues)) > 2:
             raise ValueError("resident FFN supports at most two Down tasks per worker")
-        if not config.mxfp_gate_up_ldu_weight_ring:
-            raise ValueError("resident FFN requires the Linear-1 LDU barrier bank")
-        if not config.mxfp_down_ldu_weight_ring:
-            raise ValueError("resident FFN requires the Down LDU barrier bank")
-        if int(config.mxfp_down_ldu_weight_ring_stages) != 2:
-            raise ValueError("resident FFN requires the two-stage Down ring")
-        if not config.mxfp_gate_up_direct_output:
-            raise ValueError("resident FFN requires direct native Linear-1 output")
-
         # The full DSV4 shape has 16 Linear-1 slices and 32 Down tiles per
         # expert. Keep both Down tasks on a worker whose Linear-1 record belongs
         # to that expert. This removes cross-expert readiness skew without
@@ -3327,7 +3125,7 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
             TmaLoadMxfpCoupledStream(
                 plan_address,
                 kind=TmaLoadMxfpCoupledStream.LINEAR1,
-                stages=self.placed_linear1.ring_stages,
+                stages=2,
                 area_slots=(168 * 1024) // config.slot_size,
                 area_id=0,
                 mailbox=8,
@@ -3336,7 +3134,7 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
             TmaLoadMxfpCoupledStream(
                 plan_address,
                 kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
-                stages=int(config.mxfp_down_ldu_weight_ring_stages),
+                stages=2,
                 area_slots=(76 * 1024 + config.slot_size - 1)
                     // config.slot_size,
                 area_id=0,
@@ -3347,19 +3145,18 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
         # The second LDU receives the same operator with activation/SFB
         # geometry. Its mailbox is immutable while LDU0 locally chains the two
         # commands above through their shared area-zero ownership.
-        if config.mxfp_resident_down_ldu1_zero:
-            instructions.append(
-                TmaLoadMxfpCoupledStream(
-                    plan_address,
-                    kind=TmaLoadMxfpCoupledStream.DOWN_ACTIVATION,
-                    stages=int(config.mxfp_down_ldu_weight_ring_stages),
-                    area_slots=(76 * 1024 + config.slot_size - 1)
-                        // config.slot_size,
-                    area_id=0,
-                    mailbox=7,
-                    port=1,
-                )
+        instructions.append(
+            TmaLoadMxfpCoupledStream(
+                plan_address,
+                kind=TmaLoadMxfpCoupledStream.DOWN_ACTIVATION,
+                stages=2,
+                area_slots=(76 * 1024 + config.slot_size - 1)
+                    // config.slot_size,
+                area_id=0,
+                mailbox=7,
+                port=1,
             )
+        )
         return instructions
 
 

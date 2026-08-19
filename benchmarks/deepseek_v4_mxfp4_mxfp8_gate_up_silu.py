@@ -20,10 +20,7 @@ import torch
 from dae import runtime
 from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
-from dae.schedule import (
-    SchedMxfp4Mxfp8GateUpSiluFixedRing,
-    SchedMxfp4Mxfp8GateUpSiluResident,
-)
+from dae.schedule import SchedMxfp4Mxfp8GateUpSiluFixedRing
 
 
 FP4_VALUES = (
@@ -89,49 +86,6 @@ def expected_uniform_row_output(
         quantized.to(torch.float8_e4m3fn).view(torch.uint8),
         (exponents.to(torch.int16) + 127).to(torch.uint8),
         middle,
-    )
-
-
-def report_mxfp_timeline(launcher: Launcher) -> None:
-    profile = launcher.profile.cpu().numpy()
-    task_entry = profile[:, 4]
-    active = task_entry != 0
-    if not active.any():
-        return
-
-    def relative_us(event: int) -> float:
-        values = (profile[active, event] - task_entry[active]) / 1.0e3
-        return float(statistics.median(values))
-
-    def delta_us(start: int, stop: int) -> float:
-        values = (profile[active, stop] - profile[active, start]) / 1.0e3
-        return float(statistics.median(values))
-
-    for tile in range(8):
-        print(
-            "DSV4_MXFP4_MXFP8_GATE_UP_SILU_TILE "
-            f"tile={tile} "
-            f"activation_ready_us={relative_us(5 + tile):.3f} "
-            f"scale_weight_ready_us={relative_us(13 + tile):.3f} "
-            f"gate_issue_us={relative_us(29 + tile):.3f} "
-            f"gate_complete_us={relative_us(37 + tile):.3f} "
-            f"up_ready_us={relative_us(45 + tile):.3f} "
-            f"up_issue_us={relative_us(53 + tile):.3f} "
-            f"up_complete_us={relative_us(61 + tile):.3f}",
-            flush=True,
-        )
-    print(
-        "DSV4_MXFP4_MXFP8_GATE_UP_SILU_EPILOGUE "
-        f"gate_silu_start_us={relative_us(77):.3f} "
-        f"gate_silu_helper_done_us={relative_us(78):.3f} "
-        f"all_umma_sync_us={relative_us(85):.3f} "
-        f"up_tmem_mul_done_us={relative_us(86):.3f} "
-        f"quant_scale_done_us={relative_us(87):.3f} "
-        f"pack_done_us={relative_us(88):.3f} "
-        f"task_end_us={relative_us(94):.3f} "
-        f"gate_silu_overlap_us={delta_us(77, 78):.3f} "
-        f"post_umma_epilogue_us={delta_us(85, 94):.3f}",
-        flush=True,
     )
 
 
@@ -214,14 +168,8 @@ def main() -> None:
     parser.add_argument("--slices-per-expert", type=int, default=16)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--publish-ready", action="store_true")
-    parser.add_argument(
-        "--resident-all-tma",
-        action="store_true",
-        help="use the fixed-layout non-allocating resident LDU plan",
-    )
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--tile-k", type=int, choices=(128, 512), default=512)
-    parser.add_argument("--diagnostic-output", action="store_true")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument(
@@ -270,11 +218,7 @@ def main() -> None:
         flush=True,
     )
 
-    schedule_type = (
-        SchedMxfp4Mxfp8GateUpSiluResident
-        if args.resident_all_tma
-        else SchedMxfp4Mxfp8GateUpSiluFixedRing
-    )
+    schedule_type = SchedMxfp4Mxfp8GateUpSiluFixedRing
     k_tiles = 4096 // args.tile_k
     weight_k128_tiles = args.tile_k // 128
     weight_scale_bytes = weight_k128_tiles * 512
@@ -376,20 +320,8 @@ def main() -> None:
 
     launcher.launch()
     torch.cuda.synchronize()
-    output_rows = runtime.config.mxfp_gate_up_fixed_output_rows
-    bf16_epilogue = bool(
-        runtime.config.mxfp_gate_up_fixed_bf16_epilogue
-    )
-    if args.diagnostic_output:
-        diagnostic_rows = output_data[0].reshape(8, -1)
-        print(
-            "DSV4_MXFP4_MXFP8_DIAGNOSTIC "
-            f"data_unique={output_data.unique().cpu().tolist()} "
-            f"data_row_unique="
-            f"{[row.unique().cpu().tolist() for row in diagnostic_rows]} "
-            f"scale_unique={output_scale.unique().cpu().tolist()}",
-            flush=True,
-        )
+    output_rows = 8
+    bf16_epilogue = False
     (
         expected_row_bytes,
         expected_scale_codes,
@@ -492,13 +424,8 @@ def main() -> None:
         f"routed_experts={args.routed_experts} "
         f"slices_per_expert={args.slices_per_expert} "
         "fixed_ring=true "
-        f"resident_all_tma={str(args.resident_all_tma).lower()} "
-        "ldu_weight_ring="
-        f"{str(bool(runtime.config.mxfp_gate_up_ldu_weight_ring)).lower()} "
-        "weight_scale_tma="
-        f"{str(bool(runtime.config.mxfp_weight_scale_tma)).lower()} "
-        "weight_scale_separate_barrier="
-        f"{str(bool(runtime.config.mxfp_gate_up_weight_scale_separate_barrier)).lower()} "
+        "resident_all_tma=false "
+        "ldu_weight_ring=false "
         "activation_scales_task_owned=true "
         f"tile_k={args.tile_k} "
         f"activation_tiles_per_load={k_tiles} "
@@ -525,7 +452,6 @@ def main() -> None:
         "output_exact=true",
         flush=True,
     )
-    report_mxfp_timeline(launcher)
     report_track_profile(launcher)
 
 

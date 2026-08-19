@@ -377,11 +377,9 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             f"DAE_COMPUTE_OP_HANDLER({name}) {{",
             (
                 "  DAE_UNUSED(thread_id, pc, count, finish, st_insts, "
-                "scratch_space, nvfp4_umma_pipeline_phase_mask);"
+                "scratch_space, nvfp4_umma_pipeline_phase_mask, sm_id, "
+                "g_events);"
             ),
-            "#if !defined(DAE_TRACK_MXFP_TIMELINE)",
-            "  DAE_UNUSED(sm_id, g_events);",
-            "#endif",
         ]
         metadata_lines = []
         if from_metadata:
@@ -402,9 +400,6 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
                 "smem_base, tmem_base_ptr, tmem_mma_barrier, metadata, "
                 "tmem_mma_phase, fp8_umma_pipeline_phase_mask, m2c, c2m"
             ),
-            "#if defined(DAE_TRACK_MXFP_TIMELINE)",
-            "      , sm_id, g_events",
-            "#endif",
             "      );",
             "#endif",
         ]
@@ -417,11 +412,6 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             raise ValueError(
                 f"Unsupported fused MXFP4/MXFP8 fixed K/ring={tile_k}/{stages}"
             )
-        use_ldu_weight_ring = (
-            "mxfpGateUpLduWeightRingEnabled"
-            if (tile_k, stages) == (512, 2)
-            else "false"
-        )
         prelude = [
             f"DAE_COMPUTE_OP_HANDLER({name}) {{",
             (
@@ -437,13 +427,10 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
             "  const auto *metadata = reinterpret_cast<const uint8_t *>(metadata_address);",
             (
                 "  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<"
-                f"{tile_k}, {stages}, 8, true, {use_ldu_weight_ring}, false>("
+                f"{tile_k}, {stages}, 8, true, false, false>("
                 "smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs, "
                 "metadata, global_bars, m2c, c2m"
             ),
-            "#if defined(DAE_TRACK_MXFP_TIMELINE)",
-            "      , sm_id, g_events",
-            "#endif",
             "      );",
             "#endif",
         ]

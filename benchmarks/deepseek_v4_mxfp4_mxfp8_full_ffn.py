@@ -263,12 +263,8 @@ def main() -> None:
     down_weight.fill_(args.down_weight_byte)
     down_weight_scale = weight_scale_arena[2].view(down_tasks, 8, 1024)
     down_weight_scale.fill_(args.down_weight_scale)
-    reduction_bf16 = bool(
-        getattr(runtime.config, "mxfp_down_bf16_reduction", False)
-    )
-    reduction_dtype = torch.bfloat16 if reduction_bf16 else torch.float32
     final_output = torch.empty(
-        (down_slices, 128, 8), dtype=reduction_dtype, device=device
+        (down_slices, 128, 8), dtype=torch.bfloat16, device=device
     )
     down_tma = TmaTensor(down_launcher, down_weight).mxfp4_load(256)
     output_tma = TmaTensor(
@@ -392,8 +388,8 @@ def main() -> None:
         .expand(down_slices, 128, 8)
         .to(device)
     )
-    rtol = 3e-2 if reduction_bf16 else 2e-5
-    atol = 1e-1 if reduction_bf16 else 1e-3
+    rtol = 3e-2
+    atol = 1e-1
     torch.testing.assert_close(
         final_output.float(), expected_final, rtol=rtol, atol=atol
     )
@@ -467,7 +463,7 @@ def main() -> None:
         "DSV4_MXFP4_MXFP8_FULL_FFN_RESULT "
         f"experts={experts} shared=1 routed=6 rows=8 "
         "native_handoff=true conversion=false repack=false replication=false "
-        f"reduction={'tma_bf16' if reduction_bf16 else 'tma_fp32'} "
+        "reduction=tma_bf16 "
         "kernels=2 focused_entrypoints=true "
         "allocator_compatible=true one_cta_per_sm=true "
         "linear1_tmem_epilogue=late_register "

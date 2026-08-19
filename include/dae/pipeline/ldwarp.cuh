@@ -85,30 +85,18 @@ __device__ __forceinline__ uint64_t ldu_mxfp_streaming_cache_policy() {
   return policy;
 }
 
-template<bool Streaming>
 __device__ __forceinline__ void ldu_issue_mxfp_weight_tma(
     const uint32_t destination, const CUtensorMap *descriptor,
     const int tile, const int output_task, const uint32_t barrier,
     const uint64_t cache_policy) {
-  if constexpr (Streaming) {
-    asm volatile(
-        "cp.async.bulk.tensor.5d.shared::cluster.global."
-        "mbarrier::complete_tx::bytes.L2::cache_hint "
-        "[%0], [%1, {0, %2, %3, %4, %5}], [%6], %7;"
-        :: "r"(destination), "l"(descriptor),
-           "r"(0), "r"(0), "r"(tile), "r"(output_task),
-           "r"(barrier), "l"(cache_policy)
-        : "memory");
-  } else {
-    asm volatile(
-        "cp.async.bulk.tensor.5d.shared::cluster.global."
-        "mbarrier::complete_tx::bytes "
-        "[%0], [%1, {0, %2, %3, %4, %5}], [%6];"
-        :: "r"(destination), "l"(descriptor),
-           "r"(0), "r"(0), "r"(tile), "r"(output_task),
-           "r"(barrier)
-        : "memory");
-  }
+  asm volatile(
+      "cp.async.bulk.tensor.5d.shared::cluster.global."
+      "mbarrier::complete_tx::bytes.L2::cache_hint "
+      "[%0], [%1, {0, %2, %3, %4, %5}], [%6], %7;"
+      :: "r"(destination), "l"(descriptor),
+         "r"(0), "r"(0), "r"(tile), "r"(output_task),
+         "r"(barrier), "l"(cache_policy)
+      : "memory");
 }
 
 __device__ __forceinline__ void ldu_prefetch_mxfp_weight_tma(
@@ -122,137 +110,9 @@ __device__ __forceinline__ void ldu_prefetch_mxfp_weight_tma(
       : "memory");
 }
 
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-template<typename M2LD_Type, typename M2C_Type>
-__device__ __forceinline__ void ldu_execute_mxfp_down_weight_ring(
-    M2LD_Type &m2ld, M2C_Type &m2c,
-    const MInst inst, const uint8_t slot, const uint8_t bar,
-    const void *smem_base, const CUtensorMap *tma_descs,
-    int *slot_avail,
-    cutlass::arch::ClusterTransactionBarrier *weight_full,
-    cutlass::arch::ClusterTransactionBarrier *weight_scale_full,
-    cutlass::arch::ClusterTransactionBarrier *stage_empty,
-    uint32_t *empty_phase,
-    const int release_slots
-#if defined(DAE_TRACK_PROFILE)
-    , uint64_t &commands
-#endif
-    ) {
-  constexpr int kStages = mxfpDownLduWeightRingStages;
-  constexpr int kTilesPerTask = 8;
-  constexpr int kWeightPackedBytes = 16 * 1024;
-  constexpr int kWeightStageBytes = 32 * 1024;
-  constexpr int kScalePackedBytes = 1024;
-  constexpr int kScaleStageBytes = 2 * kScalePackedBytes;
-
-  uint64_t cache_policy = 0;
-  if constexpr (mxfpWeightPrefetchEnabled) {
-    cache_policy = ldu_mxfp_streaming_cache_policy();
-  }
-
-  // Publish allocation visibility independently of tile readiness. Each
-  // compute task waits on the resident weight-full phases before UMMA.
-  static_cast<void>(m2c.barriers[bar].arrive());
-  auto *weight_ring = static_cast<uint8_t *>(
-      get_slot_address(smem_base, slot));
-  auto *scale_ring = weight_ring + kStages * kWeightStageBytes;
-  uint8_t output_task = uint8_t(inst.coords[3]);
-  uint64_t scale_base = 0;
-  if constexpr (mxfpWeightScaleTmaEnabled) {
-    scale_base = *reinterpret_cast<const uint64_t *>(
-        tma_descs + inst.coords[0]);
-  }
-
-  for (int task = 0; task < int(inst.size); ++task) {
-    if (task != 0) {
-      // The allocator warp reserved this task's M2C entry and embedded its
-      // output tile directly in the command. Descriptor, ring, and phase state
-      // remain local to this long-running LDU invocation.
-      m2ld.wait();
-      const LdCmd continuation {
-          .raw = m2ld.data[m2ld.ptr]
-      };
-      m2ld.advance();
-      output_task = continuation.slot;
-      static_cast<void>(m2c.barriers[continuation.bar].arrive());
-#if defined(DAE_TRACK_PROFILE)
-      ++commands;
-#endif
-    }
-
-    #pragma unroll
-    for (int tile = 0; tile < kTilesPerTask; ++tile) {
-      const int stage = tile % kStages;
-      stage_empty[stage].wait(empty_phase[stage]);
-      empty_phase[stage] ^= 1U;
-      const uint32_t destination = static_cast<uint32_t>(
-          __cvta_generic_to_shared(
-              weight_ring + stage * kWeightStageBytes));
-      const uint32_t barrier = static_cast<uint32_t>(
-          __cvta_generic_to_shared(weight_full + stage));
-      ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
-          destination, tma_descs + inst.arg, tile, int(output_task), barrier,
-          cache_policy);
-      if constexpr (mxfpDownWeightScaleSeparateBarrierEnabled) {
-        // Submit the latency-critical transformed weight first. The small SFA
-        // transaction still has an independent completion phase and can reach
-        // TMEM before the weight becomes visible, without occupying the first
-        // request position on this LDU.
-        weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_shared,
-            cuda::ptx::space_global,
-            scale_ring + stage * kScaleStageBytes,
-            reinterpret_cast<const uint8_t *>(scale_base) +
-                (int(output_task) * kTilesPerTask + tile) *
-                    kScalePackedBytes,
-            uint32_t(kScalePackedBytes),
-            reinterpret_cast<uint64_t *>(weight_scale_full + stage));
-        weight_scale_full[stage].arrive_and_expect_tx(kScalePackedBytes);
-      } else if constexpr (mxfpWeightScaleTmaEnabled) {
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_shared,
-            cuda::ptx::space_global,
-            scale_ring + stage * kScaleStageBytes,
-            reinterpret_cast<const uint8_t *>(scale_base) +
-                (int(output_task) * kTilesPerTask + tile) *
-                    kScalePackedBytes,
-            uint32_t(kScalePackedBytes),
-            reinterpret_cast<uint64_t *>(weight_full + stage));
-        weight_full[stage].arrive_and_expect_tx(
-            kWeightPackedBytes + kScalePackedBytes);
-      } else {
-        weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
-      }
-      if constexpr (mxfpWeightPrefetchEnabled) {
-        if (tile + 1 < kTilesPerTask) {
-          ldu_prefetch_mxfp_weight_tma(
-              tma_descs + inst.arg, tile + 1, int(output_task), cache_policy);
-        }
-      }
-    }
-  }
-
-  // This is the lease's true last-use point: both final stage-empty phases
-  // prove that no UMMA can still read either 32-KiB half.
-  #pragma unroll
-  for (int stage = 0; stage < kStages; ++stage) {
-    stage_empty[stage].wait(empty_phase[stage]);
-  }
-  if (release_slots != 0) {
-    atomicOr(slot_avail, int(mkSlotMask(slot, release_slots)));
-  }
-}
-#endif
-
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
-    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
 __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
     uint64_t *tmem_mma_barriers
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-    , const int sm_id, uint64_t *g_events
-#endif
     ) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages = dae_mxfp_resident_ffn::kLinear1Stages;
@@ -288,14 +148,11 @@ __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
   auto *activation = resident_base +
       dae_mxfp_resident_ffn::kLinear1ActivationOffset;
   auto *weight_full = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpLduWeightRingFullBarrierBase);
+      tmem_mma_barriers + mxfpResidentLinear1FullBarrierBase);
   auto *stage_empty = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+      tmem_mma_barriers + mxfpResidentLinear1EmptyBarrierBase);
   uint32_t empty_phase[kStages] = {};
-  uint64_t cache_policy = 0;
-  if constexpr (mxfpWeightPrefetchEnabled) {
-    cache_policy = ldu_mxfp_streaming_cache_policy();
-  }
+  const uint64_t cache_policy = ldu_mxfp_streaming_cache_policy();
 
   #pragma unroll
   for (int operation = 0; operation < kOperations; ++operation) {
@@ -308,7 +165,7 @@ __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
             weight_ring + stage * kWeightStageBytes));
     const uint32_t barrier = static_cast<uint32_t>(
         __cvta_generic_to_shared(weight_full + stage));
-    ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
+    ldu_issue_mxfp_weight_tma(
         destination, tma_descs + descriptor_index, operation, output_tile,
         barrier, cache_policy);
     cuda::ptx::cp_async_bulk(
@@ -344,64 +201,32 @@ __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
     }
     weight_full[stage].arrive_and_expect_tx(transaction_bytes);
 
-    if constexpr (mxfpWeightPrefetchEnabled) {
-      if (operation + 1 < kOperations) {
-        ldu_prefetch_mxfp_weight_tma(
-            tma_descs + descriptor_index, operation + 1, output_tile,
-            cache_policy);
-      }
+    if (operation + 1 < kOperations) {
+      ldu_prefetch_mxfp_weight_tma(
+          tma_descs + descriptor_index, operation + 1, output_tile,
+          cache_policy);
     }
   }
-
-  if constexpr (!mxfpResidentFfnOverlapDownPrefetchEnabled) {
-    #pragma unroll
-    for (int stage = 0; stage < kStages; ++stage) {
-      stage_empty[stage].wait(empty_phase[stage]);
-    }
-  }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  // With full-FFN overlap enabled this marks final Linear-1 TMA issue rather
-  // than final ring consumption. The disjoint Down ring may begin issuing at
-  // once; the blockwise activation path still waits on producer readiness.
-  g_events[sm_id * numProfileEvents + mxfpProfileWeightRingRelease] =
-      cuda::ptx::get_sreg_globaltimer();
-#endif
 }
-#endif
 
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-template<bool ProduceActivation = true>
-__device__ __noinline__ void ldu_execute_mxfp_resident_down(
+__device__ __noinline__ void ldu_execute_mxfp_down_weight_stream(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
-    int *bars, uint64_t *tmem_mma_barriers) {
+    uint64_t *tmem_mma_barriers) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages = dae_mxfp_resident_ffn::kDownStages;
   constexpr int kTiles = 8;
-  constexpr int kK128PerTile = 2;
   constexpr int kWeightPackedBytes = 16 * 1024;
   constexpr int kWeightScaleBytes = 1024;
-  constexpr int kActivationRecordBytes = 1536;
-  constexpr int kActivationDataBytes = 1024;
-  constexpr int kActivationScaleBytes = 512;
 
   const auto *metadata = reinterpret_cast<const uint8_t *>(inst.address);
   const auto *weight_scale_global = reinterpret_cast<const uint8_t *>(
       load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 0)));
-  const auto *activation_records_global = reinterpret_cast<const uint8_t *>(
-      load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 8)));
   const uint64_t tma_info = load_l2_u64(
       reinterpret_cast<const uint64_t *>(metadata + 24));
   const uint16_t weight_tma_index = uint16_t(tma_info);
   const int output_task = int(uint32_t(tma_info >> 32));
-  const uint64_t barrier_info = load_l2_u64(
-      reinterpret_cast<const uint64_t *>(metadata + 32));
-  const uint32_t ready_bar = uint32_t(barrier_info);
   const uint32_t k_start_tile = uint32_t(load_l2(
       reinterpret_cast<const int *>(metadata + 64)));
-  const uint32_t resident_flags = uint32_t(load_l2(
-      reinterpret_cast<const int *>(metadata + 68)));
-  const int ready_bar_stride = (resident_flags & 2U) != 0 ? 8 : 1;
-  const bool blockwise_ready = (resident_flags & 4U) != 0;
 
   auto *resident_base = reinterpret_cast<uint8_t *>(
       const_cast<void *>(smem_base));
@@ -409,37 +234,12 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down(
       dae_mxfp_resident_ffn::kDownWeightRingOffset;
   auto *scale_ring = resident_base +
       dae_mxfp_resident_ffn::kDownScaleRingOffset;
-  auto *activation_ring = resident_base +
-      dae_mxfp_resident_ffn::kDownActivationRingOffset;
   auto *weight_full = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
-  auto *operand_full = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownResidentOperandFullBarrierBase);
+      tmem_mma_barriers + mxfpResidentDownWeightFullBarrierBase);
   auto *stage_empty = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+      tmem_mma_barriers + mxfpResidentDownEmptyBarrierBase);
   uint32_t empty_phase[kStages] = {};
-  uint64_t cache_policy = 0;
-  if constexpr (mxfpWeightPrefetchEnabled) {
-    cache_policy = ldu_mxfp_streaming_cache_policy();
-  }
-
-  if constexpr (ProduceActivation) {
-    if (!blockwise_ready && ready_bar != 0xFFFFFFFFU) {
-      volatile int *ready = bars + ready_bar;
-      bool pending = true;
-      while (pending) {
-        pending = false;
-        #pragma unroll
-        for (int record = 0; record < 16; ++record) {
-          pending |= ready[record * ready_bar_stride] != 0;
-        }
-        if (pending) {
-          __nanosleep(256);
-        }
-      }
-      asm volatile("fence.acquire.gpu;" ::: "memory");
-    }
-  }
+  const uint64_t cache_policy = ldu_mxfp_streaming_cache_policy();
 
   #pragma unroll
   for (int tile = 0; tile < kTiles; ++tile) {
@@ -453,7 +253,7 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down(
                 dae_mxfp_resident_ffn::kDownWeightStageBytes));
     const uint32_t weight_barrier = static_cast<uint32_t>(
         __cvta_generic_to_shared(weight_full + stage));
-    ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
+    ldu_issue_mxfp_weight_tma(
         weight_destination, tma_descs + weight_tma_index,
         int(k_start_tile) + tile, output_task, weight_barrier, cache_policy);
     cuda::ptx::cp_async_bulk(
@@ -466,60 +266,10 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down(
         reinterpret_cast<uint64_t *>(weight_full + stage));
     weight_full[stage].arrive_and_expect_tx(
         kWeightPackedBytes + kWeightScaleBytes);
-    if constexpr (mxfpWeightPrefetchEnabled) {
-      if (tile + 1 < kTiles) {
-        ldu_prefetch_mxfp_weight_tma(
-            tma_descs + weight_tma_index,
-            int(k_start_tile) + tile + 1, output_task, cache_policy);
-      }
-    }
-
-    if constexpr (ProduceActivation) {
-      if (blockwise_ready && ready_bar != 0xFFFFFFFFU) {
-        volatile int *ready = bars + ready_bar;
-        bool pending = true;
-        while (pending) {
-          pending = false;
-          #pragma unroll
-          for (int subtile = 0; subtile < kK128PerTile; ++subtile) {
-            const int record =
-                (int(k_start_tile) + tile) * kK128PerTile + subtile;
-            pending |= ready[record * ready_bar_stride] != 0;
-          }
-          if (pending) {
-            __nanosleep(256);
-          }
-        }
-        asm volatile("fence.acquire.gpu;" ::: "memory");
-      }
-
-      #pragma unroll
-      for (int subtile = 0; subtile < kK128PerTile; ++subtile) {
-        const int record_index =
-            (int(k_start_tile) + tile) * kK128PerTile + subtile;
-        const auto *record = activation_records_global +
-            record_index * kActivationRecordBytes;
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_shared,
-            cuda::ptx::space_global,
-            activation_ring + stage *
-                dae_mxfp_resident_ffn::kDownActivationStageBytes +
-                subtile * kActivationDataBytes,
-            record,
-            uint32_t(kActivationDataBytes),
-            reinterpret_cast<uint64_t *>(operand_full + stage));
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_shared,
-            cuda::ptx::space_global,
-            scale_ring + stage *
-                dae_mxfp_resident_ffn::kDownScaleStageBytes +
-                kWeightScaleBytes + subtile * kActivationScaleBytes,
-            record + kActivationDataBytes,
-            uint32_t(kActivationScaleBytes),
-            reinterpret_cast<uint64_t *>(operand_full + stage));
-      }
-      operand_full[stage].arrive_and_expect_tx(
-          kK128PerTile * (kActivationDataBytes + kActivationScaleBytes));
+    if (tile + 1 < kTiles) {
+      ldu_prefetch_mxfp_weight_tma(
+          tma_descs + weight_tma_index,
+          int(k_start_tile) + tile + 1, output_task, cache_policy);
     }
   }
 
@@ -563,7 +313,7 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down_activation(
   auto *operand_full = reinterpret_cast<TxBarrier *>(
       tmem_mma_barriers + mxfpDownResidentOperandFullBarrierBase);
   auto *stage_empty = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+      tmem_mma_barriers + mxfpResidentDownEmptyBarrierBase);
   uint32_t empty_phase[kStages] = {};
 
   if (!blockwise_ready && ready_bar != 0xFFFFFFFFU) {
@@ -641,12 +391,7 @@ __device__ __noinline__ void ldu_execute_mxfp_resident_down_activation(
   }
 }
 
-#endif
-
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
-    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION && \
-    DAE_MXFP_DOWN_LDU_WEIGHT_RING
-__device__ __forceinline__ void ldu_execute_mxfp_resident_ffn_aux(
+__device__ __forceinline__ void ldu_execute_mxfp_down_activation_stream(
     const MInst inst, const void *smem_base, int *bars,
     uint64_t *tmem_mma_barriers) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
@@ -672,45 +417,28 @@ __device__ __forceinline__ void ldu_execute_mxfp_resident_ffn_aux(
     *reinterpret_cast<volatile int *>(bars + second_reduce_bar) = 0;
   }
 
-  auto *reduction_ready = reinterpret_cast<TxBarrier *>(
-      tmem_mma_barriers + mxfpDownResidentReductionReadyBarrierBase);
   auto *poll_start = reinterpret_cast<TxBarrier *>(
       tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
   poll_start->wait(0);
-  if constexpr (mxfpResidentDownSplitLduEnabled) {
-    // LDU1 owns only activation/SFB. The normal allocator command that
-    // dispatched this operator observes reduction readiness independently.
-    auto *linear1_empty = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-    linear1_empty[1].wait(0);
-    MInst task_inst {};
-    #pragma unroll
-    for (int task = 0; task < 2; ++task) {
-      task_inst.address = load_l2_u64(plan + 1 + task);
-      ldu_execute_mxfp_resident_down_activation(
-          task_inst, smem_base, bars, tmem_mma_barriers);
-    }
-  } else {
-    const uint32_t task_bars[2] = {reduce_bar, second_reduce_bar};
-    #pragma unroll
-    for (int task = 0; task < 2; ++task) {
-      cuda::atomic_ref<int, cuda::thread_scope_device> ready(
-          bars[task_bars[task]]);
-      while (ready.load(cuda::memory_order_acquire) != 0) {
-        __nanosleep(128);
-      }
-      reduction_ready[task].arrive();
-    }
+  // LDU1 owns activation/SFB only. The allocator observes the independent
+  // reduction dependencies while this stream waits for Linear-1 data.
+  auto *linear1_empty = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfpResidentLinear1EmptyBarrierBase);
+  linear1_empty[1].wait(0);
+  MInst task_inst {};
+  #pragma unroll
+  for (int task = 0; task < 2; ++task) {
+    task_inst.address = load_l2_u64(plan + 1 + task);
+    ldu_execute_mxfp_resident_down_activation(
+        task_inst, smem_base, bars, tmem_mma_barriers);
   }
 }
-#endif
 
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
     MInst *st_insts,
     const void *smem_base, const CUtensorMap *tma_descs, int *bars,
-    int *slot_avail,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_barrier,
     cuda::barrier<cuda::thread_scope_block> *ldu_control_publish_barrier,
     uint64_t *tmem_mma_barriers,
@@ -739,10 +467,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   uint64_t commands = 0;
   uint32_t profile_layer_counter = 0;
   uint32_t profile_reload_counter = 0;
-#endif
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  uint32_t profile_mx_weight_tma_counter = 0;
-  uint32_t profile_mx_activation_tma_counter = 0;
 #endif
   m2ld.wait();
   LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
@@ -825,16 +549,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         if (transfer_size == 0) {
           asm volatile("trap;");
         }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (op(opcode) == op(OP_ALLOC_TMA_LOAD_1D) &&
-            profile_mx_activation_tma_counter < 8) {
-          g_events[sm_id * numProfileEvents +
-                   mxfpProfileActivationTmaIssueBase +
-                   profile_mx_activation_tma_counter] =
-              cuda::ptx::get_sreg_globaltimer();
-          ++profile_mx_activation_tma_counter;
-        }
-#endif
         __ldprint("TMA 1D Load: size=%u", transfer_size);
         // We need to get a slot ID first, as we will use its barrier
         cuda::device::memcpy_async_tx(
@@ -889,13 +603,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           asm volatile("trap;");
         }
 
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        const int producer_start_base = operand == 0
-            ? mxfpProfileSfaProducerStartBase
-            : mxfpProfileSfbProducerStartBase;
-        g_events[sm_id * numProfileEvents + producer_start_base + scale_tile] =
-            cuda::ptx::get_sreg_globaltimer();
-#endif
         const uint32_t phase = (mxScalePhaseMask >> phase_index) & 1U;
         bool empty = cuda::ptx::mbarrier_try_wait_parity(
             cuda::ptx::sem_acquire,
@@ -911,13 +618,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               phase);
         }
         mxScalePhaseMask ^= 1U << phase_index;
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        const int producer_ready_base = operand == 0
-            ? mxfpProfileSfaProducerReadyBase
-            : mxfpProfileSfbProducerReadyBase;
-        g_events[sm_id * numProfileEvents + producer_ready_base + scale_tile] =
-            cuda::ptx::get_sreg_globaltimer();
-#endif
 
         auto *destination = static_cast<char *>(
             get_slot_address(smem_base, numSlots));
@@ -935,9 +635,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         ++mxScaleTile[operand];
         break; }
 #endif
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
-    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION && \
-    DAE_MXFP_DOWN_LDU_WEIGHT_RING
       case op(OP_TMA_LOAD_MX_COUPLED_STREAM): {
         produces_compute_operand = false;
         MInst stream_inst = inst;
@@ -947,16 +644,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           if (stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
             ldu_execute_mxfp_coupled_linear1(
                 stream_inst, smem_base, tma_descs, tmem_mma_barriers
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-                , sm_id, g_events
-#endif
                 );
-            if constexpr (mxfpResidentDownLdu1ZeroEnabled) {
-              auto *poll_start = reinterpret_cast<
-                  cutlass::arch::ClusterTransactionBarrier *>(
-                  tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
-              poll_start->arrive();
-            }
+            auto *poll_start = reinterpret_cast<
+                cutlass::arch::ClusterTransactionBarrier *>(
+                tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
+            poll_start->arrive();
           } else if (
               stream_kind == dae_mxfp_resident_ffn::kCoupledDownWeight) {
             const auto *plan = reinterpret_cast<const uint64_t *>(
@@ -969,24 +661,20 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             const uint64_t down_task_address1 = down_task_count > 1
                 ? load_l2_u64(plan + 2)
                 : 0;
-            if constexpr (mxfpResidentDownSplitLduEnabled) {
-              auto *linear1_empty = reinterpret_cast<
-                  cutlass::arch::ClusterTransactionBarrier *>(
-                  tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-              linear1_empty[0].wait(0);
-            }
+            auto *linear1_empty = reinterpret_cast<
+                cutlass::arch::ClusterTransactionBarrier *>(
+                tmem_mma_barriers + mxfpResidentLinear1EmptyBarrierBase);
+            linear1_empty[0].wait(0);
             MInst task_inst = stream_inst;
             for (int task = 0; task < down_task_count; ++task) {
               task_inst.address = task == 0
                   ? down_task_address0
                   : down_task_address1;
-              ldu_execute_mxfp_resident_down<
-                  !mxfpResidentDownSplitLduEnabled>(
-                  task_inst, smem_base, tma_descs, bars,
-                  tmem_mma_barriers);
+              ldu_execute_mxfp_down_weight_stream(
+                  task_inst, smem_base, tma_descs, tmem_mma_barriers);
             }
           } else {
-            ldu_execute_mxfp_resident_ffn_aux(
+            ldu_execute_mxfp_down_activation_stream(
                 stream_inst, smem_base, bars, tmem_mma_barriers);
           }
 
@@ -1008,342 +696,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #endif
         }
         break; }
-#endif
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-      case op(OP_TMA_LOAD_MX_DOWN_RESIDENT): {
-        produces_compute_operand = false;
-        const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
-        const int task_count = load_l2(
-            reinterpret_cast<const int *>(plan + 2));
-        for (int task = 0; task < task_count; ++task) {
-          MInst task_inst = inst;
-          task_inst.address = load_l2_u64(plan + task);
-          ldu_execute_mxfp_resident_down(
-              task_inst, smem_base, tma_descs, bars, tmem_mma_barriers);
-        }
-        break; }
-#endif
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
-    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
-      case op(OP_TMA_LOAD_MX_GATE_UP_RESIDENT): {
-        using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-        constexpr int kStages =
-            dae_mxfp_resident_ffn::kLinear1Stages;
-        constexpr int kTilesPerProjection = 8;
-        constexpr int kWeightPackedBytes = 32 * 1024;
-        constexpr int kWeightStageBytes =
-            dae_mxfp_resident_ffn::kLinear1WeightStageBytes;
-        constexpr int kScalePackedBytes = 2048;
-        constexpr int kScaleStageBytes =
-            dae_mxfp_resident_ffn::kLinear1ScaleStageBytes;
-        constexpr int kActivationBytes =
-            dae_mxfp_resident_ffn::kLinear1ActivationBytes;
-        constexpr int kActivationChunkBytes = 16 * 1024;
-
-        produces_compute_operand = false;
-        const auto *metadata = reinterpret_cast<const uint8_t *>(
-            inst.address);
-        const auto *activation_global = reinterpret_cast<const uint8_t *>(
-            load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 0)));
-        const auto *gate_scale_global = reinterpret_cast<const uint8_t *>(
-            load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 16)));
-        const auto *activation_scale_global =
-            reinterpret_cast<const uint8_t *>(load_l2_u64(
-                reinterpret_cast<const uint64_t *>(metadata + 24)));
-        const auto *up_scale_global = reinterpret_cast<const uint8_t *>(
-            load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 32)));
-        const uint64_t tma_info = load_l2_u64(
-            reinterpret_cast<const uint64_t *>(metadata + 40));
-        const uint16_t descriptor_indices[2] = {
-            uint16_t(tma_info), uint16_t(tma_info >> 16)};
-        const int output_tile = int(uint32_t(tma_info >> 32));
-
-        auto *resident_base = reinterpret_cast<uint8_t *>(
-            const_cast<void *>(smem_base));
-        auto *weight_ring = resident_base +
-            dae_mxfp_resident_ffn::kLinear1WeightRingOffset;
-        auto *scale_ring = resident_base +
-            dae_mxfp_resident_ffn::kLinear1ScaleRingOffset;
-        auto *activation = resident_base +
-            dae_mxfp_resident_ffn::kLinear1ActivationOffset;
-        auto *weight_full = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpLduWeightRingFullBarrierBase);
-        auto *stage_empty = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-        uint32_t empty_phase[kStages] = {};
-        uint64_t cache_policy = 0;
-        if constexpr (mxfpWeightPrefetchEnabled) {
-          cache_policy = ldu_mxfp_streaming_cache_policy();
-        }
-
-        #pragma unroll
-        for (int projection = 0; projection < 2; ++projection) {
-          const auto *weight_scale_global = projection == 0
-              ? gate_scale_global
-              : up_scale_global;
-          #pragma unroll
-          for (int tile = 0; tile < kTilesPerProjection; ++tile) {
-            const int operation = projection * kTilesPerProjection + tile;
-            const int stage = operation % kStages;
-            stage_empty[stage].wait(empty_phase[stage]);
-            empty_phase[stage] ^= 1U;
-
-            const uint32_t destination = static_cast<uint32_t>(
-                __cvta_generic_to_shared(
-                    weight_ring + stage * kWeightStageBytes));
-            const uint32_t barrier = static_cast<uint32_t>(
-                __cvta_generic_to_shared(weight_full + stage));
-            ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
-                destination, tma_descs + descriptor_indices[projection],
-                tile, output_tile, barrier, cache_policy);
-            cuda::ptx::cp_async_bulk(
-                cuda::ptx::space_shared,
-                cuda::ptx::space_global,
-                scale_ring + stage * kScaleStageBytes,
-                weight_scale_global + tile * kScalePackedBytes,
-                uint32_t(kScalePackedBytes),
-                reinterpret_cast<uint64_t *>(weight_full + stage));
-            cuda::ptx::cp_async_bulk(
-                cuda::ptx::space_shared,
-                cuda::ptx::space_global,
-                scale_ring + stage * kScaleStageBytes + kScalePackedBytes,
-                activation_scale_global + tile * kScalePackedBytes,
-                uint32_t(kScalePackedBytes),
-                reinterpret_cast<uint64_t *>(weight_full + stage));
-
-            int transaction_bytes =
-                kWeightPackedBytes + 2 * kScalePackedBytes;
-            if (projection == 0 && tile == 0) {
-              #pragma unroll
-              for (int chunk = 0;
-                   chunk < kActivationBytes / kActivationChunkBytes;
-                   ++chunk) {
-                cuda::ptx::cp_async_bulk(
-                    cuda::ptx::space_shared,
-                    cuda::ptx::space_global,
-                    activation + chunk * kActivationChunkBytes,
-                    activation_global + chunk * kActivationChunkBytes,
-                    uint32_t(kActivationChunkBytes),
-                    reinterpret_cast<uint64_t *>(weight_full + stage));
-              }
-              transaction_bytes += kActivationBytes;
-            }
-            weight_full[stage].arrive_and_expect_tx(transaction_bytes);
-
-            if constexpr (mxfpWeightPrefetchEnabled) {
-              if (tile + 1 < kTilesPerProjection) {
-                ldu_prefetch_mxfp_weight_tma(
-                    tma_descs + descriptor_indices[projection], tile + 1,
-                    output_tile, cache_policy);
-              }
-            }
-          }
-        }
-
-        #pragma unroll
-        for (int stage = 0; stage < kStages; ++stage) {
-          stage_empty[stage].wait(empty_phase[stage]);
-        }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        g_events[sm_id * numProfileEvents + mxfpProfileWeightRingRelease] =
-            cuda::ptx::get_sreg_globaltimer();
-#endif
-        break; }
-
-      case op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D):
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-      case op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D):
-#endif
-      {
-        using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-        constexpr int kStages = mxfpLduWeightRingStages;
-        constexpr int kTilesPerProjection = 8;
-        constexpr int kWeightPackedBytes = 32 * 1024;
-        constexpr int kWeightStageBytes = 64 * 1024;
-        constexpr int kScalePackedBytes = 2048;
-        constexpr int kScaleStageBytes = 2 * kScalePackedBytes;
-        constexpr int kLeaseSlots =
-            16 + (mxfpWeightScaleTmaEnabled ? 1 : 0);
-
-        // Allocation publication is independent of weight readiness. Compute
-        // learns the ring base now, then each UMMA stage waits on weight_full.
-        // The handler owns the lease until every final consumer has produced
-        // the matching resident empty phase.
-        static_cast<void>(m2c.barriers[bar].arrive());
-        produces_compute_operand = false;
-        auto *weight_full = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpLduWeightRingFullBarrierBase);
-        auto *weight_scale_full = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpLduWeightScaleFullBarrierBase);
-        auto *stage_empty = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
-        auto *weight_ring = static_cast<uint8_t *>(
-            get_slot_address(smem_base, slot));
-        auto *scale_ring = weight_ring + kStages * kWeightStageBytes;
-        uint32_t empty_phase[kStages] = {};
-        uint64_t cache_policy = 0;
-        if constexpr (mxfpWeightPrefetchEnabled) {
-          cache_policy = ldu_mxfp_streaming_cache_policy();
-        }
-
-        #pragma unroll
-        for (int projection = 0; projection < 2; ++projection) {
-          if (projection == 1) {
-            // Keep the lease, barrier phases, and descriptor state in this
-            // LDU invocation. Only the compact queue marker is consumed.
-            m2ld.wait();
-            const LdCmd continuation {
-                .raw = m2ld.data[m2ld.ptr]
-            };
-            static_cast<void>(continuation);
-            m2ld.advance();
-#if defined(DAE_TRACK_PROFILE)
-            ++commands;
-#endif
-          }
-          const uint16_t descriptor_index =
-              projection == 0 ? inst.size : inst.arg;
-          uint64_t scale_base = 0;
-          if constexpr (mxfpWeightScaleTmaEnabled) {
-            scale_base = *reinterpret_cast<const uint64_t *>(
-                tma_descs + inst.coords[projection]);
-          }
-          #pragma unroll
-          for (int tile = 0; tile < kTilesPerProjection; ++tile) {
-            const int stage = tile % kStages;
-            stage_empty[stage].wait(empty_phase[stage]);
-            empty_phase[stage] ^= 1U;
-            const uint32_t destination = static_cast<uint32_t>(
-                __cvta_generic_to_shared(
-                    weight_ring + stage * kWeightStageBytes));
-            const uint32_t barrier = static_cast<uint32_t>(
-                __cvta_generic_to_shared(weight_full + stage));
-            ldu_issue_mxfp_weight_tma<mxfpWeightPrefetchEnabled>(
-                destination, tma_descs + descriptor_index, tile,
-                int(inst.coords[3]), barrier, cache_policy);
-            if constexpr (mxfpGateUpWeightScaleSeparateBarrierEnabled) {
-              weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
-              cuda::ptx::cp_async_bulk(
-                  cuda::ptx::space_shared,
-                  cuda::ptx::space_global,
-                  scale_ring + stage * kScaleStageBytes,
-                  reinterpret_cast<const uint8_t *>(scale_base) +
-                      (int(inst.coords[3]) * kTilesPerProjection + tile) *
-                          kScalePackedBytes,
-                  uint32_t(kScalePackedBytes),
-                  reinterpret_cast<uint64_t *>(weight_scale_full + stage));
-              weight_scale_full[stage].arrive_and_expect_tx(
-                  kScalePackedBytes);
-            } else if constexpr (mxfpWeightScaleTmaEnabled) {
-              cuda::ptx::cp_async_bulk(
-                  cuda::ptx::space_shared,
-                  cuda::ptx::space_global,
-                  scale_ring + stage * kScaleStageBytes,
-                  reinterpret_cast<const uint8_t *>(scale_base) +
-                      (int(inst.coords[3]) * kTilesPerProjection + tile) *
-                          kScalePackedBytes,
-                  uint32_t(kScalePackedBytes),
-                  reinterpret_cast<uint64_t *>(weight_full + stage));
-              weight_full[stage].arrive_and_expect_tx(
-                  kWeightPackedBytes + kScalePackedBytes);
-            } else {
-              weight_full[stage].arrive_and_expect_tx(kWeightPackedBytes);
-            }
-            if constexpr (mxfpWeightPrefetchEnabled) {
-              if (tile + 1 < kTilesPerProjection) {
-                ldu_prefetch_mxfp_weight_tma(
-                    tma_descs + descriptor_index, tile + 1,
-                    int(inst.coords[3]), cache_policy);
-              }
-            }
-          }
-        }
-
-        const bool transfer_to_down =
-            op(opcode) == op(OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D);
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-        if (transfer_to_down) {
-          // The following logical ring command is already queued on this
-          // same LDU. Transfer the lease locally and preserve the target's
-          // descriptor/task chain without another allocator transaction.
-          m2ld.wait();
-          const LdCmd handoff {
-              .raw = m2ld.data[m2ld.ptr]
-          };
-          m2ld.advance();
-          const MInst down_inst = st_insts[handoff.slot];
-#if defined(DAE_TRACK_PROFILE)
-          ++commands;
-#endif
-          // A K256 down ring needs only the first 64 KiB of this lease. Wait
-          // for both Linear-1 physical stages before starting its traffic:
-          // issuing after stage 0 alone contends with the gate/up tail and is
-          // measurably slower even though the address ranges are disjoint.
-          #pragma unroll
-          for (int stage = 0; stage < kStages; ++stage) {
-            stage_empty[stage].wait(empty_phase[stage]);
-          }
-          auto *down_weight_full = reinterpret_cast<TxBarrier *>(
-              tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
-          auto *down_weight_scale_full = reinterpret_cast<TxBarrier *>(
-              tmem_mma_barriers + mxfpDownLduWeightScaleFullBarrierBase);
-          auto *down_stage_empty = reinterpret_cast<TxBarrier *>(
-              tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
-          uint32_t down_empty_phase[mxfpDownLduWeightRingStages] = {};
-          ldu_execute_mxfp_down_weight_ring(
-              m2ld, m2c, down_inst, slot, handoff.bar,
-              smem_base, tma_descs, slot_avail,
-              down_weight_full, down_weight_scale_full,
-              down_stage_empty, down_empty_phase,
-              0
-#if defined(DAE_TRACK_PROFILE)
-              , commands
-#endif
-              );
-          // Down may consume half or all of the transferred storage. Allocator
-          // ownership remains the original 16/17-slot lease until its last
-          // resident phase retires.
-          atomicOr(slot_avail, int(mkSlotMask(slot, kLeaseSlots)));
-        } else
-#endif
-        {
-          #pragma unroll
-          for (int stage = 0; stage < kStages; ++stage) {
-            stage_empty[stage].wait(empty_phase[stage]);
-          }
-          atomicOr(slot_avail, int(mkSlotMask(slot, kLeaseSlots)));
-        }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        g_events[sm_id * numProfileEvents + mxfpProfileWeightRingRelease] =
-            cuda::ptx::get_sreg_globaltimer();
-#endif
-        break; }
-#endif
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-      case op(OP_ALLOC_TMA_LOAD_MX_DOWN_WEIGHT_RING_5D): {
-        using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
-        constexpr int kDownLeaseSlots =
-            4 * mxfpDownLduWeightRingStages +
-            (mxfpWeightScaleTmaEnabled ? 1 : 0);
-        produces_compute_operand = false;
-        auto *weight_full = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
-        auto *weight_scale_full = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpDownLduWeightScaleFullBarrierBase);
-        auto *stage_empty = reinterpret_cast<TxBarrier *>(
-            tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
-        uint32_t empty_phase[mxfpDownLduWeightRingStages] = {};
-        ldu_execute_mxfp_down_weight_ring(
-            m2ld, m2c, inst, slot, bar,
-            smem_base, tma_descs, slot_avail,
-            weight_full, weight_scale_full, stage_empty, empty_phase,
-            kDownLeaseSlots
-#if defined(DAE_TRACK_PROFILE)
-            , commands
-#endif
-            );
-        break; }
-#endif
       case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):
       case op(OP_ALLOC_LAYER_TMA_LOAD_1D): {
         const uint64_t resolved = load_l2_u64(
@@ -1511,14 +863,6 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break; }
       case op(OP_ALLOC_TMA_LOAD_5D_FIX0): {
         const uint16_t *cord = inst.coords;
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (profile_mx_weight_tma_counter < 8) {
-          g_events[sm_id * numProfileEvents + mxfpProfileWeightTmaIssueBase +
-                   profile_mx_weight_tma_counter] =
-              cuda::ptx::get_sreg_globaltimer();
-          ++profile_mx_weight_tma_counter;
-        }
-#endif
         // hardcode first coord to be 0
         __ldprint("TMA 5D Load: desc_idx=%d size=%d cord=(0,%d,%d,%d,%d)",
           inst.arg, inst.size, cord[0], cord[1], cord[2], cord[3]);

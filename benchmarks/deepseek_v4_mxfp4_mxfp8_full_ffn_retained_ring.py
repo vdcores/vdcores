@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import os
 import statistics
 
 import torch
 
 from dae import runtime
-from dae.instructions import ProfileEvent, TmaLoadMxfpCoupledStream, TmaTensor
+from dae.instructions import TmaLoadMxfpCoupledStream, TmaTensor
 from dae.launcher import Launcher
 from dae.runtime import opcode
 from dae.schedule import (
@@ -188,23 +187,6 @@ def report_track_counters(profile: torch.Tensor) -> None:
         )
         if int(timer_end) > int(timer_start)
     ]
-    startup_us = [
-        (int(post_init) - int(entry)) / 1.0e3
-        for entry, post_init in zip(values[:, 124], values[:, 0])
-    ]
-    join_tail_us = [
-        (int(join) - int(compute_end)) / 1.0e3
-        for compute_end, join in zip(values[:, 1], values[:, 125])
-    ]
-    free_us = [
-        (int(post_free) - int(join)) / 1.0e3
-        for join, post_free in zip(values[:, 125], values[:, 126])
-    ]
-    device_envelope_us = [
-        (int(post_free) - int(entry)) / 1.0e3
-        for entry, post_free in zip(values[:, 124], values[:, 126])
-    ]
-
     print(
         "DSV4_MXFP4_MXFP8_FULL_FFN_RETAINED_RING_COUNTERS "
         f"compute_m2c_wait_pct={percent(0):.3f} "
@@ -221,159 +203,8 @@ def report_track_counters(profile: torch.Tensor) -> None:
         f"store_queue_wait_pct={percent(19):.3f} "
         f"store_service_pct={percent(21):.3f} "
         f"store_commands={total(23)} "
-        f"startup_median_us={statistics.median(startup_us):.6f} "
-        f"join_tail_median_us={statistics.median(join_tail_us):.6f} "
-        f"tmem_free_median_us={statistics.median(free_us):.6f} "
-        "device_envelope_median_us="
-        f"{statistics.median(device_envelope_us):.6f} "
         f"effective_sm_clock_median_ghz="
         f"{statistics.median(effective_ghz):.6f}",
-        flush=True,
-    )
-
-
-def report_sm_timeline(
-    profile: torch.Tensor,
-    down_schedule: SchedMxfp4Mxfp8DownFixedRing,
-) -> None:
-    values = profile.cpu().numpy()
-    origin = int(values[:, 2].min())
-    rows = []
-    for worker in range(values.shape[0]):
-        linear1_local = (int(values[worker, 4]) - int(values[worker, 2])) / 1.0e3
-        down_local = (int(values[worker, 5]) - int(values[worker, 4])) / 1.0e3
-        task_local = (int(values[worker, 3]) - int(values[worker, 2])) / 1.0e3
-        finish = (int(values[worker, 3]) - origin) / 1.0e3
-        rows.append((worker, linear1_local, down_local, task_local, finish))
-
-    slices_per_expert = 16
-    for expert in range(len(rows) // slices_per_expert):
-        group = rows[
-            expert * slices_per_expert : (expert + 1) * slices_per_expert
-        ]
-
-        def group_stats(index: int) -> tuple[float, float]:
-            samples = [row[index] for row in group]
-            return statistics.median(samples), max(samples)
-
-        linear1_stats = group_stats(1)
-        down_stats = group_stats(2)
-        task_stats = group_stats(3)
-        print(
-            "DSV4_MXFP4_MXFP8_FULL_FFN_SM_GROUP "
-            f"linear1_expert={expert} "
-            f"worker_start={expert * slices_per_expert} "
-            f"linear1_local_median_us={linear1_stats[0]:.6f} "
-            f"linear1_local_max_us={linear1_stats[1]:.6f} "
-            f"down_local_median_us={down_stats[0]:.6f} "
-            f"down_local_max_us={down_stats[1]:.6f} "
-            f"task_local_median_us={task_stats[0]:.6f} "
-            f"task_local_max_us={task_stats[1]:.6f}",
-            flush=True,
-        )
-
-    # Down traverses K in Linear-1 record order, two records per K256 tile.
-    # Group producer finishes by record index so a persistently late pair is
-    # visible independently of the expert and physical worker placement.
-    for local_slice in range(slices_per_expert):
-        workers = range(local_slice, values.shape[0], slices_per_expert)
-        local_samples = [
-            (int(values[worker, 4]) - int(values[worker, 2])) / 1.0e3
-            for worker in workers
-        ]
-        finish_samples = [
-            (int(values[worker, 4]) - origin) / 1.0e3
-            for worker in workers
-        ]
-        print(
-            "DSV4_MXFP4_MXFP8_LINEAR1_RECORD_FINISH "
-            f"record={local_slice} samples={len(local_samples)} "
-            f"local_median_us={statistics.median(local_samples):.6f} "
-            f"local_max_us={max(local_samples):.6f} "
-            f"finish_median_us={statistics.median(finish_samples):.6f} "
-            f"finish_max_us={max(finish_samples):.6f}",
-            flush=True,
-        )
-
-    for worker, linear1_local, down_local, task_local, finish in sorted(
-        rows, key=lambda row: row[3], reverse=True
-    )[:16]:
-        print(
-            "DSV4_MXFP4_MXFP8_FULL_FFN_SM_TAIL "
-            f"worker={worker} linear1_task={worker} "
-            f"down_tasks={','.join(map(str, down_schedule.task_queues[worker]))} "
-            f"linear1_local_us={linear1_local:.6f} "
-            f"down_local_us={down_local:.6f} "
-            f"task_local_us={task_local:.6f} "
-            f"finish_us={finish:.6f}",
-            flush=True,
-        )
-
-
-def down_task_timeline_samples(
-    values, base: int
-) -> list[list[float]]:
-    samples = []
-    for worker in range(values.shape[0]):
-        entry = int(values[worker, base])
-        end = int(values[worker, base + 14])
-        if entry <= 0 or end < entry:
-            continue
-        samples.append(
-            [
-                (int(values[worker, event]) - entry) / 1.0e3
-                for event in range(base, base + 15)
-            ]
-        )
-    return samples
-
-
-def report_down_task_timeline(profile: torch.Tensor) -> None:
-    values = profile.cpu().numpy()
-    first_samples = down_task_timeline_samples(values, 35)
-    second_samples = down_task_timeline_samples(values, 20)
-    if not first_samples or not second_samples:
-        raise RuntimeError("Down timeline events were not populated")
-
-    labels = [
-        "entry",
-        "compute_start",
-        *[f"umma_issue_{tile}" for tile in range(8)],
-        "umma_complete",
-        "output_smem_ready",
-        "reduction_ready",
-        "reduce_complete",
-        "task_end",
-    ]
-    for task_name, samples in (
-        ("first", first_samples),
-        ("second", second_samples),
-    ):
-        medians = [
-            statistics.median(sample[index] for sample in samples)
-            for index in range(len(labels))
-        ]
-        p95s = [
-            percentile_us([sample[index] for sample in samples], 0.95)
-            for index in range(len(labels))
-        ]
-        print(
-            "DSV4_MXFP4_MXFP8_DOWN_TIMELINE "
-            f"task={task_name} workers={len(samples)} "
-            + " ".join(
-                f"{label}_median_us={median:.6f} {label}_p95_us={p95:.6f}"
-                for label, median, p95 in zip(labels, medians, p95s)
-            ),
-            flush=True,
-        )
-    handoff = [
-        (int(values[worker, 20]) - int(values[worker, 49])) / 1.0e3
-        for worker in range(values.shape[0])
-    ]
-    print(
-        "DSV4_MXFP4_MXFP8_DOWN_TASK_HANDOFF "
-        f"median_us={statistics.median(handoff):.6f} "
-        f"p95_us={percentile_us(handoff, 0.95):.6f}",
         flush=True,
     )
 
@@ -387,51 +218,6 @@ def main() -> None:
     parser.add_argument("--cold-l2-scrub-mib", type=int, default=260)
     parser.add_argument("--workers", type=int, default=112)
     parser.add_argument(
-        "--resident-all-tma",
-        action="store_true",
-        help="use one fixed-layout compute/LDU FFN plan per worker",
-    )
-    parser.add_argument(
-        "--down-task-limit",
-        type=int,
-        default=224,
-        help=(
-            "diagnostic: enqueue only this shared-first prefix of Down tasks; "
-            "the full tensors and selected-op image remain unchanged"
-        ),
-    )
-    parser.add_argument(
-        "--report-sm-timeline",
-        action="store_true",
-        help="report producer-group summaries and the 16 slowest workers",
-    )
-    parser.add_argument(
-        "--report-down-task-timeline",
-        action="store_true",
-        help="report diagnostic second-Down-task stage timestamps",
-    )
-    parser.add_argument(
-        "--ring-handoff",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="rewrite adjacent retained gate/up and down rings as one lease",
-    )
-    parser.add_argument(
-        "--blockwise-ready",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="let each down K bundle wait only for its Linear-1 records",
-    )
-    parser.add_argument(
-        "--prebuilt-down-input",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "diagnostic control: make Down consume a separate already-ready "
-            "native activation tensor while Linear-1 still publishes output"
-        ),
-    )
-    parser.add_argument(
         "--weight-byte", type=lambda value: int(value, 0), default=0x66
     )
     parser.add_argument("--weight-scale", type=int, default=125)
@@ -443,38 +229,11 @@ def main() -> None:
         "--activation-byte", type=lambda value: int(value, 0), default=0x60
     )
     parser.add_argument("--activation-scale", type=int, default=119)
-    parser.add_argument(
-        "--tma-l2-promotion", choices=("none", "64", "128", "256"),
-        default="256",
-    )
     args = parser.parse_args()
-    os.environ["DAE_TMA_L2_PROMOTION"] = args.tma_l2_promotion
     if args.graph_inner <= 0:
         parser.error("--graph-inner must be positive")
-    if not 32 <= args.workers <= 112:
-        parser.error("--workers must be in [32,112]")
-    weight_prefetch = bool(runtime.config.mxfp_weight_prefetch)
-    weight_scale_tma = bool(runtime.config.mxfp_weight_scale_tma)
-    gate_up_weight_scale_separate_barrier = bool(
-        runtime.config.mxfp_gate_up_weight_scale_separate_barrier
-    )
-    down_weight_scale_separate_barrier = bool(
-        runtime.config.mxfp_down_weight_scale_separate_barrier
-    )
-    overlap_down_prefetch = bool(
-        runtime.config.mxfp_resident_ffn_overlap_down_prefetch
-    )
-    resident_down_pair_zero = bool(
-        runtime.config.mxfp_resident_down_pair_zero
-    )
-    resident_down_split_ldu = bool(
-        runtime.config.mxfp_resident_down_split_ldu
-    )
-    stu_reduction = bool(runtime.config.mxfp_resident_down_stu_reduction)
-    ldu1_zero = bool(runtime.config.mxfp_resident_down_ldu1_zero)
-    python_output_zero = ldu1_zero
-    if not 0 <= args.down_task_limit <= 224:
-        parser.error("--down-task-limit must be in [0,224]")
+    if args.workers != 112:
+        parser.error("the production resident FFN uses exactly 112 workers")
     for name, value in (
         ("weight-byte", args.weight_byte),
         ("weight-scale", args.weight_scale),
@@ -487,15 +246,6 @@ def main() -> None:
             parser.error(f"--{name} must fit uint8")
     if args.activation_byte > 0xF8:
         parser.error("--activation-byte must leave room for eight rows")
-    if args.ring_handoff and not (
-        bool(runtime.config.mxfp_gate_up_ldu_weight_ring)
-        and bool(runtime.config.mxfp_down_ldu_weight_ring)
-    ):
-        parser.error("--ring-handoff requires both retained LDU ring paths")
-    if args.resident_all_tma and args.ring_handoff:
-        parser.error("resident all-TMA FFN does not use allocator ring handoff")
-    if args.resident_all_tma and args.down_task_limit != 224:
-        parser.error("resident all-TMA FFN currently requires all 224 Down tasks")
     device = torch.device("cuda")
     experts, linear1_slices, down_slices = 7, 16, 32
     linear1_tasks = experts * linear1_slices
@@ -504,7 +254,6 @@ def main() -> None:
     k_tiles = 4096 // tile_k
     k128_per_tile = tile_k // 128
     launcher = Launcher(args.workers, device=device)
-    launcher.rewrite_retained_weight_ring_handoffs = args.ring_handoff
 
     ready_bars = [launcher.new_bar(1) for _ in range(linear1_tasks)]
     zero_ready = [launcher.new_bar(1) for _ in range(down_slices)]
@@ -553,22 +302,6 @@ def main() -> None:
     activation_output_data = activation_records_flat[:, :1024]
     activation_output_scale = activation_records_flat[:, 1024:]
     down_activation_records = activation_records
-    if args.prebuilt_down_input:
-        down_activation_records = torch.zeros_like(activation_records)
-        prebuilt_data = (
-            expected_data.reshape(8, 1)
-            .expand(8, 128)
-            .reshape(1, 1, -1)
-            .to(device)
-        )
-        down_activation_records[..., :1024].copy_(prebuilt_data)
-        active_scale_indices = (
-            torch.arange(8, device=device).reshape(-1, 1) * 16
-            + torch.arange(4, device=device).reshape(1, -1)
-        ).reshape(-1)
-        down_activation_records[
-            ..., 1024 + active_scale_indices
-        ] = expected_scale.repeat_interleave(4).to(device)
 
     gate_tma = TmaTensor(launcher, gate_weight).mxfp4_load(tile_k)
     up_tma = TmaTensor(launcher, up_weight).mxfp4_load(tile_k)
@@ -600,12 +333,8 @@ def main() -> None:
         dtype=torch.uint8,
         device=device,
     )
-    reduction_bf16 = bool(
-        getattr(runtime.config, "mxfp_down_bf16_reduction", False)
-    )
-    reduction_dtype = torch.bfloat16 if reduction_bf16 else torch.float32
     final_output = torch.empty(
-        (down_slices, 128, 8), dtype=reduction_dtype, device=device
+        (down_slices, 128, 8), dtype=torch.bfloat16, device=device
     )
     down_tma = TmaTensor(launcher, down_weight).mxfp4_load(256)
     output_tma = TmaTensor(
@@ -624,30 +353,13 @@ def main() -> None:
         down_records[task, 3] = (
             down_tma.arg | (output_tma.arg << 16) | (task << 32)
         )
-        ready_bar = (
-            0xFFFFFFFF
-            if args.prebuilt_down_input
-            else ready_bars[expert * linear1_slices]
-        )
+        ready_bar = ready_bars[expert * linear1_slices]
         down_records[task, 4] = ready_bar | (
             zero_ready[output_tile] << 32
         )
         down_records[task, 5] = f32_bits(route_scales[expert])
         down_records[task, 6] = final_output[output_tile].data_ptr()
-        # This benchmark control deliberately permits reduce-add into the
-        # destination's existing contents when LDU1 output zeroing is omitted.
-        flags = 1 | (4 if args.blockwise_ready else 0)
-        if resident_down_pair_zero and expert == 0:
-            if output_tile < down_slices // 2:
-                paired_output_tile = output_tile + down_slices // 2
-                down_records[task, 9] = final_output[
-                    paired_output_tile
-                ].data_ptr()
-                down_records[task, 10] = zero_ready[paired_output_tile]
-                flags |= 8
-            else:
-                flags |= 16
-        down_records[task, 8] = flags << 32
+        down_records[task, 8] = (1 | 4) << 32
     down_metadata = down_records.view(torch.uint8).to(device)
 
     linear1_schedule_base = SchedMxfp4Mxfp8GateUpSiluFixedRing(
@@ -671,64 +383,21 @@ def main() -> None:
         final_output,
         down_tma,
         down_metadata,
-        retain_weight_ring_between_tasks=True,
     )
-    if args.resident_all_tma:
-        resident_schedule = SchedMxfp4Mxfp8ResidentFfn(
-            linear1_schedule_base, down_schedule_base
-        ).place(args.workers)
-        linear1_schedule = resident_schedule.placed_linear1
-        down_schedule = resident_schedule.placed_down
-    else:
-        linear1_schedule = linear1_schedule_base.place(args.workers)
-        down_schedule = down_schedule_base.place(args.workers)
-        if args.down_task_limit != down_tasks:
-            for queue in down_schedule.task_queues:
-                queue[:] = [
-                    task for task in queue if task < args.down_task_limit
-                ]
+    resident_schedule = SchedMxfp4Mxfp8ResidentFfn(
+        linear1_schedule_base, down_schedule_base
+    ).place(args.workers)
+    linear1_schedule = resident_schedule.placed_linear1
+    down_schedule = resident_schedule.placed_down
     queued_down_tasks = [
         task for queue in down_schedule.task_queues for task in queue
     ]
     down_active_workers = sum(
         bool(queue) for queue in down_schedule.task_queues
     )
-    if args.resident_all_tma:
-        launcher.s(resident_schedule)
-    else:
-        launcher.s(
-            ProfileEvent(2),
-            linear1_schedule,
-            ProfileEvent(4),
-            down_schedule,
-            ProfileEvent(5),
-            ProfileEvent(3),
-        )
+    launcher.s(resident_schedule)
     launcher.build_instructions()
     flag_mask = (1 << 6) - 1
-    handoff_source = (
-        opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D & ~flag_mask
-    )
-    handoff_target = (
-        opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D & ~flag_mask
-    )
-    source_count = sum(
-        (inst.opcode & ~flag_mask) == handoff_source
-        for builder in launcher.builder
-        for inst in builder.built_minsts
-    )
-    target_count = sum(
-        (inst.opcode & ~flag_mask) == handoff_target
-        for builder in launcher.builder
-        for inst in builder.built_minsts
-    )
-    expected_handoffs = down_active_workers if args.ring_handoff else 0
-    if source_count != expected_handoffs or target_count != expected_handoffs:
-        raise RuntimeError(
-            "unexpected retained-ring rewrite count: "
-            f"sources={source_count} targets={target_count} "
-            f"expected={expected_handoffs}"
-        )
     coupled_opcode = opcode.OP_TMA_LOAD_MX_COUPLED_STREAM & ~flag_mask
     coupled_commands = [
         inst
@@ -740,8 +409,8 @@ def main() -> None:
         bool(inst.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN)
         for inst in coupled_commands
     )
-    expected_coupled_commands = 3 * args.workers if args.resident_all_tma else 0
-    expected_coupled_chains = args.workers if args.resident_all_tma else 0
+    expected_coupled_commands = 3 * args.workers
+    expected_coupled_chains = args.workers
     if (
         len(coupled_commands) != expected_coupled_commands
         or coupled_chain_sources != expected_coupled_chains
@@ -758,8 +427,7 @@ def main() -> None:
 
     def enqueue() -> None:
         with torch.cuda.stream(stream):
-            if python_output_zero:
-                final_output.zero_()
+            final_output.zero_()
             launcher.launch(synchronize=False)
 
     stream.wait_stream(torch.cuda.current_stream())
@@ -814,8 +482,8 @@ def main() -> None:
         torch.testing.assert_close(
             final_output[checked_outputs_device].float(),
             expected_final[checked_outputs_device],
-            rtol=3e-2 if reduction_bf16 else 2e-5,
-            atol=1e-1 if reduction_bf16 else 1e-3,
+            rtol=3e-2,
+            atol=1e-1,
         )
 
     graph = torch.cuda.CUDAGraph()
@@ -855,8 +523,8 @@ def main() -> None:
         torch.testing.assert_close(
             final_output[checked_outputs_device].float(),
             expected_final[checked_outputs_device],
-            rtol=3e-2 if reduction_bf16 else 2e-5,
-            atol=1e-1 if reduction_bf16 else 1e-3,
+            rtol=3e-2,
+            atol=1e-1,
         )
     profile = hot_profile
     linear1_profile = profile[:linear1_tasks]
@@ -881,10 +549,6 @@ def main() -> None:
         max_abs_error = 0.0
         max_rel_error = 0.0
     report_track_counters(profile)
-    if args.report_sm_timeline:
-        report_sm_timeline(profile, down_schedule)
-    if args.report_down_task_timeline:
-        report_down_task_timeline(profile)
     profile_values = profile.cpu().numpy()
     linear1_samples = [
         (int(end) - int(begin)) / 1.0e3
@@ -937,12 +601,6 @@ def main() -> None:
             "timing=cold_data_one_ffn_graph "
             f"l2_scrub_mib={args.cold_l2_scrub_mib} "
             f"samples={args.cold_samples} "
-            f"weight_prefetch={str(weight_prefetch).lower()} "
-            f"weight_scale_tma={str(weight_scale_tma).lower()} "
-            "gate_up_weight_scale_separate_barrier="
-            f"{str(gate_up_weight_scale_separate_barrier).lower()} "
-            "down_weight_scale_separate_barrier="
-            f"{str(down_weight_scale_separate_barrier).lower()} "
             f"min_us={min(cold_times):.6f} "
             f"median_us={statistics.median(cold_times):.6f} "
             f"p90_us={percentile_us(cold_times, 0.90):.6f} "
@@ -967,36 +625,24 @@ def main() -> None:
         f"down_active_workers={down_active_workers} "
         "cuda_kernel_launches=1 vdcores_launches=1 "
         "persistent=true "
-        f"resident_all_tma={str(args.resident_all_tma).lower()} "
+        "resident_all_tma=true "
         "resident_load_operator=coupled_stream "
         f"coupled_stream_commands={len(coupled_commands)} "
         f"coupled_stream_local_chains={coupled_chain_sources} "
         "kernel=dae2 "
         "linear1_ldu_weight_ring=true "
         "down_ldu_weight_ring=true "
-        "down_ring_stages="
-        f"{int(runtime.config.mxfp_down_ldu_weight_ring_stages)} "
-        "activation_scales_task_owned="
-        f"{str(not args.resident_all_tma).lower()} "
-        f"down_bf16_reduction={str(reduction_bf16).lower()} "
-        f"overlap_down_prefetch={str(overlap_down_prefetch).lower()} "
-        f"resident_down_pair_zero={str(resident_down_pair_zero).lower()} "
-        f"resident_down_split_ldu={str(resident_down_split_ldu).lower()} "
+        "down_ring_stages=2 "
+        "activation_scales_task_owned=false "
+        "down_bf16_reduction=true "
+        "weight_prefetch_distance=1 "
         "queue_init=generic "
-        f"stu_reduction={str(stu_reduction).lower()} "
-        f"ldu1_enabled={str(ldu1_zero).lower()} "
-        f"ldu1_output_zero={str(resident_down_pair_zero).lower()} "
-        f"python_output_zero={str(python_output_zero).lower()} "
-        f"ring_handoff={str(args.ring_handoff).lower()} "
-        f"handoff_sources={source_count} handoff_targets={target_count} "
-        f"blockwise_ready={str(args.blockwise_ready).lower()} "
-        f"weight_prefetch={str(weight_prefetch).lower()} "
-        f"weight_scale_tma={str(weight_scale_tma).lower()} "
-        "gate_up_weight_scale_separate_barrier="
-        f"{str(gate_up_weight_scale_separate_barrier).lower()} "
-        "down_weight_scale_separate_barrier="
-        f"{str(down_weight_scale_separate_barrier).lower()} "
-        f"down_input={'prebuilt' if args.prebuilt_down_input else 'linear1'} "
+        "stu_reduction=false "
+        "ldu1_enabled=true "
+        "python_output_zero=true "
+        "blockwise_ready=true "
+        "weight_scale_tma=true "
+        "down_input=linear1 "
         f"allocator_slots={runtime.config.num_slots} "
         f"linear1_span_us={span_us(linear1_profile, 2, 4):.6f} "
         f"down_span_us={span_us(profile, 4, 5):.6f} "

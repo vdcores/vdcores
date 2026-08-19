@@ -16,27 +16,17 @@
 
 #include <type_traits>
 
-#ifndef DAE_MXFP_GATE_UP_RAW_UMMA
-#define DAE_MXFP_GATE_UP_RAW_UMMA 1
-#endif
-#ifndef DAE_MXFP_GATE_UP_PADDED_TMEM_SCALE
-#define DAE_MXFP_GATE_UP_PADDED_TMEM_SCALE 0
-#endif
-#ifndef DAE_MXFP_GATE_UP_FIXED_BULK_SCALE
-#define DAE_MXFP_GATE_UP_FIXED_BULK_SCALE 0
-#endif
-#ifndef DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS
-#define DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS 1
-#endif
-static constexpr bool mxfpGateUpRawUmma = DAE_MXFP_GATE_UP_RAW_UMMA != 0;
-static constexpr bool mxfpGateUpPaddedTmemScale =
-    DAE_MXFP_GATE_UP_PADDED_TMEM_SCALE != 0;
-static constexpr bool mxfpGateUpFixedBulkScale =
-    DAE_MXFP_GATE_UP_FIXED_BULK_SCALE != 0;
-static constexpr bool mxfpGateUpSubtileScaleSlots =
-    DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS != 0;
-static constexpr bool mxfpGateUpDirectOutput =
-    mxfpGateUpDirectOutputEnabled;
+// Finalized task-owned and resident FFN layout. Superseded tuning variants
+// remain available in commit 79022cc for archaeology only.
+static constexpr bool mxfpGateUpRawUmma = true;
+static constexpr bool mxfpGateUpPaddedTmemScale = false;
+static constexpr bool mxfpGateUpFixedBulkScale = false;
+static constexpr bool mxfpGateUpSubtileScaleSlots = true;
+static constexpr bool mxfpGateUpDirectOutput = true;
+static constexpr bool mxfpGateUpDirectActivationEnabled = true;
+static constexpr int mxfpGateUpDirectActivationTiles = 8;
+static constexpr int mxfpGateUpFixedOutputRows = 8;
+static constexpr bool mxfpGateUpFixedBf16Epilogue = false;
 
 template <
     int SfaStageBytes, int SfaK128Bytes, int SfbK128Bytes,
@@ -164,9 +154,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     int *global_bars,
     M2CQueue &m2c,
     C2MQueue &c2m
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-    , int sm_id, uint64_t *g_events
-#endif
     ) {
   using namespace cute;
   using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
@@ -184,18 +171,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       !UseLduWeightRing || (K == 512 && RingStages == 2),
       "retained LDU weight ring requires the K512 two-stage task");
   static_assert(
-      !UseLduWeightRing || ResidentAllTma ||
-          !mxfpGateUpDirectActivationEnabled,
-      "retained LDU weights require allocator-owned activation storage");
-  static_assert(
-      !ResidentAllTma || UseLduWeightRing,
-      "resident all-TMA Linear-1 requires the LDU ring protocol");
-  constexpr bool kLduWeightScaleTma =
-      UseLduWeightRing &&
-      (mxfpWeightScaleTmaEnabled || ResidentAllTma);
-  constexpr bool kSeparateWeightScaleBarrier =
-      kLduWeightScaleTma && !ResidentAllTma &&
-      mxfpGateUpWeightScaleSeparateBarrierEnabled;
+      UseLduWeightRing == ResidentAllTma,
+      "LDU-owned Linear-1 storage is reserved for the resident FFN");
+  constexpr bool kLduWeightScaleTma = ResidentAllTma;
+  constexpr bool kSeparateWeightScaleBarrier = false;
   constexpr bool kStreamDirectActivation =
       !ResidentAllTma && mxfpGateUpDirectActivationEnabled &&
       mxfpGateUpDirectActivationTiles == 1;
@@ -302,13 +281,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   const int tid = __compute_tid();
   const int warp = tid / numThreadsPerWarp;
   const int lane = tid & (numThreadsPerWarp - 1);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  auto *profile_events = g_events + sm_id * numProfileEvents;
-  if (tid == 0) {
-    profile_events[mxfpProfileTaskEntry] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
   int activation_slots = 0;
   uint8_t *activation_base = static_cast<uint8_t *>(smem_base);
   if constexpr (ResidentAllTma) {
@@ -325,15 +297,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     } else {
       m2c.advance();
     }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-    if (tid == 0) {
-      const uint64_t ready = cuda::ptx::get_sreg_globaltimer();
-      #pragma unroll
-      for (int tile = 0; tile < kNumKTiles; ++tile) {
-        profile_events[mxfpProfileActivationReadyBase + tile] = ready;
-      }
-    }
-#endif
   }
 
   uint8_t *ldu_weight_ring = nullptr;
@@ -440,11 +403,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   TxBarrier *projection_ready;
   if constexpr (UseLduWeightRing) {
     weight_full = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpLduWeightRingFullBarrierBase);
-    weight_scale_full = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpLduWeightScaleFullBarrierBase);
+        tmem_mma_barriers + mxfpResidentLinear1FullBarrierBase);
+    weight_scale_full = weight_full;
     stage_empty = reinterpret_cast<TxBarrier *>(
-        tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase);
+        tmem_mma_barriers + mxfpResidentLinear1EmptyBarrierBase);
     scale_full = reinterpret_cast<TxBarrier *>(local_barrier_base);
     umma_full = scale_full + RingStages;
     activation_full = umma_full + RingStages;
@@ -522,15 +484,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     }
     if (warp == 0) {
       activation_full->wait(0);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-      if (tid == 0) {
-        const uint64_t ready = cuda::ptx::get_sreg_globaltimer();
-        #pragma unroll
-        for (int tile = 0; tile < kNumKTiles; ++tile) {
-          profile_events[mxfpProfileActivationReadyBase + tile] = ready;
-        }
-      }
-#endif
     }
   }
 
@@ -685,15 +638,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
           const int retire_stage = retire_operation % RingStages;
           const int retire_phase = (retire_operation / RingStages) & 1;
           umma_full[retire_stage].wait(retire_phase);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (lane == 0) {
-            const int event_base = projection == 0
-                ? mxfpProfileUmmaCompleteBase
-                : mxfpProfileSfbProducerStartBase;
-            profile_events[event_base + retire_tile] =
-                cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
           if (lane == 0) {
             stage_empty[retire_stage].arrive();
           }
@@ -704,20 +648,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         constexpr int kLateGateDrainTile = kNumKTiles - 3;
         if (projection == 1 && tile == kLateGateDrainTile) {
           projection_ready[0].wait(0);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (tid == 2 * numThreadsPerWarp) {
-            profile_events[77] = cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
           asm volatile(
               "tcgen05.fence::after_thread_sync;" ::: "memory");
           dae_mxfp_gate_silu_registers<kOutputRows>(
               tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (tid == 2 * numThreadsPerWarp) {
-            profile_events[78] = cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
         }
       }
       if (warp == 2) {
@@ -730,15 +664,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
           const int retire_stage = retire_operation % RingStages;
           const int retire_phase = (retire_operation / RingStages) & 1;
           umma_full[retire_stage].wait(retire_phase);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          if (lane == 0) {
-            const int event_base = projection == 0
-                ? mxfpProfileUmmaCompleteBase
-                : mxfpProfileSfbProducerStartBase;
-            profile_events[event_base + retire_tile] =
-                cuda::ptx::get_sreg_globaltimer();
-          }
-#endif
           if (lane == 0) {
             stage_empty[retire_stage].arrive();
           }
@@ -781,15 +706,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
           weight_full[stage].wait(phase);
           scale_full[stage].wait(phase);
         }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (lane == 0) {
-          const int event_base = projection == 0
-              ? mxfpProfileScaleReadyBase
-              : mxfpProfileSfaProducerStartBase;
-          profile_events[event_base + tile] =
-              cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
 
 #if defined(DAE_DEBUG_PRINT)
         if (projection == 0 && tile == 0 && lane == 0) {
@@ -889,15 +805,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         }
         cutlass::arch::umma_arrive(
             reinterpret_cast<uint64_t *>(umma_full + stage));
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        if (lane == 0) {
-          const int event_base = projection == 0
-              ? mxfpProfileUmmaIssueBase
-              : mxfpProfileSfaProducerReadyBase;
-          profile_events[event_base + tile] =
-              cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
 #if defined(DAE_DEBUG_PRINT)
         umma_full[stage].wait(phase);
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -938,11 +845,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __sync_compute_group(128);
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    profile_events[85] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
 #if defined(DAE_DEBUG_PRINT)
   {
@@ -1014,12 +916,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       }
     }
   }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  __sync_compute_group(128);
-  if (tid == 0) {
-    profile_events[86] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   #pragma unroll
   for (int output_row = 0; output_row < kOutputRows; ++output_row) {
@@ -1038,11 +934,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     }
   }
   __sync_compute_group(128);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    profile_events[87] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   const int source_chunk = tid / 16;
   const int byte_in_chunk = tid % 16;
@@ -1073,11 +964,6 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
             output_row * (kTileM / kScaleVector) + scale_fragment]);
   }
   __sync_compute_group(128);
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    profile_events[88] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
   if constexpr (mxfpGateUpDirectOutput) {
     if (tid == 0) {
       cuda::ptx::cp_async_bulk(
@@ -1102,10 +988,4 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   } else {
     c2m.template push<31, true, false>(tid, output_slots);
   }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0) {
-    profile_events[mxfpProfileTaskEnd] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 }

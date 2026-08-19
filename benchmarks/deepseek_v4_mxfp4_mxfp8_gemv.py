@@ -20,9 +20,7 @@ from dae.launcher import Launcher
 from dae.schedule import SchedMxfp4Mxfp8GemvUmmaK512
 
 
-def report_track_profile(
-    launcher: Launcher, mode: str, activation_tiles: int
-) -> None:
+def report_track_profile(launcher: Launcher, mode: str) -> None:
     profile = launcher.profile.cpu().numpy()
     if not all(int(value) == 0x4454524B50524631 for value in profile[:, 127]):
         return
@@ -52,77 +50,6 @@ def report_track_profile(
         f"ldu0_commands={total(13)} ldu1_commands={total(18)}",
         flush=True,
     )
-
-    row = profile[0]
-    task_entry = int(row[4])
-    if task_entry == 0:
-        return
-
-    def timestamp(event: int) -> float:
-        value = int(row[event])
-        return (value - task_entry) / 1.0e3 if value else float("nan")
-
-    activation_issues = [
-        timestamp(85 + chunk)
-        for chunk in range(8 // activation_tiles)
-    ]
-    print(
-        "DSV4_MXFP4_MXFP8_TIMELINE_HEADER "
-        f"scale_mode={mode} activation_tiles_per_load={activation_tiles} "
-        f"activation_tma_issue_us={activation_issues} "
-        f"output_ready_us={timestamp(93):.3f} task_end_us={timestamp(94):.3f}",
-        flush=True,
-    )
-    for tile in range(8):
-        values = {
-            "activation_ready": timestamp(5 + tile),
-            "scale_ready": timestamp(13 + tile),
-            "weight_ready": timestamp(21 + tile),
-            "umma_issue": timestamp(29 + tile),
-            "umma_complete": timestamp(37 + tile),
-            "sfa_start": timestamp(45 + tile),
-            "sfa_ready": timestamp(53 + tile),
-            "sfb_start": timestamp(61 + tile),
-            "sfb_ready": timestamp(69 + tile),
-            "weight_issue": timestamp(77 + tile),
-        }
-        producer_ready = max(values["sfa_ready"], values["sfb_ready"])
-        dependencies_ready = max(values["scale_ready"], values["weight_ready"])
-        consumer_frontier = max(
-            values["activation_ready"],
-            timestamp(29 + tile - 1) if tile else 0.0,
-        )
-        if mode == "tma":
-            consumer_scale_section = values["scale_ready"] - consumer_frontier
-            consumer_weight_section = (
-                values["weight_ready"] - values["scale_ready"]
-            )
-        else:
-            consumer_weight_section = (
-                values["weight_ready"] - consumer_frontier
-            )
-            consumer_scale_section = (
-                values["scale_ready"] - values["weight_ready"]
-            )
-        producer_relation = (
-            f"scale_tma_to_visible_us={values['scale_ready'] - producer_ready:.3f}"
-            if mode == "tma"
-            else f"scale_prefetch_lead_us={values['scale_ready'] - producer_ready:.3f}"
-        )
-        print(
-            "DSV4_MXFP4_MXFP8_TIMELINE "
-            f"scale_mode={mode} tile={tile} "
-            + " ".join(f"{name}_us={value:.3f}" for name, value in values.items())
-            + f" producer_duration_us={producer_ready - min(values['sfa_start'], values['sfb_start']):.3f}"
-            + f" {producer_relation}"
-            + f" consumer_scale_section_us={consumer_scale_section:.3f}"
-            + f" consumer_weight_section_us={consumer_weight_section:.3f}"
-            + f" weight_tma_to_visible_us={values['weight_ready'] - values['weight_issue']:.3f}"
-            + f" issue_section_us={values['umma_issue'] - dependencies_ready:.3f}"
-            + f" umma_latency_us={values['umma_complete'] - values['umma_issue']:.3f}",
-            flush=True,
-        )
-
 
 def build_metadata(
     weight_scale: torch.Tensor,
@@ -313,7 +240,7 @@ def main() -> None:
                     "output_exact=true",
                     flush=True,
                 )
-                report_track_profile(launcher, mode, activation_tiles)
+                report_track_profile(launcher, mode)
 
 
 if __name__ == "__main__":

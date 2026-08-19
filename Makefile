@@ -42,12 +42,6 @@ ifneq ($(aggregate_profile),)
 	export DAE_AGGREGATE_PROFILE := 1
 endif
 
-ifneq ($(mxfp_timeline),)
-	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_TRACK_MXFP_TIMELINE
-	export DAE_TRACK_PROFILE := 1
-	export DAE_TRACK_MXFP_TIMELINE := 1
-endif
-
 ifneq ($(global_insts),)
 	NVCC_FLAGS += -DDAE_LOAD_INSTRUCTIONS=0
 	export DAE_GLOBAL_INSTRUCTIONS := 1
@@ -101,111 +95,6 @@ endif
 ifneq ($(mxfp_direct_tma),)
 	NVCC_FLAGS += -DDAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA=1
 	export DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA := 1
-endif
-
-ifneq ($(mxfp_gate_up_raw_umma),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_RAW_UMMA=$(mxfp_gate_up_raw_umma)
-	export DAE_MXFP_GATE_UP_RAW_UMMA := $(mxfp_gate_up_raw_umma)
-endif
-
-ifneq ($(mxfp_gate_up_fixed_bulk_scale),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_FIXED_BULK_SCALE=$(mxfp_gate_up_fixed_bulk_scale)
-	export DAE_MXFP_GATE_UP_FIXED_BULK_SCALE := $(mxfp_gate_up_fixed_bulk_scale)
-endif
-
-ifneq ($(mxfp_gate_up_subtile_scale_slots),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS=$(mxfp_gate_up_subtile_scale_slots)
-	export DAE_MXFP_GATE_UP_SUBTILE_SCALE_SLOTS := $(mxfp_gate_up_subtile_scale_slots)
-endif
-
-ifneq ($(mxfp_gate_up_direct_output),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_OUTPUT=$(mxfp_gate_up_direct_output)
-	export DAE_MXFP_GATE_UP_DIRECT_OUTPUT := $(mxfp_gate_up_direct_output)
-endif
-
-ifneq ($(mxfp_gate_up_direct_activation),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION=$(mxfp_gate_up_direct_activation)
-	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION := $(mxfp_gate_up_direct_activation)
-endif
-
-ifneq ($(mxfp_gate_up_ldu_weight_ring),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_LDU_WEIGHT_RING=$(mxfp_gate_up_ldu_weight_ring)
-	export DAE_MXFP_GATE_UP_LDU_WEIGHT_RING := $(mxfp_gate_up_ldu_weight_ring)
-endif
-
-ifneq ($(mxfp_down_ldu_weight_ring),)
-	NVCC_FLAGS += -DDAE_MXFP_DOWN_LDU_WEIGHT_RING=$(mxfp_down_ldu_weight_ring)
-	export DAE_MXFP_DOWN_LDU_WEIGHT_RING := $(mxfp_down_ldu_weight_ring)
-endif
-
-ifneq ($(mxfp_down_ldu_weight_ring_stages),)
-	NVCC_FLAGS += -DDAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES=$(mxfp_down_ldu_weight_ring_stages)
-	export DAE_MXFP_DOWN_LDU_WEIGHT_RING_STAGES := $(mxfp_down_ldu_weight_ring_stages)
-endif
-
-ifneq ($(mxfp_weight_prefetch),)
-	NVCC_FLAGS += -DDAE_MXFP_WEIGHT_PREFETCH=$(mxfp_weight_prefetch)
-	export DAE_MXFP_WEIGHT_PREFETCH := $(mxfp_weight_prefetch)
-endif
-
-ifneq ($(mxfp_weight_scale_tma),)
-	NVCC_FLAGS += -DDAE_MXFP_WEIGHT_SCALE_TMA=$(mxfp_weight_scale_tma)
-	export DAE_MXFP_WEIGHT_SCALE_TMA := $(mxfp_weight_scale_tma)
-endif
-
-ifneq ($(mxfp_gate_up_weight_scale_separate_barrier),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER=$(mxfp_gate_up_weight_scale_separate_barrier)
-	export DAE_MXFP_GATE_UP_WEIGHT_SCALE_SEPARATE_BARRIER := $(mxfp_gate_up_weight_scale_separate_barrier)
-endif
-
-ifneq ($(mxfp_down_weight_scale_separate_barrier),)
-	NVCC_FLAGS += -DDAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER=$(mxfp_down_weight_scale_separate_barrier)
-	export DAE_MXFP_DOWN_WEIGHT_SCALE_SEPARATE_BARRIER := $(mxfp_down_weight_scale_separate_barrier)
-endif
-
-ifneq ($(mxfp_down_bf16_reduction),)
-	NVCC_FLAGS += -DDAE_MXFP_DOWN_BF16_REDUCTION=$(mxfp_down_bf16_reduction)
-	export DAE_MXFP_DOWN_BF16_REDUCTION := $(mxfp_down_bf16_reduction)
-endif
-
-ifneq ($(mxfp_resident_ffn_overlap_down_prefetch),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH=$(mxfp_resident_ffn_overlap_down_prefetch)
-	export DAE_MXFP_RESIDENT_FFN_OVERLAP_DOWN_PREFETCH := $(mxfp_resident_ffn_overlap_down_prefetch)
-endif
-
-ifneq ($(mxfp_resident_down_pair_zero),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_DOWN_PAIR_ZERO=$(mxfp_resident_down_pair_zero)
-	export DAE_MXFP_RESIDENT_DOWN_PAIR_ZERO := $(mxfp_resident_down_pair_zero)
-endif
-
-ifneq ($(mxfp_resident_down_stu_reduction),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_DOWN_STU_REDUCTION=$(mxfp_resident_down_stu_reduction)
-	export DAE_MXFP_RESIDENT_DOWN_STU_REDUCTION := $(mxfp_resident_down_stu_reduction)
-endif
-
-ifneq ($(mxfp_resident_down_ldu1_zero),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_DOWN_LDU1_ZERO=$(mxfp_resident_down_ldu1_zero)
-	export DAE_MXFP_RESIDENT_DOWN_LDU1_ZERO := $(mxfp_resident_down_ldu1_zero)
-endif
-
-ifneq ($(mxfp_resident_down_split_ldu),)
-	NVCC_FLAGS += -DDAE_MXFP_RESIDENT_DOWN_SPLIT_LDU=$(mxfp_resident_down_split_ldu)
-	export DAE_MXFP_RESIDENT_DOWN_SPLIT_LDU := $(mxfp_resident_down_split_ldu)
-endif
-
-ifneq ($(mxfp_gate_up_direct_activation_tiles),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES=$(mxfp_gate_up_direct_activation_tiles)
-	export DAE_MXFP_GATE_UP_DIRECT_ACTIVATION_TILES := $(mxfp_gate_up_direct_activation_tiles)
-endif
-
-ifneq ($(mxfp_gate_up_fixed_output_rows),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS=$(mxfp_gate_up_fixed_output_rows)
-	export DAE_MXFP_GATE_UP_FIXED_OUTPUT_ROWS := $(mxfp_gate_up_fixed_output_rows)
-endif
-
-ifneq ($(mxfp_gate_up_fixed_bf16_epilogue),)
-	NVCC_FLAGS += -DDAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE=$(mxfp_gate_up_fixed_bf16_epilogue)
-	export DAE_MXFP_GATE_UP_FIXED_BF16_EPILOGUE := $(mxfp_gate_up_fixed_bf16_epilogue)
 endif
 
 # Directories

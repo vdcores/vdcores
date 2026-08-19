@@ -2860,8 +2860,6 @@ operator inside the normal loop.
 The cleanup preserves the 248-register kernel cap and the software-interleaved
 Down metadata fetch. The selected normal image builds at 244 registers, nine
 barriers, a 112-byte stack, zero spills, and 2,368 bytes static shared memory.
-The default-off STU Down-reduction control is separate from the deleted fast
-runtime and remains available for the previously measured handoff experiment.
 
 ## Unified coupled-stream normal operator (2026-08-18)
 
@@ -2916,3 +2914,26 @@ benchmark permanently reports min/median/P90/stddev/max for Linear-1, the
 inter-kernel gap, Down, and their combined device envelope. The installed
 worker runtime was restored to the four-command unified resident image after
 the controls.
+
+## Production FFN conclusion (2026-08-19)
+
+The unified coupled-stream operator is the sole resident FFN load path in the
+normal DAE2 runtime. It uses two fixed stages, coupled weight/scale completion,
+K+1 streaming-weight prefetch, an LDU0-local Linear-1-to-Down chain, an
+independent LDU1 activation/scale stream, Python-initialized BF16 reduction
+output, and direct compute-side TMA reduction stores.
+
+The allocator-ring, continuation/handoff, standalone resident commands,
+separate scale barriers, pair/LDU output clearing, STU reduction, split-LDU
+selection, and FFN tile-timeline controls were removed along with their build
+and Python configuration surface. For future archaeology only, the complete
+pre-cleanup implementation is retained in commit `79022cc`; production code
+does not carry compatibility branches for those experiments.
+
+The cleaned selected image remains at 243 registers, nine barriers, a 64-byte
+stack, zero spills, and 2,400 bytes static shared memory. A bounded validation
+run (`20260819T004918Z-960160`, 100 hot samples and 20 cold samples) passed all
+output checks. It measured 30.838 us hot and 48.288 us cold by CUDA events,
+with 25.856 us hot and 35.712 us cold device-counter medians. Relative to the
+pre-cleanup unified result, hot latency improved by 0.218 us while cold latency
+was unchanged within the short-run variance.

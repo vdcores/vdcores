@@ -1062,43 +1062,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfp4Mxfp8TmaScaleStages;
   config.attr("mxfp4_mxfp8_direct_tma_enabled") =
       mxfp4Mxfp8DirectTmaEnabled;
-  config.attr("mxfp_gate_up_direct_output") =
-      mxfpGateUpDirectOutputEnabled;
-  config.attr("mxfp_gate_up_direct_activation") =
-      mxfpGateUpDirectActivationEnabled;
-  config.attr("mxfp_gate_up_ldu_weight_ring") =
-      mxfpGateUpLduWeightRingEnabled;
-  config.attr("mxfp_down_ldu_weight_ring") =
-      mxfpDownLduWeightRingEnabled;
-  config.attr("mxfp_down_ldu_weight_ring_stages") =
-      mxfpDownLduWeightRingStages;
-  config.attr("mxfp_weight_prefetch") =
-      mxfpWeightPrefetchEnabled;
-  config.attr("mxfp_weight_scale_tma") =
-      mxfpWeightScaleTmaEnabled;
-  config.attr("mxfp_gate_up_weight_scale_separate_barrier") =
-      mxfpGateUpWeightScaleSeparateBarrierEnabled;
-  config.attr("mxfp_down_weight_scale_separate_barrier") =
-      mxfpDownWeightScaleSeparateBarrierEnabled;
-  config.attr("mxfp_down_bf16_reduction") =
-      mxfpDownBf16ReductionEnabled;
-  config.attr("mxfp_resident_ffn_overlap_down_prefetch") =
-      mxfpResidentFfnOverlapDownPrefetchEnabled;
-  config.attr("mxfp_resident_down_pair_zero") =
-      mxfpResidentDownPairZeroEnabled;
-  config.attr("mxfp_resident_down_stu_reduction") =
-      mxfpResidentDownStuReductionEnabled;
-  config.attr("mxfp_resident_down_ldu1_zero") =
-      mxfpResidentDownLdu1ZeroEnabled;
-  config.attr("mxfp_resident_down_split_ldu") =
-      mxfpResidentDownSplitLduEnabled;
-  config.attr("mxfp_gate_up_direct_activation_tiles") =
-      mxfpGateUpDirectActivationTiles;
-  config.attr("mxfp_gate_up_fixed_output_rows") =
-      mxfpGateUpFixedOutputRows;
-  config.attr("mxfp_gate_up_fixed_bf16_epilogue") =
-      mxfpGateUpFixedBf16Epilogue;
-
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");
   // flag.attr("jump") = MEM_OP_FLAGS_JUMP;
   // flag.attr("writeback") = MEM_OP_FLAGS_WRITEBACK;

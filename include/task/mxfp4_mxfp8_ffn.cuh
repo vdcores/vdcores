@@ -22,17 +22,13 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     M2CQueue &m2c,
     C2MQueue &c2m,
     int resident_task_index
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-    , int sm_id, uint64_t *g_events
-#endif
     ) {
   using namespace cute;
   using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
   using Activation = cutlass::float_e4m3_t;
   using Scale = cutlass::float_ue8m0_t;
   using Accum = float;
-  using Output = std::conditional_t<
-      mxfpDownBf16ReductionEnabled, cutlass::bfloat16_t, float>;
+  using Output = cutlass::bfloat16_t;
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
 
   constexpr int kTileM = 128;
@@ -51,14 +47,10 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
           ((RingStages == 2 || RingStages == 3 || RingStages == 4) &&
            BundleK == 256));
   static_assert(
-      !ResidentAllTma || UseLduWeightRing,
-      "resident all-TMA Down requires the LDU ring protocol");
-  constexpr bool kLduWeightScaleTma =
-      UseLduWeightRing &&
-      (mxfpWeightScaleTmaEnabled || ResidentAllTma);
-  constexpr bool kSeparateWeightScaleBarrier =
-      kLduWeightScaleTma && !ResidentAllTma &&
-      mxfpDownWeightScaleSeparateBarrierEnabled;
+      UseLduWeightRing == ResidentAllTma,
+      "LDU-owned Down storage is reserved for the resident FFN");
+  constexpr bool kLduWeightScaleTma = ResidentAllTma;
+  constexpr bool kSeparateWeightScaleBarrier = false;
   constexpr int kTotalK = KBundles * kBundleK;
   constexpr int kNumKTiles = kTotalK / kBundleK;
   constexpr int kRingStages = RingStages;
@@ -166,14 +158,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   const bool reduce_from_zero = (resident_flags & 1U) != 0;
   const int ready_bar_stride = (resident_flags & 2U) != 0 ? 8 : 1;
   const bool blockwise_ready = (resident_flags & 4U) != 0;
-  const bool prezero_pair = (resident_flags & 8U) != 0;
-  const bool zero_already_prepared = (resident_flags & 16U) != 0;
   auto *final_output_global = reinterpret_cast<Output *>(
       *reinterpret_cast<const uint64_t *>(metadata + 48));
-  auto *paired_output_global = reinterpret_cast<Output *>(
-      *reinterpret_cast<const uint64_t *>(metadata + 72));
-  const uint32_t paired_reduce_bar =
-      *reinterpret_cast<const uint32_t *>(metadata + 80);
   const uint64_t layout_info =
       *reinterpret_cast<const uint64_t *>(metadata + 56);
   const uint32_t weight_scale_tile_stride = uint32_t(layout_info) != 0
@@ -184,14 +170,6 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       *reinterpret_cast<const uint32_t *>(metadata + 64);
   const int expert = int(output_task) / kDownTilesPerExpert;
   const int output_m_tile = int(output_task) % kDownTilesPerExpert;
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  auto *profile_events = g_events + sm_id * numProfileEvents;
-  const bool track_down_tail = true;
-  const int timeline_base = output_m_tile < kDownTilesPerExpert / 2 ? 35 : 20;
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 0] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   // The shared-expert CTA initializes its FP32 destination and publishes the
   // zero-ready edge used by all seven TMA reduce-add producers.
@@ -226,11 +204,6 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
   }
   __sync_barrier<SyncBarrierId, 128>();
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 1] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   constexpr int kWeightRingBytes = kRingStages * kWeightStageBytes;
   constexpr int kActivationRingBytes =
@@ -278,28 +251,13 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     activation_ring = resident_base +
         dae_mxfp_resident_ffn::kDownActivationRingOffset;
     weight_full = reinterpret_cast<TxBarrier *>(
-        resident_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
+        resident_mma_barriers + mxfpResidentDownWeightFullBarrierBase);
     weight_scale_full = weight_full;
     operand_full = reinterpret_cast<TxBarrier *>(
         resident_mma_barriers + mxfpDownResidentOperandFullBarrierBase);
     umma_full = local_barriers;
     stage_empty = reinterpret_cast<TxBarrier *>(
-        resident_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
-  } else if constexpr (UseLduWeightRing) {
-    const int weight_slot_mask = m2c.template pop<0>();
-    weight_ring = static_cast<uint8_t *>(
-        get_slot_address(smem_base, extract(weight_slot_mask)));
-    scale_ring = kLduWeightScaleTma
-        ? weight_ring + kWeightRingBytes
-        : local_scale_ring;
-    weight_full = reinterpret_cast<TxBarrier *>(
-        resident_mma_barriers + mxfpDownLduWeightRingFullBarrierBase);
-    weight_scale_full = reinterpret_cast<TxBarrier *>(
-        resident_mma_barriers + mxfpDownLduWeightScaleFullBarrierBase);
-    operand_full = local_barriers;
-    umma_full = operand_full + kRingStages;
-    stage_empty = reinterpret_cast<TxBarrier *>(
-        resident_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase);
+        resident_mma_barriers + mxfpResidentDownEmptyBarrierBase);
   } else {
     weight_ring = local_weight_ring;
     scale_ring = local_scale_ring;
@@ -468,42 +426,6 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
           operand_full[stage].arrive();
         }
       }
-    } else {
-      // Resident operands leave this warp idle.  Hide the shared expert's
-      // destination clears under the UMMA mainloop. In the paired form, the
-      // first task also prepares its worker's second output tile so routed
-      // experts never wait for expert 0's second-task entry.
-      if constexpr (!mxfpResidentDownLdu1ZeroEnabled) {
-        if (reduce_from_zero && expert == 0) {
-          const bool clear_current =
-              !mxfpResidentDownPairZeroEnabled || !zero_already_prepared;
-          const bool clear_pair =
-              mxfpResidentDownPairZeroEnabled && prezero_pair;
-          if (clear_current || clear_pair) {
-            if (clear_current) {
-              for (int index = lane; index < kOutputElements; index += 32) {
-                final_output_global[index] = Output(0.0f);
-              }
-            }
-            if (clear_pair) {
-              for (int index = lane; index < kOutputElements; index += 32) {
-                paired_output_global[index] = Output(0.0f);
-              }
-            }
-            __syncwarp();
-            if (lane == 0) {
-              asm volatile("fence.release.gpu;" ::: "memory");
-              if (clear_current) {
-                *reinterpret_cast<volatile int *>(global_bars + reduce_bar) = 0;
-              }
-              if (clear_pair) {
-                *reinterpret_cast<volatile int *>(
-                    global_bars + paired_reduce_bar) = 0;
-              }
-            }
-          }
-        }
-      }
     }
   } else if (warp == 0) {
     using Utccp = SM100_UTCCP_4x32dp128bit_1cta;
@@ -579,12 +501,6 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       }
       cutlass::arch::umma_arrive(
           reinterpret_cast<uint64_t *>(umma_full + stage));
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-      if (lane == 0 && track_down_tail) {
-        profile_events[timeline_base + 2 + tile] =
-            cuda::ptx::get_sreg_globaltimer();
-      }
-#endif
     }
   }
 
@@ -599,11 +515,6 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __sync_barrier<SyncBarrierId, 128>();
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 10] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   auto coord_c = make_identity_tensor(
       make_shape(Int<kTileM>{}, Int<kTileN>{}));
@@ -630,14 +541,9 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     }
   }
   __sync_barrier<SyncBarrierId, 128>();
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 11] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
   if (tid == 0 && (reduce_from_zero || expert != 0)) {
-    if constexpr (ResidentAllTma && mxfpResidentDownLdu1ZeroEnabled) {
+    if constexpr (ResidentAllTma) {
       auto *reduction_ready = reinterpret_cast<TxBarrier *>(
           resident_mma_barriers +
           mxfpDownResidentReductionReadyBarrierBase);
@@ -650,29 +556,13 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       }
     }
   }
-  if constexpr (!(ResidentAllTma && mxfpResidentDownLdu1ZeroEnabled)) {
+  if constexpr (!ResidentAllTma) {
     __sync_barrier<SyncBarrierId, 128>();
   }
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 12] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 
-  // The shared expert can establish the FP32 destination with a bulk copy, or
-  // all seven experts can reduce-add after the shared CTA publishes zero.
-  // Both paths consume the selected FP32/BF16 shared epilogue directly: no
-  // expert-output write/read round trip is present.
-  if constexpr (ResidentAllTma && mxfpResidentDownStuReductionEnabled) {
-    if (tid == 0) {
-      auto *store_ready = reinterpret_cast<TxBarrier *>(
-          resident_mma_barriers + mxfpDownResidentStoreReadyBarrierBase);
-      auto *store_done = reinterpret_cast<TxBarrier *>(
-          resident_mma_barriers + mxfpDownResidentStoreDoneBarrierBase);
-      store_ready[resident_task_index].arrive();
-      store_done[resident_task_index].wait(0);
-    }
-  } else if (tid == 0) {
+  // The shared expert establishes the BF16 destination with a bulk copy; the
+  // routed experts reduce-add into the Python-initialized destination.
+  if (tid == 0) {
       const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
       const int row = output_m_tile * kTileM;
       if (expert == 0 && !reduce_from_zero) {
@@ -702,14 +592,4 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       }
   }
   __sync_barrier<SyncBarrierId, 128>();
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 13] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-  if (tid == 0 && track_down_tail) {
-    profile_events[timeline_base + 14] = cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 }

@@ -67,9 +67,6 @@ void dae_ffn_linear1_direct_kernel(
       8, false, false, false>(
       smem_base, tmem_base_ptr, nullptr, tma_descs,
       metadata + worker * 128, bars, m2c, c2m
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-      , worker, profile
-#endif
       );
 
   __syncthreads();
@@ -128,9 +125,6 @@ void dae_ffn_down_direct_kernel(
           0, kDownScratchBytes, 0, false, false>(
           smem_base, tmem_base_ptr, nullptr, tma_descs,
         first_metadata, bars, m2c, c2m, -1
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-        , worker, profile
-#endif
     );
   } else {
     if (*reinterpret_cast<const uint64_t *>(second_metadata) != 0) {
@@ -140,9 +134,6 @@ void dae_ffn_down_direct_kernel(
             smem_base, tmem_base_ptr + kDownTmemColumnsPerTask,
             nullptr, tma_descs,
           second_metadata, bars, m2c, c2m, -1
-#if defined(DAE_TRACK_MXFP_TIMELINE)
-          , worker, profile
-#endif
       );
     }
   }

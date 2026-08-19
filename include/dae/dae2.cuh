@@ -44,13 +44,6 @@ void dae2(
   int warp_id = (thread_id % 128) / 32;
   int lane_id = thread_id % 32;
 
-#if defined(DAE_TRACK_PROFILE)
-  if (thread_id == 0) {
-    g_events[sm_id * numProfileEvents + DAE_TRACK_KERNEL_ENTRY] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
-
   __kprint("[DAE2 SM %d] Kernel launched with %d threads (%d warps)\n", sm_id, blockDim.x, blockDim.x / 32);
 
 
@@ -153,33 +146,24 @@ void dae2(
           cuda::ptx::space_shared,
           tmem_mma_barriers + mxfp4Mxfp8TmaScaleBarrierBase + i);
     }
-    // The retained LDU weight stages begin empty. LDU0 observes this initial
-    // phase before its first overwrite; compute produces every later empty
-    // phase when the corresponding UMMA bundle retires.
-#if DAE_MXFP_GATE_UP_LDU_WEIGHT_RING && \
-    !DAE_MXFP_GATE_UP_DIRECT_ACTIVATION
+    // The resident FFN stages begin empty. The LDUs observe this initial phase
+    // before their first overwrite; compute returns each later empty phase.
     #pragma unroll
-    for (int i = 0; i < mxfpLduWeightRingStages; ++i) {
+    for (int i = 0; i < mxfpResidentLinear1Stages; ++i) {
       cuda::ptx::mbarrier_arrive(
           cuda::ptx::sem_release,
           cuda::ptx::scope_cta,
           cuda::ptx::space_shared,
-          tmem_mma_barriers + mxfpLduWeightRingEmptyBarrierBase + i);
+          tmem_mma_barriers + mxfpResidentLinear1EmptyBarrierBase + i);
     }
-#endif
-#if DAE_MXFP_DOWN_LDU_WEIGHT_RING
-    // The retained Linear-2 stages use the same ownership protocol: LDU0
-    // waits for an empty phase before overwriting and compute returns that
-    // phase immediately after the corresponding UMMA bundle retires.
     #pragma unroll
-    for (int i = 0; i < mxfpDownLduWeightRingStages; ++i) {
+    for (int i = 0; i < mxfpResidentDownStages; ++i) {
       cuda::ptx::mbarrier_arrive(
           cuda::ptx::sem_release,
           cuda::ptx::scope_cta,
           cuda::ptx::space_shared,
-          tmem_mma_barriers + mxfpDownLduWeightRingEmptyBarrierBase + i);
+          tmem_mma_barriers + mxfpResidentDownEmptyBarrierBase + i);
     }
-#endif
   }
 #else
   if (thread_id == 0) {
@@ -253,23 +237,13 @@ void dae2(
       );
     } else if (warp_id == 1) {
       if (lane_id == 0) {
-        if constexpr (mxfpResidentDownStuReductionEnabled) {
-          stwarp_execute_mxfp_resident_down_reduction(
-            c2m, minsts, smem_base, tma_descs, bars,
-            tmem_mma_barriers
+        stwarp_execute_singlethread(
+          c2m, st_insts,
+          smem_base, tma_descs, bars
 #if defined(DAE_TRACK_PROFILE)
-            , sm_id, g_events
+          , sm_id, g_events
 #endif
-          );
-        } else {
-          stwarp_execute_singlethread(
-            c2m, st_insts,
-            smem_base, tma_descs, bars
-#if defined(DAE_TRACK_PROFILE)
-            , sm_id, g_events
-#endif
-          );
-        }
+        );
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
       int port_id = warp_id - 2;
@@ -277,7 +251,7 @@ void dae2(
         ldwarp_execute_singlethread(
           m2ld[port_id], m2c,
           st_insts,
-          smem_base, tma_descs, bars, &slot_avail, &ldu_control_barrier,
+          smem_base, tma_descs, bars, &ldu_control_barrier,
           &ldu_control_publish_barrier,
           tmem_mma_barriers,
           port_id
@@ -291,22 +265,10 @@ void dae2(
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   __syncthreads();
-#if defined(DAE_TRACK_PROFILE)
-  if (thread_id == 0) {
-    g_events[sm_id * numProfileEvents + DAE_TRACK_FINAL_ROLE_JOIN] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
   if (thread_id / numThreadsPerWarp == 0) {
     tmem_allocator.release_allocation_lock();
     tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
   }
-#if defined(DAE_TRACK_PROFILE)
-  if (thread_id == 0) {
-    g_events[sm_id * numProfileEvents + DAE_TRACK_POST_TMEM_FREE] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
 #endif
 
   // end of megakernel

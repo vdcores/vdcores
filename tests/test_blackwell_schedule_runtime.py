@@ -45,6 +45,7 @@ from dae.instructions import (
     Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100,
     Mxfp4Mxfp8GateUpSiluFixedRingSm100,
     Mxfp4Mxfp8DownFixedRingSm100,
+    TmaLoadMxfpCoupledStream,
     Nvfp4GemvSm100,
     Nvfp4GemvUmmaK512Fp32Sm100,
     Nvfp4GemvUmmaPipelineSm100,
@@ -62,12 +63,9 @@ from dae.instructions import (
     RegStore,
     TmaLoadAddressReg1D,
     TmaLoad1D,
-    TmaLoadMxfpWeightRing5D,
-    TmaLoadMxfpDownWeightRing5D,
     TmaLoadMxfpScaleBase1D,
     TmaLoadMxfpScale1D,
     TmaLoadReg1D,
-    TmaStore1D,
     TmaTensor,
 )
 from dae.runtime import config, opcode
@@ -896,17 +894,6 @@ def test_mxfp4_mxfp8_gate_up_silu_instructions_encode_selected_families():
 
 def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
     monkeypatch.setattr(
-        config, "mxfp_weight_scale_tma", False, raising=False
-    )
-    tma_load = SchedMxfp4Mxfp8GateUpSiluFixedRing.schedule.__globals__[
-        "TmaLoad1D"
-    ]
-    monkeypatch.setitem(
-        tma_load.__init__.__globals__,
-        "get_tensor_address",
-        lambda tensor: tensor.data_ptr(),
-    )
-    monkeypatch.setattr(
         "dae.runtime.build_tma_desc",
         lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
     )
@@ -955,205 +942,61 @@ def test_mxfp4_mxfp8_gate_up_fixed_ring_shards_mixed_tasks(monkeypatch):
     assert schedule._tile_shard(0) == (0, 2)
     assert schedule._tile_shard(1) == (2, 1)
 
-    monkeypatch.setattr(config, "mxfp_gate_up_direct_output", True)
-    monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", False)
-    monkeypatch.setattr(config, "mxfp_gate_up_ldu_weight_ring", False)
     direct = schedule.schedule(0)
-    assert len(direct) == 4
-    assert all(
-        isinstance(direct[index], Mxfp4Mxfp8GateUpSiluFixedRingSm100)
-        for index in (0, 2)
-    )
-    assert [direct[index].size for index in (1, 3)] == [32768, 32768]
-
-    monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", True)
-    direct_activation = schedule.schedule(0)
-    assert len(direct_activation) == 2
+    assert len(direct) == 2
     assert all(
         isinstance(inst, Mxfp4Mxfp8GateUpSiluFixedRingSm100)
-        for inst in direct_activation
+        for inst in direct
+    )
+    assert len(schedule.schedule(1)) == 1
+
+def test_mxfp4_mxfp8_coupled_stream_local_chain():
+    plan_address = 0x1234
+    linear1 = TmaLoadMxfpCoupledStream(
+        plan_address,
+        kind=TmaLoadMxfpCoupledStream.LINEAR1,
+        stages=2,
+        area_slots=21,
+        area_id=0,
+        mailbox=8,
+        port=0,
+    )
+    down_weight = TmaLoadMxfpCoupledStream(
+        plan_address,
+        kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
+        stages=2,
+        area_slots=10,
+        area_id=0,
+        mailbox=6,
+        port=0,
+    )
+    down_activation = TmaLoadMxfpCoupledStream(
+        plan_address,
+        kind=TmaLoadMxfpCoupledStream.DOWN_ACTIVATION,
+        stages=2,
+        area_slots=10,
+        area_id=0,
+        mailbox=7,
+        port=1,
     )
 
-    monkeypatch.setattr(config, "mxfp_gate_up_direct_activation", False)
-    monkeypatch.setattr(config, "mxfp_gate_up_direct_output", False)
-    queued = schedule.schedule(1)
-    assert len(queued) == 3
-    assert isinstance(queued[0], Mxfp4Mxfp8GateUpSiluFixedRingSm100)
-    assert queued[1].size == 32768
-    assert isinstance(queued[2], TmaStore1D)
-    assert queued[2].size == 1536
-
-    monkeypatch.setattr(config, "mxfp_gate_up_direct_output", True)
-    monkeypatch.setattr(config, "mxfp_gate_up_ldu_weight_ring", True)
-    retained = schedule.schedule(0)
-    assert len(retained) == 8
-    for task, output_tile in enumerate((0, 1)):
-        compute, activation, ring, continuation = retained[
-            task * 4 : (task + 1) * 4
-        ]
-        assert isinstance(compute, Mxfp4Mxfp8GateUpSiluFixedRingSm100)
-        assert activation.size == 32768
-        assert isinstance(ring, TmaLoadMxfpWeightRing5D)
-        assert ring.opcode == opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_5D
-        assert ring.num_slots == TmaLoadMxfpWeightRing5D.RING_SLOTS
-        assert ring.size == gate_tma.arg
-        assert ring.arg == up_tma.arg
-        assert ring.cords == [0, 0, 0, output_tile]
-        assert ring.annotation["fixed_port"] == 0
-        assert (
-            continuation.opcode
-            == opcode.OP_TMA_LOAD_MX_WEIGHT_RING_CONTINUE_5D
-        )
-        assert continuation.num_slots == config.num_slots + 8
-        assert continuation.annotation["fixed_port"] == 0
-
-    monkeypatch.setattr(config, "mxfp_weight_scale_tma", True)
-    retained_scale_tma = SchedMxfp4Mxfp8GateUpSiluFixedRing(
-        gate_weight,
-        gate_scale,
-        up_weight,
-        up_scale,
-        activation_data,
-        activation_scale,
-        output_data,
-        output_scale,
-        gate_tma,
-        up_tma,
-        metadata,
-        tile_k=512,
-    ).place(2).schedule(0)
-    assert retained_scale_tma[2].cords == [7, 8, 0, 0]
-    assert retained_scale_tma[6].cords == [7, 8, 0, 1]
-
-
-def test_mxfp4_mxfp8_down_retains_one_weight_ring_per_worker(monkeypatch):
-    monkeypatch.setattr(
-        "dae.runtime.build_tma_desc",
-        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
-    )
-    monkeypatch.setattr(
-        config, "mxfp_down_ldu_weight_ring", True, raising=False
-    )
-    monkeypatch.setattr(
-        config, "mxfp_weight_scale_tma", False, raising=False
-    )
-    class FakeLauncher:
-        def new_tma(self, _desc):
-            return 11
-
-    experts = 2
-    tasks = experts * 32
-    weight = torch.empty((tasks, 8, 2, 128, 64), dtype=torch.uint8)
-    scale = torch.empty((tasks, 8, 1024), dtype=torch.uint8)
-    activation = torch.empty((experts, 16, 1536), dtype=torch.uint8)
-    output_dtype = (
-        torch.bfloat16
-        if getattr(config, "mxfp_down_bf16_reduction", False)
-        else torch.float32
-    )
-    output = torch.empty((32, 128, 8), dtype=output_dtype)
-    metadata = torch.empty((tasks, 128), dtype=torch.uint8)
-    weight_tma = TmaTensor(FakeLauncher(), weight).mxfp4_load(256)
-
-    retained = SchedMxfp4Mxfp8DownFixedRing(
-        weight,
-        scale,
-        activation,
-        output,
-        weight_tma,
-        metadata,
-        retain_weight_ring_between_tasks=True,
-    ).place(32)
-    instructions = retained.schedule(0)
-    assert len(instructions) == 4
-    first_compute, ring, second_compute, continuation = instructions
-    assert isinstance(first_compute, Mxfp4Mxfp8DownFixedRingSm100)
-    assert isinstance(second_compute, Mxfp4Mxfp8DownFixedRingSm100)
-    assert isinstance(ring, TmaLoadMxfpDownWeightRing5D)
-    assert ring.num_slots == TmaLoadMxfpDownWeightRing5D.RING_SLOTS
-    assert ring.size == 2
-    assert ring.arg == weight_tma.arg
-    assert ring.cords == [0, 0, 0, 0]
-    assert ring.annotation["fixed_port"] == 0
-    assert (
-        continuation.opcode
-        == opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_CONTINUE_5D
-    )
-    assert continuation.num_slots == 32
-    assert continuation.annotation["fixed_port"] == 0
-
-    monkeypatch.setattr(config, "mxfp_weight_scale_tma", True)
-    retained_scale_tma = SchedMxfp4Mxfp8DownFixedRing(
-        weight,
-        scale,
-        activation,
-        output,
-        weight_tma,
-        metadata,
-        retain_weight_ring_between_tasks=True,
-    ).place(32).schedule(0)
-    assert retained_scale_tma[1].cords == [11, 0, 0, 0]
-    monkeypatch.setattr(config, "mxfp_weight_scale_tma", False)
-
-    per_task = SchedMxfp4Mxfp8DownFixedRing(
-        weight,
-        scale,
-        activation,
-        output,
-        weight_tma,
-        metadata,
-        retain_weight_ring_between_tasks=False,
-    ).place(32).schedule(0)
-    assert len(per_task) == 4
-    assert all(
-        isinstance(per_task[index], TmaLoadMxfpDownWeightRing5D)
-        for index in (1, 3)
-    )
-    assert [per_task[index].size for index in (1, 3)] == [1, 1]
-
-    gate_weight = torch.empty((1, 8, 4, 128, 64), dtype=torch.uint8)
-    gate_tma = TmaTensor(FakeLauncher(), gate_weight).mxfp4_load(512)
-    source = TmaLoadMxfpWeightRing5D(gate_tma, gate_tma, 0)
-    gate_to_up = TmaLoadMxfpWeightRing5D.continuation()
-    target = ring
     builder = SMInstructionBuilder(0)
-    builder.add(source)
-    builder.add(gate_to_up)
-    builder.add(target)
-    builder.rewrite_retained_weight_ring_handoffs()
-    rewritten_source, unchanged_continuation, rewritten_target = (
+    builder.add([linear1, down_weight, down_activation])
+    builder.rewrite_coupled_stream_local_chains()
+
+    rewritten_linear1, rewritten_down_weight, rewritten_activation = (
         builder.minsts
     )
-    assert (
-        rewritten_source.opcode
-        == opcode.OP_ALLOC_TMA_LOAD_MX_WEIGHT_RING_HANDOFF_5D
+    assert rewritten_linear1.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+    assert not (
+        rewritten_down_weight.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
     )
-    assert rewritten_source.annotation["weight_ring_handoff"] == "source"
-    assert unchanged_continuation is gate_to_up
-    assert (
-        rewritten_target.opcode
-        == opcode.OP_TMA_LOAD_MX_DOWN_WEIGHT_RING_HANDOFF_5D
+    assert not (
+        rewritten_activation.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
     )
-    assert rewritten_target.num_slots == config.num_slots + 8
-    assert rewritten_target.size == ring.size
-    assert rewritten_target.arg == ring.arg
-    assert rewritten_target.cords == ring.cords
-    assert rewritten_target.annotation["weight_ring_handoff"] == "target"
-
-    separated = SMInstructionBuilder(0)
-    separated.add(source)
-    separated.add(gate_to_up)
-    separated.add(MemoryInstruction(
-        opcode=opcode.OP_ISSUE_BARRIER,
-        num_slots=0,
-        arg=0,
-        size=0,
-        address=0,
-    ))
-    separated.add(target)
-    separated.rewrite_retained_weight_ring_handoffs()
-    assert separated.minsts[0].opcode == source.opcode
-    assert separated.minsts[-1].opcode == target.opcode
+    assert rewritten_linear1.annotation["coupled_stream_local_chain"] == "source"
+    assert rewritten_down_weight.annotation["fixed_port"] == 0
+    assert rewritten_activation.annotation["fixed_port"] == 1
 
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
