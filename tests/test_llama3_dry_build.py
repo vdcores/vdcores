@@ -136,6 +136,64 @@ def test_rope_values_are_finite():
     assert torch.allclose(sin[0, 0], torch.zeros_like(sin[0, 0]))
 
 
+def real_config_or_none():
+    """The published Llama-3.1-8B-Instruct config, if this host can reach it.
+
+    Returns None when there is no Hugging Face credential or no network, so
+    the suite still runs on a host that has neither.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return None
+    try:
+        path = hf_hub_download(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "config.json",
+            cache_dir=os.environ.get("HF_CACHE_DIR", "/tmp/huggingface_cache"),
+        )
+    except Exception:
+        return None
+    import json
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def test_stub_geometry_matches_the_published_config():
+    """The legality sweep is only meaningful if the stub's shapes are real.
+
+    Every candidate in the Llama3 legality map was judged against these
+    numbers. If one drifts from the published config, that whole map becomes
+    quietly wrong rather than loudly broken, so pin it here.
+
+    Skipped when the model is unreachable, since it is gated.
+    """
+    real = real_config_or_none()
+    if real is None:
+        print("     (skipped: no Hugging Face credential or no network)")
+        return
+
+    stub = dry_build.build_stub_config()
+    for field in (
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "num_hidden_layers",
+        "vocab_size",
+        "rms_norm_eps",
+    ):
+        assert getattr(stub, field) == real[field], (
+            f"{field}: stub has {getattr(stub, field)}, published config has {real[field]}"
+        )
+
+    # rope_theta moved between config layouts across transformers versions
+    real_theta = real.get("rope_theta")
+    if real_theta is None:
+        real_theta = (real.get("rope_parameters") or {}).get("rope_theta")
+    assert stub.rope_parameters["rope_theta"] == real_theta
+
+
 def test_stub_tokenizer_refuses_to_pretend_it_can_tokenize():
     """Better a clear error than silently scheduling the wrong token count."""
     tokenizer = dry_build.build_stub_tokenizer()
