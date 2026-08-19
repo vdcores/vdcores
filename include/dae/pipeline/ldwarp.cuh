@@ -110,6 +110,109 @@ __device__ __forceinline__ void ldu_prefetch_mxfp_weight_tma(
       : "memory");
 }
 
+// Common allocator-owned MXFP8 x MXFP8 stream. Each stage carries both M128
+// output groups for one K256 pair, while LDU1 supplies their shared activation.
+__device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
+    const MInst inst, const int slot, const int port_id,
+    const void *smem_base, uint64_t *tmem_mma_barriers) {
+  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+  constexpr int kStages =
+      dae_mxfp_resident_ffn::kFp8CoupledStages;
+  constexpr int kWeightBytes =
+      dae_mxfp_resident_ffn::kFp8CoupledWeightDataBytes +
+      dae_mxfp_resident_ffn::kFp8CoupledWeightScaleBytes;
+  constexpr int kActivationBytes =
+      dae_mxfp_resident_ffn::kFp8CoupledActivationDataBytes +
+      dae_mxfp_resident_ffn::kFp8CoupledActivationScaleBytes;
+  constexpr int kActivationTileBytes = 2 * 1024;
+  constexpr int kActivationDataBytes =
+      dae_mxfp_resident_ffn::kFp8CoupledActivationDataBytes / 2;
+  constexpr int kBulkBytes = 16 * 1024;
+  static_assert(
+      dae_mxfp_resident_ffn::kFp8CoupledWeightDataBytes % kBulkBytes == 0);
+
+  const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
+  const auto *source = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + port_id));
+  auto *ring = static_cast<uint8_t *>(
+      get_slot_address(smem_base, slot));
+  auto *stage_empty = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + mxfp8CoupledEmptyBarrierBase);
+  auto *stage_full = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers +
+      (port_id == 0 ? mxfp8CoupledWeightFullBarrierBase
+                    : mxfp8CoupledActivationFullBarrierBase));
+  const int phase_base =
+      (inst.arg & dae_mxfp_resident_ffn::kCoupledPhaseBaseMask) >>
+      dae_mxfp_resident_ffn::kCoupledPhaseBaseShift;
+
+  for (int pair = 0; pair < int(inst.size); ++pair) {
+    const int global_pair = phase_base + pair;
+    const int stage = global_pair % kStages;
+    const int phase = (global_pair / kStages) & 1;
+    stage_empty[stage].wait(phase);
+    auto *destination = ring +
+        stage * dae_mxfp_resident_ffn::kFp8CoupledStageBytes;
+
+    if (port_id == 0) {
+      const auto *record = source + uint64_t(pair) * kWeightBytes;
+      #pragma unroll
+      for (int chunk = 0;
+           chunk <
+               dae_mxfp_resident_ffn::kFp8CoupledWeightDataBytes /
+                   kBulkBytes;
+           ++chunk) {
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_shared,
+            cuda::ptx::space_global,
+            destination + chunk * kBulkBytes,
+            record + chunk * kBulkBytes,
+            uint32_t(kBulkBytes),
+            reinterpret_cast<uint64_t *>(stage_full + stage));
+      }
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          destination +
+              dae_mxfp_resident_ffn::kFp8CoupledWeightScaleOffset,
+          record +
+              dae_mxfp_resident_ffn::kFp8CoupledWeightDataBytes,
+          uint32_t(dae_mxfp_resident_ffn::kFp8CoupledWeightScaleBytes),
+          reinterpret_cast<uint64_t *>(stage_full + stage));
+      stage_full[stage].arrive_and_expect_tx(kWeightBytes);
+    } else {
+      const auto *record =
+          source + uint64_t(pair) * 2 * kActivationTileBytes;
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          destination +
+              dae_mxfp_resident_ffn::kFp8CoupledActivationDataOffset,
+          record,
+          uint32_t(kActivationDataBytes),
+          reinterpret_cast<uint64_t *>(stage_full + stage));
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          destination +
+              dae_mxfp_resident_ffn::kFp8CoupledActivationDataOffset +
+              kActivationDataBytes,
+          record + kActivationTileBytes,
+          uint32_t(kActivationDataBytes),
+          reinterpret_cast<uint64_t *>(stage_full + stage));
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          destination +
+              dae_mxfp_resident_ffn::kFp8CoupledActivationScaleOffset,
+          record + kActivationDataBytes,
+          uint32_t(dae_mxfp_resident_ffn::kFp8CoupledActivationScaleBytes),
+          reinterpret_cast<uint64_t *>(stage_full + stage));
+      stage_full[stage].arrive_and_expect_tx(kActivationBytes);
+    }
+  }
+}
+
 __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
     uint64_t *tmem_mma_barriers
@@ -641,7 +744,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         while (true) {
           const uint16_t stream_kind =
               stream_inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask;
-          if (stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
+          if (stream_kind == dae_mxfp_resident_ffn::kCoupledFp8Gemv) {
+            ldu_execute_mxfp8_coupled_stream(
+                stream_inst, slot, port_id, smem_base,
+                tmem_mma_barriers);
+          } else if (
+              stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
             ldu_execute_mxfp_coupled_linear1(
                 stream_inst, smem_base, tma_descs, tmem_mma_barriers
                 );

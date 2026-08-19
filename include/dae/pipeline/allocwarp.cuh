@@ -227,14 +227,36 @@ __device__ __forceinline__ void allocwarp_execute(
 
         LdCmd ld;
         ld.init(di.slot_alloc, m2c.ptr, inst.opcode);
+        const bool dual_port_coupled =
+            decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
+            (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+                dae_mxfp_resident_ffn::kCoupledFp8Gemv;
+        const bool direct_writeback_publication =
+            (inst.opcode & MEM_OP_FLAGS_WRITEBACK) != 0;
+        if (dual_port_coupled || direct_writeback_publication) {
+          // The lease itself is the compute operand. Publish it immediately;
+          // compute observes the per-stage transaction barriers before
+          // touching payload bytes. A writeback lease likewise has no load
+          // producer: compute fills it and STU remains its only consumer.
+          m2c.commit();
+          if (dual_port_coupled) {
+            #pragma unroll
+            for (int port = 0; port < 2; ++port) {
+              m2ld[port].put(ld.raw);
+              m2ld[port].commit();
+              m2ld[port].advance();
+            }
+          }
+          m2c.advance();
+        } else {
+          curld.put(ld.raw);
+          // TODO(zhiyuang): change the return value of allocate
 
-        curld.put(ld.raw);
-        // TODO(zhiyuang): change the return value of allocate
-
-        // TODO(zhiyuang): double push could be optimize? maybe put the barrier to the last
-        m2c.advance();
-        curld.commit();
-        curld.advance();
+          // TODO(zhiyuang): double push could be optimize? maybe put the barrier to the last
+          m2c.advance();
+          curld.commit();
+          curld.advance();
+        }
       }
 
       // have to keep this branch

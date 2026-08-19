@@ -164,6 +164,14 @@ void dae2(
           cuda::ptx::space_shared,
           tmem_mma_barriers + mxfpResidentDownEmptyBarrierBase + i);
     }
+    #pragma unroll
+    for (int i = 0; i < mxfp8CoupledStages; ++i) {
+      cuda::ptx::mbarrier_arrive(
+          cuda::ptx::sem_release,
+          cuda::ptx::scope_cta,
+          cuda::ptx::space_shared,
+          tmem_mma_barriers + mxfp8CoupledEmptyBarrierBase + i);
+    }
   }
 #else
   if (thread_id == 0) {

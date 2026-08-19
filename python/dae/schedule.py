@@ -789,7 +789,7 @@ class SchedNvfp4GemvUmmaStream(Schedule):
         if (
             self.weight_tiles.dtype != torch.uint8
             or self.weight_tiles.ndim != 3
-            or self.weight_tiles.shape[2] != self.WEIGHT_TILE_BYTES
+            or self.weight_tiles.shape[-1] != self.WEIGHT_TILE_BYTES
             or not self.weight_tiles.is_contiguous()
         ):
             raise ValueError("streaming weight tiles must be [M/128,K/256,18432] uint8")
@@ -3460,6 +3460,387 @@ class SchedFp8GemvUmmaSplitK(Schedule):
                     store.bar(self._bar("output"))
                 instructions.append(store)
             work += group_count
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedFp8GemvUmmaCoupled(Schedule):
+    """Common M256/K256 retained-ring MXFP8 projection schedule.
+
+    The input tensors use the existing native K128 prepack.  Placement performs
+    setup-only compaction into homogeneous K-pair streams; the device operator
+    receives no projection identity or shape-specific implementation choice.
+    An optional leading batch dimension represents independent projections
+    with distinct weights and activations, such as the eight O-a projections.
+    """
+
+    TILE_M = 128
+    OUTPUT_TILES = 2
+    TILE_K = 128
+    SCALE_PACK = 2
+    WEIGHT_TILE_BYTES = 16896
+    WEIGHT_DATA_BYTES = TILE_M * TILE_K
+    WEIGHT_SCALE_BYTES = 512
+    ACTIVATION_TILE_BYTES = 2048
+    ACTIVATION_DATA_BYTES = 8 * TILE_K
+    WEIGHT_STREAM_BYTES = (
+        OUTPUT_TILES * SCALE_PACK * WEIGHT_DATA_BYTES
+        + OUTPUT_TILES * WEIGHT_SCALE_BYTES
+    )
+    AREA_SLOTS = TmaLoadMxfpCoupledStream.FP8_AREA_SLOTS
+
+    def __init__(
+        self,
+        weight_tiles,
+        activation_tiles,
+        output,
+        *,
+        split_k: int = 1,
+        balanced_k: bool = False,
+    ):
+        super().__init__()
+        self.weight_tiles = weight_tiles
+        self.activation_tiles = activation_tiles
+        self.output = output
+        self.split_k = int(split_k)
+        self.balanced_k = bool(balanced_k)
+
+    def _on_place(self):
+        if (
+            self.weight_tiles.dtype != torch.uint8
+            or self.weight_tiles.ndim not in (3, 4)
+            or self.weight_tiles.shape[-1] != self.WEIGHT_TILE_BYTES
+            or not self.weight_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "coupled FP8 weights must be contiguous uint8 "
+                "[M/128,K/128,16896] or [B,M/128,K/128,16896]"
+            )
+        self.weight_batches = (
+            self.weight_tiles.unsqueeze(0)
+            if self.weight_tiles.ndim == 3
+            else self.weight_tiles
+        )
+        self.batch_size, self.m_tiles, self.k_tiles, _ = (
+            self.weight_batches.shape
+        )
+        if self.m_tiles % self.OUTPUT_TILES or self.k_tiles % self.SCALE_PACK:
+            raise ValueError("coupled FP8 requires M128 and K256 alignment")
+        if (
+            self.activation_tiles.dtype != torch.uint8
+            or self.activation_tiles.ndim not in (2, 3)
+            or not self.activation_tiles.is_contiguous()
+        ):
+            raise ValueError(
+                "coupled FP8 activations must be contiguous uint8 "
+                "[K/128,2048] or [B,K/128,2048]"
+            )
+        self.activation_batches = (
+            self.activation_tiles.unsqueeze(0)
+            if self.activation_tiles.ndim == 2
+            else self.activation_tiles
+        )
+        if tuple(self.activation_batches.shape) != (
+            self.batch_size,
+            self.k_tiles,
+            self.ACTIVATION_TILE_BYTES,
+        ):
+            raise ValueError(
+                "coupled FP8 activation batch/shape does not match weights"
+            )
+        self.m_pairs = self.m_tiles // self.OUTPUT_TILES
+        self.k_pairs = self.k_tiles // self.SCALE_PACK
+        if self.balanced_k and self.split_k != 1:
+            raise ValueError(
+                "balanced coupled FP8 placement cannot also use uniform split_k"
+            )
+        if self.split_k <= 0 or self.k_pairs % self.split_k:
+            raise ValueError("coupled FP8 split_k must divide K/256")
+        self.k_pairs_per_split = self.k_pairs // self.split_k
+        self.work_per_batch = self.m_pairs * self.split_k
+        self.work_tiles = self.batch_size * self.work_per_batch
+        max_useful_sms = (
+            self.batch_size * self.m_pairs * self.k_pairs
+            if self.balanced_k
+            else self.work_tiles
+        )
+        if not 0 < self.num_sms <= max_useful_sms:
+            raise ValueError(
+                f"coupled FP8 projection requires 1..{max_useful_sms} SMs"
+            )
+        if not self.balanced_k:
+            max_work_per_sm = (
+                self.work_tiles + self.num_sms - 1
+            ) // self.num_sms
+            if (
+                max_work_per_sm * self.k_pairs_per_split
+                > TmaLoadMxfpCoupledStream.MAX_PHASE_BASE + 1
+            ):
+                raise ValueError(
+                    "coupled FP8 placement exceeds its per-SM phase window"
+                )
+
+        self.rows = self.m_tiles * self.TILE_M
+        self.total_rows = self.batch_size * self.rows
+        self.uses_reduction = self.split_k > 1 or self.balanced_k
+        if not self.uses_reduction:
+            if (
+                not isinstance(self.output, torch.Tensor)
+                or self.output.dtype != torch.bfloat16
+                or self.output.numel() != self.total_rows
+                or not self.output.is_contiguous()
+            ):
+                raise ValueError(
+                    "unsplit coupled FP8 output must be contiguous BF16 [B,M]"
+                )
+            self.direct_output = self.output.reshape(-1)
+            self.reduction_bytes = Fp8GemvUmmaCoupledSm100.BF16_BYTES
+        else:
+            output_mat = getattr(self.output, "mat", None)
+            flat_reduce_shape = (1, self.total_rows)
+            tiled_reduce_shape = (
+                self.total_rows // self.TILE_M,
+                self.TILE_M,
+            )
+            if (
+                getattr(self.output, "mode", None) != "reduce"
+                or output_mat is None
+                or output_mat.dtype not in (torch.bfloat16, torch.float32)
+                or tuple(output_mat.shape)
+                not in (flat_reduce_shape, tiled_reduce_shape)
+                or not output_mat.is_contiguous()
+            ):
+                raise ValueError(
+                    "split coupled FP8 output must be contiguous BF16/FP32 "
+                    "flat or M128-tiled row-major TMA reduction storage"
+                )
+            self.tiled_reduce_output = (
+                tuple(output_mat.shape) == tiled_reduce_shape
+            )
+            self.reduction_bytes = output_mat.element_size()
+
+        # Offline layout conversion: data for the four M128/K128 products is
+        # contiguous, followed by one packed SFA image per output.  The
+        # immutable weights are compacted during setup.  Activations remain in
+        # their producer-written two-tile layout; LDU1 gathers the two data
+        # images and the packed SFB image directly so placement never snapshots
+        # a dynamic activation before its producer runs.
+        weight_data = (
+            self.weight_batches[..., : self.WEIGHT_DATA_BYTES]
+            .contiguous()
+            .reshape(
+                self.batch_size,
+                self.m_pairs,
+                self.OUTPUT_TILES,
+                self.k_pairs,
+                self.SCALE_PACK,
+                self.WEIGHT_DATA_BYTES,
+            )
+            .permute(0, 1, 3, 2, 4, 5)
+            .contiguous()
+            .reshape(self.batch_size, self.m_pairs, self.k_pairs, -1)
+        )
+        weight_scale = (
+            self.weight_batches[
+                ..., :: self.SCALE_PACK, self.WEIGHT_DATA_BYTES :
+            ]
+            .contiguous()
+            .reshape(
+                self.batch_size,
+                self.m_pairs,
+                self.OUTPUT_TILES,
+                self.k_pairs,
+                self.WEIGHT_SCALE_BYTES,
+            )
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .reshape(self.batch_size, self.m_pairs, self.k_pairs, -1)
+        )
+        weight_stream_m_major = torch.cat(
+            (weight_data, weight_scale), dim=3
+        ).contiguous()
+        if weight_stream_m_major.shape[3] != self.WEIGHT_STREAM_BYTES:
+            raise ValueError("internal coupled FP8 weight layout mismatch")
+        self.weight_stream = weight_stream_m_major
+
+        if self.balanced_k:
+            self._build_balanced_tasks()
+        else:
+            plans = torch.empty(
+                (self.work_tiles, 2), dtype=torch.int64, device="cpu"
+            )
+            for work in range(self.work_tiles):
+                batch, batch_work = divmod(work, self.work_per_batch)
+                split, m_pair = divmod(batch_work, self.m_pairs)
+                pair_start = split * self.k_pairs_per_split
+                plans[work, 0] = self.weight_stream[
+                    batch, m_pair, pair_start
+                ].data_ptr()
+                plans[work, 1] = self.activation_batches[
+                    batch,
+                    pair_start * self.SCALE_PACK
+                ].data_ptr()
+            self.stream_plans = plans.to(self.weight_tiles.device)
+
+    def _build_balanced_tasks(self):
+        """Split only the output tiles needed to equalize K-pair work."""
+        output_pairs = self.batch_size * self.m_pairs
+        whole_per_sm, remaining_outputs = divmod(
+            output_pairs, self.num_sms
+        )
+        tasks = [[] for _ in range(self.num_sms)]
+        pair_loads = [0 for _ in range(self.num_sms)]
+        next_output = 0
+        for _ in range(whole_per_sm):
+            for sm in range(self.num_sms):
+                batch, m_pair = divmod(next_output, self.m_pairs)
+                tasks[sm].append((batch, m_pair, 0, self.k_pairs))
+                pair_loads[sm] += self.k_pairs
+                next_output += 1
+
+        target_pair_load = (
+            output_pairs * self.k_pairs + self.num_sms - 1
+        ) // self.num_sms
+        shard_limit = target_pair_load - whole_per_sm * self.k_pairs
+        if remaining_outputs and shard_limit <= 0:
+            raise ValueError("internal balanced coupled FP8 shard limit is zero")
+        shards = []
+        for output_index in range(
+            next_output, next_output + remaining_outputs
+        ):
+            batch, m_pair = divmod(output_index, self.m_pairs)
+            pair_start = 0
+            while pair_start < self.k_pairs:
+                pair_count = min(
+                    shard_limit, self.k_pairs - pair_start
+                )
+                shards.append((batch, m_pair, pair_start, pair_count))
+                pair_start += pair_count
+
+        for task in shards:
+            sm = min(
+                range(self.num_sms),
+                key=lambda index: (
+                    pair_loads[index], len(tasks[index]), index
+                ),
+            )
+            tasks[sm].append(task)
+            pair_loads[sm] += task[3]
+
+        if max(pair_loads, default=0) > (
+            TmaLoadMxfpCoupledStream.MAX_PHASE_BASE + 1
+        ):
+            raise ValueError(
+                "balanced coupled FP8 placement exceeds its per-SM phase window"
+            )
+
+        plan_specs = []
+        self.balanced_tasks = [[] for _ in range(self.num_sms)]
+        for sm, sm_tasks in enumerate(tasks):
+            for batch, m_pair, pair_start, pair_count in sm_tasks:
+                plan_index = len(plan_specs)
+                plan_specs.append((batch, m_pair, pair_start))
+                self.balanced_tasks[sm].append(
+                    (batch, m_pair, pair_start, pair_count, plan_index)
+                )
+        self.work_tiles = len(plan_specs)
+        plans = torch.empty(
+            (self.work_tiles, 2), dtype=torch.int64, device="cpu"
+        )
+        for plan_index, (batch, m_pair, pair_start) in enumerate(plan_specs):
+            plans[plan_index, 0] = self.weight_stream[
+                batch, m_pair, pair_start
+            ].data_ptr()
+            plans[plan_index, 1] = self.activation_batches[
+                batch, pair_start * self.SCALE_PACK
+            ].data_ptr()
+        self.stream_plans = plans.to(self.weight_tiles.device)
+
+    def _work_shard(self, sm):
+        work_per_sm, extra = divmod(self.work_tiles, self.num_sms)
+        work_start = sm * work_per_sm + min(sm, extra)
+        work_count = work_per_sm + int(sm < extra)
+        return work_start, work_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        if self.balanced_k:
+            work_items = self.balanced_tasks[sm]
+        else:
+            work_start, work_count = self._work_shard(sm)
+            work_items = []
+            for work in range(work_start, work_start + work_count):
+                batch, batch_work = divmod(work, self.work_per_batch)
+                _, m_pair = divmod(batch_work, self.m_pairs)
+                work_items.append(
+                    (
+                        batch,
+                        m_pair,
+                        0,
+                        self.k_pairs_per_split,
+                        work,
+                    )
+                )
+        instructions = []
+        phase_base = 0
+        work_count = len(work_items)
+        for local_work, (
+            batch,
+            m_pair,
+            _,
+            pair_count,
+            plan_index,
+        ) in enumerate(work_items):
+            instructions.append(
+                Fp8GemvUmmaCoupledSm100(
+                    pair_count,
+                    self.reduction_bytes,
+                    phase_base,
+                )
+            )
+            instructions.append(
+                TmaLoadMxfpCoupledStream(
+                    self.stream_plans[plan_index].data_ptr(),
+                    kind=TmaLoadMxfpCoupledStream.FP8_GEMV,
+                    stages=TmaLoadMxfpCoupledStream.FP8_STAGES,
+                    area_slots=self.AREA_SLOTS,
+                    area_id=local_work,
+                    stream_length=pair_count,
+                    phase_base=phase_base,
+                )
+            )
+            for output_group in range(self.OUTPUT_TILES):
+                output_tile = (
+                    (batch * self.m_pairs + m_pair) * self.OUTPUT_TILES
+                    + output_group
+                )
+                if not self.uses_reduction:
+                    row_start = output_tile * self.TILE_M
+                    store = TmaStore1D(
+                        self.direct_output[
+                            row_start : row_start + self.TILE_M
+                        ]
+                    )
+                else:
+                    store = (
+                        self.output.cord(output_tile, 0)
+                        if self.tiled_reduce_output
+                        else self.output.cord(
+                            0, output_tile * self.TILE_M
+                        )
+                    )
+                if (
+                    local_work + 1 == work_count
+                    and output_group + 1 == self.OUTPUT_TILES
+                ):
+                    store.bar(self._bar("output"))
+                instructions.append(store)
+            phase_base += pair_count
         return instructions
 
     def bar_release_count(self, role: str):

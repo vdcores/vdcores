@@ -40,6 +40,7 @@ from dae.instructions import (
     LduProfileLayer,
     Fp8GemvUmmaSplitKSm100,
     Fp8GemvUmmaStreamSm100,
+    Fp8GemvUmmaCoupledSm100,
     Fp8UmmaPrepackSm100,
     Mxfp4Mxfp8GemvUmmaK512MetaScaleFp32Sm100,
     Mxfp4Mxfp8GemvUmmaK512TmaScaleFp32Sm100,
@@ -83,6 +84,7 @@ from dae.schedule import (
     SchedDsv4RmsRope512_64,
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
+    SchedFp8GemvUmmaCoupled,
     SchedMxfp4Mxfp8GemvUmmaK512,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
     SchedMxfp4Mxfp8DownFixedRing,
@@ -1540,6 +1542,159 @@ def test_fp8_native_splitk_balances_more_work_tiles_than_sms(monkeypatch):
     assert sum(bool(inst.opcode & 16) for inst in first_stores) == 1
     assert first_stores[-1].opcode & 16
     assert schedule.bar_release_count("output") == 152
+
+
+def test_fp8_coupled_stream_uses_one_allocator_lease_for_both_ldus(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    weights = torch.empty((4, 8, 16896), dtype=torch.uint8)
+    activations = torch.empty((8, 2048), dtype=torch.uint8)
+    output = torch.empty((512,), dtype=torch.bfloat16)
+    schedule = SchedFp8GemvUmmaCoupled(
+        weights, activations, output
+    ).bar("output", 7).place(2)
+
+    instructions = schedule.schedule(0)
+    compute = [
+        inst for inst in instructions
+        if isinstance(inst, Fp8GemvUmmaCoupledSm100)
+    ]
+    coupled = [
+        inst for inst in instructions
+        if isinstance(inst, TmaLoadMxfpCoupledStream)
+    ]
+
+    assert [inst.args for inst in compute] == [[4, 2, 0]]
+    assert len(coupled) == 1
+    assert coupled[0].opcode & 1
+    assert coupled[0].num_slots == 17
+    assert coupled[0].size == 4
+    assert coupled[0].annotation["coupled_stream_dual_port"]
+    assert schedule.weight_stream.shape == (1, 2, 4, 66560)
+    assert not hasattr(schedule, "activation_stream")
+    assert schedule.bar_release_count("output") == 2
+
+
+def test_fp8_coupled_batch_flattens_independent_projection_work(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    weights = torch.empty((2, 2, 2, 16896), dtype=torch.uint8)
+    activations = torch.empty((2, 2, 2048), dtype=torch.uint8)
+    output = torch.empty((2, 256), dtype=torch.bfloat16)
+    schedule = SchedFp8GemvUmmaCoupled(
+        weights, activations, output
+    ).place(2)
+
+    first = schedule.schedule(0)
+    second = schedule.schedule(1)
+    first_load = next(
+        inst for inst in first if isinstance(inst, TmaLoadMxfpCoupledStream)
+    )
+    second_load = next(
+        inst for inst in second if isinstance(inst, TmaLoadMxfpCoupledStream)
+    )
+
+    assert schedule.weight_stream.shape == (2, 1, 1, 66560)
+    assert schedule.work_tiles == 2
+    first_address = sum(
+        value << (16 * index) for index, value in enumerate(first_load.cords)
+    )
+    second_address = sum(
+        value << (16 * index) for index, value in enumerate(second_load.cords)
+    )
+    assert first_address == schedule.stream_plans[0].data_ptr()
+    assert second_address == schedule.stream_plans[1].data_ptr()
+
+
+def test_fp8_coupled_balanced_k_splits_only_the_placement_tail(monkeypatch):
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    weights = torch.empty((10, 8, 16896), dtype=torch.uint8)
+    activations = torch.empty((8, 2048), dtype=torch.uint8)
+    accumulator = torch.empty((10, 128), dtype=torch.bfloat16)
+    output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
+        "reduce", 1, 128
+    )
+    schedule = SchedFp8GemvUmmaCoupled(
+        weights,
+        activations,
+        output_reduce,
+        balanced_k=True,
+    ).place(3)
+
+    pair_loads = []
+    task_counts = []
+    for sm in range(3):
+        compute = [
+            inst
+            for inst in schedule.schedule(sm)
+            if isinstance(inst, Fp8GemvUmmaCoupledSm100)
+        ]
+        pair_loads.append(sum(inst.args[0] for inst in compute))
+        task_counts.append(len(compute))
+
+    assert schedule.work_tiles == 7
+    assert sum(pair_loads) == 5 * 4
+    assert max(pair_loads) == 7
+    assert max(task_counts) == 3
+
+
+def test_fp8_coupled_splitk_keeps_one_common_compute_shape(monkeypatch):
+    monkeypatch.setattr(
+        "dae.runtime.build_tma_desc",
+        lambda *args, **kwargs: torch.empty((128,), dtype=torch.uint8),
+    )
+
+    class FakeLauncher:
+        def new_tma(self, _desc):
+            return 3
+
+    weights = torch.empty((8, 32, 16896), dtype=torch.uint8)
+    activations = torch.empty((32, 2048), dtype=torch.uint8)
+    accumulator = torch.empty((1, 1024), dtype=torch.float32)
+    output_reduce = TmaTensor(FakeLauncher(), accumulator).rowmajor_2d(
+        "reduce", 1, 128
+    )
+    schedule = SchedFp8GemvUmmaCoupled(
+        weights, activations, output_reduce, split_k=2
+    ).place(4)
+
+    instructions = schedule.schedule(0)
+    compute = [
+        inst for inst in instructions
+        if isinstance(inst, Fp8GemvUmmaCoupledSm100)
+    ]
+    coupled = [
+        inst for inst in instructions
+        if isinstance(inst, TmaLoadMxfpCoupledStream)
+    ]
+    stores = [
+        inst for inst in instructions
+        if isinstance(inst, MemoryInstruction) and inst.opcode & 2
+    ]
+
+    assert [inst.args for inst in compute] == [
+        [8, 4, 0],
+        [8, 4, 8],
+    ]
+    assert [inst.size for inst in coupled] == [8, 8]
+    assert all(inst.num_slots == 17 for inst in coupled)
+    assert len(stores) == 4
+    assert all(
+        (inst.opcode & ~16) == opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D
+        for inst in stores
+    )
 
 
 def test_dsv4_shard_swiglu_encodes_bound_and_width():

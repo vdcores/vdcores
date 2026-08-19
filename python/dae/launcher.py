@@ -254,6 +254,11 @@ class Launcher:
         self.mptrs = [0 for _ in range(num_sms)]
 
         self.tmas = []
+        # Schedules may own setup-only packed tensors whose addresses are
+        # embedded in memory plans. Keep the instruction sources alive for
+        # the lifetime of the launcher instead of retaining only encoded
+        # integer addresses in the builders.
+        self._instruction_sources = []
 
         self.need_instruction_build = True
         self._compute_operator_names = None
@@ -513,6 +518,7 @@ class Launcher:
 
     def i(self, *insts):
         """Add instructions to all SM builders."""
+        self._instruction_sources.extend(insts)
         for inst in insts:
             for b in self.builder:
                 b.add(inst)

@@ -1,20 +1,50 @@
 #pragma once
 
-// Fixed shared-memory contract for the dedicated resident MXFP4/MXFP8 FFN
-// path.  The memory and compute virtual cores use these addresses directly;
-// no allocator lease or ring-base publication is part of the protocol.
+// Shared-memory contracts for coupled MX streams. The resident MXFP4/MXFP8
+// FFN kinds use fixed addresses; the common MXFP8 projection kind below uses
+// an ordinary allocator-owned retained-ring lease.
 namespace dae_mxfp_resident_ffn {
 
 enum CoupledStreamKind : uint16_t {
   kCoupledLinear1 = 0,
   kCoupledDownWeight = 1,
   kCoupledDownActivation = 2,
+  // Allocator-owned, projection-agnostic MXFP8 x MXFP8 GEMV stream.  Unlike
+  // the three resident-FFN kinds above, this form publishes one normal M2C
+  // lease and sends the same immutable command to both LDUs.
+  kCoupledFp8Gemv = 3,
 };
 
 static constexpr uint16_t kCoupledKindMask = 0x000f;
 static constexpr int kCoupledStagesShift = 4;
 static constexpr uint16_t kCoupledStagesMask = 0x00f0;
 static constexpr uint16_t kCoupledLocalChain = 0x0100;
+static constexpr int kCoupledPhaseBaseShift = 9;
+static constexpr uint16_t kCoupledPhaseBaseMask = 0xfe00;
+
+// Common native MXFP8 x MXFP8 ring. Each retained K256 stage carries both
+// M128 output groups, their packed SFA images, and the shared activation/SFB.
+static constexpr int kFp8CoupledStages = 2;
+static constexpr int kFp8CoupledWeightDataBytes = 4 * 128 * 128;
+static constexpr int kFp8CoupledWeightScaleBytes = 2 * 512;
+static constexpr int kFp8CoupledActivationDataBytes = 2 * 8 * 128;
+static constexpr int kFp8CoupledActivationScaleBytes = 1024;
+static constexpr int kFp8CoupledWeightScaleOffset =
+    kFp8CoupledWeightDataBytes;
+static constexpr int kFp8CoupledActivationDataOffset =
+    kFp8CoupledWeightScaleOffset + kFp8CoupledWeightScaleBytes;
+static constexpr int kFp8CoupledActivationScaleOffset =
+    kFp8CoupledActivationDataOffset + kFp8CoupledActivationDataBytes;
+static constexpr int kFp8CoupledStageBytes = 68 * 1024;
+static constexpr int kFp8CoupledRingBytes =
+    kFp8CoupledStages * kFp8CoupledStageBytes;
+static constexpr int kFp8CoupledAreaSlots =
+    (kFp8CoupledRingBytes + 8 * 1024 - 1) / (8 * 1024);
+static_assert(
+    kFp8CoupledActivationScaleOffset +
+        kFp8CoupledActivationScaleBytes <= kFp8CoupledStageBytes);
+static_assert(kFp8CoupledRingBytes == 136 * 1024);
+static_assert(kFp8CoupledAreaSlots == 17);
 
 static constexpr int kLinear1Stages = 2;
 static constexpr int kLinear1WeightStageBytes = 64 * 1024;

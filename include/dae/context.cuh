@@ -129,9 +129,23 @@ static constexpr int mxfpDownResidentReductionReadyBarrierCount = 3;
 static constexpr int mxfpDownResidentLdu1PollStartBarrier =
     mxfpDownResidentReductionReadyBarrierBase + 2;
 
-static constexpr int tmemMmaBarrierCount =
+// The allocator-owned common MXFP8 stream uses independent weight,
+// activation, UMMA-completion, and empty barriers for each of its two ring
+// stages.  These barriers persist across sequential generic projection tasks;
+// Python supplies each task's cumulative K-pair phase base.
+static constexpr int mxfp8CoupledStages = 2;
+static constexpr int mxfp8CoupledWeightFullBarrierBase =
     mxfpDownResidentReductionReadyBarrierBase +
     mxfpDownResidentReductionReadyBarrierCount;
+static constexpr int mxfp8CoupledActivationFullBarrierBase =
+    mxfp8CoupledWeightFullBarrierBase + mxfp8CoupledStages;
+static constexpr int mxfp8CoupledUmmaFullBarrierBase =
+    mxfp8CoupledActivationFullBarrierBase + mxfp8CoupledStages;
+static constexpr int mxfp8CoupledEmptyBarrierBase =
+    mxfp8CoupledUmmaFullBarrierBase + mxfp8CoupledStages;
+
+static constexpr int tmemMmaBarrierCount =
+    mxfp8CoupledEmptyBarrierBase + mxfp8CoupledStages;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);

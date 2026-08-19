@@ -358,6 +358,18 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_BLOCK128_GEMV_BF16_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_COUPLED_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
+             tmem_mma_phase, fp8_umma_pipeline_phase_mask,
+             nvfp4_umma_pipeline_phase_mask, scratch_space, tma_descs,
+             global_bars, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_fp8_gemv_umma_coupled_sm100(
+      inst.args[0], inst.args[1], inst.args[2], smem_base,
+      tmem_base_ptr, tmem_mma_barrier, m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_FP8_UMMA_PREPACK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);

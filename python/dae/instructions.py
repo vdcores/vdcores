@@ -521,6 +521,30 @@ class Fp8GemvUmmaSplitKSm100(ComputeInstruction):
         )
 
 
+class Fp8GemvUmmaCoupledSm100(ComputeInstruction):
+    """Common retained-ring MXFP8 x MXFP8 M256/K256 task."""
+
+    BF16_BYTES = 2
+    FP32_BYTES = 4
+
+    def __init__(
+        self,
+        k_pairs: int,
+        reduction_bytes: int,
+        phase_base: int,
+    ):
+        if not 1 <= int(k_pairs) <= 0xFFFF:
+            raise ValueError("coupled FP8 K-pair count must fit uint16")
+        if reduction_bytes not in (self.BF16_BYTES, self.FP32_BYTES):
+            raise ValueError("coupled FP8 output must use BF16 or FP32")
+        if not 0 <= int(phase_base) <= 0xFFFF:
+            raise ValueError("coupled FP8 phase base must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_FP8_GEMV_UMMA_COUPLED_SM100,
+            args=[int(k_pairs), int(reduction_bytes), int(phase_base)],
+        )
+
+
 class Fp8GemvUmmaStreamRawScaleSm100(ComputeInstruction):
     """Stream compact FP8 weights and populate SFA TMEM from a raw scale."""
 
@@ -2674,21 +2698,27 @@ class TmaLoad1D(MemoryInstruction):
 
 
 class TmaLoadMxfpCoupledStream(MemoryInstruction):
-    """Produce one fixed-area data/scale stream through either LDU.
+    """Produce one common MX data/scale stream through the LDUs.
 
-    ``area_slots`` is the physical shared-memory footprint, independent of the
-    special mailbox used to publish this non-allocating command.  The Python
-    builder may chain adjacent commands with the same ``area_id`` and port so
-    their persistent LDU state is handed over locally.
+    Resident-FFN kinds retain their fixed-area special-mailbox contract.  The
+    generic MXFP8 kind instead allocates ``area_slots`` from the normal arena,
+    publishes one lease to compute, and dispatches the same plan to both LDUs.
+    The Python builder may still chain adjacent fixed-area commands with the
+    same ``area_id`` and port so their state is handed over locally.
     """
 
     LINEAR1 = 0
     DOWN_WEIGHT = 1
     DOWN_ACTIVATION = 2
+    FP8_GEMV = 3
     KIND_MASK = 0x000F
     STAGES_SHIFT = 4
     STAGES_MASK = 0x00F0
     LOCAL_CHAIN = 0x0100
+    PHASE_BASE_SHIFT = 9
+    MAX_PHASE_BASE = 0x7F
+    FP8_STAGES = 2
+    FP8_AREA_SLOTS = 17
 
     def __init__(
         self,
@@ -2698,12 +2728,19 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         stages: int,
         area_slots: int,
         area_id: int,
-        mailbox: int,
-        port: int,
+        mailbox: int | None = None,
+        port: int | None = None,
+        stream_length: int | None = None,
+        phase_base: int = 0,
     ):
         if plan_address <= 0 or plan_address >= 1 << 64:
             raise ValueError("coupled-stream plan address must fit uint64")
-        if kind not in (self.LINEAR1, self.DOWN_WEIGHT, self.DOWN_ACTIVATION):
+        if kind not in (
+            self.LINEAR1,
+            self.DOWN_WEIGHT,
+            self.DOWN_ACTIVATION,
+            self.FP8_GEMV,
+        ):
             raise ValueError("unknown MXFP coupled-stream kind")
         if not 1 <= int(stages) <= 0xF:
             raise ValueError("coupled-stream pipeline depth must fit four bits")
@@ -2711,8 +2748,39 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
             raise ValueError("coupled-stream area size must fit uint16")
         if not 0 <= int(area_id) <= 0xFFFF:
             raise ValueError("coupled-stream area id must fit uint16")
-        if not 0 <= int(mailbox) < config.num_special_slots:
+        if kind == self.FP8_GEMV:
+            if int(stages) != self.FP8_STAGES:
+                raise ValueError("coupled FP8 stream requires two stages")
+            if int(area_slots) != self.FP8_AREA_SLOTS:
+                raise ValueError("coupled FP8 stream requires a 17-slot ring")
+            if mailbox is not None or port is not None:
+                raise ValueError(
+                    "allocator-owned coupled FP8 stream dispatches both LDUs"
+                )
+            if not 1 <= int(stream_length or 0) <= 0xFFFF:
+                raise ValueError("coupled FP8 stream length must fit uint16")
+            if not 0 <= int(phase_base) <= self.MAX_PHASE_BASE:
+                raise ValueError("coupled FP8 memory phase base must fit seven bits")
+            super().__init__(
+                opcode=opcode.OP_TMA_LOAD_MX_COUPLED_STREAM | 1,
+                num_slots=int(area_slots),
+                arg=(
+                    int(kind)
+                    | (int(stages) << self.STAGES_SHIFT)
+                    | (int(phase_base) << self.PHASE_BASE_SHIFT)
+                ),
+                size=int(stream_length),
+                address=plan_address,
+            )
+            self.annotation["coupled_stream_area"] = int(area_id)
+            self.annotation["coupled_stream_kind"] = int(kind)
+            self.annotation["coupled_stream_allocator_lease"] = True
+            self.annotation["coupled_stream_dual_port"] = True
+            return
+        if mailbox is None or not 0 <= int(mailbox) < config.num_special_slots:
             raise ValueError("coupled-stream mailbox is outside special slots")
+        if port not in (0, 1):
+            raise ValueError("fixed coupled stream requires one LDU port")
         super().__init__(
             opcode=opcode.OP_TMA_LOAD_MX_COUPLED_STREAM,
             num_slots=config.num_slots + int(mailbox),
@@ -2723,7 +2791,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         self.annotation["coupled_stream_area"] = int(area_id)
         self.annotation["coupled_stream_kind"] = int(kind)
         self.annotation["coupled_stream_mailbox"] = int(mailbox)
-        self.fixed_port(port)
+        self.fixed_port(int(port))
 
     def local_chain_source(self):
         inst = self.copy()
@@ -3048,6 +3116,7 @@ __all__ = [
     "Fp8Block128GemvBf16Sm100",
     "Fp8GemvUmmaStreamSm100",
     "Fp8GemvUmmaSplitKSm100",
+    "Fp8GemvUmmaCoupledSm100",
     "Fp8GemvUmmaStreamRawScaleSm100",
     "Fp8GemvUmmaSplitKRawScaleSm100",
     "Fp8UmmaPrepackSm100",
