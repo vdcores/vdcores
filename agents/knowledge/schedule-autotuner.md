@@ -9,7 +9,7 @@ fold, operator grouping, overlap boundary) instead of tuning them by hand.
 2. `tools/autotune.py` with static + dry-build legality filtering only. **done**
 3. Timed runs plus a noise-aware objective. **done**
 4. Coordinate-descent search, presets, correctness gate. **done**
-5. Extend to `app/python/llama3/sched.py`, which first needs a `--dry-build` mode.
+5. Extend to `app/python/llama3/sched.py`, which first needs a `--dry-build` mode. **done**
 
 ## Knob Configuration Layer
 
@@ -176,6 +176,97 @@ suggests.
 ```bash
 python tests/test_autotune.py
 ```
+
+## Llama3 8B Target
+
+`app/python/llama3/sched.py` declares 33 knobs under namespace `llama3_8b` and
+is registered in `tools/autotune.py` as target `llama3_8b`.
+
+- `<stage>.sms` and `<stage>.base_sm` for `q_proj`, `q_rope`, `k_proj`,
+  `k_rope`, `v_proj`, `out_proj`, `gate_low`, `gate_high`, `up_low`, `up_high`,
+  `silu`, `gate_fused`, `up_fused`, `silu_fused`, `down_low`, `down_high`
+- `logits.split_m`
+
+All defaults reproduce the previously hardcoded `place(...)` arguments exactly.
+
+### Building Without Weights
+
+Unlike Qwen3, Llama-3.1-8B is **gated**: it needs `HF_TOKEN` set on an account
+that has been granted access. A legality sweep runs the target ~160 times, so
+downloading and loading 16GB per attempt was never an option.
+
+[app/python/llama3/dry_build.py](app/python/llama3/dry_build.py) supplies
+synthetic stand-ins with the same *attribute shape* the real `transformers`
+model exposes -- `model.model.layers[i].self_attn.q_proj.weight`,
+`model.model.rotary_emb`, `model.lm_head.weight`, and so on. The rest of
+`sched.py` runs against them unchanged, so the TMA descriptors, barrier wiring,
+and `place()` -> `validate()` produce the *real* legality answer while only the
+values are fake.
+
+This was deliberately not a restructure of the 1,170-line script into a
+`runtime_context.py` the way Qwen3 is organized. Matching the attribute shape
+touches four places in `sched.py`; extracting a context object would touch
+most of it, for no additional capability.
+
+Consequences worth knowing:
+
+- `--dry-build` needs no token, no download, and no network.
+- It refuses `--prompt`/`--message`, because there is no tokenizer to turn text
+  into the token count the schedule is built around.
+- It defaults to a **1-step** decode schedule. Placement legality does not
+  depend on the decode step count, and the normal 128-step schedule takes far
+  longer to construct.
+- Without `--dry-build` and without `HF_TOKEN`, the script now exits with an
+  explanation instead of a bare `KeyError` on `os.environ['HF_TOKEN']`.
+- The compute-op dump works from a dry build too:
+  `python app/python/llama3/sched.py --dry-build -w ops.txt` writes 11
+  operators, so a runnable runtime can be built before any weights exist.
+
+[tests/test_llama3_dry_build.py](tests/test_llama3_dry_build.py) pins the
+attribute-shape contract on CPU with a tiny geometry, so it needs neither CUDA
+nor a download:
+
+```bash
+python tests/test_llama3_dry_build.py
+```
+
+### Legality Map
+
+45 of 159 candidates build: 50 static-rejected, 64 build-rejected.
+
+Two things stand out against Qwen3:
+
+- **The paired-move problem is worse here.** Ten knobs have `base_sm` legal
+  *only* at 0, and all ten belong to stages sitting at 128 SMs, where any shift
+  runs off a 132-SM device. Their `base_sm` is not really pinned; it is pinned
+  *given* `sms=128`. Drop the stage to 64 SMs and 32 or 64 become reachable.
+  A single-knob sweep cannot see that, which is exactly what `search` is for.
+- **The non-GEMV stages are far freer.** `q_rope.sms` and `silu_fused.sms`
+  accept every one of their eight candidate values, because they are not bound
+  by the GEMV fold rules that reject most SM counts elsewhere.
+
+### Left Untunable On Purpose
+
+- The MLP split constants (`4096`, `2048`, `6144`, `8192`, `mlp_split`) are
+  structurally coupled across `gate_proj_low/high`, `up_proj_low/high`,
+  `gate_proj_fused`, `up_proj_fused`, `silu_fused`, and `down_proj_low/high`.
+  Unlike Qwen3's single `mlp.low`, there is no one value to turn here, so the
+  split is left alone rather than exposed as a knob that cannot be moved safely.
+- `logits_slice` stays at `8192 * logits_fold`, because the selected argmax atom
+  `ARGMAX_PARTIAL_bf16_1024_65536_128` bakes in that 65536. Only the `split_M`
+  fold is exposed, as `logits.split_m`.
+- `Gqa` derives its placement from `N * NUM_KV_HEAD`, `Argmax` is fixed at the
+  128 its atom encodes, the `*_rms` stages follow `rms_sms`, and `copy_hidden`,
+  `clear_*`, and `restore_bars_*` sit on fixed spare SMs.
+- `no_prefetch` is a Qwen3 knob only. Llama3 has no `maybe_no_prefetch` helper,
+  and adding one is a separate change.
+
+### Not Yet Verified
+
+Everything above is the build path. No Llama3 schedule has been **run** here,
+because that needs `HF_TOKEN` and the weights. In particular the correctness
+gate is registered (`--correctness`) but unexercised on this target, and the
+required compute ops have not been compiled into a runtime.
 
 ## Building A Runnable Runtime
 

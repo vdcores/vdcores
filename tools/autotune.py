@@ -43,6 +43,13 @@ TARGETS = {
         "dry_build_args": ["--dry-build"],
         "correctness_args": ["--correctness"],
     },
+    "llama3_8b": {
+        "namespace": "llama3_8b",
+        "script": "app/python/llama3/sched.py",
+        "dry_build_args": ["--dry-build"],
+        # Needs HF_TOKEN and real weights; --dry-build does not.
+        "correctness_args": ["--correctness"],
+    },
 }
 
 
