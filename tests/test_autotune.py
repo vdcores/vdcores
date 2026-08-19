@@ -738,6 +738,112 @@ def test_unknown_group_is_rejected():
         raise AssertionError("expected an unknown group name to be rejected")
 
 
+def test_classify_failure_ignores_cpp_stack_frames():
+    """A c10 stack frame contains "Error:" and must not outrank the message.
+
+    Observed for real: a whole sweep of runtime failures reported only
+    "frame #0: c10::Error::Error(c10::SourceLocation, ...)", which says
+    nothing except that an error happened.
+    """
+    output = (
+        "[bench] VDCores with 132 SMs...\n"
+        "RuntimeError: launch_dae failed: misaligned address\n"
+        "Exception raised from py_launch_dae at src/torch_runtime.cu:162\n"
+        "frame #0: c10::Error::Error(c10::SourceLocation, std::string) + 0xe8\n"
+        "frame #1: something_else + 0x24\n"
+    )
+    assert autotune.classify_failure(output) == (
+        "RuntimeError: launch_dae failed: misaligned address"
+    )
+
+
+def test_classify_failure_still_finds_a_python_assertion():
+    output = (
+        "  File \"schedule.py\", line 471, in _on_place\n"
+        "AssertionError: SMS must be multiple of M tiles, got SMS=48\n"
+    )
+    assert "SMS must be multiple" in autotune.classify_failure(output)
+
+
+def test_measure_rounds_stops_retrying_a_candidate_that_never_runs():
+    """A schedule can dry-build and still die on launch every single time."""
+    calls = []
+
+    def fake_run_timed(target, values, args, workdir):
+        label = values["label"]
+        calls.append(label)
+        if label == "broken":
+            return "fail", None, "launch_dae failed: misaligned address"
+        return "ok", 1_000_000.0, None
+
+    candidates = [
+        autotune.Candidate({"label": "current"}, {}, "current"),
+        autotune.Candidate({"label": "broken"}, {"k": 1}, "broken"),
+        autotune.Candidate({"label": "fine"}, {"k": 2}, "fine"),
+    ]
+    args = argparse.Namespace(repeats=8, seed=0, drop_after=2)
+
+    original = autotune.run_timed
+    autotune.run_timed = fake_run_timed
+    try:
+        samples, failures = autotune.measure_rounds(None, candidates, args, ".")
+    finally:
+        autotune.run_timed = original
+
+    # tried twice, then dropped, rather than all eight rounds
+    assert calls.count("broken") == 2, calls.count("broken")
+    assert calls.count("fine") == 8
+    assert calls.count("current") == 8
+    assert samples["broken"] == []
+    assert "broken" in failures
+
+
+def test_measure_rounds_keeps_a_candidate_that_recovers():
+    """One transient failure should not disqualify a working schedule."""
+    state = {"n": 0}
+
+    def fake_run_timed(target, values, args, workdir):
+        if values["label"] == "flaky":
+            state["n"] += 1
+            if state["n"] == 1:
+                return "fail", None, "transient"
+        return "ok", 1_000_000.0, None
+
+    candidates = [
+        autotune.Candidate({"label": "current"}, {}, "current"),
+        autotune.Candidate({"label": "flaky"}, {"k": 1}, "flaky"),
+    ]
+    args = argparse.Namespace(repeats=6, seed=0, drop_after=2)
+
+    original = autotune.run_timed
+    autotune.run_timed = fake_run_timed
+    try:
+        samples, _ = autotune.measure_rounds(None, candidates, args, ".")
+    finally:
+        autotune.run_timed = original
+
+    assert len(samples["flaky"]) == 5, samples["flaky"]
+
+
+def test_measure_rounds_never_drops_the_reference():
+    """Dropping the reference would leave nothing to compare against."""
+    def fake_run_timed(target, values, args, workdir):
+        return "fail", None, "everything is broken"
+
+    candidates = [autotune.Candidate({"label": "current"}, {}, "current")]
+    args = argparse.Namespace(repeats=4, seed=0, drop_after=2)
+
+    original = autotune.run_timed
+    autotune.run_timed = fake_run_timed
+    calls = []
+    autotune.run_timed = lambda *a, **k: (calls.append(1), ("fail", None, "x"))[1]
+    try:
+        autotune.measure_rounds(None, candidates, args, ".")
+    finally:
+        autotune.run_timed = original
+    assert len(calls) == 4
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0

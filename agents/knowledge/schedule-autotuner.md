@@ -302,6 +302,36 @@ more than it sounds: a gate that fails on the baseline would make `search`
 refuse to adopt *anything*, and it would look like "the search found nothing"
 rather than "the gate is broken".
 
+### The Dry-Build Blind Spot Is Real, Not Theoretical
+
+A schedule can pass `--dry-build` and still die on launch. Observed on the
+first Llama3 search:
+
+```
+DAE_TUNE_SET="down_high.sms=64,down_high.base_sm=32" python app/python/llama3/sched.py -b 3
+RuntimeError: launch_dae failed: misaligned address
+```
+
+`--dry-build` constructs the schedule but never launches it, so an alignment
+constraint that only bites the real launch is invisible to `check`. Two of the
+three legal `down_high` placements fail this way.
+
+This is not a correctness risk for the search -- a candidate that never
+produces a timing cannot be adopted -- but it has two consequences that were
+worth fixing before spending a night on it:
+
+1. **`classify_failure` reported nothing useful.** A c10 stack frame like
+   `c10::Error::Error(c10::SourceLocation, ...)` contains the substring
+   `Error:`, so it outranked the real message and every runtime failure in the
+   sweep read as `frame #0: c10::Error::Error(...)`. Stack frames are now
+   dropped before the search for an informative line.
+2. **Failing candidates were retried every round.** Eight rounds against a
+   schedule that crashes every time buys nothing. `measure_rounds` now stops
+   retrying after `--drop-after` failures (default 2, so a transient failure
+   still gets a second chance) when the candidate has produced no timing at
+   all. The reference arm is never dropped. On the observed failure rate this
+   is roughly an hour saved per pass.
+
 ### One Environment Trap
 
 Do not set `HF_HOME` when running a gated target. `hf auth login` stores its

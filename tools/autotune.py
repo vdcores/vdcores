@@ -286,10 +286,22 @@ def config_key(values):
 # ------------------------------------------------------------ dry-build run
 
 
+STACK_FRAME = re.compile(r"^(frame #\d+|#\d+\s|at\s+/|File \")")
+
+
 def classify_failure(output):
-    """Pull the most informative line out of a failed build."""
-    interesting = ("AssertionError", "ValueError", "KnobError", "Error:", "error:")
+    """Pull the most informative line out of a failed build or run.
+
+    Stack frames are dropped before the search, because a C++ frame such as
+    `c10::Error::Error(c10::SourceLocation, ...)` contains the substring
+    `Error:` and would otherwise outrank the actual message. A whole sweep of
+    runtime failures once reported nothing but that frame, which said only
+    that an error existed.
+    """
+    interesting = ("AssertionError", "RuntimeError", "ValueError", "KnobError",
+                   "Error:", "error:")
     lines = [line.strip() for line in output.splitlines() if line.strip()]
+    lines = [line for line in lines if not STACK_FRAME.match(line)]
     for line in reversed(lines):
         if any(marker in line for marker in interesting):
             return line[:400]
@@ -595,9 +607,17 @@ def measure_rounds(target, candidates, args, workdir, on_sample=None):
     rng = random.Random(args.seed)
     samples = {candidate.label: [] for candidate in candidates}
     failures = {}
+    fail_counts = {}
+    dropped = set()
+    # A schedule can pass the dry build and still die on launch, e.g. with
+    # "launch_dae failed: misaligned address". Such a candidate fails every
+    # round, so retrying it for the whole budget buys nothing. Give it a
+    # couple of chances in case the failure was transient, then stop.
+    drop_after = getattr(args, "drop_after", 2)
+    protected = {"baseline", "current", "origin"}
 
     for round_index in range(args.repeats):
-        order = list(candidates)
+        order = [c for c in candidates if c.label not in dropped]
         rng.shuffle(order)
         for candidate in order:
             status, ns, reason = run_timed(target, candidate.values, args, workdir)
@@ -605,6 +625,17 @@ def measure_rounds(target, candidates, args, workdir, on_sample=None):
                 samples[candidate.label].append(ns)
             else:
                 failures.setdefault(candidate.label, (status, reason))
+                fail_counts[candidate.label] = fail_counts.get(candidate.label, 0) + 1
+                if (
+                    drop_after
+                    and candidate.label not in protected
+                    and not samples[candidate.label]
+                    and fail_counts[candidate.label] >= drop_after
+                ):
+                    dropped.add(candidate.label)
+                    print(f"  [drop] {candidate.label}: failed "
+                          f"{fail_counts[candidate.label]}x with no timing, "
+                          f"skipping the remaining rounds", flush=True)
             if on_sample is not None:
                 on_sample(round_index, candidate, status, ns, reason)
     return samples, failures
@@ -1439,6 +1470,9 @@ def main(argv=None):
                              help="DAE_BENCH_WARMUP launches before timing")
         parser_.add_argument("--seed", type=int, default=0,
                              help="Seed for the per-round shuffle")
+        parser_.add_argument("--drop-after", type=int, default=2,
+                             help="Stop retrying a candidate after this many "
+                                  "failures with no timing; 0 keeps retrying")
         parser_.add_argument("--kill-stale", action="store_true",
                              help="pkill leftover runs of this target between measurements")
         parser_.add_argument("--post-launch-timeout", type=float, default=120.0)
