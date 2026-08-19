@@ -81,3 +81,6 @@ debug*.log
 inst*.txt
 inst*.dump
 *.vdcore.build
+
+# Autotuner run artifacts (machine-specific)
+tuning/
