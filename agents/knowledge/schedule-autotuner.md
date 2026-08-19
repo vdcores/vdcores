@@ -142,6 +142,13 @@ So the milestone 4 search cannot move one knob at a time for placement. SM
 count and base SM of a stage have to move as a pair, or wide placements are
 unreachable from the current baseline.
 
+The real-hardware sweep confirmed this is the dominant limitation, not a corner
+case. Of the 23 knobs, five have **no** legal alternative to their current value
+when the others sit at baseline: `gate_low.sms`, `up_low.sms`, `logits.split_m`,
+`mlp.low`, and `silu.base_sm`. Most of the rest have one or two. A single-knob
+sweep therefore explores only the immediate neighbourhood of a schedule a human
+already hand-tuned, which is close to a tautological test.
+
 ## Fixture
 
 [tests/fake_sched.py](tests/fake_sched.py) is a stand-in target that declares
@@ -160,6 +167,123 @@ suggests.
 ```bash
 python tests/test_autotune.py
 ```
+
+## Building A Runnable Runtime
+
+Structural, and easy to lose a day to. A default `make pyext` build produces a
+runtime that **builds** every schedule but **cannot launch** the qwen3_1p7b one:
+
+```
+ValueError: Missing runtime opcode for op-family instruction
+OP_GEMV_WGMMA__M_64__N_8__K_256__BLOAD_4__RESIDUAL_0
+```
+
+The default op selection is static-only (26 ops, 0 dynamic). The op family the
+GEMV stages need is generated on demand, so the required set has to be dumped
+from the schedule first and compiled in:
+
+```bash
+python app/python/qwen3_1p7b/sched.py --dry-build -w ops.txt   # 9 operators
+DAE_COMPUTE_OPS_FILE=ops.txt make runtime.o
+python setup.py build_ext --inplace
+```
+
+Two traps worth knowing:
+
+- **`--dry-build` does not catch this.** It constructs the schedule but never
+  encodes instructions, so the missing opcode only surfaces at launch. The
+  driver's legality filter is therefore blind to it by construction: a
+  candidate can pass `check` and still fail under `measure`.
+- **`pip install -e .` does not rebuild on generated-header changes.** setuptools
+  tracks `src/torch_runtime.cu`, not `build/generated/dae/*.inc`. After
+  regenerating the op set it reports "Successfully installed" while reusing the
+  stale object and `.so`. Use `python setup.py build_ext --inplace`, or clear
+  `build/temp.*`, `build/lib.*`, and `python/dae/*.so` first. Confirm with:
+
+  ```bash
+  python -c "from dae.runtime import opcode; print([n for n in vars(opcode) if 'GEMV' in n])"
+  ```
+
+For the current knob surface this costs nothing at search time: the union of
+required ops across all 41 legal candidates is identical to the baseline's 9.
+The knob that would have changed it, `mlp.low`, drives
+`OP_SILU_MUL_SHARED_BF16_K_4096_INTER`, but every non-default `mlp.low` value is
+rejected as illegal anyway. **Re-check this whenever the knob surface or a
+choice list changes**, or `measure` will start reporting spurious failures that
+are really missing opcodes.
+
+The environment itself is not reproducible from `setup.sh` on a non-conda host.
+The two durable facts: CUTLASS must be **4.x or newer**, because
+`include/task/attention.cuh` includes `cute/algorithm/tensor_reduce.hpp`, which
+does not exist in 3.x; and `include/task/argmax.cuh`, `include/task/attention.cuh`,
+and `include/dae/runtime.cuh` rely on `<cfloat>` and `<array>` arriving as
+transitive includes from CUTLASS 3.x, so on 4.x they need
+`NVCC_PREPEND_FLAGS="-include cfloat -include array"` until those includes are
+added properly.
+
+## Verified On Real Hardware
+
+Run on a GH200 480GB (132 SMs, CUDA 12.8, PyTorch 2.7.0+cu128) on 2026-08-19.
+Milestones 1-3 all work end to end against the real target, not just the fixture.
+
+| Check | Result |
+| --- | --- |
+| `python tests/test_tune.py` | 11/11 pass |
+| `python tests/test_autotune.py` | 28/28 pass |
+| `sched.py --dry-build` | ok, 23 knobs at defaults |
+| `autotune.py discover` | 23 knobs, notes `full_sms=132` |
+| `autotune.py check` | 41/115 buildable, 29 static-reject, 45 build-reject, ~9 min |
+| one timed run through the wrapper | ok, median 1.515 ms |
+| `autotune.py noise --repeats 12` | IQR 1.8% of median, range 3.7%, drift negligible |
+
+The fixture is a fair proxy but not exact: it predicted 107 candidates / 40
+legal, the real target gives 115 / 41.
+
+Budget: roughly 20s per timed run including model load, so a full 41-candidate
+sweep at 8 rounds is about two hours.
+
+### The Objective Behaves Correctly On Real Data
+
+`measure` over `q_proj.sms`, `down_proj.sms`, `v_proj.base_sm`, `silu.sms`,
+8 rounds, `--min-effect-pct 1.8`:
+
+```
+Baseline: 1.537 ms median over 8 runs, IQR 0.029 ms
+Confidence 95% spread across 8 comparisons -> 99.3750% per candidate
+
+  down_proj.sms=64   1.542 ms    +0.4%   [-0.018, +0.055]  same
+  v_proj.base_sm=32  1.549 ms    +0.8%   [-0.006, +0.068]  same
+  q_proj.sms=32      1.552 ms    +1.0%   [-0.007, +0.042]  same
+  v_proj.base_sm=64  1.563 ms    +1.7%   [+0.004, +0.070]  same
+  v_proj.base_sm=0   1.568 ms    +2.0%   [-0.001, +0.060]  same
+  down_proj.sms=32   1.753 ms   +14.1%   [+0.194, +0.243]  slower
+  silu.sms=2         2.152 ms   +40.0%   [+0.488, +0.661]  slower
+  silu.sms=1         2.397 ms   +56.0%   [+0.817, +0.936]  slower
+
+0 candidate(s) beat the baseline
+```
+
+Two things this establishes beyond what the fixture tests could:
+
+- `v_proj.base_sm=64` has an interval that excludes zero yet is still reported
+  `same`, because +1.7% does not clear the 1.8% floor. The "significant but not
+  worth acting on" path fires on real data, not only in unit tests.
+- Nothing was crowned. On this knob subset the hand-tuned baseline stands.
+
+That last result should not be read as "search does not help". Every candidate
+here moved a single knob away from a schedule a human had already tuned, so the
+region tested is the one most likely to be already optimal. The paired
+`(sms, base_sm)` moves that milestone 4 exists to explore were unreachable in
+this sweep by construction.
+
+### Rejections That Explain Nothing
+
+Four of the 45 build-rejections (`q_proj.sms=96`, `k_proj.sms=48`,
+`out_proj.sms=96`, `gate_high.sms=96`) report a bare `AssertionError`.
+`classify_failure` is behaving correctly; the cause is that
+`SchedGemv.validate()` in [python/dae/schedule.py](python/dae/schedule.py) has
+asserts with no message string, such as `assert K % self.fold == 0`. Adding
+messages there would make the driver's report self-explaining.
 
 ## Measurement
 
