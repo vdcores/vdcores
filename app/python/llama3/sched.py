@@ -98,14 +98,28 @@ model_name = 'meta-llama/Llama-3.1-8B-Instruct'
 cache_dir = parsed_args.hf_cache_dir
 
 def hf_auth_kwargs():
+  """Resolve a credential the same way qwen3_1p7b does.
+
+  Passing nothing lets huggingface_hub resolve the credential itself, which
+  covers both HF_TOKEN and a token stored by `hf auth login`. Only when there
+  is no credential at all is it worth failing early, because this model is
+  gated and the download would fail with a less obvious 401.
+  """
   token = os.environ.get("HF_TOKEN")
-  if not token:
-    raise SystemExit(
-      f"{model_name} is a gated model and needs HF_TOKEN set to an account that "
-      "has been granted access to it. Use --dry-build to build the schedule "
-      "without weights."
-    )
-  return {"token": token}
+  if token:
+    return {"token": token}
+  try:
+    from huggingface_hub import get_token
+    stored = get_token()
+  except Exception:
+    stored = None
+  if stored:
+    return {}
+  raise SystemExit(
+    f"{model_name} is gated and no Hugging Face credential was found. Run "
+    "`hf auth login`, or set HF_TOKEN, using an account that has been granted "
+    "access to it. Use --dry-build to build the schedule without weights."
+  )
 
 if parsed_args.dry_build:
   # Synthetic stand-ins with the real tensor shapes; see dry_build.py.
