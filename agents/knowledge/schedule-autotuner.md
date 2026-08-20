@@ -616,6 +616,64 @@ Four of the 45 build-rejections (`q_proj.sms=96`, `k_proj.sms=48`,
 asserts with no message string, such as `assert K % self.fold == 0`. Adding
 messages there would make the driver's report self-explaining.
 
+## Result: The Llama3 Search
+
+The first complete search on `llama3_8b`, on a GH200, 2 passes, **2056 timed
+runs**, ~8.5 hours.
+
+```
+Search changed 1 knob(s) over 2 pass(es), 2056 timed runs:
+  pass 1  silu           silu.sms=2, silu.base_sm=128         -1.5%
+
+Head-to-head over 10 fresh rounds each:
+  original baseline  598.388 ms
+  searched config    588.848 ms
+  difference         -1.6%  [-10.969, -7.165] ms  -> faster
+```
+
+The interval excludes zero, the run was clean (0 out-of-memory rejections, 0
+groups skipped for host reasons, 0 aborts), and 226 legal candidates were timed
+across the two passes. **Search beat a hand-tuned schedule, end to end, by
+1.6%.**
+
+### Read It Honestly
+
+- **The margin is small.** 1.6% against a 1.0% effect floor and a 0.4% noise
+  floor. Real and reproducible, not dramatic.
+- **The winning move did not need paired knobs.** `silu.base_sm` stayed at 128;
+  only `silu.sms` moved, 4 -> 2. Pairing made 113 configurations reachable
+  against 44 for single-knob sweeps (2.6x), and **none of those extra 69
+  configurations won**. Milestone 4's mechanism is validated; its premise is
+  not yet paid off.
+- **Almost everything else was already optimal.** 14 of 17 groups in pass 1 and
+  every group in pass 2 returned "nothing beat the current config". The
+  hand-tuned schedule was good, and the search mostly confirmed that.
+- **Not an optimum.** Coordinate descent finds a local optimum along group
+  coordinates, over a hand-chosen grid of candidate values, at a 1% resolution.
+  The defensible claim is "no single-group move detectably improves on this",
+  nothing stronger.
+
+### The Correctness Gate Caught A Real Bug
+
+`gate_high.sms=128` cleared the timing test **and** the confirmation pass, then
+failed the correctness gate. Settled with three standalone runs plus a baseline
+control:
+
+```
+gate_high.sms=128  run 1: FAIL logits_high: 169.887% <= 10.000%
+gate_high.sms=128  run 2: FAIL logits_high: 160.618% <= 10.000%
+gate_high.sms=128  run 3: FAIL logits_high: 169.844% <= 10.000%
+baseline (control): PASS
+```
+
+Deterministic, ~165% error in the high half of the logits projection, and the
+baseline passes under the identical invocation. This is a genuinely wrong
+schedule that is measurably faster, and **only running the model caught it** --
+the bootstrap intervals and the confirmation pass were both fully convinced.
+
+That is the concrete argument for the gate: without it this search would have
+adopted a wrong schedule and reported it as a win.
+
 ## Measurement
 
 ```bash
