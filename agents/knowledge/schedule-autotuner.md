@@ -636,6 +636,28 @@ groups skipped for host reasons, 0 aborts), and 226 legal candidates were timed
 across the two passes. **Search beat a hand-tuned schedule, end to end, by
 1.6%.**
 
+### Independently Verified
+
+Re-measured outside the driver: 6 interleaved rounds, fresh process each, one
+at a time on an otherwise idle GPU.
+
+```
+baseline  median 599.83 ms  (n=6, range 598.0-603.2)
+tuned     median 589.37 ms  (n=6, range 588.6-592.3)
+delta     -1.74%                     [the driver reported -1.59%]
+tuned faster in 6/6 paired rounds
+```
+
+The two distributions do **not overlap**: the slowest tuned run (592.3ms) is
+faster than the fastest baseline run (598.0ms). The independent estimate is
+slightly larger than the driver's, which is the right direction -- the driver's
+own head-to-head is the conservative number.
+
+Note on method: the first attempt at this produced a 23,437ms outlier because
+two benchmark processes ran concurrently on the same device. Verify on an idle
+GPU, one process at a time, and check `nvidia-smi --query-compute-apps` before
+trusting a number.
+
 ### Read It Honestly
 
 - **The margin is small.** 1.6% against a 1.0% effect floor and a 0.4% noise
