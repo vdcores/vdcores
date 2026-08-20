@@ -375,6 +375,46 @@ The lesson worth keeping: for a search whose headline output is "we found
 nothing", every infrastructure failure must be loud, because the quiet version
 of that failure looks exactly like the answer.
 
+### Hangs Dominated The Budget Until The Startup Timeout Was Set
+
+The second Llama3 search ran cleanly -- no orphans, no out-of-memory, the
+infrastructure fixes held -- and still got through only **6 of 17 groups in 12
+hours**. The accounting:
+
+| | |
+| --- | --- |
+| timed runs attempted | 172 |
+| produced a timing | 126, at ~14s each = 0.5h |
+| hung | 45 |
+| a healthy run reaches `[bench]` in | ~9s |
+
+`run_with_launch_timeout.py` takes `--startup-timeout`, but it defaults to
+`None` and the driver never passed it. So the wrapper's timeouts only applied
+*after* the launch marker appeared. A schedule that deadlocks **before** that --
+during construction or launch setup -- was not caught by the wrapper at all,
+and ran until the driver's `--hard-timeout` of 900s. 45 x 900s is 11.25 hours,
+which is essentially the whole run.
+
+Two changes:
+
+- The driver now passes `--startup-timeout` (default 120s). A healthy Llama3
+  run reaches the marker in ~9s, so that is more than an order of magnitude of
+  slack, and it turns a 900s hang into a 120s one.
+- A hang now disqualifies a candidate on the **first** attempt
+  (`--drop-after-hang`, default 1), while other failures still get the second
+  chance `--drop-after` allows. The evidence: across those 172 runs every
+  hanging candidate hung on *both* attempts and not one recovered. Deadlock is
+  a property of the schedule, not luck, so the second attempt only pays the
+  timeout again.
+
+Together these cut the cost of a deadlocking candidate from 1800s to 120s, a
+15x reduction on the dominant term.
+
+Also worth knowing: the hangs are concentrated in `k_proj` and `k_rope`, and
+never hit the reference configuration. They are real deadlocking schedules, not
+flakiness, and the search handles them correctly -- it was only ever a question
+of how long it waited to find out.
+
 ### One Environment Trap
 
 Do not set `HF_HOME` when running a gated target. `hf auth login` stores its

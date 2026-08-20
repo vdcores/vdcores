@@ -362,6 +362,7 @@ def measure_args(**overrides):
         "workdir": REPO_ROOT, "script": FAKE_SCHED, "dry_build_arg": ["--dry-build"],
         "repeats": 3, "iterations": 3, "warmup": 0, "seed": 0, "kill_stale": False,
         "post_launch_timeout": 60.0, "idle_timeout": 20.0, "hard_timeout": 120.0,
+        "startup_timeout": 60.0, "drop_after": 2, "drop_after_hang": 1,
         "knob": None, "no_prebuild": False, "build_timeout": 60.0, "max": None,
         "min_effect_pct": 1.0, "bootstrap": 400, "confidence": 0.95,
         "no_correction": False, "confirm_rounds": 2, "out": None,
@@ -910,6 +911,63 @@ def test_filter_legal_aborts_rather_than_calling_an_oom_illegal():
         raise AssertionError("expected an OOM to abort rather than reject")
     finally:
         autotune.run_dry_build = original
+
+
+def test_a_hang_disqualifies_a_candidate_on_the_first_attempt():
+    """Deadlocks are structural, and retrying one pays the timeout twice.
+
+    Measured: across 172 Llama3 runs every hanging candidate hung on both
+    attempts and none recovered.
+    """
+    calls = []
+
+    def fake_run_timed(target, values, args, workdir):
+        calls.append(values["label"])
+        if values["label"] == "deadlock":
+            return "hang", None, "no progress after launch"
+        return "ok", 1_000_000.0, None
+
+    candidates = [
+        autotune.Candidate({"label": "current"}, {}, "current"),
+        autotune.Candidate({"label": "deadlock"}, {"k": 1}, "deadlock"),
+    ]
+    args = argparse.Namespace(repeats=8, seed=0, drop_after=2, drop_after_hang=1)
+
+    original = autotune.run_timed
+    autotune.run_timed = fake_run_timed
+    try:
+        autotune.measure_rounds(None, candidates, args, ".")
+    finally:
+        autotune.run_timed = original
+
+    assert calls.count("deadlock") == 1, calls.count("deadlock")
+    assert calls.count("current") == 8
+
+
+def test_a_non_hang_failure_still_gets_a_second_chance():
+    """Only hangs are treated as structural; other failures may be transient."""
+    calls = []
+
+    def fake_run_timed(target, values, args, workdir):
+        calls.append(values["label"])
+        if values["label"] == "broken":
+            return "fail", None, "some transient thing"
+        return "ok", 1_000_000.0, None
+
+    candidates = [
+        autotune.Candidate({"label": "current"}, {}, "current"),
+        autotune.Candidate({"label": "broken"}, {"k": 1}, "broken"),
+    ]
+    args = argparse.Namespace(repeats=8, seed=0, drop_after=2, drop_after_hang=1)
+
+    original = autotune.run_timed
+    autotune.run_timed = fake_run_timed
+    try:
+        autotune.measure_rounds(None, candidates, args, ".")
+    finally:
+        autotune.run_timed = original
+
+    assert calls.count("broken") == 2, calls.count("broken")
 
 
 def main():

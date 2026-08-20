@@ -465,6 +465,7 @@ def run_timed(target, values, args, workdir):
         "--launch-pattern", BENCH_MARKER,
         "--post-launch-timeout", str(args.post_launch_timeout),
         "--post-launch-idle-timeout", str(args.idle_timeout),
+        "--startup-timeout", str(args.startup_timeout),
         "--", sys.executable, target["script"], "-b", str(args.iterations),
     ]
 
@@ -668,6 +669,10 @@ def measure_rounds(target, candidates, args, workdir, on_sample=None):
     # round, so retrying it for the whole budget buys nothing. Give it a
     # couple of chances in case the failure was transient, then stop.
     drop_after = getattr(args, "drop_after", 2)
+    # A deadlock is a property of the schedule, not luck. Across 172 measured
+    # Llama3 runs every hanging candidate hung on *both* attempts and not one
+    # recovered, so a second attempt only pays the timeout twice.
+    drop_after_hang = getattr(args, "drop_after_hang", 1)
     protected = {"baseline", "current", "origin"}
 
     for round_index in range(args.repeats):
@@ -680,11 +685,12 @@ def measure_rounds(target, candidates, args, workdir, on_sample=None):
             else:
                 failures.setdefault(candidate.label, (status, reason))
                 fail_counts[candidate.label] = fail_counts.get(candidate.label, 0) + 1
+                limit = drop_after_hang if status == "hang" else drop_after
                 if (
-                    drop_after
+                    limit
                     and candidate.label not in protected
                     and not samples[candidate.label]
-                    and fail_counts[candidate.label] >= drop_after
+                    and fail_counts[candidate.label] >= limit
                 ):
                     dropped.add(candidate.label)
                     print(f"  [drop] {candidate.label}: failed "
@@ -1551,8 +1557,18 @@ def main(argv=None):
         parser_.add_argument("--drop-after", type=int, default=2,
                              help="Stop retrying a candidate after this many "
                                   "failures with no timing; 0 keeps retrying")
+        parser_.add_argument("--drop-after-hang", type=int, default=1,
+                             help="Same, for hangs, which are structural rather "
+                                  "than transient; 0 falls back to --drop-after")
         parser_.add_argument("--kill-stale", action="store_true",
                              help="pkill leftover runs of this target between measurements")
+        # Without this the wrapper waits forever for the launch marker, and a
+        # schedule that deadlocks *before* reaching it burns the full
+        # --hard-timeout instead. In one Llama3 pass that was 45 hangs at 900s
+        # each: 11 of the 12 hours the search was allowed. A healthy Llama3 run
+        # reaches the marker in ~9s, so this is an order of magnitude of slack.
+        parser_.add_argument("--startup-timeout", type=float, default=120.0,
+                             help="Seconds allowed before the launch marker appears")
         parser_.add_argument("--post-launch-timeout", type=float, default=120.0)
         parser_.add_argument("--idle-timeout", type=float, default=30.0)
         parser_.add_argument("--hard-timeout", type=float, default=900.0)
