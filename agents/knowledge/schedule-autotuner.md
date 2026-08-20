@@ -402,4 +402,5 @@ All three run on a host with no CUDA and no PyTorch extension built.
 ## Figures
 
 [docs/autotune/](../../docs/autotune/) holds the result, funnel, reachability
-and noise figures, generated from `tuning/llama3_8b.search.json`.
+and noise figures. They were generated from a `search` run trace, which is a
+run artifact and not kept in the repo; `--out` writes a new one.

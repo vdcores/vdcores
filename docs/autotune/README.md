@@ -1,7 +1,9 @@
 # Schedule Autotuner Results
 
 Figures generated from the Llama-3.1-8B search on a GH200 (132 SMs).
-Source data: `tuning/llama3_8b.search.json` (2056 timed runs).
+Generated from the search trace (`tuning/llama3_8b.search.json`, 2056 timed
+runs), which is a run artifact and is not kept in the repo. Re-running
+`autotune.py search` produces a new one.
 
 | Figure | What it shows |
 | --- | --- |
