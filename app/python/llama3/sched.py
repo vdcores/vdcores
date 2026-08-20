@@ -7,12 +7,14 @@ from dae.launcher import *
 from dae.schedule import *
 from dae.model import *
 from dae.util import dae_app
+from dae import tune as dae_tune
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 try:
   from transformers.cache_utils import StaticKVCache
 except ImportError:
   from transformers.cache_utils import StaticCache as StaticKVCache
 from reference import input_batch1, reference_pass, check_tensor_threshold
+from dry_build import build_stub_config, build_stub_model, build_stub_tokenizer
 import os
 import math
 
@@ -23,6 +25,8 @@ arg_parser.add_argument("-N", "--num-generates", type=int, default=None)
 arg_parser.add_argument("--max-decode-steps", type=int, default=DEFAULT_MAX_DECODE_STEPS)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--correctness", action="store_true")
+arg_parser.add_argument("--dry-build", action="store_true",
+                        help="Build the schedule with synthetic weights and exit without running")
 arg_parser.add_argument("--prompt", default=None)
 arg_parser.add_argument("--message", action="append", default=None)
 arg_parser.add_argument("--control-flow", dest="control_flow", action="store_true", default=True)
@@ -56,6 +60,16 @@ def dae_work_requested(argv):
     for arg in argv
   )
 
+if parsed_args.dry_build:
+  if parsed_args.prompt is not None or parsed_args.message:
+    raise ValueError("--dry-build has no tokenizer, so it cannot take a prompt")
+  # Placement legality does not depend on how many tokens are decoded, and a
+  # 128-step schedule takes far longer to construct than a 1-step one. The
+  # autotuner runs this hundreds of times, so default to the cheapest schedule
+  # that still exercises every place() call.
+  if parsed_args.num_generates is None:
+    parsed_args.num_generates = 1
+
 has_user_prompt = parsed_args.prompt is not None or bool(parsed_args.message)
 if parsed_args.correctness and not dae_execution_requested(remaining_argv):
   remaining_argv = [*remaining_argv, "--launch"]
@@ -83,23 +97,55 @@ def dae_execution_iterations(argv):
 model_name = 'meta-llama/Llama-3.1-8B-Instruct'
 cache_dir = parsed_args.hf_cache_dir
 
-model = AutoModelForCausalLM.from_pretrained(
+def hf_auth_kwargs():
+  """Resolve a credential the same way qwen3_1p7b does.
+
+  Passing nothing lets huggingface_hub resolve the credential itself, which
+  covers both HF_TOKEN and a token stored by `hf auth login`. Only when there
+  is no credential at all is it worth failing early, because this model is
+  gated and the download would fail with a less obvious 401.
+  """
+  token = os.environ.get("HF_TOKEN")
+  if token:
+    return {"token": token}
+  try:
+    from huggingface_hub import get_token
+    stored = get_token()
+  except Exception:
+    stored = None
+  if stored:
+    return {}
+  raise SystemExit(
+    f"{model_name} is gated and no Hugging Face credential was found. Run "
+    "`hf auth login`, or set HF_TOKEN, using an account that has been granted "
+    "access to it. Use --dry-build to build the schedule without weights."
+  )
+
+if parsed_args.dry_build:
+  # Synthetic stand-ins with the real tensor shapes; see dry_build.py.
+  config = build_stub_config()
+  model = build_stub_model(torch.device("cuda"))
+  tokenizer = build_stub_tokenizer()
+else:
+  auth = hf_auth_kwargs()
+  model = AutoModelForCausalLM.from_pretrained(
+      model_name,
+      cache_dir=cache_dir,
+      dtype=torch.bfloat16,
+      device_map="auto",
+      **auth,
+  )
+  config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, **auth)
+  tokenizer = AutoTokenizer.from_pretrained(
     model_name,
     cache_dir=cache_dir,
-    dtype=torch.bfloat16,
-    device_map="auto",
-    token=os.environ['HF_TOKEN']
-)
-config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, token=os.environ['HF_TOKEN'])
+    **auth,
+  )
+
 eps = config.rms_norm_eps # 1e-6
 rope_theta = config.rope_parameters["rope_theta"]
 
 layers = model.model.layers
-tokenizer = AutoTokenizer.from_pretrained(
-  model_name,
-  cache_dir=cache_dir,
-  token=os.environ['HF_TOKEN'],
-)
 
 def normalize_token_ids(tokens, *, add_special_tokens=False):
   if isinstance(tokens, str):
@@ -252,6 +298,57 @@ KW = HEAD_DIM * config.num_key_value_heads
 VW = HEAD_DIM * config.num_key_value_heads
 num_layers = len(layers)
 
+###################################
+# Tunable schedule knobs
+###################################
+
+tune = dae_tune.load("llama3_8b")
+tune.note("full_sms", full_sms)
+tune.note("num_sms", num_sms)
+tune.note("rms_sms", rms_sms)
+tune.note("hidden", HIDDEN)
+tune.note("intermediate", INTERMIDIATE)
+tune.note("gemv_tile_m", Gemv_M64N8.MNK[0])
+
+# Candidate values only. Illegal combinations are rejected by the schedule's
+# own place() -> validate() path rather than being enumerated here.
+GEMV_SMS_CHOICES = [16, 32, 48, 64, 80, 96, 112, 128]
+BASE_SM_CHOICES = [0, 32, 64, 96]
+
+QPROJ_SMS = tune.sms("q_proj", 128, GEMV_SMS_CHOICES)
+QROPE_SMS = tune.sms("q_rope", 128, GEMV_SMS_CHOICES)
+KPROJ_SMS = tune.sms("k_proj", 64, GEMV_SMS_CHOICES)
+KROPE_SMS = tune.sms("k_rope", 64, GEMV_SMS_CHOICES)
+VPROJ_SMS = tune.sms("v_proj", 64, GEMV_SMS_CHOICES)
+OUTPROJ_SMS = tune.sms("out_proj", num_sms, GEMV_SMS_CHOICES)
+GATE_LOW_SMS = tune.sms("gate_low", 64, GEMV_SMS_CHOICES)
+GATE_HIGH_SMS = tune.sms("gate_high", 64, GEMV_SMS_CHOICES)
+UP_LOW_SMS = tune.sms("up_low", 64, GEMV_SMS_CHOICES)
+UP_HIGH_SMS = tune.sms("up_high", 64, GEMV_SMS_CHOICES)
+SILU_SMS = tune.sms("silu", 4, [1, 2, 4, 8])
+GATE_FUSED_SMS = tune.sms("gate_fused", 128, GEMV_SMS_CHOICES)
+UP_FUSED_SMS = tune.sms("up_fused", 128, GEMV_SMS_CHOICES)
+SILU_FUSED_SMS = tune.sms("silu_fused", 128, GEMV_SMS_CHOICES)
+DOWN_LOW_SMS = tune.sms("down_low", 128, GEMV_SMS_CHOICES)
+DOWN_HIGH_SMS = tune.sms("down_high", 128, GEMV_SMS_CHOICES)
+
+QPROJ_BASE_SM = tune.base_sm("q_proj", 0, BASE_SM_CHOICES)
+QROPE_BASE_SM = tune.base_sm("q_rope", 0, BASE_SM_CHOICES)
+KPROJ_BASE_SM = tune.base_sm("k_proj", 64, BASE_SM_CHOICES)
+KROPE_BASE_SM = tune.base_sm("k_rope", 64, BASE_SM_CHOICES)
+VPROJ_BASE_SM = tune.base_sm("v_proj", 0, BASE_SM_CHOICES)
+OUTPROJ_BASE_SM = tune.base_sm("out_proj", 0, BASE_SM_CHOICES)
+GATE_LOW_BASE_SM = tune.base_sm("gate_low", 0, BASE_SM_CHOICES)
+GATE_HIGH_BASE_SM = tune.base_sm("gate_high", 0, BASE_SM_CHOICES)
+UP_LOW_BASE_SM = tune.base_sm("up_low", 64, BASE_SM_CHOICES)
+UP_HIGH_BASE_SM = tune.base_sm("up_high", 64, BASE_SM_CHOICES)
+GATE_FUSED_BASE_SM = tune.base_sm("gate_fused", 0, BASE_SM_CHOICES)
+UP_FUSED_BASE_SM = tune.base_sm("up_fused", 0, BASE_SM_CHOICES)
+SILU_FUSED_BASE_SM = tune.base_sm("silu_fused", 0, BASE_SM_CHOICES)
+DOWN_LOW_BASE_SM = tune.base_sm("down_low", 0, BASE_SM_CHOICES)
+DOWN_HIGH_BASE_SM = tune.base_sm("down_high", 0, BASE_SM_CHOICES)
+SILU_BASE_SM = tune.base_sm("silu", 128, [128, 129, 130])
+
 
 ###################################
 # Define groups, barriers and TMA for scheduling
@@ -350,6 +447,13 @@ matGates = [l.mlp.gate_proj.weight for l in layers]
 matDowns = [l.mlp.down_proj.weight for l in layers]
 
 logits_fold = 8
+# Only the fold used to split the logits projection across SMs. The slice size
+# below stays at 8192 * logits_fold, because the selected argmax atom
+# (ARGMAX_PARTIAL_bf16_1024_65536_128) bakes that 65536 in.
+LOGITS_SPLIT_M = tune.int_knob(
+    "logits.split_m", logits_fold, choices=[2, 4, 8, 16],
+    doc="split_M factor for the logits projection",
+)
 logits_slice = 8192 * logits_fold
 logits_epoch = 2
 
@@ -758,7 +862,7 @@ def schedule_single_token(
   LogitsProj = []
   for i in range(logits_epoch):
     proj = QWen8BGemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-    sched = proj.schedule_(group=False).split_M(logits_fold)
+    sched = proj.schedule_(group=False).split_M(LOGITS_SPLIT_M)
     if i == 0:
       sched.bar("load", layerg.over('bar_pre_attn_rms'))
       sched[0].no_prefetch()
@@ -807,23 +911,23 @@ def schedule_single_token(
   ).place(full_sms - num_sms, base_sm=num_sms)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
-  QProj = QProj.place(128)
-  QRope = QRope.place(128)
-  KProj = KProj.place(64, base_sm=64)
-  KRope = KRope.place(64, base_sm=64)
-  VProj = VProj.place(64)
+  QProj = QProj.place(QPROJ_SMS, base_sm=QPROJ_BASE_SM)
+  QRope = QRope.place(QROPE_SMS, base_sm=QROPE_BASE_SM)
+  KProj = KProj.place(KPROJ_SMS, base_sm=KPROJ_BASE_SM)
+  KRope = KRope.place(KROPE_SMS, base_sm=KROPE_BASE_SM)
+  VProj = VProj.place(VPROJ_SMS, base_sm=VPROJ_BASE_SM)
   Gqa = Gqa.place(N * NUM_KV_HEAD)
-  OutProj = OutProj.place(num_sms)
-  gate_proj_low = gate_proj_low.place(64)
-  gate_proj_high = gate_proj_high.place(64)
-  up_proj_low = up_proj_low.place(64, base_sm=64)
-  up_proj_high = up_proj_high.place(64, base_sm=64)
-  silu1 = silu1.place(4, base_sm=128)
-  gate_proj_fused = gate_proj_fused.place(128)
-  up_proj_fused = up_proj_fused.place(128)
-  silu_fused = silu_fused.place(128)
-  down_proj_low = down_proj_low.place(128)
-  down_proj_high = down_proj_high.place(128)
+  OutProj = OutProj.place(OUTPROJ_SMS, base_sm=OUTPROJ_BASE_SM)
+  gate_proj_low = gate_proj_low.place(GATE_LOW_SMS, base_sm=GATE_LOW_BASE_SM)
+  gate_proj_high = gate_proj_high.place(GATE_HIGH_SMS, base_sm=GATE_HIGH_BASE_SM)
+  up_proj_low = up_proj_low.place(UP_LOW_SMS, base_sm=UP_LOW_BASE_SM)
+  up_proj_high = up_proj_high.place(UP_HIGH_SMS, base_sm=UP_HIGH_BASE_SM)
+  silu1 = silu1.place(SILU_SMS, base_sm=SILU_BASE_SM)
+  gate_proj_fused = gate_proj_fused.place(GATE_FUSED_SMS, base_sm=GATE_FUSED_BASE_SM)
+  up_proj_fused = up_proj_fused.place(UP_FUSED_SMS, base_sm=UP_FUSED_BASE_SM)
+  silu_fused = silu_fused.place(SILU_FUSED_SMS, base_sm=SILU_FUSED_BASE_SM)
+  down_proj_low = down_proj_low.place(DOWN_LOW_SMS, base_sm=DOWN_LOW_BASE_SM)
+  down_proj_high = down_proj_high.place(DOWN_HIGH_SMS, base_sm=DOWN_HIGH_BASE_SM)
   Argmax = Argmax.place(128)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
@@ -991,7 +1095,18 @@ else:
     dae.i(IssueBarrier(systemg['bar_token_finish']))
     schedule_single_token(cur_offset, cur_pos)
 
-print(f"run vdcors with {cur_offset+1} tokens...")
+print(tune.summary())
+if parsed_args.dry_build:
+  print(
+    f"[dry-build] built llama3.1-8b schedule with hidden={HIDDEN}, intermediate={INTERMIDIATE}, "
+    f"head_dim={HEAD_DIM}, layers={num_layers}, max_seq_len={MAX_SEQ_LEN}"
+  )
+  print(
+    f"[dry-build] logits_epoch={logits_epoch}, logits_slice={logits_slice}, "
+    f"vocab_size={vocab_size}, decode_steps={total_decode_tokens}"
+  )
+else:
+  print(f"run vdcors with {cur_offset+1} tokens...")
 dae.s()
 dae_app(dae)
 if will_execute:

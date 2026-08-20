@@ -1,0 +1,62 @@
+{
+  "knobs": {
+    "down_high.base_sm": 0,
+    "down_high.sms": 128,
+    "down_low.base_sm": 0,
+    "down_low.sms": 128,
+    "gate_fused.base_sm": 0,
+    "gate_fused.sms": 128,
+    "gate_high.base_sm": 0,
+    "gate_high.sms": 64,
+    "gate_low.base_sm": 0,
+    "gate_low.sms": 64,
+    "k_proj.base_sm": 64,
+    "k_proj.sms": 64,
+    "k_rope.base_sm": 64,
+    "k_rope.sms": 64,
+    "logits.split_m": 8,
+    "out_proj.base_sm": 0,
+    "out_proj.sms": 128,
+    "q_proj.base_sm": 0,
+    "q_proj.sms": 128,
+    "q_rope.base_sm": 0,
+    "q_rope.sms": 128,
+    "silu.base_sm": 128,
+    "silu.sms": 2,
+    "silu_fused.base_sm": 0,
+    "silu_fused.sms": 128,
+    "up_fused.base_sm": 0,
+    "up_fused.sms": 128,
+    "up_high.base_sm": 64,
+    "up_high.sms": 64,
+    "up_low.base_sm": 64,
+    "up_low.sms": 64,
+    "v_proj.base_sm": 0,
+    "v_proj.sms": 64
+  },
+  "namespace": "llama3_8b",
+  "search": {
+    "adopted": [
+      {
+        "delta_pct": -1.5229722657007454,
+        "group": "silu",
+        "overrides": {
+          "silu.base_sm": 128,
+          "silu.sms": 2
+        },
+        "pass": 1
+      }
+    ],
+    "head_to_head": {
+      "ci_high_ns": -7164933.800000003,
+      "ci_low_ns": -10968560.0,
+      "delta_ns": -9540008.0,
+      "delta_pct": -1.594283600340964,
+      "origin_median_ns": 598388392.0,
+      "rounds": 10,
+      "searched_median_ns": 588848384.0,
+      "verdict": "faster"
+    },
+    "min_effect_pct": 1.0
+  }
+}

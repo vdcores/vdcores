@@ -81,3 +81,9 @@ debug*.log
 inst*.txt
 inst*.dump
 *.vdcore.build
+
+# Autotuner run artifacts. Traces, logs and knob dumps are measurement output
+# from one host on one day, not source; keep them out of the tree. The winning
+# preset is the exception: it is the deliverable, and it is 1.4KB.
+tuning/*
+!tuning/*.preset.json
