@@ -144,8 +144,20 @@ static constexpr int mxfp8CoupledUmmaFullBarrierBase =
 static constexpr int mxfp8CoupledEmptyBarrierBase =
     mxfp8CoupledUmmaFullBarrierBase + mxfp8CoupledStages;
 
-static constexpr int tmemMmaBarrierCount =
+// Generic descriptor-driven internal ring.  Each port owns an independent
+// transaction-completion barrier per stage; both observe the same consumer-
+// released empty barrier.  Port-local command counters and the compute-side
+// consumer counter preserve parity across sequential commands.
+static constexpr int internalRingStages = 2;
+static constexpr int internalRingFullBarrierBase =
     mxfp8CoupledEmptyBarrierBase + mxfp8CoupledStages;
+static constexpr int internalRingFullBarrierCount =
+    2 * internalRingStages;
+static constexpr int internalRingEmptyBarrierBase =
+    internalRingFullBarrierBase + internalRingFullBarrierCount;
+
+static constexpr int tmemMmaBarrierCount =
+    internalRingEmptyBarrierBase + internalRingStages;
 
 static constexpr int numThreadsPerWarp = 32;
 static constexpr int numThreads = numThreadsPerWarp * (numComputeWarps + numMemoryWarps);

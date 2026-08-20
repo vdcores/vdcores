@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .instructions import (
     ComputeInstruction,
+    Fp8GemvUmmaCoupledSm100,
     LduProfileLayer,
     LduReloadBarriers,
     LoopC,
@@ -14,6 +15,7 @@ from .instructions import (
     ProfileAggregate,
     ProfileStep,
     ResetIndirectLayer,
+    TmaLoadMxfpCoupledStream,
 )
 from .runtime import config
 from .schedule import Schedule
@@ -43,6 +45,8 @@ class SequentialStage:
     profile_span_begin: tuple[int, int] | None = None
     profile_span_end: tuple[int, int] | None = None
     prefetch_before_wait: bool = False
+    wait_group_roles: tuple[tuple[str, str], ...] = ()
+    release_group_roles: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -166,6 +170,21 @@ def _validate_prefetch_gate(per_sm: list[list], bar_id: int, stage: str) -> None
         raise ValueError(f"sequential stage {stage!r} has no active SMs")
 
 
+def _validate_explicit_role_bar(
+    per_sm: list[list], bar_id: int, stage: str, role: str
+) -> None:
+    if any(
+        isinstance(inst, MemoryInstruction) and _bar_id(inst) == bar_id
+        for instructions in per_sm
+        for inst in instructions
+    ):
+        return
+    raise ValueError(
+        f"sequential stage {stage!r} role {role!r} emitted no "
+        "memory command for its dependency barrier"
+    )
+
+
 def _balance_load_ports(per_sm: list[list]) -> None:
     """Distribute stage operands over both LDU FIFOs by encoded byte size."""
 
@@ -195,6 +214,64 @@ def _balance_load_ports(per_sm: list[list]) -> None:
             port_bytes[port] += max(1, inst.size)
 
 
+def _rebase_coupled_fp8_phases(
+    instructions: list, initial_phase: int
+) -> int:
+    """Carry the persistent two-stage ring phase across schedule boundaries."""
+
+    computes = [
+        inst
+        for inst in instructions
+        if isinstance(inst, Fp8GemvUmmaCoupledSm100)
+    ]
+    loads = [
+        inst
+        for inst in instructions
+        if isinstance(inst, MemoryInstruction)
+        and inst.annotation.get("coupled_stream_kind")
+        == TmaLoadMxfpCoupledStream.FP8_GEMV
+        and inst.annotation.get("coupled_stream_allocator_lease")
+    ]
+    if len(computes) != len(loads):
+        raise ValueError(
+            "coupled FP8 compute/load command counts do not match"
+        )
+
+    phase = int(initial_phase) % (2 * TmaLoadMxfpCoupledStream.FP8_STAGES)
+    local_phase = 0
+    phase_mask = (
+        TmaLoadMxfpCoupledStream.MAX_PHASE_BASE
+        << TmaLoadMxfpCoupledStream.PHASE_BASE_SHIFT
+    )
+    for compute, load in zip(computes, loads):
+        pair_count = int(compute.args[0])
+        encoded_phase = (
+            load.arg >> TmaLoadMxfpCoupledStream.PHASE_BASE_SHIFT
+        ) & TmaLoadMxfpCoupledStream.MAX_PHASE_BASE
+        if (
+            pair_count != int(load.size)
+            or int(compute.args[2]) != encoded_phase
+            or encoded_phase
+            % (2 * TmaLoadMxfpCoupledStream.FP8_STAGES)
+            != local_phase
+        ):
+            raise ValueError(
+                "coupled FP8 stage has inconsistent local phase progression"
+            )
+        compute.args[2] = phase
+        load.arg = (
+            (load.arg & ~phase_mask)
+            | (phase << TmaLoadMxfpCoupledStream.PHASE_BASE_SHIFT)
+        )
+        phase = (
+            phase + pair_count
+        ) % (2 * TmaLoadMxfpCoupledStream.FP8_STAGES)
+        local_phase = (
+            local_phase + pair_count
+        ) % (2 * TmaLoadMxfpCoupledStream.FP8_STAGES)
+    return phase
+
+
 class SequentialProgram:
     """Render a strict stage chain into per-SM compute/memory queues.
 
@@ -212,6 +289,7 @@ class SequentialProgram:
         profile_event_count: int | None = None,
         profile_special_slot: int = 0,
         balance_load_ports: bool = False,
+        coupled_fp8_initial_phases: list[int] | tuple[int, ...] | None = None,
     ):
         self.launcher = launcher
         self.stages = tuple(stages)
@@ -267,19 +345,36 @@ class SequentialProgram:
         # scalar storage referenced by encoded memory instructions.  Retain
         # every placed schedule for at least as long as the launch program.
         self.placed_schedules = []
+        if coupled_fp8_initial_phases is None:
+            coupled_fp8_initial_phases = (0,) * launcher.num_sms
+        if len(coupled_fp8_initial_phases) != launcher.num_sms:
+            raise ValueError(
+                "coupled FP8 phase state must cover every resident SM"
+            )
+        self.coupled_fp8_initial_phases = tuple(
+            int(phase) % (2 * TmaLoadMxfpCoupledStream.FP8_STAGES)
+            for phase in coupled_fp8_initial_phases
+        )
+        coupled_fp8_phases = list(self.coupled_fp8_initial_phases)
 
         release_groups = []
         for stage in self.stages:
-            if (
-                stage.release_group is not None
-                and stage.release_group not in release_groups
-            ):
-                release_groups.append(stage.release_group)
-        wait_groups = {
-            stage.wait_group
-            for stage in self.stages
-            if stage.wait_group is not None
-        }
+            stage_groups = []
+            if stage.release_group is not None:
+                stage_groups.append(stage.release_group)
+            stage_groups.extend(
+                group for group, _ in stage.release_group_roles
+            )
+            for group in stage_groups:
+                if group not in release_groups:
+                    release_groups.append(group)
+        wait_groups = set()
+        for stage in self.stages:
+            if stage.wait_group is not None:
+                wait_groups.add(stage.wait_group)
+            wait_groups.update(
+                group for group, _ in stage.wait_group_roles
+            )
         missing_groups = wait_groups.difference(release_groups)
         if missing_groups:
             raise ValueError(
@@ -312,10 +407,30 @@ class SequentialProgram:
                 raise ValueError(
                     f"prefetching stage {stage.name!r} requires an input_role"
                 )
+            if stage.wait_group is not None and stage.wait_group_roles:
+                raise ValueError(
+                    f"stage {stage.name!r} cannot mix wait_group with "
+                    "wait_group_roles"
+                )
+            role_groups = {}
+            for group, role in (
+                *stage.wait_group_roles,
+                *stage.release_group_roles,
+            ):
+                previous_group = role_groups.setdefault(role, group)
+                if previous_group != group:
+                    raise ValueError(
+                        f"stage {stage.name!r} binds role {role!r} to "
+                        "multiple dependency groups"
+                    )
 
             input_bar = None
             if stage.wait_group is not None:
                 input_bar = group_barriers[stage.wait_group]
+            elif stage.wait_group_roles:
+                # The schedule binds each consuming memory command to its
+                # own named edge below; no stage-wide LDU gate is needed.
+                pass
             elif previous is not None and stage.wait_for_previous:
                 count, tails = _writeback_tail(previous, previous_name)
                 if launcher.num_bars >= config.max_bars - 2:
@@ -339,7 +454,15 @@ class SequentialProgram:
                     )
 
             if previous_profile_after:
-                if input_bar is None:
+                profile_input_bar = input_bar
+                if profile_input_bar is None and stage.wait_group_roles:
+                    profile_bars = {
+                        group_barriers[group]
+                        for group, _ in stage.wait_group_roles
+                    }
+                    if len(profile_bars) == 1:
+                        profile_input_bar = next(iter(profile_bars))
+                if profile_input_bar is None:
                     raise ValueError(
                         "a profiled stage requires a following dependency"
                     )
@@ -349,13 +472,17 @@ class SequentialProgram:
                     config.layer_profile_event_base,
                     self.profile_event_count,
                     special_slot=profile_special_slot,
-                ).bar(input_bar)
+                ).bar(profile_input_bar)
                 for instructions in self.instructions:
                     instructions.append(marker.copy())
 
             schedule = stage.schedule._clone()
             if input_bar is not None and stage.input_role is not None:
                 schedule.bar(stage.input_role, input_bar)
+            for group, role in stage.wait_group_roles:
+                schedule.bar(role, group_barriers[group])
+            for group, role in stage.release_group_roles:
+                schedule.bar(role, group_barriers[group])
             placed = schedule.place(stage.num_sms, stage.base_sm)
             self.placed_schedules.append(placed)
             rendered = []
@@ -415,11 +542,22 @@ class SequentialProgram:
                 rendered.append(instructions)
             if balance_load_ports:
                 _balance_load_ports(rendered)
+            for sm, instructions in enumerate(rendered):
+                coupled_fp8_phases[sm] = _rebase_coupled_fp8_phases(
+                    instructions, coupled_fp8_phases[sm]
+                )
             if input_bar is not None:
                 if stage.prefetch_before_wait:
                     _validate_prefetch_gate(rendered, input_bar, stage.name)
                 else:
                     _gate_load_ports(rendered, input_bar, stage.name)
+            for group, role in stage.wait_group_roles:
+                _validate_explicit_role_bar(
+                    rendered,
+                    group_barriers[group],
+                    stage.name,
+                    role,
+                )
 
             max_compute = max(
                 sum(isinstance(inst, ComputeInstruction) for inst in instructions)
@@ -438,6 +576,18 @@ class SequentialProgram:
                 for tail in tails:
                     _attach_bar(tail, release_bar, stage=stage.name)
                 group_release_counts[stage.release_group] += count
+            for group, role in stage.release_group_roles:
+                release_bar = group_barriers[group]
+                _validate_explicit_role_bar(
+                    rendered, release_bar, stage.name, role
+                )
+                count = placed.bar_release_count(role)
+                if count <= 0:
+                    raise ValueError(
+                        f"sequential stage {stage.name!r} role {role!r} "
+                        "has no barrier release count"
+                    )
+                group_release_counts[group] += count
             previous = rendered
             previous_stage = stage
             previous_name = stage.name
@@ -472,6 +622,7 @@ class SequentialProgram:
                 "a profiled final stage requires a completion barrier"
             )
         self.barrier_stop = launcher.num_bars
+        self.coupled_fp8_final_phases = tuple(coupled_fp8_phases)
 
         max_compute = max(
             sum(isinstance(inst, ComputeInstruction) for inst in instructions)
@@ -515,6 +666,7 @@ class LoopedSequentialProgram:
         self.stage_stats = []
         self.segments = []
         self.placed_schedules = []
+        coupled_fp8_phases = [0] * launcher.num_sms
         self.profile_event_count = sum(
             sum(stage.profile_after for stage in block.stages) * block.repeat
             for block in self.blocks
@@ -567,7 +719,24 @@ class LoopedSequentialProgram:
                 completion_barrier=block.reload_after,
                 profile_event_count=self.profile_event_count,
                 balance_load_ports=balance_load_ports,
+                coupled_fp8_initial_phases=coupled_fp8_phases,
             )
+            if block.repeat > 1:
+                incompatible_sms = [
+                    sm
+                    for sm, (initial, final) in enumerate(zip(
+                        segment.coupled_fp8_initial_phases,
+                        segment.coupled_fp8_final_phases,
+                    ))
+                    if initial != final
+                ]
+                if incompatible_sms:
+                    raise ValueError(
+                        "repeated coupled FP8 block does not return its "
+                        "persistent ring phase to the entry state on SMs "
+                        f"{incompatible_sms}"
+                    )
+            coupled_fp8_phases = list(segment.coupled_fp8_final_phases)
             self.segments.append(segment)
             barriers_per_bank = segment.barrier_stop - segment.barrier_start
             if bank_count > 1:
@@ -667,6 +836,7 @@ class LoopedSequentialProgram:
             )
         self.max_compute_instructions = max_compute + 1
         self.max_memory_instructions = max_memory + 1
+        self.coupled_fp8_final_phases = tuple(coupled_fp8_phases)
 
     def __call__(self, sm: int):
         return self.instructions[sm]

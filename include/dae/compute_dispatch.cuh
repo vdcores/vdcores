@@ -32,6 +32,7 @@
   uint32_t &tmem_mma_phase, \
   uint32_t &fp8_umma_pipeline_phase_mask, \
   uint32_t &nvfp4_umma_pipeline_phase_mask, \
+  uint32_t &internal_ring_full_phase_mask, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
   const CUtensorMap *tma_descs, \
@@ -221,7 +222,7 @@ DAE_COMPUTE_OP_HANDLER(OP_GEMV_SM100_M64N8_ISSUER_ONLY) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_NVFP4_GEMV_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_nvfp4_gemv_sm100(
@@ -511,13 +512,25 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT32_UMMA_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100) {
+  DAE_UNUSED(thread_id, pc, count, finish, scratch_space, st_insts,
+             tma_descs, global_bars);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_attention_split64_umma_sm100(
+      sm_id, inst.args[0], inst.args[1],
+      tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+      internal_ring_full_phase_mask, smem_base, st_insts,
+      m2c, c2m, g_events);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
-             tmem_mma_barrier, tmem_mma_phase, g_events);
+  DAE_UNUSED(thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_dsv4_attention_split_reduce_fp8_sm100<2>(
-      inst.args[0], inst.args[1], smem_base,
-      get_slot_address(smem_base, numSlots), m2c, c2m);
+      sm_id, inst.args[0], inst.args[1], inst.args[2],
+      get_slot_address(smem_base, numSlots), st_insts, m2c, c2m, g_events);
 #endif
 }
 
@@ -1377,6 +1390,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint32_t &tmem_mma_phase,
   uint32_t &fp8_umma_pipeline_phase_mask,
   uint32_t &nvfp4_umma_pipeline_phase_mask,
+  uint32_t &internal_ring_full_phase_mask,
   uint64_t *scratch_space,
   MInst *st_insts,
   const CUtensorMap *tma_descs,
@@ -1385,10 +1399,37 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   C2MQueue &c2m,
   uint64_t *g_events
 ) {
+  // Keep the resident attention pair ahead of the large general switch when
+  // it is present in the selected image.  These are the ordinary handlers;
+  // the early tests only give ptxas a compact hot CFG instead of interleaving
+  // the producer across every other selected compute case.
+  constexpr bool has_dsv4_split_attention = false
+    #define DAE_COMPUTE_OP(name) \
+      || (name == OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100) \
+      || (name == OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100)
+    #include "dae/selected_compute_ops.inc"
+    #undef DAE_COMPUTE_OP
+    ;
+
+  #define DAE_INVOKE_COMPUTE_HANDLER(name) \
+    DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, internal_ring_full_phase_mask, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events)
+
+  if constexpr (has_dsv4_split_attention) {
+    if (inst.opcode == OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100) {
+      DAE_INVOKE_COMPUTE_HANDLER(OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100);
+      return;
+    }
+    if (inst.opcode == OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
+      DAE_INVOKE_COMPUTE_HANDLER(
+          OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100);
+      return;
+    }
+  }
+
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events); \
+        DAE_INVOKE_COMPUTE_HANDLER(name); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP
@@ -1396,6 +1437,8 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
       __cprint("Unknown compute opcode: %d\n", inst.opcode);
       assert(false && "Unknown compute opcode");
   }
+
+  #undef DAE_INVOKE_COMPUTE_HANDLER
 }
 
 #undef DAE_UNUSED

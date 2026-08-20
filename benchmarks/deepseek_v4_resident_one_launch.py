@@ -42,7 +42,7 @@ from dae.schedule import (
     LayeredSchedule,
     SchedArgmaxSmemPartial,
     SchedArgmaxSmemReduce,
-    SchedDsv4AttentionSplit32UmmaSm100,
+    SchedDsv4AttentionSplit64UmmaSm100,
     SchedDsv4AttentionSplitReduceFp8Sm100,
     SchedDsv4Bf16Gemv,
     SchedDsv4Bf16GemvGroup4SplitK,
@@ -113,6 +113,8 @@ class Stage:
     wait_group: str | None = None
     release_group: str | None = None
     prefetch_before_wait: bool = False
+    wait_group_roles: tuple[tuple[str, str], ...] = ()
+    release_group_roles: tuple[tuple[str, str], ...] = ()
 
 
 class ResidentOneLaunchDecode:
@@ -342,6 +344,8 @@ class ResidentOneLaunchDecode:
         wait_group: str | None = None,
         release_group: str | None = None,
         prefetch_before_wait: bool = False,
+        wait_group_roles: tuple[tuple[str, str], ...] = (),
+        release_group_roles: tuple[tuple[str, str], ...] = (),
     ) -> Stage:
         if isinstance(sms, ShapeAssignment):
             sms = self._remember(sms)
@@ -355,6 +359,8 @@ class ResidentOneLaunchDecode:
             wait_group,
             release_group,
             prefetch_before_wait,
+            wait_group_roles,
+            release_group_roles,
         )
 
     @staticmethod
@@ -583,7 +589,7 @@ class ResidentOneLaunchDecode:
             )
         if "o_a" in self.splitk_components:
             max_attention_splits = max(
-                (indices.numel() + 31) // 32
+                (indices.numel() + 63) // 64
                 for indices in self.attention_indices_by_kind.values()
             )
             self.attention_partial_workspace = torch.empty(
@@ -2617,42 +2623,46 @@ class ResidentOneLaunchDecode:
         )
         output_join_group = f"{family.name}.attn.output.join"
         if use_split_umma_attention:
-            num_splits = (attention_rows + 31) // 32
+            num_splits = (attention_rows + 63) // 64
             partials = self.attention_partial_workspace[:num_splits]
             metadata = self.attention_metadata_workspace[:num_splits]
             q_tma = TmaTensor(
                 self.launcher, self.q_rope
-            ).wgmma_load(64, 128, Major.K)
-            k_tma = TmaTensor(
+            ).wgmma_load(64, 512, Major.K).encode_64k()
+            kv_tma = TmaTensor(
                 self.launcher, self.attention_cache[kind]
-            ).wgmma_load(32, 128, Major.K)
-            v_tma = TmaTensor(
+            ).wgmma_load(64, 512, Major.K)
+            kv_v_tma = TmaTensor(
                 self.launcher, self.attention_cache[kind]
-            ).wgmma_load(32, 128, Major.MN)
+            ).wgmma_load(64, 128, Major.MN)
             partial_tma = TmaTensor(
                 self.launcher,
                 partials.reshape(num_splits * cfg.num_heads, cfg.head_dim),
-            ).rowmajor_2d("store", cfg.num_heads, 128)
-            partial_ready_group = (
-                f"{family.name}.attn.split32.partials.ready"
+            ).wgmma("store", cfg.num_heads, 128, Major.K)
+            partial_ready_groups = (
+                f"{family.name}.attn.split64.group0.ready",
+                f"{family.name}.attn.split64.group1.ready",
             )
-            producer = SchedDsv4AttentionSplit32UmmaSm100(
+            producer = SchedDsv4AttentionSplit64UmmaSm100(
                 self.q_rope,
                 self.attention_cache[kind],
                 attention_rows,
                 partials,
                 metadata,
                 q_tma=q_tma,
-                k_tma=k_tma,
-                v_tma=v_tma,
+                kv_tma=kv_tma,
+                kv_v_tma=kv_v_tma,
                 partial_tma=partial_tma,
             )
             stages.append(
                 self._stage(
-                    f"attn.sparse_{kind}.split32_umma",
+                    f"attn.sparse_{kind}.split64_umma",
                     producer,
                     num_splits,
-                    release_group=partial_ready_group,
+                    release_group_roles=(
+                        (partial_ready_groups[0], "output0"),
+                        (partial_ready_groups[1], "output1"),
+                    ),
                 )
             )
             native_heads = self.o_group_native_fp8.view(
@@ -2676,9 +2686,12 @@ class ResidentOneLaunchDecode:
                     self._stage(
                         f"attn.sparse_{kind}.reduce_quant_g{group}",
                         reducer,
-                        8,
+                        16,
                         base_sm=group * 16,
-                        wait_group=partial_ready_group,
+                        wait_group_roles=(
+                            (partial_ready_groups[0], "partials0"),
+                            (partial_ready_groups[1], "partials1"),
+                        ),
                         release_group=group_input_ready,
                     )
                 )
@@ -3605,6 +3618,8 @@ class ResidentOneLaunchDecode:
                 profile_span_begin=profile_span_begin,
                 profile_span_end=profile_span_end,
                 prefetch_before_wait=stage.prefetch_before_wait,
+                wait_group_roles=stage.wait_group_roles,
+                release_group_roles=stage.release_group_roles,
             )
 
         def queued_family(family: LayerFamily) -> list[SequentialStage]:

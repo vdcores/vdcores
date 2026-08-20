@@ -13,6 +13,11 @@ enum CoupledStreamKind : uint16_t {
   // the three resident-FFN kinds above, this form publishes one normal M2C
   // lease and sends the same immutable command to both LDUs.
   kCoupledFp8Gemv = 3,
+  // Descriptor-driven allocator-owned internal ring.  The device plan
+  // describes rank, coordinates, iteration/issue strides, and one lane per
+  // LDU port.  This is intentionally operand-agnostic; attention is its first
+  // consumer, not part of the operator contract.
+  kCoupledTmaRing = 4,
 };
 
 static constexpr uint16_t kCoupledKindMask = 0x000f;
@@ -21,6 +26,8 @@ static constexpr uint16_t kCoupledStagesMask = 0x00f0;
 static constexpr uint16_t kCoupledLocalChain = 0x0100;
 static constexpr int kCoupledPhaseBaseShift = 9;
 static constexpr uint16_t kCoupledPhaseBaseMask = 0xfe00;
+static constexpr int kCoupledPortMaskShift = 9;
+static constexpr uint16_t kCoupledPortMask = 0x0600;
 // The common plan is two uint64 pointers. A size-field flag asks the allocator
 // to select the current resident layer's 16-byte plan record before publishing
 // the otherwise unchanged command to both LDUs.

@@ -1900,6 +1900,66 @@ def test_fp8_coupled_splitk_keeps_one_common_compute_shape(monkeypatch):
     assert all(inst.size == 2 * 128 * 4 for inst in stores)
 
 
+def test_sequential_program_carries_coupled_fp8_phase_between_stages():
+    class FakeLauncher:
+        num_sms = 1
+        num_bars = 0
+        max_insts = 16
+
+    class CoupledStage(Schedule):
+        def __init__(self, pair_count):
+            super().__init__()
+            self.pair_count = pair_count
+
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Fp8GemvUmmaCoupledSm100(self.pair_count, 2, 0),
+                TmaLoadMxfpCoupledStream(
+                    0x1000,
+                    kind=TmaLoadMxfpCoupledStream.FP8_GEMV,
+                    stages=TmaLoadMxfpCoupledStream.FP8_STAGES,
+                    area_slots=TmaLoadMxfpCoupledStream.FP8_AREA_SLOTS,
+                    area_id=0,
+                    stream_length=self.pair_count,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialStage("first", CoupledStage(2), 1),
+            SequentialStage(
+                "second",
+                CoupledStage(4),
+                1,
+                wait_for_previous=False,
+            ),
+        ),
+    )
+
+    compute = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, Fp8GemvUmmaCoupledSm100)
+    ]
+    loads = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+        and inst.annotation.get("coupled_stream_kind")
+        == TmaLoadMxfpCoupledStream.FP8_GEMV
+    ]
+    assert [inst.args[2] for inst in compute] == [0, 2]
+    assert [
+        (inst.arg >> TmaLoadMxfpCoupledStream.PHASE_BASE_SHIFT)
+        & TmaLoadMxfpCoupledStream.MAX_PHASE_BASE
+        for inst in loads
+    ] == [0, 2]
+    assert program.coupled_fp8_final_phases == (2,)
+
+
 def test_dsv4_swiglu_encodes_bound_and_width():
     instruction = Dsv4SiluClampMul(1, 128, 10.0)
 
@@ -2234,6 +2294,114 @@ def test_sequential_program_fans_out_and_joins_labeled_stage_groups():
         if sm < 2:
             assert memory[1].num_slots >> 6 == 0
         assert memory[-2].num_slots >> 6 == 1
+
+
+def test_sequential_program_binds_multiple_group_roles_inside_stages():
+    class FakeLauncher:
+        num_sms = 4
+        num_bars = 0
+        max_insts = 32
+
+        def __init__(self):
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def set_bar(self, bar_id, count):
+            self.bar_values[bar_id] = count
+
+    class RoleProducer(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ).bar(self._bar("output0")),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ).bar(self._bar("output1")),
+            ]
+
+        def bar_release_count(self, role):
+            if role not in ("output0", "output1"):
+                return 0
+            return self._bar_release_if_present(role, self.num_sms)
+
+    class RoleConsumer(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            role = f"input{sm & 1}"
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ).bar(self._bar(role)),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    launcher = FakeLauncher()
+    program = SequentialProgram(
+        launcher,
+        (
+            SequentialStage(
+                "producer",
+                RoleProducer(),
+                2,
+                release_group_roles=(
+                    ("ready0", "output0"),
+                    ("ready1", "output1"),
+                ),
+            ),
+            SequentialStage(
+                "consumer",
+                RoleConsumer(),
+                4,
+                wait_group_roles=(
+                    ("ready0", "input0"),
+                    ("ready1", "input1"),
+                ),
+            ),
+        ),
+    )
+
+    assert launcher.bar_values == {0: 2, 1: 2}
+    for sm, instructions in enumerate(program.instructions):
+        memory = [
+            inst for inst in instructions
+            if isinstance(inst, MemoryInstruction)
+        ]
+        if sm < 2:
+            assert memory[0].num_slots >> 6 == 0
+            assert memory[1].num_slots >> 6 == 1
+            consumer_load = memory[2]
+        else:
+            consumer_load = memory[0]
+        assert consumer_load.num_slots >> 6 == (sm & 1)
 
 
 def test_sequential_program_rejects_wait_group_without_producer():

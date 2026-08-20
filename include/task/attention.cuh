@@ -1226,7 +1226,7 @@ task_dsv4_contiguous_attention_512_umma_tail32(
     }
     tail_qk.accumulate_ = UMMA::ScaleOut::Zero;
     if (tid < numThreadsPerWarp) {
-#pragma unroll 1
+#pragma unroll
         for (int tile = 0; tile < D_TILES; ++tile) {
             auto sQ = make_tensor(
                 make_smem_ptr(q_ptrs[tile]), tail_q_layout);
@@ -1603,15 +1603,368 @@ __device__ __forceinline__ void task_dsv4_attention_split32_umma_sm100(
     c2m.template push<31, true, false>(tid, metadata_slots);
 }
 
+// B64 BF16 split producer used by the FlashMLA-style resident path.  Scores
+// become one BF16 probability tile in TMEM, so the ordinary 128-thread
+// compute warpgroup performs QK and PV without a dequant/transform warpgroup.
+template <typename ScoreTensor, typename CoordTensor,
+          typename ProbTensor, typename ProbCoordTensor>
+__device__ __forceinline__ void sm100_dsv4_softmax_split64_tmem(
+    ScoreTensor const& scores,
+    CoordTensor const& coords,
+    ProbTensor const& probabilities,
+    ProbCoordTensor const& probability_coords,
+    const int active_tokens,
+    int& logical_row,
+    float& row_max,
+    float& row_sum) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    constexpr int M = 64;
+    constexpr float kScoreScale =
+        M_LOG2E * 0.04419417382415922f;
+    const int tid = __compute_tid();
+
+    if (tid < 2 * M) {
+        using ScoreLoad = SM100_TMEM_LOAD_16dp32b16x;
+        auto tiled_load = make_tmem_copy(ScoreLoad{}, scores);
+        auto thread_load = tiled_load.get_slice(tid);
+        auto thread_scores = thread_load.partition_S(scores);
+        auto thread_coords = thread_load.partition_D(coords);
+        auto values = make_tensor<accum_t>(shape(thread_coords));
+        copy(tiled_load, thread_scores, values);
+        // TMEM loads retire asynchronously with respect to the issuing
+        // thread.  Drain the load before consuming its register fragment or
+        // allowing a later UMMA/kernel teardown to reuse the same TMEM.
+        cutlass::arch::fence_view_async_tmem_load();
+
+        logical_row = int(get<0>(thread_coords(0)));
+        row_max = -FLT_MAX;
+#pragma unroll
+        for (int i = 0; i < size(values); ++i) {
+            const int col = int(get<1>(thread_coords(i)));
+            values(i) *= kScoreScale;
+            if (col < active_tokens) {
+                row_max = fmaxf(row_max, values(i));
+            }
+        }
+        row_max = fmaxf(
+            row_max, __shfl_xor_sync(0xFFFFFFFFU, row_max, 16));
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < size(values); ++i) {
+            const int col = int(get<1>(thread_coords(i)));
+            values(i) = col < active_tokens
+                ? exp2f(values(i) - row_max) : 0.0f;
+            local_sum += values(i);
+        }
+        row_sum = local_sum +
+            __shfl_xor_sync(0xFFFFFFFFU, local_sum, 16);
+
+        using ProbStore = SM100_TMEM_STORE_16dp32b16x;
+        auto tiled_store = make_tmem_copy(ProbStore{}, probabilities);
+        auto thread_store = tiled_store.get_slice(tid);
+        auto thread_probability_coords =
+            thread_store.partition_S(probability_coords);
+        auto thread_probabilities =
+            thread_store.partition_D(probabilities);
+        auto packed = make_tensor<uint32_t>(shape(thread_probability_coords));
+        auto pairs = recast<cutlass::Array<data_t, 2>>(packed);
+        cutlass::NumericArrayConverter<data_t, accum_t, 2> convert;
+        const int lane_half = (tid >> 4) & 1;
+#pragma unroll
+        for (int i = 0; i < size(pairs); ++i) {
+            const int chunk = i / 16;
+            const int pair_in_quarter = i & 7;
+            const int local_index =
+                chunk * 32 + 16 * lane_half + 2 * pair_in_quarter;
+            const int peer_index =
+                chunk * 32 + 16 * (1 - lane_half) + 2 * pair_in_quarter;
+            const bool use_peer = ((i >> 3) & 1) != lane_half;
+            const accum_t peer_0 = __shfl_xor_sync(
+                0xFFFFFFFFU, values(peer_index), 16);
+            const accum_t peer_1 = __shfl_xor_sync(
+                0xFFFFFFFFU, values(peer_index + 1), 16);
+            cutlass::Array<accum_t, 2> pair;
+            pair[0] = use_peer ? peer_0 : values(local_index);
+            pair[1] = use_peer ? peer_1 : values(local_index + 1);
+            pairs(i) = convert(pair);
+        }
+        copy(tiled_store, packed, thread_probabilities);
+        cutlass::arch::fence_view_async_tmem_store();
+    }
+    // The probability tile is produced by four warps but consumed by the
+    // single UMMA-issuing warp.  Ordinary bar.sync does not transfer the
+    // tcgen05 proxy view by itself.
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    __sync_compute_group(128);
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+}
+
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
+    int sm_id,
+    int active_tokens,
+    int ring_port_mask,
+    uint32_t tmem_base_ptr,
+    uint64_t *tmem_mma_barrier,
+    uint32_t& tmem_mma_phase,
+    uint32_t& internal_ring_full_phase_mask,
+    void *smem_base,
+    const MInst *st_insts,
+    M2CQueue& m2c,
+    C2MQueue& c2m,
+    uint64_t *g_events) {
+    using namespace cute;
+    using data_t = cutlass::bfloat16_t;
+    using accum_t = float;
+    using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+    constexpr int M = 64;
+    constexpr int KV = 64;
+    constexpr int D_TILE = 128;
+    constexpr int D_TILES = 4;
+    constexpr uint32_t P_OFFSET = 0;
+    constexpr uint32_t O_OFFSET = 128;
+
+    using QKAtom = SM100_MMA_F16BF16_SS<
+        data_t, data_t, accum_t, M, KV,
+        UMMA::Major::K, UMMA::Major::K>;
+    using PVAtom = SM100_MMA_F16BF16_TS<
+        data_t, data_t, accum_t, M, D_TILE,
+        UMMA::Major::K, UMMA::Major::MN>;
+
+    const int tid = __compute_tid();
+#if defined(DAE_TRACK_PROFILE)
+#define DAE_DSV4_ATTN_EVENT(event_id)                                      \
+    do {                                                                   \
+        if (tid == 0) {                                                    \
+            g_events[sm_id * numProfileEvents + (event_id)] =              \
+                cuda::ptx::get_sreg_globaltimer();                         \
+        }                                                                  \
+    } while (false)
+#else
+#define DAE_DSV4_ATTN_EVENT(event_id) do { } while (false)
+    (void)sm_id;
+    (void)g_events;
+#endif
+    DAE_DSV4_ATTN_EVENT(2);
+    auto tiled_qk = make_tiled_mma(QKAtom{});
+    auto qk_cta = tiled_qk.get_slice(0);
+    auto tiled_pv = make_tiled_mma(PVAtom{});
+    auto pv_cta = tiled_pv.get_slice(0);
+    auto q_shape = partition_shape_A(
+        tiled_qk, make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto k_shape = partition_shape_B(
+        tiled_qk, make_shape(Int<KV>{}, Int<D_TILE>{}));
+    auto v_shape = partition_shape_B(
+        tiled_pv, make_shape(Int<D_TILE>{}, Int<KV>{}));
+    auto p_shape = partition_shape_A(
+        tiled_pv, make_shape(Int<M>{}, Int<KV>{}));
+    auto q_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, q_shape);
+    auto k_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, k_shape);
+    auto v_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_MN_SW128_Atom<data_t>{}, v_shape);
+    auto p_layout = UMMA::tile_to_mma_shape(
+        UMMA::Layout_K_SW128_Atom<data_t>{}, p_shape);
+
+    auto logical_s = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<KV>{}),
+                    make_stride(Int<KV>{}, Int<1>{})));
+    auto coord_s = make_identity_tensor(make_shape(Int<M>{}, Int<KV>{}));
+    auto cta_s = qk_cta.partition_C(logical_s);
+    auto cta_coord_s = qk_cta.partition_C(coord_s);
+    auto tmem_s = qk_cta.make_fragment_C(cta_s);
+    tmem_s.data() = tmem_base_ptr;
+    auto tmem_p_view = tmem_s.compose(
+        make_layout(make_shape(Int<M>{}, Int<KV / 2>{})));
+    tmem_p_view.data() = tmem_base_ptr + P_OFFSET;
+    auto coord_p_view = cta_coord_s.compose(
+        make_layout(make_shape(Int<M>{}, Int<KV / 2>{})));
+    auto dummy_p = make_tensor(
+        make_smem_ptr(static_cast<data_t *>(nullptr)), p_layout);
+    auto tmem_p = pv_cta.make_fragment_A(dummy_p);
+    tmem_p.data() = tmem_base_ptr + P_OFFSET;
+
+    auto logical_o = make_tensor(
+        make_smem_ptr(static_cast<accum_t *>(nullptr)),
+        make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                    make_stride(Int<D_TILE>{}, Int<1>{})));
+    auto coord_o = make_identity_tensor(make_shape(Int<M>{}, Int<D_TILE>{}));
+    auto cta_o = pv_cta.partition_C(logical_o);
+    auto cta_coord_o = pv_cta.partition_C(coord_o);
+
+    const int ring_slots = m2c.template pop<0>();
+    auto *ring = static_cast<data_t *>(
+        get_slot_address(smem_base, extract(ring_slots)));
+    const int q_slots = m2c.template pop<0>();
+    auto *q = static_cast<data_t *>(
+        get_slot_address(smem_base, extract(q_slots)));
+
+    auto *ring_full = reinterpret_cast<TxBarrier *>(
+        tmem_mma_barrier + internalRingFullBarrierBase);
+    auto *ring_empty = reinterpret_cast<TxBarrier *>(
+        tmem_mma_barrier + internalRingEmptyBarrierBase);
+    for (int port = 0; port < 2; ++port) {
+        if (ring_port_mask & (1 << port)) {
+            constexpr int kStage = 0;
+            const int phase_index = port * internalRingStages + kStage;
+            const uint32_t phase =
+                (internal_ring_full_phase_mask >> phase_index) & 1U;
+            if (tid < numThreadsPerWarp) {
+                ring_full[phase_index].wait(phase);
+            }
+            internal_ring_full_phase_mask ^= 1U << phase_index;
+        }
+    }
+    DAE_DSV4_ATTN_EVENT(3);
+
+    tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
+    if (tid < numThreadsPerWarp) {
+#pragma unroll
+        for (int tile = 0; tile < D_TILES; ++tile) {
+            auto sQ = make_tensor(
+                make_smem_ptr(q + tile * M * D_TILE), q_layout);
+            auto sK = make_tensor(
+                make_smem_ptr(ring + tile * KV * D_TILE), k_layout);
+            auto frag_q = qk_cta.make_fragment_A(sQ);
+            auto frag_k = qk_cta.make_fragment_B(sK);
+#pragma unroll
+            for (int k_block = 0; k_block < size<2>(frag_q); ++k_block) {
+                gemm(tiled_qk, frag_q(_, _, k_block),
+                     frag_k(_, _, k_block), tmem_s);
+                tiled_qk.accumulate_ = UMMA::ScaleOut::One;
+            }
+        }
+        cutlass::arch::umma_arrive(tmem_mma_barrier);
+    }
+
+    cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+    tmem_mma_phase ^= 1;
+    // tcgen05.commit (umma_arrive) supplies the producer-side ordering.  A
+    // consumer-side fence is still required before the other compute warps
+    // may load the completed score tile from TMEM.
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    c2m.push(tid, q_slots);
+    DAE_DSV4_ATTN_EVENT(4);
+
+    // Metadata is a small raw vector.  Consume its dedicated mailbox before
+    // the four allocator-owned partial-tile destinations.
+    const int metadata_slots = m2c.template pop<0>();
+    const ComputeRawAddressSlots raw_slots{st_insts};
+    auto *metadata = raw_slots.template get<float>(metadata_slots);
+    DAE_DSV4_ATTN_EVENT(5);
+
+    int logical_row = 0;
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    sm100_dsv4_softmax_split64_tmem(
+        tmem_s, cta_coord_s, tmem_p_view, coord_p_view,
+        active_tokens, logical_row, row_max, row_sum);
+    DAE_DSV4_ATTN_EVENT(6);
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    if ((tid & 16) == 0) {
+        metadata[logical_row * 2] = row_max;
+        metadata[logical_row * 2 + 1] = row_sum;
+    }
+    // Metadata rows are disjoint raw global stores.  Do not stop PV issue on
+    // them: the first PV materialization joins all four compute warps before
+    // either output group (and therefore either reducer) can be published.
+    DAE_DSV4_ATTN_EVENT(20);
+
+#pragma unroll 1
+    for (int tile = 0; tile < D_TILES; ++tile) {
+        // Publish the second output group first.  Its reducer owns the final
+        // D128 tile and therefore also performs inverse RoPE; starting that
+        // longer group while group 0 is still being materialized removes it
+        // from the producer/reducer tail.
+        const int output_tile = tile ^ 2;
+        auto sV = make_tensor(
+            make_smem_ptr(
+                ring + KV * D_TILE * D_TILES +
+                    output_tile * KV * D_TILE),
+            v_layout);
+        auto frag_v = pv_cta.make_fragment_B(sV);
+        auto tmem_o = pv_cta.make_fragment_C(cta_o);
+        tmem_o.data() = tmem_base_ptr + O_OFFSET;
+        tiled_pv.accumulate_ = UMMA::ScaleOut::Zero;
+        if (tid < numThreadsPerWarp) {
+#pragma unroll
+            for (int k_block = 0; k_block < size<2>(tmem_p); ++k_block) {
+                gemm(tiled_pv, tmem_p(_, _, k_block),
+                     frag_v(_, _, k_block), tmem_o);
+                tiled_pv.accumulate_ = UMMA::ScaleOut::One;
+            }
+            cutlass::arch::umma_arrive(tmem_mma_barrier);
+        }
+        cute::wait_barrier(*tmem_mma_barrier, tmem_mma_phase);
+        tmem_mma_phase ^= 1;
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        DAE_DSV4_ATTN_EVENT(7 + 3 * tile);
+        if (tile + 1 == D_TILES) {
+            if (tid == 0) {
+                ring_empty[0].arrive();
+            }
+            c2m.push(tid, ring_slots);
+        }
+
+        const int output_slots = m2c.template pop<0>();
+        auto *output = static_cast<data_t *>(
+            get_slot_address(smem_base, extract(output_slots)));
+        auto sO = make_tensor(make_smem_ptr(output), q_layout);
+        if (tid < 2 * M) {
+            using OutputLoad = SM100_TMEM_LOAD_16dp32b16x;
+            auto tiled_load = make_tmem_copy(OutputLoad{}, tmem_o);
+            auto thread_load = tiled_load.get_slice(tid);
+            auto thread_tmem = thread_load.partition_S(tmem_o);
+            auto thread_coords = thread_load.partition_D(cta_coord_o);
+            auto values = make_tensor<accum_t>(shape(thread_coords));
+            copy(tiled_load, thread_tmem, values);
+            // Every D128 PV tile reuses O_OFFSET.  Complete this tile's TMEM
+            // drain before the next UMMA overwrites that address and before
+            // the resident allocation is released at kernel exit.
+            cutlass::arch::fence_view_async_tmem_load();
+#pragma unroll
+            for (int index = 0; index < size(values); ++index) {
+                const int row = int(get<0>(thread_coords(index)));
+                const int column = int(get<1>(thread_coords(index)));
+                const auto sw128_coordinate = make_coord(
+                    make_coord(row, column & 15),
+                    0,
+                    make_coord((column >> 4) & 3, column >> 6));
+                sO(sw128_coordinate) = data_t(values(index) * inv_sum);
+            }
+        }
+        DAE_DSV4_ATTN_EVENT(8 + 3 * tile);
+        // All four warps drain the same output tile.  Wait for every
+        // tcgen05.ld before warp 0 reuses O_OFFSET for the next PV UMMA.
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        __sync_compute_group(128);
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        cutlass::arch::fence_view_async_shared();
+        c2m.template push<31, true, false>(tid, output_slots);
+        DAE_DSV4_ATTN_EVENT(9 + 3 * tile);
+    }
+    DAE_DSV4_ATTN_EVENT(19);
+    DAE_DSV4_ATTN_EVENT(21);
+#undef DAE_DSV4_ATTN_EVENT
+}
+
 template <int ScalePack, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_dsv4_attention_split_reduce_fp8_sm100(
+    int sm_id,
     int num_splits,
     int head,
-    void *smem_base,
+    int output_group,
     void *task_scratch,
+    const MInst *st_insts,
     M2CQueue& m2c,
-    C2MQueue& c2m) {
+    C2MQueue& c2m,
+    uint64_t *g_events) {
     using namespace cute;
     using Fp8 = cutlass::float_e4m3_t;
     using Scale = cutlass::float_ue8m0_t;
@@ -1620,12 +1973,28 @@ task_dsv4_attention_split_reduce_fp8_sm100(
     constexpr int kTileM = 128;
     constexpr int kTileN = 8;
     constexpr int kTileK = 128;
-    constexpr int kTiles = 4;
+    constexpr int kTotalTiles = 4;
+    constexpr int kTiles = 2;
     constexpr int kScaleVector = 32;
     constexpr int kBBytes = kTileN * kTileK;
     constexpr int kBTileBytes = 2048;
+    const int tid = __compute_tid();
+#if defined(DAE_TRACK_PROFILE)
+#define DAE_DSV4_REDUCE_EVENT(event_id)                                    \
+    do {                                                                   \
+        if (tid == 0) {                                                    \
+            g_events[sm_id * numProfileEvents + (event_id)] =              \
+                cuda::ptx::get_sreg_globaltimer();                         \
+        }                                                                  \
+    } while (false)
+#else
+#define DAE_DSV4_REDUCE_EVENT(event_id) do { } while (false)
+    (void)sm_id;
+    (void)g_events;
+#endif
+    DAE_DSV4_REDUCE_EVENT(22);
     static_assert(ScalePack == 2);
-    static_assert(kTiles % ScalePack == 0);
+    static_assert(kTiles == ScalePack);
     using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
     using Atom = SM100_MMA_MXF8F6F4_SS<
         Fp8, Fp8, Accum, Scale, kTileM, kTileN,
@@ -1638,59 +2007,125 @@ task_dsv4_attention_split_reduce_fp8_sm100(
     const auto logical_sfb =
         ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
 
-    const int metadata_slots = m2c.template pop<0>();
-    const auto *metadata = static_cast<const float *>(
-        get_slot_address(smem_base, extract(metadata_slots)));
-    const int sink_slots = m2c.template pop<0>();
-    const auto *sink = static_cast<const float *>(
-        get_slot_address(smem_base, extract(sink_slots)));
-    const int table_slots = m2c.template pop<0>();
-    const auto *table = static_cast<const float *>(
-        get_slot_address(smem_base, extract(table_slots)));
-    const int tid = __compute_tid();
+    // The barriered record is the reducer's sole input message.  Its four
+    // pointers name [partials, metadata, sink, inverse-RoPE table]; LDU owns
+    // the producer dependency and publishes this message only after every
+    // producer STU has completed its partial and metadata stores.
+    const int record_slot = m2c.template pop<0>();
+    DAE_DSV4_REDUCE_EVENT(23);
+    const ComputeRawAddressSlots raw_slots{st_insts};
+    const auto *record = raw_slots.template get<const uint64_t>(record_slot);
+    const auto *partials = reinterpret_cast<const __nv_bfloat16 *>(record[0]);
+    const auto *metadata = reinterpret_cast<const float *>(record[1]);
+    const auto *sink = reinterpret_cast<const float *>(record[2]);
+    const auto *table = reinterpret_cast<const float *>(record[3]);
     const int lane = tid & 31;
     const int warp = tid >> 5;
+    const int first_tile = output_group * kTiles;
     auto *shared = static_cast<float *>(task_scratch);
 
 
-    if (tid == 0) {
-        float global_max = sink[0] * M_LOG2E;
-        for (int split = 0; split < num_splits; ++split) {
-            global_max = fmaxf(
-                global_max, metadata[(split * kHeads + head) * 2]);
-        }
-        float denominator = exp2f(sink[0] * M_LOG2E - global_max);
-        for (int split = 0; split < num_splits; ++split) {
-            const float local_max = metadata[(split * kHeads + head) * 2];
-            const float local_mass =
-                metadata[(split * kHeads + head) * 2 + 1];
-            shared[split] = exp2f(local_max - global_max) * local_mass;
-            denominator += shared[split];
-        }
-        const float inv_denominator = 1.0f / denominator;
-        for (int split = 0; split < num_splits; ++split) {
-            shared[split] *= inv_denominator;
+    if (warp == 0) {
+        const float sink_log2 = sink[head] * M_LOG2E;
+        if (num_splits == 2) {
+            const float split_max = lane < 2
+                ? metadata[(lane * kHeads + head) * 2] : -FLT_MAX;
+            const float max_candidate = lane == 0
+                ? fmaxf(split_max, sink_log2) : split_max;
+            const float global_max = fmaxf(
+                max_candidate,
+                __shfl_xor_sync(0xFFFFFFFFU, max_candidate, 1));
+            float split_contribution = 0.0f;
+            if (lane < 2) {
+                const float local_mass =
+                    metadata[(lane * kHeads + head) * 2 + 1];
+                split_contribution =
+                    exp2f(split_max - global_max) * local_mass;
+            }
+            float denominator_part = split_contribution;
+            if (lane == 0) {
+                denominator_part += exp2f(sink_log2 - global_max);
+            }
+            const float denominator = denominator_part +
+                __shfl_xor_sync(
+                    0xFFFFFFFFU, denominator_part, 1);
+            if (lane < 2) {
+                shared[32 + lane] =
+                    split_contribution / denominator;
+            }
+        } else {
+            float global_max = lane == 0 ? sink_log2 : -FLT_MAX;
+            if (lane < num_splits) {
+                global_max = fmaxf(
+                    global_max, metadata[(lane * kHeads + head) * 2]);
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                global_max = fmaxf(
+                    global_max,
+                    __shfl_down_sync(0xFFFFFFFFU, global_max, offset));
+            }
+            global_max = __shfl_sync(0xFFFFFFFFU, global_max, 0);
+
+            float split_contribution = 0.0f;
+            if (lane < num_splits) {
+                const float local_max =
+                    metadata[(lane * kHeads + head) * 2];
+                const float local_mass =
+                    metadata[(lane * kHeads + head) * 2 + 1];
+                split_contribution =
+                    exp2f(local_max - global_max) * local_mass;
+            }
+            float contribution = split_contribution;
+            if (lane == 0) {
+                contribution += exp2f(sink_log2 - global_max);
+            }
+            float denominator = contribution;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                denominator += __shfl_down_sync(
+                    0xFFFFFFFFU, denominator, offset);
+            }
+            const float inv_denominator = 1.0f /
+                __shfl_sync(0xFFFFFFFFU, denominator, 0);
+            if (lane < num_splits) {
+                shared[32 + lane] =
+                    split_contribution * inv_denominator;
+            }
         }
     }
     __sync_compute_group(128);
-    c2m.push(tid, metadata_slots | sink_slots);
+    DAE_DSV4_REDUCE_EVENT(24);
 
-    float values[kTiles] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 1
-    for (int split = 0; split < num_splits; ++split) {
-        const int partial_slots = m2c.template pop<0>();
-        const auto *partial = static_cast<const __nv_bfloat16 *>(
-            get_slot_address(smem_base, extract(partial_slots)));
-        const float weight = shared[split];
+    float values[kTiles] = {};
+    if (num_splits == 2) {
+        const auto *partial_0 = partials +
+            head * kTotalTiles * kTileK;
+        const auto *partial_1 = partial_0 +
+            kHeads * kTotalTiles * kTileK;
 #pragma unroll
         for (int tile = 0; tile < kTiles; ++tile) {
-            values[tile] +=
-                weight * __bfloat162float(partial[tile * kTileK + tid]);
+            const int offset = (first_tile + tile) * kTileK + tid;
+            values[tile] =
+                shared[32] * __bfloat162float(partial_0[offset]) +
+                shared[33] * __bfloat162float(partial_1[offset]);
         }
-        c2m.push(tid, partial_slots);
+    } else {
+#pragma unroll 1
+        for (int split = 0; split < num_splits; ++split) {
+            const auto *partial = partials +
+                (split * kHeads + head) * kTotalTiles * kTileK;
+            const float weight = shared[32 + split];
+#pragma unroll
+            for (int tile = 0; tile < kTiles; ++tile) {
+                values[tile] +=
+                    weight * __bfloat162float(
+                        partial[(first_tile + tile) * kTileK + tid]);
+            }
+        }
     }
 
-    if (tid >= 64) {
+    if (output_group == 1 && tid >= 64) {
         const int pair = (tid - 64) >> 1;
         const float partner =
             __shfl_xor_sync(0xFFFFFFFFU, values[kTiles - 1], 1);
@@ -1700,14 +2135,18 @@ task_dsv4_attention_split_reduce_fp8_sm100(
             ? values[kTiles - 1] * cosine - partner * sine
             : values[kTiles - 1] * cosine + partner * sine;
     }
-    c2m.push(tid, table_slots);
+    DAE_DSV4_REDUCE_EVENT(25);
 
-    const int output_slots = m2c.template pop<0>();
-    auto *output = static_cast<uint8_t *>(
-        get_slot_address(smem_base, extract(output_slots)));
-#pragma unroll 1
+    const int output_slot = m2c.template pop<0>();
+    DAE_DSV4_REDUCE_EVENT(26);
+    auto *output = raw_slots.template get<uint8_t>(output_slot) +
+        (head * kTotalTiles + first_tile) * kBTileBytes;
+
+    // Reduce both local tile maxima together.  Keeping the merge coefficients
+    // at shared[32..] leaves shared[0..19] available for this phase without
+    // a producer/consumer reuse join.
+#pragma unroll
     for (int tile = 0; tile < kTiles; ++tile) {
-        auto *tile_output = output + tile * kBTileBytes;
         float maximum = fabsf(values[tile]);
         for (int offset = 16; offset > 0; offset >>= 1) {
             maximum = fmaxf(
@@ -1715,27 +2154,51 @@ task_dsv4_attention_split_reduce_fp8_sm100(
                 __shfl_down_sync(0xFFFFFFFFU, maximum, offset));
         }
         if (lane == 0) {
-            shared[warp] = maximum;
+            shared[tile * 4 + warp] = maximum;
         }
-        for (int offset = tid; offset < kBTileBytes - kBBytes;
-             offset += 128) {
-            tile_output[kBBytes + offset] = 0;
+    }
+    __sync_compute_group(128);
+    DAE_DSV4_REDUCE_EVENT(27);
+    if (tid < kTiles) {
+        const int tile = tid;
+        const float maximum = fmaxf(
+            fmaxf(shared[tile * 4], shared[tile * 4 + 1]),
+            fmaxf(shared[tile * 4 + 2], shared[tile * 4 + 3]));
+        const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+        const uint32_t requested_bits = __float_as_uint(requested);
+        const uint32_t exponent_bits = (requested_bits >> 23) & 0xFFU;
+        const uint32_t fraction_bits = requested_bits & 0x7FFFFFU;
+        int exponent;
+        if (exponent_bits == 0) {
+            const int highest_bit = 31 - __clz(fraction_bits);
+            const int floor_exponent = highest_bit - 149;
+            exponent = floor_exponent +
+                ((fraction_bits & (fraction_bits - 1)) != 0);
+        } else if (exponent_bits == 0xFFU) {
+            exponent = 127;
+        } else {
+            exponent = int(exponent_bits) - 127 +
+                (fraction_bits != 0);
         }
-        __sync_compute_group(128);
-        if (tid == 0) {
-            maximum = fmaxf(
-                fmaxf(shared[0], shared[1]),
-                fmaxf(shared[2], shared[3]));
-            const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
-            const float exponent = ceilf(log2f(requested));
-            shared[4] = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
-            shared[16 + tile % ScalePack] = shared[4];
-        }
-        __sync_compute_group(128);
+        exponent = max(-127, min(127, exponent));
+        const uint32_t scale_bits = exponent >= -126
+            ? uint32_t(exponent + 127) << 23
+            : 1U << 22;
+        shared[16 + tile] = __uint_as_float(scale_bits);
+    }
+    __sync_compute_group(128);
+    DAE_DSV4_REDUCE_EVENT(28);
+
+    // Emit all data tiles after the shared scales are ready.  Padding bytes
+    // in each native record are deliberately unspecified and are not stored.
+#pragma unroll
+    for (int tile = 0; tile < kTiles; ++tile) {
+        auto *tile_output = output + tile * kBTileBytes;
         const Fp8 quantized = values[tile] == 0.0f
             ? Fp8(0.0f)
             : Fp8(fminf(
-                fmaxf(values[tile] / shared[4], -448.0f), 448.0f));
+                fmaxf(values[tile] / shared[16 + tile], -448.0f),
+                448.0f));
         const int source_chunk = tid / 16;
         const int byte_in_chunk = tid % 16;
 #pragma unroll
@@ -1745,18 +2208,21 @@ task_dsv4_attention_split_reduce_fp8_sm100(
                 row * kTileK + destination_chunk * 16 + byte_in_chunk] =
                 quantized;
         }
-        if (tile % ScalePack == ScalePack - 1 &&
-            tid < kTileN * ScalePack) {
-            const int row = tid / ScalePack;
-            const int sf = tid % ScalePack;
-            auto *packed_scale = reinterpret_cast<Scale *>(
-                output + (tile + 1 - ScalePack) * kBTileBytes + kBBytes);
-            const int dst = int(logical_sfb(row, sf * kScaleVector));
-            packed_scale[dst] = Scale(shared[16 + sf]);
-        }
-        __sync_compute_group(128);
     }
-    c2m.template push<31, true, false>(tid, output_slots);
+    if (tid < kTileN * ScalePack) {
+        const int row = tid / ScalePack;
+        const int sf = tid % ScalePack;
+        auto *packed_scale = reinterpret_cast<Scale *>(
+            output + kBBytes);
+        const int dst = int(logical_sfb(row, sf * kScaleVector));
+        packed_scale[dst] = Scale(shared[16 + sf]);
+    }
+    // Raw-address M2C messages carry a slot index; STU consumes a one-hot
+    // completion token.  The C2M barrier also joins all 128 direct stores
+    // before STU releases any downstream dependency.
+    c2m.template push<31, true, false>(tid, 1U << output_slot);
+    DAE_DSV4_REDUCE_EVENT(29);
+#undef DAE_DSV4_REDUCE_EVENT
 }
 
 template <int M, int KV, typename TmemTensor, typename CoordTensor,

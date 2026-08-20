@@ -870,17 +870,33 @@ class Dsv4AttentionSplit32UmmaSm100(ComputeInstruction):
         )
 
 
+class Dsv4AttentionSplit64UmmaSm100(ComputeInstruction):
+    """Produce one B64 BF16 partial from a retained internal KV ring."""
+
+    def __init__(self, active_tokens: int, *, ring_port_mask: int = 1):
+        if not 1 <= active_tokens <= 64:
+            raise ValueError("B64 attention split must contain 1..64 tokens")
+        if ring_port_mask not in (1, 2, 3):
+            raise ValueError("attention ring must select LDU0 and/or LDU1")
+        super().__init__(
+            opcode=opcode.OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100,
+            args=[active_tokens, ring_port_mask],
+        )
+
+
 class Dsv4AttentionSplitReduceFp8Sm100(ComputeInstruction):
     """Merge attention partials and emit inverse-RoPE native FP8."""
 
-    def __init__(self, num_splits: int, head: int):
+    def __init__(self, num_splits: int, head: int, output_group: int = 0):
         if not 1 <= num_splits <= 24:
             raise ValueError("attention reducer split count must be in [1,24]")
         if not 0 <= head < 64:
             raise ValueError("attention reducer head must be in [0,64)")
+        if output_group not in (0, 1):
+            raise ValueError("attention reducer output group must be 0 or 1")
         super().__init__(
             opcode=opcode.OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100,
-            args=[num_splits, head],
+            args=[num_splits, head, output_group],
         )
 
 
@@ -2707,6 +2723,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
     DOWN_WEIGHT = 1
     DOWN_ACTIVATION = 2
     FP8_GEMV = 3
+    TMA_RING = 4
     KIND_MASK = 0x000F
     STAGES_SHIFT = 4
     STAGES_MASK = 0x00F0
@@ -2739,6 +2756,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
             self.DOWN_WEIGHT,
             self.DOWN_ACTIVATION,
             self.FP8_GEMV,
+            self.TMA_RING,
         ):
             raise ValueError("unknown MXFP coupled-stream kind")
         if not 1 <= int(stages) <= 0xF:
@@ -2747,7 +2765,11 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
             raise ValueError("coupled-stream area size must fit uint16")
         if not 0 <= int(area_id) <= 0xFFFF:
             raise ValueError("coupled-stream area id must fit uint16")
-        if kind == self.FP8_GEMV:
+        if kind in (self.FP8_GEMV, self.TMA_RING):
+            if kind == self.TMA_RING:
+                raise ValueError(
+                    "use TmaLoadInternalRingStream for descriptor-driven plans"
+                )
             if int(stages) != self.FP8_STAGES:
                 raise ValueError("coupled FP8 stream requires two stages")
             if int(area_slots) != self.FP8_AREA_SLOTS:
@@ -2811,6 +2833,123 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         inst.arg |= self.LOCAL_CHAIN
         inst.annotation["coupled_stream_local_chain"] = "source"
         return inst
+
+
+def build_internal_ring_tma_plan(
+    *,
+    device,
+    stage_bytes: int,
+    lanes: dict[int, dict],
+    cache_evict_first: bool = True,
+) -> torch.Tensor:
+    """Pack one two-port descriptor plan for the generic internal-ring LDU.
+
+    Each lane dictionary contains ``descriptor_index``, ``rank``,
+    ``transaction_bytes`` and optional issue/destination/coordinate fields.
+    Coordinates and both deltas are four-element signed sequences; unused
+    dimensions remain zero.  The resulting CUDA tensor is retained by the
+    instruction object, so callers need no separate lifetime bookkeeping.
+    """
+
+    if not 16 <= int(stage_bytes) <= 0x7FFFFFFF:
+        raise ValueError("internal-ring stage_bytes must fit positive int32")
+    if any(port not in (0, 1) for port in lanes):
+        raise ValueError("internal-ring plan supports only LDU ports 0 and 1")
+    words = torch.zeros(36, dtype=torch.int32)
+    words[0] = int(stage_bytes)
+    words[1] = 1 if cache_evict_first else 0
+    for port, lane in lanes.items():
+        base = 4 + int(port) * 16
+        descriptor_index = int(lane["descriptor_index"])
+        rank = int(lane["rank"])
+        issue_count = int(lane.get("issue_count", 1))
+        transaction_bytes = int(lane["transaction_bytes"])
+        if not 0 <= descriptor_index <= 0xFFFF:
+            raise ValueError("internal-ring descriptor index must fit uint16")
+        if not 1 <= rank <= 4:
+            raise ValueError("internal-ring TMA rank must be in [1,4]")
+        if not 1 <= issue_count <= 0xFF:
+            raise ValueError("internal-ring issue_count must fit uint8")
+        if transaction_bytes <= 0:
+            raise ValueError("internal-ring transaction_bytes must be positive")
+        words[base] = (
+            descriptor_index | (rank << 16) | (issue_count << 24)
+        )
+        words[base + 1] = transaction_bytes
+        words[base + 2] = int(lane.get("destination_offset", 0))
+        words[base + 3] = int(lane.get("destination_issue_stride", 0))
+        for field, offset in (
+            ("coordinates", 4),
+            ("iteration_delta", 8),
+            ("issue_delta", 12),
+        ):
+            values = tuple(int(value) for value in lane.get(field, ()))
+            if len(values) > 4:
+                raise ValueError(f"internal-ring {field} has more than 4 values")
+            if values:
+                words[base + offset : base + offset + len(values)] = torch.tensor(
+                    values, dtype=torch.int32
+                )
+    return words.to(device=device, non_blocking=False)
+
+
+class TmaLoadInternalRingStream(MemoryInstruction):
+    """Lease an allocator area once and fill its stages from up to two LDUs."""
+
+    KIND = TmaLoadMxfpCoupledStream.TMA_RING
+    STAGES_SHIFT = TmaLoadMxfpCoupledStream.STAGES_SHIFT
+    PORT_MASK_SHIFT = 9
+
+    def __init__(
+        self,
+        plan: torch.Tensor,
+        *,
+        stages: int,
+        stage_bytes: int,
+        area_slots: int,
+        area_id: int,
+        stream_length: int,
+        port_mask: int,
+    ):
+        if (
+            plan.dtype != torch.int32
+            or plan.device.type != "cuda"
+            or not plan.is_contiguous()
+            or plan.numel() != 36
+        ):
+            raise ValueError("internal-ring plan must be contiguous CUDA int32[36]")
+        if int(stages) not in (1, 2):
+            raise ValueError("internal-ring stream supports one or two stages")
+        if not 1 <= int(stream_length) <= 0xFFFF:
+            raise ValueError("internal-ring stream length must fit uint16")
+        if int(port_mask) not in (1, 2, 3):
+            raise ValueError("internal-ring port mask must select LDU0 and/or LDU1")
+        if int(stage_bytes) <= 0 or int(stage_bytes) % 16:
+            raise ValueError("internal-ring stage size must be positive/aligned16")
+        minimum_slots = bytes2slots(int(stages) * int(stage_bytes))
+        if int(area_slots) != minimum_slots:
+            raise ValueError(
+                f"internal-ring area must use exactly {minimum_slots} slots"
+            )
+        if not 0 <= int(area_id) <= 0xFFFF:
+            raise ValueError("internal-ring area id must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_TMA_LOAD_MX_COUPLED_STREAM | 1,
+            num_slots=int(area_slots),
+            arg=(
+                self.KIND
+                | (int(stages) << self.STAGES_SHIFT)
+                | (int(port_mask) << self.PORT_MASK_SHIFT)
+            ),
+            size=int(stream_length),
+            address=get_tensor_address(plan),
+        )
+        self.plan = plan
+        self.annotation["coupled_stream_area"] = int(area_id)
+        self.annotation["coupled_stream_kind"] = self.KIND
+        self.annotation["coupled_stream_allocator_lease"] = True
+        self.annotation["coupled_stream_dual_port"] = True
+        self.annotation["internal_ring_port_mask"] = int(port_mask)
 
 
 class TmaLoadMxfpScale1D(MemoryInstruction):
@@ -3049,6 +3188,13 @@ class TmaTensor(MemoryInstruction):
             cord_func_2d_tile_major,
         )
 
+    def encode_64k(self):
+        """Encode one descriptor-backed 64-KiB tile in uint16 MInst.size."""
+        if self.size != 64 * 1024 or self.num_slots != 8:
+            raise ValueError("64-KiB tensor encoding requires exactly eight slots")
+        self.size = 0
+        return self
+
     def mxfp4_k512_load(self):
         """Packed W4 HBM load with TMA expansion into a 64 KiB UMMA tile."""
         inst = self._build(
@@ -3146,6 +3292,7 @@ __all__ = [
     "Dsv4ContiguousAttention512UmmaSm100",
     "Dsv4ContiguousAttention512UmmaTail32Sm100",
     "Dsv4AttentionSplit32UmmaSm100",
+    "Dsv4AttentionSplit64UmmaSm100",
     "Dsv4AttentionSplitReduceFp8Sm100",
     "Dsv4RouteTop6",
     "Dsv4ExpertReduce",
@@ -3255,6 +3402,8 @@ __all__ = [
     "RegLoad",
     "TmaLoad1D",
     "TmaLoadMxfpCoupledStream",
+    "build_internal_ring_tma_plan",
+    "TmaLoadInternalRingStream",
     "TmaLoadMxfpScale1D",
     "TmaLoadMxfpScaleBase1D",
     "TmaLoad64K1D",

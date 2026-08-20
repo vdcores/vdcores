@@ -4889,10 +4889,187 @@ class SchedDsv4AttentionSplit32UmmaSm100(Schedule):
         return self._bar_release_if_present(role, self.num_splits)
 
 
+class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
+    """B64 BF16 producers with one allocator-leased internal KV ring."""
+
+    KV_TILE = 64
+    HEADS = 64
+    DIM = 512
+    KV_LAYOUT_BYTES = KV_TILE * DIM * 2
+    STAGE_BYTES = 2 * KV_LAYOUT_BYTES
+    AREA_SLOTS = STAGE_BYTES // config.slot_size
+
+    def __init__(
+        self,
+        q,
+        kv,
+        rows,
+        partials,
+        metadata,
+        *,
+        q_tma,
+        kv_tma,
+        kv_v_tma,
+        partial_tma,
+    ):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.rows = int(rows)
+        self.partials = partials
+        self.metadata = metadata
+        self.q_tma = q_tma
+        self.kv_tma = kv_tma
+        self.kv_v_tma = kv_v_tma
+        self.partial_tma = partial_tma
+        self.ring_plans = []
+        self.split_rows = []
+
+    def _on_place(self):
+        if (
+            self.q.dtype != torch.bfloat16
+            or tuple(self.q.shape) != (self.HEADS, self.DIM)
+            or not self.q.is_contiguous()
+        ):
+            raise ValueError("B64 attention Q must be BF16 [64,512]")
+        if (
+            self.kv.dtype != torch.bfloat16
+            or self.kv.ndim != 2
+            or self.kv.shape[1] != self.DIM
+            or not self.kv.is_contiguous()
+        ):
+            raise ValueError("B64 attention KV must be BF16 [rows,512]")
+        if self.rows <= 0 or self.rows > self.kv.shape[0]:
+            raise ValueError("B64 attention row count exceeds its cache")
+        self.num_splits = (self.rows + self.KV_TILE - 1) // self.KV_TILE
+        if self.num_sms != self.num_splits:
+            raise ValueError("B64 attention requires one SM per KV split")
+        if (
+            self.partials.dtype != torch.bfloat16
+            or tuple(self.partials.shape)
+            != (self.num_splits, self.HEADS, self.DIM)
+            or not self.partials.is_contiguous()
+        ):
+            raise ValueError("B64 partials must be BF16 [splits,64,512]")
+        if (
+            self.metadata.dtype != torch.float32
+            or tuple(self.metadata.shape)
+            != (self.num_splits, self.HEADS, 2)
+            or not self.metadata.is_contiguous()
+        ):
+            raise ValueError("B64 metadata must be FP32 [splits,64,2]")
+        if self.q_tma.rank != 3 or self.kv_tma.rank != 3:
+            raise ValueError("B64 Q/K require rank-3 K-major descriptors")
+        if self.kv_v_tma.rank != 4:
+            raise ValueError("B64 V requires a rank-4 MN-major descriptor")
+        if self.q_tma.size != 0 or self.q_tma.num_slots != 8:
+            raise ValueError("B64 Q descriptor must use encoded 64-KiB form")
+        if (
+            self.partial_tma.size != self.KV_LAYOUT_BYTES // 4
+            or self.partial_tma.num_slots != 2
+        ):
+            raise ValueError("B64 partial descriptor must store one D128 tile")
+
+        # Keep every non-final TMA origin aligned to the MN-major descriptor's
+        # eight-row block while distributing work evenly across split CTAs.
+        # This avoids a 64+1 tail and reduces producer stragglers without
+        # changing the number of partials consumed by the reducer.
+        full_row_groups, residual_rows = divmod(self.rows, 8)
+        base_groups, extra_groups = divmod(full_row_groups, self.num_splits)
+        split_lengths = [
+            8 * (base_groups + (split < extra_groups))
+            for split in range(self.num_splits)
+        ]
+        split_lengths[-1] += residual_rows
+        row_start = 0
+        self.split_rows = []
+        for split_length in split_lengths:
+            if not 1 <= split_length <= self.KV_TILE:
+                raise ValueError("balanced B64 split is outside [1,64]")
+            self.split_rows.append((row_start, split_length))
+            row_start += split_length
+        if row_start != self.rows:
+            raise ValueError("balanced B64 split coverage is incomplete")
+
+        self.ring_plans = []
+        for row, _ in self.split_rows:
+            v_coordinates = self.kv_v_tma.cord2tma(row, 0)
+            next_v_coordinates = self.kv_v_tma.cord2tma(row, 128)
+            self.ring_plans.append(
+                build_internal_ring_tma_plan(
+                    device=self.kv.device,
+                    stage_bytes=self.STAGE_BYTES,
+                    lanes={
+                    0: {
+                        "descriptor_index": self.kv_tma.arg,
+                        "rank": self.kv_tma.rank,
+                        "transaction_bytes": self.KV_LAYOUT_BYTES,
+                        "coordinates": self.kv_tma.cord2tma(row, 0),
+                    },
+                        1: {
+                            "descriptor_index": self.kv_v_tma.arg,
+                            "rank": self.kv_v_tma.rank,
+                            "issue_count": 4,
+                            "transaction_bytes": self.KV_LAYOUT_BYTES // 4,
+                            "destination_offset": self.KV_LAYOUT_BYTES,
+                            "destination_issue_stride":
+                                self.KV_LAYOUT_BYTES // 4,
+                            "coordinates": v_coordinates,
+                            "issue_delta": tuple(
+                                next_value - value
+                                for value, next_value in zip(
+                                    v_coordinates, next_v_coordinates
+                                )
+                            ),
+                        }
+                    },
+                )
+            )
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        row, active_tokens = self.split_rows[sm]
+        return [
+            Dsv4AttentionSplit64UmmaSm100(
+                active_tokens, ring_port_mask=3
+            ),
+            TmaLoadInternalRingStream(
+                self.ring_plans[sm],
+                stages=1,
+                stage_bytes=self.STAGE_BYTES,
+                area_slots=self.AREA_SLOTS,
+                area_id=0,
+                stream_length=1,
+                port_mask=3,
+            ),
+            self.q_tma.cord(0, 0),
+            RawAddress(
+                self.metadata[sm], config.num_slots + 8
+            ),
+            self.partial_tma.cord(sm * self.HEADS, 256),
+            self.partial_tma.cord(sm * self.HEADS, 384).bar(
+                self._bar("output1")
+                if self._bar("output1") is not None
+                else self._bar("output")
+            ),
+            self.partial_tma.cord(sm * self.HEADS, 0),
+            self.partial_tma.cord(sm * self.HEADS, 128).bar(
+                self._bar("output0")
+            ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role not in ("output", "output0", "output1"):
+            return 0
+        return self._bar_release_if_present(role, self.num_splits)
+
+
 class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
     """Merge split-KV partials and directly publish native O_a records."""
 
     HEADS = 64
+    OUTPUT_GROUPS = 2
     TILES = 4
     TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
 
@@ -4951,34 +5128,46 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
             or self.head_start + self.head_count > self.HEADS
         ):
             raise ValueError("attention reducer head shard exceeds [0,64)")
-        if not 0 < self.num_sms <= self.head_count:
-            raise ValueError("attention reducer SMs exceed its head shard")
+        if not 0 < self.num_sms <= self.head_count * self.OUTPUT_GROUPS:
+            raise ValueError("attention reducer SMs exceed its output groups")
+        # One immutable device record replaces the old metadata/sink/table
+        # loads and every per-split partial TMA.  The barrier is attached to
+        # this record's LDU command, so compute cannot dereference any pointer
+        # until producer writeback is globally complete.
+        self.raw_record = torch.tensor(
+            (
+                self.partials.data_ptr(),
+                self.metadata.data_ptr(),
+                self.sink.data_ptr(),
+                self.table.data_ptr(),
+            ),
+            dtype=torch.uint64,
+            device=self.partials.device,
+        )
 
     def schedule(self, sm):
         if sm < 0:
             return []
         instructions = []
-        head_stop = self.head_start + self.head_count
-        for head in range(
-            self.head_start + sm, head_stop, self.num_sms
-        ):
+        work_count = self.head_count * self.OUTPUT_GROUPS
+        for work in range(sm, work_count, self.num_sms):
+            head = self.head_start + work // self.OUTPUT_GROUPS
+            output_group = work % self.OUTPUT_GROUPS
             instructions.extend(
                 (
                     Dsv4AttentionSplitReduceFp8Sm100(
-                        self.num_splits, head
+                        self.num_splits, head, output_group
                     ),
-                    TmaLoad1D(self.metadata.reshape(-1)).bar(
-                        self._bar("partials")
-                    ),
-                    _shared_load_1d(self.sink[head : head + 1]),
-                    TmaLoad1D(self.table),
-                )
-            )
-            for split in range(self.num_splits):
-                instructions.append(TmaLoad1D(self.partials[split, head]))
-            instructions.append(
-                TmaStore1D(self.output[head].reshape(-1)).bar(
-                    self._bar("output")
+                    RawAddress(
+                        self.raw_record, config.num_slots
+                    ).bar(
+                        self._bar(f"partials{output_group}")
+                        if self._bar(f"partials{output_group}") is not None
+                        else self._bar("partials")
+                    ).fixed_port(0),
+                    RawAddress(
+                        self.output, config.num_slots + 1
+                    ).writeback().bar(self._bar("output")),
                 )
             )
         return instructions
@@ -4986,7 +5175,9 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, self.head_count)
+        return self._bar_release_if_present(
+            role, self.head_count * self.OUTPUT_GROUPS
+        )
 
 
 class SchedDsv4RouteTop6(Schedule):

@@ -4,6 +4,7 @@
 
 #include <cutlass/arch/barrier.h>
 
+#include "internal_ring_stream.cuh"
 #include "mxfp_resident_ffn.cuh"
 #include "virtualcore.cuh"
 
@@ -108,6 +109,160 @@ __device__ __forceinline__ void ldu_prefetch_mxfp_weight_tma(
       :: "l"(descriptor), "r"(0), "r"(0), "r"(tile), "r"(output_task),
          "l"(cache_policy)
       : "memory");
+}
+
+__device__ __forceinline__ uint32_t ldu_tensor_transfer_bytes(
+    const MInst &inst) {
+  // MInst::size is uint16.  Descriptor-backed 64-KiB tensor tiles reserve
+  // size=0 with an eight-slot lease; rank and descriptor id still come from
+  // the ordinary tensor opcode/arg fields.
+  return inst.size == 0 && inst.nslot() == 8
+      ? 64U * 1024U
+      : uint32_t(inst.size);
+}
+
+__device__ __forceinline__ void ldu_issue_internal_ring_tma(
+    const int rank, const uint32_t destination,
+    const CUtensorMap *descriptor, const int32_t *coordinates,
+    const uint32_t barrier, const uint64_t cache_policy) {
+  switch (rank) {
+    case 1:
+      asm volatile(
+          "cp.async.bulk.tensor.1d.shared::cluster.global."
+          "mbarrier::complete_tx::bytes.L2::cache_hint "
+          "[%0], [%1, {%2}], [%3], %4;"
+          :: "r"(destination), "l"(descriptor),
+             "r"(coordinates[0]), "r"(barrier), "l"(cache_policy)
+          : "memory");
+      break;
+    case 2:
+      asm volatile(
+          "cp.async.bulk.tensor.2d.shared::cluster.global."
+          "mbarrier::complete_tx::bytes.L2::cache_hint "
+          "[%0], [%1, {%2, %3}], [%4], %5;"
+          :: "r"(destination), "l"(descriptor),
+             "r"(coordinates[0]), "r"(coordinates[1]),
+             "r"(barrier), "l"(cache_policy)
+          : "memory");
+      break;
+    case 3:
+      asm volatile(
+          "cp.async.bulk.tensor.3d.shared::cluster.global."
+          "mbarrier::complete_tx::bytes.L2::cache_hint "
+          "[%0], [%1, {%2, %3, %4}], [%5], %6;"
+          :: "r"(destination), "l"(descriptor),
+             "r"(coordinates[0]), "r"(coordinates[1]),
+             "r"(coordinates[2]), "r"(barrier), "l"(cache_policy)
+          : "memory");
+      break;
+    case 4:
+      asm volatile(
+          "cp.async.bulk.tensor.4d.shared::cluster.global."
+          "mbarrier::complete_tx::bytes.L2::cache_hint "
+          "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+          :: "r"(destination), "l"(descriptor),
+             "r"(coordinates[0]), "r"(coordinates[1]),
+             "r"(coordinates[2]), "r"(coordinates[3]),
+             "r"(barrier), "l"(cache_policy)
+          : "memory");
+      break;
+  }
+}
+
+// General allocator-owned descriptor stream.  The command reaches both LDUs,
+// but the plan's port mask may leave either lane idle.  Idle lanes still
+// advance their logical empty-barrier phases so a later command can activate
+// that LDU without rebuilding or resetting the persistent barrier bank.
+__device__ __noinline__ void ldu_execute_internal_ring_stream(
+    const MInst inst, const int slot, const int port_id,
+    const void *smem_base, const CUtensorMap *tma_descs,
+    uint64_t *tmem_mma_barriers, uint32_t &empty_phase_mask) {
+  using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using namespace dae_internal_ring;
+
+  const auto *plan = reinterpret_cast<const TmaPlan *>(inst.address);
+  const TmaLanePlan &lane = plan->lanes[port_id];
+  const int stages =
+      (inst.arg & dae_mxfp_resident_ffn::kCoupledStagesMask) >>
+      dae_mxfp_resident_ffn::kCoupledStagesShift;
+  const int port_mask =
+      (inst.arg & dae_mxfp_resident_ffn::kCoupledPortMask) >>
+      dae_mxfp_resident_ffn::kCoupledPortMaskShift;
+  const bool active = (port_mask & (1 << port_id)) != 0;
+  const uint32_t stage_bytes = load_l2(
+      reinterpret_cast<const int *>(&plan->stage_bytes));
+  const uint32_t flags = load_l2(
+      reinterpret_cast<const int *>(&plan->flags));
+  auto *ring = static_cast<uint8_t *>(get_slot_address(smem_base, slot));
+  auto *stage_empty = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + internalRingEmptyBarrierBase);
+  auto *stage_full = reinterpret_cast<TxBarrier *>(
+      tmem_mma_barriers + internalRingFullBarrierBase +
+      port_id * internalRingStages);
+  const uint64_t cache_policy = ldu_mxfp_streaming_cache_policy();
+  __ldprint(
+      "internal ring port=%d active=%d stages=%d iterations=%d rank=%d "
+      "issues=%d tx=%u dst=%u stride=%u",
+      port_id, int(active), stages, int(inst.size), int(lane.rank),
+      int(lane.issue_count), lane.transaction_bytes,
+      lane.destination_offset, lane.destination_issue_stride);
+
+  for (int iteration = 0; iteration < int(inst.size); ++iteration) {
+    const int stage = iteration % stages;
+    const uint32_t phase = (empty_phase_mask >> stage) & 1U;
+    if (active) {
+      stage_empty[stage].wait(phase);
+      __ldprint(
+          "internal ring port=%d stage=%d empty phase=%u ready",
+          port_id, stage, phase);
+      const uint32_t barrier = static_cast<uint32_t>(
+          __cvta_generic_to_shared(stage_full + stage));
+      const uint32_t stage_destination = static_cast<uint32_t>(
+          __cvta_generic_to_shared(ring + stage * stage_bytes));
+      const uint16_t descriptor_index = lane.descriptor_index;
+      const int rank = lane.rank;
+      const int issue_count = lane.issue_count;
+      const uint32_t destination_offset = lane.destination_offset;
+      const uint32_t destination_issue_stride =
+          lane.destination_issue_stride;
+      const uint32_t expected_bytes =
+          lane.transaction_bytes * issue_count;
+      int32_t coordinates[kMaxRank];
+      #pragma unroll
+      for (int coordinate = 0; coordinate < kMaxRank; ++coordinate) {
+        coordinates[coordinate] = lane.coordinates[coordinate] +
+            iteration * lane.iteration_delta[coordinate];
+      }
+
+      // Arm the phase before any TMA can complete against it.  This is
+      // required when one logical port contributes multiple copies to the
+      // same stage: an early copy must not decrement an unarmed phase.
+      stage_full[stage].arrive_and_expect_tx(expected_bytes);
+      for (int issue = 0; issue < issue_count; ++issue) {
+        int32_t issue_coordinates[kMaxRank];
+        #pragma unroll
+        for (int coordinate = 0; coordinate < kMaxRank; ++coordinate) {
+          issue_coordinates[coordinate] = coordinates[coordinate] +
+              issue * lane.issue_delta[coordinate];
+        }
+        ldu_issue_internal_ring_tma(
+            rank,
+            stage_destination + destination_offset +
+                issue * destination_issue_stride,
+            tma_descs + descriptor_index, issue_coordinates,
+            barrier, cache_policy);
+        __ldprint(
+            "internal ring port=%d issue=%d coords=(%d,%d,%d,%d)",
+            port_id, issue, issue_coordinates[0], issue_coordinates[1],
+            issue_coordinates[2], issue_coordinates[3]);
+      }
+      __ldprint(
+          "internal ring port=%d stage=%d expected=%u",
+          port_id, stage, expected_bytes);
+    }
+    empty_phase_mask ^= 1U << stage;
+  }
+  static_cast<void>(flags);
 }
 
 // Common allocator-owned MXFP8 x MXFP8 stream. Each stage carries both M128
@@ -557,6 +712,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   uint64_t routedBaseAddress = 0;
   uint64_t cachedRouteAddress = 0;
   LduRouteExperts cachedRouteExperts;
+  uint32_t internal_ring_empty_phase_mask = 0;
 #if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
   // SFA and SFB may be assigned independently to either LDU. Track the
   // observed empty phase per (operand, shared stage), not merely per port.
@@ -625,6 +781,13 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         //   printf("[LD][sm=%d] waiting bar=%d bars[bar]=%d\n", blockIdx.x, inst.bar(), *bar);
         //   first_wait = false;
         // }
+      }
+      // A barriered raw-address command is itself the producer dependency:
+      // compute will dereference HBM directly instead of issuing a TMA after
+      // this wait.  Carry the device-scope release/acquire edge through the
+      // LDU-to-compute mailbox before publishing that pointer.
+      if (op(opcode) == op(OP_ALLOC_WB_RAW_ADDRESS)) {
+        asm volatile("fence.acquire.gpu;" ::: "memory");
       }
 #if defined(DAE_TRACK_PROFILE)
       dependency_wait_ns +=
@@ -747,6 +910,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           if (stream_kind == dae_mxfp_resident_ffn::kCoupledFp8Gemv) {
             ldu_execute_mxfp8_coupled_stream(
                 stream_inst, slot, port_id, smem_base, tmem_mma_barriers);
+          } else if (
+              stream_kind == dae_mxfp_resident_ffn::kCoupledTmaRing) {
+            ldu_execute_internal_ring_stream(
+                stream_inst, slot, port_id, smem_base, tma_descs,
+                tmem_mma_barriers, internal_ring_empty_phase_mask);
           } else if (
               stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
             ldu_execute_mxfp_coupled_linear1(
@@ -886,7 +1054,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         }
         break; }
       case op(OP_ALLOC_TMA_LOAD_TENSOR_1D): {
-        __ldprint("TMA Tensor 1D Load: size=%d", inst.size);
+        const uint32_t transfer_size = ldu_tensor_transfer_bytes(inst);
+        __ldprint("TMA Tensor 1D Load: size=%u", transfer_size);
         asm volatile(
           "cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes"
           "[%0], [%1, {%2}], [%3];\n"
@@ -900,10 +1069,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           : "memory");
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar],
-          cuda::aligned_size_t<16>(inst.size)
+          cuda::aligned_size_t<16>(transfer_size)
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_2D): {
+        const uint32_t transfer_size = ldu_tensor_transfer_bytes(inst);
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 2D Load: desc_idx=%d size=%d cord=(%d,%d)", inst.arg, inst.size, cord[0], cord[1]);
         asm volatile(
@@ -920,10 +1090,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           : "memory");
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar],
-          cuda::aligned_size_t<16>(inst.size)
+          cuda::aligned_size_t<16>(transfer_size)
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_3D): {
+        const uint32_t transfer_size = ldu_tensor_transfer_bytes(inst);
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 3D Load: desc_idx=%d size=%d cord=(%d,%d,%d)", inst.arg, inst.size, cord[0], cord[1], cord[2]);
         asm volatile(
@@ -941,11 +1112,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           : "memory");
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar],
-          cuda::aligned_size_t<16>(inst.size)
+          cuda::aligned_size_t<16>(transfer_size)
         );
         break; }
       case op(OP_ALLOC_LAYER_TMA_LOAD_4D):
       case op(OP_ALLOC_TMA_LOAD_4D): {
+        const uint32_t transfer_size = ldu_tensor_transfer_bytes(inst);
         const uint16_t *cord = inst.coords;
         __ldprint("TMA 4D Load: desc_idx=%d size=%d cord=(%d,%d,%d,%d)",
           inst.arg, inst.size, cord[0], cord[1], cord[2], cord[3]);
@@ -965,10 +1137,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           : "memory");
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar],
-          cuda::aligned_size_t<16>(inst.size)
+          cuda::aligned_size_t<16>(transfer_size)
         );
         break; }
       case op(OP_ALLOC_TMA_LOAD_5D_FIX0): {
+        const uint32_t transfer_size = ldu_tensor_transfer_bytes(inst);
         const uint16_t *cord = inst.coords;
         // hardcode first coord to be 0
         __ldprint("TMA 5D Load: desc_idx=%d size=%d cord=(0,%d,%d,%d,%d)",
@@ -989,7 +1162,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           : "memory");
         cuda::device::barrier_expect_tx(
           m2c.barriers[bar],
-          cuda::aligned_size_t<16>(inst.size)
+          cuda::aligned_size_t<16>(transfer_size)
         );
         break; }
       case op(OP_ALLOC_WB_REG_STORE): {

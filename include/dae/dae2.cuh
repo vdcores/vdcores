@@ -150,7 +150,9 @@ void dae2(
         (i >= mxfpResidentDownEmptyBarrierBase &&
          i < mxfpResidentDownEmptyBarrierBase + mxfpResidentDownStages) ||
         (i >= mxfp8CoupledEmptyBarrierBase &&
-         i < mxfp8CoupledEmptyBarrierBase + mxfp8CoupledStages);
+         i < mxfp8CoupledEmptyBarrierBase + mxfp8CoupledStages) ||
+        (i >= internalRingEmptyBarrierBase &&
+         i < internalRingEmptyBarrierBase + internalRingStages);
     if (initially_empty) {
       cuda::ptx::mbarrier_arrive(
           cuda::ptx::sem_release,
@@ -195,6 +197,7 @@ void dae2(
     uint32_t tmem_mma_phase = 0;
     uint32_t fp8_umma_pipeline_phase_mask = 0;
     uint32_t nvfp4_umma_pipeline_phase_mask = 0;
+    uint32_t internal_ring_full_phase_mask = 0;
     bool finish = false;
 
     while (!finish) {
@@ -205,6 +208,7 @@ void dae2(
         sm_id, thread_id, pc, count, finish, inst, smem_base,
         tmem_base_ptr, tmem_mma_barriers, tmem_mma_phase,
         fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask,
+        internal_ring_full_phase_mask,
         scratch_space, st_insts, tma_descs, bars, m2c, c2m, g_events);
       // if (blockIdx.x == 0 && threadIdx.x == 0) {
       //   printf("[COMP] after execution: pc=%d, opcode=%04x\n", pc-1, inst.opcode);
