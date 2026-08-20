@@ -82,5 +82,10 @@ inst*.txt
 inst*.dump
 *.vdcore.build
 
-# Autotuner run artifacts (machine-specific)
-tuning/
+# Autotuner run artifacts. Logs are machine-specific and disposable; the knob
+# registry, the search trace and the winning preset are cited by docs/autotune/
+# and cost GPU-hours to regenerate, so they are kept.
+tuning/*
+!tuning/*.knobs.json
+!tuning/*.search.json
+!tuning/*.preset.json
