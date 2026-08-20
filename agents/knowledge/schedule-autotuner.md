@@ -415,6 +415,76 @@ never hit the reference configuration. They are real deadlocking schedules, not
 flakiness, and the search handles them correctly -- it was only ever a question
 of how long it waited to find out.
 
+### Result: The Search Beat The Hand-Tuned Llama3 Schedule
+
+Third attempt, on a clean host, converged in 2 passes over 2056 timed runs.
+
+```
+Search changed 1 knob(s) over 2 pass(es):
+  pass 1  silu   silu.sms=2, silu.base_sm=128   -1.5%
+
+Head-to-head over 10 fresh rounds each:
+  original baseline  598.388 ms
+  searched config    588.848 ms
+  difference         -1.6%  [-10.969, -7.165] ms  -> faster
+```
+
+**`silu.sms` 4 -> 2 is worth -1.6%.** Independently re-measured afterwards with
+a warmup and an outlier guard: baseline 598.805 ms, tuned 589.351 ms,
+**-1.58%**, with the tuned config winning **8 of 8** paired rounds (sign test
+p ~ 0.004). The preset is at `tuning/llama3_8b.preset.json`.
+
+Two things about that result are worth keeping:
+
+- The win came from `silu`, the smallest stage on the surface, not from any of
+  the large projections a person would tune first. It is also a knob the Qwen3
+  fixture's cost model deliberately ignores, and on the real Qwen3 target
+  `silu.sms=1/2` was *much slower* (+40%, +56%). The same knob moves in
+  opposite directions on the two models, which is a decent argument for
+  searching rather than porting intuitions between schedules.
+- Only one knob moved out of 33. That is consistent with the legality map:
+  hand tuning had the big stages right, and what was left was a corner nobody
+  had swept.
+
+### The Correctness Gate Caught A Faster, Wrong Schedule
+
+`gate_high.sms=128` cleared the effect floor, won the statistical test, and won
+the confirmation pass on fresh samples. It then failed the correctness gate, and
+the search refused it:
+
+```
+[correctness] FAIL final_rms:   212.092% <= 5.000%
+[correctness] FAIL logits_low:  124.987% <= 10.000%
+[correctness] FAIL logits_high: 171.039% <= 10.000%
+```
+
+Verified by hand afterwards on an idle GPU, so this is not a host artifact. It
+is genuinely faster and computes garbage.
+
+Without the gate this run would have reported it as a second win. Every
+timing-based defence in the driver -- bootstrap intervals, multiple-comparison
+correction, the confirmation pass -- was fully convinced. Only running the model
+and comparing tokens caught it.
+
+Note for anyone reading an older log: on the second (slow but clean) attempt the
+same candidate was reported `did not win twice (same)`, because timing noise
+there never produced a `faster` verdict and the gate was therefore never
+consulted. That is not evidence the schedule is correct.
+
+### Search Space, Measured
+
+Of 17 groups, 28 group-passes had at least one legal alternative. The freedom is
+very unevenly distributed:
+
+| Freedom | Groups |
+| --- | --- |
+| 19 of 31 combinations legal | `k_rope`, `q_rope`, `silu_fused` |
+| 7-10 of 31 | `k_proj`, `v_proj`, `gate_high`, `up_high` |
+| 0-3 of 31 | `gate_fused`, `up_fused`, `logits.split_m`, `q_proj`, `out_proj`, `down_low`, `down_high`, `gate_low`, `up_low` |
+
+The non-GEMV stages (`*_rope`, `silu_fused`) have real room; the GEMV stages are
+boxed in by the fold rules.
+
 ### One Environment Trap
 
 Do not set `HF_HOME` when running a gated target. `hf auth login` stores its
