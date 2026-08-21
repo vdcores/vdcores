@@ -302,33 +302,29 @@ __device__ __forceinline__ float *dsv4_resident_rope_table(
       table_id * kDsv4RopeTableBytes);
 }
 
-template <typename M2CQueue, typename C2MQueue>
+template <typename M2CQueue>
 __device__ __forceinline__ void task_dsv4_preload_rope_tables(
     int num_tables,
     void *smem_base,
-    M2CQueue &m2c,
-    C2MQueue &c2m) {
+    const MInst *st_insts,
+    M2CQueue &m2c) {
   if (num_tables <= 0 || num_tables > kDsv4MaxResidentRopeTables) {
     asm volatile("trap;");
   }
 
   const int tid = __compute_tid();
-  int input_slots = 0;
-  for (int table_id = 0; table_id < num_tables; ++table_id) {
-    const int table_slots = m2c.template pop<0>();
-    input_slots |= table_slots;
-    const auto *source = static_cast<const float *>(
-        get_slot_address(smem_base, extract(table_slots)));
-    auto *target = dsv4_resident_rope_table(smem_base, table_id);
-    for (int item = tid; item < kDsv4RopeTableElements; item += 128) {
-      target[item] = source[item];
-    }
+  const int record_slot = m2c.template pop<0>();
+  const ComputeRawAddressSlots raw_slots{st_insts};
+  const auto *source = raw_slots.template get<const float>(record_slot);
+  auto *target = dsv4_resident_rope_table(smem_base, 0);
+  const int elements = num_tables * kDsv4RopeTableElements;
+  for (int item = tid; item < elements; item += 128) {
+    target[item] = source[item];
   }
 
-  // All four compute warps publish the fixed tables before their source slots
-  // are returned. Memory threads are independent and never join this barrier.
+  // The raw record owns no allocator slots.  All four compute warps publish
+  // the fixed tables before any following resident task can consume them.
   __sync_compute_group(128);
-  c2m.push(tid, input_slots);
 }
 
 // Apply the DeepSeek partial rotary embedding to the final 64 dimensions of
@@ -822,7 +818,7 @@ __device__ __forceinline__ void task_dsv4_contiguous_attention_512_block4(
   auto *shared = static_cast<float *>(task_scratch);
 
   float q_values[kQValuesPerLane];
-#pragma unroll 1
+#pragma unroll
   for (int item = 0; item < kQValuesPerLane; ++item) {
     q_values[item] = __bfloat162float(q[lane + item * 32]);
   }
@@ -934,104 +930,135 @@ __device__ __forceinline__ bool dsv4_route_score_better(
       (candidate_score == current_score && candidate_expert < current_expert);
 }
 
-template <typename M2CQueue, typename C2MQueue>
+// SM100 redux only accepts 32-bit operands.  Map IEEE FP32 to an unsigned key
+// whose integer ordering matches numeric ordering, then reduce the score and
+// the inverted expert id separately.  The second reduction preserves the
+// router's lower-expert-id tie break without a five-step score/id shuffle tree.
+__device__ __forceinline__ int dsv4_route_argmax_sm100(
+    float score,
+    int expert) {
+  uint32_t bits = __float_as_uint(score);
+  if ((bits & 0x7FFFFFFFU) == 0) {
+    bits = 0;
+  }
+  const uint32_t ordered = bits ^
+      ((static_cast<int32_t>(bits) < 0) ? 0xFFFFFFFFU : 0x80000000U);
+  uint32_t winning_ordered;
+  asm volatile(
+      "redux.sync.max.u32 %0, %1, 0xffffffff;\n"
+      : "=r"(winning_ordered)
+      : "r"(ordered));
+  const uint32_t expert_key = ordered == winning_ordered
+      ? 0xFFFFFFFFU - static_cast<uint32_t>(expert)
+      : 0U;
+  uint32_t winning_expert_key;
+  asm volatile(
+      "redux.sync.max.u32 %0, %1, 0xffffffff;\n"
+      : "=r"(winning_expert_key)
+      : "r"(expert_key));
+  return static_cast<int>(0xFFFFFFFFU - winning_expert_key);
+}
+
+template <bool PretransformedRaw, typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_route_top6(
     bool hash_routing,
     float route_scale,
     void *smem_base,
     void *task_scratch,
+    const MInst *st_insts,
     M2CQueue &m2c,
     C2MQueue &c2m) {
-  constexpr int kExperts = 256;
   constexpr int kTopK = 6;
-
-  const int logits_slots = m2c.template pop<0>();
-  const int logits_slot = extract(logits_slots);
-  const auto *logits = static_cast<const __nv_bfloat16 *>(
-      get_slot_address(smem_base, logits_slot));
-  const int bias_slots = m2c.template pop<0>();
-  const int bias_slot = extract(bias_slots);
-  const auto *bias = static_cast<const float *>(
-      get_slot_address(smem_base, bias_slot));
-  const int hash_slots = m2c.template pop<0>();
-  const int hash_slot = extract(hash_slots);
-  const auto *hash_indices = static_cast<const int *>(
-      get_slot_address(smem_base, hash_slot));
-  const int indices_slots = m2c.template pop<0>();
-  const int indices_slot = extract(indices_slots);
-  auto *output_indices = static_cast<int *>(
-      get_slot_address(smem_base, indices_slot));
-  const int weights_slots = m2c.template pop<0>();
-  const int weights_slot = extract(weights_slots);
-  auto *output_weights = static_cast<float *>(
-      get_slot_address(smem_base, weights_slot));
-
   const int tid = __compute_tid();
-  auto *original_scores = static_cast<float *>(task_scratch);
-  auto *selection_scores = original_scores + kExperts;
-  auto *warp_scores = selection_scores + kExperts;
-  auto *warp_indices = reinterpret_cast<int *>(warp_scores + 4);
-  auto *selected_indices = warp_indices + 4;
-  for (int expert = tid; expert < kExperts; expert += 128) {
-    const float transformed =
-        sqrtf(dsv4_softplus(__bfloat162float(logits[expert])));
-    original_scores[expert] = transformed;
-    selection_scores[expert] = transformed + bias[expert];
-  }
-  __sync_compute_group(128);
-
-  if (hash_routing) {
-    if (tid == 0) {
-      for (int rank = 0; rank < kTopK; ++rank) {
-        selected_indices[rank] = hash_indices[rank];
-      }
-    }
+  const int lane = tid & 31;
+  const int scores_token = m2c.template pop<0>();
+  const float *logits = nullptr;
+  const float2 *prepared_scores = nullptr;
+  if constexpr (PretransformedRaw) {
+    prepared_scores = static_cast<const float2 *>(
+        get_slot_address(smem_base, extract(scores_token)));
   } else {
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    int first_expert = tid;
-    int second_expert = tid + 128;
-    float first_score = selection_scores[first_expert];
-    float second_score = selection_scores[second_expert];
-    for (int rank = 0; rank < kTopK; ++rank) {
-      float best_score = first_score;
-      int best_expert = first_expert;
-      if (dsv4_route_score_better(
-              second_score, second_expert, best_score, best_expert)) {
-        best_score = second_score;
-        best_expert = second_expert;
-      }
-      for (int offset = 16; offset > 0; offset >>= 1) {
-        const float candidate_score = __shfl_down_sync(
-            0xFFFFFFFFU, best_score, offset);
-        const int candidate_expert = __shfl_down_sync(
-            0xFFFFFFFFU, best_expert, offset);
-        if (lane + offset < 32 && dsv4_route_score_better(
-                candidate_score,
-                candidate_expert,
-                best_score,
-                best_expert)) {
-          best_score = candidate_score;
-          best_expert = candidate_expert;
+    logits = static_cast<const float *>(
+        get_slot_address(smem_base, extract(scores_token)));
+  }
+  int bias_token = 0;
+  const float *bias = nullptr;
+  if constexpr (!PretransformedRaw) {
+    bias_token = m2c.template pop<0>();
+    bias = static_cast<const float *>(
+        get_slot_address(smem_base, extract(bias_token)));
+  }
+  const int hash_token = hash_routing ? m2c.template pop<0>() : 0;
+  const int *hash_indices = nullptr;
+  if (hash_routing) {
+    if constexpr (PretransformedRaw) {
+      hash_indices = static_cast<const int *>(
+          slot_2_glob_ptr(st_insts, hash_token));
+    } else {
+      hash_indices = static_cast<const int *>(
+          get_slot_address(smem_base, extract(hash_token)));
+    }
+  }
+  const int indices_token = m2c.template pop<0>();
+  int weights_token = indices_token;
+  int *output_indices;
+  float *output_weights;
+  if constexpr (PretransformedRaw) {
+    output_indices = static_cast<int *>(
+        slot_2_glob_ptr(st_insts, indices_token));
+    output_weights = reinterpret_cast<float *>(output_indices + 8);
+  } else {
+    weights_token = m2c.template pop<0>();
+    output_indices = static_cast<int *>(
+        get_slot_address(smem_base, extract(indices_token)));
+    output_weights = static_cast<float *>(
+        get_slot_address(smem_base, extract(weights_token)));
+  }
+  if (tid < 32) {
+    if (hash_routing) {
+      const bool active = lane < kTopK;
+      const int expert = active ? hash_indices[lane] : 0;
+      float original = 0.0f;
+      if (active) {
+        if constexpr (PretransformedRaw) {
+          original = prepared_scores[expert].x;
+        } else {
+          original = sqrtf(dsv4_softplus(logits[expert]));
         }
       }
-      if (lane == 0) {
-        warp_scores[warp] = best_score;
-        warp_indices[warp] = best_expert;
+      float weight_sum = original;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        weight_sum += __shfl_down_sync(
+            0xFFFFFFFFU, weight_sum, offset);
       }
-      __sync_compute_group(128);
-
-      if (warp == 0) {
-        best_score = lane < 4
-            ? warp_scores[lane]
-            : -__int_as_float(0x7f800000);
-        best_expert = lane < 4 ? warp_indices[lane] : 0x7fffffff;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-          const float candidate_score = __shfl_down_sync(
-              0xFFFFFFFFU, best_score, offset);
-          const int candidate_expert = __shfl_down_sync(
-              0xFFFFFFFFU, best_expert, offset);
-          if (lane + offset < 32 && dsv4_route_score_better(
+      const float total = __shfl_sync(0xFFFFFFFFU, weight_sum, 0);
+      if (active) {
+        output_indices[lane] = expert;
+        output_weights[lane] =
+            original * (route_scale / (total > 0.0f ? total : 1.0f));
+      }
+    } else if constexpr (PretransformedRaw) {
+      float selection_scores[8];
+#pragma unroll
+      for (int item = 0; item < 8; ++item) {
+        const int expert = lane + item * 32;
+        const float selection = prepared_scores[expert].y;
+        selection_scores[item] = selection == selection
+            ? selection
+            : -1.0e30f;
+      }
+      float selected_weight = 0.0f;
+      int selected_expert = 0;
+#pragma unroll
+      for (int rank = 0; rank < kTopK; ++rank) {
+        int best_expert = lane;
+        float best_score = selection_scores[0];
+#pragma unroll
+        for (int item = 1; item < 8; ++item) {
+          const int candidate_expert = lane + item * 32;
+          const float candidate_score = selection_scores[item];
+          if (dsv4_route_score_better(
                   candidate_score,
                   candidate_expert,
                   best_score,
@@ -1040,38 +1067,121 @@ __device__ __forceinline__ void task_dsv4_route_top6(
             best_expert = candidate_expert;
           }
         }
-        if (lane == 0) {
-          selected_indices[rank] = best_expert;
+        const int selected = dsv4_route_argmax_sm100(
+            best_score, best_expert);
+        if (lane == rank) {
+          selected_expert = selected;
+          selected_weight = prepared_scores[selected].x;
+        }
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+          if (lane + item * 32 == selected) {
+            selection_scores[item] = -__int_as_float(0x7f800000);
+          }
         }
       }
-      __sync_compute_group(128);
-      const int selected = selected_indices[rank];
-      if (first_expert == selected) {
-        first_score = -__int_as_float(0x7f800000);
+      float weight_sum = selected_weight;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        weight_sum += __shfl_down_sync(
+            0xFFFFFFFFU, weight_sum, offset);
       }
-      if (second_expert == selected) {
-        second_score = -__int_as_float(0x7f800000);
+      const float total = __shfl_sync(0xFFFFFFFFU, weight_sum, 0);
+      if (lane < kTopK) {
+        output_indices[lane] = selected_expert;
+        output_weights[lane] = selected_weight *
+            (route_scale / (total > 0.0f ? total : 1.0f));
+      }
+    } else {
+      float original_scores[8];
+      float selection_scores[8];
+#pragma unroll
+      for (int item = 0; item < 8; ++item) {
+        const int expert = lane + item * 32;
+        const float original = sqrtf(dsv4_softplus(logits[expert]));
+        const float selection = original + bias[expert];
+        original_scores[item] = original;
+        selection_scores[item] = selection == selection
+            ? selection
+            : -1.0e30f;
+      }
+#pragma unroll
+      for (int rank = 0; rank < kTopK; ++rank) {
+        int best_expert = lane;
+        float best_score = selection_scores[0];
+        float best_original = original_scores[0];
+#pragma unroll
+        for (int item = 1; item < 8; ++item) {
+          const int candidate_expert = lane + item * 32;
+          const float candidate_score = selection_scores[item];
+          if (dsv4_route_score_better(
+                  candidate_score,
+                  candidate_expert,
+                  best_score,
+                  best_expert)) {
+            best_score = candidate_score;
+            best_expert = candidate_expert;
+            best_original = original_scores[item];
+          }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          const float candidate_score = __shfl_down_sync(
+              0xFFFFFFFFU, best_score, offset);
+          const int candidate_expert = __shfl_down_sync(
+              0xFFFFFFFFU, best_expert, offset);
+          const float candidate_original = __shfl_down_sync(
+              0xFFFFFFFFU, best_original, offset);
+          if (lane + offset < 32 && dsv4_route_score_better(
+                  candidate_score,
+                  candidate_expert,
+                  best_score,
+                  best_expert)) {
+            best_score = candidate_score;
+            best_expert = candidate_expert;
+            best_original = candidate_original;
+          }
+        }
+        const int selected = __shfl_sync(0xFFFFFFFFU, best_expert, 0);
+        if (lane == 0) {
+          output_indices[rank] = selected;
+          output_weights[rank] = best_original;
+        }
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+          if (lane + item * 32 == selected) {
+            selection_scores[item] = -__int_as_float(0x7f800000);
+          }
+        }
+      }
+      if (lane == 0) {
+        float weight_sum = 0.0f;
+#pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+          weight_sum += output_weights[rank];
+        }
+        const float normalization =
+            route_scale / (weight_sum > 0.0f ? weight_sum : 1.0f);
+#pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+          output_weights[rank] *= normalization;
+        }
       }
     }
   }
 
-  if (tid == 0) {
-    float weight_sum = 0.0f;
-    for (int rank = 0; rank < kTopK; ++rank) {
-      weight_sum += original_scores[selected_indices[rank]];
+  if constexpr (PretransformedRaw) {
+    if (tid < 32) {
+      __syncwarp();
     }
-    const float normalization = route_scale / weight_sum;
-    for (int rank = 0; rank < kTopK; ++rank) {
-      output_indices[rank] = selected_indices[rank];
-      output_weights[rank] =
-          original_scores[selected_indices[rank]] * normalization;
-    }
+    c2m.push(tid, scores_token);
+    c2m.template push<0, true, false>(tid, 1U << indices_token);
+  } else {
+    __sync_compute_group(128);
+    c2m.push(tid, scores_token | bias_token | hash_token);
+    c2m.template push<0, true>(tid, indices_token);
+    c2m.template push<0, true>(tid, weights_token);
   }
-
-  __sync_compute_group(128);
-  c2m.push(tid, logits_slots | bias_slots | hash_slots);
-  c2m.template push<0, true>(tid, indices_slots);
-  c2m.template push<0, true>(tid, weights_slots);
 }
 
 // Sum the six routed expert down projections and one shared expert.  Applying
@@ -1120,14 +1230,171 @@ __device__ __forceinline__ void task_dsv4_expert_reduce(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
-// FP32-weight/BF16-input GEMV for the small mHC mixing projections.  It is
-// deliberately scalar and correctness-oriented; one SM owns one or more rows.
-template <bool EmitPreRmsMetadata, typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ float dsv4_hc_post_value(
+    float branch_value,
+    float residual0,
+    float residual1,
+    float residual2,
+    float residual3,
+    float post_value,
+    float comb0,
+    float comb1,
+    float comb2,
+    float comb3) {
+  // The model updates streams with comb^T @ residual.
+  float value = post_value * branch_value;
+  value = fmaf(comb0, residual0, value);
+  value = fmaf(comb1, residual1, value);
+  value = fmaf(comb2, residual2, value);
+  value = fmaf(comb3, residual3, value);
+  return value;
+}
+
+__device__ __forceinline__ float2 dsv4_hc_post_value2(
+    float2 branch_value,
+    float2 residual0,
+    float2 residual1,
+    float2 residual2,
+    float2 residual3,
+    float post_value,
+    float comb0,
+    float comb1,
+    float comb2,
+    float comb3) {
+  return make_float2(
+      dsv4_hc_post_value(
+          branch_value.x, residual0.x, residual1.x, residual2.x,
+          residual3.x, post_value, comb0, comb1, comb2, comb3),
+      dsv4_hc_post_value(
+          branch_value.y, residual0.y, residual1.y, residual2.y,
+          residual3.y, post_value, comb0, comb1, comb2, comb3));
+}
+
+template <int TileHidden, int HalvesPerTask, int OutputsPerTask,
+          bool EmitResidual>
+__device__ __forceinline__ void dsv4_hc_post_project_tile(
+    const __nv_bfloat16 *record,
+    const float *coefficients,
+    const float *weight,
+    __nv_bfloat16 *residual_output,
+    int tid,
+    float (&partials)[OutputsPerTask],
+    float &square_partial) {
+  constexpr int kHc = 4;
+  constexpr int kTileHidden = TileHidden;
+  const auto *branch = record;
+  const auto *residual = record + kTileHidden;
+
+  const float post0 = coefficients[0];
+  const float post1 = coefficients[1];
+  const float post2 = coefficients[2];
+  const float post3 = coefficients[3];
+  const float comb00 = coefficients[4];
+  const float comb01 = coefficients[5];
+  const float comb02 = coefficients[6];
+  const float comb03 = coefficients[7];
+  const float comb10 = coefficients[8];
+  const float comb11 = coefficients[9];
+  const float comb12 = coefficients[10];
+  const float comb13 = coefficients[11];
+  const float comb20 = coefficients[12];
+  const float comb21 = coefficients[13];
+  const float comb22 = coefficients[14];
+  const float comb23 = coefficients[15];
+  const float comb30 = coefficients[16];
+  const float comb31 = coefficients[17];
+  const float comb32 = coefficients[18];
+  const float comb33 = coefficients[19];
+
+#pragma unroll
+  for (int half = 0; half < HalvesPerTask; ++half) {
+    const auto *half_record = record + half * (6 * kTileHidden);
+    branch = half_record;
+    residual = half_record + kTileHidden;
+    const auto *half_weight =
+        weight + half * (OutputsPerTask * kHc * kTileHidden);
+    auto *half_output = residual_output == nullptr
+        ? nullptr
+        : residual_output + half * (kHc * kTileHidden);
+    for (int dim = tid * 2; dim < kTileHidden; dim += 256) {
+      const float2 branch_value = __bfloat1622float2(
+          *reinterpret_cast<const __nv_bfloat162 *>(branch + dim));
+      const float2 residual0 = __bfloat1622float2(
+          *reinterpret_cast<const __nv_bfloat162 *>(residual + dim));
+      const float2 residual1 = __bfloat1622float2(
+          *reinterpret_cast<const __nv_bfloat162 *>(
+              residual + kTileHidden + dim));
+      const float2 residual2 = __bfloat1622float2(
+          *reinterpret_cast<const __nv_bfloat162 *>(
+              residual + 2 * kTileHidden + dim));
+      const float2 residual3 = __bfloat1622float2(
+          *reinterpret_cast<const __nv_bfloat162 *>(
+              residual + 3 * kTileHidden + dim));
+      const float2 values[kHc] = {
+          dsv4_hc_post_value2(
+              branch_value, residual0, residual1, residual2, residual3,
+              post0, comb00, comb10, comb20, comb30),
+          dsv4_hc_post_value2(
+              branch_value, residual0, residual1, residual2, residual3,
+              post1, comb01, comb11, comb21, comb31),
+          dsv4_hc_post_value2(
+              branch_value, residual0, residual1, residual2, residual3,
+              post2, comb02, comb12, comb22, comb32),
+          dsv4_hc_post_value2(
+              branch_value, residual0, residual1, residual2, residual3,
+              post3, comb03, comb13, comb23, comb33),
+      };
+#pragma unroll
+      for (int output_index = 0;
+           output_index < OutputsPerTask;
+           ++output_index) {
+        const auto *output_weight =
+            half_weight + output_index * (kHc * kTileHidden);
+#pragma unroll
+        for (int input_index = 0; input_index < kHc; ++input_index) {
+          const float2 weight_pair = *reinterpret_cast<const float2 *>(
+              output_weight + input_index * kTileHidden + dim);
+          partials[output_index] = fmaf(
+              weight_pair.x, values[input_index].x,
+              partials[output_index]);
+          partials[output_index] = fmaf(
+              weight_pair.y, values[input_index].y,
+              partials[output_index]);
+        }
+      }
+      if constexpr (EmitResidual) {
+#pragma unroll
+        for (int output_index = 0; output_index < kHc; ++output_index) {
+          *reinterpret_cast<__nv_bfloat162 *>(
+              half_output + output_index * kTileHidden + dim) =
+              __float22bfloat162_rn(values[output_index]);
+          square_partial = fmaf(
+              values[output_index].x,
+              values[output_index].x,
+              square_partial);
+          square_partial = fmaf(
+              values[output_index].y,
+              values[output_index].y,
+              square_partial);
+        }
+      }
+    }
+  }
+}
+
+// FP32-weight/BF16-input GEMV for the small mHC mixing projections.  Its fused
+// mode forms all four unrounded post streams once per hidden dimension, feeds
+// them directly to the projection, and only materializes the BF16 residual on
+// row zero.  One opcode therefore covers both ordinary and post-fused GEMV.
+template <bool EmitPreRmsMetadata, bool FuseHcPost,
+          int FusedHalvesPerTask = 2, int FusedOutputsPerTask = 2,
+          typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     int k,
     int tile_k,
     void *smem_base,
     void *task_scratch,
+    const MInst *st_insts,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   const int tid = __compute_tid();
@@ -1139,28 +1406,108 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
   if constexpr (EmitPreRmsMetadata) {
     square_partial = 0.0f;
   }
-  for (int column_start = 0; column_start < k; column_start += tile_k) {
-    const int columns = min(tile_k, k - column_start);
+
+  if constexpr (FuseHcPost) {
+    constexpr int kTileHidden = 256;
+    float partials[FusedOutputsPerTask] = {};
     const int weight_slots = m2c.template pop<0>();
-    const int weight_slot = extract(weight_slots);
     const auto *weight = static_cast<const float *>(
-        get_slot_address(smem_base, weight_slot));
-    const int input_slots = m2c.template pop<0>();
-    const int input_slot = extract(input_slots);
-    const auto *input = static_cast<const __nv_bfloat16 *>(
-        get_slot_address(smem_base, input_slot));
-    for (int column = tid; column < columns; column += 128) {
-      const float input_value = __bfloat162float(input[column]);
-      partial = fmaf(
-          weight[column],
-          input_value,
-          partial);
+        get_slot_address(smem_base, extract(weight_slots)));
+    const int record_slots = m2c.template pop<0>();
+    const auto *record = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(record_slots)));
+    const auto *coefficients = reinterpret_cast<const float *>(
+        record + 5 * kTileHidden);
+    int output_slots;
+    __nv_bfloat16 *output = nullptr;
+    if constexpr (EmitPreRmsMetadata) {
+      output_slots = m2c.template pop<0>();
+      output = static_cast<__nv_bfloat16 *>(
+          get_slot_address(smem_base, extract(output_slots)));
+    }
+    dsv4_hc_post_project_tile<
+        kTileHidden, FusedHalvesPerTask, FusedOutputsPerTask,
+        EmitPreRmsMetadata>(
+        record, coefficients, weight, output, tid, partials, square_partial);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+      for (int output_index = 0;
+           output_index < FusedOutputsPerTask;
+           ++output_index) {
+        partials[output_index] += __shfl_down_sync(
+            0xFFFFFFFFU, partials[output_index], offset);
+      }
       if constexpr (EmitPreRmsMetadata) {
-        square_partial = fmaf(input_value, input_value, square_partial);
+        square_partial += __shfl_down_sync(
+            0xFFFFFFFFU, square_partial, offset);
+      }
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int output_index = 0;
+           output_index < FusedOutputsPerTask;
+           ++output_index) {
+        warp_reduce[output_index * 4 + warp] = partials[output_index];
+      }
+      if constexpr (EmitPreRmsMetadata) {
+        warp_reduce[FusedOutputsPerTask * 4 + warp] = square_partial;
       }
     }
     __sync_compute_group(128);
-    c2m.push(tid, weight_slots | input_slots);
+
+    const int partial_output_slot = m2c.template pop<0>();
+    auto *partial_output = static_cast<float *>(
+        slot_2_glob_ptr(st_insts, partial_output_slot));
+    if (tid == 0) {
+      const int partial_index = 1 + tile_k * FusedOutputsPerTask;
+#pragma unroll
+      for (int output_index = 0;
+           output_index < FusedOutputsPerTask;
+           ++output_index) {
+        const int reduce_index = output_index * 4;
+        partial_output[partial_index + output_index] =
+            warp_reduce[reduce_index] + warp_reduce[reduce_index + 1] +
+            warp_reduce[reduce_index + 2] + warp_reduce[reduce_index + 3];
+      }
+      if constexpr (EmitPreRmsMetadata) {
+        constexpr int kSquareIndex = FusedOutputsPerTask * 4;
+        partial_output[0] =
+            warp_reduce[kSquareIndex] + warp_reduce[kSquareIndex + 1] +
+            warp_reduce[kSquareIndex + 2] + warp_reduce[kSquareIndex + 3];
+      }
+    }
+    c2m.template push<31, true, false>(
+        tid, 1U << partial_output_slot);
+    c2m.push(tid, record_slots | weight_slots);
+    if constexpr (EmitPreRmsMetadata) {
+      c2m.template push<31, true, false>(tid, output_slots);
+    }
+    return;
+  } else {
+    for (int column_start = 0; column_start < k; column_start += tile_k) {
+      const int columns = min(tile_k, k - column_start);
+      const int weight_slots = m2c.template pop<0>();
+      const int weight_slot = extract(weight_slots);
+      const auto *weight = static_cast<const float *>(
+          get_slot_address(smem_base, weight_slot));
+      const int input_slots = m2c.template pop<0>();
+      const int input_slot = extract(input_slots);
+      const auto *input = static_cast<const __nv_bfloat16 *>(
+          get_slot_address(smem_base, input_slot));
+      for (int column = tid; column < columns; column += 128) {
+        const float input_value = __bfloat162float(input[column]);
+        partial = fmaf(
+            weight[column],
+            input_value,
+            partial);
+        if constexpr (EmitPreRmsMetadata) {
+          square_partial = fmaf(input_value, input_value, square_partial);
+        }
+      }
+      __sync_compute_group(128);
+      c2m.push(tid, weight_slots | input_slots);
+    }
   }
   const int output_slots = m2c.template pop<0>();
   const int output_slot = extract(output_slots);
@@ -1288,6 +1635,136 @@ __device__ __forceinline__ void task_dsv4_bf16_gemv(
   }
   __sync_compute_group(128);
   c2m.template push<31, true, false>(tid, output_slots);
+}
+
+union Dsv4RouterBf16x8 {
+  uint4 raw;
+  __nv_bfloat162 pair[4];
+};
+static_assert(sizeof(Dsv4RouterBf16x8) == 16);
+
+// Decode-sized BF16 router projection.  Rows is a build-selected shape, not a
+// runtime mode.  Bias and the tiny route-preparation output use raw-address
+// metadata slots; hidden and the contiguous row group remain allocator-owned
+// LDU operands.  Parallelizing sqrt(softplus(logit)) here leaves the one-warp
+  // top-k task with comparisons and normalization only.
+template <int Rows, typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_router_bf16_gemv_sm100(
+    int k,
+    int sm_id,
+    void *smem_base,
+    const MInst *st_insts,
+    void *task_scratch,
+    uint64_t *g_events,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  static_assert(Rows == 1 || Rows == 2 || Rows == 4);
+  constexpr int kVectorElements = 8;
+  constexpr int kThreads = 128;
+  const int tid = __compute_tid();
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 80] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 81] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  const int weight_slots = Rows == 2 ? 0 : m2c.template pop<0>();
+  const auto *weights = Rows == 2
+      ? input + k
+      : static_cast<const __nv_bfloat16 *>(
+          get_slot_address(smem_base, extract(weight_slots)));
+
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 82] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  float partial[Rows] = {};
+  for (int column = tid * kVectorElements; column < k;
+       column += kThreads * kVectorElements) {
+    Dsv4RouterBf16x8 input_vector;
+    input_vector.raw = *reinterpret_cast<const uint4 *>(input + column);
+    float input_values[kVectorElements];
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+      const float2 converted = __bfloat1622float2(input_vector.pair[pair]);
+      input_values[pair * 2] = converted.x;
+      input_values[pair * 2 + 1] = converted.y;
+    }
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+      Dsv4RouterBf16x8 weight_vector;
+      weight_vector.raw =
+          *reinterpret_cast<const uint4 *>(weights + row * k + column);
+#pragma unroll
+      for (int pair = 0; pair < 4; ++pair) {
+        const float2 converted =
+            __bfloat1622float2(weight_vector.pair[pair]);
+        partial[row] = fmaf(
+            converted.x, input_values[pair * 2], partial[row]);
+        partial[row] = fmaf(
+            converted.y, input_values[pair * 2 + 1], partial[row]);
+      }
+    }
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 83] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  c2m.push(tid, input_slots | weight_slots);
+
+  auto *warp_reduce = static_cast<float *>(task_scratch);
+#pragma unroll
+  for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      partial[row] += __shfl_down_sync(
+          0xFFFFFFFFU, partial[row], offset);
+    }
+    if (lane == 0) {
+      warp_reduce[warp * Rows + row] = partial[row];
+    }
+  }
+  __sync_compute_group(128);
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 84] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  const int bias_slot = m2c.template pop<0>();
+  const auto *bias = static_cast<const float *>(
+      slot_2_glob_ptr(st_insts, bias_slot));
+  const int output_slot = m2c.template pop<0>();
+  auto *output = static_cast<float *>(
+      slot_2_glob_ptr(st_insts, output_slot));
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 85] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  if (tid < Rows) {
+    const float logit =
+        warp_reduce[tid] + warp_reduce[Rows + tid] +
+        warp_reduce[2 * Rows + tid] + warp_reduce[3 * Rows + tid];
+    const float original = sqrtf(dsv4_softplus(logit));
+    output[tid * 2] = original;
+    output[tid * 2 + 1] = original + bias[tid];
+  }
+  if (tid < 32) {
+    __syncwarp();
+  }
+  if (tid == 0) {
+    g_events[sm_id * numProfileEvents + 86] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+
+  c2m.template push<31, true, false>(tid, 1U << output_slot);
 }
 
 // Normalized Walsh-Hadamard transform used by the ratio-4 indexer before its
@@ -2297,7 +2774,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre(
   auto *pre = shared + 4;
   auto *post_values = shared + 9;
   auto *comb_values = shared + 13;
-
   float sum_squares = 0.0f;
   constexpr int kVectorWidth = 8;
   for (int item = tid * kVectorWidth; item < kHc * kHidden;
@@ -2541,6 +3017,7 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     const MInst *st_insts,
     int sm_id,
     uint64_t *g_events,
+    int metadata_splits,
     M2CQueue &m2c,
     C2MQueue &c2m) {
   constexpr int kHc = 4;
@@ -2553,6 +3030,14 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
   (void)g_events;
 #endif
 
+  const int tid = __compute_tid();
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  auto *shared = static_cast<float *>(task_scratch);
+  auto *warp_reduce = shared;
+  auto *pre = shared + 4;
+  auto *post_values = shared + 9;
+  auto *comb_values = shared + 13;
   int square_sum_slots;
   int mixes_slots;
   int scale_slots;
@@ -2585,23 +3070,52 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
           smem_base, extract(packed_metadata_slot)));
     } else {
       static_assert(MetadataMode == Dsv4HcPreRmsMetadataMode::PackedRaw);
-      metadata = static_cast<const float *>(slot_2_glob_ptr(
-          st_insts, packed_metadata_slot));
+      if (metadata_splits > 0) {
+        metadata = static_cast<const float *>(get_slot_address(
+            smem_base, extract(packed_metadata_slot)));
+      } else {
+        metadata = static_cast<const float *>(slot_2_glob_ptr(
+            st_insts, packed_metadata_slot));
+      }
     }
-    square_sum = metadata;
-    mixes = metadata + 1;
-    scale = metadata + dsv4HcPreRmsScaleOffset;
-    base = metadata + dsv4HcPreRmsBaseOffset;
+    if (metadata_splits > 0) {
+      if (metadata_splits == 16) {
+        if (tid < 25) {
+          float total = 0.0f;
+#pragma unroll
+          for (int split = 0; split < 16; ++split) {
+            total += metadata[split * 32 + tid];
+          }
+          shared[32 + tid] = total;
+        }
+      } else if (tid < 25) {
+        float total = 0.0f;
+#pragma unroll
+        for (int split = 0; split < 16; ++split) {
+          if (split < metadata_splits) {
+            total += metadata[split * 32 + tid];
+          }
+        }
+        shared[32 + tid] = total;
+      }
+      __sync_compute_group(128);
+#if defined(DAE_TRACK_PROFILE)
+      if (tid == 0) {
+        g_events[sm_id * numProfileEvents + 122] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
+      square_sum = shared + 32;
+      mixes = shared + 33;
+      scale = metadata + metadata_splits * 32;
+      base = scale + 3;
+    } else {
+      square_sum = metadata;
+      mixes = metadata + 1;
+      scale = metadata + dsv4HcPreRmsScaleOffset;
+      base = metadata + dsv4HcPreRmsBaseOffset;
+    }
   }
-
-  const int tid = __compute_tid();
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  auto *shared = static_cast<float *>(task_scratch);
-  auto *warp_reduce = shared;
-  auto *pre = shared + 4;
-  auto *post_values = shared + 9;
-  auto *comb_values = shared + 13;
 
   if (warp == 0) {
     float coefficient_rstd = 0.0f;
@@ -2618,21 +3132,9 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     }
     if (lane == 0) {
       shared[8] = coefficient_rstd;
-      *reinterpret_cast<int *>(shared + 29) = 0;
-      *reinterpret_cast<int *>(shared + 30) = 0;
     }
   }
   __sync_compute_group(128);
-
-  const int residual_slots = m2c.template pop<0>();
-  const auto *residual = static_cast<const __nv_bfloat16 *>(
-      get_slot_address(smem_base, extract(residual_slots)));
-#if defined(DAE_TRACK_PROFILE)
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 125] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
-#endif
   auto *hidden = reinterpret_cast<__nv_bfloat16 *>(shared + 64);
 
   // Warp zero owns the coefficient transform while the other three warps
@@ -2664,6 +3166,12 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
       column_sum += __shfl_xor_sync(kCombMask, column_sum, 4);
       column_sum += __shfl_xor_sync(kCombMask, column_sum, 8);
       comb /= column_sum + dsv4HcPreRmsEpsilon;
+#if defined(DAE_TRACK_PROFILE)
+      if (tid == 0) {
+        g_events[sm_id * numProfileEvents + 94] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
 #pragma unroll
       for (int iteration = 1;
            iteration < dsv4HcPreRmsSinkhornIters;
@@ -2676,6 +3184,12 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
         column_sum += __shfl_xor_sync(kCombMask, column_sum, 4);
         column_sum += __shfl_xor_sync(kCombMask, column_sum, 8);
         comb /= column_sum + dsv4HcPreRmsEpsilon;
+#if defined(DAE_TRACK_PROFILE)
+        if (iteration == 10 && tid == 0) {
+          g_events[sm_id * numProfileEvents + 95] =
+              cuda::ptx::get_sreg_globaltimer();
+        }
+#endif
       }
       comb_values[lane] = comb;
     }
@@ -2685,12 +3199,24 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
           cuda::ptx::get_sreg_globaltimer();
     }
 #endif
+    // Worker warps consume the residual mailbox while warp zero runs the
+    // independent coefficient transform. Keep every thread-local observer
+    // queue at the same logical position without making warp zero wait.
+    m2c.advance();
   }
 
-  auto *worker_count = reinterpret_cast<int *>(shared + 29);
-  auto *rms_ready = reinterpret_cast<int *>(shared + 30);
   auto *worker_rms_rcp = shared + 31;
+  int residual_slots = 0;
   if (warp != 0) {
+    residual_slots = m2c.template pop<0>();
+    const auto *residual = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(residual_slots)));
+#if defined(DAE_TRACK_PROFILE)
+    if (tid == 32) {
+      g_events[sm_id * numProfileEvents + 125] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+#endif
     constexpr int kWorkerThreads = 96;
     const int worker = tid - 32;
     float hidden_sum = 0.0f;
@@ -2705,42 +3231,34 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     }
     if (lane == 0) {
       warp_reduce[warp] = hidden_sum;
-      __threadfence_block();
-      atomicAdd(worker_count, 1);
-      while (atomicAdd(worker_count, 0) < 3) {
-      }
     }
-    __syncwarp();
+    __sync_barrier<9, 96>();
     if (tid == 32) {
       const float total =
           warp_reduce[1] + warp_reduce[2] + warp_reduce[3];
       *worker_rms_rcp = rsqrtf(
           total / float(kHidden) + dsv4HcPreRmsNormEpsilon);
-      __threadfence_block();
-      atomicExch(rms_ready, 1);
     }
-    if (lane == 0) {
-      while (atomicAdd(rms_ready, 0) == 0) {
-      }
-    }
-    __syncwarp();
+    __sync_barrier<9, 96>();
+    c2m.template push<32>(tid, residual_slots);
   }
 
   norm_weight_slots = m2c.template pop<0>();
   norm_weight = static_cast<const __nv_bfloat16 *>(get_slot_address(
       smem_base, extract(norm_weight_slots)));
   const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *global_output = static_cast<uint8_t *>(slot_2_glob_ptr(
+      st_insts, output_slot));
   __nv_bfloat16 *output;
   Fp8 *fp8_output;
   if constexpr (OutputFp8) {
     fp8_output = static_cast<Fp8 *>(
-        get_slot_address(smem_base, extract(output_slots)));
+        get_slot_address(smem_base, output_slot));
   } else {
     output = static_cast<__nv_bfloat16 *>(
-        get_slot_address(smem_base, extract(output_slots)));
+        get_slot_address(smem_base, output_slot));
   }
-  auto *global_output = static_cast<uint8_t *>(slot_2_glob_ptr(
-      st_insts, extract(output_slots)));
   constexpr int kPrimaryOutputBytes = OutputFp8 ? kHidden : kHidden * 2;
   auto *post_output = reinterpret_cast<float *>(
       global_output + kPrimaryOutputBytes);
@@ -2759,7 +3277,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     zero_output = static_cast<float *>(
         get_slot_address(smem_base, extract(zero_output_slots)));
   }
-
   if (warp == 0) {
     if (lane < kHc) {
       post_output[lane] = post_values[lane];
@@ -2877,11 +3394,13 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
   }
 
   __sync_compute_group(128);
-  int input_slots = residual_slots | norm_weight_slots;
+  int input_slots = norm_weight_slots;
   if constexpr (MetadataMode == Dsv4HcPreRmsMetadataMode::SeparateShared) {
     input_slots |= square_sum_slots | mixes_slots | scale_slots | base_slots;
   } else if constexpr (
       MetadataMode == Dsv4HcPreRmsMetadataMode::PackedShared) {
+    input_slots |= packed_metadata_slot;
+  } else if (metadata_splits > 0) {
     input_slots |= packed_metadata_slot;
   }
   c2m.push(tid, input_slots);
@@ -2898,6 +3417,9 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_hc_post(
     int width,
     bool branch_fp32,
+    bool compact_io,
+    bool packed_rw,
+    const float *packed_coefficients,
     void *smem_base,
     M2CQueue &m2c,
     C2MQueue &c2m) {
@@ -2905,53 +3427,140 @@ __device__ __forceinline__ void task_dsv4_hc_post(
 
   const int branch_slots = m2c.template pop<0>();
   const auto *branch = get_slot_address(smem_base, extract(branch_slots));
-  int residual_slots[kHc];
+  int residual_slots[kHc] = {};
   const __nv_bfloat16 *residual[kHc];
-  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
-    residual_slots[branch_index] = m2c.template pop<0>();
-    residual[branch_index] = static_cast<const __nv_bfloat16 *>(
-        get_slot_address(smem_base, extract(residual_slots[branch_index])));
+  if (packed_rw) {
+    const auto *residual_base = reinterpret_cast<const __nv_bfloat16 *>(
+        static_cast<const char *>(branch) +
+        width * (branch_fp32 ? int(sizeof(float))
+                             : int(sizeof(__nv_bfloat16))));
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      residual[branch_index] = residual_base + branch_index * width;
+    }
+  } else if (compact_io) {
+    residual_slots[0] = m2c.template pop<0>();
+    const auto *residual_base = static_cast<const __nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(residual_slots[0])));
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      residual[branch_index] = residual_base + branch_index * width;
+    }
+  } else {
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      residual_slots[branch_index] = m2c.template pop<0>();
+      residual[branch_index] = static_cast<const __nv_bfloat16 *>(
+          get_slot_address(smem_base, extract(residual_slots[branch_index])));
+    }
   }
-  const int post_slots = m2c.template pop<0>();
-  const auto *post = static_cast<const float *>(
-      get_slot_address(smem_base, extract(post_slots)));
-  const int comb_slots = m2c.template pop<0>();
-  const auto *comb = static_cast<const float *>(
-      get_slot_address(smem_base, extract(comb_slots)));
-  int output_slots[kHc];
+  int post_slots = 0;
+  const float *post;
+  int comb_slots = 0;
+  const float *comb;
+  if (!compact_io) {
+    post_slots = m2c.template pop<0>();
+    post = static_cast<const float *>(
+        get_slot_address(smem_base, extract(post_slots)));
+    comb_slots = m2c.template pop<0>();
+    comb = static_cast<const float *>(
+        get_slot_address(smem_base, extract(comb_slots)));
+  }
+  int output_slots[kHc] = {};
   __nv_bfloat16 *output[kHc];
-  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
-    output_slots[branch_index] = m2c.template pop<0>();
-    output[branch_index] = static_cast<__nv_bfloat16 *>(
-        get_slot_address(smem_base, extract(output_slots[branch_index])));
-  }
-
-  const int tid = __compute_tid();
-  for (int output_branch = 0; output_branch < kHc; ++output_branch) {
-    for (int dim = tid; dim < width; dim += 128) {
-      const float branch_value = branch_fp32
-          ? static_cast<const float *>(branch)[dim]
-          : __bfloat162float(
-                static_cast<const __nv_bfloat16 *>(branch)[dim]);
-      float value = post[output_branch] * branch_value;
-      for (int input_branch = 0; input_branch < kHc; ++input_branch) {
-        // The model updates streams with comb^T @ residual.
-        value = fmaf(
-            comb[input_branch * kHc + output_branch],
-            __bfloat162float(residual[input_branch][dim]),
-            value);
-      }
-      output[output_branch][dim] = __float2bfloat16(value);
+  if (packed_rw) {
+    output_slots[0] = branch_slots;
+    auto *output_base = const_cast<__nv_bfloat16 *>(residual[0]);
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      output[branch_index] = output_base + branch_index * width;
+    }
+    post = reinterpret_cast<const float *>(output_base + kHc * width);
+    comb = post + kHc;
+  } else if (compact_io) {
+    output_slots[0] = m2c.template pop<0>();
+    auto *output_base = static_cast<__nv_bfloat16 *>(
+        get_slot_address(smem_base, extract(output_slots[0])));
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      output[branch_index] = output_base + branch_index * width;
+    }
+    post = packed_coefficients;
+    comb = post + kHc;
+  } else {
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      output_slots[branch_index] = m2c.template pop<0>();
+      output[branch_index] = static_cast<__nv_bfloat16 *>(
+          get_slot_address(smem_base, extract(output_slots[branch_index])));
     }
   }
 
+  const int tid = __compute_tid();
+  const float post0 = post[0];
+  const float post1 = post[1];
+  const float post2 = post[2];
+  const float post3 = post[3];
+  const float comb00 = comb[0];
+  const float comb01 = comb[1];
+  const float comb02 = comb[2];
+  const float comb03 = comb[3];
+  const float comb10 = comb[4];
+  const float comb11 = comb[5];
+  const float comb12 = comb[6];
+  const float comb13 = comb[7];
+  const float comb20 = comb[8];
+  const float comb21 = comb[9];
+  const float comb22 = comb[10];
+  const float comb23 = comb[11];
+  const float comb30 = comb[12];
+  const float comb31 = comb[13];
+  const float comb32 = comb[14];
+  const float comb33 = comb[15];
+  for (int dim = tid; dim < width; dim += 128) {
+    const float branch_value = branch_fp32
+        ? static_cast<const float *>(branch)[dim]
+        : __bfloat162float(
+              static_cast<const __nv_bfloat16 *>(branch)[dim]);
+    const float residual0 = __bfloat162float(residual[0][dim]);
+    const float residual1 = __bfloat162float(residual[1][dim]);
+    const float residual2 = __bfloat162float(residual[2][dim]);
+    const float residual3 = __bfloat162float(residual[3][dim]);
+    output[0][dim] = __float2bfloat16(dsv4_hc_post_value(
+        branch_value, residual0, residual1, residual2, residual3,
+        post0, comb00, comb10, comb20, comb30));
+    output[1][dim] = __float2bfloat16(dsv4_hc_post_value(
+        branch_value, residual0, residual1, residual2, residual3,
+        post1, comb01, comb11, comb21, comb31));
+    output[2][dim] = __float2bfloat16(dsv4_hc_post_value(
+        branch_value, residual0, residual1, residual2, residual3,
+        post2, comb02, comb12, comb22, comb32));
+    output[3][dim] = __float2bfloat16(dsv4_hc_post_value(
+        branch_value, residual0, residual1, residual2, residual3,
+        post3, comb03, comb13, comb23, comb33));
+  }
+
+  if (packed_rw) {
+    // The writeback queue barrier includes all 128 compute threads and STU,
+    // so it is already the release point for the in-place shared record.
+    c2m.template push<31, true, false>(tid, branch_slots);
+    return;
+  }
   __sync_compute_group(128);
-  int input_slots = branch_slots | post_slots | comb_slots;
+  int input_slots = branch_slots | comb_slots;
+  if (!compact_io) {
+    input_slots |= post_slots;
+  }
   for (int branch_index = 0; branch_index < kHc; ++branch_index) {
     input_slots |= residual_slots[branch_index];
   }
   c2m.push(tid, input_slots);
-  for (int branch_index = 0; branch_index < kHc; ++branch_index) {
-    c2m.template push<31, true, false>(tid, output_slots[branch_index]);
+  if (compact_io) {
+    c2m.template push<31, true, false>(tid, output_slots[0]);
+  } else {
+#pragma unroll
+    for (int branch_index = 0; branch_index < kHc; ++branch_index) {
+      c2m.template push<31, true, false>(tid, output_slots[branch_index]);
+    }
   }
 }

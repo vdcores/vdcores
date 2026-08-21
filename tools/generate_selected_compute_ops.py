@@ -343,7 +343,7 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
         prelude = [
             f"DAE_COMPUTE_OP_HANDLER({name}) {{",
             (
-                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, "
+                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, "
                 "tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, "
                 "fp8_umma_pipeline_phase_mask, scratch_space, g_events);"
             ),
@@ -356,6 +356,29 @@ def render_dynamic_handler(entry: dict[str, int | str]) -> str:
                 "m2c, c2m);"
             ),
             "#endif",
+        ]
+    elif family == "dsv4_router_bf16_gemv_sm100":
+        rows = int(entry["rows"])
+        if rows not in (1, 2, 4):
+            raise ValueError(
+                f"Unsupported DSV4 router rows={rows}; expected 1, 2, or 4"
+            )
+        prelude = [
+            f"DAE_COMPUTE_OP_HANDLER({name}) {{",
+            (
+                "  DAE_UNUSED(sm_id, thread_id, pc, count, finish, "
+                "tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, "
+                "fp8_umma_pipeline_phase_mask, "
+                "nvfp4_umma_pipeline_phase_mask, "
+                "internal_ring_full_phase_mask);"
+            ),
+        ]
+        body = [
+            (
+                f"  task_dsv4_router_bf16_gemv_sm100<{rows}>("
+                "inst.args[0], sm_id, smem_base, st_insts, "
+                "get_slot_address(smem_base, numSlots), g_events, m2c, c2m);"
+            ),
         ]
     elif family in (
         "mxfp4_mxfp8_gemv_umma_tma_scale_fp32_sm100",

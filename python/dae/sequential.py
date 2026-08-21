@@ -38,6 +38,7 @@ class SequentialStage:
     input_role: str | None = None
     profile_after: bool = False
     wait_for_previous: bool = True
+    parallel_with_previous: bool = False
     wait_group: str | None = None
     release_group: str | None = None
     profile_step_event: int | None = None
@@ -130,7 +131,11 @@ def _gate_load_ports(per_sm: list[list], bar_id: int, stage: str) -> None:
         for inst in instructions:
             if not isinstance(inst, MemoryInstruction):
                 continue
-            if not inst.opcode & _MEM_ALLOCATE or inst.opcode & _MEM_WRITEBACK:
+            if not inst.opcode & _MEM_ALLOCATE:
+                continue
+            if inst.opcode & _MEM_WRITEBACK and not inst.annotation.get(
+                "readwrite_load"
+            ):
                 continue
             port = 1 if inst.opcode & _MEM_PORT1 else 0
             first_load_by_port.setdefault(port, inst)
@@ -139,7 +144,18 @@ def _gate_load_ports(per_sm: list[list], bar_id: int, stage: str) -> None:
                 f"sequential stage {stage!r} has work but no allocating load boundary"
             )
         for inst in first_load_by_port.values():
-            _attach_bar(inst, bar_id, stage=stage)
+            if inst.annotation.get("readwrite_load"):
+                coord = inst.annotation.get("input_bar_coord")
+                if coord is None:
+                    raise ValueError("read/write load has no input-barrier field")
+                if inst.cords[coord] not in (0xFFFF, bar_id):
+                    raise ValueError(
+                        f"stage {stage!r} read/write instruction already waits "
+                        f"on barrier {inst.cords[coord]}; cannot also wait on {bar_id}"
+                    )
+                inst.cords[coord] = bar_id
+            else:
+                _attach_bar(inst, bar_id, stage=stage)
     if not active:
         raise ValueError(f"sequential stage {stage!r} has no active SMs")
 
@@ -243,20 +259,27 @@ def _rebase_coupled_fp8_phases(
         TmaLoadMxfpCoupledStream.MAX_PHASE_BASE
         << TmaLoadMxfpCoupledStream.PHASE_BASE_SHIFT
     )
-    for compute, load in zip(computes, loads):
+    for command_index, (compute, load) in enumerate(zip(computes, loads)):
         pair_count = int(compute.args[0])
         encoded_phase = (
             load.arg >> TmaLoadMxfpCoupledStream.PHASE_BASE_SHIFT
         ) & TmaLoadMxfpCoupledStream.MAX_PHASE_BASE
+        stream_length = (
+            int(load.size) & TmaLoadMxfpCoupledStream.STREAM_LENGTH_MASK
+        )
         if (
-            pair_count != int(load.size)
+            pair_count != stream_length
             or int(compute.args[2]) != encoded_phase
             or encoded_phase
             % (2 * TmaLoadMxfpCoupledStream.FP8_STAGES)
             != local_phase
         ):
             raise ValueError(
-                "coupled FP8 stage has inconsistent local phase progression"
+                "coupled FP8 stage has inconsistent local phase progression: "
+                f"command={command_index} pairs={pair_count} "
+                f"stream_length={stream_length} raw_size={int(load.size)} "
+                f"compute_phase={int(compute.args[2])} "
+                f"encoded_phase={encoded_phase} expected={local_phase}"
             )
         compute.args[2] = phase
         load.arg = (
@@ -407,6 +430,14 @@ class SequentialProgram:
                 raise ValueError(
                     f"prefetching stage {stage.name!r} requires an input_role"
                 )
+            if stage.parallel_with_previous and (
+                stage.wait_for_previous
+                or stage.wait_group is not None
+                or stage.wait_group_roles
+            ):
+                raise ValueError(
+                    f"parallel stage {stage.name!r} cannot also wait on an edge"
+                )
             if stage.wait_group is not None and stage.wait_group_roles:
                 raise ValueError(
                     f"stage {stage.name!r} cannot mix wait_group with "
@@ -444,14 +475,28 @@ class SequentialProgram:
                     raise ValueError(
                         "a profiled stage cannot elide its completion edge"
                     )
-                if (
+                placement_differs = (
                     stage.base_sm != previous_stage.base_sm
                     or stage.num_sms != previous_stage.num_sms
-                ):
+                )
+                if placement_differs and not stage.parallel_with_previous:
                     raise ValueError(
                         f"independent stage {stage.name!r} must match the "
                         "previous stage placement so its queue tail dominates"
                     )
+                if stage.parallel_with_previous:
+                    previous_stop = (
+                        previous_stage.base_sm + previous_stage.num_sms
+                    )
+                    stage_stop = stage.base_sm + stage.num_sms
+                    if not (
+                        stage_stop <= previous_stage.base_sm
+                        or previous_stop <= stage.base_sm
+                    ):
+                        raise ValueError(
+                            f"parallel stage {stage.name!r} must use a "
+                            "disjoint SM placement"
+                        )
 
             if previous_profile_after:
                 profile_input_bar = input_bar
@@ -543,9 +588,14 @@ class SequentialProgram:
             if balance_load_ports:
                 _balance_load_ports(rendered)
             for sm, instructions in enumerate(rendered):
-                coupled_fp8_phases[sm] = _rebase_coupled_fp8_phases(
-                    instructions, coupled_fp8_phases[sm]
-                )
+                try:
+                    coupled_fp8_phases[sm] = _rebase_coupled_fp8_phases(
+                        instructions, coupled_fp8_phases[sm]
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        f"sequential stage {stage.name!r} SM {sm}: {error}"
+                    ) from error
             if input_bar is not None:
                 if stage.prefetch_before_wait:
                     _validate_prefetch_gate(rendered, input_bar, stage.name)
@@ -721,21 +771,9 @@ class LoopedSequentialProgram:
                 balance_load_ports=balance_load_ports,
                 coupled_fp8_initial_phases=coupled_fp8_phases,
             )
-            if block.repeat > 1:
-                incompatible_sms = [
-                    sm
-                    for sm, (initial, final) in enumerate(zip(
-                        segment.coupled_fp8_initial_phases,
-                        segment.coupled_fp8_final_phases,
-                    ))
-                    if initial != final
-                ]
-                if incompatible_sms:
-                    raise ValueError(
-                        "repeated coupled FP8 block does not return its "
-                        "persistent ring phase to the entry state on SMs "
-                        f"{incompatible_sms}"
-                    )
+            # Coupled FP8 phase is owned by persistent per-SM LDU/compute
+            # counters. Repeated command bodies therefore advance naturally;
+            # they need not return to their encoded entry phase per iteration.
             coupled_fp8_phases = list(segment.coupled_fp8_final_phases)
             self.segments.append(segment)
             barriers_per_bank = segment.barrier_stop - segment.barrier_start

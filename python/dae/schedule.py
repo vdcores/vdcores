@@ -2012,6 +2012,68 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4Mxfp8QuantFfnInput(Schedule):
+    """Quantize BF16 directly into packed native K512 Linear-1 records.
+
+    Every output row is ``[4096-byte N8 E4M3 data | 2048-byte SFB]``.
+    Only the 128 active SFB bytes are initialized; native-layout padding is
+    deliberately unspecified.
+    """
+
+    TILE_K = 512
+    DATA_BYTES = 8 * TILE_K
+    SCALE_BYTES = 4 * 512
+    RECORD_BYTES = DATA_BYTES + SCALE_BYTES
+
+    def __init__(self, input, output):
+        super().__init__()
+        self.input = input
+        self.output = output
+
+    def _on_place(self):
+        if (
+            self.input.dtype != torch.bfloat16
+            or self.input.ndim != 1
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("FFN MXFP8 quant input must be contiguous BF16 [K]")
+        self.k = self.input.numel()
+        if self.k % self.TILE_K:
+            raise ValueError("FFN MXFP8 quant K must be K512 aligned")
+        self.k_tiles = self.k // self.TILE_K
+        if self.num_sms != self.k_tiles:
+            raise ValueError("FFN MXFP8 quant requires one resident task per K512")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape) != (self.k_tiles, self.RECORD_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                "FFN MXFP8 output must be contiguous uint8 [K/512,6144]"
+            )
+        if self.input.device != self.output.device:
+            raise ValueError("FFN MXFP8 input and output must share one device")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        start = sm * self.TILE_K
+        return [
+            Dsv4Mxfp8QuantFfnInputSm100(1),
+            _shared_load_1d(
+                self.input[start : start + self.TILE_K]
+            ).fixed_port(1),
+            TmaStore1D(self.output[sm].reshape(-1)).bar(
+                self._bar("output")
+            ),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4InverseRopeFp8QuantUmmaB(Schedule):
     """Fuse inverse final-64 RoPE with native O_a activation packing."""
 
@@ -4171,7 +4233,7 @@ class SchedFp8Block128GemvBf16(Schedule):
 
 
 class SchedDsv4PreloadRopeTables(Schedule):
-    """Load immutable RoPE metadata once into fixed per-SM shared scratch."""
+    """Copy one packed RoPE metadata record into fixed per-SM scratch."""
 
     def __init__(self, tables):
         super().__init__()
@@ -4181,15 +4243,27 @@ class SchedDsv4PreloadRopeTables(Schedule):
         if not 1 <= len(self.tables) <= 4:
             raise ValueError("DeepSeek resident RoPE preload requires 1-4 tables")
         for table in self.tables:
-            if table.dtype != torch.float32 or tuple(table.shape) != (32, 2):
+            if (
+                table.dtype != torch.float32
+                or tuple(table.shape) != (32, 2)
+                or table.device.type != "cuda"
+                or not table.is_contiguous()
+            ):
                 raise ValueError("DeepSeek RoPE table must be FP32 [32,2]")
+        devices = {table.device for table in self.tables}
+        if len(devices) != 1:
+            raise ValueError("DeepSeek RoPE tables must share one CUDA device")
+        # This setup-time pack is the persistent HBM layout consumed by every
+        # SM.  A raw metadata record avoids fragmenting the allocator directly
+        # in front of the 16-slot attention ring and its contiguous 8-slot Q.
+        self.packed_tables = torch.stack(self.tables).contiguous()
 
     def schedule(self, sm):
         if sm < 0:
             return []
         return [
             Dsv4PreloadRopeTables(len(self.tables)),
-            *(TmaLoad1D(table) for table in self.tables),
+            RawAddress(self.packed_tables, config.num_slots),
         ]
 
 
@@ -5043,7 +5117,7 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
                 stream_length=1,
                 port_mask=3,
             ),
-            self.q_tma.cord(0, 0),
+            self.q_tma.cord(0, 0).bar(self._bar("q")),
             RawAddress(
                 self.metadata[sm], config.num_slots + 8
             ),
@@ -5182,7 +5256,8 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
 
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
-                 output_weights, hash_routing=False, route_scale=1.5):
+                 output_weights, hash_routing=False, route_scale=1.5,
+                 pretransformed=False, packed_output=None):
         super().__init__()
         self.logits = logits
         self.bias = bias
@@ -5191,14 +5266,40 @@ class SchedDsv4RouteTop6(Schedule):
         self.output_weights = output_weights
         self.hash_routing = hash_routing
         self.route_scale = route_scale
+        self.pretransformed = bool(pretransformed)
+        self.packed_output = packed_output
 
     def _on_place(self):
         if self.num_sms != 1:
             raise ValueError("DeepSeek routing currently uses exactly one SM")
-        if self.logits.dtype != torch.bfloat16 or self.logits.numel() != 256:
-            raise ValueError("DeepSeek routing logits must contain 256 BF16 values")
-        if self.bias.dtype != torch.float32 or self.bias.numel() != 256:
+        expected_shape = (256, 2) if self.pretransformed else (256,)
+        if (
+            self.logits.dtype != torch.float32
+            or tuple(self.logits.shape) != expected_shape
+            or not self.logits.is_contiguous()
+        ):
+            raise ValueError(
+                "DeepSeek routing input must be contiguous FP32 "
+                f"{list(expected_shape)}"
+            )
+        if self.pretransformed:
+            if self.bias is not None:
+                raise ValueError("pretransformed routing does not reload bias")
+            if (
+                self.packed_output is None
+                or self.packed_output.dtype != torch.uint8
+                or self.packed_output.numel() != 64
+                or not self.packed_output.is_contiguous()
+            ):
+                raise ValueError("prepared routing requires one packed 64-byte output")
+            if self.output_indices.data_ptr() != self.packed_output.data_ptr():
+                raise ValueError("route indices must begin the packed output")
+            if self.output_weights.data_ptr() != self.packed_output.data_ptr() + 32:
+                raise ValueError("route weights must follow packed route indices")
+        elif self.bias.dtype != torch.float32 or self.bias.numel() != 256:
             raise ValueError("DeepSeek routing bias must contain 256 FP32 values")
+        elif self.packed_output is not None:
+            raise ValueError("legacy routing does not use prepared stream metadata")
         if self.hash_indices.dtype != torch.int32 or self.hash_indices.numel() != 8:
             raise ValueError("DeepSeek hash routing storage must contain eight int32 values")
         if self.output_indices.dtype != torch.int32 or self.output_indices.numel() != 8:
@@ -5209,14 +5310,42 @@ class SchedDsv4RouteTop6(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        return [
+        if self.pretransformed:
+            instructions = [
+                Dsv4RouteTop6Prepared(
+                    self.hash_routing,
+                    self.route_scale,
+                ),
+            ]
+            instructions.append(
+                TmaLoad1D(self.logits).fixed_port(0).bar(self._bar("logits"))
+            )
+            if self.hash_routing:
+                instructions.append(
+                    RawAddress(
+                        self.hash_indices, config.num_slots + 1
+                    ).fixed_port(1)
+                )
+            instructions.append(
+                RawAddress(
+                    self.packed_output, config.num_slots + 8
+                ).writeback().bar(self._bar("output"))
+            )
+            return instructions
+        logits_load = TmaLoad1D(self.logits).fixed_port(0)
+        logits_load.bar(self._bar("logits"))
+        instructions = [
             Dsv4RouteTop6(self.hash_routing, self.route_scale),
-            TmaLoad1D(self.logits),
-            TmaLoad1D(self.bias),
-            TmaLoad1D(self.hash_indices),
-            TmaStore1D(self.output_indices).bar(self._bar("output")),
-            TmaStore1D(self.output_weights),
+            logits_load,
+            TmaLoad1D(self.bias).fixed_port(1),
         ]
+        if self.hash_routing:
+            instructions.append(TmaLoad1D(self.hash_indices).fixed_port(1))
+        instructions.extend((
+            TmaStore1D(self.output_indices),
+            TmaStore1D(self.output_weights).bar(self._bar("output")),
+        ))
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -5328,6 +5457,14 @@ class SchedDsv4ExpertTmaReduceFp32(Schedule):
 
 class SchedDsv4Fp32Bf16Gemv(Schedule):
     TILE_K = 8192
+    FUSED_SPLITS = 16
+    FUSED_HALVES_PER_TASK = 1
+    FUSED_TILE_HIDDEN = 256
+    FUSED_OUTPUTS_PER_TASK = 3
+    FUSED_GROUPS = 8
+    FUSED_TASK_SMS = FUSED_GROUPS * FUSED_SPLITS
+    FUSED_RECORD_STRIDE = 32
+    FUSED_TAIL_ITEMS = 28
 
     def __init__(
         self,
@@ -5338,6 +5475,10 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         metadata_scale=None,
         metadata_base=None,
         metadata_tail_output=None,
+        fused_post_input_record=None,
+        fused_post_output=None,
+        fused_partial_metadata=None,
+        launcher=None,
     ):
         super().__init__()
         self.weight = weight
@@ -5347,22 +5488,104 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         self.metadata_scale = metadata_scale
         self.metadata_base = metadata_base
         self.metadata_tail_output = metadata_tail_output
+        self.fused_post_input_record = fused_post_input_record
+        self.fused_post_output = fused_post_output
+        self.fused_partial_metadata = fused_partial_metadata
+        self.launcher = launcher
 
     def _on_place(self):
-        if self.weight.dtype != torch.float32 or self.weight.ndim != 2:
-            raise ValueError("DeepSeek mHC weight must be rank-2 FP32")
-        self.rows, self.k = self.weight.shape
+        self.fuse_hc_post = self.fused_post_input_record is not None
+        if self.fuse_hc_post:
+            expected_weight_shape = (
+                self.FUSED_GROUPS,
+                self.FUSED_SPLITS,
+                self.FUSED_HALVES_PER_TASK,
+                self.FUSED_OUTPUTS_PER_TASK,
+                4,
+                self.FUSED_TILE_HIDDEN,
+            )
+            if (
+                self.weight.dtype != torch.float32
+                or tuple(self.weight.shape) != expected_weight_shape
+                or not self.weight.is_contiguous()
+            ):
+                raise ValueError(
+                    "fused mHC weights must use packed FP32 "
+                    f"{list(expected_weight_shape)} layout"
+                )
+            self.rows, self.k = 24, 4 * 4096
+        else:
+            if self.weight.dtype != torch.float32 or self.weight.ndim != 2:
+                raise ValueError("DeepSeek mHC weight must be rank-2 FP32")
+            self.rows, self.k = self.weight.shape
         if self.input.dtype != torch.bfloat16 or self.input.numel() != self.k:
             raise ValueError("DeepSeek mHC input must be BF16 [K]")
         if self.output.dtype != torch.float32 or self.output.numel() != self.rows:
             raise ValueError("DeepSeek mHC GEMV output must be FP32 [rows]")
+        if self.fuse_hc_post != (self.fused_post_output is not None):
+            raise ValueError(
+                "fused mHC post input record and residual output are required together"
+            )
+        if self.fuse_hc_post:
+            if self.rows != 24 or self.k != 4 * 4096:
+                raise ValueError(
+                    "fused mHC post projection requires FP32 [24,16384] weights"
+                )
+            if (
+                self.fused_post_input_record.dtype != torch.bfloat16
+                or tuple(self.fused_post_input_record.shape) != (6, 4096)
+                or not self.fused_post_input_record.is_contiguous()
+            ):
+                raise ValueError(
+                    "fused mHC post input record must be contiguous BF16 [6,4096]"
+                )
+            if (
+                self.fused_post_output.dtype != torch.bfloat16
+                or tuple(self.fused_post_output.shape) != (4, 4096)
+                or not self.fused_post_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "fused mHC post output must be contiguous BF16 [4,4096]"
+                )
+            if self.input.data_ptr() != self.fused_post_output.data_ptr():
+                raise ValueError(
+                    "fused projection input must alias the materialized post output"
+                )
+            if (
+                self.fused_partial_metadata is None
+                or self.fused_partial_metadata.dtype != torch.float32
+                or self.fused_partial_metadata.numel()
+                != self.FUSED_SPLITS * self.FUSED_RECORD_STRIDE
+                + self.FUSED_TAIL_ITEMS
+                or not self.fused_partial_metadata.is_contiguous()
+            ):
+                raise ValueError(
+                    "fused mHC partial metadata must be contiguous FP32 "
+                    "split records plus a packed scale/base tail"
+                )
+            if self.launcher is None:
+                raise ValueError("fused mHC projection requires a TMA launcher")
+            self.fused_record_tma = TmaTensor(
+                self.launcher, self.fused_post_input_record
+            ).rowmajor_2d(
+                "load",
+                6,
+                self.FUSED_TILE_HIDDEN,
+            )
+            self.fused_output_tma = TmaTensor(
+                self.launcher, self.fused_post_output
+            ).rowmajor_2d(
+                "store",
+                4,
+                self.FUSED_TILE_HIDDEN,
+            )
         metadata_items = (
             self.square_sum_output,
             self.metadata_scale,
             self.metadata_base,
             self.metadata_tail_output,
         )
-        if any(item is not None for item in metadata_items):
+        if not self.fuse_hc_post and any(item is not None for item in metadata_items):
             if not all(item is not None for item in metadata_items):
                 raise ValueError(
                     "DeepSeek mHC GEMV metadata outputs must be provided together"
@@ -5412,12 +5635,69 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                 raise ValueError(
                     "DeepSeek mHC GEMV metadata tail must start at packed offset 28"
                 )
-        if self.num_sms <= 0 or self.num_sms > self.rows:
+        if self.fuse_hc_post:
+            expected_sms = self.FUSED_TASK_SMS
+            if self.num_sms != expected_sms:
+                raise ValueError(
+                    f"fused mHC projection requires exactly {expected_sms} SMs"
+                )
+        elif self.num_sms <= 0 or self.num_sms > self.rows:
             raise ValueError("DeepSeek mHC GEMV requires 1 <= num_sms <= rows")
 
     def schedule(self, sm):
         if sm < 0:
             return []
+        if self.fuse_hc_post:
+            output_group, split = divmod(sm, self.FUSED_SPLITS)
+            emit_residual = output_group == 0
+            task = [
+                Dsv4Fp32Bf16Gemv(
+                    self.FUSED_HALVES_PER_TASK * self.FUSED_TILE_HIDDEN,
+                    output_group,
+                    emit_square_sum=emit_residual,
+                    fuse_hc_post=True,
+                ),
+                _shared_load_1d(
+                    self.weight[output_group, split]
+                ).fixed_port(0),
+            ]
+            tile_start = (
+                split * self.FUSED_HALVES_PER_TASK * self.FUSED_TILE_HIDDEN
+            )
+            if self.FUSED_HALVES_PER_TASK == 1:
+                record_load = self.fused_record_tma.cord(0, tile_start)
+            else:
+                record_load = self.fused_record_tma.cord_pair_2d(
+                    0,
+                    tile_start,
+                    delta_cols=self.FUSED_TILE_HIDDEN,
+                )
+            task.append(record_load.fixed_port(1))
+            if emit_residual:
+                if self.FUSED_HALVES_PER_TASK == 1:
+                    residual_store = self.fused_output_tma.cord(0, tile_start)
+                else:
+                    residual_store = self.fused_output_tma.cord_pair_2d(
+                        0,
+                        tile_start,
+                        delta_cols=self.FUSED_TILE_HIDDEN,
+                    )
+                if self._bar("residual") is not None:
+                    residual_store.bar(self._bar("residual"))
+                task.append(residual_store)
+            metadata_bar = self._bar("metadata")
+            if metadata_bar is None:
+                metadata_bar = self._bar("output")
+            partial_store = RawAddress(
+                self.fused_partial_metadata[
+                    split * self.FUSED_RECORD_STRIDE:
+                    (split + 1) * self.FUSED_RECORD_STRIDE
+                ],
+                config.num_slots,
+            ).writeback().bar(metadata_bar)
+            task.append(partial_store)
+            return task
+
         rows_per_sm, extra = divmod(self.rows, self.num_sms)
         row_start = sm * rows_per_sm + min(sm, extra)
         row_count = rows_per_sm + (1 if sm < extra else 0)
@@ -5425,7 +5705,9 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         for local_row, row in enumerate(range(row_start, row_start + row_count)):
             emit_square_sum = self.square_sum_output is not None and row == 0
             instructions.append(Dsv4Fp32Bf16Gemv(
-                self.k, self.TILE_K, emit_square_sum=emit_square_sum
+                self.k,
+                self.TILE_K,
+                emit_square_sum=emit_square_sum,
             ))
             for column in range(0, self.k, self.TILE_K):
                 end = min(column + self.TILE_K, self.k)
@@ -5449,9 +5731,15 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         return instructions
 
     def bar_release_count(self, role: str):
-        if role != "output":
-            return 0
-        return self._bar_release_if_present(role, self.num_sms)
+        if role == "output":
+            return self._bar_release_if_present(role, self.num_sms)
+        if role == "metadata" and self.fuse_hc_post:
+            return self._bar_release_if_present(
+                role, self.FUSED_GROUPS * self.FUSED_SPLITS
+            )
+        if role == "residual" and self.fuse_hc_post:
+            return self._bar_release_if_present(role, self.FUSED_SPLITS)
+        return 0
 
 
 class SchedDsv4Bf16Gemv(Schedule):
@@ -5498,6 +5786,135 @@ class SchedDsv4Bf16Gemv(Schedule):
                 ]
             store = _shared_store_1d(self.output[row:row + 1])
             if local_row + 1 == row_count:
+                store.bar(self._bar("output"))
+            instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4RouterBf16Gemv(Schedule):
+    """Vectorized BF16 router GEMV with fused route-score preparation."""
+
+    def __init__(
+        self,
+        weight,
+        input,
+        bias,
+        output,
+        *,
+        rows_per_task: int = 2,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.input = input
+        self.bias = bias
+        self.output = output
+        self.rows_per_task = int(rows_per_task)
+
+    def _on_place(self):
+        if self.rows_per_task not in (1, 2, 4):
+            raise ValueError("router rows per task must be 1, 2, or 4")
+        if (
+            self.weight.dtype != torch.bfloat16
+            or self.weight.ndim != 2
+            or not self.weight.is_contiguous()
+        ):
+            raise ValueError("router weight must be contiguous BF16 [M,K]")
+        self.rows, self.k = self.weight.shape
+        if self.rows % self.rows_per_task:
+            raise ValueError("router M must divide the constexpr row group")
+        if self.k % 1024:
+            raise ValueError("router K must be K1024 aligned")
+        if (
+            self.input.dtype != torch.bfloat16
+            or self.input.numel() != self.k
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("router input must be contiguous BF16 [K]")
+        if (
+            self.bias.dtype != torch.float32
+            or self.bias.numel() != self.rows
+            or not self.bias.is_contiguous()
+        ):
+            raise ValueError("router bias must be contiguous FP32 [M]")
+        if (
+            self.output.dtype != torch.float32
+            or tuple(self.output.shape) != (self.rows, 2)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("router output must be contiguous FP32 [M,2]")
+        if any(
+            tensor.device != self.output.device
+            for tensor in (self.weight, self.input, self.bias)
+        ):
+            raise ValueError("router tensors must share one device")
+        self.tasks = self.rows // self.rows_per_task
+        if not 0 < self.num_sms <= self.tasks:
+            raise ValueError("router GEMV requires 1..M/rows_per_task SMs")
+        self._paired_load_plans = None
+        if self.rows_per_task == 2:
+            self._paired_load_plans = torch.tensor(
+                [
+                    (
+                        self.input.data_ptr(),
+                        self.weight[task * self.rows_per_task].data_ptr(),
+                    )
+                    for task in range(self.tasks)
+                ],
+                dtype=torch.int64,
+                device=self.output.device,
+            )
+
+    def _task_shard(self, sm):
+        tasks_per_sm, extra = divmod(self.tasks, self.num_sms)
+        task_start = sm * tasks_per_sm + min(sm, extra)
+        task_count = tasks_per_sm + int(sm < extra)
+        return task_start, task_count
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        task_start, task_count = self._task_shard(sm)
+        instructions = []
+        for local_task, task in enumerate(
+            range(task_start, task_start + task_count)
+        ):
+            row_start = task * self.rows_per_task
+            row_stop = row_start + self.rows_per_task
+            instructions.append(
+                Dsv4RouterBf16GemvSm100(self.k, self.rows_per_task)
+            )
+            if self.rows_per_task == 2:
+                instructions.append(
+                    TmaLoadPair1D(
+                        self._paired_load_plans[task],
+                        first_bytes=self.input.numel() * self.input.element_size(),
+                        second_bytes=(
+                            self.weight[row_start:row_stop].numel()
+                            * self.weight.element_size()
+                        ),
+                    ).fixed_port(0)
+                )
+            else:
+                instructions.append(_shared_load_1d(self.input).fixed_port(1))
+                instructions.append(
+                    _shared_load_1d(
+                        self.weight[row_start:row_stop].reshape(-1)
+                    ).fixed_port(0)
+                )
+            instructions.append(
+                RawAddress(
+                    self.bias[row_start:row_stop], config.num_slots + 4
+                ).fixed_port(1)
+            )
+            store = RawAddress(
+                self.output[row_start:row_stop], config.num_slots + 5
+            ).writeback()
+            if local_task + 1 == task_count:
                 store.bar(self._bar("output"))
             instructions.append(store)
         return instructions
@@ -5591,6 +6008,7 @@ class SchedDsv4HcPreRms(Schedule):
         zero_fp32_output=None,
         fp8_output=None,
         fp8_scale=None,
+        split_metadata_splits: int = 0,
     ):
         super().__init__()
         self.residual = residual
@@ -5607,6 +6025,7 @@ class SchedDsv4HcPreRms(Schedule):
         self.zero_fp32_output = zero_fp32_output
         self.fp8_output = fp8_output
         self.fp8_scale = fp8_scale
+        self.split_metadata_splits = split_metadata_splits
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -5643,14 +6062,23 @@ class SchedDsv4HcPreRms(Schedule):
             raise ValueError(
                 "fused mHC/RMS residual square sum must contain one FP32 value"
             )
+        expected_metadata_items = (
+            self.split_metadata_splits * 32 + 28
+            if self.split_metadata_splits
+            else 56
+        )
+        if self.split_metadata_splits not in (0, 2, 4, 8, 16):
+            raise ValueError(
+                "fused mHC/RMS metadata splits must be 0, 2, 4, 8, or 16"
+            )
         if (
             self.packed_metadata is None
             or self.packed_metadata.dtype != torch.float32
-            or self.packed_metadata.numel() != 56
+            or self.packed_metadata.numel() != expected_metadata_items
             or not self.packed_metadata.is_contiguous()
         ):
             raise ValueError(
-                "packed mHC/RMS input metadata must be contiguous FP32 [56]"
+                "packed mHC/RMS input metadata has the wrong split-record size"
             )
         if self.zero_fp32_output is not None and (
             self.zero_fp32_output.dtype != torch.float32
@@ -5728,17 +6156,36 @@ class SchedDsv4HcPreRms(Schedule):
     def schedule(self, sm):
         if sm != 0:
             return []
-        instructions = [
-            Dsv4HcPreRms(
-                zero_fp32_output=self.zero_fp32_output is not None,
-                output_fp8=self.fp8_output is not None,
-            ),
-            RawAddress(
+        if self.split_metadata_splits:
+            metadata = TmaLoad1D(self.packed_metadata).fixed_port(1)
+            if self._bar("metadata") is not None:
+                metadata.bar(self._bar("metadata"))
+        else:
+            metadata = RawAddress(
                 self.packed_metadata, config.num_slots
-            ).fixed_port(1),
-            TmaLoad1D(self.residual).fixed_port(0),
-            TmaLoad1D(self.norm_weight).fixed_port(1),
-        ]
+            ).fixed_port(1)
+            if self._bar("metadata") is not None:
+                metadata.bar(self._bar("metadata"))
+        residual = TmaLoad1D(self.residual).fixed_port(0)
+        if self._bar("residual") is not None:
+            residual.bar(self._bar("residual"))
+        instructions = [Dsv4HcPreRms(
+            zero_fp32_output=self.zero_fp32_output is not None,
+            output_fp8=self.fp8_output is not None,
+            split_metadata_splits=self.split_metadata_splits,
+        )]
+        if self.split_metadata_splits:
+            instructions.extend((
+                metadata,
+                residual,
+                TmaLoad1D(self.norm_weight).fixed_port(1),
+            ))
+        else:
+            instructions.extend((
+                metadata,
+                residual,
+                TmaLoad1D(self.norm_weight).fixed_port(1),
+            ))
         if self.fp8_output is not None:
             instructions.extend(
                 (
@@ -5759,13 +6206,45 @@ class SchedDsv4HcPreRms(Schedule):
 
 
 class SchedDsv4HcPost(Schedule):
-    def __init__(self, branch, residual, post, comb, output):
+    """Shard mHC post with an optional compact TMA/raw-address transport.
+
+    The compact form keeps bulk branch/residual/output data on LDU/STU.  The
+    contiguous 20-FP32 coefficient record is a direct, instruction-packed raw
+    address and consumes no shared slot or memory command.  The legacy form
+    remains available to diagnostic callers that have not constructed TMA
+    descriptors; both forms execute the same compute opcode.
+    """
+
+    def __init__(
+        self,
+        branch,
+        residual,
+        post,
+        comb,
+        output,
+        *,
+        launcher=None,
+        packed_coefficients=None,
+        packed_input_record=None,
+        packed_output_record=None,
+    ):
         super().__init__()
         self.branch = branch
         self.residual = residual
         self.post = post
         self.comb = comb
         self.output = output
+        self.launcher = launcher
+        self.packed_coefficients = packed_coefficients
+        self.packed_input_record = packed_input_record
+        self.packed_output_record = packed_output_record
+        self.compact_io = launcher is not None
+        if self.compact_io != (packed_coefficients is not None):
+            raise ValueError(
+                "compact mHC post requires both launcher and packed coefficients"
+            )
+        if (packed_input_record is None) != (packed_output_record is None):
+            raise ValueError("packed mHC post requires both input/output records")
 
     def _on_place(self):
         if (
@@ -5792,6 +6271,63 @@ class SchedDsv4HcPost(Schedule):
             raise ValueError("mHC combination matrix must be FP32 [4,4]")
         if self.output.dtype != torch.bfloat16 or tuple(self.output.shape) != (4, 4096):
             raise ValueError("mHC post output must be BF16 [4,4096]")
+        if self.compact_io:
+            if (
+                self.packed_coefficients.dtype != torch.float32
+                or self.packed_coefficients.numel() != 20
+                or not self.packed_coefficients.is_contiguous()
+            ):
+                raise ValueError(
+                    "compact mHC post coefficients must be contiguous FP32 [20]"
+                )
+            base_address = self.packed_coefficients.data_ptr()
+            if self.post.data_ptr() != base_address:
+                raise ValueError("mHC post coefficients must start the packed record")
+            if self.comb.data_ptr() != base_address + 4 * 4:
+                raise ValueError("mHC combination matrix must follow post coefficients")
+            width = 4096 // self.num_sms
+            self.packed_rw = self.packed_input_record is not None
+            if self.packed_rw:
+                if self.branch.dtype != torch.bfloat16:
+                    raise ValueError(
+                        "packed 2-D mHC post currently requires a BF16 branch"
+                    )
+                for name, record in (
+                    ("input", self.packed_input_record),
+                    ("output", self.packed_output_record),
+                ):
+                    if (
+                        record.dtype != torch.bfloat16
+                        or tuple(record.shape) != (6, 4096)
+                        or not record.is_contiguous()
+                    ):
+                        raise ValueError(
+                            f"packed mHC {name} record must be BF16 [6,4096]"
+                        )
+                if (
+                    self.branch.data_ptr() != self.packed_input_record[0].data_ptr()
+                    or self.residual.data_ptr()
+                    != self.packed_input_record[1:5].data_ptr()
+                    or self.output.data_ptr()
+                    != self.packed_output_record[1:5].data_ptr()
+                ):
+                    raise ValueError("mHC tensors must be views of their packed records")
+                self.input_record_tma = TmaTensor(
+                    self.launcher, self.packed_input_record
+                ).rowmajor_2d("load", 6, width)
+                self.output_record_tma = TmaTensor(
+                    self.launcher, self.packed_output_record
+                ).rowmajor_2d("store", 6, width)
+                if self.input_record_tma.size != self.output_record_tma.size:
+                    raise ValueError("packed mHC input/output TMA sizes must match")
+                self.packed_rw_slots = bytes2slots(self.input_record_tma.size)
+            else:
+                self.residual_tma = TmaTensor(
+                    self.launcher, self.residual
+                ).rowmajor_2d("load", 4, width)
+                self.output_tma = TmaTensor(
+                    self.launcher, self.output
+                ).rowmajor_2d("store", 4, width)
 
     def schedule(self, sm):
         if sm < 0 or sm >= self.num_sms:
@@ -5799,6 +6335,38 @@ class SchedDsv4HcPost(Schedule):
         width = 4096 // self.num_sms
         start = sm * width
         stop = start + width
+        if self.compact_io:
+            if self.packed_rw:
+                coords = self.input_record_tma.cord2tma(0, start)
+                output_coords = self.output_record_tma.cord2tma(0, start)
+                if coords != output_coords:
+                    raise ValueError("packed mHC input/output coordinates must match")
+                return [
+                    Dsv4HcPost(
+                        width,
+                        branch_fp32=self.branch.dtype == torch.float32,
+                        packed_coefficients=self.packed_coefficients,
+                        packed_rw=True,
+                    ),
+                    TmaReadWrite2D(
+                        self.input_record_tma.arg,
+                        self.output_record_tma.arg,
+                        coords=(coords[0], coords[1]),
+                        bytes=self.input_record_tma.size,
+                        num_slots=self.packed_rw_slots,
+                    ).bar(self._bar("output")),
+                ]
+            store = self.output_tma.cord(0, start).bar(self._bar("output"))
+            return [
+                Dsv4HcPost(
+                    width,
+                    branch_fp32=self.branch.dtype == torch.float32,
+                    packed_coefficients=self.packed_coefficients,
+                ),
+                TmaLoad1D(self.branch[start:stop]),
+                self.residual_tma.cord(0, start),
+                store,
+            ]
         instructions = [
             Dsv4HcPost(width, branch_fp32=self.branch.dtype == torch.float32),
             TmaLoad1D(self.branch[start:stop]),

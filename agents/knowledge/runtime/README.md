@@ -30,5 +30,11 @@ Then pull in narrower notes as needed:
 - [deepseek-v4-bf16-flashmla-port.md](deepseek-v4-bf16-flashmla-port.md):
   B64 BF16 sparse-attention port contract, general retained internal-ring LDU
   operator, CTA-parallel reducer, and performance acceptance gates
+- [deepseek-v4-mhc-post-optimization.md](deepseek-v4-mhc-post-optimization.md):
+  BF16 mHC-post boundary, compact metadata transport, shared standalone/fused
+  implementation, and performance acceptance gates
+- [deepseek-v4-routing-ffn-ready-optimization.md](deepseek-v4-routing-ffn-ready-optimization.md):
+  BF16 routing plus CTA-parallel native MXFP8 preparation, dependency graph,
+  VDCores shape sweeps, and full-image performance acceptance
 - [vdcores-queues.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-queues.md):
   queue protocol and deadlock-oriented guidance

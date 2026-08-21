@@ -283,6 +283,94 @@ def build_mhc_post(
     )
 
 
+def build_mhc_fused_post_pre(
+    device: torch.device, generator: torch.Generator
+) -> Case:
+    import vllm
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        mhc_fused_post_pre_tilelang,
+    )
+
+    branch = torch.randn(
+        (1, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    residual = torch.randn(
+        (1, 4, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    post = torch.rand(
+        (1, 4, 1), generator=generator, dtype=torch.float32, device=device
+    )
+    comb = torch.rand(
+        (1, 4, 4), generator=generator, dtype=torch.float32, device=device
+    )
+    projection = torch.randn(
+        (24, 4 * 4096),
+        generator=generator,
+        dtype=torch.float32,
+        device=device,
+    ) * 0.01
+    scale = torch.tensor(
+        (0.5, 0.75, 1.25), dtype=torch.float32, device=device
+    )
+    base = torch.randn(
+        (24,), generator=generator, dtype=torch.float32, device=device
+    ) * 0.05
+    norm_weight = (
+        torch.randn(
+            (4096,), generator=generator, dtype=torch.bfloat16, device=device
+        ) * 0.05
+        + 1.0
+    )
+    captured: dict[str, tuple[torch.Tensor, ...]] = {}
+
+    def function():
+        result = mhc_fused_post_pre_tilelang(
+            branch,
+            residual,
+            post,
+            comb,
+            projection,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            1.0e-6,
+            2.0,
+            20,
+            n_splits=1,
+            tile_n=1,
+            norm_weight=norm_weight,
+            norm_eps=1.0e-6,
+        )
+        captured["result"] = result
+        return result
+
+    def validate() -> float:
+        output_residual, next_post, next_comb, normalized = captured["result"]
+        expected_residual = (
+            post * branch[:, None, :].float()
+            + torch.einsum("tij,tih->tjh", comb, residual.float())
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(
+            output_residual,
+            expected_residual,
+            rtol=2.0e-2,
+            atol=1.0e-2,
+        )
+        for value in (next_post, next_comb, normalized):
+            if not torch.isfinite(value.float()).all():
+                raise AssertionError("vLLM fused mHC post/pre returned non-finite output")
+        return _max_abs(output_residual, expected_residual)
+
+    return Case(
+        function,
+        validate,
+        f"vLLM-{vllm.__version__}",
+        "mhc_fused_post_pre_tilelang",
+        "tokens1_hc4_hidden4096_projection24_norm_bf16",
+    )
+
+
 def build_route(
     device: torch.device,
     generator: torch.Generator,
@@ -338,6 +426,232 @@ def build_route(
         f"vLLM-{vllm.__version__}",
         "topk_hash_softplus_sqrt",
         f"tokens1_experts256_top6_hash={int(hash_routing)}",
+    )
+
+
+def _router_inputs(
+    device: torch.device,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hidden = torch.randn(
+        (1, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    weight = torch.randn(
+        (256, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    bias = torch.randn(
+        (256,), generator=generator, dtype=torch.float32, device=device
+    ) * 0.1
+    return hidden, weight, bias
+
+
+def build_vllm_router_gemv(
+    device: torch.device,
+    generator: torch.Generator,
+) -> Case:
+    import vllm
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm,
+    )
+
+    hidden, weight, _ = _router_inputs(device, generator)
+    captured: dict[str, torch.Tensor] = {}
+
+    def function():
+        captured["logits"] = ll_bf16_gemm(hidden, weight, torch.float32)
+        return captured["logits"]
+
+    def validate() -> float:
+        expected = hidden.float() @ weight.float().t()
+        torch.testing.assert_close(
+            captured["logits"], expected, rtol=1.0e-3, atol=1.0e-3
+        )
+        return _max_abs(captured["logits"], expected)
+
+    return Case(
+        function,
+        validate,
+        f"vLLM-{vllm.__version__}",
+        "ll_bf16_gemm",
+        "router_m1_n256_k4096_fp32",
+    )
+
+
+def build_vllm_router_gate_top6(
+    device: torch.device,
+    generator: torch.Generator,
+) -> Case:
+    import vllm
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm,
+    )
+    from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+
+    hidden, weight, bias = _router_inputs(device, generator)
+    captured: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def function():
+        logits = ll_bf16_gemm(hidden, weight, torch.float32)
+        captured["logits"] = logits
+        captured["route"] = dsv4_topk(logits, bias, torch.int32, 1.5)
+        return captured["route"]
+
+    def validate() -> float:
+        logits = captured["logits"]
+        weights, indices = captured["route"]
+        expected_logits = hidden.float() @ weight.float().t()
+        scores = torch.nn.functional.softplus(expected_logits).sqrt()
+        expected_indices = (scores + bias).topk(6).indices
+        expected_weights = scores.gather(1, expected_indices)
+        expected_weights = expected_weights / expected_weights.sum(1, keepdim=True) * 1.5
+        torch.testing.assert_close(logits, expected_logits, rtol=1.0e-3, atol=1.0e-3)
+        torch.testing.assert_close(indices, expected_indices.to(torch.int32), rtol=0, atol=0)
+        torch.testing.assert_close(weights, expected_weights, rtol=2.0e-5, atol=2.0e-5)
+        return _max_abs(weights, expected_weights)
+
+    return Case(
+        function,
+        validate,
+        f"vLLM-{vllm.__version__}",
+        "ll_bf16_gemm+dsv4_topk",
+        "router_m1_n256_k4096_top6_fp32",
+    )
+
+
+def build_flashinfer_mxfp8_k4096(
+    device: torch.device,
+    generator: torch.Generator,
+) -> Case:
+    import flashinfer
+
+    hidden = torch.randn(
+        (1, 4096), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    captured: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def function():
+        captured["output"] = flashinfer.mxfp8_quantize(
+            hidden,
+            is_sf_swizzled_layout=False,
+            alignment=32,
+            enable_pdl=False,
+            backend="cute-dsl",
+        )
+        return captured["output"]
+
+    def validate() -> float:
+        quantized, scales = captured["output"]
+        if quantized.shape != hidden.shape or scales.numel() != 4096 // 32:
+            raise AssertionError("FlashInfer MXFP8 quantizer returned an invalid shape")
+        if not torch.isfinite(quantized.float()).all():
+            raise AssertionError("FlashInfer MXFP8 quantizer returned non-finite data")
+        return 0.0
+
+    return Case(
+        function,
+        validate,
+        f"FlashInfer-{flashinfer.__version__}",
+        "mxfp8_quantize_cute_dsl_linear",
+        "rows1_k4096_sf32",
+    )
+
+
+def build_vllm_flashinfer_router_ffn_ready(
+    device: torch.device,
+    generator: torch.Generator,
+) -> Case:
+    import flashinfer
+    import vllm
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm,
+    )
+    from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+
+    hidden, weight, bias = _router_inputs(device, generator)
+    captured: dict[str, object] = {}
+
+    def function():
+        logits = ll_bf16_gemm(hidden, weight, torch.float32)
+        captured["route"] = dsv4_topk(logits, bias, torch.int32, 1.5)
+        captured["mx"] = flashinfer.mxfp8_quantize(
+            hidden,
+            is_sf_swizzled_layout=False,
+            alignment=32,
+            enable_pdl=False,
+            backend="cute-dsl",
+        )
+        return captured["route"], captured["mx"]
+
+    def validate() -> float:
+        weights, indices = captured["route"]
+        quantized, scales = captured["mx"]
+        if indices.shape != (1, 6) or weights.shape != (1, 6):
+            raise AssertionError("vLLM router returned an invalid top-6 shape")
+        if quantized.shape != hidden.shape or scales.numel() != 4096 // 32:
+            raise AssertionError("FlashInfer MXFP8 quantizer returned an invalid shape")
+        return 0.0
+
+    return Case(
+        function,
+        validate,
+        f"vLLM-{vllm.__version__}/FlashInfer-{flashinfer.__version__}",
+        "ll_bf16_gemm+dsv4_topk+mxfp8_quantize",
+        "router_to_ffn_ready_m1_n256_k4096_top6",
+    )
+
+
+def build_vllm_flashinfer_router_ffn_ready_parallel(
+    device: torch.device,
+    generator: torch.Generator,
+) -> Case:
+    import flashinfer
+    import vllm
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm,
+    )
+    from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+
+    hidden, weight, bias = _router_inputs(device, generator)
+    route_stream = torch.cuda.Stream(device=device)
+    quant_stream = torch.cuda.Stream(device=device)
+    captured: dict[str, object] = {}
+
+    def function():
+        root_stream = torch.cuda.current_stream(device)
+        route_stream.wait_stream(root_stream)
+        quant_stream.wait_stream(root_stream)
+        with torch.cuda.stream(route_stream):
+            logits = ll_bf16_gemm(hidden, weight, torch.float32)
+            captured["route"] = dsv4_topk(
+                logits, bias, torch.int32, 1.5
+            )
+        with torch.cuda.stream(quant_stream):
+            captured["mx"] = flashinfer.mxfp8_quantize(
+                hidden,
+                is_sf_swizzled_layout=False,
+                alignment=32,
+                enable_pdl=False,
+                backend="cute-dsl",
+            )
+        root_stream.wait_stream(route_stream)
+        root_stream.wait_stream(quant_stream)
+        return captured["route"], captured["mx"]
+
+    def validate() -> float:
+        weights, indices = captured["route"]
+        quantized, scales = captured["mx"]
+        if indices.shape != (1, 6) or weights.shape != (1, 6):
+            raise AssertionError("vLLM router returned an invalid top-6 shape")
+        if quantized.shape != hidden.shape or scales.numel() != 4096 // 32:
+            raise AssertionError("FlashInfer MXFP8 quantizer returned an invalid shape")
+        return 0.0
+
+    return Case(
+        function,
+        validate,
+        f"vLLM-{vllm.__version__}/FlashInfer-{flashinfer.__version__}",
+        "parallel(ll_bf16_gemm+dsv4_topk,mxfp8_quantize)",
+        "router_to_ffn_ready_m1_n256_k4096_top6_two_stream",
     )
 
 
@@ -451,8 +765,16 @@ CASES: dict[str, Callable[[torch.device, torch.Generator], Case]] = {
     "flashinfer_nvfp4_k4096": lambda d, g: build_flashinfer_nvfp4(d, g, k=4096),
     "vllm_mhc_pre_rms": build_mhc_pre_rms,
     "vllm_mhc_post": build_mhc_post,
+    "vllm_mhc_fused_post_pre": build_mhc_fused_post_pre,
     "vllm_route_score": lambda d, g: build_route(d, g, hash_routing=False),
     "vllm_route_hash": lambda d, g: build_route(d, g, hash_routing=True),
+    "vllm_router_gemv": build_vllm_router_gemv,
+    "vllm_router_gate_top6": build_vllm_router_gate_top6,
+    "flashinfer_mxfp8_k4096": build_flashinfer_mxfp8_k4096,
+    "vllm_flashinfer_router_ffn_ready": build_vllm_flashinfer_router_ffn_ready,
+    "vllm_flashinfer_router_ffn_ready_parallel": (
+        build_vllm_flashinfer_router_ffn_ready_parallel
+    ),
     "vllm_argmax": build_argmax,
     "flashinfer_attention_rows128": lambda d, g: build_flashinfer_attention(
         d, g, rows=128

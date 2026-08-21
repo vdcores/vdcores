@@ -408,6 +408,7 @@ class ResidentOneLaunchDecode:
         mhc_output_metadata = self.mhc_packed_output[cfg.hidden_size:].view(
             torch.float32
         )
+        self.mhc_output_metadata = mhc_output_metadata
         direct_projection_views = {}
         if self.direct_splitk_bf16:
             projection_rows = (
@@ -722,7 +723,7 @@ class ResidentOneLaunchDecode:
             self.index_pooled_rope = torch.empty_like(self.index_pooled).reshape(1, -1)
 
         self.router_logits = torch.empty(
-            (cfg.num_experts,), dtype=torch.bfloat16, device=d
+            (cfg.num_experts,), dtype=torch.float32, device=d
         )
         self.route_indices = torch.empty((8,), dtype=torch.int32, device=d)
         self.route_weights = torch.empty((8,), dtype=torch.float32, device=d)
@@ -1510,6 +1511,8 @@ class ResidentOneLaunchDecode:
                 self.post,
                 self.comb,
                 output_residual,
+                launcher=self.launcher,
+                packed_coefficients=self.mhc_output_metadata,
             ),
             self.policy.hc_post(
                 self.config.hidden_size, self.config.hc_mult
@@ -2659,6 +2662,8 @@ class ResidentOneLaunchDecode:
                     f"attn.sparse_{kind}.split64_umma",
                     producer,
                     num_splits,
+                    input_role="q",
+                    prefetch_before_wait=True,
                     release_group_roles=(
                         (partial_ready_groups[0], "output0"),
                         (partial_ready_groups[1], "output1"),

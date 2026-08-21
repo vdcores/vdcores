@@ -190,7 +190,15 @@ __device__ __forceinline__ void allocwarp_execute(
       uint64_t slot_stall_start = 0;
 #endif
       while (true) {
-        di.slot_alloc = alloc.allocate(lane_id, flags, inst.nslot(), alloc_mask);
+        const bool fixed_internal_ring =
+            decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
+            (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+                dae_mxfp_resident_ffn::kCoupledTmaRing;
+        di.slot_alloc = fixed_internal_ring
+            ? alloc.allocate_at_zero(
+                  lane_id, flags, inst.nslot(), alloc_mask)
+            : alloc.allocate(
+                  lane_id, flags, inst.nslot(), alloc_mask);
         // TODO(zhiyuang): reorder this store
 
         __mprint("[id] after allocation: allocate=%d slot=%d",
@@ -245,7 +253,8 @@ __device__ __forceinline__ void allocwarp_execute(
         LdCmd ld;
         ld.init(di.slot_alloc, m2c.ptr, inst.opcode);
         const bool direct_writeback_publication =
-            (inst.opcode & MEM_OP_FLAGS_WRITEBACK) != 0;
+            (inst.opcode & MEM_OP_FLAGS_WRITEBACK) != 0 &&
+            decoded_op != op(OP_ALLOC_RW_TMA_2D);
         if (allocator_owned_coupled || direct_writeback_publication) {
           // The lease itself is the compute operand. Publish it immediately;
           // compute observes the per-stage transaction barriers before

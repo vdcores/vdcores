@@ -269,7 +269,8 @@ __device__ __noinline__ void ldu_execute_internal_ring_stream(
 // output groups for one K256 pair, while LDU1 supplies their shared activation.
 __device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
     const MInst inst, const int slot, const int port_id,
-    const void *smem_base, uint64_t *tmem_mma_barriers) {
+    const void *smem_base, uint64_t *tmem_mma_barriers,
+    uint32_t &pair_base_state) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages =
       dae_mxfp_resident_ffn::kFp8CoupledStages;
@@ -296,9 +297,9 @@ __device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
       tmem_mma_barriers +
       (port_id == 0 ? mxfp8CoupledWeightFullBarrierBase
                     : mxfp8CoupledActivationFullBarrierBase));
-  const int phase_base = int(
-      (inst.arg & dae_mxfp_resident_ffn::kCoupledPhaseBaseMask) >>
-      dae_mxfp_resident_ffn::kCoupledPhaseBaseShift);
+  const int phase_base = int(pair_base_state);
+  pair_base_state = uint32_t(
+      (phase_base + int(inst.size)) % (2 * kStages));
 
   for (int pair = 0; pair < int(inst.size); ++pair) {
     const int global_pair = phase_base + pair;
@@ -712,6 +713,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   uint64_t routedBaseAddress = 0;
   uint64_t cachedRouteAddress = 0;
   LduRouteExperts cachedRouteExperts;
+  uint32_t mxfp8_coupled_pair_base = 0;
   uint32_t internal_ring_empty_phase_mask = 0;
 #if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
   // SFA and SFB may be assigned independently to either LDU. Track the
@@ -782,6 +784,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         //   first_wait = false;
         // }
       }
+#if defined(DAE_TRACK_PROFILE)
+      if (sm_id + 1 == int(gridDim.x) && port_id == 1) {
+        g_events[sm_id * numProfileEvents + 121] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
       // A barriered raw-address command is itself the producer dependency:
       // compute will dereference HBM directly instead of issuing a TMA after
       // this wait.  Carry the device-scope release/acquire edge through the
@@ -795,6 +803,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #endif
       __ldprint("wait for global barrier before load: bar=%d", inst.bar());
     };
+
+    if (op(opcode) == op(OP_ALLOC_RW_TMA_2D) &&
+        inst.coords[2] != 0xFFFFU) {
+      volatile int *input_bar = bars + inst.coords[2];
+      while (*input_bar != 0) {
+        __nanosleep(barrierPollSleepCycles);
+      }
+    }
 
     // TODO(zhiyuang): change location?
     switch(op(opcode)) {
@@ -836,6 +852,85 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               "[REG] retain TMA: reg_id=%d slot=%d nslot=%d mask=0x%X",
               inst.arg, slot, inst.nslot(), regFile[inst.arg]);
         }
+        break; }
+      case op(OP_ALLOC_TMA_LOAD_PAIR_1D): {
+        const uint32_t transfer_size = uint32_t(inst.size);
+        const uint32_t first_size = uint32_t(inst.arg);
+        const auto *address_plan =
+            reinterpret_cast<const uint64_t *>(inst.address);
+        const uint64_t first_address = load_l2_u64(address_plan);
+        const uint64_t second_address = load_l2_u64(address_plan + 1);
+        char *destination = static_cast<char *>(
+            get_slot_address(smem_base, slot));
+        const uint32_t shared_destination = uint32_t(
+            __cvta_generic_to_shared(destination));
+        const uint32_t transaction_barrier = uint32_t(
+            __cvta_generic_to_shared(m2c.native_bar(bar)));
+        // Register the complete transaction before either independent copy can
+        // retire, so both completion decrements belong to this barrier phase.
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar],
+            cuda::aligned_size_t<16>(transfer_size));
+        // NVCC 13.0 drops the second consecutive libcudacxx
+        // memcpy_async_tx call in this runtime-dispatched basic block.  Keep
+        // both copies in one volatile PTX statement, matching the established
+        // paired-2D implementation below.
+        asm volatile(
+            "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+            "[%0], [%1], %2, [%3];\n"
+            "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+            "[%4], [%5], %6, [%3];\n"
+            :
+            : "r"(shared_destination),
+              "l"(first_address),
+              "r"(first_size),
+              "r"(transaction_barrier),
+              "r"(shared_destination + first_size),
+              "l"(second_address),
+              "r"(transfer_size - first_size)
+            : "memory");
+        break; }
+      case op(OP_ALLOC_RW_TMA_2D): {
+        asm volatile(
+          "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+          "[%0], [%1, {%2, %3}], [%4];\n"
+          :
+          : "r"((uint32_t)__cvta_generic_to_shared(
+                get_slot_address(smem_base, slot))),
+            "l"((void *)(tma_descs + inst.arg)),
+            "r"((int)inst.coords[0]),
+            "r"((int)inst.coords[1]),
+            "r"((uint32_t)__cvta_generic_to_shared(m2c.native_bar(bar)))
+          : "memory");
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar],
+            cuda::aligned_size_t<16>(uint32_t(inst.size)));
+        break; }
+      case op(OP_ALLOC_TMA_LOAD_PAIR_2D): {
+        const uint32_t transfer_size = uint32_t(inst.size);
+        const uint32_t tile_size = transfer_size / 2;
+        const uint16_t *cord = inst.coords;
+        const uint32_t smem = uint32_t(__cvta_generic_to_shared(
+            get_slot_address(smem_base, slot)));
+        const uint32_t tx_bar = uint32_t(__cvta_generic_to_shared(
+            m2c.native_bar(bar)));
+        asm volatile(
+          "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+          "[%0], [%1, {%2, %3}], [%4];\n"
+          "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+          "[%5], [%1, {%6, %3}], [%4];\n"
+          :
+          : "r"(smem),
+            "l"((void *)(tma_descs + inst.arg)),
+            "r"((int)cord[0]),
+            "r"((int)cord[1]),
+            "r"(tx_bar),
+            "r"(smem + tile_size),
+            "r"((int)cord[0] + (int)cord[2])
+          : "memory");
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar],
+            cuda::aligned_size_t<16>(transfer_size));
         break; }
 #if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
       case op(OP_ALLOC_TMA_LOAD_MX_SCALE_1D):
@@ -909,7 +1004,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               stream_inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask;
           if (stream_kind == dae_mxfp_resident_ffn::kCoupledFp8Gemv) {
             ldu_execute_mxfp8_coupled_stream(
-                stream_inst, slot, port_id, smem_base, tmem_mma_barriers);
+                stream_inst, slot, port_id, smem_base, tmem_mma_barriers,
+                mxfp8_coupled_pair_base);
           } else if (
               stream_kind == dae_mxfp_resident_ffn::kCoupledTmaRing) {
             ldu_execute_internal_ring_stream(

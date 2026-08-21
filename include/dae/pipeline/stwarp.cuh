@@ -79,6 +79,44 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
         }
       }
         break;
+      case op(OP_ALLOC_RW_TMA_2D):
+      {
+        asm volatile(
+          "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
+          "[%0, {%1, %2}], [%3];\n"
+          :
+          : "l"((void *)(tma_descs + inst.coords[3])),
+            "r"((int)inst.coords[0]),
+            "r"((int)inst.coords[1]),
+            "r"((uint32_t)__cvta_generic_to_shared(
+                get_slot_address(smem_base, slot)))
+          : "memory");
+        cuda::ptx::cp_async_bulk_commit_group();
+      }
+        break;
+      case op(OP_ALLOC_WB_TMA_STORE_PAIR_2D):
+      {
+        const uint32_t transfer_size = uint32_t(inst.size);
+        const uint32_t tile_size = transfer_size / 2;
+        const uint16_t *cord = inst.coords;
+        const uint32_t smem = uint32_t(__cvta_generic_to_shared(
+            get_slot_address(smem_base, slot)));
+        asm volatile(
+          "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
+          "[%0, {%1, %2}], [%3];\n"
+          "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
+          "[%0, {%4, %2}], [%5];\n"
+          :
+          : "l"((void *)(tma_descs + inst.arg)),
+            "r"((int)cord[0]),
+            "r"((int)cord[1]),
+            "r"(smem),
+            "r"((int)cord[0] + (int)cord[2]),
+            "r"(smem + tile_size)
+          : "memory");
+        cuda::ptx::cp_async_bulk_commit_group();
+      }
+        break;
       case op(OP_ALLOC_WB_TMA_STORE_2D):
         {
           const uint16_t *cord = inst.coords;

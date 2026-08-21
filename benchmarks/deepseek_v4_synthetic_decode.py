@@ -20,6 +20,7 @@ from dae.deepseek_v4_flow import build_decode_plan
 from dae.launcher import Launcher
 from dae.routing import RoutedAddressTable
 from dae.schedule import (
+    SchedDsv4Bf16Gemv,
     SchedDsv4ExpertReduce,
     SchedDsv4Fp32Bf16Gemv,
     SchedDsv4GatedPool,
@@ -684,12 +685,22 @@ class SyntheticDecode:
             self.hc_ffn_post,
         ) = self._build_hc_pair("ffn", self.next_residual, self.residual)
         self.ffn_hidden_fp8 = Fp8Activation("ffn.hidden", self.norm_hidden, self.sms, d)
-        self.router_logits = torch.empty((256,), dtype=torch.bfloat16, device=d)
-        self.router_projection = Fp8Linear(
-            "ffn.router", self.factory, self.ffn_hidden_fp8, self.router_logits,
-            self.sms, d
+        self.router_logits = torch.empty((256,), dtype=torch.float32, device=d)
+        self.router_weight = torch.zeros(
+            (256, cfg.hidden_size), dtype=torch.bfloat16, device=d
         )
-        self.router_bias = torch.linspace(-0.5, 0.5, 256, dtype=torch.float32, device=d)
+        self.router_bias = torch.linspace(
+            -0.5, 0.5, 256, dtype=torch.float32, device=d
+        )
+        self.router_projection = self._stage(
+            "ffn.router_bf16",
+            SchedDsv4Bf16Gemv(
+                self.router_weight,
+                self.norm_hidden,
+                self.router_logits,
+            ),
+            128,
+        )
         self.hash_indices = torch.zeros((8,), dtype=torch.int32, device=d)
         self.hash_indices[:6] = torch.tensor(
             [3, 17, 29, 71, 130, 255], dtype=torch.int32, device=d
@@ -996,7 +1007,7 @@ class SyntheticDecode:
             self.hc_ffn_pre,
             self.ffn_norm,
             self.ffn_hidden_fp8.stage,
-            self.router_projection.stage,
+            self._unwrap_stage(self.router_projection),
             self.router_hash if plan.hash_routing else self.router_score,
             self.ffn_hidden_nvfp4.stage,
         ]

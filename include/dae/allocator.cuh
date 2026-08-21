@@ -36,6 +36,22 @@ struct SharedMemoryAllocator {
             (int)req, availbility, mask, slot, alloc, *(volatile uint32_t *)slot_avail);
     return slot;
   }
+
+  // Large internal rings have a fixed companion allocation at the arena
+  // tail.  Leasing the ring from slot zero preserves that contiguous tail
+  // even when a preceding small task is still retiring; first-fit can split
+  // the same total free space into two unusable fragments.
+  __device__ __forceinline__ int allocate_at_zero(
+      int lane_id, int *slot_avail, uint16_t req, int &alloc) {
+    const uint32_t available = *(volatile uint32_t *)slot_avail;
+    const uint32_t mask = (1U << req) - 1U;
+    const bool ready = (available & mask) == mask;
+    if (ready && lane_id == 0) {
+      atomicAnd(slot_avail, ~mask);
+    }
+    alloc = ready ? int(mask) : 0;
+    return ready ? 0 : -1;
+  }
 };
 
 template <unsigned numSlots>

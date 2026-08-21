@@ -346,7 +346,7 @@ def run_attention(device: torch.device, generator: torch.Generator) -> None:
 
 def run_router(device: torch.device, generator: torch.Generator) -> None:
     logits = torch.randn(
-        (256,), generator=generator, dtype=torch.bfloat16, device=device
+        (256,), generator=generator, dtype=torch.float32, device=device
     )
     bias = torch.linspace(-0.4, 0.4, 256, dtype=torch.float32, device=device)
     bias[[3, 29, 71]] += torch.tensor(

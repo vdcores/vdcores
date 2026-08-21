@@ -18,6 +18,7 @@ from dae.instructions import (
     Dsv4HcHeadRms,
     Dsv4HcPost,
     Dsv4Fp8QuantUmmaBSm100,
+    Dsv4Mxfp8QuantFfnInputSm100,
     Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100,
     Dsv4RmsFp8QuantUmmaBSm100,
     Dsv4Fp32ToBf16,
@@ -57,6 +58,7 @@ from dae.instructions import (
     Nvfp4UmmaPrepackSm100,
     ProfileEvent,
     ProfileStep,
+    RawAddress,
     RMS_NORM_F16_SMEM,
     RepeatM,
     ResetIndirectLayer,
@@ -77,6 +79,7 @@ from dae.launcher import Launcher, SMInstructionBuilder
 from dae.schedule import (
     Schedule,
     SchedDsv4Fp8QuantUmmaB,
+    SchedDsv4Mxfp8QuantFfnInput,
     SchedDsv4HcPreRms,
     SchedDsv4HcPost,
     SchedDsv4PreloadRopeTables,
@@ -1277,6 +1280,15 @@ def test_dsv4_fp8_native_quant_encodes_k_tile_count():
     )
 
 
+def test_dsv4_mxfp8_ffn_input_quant_encodes_k512_tiles():
+    instruction = Dsv4Mxfp8QuantFfnInputSm100(1)
+
+    assert instruction.args == [1]
+    assert instruction.compute_operator_name() == (
+        "OP_DSV4_MXFP8_QUANT_FFN_INPUT_SM100"
+    )
+
+
 def test_dsv4_cleanroom_preattention_fusions_encode_shape_shards(monkeypatch):
     monkeypatch.setattr(
         "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
@@ -1454,6 +1466,27 @@ def test_dsv4_fp8_native_quant_shards_whole_scale_groups(monkeypatch):
     assert first[0].args == last[0].args == [4]
     assert first[1].size == last[1].size == 4 * 128 * 2
     assert first[2].size == last[2].size == 4 * 2048
+    assert first[1].cords != last[1].cords
+
+
+def test_dsv4_mxfp8_ffn_input_quant_uses_one_packed_record_per_sm(monkeypatch):
+    monkeypatch.setattr(
+        "dae.instructions.get_tensor_address", lambda tensor: tensor.data_ptr()
+    )
+    schedule = SchedDsv4Mxfp8QuantFfnInput(
+        torch.empty((4096,), dtype=torch.bfloat16),
+        torch.empty((8, 6144), dtype=torch.uint8),
+    ).place(8)
+
+    first = schedule.schedule(0)
+    last = schedule.schedule(7)
+
+    assert isinstance(first[0], Dsv4Mxfp8QuantFfnInputSm100)
+    assert first[0].args == last[0].args == [1]
+    assert first[1].size == last[1].size == 512 * 2
+    assert first[2].size == last[2].size == 6144
+    assert first[1].num_slots == last[1].num_slots == 1
+    assert first[2].num_slots == last[2].num_slots == 1
     assert first[1].cords != last[1].cords
 
 
@@ -2083,7 +2116,7 @@ def test_subgrid_schedule_keeps_shape_placement_inside_global_stage():
 
 def test_sequential_program_elides_only_same_placement_independent_edge():
     class FakeLauncher:
-        num_sms = 2
+        num_sms = 4
         num_bars = 0
         max_insts = 32
 
@@ -2149,6 +2182,39 @@ def test_sequential_program_elides_only_same_placement_independent_edge():
                 SequentialStage("first", BasicStage(), 2),
                 SequentialStage(
                     "bad", BasicStage(), 1, wait_for_previous=False
+                ),
+            ),
+        )
+
+    fork = SequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialStage("left", BasicStage(), 2),
+            SequentialStage(
+                "right",
+                BasicStage(),
+                2,
+                base_sm=2,
+                wait_for_previous=False,
+                parallel_with_previous=True,
+            ),
+        ),
+    )
+    assert fork.barriers == []
+    assert all(fork.instructions[sm] for sm in range(4))
+
+    with pytest.raises(ValueError, match="disjoint SM placement"):
+        SequentialProgram(
+            FakeLauncher(),
+            (
+                SequentialStage("left", BasicStage(), 2),
+                SequentialStage(
+                    "overlap",
+                    BasicStage(),
+                    2,
+                    base_sm=1,
+                    wait_for_previous=False,
+                    parallel_with_previous=True,
                 ),
             ),
         )
@@ -2833,6 +2899,10 @@ def test_deepseek_compute_tasks_cannot_escape_shared_memory():
     assert "__threadfence" not in combined
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="resident raw-address metadata requires a CUDA tensor",
+)
 def test_resident_rope_tables_preload_once_and_fixed_tasks_skip_table_loads(
     monkeypatch,
 ):
@@ -2844,18 +2914,18 @@ def test_resident_rope_tables_preload_once_and_fixed_tasks_skip_table_loads(
         lambda tensor: tensor.data_ptr(),
     )
     tables = tuple(
-        torch.empty((32, 2), dtype=torch.float32) for _ in range(4)
+        torch.empty((32, 2), dtype=torch.float32, device="cuda")
+        for _ in range(4)
     )
     preload = SchedDsv4PreloadRopeTables(tables).place(2)
     preload_instructions = preload.schedule(0)
 
     assert isinstance(preload_instructions[0], Dsv4PreloadRopeTables)
     assert preload_instructions[0].args == [4]
-    assert len(preload_instructions) == 5
-    assert all(
-        instruction.opcode == opcode.OP_ALLOC_TMA_LOAD_1D
-        for instruction in preload_instructions[1:]
-    )
+    assert len(preload_instructions) == 2
+    assert isinstance(preload_instructions[1], RawAddress)
+    assert preload_instructions[1].num_slots == config.num_slots
+    assert preload.packed_tables.shape == (4, 32, 2)
 
     input512 = torch.empty((1, 512), dtype=torch.bfloat16)
     output512 = torch.empty_like(input512)

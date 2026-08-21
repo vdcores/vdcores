@@ -639,6 +639,18 @@ class Dsv4Fp8QuantUmmaBSm100(ComputeInstruction):
         )
 
 
+class Dsv4Mxfp8QuantFfnInputSm100(ComputeInstruction):
+    """Pack BF16 K512 shards into native Linear-1 MXFP8 records."""
+
+    def __init__(self, k512_tiles: int = 1):
+        if k512_tiles <= 0 or k512_tiles > 0xFFFF:
+            raise ValueError("FFN MXFP8 K512-tile count must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_DSV4_MXFP8_QUANT_FFN_INPUT_SM100,
+            args=[k512_tiles],
+        )
+
+
 class Dsv4InverseRopeFp8QuantUmmaBSm100(ComputeInstruction):
     """Inverse partial RoPE and native N8/K128 FP8 packing for one head."""
 
@@ -901,11 +913,33 @@ class Dsv4AttentionSplitReduceFp8Sm100(ComputeInstruction):
 
 
 class Dsv4RouteTop6(ComputeInstruction):
-    def __init__(self, hash_routing: bool, route_scale: float = 1.5):
+    def __init__(
+        self,
+        hash_routing: bool,
+        route_scale: float = 1.5,
+        *,
+        pretransformed_raw: bool = False,
+    ):
         if route_scale <= 0:
             raise ValueError("DeepSeek route_scale must be positive")
         super().__init__(
             opcode=opcode.OP_DSV4_ROUTE_TOP6,
+            args=[
+                int(hash_routing),
+                encode_bfloat16_u16(route_scale),
+                int(pretransformed_raw),
+            ],
+        )
+
+
+class Dsv4RouteTop6Prepared(ComputeInstruction):
+    """Select top-6 from projection-prepared original/biased score pairs."""
+
+    def __init__(self, hash_routing: bool, route_scale: float = 1.5):
+        if route_scale <= 0:
+            raise ValueError("DeepSeek route_scale must be positive")
+        super().__init__(
+            opcode=opcode.OP_DSV4_ROUTE_TOP6_PREPARED,
             args=[int(hash_routing), encode_bfloat16_u16(route_scale)],
         )
 
@@ -916,14 +950,30 @@ class Dsv4ExpertReduce(ComputeInstruction):
 
 
 class Dsv4Fp32Bf16Gemv(ComputeInstruction):
-    def __init__(self, k: int, tile_k: int, emit_square_sum: bool = False):
+    EMIT_SQUARE_SUM = 1 << 0
+    FUSE_HC_POST = 1 << 1
+
+    def __init__(
+        self,
+        k: int,
+        tile_k: int,
+        emit_square_sum: bool = False,
+        fuse_hc_post: bool = False,
+    ):
         if k <= 0 or k > 0xFFFF:
             raise ValueError("DeepSeek FP32 GEMV K must fit in uint16")
-        if tile_k <= 0 or tile_k > 0xFFFF:
+        if fuse_hc_post:
+            if tile_k < 0 or tile_k > 0xFFFF:
+                raise ValueError("fused mHC projection group must fit in uint16")
+        elif tile_k <= 0 or tile_k > 0xFFFF:
             raise ValueError("DeepSeek FP32 GEMV tile K must fit in uint16")
+        flags = (
+            self.EMIT_SQUARE_SUM * int(bool(emit_square_sum))
+            | self.FUSE_HC_POST * int(bool(fuse_hc_post))
+        )
         super().__init__(
             opcode=opcode.OP_DSV4_FP32_BF16_GEMV,
-            args=[k, tile_k, int(bool(emit_square_sum))],
+            args=[k, tile_k, flags],
         )
 
 
@@ -936,6 +986,22 @@ class Dsv4Bf16Gemv(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_DSV4_BF16_GEMV,
             args=[k, tile_k, int(output_fp32)],
+        )
+
+
+class Dsv4RouterBf16GemvSm100(ComputeInstruction):
+    """Vectorized router GEMV plus parallel score preparation."""
+
+    def __init__(self, k: int, rows_per_task: int):
+        if k <= 0 or k > 0xFFFF or k % 1024:
+            raise ValueError("DSV4 router GEMV K must be a uint16 K1024 multiple")
+        if rows_per_task not in (1, 2, 4):
+            raise ValueError("DSV4 router rows per task must be 1, 2, or 4")
+        super().__init__(
+            opcode=family_ref(
+                "DSV4_ROUTER_BF16_GEMV_SM100", ROWS=rows_per_task
+            ),
+            args=[k],
         )
 
 
@@ -959,19 +1025,67 @@ class Dsv4HcPreRms(ComputeInstruction):
         self,
         zero_fp32_output: bool = False,
         output_fp8: bool = False,
+        split_metadata_splits: int = 0,
     ):
+        if split_metadata_splits not in (0, 2, 4, 8, 16):
+            raise ValueError(
+                "mHC pre-RMS metadata splits must be 0, 2, 4, 8, or 16"
+            )
         flags = (
             self.ZERO_FP32_OUTPUT * int(bool(zero_fp32_output))
             | self.OUTPUT_FP8 * int(bool(output_fp8))
         )
         super().__init__(
             opcode=opcode.OP_DSV4_HC_PRE_RMS,
-            args=[flags],
+            args=[flags, split_metadata_splits],
         )
 
 
 class Dsv4HcPost(ComputeInstruction):
-    def __init__(self, width: int, branch_fp32: bool = False):
+    COMPACT_IO = 1 << 0
+    BRANCH_FP32 = 1 << 1
+    WIDTH_SHIFT = 2
+    PACKED_RW = 1 << 6
+    POINTER_ALIGNMENT = 128
+
+    def __init__(
+        self,
+        width: int | None = None,
+        branch_fp32: bool = False,
+        packed_coefficients: torch.Tensor | None = None,
+        packed_rw: bool = False,
+    ):
+        if packed_coefficients is not None:
+            if width is None or width <= 0 or width > 4096:
+                raise ValueError("compact mHC post requires a valid shard width")
+            if width & (width - 1):
+                raise ValueError("compact mHC post shard width must be a power of two")
+            if packed_coefficients.device.type != "cuda":
+                raise ValueError("packed mHC post coefficients must be on CUDA")
+            address = packed_coefficients.data_ptr()
+            if address & (self.POINTER_ALIGNMENT - 1):
+                raise ValueError(
+                    "packed mHC post coefficients must be 128-byte aligned"
+                )
+            width_log2 = width.bit_length() - 1
+            encoded = (
+                address
+                | self.COMPACT_IO
+                | self.BRANCH_FP32 * int(bool(branch_fp32))
+                | (width_log2 << self.WIDTH_SHIFT)
+                | self.PACKED_RW * int(bool(packed_rw))
+            )
+            super().__init__(
+                opcode=opcode.OP_DSV4_HC_POST,
+                args=[
+                    encoded & 0xFFFF,
+                    (encoded >> 16) & 0xFFFF,
+                    (encoded >> 32) & 0xFFFF,
+                ],
+            )
+            return
+        if width is None:
+            raise ValueError("legacy mHC post requires a shard width")
         if width <= 0 or width > 4096:
             raise ValueError("DeepSeek mHC post width must be in [1,4096]")
         super().__init__(
@@ -2709,6 +2823,48 @@ class TmaLoad1D(MemoryInstruction):
         return new_inst
 
 
+class TmaLoadPair1D(MemoryInstruction):
+    """Load two independent sources into one contiguous shared allocation."""
+
+    def __init__(
+        self,
+        address_plan: torch.Tensor,
+        *,
+        first_bytes: int,
+        second_bytes: int,
+    ):
+        if (
+            address_plan.device.type != "cuda"
+            or address_plan.dtype != torch.int64
+            or address_plan.numel() != 2
+            or not address_plan.is_contiguous()
+        ):
+            raise ValueError(
+                "paired 1D TMA address plan must be contiguous CUDA int64[2]"
+            )
+        first_bytes = int(first_bytes)
+        second_bytes = int(second_bytes)
+        total_bytes = first_bytes + second_bytes
+        if (
+            first_bytes <= 0
+            or second_bytes <= 0
+            or first_bytes % 16
+            or second_bytes % 16
+            or total_bytes > 0xFFFF
+        ):
+            raise ValueError(
+                "paired 1D TMA byte counts must be positive/aligned16 and fit uint16"
+            )
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_PAIR_1D,
+            num_slots=bytes2slots(total_bytes),
+            arg=first_bytes,
+            size=total_bytes,
+            address=get_tensor_address(address_plan),
+        )
+        self.address_plan = address_plan
+
+
 class TmaLoadMxfpCoupledStream(MemoryInstruction):
     """Produce one common MX data/scale stream through the LDUs.
 
@@ -3091,6 +3247,38 @@ class StuStore1D(MemoryInstruction):
         )
 
 
+class TmaReadWrite2D(MemoryInstruction):
+    """One allocator lease loaded and stored by equal-shaped 2-D TMAs."""
+
+    NO_INPUT_BARRIER = 0xFFFF
+
+    def __init__(
+        self,
+        load_descriptor: int,
+        store_descriptor: int,
+        *,
+        coords: tuple[int, int],
+        bytes: int,
+        num_slots: int,
+    ):
+        for descriptor in (load_descriptor, store_descriptor):
+            if not 0 <= descriptor <= 0xFFFF:
+                raise ValueError("TMA descriptor index must fit uint16")
+        if bytes <= 0 or bytes > 0xFFFF:
+            raise ValueError("2-D read/write size must fit uint16")
+        if num_slots <= 0 or num_slots >= config.num_slots:
+            raise ValueError("2-D read/write lease must use normal shared slots")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_RW_TMA_2D,
+            num_slots=num_slots,
+            arg=load_descriptor,
+            size=bytes,
+            cords=[coords[0], coords[1], self.NO_INPUT_BARRIER, store_descriptor],
+        )
+        self.annotation["readwrite_load"] = True
+        self.annotation["input_bar_coord"] = 2
+
+
 class TmaTensor(MemoryInstruction):
     def __init__(self, launcher, mat: torch.Tensor):
         super().__init__(opcode=0, num_slots=0, arg=0, size=0, cords=[])
@@ -3167,6 +3355,32 @@ class TmaTensor(MemoryInstruction):
             tile_cols,
             build_tma_rowmajor_2d,
             cord_func_rowmajor_2d,
+        )
+
+    def cord_pair_2d(
+        self, row: int, col: int, *, delta_cols: int
+    ) -> "MemoryInstruction":
+        if self.rank != 2 or self.mode not in ("load", "store"):
+            raise ValueError(
+                "paired 2-D TMA requires a row-major rank-2 load or store"
+            )
+        if delta_cols <= 0 or delta_cols > 0xFFFF:
+            raise ValueError("paired 2-D TMA column delta must fit uint16")
+        coords = self.cord2tma(row, col)
+        total_size = 2 * self.size
+        if total_size > 0xFFFF:
+            raise ValueError("paired 2-D TMA transfer exceeds uint16 bytes")
+        pair_opcode = (
+            opcode.OP_ALLOC_TMA_LOAD_PAIR_2D
+            if self.mode == "load"
+            else opcode.OP_ALLOC_WB_TMA_STORE_PAIR_2D
+        )
+        return MemoryInstruction(
+            opcode=pair_opcode,
+            num_slots=bytes2slots(total_size),
+            arg=self.arg,
+            size=total_size,
+            cords=[coords[0], coords[1], delta_cols],
         )
 
     def wgmma(self, action: str, tileN: int, tileM: int, major: Major):
@@ -3295,11 +3509,13 @@ __all__ = [
     "Dsv4AttentionSplit64UmmaSm100",
     "Dsv4AttentionSplitReduceFp8Sm100",
     "Dsv4RouteTop6",
+    "Dsv4RouteTop6Prepared",
     "Dsv4ExpertReduce",
     "Dsv4Fp32Bf16Gemv",
     "Dsv4ZeroFill",
     "Dsv4Fp32ToBf16",
     "Dsv4Bf16Gemv",
+    "Dsv4RouterBf16GemvSm100",
     "Dsv4HcPre",
     "Dsv4HcPreRms",
     "Dsv4HcPost",
@@ -3321,6 +3537,7 @@ __all__ = [
     "Dsv4Nvfp4Quant16",
     "Dsv4Nvfp4QuantUmmaBSm100",
     "Dsv4Fp8QuantUmmaBSm100",
+    "Dsv4Mxfp8QuantFfnInputSm100",
     "Dsv4InverseRopeFp8QuantUmmaBSm100",
     "Gemv_M64N8UpSiLU",
     "Gemv_M128N8",
@@ -3401,6 +3618,7 @@ __all__ = [
     "RegStore",
     "RegLoad",
     "TmaLoad1D",
+    "TmaLoadPair1D",
     "TmaLoadMxfpCoupledStream",
     "build_internal_ring_tma_plan",
     "TmaLoadInternalRingStream",
@@ -3410,5 +3628,6 @@ __all__ = [
     "TmaLoadReg1D",
     "TmaStore1D",
     "StuStore1D",
+    "TmaReadWrite2D",
     "TmaTensor",
 ]

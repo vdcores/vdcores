@@ -89,7 +89,7 @@ def main() -> None:
     )
 
     logits = torch.linspace(
-        -1.0, 1.0, 256, dtype=torch.bfloat16, device=device
+        -1.0, 1.0, 256, dtype=torch.float32, device=device
     )
     bias = torch.zeros((256,), dtype=torch.float32, device=device)
     hash_indices = torch.zeros((8,), dtype=torch.int32, device=device)

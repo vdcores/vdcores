@@ -427,10 +427,10 @@ def main() -> None:
         [5, 2, 4, 1, 3, 0], dtype=torch.int64, device=device
     )
     logits = torch.full(
-        (cfg.num_experts,), -20.0, dtype=torch.bfloat16, device=device
+        (cfg.num_experts,), -20.0, dtype=torch.float32, device=device
     )
     logits[desired_routes] = torch.arange(
-        6.0, 0.0, -1.0, dtype=torch.bfloat16, device=device
+        6.0, 0.0, -1.0, dtype=torch.float32, device=device
     )
     bias = torch.zeros((cfg.num_experts,), dtype=torch.float32, device=device)
     hash_indices = torch.zeros((8,), dtype=torch.int32, device=device)

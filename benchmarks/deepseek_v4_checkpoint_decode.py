@@ -631,7 +631,9 @@ class CheckpointDecode:
         token_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prefix = f"layers.{layer_id}.ffn.gate"
-        logits = self._bf16_weight(f"{prefix}.weight", normalized)
+        logits = self._bf16_weight(
+            f"{prefix}.weight", normalized, output_dtype=torch.float32
+        )
         hash_routing = layer_id < self.config.num_hash_layers
         if hash_routing:
             loaded_hash_indices = self.checkpoint.load_tensor_slice(

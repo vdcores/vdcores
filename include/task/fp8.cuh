@@ -569,6 +569,142 @@ __device__ __forceinline__ void task_dsv4_fp8_quant_umma_b_sm100(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
+// Quantize one or more BF16 K512 shards into the exact native activation
+// record consumed by the retained MXFP4 x MXFP8 Linear-1 path. Each record is
+// [4 KiB N8 E4M3 data | 2 KiB SFB]. Four threads own one independent K32
+// scale group and keep their eight BF16 values in registers through max,
+// scale selection, conversion, and N8 replication. Native SFB padding is not
+// read by UMMA and is intentionally left uninitialized.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_mxfp8_quant_ffn_input_sm100(
+    int num_k512_tiles,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  using namespace cute;
+  using Fp8 = cutlass::float_e4m3_t;
+  using Scale = cutlass::float_ue8m0_t;
+  using Accum = float;
+
+  constexpr int kTileM = 128;
+  constexpr int kTileN = 8;
+  constexpr int kTileK = 128;
+  constexpr int kK512 = 512;
+  constexpr int kK128PerRecord = kK512 / kTileK;
+  constexpr int kScaleVector = 32;
+  constexpr int kThreadsPerScale = 4;
+  constexpr int kValuesPerThread = kScaleVector / kThreadsPerScale;
+  constexpr int kScaleGroups = kK512 / kScaleVector;
+  constexpr int kActiveThreads = kScaleGroups * kThreadsPerScale;
+  constexpr int kDataK128Bytes = kTileN * kTileK;
+  constexpr int kDataBytes = kK128PerRecord * kDataK128Bytes;
+  constexpr int kSfbK128Bytes = 512;
+  constexpr int kScaleBytes = kK128PerRecord * kSfbK128Bytes;
+  constexpr int kRecordBytes = kDataBytes + kScaleBytes;
+
+  using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
+  using Atom = SM100_MMA_MXF8F6F4_SS<
+      Fp8, Fp8, Accum, Scale, kTileM, kTileN,
+      UMMA::Major::K, UMMA::Major::K>;
+  using TiledMma = decltype(make_tiled_mma(Atom{}));
+  using ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<kScaleVector>;
+  using LayoutSFB = decltype(
+      ScaleConfig::deduce_smem_layoutSFB(TiledMma{}, TileShape{}));
+  using ScaleProblemShape = Shape<Int<kTileM>, Int<128>, Int<kTileK>>;
+  const auto logical_sfb =
+      ScaleConfig::tile_atom_to_shape_SFB(ScaleProblemShape{});
+  static_assert(cosize_v<LayoutSFB> == kSfbK128Bytes);
+  static_assert(kActiveThreads == 64);
+  static_assert(kRecordBytes == 6144);
+
+  const int input_slots = m2c.template pop<0>();
+  const auto *input = static_cast<const __nv_bfloat16 *>(
+      get_slot_address(smem_base, extract(input_slots)));
+  const int output_slots = m2c.template pop<0>();
+  auto *output = static_cast<uint8_t *>(
+      get_slot_address(smem_base, extract(output_slots)));
+  const int tid = __compute_tid();
+
+  if (tid < kActiveThreads) {
+    const int scale_group = tid / kThreadsPerScale;
+    const int scale_lane = tid & (kThreadsPerScale - 1);
+    const int element_start =
+        scale_group * kScaleVector + scale_lane * kValuesPerThread;
+
+    for (int tile = 0; tile < num_k512_tiles; ++tile) {
+      const auto *tile_input = input + tile * kK512;
+      auto *tile_output = output + tile * kRecordBytes;
+      float values[kValuesPerThread];
+      float maximum = 0.0f;
+
+#pragma unroll
+      for (int pair = 0; pair < kValuesPerThread / 2; ++pair) {
+        const __nv_bfloat162 packed =
+            *reinterpret_cast<const __nv_bfloat162 *>(
+                tile_input + element_start + pair * 2);
+        const float2 converted = __bfloat1622float2(packed);
+        values[pair * 2] = converted.x;
+        values[pair * 2 + 1] = converted.y;
+        maximum = fmaxf(
+            maximum, fmaxf(fabsf(converted.x), fabsf(converted.y)));
+      }
+#pragma unroll
+      for (int offset = kThreadsPerScale / 2; offset > 0; offset >>= 1) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(
+                0xFFFFFFFFU, maximum, offset, kThreadsPerScale));
+      }
+
+      float block_scale = 1.0f;
+      if (scale_lane == 0) {
+        const float requested = fmaxf(maximum / 448.0f, 0x1p-127f);
+        const float exponent = ceilf(log2f(requested));
+        block_scale = exp2f(fminf(fmaxf(exponent, -127.0f), 127.0f));
+      }
+      block_scale = __shfl_sync(
+          0xFFFFFFFFU, block_scale, 0, kThreadsPerScale);
+
+      const int k128_tile = scale_group / (kTileK / kScaleVector);
+      const int scale_in_k128 = scale_group % (kTileK / kScaleVector);
+#pragma unroll
+      for (int value_id = 0; value_id < kValuesPerThread; ++value_id) {
+        const int element = element_start + value_id;
+        const float value = values[value_id];
+        const Fp8 quantized = value == 0.0f
+            ? Fp8(0.0f)
+            : Fp8(fminf(fmaxf(value / block_scale, -448.0f), 448.0f));
+        const int element_in_k128 = element % kTileK;
+        const int source_chunk = element_in_k128 / 16;
+        const int byte_in_chunk = element_in_k128 % 16;
+#pragma unroll
+        for (int row = 0; row < kTileN; ++row) {
+          const int destination_chunk = source_chunk ^ row;
+          reinterpret_cast<Fp8 *>(
+              tile_output + k128_tile * kDataK128Bytes)[
+                  row * kTileK + destination_chunk * 16 + byte_in_chunk] =
+              quantized;
+        }
+      }
+
+      if (scale_lane == 0) {
+        auto *packed_scale = reinterpret_cast<Scale *>(
+            tile_output + kDataBytes + k128_tile * kSfbK128Bytes);
+        const Scale native_scale = Scale(block_scale);
+#pragma unroll
+        for (int row = 0; row < kTileN; ++row) {
+          const int destination = int(
+              logical_sfb(row, scale_in_k128 * kScaleVector));
+          packed_scale[destination] = native_scale;
+        }
+      }
+    }
+  }
+
+  c2m.push(tid, input_slots);
+  c2m.template push<31, true, false>(tid, output_slots);
+}
+
 // Consume one BF16 attention head, apply inverse partial RoPE to the final
 // 64 values, and publish the four K128 blocks directly in the native N8 MXF8
 // B layout consumed by the O_a UMMA GEMVs.  Keeping the rotary values in
@@ -1295,7 +1431,7 @@ template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_fp8_gemv_umma_coupled_sm100(
     int num_k_pairs,
     int reduction_bytes,
-    int phase_base,
+    uint32_t &pair_base_state,
     void *smem_base,
     uint32_t tmem_base_ptr,
     uint64_t *tmem_mma_barriers,
@@ -1320,6 +1456,9 @@ __device__ __forceinline__ void task_fp8_gemv_umma_coupled_sm100(
   constexpr int kSfaBytes =
       dae_mxfp_resident_ffn::kFp8CoupledWeightScaleBytes /
       kOutputGroups;
+  const int phase_base = int(pair_base_state);
+  pair_base_state = uint32_t(
+      (phase_base + num_k_pairs) % (2 * kStages));
   using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
   using Atom = SM100_MMA_MXF8F6F4_SS<
       Fp8, Fp8, Accum, Scale, kTileM, kTileN,

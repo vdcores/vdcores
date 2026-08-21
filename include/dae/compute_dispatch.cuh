@@ -32,6 +32,7 @@
   uint32_t &tmem_mma_phase, \
   uint32_t &fp8_umma_pipeline_phase_mask, \
   uint32_t &nvfp4_umma_pipeline_phase_mask, \
+  uint32_t &mxfp8_coupled_pair_base, \
   uint32_t &internal_ring_full_phase_mask, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
@@ -371,7 +372,7 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_COUPLED_SM100) {
              global_bars, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_fp8_gemv_umma_coupled_sm100(
-      inst.args[0], inst.args[1], inst.args[2], smem_base,
+      inst.args[0], inst.args[1], mxfp8_coupled_pair_base, smem_base,
       tmem_base_ptr, tmem_mma_barrier, m2c, c2m);
 #endif
 }
@@ -420,6 +421,15 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_FP8_QUANT_UMMA_B_SM100) {
 #endif
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_MXFP8_QUANT_FFN_INPUT_SM100) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  task_dsv4_mxfp8_quant_ffn_input_sm100(
+      inst.args[0], smem_base, m2c, c2m);
+#endif
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV_GROUP4_SPLITK_SM100) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, scratch_space,
              g_events);
@@ -431,9 +441,9 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV_GROUP4_SPLITK_SM100) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_PRELOAD_ROPE_TABLES) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
-             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_preload_rope_tables(inst.args[0], smem_base, m2c, c2m);
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, c2m, g_events);
+  task_dsv4_preload_rope_tables(inst.args[0], smem_base, st_insts, m2c);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROPE_64) {
@@ -535,12 +545,31 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROUTE_TOP6) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  task_dsv4_route_top6(
-      inst.args[0] != 0,
-      __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1)),
-      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+  const bool hash_routing = inst.args[0] != 0;
+  const float route_scale = __bfloat162float(
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1));
+  if (inst.args[2] != 0) {
+    task_dsv4_route_top6<true>(
+        hash_routing, route_scale, smem_base,
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+  } else {
+    task_dsv4_route_top6<false>(
+        hash_routing, route_scale, smem_base,
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+  }
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_ROUTE_TOP6_PREPARED) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  const bool hash_routing = inst.args[0] != 0;
+  const float route_scale = __bfloat162float(
+      *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1));
+  task_dsv4_route_top6<true>(
+      hash_routing, route_scale, smem_base,
+      get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_EXPERT_REDUCE) {
@@ -551,16 +580,29 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_EXPERT_REDUCE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
-  if (inst.args[2] != 0) {
-    task_dsv4_fp32_bf16_gemv<true>(
+  switch (inst.args[2] & 3U) {
+  case 3:
+    task_dsv4_fp32_bf16_gemv<true, true, 1, 3>(
         inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), m2c, c2m);
-  } else {
-    task_dsv4_fp32_bf16_gemv<false>(
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+    break;
+  case 2:
+    task_dsv4_fp32_bf16_gemv<false, true, 1, 3>(
         inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), m2c, c2m);
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+    break;
+  case 1:
+    task_dsv4_fp32_bf16_gemv<true, false>(
+        inst.args[0], inst.args[1], smem_base,
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+    break;
+  default:
+    task_dsv4_fp32_bf16_gemv<false, false>(
+        inst.args[0], inst.args[1], smem_base,
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+    break;
   }
 }
 
@@ -590,22 +632,22 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_PRE_RMS) {
   case 0:
     task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, false, false>(
         smem_base, get_slot_address(smem_base, numSlots), st_insts,
-        sm_id, g_events, m2c, c2m);
+        sm_id, g_events, inst.args[1], m2c, c2m);
     break;
   case 1:
     task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, true, false>(
         smem_base, get_slot_address(smem_base, numSlots), st_insts,
-        sm_id, g_events, m2c, c2m);
+        sm_id, g_events, inst.args[1], m2c, c2m);
     break;
   case 2:
     task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, false, true>(
         smem_base, get_slot_address(smem_base, numSlots), st_insts,
-        sm_id, g_events, m2c, c2m);
+        sm_id, g_events, inst.args[1], m2c, c2m);
     break;
   default:
     task_dsv4_hc_pre_rms<dsv4HcPreRmsMetadataMode, true, true>(
         smem_base, get_slot_address(smem_base, numSlots), st_insts,
-        sm_id, g_events, m2c, c2m);
+        sm_id, g_events, inst.args[1], m2c, c2m);
     break;
   }
 }
@@ -614,8 +656,19 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_HC_POST) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts,
              tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, scratch_space,
              g_events);
+  const uint64_t encoded = uint64_t(inst.args[0]) |
+      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
+  const bool compact_io = (encoded & 1U) != 0;
+  const bool packed_rw = compact_io && (encoded & 64U) != 0;
   task_dsv4_hc_post(
-      inst.args[0], inst.args[1] != 0, smem_base, m2c, c2m);
+      compact_io ? (1U << ((encoded >> 2) & 15U)) : inst.args[0],
+      compact_io ? (encoded & 2U) != 0 : inst.args[1] != 0,
+      compact_io,
+      packed_rw,
+      compact_io
+          ? reinterpret_cast<const float *>(encoded & ~uint64_t(127))
+          : nullptr,
+      smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_SILU_CLAMP_MUL) {
@@ -1390,6 +1443,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint32_t &tmem_mma_phase,
   uint32_t &fp8_umma_pipeline_phase_mask,
   uint32_t &nvfp4_umma_pipeline_phase_mask,
+  uint32_t &mxfp8_coupled_pair_base,
   uint32_t &internal_ring_full_phase_mask,
   uint64_t *scratch_space,
   MInst *st_insts,
@@ -1410,9 +1464,21 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
     #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP
     ;
+  constexpr bool has_dsv4_hc_post = false
+    #define DAE_COMPUTE_OP(name) || (name == OP_DSV4_HC_POST)
+    #include "dae/selected_compute_ops.inc"
+    #undef DAE_COMPUTE_OP
+    ;
 
   #define DAE_INVOKE_COMPUTE_HANDLER(name) \
-    DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, internal_ring_full_phase_mask, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events)
+    DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, mxfp8_coupled_pair_base, internal_ring_full_phase_mask, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events)
+
+  if constexpr (has_dsv4_hc_post) {
+    if (inst.opcode == OP_DSV4_HC_POST) {
+      DAE_INVOKE_COMPUTE_HANDLER(OP_DSV4_HC_POST);
+      return;
+    }
+  }
 
   if constexpr (has_dsv4_split_attention) {
     if (inst.opcode == OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100) {
