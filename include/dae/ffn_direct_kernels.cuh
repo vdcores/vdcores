@@ -122,7 +122,7 @@ void dae_ffn_down_direct_kernel(
   if (threadIdx.x < 128) {
       task_mxfp4_mxfp8_down_fixed_ring_sm100<
           8, 2, 256, 1, kDownTmemColumnsPerTask,
-          0, kDownScratchBytes, 0, false, false>(
+          0, kDownScratchBytes, 0, false, false, false, false>(
           smem_base, tmem_base_ptr, nullptr, tma_descs,
         first_metadata, bars, m2c, c2m, -1
     );
@@ -130,7 +130,8 @@ void dae_ffn_down_direct_kernel(
     if (*reinterpret_cast<const uint64_t *>(second_metadata) != 0) {
         task_mxfp4_mxfp8_down_fixed_ring_sm100<
             8, 2, 256, 2, kDownTmemColumnsPerTask,
-            kDownScratchBytes, 2 * kDownScratchBytes, 128, false, false>(
+            kDownScratchBytes, 2 * kDownScratchBytes, 128,
+            false, false, false, false>(
             smem_base, tmem_base_ptr + kDownTmemColumnsPerTask,
             nullptr, tma_descs,
           second_metadata, bars, m2c, c2m, -1

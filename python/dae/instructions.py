@@ -22,10 +22,12 @@ from .tma_utils import (
     build_tma_mxfp4_kmajor,
     build_tma_mxfp4_k512,
     build_tma_wgmma_kmajor,
+    build_tma_wgmma_mnmajor_m128n8,
     build_tma_wgmma_mnmajor,
     build_tma_wgmma_tile_major,
     bytes2slots,
     cord_func_2d_kmajor,
+    cord_func_m128n8_output,
     cord_func_2d_mnmajor,
     cord_func_2d_tile_major,
     cord_func_tma_1d,
@@ -411,6 +413,22 @@ class Mxfp4Mxfp8ResidentFfnSm100(ComputeInstruction):
             raise ValueError("resident FFN plan pointer must fit in 48 bits")
         super().__init__(
             opcode=opcode.OP_MXFP4_MXFP8_RESIDENT_FFN_SM100,
+            args=[
+                plan_address & 0xFFFF,
+                (plan_address >> 16) & 0xFFFF,
+                (plan_address >> 32) & 0xFFFF,
+            ],
+        )
+
+
+class Mxfp4Mxfp8RoutedResidentFfnSm100(ComputeInstruction):
+    """Resident MX FFN with route-selected weights and N-major output."""
+
+    def __init__(self, plan_address: int):
+        if plan_address < 0 or plan_address >= 1 << 48:
+            raise ValueError("routed resident FFN plan pointer must fit in 48 bits")
+        super().__init__(
+            opcode=opcode.OP_MXFP4_MXFP8_ROUTED_RESIDENT_FFN_SM100,
             args=[
                 plan_address & 0xFFFF,
                 (plan_address >> 16) & 0xFFFF,
@@ -2884,6 +2902,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
     STAGES_SHIFT = 4
     STAGES_MASK = 0x00F0
     LOCAL_CHAIN = 0x0100
+    DYNAMIC_EXPERT = 0x0200
     PHASE_BASE_SHIFT = 9
     MAX_PHASE_BASE = 0x7F
     FP8_STAGES = 2
@@ -2904,6 +2923,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         stream_length: int | None = None,
         phase_base: int = 0,
         layer_indexed: bool = False,
+        dynamic_expert: bool = False,
     ):
         if plan_address <= 0 or plan_address >= 1 << 64:
             raise ValueError("coupled-stream plan address must fit uint64")
@@ -2922,6 +2942,10 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         if not 0 <= int(area_id) <= 0xFFFF:
             raise ValueError("coupled-stream area id must fit uint16")
         if kind in (self.FP8_GEMV, self.TMA_RING):
+            if dynamic_expert:
+                raise ValueError(
+                    "dynamic expert selection is reserved for resident FFN streams"
+                )
             if kind == self.TMA_RING:
                 raise ValueError(
                     "use TmaLoadInternalRingStream for descriptor-driven plans"
@@ -2975,13 +2999,20 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         super().__init__(
             opcode=opcode.OP_TMA_LOAD_MX_COUPLED_STREAM,
             num_slots=config.num_slots + int(mailbox),
-            arg=int(kind) | (int(stages) << self.STAGES_SHIFT),
+            arg=(
+                int(kind)
+                | (int(stages) << self.STAGES_SHIFT)
+                | (self.DYNAMIC_EXPERT if dynamic_expert else 0)
+            ),
             size=int(area_slots),
             address=plan_address,
         )
         self.annotation["coupled_stream_area"] = int(area_id)
         self.annotation["coupled_stream_kind"] = int(kind)
         self.annotation["coupled_stream_mailbox"] = int(mailbox)
+        self.annotation["coupled_stream_dynamic_expert"] = bool(
+            dynamic_expert
+        )
         self.fixed_port(int(port))
 
     def local_chain_source(self):
@@ -3357,6 +3388,18 @@ class TmaTensor(MemoryInstruction):
             cord_func_rowmajor_2d,
         )
 
+    def m128n8_output(self, action: str):
+        """Rank-3 reducible TMA view of contiguous BF16 ``[8, M]``."""
+        if action not in ("store", "reduce"):
+            raise ValueError("M128N8 output action must be store or reduce")
+        return self._build(
+            action,
+            128,
+            8,
+            build_tma_wgmma_mnmajor_m128n8,
+            cord_func_m128n8_output,
+        )
+
     def cord_pair_2d(
         self, row: int, col: int, *, delta_cols: int
     ) -> "MemoryInstruction":
@@ -3484,6 +3527,7 @@ __all__ = [
     "Mxfp4Mxfp8GateUpSiluFixedRingSm100",
     "Mxfp4Mxfp8DownFixedRingSm100",
     "Mxfp4Mxfp8ResidentFfnSm100",
+    "Mxfp4Mxfp8RoutedResidentFfnSm100",
     "Nvfp4UmmaPrepackSm100",
     "Fp8Block128GemvSm100",
     "Fp8Block128GemvBf16Sm100",

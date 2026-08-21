@@ -111,7 +111,8 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
       dynamicSmemBytes - numSlots * slotSizeKb * 1024 >= 80 * 1024) {
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
-        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, false, false>(
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
+        false, false, false, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, metadata, global_bars,
         m2c, c2m, -1
@@ -153,11 +154,62 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100) {
         load_l2_u64(plan + 1 + task));
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
-        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0, true, true>(
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
+        true, true, false, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, down_metadata, global_bars, m2c, c2m, task
         );
   }
+  if (thread_id == 0) {
+    const uint64_t finish_time = cuda::ptx::get_sreg_globaltimer();
+    g_events[sm_id * numProfileEvents + 5] = finish_time;
+    g_events[sm_id * numProfileEvents + 3] = finish_time;
+  }
+#endif
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_ROUTED_RESIDENT_FFN_SM100) {
+  DAE_UNUSED(pc, count, finish, tmem_mma_phase,
+             fp8_umma_pipeline_phase_mask,
+             nvfp4_umma_pipeline_phase_mask, scratch_space);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const uint64_t plan_address = uint64_t(inst.args[0]) |
+      (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
+  const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + 2] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+  const auto *linear1_metadata = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + 0));
+  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
+      512, 2, 8, true, true, true>(
+      smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs,
+      linear1_metadata, global_bars, m2c, c2m);
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + 4] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+
+  const auto *route_record = reinterpret_cast<const uint8_t *>(
+      load_l2_u64(plan + 8));
+  const int route_rank = load_l2(
+      reinterpret_cast<const int *>(plan + 9));
+  const int down_task_count = load_l2(
+      reinterpret_cast<const int *>(plan + 3));
+  for (int task = 0; task < down_task_count; ++task) {
+    const auto *down_metadata = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 1 + task));
+    task_mxfp4_mxfp8_down_fixed_ring_sm100<
+        8, 2, 256, __bar_cgroup, 512,
+        numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
+        true, true, true, true>(
+        smem_base, tmem_base_ptr, tmem_mma_barrier,
+        tma_descs, down_metadata, global_bars, m2c, c2m, task,
+        route_record, route_rank);
+  }
+  const int output_token = m2c.template pop<0>();
+  c2m.template push<0, true, false>(thread_id, 1U << output_token);
   if (thread_id == 0) {
     const uint64_t finish_time = cuda::ptx::get_sreg_globaltimer();
     g_events[sm_id * numProfileEvents + 5] = finish_time;

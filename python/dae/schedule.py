@@ -2993,6 +2993,8 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         final_output,
         weight_tma,
         metadata,
+        *,
+        output_n_major: bool = False,
     ):
         super().__init__()
         self.weight_data = weight_data
@@ -3001,6 +3003,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         self.final_output = final_output
         self.weight_tma = weight_tma
         self.metadata = metadata
+        self.output_n_major = bool(output_n_major)
 
     def _on_place(self):
         if (
@@ -3048,14 +3051,19 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
                 "down activation must be native contiguous uint8 "
                 "[experts,16,1536]"
             )
+        expected_output_shape = (
+            (self.TILE_N, self.HIDDEN)
+            if self.output_n_major
+            else (self.DOWN_TILES_PER_EXPERT, self.TILE_M, self.TILE_N)
+        )
         if (
             self.final_output.dtype != torch.bfloat16
-            or tuple(self.final_output.shape)
-            != (self.DOWN_TILES_PER_EXPERT, self.TILE_M, self.TILE_N)
+            or tuple(self.final_output.shape) != expected_output_shape
             or not self.final_output.is_contiguous()
         ):
+            layout = "[8,4096]" if self.output_n_major else "[32,128,8]"
             raise ValueError(
-                "down final output must be BF16 contiguous [32,128,8]"
+                f"down final output must be BF16 contiguous {layout}"
             )
         if (
             self.metadata.dtype != torch.uint8
@@ -3238,6 +3246,220 @@ class SchedMxfp4Mxfp8ResidentFfn(Schedule):
             )
         )
         return instructions
+
+
+class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
+    """Route-selected all-MX resident FFN with one homogeneous weight image.
+
+    The physical worker image remains seven experts: shared plus six routed
+    ranks.  LDU0 maps each routed rank to its offline-packed expert block from
+    the 128-byte route record; compute continues to operate on fixed physical
+    activation records.  The output is contiguous BF16 ``[8,4096]``.
+    """
+
+    ROUTE_RECORD_BYTES = 128
+    CHECKPOINT_EXPERTS = 256
+    LINEAR1_SLICES = 16
+    DOWN_SLICES = 32
+
+    def __init__(
+        self,
+        linear1,
+        down,
+        route_record,
+        linear1_stream_weights,
+        linear1_stream_scales,
+        down_stream_weights,
+        down_stream_scales,
+    ):
+        super().__init__()
+        self.linear1 = linear1
+        self.down = down
+        self.route_record = route_record
+        self.linear1_stream_weights = linear1_stream_weights
+        self.linear1_stream_scales = linear1_stream_scales
+        self.down_stream_weights = down_stream_weights
+        self.down_stream_scales = down_stream_scales
+
+    def _validate_streams(self):
+        stream_experts = self.CHECKPOINT_EXPERTS + 1
+        linear1_tasks = stream_experts * self.LINEAR1_SLICES
+        down_tasks = stream_experts * self.DOWN_SLICES
+        if (
+            self.route_record.dtype != torch.uint8
+            or self.route_record.device.type != "cuda"
+            or self.route_record.numel() != self.ROUTE_RECORD_BYTES
+            or not self.route_record.is_contiguous()
+        ):
+            raise ValueError(
+                "routed resident FFN requires one contiguous CUDA uint8[128] "
+                "route record"
+            )
+        if (
+            self.linear1_stream_weights.dtype != torch.uint8
+            or tuple(self.linear1_stream_weights.shape)
+            != (linear1_tasks, 16, 4, 128, 64)
+            or not self.linear1_stream_weights.is_contiguous()
+        ):
+            raise ValueError(
+                "offline Linear-1 MX stream must be uint8 "
+                "[257*16,16,4,128,64]"
+            )
+        if (
+            self.linear1_stream_scales.dtype != torch.uint8
+            or tuple(self.linear1_stream_scales.shape)
+            != (linear1_tasks, 16, 2048)
+            or not self.linear1_stream_scales.is_contiguous()
+        ):
+            raise ValueError(
+                "offline Linear-1 MX scales must be uint8 [257*16,16,2048]"
+            )
+        if (
+            self.down_stream_weights.dtype != torch.uint8
+            or tuple(self.down_stream_weights.shape)
+            != (down_tasks, 8, 2, 128, 64)
+            or not self.down_stream_weights.is_contiguous()
+        ):
+            raise ValueError(
+                "offline Down MX stream must be uint8 [257*32,8,2,128,64]"
+            )
+        if (
+            self.down_stream_scales.dtype != torch.uint8
+            or tuple(self.down_stream_scales.shape)
+            != (down_tasks, 8, 1024)
+            or not self.down_stream_scales.is_contiguous()
+        ):
+            raise ValueError(
+                "offline Down MX scales must be uint8 [257*32,8,1024]"
+            )
+        tensors = (
+            self.linear1_stream_weights,
+            self.linear1_stream_scales,
+            self.down_stream_weights,
+            self.down_stream_scales,
+        )
+        if any(tensor.device != self.route_record.device for tensor in tensors):
+            raise ValueError("route metadata and offline MX streams must share a GPU")
+
+    def _on_place(self):
+        self._validate_streams()
+        self.placed_linear1 = self.linear1.place(self.num_sms)
+        self.placed_down = self.down.place(self.num_sms)
+        if self.placed_linear1.m_tiles != self.num_sms:
+            raise ValueError("routed resident FFN requires one Linear-1 task per worker")
+        if self.num_sms != 7 * self.LINEAR1_SLICES:
+            raise ValueError("routed resident FFN requires 112 physical workers")
+        if not self.placed_down.output_n_major:
+            raise ValueError("routed resident FFN output must use [8,4096] layout")
+        if max(map(len, self.placed_down.task_queues)) > 2:
+            raise ValueError("routed resident FFN supports two Down tasks per worker")
+        if (
+            self.placed_down.experts != 7
+            or self.placed_down.DOWN_TILES_PER_EXPERT != self.DOWN_SLICES
+        ):
+            raise ValueError("routed resident FFN needs seven physical expert slots")
+
+        self.placed_down.task_queues = []
+        for worker in range(self.num_sms):
+            physical_expert, local_slice = divmod(worker, self.LINEAR1_SLICES)
+            expert_base = physical_expert * self.DOWN_SLICES
+            self.placed_down.task_queues.append(
+                [expert_base + local_slice, expert_base + 16 + local_slice]
+            )
+
+        launcher = getattr(self.placed_linear1.gate_weight_tma, "launcher", None)
+        if launcher is None:
+            raise ValueError("routed resident streams require one launcher")
+        self.linear1_stream_tma = TmaTensor(
+            launcher, self.linear1_stream_weights
+        ).mxfp4_load(512)
+        self.down_stream_tma = TmaTensor(
+            launcher, self.down_stream_weights
+        ).mxfp4_load(256)
+
+        plans = torch.zeros((self.num_sms, 12), dtype=torch.int64, device="cpu")
+        linear1_scale_base = self.linear1_stream_scales.data_ptr()
+        for worker, task_queue in enumerate(self.placed_down.task_queues):
+            physical_expert, local_slice = divmod(worker, self.LINEAR1_SLICES)
+            route_rank = physical_expert - 1
+            plans[worker, 0] = self.placed_linear1.metadata[worker].data_ptr()
+            plans[worker, 1] = self.placed_down.metadata[task_queue[0]].data_ptr()
+            plans[worker, 2] = self.placed_down.metadata[task_queue[1]].data_ptr()
+            plans[worker, 3] = 2
+            if physical_expert == 0:
+                plans[worker, 4] = self.linear1_stream_scales[
+                    worker, 0
+                ].data_ptr()
+                linear1_coordinate = worker
+            else:
+                plans[worker, 4] = linear1_scale_base
+                linear1_coordinate = local_slice
+            plans[worker, 5] = (
+                self.linear1_stream_tma.arg | (linear1_coordinate << 32)
+            )
+            plans[worker, 6] = self.placed_linear1.activation_data.data_ptr()
+            plans[worker, 7] = self.placed_linear1.activation_scale.data_ptr()
+            plans[worker, 8] = self.route_record.data_ptr()
+            plans[worker, 9] = (
+                (route_rank & 0xFFFFFFFF) | (local_slice << 32)
+            )
+            plans[worker, 10] = self.down_stream_scales.data_ptr()
+            plans[worker, 11] = self.down_stream_tma.arg
+        self.resident_plans = plans.to(self.route_record.device)
+        self.task_queues = self.placed_down.task_queues
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        plan_address = self.resident_plans[sm].data_ptr()
+        dynamic_expert = sm >= self.LINEAR1_SLICES
+        linear1_load = TmaLoadMxfpCoupledStream(
+            plan_address,
+            kind=TmaLoadMxfpCoupledStream.LINEAR1,
+            stages=2,
+            area_slots=(168 * 1024) // config.slot_size,
+            area_id=0,
+            # Prepared top-k owns mailbox 3 until its no-copy STU publish.
+            # A distinct fixed command slot prevents allocator look-ahead
+            # from overwriting that raw route-record address.
+            mailbox=4,
+            port=0,
+            dynamic_expert=dynamic_expert,
+        ).bar(self._bar("input"))
+        instructions = [
+            Mxfp4Mxfp8RoutedResidentFfnSm100(plan_address),
+            linear1_load,
+            TmaLoadMxfpCoupledStream(
+                plan_address,
+                kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
+                stages=2,
+                area_slots=(76 * 1024 + config.slot_size - 1)
+                    // config.slot_size,
+                area_id=0,
+                mailbox=6,
+                port=0,
+                dynamic_expert=dynamic_expert,
+            ),
+            TmaLoadMxfpCoupledStream(
+                plan_address,
+                kind=TmaLoadMxfpCoupledStream.DOWN_ACTIVATION,
+                stages=2,
+                area_slots=(76 * 1024 + config.slot_size - 1)
+                    // config.slot_size,
+                area_id=0,
+                mailbox=7,
+                port=1,
+            ),
+            RawAddress(
+                self.placed_down.final_output, config.num_slots + 5
+            ).writeback().bar(self._bar("output")).fixed_port(1),
+        ]
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedFp8GemvUmmaStream(Schedule):
@@ -5288,10 +5510,12 @@ class SchedDsv4RouteTop6(Schedule):
             if (
                 self.packed_output is None
                 or self.packed_output.dtype != torch.uint8
-                or self.packed_output.numel() != 64
+                or self.packed_output.numel() != 128
                 or not self.packed_output.is_contiguous()
             ):
-                raise ValueError("prepared routing requires one packed 64-byte output")
+                raise ValueError(
+                    "prepared routing requires one packed 128-byte route record"
+                )
             if self.output_indices.data_ptr() != self.packed_output.data_ptr():
                 raise ValueError("route indices must begin the packed output")
             if self.output_weights.data_ptr() != self.packed_output.data_ptr() + 32:
@@ -5328,7 +5552,10 @@ class SchedDsv4RouteTop6(Schedule):
                 )
             instructions.append(
                 RawAddress(
-                    self.packed_output, config.num_slots + 8
+                    # C2M/STU publication is a 32-bit slot mask. The resident
+                    # FFN image has 24 allocator slots, so special mailbox 8
+                    # would be unrepresentable (absolute slot 32).
+                    self.packed_output, config.num_slots + 3
                 ).writeback().bar(self._bar("output"))
             )
             return instructions

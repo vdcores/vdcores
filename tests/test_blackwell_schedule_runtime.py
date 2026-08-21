@@ -1064,6 +1064,21 @@ def test_mxfp4_mxfp8_coupled_stream_local_chain():
     assert rewritten_down_weight.annotation["fixed_port"] == 0
     assert rewritten_activation.annotation["fixed_port"] == 1
 
+    # SequentialProgram deliberately copies memory instructions into the
+    # common base type. Local-chain lowering must therefore depend only on
+    # the operator annotations, not a subclass-only helper method.
+    copied_builder = SMInstructionBuilder(0)
+    copied_builder.add([linear1.copy(), down_weight.copy()])
+    copied_builder.rewrite_coupled_stream_local_chains()
+    assert (
+        copied_builder.minsts[0].arg
+        & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+    )
+    assert (
+        copied_builder.minsts[0].annotation["coupled_stream_local_chain"]
+        == "source"
+    )
+
 
 def test_mxfp4_mxfp8_k512_schedule_separates_scale_delivery(monkeypatch):
     tma_load = SchedMxfp4Mxfp8GemvUmmaK512.schedule.__globals__["TmaLoad1D"]

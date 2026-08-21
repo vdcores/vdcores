@@ -82,7 +82,10 @@ class SMInstructionBuilder:
                     != target.annotation.get("coupled_stream_mailbox")
                 and not source.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
             ):
-                self.minsts[index] = source.local_chain_source()
+                chained = source.copy()
+                chained.arg |= TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+                chained.annotation["coupled_stream_local_chain"] = "source"
+                self.minsts[index] = chained
 
     def build(self,
         ctensor : torch.Tensor, cptrs: list[int],

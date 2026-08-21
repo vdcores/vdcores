@@ -369,6 +369,7 @@ __device__ __forceinline__ void ldu_execute_mxfp8_coupled_stream(
   }
 }
 
+template <bool DynamicExpert>
 __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
     uint64_t *tmem_mma_barriers
@@ -396,7 +397,19 @@ __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
       load_l2_u64(plan + 7));
   const uint64_t tma_info = load_l2_u64(plan + 5);
   const uint16_t descriptor_index = uint16_t(tma_info);
-  const int output_tile = int(uint32_t(tma_info >> 32));
+  int output_tile = int(uint32_t(tma_info >> 32));
+  if constexpr (DynamicExpert) {
+    const auto *route_record = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 8));
+    const uint64_t selector = load_l2_u64(plan + 9);
+    const int route_rank = int(uint32_t(selector));
+    const int local_slice = int(uint32_t(selector >> 32));
+    const uint32_t task_base = uint32_t(load_l2(
+        reinterpret_cast<const int *>(route_record + 64) + route_rank));
+    output_tile = int(task_base) + local_slice;
+    scale_stream_global +=
+        uint64_t(output_tile) * kOperations * kWeightScaleBytes;
+  }
 
   auto *resident_base = reinterpret_cast<uint8_t *>(
       const_cast<void *>(smem_base));
@@ -468,9 +481,10 @@ __device__ __noinline__ void ldu_execute_mxfp_coupled_linear1(
   }
 }
 
+template <bool DynamicExpert>
 __device__ __noinline__ void ldu_execute_mxfp_down_weight_stream(
     const MInst inst, const void *smem_base, const CUtensorMap *tma_descs,
-    uint64_t *tmem_mma_barriers) {
+    uint64_t *tmem_mma_barriers, const uint64_t *plan = nullptr) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages = dae_mxfp_resident_ffn::kDownStages;
   constexpr int kTiles = 8;
@@ -482,10 +496,24 @@ __device__ __noinline__ void ldu_execute_mxfp_down_weight_stream(
       load_l2_u64(reinterpret_cast<const uint64_t *>(metadata + 0)));
   const uint64_t tma_info = load_l2_u64(
       reinterpret_cast<const uint64_t *>(metadata + 24));
-  const uint16_t weight_tma_index = uint16_t(tma_info);
-  const int output_task = int(uint32_t(tma_info >> 32));
+  uint16_t weight_tma_index = uint16_t(tma_info);
+  int output_task = int(uint32_t(tma_info >> 32));
   const uint32_t k_start_tile = uint32_t(load_l2(
       reinterpret_cast<const int *>(metadata + 64)));
+  if constexpr (DynamicExpert) {
+    const auto *route_record = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 8));
+    const int route_rank = load_l2(
+        reinterpret_cast<const int *>(plan + 9));
+    const int local_output_tile = output_task % 32;
+    const uint32_t task_base = uint32_t(load_l2(
+        reinterpret_cast<const int *>(route_record + 96) + route_rank));
+    output_task = int(task_base) + local_output_tile;
+    weight_scale_global = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 10)) +
+        uint64_t(output_task) * kTiles * kWeightScaleBytes;
+    weight_tma_index = uint16_t(load_l2_u64(plan + 11));
+  }
 
   auto *resident_base = reinterpret_cast<uint8_t *>(
       const_cast<void *>(smem_base));
@@ -1013,9 +1041,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
                 tmem_mma_barriers, internal_ring_empty_phase_mask);
           } else if (
               stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
-            ldu_execute_mxfp_coupled_linear1(
-                stream_inst, smem_base, tma_descs, tmem_mma_barriers
-                );
+            if (stream_inst.arg &
+                dae_mxfp_resident_ffn::kCoupledDynamicExpert) {
+              ldu_execute_mxfp_coupled_linear1<true>(
+                  stream_inst, smem_base, tma_descs, tmem_mma_barriers);
+            } else {
+              ldu_execute_mxfp_coupled_linear1<false>(
+                  stream_inst, smem_base, tma_descs, tmem_mma_barriers);
+            }
             auto *poll_start = reinterpret_cast<
                 cutlass::arch::ClusterTransactionBarrier *>(
                 tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
@@ -1041,8 +1074,16 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               task_inst.address = task == 0
                   ? down_task_address0
                   : down_task_address1;
-              ldu_execute_mxfp_down_weight_stream(
-                  task_inst, smem_base, tma_descs, tmem_mma_barriers);
+              if (stream_inst.arg &
+                  dae_mxfp_resident_ffn::kCoupledDynamicExpert) {
+                ldu_execute_mxfp_down_weight_stream<true>(
+                    task_inst, smem_base, tma_descs,
+                    tmem_mma_barriers, plan);
+              } else {
+                ldu_execute_mxfp_down_weight_stream<false>(
+                    task_inst, smem_base, tma_descs,
+                    tmem_mma_barriers);
+              }
             }
           } else {
             ldu_execute_mxfp_down_activation_stream(

@@ -1014,6 +1014,12 @@ __device__ __forceinline__ void task_dsv4_route_top6(
     output_weights = static_cast<float *>(
         get_slot_address(smem_base, extract(weights_token)));
   }
+  uint32_t *linear1_task_bases = nullptr;
+  uint32_t *down_task_bases = nullptr;
+  if constexpr (PretransformedRaw) {
+    linear1_task_bases = reinterpret_cast<uint32_t *>(output_weights + 8);
+    down_task_bases = linear1_task_bases + 8;
+  }
   if (tid < 32) {
     if (hash_routing) {
       const bool active = lane < kTopK;
@@ -1037,6 +1043,12 @@ __device__ __forceinline__ void task_dsv4_route_top6(
         output_indices[lane] = expert;
         output_weights[lane] =
             original * (route_scale / (total > 0.0f ? total : 1.0f));
+        if constexpr (PretransformedRaw) {
+          // Expert zero in the homogeneous MX stream is the shared expert;
+          // checkpoint routed expert e begins at stream expert e+1.
+          linear1_task_bases[lane] = uint32_t(expert + 1) * 16U;
+          down_task_bases[lane] = uint32_t(expert + 1) * 32U;
+        }
       }
     } else if constexpr (PretransformedRaw) {
       float selection_scores[8];
@@ -1091,6 +1103,8 @@ __device__ __forceinline__ void task_dsv4_route_top6(
         output_indices[lane] = selected_expert;
         output_weights[lane] = selected_weight *
             (route_scale / (total > 0.0f ? total : 1.0f));
+        linear1_task_bases[lane] = uint32_t(selected_expert + 1) * 16U;
+        down_task_bases[lane] = uint32_t(selected_expert + 1) * 32U;
       }
     } else {
       float original_scores[8];

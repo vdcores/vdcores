@@ -962,9 +962,9 @@ def build_route(
     )
     packed_output = None
     if pretransformed:
-        packed_output = torch.empty((64,), dtype=torch.uint8, device=device)
+        packed_output = torch.empty((128,), dtype=torch.uint8, device=device)
         output_indices = packed_output[:32].view(torch.int32)
-        output_weights = packed_output[32:].view(torch.float32)
+        output_weights = packed_output[32:64].view(torch.float32)
     else:
         output_indices = torch.empty((8,), dtype=torch.int32, device=device)
         output_weights = torch.empty((8,), dtype=torch.float32, device=device)
@@ -1001,6 +1001,19 @@ def build_route(
         torch.testing.assert_close(
             output_weights[:6], expected_weights, rtol=2.0e-5, atol=2.0e-5
         )
+        if pretransformed:
+            torch.testing.assert_close(
+                packed_output[64:96].view(torch.int32)[:6],
+                (expected_indices.to(torch.int32) + 1) * 16,
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                packed_output[96:128].view(torch.int32)[:6],
+                (expected_indices.to(torch.int32) + 1) * 32,
+                rtol=0,
+                atol=0,
+            )
         return _max_abs(output_weights[:6], expected_weights)
 
     return Case(
@@ -1109,9 +1122,9 @@ def build_router_ffn_ready(
     ) * 0.1
     hash_indices = torch.zeros((8,), dtype=torch.int32, device=device)
     prepared = torch.empty((256, 2), dtype=torch.float32, device=device)
-    route_output = torch.empty((64,), dtype=torch.uint8, device=device)
+    route_output = torch.empty((128,), dtype=torch.uint8, device=device)
     route_indices = route_output[:32].view(torch.int32)
-    route_weights = route_output[32:].view(torch.float32)
+    route_weights = route_output[32:64].view(torch.float32)
     activation_records = torch.empty(
         (8, SchedDsv4Mxfp8QuantFfnInput.RECORD_BYTES),
         dtype=torch.uint8,
@@ -1191,6 +1204,18 @@ def build_router_ffn_ready(
         )
         torch.testing.assert_close(
             route_weights[:6], expected_weights, rtol=2.0e-5, atol=2.0e-5
+        )
+        torch.testing.assert_close(
+            route_output[64:96].view(torch.int32)[:6],
+            (expected_indices.to(torch.int32) + 1) * 16,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            route_output[96:128].view(torch.int32)[:6],
+            (expected_indices.to(torch.int32) + 1) * 32,
+            rtol=0,
+            atol=0,
         )
 
         expected_data, expected_scales = _mxfp8_ffn_input_reference(hidden)

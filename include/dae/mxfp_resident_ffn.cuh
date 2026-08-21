@@ -24,6 +24,9 @@ static constexpr uint16_t kCoupledKindMask = 0x000f;
 static constexpr int kCoupledStagesShift = 4;
 static constexpr uint16_t kCoupledStagesMask = 0x00f0;
 static constexpr uint16_t kCoupledLocalChain = 0x0100;
+// The fixed-area resident command resolves its expert task base from the
+// prepared 128-byte route record before issuing either weight or scale TMA.
+static constexpr uint16_t kCoupledDynamicExpert = 0x0200;
 static constexpr int kCoupledPhaseBaseShift = 9;
 static constexpr uint16_t kCoupledPhaseBaseMask = 0xfe00;
 static constexpr int kCoupledPortMaskShift = 9;

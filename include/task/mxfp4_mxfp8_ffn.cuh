@@ -10,6 +10,7 @@ template <int KBundles, int RingStages, int BundleK,
           int SyncBarrierId, int TmemColumns,
           int ScratchOffsetBytes, int ScratchCapacityBytes, int ThreadOffset,
           bool UseLduWeightRing, bool ResidentAllTma,
+          bool DynamicRouteScale, bool NMajorOutput,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_down_fixed_ring_sm100(
@@ -21,7 +22,9 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     int *global_bars,
     M2CQueue &m2c,
     C2MQueue &c2m,
-    int resident_task_index
+    int resident_task_index,
+    const uint8_t *route_record = nullptr,
+    int route_rank = -1
     ) {
   using namespace cute;
   using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
@@ -151,8 +154,9 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       *reinterpret_cast<const uint64_t *>(metadata + 32);
   const uint32_t ready_bar = uint32_t(barrier_info);
   const uint32_t reduce_bar = uint32_t(barrier_info >> 32);
-  const float route_scale =
-      *reinterpret_cast<const float *>(metadata + 40);
+  const float static_route_scale = DynamicRouteScale
+      ? 1.0f
+      : *reinterpret_cast<const float *>(metadata + 40);
   const uint32_t resident_flags =
       *reinterpret_cast<const uint32_t *>(metadata + 68);
   const bool reduce_from_zero = (resident_flags & 1U) != 0;
@@ -523,21 +527,47 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   auto accumulator_tmem = accumulator(make_coord(_, _), _0{}, _0{});
   auto c_acc = cta_coord_c(make_coord(_, _), _0{}, _0{});
   auto tiled_t2r = make_tmem_copy(TmemLoad{}, accumulator_tmem);
+  auto output_layout = tile_to_shape(
+      GMMA::Layout_MN_SW128_Atom<Output>{},
+      make_shape(Int<kTileM>{}, Int<kTileN>{}));
+  auto nmajor_output = make_tensor(
+      make_smem_ptr(output_smem), output_layout);
   if (tid < size(tiled_t2r)) {
     auto thread_t2r = tiled_t2r.get_slice(tid);
     auto thread_tmem = thread_t2r.partition_S(accumulator_tmem);
     auto thread_coord = thread_t2r.partition_D(c_acc);
     auto registers = make_tensor<Accum>(shape(thread_coord));
+    auto output_registers = make_tensor<Output>(shape(thread_coord));
+    auto thread_nmajor_output = thread_t2r.partition_D(
+        cta_mma.partition_C(nmajor_output));
     copy(tiled_t2r, thread_tmem, registers);
     cutlass::arch::fence_view_async_tmem_load();
+    float route_scale = static_route_scale;
+    if constexpr (DynamicRouteScale) {
+      float warp_route_scale = 0.0f;
+      if (lane == 0 && route_rank >= 0) {
+        warp_route_scale = __int_as_float(load_l2(
+            reinterpret_cast<const int *>(route_record + 32) + route_rank));
+      } else if (lane == 0) {
+        warp_route_scale = 1.0f;
+      }
+      route_scale = __shfl_sync(0xFFFFFFFFU, warp_route_scale, 0);
+    }
     #pragma unroll
     for (int index = 0; index < size(registers); ++index) {
       const int row = int(get<0>(thread_coord(index)));
       const int column = int(get<1>(thread_coord(index)));
       if (row < kTileM && column < kNativeOutputRows) {
-        output_smem[row * kNativeOutputRows + column] =
-            Output(registers(index) * route_scale);
+        const Output output_value = Output(registers(index) * route_scale);
+        if constexpr (NMajorOutput) {
+          output_registers(index) = output_value;
+        } else {
+          output_smem[row * kNativeOutputRows + column] = output_value;
+        }
       }
+    }
+    if constexpr (NMajorOutput) {
+      copy(output_registers, thread_nmajor_output);
     }
   }
   __sync_barrier<SyncBarrierId, 128>();
@@ -566,21 +596,41 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
       const int row = output_m_tile * kTileM;
       if (expert == 0 && !reduce_from_zero) {
-        asm volatile(
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
-            "[%0, {%1, %2}], [%3];\n"
-            :
-            : "l"((void *)(tma_descs + output_tma_index)),
-              "r"(0), "r"(row), "r"(source)
-            : "memory");
+        if constexpr (NMajorOutput) {
+          asm volatile(
+              "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
+              "[%0, {%1, %2, %3}], [%4];\n"
+              :
+              : "l"((void *)(tma_descs + output_tma_index)),
+                "r"(0), "r"(0), "r"(2 * output_m_tile), "r"(source)
+              : "memory");
+        } else {
+          asm volatile(
+              "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
+              "[%0, {%1, %2}], [%3];\n"
+              :
+              : "l"((void *)(tma_descs + output_tma_index)),
+                "r"(0), "r"(row), "r"(source)
+              : "memory");
+        }
       } else {
-        asm volatile(
-            "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group "
-            "[%0, {%1, %2}], [%3];\n"
-            :
-            : "l"((void *)(tma_descs + output_tma_index)),
-              "r"(0), "r"(row), "r"(source)
-            : "memory");
+        if constexpr (NMajorOutput) {
+          asm volatile(
+              "cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.bulk_group "
+              "[%0, {%1, %2, %3}], [%4];\n"
+              :
+              : "l"((void *)(tma_descs + output_tma_index)),
+                "r"(0), "r"(0), "r"(2 * output_m_tile), "r"(source)
+              : "memory");
+        } else {
+          asm volatile(
+              "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group "
+              "[%0, {%1, %2}], [%3];\n"
+              :
+              : "l"((void *)(tma_descs + output_tma_index)),
+                "r"(0), "r"(row), "r"(source)
+              : "memory");
+        }
       }
       cuda::ptx::cp_async_bulk_commit_group();
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
