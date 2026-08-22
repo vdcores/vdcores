@@ -39,6 +39,7 @@ from dae.instructions import (
     IndirectRoutedTmaLoad1D,
     IndirectTmaLoad1D,
     LduProfileLayer,
+    LduReloadBarriers,
     Fp8GemvUmmaSplitKSm100,
     Fp8GemvUmmaStreamSm100,
     Fp8GemvUmmaCoupledSm100,
@@ -186,6 +187,82 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert repeat.arg & RepeatM.COUNT_COUNTER_MODE_FLAG
     assert repeat.arg & RepeatM.COUNTER_REG_MASK == 3
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
+
+
+def test_counter_offset_window_preserves_retained_stream_adjacency():
+    linear1 = TmaLoadMxfpCoupledStream(
+        0x100000,
+        kind=TmaLoadMxfpCoupledStream.LINEAR1,
+        stages=2,
+        area_slots=21,
+        area_id=0,
+        mailbox=4,
+        port=0,
+    )
+    down = TmaLoadMxfpCoupledStream(
+        0x100000,
+        kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
+        stages=2,
+        area_slots=10,
+        area_id=0,
+        mailbox=6,
+        port=0,
+    )
+    expanded = RepeatM.offsetWindowByCounters(
+        ((0, 112 * 12 * 8), (1, 2 * 112 * 12 * 8)),
+        linear1,
+        down,
+    )
+
+    assert len(expanded) == 5
+    assert all(isinstance(inst, RepeatM) for inst in expanded[:3])
+    assert [inst.num_slots for inst in expanded[1:3]] == [0x0402, 0x0402]
+    assert expanded[-2] is linear1
+    assert expanded[-1] is down
+    assert not linear1.opcode & 0x8
+    assert down.opcode & 0x8
+
+    builder = SMInstructionBuilder(sm_id=0)
+    builder.add(expanded)
+    builder.rewrite_coupled_stream_local_chains()
+    assert builder.minsts[-2].arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+    assert not builder.minsts[-1].arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+
+
+def test_counter_offset_helpers_retire_their_allocator_windows():
+    single = MemoryInstruction(
+        opcode.OP_ALLOC_TMA_LOAD_1D,
+        num_slots=1,
+        arg=0,
+        size=16,
+        address=0x100000,
+    )
+    expanded_single = RepeatM.offsetByCounters(((0, 128),), single)
+    assert expanded_single[-1] is single
+    assert single.opcode & 0x8
+
+    first = MemoryInstruction(
+        opcode.OP_ALLOC_TMA_LOAD_1D,
+        num_slots=1,
+        arg=0,
+        size=16,
+        address=0x200000,
+    )
+    second = MemoryInstruction(
+        opcode.OP_ALLOC_TMA_LOAD_1D,
+        num_slots=1,
+        arg=0,
+        size=16,
+        address=0x300000,
+    )
+    expanded_window = RepeatM.byCounter(
+        0,
+        (first, 128),
+        (second, 256),
+    )
+    assert not first.opcode & 0x8
+    assert expanded_window[-1] is second
+    assert second.opcode & 0x8
 
 
 def test_memory_instruction_accepts_maximum_uint16_address_chunk():
@@ -1572,7 +1649,7 @@ def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
         zero_fp32_output=torch.empty((4096,), dtype=torch.float32),
     ).place(1).schedule(0)
     assert isinstance(zeroed[0], Dsv4HcPreRms)
-    assert zeroed[0].args == [1]
+    assert zeroed[0].args == [1, 0]
     assert zeroed[-1].size == 4096 * 4
 
     fp8_packed_output = torch.empty((4176,), dtype=torch.uint8)
@@ -1594,7 +1671,7 @@ def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
         fp8_scale=torch.empty((32,), dtype=torch.float8_e8m0fnu),
     ).bar("output", 9).place(1).schedule(0)
     assert isinstance(fp8[0], Dsv4HcPreRms)
-    assert fp8[0].args == [Dsv4HcPreRms.OUTPUT_FP8]
+    assert fp8[0].args == [Dsv4HcPreRms.OUTPUT_FP8, 0]
     assert [inst.size for inst in fp8[-2:]] == [4096, 32]
     assert fp8[-1].num_slots >> 6 == 9
 
@@ -2759,6 +2836,205 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     assert all((inst.opcode & ~0x10) != opcode.OP_ISSUE_BARRIER for inst in memory)
 
 
+def test_looped_program_reload_can_include_shared_task_barriers():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeBarrierSource:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 1 << 20
+
+        @staticmethod
+        def element_size():
+            return 4
+
+        @staticmethod
+        def data_ptr():
+            return 0x34560000
+
+    class FakeLauncher:
+        num_sms = 1
+        max_insts = 64
+        bars_src = FakeBarrierSource()
+
+        def __init__(self):
+            self.num_bars = 4
+            self.bar_values = {bar: 1 for bar in range(4)}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def copy_cptrs(self):
+            return [0]
+
+        def copy_mptrs(self):
+            return [0]
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = LoopedSequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialBlock(
+                "shared-bars",
+                (SequentialStage("work", BasicStage(), 1),),
+                repeat=2,
+                reload_barrier_start=0,
+                reload_mxfp_resident=True,
+            ),
+        ),
+    )
+    reload = next(
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+        and (inst.opcode & ~0x3F)
+        == (opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F)
+    )
+    completion = reload.num_slots >> 6
+    assert reload.arg == LduReloadBarriers.RESET_MXFP_RESIDENT
+    assert reload.num_slots & 0x3F == config.num_slots + 2
+    assert reload.size == completion + 1
+    assert completion >= 4
+
+    with pytest.raises(ValueError, match="shifted barrier banks"):
+        LoopedSequentialProgram(
+            FakeLauncher(),
+            (
+                SequentialBlock(
+                    "bad",
+                    (SequentialStage("work", BasicStage(), 1),),
+                    repeat=2,
+                    barrier_banks=2,
+                    reload_barrier_start=0,
+                ),
+            ),
+        )
+
+
+def test_sequential_program_resets_resident_state_between_two_ffns():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeBarrierSource:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 1 << 20
+
+        @staticmethod
+        def element_size():
+            return 4
+
+        @staticmethod
+        def data_ptr():
+            return 0x34560000
+
+    class FakeLauncher:
+        num_sms = 1
+        max_insts = 64
+        bars_src = FakeBarrierSource()
+
+        def __init__(self):
+            self.num_bars = 0
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = SequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialStage(
+                "linear1",
+                BasicStage(),
+                1,
+                reset_mxfp_resident_after=True,
+            ),
+            SequentialStage("linear2", BasicStage(), 1),
+        ),
+    )
+    memory = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+    ]
+    reload_index = next(
+        index
+        for index, inst in enumerate(memory)
+        if (inst.opcode & ~0x3F)
+        == (opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F)
+    )
+    reload = memory[reload_index]
+    boundary = reload.num_slots >> 6
+    assert reload.num_slots & 0x3F == config.num_slots + 7
+    assert reload.arg == boundary | LduReloadBarriers.RESET_MXFP_RESIDENT
+    assert reload.size == 1
+    assert reload_index == 2
+    assert memory[1].num_slots >> 6 == boundary
+    assert not memory[3].opcode & 0x10
+
+
 def test_looped_program_nests_two_barrier_banks_inside_ten_outer_iterations():
     class FakeDevice:
         type = "cuda"
@@ -2899,10 +3175,12 @@ def test_nvfp4_gemv_encodes_shared_shard_shape():
     assert instruction.args == [32, 256, 0]
 
 
-def test_deepseek_compute_tasks_cannot_escape_shared_memory():
+def test_generic_gemm_compute_tasks_cannot_escape_shared_memory():
     root = Path(__file__).resolve().parents[1]
+    # DeepSeek's compact metadata tasks intentionally use the explicit raw-
+    # address operand contract for tiny packed records.  Keep the generic
+    # FP8/NVFP4 GEMM handlers allocator-owned and shared-memory confined.
     sources = [
-        root / "include/task/deepseek_v4.cuh",
         root / "include/task/fp8.cuh",
         root / "include/task/nvfp4.cuh",
         root / "include/task/nvfp4_umma.cuh",

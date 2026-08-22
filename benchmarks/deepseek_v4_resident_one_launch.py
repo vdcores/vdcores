@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import math
+import struct
 import statistics
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import torch
 
@@ -29,6 +31,12 @@ from dae.deepseek_v4_checkpoint import (
     expected_inference_tensor_specs,
 )
 from dae.deepseek_v4_flow import build_layer_decode_plan
+from dae.deepseek_v4_mxfp_checkpoint import (
+    DeepSeekV4MxfpFfnLayer,
+    default_mxfp_ffn_directory,
+    load_mxfp_ffn_layer,
+    mxfp_ffn_layer_path,
+)
 from dae.deepseek_v4_schedule import DeepSeekV4ShapePolicy, ShapeAssignment
 from dae.deepseek_v4_quant import (
     dequantize_fp8_block128,
@@ -36,7 +44,6 @@ from dae.deepseek_v4_quant import (
 )
 from dae.launcher import Launcher
 from dae.instructions import TmaTensor
-from dae.routing import RoutedAddressTable
 from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayeredSchedule,
@@ -46,7 +53,6 @@ from dae.schedule import (
     SchedDsv4AttentionSplitReduceFp8Sm100,
     SchedDsv4Bf16Gemv,
     SchedDsv4Bf16GemvGroup4SplitK,
-    SchedDsv4ExpertReduce,
     SchedDsv4Fp8QuantUmmaB,
     SchedDsv4Fp32RmsFp8QuantUmmaB,
     SchedDsv4RmsFp8QuantUmmaB,
@@ -75,12 +81,17 @@ from dae.schedule import (
     SchedDsv4ContiguousAttention512Block4,
     SchedDsv4TopK512,
     SchedDsv4ZeroFill,
+    SchedDsv4Mxfp8QuantFfnInput,
+    SchedDsv4SplitMxfp8FfnInputRecords,
     SchedFp8Block128Gemv,
     SchedFp8Block128GateUpSwiGlu,
     SchedFp8GemvUmmaCoupled,
+    SchedLayeredDsv4RouterBf16Gemv,
+    SchedLayeredMxfp4Mxfp8RoutedResidentFfn,
+    SchedMxfp4Mxfp8DownFixedRing,
+    SchedMxfp4Mxfp8GateUpSiluFixedRing,
+    SchedMxfp4Mxfp8RoutedResidentFfn,
     SchedRMS,
-    SchedRoutedDsv4Nvfp4QuantUmmaB,
-    SchedRoutedNvfp4GemvUmmaStream,
 )
 from dae.sequential import (
     LoopedSequentialProgram,
@@ -100,6 +111,15 @@ class LayerFamily:
     @property
     def representative(self) -> int:
         return self.layer_ids[0]
+
+
+@dataclass(frozen=True)
+class MxfpFfnRuntimeLayer:
+    image: DeepSeekV4MxfpFfnLayer
+    linear1_tma: TmaTensor
+    down_tma: TmaTensor
+    linear1_metadata: torch.Tensor
+    down_metadata: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -149,7 +169,6 @@ class ResidentOneLaunchDecode:
         self.direct_splitk_bf16 = bool(self.splitk_components) and (
             args.fp8_splitk_reduction == "bf16"
         )
-        self.ffn_fp32_tma = args.ffn_reduction == "fp32-tma"
         self.splitk_accumulators: list[torch.Tensor] = []
         self._active_splitk_workspace: torch.Tensor | None = None
         self._active_splitk_offset = 0
@@ -158,11 +177,10 @@ class ResidentOneLaunchDecode:
         self.launcher = Launcher(self.sms, device=self.device)
         self.checkpoint = self._load_checkpoint()
         self.families = self._families()
-        self._routing_tables: dict[int, RoutedAddressTable] = {}
-        self._routing_owners: dict[int, tuple[torch.Tensor, ...]] = {}
         self._hash_rows: dict[int, torch.Tensor] = {}
         self._fused_bf16_weight_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
         self._allocate_state()
+        self._allocate_mxfp_ffn_runtime()
         rope_tables = [self.main_rope, self.compress_rope]
         rope_tables.extend(
             self.compressed_output_rope[kind]
@@ -202,16 +220,41 @@ class ResidentOneLaunchDecode:
             if self.args.layers == 1
             else tuple(range(self.args.layers))
         )
-        names = None
-        if self.args.layers != self.config.num_layers:
-            prefix = tuple(
-                f"layers.{layer_id}." for layer_id in resident_layer_ids
+        prefix = tuple(
+            f"layers.{layer_id}." for layer_id in resident_layer_ids
+        )
+        names = tuple(
+            name
+            for name in expected_inference_tensor_specs(self.config)
+            if (
+                (not name.startswith("layers.") or name.startswith(prefix))
+                and ".ffn.experts." not in name
+                and ".ffn.shared_experts." not in name
             )
-            names = tuple(
-                name
-                for name in expected_inference_tensor_specs(self.config)
-                if not name.startswith("layers.") or name.startswith(prefix)
+        )
+        self.mxfp_ffn_root = (
+            Path(self.args.mxfp_ffn_root)
+            if self.args.mxfp_ffn_root is not None
+            else default_mxfp_ffn_directory(self.args.checkpoint)
+        )
+        missing = [
+            mxfp_ffn_layer_path(self.mxfp_ffn_root, layer_id)
+            for layer_id in resident_layer_ids
+            if not mxfp_ffn_layer_path(
+                self.mxfp_ffn_root, layer_id
+            ).is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "offline MXFP FFN images are required; missing "
+                + ", ".join(str(path) for path in missing[:4])
             )
+        mxfp_reserve_bytes = sum(
+            mxfp_ffn_layer_path(
+                self.mxfp_ffn_root, layer_id
+            ).stat().st_size
+            for layer_id in resident_layer_ids
+        )
         started = time.monotonic()
         print(
             "DSV4_ONE_LAUNCH_RESIDENT status=START "
@@ -231,10 +274,6 @@ class ResidentOneLaunchDecode:
         native_fp8_prefixes = []
         for layer_id in resident_layer_ids:
             attention_prefix = f"layers.{layer_id}.attn"
-            if self.ffn_fp32_tma:
-                native_fp8_prefixes.append(
-                    f"layers.{layer_id}.ffn.shared_experts.w2"
-                )
             if "q_a" in self.splitk_components:
                 native_fp8_prefixes.append(f"{attention_prefix}.wq_a")
             if "kv" in self.splitk_components:
@@ -263,8 +302,11 @@ class ResidentOneLaunchDecode:
             disk,
             device=self.device,
             names=names,
-            reserve_bytes=int(self.args.resident_reserve_gib * (1 << 30)),
-            native_nvfp4=True,
+            reserve_bytes=(
+                int(self.args.resident_reserve_gib * (1 << 30))
+                + mxfp_reserve_bytes
+            ),
+            native_nvfp4=False,
             native_fp8_prefixes=tuple(native_fp8_prefixes),
             native_fp8_scale_pack=self.args.fp8_umma_scale_pack,
             progress=progress,
@@ -277,6 +319,30 @@ class ResidentOneLaunchDecode:
             f"free_gib={free_bytes / (1 << 30):.3f} "
             f"total_gib={total_bytes / (1 << 30):.3f} "
             f"elapsed_s={time.monotonic() - started:.3f}",
+            flush=True,
+        )
+        self.mxfp_ffn_images = {}
+        for index, layer_id in enumerate(resident_layer_ids, 1):
+            image_started = time.monotonic()
+            image = load_mxfp_ffn_layer(
+                self.mxfp_ffn_root,
+                layer_id,
+                device=self.device,
+            )
+            self.mxfp_ffn_images[layer_id] = image
+            print(
+                "DSV4_MXFP_RESIDENT_LAYER status=PASS "
+                f"layer={layer_id} index={index}/{len(resident_layer_ids)} "
+                f"gib={image.nbytes / (1 << 30):.3f} "
+                f"elapsed_s={time.monotonic() - image_started:.3f}",
+                flush=True,
+            )
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        print(
+            "DSV4_MXFP_RESIDENT status=PASS "
+            f"layers={len(self.mxfp_ffn_images)} "
+            f"tensor_gib={sum(image.nbytes for image in self.mxfp_ffn_images.values()) / (1 << 30):.3f} "
+            f"free_gib={free_bytes / (1 << 30):.3f} conversion=offline",
             flush=True,
         )
         return resident
@@ -379,19 +445,6 @@ class ResidentOneLaunchDecode:
             schedule,
             self._groups(*tensor_sets),
             counter_strides=family.counter_strides,
-        )
-
-    def _routed_layered(
-        self,
-        schedule,
-        family: LayerFamily,
-        tables: tuple[RoutedAddressTable, ...],
-    ):
-        return LayeredSchedule(
-            schedule,
-            ((tables[0].state, tuple(table.state for table in tables)),),
-            counter_strides=family.counter_strides,
-            route_indices=self.route_indices,
         )
 
     def _allocate_state(self) -> None:
@@ -722,11 +775,12 @@ class ResidentOneLaunchDecode:
             self.index_pooled_norm = torch.empty_like(self.index_pooled)
             self.index_pooled_rope = torch.empty_like(self.index_pooled).reshape(1, -1)
 
-        self.router_logits = torch.empty(
-            (cfg.num_experts,), dtype=torch.float32, device=d
+        self.router_prepared = torch.empty(
+            (cfg.num_experts, 2), dtype=torch.float32, device=d
         )
-        self.route_indices = torch.empty((8,), dtype=torch.int32, device=d)
-        self.route_weights = torch.empty((8,), dtype=torch.float32, device=d)
+        self.route_record = torch.empty((128,), dtype=torch.uint8, device=d)
+        self.route_indices = self.route_record[:32].view(torch.int32)
+        self.route_weights = self.route_record[32:64].view(torch.float32)
         self.zero_bias = torch.zeros(
             (cfg.num_experts,), dtype=torch.float32, device=d
         )
@@ -735,53 +789,131 @@ class ResidentOneLaunchDecode:
         )
         self.zero_hash = torch.zeros((8,), dtype=torch.int32, device=d)
 
-        self.routed_input = torch.empty(
-            (cfg.experts_per_token, cfg.hidden_size // 256, 3072),
-            dtype=torch.uint8,
-            device=d,
+        self.mxfp_input_records = torch.empty(
+            (8, 6144), dtype=torch.uint8, device=d
         )
-        self.routed_middle = torch.empty(
-            (cfg.experts_per_token, cfg.expert_intermediate_size),
-            dtype=torch.bfloat16,
-            device=d,
+        self.mxfp_activation_data = torch.empty(
+            (8, 4096), dtype=torch.uint8, device=d
         )
-        self.routed_middle_packed = torch.empty(
-            (
-                cfg.experts_per_token,
-                cfg.expert_intermediate_size // 256,
-                3072,
-            ),
-            dtype=torch.uint8,
-            device=d,
+        self.mxfp_activation_scales = torch.empty(
+            (8, 2048), dtype=torch.uint8, device=d
         )
-        self.routed_output = torch.empty(
-            (cfg.experts_per_token, cfg.hidden_size),
-            dtype=torch.bfloat16,
-            device=d,
+        self.mxfp_middle_records = torch.empty(
+            (7, 16, 1536), dtype=torch.uint8, device=d
         )
-        self.shared_middle = torch.empty(
-            (cfg.expert_intermediate_size,), dtype=torch.bfloat16, device=d
+        middle_flat = self.mxfp_middle_records.view(112, 1536)
+        self.mxfp_middle_data = middle_flat[:, :1024]
+        self.mxfp_middle_scales = middle_flat[:, 1024:]
+        self.mxfp_ffn_output = torch.empty(
+            (8, cfg.hidden_size), dtype=torch.bfloat16, device=d
         )
-        self.shared_middle_fp8 = torch.empty_like(
-            self.shared_middle, dtype=torch.float8_e4m3fn
-        )
-        self.shared_middle_scale = torch.empty(
-            (cfg.expert_intermediate_size // 128,),
-            dtype=torch.float8_e8m0fnu,
-            device=d,
-        )
-        if self.ffn_fp32_tma:
-            self.shared_middle_native_fp8 = torch.empty(
-                (cfg.expert_intermediate_size // 128, 2048),
-                dtype=torch.uint8,
-                device=d,
+
+    def _allocate_mxfp_ffn_runtime(self) -> None:
+        if self.sms < 148:
+            raise ValueError(
+                "the production MXFP FFN overlap requires at least 148 SMs"
             )
-            self.ffn_accumulator = torch.empty(
-                (1, cfg.hidden_size), dtype=torch.float32, device=d
+        barrier_sets = 2 if self.args.layers == self.config.num_layers else 1
+        self.mxfp_internal_barrier_start = self.launcher.num_bars
+        self.mxfp_ready_bars = []
+        self.mxfp_zero_ready_bars = []
+        for _ in range(barrier_sets):
+            self.mxfp_ready_bars.append(
+                tuple(self.launcher.new_bar(1) for _ in range(112))
             )
-        self.shared_output = torch.empty(
-            (cfg.hidden_size,), dtype=torch.bfloat16, device=d
+            self.mxfp_zero_ready_bars.append(
+                tuple(self.launcher.new_bar(1) for _ in range(32))
+            )
+        self.mxfp_internal_barrier_stop = self.launcher.num_bars
+        self.mxfp_output_tma = TmaTensor(
+            self.launcher, self.mxfp_ffn_output
+        ).m128n8_output("reduce")
+        self._mxfp_runtime_layers: dict[
+            tuple[int, int], MxfpFfnRuntimeLayer
+        ] = {}
+
+    @staticmethod
+    def _f32_bits(value: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+    def _mxfp_runtime_layer(
+        self, layer_id: int, barrier_set: int
+    ) -> MxfpFfnRuntimeLayer:
+        key = (int(layer_id), int(barrier_set))
+        existing = self._mxfp_runtime_layers.get(key)
+        if existing is not None:
+            return existing
+        image = self.mxfp_ffn_images[layer_id]
+        ready_bars = self.mxfp_ready_bars[barrier_set]
+        zero_ready = self.mxfp_zero_ready_bars[barrier_set]
+        linear1_tma = TmaTensor(
+            self.launcher, image.linear1_weights
+        ).mxfp4_load(512)
+        down_tma = TmaTensor(
+            self.launcher, image.down_weights
+        ).mxfp4_load(256)
+
+        linear1_records = torch.zeros(
+            (112, 16), dtype=torch.int64, device="cpu"
         )
+        middle_flat = self.mxfp_middle_records.view(112, 1536)
+        for task in range(112):
+            linear1_records[task, 0] = self.mxfp_activation_data.data_ptr()
+            linear1_records[task, 2] = image.linear1_scales[
+                task, 0
+            ].data_ptr()
+            linear1_records[task, 3] = (
+                self.mxfp_activation_scales.data_ptr()
+            )
+            linear1_records[task, 4] = image.linear1_scales[
+                task, 8
+            ].data_ptr()
+            linear1_records[task, 5] = (
+                linear1_tma.arg
+                | (linear1_tma.arg << 16)
+                | (task << 32)
+            )
+            linear1_records[task, 6] = middle_flat[task].data_ptr()
+            linear1_records[task, 7] = 2048
+            linear1_records[task, 8] = ready_bars[task]
+        linear1_metadata = linear1_records.view(torch.uint8).to(self.device)
+
+        down_records = torch.zeros(
+            (7 * 32, 16), dtype=torch.int64, device="cpu"
+        )
+        for task in range(7 * 32):
+            expert, output_tile = divmod(task, 32)
+            down_records[task, 0] = image.down_scales[
+                task, 0
+            ].data_ptr()
+            down_records[task, 1] = self.mxfp_middle_records[
+                expert, 0
+            ].data_ptr()
+            down_records[task, 3] = (
+                down_tma.arg
+                | (self.mxfp_output_tma.arg << 16)
+                | (task << 32)
+            )
+            down_records[task, 4] = (
+                ready_bars[expert * 16]
+                | (zero_ready[output_tile] << 32)
+            )
+            down_records[task, 5] = self._f32_bits(1.0)
+            down_records[task, 6] = self.mxfp_ffn_output.data_ptr()
+            # Reduce-add from a schedule-owned zeroed row, and consume
+            # Linear-1 records at their per-K128 readiness frontier.
+            down_records[task, 8] = (1 | 4) << 32
+        down_metadata = down_records.view(torch.uint8).to(self.device)
+
+        runtime_layer = MxfpFfnRuntimeLayer(
+            image=image,
+            linear1_tma=linear1_tma,
+            down_tma=down_tma,
+            linear1_metadata=linear1_metadata,
+            down_metadata=down_metadata,
+        )
+        self._mxfp_runtime_layers[key] = runtime_layer
+        return runtime_layer
 
     def _fp8_quant_stage(
         self,
@@ -2883,177 +3015,6 @@ class ResidentOneLaunchDecode:
             + row_start * tensor.stride(0) * tensor.element_size()
         )
 
-    def _routing_table(self, layer_id: int) -> RoutedAddressTable:
-        existing = self._routing_tables.get(layer_id)
-        if existing is not None:
-            return existing
-        cfg = self.config
-        shapes = {
-            "w1": (cfg.expert_intermediate_size, cfg.hidden_size),
-            "w3": (cfg.expert_intermediate_size, cfg.hidden_size),
-            "w2": (cfg.hidden_size, cfg.expert_intermediate_size),
-        }
-        columns: dict[str, list[int]] = {}
-        for tag, (rows, _) in shapes.items():
-            for tile in range(rows // 128):
-                columns[f"{tag}.m{tile}"] = []
-
-        linears = {tag: [] for tag in shapes}
-        for expert_id in range(cfg.num_experts):
-            prefix = f"layers.{layer_id}.ffn.experts.{expert_id}"
-            for tag, (rows, k) in shapes.items():
-                linear = self.checkpoint.load_native_nvfp4_linear(
-                    f"{prefix}.{tag}", device=self.device
-                )
-                linears[tag].append(linear)
-                expected_shape = (rows // 128, k // 256, 18432)
-                if tuple(linear.weight_tiles.shape) != expected_shape:
-                    raise ValueError(
-                        f"{linear.prefix} native tiles must be {expected_shape}"
-                    )
-                for tile in range(rows // 128):
-                    columns[f"{tag}.m{tile}"].append(
-                        linear.weight_tiles[tile].data_ptr()
-                    )
-
-        def stack(tag: str, field: str) -> torch.Tensor:
-            return torch.stack(
-                [getattr(linear, field).reshape(()) for linear in linears[tag]]
-            )
-
-        w1_input = stack("w1", "input_scale")
-        w3_input = stack("w3", "input_scale")
-        if not torch.equal(w1_input, w3_input):
-            raise ValueError(f"layer {layer_id} w1/w3 input scales differ")
-        w2_input = stack("w2", "input_scale")
-        alpha = {
-            tag: stack(tag, "weight_scale_2") * stack(tag, "input_scale")
-            for tag in shapes
-        }
-
-        def padded(values: torch.Tensor) -> torch.Tensor:
-            result = torch.zeros(
-                (cfg.num_experts, 4), dtype=torch.float32, device=self.device
-            )
-            result[:, 0].copy_(values)
-            return result
-
-        derived = {
-            "up.input_scale": padded(w1_input),
-            "down.input_scale": padded(w2_input),
-            **{f"{tag}.alpha": padded(values) for tag, values in alpha.items()},
-        }
-        for name, tensor in derived.items():
-            columns[name] = [
-                self._row_pointer(tensor, expert_id)
-                for expert_id in range(cfg.num_experts)
-            ]
-        owners = tuple(derived.values())
-        table = RoutedAddressTable.from_pointer_columns(
-            columns, device=self.device, owners=owners
-        )
-        self._routing_tables[layer_id] = table
-        self._routing_owners[layer_id] = owners
-        return table
-
-    def _routed_native_quant_stage(
-        self,
-        name: str,
-        family: LayerFamily,
-        tables: tuple[RoutedAddressTable, ...],
-        rank: int,
-        field_name: str,
-        source: torch.Tensor,
-        output: torch.Tensor,
-        *,
-        base_sm: int | None = None,
-        wait_group: str | None = None,
-        release_group: str | None = None,
-    ) -> Stage:
-        representative = tables[0]
-        schedule = SchedRoutedDsv4Nvfp4QuantUmmaB(
-            representative.state,
-            rank,
-            representative.field(field_name),
-            source.reshape(-1),
-            output,
-        )
-        schedule = self._routed_layered(schedule, family, tables)
-        return self._stage(
-            name,
-            schedule,
-            source.numel() // 256,
-            input_role="route",
-            base_sm=base_sm,
-            wait_group=wait_group,
-            release_group=release_group,
-        )
-
-    def _routed_native_linear_stage(
-        self,
-        name: str,
-        family: LayerFamily,
-        tables: tuple[RoutedAddressTable, ...],
-        rank: int,
-        tag: str,
-        rows: int,
-        k: int,
-        activation: torch.Tensor,
-        output: torch.Tensor | None,
-        *,
-        wait_for_previous: bool = True,
-        activation_mode: str = "load",
-        output_mode: str = "store",
-        output_register: int = 0,
-        output_port: int = 0,
-        output_scale: torch.Tensor | None = None,
-        swiglu_limit: float | None = None,
-        pipeline: bool = False,
-        activation_tiles_per_load: int | None = None,
-        placement: tuple[int, int] | None = None,
-        wait_group: str | None = None,
-        release_group: str | None = None,
-    ) -> Stage:
-        if placement is None:
-            base_sm, num_sms = 0, rows // 128
-        else:
-            base_sm, num_sms = placement
-        assignment = replace(
-            self.policy.nvfp4_gemv(rows, k), num_sms=num_sms
-        )
-        table = tables[0]
-        weight_fields = tuple(
-            table.field(f"{tag}.m{tile}") for tile in range(rows // 128)
-        )
-        schedule = SchedRoutedNvfp4GemvUmmaStream(
-            table.state,
-            rank,
-            weight_fields,
-            table.field(f"{tag}.alpha"),
-            activation,
-            output,
-            route_ready=not wait_for_previous,
-            activation_mode=activation_mode,
-            output_mode=output_mode,
-            output_register=output_register,
-            output_port=output_port,
-            output_scale=output_scale,
-            swiglu_limit=swiglu_limit,
-            pipeline=pipeline,
-            activation_tiles_per_load=activation_tiles_per_load,
-        )
-        schedule = self._routed_layered(schedule, family, tables)
-        return self._stage(
-            name,
-            schedule,
-            assignment,
-            input_role="route" if wait_for_previous else None,
-            wait_for_previous=wait_for_previous,
-            base_sm=base_sm,
-            wait_group=wait_group,
-            release_group=release_group,
-        )
-
     def _hash_row(self, layer_id: int) -> torch.Tensor:
         existing = self._hash_rows.get(layer_id)
         if existing is not None:
@@ -3066,286 +3027,197 @@ class ResidentOneLaunchDecode:
         self._hash_rows[layer_id] = row
         return row
 
-    def _build_ffn(self, family: LayerFamily) -> list[Stage]:
+    def _build_mxfp_ffn(self, family: LayerFamily) -> list[Stage]:
         cfg = self.config
-        routed_branch_sms = cfg.expert_intermediate_size // 128
-        routed_sms = cfg.experts_per_token * routed_branch_sms
-        shared_base = routed_sms
-        shared_sms = self.sms - routed_sms
-        if shared_sms <= 0:
-            raise ValueError("FFN placement has no SMs left for the shared expert")
-        w2_routed_sms = self.args.ffn_w2_routed_sms
-        w2_shared_base = cfg.experts_per_token * w2_routed_sms
-        w2_shared_sms = self.sms - w2_shared_base
-        if not 0 < w2_routed_sms <= cfg.hidden_size // 128:
-            raise ValueError("routed W2 placement must use 1..M/128 SMs")
-        if not 0 < w2_shared_sms <= 2 * (cfg.hidden_size // 128):
-            raise ValueError("shared split-K W2 placement must use 1..64 SMs")
-        output_reduce = None
-        ffn_branch = self.branch
-        if self.ffn_fp32_tma:
-            output_reduce = TmaTensor(
-                self.launcher, self.ffn_accumulator
-            ).rowmajor_2d("reduce", 1, 128)
-            ffn_branch = self.ffn_accumulator.reshape(-1)
+        barrier_set = (
+            1
+            if (
+                self.args.layers == cfg.num_layers
+                and family.name == "layers4-42.csa_score"
+            )
+            else 0
+        )
+        runtime_layers = tuple(
+            self._mxfp_runtime_layer(layer_id, barrier_set)
+            for layer_id in family.layer_ids
+        )
+        representative = runtime_layers[0]
+        # The fixed compute task validates seven physical slots.  Its retained
+        # LDU plans below still point at the complete 257-stream offline image,
+        # so routed slots are selected dynamically from the packed top-k record.
+        linear1_physical = representative.image.linear1_weights[:112]
+        linear1_scale_physical = representative.image.linear1_scales[:112]
+        gate_weight = linear1_physical[:, :8].contiguous()
+        up_weight = linear1_physical[:, 8:].contiguous()
+        gate_scale = linear1_scale_physical[:, :8].contiguous()
+        up_scale = linear1_scale_physical[:, 8:].contiguous()
+        down_weight = representative.image.down_weights[: 7 * 32]
+        down_scale = representative.image.down_scales[: 7 * 32]
+        linear1 = SchedMxfp4Mxfp8GateUpSiluFixedRing(
+            gate_weight,
+            gate_scale,
+            up_weight,
+            up_scale,
+            self.mxfp_activation_data,
+            self.mxfp_activation_scales,
+            self.mxfp_middle_data,
+            self.mxfp_middle_scales,
+            representative.linear1_tma,
+            representative.linear1_tma,
+            representative.linear1_metadata,
+            tile_k=512,
+        )
+        down = SchedMxfp4Mxfp8DownFixedRing(
+            down_weight,
+            down_scale,
+            self.mxfp_middle_records,
+            self.mxfp_ffn_output,
+            representative.down_tma,
+            representative.down_metadata,
+            output_n_major=True,
+        )
+        resident = SchedMxfp4Mxfp8RoutedResidentFfn(
+            linear1,
+            down,
+            self.route_record,
+            representative.image.linear1_weights,
+            representative.image.linear1_scales,
+            representative.image.down_weights,
+            representative.image.down_scales,
+        )
+        resident = SchedLayeredMxfp4Mxfp8RoutedResidentFfn(
+            resident,
+            tuple(layer.linear1_metadata for layer in runtime_layers),
+            tuple(layer.down_metadata for layer in runtime_layers),
+            tuple(layer.image.linear1_weights for layer in runtime_layers),
+            tuple(layer.image.linear1_scales for layer in runtime_layers),
+            tuple(layer.image.down_weights for layer in runtime_layers),
+            tuple(layer.image.down_scales for layer in runtime_layers),
+            counter_strides=family.counter_strides,
+            linear1_tmas=tuple(layer.linear1_tma for layer in runtime_layers),
+            down_tmas=tuple(layer.down_tma for layer in runtime_layers),
+        )
+
         stages, post = self._hc_stages(
             family,
             "ffn",
             self.next_residual,
             self.residual,
-            branch=ffn_branch,
-            zero_fp32_output=(
-                ffn_branch if self.ffn_fp32_tma else None
-            ),
+            branch=self.mxfp_ffn_output[0],
         )
         ffn_input_ready = f"{family.name}.ffn.input.ready"
+        quant_records_ready = f"{family.name}.ffn.mx.quant.ready"
+        router_scores_ready = f"{family.name}.ffn.router.scores.ready"
+        resident_input_ready = f"{family.name}.ffn.mx.input.ready"
         stages[-1] = replace(stages[-1], release_group=ffn_input_ready)
-        shared_ready = f"{family.name}.ffn.shared.ready"
-        stages.append(
-            self._fp8_quant_stage(
-                "ffn.hidden.quant_fp8",
-                self.norm_hidden,
-                self.hidden_fp8,
-                self.hidden_fp8_scale,
-                wait_group=ffn_input_ready,
-                release_group=shared_ready,
-            )
-        )
-        stages.append(
-            replace(
-                self._bf16_linear_stage(
-                    "ffn.router",
-                    family,
-                    "ffn.gate.weight",
-                    self.norm_hidden,
-                    self.router_logits,
+
+        # CTA placements are disjoint at the independent frontier:
+        # router [0,128), route 128, zero [129,132), split [136,152),
+        # quant [144,152).  Quant precedes split on their shared eight CTAs.
+        stages.extend(
+            (
+                self._stage(
+                    "ffn.mx.output_zero",
+                    SchedDsv4ZeroFill(
+                        self.zero_fill_gate, self.mxfp_ffn_output[0]
+                    ),
+                    3,
+                    base_sm=129,
+                    wait_group=ffn_input_ready,
+                    release_group=resident_input_ready,
                 ),
-                wait_group=ffn_input_ready,
+                self._stage(
+                    "ffn.hidden.quant_mxfp8",
+                    SchedDsv4Mxfp8QuantFfnInput(
+                        self.norm_hidden, self.mxfp_input_records
+                    ),
+                    8,
+                    base_sm=self.sms - 8,
+                    wait_group=ffn_input_ready,
+                    release_group=quant_records_ready,
+                ),
             )
         )
+
+        router_weights = self._family_tensors(family, "ffn.gate.weight")
         hash_routing = family.representative < cfg.num_hash_layers
         if hash_routing:
-            hash_rows = tuple(self._hash_row(layer) for layer in family.layer_ids)
-            biases = (self.zero_bias,) * len(family.layer_ids)
+            router_biases = (self.zero_bias,) * len(family.layer_ids)
+            hash_rows = torch.stack(
+                tuple(self._hash_row(layer_id) for layer_id in family.layer_ids)
+            ).contiguous()
         else:
-            hash_rows = (self.zero_hash,) * len(family.layer_ids)
-            biases = self._family_tensors(family, "ffn.gate.bias")
-        route = SchedDsv4RouteTop6(
-            self.router_logits,
-            biases[0],
-            hash_rows[0],
-            self.route_indices,
-            self.route_weights,
-            hash_routing=hash_routing,
-            route_scale=cfg.route_scale,
-        )
-        route_groups = (hash_rows,) if hash_routing else (biases,)
-        route = self._layered(route, family, *route_groups)
-        experts_ready = f"{family.name}.ffn.experts.ready"
-        expert_join = f"{family.name}.ffn.experts.join"
-        deferred_w2: list[Stage] = []
+            router_biases = self._family_tensors(family, "ffn.gate.bias")
+            hash_rows = self.zero_hash
         stages.append(
             self._stage(
-                "ffn.route",
-                route,
-                release_group=experts_ready,
-            )
-        )
-
-        tables = tuple(self._routing_table(layer) for layer in family.layer_ids)
-        for rank in range(cfg.experts_per_token):
-            placement = (rank * routed_branch_sms, routed_branch_sms)
-            base_sm, branch_sms = placement
-            input_ready = f"{family.name}.ffn.expert{rank}.input.ready"
-            middle_ready = f"{family.name}.ffn.expert{rank}.middle.ready"
-            down_ready = f"{family.name}.ffn.expert{rank}.down.ready"
-            stages.append(
-                self._routed_native_quant_stage(
-                    f"ffn.expert{rank}.input.quant_nvfp4",
-                    family,
-                    tables,
-                    rank,
-                    "up.input_scale",
+                "ffn.router.prepared",
+                SchedLayeredDsv4RouterBf16Gemv(
+                    router_weights,
                     self.norm_hidden,
-                    self.routed_input[rank],
-                    base_sm=base_sm,
-                    wait_group=experts_ready,
-                    release_group=input_ready,
-                )
-            )
-            stages.append(
-                self._routed_native_linear_stage(
-                    f"ffn.expert{rank}.w1",
-                    family,
-                    tables,
-                    rank,
-                    "w1",
-                    cfg.expert_intermediate_size,
-                    cfg.hidden_size,
-                    self.routed_input[rank],
-                    None,
-                    activation_mode="retain",
-                    output_mode="retain",
-                    output_register=1,
-                    output_port=0,
-                    placement=(base_sm, cfg.expert_intermediate_size // 128),
-                    wait_group=input_ready,
-                )
-            )
-            stages.append(
-                self._routed_native_linear_stage(
-                    f"ffn.expert{rank}.w3",
-                    family,
-                    tables,
-                    rank,
-                    "w3",
-                    cfg.expert_intermediate_size,
-                    cfg.hidden_size,
-                    self.routed_input[rank],
-                    self.routed_middle[rank],
-                    wait_for_previous=False,
-                    activation_mode="reuse",
-                    output_mode="silu_store",
-                    output_register=1,
-                    output_port=0,
-                    swiglu_limit=cfg.swiglu_limit,
-                    placement=(base_sm, cfg.expert_intermediate_size // 128),
-                    release_group=middle_ready,
-                )
-            )
-            stages.append(
-                self._routed_native_quant_stage(
-                    f"ffn.expert{rank}.middle.quant_nvfp4",
-                    family,
-                    tables,
-                    rank,
-                    "down.input_scale",
-                    self.routed_middle[rank],
-                    self.routed_middle_packed[rank],
-                    base_sm=base_sm,
-                    wait_group=middle_ready,
-                    release_group=down_ready,
-                )
-            )
-            w2_stage = self._routed_native_linear_stage(
-                    f"ffn.expert{rank}.w2",
-                    family,
-                    tables,
-                    rank,
-                    "w2",
-                    cfg.hidden_size,
-                    cfg.expert_intermediate_size,
-                    self.routed_middle_packed[rank],
-                    (
-                        output_reduce
-                        if self.ffn_fp32_tma
-                        else self.routed_output[rank]
-                    ),
-                    output_mode=(
-                        "reduce" if self.ffn_fp32_tma else "store"
-                    ),
-                    output_scale=(
-                        self.route_weights[rank : rank + 1]
-                        if self.ffn_fp32_tma
-                        else None
-                    ),
-                    placement=(rank * w2_routed_sms, w2_routed_sms),
-                    wait_group=down_ready,
-                    release_group=expert_join,
-            )
-            if w2_routed_sms == routed_branch_sms:
-                stages.append(w2_stage)
-            else:
-                deferred_w2.append(w2_stage)
-
-        shared_middle_ready = f"{family.name}.ffn.shared.middle.ready"
-        stages.append(
-            self._fp8_gate_up_swiglu_stage(
-                "ffn.shared.gate_up_swiglu",
-                family,
-                "ffn.shared_experts.w1",
-                "ffn.shared_experts.w3",
-                self.hidden_fp8,
-                self.hidden_fp8_scale,
-                self.shared_middle,
-                placement=(shared_base, shared_sms),
-                wait_group=shared_ready,
-                release_group=shared_middle_ready,
+                    router_biases,
+                    self.router_prepared,
+                    counter_strides=family.counter_strides,
+                ),
+                128,
+                base_sm=0,
+                wait_group=ffn_input_ready,
+                release_group=router_scores_ready,
             )
         )
-        if self.ffn_fp32_tma:
-            shared_down_ready = f"{family.name}.ffn.shared.down.ready"
-            shared_quant_sms = cfg.expert_intermediate_size // (
-                128 * self.args.fp8_umma_scale_pack
-            )
-            stages.append(
-                self._native_fp8_quant_stage(
-                    "ffn.shared.middle.quant_native_fp8",
-                    self.shared_middle,
-                    self.shared_middle_native_fp8,
-                    placement=(shared_base, shared_quant_sms),
-                    wait_group=shared_middle_ready,
-                    release_group=shared_down_ready,
-                )
-            )
-            stages.extend(deferred_w2)
-            stages.append(
-                self._native_fp8_reduce_stage(
-                    "ffn.shared.w2",
-                    family,
-                    "ffn.shared_experts.w2",
-                    self.shared_middle_native_fp8,
-                    output_reduce,
-                    split_k=2,
-                    placement=(w2_shared_base, w2_shared_sms),
-                    wait_group=shared_down_ready,
-                    release_group=expert_join,
-                )
-            )
-            stages.append(replace(post, wait_group=expert_join))
-        else:
-            stages.append(
-                self._fp8_quant_stage(
-                    "ffn.shared.middle.quant_fp8",
-                    self.shared_middle,
-                    self.shared_middle_fp8,
-                    self.shared_middle_scale,
-                    placement=(
-                        shared_base,
-                        cfg.expert_intermediate_size // 128,
-                    ),
-                    wait_group=shared_middle_ready,
-                )
-            )
-            stages.append(
-                self._fp8_linear_stage(
-                    "ffn.shared.w2",
-                    family,
-                    "ffn.shared_experts.w2",
-                    self.shared_middle_fp8,
-                    self.shared_middle_scale,
-                    self.shared_output,
-                    placement=(shared_base, shared_sms),
-                    release_group=expert_join,
-                )
-            )
-            stages.append(
+        stages.extend(
+            (
                 self._stage(
-                    "ffn.expert_reduce",
-                    SchedDsv4ExpertReduce(
-                        self.routed_output,
-                        self.route_weights[: cfg.experts_per_token],
-                        self.shared_output,
-                        self.branch,
+                    "ffn.hidden.split_mxfp8",
+                    SchedDsv4SplitMxfp8FfnInputRecords(
+                        self.mxfp_input_records,
+                        self.mxfp_activation_data,
+                        self.mxfp_activation_scales,
                     ),
-                    wait_group=expert_join,
-                )
+                    16,
+                    base_sm=self.sms - 16,
+                    wait_group=quant_records_ready,
+                    release_group=resident_input_ready,
+                ),
+                self._stage(
+                    "ffn.route.prepared",
+                    SchedDsv4RouteTop6(
+                        self.router_prepared,
+                        None,
+                        hash_rows,
+                        self.route_indices,
+                        self.route_weights,
+                        hash_routing=hash_routing,
+                        route_scale=cfg.route_scale,
+                        pretransformed=True,
+                        packed_output=self.route_record,
+                        hash_counter_strides=(
+                            family.counter_strides if hash_routing else ()
+                        ),
+                    ),
+                    1,
+                    base_sm=128,
+                    wait_group=router_scores_ready,
+                    release_group=resident_input_ready,
+                ),
+                self._stage(
+                    "ffn.mx.resident",
+                    resident,
+                    112,
+                    base_sm=0,
+                    wait_group_roles=((resident_input_ready, "input"),),
+                ),
+                post,
             )
-            stages.append(post)
+        )
         return stages
 
+    def _build_ffn(self, family: LayerFamily) -> list[Stage]:
+        return self._build_mxfp_ffn(family)
+
     def _build_family(self, family: LayerFamily) -> list[Stage]:
-        return self._build_attention(family) + self._build_ffn(family)
+        attention = self._build_attention(family)
+        return attention + self._build_ffn(family)
 
     def _build_head(self) -> list[Stage]:
         cfg = self.config
@@ -3482,6 +3354,8 @@ class ResidentOneLaunchDecode:
 
     def _build_program(self) -> None:
         serial_sm = 0
+        mxfp_reload_start = self.mxfp_internal_barrier_start
+        family_barrier_banks = 1
         self.stage_profile_labels: list[str] = []
         self.step_profile_records: list[tuple[int, str, int, int, int]] = []
         self.step_profile_total = 0
@@ -3491,17 +3365,7 @@ class ResidentOneLaunchDecode:
             "hidden_quant",
             "router",
             "route_top6",
-            "routed_input_quant",
-            "routed_w1",
-            "routed_w3",
-            "routed_swiglu",
-            "routed_middle_quant",
-            "routed_w2",
-            "shared_w1",
-            "shared_w3",
-            "shared_swiglu",
-            "shared_middle_quant",
-            "shared_w2",
+            "resident_ffn",
             "hc_post",
         )
         aggregate_base = runtime_config.layer_profile_event_base
@@ -3525,33 +3389,14 @@ class ResidentOneLaunchDecode:
             exact = {
                 "ffn.hc_project": "hc_project",
                 "ffn.hc_pre_rms4096": "hc_pre_rms",
-                "ffn.hidden.quant_fp8": "hidden_quant",
-                "ffn.hidden.quant_native_fp8": "hidden_quant",
-                "ffn.router": "router",
-                "ffn.route": "route_top6",
-                "ffn.shared.w1": "shared_w1",
-                "ffn.shared.w3": "shared_w3",
-                "ffn.shared.swiglu": "shared_swiglu",
-                "ffn.shared.middle.quant_native_fp8": "shared_middle_quant",
-                "ffn.shared.middle.quant_fp8": "shared_middle_quant",
-                "ffn.shared.w2": "shared_w2",
+                "ffn.hidden.quant_mxfp8": "hidden_quant",
+                "ffn.hidden.split_mxfp8": "hidden_quant",
+                "ffn.router.prepared": "router",
+                "ffn.route.prepared": "route_top6",
+                "ffn.mx.resident": "resident_ffn",
                 "ffn.hc_post": "hc_post",
             }
-            category = exact.get(name)
-            if category is not None:
-                return category
-            if name.startswith("ffn.expert"):
-                for suffix, routed_category in (
-                    (".input.quant_nvfp4", "routed_input_quant"),
-                    (".middle.quant_nvfp4", "routed_middle_quant"),
-                    (".w1", "routed_w1"),
-                    (".w3", "routed_w3"),
-                    (".swiglu", "routed_swiglu"),
-                    (".w2", "routed_w2"),
-                ):
-                    if name.endswith(suffix):
-                        return routed_category
-            return None
+            return exact.get(name)
 
         def profile_stage(name: str) -> bool:
             if not self.args.profile_stages:
@@ -3585,9 +3430,8 @@ class ResidentOneLaunchDecode:
                 "attn.o_b",
                 "attn.hc_post",
                 "ffn.hc_pre",
-                "ffn.route",
-                "ffn.shared.w2",
-                "ffn.expert_reduce",
+                "ffn.route.prepared",
+                "ffn.mx.resident",
                 "ffn.hc_post",
             }:
                 return True
@@ -3714,15 +3558,21 @@ class ResidentOneLaunchDecode:
             family = self.families[0]
             family_stages = queued_family(family)
             head_stages = [queued(stage) for stage in self.head_stages]
-            blocks = (
+            blocks = [
                 SequentialBlock(
                     family.name,
                     family_stages,
                     repeat=2,
-                    barrier_banks=2,
+                    barrier_banks=family_barrier_banks,
+                    reload_barrier_start=mxfp_reload_start,
+                    reload_mxfp_resident=True,
                 ),
-                SequentialBlock("head", head_stages, reload_after=False),
-            )
+            ]
+            if head_stages:
+                blocks.append(
+                    SequentialBlock("head", head_stages, reload_after=False)
+                )
+            blocks = tuple(blocks)
             self.program = LoopedSequentialProgram(
                 self.launcher, blocks, balance_load_ports=True
             )
@@ -3734,21 +3584,41 @@ class ResidentOneLaunchDecode:
             swa, layer2, hca, csa = self.families
             swa_stages = queued_family(swa)
             layer2_stages = queued_family(layer2)
-            pair_stages = queued_family(hca) + queued_family(csa)
+            hca_stages = queued_family(hca)
+            hca_stages[-1] = replace(
+                hca_stages[-1], reset_mxfp_resident_after=True
+            )
+            pair_stages = hca_stages + queued_family(csa)
             head_stages = [queued(stage) for stage in self.head_stages]
-            blocks = (
+            blocks = [
                 SequentialBlock(
-                    swa.name, swa_stages, repeat=2, barrier_banks=2
+                    swa.name,
+                    swa_stages,
+                    repeat=2,
+                    barrier_banks=family_barrier_banks,
+                    reload_barrier_start=mxfp_reload_start,
+                    reload_mxfp_resident=True,
                 ),
-                SequentialBlock(layer2.name, layer2_stages),
+                SequentialBlock(
+                    layer2.name,
+                    layer2_stages,
+                    reload_barrier_start=mxfp_reload_start,
+                    reload_mxfp_resident=True,
+                ),
                 SequentialBlock(
                     "layers3-42.hca_csa_score",
                     pair_stages,
                     repeat=20,
-                    barrier_banks=2,
+                    barrier_banks=family_barrier_banks,
+                    reload_barrier_start=mxfp_reload_start,
+                    reload_mxfp_resident=True,
                 ),
-                SequentialBlock("head", head_stages, reload_after=False),
-            )
+            ]
+            if head_stages:
+                blocks.append(
+                    SequentialBlock("head", head_stages, reload_after=False)
+                )
+            blocks = tuple(blocks)
             self.program = LoopedSequentialProgram(
                 self.launcher, blocks, balance_load_ports=True
             )
@@ -3768,8 +3638,7 @@ class ResidentOneLaunchDecode:
             f"attention={self.args.attention_mode} "
             f"fp8_projection_mode={self.args.fp8_projection_mode} "
             f"fp8_splitk_reduction={self.args.fp8_splitk_reduction} "
-            f"ffn_reduction={self.args.ffn_reduction} "
-            f"ffn_w2_routed_sms={self.args.ffn_w2_routed_sms} "
+            "ffn=mxfp4_mxfp8_routed_resident "
             f"fp8_splitk_components={','.join(sorted(self.splitk_components)) or 'none'} "
             f"index_selection={self.args.index_selection_mode} "
             f"gated_pool={self.args.gated_pool_mode} "
@@ -3864,15 +3733,25 @@ class ResidentOneLaunchDecode:
     def validate_fp8_head(self, token: int) -> None:
         if not self.fp8_head:
             return
+        resident_logits = self.logits.float()
+        if not bool(torch.isfinite(resident_logits).all().item()):
+            raise AssertionError("FP8 head logits are not finite")
+        resident_token = int(torch.argmax(resident_logits).item())
+        if token != resident_token:
+            raise AssertionError(
+                "FP8 head argmax emitted "
+                f"token {token}, resident logits select {resident_token}"
+            )
         reference_logits = torch.mv(
             self._tensor("head.weight")[: self.config.vocab_size],
             self.head_norm,
         )
         reference_token = int(torch.argmax(reference_logits).item())
-        if token != reference_token:
+        if resident_token != reference_token:
             raise AssertionError(
-                "FP8 head emitted "
-                f"token {token}, reference BF16 GEMV emitted {reference_token}"
+                "FP8 head logits select "
+                f"token {resident_token}, reference BF16 GEMV selects "
+                f"{reference_token}"
             )
         print(
             "DSV4_HEAD_REFERENCE status=PASS "
@@ -4342,6 +4221,14 @@ class ResidentOneLaunchDecode:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--mxfp-ffn-root",
+        default=None,
+        help=(
+            "directory containing offline layer-XXX.safetensors MXFP FFN "
+            "images; defaults beneath the checkpoint"
+        ),
+    )
     parser.add_argument("--layers", type=int, choices=(1, 2, 43), default=1)
     parser.add_argument(
         "--single-layer-id",
@@ -4375,7 +4262,7 @@ def main() -> None:
     parser.add_argument(
         "--fp8-projection-mode",
         choices=("legacy", "splitk"),
-        default="legacy",
+        default="splitk",
         help=(
             "select legacy attention FP8 projections or native split-K/TMA "
             "reduction for q_a, q_b, kv, index q_b, o_a, and o_b"
@@ -4396,24 +4283,6 @@ def main() -> None:
         help=(
             "reduce split-K projections directly to BF16 model outputs or "
             "use an exact FP32 accumulator plus BF16 finalizer"
-        ),
-    )
-    parser.add_argument(
-        "--ffn-reduction",
-        choices=("legacy", "fp32-tma"),
-        default="fp32-tma",
-        help=(
-            "select BF16 expert outputs plus a compute reducer, or direct "
-            "FP32 tensor-core outputs into one TMA reduce accumulator"
-        ),
-    )
-    parser.add_argument(
-        "--ffn-w2-routed-sms",
-        type=int,
-        default=16,
-        help=(
-            "SMs per routed W2 after the fixed 16-SM W1/W3 front half; "
-            "values above 16 defer W2 and repartition the full device"
         ),
     )
     parser.add_argument(
@@ -4534,10 +4403,6 @@ def main() -> None:
         parser.error("sms/iterations must be positive and warmup non-negative")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
-    if args.ffn_reduction == "legacy" and args.ffn_w2_routed_sms != 16:
-        parser.error("repartitioned W2 requires --ffn-reduction fp32-tma")
-    if not 16 <= args.ffn_w2_routed_sms <= 25:
-        parser.error("ffn-w2-routed-sms must be in [16,25]")
     profile_modes = sum(
         (
             args.profile_layers,
@@ -4624,6 +4489,12 @@ def main() -> None:
             f"checkpoint emitted token {reference_token}, "
             f"expected {args.expected_token_id}"
         )
+    flow.validate_fp8_head(reference_token)
+    if reference_token != prime_token:
+        raise AssertionError(
+            "one-launch checkpoint token changed between prime and timed "
+            f"launches: prime={prime_token}, timed={reference_token}"
+        )
     assert logits is not None
     if profile_modes:
         median_timing = statistics.median(timings)
@@ -4657,8 +4528,7 @@ def main() -> None:
         f"layers={args.layers} token_id={args.token_id} "
         f"context={args.context_length} position={args.context_length - 1} "
         f"attention={args.attention_mode} "
-        f"ffn_reduction={args.ffn_reduction} "
-        f"ffn_w2_routed_sms={args.ffn_w2_routed_sms} "
+        "ffn=mxfp4_mxfp8_routed_resident "
         f"index_selection={args.index_selection_mode} "
         f"gated_pool={args.gated_pool_mode} "
         f"prefix_cache={'current_token' if args.context_length == 1 else 'deterministic_seeded'} "

@@ -2329,6 +2329,7 @@ class RepeatM(MemoryInstruction):
             insts += [cls(1, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords, counter_reg=counter_reg)]
         for inst, _ in steps:
             insts.append(inst)
+        insts[-1].jump()
         return insts
 
     @classmethod
@@ -2363,7 +2364,62 @@ class RepeatM(MemoryInstruction):
                 accumulate=True,
             ))
         insts.append(inst)
+        insts[-1].jump()
         return insts
+
+    @classmethod
+    def offsetWindowByCounters(cls, counter_offsets, *instructions):
+        """Apply one counter-derived address offset to adjacent commands.
+
+        The allocator's repeat registers correspond to the following memory
+        instruction lanes.  Seeding one complete window therefore preserves
+        adjacency between its final commands, which is required by LDU-local
+        retained-ring handoff rewriting.
+        """
+
+        offsets = [
+            (counter_reg, delta) for counter_reg, delta in counter_offsets
+        ]
+        instructions = tuple(instructions)
+        if not instructions:
+            return []
+        if not offsets:
+            return list(instructions)
+        target_start = len(offsets)
+        target_end = target_start + len(instructions)
+        assert target_end <= 32, (
+            "offsetWindowByCounters counter controls and target window must "
+            "fit 32 allocator lanes"
+        )
+
+        expanded = [cls(1, reg=0, reg_end=32, delta_cords=[0])]
+        for counter_reg, delta in offsets:
+            if isinstance(delta, list):
+                delta_cords = delta
+                delta_addr = None
+            elif isinstance(delta, int):
+                delta_cords = []
+                delta_addr = delta
+            else:
+                raise ValueError("delta must be int or list[int]")
+            expanded.append(
+                cls(
+                    1,
+                    reg=target_start,
+                    reg_end=target_end,
+                    delta_addr=delta_addr,
+                    delta_cords=delta_cords,
+                    counter_reg=counter_reg,
+                    accumulate=True,
+                )
+            )
+        expanded.extend(instructions)
+        # The fixed resident commands below deliberately bypass allocation,
+        # but they still form a normal allocator repeat window.  Mark its
+        # final command so the runtime retires the window before decoding the
+        # following instruction.
+        expanded[-1].jump()
+        return expanded
 
     @classmethod
     def onSync(cls, bar_inst_offset: int, bar_id: int | None, count: int, *steps, asyncPort: bool = True):
@@ -2721,12 +2777,15 @@ def indirect_1d_from(
 class LduReloadBarriers(MemoryInstruction):
     """Drain both LDU ports and restore one loop-local barrier range."""
 
+    RESET_MXFP_RESIDENT = 1 << 15
+
     def __init__(
         self,
         bar_source: torch.Tensor,
         first_bar: int,
         count: int,
         special_slot: int,
+        reset_mxfp_resident: bool = False,
     ):
         if bar_source.device.type != "cuda" or not bar_source.is_contiguous():
             raise ValueError("barrier reload source must be a contiguous CUDA tensor")
@@ -2736,12 +2795,15 @@ class LduReloadBarriers(MemoryInstruction):
             raise ValueError("barrier reload range overlaps runtime handshake counters")
         if bar_source.numel() * bar_source.element_size() < 4 * (first_bar + count):
             raise ValueError("barrier reload source does not cover the requested range")
-        if not 0 <= special_slot < config.num_special_slots - 1:
-            raise ValueError("barrier reload requires two adjacent special slots")
+        if not 0 <= special_slot < config.num_special_slots:
+            raise ValueError("barrier reload requires one special slot")
         super().__init__(
             opcode=opcode.OP_LDU_RELOAD_BARRIERS,
             num_slots=config.num_slots + special_slot,
-            arg=first_bar,
+            arg=(
+                first_bar
+                | (self.RESET_MXFP_RESIDENT if reset_mxfp_resident else 0)
+            ),
             size=count,
             address=bar_source.data_ptr(),
         )

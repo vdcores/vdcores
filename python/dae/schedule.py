@@ -2074,6 +2074,74 @@ class SchedDsv4Mxfp8QuantFfnInput(Schedule):
         return self._bar_release_if_present(role, self.num_sms)
 
 
+class SchedDsv4SplitMxfp8FfnInputRecords(Schedule):
+    """Split native K512 ``[data|SFB]`` records into resident FFN planes.
+
+    This is a pure layout handoff through the existing copy task.  Eight data
+    copies and eight scale copies are independent, so the production schedule
+    uses exactly sixteen resident workers and can overlap unrelated router
+    work on a disjoint CTA placement.
+    """
+
+    RECORDS = 8
+    DATA_BYTES = SchedDsv4Mxfp8QuantFfnInput.DATA_BYTES
+    SCALE_BYTES = SchedDsv4Mxfp8QuantFfnInput.SCALE_BYTES
+    RECORD_BYTES = SchedDsv4Mxfp8QuantFfnInput.RECORD_BYTES
+
+    def __init__(self, records, data, scales):
+        super().__init__()
+        self.records = records
+        self.data = data
+        self.scales = scales
+
+    def _on_place(self):
+        if self.num_sms != 2 * self.RECORDS:
+            raise ValueError("FFN MXFP8 record split requires exactly 16 workers")
+        expected = (
+            ("records", self.records, (self.RECORDS, self.RECORD_BYTES)),
+            ("data", self.data, (self.RECORDS, self.DATA_BYTES)),
+            ("scales", self.scales, (self.RECORDS, self.SCALE_BYTES)),
+        )
+        for name, tensor, shape in expected:
+            if (
+                tensor.dtype != torch.uint8
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"FFN MXFP8 split {name} must be contiguous uint8{shape}"
+                )
+        if any(
+            tensor.device != self.records.device
+            for tensor in (self.data, self.scales)
+        ):
+            raise ValueError("FFN MXFP8 split tensors must share one device")
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        if sm < self.RECORDS:
+            row = sm
+            source = self.records[row, : self.DATA_BYTES]
+            destination = self.data[row]
+            size = self.DATA_BYTES
+        else:
+            row = sm - self.RECORDS
+            source = self.records[row, self.DATA_BYTES :]
+            destination = self.scales[row]
+            size = self.SCALE_BYTES
+        return [
+            Copy(1, size),
+            TmaLoad1D(source).bar(self._bar("input")).fixed_port(sm & 1),
+            TmaStore1D(destination).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
 class SchedDsv4InverseRopeFp8QuantUmmaB(Schedule):
     """Fuse inverse final-64 RoPE with native O_a activation packing."""
 
@@ -3419,10 +3487,11 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
             stages=2,
             area_slots=(168 * 1024) // config.slot_size,
             area_id=0,
-            # Prepared top-k owns mailbox 3 until its no-copy STU publish.
-            # A distinct fixed command slot prevents allocator look-ahead
-            # from overwriting that raw route-record address.
-            mailbox=4,
+            # Ordinary router and prepared-top-k raw operands occupy special
+            # mailboxes 1, 3, 4, and 5.  Coupled streams bypass allocator slot
+            # ownership, so use the otherwise-unaddressable final mailbox to
+            # prevent look-ahead from overwriting any live raw operand.
+            mailbox=8,
             port=0,
             dynamic_expert=dynamic_expert,
         ).bar(self._bar("input"))
@@ -3460,6 +3529,259 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
+    """Counter-select per-layer MX streams without expanding the FFN task.
+
+    Compute keeps one layer-invariant resident plan.  Only the adjacent
+    Linear-1 and Down-weight LDU commands receive a counter-derived plan
+    address; keeping those two commands adjacent preserves the allocator-less
+    retained-ring handoff in the normal launcher rewrite.
+    """
+
+    def __init__(
+        self,
+        resident,
+        linear1_metadata_layers,
+        down_metadata_layers,
+        linear1_weight_layers,
+        linear1_scale_layers,
+        down_weight_layers,
+        down_scale_layers,
+        *,
+        counter_strides=(),
+        linear1_tmas=None,
+        down_tmas=None,
+    ):
+        super().__init__()
+        self.resident = resident
+        self.linear1_metadata_layers = tuple(linear1_metadata_layers)
+        self.down_metadata_layers = tuple(down_metadata_layers)
+        self.linear1_weight_layers = tuple(linear1_weight_layers)
+        self.linear1_scale_layers = tuple(linear1_scale_layers)
+        self.down_weight_layers = tuple(down_weight_layers)
+        self.down_scale_layers = tuple(down_scale_layers)
+        self.counter_strides = tuple(
+            (int(counter), int(stride))
+            for counter, stride in counter_strides
+        )
+        self.supplied_linear1_tmas = (
+            None if linear1_tmas is None else tuple(linear1_tmas)
+        )
+        self.supplied_down_tmas = (
+            None if down_tmas is None else tuple(down_tmas)
+        )
+
+    def _on_place(self):
+        layer_groups = (
+            self.linear1_metadata_layers,
+            self.down_metadata_layers,
+            self.linear1_weight_layers,
+            self.linear1_scale_layers,
+            self.down_weight_layers,
+            self.down_scale_layers,
+        )
+        layer_counts = {len(group) for group in layer_groups}
+        if len(layer_counts) != 1 or next(iter(layer_counts)) <= 0:
+            raise ValueError("layered resident FFN inputs need one common layer count")
+        self.layer_count = next(iter(layer_counts))
+        if self.layer_count > 1 and not self.counter_strides:
+            raise ValueError("multi-layer resident FFN requires loop-counter strides")
+        if any(
+            counter < 0 or counter >= 32 or stride <= 0
+            for counter, stride in self.counter_strides
+        ):
+            raise ValueError(
+                "resident FFN counter strides require reg [0,31] and positive stride"
+            )
+
+        resident = self.resident._clone()
+        resident._bars.update(self._bars)
+        self.placed_resident = resident.place(self.num_sms)
+        if self.num_sms != 112:
+            raise ValueError("layered routed resident FFN requires 112 workers")
+        device = self.placed_resident.route_record.device
+        representatives = (
+            self.placed_resident.linear1_stream_weights,
+            self.placed_resident.linear1_stream_scales,
+            self.placed_resident.down_stream_weights,
+            self.placed_resident.down_stream_scales,
+        )
+        stream_groups = (
+            self.linear1_weight_layers,
+            self.linear1_scale_layers,
+            self.down_weight_layers,
+            self.down_scale_layers,
+        )
+        for representative, layers in zip(representatives, stream_groups):
+            if layers[0].data_ptr() != representative.data_ptr():
+                raise ValueError(
+                    "layer zero MXFP stream must match the resident representative"
+                )
+            for tensor in layers:
+                if (
+                    tensor.device != device
+                    or tensor.dtype != representative.dtype
+                    or tensor.shape != representative.shape
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        "layered MXFP streams must match representative storage"
+                    )
+        expected_linear1_metadata = (self.num_sms, 128)
+        expected_down_metadata = (7 * 32, 128)
+        for layer in range(self.layer_count):
+            linear1_metadata = self.linear1_metadata_layers[layer]
+            down_metadata = self.down_metadata_layers[layer]
+            if (
+                linear1_metadata.device != device
+                or linear1_metadata.dtype != torch.uint8
+                or tuple(linear1_metadata.shape) != expected_linear1_metadata
+                or not linear1_metadata.is_contiguous()
+            ):
+                raise ValueError(
+                    "layered Linear-1 metadata must be CUDA uint8[112,128]"
+                )
+            if (
+                down_metadata.device != device
+                or down_metadata.dtype != torch.uint8
+                or tuple(down_metadata.shape) != expected_down_metadata
+                or not down_metadata.is_contiguous()
+            ):
+                raise ValueError(
+                    "layered Down metadata must be CUDA uint8[224,128]"
+                )
+        if (
+            self.linear1_metadata_layers[0].data_ptr()
+            != self.placed_resident.placed_linear1.metadata.data_ptr()
+            or self.down_metadata_layers[0].data_ptr()
+            != self.placed_resident.placed_down.metadata.data_ptr()
+        ):
+            raise ValueError(
+                "layer zero metadata must match the resident representative"
+            )
+
+        # The representative schedule already validates layer zero and owns
+        # its two descriptors.  Materialize only the additional per-layer TMA
+        # maps; no data or scale payload is repacked here.
+        if self.supplied_linear1_tmas is None:
+            linear1_tmas = [self.placed_resident.linear1_stream_tma]
+            for layer in range(1, self.layer_count):
+                linear1_tmas.append(
+                    TmaTensor(
+                        linear1_tmas[0].launcher,
+                        self.linear1_weight_layers[layer],
+                    ).mxfp4_load(512)
+                )
+        else:
+            linear1_tmas = list(self.supplied_linear1_tmas)
+        if self.supplied_down_tmas is None:
+            down_tmas = [self.placed_resident.down_stream_tma]
+            for layer in range(1, self.layer_count):
+                down_tmas.append(
+                    TmaTensor(
+                        down_tmas[0].launcher,
+                        self.down_weight_layers[layer],
+                    ).mxfp4_load(256)
+                )
+        else:
+            down_tmas = list(self.supplied_down_tmas)
+        if len(linear1_tmas) != self.layer_count or len(down_tmas) != self.layer_count:
+            raise ValueError("supplied layered MXFP TMA lists must cover every layer")
+        if any(
+            getattr(tma, "launcher", None)
+            is not getattr(self.placed_resident.linear1_stream_tma, "launcher", None)
+            for tma in (*linear1_tmas, *down_tmas)
+        ):
+            raise ValueError("layered MXFP TMA descriptors must share one launcher")
+        self.linear1_tmas = tuple(linear1_tmas)
+        self.down_tmas = tuple(down_tmas)
+
+        plans = torch.zeros(
+            (self.layer_count, self.num_sms, 12),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        route_record = self.placed_resident.route_record
+        activation_data = self.placed_resident.placed_linear1.activation_data
+        activation_scale = self.placed_resident.placed_linear1.activation_scale
+        task_queues = self.placed_resident.task_queues
+        for layer in range(self.layer_count):
+            linear1_scales = self.linear1_scale_layers[layer]
+            down_scales = self.down_scale_layers[layer]
+            if (
+                linear1_scales.device != device
+                or down_scales.device != device
+                or not linear1_scales.is_contiguous()
+                or not down_scales.is_contiguous()
+            ):
+                raise ValueError("layered MXFP scale streams must be contiguous CUDA")
+            for worker, task_queue in enumerate(task_queues):
+                physical_expert, local_slice = divmod(worker, 16)
+                route_rank = physical_expert - 1
+                plans[layer, worker, 0] = (
+                    self.linear1_metadata_layers[layer][worker].data_ptr()
+                )
+                plans[layer, worker, 1] = (
+                    self.down_metadata_layers[layer][task_queue[0]].data_ptr()
+                )
+                plans[layer, worker, 2] = (
+                    self.down_metadata_layers[layer][task_queue[1]].data_ptr()
+                )
+                plans[layer, worker, 3] = len(task_queue)
+                if physical_expert == 0:
+                    plans[layer, worker, 4] = linear1_scales[
+                        worker, 0
+                    ].data_ptr()
+                    linear1_coordinate = worker
+                else:
+                    plans[layer, worker, 4] = linear1_scales.data_ptr()
+                    linear1_coordinate = local_slice
+                plans[layer, worker, 5] = (
+                    self.linear1_tmas[layer].arg
+                    | (linear1_coordinate << 32)
+                )
+                plans[layer, worker, 6] = activation_data.data_ptr()
+                plans[layer, worker, 7] = activation_scale.data_ptr()
+                plans[layer, worker, 8] = route_record.data_ptr()
+                plans[layer, worker, 9] = (
+                    (route_rank & 0xFFFFFFFF) | (local_slice << 32)
+                )
+                plans[layer, worker, 10] = down_scales.data_ptr()
+                plans[layer, worker, 11] = self.down_tmas[layer].arg
+        self.layered_plans = plans.to(device)
+        self.plan_layer_bytes = (
+            self.layered_plans.stride(0)
+            * self.layered_plans.element_size()
+        )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        base = self.placed_resident.schedule(sm)
+        if len(base) != 5:
+            raise ValueError("routed resident FFN command contract changed")
+        compute, linear1, down_weight, down_activation, output = base
+        plan_address = self.layered_plans[0, sm].data_ptr()
+        linear1 = linear1.copy()
+        linear1.address = plan_address
+        down_weight = down_weight.copy()
+        down_weight.address = plan_address
+        down_activation = down_activation.copy()
+        down_activation.address = plan_address
+        offsets = tuple(
+            (counter, stride * self.plan_layer_bytes)
+            for counter, stride in self.counter_strides
+        )
+        weight_window = RepeatM.offsetWindowByCounters(
+            offsets, linear1, down_weight
+        )
+        return [compute, weight_window, down_activation, output]
+
+    def bar_release_count(self, role: str):
+        self._require_placed()
+        return self.placed_resident.bar_release_count(role)
 
 
 class SchedFp8GemvUmmaStream(Schedule):
@@ -5479,7 +5801,8 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
 class SchedDsv4RouteTop6(Schedule):
     def __init__(self, logits, bias, hash_indices, output_indices,
                  output_weights, hash_routing=False, route_scale=1.5,
-                 pretransformed=False, packed_output=None):
+                 pretransformed=False, packed_output=None,
+                 hash_counter_strides=()):
         super().__init__()
         self.logits = logits
         self.bias = bias
@@ -5490,6 +5813,10 @@ class SchedDsv4RouteTop6(Schedule):
         self.route_scale = route_scale
         self.pretransformed = bool(pretransformed)
         self.packed_output = packed_output
+        self.hash_counter_strides = tuple(
+            (int(counter), int(stride))
+            for counter, stride in hash_counter_strides
+        )
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -5524,7 +5851,28 @@ class SchedDsv4RouteTop6(Schedule):
             raise ValueError("DeepSeek routing bias must contain 256 FP32 values")
         elif self.packed_output is not None:
             raise ValueError("legacy routing does not use prepared stream metadata")
-        if self.hash_indices.dtype != torch.int32 or self.hash_indices.numel() != 8:
+        if self.hash_counter_strides:
+            if not self.pretransformed or not self.hash_routing:
+                raise ValueError(
+                    "layered hash selection requires prepared hash routing"
+                )
+            if (
+                self.hash_indices.dtype != torch.int32
+                or self.hash_indices.ndim != 2
+                or self.hash_indices.shape[1] != 8
+                or not self.hash_indices.is_contiguous()
+            ):
+                raise ValueError(
+                    "layered hash routing storage must be contiguous int32[L,8]"
+                )
+            if any(
+                counter < 0 or counter >= 32 or stride <= 0
+                for counter, stride in self.hash_counter_strides
+            ):
+                raise ValueError(
+                    "hash counter strides require reg [0,31] and positive stride"
+                )
+        elif self.hash_indices.dtype != torch.int32 or self.hash_indices.numel() != 8:
             raise ValueError("DeepSeek hash routing storage must contain eight int32 values")
         if self.output_indices.dtype != torch.int32 or self.output_indices.numel() != 8:
             raise ValueError("DeepSeek route-id storage must contain eight int32 values")
@@ -5545,11 +5893,27 @@ class SchedDsv4RouteTop6(Schedule):
                 TmaLoad1D(self.logits).fixed_port(0).bar(self._bar("logits"))
             )
             if self.hash_routing:
-                instructions.append(
-                    RawAddress(
-                        self.hash_indices, config.num_slots + 1
-                    ).fixed_port(1)
+                hash_indices = (
+                    self.hash_indices[0]
+                    if self.hash_indices.ndim == 2
+                    else self.hash_indices
                 )
+                hash_address = RawAddress(
+                    hash_indices, config.num_slots + 1
+                ).fixed_port(1)
+                if self.hash_counter_strides:
+                    row_bytes = (
+                        self.hash_indices.stride(0)
+                        * self.hash_indices.element_size()
+                    )
+                    hash_address = RepeatM.offsetByCounters(
+                        (
+                            (counter, stride * row_bytes)
+                            for counter, stride in self.hash_counter_strides
+                        ),
+                        hash_address,
+                    )
+                instructions.append(hash_address)
             instructions.append(
                 RawAddress(
                     # C2M/STU publication is a 32-bit slot mask. The resident
@@ -6144,6 +6508,175 @@ class SchedDsv4RouterBf16Gemv(Schedule):
             if local_task + 1 == task_count:
                 store.bar(self._bar("output"))
             instructions.append(store)
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedLayeredDsv4RouterBf16Gemv(Schedule):
+    """Counter-selected BF16 router with the same vectorized compute task.
+
+    Only compact pointer plans and biases are layered.  Checkpoint weights stay
+    in their original resident allocations, and the allocator applies the
+    active loop counters directly to the two memory-command addresses.
+    """
+
+    def __init__(
+        self,
+        weights,
+        input,
+        biases,
+        output,
+        *,
+        counter_strides=(),
+        rows_per_task: int = 2,
+    ):
+        super().__init__()
+        self.weights = tuple(weights)
+        self.input = input
+        self.biases = tuple(biases)
+        self.output = output
+        self.counter_strides = tuple(
+            (int(counter), int(stride))
+            for counter, stride in counter_strides
+        )
+        self.rows_per_task = int(rows_per_task)
+
+    def _on_place(self):
+        if not self.weights or len(self.weights) != len(self.biases):
+            raise ValueError("layered router requires matching weight/bias layers")
+        representative = self.weights[0]
+        if (
+            representative.dtype != torch.bfloat16
+            or representative.ndim != 2
+            or not representative.is_contiguous()
+        ):
+            raise ValueError("layered router weight must be contiguous BF16 [M,K]")
+        self.rows, self.k = representative.shape
+        if self.rows_per_task not in (1, 2, 4):
+            raise ValueError("router rows per task must be 1, 2, or 4")
+        if self.rows % self.rows_per_task or self.k % 1024:
+            raise ValueError("layered router shape must divide its constexpr task")
+        if self.rows_per_task != 2:
+            raise ValueError("layered router currently uses paired two-row loads")
+        for weight in self.weights:
+            if (
+                weight.device != representative.device
+                or weight.dtype != representative.dtype
+                or weight.shape != representative.shape
+                or not weight.is_contiguous()
+            ):
+                raise ValueError("layered router weights must have identical storage")
+        for bias in self.biases:
+            if (
+                bias.device != representative.device
+                or bias.dtype != torch.float32
+                or bias.numel() != self.rows
+                or not bias.is_contiguous()
+            ):
+                raise ValueError("layered router biases must be contiguous FP32 [M]")
+        if (
+            self.input.device != representative.device
+            or self.input.dtype != torch.bfloat16
+            or self.input.numel() != self.k
+            or not self.input.is_contiguous()
+        ):
+            raise ValueError("layered router input must be contiguous BF16 [K]")
+        if (
+            self.output.device != representative.device
+            or self.output.dtype != torch.float32
+            or tuple(self.output.shape) != (self.rows, 2)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("layered router output must be contiguous FP32 [M,2]")
+        if any(
+            counter < 0 or counter >= 32 or stride <= 0
+            for counter, stride in self.counter_strides
+        ):
+            raise ValueError(
+                "layered router counter strides require reg [0,31] and positive stride"
+            )
+        if len(self.weights) > 1 and not self.counter_strides:
+            raise ValueError("multi-layer router requires loop-counter strides")
+        self.tasks = self.rows // self.rows_per_task
+        if not 0 < self.num_sms <= self.tasks:
+            raise ValueError("layered router requires 1..M/2 workers")
+
+        plans = torch.empty(
+            (len(self.weights), self.tasks, 2), dtype=torch.int64, device="cpu"
+        )
+        for layer, weight in enumerate(self.weights):
+            plans[layer, :, 0] = self.input.data_ptr()
+            plans[layer, :, 1] = torch.tensor(
+                [
+                    weight[task * self.rows_per_task].data_ptr()
+                    for task in range(self.tasks)
+                ],
+                dtype=torch.int64,
+            )
+        self.paired_load_plans = plans.to(representative.device)
+        self.bias_layers = torch.stack(self.biases).contiguous()
+        self.plan_layer_bytes = (
+            self.paired_load_plans.stride(0)
+            * self.paired_load_plans.element_size()
+        )
+        self.bias_layer_bytes = (
+            self.bias_layers.stride(0) * self.bias_layers.element_size()
+        )
+
+    def _task_shard(self, sm):
+        tasks_per_sm, extra = divmod(self.tasks, self.num_sms)
+        task_start = sm * tasks_per_sm + min(sm, extra)
+        task_count = tasks_per_sm + int(sm < extra)
+        return task_start, task_count
+
+    def _offsets(self, layer_bytes):
+        return tuple(
+            (counter, stride * layer_bytes)
+            for counter, stride in self.counter_strides
+        )
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        task_start, task_count = self._task_shard(sm)
+        instructions = []
+        for local_task, task in enumerate(
+            range(task_start, task_start + task_count)
+        ):
+            row_start = task * self.rows_per_task
+            row_stop = row_start + self.rows_per_task
+            instructions.append(
+                Dsv4RouterBf16GemvSm100(self.k, self.rows_per_task)
+            )
+            pair = TmaLoadPair1D(
+                self.paired_load_plans[0, task],
+                first_bytes=self.input.numel() * self.input.element_size(),
+                second_bytes=(
+                    self.rows_per_task
+                    * self.k
+                    * self.weights[0].element_size()
+                ),
+            ).fixed_port(0)
+            pair = RepeatM.offsetByCounters(
+                self._offsets(self.plan_layer_bytes), pair
+            )
+            bias = RawAddress(
+                self.bias_layers[0, row_start:row_stop],
+                config.num_slots + 4,
+            ).fixed_port(1)
+            bias = RepeatM.offsetByCounters(
+                self._offsets(self.bias_layer_bytes), bias
+            )
+            store = RawAddress(
+                self.output[row_start:row_stop], config.num_slots + 5
+            ).writeback()
+            if local_task + 1 == task_count:
+                store.bar(self._bar("output"))
+            instructions.extend((pair, bias, store))
         return instructions
 
     def bar_release_count(self, role: str):

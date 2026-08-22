@@ -361,13 +361,24 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_LDU_PROFILE_LAYER): {
           if (lane_id == 0) {
             const int special_slot = inst.nslot();
+            const bool shared_reload_mailbox =
+                decoded_op == op(OP_LDU_RELOAD_BARRIERS);
             if (special_slot < numSlots ||
-                special_slot + 1 >= numSlots + numSpecialSlots) {
+                special_slot >= numSlots + numSpecialSlots ||
+                (!shared_reload_mailbox &&
+                 special_slot + 1 >= numSlots + numSpecialSlots)) {
               asm volatile("trap;");
             }
+            st_insts[special_slot] = inst;
             for (int port = 0; port < 2; ++port) {
-              const int slot = special_slot + port;
-              st_insts[slot] = inst;
+              // Reload is immutable and its completion handshake prevents a
+              // later control command from overwriting this shared mailbox.
+              // Profiling retains its historic per-port mailbox pair.
+              const int slot = special_slot +
+                  (shared_reload_mailbox ? 0 : port);
+              if (!shared_reload_mailbox) {
+                st_insts[slot] = inst;
+              }
               LdCmd ld;
               ld.init(slot, 0, inst.opcode);
               m2ld[port].put(ld.raw);
@@ -376,8 +387,8 @@ __device__ __forceinline__ void allocwarp_execute(
             }
           }
           __syncwarp();
-          // Do not allow a later control command to overwrite the shared
-          // metadata slots until both LDU handlers have copied this command.
+          // Do not allow a later control command to overwrite the metadata
+          // until both LDU handlers have consumed the command.
           ldu_control_publish_barrier->arrive_and_wait();
         }
         break;
@@ -448,6 +459,18 @@ __device__ __forceinline__ void allocwarp_execute(
           __mprint("Unknown mem opcode: %04x op=%d\n", inst.opcode, op(inst.opcode));
           // assert(false && "Unknown mem opcode");
         break;
+      }
+
+      // Fixed-address resident commands bypass allocation but can still be
+      // the final consumer in an allocator repeat window.  Retire that window
+      // here just as the allocating path above does, otherwise later commands
+      // decode their offsets from lanes beyond the 32-lane repeat window.
+      if (di.pred_jump) {
+        --di.loop_counter;
+        if (di.loop_counter > 0) {
+          next_pc = di.loop_start_pc;
+        }
+        di.gpr[1] += di.gpr[0];
       }
     }
 

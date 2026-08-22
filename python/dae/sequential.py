@@ -48,6 +48,7 @@ class SequentialStage:
     prefetch_before_wait: bool = False
     wait_group_roles: tuple[tuple[str, str], ...] = ()
     release_group_roles: tuple[tuple[str, str], ...] = ()
+    reset_mxfp_resident_after: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ class SequentialBlock:
     repeat: int = 1
     reload_after: bool = True
     barrier_banks: int = 1
+    reload_barrier_start: int | None = None
+    reload_mxfp_resident: bool = False
 
 
 def _flatten(item, sm: int, output: list) -> None:
@@ -455,6 +458,21 @@ class SequentialProgram:
                         "multiple dependency groups"
                     )
 
+            reset_mxfp_before_stage = (
+                previous_stage is not None
+                and previous_stage.reset_mxfp_resident_after
+            )
+            if reset_mxfp_before_stage and (
+                not stage.wait_for_previous
+                or stage.parallel_with_previous
+                or stage.wait_group is not None
+                or stage.wait_group_roles
+            ):
+                raise ValueError(
+                    f"stage {previous_name!r} resident reset requires a "
+                    "direct dependency on the following stage"
+                )
+
             input_bar = None
             if stage.wait_group is not None:
                 input_bar = group_barriers[stage.wait_group]
@@ -520,6 +538,32 @@ class SequentialProgram:
                 ).bar(profile_input_bar)
                 for instructions in self.instructions:
                     instructions.append(marker.copy())
+
+            if reset_mxfp_before_stage:
+                if input_bar is None:
+                    raise ValueError(
+                        f"stage {previous_name!r} resident reset has no "
+                        "completion dependency"
+                    )
+                # The control command waits directly on the producer's STU
+                # completion edge, drains both LDU queues, and resets the
+                # one-shot resident ring state.  Allocator publication does
+                # not advance to the next stage until both LDUs acknowledge,
+                # so the following loads need no second wait on a barrier that
+                # this command has just reinitialized.
+                reload = LduReloadBarriers(
+                    launcher.bars_src,
+                    input_bar,
+                    1,
+                    # Slot two identifies loop-tail reloads to the optional
+                    # profiler.  A distinct immutable mailbox keeps this
+                    # intra-body reset out of that bounded event stream.
+                    special_slot=7,
+                    reset_mxfp_resident=True,
+                ).bar(input_bar)
+                for instructions in self.instructions:
+                    instructions.append(reload.copy())
+                input_bar = None
 
             schedule = stage.schedule._clone()
             if input_bar is not None and stage.input_role is not None:
@@ -643,6 +687,12 @@ class SequentialProgram:
             previous_name = stage.name
             previous_profile_after = stage.profile_after
 
+        if previous_stage.reset_mxfp_resident_after:
+            raise ValueError(
+                f"final stage {previous_name!r} cannot reset resident MXFP "
+                "state without a following stage"
+            )
+
         for group, bar_id in group_barriers.items():
             count = group_release_counts[group]
             if count <= 0:
@@ -736,11 +786,29 @@ class LoopedSequentialProgram:
                 raise ValueError(
                     f"repeated block {block.name!r} must reload its dependencies"
                 )
+            if block.reload_mxfp_resident and not block.reload_after:
+                raise ValueError(
+                    f"block {block.name!r} cannot reset resident MXFP state "
+                    "without a loop-tail reload"
+                )
             if block.barrier_banks <= 0:
                 raise ValueError(f"block {block.name!r} barrier_banks must be positive")
             bank_count = min(block.barrier_banks, block.repeat)
             while block.repeat % bank_count:
                 bank_count -= 1
+            if block.reload_barrier_start is not None:
+                if bank_count != 1:
+                    raise ValueError(
+                        f"block {block.name!r} cannot combine an external "
+                        "reload range with shifted barrier banks"
+                    )
+                if (
+                    block.reload_barrier_start < 0
+                    or block.reload_barrier_start > launcher.num_bars
+                ):
+                    raise ValueError(
+                        f"block {block.name!r} has an invalid reload barrier start"
+                    )
             outer_count = block.repeat // bank_count
             required_counters = int(bank_count > 1) + int(outer_count > 1)
             if required_counters > config.num_loop_counters:
@@ -820,11 +888,23 @@ class LoopedSequentialProgram:
                 # the current bank's final STU completion and sits ahead of
                 # every following LDU command in both port FIFOs, providing
                 # the loop-carried dependency without an IssueBarrier.
+                reload_start = (
+                    segment.barrier_start
+                    if block.reload_barrier_start is None
+                    else block.reload_barrier_start
+                )
+                reload_count = segment.completion_barrier + 1 - reload_start
+                if reload_count <= 0:
+                    raise ValueError(
+                        f"block {block.name!r} reload range does not reach "
+                        "its completion barrier"
+                    )
                 reload = LduReloadBarriers(
                     launcher.bars_src,
-                    segment.barrier_start,
-                    barriers_per_bank,
-                    2 if self.profile_event_count else 0,
+                    reload_start,
+                    reload_count,
+                    2,
+                    reset_mxfp_resident=block.reload_mxfp_resident,
                 ).bar(segment.completion_barrier)
                 if bank_count > 1:
                     reload.group()

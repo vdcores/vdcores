@@ -785,8 +785,7 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     auto &bar = cmd.bar;
     bool produces_compute_operand = true;
 
-    if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS) ||
-        op(opcode) == op(OP_LDU_PROFILE_LAYER))
+    if (op(opcode) == op(OP_LDU_PROFILE_LAYER))
       ldu_control_publish_barrier->arrive_and_wait();
 
     __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
@@ -1507,6 +1506,9 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       }
       case op(OP_LDU_RELOAD_BARRIERS): {
         produces_compute_operand = false;
+        constexpr uint16_t kResetMxfpResident = 1U << 15;
+        const bool reset_mxfp_resident = inst.arg & kResetMxfpResident;
+        const int source_first_bar = inst.arg & ~kResetMxfpResident;
         // Route results are constant throughout one loop iteration.  Drop the
         // LDU-local all-rank cache only after both ports have drained so the
         // next layer/step cannot observe stale expert IDs.
@@ -1517,6 +1519,34 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         // block's port 0 to restore a disjoint slice of the active bank.
         ldu_control_barrier->arrive_and_wait();
         if (port_id == 0) {
+          if (reset_mxfp_resident) {
+            constexpr int first = mxfpResidentLinear1FullBarrierBase;
+            constexpr int last =
+                mxfpDownResidentReductionReadyBarrierBase +
+                mxfpDownResidentReductionReadyBarrierCount;
+            #pragma unroll
+            for (int index = first; index < last; ++index) {
+              cute::initialize_barrier(tmem_mma_barriers[index], 1);
+            }
+            #pragma unroll
+            for (int index = 0; index < mxfpResidentLinear1Stages; ++index) {
+              cuda::ptx::mbarrier_arrive(
+                  cuda::ptx::sem_release,
+                  cuda::ptx::scope_cta,
+                  cuda::ptx::space_shared,
+                  tmem_mma_barriers +
+                      mxfpResidentLinear1EmptyBarrierBase + index);
+            }
+            #pragma unroll
+            for (int index = 0; index < mxfpResidentDownStages; ++index) {
+              cuda::ptx::mbarrier_arrive(
+                  cuda::ptx::sem_release,
+                  cuda::ptx::scope_cta,
+                  cuda::ptx::space_shared,
+                  tmem_mma_barriers +
+                      mxfpResidentDownEmptyBarrierBase + index);
+            }
+          }
           int *arrivals = bars + lduBarrierReloadArrival;
           const int count = inst.size;
           // The attached completion barrier is the last barrier in the
@@ -1524,8 +1554,8 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           // restoring every bank on every loop iteration.
           const int first_bar = inst.bar() + 1 - count;
           const int *source = reinterpret_cast<const int *>(inst.address);
-          if (first_bar < inst.arg || count <= 0 ||
-              (first_bar - inst.arg) % count != 0 ||
+          if (first_bar < source_first_bar || count <= 0 ||
+              (first_bar - source_first_bar) % count != 0 ||
               first_bar + count > lduBarrierReloadArrival) {
             asm volatile("trap;");
           }
@@ -1584,6 +1614,9 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break;
       }
     }
+
+    if (op(opcode) == op(OP_LDU_RELOAD_BARRIERS))
+      ldu_control_publish_barrier->arrive_and_wait();
 
     // m2c data should be prepared in the CFU
     if (produces_compute_operand)
