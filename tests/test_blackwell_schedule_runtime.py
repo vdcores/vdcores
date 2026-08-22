@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -94,6 +95,7 @@ from dae.schedule import (
     SchedMxfp4Mxfp8GemvUmmaK512,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
     SchedMxfp4Mxfp8DownFixedRing,
+    SchedLayeredMxfp4Mxfp8RoutedResidentFfn,
     SchedDsv4ZeroFill,
     SchedDsv4Fp32ToBf16,
     SchedAttentionDecoding,
@@ -227,6 +229,31 @@ def test_counter_offset_window_preserves_retained_stream_adjacency():
     builder.rewrite_coupled_stream_local_chains()
     assert builder.minsts[-2].arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
     assert not builder.minsts[-1].arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN
+
+
+def test_layered_mxfp_resident_rebases_encoded_plan_addresses():
+    plans = torch.zeros((2, 112, 12), dtype=torch.int64)
+    commands = [
+        None,
+        MemoryInstruction(opcode.OP_TMA_LOAD_MX_COUPLED_STREAM, 1, 0, 0, address=0x1000),
+        MemoryInstruction(opcode.OP_TMA_LOAD_MX_COUPLED_STREAM, 1, 0, 0, address=0x2000),
+        MemoryInstruction(opcode.OP_TMA_LOAD_MX_COUPLED_STREAM, 1, 0, 0, address=0x3000),
+        MemoryInstruction(opcode.OP_ALLOC_WB_RAW_ADDRESS, 1, 0, 0, address=0x4000),
+    ]
+    layered = object.__new__(SchedLayeredMxfp4Mxfp8RoutedResidentFfn)
+    layered.num_sms = 112
+    layered.placed_resident = SimpleNamespace(
+        schedule=lambda sm: commands,
+    )
+    layered.layered_plans = plans
+    layered.plan_layer_bytes = plans.stride(0) * plans.element_size()
+    layered.counter_strides = ((0, 1),)
+
+    _, weight_window, down_activation, _ = layered.schedule(4)
+    expected = plans[0, 4].data_ptr()
+    assert cords2addr(weight_window[-2].cords) == expected
+    assert cords2addr(weight_window[-1].cords) == expected
+    assert cords2addr(down_activation.cords) == expected
 
 
 def test_counter_offset_helpers_retire_their_allocator_windows():

@@ -112,7 +112,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_DOWN_FIXED_RING_SM100) {
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
-        false, false, false, false>(
+        false, false, false, false, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, metadata, global_bars,
         m2c, c2m, -1
@@ -155,7 +155,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100) {
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
-        true, true, false, false>(
+        true, true, false, false, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, down_metadata, global_bars, m2c, c2m, task
         );
@@ -203,7 +203,7 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_ROUTED_RESIDENT_FFN_SM100) {
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
-        true, true, true, true>(
+        true, true, true, true, true>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, down_metadata, global_bars, m2c, c2m, task,
         route_record, route_rank);

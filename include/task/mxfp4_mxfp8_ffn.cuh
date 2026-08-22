@@ -1,5 +1,7 @@
 #pragma once
 
+#include <type_traits>
+
 #include "mxfp4_mxfp8_gate_up_silu.cuh"
 
 // Full-FFN Linear-2 task.  One CTA owns one expert/M128 output tile and
@@ -10,7 +12,7 @@ template <int KBundles, int RingStages, int BundleK,
           int SyncBarrierId, int TmemColumns,
           int ScratchOffsetBytes, int ScratchCapacityBytes, int ThreadOffset,
           bool UseLduWeightRing, bool ResidentAllTma,
-          bool DynamicRouteScale, bool NMajorOutput,
+          bool DynamicRouteScale, bool NMajorOutput, bool Fp32Aggregate,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void
 task_mxfp4_mxfp8_down_fixed_ring_sm100(
@@ -31,7 +33,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   using Activation = cutlass::float_e4m3_t;
   using Scale = cutlass::float_ue8m0_t;
   using Accum = float;
-  using Output = cutlass::bfloat16_t;
+  using Output = std::conditional_t<
+      Fp32Aggregate, float, cutlass::bfloat16_t>;
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
 
   constexpr int kTileM = 128;
@@ -65,6 +68,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   constexpr int kDownTilesPerExpert = 4096 / kTileM;
   constexpr int kOutputElements = kTileM * kNativeOutputRows;
   constexpr int kOutputBytes = kOutputElements * int(sizeof(Output));
+  constexpr int kOutputM128Segments = int(sizeof(Output));
 
   using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
   using Atom = cute::SM100_MMA_MXF8F6F4_SS<
@@ -590,8 +594,10 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     __sync_barrier<SyncBarrierId, 128>();
   }
 
-  // The shared expert establishes the BF16 destination with a bulk copy; the
-  // routed experts reduce-add into the Python-initialized destination.
+  // The shared expert establishes the destination with a bulk copy; routed
+  // experts reduce-add into the schedule-initialized destination.  The routed
+  // production image keeps this transaction in FP32 and rounds only once in
+  // the following handoff task.
   if (tid == 0) {
       const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
       const int row = output_m_tile * kTileM;
@@ -602,7 +608,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
               "[%0, {%1, %2, %3}], [%4];\n"
               :
               : "l"((void *)(tma_descs + output_tma_index)),
-                "r"(0), "r"(0), "r"(2 * output_m_tile), "r"(source)
+                "r"(0), "r"(0),
+                "r"(kOutputM128Segments * output_m_tile), "r"(source)
               : "memory");
         } else {
           asm volatile(
@@ -620,7 +627,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
               "[%0, {%1, %2, %3}], [%4];\n"
               :
               : "l"((void *)(tma_descs + output_tma_index)),
-                "r"(0), "r"(0), "r"(2 * output_m_tile), "r"(source)
+                "r"(0), "r"(0),
+                "r"(kOutputM128Segments * output_m_tile), "r"(source)
               : "memory");
         } else {
           asm volatile(

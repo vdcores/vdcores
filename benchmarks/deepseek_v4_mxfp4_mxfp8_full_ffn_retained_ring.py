@@ -13,6 +13,7 @@ from dae.instructions import TmaLoadMxfpCoupledStream, TmaTensor
 from dae.launcher import Launcher
 from dae.runtime import opcode
 from dae.schedule import (
+    SchedDsv4Fp32ToBf16,
     SchedDsv4RouteTop6,
     SchedMxfp4Mxfp8DownFixedRing,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
@@ -442,6 +443,9 @@ def main() -> None:
                 )
         down_weight = down_stream_weights[:down_tasks]
         down_scale = down_stream_scales[:down_tasks]
+        final_output_accumulator = torch.empty(
+            (8, 4096), dtype=torch.float32, device=device
+        )
         final_output = torch.empty(
             (8, 4096), dtype=torch.bfloat16, device=device
         )
@@ -461,10 +465,11 @@ def main() -> None:
         final_output = torch.empty(
             (down_slices, 128, 8), dtype=torch.bfloat16, device=device
         )
+        final_output_accumulator = final_output
     down_tma = TmaTensor(launcher, down_weight).mxfp4_load(256)
     if args.dynamic_routing:
         output_tma = TmaTensor(
-            launcher, final_output
+            launcher, final_output_accumulator
         ).m128n8_output("reduce")
         route_scales = [
             1.0,
@@ -496,8 +501,8 @@ def main() -> None:
             zero_ready[output_tile] << 32
         )
         down_records[task, 5] = f32_bits(route_scales[expert])
-        down_records[task, 6] = final_output.data_ptr()
-        down_records[task, 8] = (1 | 4) << 32
+        down_records[task, 6] = final_output_accumulator.data_ptr()
+        down_records[task, 8] = 4 << 32
     down_metadata = down_records.view(torch.uint8).to(device)
 
     linear1_schedule_base = SchedMxfp4Mxfp8GateUpSiluFixedRing(
@@ -518,10 +523,11 @@ def main() -> None:
         down_weight,
         down_scale,
         down_activation_records,
-        final_output,
+        final_output_accumulator,
         down_tma,
         down_metadata,
         output_n_major=args.dynamic_routing,
+        fp32_output=args.dynamic_routing,
     )
     if args.dynamic_routing:
         resident_schedule_base = SchedMxfp4Mxfp8RoutedResidentFfn(
@@ -544,28 +550,42 @@ def main() -> None:
                 pretransformed=True,
                 packed_output=route_record,
             )
-            program = SequentialProgram(
-                launcher,
-                (
-                    SequentialStage(
-                        "router_top6",
-                        route_schedule,
-                        1,
-                        release_group="mx_route_ready",
-                    ),
-                    SequentialStage(
-                        "routed_mx_ffn",
-                        resident_schedule_base,
-                        args.workers,
-                        wait_group_roles=(("mx_route_ready", "input"),),
+            stages = [
+                SequentialStage(
+                    "router_top6",
+                    route_schedule,
+                    1,
+                    release_group="mx_route_ready",
+                )
+            ]
+            resident_index = 1
+        else:
+            stages = []
+            resident_index = 0
+        stages.extend(
+            (
+                SequentialStage(
+                    "routed_mx_ffn",
+                    resident_schedule_base,
+                    args.workers,
+                    wait_group_roles=(
+                        (("mx_route_ready", "input"),)
+                        if args.route_with_topk
+                        else ()
                     ),
                 ),
+                SequentialStage(
+                    "mx_fp32_to_bf16",
+                    SchedDsv4Fp32ToBf16(
+                        final_output_accumulator[0], final_output[0]
+                    ),
+                    down_slices,
+                ),
             )
-            resident_schedule = program.placed_schedules[1]
-            launcher.s(program)
-        else:
-            resident_schedule = resident_schedule_base.place(args.workers)
-            launcher.s(resident_schedule)
+        )
+        program = SequentialProgram(launcher, tuple(stages))
+        resident_schedule = program.placed_schedules[resident_index]
+        launcher.s(program)
     else:
         resident_schedule = SchedMxfp4Mxfp8ResidentFfn(
             linear1_schedule_base, down_schedule_base
@@ -610,7 +630,6 @@ def main() -> None:
 
     def enqueue() -> None:
         with torch.cuda.stream(stream):
-            final_output.zero_()
             launcher.launch(synchronize=False)
 
     stream.wait_stream(torch.cuda.current_stream())
@@ -710,7 +729,16 @@ def main() -> None:
     checked_outputs_device = checked_outputs.to(device)
     if args.dynamic_routing:
         torch.testing.assert_close(
-            final_output.float(), expected_final, rtol=3e-2, atol=1e-1
+            final_output_accumulator,
+            expected_final,
+            rtol=3e-2,
+            atol=1e-1,
+        )
+        torch.testing.assert_close(
+            final_output[0].float(),
+            expected_final[0],
+            rtol=3e-2,
+            atol=1e-1,
         )
     elif bool(checked_outputs.any()):
         torch.testing.assert_close(
@@ -755,7 +783,16 @@ def main() -> None:
 
     if args.dynamic_routing:
         torch.testing.assert_close(
-            final_output.float(), expected_final, rtol=3e-2, atol=1e-1
+            final_output_accumulator,
+            expected_final,
+            rtol=3e-2,
+            atol=1e-1,
+        )
+        torch.testing.assert_close(
+            final_output[0].float(),
+            expected_final[0],
+            rtol=3e-2,
+            atol=1e-1,
         )
     elif bool(checked_outputs.any()):
         torch.testing.assert_close(
@@ -774,7 +811,7 @@ def main() -> None:
     linear1_tail = local_tail_us(linear1_profile, 2, 4)
     down_tail = local_tail_us(profile, 4, 5)
     if args.dynamic_routing:
-        error = (final_output.float() - expected_final).abs()
+        error = (final_output_accumulator - expected_final).abs()
         relative_error = error / expected_final.abs().clamp_min(
             torch.finfo(torch.float32).tiny
         )
@@ -885,12 +922,14 @@ def main() -> None:
         "down_ldu_weight_ring=true "
         "down_ring_stages=2 "
         "activation_scales_task_owned=false "
-        "down_bf16_reduction=true "
+        f"down_fp32_reduction={str(args.dynamic_routing).lower()} "
+        f"down_bf16_reduction={str(not args.dynamic_routing).lower()} "
+        f"fp32_to_bf16={str(args.dynamic_routing).lower()} "
         "weight_prefetch_distance=1 "
         "queue_init=generic "
         "stu_reduction=false "
         "ldu1_enabled=true "
-        "python_output_zero=true "
+        "python_output_zero=false "
         "blockwise_ready=true "
         "weight_scale_tma=true "
         "down_input=linear1 "

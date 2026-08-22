@@ -3063,6 +3063,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         metadata,
         *,
         output_n_major: bool = False,
+        fp32_output: bool = False,
     ):
         super().__init__()
         self.weight_data = weight_data
@@ -3072,6 +3073,7 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         self.weight_tma = weight_tma
         self.metadata = metadata
         self.output_n_major = bool(output_n_major)
+        self.fp32_output = bool(fp32_output)
 
     def _on_place(self):
         if (
@@ -3124,14 +3126,19 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
             if self.output_n_major
             else (self.DOWN_TILES_PER_EXPERT, self.TILE_M, self.TILE_N)
         )
+        expected_output_dtype = (
+            torch.float32 if self.fp32_output else torch.bfloat16
+        )
         if (
-            self.final_output.dtype != torch.bfloat16
+            self.final_output.dtype != expected_output_dtype
             or tuple(self.final_output.shape) != expected_output_shape
             or not self.final_output.is_contiguous()
         ):
             layout = "[8,4096]" if self.output_n_major else "[32,128,8]"
             raise ValueError(
-                f"down final output must be BF16 contiguous {layout}"
+                "down final output must be "
+                f"{str(expected_output_dtype).removeprefix('torch.').upper()} "
+                f"contiguous {layout}"
             )
         if (
             self.metadata.dtype != torch.uint8
@@ -3322,7 +3329,8 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
     The physical worker image remains seven experts: shared plus six routed
     ranks.  LDU0 maps each routed rank to its offline-packed expert block from
     the 128-byte route record; compute continues to operate on fixed physical
-    activation records.  The output is contiguous BF16 ``[8,4096]``.
+    activation records.  The output is an FP32 ``[8,4096]`` accumulation;
+    one following task performs the sole BF16 rounding for the model handoff.
     """
 
     ROUTE_RECORD_BYTES = 128
@@ -3417,8 +3425,10 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
             raise ValueError("routed resident FFN requires one Linear-1 task per worker")
         if self.num_sms != 7 * self.LINEAR1_SLICES:
             raise ValueError("routed resident FFN requires 112 physical workers")
-        if not self.placed_down.output_n_major:
-            raise ValueError("routed resident FFN output must use [8,4096] layout")
+        if not self.placed_down.output_n_major or not self.placed_down.fp32_output:
+            raise ValueError(
+                "routed resident FFN output must use FP32 [8,4096] layout"
+            )
         if max(map(len, self.placed_down.task_queues)) > 2:
             raise ValueError("routed resident FFN supports two Down tasks per worker")
         if (
@@ -3765,11 +3775,11 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
         compute, linear1, down_weight, down_activation, output = base
         plan_address = self.layered_plans[0, sm].data_ptr()
         linear1 = linear1.copy()
-        linear1.address = plan_address
+        linear1.set_cords(addr2cords(plan_address))
         down_weight = down_weight.copy()
-        down_weight.address = plan_address
+        down_weight.set_cords(addr2cords(plan_address))
         down_activation = down_activation.copy()
-        down_activation.address = plan_address
+        down_activation.set_cords(addr2cords(plan_address))
         offsets = tuple(
             (counter, stride * self.plan_layer_bytes)
             for counter, stride in self.counter_strides

@@ -322,13 +322,72 @@ class ResidentOneLaunchDecode:
             flush=True,
         )
         self.mxfp_ffn_images = {}
+        stacked_mxfp_storage = None
+        first_cpu_image = None
+        if len(resident_layer_ids) > 1:
+            # Install the offline image in four layer-major CUDA arenas.  The
+            # token path still sees ordinary per-layer contiguous views, but
+            # adjacent layers now share virtual/page-table locality instead
+            # of occupying 4 * num_layers independent allocator segments.
+            first_cpu_image = load_mxfp_ffn_layer(
+                self.mxfp_ffn_root,
+                resident_layer_ids[0],
+                device="cpu",
+            )
+            stacked_mxfp_storage = DeepSeekV4MxfpFfnLayer(
+                **{
+                    name: torch.empty(
+                        (len(resident_layer_ids), *getattr(first_cpu_image, name).shape),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for name in (
+                        "linear1_weights",
+                        "linear1_scales",
+                        "down_weights",
+                        "down_scales",
+                    )
+                }
+            )
+            self._mxfp_ffn_stacked_storage = stacked_mxfp_storage
         for index, layer_id in enumerate(resident_layer_ids, 1):
             image_started = time.monotonic()
-            image = load_mxfp_ffn_layer(
-                self.mxfp_ffn_root,
-                layer_id,
-                device=self.device,
-            )
+            if stacked_mxfp_storage is None:
+                image = load_mxfp_ffn_layer(
+                    self.mxfp_ffn_root,
+                    layer_id,
+                    device=self.device,
+                )
+            else:
+                cpu_image = (
+                    first_cpu_image
+                    if index == 1
+                    else load_mxfp_ffn_layer(
+                        self.mxfp_ffn_root,
+                        layer_id,
+                        device="cpu",
+                    )
+                )
+                image = DeepSeekV4MxfpFfnLayer(
+                    **{
+                        name: getattr(stacked_mxfp_storage, name)[index - 1]
+                        for name in (
+                            "linear1_weights",
+                            "linear1_scales",
+                            "down_weights",
+                            "down_scales",
+                        )
+                    }
+                )
+                for name in (
+                    "linear1_weights",
+                    "linear1_scales",
+                    "down_weights",
+                    "down_scales",
+                ):
+                    getattr(image, name).copy_(getattr(cpu_image, name))
+                if index == 1:
+                    first_cpu_image = None
             self.mxfp_ffn_images[layer_id] = image
             print(
                 "DSV4_MXFP_RESIDENT_LAYER status=PASS "
@@ -807,6 +866,9 @@ class ResidentOneLaunchDecode:
         self.mxfp_ffn_output = torch.empty(
             (8, cfg.hidden_size), dtype=torch.bfloat16, device=d
         )
+        self.mxfp_ffn_accumulator = torch.empty(
+            (8, cfg.hidden_size), dtype=torch.float32, device=d
+        )
 
     def _allocate_mxfp_ffn_runtime(self) -> None:
         if self.sms < 148:
@@ -826,7 +888,7 @@ class ResidentOneLaunchDecode:
             )
         self.mxfp_internal_barrier_stop = self.launcher.num_bars
         self.mxfp_output_tma = TmaTensor(
-            self.launcher, self.mxfp_ffn_output
+            self.launcher, self.mxfp_ffn_accumulator
         ).m128n8_output("reduce")
         self._mxfp_runtime_layers: dict[
             tuple[int, int], MxfpFfnRuntimeLayer
@@ -899,10 +961,11 @@ class ResidentOneLaunchDecode:
                 | (zero_ready[output_tile] << 32)
             )
             down_records[task, 5] = self._f32_bits(1.0)
-            down_records[task, 6] = self.mxfp_ffn_output.data_ptr()
-            # Reduce-add from a schedule-owned zeroed row, and consume
-            # Linear-1 records at their per-K128 readiness frontier.
-            down_records[task, 8] = (1 | 4) << 32
+            down_records[task, 6] = self.mxfp_ffn_accumulator.data_ptr()
+            # Expert zero establishes the FP32 destination and publishes the
+            # per-tile dependency; routed experts then reduce-add.  Linear-1
+            # records remain consumable at their per-K128 readiness frontier.
+            down_records[task, 8] = 4 << 32
         down_metadata = down_records.view(torch.uint8).to(self.device)
 
         runtime_layer = MxfpFfnRuntimeLayer(
@@ -3071,10 +3134,11 @@ class ResidentOneLaunchDecode:
             down_weight,
             down_scale,
             self.mxfp_middle_records,
-            self.mxfp_ffn_output,
+            self.mxfp_ffn_accumulator,
             representative.down_tma,
             representative.down_metadata,
             output_n_major=True,
+            fp32_output=True,
         )
         resident = SchedMxfp4Mxfp8RoutedResidentFfn(
             linear1,
@@ -3097,7 +3161,6 @@ class ResidentOneLaunchDecode:
             linear1_tmas=tuple(layer.linear1_tma for layer in runtime_layers),
             down_tmas=tuple(layer.down_tma for layer in runtime_layers),
         )
-
         stages, post = self._hc_stages(
             family,
             "ffn",
@@ -3112,20 +3175,10 @@ class ResidentOneLaunchDecode:
         stages[-1] = replace(stages[-1], release_group=ffn_input_ready)
 
         # CTA placements are disjoint at the independent frontier:
-        # router [0,128), route 128, zero [129,132), split [136,152),
-        # quant [144,152).  Quant precedes split on their shared eight CTAs.
+        # router [0,128), route 128, split [136,152), and quant [144,152).
+        # Quant precedes split on their shared eight CTAs.
         stages.extend(
             (
-                self._stage(
-                    "ffn.mx.output_zero",
-                    SchedDsv4ZeroFill(
-                        self.zero_fill_gate, self.mxfp_ffn_output[0]
-                    ),
-                    3,
-                    base_sm=129,
-                    wait_group=ffn_input_ready,
-                    release_group=resident_input_ready,
-                ),
                 self._stage(
                     "ffn.hidden.quant_mxfp8",
                     SchedDsv4Mxfp8QuantFfnInput(
@@ -3204,8 +3257,17 @@ class ResidentOneLaunchDecode:
                     "ffn.mx.resident",
                     resident,
                     112,
-                    base_sm=0,
+                    base_sm=self.sms - 112,
                     wait_group_roles=((resident_input_ready, "input"),),
+                ),
+                self._stage(
+                    "ffn.mx.fp32_to_bf16",
+                    SchedDsv4Fp32ToBf16(
+                        self.mxfp_ffn_accumulator[0],
+                        self.mxfp_ffn_output[0],
+                    ),
+                    32,
+                    base_sm=0,
                 ),
                 post,
             )
@@ -3368,20 +3430,24 @@ class ResidentOneLaunchDecode:
             "resident_ffn",
             "hc_post",
         )
-        aggregate_base = runtime_config.layer_profile_event_base
+        # Slots 2..5 are task-owned resident-FFN timestamps.
+        aggregate_base = runtime_config.layer_profile_event_base + 16
         self.ffn_aggregate_events = {
             label: (aggregate_base + 2 * index, aggregate_base + 2 * index + 1)
             for index, label in enumerate(aggregate_labels)
         }
         self.ffn_aggregate_used: set[str] = set()
+        # Slots 2..5 are written directly by the resident FFN task.  Keep
+        # phase aggregates in a disjoint part of the layer-profile range.
+        phase_aggregate_base = runtime_config.layer_profile_event_base + 16
         self.phase_aggregate_events = {
             "attention": (
-                runtime_config.layer_profile_event_base,
-                runtime_config.layer_profile_event_base + 1,
+                phase_aggregate_base,
+                phase_aggregate_base + 1,
             ),
             "ffn": (
-                runtime_config.layer_profile_event_base + 2,
-                runtime_config.layer_profile_event_base + 3,
+                phase_aggregate_base + 2,
+                phase_aggregate_base + 3,
             ),
         }
 

@@ -695,13 +695,23 @@ __device__ __forceinline__ void ldu_execute_mxfp_down_activation_stream(
   const uint32_t reduce_bar = uint32_t(barrier_info >> 32);
   const uint32_t second_reduce_bar = uint32_t(load_l2_u64(
       reinterpret_cast<const uint64_t *>(second_metadata + 32)) >> 32);
+  const uint32_t resident_flags = uint32_t(load_l2(
+      reinterpret_cast<const int *>(metadata + 68)));
+  const uint32_t second_resident_flags = uint32_t(load_l2(
+      reinterpret_cast<const int *>(second_metadata + 68)));
 
   if (output_task < 32) {
-    // Python has initialized both destinations. Publish their device-scope
-    // reduction dependencies without doing any output work in the LDU.
-    asm volatile("fence.release.gpu;" ::: "memory");
-    *reinterpret_cast<volatile int *>(bars + reduce_bar) = 0;
-    *reinterpret_cast<volatile int *>(bars + second_reduce_bar) = 0;
+    // Externally initialized destinations can publish immediately.  In the
+    // shared-first FP32 path, expert zero instead releases each counter after
+    // its initial TMA copy has completed.
+    if ((resident_flags & 1U) != 0) {
+      asm volatile("fence.release.gpu;" ::: "memory");
+      *reinterpret_cast<volatile int *>(bars + reduce_bar) = 0;
+    }
+    if ((second_resident_flags & 1U) != 0) {
+      asm volatile("fence.release.gpu;" ::: "memory");
+      *reinterpret_cast<volatile int *>(bars + second_reduce_bar) = 0;
+    }
   }
 
   auto *poll_start = reinterpret_cast<TxBarrier *>(

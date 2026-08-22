@@ -3451,7 +3451,7 @@ class TmaTensor(MemoryInstruction):
         )
 
     def m128n8_output(self, action: str):
-        """Rank-3 reducible TMA view of contiguous BF16 ``[8, M]``."""
+        """Rank-3 reducible TMA view of contiguous BF16/FP32 ``[8, M]``."""
         if action not in ("store", "reduce"):
             raise ValueError("M128N8 output action must be store or reduce")
         return self._build(
