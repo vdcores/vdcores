@@ -1676,28 +1676,18 @@ __device__ __forceinline__ void task_dsv4_router_bf16_gemv_sm100(
   constexpr int kVectorElements = 8;
   constexpr int kThreads = 128;
   const int tid = __compute_tid();
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 80] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
+  (void)sm_id;
+  (void)g_events;
 
   const int input_slots = m2c.template pop<0>();
   const auto *input = static_cast<const __nv_bfloat16 *>(
       get_slot_address(smem_base, extract(input_slots)));
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 81] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
   const int weight_slots = Rows == 2 ? 0 : m2c.template pop<0>();
   const auto *weights = Rows == 2
       ? input + k
       : static_cast<const __nv_bfloat16 *>(
           get_slot_address(smem_base, extract(weight_slots)));
 
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 82] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
   const int lane = tid & 31;
   const int warp = tid >> 5;
   float partial[Rows] = {};
@@ -1729,10 +1719,6 @@ __device__ __forceinline__ void task_dsv4_router_bf16_gemv_sm100(
     }
   }
   __sync_compute_group(128);
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 83] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
   c2m.push(tid, input_slots | weight_slots);
 
   auto *warp_reduce = static_cast<float *>(task_scratch);
@@ -1748,20 +1734,12 @@ __device__ __forceinline__ void task_dsv4_router_bf16_gemv_sm100(
     }
   }
   __sync_compute_group(128);
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 84] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
   const int bias_slot = m2c.template pop<0>();
   const auto *bias = static_cast<const float *>(
       slot_2_glob_ptr(st_insts, bias_slot));
   const int output_slot = m2c.template pop<0>();
   auto *output = static_cast<float *>(
       slot_2_glob_ptr(st_insts, output_slot));
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 85] =
-        cuda::ptx::get_sreg_globaltimer();
-  }
   if (tid < Rows) {
     const float logit =
         warp_reduce[tid] + warp_reduce[Rows + tid] +
@@ -1772,10 +1750,6 @@ __device__ __forceinline__ void task_dsv4_router_bf16_gemv_sm100(
   }
   if (tid < 32) {
     __syncwarp();
-  }
-  if (tid == 0) {
-    g_events[sm_id * numProfileEvents + 86] =
-        cuda::ptx::get_sreg_globaltimer();
   }
 
   c2m.template push<31, true, false>(tid, 1U << output_slot);
@@ -3113,12 +3087,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
         shared[32 + tid] = total;
       }
       __sync_compute_group(128);
-#if defined(DAE_TRACK_PROFILE)
-      if (tid == 0) {
-        g_events[sm_id * numProfileEvents + 122] =
-            cuda::ptx::get_sreg_globaltimer();
-      }
-#endif
       square_sum = shared + 32;
       mixes = shared + 33;
       scale = metadata + metadata_splits * 32;
@@ -3180,12 +3148,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
       column_sum += __shfl_xor_sync(kCombMask, column_sum, 4);
       column_sum += __shfl_xor_sync(kCombMask, column_sum, 8);
       comb /= column_sum + dsv4HcPreRmsEpsilon;
-#if defined(DAE_TRACK_PROFILE)
-      if (tid == 0) {
-        g_events[sm_id * numProfileEvents + 94] =
-            cuda::ptx::get_sreg_globaltimer();
-      }
-#endif
 #pragma unroll
       for (int iteration = 1;
            iteration < dsv4HcPreRmsSinkhornIters;
@@ -3198,21 +3160,9 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
         column_sum += __shfl_xor_sync(kCombMask, column_sum, 4);
         column_sum += __shfl_xor_sync(kCombMask, column_sum, 8);
         comb /= column_sum + dsv4HcPreRmsEpsilon;
-#if defined(DAE_TRACK_PROFILE)
-        if (iteration == 10 && tid == 0) {
-          g_events[sm_id * numProfileEvents + 95] =
-              cuda::ptx::get_sreg_globaltimer();
-        }
-#endif
       }
       comb_values[lane] = comb;
     }
-#if defined(DAE_TRACK_PROFILE)
-    if (tid == 0) {
-      g_events[sm_id * numProfileEvents + 124] =
-          cuda::ptx::get_sreg_globaltimer();
-    }
-#endif
     // Worker warps consume the residual mailbox while warp zero runs the
     // independent coefficient transform. Keep every thread-local observer
     // queue at the same logical position without making warp zero wait.
@@ -3225,12 +3175,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     residual_slots = m2c.template pop<0>();
     const auto *residual = static_cast<const __nv_bfloat16 *>(
         get_slot_address(smem_base, extract(residual_slots)));
-#if defined(DAE_TRACK_PROFILE)
-    if (tid == 32) {
-      g_events[sm_id * numProfileEvents + 125] =
-          cuda::ptx::get_sreg_globaltimer();
-    }
-#endif
     constexpr int kWorkerThreads = 96;
     const int worker = tid - 32;
     float hidden_sum = 0.0f;
@@ -3326,12 +3270,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
         zero_vectors[1] = make_uint4(0, 0, 0, 0);
       }
     }
-#if defined(DAE_TRACK_PROFILE)
-    if (tid == 32) {
-      g_events[sm_id * numProfileEvents + 126] =
-          cuda::ptx::get_sreg_globaltimer();
-    }
-#endif
   }
 
   if constexpr (OutputFp8) {
@@ -3399,12 +3337,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
         zero_vectors[1] = make_uint4(0, 0, 0, 0);
       }
     }
-#if defined(DAE_TRACK_PROFILE)
-    if (tid == 0) {
-      g_events[sm_id * numProfileEvents + 126] =
-          cuda::ptx::get_sreg_globaltimer();
-    }
-#endif
   }
 
   __sync_compute_group(128);

@@ -7,12 +7,15 @@ from dataclasses import dataclass
 from .instructions import (
     ComputeInstruction,
     Fp8GemvUmmaCoupledSm100,
-    LduProfileLayer,
+    LduAsyncReloadBarriers,
     LduReloadBarriers,
+    LduWaitBarrier,
     LoopC,
     LoopM,
     MemoryInstruction,
     ProfileAggregate,
+    ProfileEvent,
+    ProfileLayer,
     ProfileStep,
     ResetIndirectLayer,
     TmaLoadMxfpCoupledStream,
@@ -42,6 +45,7 @@ class SequentialStage:
     wait_group: str | None = None
     release_group: str | None = None
     profile_step_event: int | None = None
+    profile_step_begin_event: int | None = None
     profile_aggregate_events: tuple[int, int] | None = None
     profile_span_begin: tuple[int, int] | None = None
     profile_span_end: tuple[int, int] | None = None
@@ -62,6 +66,8 @@ class SequentialBlock:
     barrier_banks: int = 1
     reload_barrier_start: int | None = None
     reload_mxfp_resident: bool = False
+    elide_terminal_reload: bool = False
+    async_reload_after: bool = False
 
 
 def _flatten(item, sm: int, output: list) -> None:
@@ -143,6 +149,16 @@ def _gate_load_ports(per_sm: list[list], bar_id: int, stage: str) -> None:
             port = 1 if inst.opcode & _MEM_PORT1 else 0
             first_load_by_port.setdefault(port, inst)
         if not first_load_by_port:
+            memory_commands = [
+                inst
+                for inst in instructions
+                if isinstance(inst, MemoryInstruction)
+            ]
+            if memory_commands and all(
+                inst.annotation.get("input_independent_writeback")
+                for inst in memory_commands
+            ):
+                continue
             raise ValueError(
                 f"sequential stage {stage!r} has work but no allocating load boundary"
             )
@@ -312,8 +328,8 @@ class SequentialProgram:
         stages: list[SequentialStage] | tuple[SequentialStage, ...],
         *,
         completion_barrier: bool = False,
+        initial_barrier: int | None = None,
         profile_event_count: int | None = None,
-        profile_special_slot: int = 0,
         balance_load_ports: bool = False,
         coupled_fp8_initial_phases: list[int] | tuple[int, ...] | None = None,
     ):
@@ -366,6 +382,7 @@ class SequentialProgram:
         self.barriers = []
         self.barrier_start = launcher.num_bars
         self.completion_barrier = None
+        self.initial_barrier = initial_barrier
         self.stage_stats = []
         # Placement may materialize device-side routing/index tables or padded
         # scalar storage referenced by encoded memory instructions.  Retain
@@ -421,7 +438,7 @@ class SequentialProgram:
         previous_stage = None
         previous_name = None
         previous_profile_after = False
-        for stage in self.stages:
+        for stage_index, stage in enumerate(self.stages):
             if stage.num_sms <= 0:
                 raise ValueError(f"stage {stage.name!r} must use at least one SM")
             if stage.base_sm < 0 or stage.base_sm + stage.num_sms > launcher.num_sms:
@@ -474,7 +491,19 @@ class SequentialProgram:
                 )
 
             input_bar = None
-            if stage.wait_group is not None:
+            if stage_index == 0 and initial_barrier is not None:
+                if (
+                    not stage.wait_for_previous
+                    or stage.parallel_with_previous
+                    or stage.wait_group is not None
+                    or stage.wait_group_roles
+                ):
+                    raise ValueError(
+                        f"initial dependency for stage {stage.name!r} "
+                        "requires its direct input edge"
+                    )
+                input_bar = initial_barrier
+            elif stage.wait_group is not None:
                 input_bar = group_barriers[stage.wait_group]
             elif stage.wait_group_roles:
                 # The schedule binds each consuming memory command to its
@@ -517,27 +546,14 @@ class SequentialProgram:
                         )
 
             if previous_profile_after:
-                profile_input_bar = input_bar
-                if profile_input_bar is None and stage.wait_group_roles:
-                    profile_bars = {
-                        group_barriers[group]
-                        for group, _ in stage.wait_group_roles
-                    }
-                    if len(profile_bars) == 1:
-                        profile_input_bar = next(iter(profile_bars))
-                if profile_input_bar is None:
-                    raise ValueError(
-                        "a profiled stage requires a following dependency"
-                    )
                 if self.profile_event_count == 0:
                     raise ValueError("profiled stage requires profile event capacity")
-                marker = LduProfileLayer(
+                marker = ProfileLayer(
                     config.layer_profile_event_base,
                     self.profile_event_count,
-                    special_slot=profile_special_slot,
-                ).bar(profile_input_bar)
+                )
                 for instructions in self.instructions:
-                    instructions.append(marker.copy())
+                    instructions.append(marker)
 
             if reset_mxfp_before_stage:
                 if input_bar is None:
@@ -585,10 +601,15 @@ class SequentialProgram:
                         for inst in instructions
                     )
                 ):
-                    instructions.insert(
-                        0,
-                        ProfileStep(stage.profile_step_event, begin=True),
+                    profile_prefix = []
+                    if stage.profile_step_begin_event is not None:
+                        profile_prefix.append(
+                            ProfileEvent(stage.profile_step_begin_event)
+                        )
+                    profile_prefix.append(
+                        ProfileStep(stage.profile_step_event, begin=True)
                     )
+                    instructions[0:0] = profile_prefix
                     instructions.append(
                         ProfileStep(stage.profile_step_event, begin=False)
                     )
@@ -710,13 +731,12 @@ class SequentialProgram:
             if previous_profile_after:
                 if self.profile_event_count == 0:
                     raise ValueError("profiled stage requires profile event capacity")
-                marker = LduProfileLayer(
+                marker = ProfileLayer(
                     config.layer_profile_event_base,
                     self.profile_event_count,
-                    special_slot=profile_special_slot,
-                ).bar(self.completion_barrier)
+                )
                 for instructions in self.instructions:
-                    instructions.append(marker.copy())
+                    instructions.append(marker)
         elif previous_profile_after:
             raise ValueError(
                 "a profiled final stage requires a completion barrier"
@@ -779,12 +799,17 @@ class LoopedSequentialProgram:
         compute_base = launcher.copy_cptrs()
         memory_base = launcher.copy_mptrs()
 
-        for block in self.blocks:
+        carried_barrier = None
+        for block_index, block in enumerate(self.blocks):
             if not 1 <= block.repeat <= 0xFFFF:
                 raise ValueError(f"block {block.name!r} repeat must fit in uint16")
             if block.repeat > 1 and not block.reload_after:
                 raise ValueError(
                     f"repeated block {block.name!r} must reload its dependencies"
+                )
+            if block.async_reload_after and not block.reload_after:
+                raise ValueError(
+                    f"block {block.name!r} async reload needs a completion barrier"
                 )
             if block.reload_mxfp_resident and not block.reload_after:
                 raise ValueError(
@@ -793,10 +818,23 @@ class LoopedSequentialProgram:
                 )
             if block.barrier_banks <= 0:
                 raise ValueError(f"block {block.name!r} barrier_banks must be positive")
+            if block.elide_terminal_reload:
+                if not block.reload_after:
+                    raise ValueError(
+                        f"block {block.name!r} cannot elide a disabled reload"
+                    )
+                if block_index + 1 >= len(self.blocks):
+                    raise ValueError(
+                        f"block {block.name!r} terminal dependency has no consumer"
+                    )
             bank_count = min(block.barrier_banks, block.repeat)
             while block.repeat % bank_count:
                 bank_count -= 1
             if block.reload_barrier_start is not None:
+                if block.async_reload_after:
+                    raise ValueError(
+                        f"block {block.name!r} async reload owns its local bank range"
+                    )
                 if bank_count != 1:
                     raise ValueError(
                         f"block {block.name!r} cannot combine an external "
@@ -809,6 +847,14 @@ class LoopedSequentialProgram:
                     raise ValueError(
                         f"block {block.name!r} has an invalid reload barrier start"
                     )
+            if (
+                block.elide_terminal_reload
+                and bank_count != 1
+                and not block.async_reload_after
+            ):
+                raise ValueError(
+                    f"block {block.name!r} terminal reload elision requires one barrier bank"
+                )
             outer_count = block.repeat // bank_count
             required_counters = int(bank_count > 1) + int(outer_count > 1)
             if required_counters > config.num_loop_counters:
@@ -831,20 +877,33 @@ class LoopedSequentialProgram:
                 for sm in range(launcher.num_sms)
             ]
 
+            bank_barrier_start = launcher.num_bars
+            async_ready_bar = None
+            async_worker_bar = None
+            if block.async_reload_after:
+                if launcher.num_bars >= config.max_bars - 3:
+                    raise ValueError(
+                        "looped program exceeds async reload barrier capacity"
+                    )
+                async_ready_bar = launcher.new_bar(0)
+                async_worker_bar = launcher.new_bar(0)
             segment = SequentialProgram(
                 launcher,
                 block.stages,
                 completion_barrier=block.reload_after,
+                initial_barrier=carried_barrier,
                 profile_event_count=self.profile_event_count,
                 balance_load_ports=balance_load_ports,
                 coupled_fp8_initial_phases=coupled_fp8_phases,
             )
+            carried_barrier = None
             # Coupled FP8 phase is owned by persistent per-SM LDU/compute
             # counters. Repeated command bodies therefore advance naturally;
             # they need not return to their encoded entry phase per iteration.
             coupled_fp8_phases = list(segment.coupled_fp8_final_phases)
             self.segments.append(segment)
-            barriers_per_bank = segment.barrier_stop - segment.barrier_start
+            bank_barrier_stop = launcher.num_bars
+            barriers_per_bank = bank_barrier_stop - bank_barrier_start
             if bank_count > 1:
                 if not block.reload_after or barriers_per_bank <= 0:
                     raise ValueError(
@@ -852,7 +911,7 @@ class LoopedSequentialProgram:
                     )
                 base_values = [
                     launcher.bar_values[bar_id]
-                    for bar_id in range(segment.barrier_start, segment.barrier_stop)
+                    for bar_id in range(bank_barrier_start, bank_barrier_stop)
                 ]
                 for _ in range(1, bank_count):
                     for value in base_values:
@@ -868,12 +927,59 @@ class LoopedSequentialProgram:
                         if not inst.opcode & _MEM_BARRIER:
                             continue
                         bar_id = _bar_id(inst)
-                        if segment.barrier_start <= bar_id < segment.barrier_stop:
+                        if bank_barrier_start <= bar_id < bank_barrier_stop:
                             inst.group()
+            inner_reg = 0
+            outer_reg = int(bank_count > 1)
+            if block.async_reload_after:
+                workers = config.async_barrier_reload_workers
+                worker_base = 32
+                if worker_base + workers > launcher.num_sms:
+                    raise ValueError(
+                        f"block {block.name!r} has no disjoint async reload workers"
+                    )
+                clear_count = (
+                    segment.completion_barrier + 1 - segment.barrier_start
+                )
+                if clear_count <= 0:
+                    raise ValueError(
+                        f"block {block.name!r} has no barrier range to clear"
+                    )
+                width, remainder = divmod(clear_count, workers)
+                for sm in range(launcher.num_sms):
+                    segment.instructions[sm].insert(
+                        0,
+                        LduWaitBarrier(
+                            outer_reg,
+                            special_slot=3,
+                        )
+                        .bar(async_ready_bar)
+                        .group(),
+                    )
+                    worker = sm - worker_base
+                    if 0 <= worker < workers:
+                        local_count = width + int(worker < remainder)
+                        local_offset = (
+                            worker * width + min(worker, remainder)
+                        )
+                        segment.instructions[sm].append(
+                            LduAsyncReloadBarriers(
+                                launcher.bars_src,
+                                segment.barrier_start + local_offset,
+                                local_count,
+                                segment.completion_barrier,
+                                special_slot=2,
+                                shift_target=True,
+                                bank_ready_completion=True,
+                                bank_ready_leader=worker == 0,
+                            )
+                            .bar(async_worker_bar)
+                            .group()
+                        )
             self.barriers.extend(
                 range(
-                    segment.barrier_start,
-                    segment.barrier_start + barriers_per_bank * bank_count,
+                    bank_barrier_start,
+                    bank_barrier_start + barriers_per_bank * bank_count,
                 )
             )
             self.stage_stats.extend(segment.stage_stats)
@@ -881,9 +987,9 @@ class LoopedSequentialProgram:
             for sm in range(launcher.num_sms):
                 self.instructions[sm].extend(segment.instructions[sm])
 
-            inner_reg = 0
-            outer_reg = int(bank_count > 1)
-            if block.reload_after:
+            if block.reload_after and not (
+                block.elide_terminal_reload and block.repeat == 1
+            ) and not block.async_reload_after:
                 # Keep the reload in the repeated memory body. It waits for
                 # the current bank's final STU completion and sits ahead of
                 # every following LDU command in both port FIFOs, providing
@@ -905,6 +1011,9 @@ class LoopedSequentialProgram:
                     reload_count,
                     2,
                     reset_mxfp_resident=block.reload_mxfp_resident,
+                    skip_final_loop_reg=outer_reg
+                    if block.elide_terminal_reload
+                    else None,
                 ).bar(segment.completion_barrier)
                 if bank_count > 1:
                     reload.group()
@@ -937,6 +1046,15 @@ class LoopedSequentialProgram:
                             ),
                         )
                     )
+            if block.elide_terminal_reload:
+                final_bank = (block.repeat - 1) % bank_count
+                carried_barrier = (
+                    segment.completion_barrier
+                    + final_bank * barriers_per_bank
+                )
+
+        if carried_barrier is not None:
+            raise ValueError("terminal dependency barrier was not consumed")
 
         max_compute = max(
             sum(isinstance(inst, ComputeInstruction) for inst in instructions)

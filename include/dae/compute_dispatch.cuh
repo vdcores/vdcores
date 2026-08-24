@@ -34,6 +34,7 @@
   uint32_t &nvfp4_umma_pipeline_phase_mask, \
   uint32_t &mxfp8_coupled_pair_base, \
   uint32_t &internal_ring_full_phase_mask, \
+  uint32_t &mxfp_resident_phase, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
   const CUtensorMap *tma_descs, \
@@ -85,14 +86,17 @@ DAE_COMPUTE_OP_HANDLER(OP_COPY) {
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ZERO_FILL) {
   DAE_UNUSED(sm_id, pc, count, finish, scratch_space, st_insts, g_events);
-  const int gate_slot = m2c.template pop<0>();
+  const bool has_gate = inst.args[1] != 0;
+  const int gate_slot = has_gate ? m2c.template pop<0>() : 0;
   const int output_slot = m2c.template pop<0>();
   auto *output = static_cast<uint32_t *>(
       get_slot_address(smem_base, extract(output_slot)));
   for (int word = thread_id; word < inst.args[0]; word += 128) {
     output[word] = 0;
   }
-  c2m.push(thread_id, gate_slot);
+  if (has_gate) {
+    c2m.push(thread_id, gate_slot);
+  }
   c2m.template push<0, true>(thread_id, output_slot);
 }
 
@@ -131,21 +135,28 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100) {
   const uint64_t plan_address = uint64_t(inst.args[0]) |
       (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
   const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+#if !defined(DAE_TRACK_PROFILE)
   if (thread_id == 0) {
     g_events[sm_id * numProfileEvents + 2] =
         cuda::ptx::get_sreg_globaltimer();
   }
+#endif
   const auto *linear1_metadata = reinterpret_cast<const uint8_t *>(
       load_l2_u64(plan + 0));
   task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
       512, 2, 8, true, true, true>(
       smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs,
       linear1_metadata, global_bars, m2c, c2m
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+      , sm_id, g_events
+#endif
       );
+#if !defined(DAE_TRACK_PROFILE)
   if (thread_id == 0) {
     g_events[sm_id * numProfileEvents + 4] =
         cuda::ptx::get_sreg_globaltimer();
   }
+#endif
 
   const int down_task_count = load_l2(
       reinterpret_cast<const int *>(plan + 3));
@@ -157,14 +168,21 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_RESIDENT_FFN_SM100) {
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
         true, true, false, false, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
-        tma_descs, down_metadata, global_bars, m2c, c2m, task
+        tma_descs, down_metadata, global_bars, m2c, c2m, task,
+        nullptr, -1, mxfp_resident_phase
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+        , sm_id, g_events
+#endif
         );
   }
+  mxfp_resident_phase ^= 1U;
+#if !defined(DAE_TRACK_PROFILE)
   if (thread_id == 0) {
     const uint64_t finish_time = cuda::ptx::get_sreg_globaltimer();
     g_events[sm_id * numProfileEvents + 5] = finish_time;
     g_events[sm_id * numProfileEvents + 3] = finish_time;
   }
+#endif
 #endif
 }
 
@@ -176,45 +194,114 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_ROUTED_RESIDENT_FFN_SM100) {
   const uint64_t plan_address = uint64_t(inst.args[0]) |
       (uint64_t(inst.args[1]) << 16) | (uint64_t(inst.args[2]) << 32);
   const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + mxfpFfnDetailComputeBegin] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
+#if !defined(DAE_TRACK_PROFILE)
   if (thread_id == 0) {
     g_events[sm_id * numProfileEvents + 2] =
         cuda::ptx::get_sreg_globaltimer();
   }
-  const auto *linear1_metadata = reinterpret_cast<const uint8_t *>(
-      load_l2_u64(plan + 0));
-  task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
-      512, 2, 8, true, true, true>(
-      smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs,
-      linear1_metadata, global_bars, m2c, c2m);
+#endif
+  const bool has_linear1 = load_l2_u64(plan + 12) != 0;
+  if (has_linear1) {
+    const auto *linear1_metadata = reinterpret_cast<const uint8_t *>(
+        load_l2_u64(plan + 0));
+    task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100<
+        512, 2, 8, true, true, true>(
+        smem_base, tmem_base_ptr, tmem_mma_barrier, tma_descs,
+        linear1_metadata, global_bars, m2c, c2m
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+        , sm_id, g_events
+#endif
+        );
+  }
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + mxfpFfnDetailComputeLinear1End] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
+#if !defined(DAE_TRACK_PROFILE)
   if (thread_id == 0) {
     g_events[sm_id * numProfileEvents + 4] =
         cuda::ptx::get_sreg_globaltimer();
   }
+#endif
 
   const auto *route_record = reinterpret_cast<const uint8_t *>(
       load_l2_u64(plan + 8));
-  const int route_rank = load_l2(
+  const int plan_route_rank = load_l2(
       reinterpret_cast<const int *>(plan + 9));
   const int down_task_count = load_l2(
       reinterpret_cast<const int *>(plan + 3));
   for (int task = 0; task < down_task_count; ++task) {
     const auto *down_metadata = reinterpret_cast<const uint8_t *>(
         load_l2_u64(plan + 1 + task));
+    const uint32_t down_flags = uint32_t(load_l2(
+        reinterpret_cast<const int *>(down_metadata + 68)));
+    const int task_route_rank = load_l2(
+        reinterpret_cast<const int *>(down_metadata + 72));
+    const int route_rank =
+        (down_flags & dae_mxfp_resident_ffn::kDownPerTaskRoute)
+            ? task_route_rank
+            : plan_route_rank;
     task_mxfp4_mxfp8_down_fixed_ring_sm100<
         8, 2, 256, __bar_cgroup, 512,
         numSlots * slotSizeKb * 1024, dynamicSmemBytes, 0,
-        true, true, true, true, true>(
+        true, true, true, true, false>(
         smem_base, tmem_base_ptr, tmem_mma_barrier,
         tma_descs, down_metadata, global_bars, m2c, c2m, task,
-        route_record, route_rank);
+        route_record, route_rank, mxfp_resident_phase
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+        , sm_id, g_events
+#endif
+        );
   }
+  mxfp_resident_phase ^= 1U;
   const int output_token = m2c.template pop<0>();
+#if defined(DAE_STU_HISTORY_PROFILE)
+  const uint32_t warp_ptr = __shfl_sync(0xFFFFFFFFU, c2m.ptr, 0);
+  const uint32_t warp_ptr_match =
+      __ballot_sync(0xFFFFFFFFU, c2m.ptr == warp_ptr);
+  if ((thread_id & (numThreadsPerWarp - 1)) == 0) {
+    if (thread_id == 0) {
+      g_events[sm_id * numProfileEvents + stuRawOutputTokenEvent] =
+          output_token;
+    }
+    g_events[sm_id * numProfileEvents + stuRawPtrMatchEventBase +
+             thread_id / numThreadsPerWarp] = warp_ptr_match;
+    g_events[sm_id * numProfileEvents + stuRawPtrEventBase +
+             thread_id / numThreadsPerWarp] = c2m.ptr;
+    g_events[sm_id * numProfileEvents + stuRawArrivalEventBase +
+             thread_id / numThreadsPerWarp] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
   c2m.template push<0, true, false>(thread_id, 1U << output_token);
+#if defined(DAE_STU_HISTORY_PROFILE)
+  if ((thread_id & (numThreadsPerWarp - 1)) == 0) {
+    g_events[sm_id * numProfileEvents + stuRawPostEventBase +
+             thread_id / numThreadsPerWarp] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (thread_id == 0) {
+    g_events[sm_id * numProfileEvents + mxfpFfnDetailComputeEnd] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
+#if !defined(DAE_TRACK_PROFILE)
   if (thread_id == 0) {
     const uint64_t finish_time = cuda::ptx::get_sreg_globaltimer();
     g_events[sm_id * numProfileEvents + 5] = finish_time;
     g_events[sm_id * numProfileEvents + 3] = finish_time;
   }
+#endif
 #endif
 }
 
@@ -424,7 +511,8 @@ DAE_COMPUTE_OP_HANDLER(OP_FP8_GEMV_UMMA_COUPLED_SM100) {
              global_bars, g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_fp8_gemv_umma_coupled_sm100(
-      inst.args[0], inst.args[1], mxfp8_coupled_pair_base, smem_base,
+      inst.args[0], inst.args[1],
+      mxfp8_coupled_pair_base, smem_base,
       tmem_base_ptr, tmem_mma_barrier, m2c, c2m);
 #endif
 }
@@ -590,9 +678,15 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
   DAE_UNUSED(thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  task_dsv4_attention_split_reduce_fp8_sm100<2>(
-      sm_id, inst.args[0], inst.args[1], inst.args[2],
-      get_slot_address(smem_base, numSlots), st_insts, m2c, c2m, g_events);
+  if (inst.args[0] == 0) {
+    task_dsv4_attention_context1_fp8_sm100<2>(
+        inst.args[1], inst.args[2], smem_base,
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+  } else {
+    task_dsv4_attention_split_reduce_fp8_sm100<2>(
+        sm_id, inst.args[0], inst.args[1], inst.args[2],
+        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m, g_events);
+  }
 #endif
 }
 
@@ -1368,19 +1462,29 @@ DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
-  DAE_UNUSED(pc, count, finish, smem_base, tmem_base_ptr,
+  DAE_UNUSED(pc, finish, smem_base, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, st_insts);
   // Diagnostic-only schedule marker.  Synchronize only the four compute
   // warps: the memory warps are independent VM roles and never join this
   // barrier.  Production images do not select this opcode.
   const int mode = inst.args[1];
+  int event_id = inst.args[0];
+#if defined(DAE_TRACK_PROFILE)
+  if (mode == 6) {
+    constexpr int kProfileCounterReg = numComputeLoopCounters - 1;
+    const uint32_t profile_index = count[kProfileCounterReg]++;
+    if (profile_index >= inst.args[2]) {
+      asm volatile("trap;");
+    }
+    event_id += int(profile_index);
+  }
+#endif
   int dependency_slots = 0;
   if (mode == 1) {
     dependency_slots = m2c.template pop<0>();
   }
   __sync_compute_group(128);
   if (thread_id == 0) {
-    const int event_id = inst.args[0];
     if (event_id >= 2 && event_id < numProfileEvents) {
       uint64_t &event = g_events[sm_id * numProfileEvents + event_id];
 #if defined(DAE_TRACK_PROFILE)
@@ -1497,6 +1601,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   uint32_t &nvfp4_umma_pipeline_phase_mask,
   uint32_t &mxfp8_coupled_pair_base,
   uint32_t &internal_ring_full_phase_mask,
+  uint32_t &mxfp_resident_phase,
   uint64_t *scratch_space,
   MInst *st_insts,
   const CUtensorMap *tma_descs,
@@ -1523,7 +1628,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
     ;
 
   #define DAE_INVOKE_COMPUTE_HANDLER(name) \
-    DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, mxfp8_coupled_pair_base, internal_ring_full_phase_mask, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events)
+    DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask, mxfp8_coupled_pair_base, internal_ring_full_phase_mask, mxfp_resident_phase, scratch_space, st_insts, tma_descs, global_bars, m2c, c2m, g_events)
 
   if constexpr (has_dsv4_hc_post) {
     if (inst.opcode == OP_DSV4_HC_POST) {

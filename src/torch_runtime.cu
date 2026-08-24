@@ -1051,6 +1051,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("layer_profile_event_base") = layerProfileEventBase;
   config.attr("reload_profile_event_base") = reloadProfileEventBase;
   config.attr("track_profile_event_base") = trackProfileEventBase;
+  config.attr("detail_profile_event_base") = detailProfileEventBase;
   config.attr("num_loop_counters") = numComputeLoopCounters;
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
@@ -1062,6 +1063,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       mxfp4Mxfp8TmaScaleStages;
   config.attr("mxfp4_mxfp8_direct_tma_enabled") =
       mxfp4Mxfp8DirectTmaEnabled;
+  config.attr("async_barrier_reload_enabled") =
+      dae2AsyncBarrierReload;
+  config.attr("async_barrier_reload_workers") =
+      asyncBarrierReloadWorkers;
   // auto flag = m.def_submodule("flag", "DAE2 Instruction Flags");
   // flag.attr("jump") = MEM_OP_FLAGS_JUMP;
   // flag.attr("writeback") = MEM_OP_FLAGS_WRITEBACK;

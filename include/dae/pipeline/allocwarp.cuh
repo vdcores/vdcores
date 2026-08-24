@@ -20,9 +20,20 @@ static constexpr uint16_t repeatSkipCountMask = 0x1F00U;
 static constexpr int repeatSkipCountShift = 8;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
+static __device__ __forceinline__ void allocwarp_wait_ldu_publication(
+    const int lane_id,
+    cuda::barrier<cuda::thread_scope_block> *barrier) {
+  if (lane_id == 0)
+    barrier->arrive_and_wait();
+  // Lane zero exclusively owns the mailbox. The next allocator iteration's
+  // full-mask shuffle reconverges the warp before any lane-derived state is
+  // consumed, so a second explicit warp barrier is unnecessary here.
+}
+
 static __device__ __forceinline__ void
 allocwarp_observe_mxfp_resident_down_ready(
-    const MInst &inst, int *bars, uint64_t *tmem_mma_barriers) {
+    const MInst &inst, int *bars, uint64_t *tmem_mma_barriers,
+    const uint32_t resident_phase) {
   using TxBarrier = cutlass::arch::ClusterTransactionBarrier;
   // The allocator has published both resident LDU commands and has no more
   // useful issue work. Keep the existing overlap by observing the two
@@ -31,10 +42,14 @@ allocwarp_observe_mxfp_resident_down_ready(
       tmem_mma_barriers + mxfpDownResidentLdu1PollStartBarrier);
   auto *reduction_ready = reinterpret_cast<TxBarrier *>(
       tmem_mma_barriers + mxfpDownResidentReductionReadyBarrierBase);
-  poll_start->wait(0);
   const auto *plan = reinterpret_cast<const uint64_t *>(inst.address);
-  #pragma unroll
-  for (int task = 0; task < 2; ++task) {
+  const int down_task_count = load_l2(
+      reinterpret_cast<const int *>(plan + 3));
+  if (!(inst.arg & dae_mxfp_resident_ffn::kCoupledDownOnly)) {
+    poll_start->wait(resident_phase);
+  }
+  #pragma unroll 1
+  for (int task = 0; task < down_task_count; ++task) {
     const auto *metadata = reinterpret_cast<const uint8_t *>(
         load_l2_u64(plan + 1 + task));
     const uint32_t task_bar = uint32_t(load_l2_u64(
@@ -70,6 +85,7 @@ __device__ __forceinline__ void allocwarp_execute(
   MemoryVirtualCore di;
   di.init();
   uint32_t indirect_layer_index = 0;
+  uint32_t mxfp_resident_down_phase = 0;
   if (lane_id < numComputeLoopCounters) {
     di.jmp_cnt = initial_loop_counts.values[lane_id];
   }
@@ -86,7 +102,6 @@ __device__ __forceinline__ void allocwarp_execute(
   uint64_t issue_barrier_contended = 0;
   uint64_t allocation_instructions = 0;
 #endif
-
   __syncwarp();
 
   while (di.pred_continue) {
@@ -122,6 +137,21 @@ __device__ __forceinline__ void allocwarp_execute(
     // allocator index. The loop control advances it once per logical body,
     // replacing per-load address-arithmetic instruction sequences.
     const int decoded_op = op(inst.opcode);
+#if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
+    constexpr uint16_t kProfileStoreEventFlag = 1U << 15;
+    constexpr uint16_t kProfileStoreAllocationFlag = 1U << 14;
+    constexpr uint16_t kProfileStoreEventMask = (1U << 14) - 1;
+    const bool profile_store_allocation =
+        decoded_op == op(OP_ALLOC_WB_TMA_STORE_1D) &&
+        (inst.arg & (kProfileStoreEventFlag |
+                     kProfileStoreAllocationFlag)) ==
+            (kProfileStoreEventFlag | kProfileStoreAllocationFlag);
+    const int profile_store_event = inst.arg & kProfileStoreEventMask;
+    if (profile_store_allocation && lane_id == 0) {
+      g_events[sm_id * numProfileEvents + profile_store_event] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+#endif
     if ((decoded_op >= op(OP_ALLOC_LAYER_TMA_LOAD_1D) &&
          decoded_op <= op(OP_ALLOC_LAYER_INDEXED_TMA_LOAD_1D)) ||
         decoded_op == op(OP_ALLOC_LAYER_ROUTED_TMA_LOAD_BASE_1D)) {
@@ -157,6 +187,18 @@ __device__ __forceinline__ void allocwarp_execute(
       // __smprint(0, lane_id, "[Group] Updated: shift %x: bar=%d arg=%d nslot=%d bar=%d",
       //   shift, inst.bar(), inst.arg, inst.nslot(), inst.opcode & MEM_OP_FLAGS_BARRIER);
     }
+    if (decoded_op == op(OP_LDU_ASYNC_RELOAD_BARRIERS) &&
+        (inst.opcode & MEM_OP_FLAGS_GROUP)) {
+      constexpr uint16_t kShiftTarget = 1U << 13;
+      const int bank_shift = shift >> slotBits;
+      const int count = inst.size & ((1U << slotBits) - 1);
+      const int input_bar = (inst.size >> slotBits) + bank_shift;
+      if (inst.arg & kShiftTarget) {
+        inst.arg = (inst.arg & ~((1U << 10) - 1)) |
+            ((inst.arg + bank_shift) & ((1U << 10) - 1));
+      }
+      inst.size = count | (input_bar << slotBits);
+    }
 
 #if DAE_ENABLE_MXFP4_MXFP8_DIRECT_TMA
     if (decoded_op == op(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D)) {
@@ -171,7 +213,8 @@ __device__ __forceinline__ void allocwarp_execute(
       // allocator arrivals until a later task is about to overwrite operand
       // zero; a single-tile schedule pays no reuse rendezvous.
       if (operand == 0 && mx_scale_bases_inflight) {
-        ldu_control_publish_barrier->arrive_and_wait();
+        allocwarp_wait_ldu_publication(
+            lane_id, ldu_control_publish_barrier);
         mx_scale_bases_inflight = false;
       }
       if (operand == 1) {
@@ -205,6 +248,20 @@ __device__ __forceinline__ void allocwarp_execute(
           di.pred_allocate, di.slot_alloc);
 
         if (di.slot_alloc >= 0) {
+#if defined(DAE_TRACK_PROFILE)
+          if (lane_id == 0 &&
+              decoded_op == op(OP_ALLOC_WB_RAW_ADDRESS) &&
+              inst.size != 0) {
+            g_events[sm_id * numProfileEvents + int(inst.size) - 1] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
+#if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
+          if (profile_store_allocation && lane_id == 0) {
+            g_events[sm_id * numProfileEvents + profile_store_event + 1] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
 #if defined(DAE_TRACK_PROFILE)
           if (lane_id == 0) {
             ++allocation_instructions;
@@ -357,30 +414,35 @@ __device__ __forceinline__ void allocwarp_execute(
           indirect_layer_index = 0;
         }
         break;
-        case op(OP_LDU_RELOAD_BARRIERS):
-        case op(OP_LDU_PROFILE_LAYER): {
+        case op(OP_LDU_RELOAD_BARRIERS): {
+          constexpr uint16_t kSkipFinalLoop = 1U << 14;
+          if (inst.arg & kSkipFinalLoop) {
+            const int loop_reg = (inst.arg >> 10) & 0x3;
+            // Terminal elision is valid only for a one-bank repeated block,
+            // so its reload is immediately followed by the authoritative
+            // outer LOOPM descriptor. Keep the full reload-range width in
+            // inst.size; full-model images can span more than 255 barriers.
+            const int loop_count = smem_minsts[pc + 1].size;
+            const int completed_backedges = __shfl_sync(
+                ALL_THREADS, di.jmp_cnt, loop_reg);
+            // The following OP_LOOP increments the counter. On the final
+            // body, leave the completion barrier at zero and let the next
+            // activation load consume it directly instead of draining both
+            // LDU FIFOs through a terminal device-wide reload.
+            if (completed_backedges + 1 == loop_count) {
+              break;
+            }
+          }
           if (lane_id == 0) {
             const int special_slot = inst.nslot();
-            const bool shared_reload_mailbox =
-                decoded_op == op(OP_LDU_RELOAD_BARRIERS);
             if (special_slot < numSlots ||
-                special_slot >= numSlots + numSpecialSlots ||
-                (!shared_reload_mailbox &&
-                 special_slot + 1 >= numSlots + numSpecialSlots)) {
+                special_slot >= numSlots + numSpecialSlots) {
               asm volatile("trap;");
             }
             st_insts[special_slot] = inst;
             for (int port = 0; port < 2; ++port) {
-              // Reload is immutable and its completion handshake prevents a
-              // later control command from overwriting this shared mailbox.
-              // Profiling retains its historic per-port mailbox pair.
-              const int slot = special_slot +
-                  (shared_reload_mailbox ? 0 : port);
-              if (!shared_reload_mailbox) {
-                st_insts[slot] = inst;
-              }
               LdCmd ld;
-              ld.init(slot, 0, inst.opcode);
+              ld.init(special_slot, 0, inst.opcode);
               m2ld[port].put(ld.raw);
               m2ld[port].commit();
               m2ld[port].advance();
@@ -389,7 +451,53 @@ __device__ __forceinline__ void allocwarp_execute(
           __syncwarp();
           // Do not allow a later control command to overwrite the metadata
           // until both LDU handlers have consumed the command.
-          ldu_control_publish_barrier->arrive_and_wait();
+          allocwarp_wait_ldu_publication(
+              lane_id, ldu_control_publish_barrier);
+        }
+        break;
+        case op(OP_LDU_ASYNC_RELOAD_BARRIERS): {
+          if constexpr (dae2AsyncBarrierReload) {
+            if (lane_id == 0) {
+              const int special_slot = inst.nslot();
+              if (special_slot < numSlots ||
+                  special_slot >= numSlots + numSpecialSlots) {
+                asm volatile("trap;");
+              }
+              st_insts[special_slot] = inst;
+              for (int port = 0; port < 2; ++port) {
+                LdCmd ld;
+                ld.init(special_slot, 0, inst.opcode);
+                m2ld[port].put(ld.raw);
+                m2ld[port].commit();
+                m2ld[port].advance();
+              }
+            }
+            __syncwarp();
+            allocwarp_wait_ldu_publication(
+                lane_id, ldu_control_publish_barrier);
+          }
+        }
+        break;
+        case op(OP_LDU_WAIT_BARRIER): {
+          if constexpr (dae2AsyncBarrierReload) {
+            const int generation = __shfl_sync(
+                ALL_THREADS, di.jmp_cnt, inst.arg);
+            if (lane_id == 0) {
+              inst.arg = generation;
+              const int special_slot = inst.nslot();
+              st_insts[special_slot] = inst;
+              for (int port = 0; port < 2; ++port) {
+                LdCmd ld;
+                ld.init(special_slot, 0, inst.opcode);
+                m2ld[port].put(ld.raw);
+                m2ld[port].commit();
+                m2ld[port].advance();
+              }
+            }
+            __syncwarp();
+            allocwarp_wait_ldu_publication(
+                lane_id, ldu_control_publish_barrier);
+          }
         }
         break;
         case op(OP_TMA_LOAD_MX_COUPLED_STREAM): {
@@ -400,6 +508,24 @@ __device__ __forceinline__ void allocwarp_execute(
           // handler consumes the next queue entry locally.
           if (lane_id == 0) {
             const int special_slot = inst.nslot();
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+            const uint16_t stream_kind =
+                inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask;
+            int detail_event = -1;
+            if (stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
+              detail_event = mxfpFfnDetailAllocatorLinear1;
+            } else if (
+                stream_kind == dae_mxfp_resident_ffn::kCoupledDownWeight) {
+              detail_event = mxfpFfnDetailAllocatorDownWeight;
+            } else if (
+                stream_kind == dae_mxfp_resident_ffn::kCoupledDownActivation) {
+              detail_event = mxfpFfnDetailAllocatorDownActivation;
+            }
+            if (detail_event >= 0) {
+              g_events[sm_id * numProfileEvents + detail_event] =
+                  cuda::ptx::get_sreg_globaltimer();
+            }
+#endif
             st_insts[special_slot] = inst;
             LdCmd ld;
             ld.init(uint8_t(special_slot), 0, inst.opcode);
@@ -409,7 +535,9 @@ __device__ __forceinline__ void allocwarp_execute(
             if ((inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
                     dae_mxfp_resident_ffn::kCoupledDownActivation) {
               allocwarp_observe_mxfp_resident_down_ready(
-                  inst, bars, tmem_mma_barriers);
+                  inst, bars, tmem_mma_barriers,
+                  mxfp_resident_down_phase);
+              mxfp_resident_down_phase ^= 1U;
             }
           }
         }

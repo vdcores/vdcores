@@ -67,6 +67,9 @@ void dae_ffn_linear1_direct_kernel(
       8, false, false, false>(
       smem_base, tmem_base_ptr, nullptr, tma_descs,
       metadata + worker * 128, bars, m2c, c2m
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+      , -1, nullptr
+#endif
       );
 
   __syncthreads();

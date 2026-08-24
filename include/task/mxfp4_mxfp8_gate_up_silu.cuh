@@ -154,6 +154,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     int *global_bars,
     M2CQueue &m2c,
     C2MQueue &c2m
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+    , const int detail_sm_id, uint64_t *detail_events
+#endif
     ) {
   using namespace cute;
   using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
@@ -193,6 +196,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   constexpr int kNumKTiles = 4096 / K;
   constexpr int kScaleVector = 32;
   constexpr int kWeightPackedBytes = kTileM * K / 2;
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  uint64_t detail_weight_full_wait_ns = 0;
+  uint64_t detail_umma_full_wait_ns = 0;
+#endif
 
   using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
   using Atom = SM100_MMA_MXF8F6F4_SS<
@@ -497,7 +504,10 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   auto c_acc = cta_coord_c(make_coord(_, _), _0{}, _0{});
   auto tiled_t2r = make_tmem_copy(TmemLoad{}, gate_tmem);
 
-  #pragma unroll
+  // Keep one compact gate/up body and one compact K-tile body in the full
+  // resident image.  The isolated FFN benefits from cloning either loop, but
+  // the larger instruction footprint regresses the complete 43-layer image.
+  #pragma unroll 1
   for (int projection = 0; projection < 2; ++projection) {
     const uint16_t descriptor_index =
         projection == 0 ? gate_tma_index : up_tma_index;
@@ -559,7 +569,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
             tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
       }
     } else if (warp >= 2) {
-      #pragma unroll 2
+      #pragma unroll 1
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;
@@ -637,7 +647,18 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
               projection * kNumKTiles + retire_tile;
           const int retire_stage = retire_operation % RingStages;
           const int retire_phase = (retire_operation / RingStages) & 1;
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          const uint64_t detail_umma_wait_begin =
+              cuda::ptx::get_sreg_globaltimer();
+#endif
           umma_full[retire_stage].wait(retire_phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          if constexpr (ResidentAllTma) {
+            detail_umma_full_wait_ns +=
+                cuda::ptx::get_sreg_globaltimer() -
+                detail_umma_wait_begin;
+          }
+#endif
           if (lane == 0) {
             stage_empty[retire_stage].arrive();
           }
@@ -663,7 +684,18 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
               projection * kNumKTiles + retire_tile;
           const int retire_stage = retire_operation % RingStages;
           const int retire_phase = (retire_operation / RingStages) & 1;
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          const uint64_t detail_umma_wait_begin =
+              cuda::ptx::get_sreg_globaltimer();
+#endif
           umma_full[retire_stage].wait(retire_phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          if constexpr (ResidentAllTma) {
+            detail_umma_full_wait_ns +=
+                cuda::ptx::get_sreg_globaltimer() -
+                detail_umma_wait_begin;
+          }
+#endif
           if (lane == 0) {
             stage_empty[retire_stage].arrive();
           }
@@ -673,7 +705,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         }
       }
     } else if (warp == 0) {
-      #pragma unroll 2
+      #pragma unroll 1
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;
@@ -701,7 +733,16 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         } else if constexpr (ResidentAllTma) {
           // The single resident token covers transformed weight, SFA, SFB,
           // and (for gate tile zero) the immutable full activation image.
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          const uint64_t detail_weight_wait_begin =
+              cuda::ptx::get_sreg_globaltimer();
+#endif
           weight_full[stage].wait(phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          detail_weight_full_wait_ns +=
+              cuda::ptx::get_sreg_globaltimer() -
+              detail_weight_wait_begin;
+#endif
         } else {
           weight_full[stage].wait(phase);
           scale_full[stage].wait(phase);
@@ -988,4 +1029,19 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   } else {
     c2m.template push<31, true, false>(tid, output_slots);
   }
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (detail_events != nullptr && detail_sm_id >= 0) {
+    if (tid == 0) {
+      detail_events[
+          detail_sm_id * numProfileEvents +
+          mxfpFfnDetailComputeLinear1WeightWaitNs] =
+          detail_weight_full_wait_ns;
+    } else if (tid == 2 * numThreadsPerWarp) {
+      detail_events[
+          detail_sm_id * numProfileEvents +
+          mxfpFfnDetailComputeLinear1UmmaWaitNs] =
+          detail_umma_full_wait_ns;
+    }
+  }
+#endif
 }

@@ -95,7 +95,8 @@ void dae2(
   } else if (threadIdx.x == numQueueBarriers) {
     init(&ldu_control_barrier, 2);
   } else if (threadIdx.x == numQueueBarriers + 1) {
-    init(&ldu_control_publish_barrier, numThreadsPerWarp + 2);
+    init(&ldu_control_publish_barrier,
+         numThreadsLduControlPublishBarrier);
   }
 
   __shared__ int m2c_data[numQueueElements];
@@ -105,7 +106,7 @@ void dae2(
   SizeBoundedBarrierQueue<int, numQueueElements, dae2M2CObserverWait> m2c {
     .barriers = barriers[0], .data = m2c_data, .ptr = 0
   };
-  SizeBoundedBarrierAllocQueue<numQueueElements> c2m {
+  SizeBoundedBarrierAllocQueue<numQueueElements, dae2C2MPollWait> c2m {
     barriers[1], c2m_data, 0, &slot_avail
   };
   SizeBoundedBarrierQueue<int, numQueueElements> m2ld[2] = {
@@ -199,6 +200,7 @@ void dae2(
     uint32_t nvfp4_umma_pipeline_phase_mask = 0;
     uint32_t mxfp8_coupled_pair_base = 0;
     uint32_t internal_ring_full_phase_mask = 0;
+    uint32_t mxfp_resident_phase = 0;
     bool finish = false;
 
     while (!finish) {
@@ -211,6 +213,7 @@ void dae2(
         fp8_umma_pipeline_phase_mask, nvfp4_umma_pipeline_phase_mask,
         mxfp8_coupled_pair_base,
         internal_ring_full_phase_mask,
+        mxfp_resident_phase,
         scratch_space, st_insts, tma_descs, bars, m2c, c2m, g_events);
       // if (blockIdx.x == 0 && threadIdx.x == 0) {
       //   printf("[COMP] after execution: pc=%d, opcode=%04x\n", pc-1, inst.opcode);

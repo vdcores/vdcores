@@ -99,6 +99,8 @@ def benchmark_split_attention(
     with_oa: bool = False,
     split64: bool = False,
     detail_profile: bool = False,
+    launcher_sms_override: int | None = None,
+    producer_base_sm: int = 0,
 ) -> None:
     generator = torch.Generator(device=device).manual_seed(20260813 + rows)
     split_size = 64 if split64 else 32
@@ -129,7 +131,20 @@ def benchmark_split_attention(
     # benchmark side so exact comparisons cover only bytes the task owns.
     packed = torch.zeros((64, 4, 2048), dtype=torch.uint8, device=device)
 
-    launcher_sms = num_splits if producer_only else 128
+    minimum_launcher_sms = max(
+        producer_base_sm + num_splits,
+        num_splits if producer_only else 128,
+    )
+    launcher_sms = (
+        minimum_launcher_sms
+        if launcher_sms_override is None
+        else int(launcher_sms_override)
+    )
+    if launcher_sms < minimum_launcher_sms:
+        raise ValueError(
+            f"launcher SM override {launcher_sms} is below required "
+            f"{minimum_launcher_sms}"
+        )
     launcher = Launcher(launcher_sms, device=device)
     if reducer_only:
         partials.normal_(generator=generator)
@@ -204,10 +219,17 @@ def benchmark_split_attention(
             partial_tma=partial_tma,
         )
     if producer_only:
-        producer = producer.place(num_splits)
+        producer = producer.place(num_splits, producer_base_sm)
         launcher.s(producer)
         launcher.launch()
         torch.cuda.synchronize(device)
+        producer_cold_profile = launcher.profile.cpu().numpy()[
+            producer_base_sm : producer_base_sm + num_splits
+        ].copy()
+        producer_cold_us = float(
+            producer_cold_profile[:, 1].max()
+            - producer_cold_profile[:, 0].min()
+        ) / 1.0e3
         expected_partials = []
         expected_metadata = []
         split_rows = (
@@ -254,11 +276,6 @@ def benchmark_split_attention(
                 float(profile[:, 1].max() - profile[:, 0].min()) / 1.0e3
             )
         if detail_profile:
-            detail = launcher.profile.cpu().numpy()[:num_splits]
-            if not bool((detail[:, 127] == 0x4454524B50524631).all()):
-                raise RuntimeError(
-                    "detail profile requires a track_profile=1 runtime"
-                )
             event_names = {
                 2: "task-enter",
                 3: "operands-ready",
@@ -281,29 +298,67 @@ def benchmark_split_attention(
                 19: "output-published",
                 21: "task-done",
             }
-            previous = detail[:, 0]
-            pieces = []
-            for event_id, name in event_names.items():
-                current = detail[:, event_id]
-                delta_us = statistics.median(
-                    ((current - previous) / 1.0e3).tolist()
+            for profile_label, detail in (
+                ("cold", producer_cold_profile),
+                (
+                    "hot",
+                    launcher.profile.cpu().numpy()[
+                        producer_base_sm : producer_base_sm + num_splits
+                    ],
+                ),
+            ):
+                if not bool((detail[:, 127] == 0x4454524B50524631).all()):
+                    raise RuntimeError(
+                        "detail profile requires a track_profile=1 runtime"
+                    )
+                pieces = ["task-enter=0.000/0.000/0/0.000"]
+                previous_event = 2
+                for event_id, name in tuple(event_names.items())[1:]:
+                    ns_deltas = []
+                    ns_offsets = []
+                    cycle_deltas = []
+                    for row in detail:
+                        begin = int(row[2])
+                        previous = int(row[previous_event])
+                        current = int(row[event_id])
+                        ns_deltas.append(
+                            ((current & 0xFFFFFFFF)
+                             - (previous & 0xFFFFFFFF))
+                            & 0xFFFFFFFF
+                        )
+                        ns_offsets.append(
+                            ((current & 0xFFFFFFFF) - (begin & 0xFFFFFFFF))
+                            & 0xFFFFFFFF
+                        )
+                        cycle_deltas.append(
+                            (((current >> 32) & 0xFFFFFFFF)
+                             - ((previous >> 32) & 0xFFFFFFFF))
+                            & 0xFFFFFFFF
+                        )
+                    median_ns = statistics.median(ns_deltas)
+                    median_cycles = statistics.median(cycle_deltas)
+                    pieces.append(
+                        f"{name}={median_ns / 1.0e3:.3f}/"
+                        f"{statistics.median(ns_offsets) / 1.0e3:.3f}/"
+                        f"{median_cycles:.0f}/"
+                        f"{median_cycles / median_ns if median_ns else 0.0:.3f}"
+                    )
+                    previous_event = event_id
+                print(
+                    "DSV4_SPLIT_ATTN_PROFILE "
+                    f"temperature={profile_label} "
+                    "delta_us/offset_us/cycles/effective_ghz "
+                    + " ".join(pieces),
+                    flush=True,
                 )
-                offset_us = statistics.median(
-                    ((current - detail[:, 0]) / 1.0e3).tolist()
-                )
-                pieces.append(f"{name}={delta_us:.3f}/{offset_us:.3f}")
-                previous = current
-            print(
-                "DSV4_SPLIT_ATTN_PROFILE delta_us/offset_us "
-                + " ".join(pieces),
-                flush=True,
-            )
         print(
             "DSV4_SPLIT_ATTN_PRODUCER "
             f"rows={rows} splits={num_splits} status=COMPLETE "
+            f"base_sm={producer_base_sm} "
             f"partial_max_abs={partial_max_abs:.8f} "
             f"partial_cosine={partial_cosine:.8f} "
             f"metadata_max_abs={metadata_max_abs:.8f} "
+            f"cold_us={producer_cold_us:.3f} "
             f"samples={iterations} min_us={min(timings):.3f} "
             f"median_us={statistics.median(timings):.3f} "
             f"max_us={max(timings):.3f}",
@@ -328,6 +383,7 @@ def benchmark_split_attention(
                 "attention.producer",
                 producer,
                 num_splits,
+                base_sm=producer_base_sm,
                 release_group="attention.partials",
             )
         ]
@@ -537,6 +593,8 @@ def main() -> None:
     parser.add_argument("--with-oa", action="store_true")
     parser.add_argument("--split64", action="store_true")
     parser.add_argument("--detail-profile", action="store_true")
+    parser.add_argument("--launcher-sms", type=int)
+    parser.add_argument("--producer-base-sm", type=int, default=0)
     parser.add_argument("--correctness-repeats", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
@@ -545,6 +603,8 @@ def main() -> None:
         parser.error("heads must be in [1,64]")
     if args.correctness_repeats < 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("timing counts are invalid")
+    if args.producer_base_sm < 0:
+        parser.error("producer base SM must be non-negative")
 
     device = torch.device("cuda")
     if args.rows:
@@ -562,6 +622,8 @@ def main() -> None:
                 with_oa=args.with_oa,
                 split64=args.split64,
                 detail_profile=args.detail_profile,
+                launcher_sms_override=args.launcher_sms,
+                producer_base_sm=args.producer_base_sm,
             )
         return
     generator = torch.Generator(device=device).manual_seed(20260813)

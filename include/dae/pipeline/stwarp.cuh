@@ -20,6 +20,13 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
   uint64_t commands = 0;
   uint64_t barrier_commands = 0;
 #endif
+#if defined(DAE_STU_HISTORY_PROFILE)
+  uint64_t recent_service_begin[stuHistoryCommands] = {};
+  uint64_t recent_service_end[stuHistoryCommands] = {};
+  uint16_t recent_opcode[stuHistoryCommands] = {};
+  uint32_t recent_count = 0;
+  uint64_t pop_begin = cuda::ptx::get_sreg_globaltimer();
+#endif
     
   int slot_mask = c2m.pop();
   while (slot_mask) {
@@ -35,6 +42,46 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
     auto &inst = slot_insts[slot];
     uint16_t opcode = inst.opcode;
+#if defined(DAE_TRACK_PROFILE)
+    const int raw_profile_event =
+        op(opcode) == op(OP_ALLOC_WB_RAW_ADDRESS) && inst.size != 0
+        ? int(inst.size) - 1
+        : -1;
+    if (raw_profile_event >= 0) {
+      g_events[sm_id * numProfileEvents + raw_profile_event + 1] =
+          service_start;
+#if defined(DAE_STU_HISTORY_PROFILE)
+      g_events[sm_id * numProfileEvents + stuRawPopBeginEvent] = pop_begin;
+      const uint32_t service_queue_slot =
+          (c2m.ptr + 32 - 1) % 32;
+      g_events[sm_id * numProfileEvents + stuRawServiceIdentityEvent] =
+          (uint64_t(slot) << 32) | service_queue_slot;
+#endif
+#if defined(DAE_STU_HISTORY_PROFILE)
+      const uint32_t history_count =
+          min(recent_count, uint32_t(stuHistoryCommands));
+      const uint32_t history_start = recent_count < stuHistoryCommands
+          ? 0
+          : recent_count % stuHistoryCommands;
+#pragma unroll
+      for (uint32_t history = 0; history < stuHistoryCommands; ++history) {
+        if (history < history_count) {
+          const uint32_t source =
+              (history_start + history) % stuHistoryCommands;
+          const int event = stuHistoryEventBase + 3 * history;
+          g_events[sm_id * numProfileEvents + event + 0] =
+              recent_opcode[source];
+          g_events[sm_id * numProfileEvents + event + 1] =
+              recent_service_begin[source];
+          g_events[sm_id * numProfileEvents + event + 2] =
+              recent_service_end[source];
+        }
+      }
+      g_events[sm_id * numProfileEvents + stuHistoryEventBase +
+               3 * stuHistoryCommands] = history_count;
+#endif
+    }
+#endif
     // all ops are writeback ops
 
     switch(op(opcode)) {
@@ -259,7 +306,27 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 #endif
       // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+#if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
+      constexpr uint16_t kProfileStoreEventFlag = 1U << 15;
+      constexpr uint16_t kProfileStoreAllocationFlag = 1U << 14;
+      constexpr uint16_t kProfileStoreEventMask = (1U << 14) - 1;
+      if (op(opcode) == op(OP_ALLOC_WB_TMA_STORE_1D) &&
+          (inst.arg & kProfileStoreEventFlag)) {
+        const int event_id =
+            (inst.arg & kProfileStoreEventMask) +
+            ((inst.arg & kProfileStoreAllocationFlag) ? 2 : 0);
+        g_events[sm_id * numProfileEvents +
+                 event_id] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
       atomicSub(&bars[inst.bar()], 1);
+#if defined(DAE_TRACK_PROFILE)
+      if (raw_profile_event >= 0) {
+        g_events[sm_id * numProfileEvents + raw_profile_event + 2] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
       // int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);
       // __stprint("Arrive for barrier %d, remaining count=%d", inst.bar(), current_cnt - 1);
       // if (inst.bar() == 0)
@@ -275,11 +342,19 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     if (do_free)
       c2m.reset(slot_mask);
 #if defined(DAE_TRACK_PROFILE)
-    const uint64_t current_service_ns =
-        cuda::ptx::get_sreg_globaltimer() - service_start;
+    const uint64_t service_end = cuda::ptx::get_sreg_globaltimer();
+    const uint64_t current_service_ns = service_end - service_start;
     service_ns += current_service_ns;
     if (opcode & MEM_OP_FLAGS_BARRIER)
       barrier_service_ns += current_service_ns;
+#endif
+#if defined(DAE_STU_HISTORY_PROFILE)
+    const uint32_t history_slot = recent_count % stuHistoryCommands;
+    recent_service_begin[history_slot] = service_start;
+    recent_service_end[history_slot] = service_end;
+    recent_opcode[history_slot] = op(opcode);
+    ++recent_count;
+    pop_begin = cuda::ptx::get_sreg_globaltimer();
 #endif
     slot_mask = c2m.pop();
   }

@@ -6,9 +6,11 @@
 // each element is associated with one or more slot
 // So if the number of slots > QSIZE, both enqueue and dequeue will be safe,
 // reads as the slots are guaranteed to be unique per element
-template<typename T, unsigned QSIZE = 32, bool ObserverWait = false>
+template<typename T, unsigned QSIZE = 32, bool ObserverWait = false,
+         bool ParticipantPoll = false>
 struct SizeBoundedBarrierQueue {
   static_assert(QSIZE > numSlots, "QSIZE must be larger than numSlots");
+  static_assert(!(ObserverWait && ParticipantPoll));
 
  public:
   // pointer to shared data
@@ -51,11 +53,30 @@ struct SizeBoundedBarrierQueue {
         ++track_contended_waits;
 #endif
       while (!ready) {
+        if constexpr (m2cPollSleepCycles > 0)
+          __nanosleep(m2cPollSleepCycles);
         ready = cuda::ptx::mbarrier_try_wait_parity(
             cuda::ptx::sem_acquire,
             cuda::ptx::scope_cta,
             native_bar(ptr),
             phase_parity);
+      }
+    } else if constexpr (ParticipantPoll) {
+      // Retain this consumer's arrival so the queue cannot advance its phase
+      // without STU, but poll for completion instead of yielding the warp in
+      // arrive_and_wait().
+      const auto token = barriers[ptr].arrive();
+      bool ready = cuda::ptx::mbarrier_try_wait(
+          cuda::ptx::sem_acquire,
+          cuda::ptx::scope_cta,
+          native_bar(ptr),
+          token);
+      while (!ready) {
+        ready = cuda::ptx::mbarrier_try_wait(
+            cuda::ptx::sem_acquire,
+            cuda::ptx::scope_cta,
+            native_bar(ptr),
+            token);
       }
     } else {
       barriers[ptr].arrive_and_wait();
@@ -121,9 +142,10 @@ static __device__ __forceinline__ uint16_t extract(const int s) {
   return __ffs(s) - 1;
 }
 
-template<unsigned QSIZE = 32>
-struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE, false> {
-  using Base = SizeBoundedBarrierQueue<int, QSIZE, false>;
+template<unsigned QSIZE = 32, bool ParticipantPoll = false>
+struct SizeBoundedBarrierAllocQueue
+    : public SizeBoundedBarrierQueue<int, QSIZE, false, ParticipantPoll> {
+  using Base = SizeBoundedBarrierQueue<int, QSIZE, false, ParticipantPoll>;
 
   uint32_t shared_avail;
 

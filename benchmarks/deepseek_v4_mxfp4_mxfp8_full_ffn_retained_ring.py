@@ -13,7 +13,6 @@ from dae.instructions import TmaLoadMxfpCoupledStream, TmaTensor
 from dae.launcher import Launcher
 from dae.runtime import opcode
 from dae.schedule import (
-    SchedDsv4Fp32ToBf16,
     SchedDsv4RouteTop6,
     SchedMxfp4Mxfp8DownFixedRing,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
@@ -213,6 +212,119 @@ def report_track_counters(profile: torch.Tensor) -> None:
     )
 
 
+def report_mxfp_ffn_detail_counters(
+    profile: torch.Tensor, linear1_worker_base: int
+) -> None:
+    """Print matched detail-build intervals for isolated/integrated A/Bs."""
+    values = profile.cpu().numpy()
+    if not all(
+        int(value) == 0x4454524B50524631 for value in values[:, 127]
+    ):
+        return
+    base = runtime.config.reload_profile_event_base
+    detail = values[linear1_worker_base:]
+
+    def summary(label: str, samples: list[int]) -> None:
+        ordered = sorted(samples)
+        print(
+            "DSV4_MXFP4_MXFP8_FULL_FFN_DETAIL "
+            f"name={label} min_us={ordered[0] / 1.0e3:.3f} "
+            f"median_us={statistics.median(ordered) / 1.0e3:.3f} "
+            f"p95_us={percentile(ordered, 0.95) / 1.0e3:.3f} "
+            f"max_us={ordered[-1] / 1.0e3:.3f}",
+            flush=True,
+        )
+
+    intervals = (
+        ("ldu0-linear1", 3, 4),
+        ("ldu0-down-service", 6, 7),
+        ("ldu1-activation-service", 9, 10),
+        ("compute-linear1", 11, 12),
+        ("compute-down", 12, 13),
+    )
+    for label, begin, end in intervals:
+        starts = detail[:, base + begin]
+        stops = detail[:, base + end]
+        if any(int(value) == 0 for value in starts) or any(
+            int(value) == 0 for value in stops
+        ):
+            return
+        summary(
+            label,
+            [int(stop) - int(start) for start, stop in zip(starts, stops)],
+        )
+    duration_counters = (
+        ("ldu0-linear1-stage-empty-wait", 18),
+        ("compute-linear1-weight-full-wait", 19),
+        ("compute-linear1-umma-full-wait", 20),
+        ("ldu0-down-stage-empty-wait", 22),
+        ("ldu1-down-stage-empty-wait", 23),
+        ("compute-down-weight-full-wait", 24),
+        ("compute-down-operand-full-wait", 25),
+        ("compute-down-umma-full-wait", 26),
+    )
+    for label, offset in duration_counters:
+        summary(label, [int(value) for value in detail[:, base + offset]])
+
+    for label, offset in (
+        ("compute-down-to-umma-done", 27),
+        ("compute-down-epilogue", 28),
+        ("compute-down-reduction-wait", 29),
+        ("compute-down-output-tma", 30),
+    ):
+        summary(
+            label,
+            [
+                (int(value) & 0xFFFFFFFF) + (int(value) >> 32)
+                for value in detail[:, base + offset]
+            ],
+        )
+
+    # The routed 152-worker placement has 40 Down-only workers followed by
+    # 112 workers that execute Linear-1 before Down.  Report their readiness
+    # and local service separately; pooling them hides whether the long Down
+    # envelope is work imbalance or producer handoff skew.
+    worker_groups = (
+        ("down-only", values[:linear1_worker_base]),
+        ("linear1-down", values[linear1_worker_base:]),
+    )
+    group_intervals = (
+        ("ldu0-ready-wait", 5, 6),
+        ("ldu0-service", 6, 7),
+        ("ldu1-ready-wait", 8, 9),
+        ("ldu1-service", 9, 10),
+        ("compute-down", 12, 13),
+    )
+    for group_name, rows in worker_groups:
+        if not len(rows):
+            continue
+        for label, begin, end in group_intervals:
+            starts = rows[:, base + begin]
+            stops = rows[:, base + end]
+            if any(int(value) == 0 for value in starts) or any(
+                int(value) == 0 for value in stops
+            ):
+                continue
+            summary(
+                f"{group_name}-{label}",
+                [
+                    int(stop) - int(start)
+                    for start, stop in zip(starts, stops)
+                ],
+            )
+        packed_offsets = rows[:, base + 31]
+        for task in range(2):
+            mask = 0xFFFFFFFF
+            samples = [
+                (int(value) >> (32 * task)) & mask
+                for value in packed_offsets
+            ]
+            if any(samples):
+                summary(
+                    f"{group_name}-down-task{task}-begin-offset",
+                    samples,
+                )
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=20)
@@ -249,8 +361,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.graph_inner <= 0:
         parser.error("--graph-inner must be positive")
-    if args.workers != 112:
-        parser.error("the production resident FFN uses exactly 112 workers")
+    if args.workers not in (112, 152):
+        parser.error("the resident FFN supports 112 or 152 workers")
+    if args.workers == 152 and not args.dynamic_routing:
+        parser.error("the 152-worker schedule requires dynamic routing")
     if args.route_with_topk and not args.dynamic_routing:
         parser.error("--route-with-topk requires --dynamic-routing")
     for name, value in (
@@ -443,12 +557,10 @@ def main() -> None:
                 )
         down_weight = down_stream_weights[:down_tasks]
         down_scale = down_stream_scales[:down_tasks]
-        final_output_accumulator = torch.empty(
-            (8, 4096), dtype=torch.float32, device=device
-        )
         final_output = torch.empty(
             (8, 4096), dtype=torch.bfloat16, device=device
         )
+        final_output_accumulator = final_output
     else:
         down_weight = torch.full(
             (down_tasks, 8, 2, 128, 64),
@@ -469,7 +581,7 @@ def main() -> None:
     down_tma = TmaTensor(launcher, down_weight).mxfp4_load(256)
     if args.dynamic_routing:
         output_tma = TmaTensor(
-            launcher, final_output_accumulator
+            launcher, final_output
         ).m128n8_output("reduce")
         route_scales = [
             1.0,
@@ -484,25 +596,38 @@ def main() -> None:
             launcher, final_output.view(down_slices * 128, 8)
         ).rowmajor_2d("reduce", 128, 8)
         route_scales = [1.0, *([1.0 / 6.0] * 6)]
+    down_variants = (
+        ((0, 0), (0, 8), (4, 8 | 16))
+        if args.workers == 152
+        else ((0, 0),)
+    )
     down_records = torch.zeros(
-        (down_tasks, 16), dtype=torch.int64, device="cpu"
+        (len(down_variants) * down_tasks, 16),
+        dtype=torch.int64,
+        device="cpu",
     )
     for task in range(down_tasks):
         expert, output_tile = divmod(task, down_slices)
-        down_records[task, 0] = down_scale[task, 0].data_ptr()
-        down_records[task, 1] = down_activation_records[
-            expert, 0
-        ].data_ptr()
-        down_records[task, 3] = (
-            down_tma.arg | (output_tma.arg << 16) | (task << 32)
-        )
-        ready_bar = ready_bars[expert * linear1_slices]
-        down_records[task, 4] = ready_bar | (
-            zero_ready[output_tile] << 32
-        )
-        down_records[task, 5] = f32_bits(route_scales[expert])
-        down_records[task, 6] = final_output_accumulator.data_ptr()
-        down_records[task, 8] = 4 << 32
+        for variant, (k_start, extra_flags) in enumerate(down_variants):
+            record = len(down_variants) * task + variant
+            down_records[record, 0] = down_scale[task, k_start].data_ptr()
+            down_records[record, 1] = down_activation_records[
+                expert, 0
+            ].data_ptr()
+            down_records[record, 3] = (
+                down_tma.arg | (output_tma.arg << 16) | (task << 32)
+            )
+            ready_bar = ready_bars[expert * linear1_slices]
+            down_records[record, 4] = ready_bar | (
+                zero_ready[output_tile] << 32
+            )
+            down_records[record, 5] = f32_bits(route_scales[expert])
+            down_records[record, 6] = final_output_accumulator.data_ptr()
+            down_flags = 4 | extra_flags
+            if args.dynamic_routing:
+                down_flags |= 32
+            down_records[record, 8] = k_start | (down_flags << 32)
+            down_records[record, 9] = expert - 1
     down_metadata = down_records.view(torch.uint8).to(device)
 
     linear1_schedule_base = SchedMxfp4Mxfp8GateUpSiluFixedRing(
@@ -527,7 +652,7 @@ def main() -> None:
         down_tma,
         down_metadata,
         output_n_major=args.dynamic_routing,
-        fp32_output=args.dynamic_routing,
+        fp32_output=False,
     )
     if args.dynamic_routing:
         resident_schedule_base = SchedMxfp4Mxfp8RoutedResidentFfn(
@@ -562,24 +687,15 @@ def main() -> None:
         else:
             stages = []
             resident_index = 0
-        stages.extend(
-            (
-                SequentialStage(
-                    "routed_mx_ffn",
-                    resident_schedule_base,
-                    args.workers,
-                    wait_group_roles=(
-                        (("mx_route_ready", "input"),)
-                        if args.route_with_topk
-                        else ()
-                    ),
-                ),
-                SequentialStage(
-                    "mx_fp32_to_bf16",
-                    SchedDsv4Fp32ToBf16(
-                        final_output_accumulator[0], final_output[0]
-                    ),
-                    down_slices,
+        stages.append(
+            SequentialStage(
+                "routed_mx_ffn",
+                resident_schedule_base,
+                args.workers,
+                wait_group_roles=(
+                    (("mx_route_ready", "input"),)
+                    if args.route_with_topk
+                    else ()
                 ),
             )
         )
@@ -612,8 +728,8 @@ def main() -> None:
         bool(inst.arg & TmaLoadMxfpCoupledStream.LOCAL_CHAIN)
         for inst in coupled_commands
     )
-    expected_coupled_commands = 3 * args.workers
-    expected_coupled_chains = args.workers
+    expected_coupled_commands = linear1_tasks + 2 * args.workers
+    expected_coupled_chains = linear1_tasks
     if (
         len(coupled_commands) != expected_coupled_commands
         or coupled_chain_sources != expected_coupled_chains
@@ -704,9 +820,13 @@ def main() -> None:
             + FP4_VALUES[args.down_weight_byte >> 4]
         ) * down_weight_scale_value
     route_sum_by_output = torch.zeros(down_slices, dtype=torch.float32)
-    for task in queued_down_tasks:
+    for record in queued_down_tasks:
+        task, variant = divmod(record, len(down_variants))
         expert, output_tile = divmod(task, down_slices)
-        route_sum_by_output[output_tile] += route_scales[expert]
+        split_fraction = 1.0 if variant == 0 else 0.5
+        route_sum_by_output[output_tile] += (
+            route_scales[expert] * split_fraction
+        )
     if args.dynamic_routing:
         expected_final_mmajor = (
             down_weight_sum.reshape(down_slices, 128, 1)
@@ -729,14 +849,8 @@ def main() -> None:
     checked_outputs_device = checked_outputs.to(device)
     if args.dynamic_routing:
         torch.testing.assert_close(
-            final_output_accumulator,
+            final_output.float(),
             expected_final,
-            rtol=3e-2,
-            atol=1e-1,
-        )
-        torch.testing.assert_close(
-            final_output[0].float(),
-            expected_final[0],
             rtol=3e-2,
             atol=1e-1,
         )
@@ -783,14 +897,8 @@ def main() -> None:
 
     if args.dynamic_routing:
         torch.testing.assert_close(
-            final_output_accumulator,
+            final_output.float(),
             expected_final,
-            rtol=3e-2,
-            atol=1e-1,
-        )
-        torch.testing.assert_close(
-            final_output[0].float(),
-            expected_final[0],
             rtol=3e-2,
             atol=1e-1,
         )
@@ -802,7 +910,8 @@ def main() -> None:
             atol=1e-1,
         )
     profile = hot_profile
-    linear1_profile = profile[:linear1_tasks]
+    linear1_worker_base = args.workers - linear1_tasks
+    linear1_profile = profile[linear1_worker_base:args.workers]
     linear1_finish = relative_finish_us(linear1_profile, 2, 4)
     down_finish = relative_finish_us(profile, 2, 5)
     linear1_local = local_duration_us(linear1_profile, 2, 4)
@@ -811,7 +920,7 @@ def main() -> None:
     linear1_tail = local_tail_us(linear1_profile, 2, 4)
     down_tail = local_tail_us(profile, 4, 5)
     if args.dynamic_routing:
-        error = (final_output_accumulator - expected_final).abs()
+        error = (final_output.float() - expected_final).abs()
         relative_error = error / expected_final.abs().clamp_min(
             torch.finfo(torch.float32).tiny
         )
@@ -831,25 +940,28 @@ def main() -> None:
         max_abs_error = 0.0
         max_rel_error = 0.0
     report_track_counters(profile)
+    report_mxfp_ffn_detail_counters(profile, linear1_worker_base)
     profile_values = profile.cpu().numpy()
     linear1_samples = [
         (int(end) - int(begin)) / 1.0e3
         for begin, end in zip(
-            profile_values[:linear1_tasks, 2],
-            profile_values[:linear1_tasks, 4],
+            profile_values[linear1_worker_base:args.workers, 2],
+            profile_values[linear1_worker_base:args.workers, 4],
         )
     ]
     exposed_linear1 = [
         value
         for value, queue in zip(
-            linear1_samples, down_schedule.task_queues[:linear1_tasks]
+            linear1_samples,
+            down_schedule.task_queues[linear1_worker_base:args.workers],
         )
         if queue
     ]
     unexposed_linear1 = [
         value
         for value, queue in zip(
-            linear1_samples, down_schedule.task_queues[:linear1_tasks]
+            linear1_samples,
+            down_schedule.task_queues[linear1_worker_base:args.workers],
         )
         if not queue
     ]
@@ -922,9 +1034,9 @@ def main() -> None:
         "down_ldu_weight_ring=true "
         "down_ring_stages=2 "
         "activation_scales_task_owned=false "
-        f"down_fp32_reduction={str(args.dynamic_routing).lower()} "
-        f"down_bf16_reduction={str(not args.dynamic_routing).lower()} "
-        f"fp32_to_bf16={str(args.dynamic_routing).lower()} "
+        "down_fp32_reduction=false "
+        "down_bf16_reduction=true "
+        "fp32_to_bf16=false "
         "weight_prefetch_distance=1 "
         "queue_init=generic "
         "stu_reduction=false "

@@ -27,6 +27,21 @@ static constexpr uint16_t kCoupledLocalChain = 0x0100;
 // The fixed-area resident command resolves its expert task base from the
 // prepared 128-byte route record before issuing either weight or scale TMA.
 static constexpr uint16_t kCoupledDynamicExpert = 0x0200;
+// A Down-only worker has no preceding local Linear-1 task. Its fixed resident
+// arena is already empty, so LDU0/LDU1 must not wait for the two local
+// Linear-1 handoff tokens.
+static constexpr uint16_t kCoupledDownOnly = 0x0400;
+
+// Down metadata flags stored in the high 32 bits of metadata word eight.
+// The low bits predate the selective split-K schedule; the new flags let the
+// same resident task execute either a full K2048 tile or one K1024 half and
+// resolve a route rank independently for each queued Down item.
+static constexpr uint32_t kDownReduceFromZero = 0x01;
+static constexpr uint32_t kDownReadyStride8 = 0x02;
+static constexpr uint32_t kDownBlockwiseReady = 0x04;
+static constexpr uint32_t kDownSplitK2 = 0x08;
+static constexpr uint32_t kDownAccumulatePartial = 0x10;
+static constexpr uint32_t kDownPerTaskRoute = 0x20;
 static constexpr int kCoupledPhaseBaseShift = 9;
 static constexpr uint16_t kCoupledPhaseBaseMask = 0xfe00;
 static constexpr int kCoupledPortMaskShift = 9;

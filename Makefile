@@ -33,8 +33,59 @@ ifneq ($(m2c_legacy),)
 	NVCC_FLAGS += -DDAE_M2C_OBSERVER_WAIT=0
 endif
 
+ifneq ($(m2c_poll_sleep_cycles),)
+	NVCC_FLAGS += -DDAE_M2C_POLL_SLEEP_CYCLES=$(m2c_poll_sleep_cycles)
+	export DAE_M2C_POLL_SLEEP_CYCLES := $(m2c_poll_sleep_cycles)
+endif
+
+ifneq ($(c2m_poll_wait),)
+	NVCC_FLAGS += -DDAE_C2M_POLL_WAIT=1
+	export DAE_C2M_POLL_WAIT := 1
+endif
+
 ifneq ($(track_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE
+endif
+
+ifneq ($(reload_poll_sleep_cycles),)
+	NVCC_FLAGS += -DDAE_RELOAD_POLL_SLEEP_CYCLES=$(reload_poll_sleep_cycles)
+endif
+
+ifneq ($(reload_atomic_add),)
+	NVCC_FLAGS += -DDAE_RELOAD_ATOMIC_ADD=1
+endif
+
+ifneq ($(async_barrier_reload),)
+	NVCC_FLAGS += -DDAE_ASYNC_BARRIER_RELOAD=1
+	export DAE_ASYNC_BARRIER_RELOAD := 1
+endif
+
+ifneq ($(async_barrier_reload_workers),)
+	NVCC_FLAGS += -DDAE_ASYNC_BARRIER_RELOAD_WORKERS=$(async_barrier_reload_workers)
+	export DAE_ASYNC_BARRIER_RELOAD_WORKERS := $(async_barrier_reload_workers)
+endif
+
+ifneq ($(stu_history_profile),)
+	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_STU_HISTORY_PROFILE
+	export DAE_TRACK_PROFILE := 1
+endif
+
+ifneq ($(attention_detail_profile),)
+	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_ATTENTION_DETAIL_PROFILE
+endif
+
+ifneq ($(fp8_coupled_detail_profile),)
+	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_FP8_COUPLED_DETAIL_PROFILE
+	export DAE_TRACK_PROFILE := 1
+	export DAE_FP8_COUPLED_DETAIL_PROFILE := 1
+endif
+
+ifneq ($(fp8_coupled_completion_port_mask),)
+	NVCC_FLAGS += -DDAE_FP8_COUPLED_COMPLETION_PORT_MASK=$(fp8_coupled_completion_port_mask)
+endif
+
+ifneq ($(mxfp_ffn_detail_profile),)
+	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_MXFP_FFN_DETAIL_PROFILE
 endif
 
 ifneq ($(aggregate_profile),)

@@ -14,6 +14,7 @@ from dae.deepseek_v4_quant import (
 )
 from dae.instructions import ProfileEvent, TmaTensor
 from dae.launcher import Launcher
+from dae.sequential import SequentialProgram, SequentialStage
 from dae.schedule import (
     SchedDsv4Fp8QuantUmmaB,
     SchedFp8GemvUmmaCoupled,
@@ -39,8 +40,25 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--operator-repeats",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="queue one or two identical coupled tasks in one resident launch",
+    )
     parser.add_argument("--validate-router", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument(
+        "--resident-quant-handoff",
+        action="store_true",
+        help="queue quantization and coupled GEMV in one resident launch",
+    )
+    parser.add_argument(
+        "--validate-each-launch",
+        action="store_true",
+        help="check packed activation and GEMV output after every launch",
+    )
     parser.add_argument(
         "--kernel-envelope-only",
         action="store_true",
@@ -66,6 +84,17 @@ def main() -> None:
         parser.error("reduction dtype applies only to split-K")
     if min(args.warmup, args.iterations) <= 0:
         parser.error("timing counts must be positive")
+    if args.resident_quant_handoff and not (
+        args.batch == 1
+        and args.operator_repeats == 1
+        and args.split_k == 1
+        and not args.balanced_k
+        and args.kernel_envelope_only
+    ):
+        parser.error(
+            "resident quant handoff requires batch=1, one unsplit operator, "
+            "and --kernel-envelope-only"
+        )
 
     work_tiles = args.batch * (args.m // 256) * (
         args.k // 256 if args.balanced_k else args.split_k
@@ -132,9 +161,11 @@ def main() -> None:
     accumulator = None
     if args.split_k == 1 and not args.balanced_k:
         output = torch.empty(
-            (args.batch, args.m), dtype=torch.bfloat16, device=device
+            (args.operator_repeats, args.batch, args.m),
+            dtype=torch.bfloat16,
+            device=device,
         )
-        schedule_output = output
+        schedule_outputs = list(output.unbind(0))
     else:
         reduction_dtype = (
             torch.float32
@@ -142,28 +173,65 @@ def main() -> None:
             else torch.bfloat16
         )
         accumulator = torch.zeros(
-            (args.batch * args.m // 128, 128),
+            (
+                args.operator_repeats,
+                args.batch * args.m // 128,
+                128,
+            ),
             dtype=reduction_dtype,
             device=device,
         )
-        schedule_output = TmaTensor(
-            launcher, accumulator
-        ).rowmajor_2d("reduce", 1, 128)
-    schedule = SchedFp8GemvUmmaCoupled(
-        packed_weight,
-        packed_activation,
-        schedule_output,
-        split_k=args.split_k,
-        balanced_k=args.balanced_k,
-    )
-    placed_schedule = schedule.place(num_sms)
-    if args.kernel_envelope_only:
-        launcher.s(placed_schedule)
+        schedule_outputs = [
+            TmaTensor(launcher, repeat_accumulator).rowmajor_2d(
+                "reduce", 1, 128
+            )
+            for repeat_accumulator in accumulator.unbind(0)
+        ]
+    placed_schedules = [
+        SchedFp8GemvUmmaCoupled(
+            packed_weight,
+            packed_activation,
+            schedule_output,
+            split_k=args.split_k,
+            balanced_k=args.balanced_k,
+        ).place(num_sms)
+        for schedule_output in schedule_outputs
+    ]
+    placed_schedule = placed_schedules[0]
+    if args.resident_quant_handoff:
+        program = SequentialProgram(
+            launcher,
+            (
+                SequentialStage(
+                    "quant",
+                    SchedDsv4Fp8QuantUmmaB(
+                        input_source[0], packed_activation[0], 2
+                    ).place(k_tiles // 2),
+                    k_tiles // 2,
+                ),
+                SequentialStage(
+                    "coupled_gemv", placed_schedules[0], num_sms
+                ),
+            ),
+        )
+        launcher.s(program)
+    elif args.kernel_envelope_only:
+        launcher.s(*placed_schedules)
     else:
-        launcher.s(ProfileEvent(2), placed_schedule, ProfileEvent(3))
+        profiled_items = []
+        for repeat, repeated_schedule in enumerate(placed_schedules):
+            profiled_items.extend(
+                (
+                    ProfileEvent(2 + 2 * repeat),
+                    repeated_schedule,
+                    ProfileEvent(3 + 2 * repeat),
+                )
+            )
+        launcher.s(*profiled_items)
 
     quant_launcher.launch()
     torch.cuda.synchronize(device)
+    packed_activation_oracle = packed_activation.clone()
     if args.diagnostic:
         weight_scale_stream = placed_schedule.weight_stream[
             ...,
@@ -208,9 +276,9 @@ def main() -> None:
         "bmk,bk->bm", weight_dequant, activation_dequant
     )
     result = (
-        accumulator.view(args.batch, args.m)
+        accumulator[-1].view(args.batch, args.m)
         if accumulator is not None
-        else output
+        else output[-1]
     )
     expected = (
         reference_float
@@ -253,7 +321,8 @@ def main() -> None:
         )
 
     for _ in range(args.warmup):
-        quant_launcher.launch()
+        if not args.resident_quant_handoff:
+            quant_launcher.launch()
         if accumulator is not None:
             accumulator.zero_()
         launcher.launch()
@@ -262,30 +331,58 @@ def main() -> None:
     quant_timings = []
     task_timings = []
     kernel_timings = []
+    repeated_task_timings = [
+        [] for _ in range(args.operator_repeats)
+    ]
     for _ in range(args.iterations):
-        quant_launcher.launch()
-        quant_timings.append(
-            profile_span_us(
-                quant_launcher,
-                0 if args.kernel_envelope_only else 2,
-                1 if args.kernel_envelope_only else 3,
+        if args.resident_quant_handoff:
+            quant_timings.append(0.0)
+        else:
+            quant_launcher.launch()
+            quant_timings.append(
+                profile_span_us(
+                    quant_launcher,
+                    0 if args.kernel_envelope_only else 2,
+                    1 if args.kernel_envelope_only else 3,
+                )
             )
-        )
         if accumulator is not None:
             accumulator.zero_()
         launcher.launch()
         kernel_time = profile_span_us(launcher, 0, 1)
         kernel_timings.append(kernel_time)
+        if not args.kernel_envelope_only:
+            for repeat, timings_for_repeat in enumerate(
+                repeated_task_timings
+            ):
+                timings_for_repeat.append(
+                    profile_span_us(
+                        launcher, 2 + 2 * repeat, 3 + 2 * repeat
+                    )
+                )
         task_timings.append(
             kernel_time
             if args.kernel_envelope_only
             else profile_span_us(launcher, 2, 3)
         )
+        if args.validate_each_launch:
+            if args.resident_quant_handoff and not torch.equal(
+                packed_activation, packed_activation_oracle
+            ):
+                mismatch = packed_activation != packed_activation_oracle
+                raise AssertionError(
+                    "resident quant handoff changed packed activation: "
+                    f"mismatches={int(mismatch.count_nonzero().item())}"
+                )
+            torch.testing.assert_close(
+                result, expected, rtol=3.0e-2, atol=1.0e-1
+            )
 
     max_abs = (result.float() - expected.float()).abs().max().item()
     print(
         "DSV4_FP8_COUPLED_RESULT "
         f"shape={args.m}x{args.batch}x{args.k} sms={num_sms} "
+        f"operator_repeats={args.operator_repeats} "
         f"split_k={args.split_k} balanced_k={str(args.balanced_k).lower()} "
         f"reduction_dtype={args.reduction_dtype} "
         f"quant_median_us={statistics.median(quant_timings):.6f} "
@@ -298,6 +395,15 @@ def main() -> None:
         f"max_abs={max_abs:.6f} prepack=python_setup",
         flush=True,
     )
+    if not args.kernel_envelope_only:
+        print(
+            "DSV4_FP8_COUPLED_REPEAT_RESULT "
+            + " ".join(
+                f"repeat{repeat}_median_us={statistics.median(values):.6f}"
+                for repeat, values in enumerate(repeated_task_timings)
+            ),
+            flush=True,
+        )
     if args.diagnostic:
         tracked = launcher.profile[:num_sms].cpu()
         magic = 0x4454524B50524631

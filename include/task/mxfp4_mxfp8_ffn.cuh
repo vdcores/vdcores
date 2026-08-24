@@ -26,7 +26,12 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     C2MQueue &c2m,
     int resident_task_index,
     const uint8_t *route_record = nullptr,
-    int route_rank = -1
+    int route_rank = -1,
+    uint32_t resident_phase = 0
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+    , int detail_sm_id = -1,
+    uint64_t *detail_g_events = nullptr
+#endif
     ) {
   using namespace cute;
   using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
@@ -143,7 +148,18 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
   const int warp = tid / numThreadsPerWarp;
   const int lane = tid & (numThreadsPerWarp - 1);
   (void)c2m;
-  (void)resident_task_index;
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  uint64_t detail_weight_wait_ns = 0;
+  uint64_t detail_operand_wait_ns = 0;
+  uint64_t detail_umma_wait_ns = 0;
+  const uint64_t detail_task_begin = tid == 0
+      ? cuda::ptx::get_sreg_globaltimer()
+      : 0;
+  uint64_t detail_umma_done = 0;
+  uint64_t detail_epilogue_done = 0;
+  uint64_t detail_reduction_ready = 0;
+  uint64_t detail_output_done = 0;
+#endif
 
   const auto *weight_scale_global = reinterpret_cast<const uint8_t *>(
       *reinterpret_cast<const uint64_t *>(metadata + 0));
@@ -163,9 +179,20 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       : *reinterpret_cast<const float *>(metadata + 40);
   const uint32_t resident_flags =
       *reinterpret_cast<const uint32_t *>(metadata + 68);
-  const bool reduce_from_zero = (resident_flags & 1U) != 0;
-  const int ready_bar_stride = (resident_flags & 2U) != 0 ? 8 : 1;
-  const bool blockwise_ready = (resident_flags & 4U) != 0;
+  const bool reduce_from_zero =
+      (resident_flags & dae_mxfp_resident_ffn::kDownReduceFromZero) != 0;
+  const bool split_k2 =
+      (resident_flags & dae_mxfp_resident_ffn::kDownSplitK2) != 0;
+  const bool accumulate_partial =
+      (resident_flags &
+       dae_mxfp_resident_ffn::kDownAccumulatePartial) != 0;
+  const int num_k_tiles = split_k2 ? kNumKTiles / 2 : kNumKTiles;
+  const int ready_bar_stride =
+      (resident_flags & dae_mxfp_resident_ffn::kDownReadyStride8) != 0
+          ? 8
+          : 1;
+  const bool blockwise_ready =
+      (resident_flags & dae_mxfp_resident_ffn::kDownBlockwiseReady) != 0;
   auto *final_output_global = reinterpret_cast<Output *>(
       *reinterpret_cast<const uint64_t *>(metadata + 48));
   const uint64_t layout_info =
@@ -301,7 +328,7 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     if constexpr (!UseLduWeightRing) {
       if (elect_one_sync()) {
         #pragma unroll
-        for (int tile = 0; tile < kNumKTiles; ++tile) {
+        for (int tile = 0; tile < num_k_tiles; ++tile) {
           const int stage = tile % kRingStages;
           const int phase = (tile / kRingStages) & 1;
           if (tile >= kRingStages) {
@@ -330,8 +357,10 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       }
     }
   } else if (warp == 2) {
-    #pragma unroll
-    for (int tile = 0; tile < kNumKTiles; ++tile) {
+    // The resident K256 ring already keeps two bundles in flight; duplicating
+    // all eight control bodies only expands the megakernel instruction image.
+    #pragma unroll 1
+    for (int tile = 0; tile < num_k_tiles; ++tile) {
       const int stage = tile % kRingStages;
       const int phase = (tile / kRingStages) & 1;
       if constexpr (kRingStages == 1) {
@@ -367,24 +396,47 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
           const int retire_tile = tile - 1;
           const int retire_stage = retire_tile % kRingStages;
           const int retire_phase = (retire_tile / kRingStages) & 1;
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          const uint64_t detail_umma_wait_begin = lane == 0
+              ? cuda::ptx::get_sreg_globaltimer()
+              : 0;
+#endif
           umma_full[retire_stage].wait(retire_phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+          if (lane == 0) {
+            detail_umma_wait_ns +=
+                cuda::ptx::get_sreg_globaltimer() -
+                detail_umma_wait_begin;
+          }
+#endif
           if (lane == 0) {
             stage_empty[retire_stage].arrive();
           }
         }
       }
     }
-    constexpr int kLastTile = kNumKTiles - 1;
-    constexpr int kLastStage = kLastTile % kRingStages;
-    constexpr int kLastPhase = (kLastTile / kRingStages) & 1;
-    umma_full[kLastStage].wait(kLastPhase);
+    const int last_tile = num_k_tiles - 1;
+    const int last_stage = last_tile % kRingStages;
+    const int last_phase = (last_tile / kRingStages) & 1;
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+    const uint64_t detail_umma_wait_begin = lane == 0
+        ? cuda::ptx::get_sreg_globaltimer()
+        : 0;
+#endif
+    umma_full[last_stage].wait(last_phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
     if (lane == 0) {
-      stage_empty[kLastStage].arrive();
+      detail_umma_wait_ns +=
+          cuda::ptx::get_sreg_globaltimer() - detail_umma_wait_begin;
+    }
+#endif
+    if (lane == 0) {
+      stage_empty[last_stage].arrive();
     }
   } else if (warp == 3) {
     if constexpr (!ResidentAllTma) {
       #pragma unroll
-      for (int tile = 0; tile < kNumKTiles; ++tile) {
+      for (int tile = 0; tile < num_k_tiles; ++tile) {
         const int stage = tile % kRingStages;
         const int phase = (tile / kRingStages) & 1;
         if (tile >= kRingStages) {
@@ -437,8 +489,8 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     }
   } else if (warp == 0) {
     using Utccp = SM100_UTCCP_4x32dp128bit_1cta;
-    #pragma unroll
-    for (int tile = 0; tile < kNumKTiles; ++tile) {
+    #pragma unroll 1
+    for (int tile = 0; tile < num_k_tiles; ++tile) {
       const int stage = tile % kRingStages;
       const int phase = (tile / kRingStages) & 1;
       if constexpr (kSeparateWeightScaleBarrier) {
@@ -458,8 +510,30 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
         }
         weight_full[stage].wait(phase);
       } else {
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+        const uint64_t detail_weight_wait_begin = lane == 0
+            ? cuda::ptx::get_sreg_globaltimer()
+            : 0;
+#endif
         weight_full[stage].wait(phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+        if (lane == 0) {
+          detail_weight_wait_ns +=
+              cuda::ptx::get_sreg_globaltimer() -
+              detail_weight_wait_begin;
+        }
+        const uint64_t detail_operand_wait_begin = lane == 0
+            ? cuda::ptx::get_sreg_globaltimer()
+            : 0;
+#endif
         operand_full[stage].wait(phase);
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+        if (lane == 0) {
+          detail_operand_wait_ns +=
+              cuda::ptx::get_sreg_globaltimer() -
+              detail_operand_wait_begin;
+        }
+#endif
       }
       #pragma unroll
       for (int subtile = 0; subtile < kK128PerBundle; ++subtile) {
@@ -512,17 +586,51 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     }
   }
 
-  constexpr int kLastTile = kNumKTiles - 1;
-  constexpr int kLastStage = kLastTile % kRingStages;
-  constexpr int kLastPhase = (kLastTile / kRingStages) & 1;
+  const int last_tile = num_k_tiles - 1;
+  const int last_stage = last_tile % kRingStages;
+  const int last_phase = (last_tile / kRingStages) & 1;
   if constexpr (!UseLduWeightRing) {
     if (warp == 1) {
-      stage_empty[kLastStage].wait(kLastPhase);
+      stage_empty[last_stage].wait(last_phase);
     }
   }
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __sync_barrier<SyncBarrierId, 128>();
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (tid == 0) {
+    detail_umma_done = cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
+
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (detail_g_events != nullptr && detail_sm_id >= 0) {
+    if (warp == 0 && lane == 0) {
+      auto *weight_wait = detail_g_events +
+          detail_sm_id * numProfileEvents +
+          mxfpFfnDetailComputeDownWeightWaitNs;
+      auto *operand_wait = detail_g_events +
+          detail_sm_id * numProfileEvents +
+          mxfpFfnDetailComputeDownOperandWaitNs;
+      if (resident_task_index == 0) {
+        *weight_wait = detail_weight_wait_ns;
+        *operand_wait = detail_operand_wait_ns;
+      } else {
+        *weight_wait += detail_weight_wait_ns;
+        *operand_wait += detail_operand_wait_ns;
+      }
+    } else if (warp == 2 && lane == 0) {
+      auto *umma_wait = detail_g_events +
+          detail_sm_id * numProfileEvents +
+          mxfpFfnDetailComputeDownUmmaWaitNs;
+      if (resident_task_index == 0) {
+        *umma_wait = detail_umma_wait_ns;
+      } else {
+        *umma_wait += detail_umma_wait_ns;
+      }
+    }
+  }
+#endif
 
   auto coord_c = make_identity_tensor(
       make_shape(Int<kTileM>{}, Int<kTileN>{}));
@@ -541,9 +649,9 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
     auto thread_tmem = thread_t2r.partition_S(accumulator_tmem);
     auto thread_coord = thread_t2r.partition_D(c_acc);
     auto registers = make_tensor<Accum>(shape(thread_coord));
-    auto output_registers = make_tensor<Output>(shape(thread_coord));
     auto thread_nmajor_output = thread_t2r.partition_D(
         cta_mma.partition_C(nmajor_output));
+    auto output_registers = make_tensor<Output>(shape(thread_coord));
     copy(tiled_t2r, thread_tmem, registers);
     cutlass::arch::fence_view_async_tmem_load();
     float route_scale = static_route_scale;
@@ -564,24 +672,34 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       if (row < kTileM && column < kNativeOutputRows) {
         const Output output_value = Output(registers(index) * route_scale);
         if constexpr (NMajorOutput) {
-          output_registers(index) = output_value;
+          if constexpr (Fp32Aggregate) {
+            output_registers(index) = output_value;
+          } else {
+            thread_nmajor_output(index) = output_value;
+          }
         } else {
           output_smem[row * kNativeOutputRows + column] = output_value;
         }
       }
     }
-    if constexpr (NMajorOutput) {
+    if constexpr (NMajorOutput && Fp32Aggregate) {
       copy(output_registers, thread_nmajor_output);
     }
   }
   __sync_barrier<SyncBarrierId, 128>();
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (tid == 0) {
+    detail_epilogue_done = cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
 
-  if (tid == 0 && (reduce_from_zero || expert != 0)) {
+  if (tid == 0 &&
+      (reduce_from_zero || accumulate_partial || expert != 0)) {
     if constexpr (ResidentAllTma) {
       auto *reduction_ready = reinterpret_cast<TxBarrier *>(
           resident_mma_barriers +
           mxfpDownResidentReductionReadyBarrierBase);
-      reduction_ready[output_m_tile >= kDownTilesPerExpert / 2].wait(0);
+      reduction_ready[resident_task_index].wait(resident_phase);
     } else {
       cuda::atomic_ref<int, cuda::thread_scope_device> shared_ready(
           global_bars[reduce_bar]);
@@ -590,18 +708,24 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       }
     }
   }
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (tid == 0) {
+    detail_reduction_ready = cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
   if constexpr (!ResidentAllTma) {
     __sync_barrier<SyncBarrierId, 128>();
   }
 
   // The shared expert establishes the destination with a bulk copy; routed
-  // experts reduce-add into the schedule-initialized destination.  The routed
-  // production image keeps this transaction in FP32 and rounds only once in
-  // the following handoff task.
+  // experts reduce-add into that destination. The production specialization
+  // writes the BF16 model handoff directly, accepting BF16 split-K/expert
+  // accumulation in exchange for half the reduction traffic and no separate
+  // conversion task.
   if (tid == 0) {
       const uint32_t source = uint32_t(__cvta_generic_to_shared(output_smem));
       const int row = output_m_tile * kTileM;
-      if (expert == 0 && !reduce_from_zero) {
+      if (expert == 0 && !reduce_from_zero && !accumulate_partial) {
         if constexpr (NMajorOutput) {
           asm volatile(
               "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
@@ -643,11 +767,55 @@ task_mxfp4_mxfp8_down_fixed_ring_sm100(
       cuda::ptx::cp_async_bulk_commit_group();
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
       cuda::ptx::fence_proxy_async();
-      if (expert == 0 && !reduce_from_zero) {
+      if (expert == 0 && !reduce_from_zero && !accumulate_partial) {
         cuda::atomic_ref<int, cuda::thread_scope_device> shared_ready(
             global_bars[reduce_bar]);
         shared_ready.fetch_sub(1, cuda::memory_order_release);
       }
   }
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (tid == 0) {
+    detail_output_done = cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
   __sync_barrier<SyncBarrierId, 128>();
+#if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
+  if (detail_g_events != nullptr && detail_sm_id >= 0 && tid == 0) {
+    const uint64_t detail_finish = cuda::ptx::get_sreg_globaltimer();
+    const uint64_t samples[] = {
+        detail_umma_done - detail_task_begin,
+        detail_epilogue_done - detail_umma_done,
+        detail_reduction_ready - detail_epilogue_done,
+        detail_output_done - detail_reduction_ready,
+        detail_finish - detail_output_done,
+    };
+    // Preserve task identity without enlarging the profile row: four key
+    // phases are packed as task0/task1 uint32 halves. The known ~0.128-us
+    // terminal CTA barrier is intentionally omitted from this task-class
+    // diagnostic.
+    #pragma unroll
+    for (int event = 0; event < 4; ++event) {
+      auto *counter = detail_g_events + detail_sm_id * numProfileEvents +
+          mxfpFfnDetailComputeDownToUmmaDoneNs + event;
+      const uint64_t packed_sample = uint64_t(uint32_t(samples[event]));
+      if (resident_task_index == 0) {
+        *counter = packed_sample;
+      } else {
+        *counter |= packed_sample << 32;
+      }
+    }
+    const uint64_t down_begin = detail_g_events[
+        detail_sm_id * numProfileEvents + mxfpFfnDetailComputeLinear1End];
+    auto *begin_offsets = detail_g_events +
+        detail_sm_id * numProfileEvents +
+        mxfpFfnDetailComputeDownTaskBeginOffsetPacked;
+    const uint64_t packed_begin =
+        uint64_t(uint32_t(detail_task_begin - down_begin));
+    if (resident_task_index == 0) {
+      *begin_offsets = packed_begin;
+    } else {
+      *begin_offsets |= packed_begin << 32;
+    }
+  }
+#endif
 }

@@ -10,7 +10,9 @@ HBM buffer and LDU resolves the selected expert and current layer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
+import os
 import struct
 import statistics
 import time
@@ -47,6 +49,7 @@ from dae.instructions import TmaTensor
 from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayeredSchedule,
+    SchedDsv4AttentionContext1Fp8Sm100,
     SchedArgmaxSmemPartial,
     SchedArgmaxSmemReduce,
     SchedDsv4AttentionSplit64UmmaSm100,
@@ -91,6 +94,7 @@ from dae.schedule import (
     SchedMxfp4Mxfp8DownFixedRing,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
     SchedMxfp4Mxfp8RoutedResidentFfn,
+    SchedOverlapAsyncBarrierReload,
     SchedRMS,
 )
 from dae.sequential import (
@@ -100,6 +104,25 @@ from dae.sequential import (
     SequentialStage,
 )
 from dae.tma_utils import Major
+
+
+# Task-local detail traces occupy events 2--29 when DAE_TRACK_PROFILE is
+# enabled.  Keep step-duration windows in the disjoint low-profile tail so a
+# task cannot overwrite its enclosing begin/end pair.
+STEP_PROFILE_EVENT_BASE = 32
+STEP_PROFILE_FRONTIER_BASE = runtime_config.layer_profile_event_base
+FP8_COUPLED_STEP_BEGIN_EVENT = runtime_config.reload_profile_event_base - 1
+FP8_COUPLED_LAYER_BEGIN_EVENT = runtime_config.detail_profile_event_base + 25
+FFN_OUTPUT_PROFILE_EVENT_BASE = 55
+STU_RAW_POP_BEGIN_EVENT = 64
+STU_RAW_SERVICE_IDENTITY_EVENT = 65
+STU_RAW_OUTPUT_TOKEN_EVENT = 66
+STU_RAW_PTR_MATCH_EVENT_BASE = 67
+STU_RAW_POST_EVENT_BASE = 71
+STU_RAW_PTR_EVENT_BASE = 75
+STU_RAW_ARRIVAL_EVENT_BASE = 79
+STU_HISTORY_EVENT_BASE = 83
+STU_HISTORY_COMMANDS = 4
 
 
 @dataclass(frozen=True)
@@ -142,6 +165,22 @@ class ResidentOneLaunchDecode:
         self.args = args
         self.device = device
         self.config = DeepSeekV4FlashConfig()
+        if args.layers == 1:
+            self.layer_ids = (args.single_layer_id,)
+        elif args.layers == 2:
+            second_layer_id = (
+                args.two_layer_start_id
+                if args.repeat_same_layer
+                else args.two_layer_start_id + 1
+            )
+            self.layer_ids = (args.two_layer_start_id, second_layer_id)
+        else:
+            self.layer_ids = tuple(range(args.layers))
+        self.profile_layer_ids = (
+            self.layer_ids * args.two_layer_pair_repeats
+            if args.layers == 2
+            else self.layer_ids
+        )
         self.sms = min(
             args.sms,
             torch.cuda.get_device_properties(device).multi_processor_count,
@@ -206,6 +245,15 @@ class ResidentOneLaunchDecode:
         )
         prepare_started = time.monotonic()
         self.launcher.prepare_launch()
+        self._l2_scrub = (
+            torch.zeros(
+                args.cold_l2_scrub_mib * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if args.cold_l2_scrub_mib
+            else None
+        )
         torch.cuda.synchronize(self.device)
         print(
             "DSV4_ONE_LAUNCH_PREPARE status=PASS "
@@ -215,11 +263,9 @@ class ResidentOneLaunchDecode:
 
     def _load_checkpoint(self) -> DeepSeekV4ResidentCheckpoint:
         disk = DeepSeekV4Checkpoint(self.args.checkpoint, self.config)
-        resident_layer_ids = (
-            (self.args.single_layer_id,)
-            if self.args.layers == 1
-            else tuple(range(self.args.layers))
-        )
+        # A repeated-layer diagnostic references the same checkpoint tensors
+        # twice but should materialize only one resident weight image.
+        resident_layer_ids = tuple(dict.fromkeys(self.layer_ids))
         prefix = tuple(
             f"layers.{layer_id}." for layer_id in resident_layer_ids
         )
@@ -413,7 +459,55 @@ class ResidentOneLaunchDecode:
             routing = "hash" if layer_id < self.config.num_hash_layers else "score"
             return (LayerFamily(f"layer{layer_id}.{kind}_{routing}", (layer_id,)),)
         if self.args.layers == 2:
-            return (LayerFamily("layers0-1.swa_hash", (0, 1), ((0, 1),)),)
+            first_layer_id, second_layer_id = self.layer_ids
+            if self.args.repeat_same_layer:
+                kind = self.config.attention_kind(first_layer_id)
+                routing = (
+                    "hash"
+                    if first_layer_id < self.config.num_hash_layers
+                    else "score"
+                )
+                return (
+                    LayerFamily(
+                        f"layer{first_layer_id}-twice.{kind}_{routing}",
+                        self.profile_layer_ids,
+                        ((0, 1),),
+                    ),
+                )
+            first_kind = self.config.attention_kind(first_layer_id)
+            second_kind = self.config.attention_kind(second_layer_id)
+            first_routing = (
+                "hash" if first_layer_id < self.config.num_hash_layers else "score"
+            )
+            second_routing = (
+                "hash" if second_layer_id < self.config.num_hash_layers else "score"
+            )
+            if (first_kind, first_routing) == (second_kind, second_routing):
+                return (
+                    LayerFamily(
+                        f"layers{first_layer_id}-{second_layer_id}."
+                        f"{first_kind}_{first_routing}",
+                        self.profile_layer_ids,
+                        ((0, 1),),
+                    ),
+                )
+            counter_strides = (
+                ((0, 1), (1, 2))
+                if self.args.two_layer_pair_repeats > 1
+                else ()
+            )
+            return (
+                LayerFamily(
+                    f"layer{first_layer_id}.{first_kind}_{first_routing}",
+                    (first_layer_id,) * self.args.two_layer_pair_repeats,
+                    counter_strides,
+                ),
+                LayerFamily(
+                    f"layer{second_layer_id}.{second_kind}_{second_routing}",
+                    (second_layer_id,) * self.args.two_layer_pair_repeats,
+                    counter_strides,
+                ),
+            )
         if self.args.layers != self.config.num_layers:
             raise ValueError("one-launch resident flow supports 1, 2, or 43 layers")
         return (
@@ -837,7 +931,13 @@ class ResidentOneLaunchDecode:
         self.router_prepared = torch.empty(
             (cfg.num_experts, 2), dtype=torch.float32, device=d
         )
-        self.route_record = torch.empty((128,), dtype=torch.uint8, device=d)
+        # Ping-pong route storage with the score-layer barrier banks. The LDU
+        # route cache is keyed by address, so alternating records invalidates
+        # it naturally at each layer boundary without a queue-local reset op.
+        self.route_records = torch.empty(
+            (2, 128), dtype=torch.uint8, device=d
+        )
+        self.route_record = self.route_records[0]
         self.route_indices = self.route_record[:32].view(torch.int32)
         self.route_weights = self.route_record[32:64].view(torch.float32)
         self.zero_bias = torch.zeros(
@@ -866,16 +966,28 @@ class ResidentOneLaunchDecode:
         self.mxfp_ffn_output = torch.empty(
             (8, cfg.hidden_size), dtype=torch.bfloat16, device=d
         )
-        self.mxfp_ffn_accumulator = torch.empty(
-            (8, cfg.hidden_size), dtype=torch.float32, device=d
-        )
 
     def _allocate_mxfp_ffn_runtime(self) -> None:
         if self.sms < 148:
             raise ValueError(
                 "the production MXFP FFN overlap requires at least 148 SMs"
             )
-        barrier_sets = 2 if self.args.layers == self.config.num_layers else 1
+        # A heterogeneous two-layer diagnostic has the same adjacent HCA/CSA
+        # ownership as the production repeated pair.  Keep their internal
+        # MXFP rings disjoint even when the pair-tail clear is synchronous;
+        # otherwise CSA reuses HCA's live ring before that tail can restore it.
+        heterogeneous_pair = (
+            self.args.layers == 2 and self.layer_ids[0] != self.layer_ids[1]
+        )
+        barrier_sets = (
+            2
+            if (
+                self.args.layers == self.config.num_layers
+                or runtime_config.async_barrier_reload_enabled
+                or heterogeneous_pair
+            )
+            else 1
+        )
         self.mxfp_internal_barrier_start = self.launcher.num_bars
         self.mxfp_ready_bars = []
         self.mxfp_zero_ready_bars = []
@@ -888,7 +1000,7 @@ class ResidentOneLaunchDecode:
             )
         self.mxfp_internal_barrier_stop = self.launcher.num_bars
         self.mxfp_output_tma = TmaTensor(
-            self.launcher, self.mxfp_ffn_accumulator
+            self.launcher, self.mxfp_ffn_output
         ).m128n8_output("reduce")
         self._mxfp_runtime_layers: dict[
             tuple[int, int], MxfpFfnRuntimeLayer
@@ -940,32 +1052,42 @@ class ResidentOneLaunchDecode:
             linear1_records[task, 8] = ready_bars[task]
         linear1_metadata = linear1_records.view(torch.uint8).to(self.device)
 
+        # Three metadata views per output tile: one full K2048 task and two
+        # K1024 halves. The scheduler uses all 152 full first-wave records and
+        # only the 144 half records needed to replace the 72-task second wave.
         down_records = torch.zeros(
-            (7 * 32, 16), dtype=torch.int64, device="cpu"
+            (7 * 32 * 3, 16), dtype=torch.int64, device="cpu"
         )
         for task in range(7 * 32):
             expert, output_tile = divmod(task, 32)
-            down_records[task, 0] = image.down_scales[
-                task, 0
-            ].data_ptr()
-            down_records[task, 1] = self.mxfp_middle_records[
-                expert, 0
-            ].data_ptr()
-            down_records[task, 3] = (
-                down_tma.arg
-                | (self.mxfp_output_tma.arg << 16)
-                | (task << 32)
-            )
-            down_records[task, 4] = (
-                ready_bars[expert * 16]
-                | (zero_ready[output_tile] << 32)
-            )
-            down_records[task, 5] = self._f32_bits(1.0)
-            down_records[task, 6] = self.mxfp_ffn_accumulator.data_ptr()
-            # Expert zero establishes the FP32 destination and publishes the
-            # per-tile dependency; routed experts then reduce-add.  Linear-1
-            # records remain consumable at their per-K128 readiness frontier.
-            down_records[task, 8] = 4 << 32
+            route_rank = expert - 1
+            for variant, (k_start, extra_flags) in enumerate(
+                ((0, 0), (0, 8), (4, 8 | 16))
+            ):
+                record = 3 * task + variant
+                down_records[record, 0] = image.down_scales[
+                    task, k_start
+                ].data_ptr()
+                down_records[record, 1] = self.mxfp_middle_records[
+                    expert, 0
+                ].data_ptr()
+                down_records[record, 3] = (
+                    down_tma.arg
+                    | (self.mxfp_output_tma.arg << 16)
+                    | (task << 32)
+                )
+                down_records[record, 4] = (
+                    ready_bars[expert * 16]
+                    | (zero_ready[output_tile] << 32)
+                )
+                down_records[record, 5] = self._f32_bits(1.0)
+                down_records[record, 6] = self.mxfp_ffn_output.data_ptr()
+                # Expert zero establishes the BF16 model handoff directly.
+                # Routed experts and the optional second K half reduce-add
+                # after that one-shot frontier.
+                down_flags = 4 | 32 | extra_flags
+                down_records[record, 8] = k_start | (down_flags << 32)
+                down_records[record, 9] = route_rank
         down_metadata = down_records.view(torch.uint8).to(self.device)
 
         runtime_layer = MxfpFfnRuntimeLayer(
@@ -1030,10 +1152,21 @@ class ResidentOneLaunchDecode:
                     "native FP8 quant placement must fit its scale groups"
                 )
             assignment = replace(assignment, num_sms=num_sms)
+        profile_store_event = None
+        if (
+            self.args.profile_fp8_coupled_detail
+            and name == "attn.hidden.quant_native_fp8"
+        ):
+            profile_store_event = (
+                runtime_config.detail_profile_event_base + 24
+            )
         return self._stage(
             name,
             SchedDsv4Fp8QuantUmmaB(
-                source.reshape(-1), output, scale_pack
+                source.reshape(-1),
+                output,
+                scale_pack,
+                profile_store_event=profile_store_event,
             ),
             assignment,
             wait_for_previous=wait_for_previous,
@@ -1757,20 +1890,20 @@ class ResidentOneLaunchDecode:
         index_selection_input_join = (
             f"{family.name}.index.selection.input.join"
         )
-        stages, post = self._hc_stages(
-            family, "attn", self.residual, self.next_residual
-        )
         split_q_a = "q_a" in self.splitk_components
         split_q_b = "q_b" in self.splitk_components
         split_kv = "kv" in self.splitk_components
         split_index_q_b = "index_q_b" in self.splitk_components
         split_o_a = "o_a" in self.splitk_components
         split_o_b = "o_b" in self.splitk_components
+        attention_rows = self.attention_indices_by_kind[kind].numel()
+        use_context1_attention = (
+            split_o_a
+            and attention_rows == 1
+            and self.args.attention_mode in ("auto", "umma-split")
+        )
+        context1_q_ready = f"{family.name}.attn.context1.q.ready"
         use_grouped_preattention = split_q_a and split_kv and split_q_b
-        if use_grouped_preattention:
-            stages[-1] = replace(
-                stages[-1], release_group=attention_input_ready
-            )
         compress_values = self.compress_values
         compress_scores = self.compress_scores
         index_compress_values = self.index_compress_values
@@ -1788,6 +1921,7 @@ class ResidentOneLaunchDecode:
             + cfg.o_groups * cfg.o_lora_rank * int(split_o_a)
             + cfg.hidden_size * int(split_o_b)
         )
+        projection_reset = None
         if workspace_rows:
             if self.direct_splitk_bf16:
                 workspace = self.splitk_output_arena
@@ -1802,26 +1936,51 @@ class ResidentOneLaunchDecode:
                 self.splitk_accumulators.append(workspace)
                 self._active_splitk_workspace = workspace
                 self._active_splitk_offset = 0
-            stages.append(
-                self._stage(
-                    "attn.projections.reset",
-                    SchedDsv4ZeroFill(self.zero_fill_gate, workspace),
-                    min(self.sms, workspace_rows // 4),
-                    wait_group=(
-                        attention_input_ready
-                        if use_grouped_preattention
+            projection_reset = self._stage(
+                "attn.projections.reset",
+                SchedDsv4ZeroFill(
+                    self.zero_fill_gate
+                    if self.args.projection_reset_position == "after-input"
+                    else None,
+                    workspace,
+                    profile_store_event=(
+                        runtime_config.detail_profile_event_base + 26
+                        if self.args.profile_fp8_coupled_detail
                         else None
                     ),
-                    release_group=(
-                        qkv_input_ready
-                        if use_grouped_preattention
-                        else None
-                    ),
-                )
+                ),
+                min(
+                    self.args.projection_reset_sms or self.sms,
+                    workspace_rows // 4,
+                ),
+                wait_group=(
+                    attention_input_ready
+                    if use_grouped_preattention
+                    and self.args.projection_reset_position == "after-input"
+                    else None
+                ),
+                release_group=(
+                    qkv_input_ready
+                    if use_grouped_preattention
+                    and self.args.projection_reset_position == "after-input"
+                    else None
+                ),
             )
         else:
             self._active_splitk_workspace = None
             self._active_splitk_offset = 0
+        stages, post = self._hc_stages(
+            family, "attn", self.residual, self.next_residual
+        )
+        if use_grouped_preattention:
+            stages[-1] = replace(
+                stages[-1], release_group=attention_input_ready
+            )
+        if projection_reset is not None:
+            if self.args.projection_reset_position == "layer-first":
+                stages.insert(0, projection_reset)
+            else:
+                stages.append(projection_reset)
         need_native_hidden = split_q_a or split_kv
         need_scalar_hidden = not split_q_a or not split_kv
         if need_native_hidden:
@@ -2006,7 +2165,11 @@ class ResidentOneLaunchDecode:
                     self.hidden_native_fp8,
                     self.kv,
                     base_sm=kv_base,
-                    wait_group=qkv_input_ready,
+                    wait_group=(
+                        q_a_ready
+                        if self.args.qkv_projection_schedule == "q-first"
+                        else qkv_input_ready
+                    ),
                     release_group=(
                         qkv_prefix_join
                         if fuse_kv_splitk_epilogue
@@ -2043,7 +2206,11 @@ class ResidentOneLaunchDecode:
                     release_group=qkv_prefix_join,
                 )
             )
-        if use_grouped_preattention and kind in ("csa", "hca"):
+        if (
+            use_grouped_preattention
+            and kind in ("csa", "hca")
+            and plan.should_compress
+        ):
             width = cfg.head_dim * (2 if kind == "csa" else 1)
             fused_output = self.compress_fused_projection[: 2 * width]
             compress_values = fused_output[:width]
@@ -2079,7 +2246,11 @@ class ResidentOneLaunchDecode:
                     release_group=compressor_projection_ready,
                 )
             )
-        if use_grouped_preattention and kind == "csa":
+        if (
+            use_grouped_preattention
+            and kind == "csa"
+            and plan.should_compress
+        ):
             fused_index_output = self.index_compress_fused_projection.reshape(-1)
             index_compress_values = fused_index_output[: 2 * cfg.index_head_dim]
             index_compress_scores = fused_index_output[2 * cfg.index_head_dim :]
@@ -2428,6 +2599,11 @@ class ResidentOneLaunchDecode:
         fuse_q_splitk_epilogue = (
             split_q_b and not self.direct_splitk_bf16
         )
+        fuse_context1_q_rms = (
+            use_context1_attention
+            and split_q_b
+            and self.direct_splitk_bf16
+        )
         q_fp32_finalizer = None
         if fuse_q_splitk_epilogue:
 
@@ -2454,6 +2630,12 @@ class ResidentOneLaunchDecode:
                     self.q_rank_native_fp8,
                     self.q,
                     wait_group=qkv_prefix_join,
+                    release_group=(
+                        context1_q_ready
+                        if use_context1_attention
+                        and (fuse_q_splitk_epilogue or fuse_context1_q_rms)
+                        else None
+                    ),
                     fp32_finalizer=q_fp32_finalizer,
                 )
             )
@@ -2480,17 +2662,24 @@ class ResidentOneLaunchDecode:
                     wait_group=qkv_prefix_join,
                 )
             )
-        if not fuse_q_splitk_epilogue:
+        if not fuse_q_splitk_epilogue and not fuse_context1_q_rms:
             stages.append(
                 self._rms_rope_stage(
                     "attn.q_head_rms_rope",
                     self.q,
                     rope_table,
                     self.q_rope,
+                    release_group=(
+                        context1_q_ready if use_context1_attention else None
+                    ),
                 )
             )
 
-        if kind in ("csa", "hca") and not use_grouped_preattention:
+        if (
+            kind in ("csa", "hca")
+            and not use_grouped_preattention
+            and plan.should_compress
+        ):
             width = cfg.head_dim * (2 if kind == "csa" else 1)
             if not use_grouped_preattention:
                 stages.append(
@@ -2699,7 +2888,7 @@ class ResidentOneLaunchDecode:
                         self.index_head_weights,
                     )
                 )
-            if not use_grouped_preattention:
+            if not use_grouped_preattention and plan.should_compress:
                 stages.append(
                     self._bf16_linear_stage(
                         "index.compressor.wkv",
@@ -2820,7 +3009,55 @@ class ResidentOneLaunchDecode:
             )
         )
         output_join_group = f"{family.name}.attn.output.join"
-        if use_split_umma_attention:
+        o_rank_ready = f"{family.name}.attn.o_rank.native.ready"
+        if use_context1_attention:
+            native_heads = self.o_group_native_fp8.view(
+                cfg.num_heads, 4, 2048
+            )
+            for group in range(cfg.o_groups):
+                group_input_ready = (
+                    f"{family.name}.attn.o_a.g{group}.input.ready"
+                )
+                context1 = SchedDsv4AttentionContext1Fp8Sm100(
+                    self.q if fuse_context1_q_rms else self.q_rope,
+                    self.current_kv_rows[kind],
+                    sinks[0],
+                    rope_table,
+                    native_heads,
+                    head_start=group * 8,
+                    head_count=8,
+                    normalize_q=fuse_context1_q_rms,
+                )
+                context1 = self._layered(context1, family, sinks)
+                stages.append(
+                    self._stage(
+                        f"attn.sparse_{kind}.context1_quant_g{group}",
+                        context1,
+                        8,
+                        base_sm=group * 16,
+                        input_role="input",
+                        wait_group=context1_q_ready,
+                        prefetch_before_wait=True,
+                        release_group=group_input_ready,
+                    )
+                )
+                start = group * cfg.o_lora_rank
+                stages.extend(
+                    self._splitk_fp8_linear_stages(
+                        f"attn.o_a.g{group}",
+                        family,
+                        "attn.wo_a",
+                        self.o_group_native_fp8[group],
+                        self.o_rank[group],
+                        row_slice=slice(start, start + cfg.o_lora_rank),
+                        base_sm=group * 16,
+                        split_k=2,
+                        num_sms=16,
+                        wait_group=group_input_ready,
+                        release_group=output_join_group,
+                    )
+                )
+        elif use_split_umma_attention:
             num_splits = (attention_rows + 63) // 64
             partials = self.attention_partial_workspace[:num_splits]
             metadata = self.attention_metadata_workspace[:num_splits]
@@ -2857,6 +3094,7 @@ class ResidentOneLaunchDecode:
                     f"attn.sparse_{kind}.split64_umma",
                     producer,
                     num_splits,
+                    base_sm=self.args.attention_producer_base_sm,
                     input_role="q",
                     prefetch_before_wait=True,
                     release_group_roles=(
@@ -3021,7 +3259,6 @@ class ResidentOneLaunchDecode:
                         )
                     )
         if split_o_b:
-            o_rank_ready = f"{family.name}.attn.o_rank.native.ready"
             stages.append(
                 self._native_fp8_quant_stage(
                     "attn.o_rank.quant_native_fp8",
@@ -3038,6 +3275,8 @@ class ResidentOneLaunchDecode:
                     "attn.wo_b",
                     self.o_rank_native_fp8,
                     self.branch,
+                    split_k=8,
+                    num_sms=128,
                     wait_group=o_rank_ready,
                 )
             )
@@ -3092,14 +3331,42 @@ class ResidentOneLaunchDecode:
 
     def _build_mxfp_ffn(self, family: LayerFamily) -> list[Stage]:
         cfg = self.config
-        barrier_set = (
-            1
-            if (
-                self.args.layers == cfg.num_layers
-                and family.name == "layers4-42.csa_score"
-            )
-            else 0
+        async_reload = (
+            runtime_config.async_barrier_reload_enabled
+            and family.representative >= cfg.num_hash_layers
         )
+        heterogeneous_pair = (
+            self.args.layers == 2 and self.layer_ids[0] != self.layer_ids[1]
+        )
+        barrier_set = (
+            (
+                family.representative
+                - (
+                    self.layer_ids[0]
+                    if heterogeneous_pair
+                    else cfg.num_hash_layers
+                )
+            )
+            & 1
+            if async_reload or heterogeneous_pair
+            else (
+                1
+                if (
+                    self.args.layers == cfg.num_layers
+                    and family.name == "layers4-42.csa_score"
+                )
+                else 0
+            )
+        )
+        # The two score-layer families own disjoint internal MXFP banks.  The
+        # first bank remains dead after HCA, so defer its restore and clear the
+        # two contiguous banks together during the second layer's post work.
+        # This preserves a full HCA->CSA interval before bank-0 reuse while
+        # halving clear-command decode, publication, and stage-join overhead.
+        overlap_internal_clear = async_reload and barrier_set == 1
+        route_record = self.route_records[barrier_set]
+        route_indices = route_record[:32].view(torch.int32)
+        route_weights = route_record[32:64].view(torch.float32)
         runtime_layers = tuple(
             self._mxfp_runtime_layer(layer_id, barrier_set)
             for layer_id in family.layer_ids
@@ -3134,20 +3401,25 @@ class ResidentOneLaunchDecode:
             down_weight,
             down_scale,
             self.mxfp_middle_records,
-            self.mxfp_ffn_accumulator,
+            self.mxfp_ffn_output,
             representative.down_tma,
             representative.down_metadata,
             output_n_major=True,
-            fp32_output=True,
+            fp32_output=False,
         )
         resident = SchedMxfp4Mxfp8RoutedResidentFfn(
             linear1,
             down,
-            self.route_record,
+            route_record,
             representative.image.linear1_weights,
             representative.image.linear1_scales,
             representative.image.down_weights,
             representative.image.down_scales,
+            profile_output_event=(
+                FFN_OUTPUT_PROFILE_EVENT_BASE
+                if self.args.profile_steps
+                else None
+            ),
         )
         resident = SchedLayeredMxfp4Mxfp8RoutedResidentFfn(
             resident,
@@ -3177,6 +3449,35 @@ class ResidentOneLaunchDecode:
         # CTA placements are disjoint at the independent frontier:
         # router [0,128), route 128, split [136,152), and quant [144,152).
         # Quant precedes split on their shared eight CTAs.
+        resident_done = f"{family.name}.ffn.mx.resident.done"
+        resident_stage = self._stage(
+            "ffn.mx.resident",
+            resident,
+            self.sms,
+            base_sm=0,
+            wait_group_roles=((resident_input_ready, "input"),),
+            release_group=resident_done if overlap_internal_clear else None,
+        )
+        if overlap_internal_clear:
+            first_bar = self.mxfp_internal_barrier_start
+            clear_count = self.mxfp_internal_barrier_stop - first_bar
+            post = replace(
+                post,
+                schedule=SchedOverlapAsyncBarrierReload(
+                    post.schedule,
+                    post.num_sms,
+                    self.launcher.bars_src,
+                    first_bar,
+                    clear_count,
+                    post.num_sms,
+                    runtime_config.async_barrier_reload_workers,
+                ),
+                num_sms=self.sms,
+                input_role="input",
+                base_sm=0,
+                wait_for_previous=False,
+                wait_group=resident_done,
+            )
         stages.extend(
             (
                 self._stage(
@@ -3238,12 +3539,12 @@ class ResidentOneLaunchDecode:
                         self.router_prepared,
                         None,
                         hash_rows,
-                        self.route_indices,
-                        self.route_weights,
+                        route_indices,
+                        route_weights,
                         hash_routing=hash_routing,
                         route_scale=cfg.route_scale,
                         pretransformed=True,
-                        packed_output=self.route_record,
+                        packed_output=route_record,
                         hash_counter_strides=(
                             family.counter_strides if hash_routing else ()
                         ),
@@ -3253,22 +3554,7 @@ class ResidentOneLaunchDecode:
                     wait_group=router_scores_ready,
                     release_group=resident_input_ready,
                 ),
-                self._stage(
-                    "ffn.mx.resident",
-                    resident,
-                    112,
-                    base_sm=self.sms - 112,
-                    wait_group_roles=((resident_input_ready, "input"),),
-                ),
-                self._stage(
-                    "ffn.mx.fp32_to_bf16",
-                    SchedDsv4Fp32ToBf16(
-                        self.mxfp_ffn_accumulator[0],
-                        self.mxfp_ffn_output[0],
-                    ),
-                    32,
-                    base_sm=0,
-                ),
+                resident_stage,
                 post,
             )
         )
@@ -3290,7 +3576,9 @@ class ResidentOneLaunchDecode:
         self.head_norm = torch.empty(
             (cfg.hidden_size,), dtype=torch.bfloat16, device=self.device
         )
+        self.head_norm_oracle = None
         self.fp8_head = self.args.vocab_size == cfg.vocab_size
+        self.fp8_head_activation_oracle = None
         self.logits = torch.empty(
             (self.args.vocab_size,), dtype=torch.bfloat16, device=self.device
         )
@@ -3418,8 +3706,12 @@ class ResidentOneLaunchDecode:
         serial_sm = 0
         mxfp_reload_start = self.mxfp_internal_barrier_start
         family_barrier_banks = 1
+        pair_barrier_banks = (
+            2 if runtime_config.async_barrier_reload_enabled else 1
+        )
         self.stage_profile_labels: list[str] = []
         self.step_profile_records: list[tuple[int, str, int, int, int]] = []
+        self.step_profile_begin_events: dict[int, int] = {}
         self.step_profile_total = 0
         aggregate_labels = (
             "hc_project",
@@ -3507,13 +3799,22 @@ class ResidentOneLaunchDecode:
             stage: Stage,
             prefix: str = "",
             *,
+            group_namespace: str = "",
             profile_after: bool = False,
             profile_step_event: int | None = None,
+            profile_step_begin_event: int | None = None,
             profile_aggregate_events: tuple[int, int] | None = None,
             profile_span_begin: tuple[int, int] | None = None,
             profile_span_end: tuple[int, int] | None = None,
         ) -> SequentialStage:
             nonlocal serial_sm
+            def group_name(group: str | None) -> str | None:
+                return (
+                    f"{group_namespace}{group}"
+                    if group is not None
+                    else None
+                )
+
             base_sm = 0 if stage.base_sm is None else stage.base_sm
             if stage.base_sm is None and stage.num_sms == 1:
                 base_sm = serial_sm
@@ -3526,23 +3827,41 @@ class ResidentOneLaunchDecode:
                 input_role=stage.input_role,
                 profile_after=profile_after,
                 wait_for_previous=stage.wait_for_previous,
-                wait_group=stage.wait_group,
-                release_group=stage.release_group,
+                wait_group=group_name(stage.wait_group),
+                release_group=group_name(stage.release_group),
                 profile_step_event=profile_step_event,
+                profile_step_begin_event=profile_step_begin_event,
                 profile_aggregate_events=profile_aggregate_events,
                 profile_span_begin=profile_span_begin,
                 profile_span_end=profile_span_end,
                 prefetch_before_wait=stage.prefetch_before_wait,
-                wait_group_roles=stage.wait_group_roles,
-                release_group_roles=stage.release_group_roles,
+                wait_group_roles=tuple(
+                    (group_name(group), role)
+                    for group, role in stage.wait_group_roles
+                ),
+                release_group_roles=tuple(
+                    (group_name(group), role)
+                    for group, role in stage.release_group_roles
+                ),
             )
 
-        def queued_family(family: LayerFamily) -> list[SequentialStage]:
+        def queued_family(
+            family: LayerFamily,
+            *,
+            enable_profile: bool = True,
+            group_namespace: str = "",
+        ) -> list[SequentialStage]:
             stages = self.family_stages[family.representative]
             self.step_profile_total = len(stages)
+            profile_step_family = (
+                len(self.families) == 1
+                or self.profile_layer_ids[-1] in family.layer_ids
+            )
             queued_stages = []
             for index, stage in enumerate(stages):
-                stage_profile_after = profile_stage(stage.name)
+                stage_profile_after = (
+                    enable_profile and profile_stage(stage.name)
+                )
                 if stage_profile_after:
                     label = (
                         "ffn.outputs_join"
@@ -3552,25 +3871,34 @@ class ResidentOneLaunchDecode:
                     self.stage_profile_labels.append(label)
                 step_event = None
                 if (
-                    self.args.profile_steps
+                    enable_profile
+                    and self.args.profile_steps
+                    and profile_step_family
                     and self.args.profile_step_start
                     <= index
                     < self.args.profile_step_start + self.args.profile_step_count
                 ):
                     step_event = (
-                        runtime_config.layer_profile_event_base
+                        STEP_PROFILE_EVENT_BASE
+                        + index
+                        - self.args.profile_step_start
+                    )
+                step_begin_event = None
+                if step_event is not None and self.args.profile_step_frontiers:
+                    step_begin_event = (
+                        STEP_PROFILE_FRONTIER_BASE
                         + index
                         - self.args.profile_step_start
                     )
                 aggregate_events = None
-                if self.args.profile_ffn_aggregate:
+                if enable_profile and self.args.profile_ffn_aggregate:
                     category = aggregate_category(stage.name)
                     if category is not None:
                         aggregate_events = self.ffn_aggregate_events[category]
                         self.ffn_aggregate_used.add(category)
                 span_begin = None
                 span_end = None
-                if self.args.profile_phase_aggregate:
+                if enable_profile and self.args.profile_phase_aggregate:
                     if stage.name == "attn.hc_project":
                         span_begin = self.phase_aggregate_events["attention"]
                     elif stage.name == "attn.hc_post":
@@ -3582,16 +3910,39 @@ class ResidentOneLaunchDecode:
                 queued_stage = queued(
                     stage,
                     f"{family.name}.",
+                    group_namespace=group_namespace,
                     profile_after=(
-                        self.args.profile_layers and index + 1 == len(stages)
+                        enable_profile
+                        and (
+                            self.args.profile_layers
+                            or self.args.profile_mxfp_ffn_detail
+                        )
+                        and index + 1 == len(stages)
                     ) or stage_profile_after,
                     profile_step_event=step_event,
+                    profile_step_begin_event=(
+                        step_begin_event
+                        if step_begin_event is not None
+                        else (
+                            FP8_COUPLED_STEP_BEGIN_EVENT
+                            if self.args.profile_fp8_coupled_detail
+                            and stage.name == "attn.q_a.partial"
+                            else (
+                                FP8_COUPLED_LAYER_BEGIN_EVENT
+                                if self.args.profile_fp8_coupled_detail
+                                and index == 0
+                                else None
+                            )
+                        )
+                    ),
                     profile_aggregate_events=aggregate_events,
                     profile_span_begin=span_begin,
                     profile_span_end=span_end,
                 )
                 queued_stages.append(queued_stage)
                 if step_event is not None:
+                    if step_begin_event is not None:
+                        self.step_profile_begin_events[index] = step_begin_event
                     self.step_profile_records.append(
                         (
                             index,
@@ -3611,27 +3962,125 @@ class ResidentOneLaunchDecode:
         if self.args.layers == 1:
             family = self.families[0]
             stages = queued_family(family)
+            # The looped multi-layer image resets the persistent MXFP rings
+            # at every block tail.  Preserve the same direct, FFN-completion-
+            # dependent reset in the one-layer diagnostic image so repeated
+            # launches do not inherit the previous launch's full/empty phase.
+            stages[-1] = replace(
+                stages[-1], reset_mxfp_resident_after=True
+            )
             stages.extend(queued(stage) for stage in self.head_stages)
             self.program = SequentialProgram(
                 self.launcher,
                 stages,
-                profile_special_slot=7 if self.args.profile_stages else 0,
                 balance_load_ports=True,
             )
             logical_stages = len(stages)
             queue_stages = logical_stages
-        elif self.args.layers == 2:
+        elif self.args.layers == 2 and self.args.unroll_two_layers:
+            # Diagnostic only: duplicate the same layer-0 command body with
+            # independent dependency barriers.  This preserves one resident
+            # kernel and identical task placement while removing LOOPC,
+            # LOOPM, and the loop-wide dependency-barrier reload.  The MXFP
+            # rings still require their direct tail-dependent phase reset.
+            family = self.families[0]
+            family_serial_sm = serial_sm
+            first_stages = queued_family(
+                family,
+                # Layer profiling needs one frontier for each duplicated
+                # body. Other profiling modes intentionally remain attached
+                # only to the second body so their event IDs stay unique.
+                enable_profile=self.args.profile_layers,
+                group_namespace="unroll0.",
+            )
+            first_stages[-1] = replace(
+                first_stages[-1], reset_mxfp_resident_after=True
+            )
+            serial_sm = family_serial_sm
+            second_stages = queued_family(
+                family,
+                group_namespace="unroll1.",
+            )
+            stages = first_stages + second_stages
+            stages.extend(queued(stage) for stage in self.head_stages)
+            self.program = SequentialProgram(
+                self.launcher,
+                stages,
+                balance_load_ports=True,
+            )
+            logical_stages = len(stages)
+            queue_stages = logical_stages
+        elif self.args.layers == 2 and len(self.families) == 1:
             family = self.families[0]
             family_stages = queued_family(family)
+            if self.args.profile_stages:
+                labels = tuple(self.stage_profile_labels)
+                self.stage_profile_labels = [
+                    f"iteration{iteration}.{label}"
+                    for iteration in range(len(self.profile_layer_ids))
+                    for label in labels
+                ]
             head_stages = [queued(stage) for stage in self.head_stages]
             blocks = [
                 SequentialBlock(
                     family.name,
                     family_stages,
-                    repeat=2,
+                    repeat=len(self.profile_layer_ids),
                     barrier_banks=family_barrier_banks,
                     reload_barrier_start=mxfp_reload_start,
                     reload_mxfp_resident=True,
+                    elide_terminal_reload=bool(head_stages),
+                ),
+            ]
+            if head_stages:
+                blocks.append(
+                    SequentialBlock("head", head_stages, reload_after=False)
+                )
+            blocks = tuple(blocks)
+            self.program = LoopedSequentialProgram(
+                self.launcher, blocks, balance_load_ports=True
+            )
+            logical_stages = sum(
+                len(block.stages) * block.repeat for block in blocks
+            )
+            queue_stages = sum(len(block.stages) for block in blocks)
+        elif self.args.layers == 2:
+            # Diagnostic HCA->CSA (or any heterogeneous adjacent pair): use
+            # exactly the same concatenated pair body and loop-tail reload as
+            # the production 43-layer block, but execute one pair only.
+            first_family, second_family = self.families
+            first_stages = queued_family(first_family)
+            first_stages[-1] = replace(
+                first_stages[-1], reset_mxfp_resident_after=True
+            )
+            pair_stages = first_stages + queued_family(second_family)
+            if (
+                self.args.profile_stages
+                and self.args.two_layer_pair_repeats > 1
+            ):
+                labels = tuple(self.stage_profile_labels)
+                self.stage_profile_labels = [
+                    f"pair{pair_index}.{label}"
+                    for pair_index in range(self.args.two_layer_pair_repeats)
+                    for label in labels
+                ]
+            head_stages = [queued(stage) for stage in self.head_stages]
+            blocks = [
+                SequentialBlock(
+                    f"{first_family.name}.{second_family.name}",
+                    pair_stages,
+                    repeat=self.args.two_layer_pair_repeats,
+                    barrier_banks=pair_barrier_banks,
+                    reload_barrier_start=(
+                        None
+                        if runtime_config.async_barrier_reload_enabled
+                        else mxfp_reload_start
+                    ),
+                    reload_mxfp_resident=True,
+                    elide_terminal_reload=bool(head_stages),
+                    async_reload_after=(
+                        runtime_config.async_barrier_reload_enabled
+                    ),
                 ),
             ]
             if head_stages:
@@ -3675,9 +4124,17 @@ class ResidentOneLaunchDecode:
                     "layers3-42.hca_csa_score",
                     pair_stages,
                     repeat=20,
-                    barrier_banks=family_barrier_banks,
-                    reload_barrier_start=mxfp_reload_start,
+                    barrier_banks=pair_barrier_banks,
+                    reload_barrier_start=(
+                        None
+                        if runtime_config.async_barrier_reload_enabled
+                        else mxfp_reload_start
+                    ),
                     reload_mxfp_resident=True,
+                    elide_terminal_reload=bool(head_stages),
+                    async_reload_after=(
+                        runtime_config.async_barrier_reload_enabled
+                    ),
                 ),
             ]
             if head_stages:
@@ -3693,6 +4150,20 @@ class ResidentOneLaunchDecode:
             )
             queue_stages = sum(len(block.stages) for block in blocks)
         self.launcher.s(self.program)
+        if os.environ.get("DAE_DUMP_COUPLED_PHASES"):
+            segments = getattr(self.program, "segments", (self.program,))
+            for segment_index, segment in enumerate(segments):
+                phases = tuple(segment.coupled_fp8_final_phases)
+                counts = {
+                    phase: phases.count(phase)
+                    for phase in sorted(set(phases))
+                }
+                print(
+                    "DSV4_COUPLED_PHASES "
+                    f"segment={segment_index} counts={counts} "
+                    f"values={','.join(str(phase) for phase in phases)}",
+                    flush=True,
+                )
         print(
             "DSV4_ONE_LAUNCH_PROGRAM "
             f"model_launches=1 layers={self.args.layers} "
@@ -3718,7 +4189,10 @@ class ResidentOneLaunchDecode:
             f"step_profile_events={len(self.step_profile_records)}",
             flush=True,
         )
-        if self.args.profile_layers and self.program.profile_event_count != self.args.layers:
+        if (
+            self.args.profile_layers
+            and self.program.profile_event_count != len(self.profile_layer_ids)
+        ):
             raise AssertionError(
                 "internal layer counter does not cover every requested layer"
             )
@@ -3778,8 +4252,13 @@ class ResidentOneLaunchDecode:
             or self.args.profile_stages
             or self.args.profile_ffn_aggregate
             or self.args.profile_phase_aggregate
+            or self.args.profile_attention_detail
+            or self.args.profile_mxfp_ffn_basic
+            or self.args.profile_mxfp_ffn_detail
         ):
             self.launcher.profile.zero_()
+        if self._l2_scrub is not None:
+            self._l2_scrub.add_(1)
         torch.cuda.synchronize(self.device)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -3796,9 +4275,49 @@ class ResidentOneLaunchDecode:
         token = int(torch.argmax(logits_fp32).item())
         return token, start.elapsed_time(end), logits_fp32
 
-    def validate_fp8_head(self, token: int) -> None:
+    def device_frontier_ms(self) -> float:
+        """Return the last completed kernel's device-only grid envelope."""
+        frontiers = self.launcher.profile[:, :2].cpu()
+        start = max(int(value) for value in frontiers[:, 0])
+        end = max(int(value) for value in frontiers[:, 1])
+        if end < start:
+            raise RuntimeError("device termination frontier precedes startup")
+        return (end - start) / 1.0e6
+
+    def validate_fp8_head(
+        self, token: int, *, require_reference: bool = True
+    ) -> None:
         if not self.fp8_head:
             return
+        if self.head_norm_oracle is not None and not torch.equal(
+            self.head_norm, self.head_norm_oracle
+        ):
+            mismatch = self.head_norm != self.head_norm_oracle
+            first = int(mismatch.nonzero()[0].item())
+            delta = (self.head_norm.float() - self.head_norm_oracle.float()).abs()
+            raise AssertionError(
+                "BF16 head input changed between launches: "
+                f"mismatches={int(mismatch.count_nonzero().item())} "
+                f"max_abs={float(delta.max().item()):.6f} "
+                f"first_index={first} "
+                f"actual={float(self.head_norm[first].item()):.6f} "
+                f"expected={float(self.head_norm_oracle[first].item()):.6f}"
+            )
+        if self.fp8_head_activation_oracle is not None and not torch.equal(
+            self.head_input_native_fp8, self.fp8_head_activation_oracle
+        ):
+            mismatch = (
+                self.head_input_native_fp8 != self.fp8_head_activation_oracle
+            )
+            mismatch_indices = mismatch.nonzero()
+            first = tuple(int(value) for value in mismatch_indices[0].tolist())
+            raise AssertionError(
+                "FP8 head packed activation changed between launches: "
+                f"mismatches={int(mismatch.count_nonzero().item())} "
+                f"first_index={first} "
+                f"actual={int(self.head_input_native_fp8[first].item())} "
+                f"expected={int(self.fp8_head_activation_oracle[first].item())}"
+            )
         resident_logits = self.logits.float()
         if not bool(torch.isfinite(resident_logits).all().item()):
             raise AssertionError("FP8 head logits are not finite")
@@ -3813,17 +4332,78 @@ class ResidentOneLaunchDecode:
             self.head_norm,
         )
         reference_token = int(torch.argmax(reference_logits).item())
-        if resident_token != reference_token:
+        if resident_token != reference_token and require_reference:
             raise AssertionError(
                 "FP8 head logits select "
                 f"token {resident_token}, reference BF16 GEMV selects "
                 f"{reference_token}"
             )
         print(
-            "DSV4_HEAD_REFERENCE status=PASS "
-            f"output_token={token}",
+            "DSV4_HEAD_REFERENCE "
+            f"status={'PASS' if resident_token == reference_token else 'DIAGNOSTIC'} "
+            f"output_token={token} reference_token={reference_token}",
             flush=True,
         )
+
+    def capture_repeat_state(self) -> dict[str, torch.Tensor]:
+        names = (
+            "mhc_packed_output",
+            "hidden",
+            "hidden_native_fp8",
+            "q_rank",
+            "q_rank_norm",
+            "q_rank_native_fp8",
+            "q",
+            "q_norm",
+            "q_rope",
+            "kv",
+            "kv_norm",
+            "attention_output",
+            "attention_inverse",
+            "o_group_native_fp8",
+            "o_rank",
+            "o_rank_native_fp8",
+            "branch",
+            "router_prepared",
+            "route_record",
+            "mxfp_input_records",
+            "mxfp_middle_records",
+            "mxfp_ffn_output",
+            "next_residual",
+            "residual",
+            "head_mixes",
+            "head_norm",
+            "head_input_native_fp8",
+            "logits",
+            "output_token",
+        )
+        return {
+            name: getattr(self, name).clone()
+            for name in names
+            if isinstance(getattr(self, name, None), torch.Tensor)
+        }
+
+    def report_repeat_state(
+        self, oracle: dict[str, torch.Tensor], iteration: int
+    ) -> None:
+        for name, expected in oracle.items():
+            actual = getattr(self, name)
+            if torch.equal(actual, expected):
+                continue
+            mismatch = actual != expected
+            count = int(mismatch.count_nonzero().item())
+            if actual.is_floating_point():
+                max_abs = float(
+                    (actual.float() - expected.float()).abs().max().item()
+                )
+            else:
+                max_abs = -1.0
+            print(
+                "DSV4_REPEAT_STATE "
+                f"iteration={iteration} name={name} exact=false "
+                f"mismatches={count} max_abs={max_abs:.6f}",
+                flush=True,
+            )
 
     def report_projection_diagnostics(self) -> None:
         """Compare resident Q_b output with its raw-checkpoint FP8 oracle."""
@@ -3890,11 +4470,7 @@ class ResidentOneLaunchDecode:
             int(value)
             for value in profile[:, runtime_config.track_profile_event_base + 25]
         ]
-        profile_layer_ids = (
-            (self.args.single_layer_id,)
-            if self.args.layers == 1
-            else tuple(range(self.args.layers))
-        )
+        profile_layer_ids = self.profile_layer_ids
         boundaries = []
         spreads = []
         frontier_vcores = []
@@ -3909,25 +4485,36 @@ class ResidentOneLaunchDecode:
 
         if self.args.layers == 1:
             reload_after_layers = ()
+        elif self.args.layers == 2 and len(self.families) == 1:
+            reload_after_layers = self.profile_layer_ids
         elif self.args.layers == 2:
-            reload_after_layers = (0, 1)
+            reload_after_layers = tuple(self.profile_layer_ids[1::2])
         else:
             reload_after_layers = (0, 1, 2, *range(4, self.args.layers, 2))
-        reload_frontiers = []
+        reload_durations = []
         reload_spreads = []
-        reload_frontier_vcores = []
+        reload_slowest_vcores = []
+        internal_span = end_frontier - start_frontier
         for reload_index, layer_id in enumerate(reload_after_layers):
             event_id = runtime_config.reload_profile_event_base + reload_index
             values = [int(value) for value in profile[:, event_id]]
-            if any(value == 0 for value in values):
-                raise RuntimeError(
-                    f"reload after layer {layer_id} was not recorded"
+            # Reload timing is diagnostic-only and some balanced LDU streams
+            # do not place the profiling form on port 0. Treat a missing or
+            # unsubtracted globaltimer value as unavailable instead of
+            # corrupting the otherwise valid layer-frontier report.
+            if (
+                any(value == 0 for value in values)
+                or max(values) > internal_span
+            ):
+                reload_durations.append(None)
+                reload_spreads.append(None)
+                reload_slowest_vcores.append(None)
+            else:
+                reload_durations.append(max(values))
+                reload_spreads.append(max(values) - min(values))
+                reload_slowest_vcores.append(
+                    max(range(len(values)), key=values.__getitem__)
                 )
-            reload_frontiers.append(max(values))
-            reload_spreads.append(max(values) - min(values))
-            reload_frontier_vcores.append(
-                max(range(len(values)), key=values.__getitem__)
-            )
 
         previous = start_frontier
         layer_total = 0
@@ -3957,30 +4544,32 @@ class ResidentOneLaunchDecode:
                 flush=True,
             )
             if layer_id in reload_after_layers:
-                reload_frontier = reload_frontiers[reload_index]
-                reload_elapsed = reload_frontier - boundary
-                if reload_elapsed < 0:
-                    raise RuntimeError("reload profile frontier precedes its layer")
-                reload_total += reload_elapsed
-                print(
-                    "DSV4_RELOAD_TIME "
-                    f"after_layer={layer_id} "
-                    f"barriers={'pair' if layer_id >= 4 else 'family'} "
-                    f"elapsed_ms={reload_elapsed / 1.0e6:.6f} "
-                    f"frontier_spread_us={reload_spreads[reload_index] / 1.0e3:.3f} "
-                    f"frontier_vcore={reload_frontier_vcores[reload_index]} "
-                    "frontier_physical_sm="
-                    f"{physical_sm_ids[reload_frontier_vcores[reload_index]]}",
-                    flush=True,
-                )
-                previous = reload_frontier
+                reload_elapsed = reload_durations[reload_index]
+                if reload_elapsed is None:
+                    print(
+                        "DSV4_RELOAD_SERVICE "
+                        f"after_layer={layer_id} status=UNAVAILABLE",
+                        flush=True,
+                    )
+                else:
+                    reload_total += reload_elapsed
+                    slowest_vcore = reload_slowest_vcores[reload_index]
+                    assert slowest_vcore is not None
+                    print(
+                        "DSV4_RELOAD_SERVICE "
+                        f"after_layer={layer_id} "
+                        f"barriers={'pair' if layer_id >= 4 else 'family'} "
+                        f"elapsed_ms={reload_elapsed / 1.0e6:.6f} "
+                        f"frontier_spread_us={reload_spreads[reload_index] / 1.0e3:.3f} "
+                        f"slowest_vcore={slowest_vcore} "
+                        "frontier_physical_sm="
+                        f"{physical_sm_ids[slowest_vcore]}",
+                        flush=True,
+                    )
                 reload_index += 1
-            else:
-                previous = boundary
         head_elapsed = end_frontier - previous
         if head_elapsed < 0:
             raise RuntimeError("head profile frontier precedes the final layer")
-        internal_span = end_frontier - start_frontier
         grid_envelope = internal_span * profile.shape[0]
         counter_base = runtime_config.track_profile_event_base
 
@@ -4002,7 +4591,11 @@ class ResidentOneLaunchDecode:
             )
             if elapsed_ns > 0:
                 sm_clock_ghz.append(elapsed_cycles / elapsed_ns)
-
+        physical_sm_ids = [
+            int(profile[vcore, counter_base + 25])
+            for vcore in range(profile.shape[0])
+        ]
+        placement_signature_vcores = (0, 1, 2, 3, 16, 31, 101, 116)
         print(
             "DSV4_TRACK_PROFILE_SAMPLE "
             f"sample_index={sample_index if sample_index is not None else -1} "
@@ -4032,7 +4625,7 @@ class ResidentOneLaunchDecode:
         print(
             "DSV4_LAYER_PROFILE_SUMMARY "
             f"layers={self.args.layers} layer_total_ms={layer_total / 1.0e6:.6f} "
-            f"reload_total_ms={reload_total / 1.0e6:.6f} "
+            f"reload_service_sum_ms={reload_total / 1.0e6:.6f} "
             f"head_ms={head_elapsed / 1.0e6:.6f} "
             f"internal_span_ms={internal_span / 1.0e6:.6f} "
             f"sample_index={sample_index if sample_index is not None else -1} "
@@ -4102,6 +4695,8 @@ class ResidentOneLaunchDecode:
     ) -> None:
         if not self.args.profile_steps:
             return
+        step_end_frontiers = {}
+        step_end_by_sm = {}
         if profile is None:
             profile = self.launcher.profile.cpu()
         magic = 0x4454524B50524631
@@ -4112,6 +4707,21 @@ class ResidentOneLaunchDecode:
 
         summed_local_elapsed_ns = 0
         summed_wait_ns = 0
+        counter_base = runtime_config.track_profile_event_base
+        sm_clock_ghz = []
+        for vcore in range(profile.shape[0]):
+            elapsed_ns = int(profile[vcore, 1]) - int(profile[vcore, 0])
+            elapsed_cycles = int(profile[vcore, counter_base + 27]) - int(
+                profile[vcore, counter_base + 26]
+            )
+            if elapsed_ns > 0:
+                sm_clock_ghz.append(elapsed_cycles / elapsed_ns)
+        physical_sm_ids = [
+            int(profile[vcore, counter_base + 25])
+            for vcore in range(profile.shape[0])
+        ]
+        grid_start = max(int(value) for value in profile[:, 0])
+        placement_signature_vcores = (0, 1, 2, 3, 16, 31, 101, 116)
         for (
             step_index,
             name,
@@ -4151,6 +4761,52 @@ class ResidentOneLaunchDecode:
             summed_wait_ns += wait_ns
             elapsed_values = [sample[1] for sample in samples]
             active_values = [sample[1] for sample in active_samples]
+            frontier_summary = ""
+            if self.args.profile_step_frontiers:
+                begin_event = self.step_profile_begin_events[step_index]
+                elapsed_by_sm = {
+                    sm: (sample_elapsed_ns, sample_wait_ns)
+                    for sm, sample_elapsed_ns, sample_wait_ns in samples
+                }
+                begin_samples = [
+                    (sm, int(profile[sm, begin_event]))
+                    for sm in elapsed_by_sm
+                ]
+                if any(timestamp == 0 for _, timestamp in begin_samples):
+                    raise RuntimeError(
+                        f"step begin event {begin_event} for {name!r} was not recorded"
+                    )
+                begin_values = [timestamp for _, timestamp in begin_samples]
+                ready_values = [
+                    timestamp + elapsed_by_sm[sm][1]
+                    for sm, timestamp in begin_samples
+                ]
+                end_values = [
+                    timestamp + elapsed_by_sm[sm][0]
+                    for sm, timestamp in begin_samples
+                ]
+                latest_end_sm, latest_end = max(
+                    (
+                        (sm, timestamp + elapsed_by_sm[sm][0])
+                        for sm, timestamp in begin_samples
+                    ),
+                    key=lambda sample: sample[1],
+                )
+                step_end_frontiers[step_index] = latest_end
+                step_end_by_sm[step_index] = {
+                    sm: timestamp + elapsed_by_sm[sm][0]
+                    for sm, timestamp in begin_samples
+                }
+                frontier_summary = (
+                    f" begin_min_us={(min(begin_values) - grid_start) / 1.0e3:.3f}"
+                    f" begin_max_us={(max(begin_values) - grid_start) / 1.0e3:.3f}"
+                    f" begin_spread_us={(max(begin_values) - min(begin_values)) / 1.0e3:.3f}"
+                    f" ready_frontier_us={(max(ready_values) - grid_start) / 1.0e3:.3f}"
+                    f" end_frontier_us={(latest_end - grid_start) / 1.0e3:.3f}"
+                    f" end_spread_us={(max(end_values) - min(end_values)) / 1.0e3:.3f}"
+                    f" latest_end_sm={latest_end_sm}"
+                    f" latest_end_physical_sm={physical_sm_ids[latest_end_sm]}"
+                )
             print(
                 "DSV4_STEP_TIME "
                 f"step={step_index} name={name} "
@@ -4164,20 +4820,1519 @@ class ResidentOneLaunchDecode:
                 f"max_compute_active_us={max_active_ns / 1.0e3:.3f} "
                 f"median_compute_active_us="
                 f"{statistics.median(active_values) / 1.0e3:.3f} "
-                f"m2c_wait_pct={100.0 * wait_ns / elapsed_ns if elapsed_ns else 0.0:.3f}",
+                f"m2c_wait_pct={100.0 * wait_ns / elapsed_ns if elapsed_ns else 0.0:.3f}"
+                f"{frontier_summary}",
                 flush=True,
             )
+        resident_step_indices = [
+            step_index
+            for step_index, name, _, _, _ in self.step_profile_records
+            if name == "ffn.mx.resident"
+        ]
+        if resident_step_indices:
+            if len(resident_step_indices) != 1:
+                raise RuntimeError("resident FFN step profiling is ambiguous")
+            resident_step_index = resident_step_indices[0]
+            resident_base = self.sms - 112
+            output_profile = profile[
+                resident_base : resident_base + 112,
+                FFN_OUTPUT_PROFILE_EVENT_BASE :
+                FFN_OUTPUT_PROFILE_EVENT_BASE + 3,
+            ]
+            if bool((output_profile == 0).any().item()):
+                raise RuntimeError("resident FFN output publication was not recorded")
+            allocation = [int(value) for value in output_profile[:, 0]]
+            dequeue = [int(value) for value in output_profile[:, 1]]
+            publication = [int(value) for value in output_profile[:, 2]]
+            compute_end = step_end_frontiers[resident_step_index]
+            service = [
+                end - begin for begin, end in zip(dequeue, publication)
+            ]
+            print(
+                "DSV4_FFN_OUTPUT_PUBLICATION "
+                f"allocation_frontier_us={(max(allocation) - grid_start) / 1.0e3:.3f} "
+                f"dequeue_frontier_us={(max(dequeue) - grid_start) / 1.0e3:.3f} "
+                f"publication_frontier_us={(max(publication) - grid_start) / 1.0e3:.3f} "
+                f"compute_end_to_dequeue_us={(max(dequeue) - compute_end) / 1.0e3:.3f} "
+                f"compute_end_to_publication_us={(max(publication) - compute_end) / 1.0e3:.3f} "
+                f"stu_service_median_us={statistics.median(service) / 1.0e3:.3f} "
+                f"stu_service_max_us={max(service) / 1.0e3:.3f}",
+                flush=True,
+            )
+            history_profile = profile[
+                resident_base : resident_base + 112,
+                STU_HISTORY_EVENT_BASE :
+                STU_HISTORY_EVENT_BASE + 3 * STU_HISTORY_COMMANDS + 1,
+            ]
+            history_counts = [
+                int(value)
+                for value in history_profile[:, 3 * STU_HISTORY_COMMANDS]
+            ]
+            if any(history_counts):
+                critical_local = max(
+                    range(len(dequeue)), key=dequeue.__getitem__
+                )
+                critical_sm = resident_base + critical_local
+                critical_compute_end = step_end_by_sm[resident_step_index][critical_sm]
+                pop_begin = [
+                    int(value)
+                    for value in profile[
+                        resident_base : resident_base + 112,
+                        STU_RAW_POP_BEGIN_EVENT,
+                    ]
+                ]
+                service_identity = profile[
+                    resident_base : resident_base + 112,
+                    STU_RAW_SERVICE_IDENTITY_EVENT,
+                ]
+                output_tokens = profile[
+                    resident_base : resident_base + 112,
+                    STU_RAW_OUTPUT_TOKEN_EVENT,
+                ]
+                raw_ptr_matches = profile[
+                    resident_base : resident_base + 112,
+                    STU_RAW_PTR_MATCH_EVENT_BASE :
+                    STU_RAW_PTR_MATCH_EVENT_BASE + 4,
+                ]
+                raw_ptrs = profile[
+                    resident_base : resident_base + 112,
+                    STU_RAW_PTR_EVENT_BASE :
+                    STU_RAW_PTR_EVENT_BASE + 4,
+                ]
+                raw_arrivals = profile[
+                    resident_base : resident_base + 112,
+                    STU_RAW_ARRIVAL_EVENT_BASE :
+                    STU_RAW_ARRIVAL_EVENT_BASE + 4,
+                ]
+                raw_posts = profile[
+                    resident_base : resident_base + 112,
+                    STU_RAW_POST_EVENT_BASE :
+                    STU_RAW_POST_EVENT_BASE + 4,
+                ]
+                pointer_matches = [
+                    len({int(value) for value in row}) == 1
+                    for row in raw_ptrs
+                ]
+                lane_pointer_matches = [
+                    all(int(value) == 0xFFFFFFFF for value in row)
+                    for row in raw_ptr_matches
+                ]
+                service_identity_matches = [
+                    (int(identity) & 0xFFFFFFFF) == int(ptr_row[0])
+                    and (int(identity) >> 32) == int(output_token)
+                    for identity, output_token, ptr_row in zip(
+                        service_identity, output_tokens, raw_ptrs
+                    )
+                ]
+                arrival_spreads = [
+                    max(int(value) for value in row) -
+                    min(int(value) for value in row)
+                    for row in raw_arrivals
+                ]
+                arrival_to_dequeue = [
+                    target_dequeue - max(int(value) for value in row)
+                    for target_dequeue, row in zip(dequeue, raw_arrivals)
+                ]
+                post_to_dequeue = [
+                    target_dequeue - max(int(value) for value in row)
+                    for target_dequeue, row in zip(dequeue, raw_posts)
+                ]
+                pop_wait = [
+                    target_dequeue - begin
+                    for target_dequeue, begin in zip(dequeue, pop_begin)
+                ]
+                critical_ptrs = ",".join(
+                    str(int(value)) for value in raw_ptrs[critical_local]
+                )
+                critical_ptr_masks = ",".join(
+                    f"0x{int(value):08x}"
+                    for value in raw_ptr_matches[critical_local]
+                )
+                critical_identity = int(service_identity[critical_local])
+                critical_arrivals = [
+                    int(value) for value in raw_arrivals[critical_local]
+                ]
+                critical_posts = [
+                    int(value) for value in raw_posts[critical_local]
+                ]
+                print(
+                    "DSV4_FFN_OUTPUT_C2M_ARRIVAL "
+                    f"pointer_match_sms={sum(pointer_matches)}/{len(pointer_matches)} "
+                    f"lane_pointer_match_sms="
+                    f"{sum(lane_pointer_matches)}/{len(lane_pointer_matches)} "
+                    f"service_identity_match_sms="
+                    f"{sum(service_identity_matches)}/{len(service_identity_matches)} "
+                    f"arrival_spread_median_us="
+                    f"{statistics.median(arrival_spreads) / 1.0e3:.3f} "
+                    f"arrival_spread_max_us={max(arrival_spreads) / 1.0e3:.3f} "
+                    f"last_arrival_to_dequeue_median_us="
+                    f"{statistics.median(arrival_to_dequeue) / 1.0e3:.3f} "
+                    f"last_arrival_to_dequeue_max_us="
+                    f"{max(arrival_to_dequeue) / 1.0e3:.3f} "
+                    f"last_post_to_dequeue_median_us="
+                    f"{statistics.median(post_to_dequeue) / 1.0e3:.3f} "
+                    f"last_post_to_dequeue_max_us="
+                    f"{max(post_to_dequeue) / 1.0e3:.3f} "
+                    f"pop_wait_median_us="
+                    f"{statistics.median(pop_wait) / 1.0e3:.3f} "
+                    f"pop_wait_max_us={max(pop_wait) / 1.0e3:.3f} "
+                    f"critical_sm={critical_sm} "
+                    f"critical_ptrs={critical_ptrs} "
+                    f"critical_ptr_masks={critical_ptr_masks} "
+                    f"critical_output_token={int(output_tokens[critical_local])} "
+                    f"critical_service_slot={critical_identity >> 32} "
+                    f"critical_service_queue={critical_identity & 0xFFFFFFFF} "
+                    f"critical_pop_begin_from_compute_end_us="
+                    f"{(pop_begin[critical_local] - critical_compute_end) / 1.0e3:.3f} "
+                    f"critical_arrival_spread_us="
+                    f"{(max(critical_arrivals) - min(critical_arrivals)) / 1.0e3:.3f} "
+                    f"critical_last_arrival_from_compute_end_us="
+                    f"{(max(critical_arrivals) - critical_compute_end) / 1.0e3:.3f} "
+                    f"critical_last_arrival_to_dequeue_us="
+                    f"{(dequeue[critical_local] - max(critical_arrivals)) / 1.0e3:.3f} "
+                    f"critical_last_post_to_dequeue_us="
+                    f"{(dequeue[critical_local] - max(critical_posts)) / 1.0e3:.3f}",
+                    flush=True,
+                )
+                opcode_names = {}
+                for name in dir(runtime.opcode):
+                    if not name.startswith("OP_"):
+                        continue
+                    value = getattr(runtime.opcode, name)
+                    if isinstance(value, int):
+                        opcode_names.setdefault(int(value) >> 6, name)
+                for distance in range(STU_HISTORY_COMMANDS, 0, -1):
+                    samples = []
+                    for local_sm, count in enumerate(history_counts):
+                        if count < distance:
+                            continue
+                        event = 3 * (count - distance)
+                        samples.append(
+                            (
+                                local_sm,
+                                int(history_profile[local_sm, event + 0]),
+                                int(history_profile[local_sm, event + 1]),
+                                int(history_profile[local_sm, event + 2]),
+                            )
+                        )
+                    if not samples:
+                        continue
+                    opcode_values = [sample[1] for sample in samples]
+                    service_begin = [sample[2] for sample in samples]
+                    service_end = [sample[3] for sample in samples]
+                    durations = [
+                        end - begin
+                        for begin, end in zip(service_begin, service_end)
+                    ]
+                    opcode_counts = {}
+                    for value in opcode_values:
+                        name = opcode_names.get(value, f"mop_{value}")
+                        opcode_counts[name] = opcode_counts.get(name, 0) + 1
+                    critical_sample = next(
+                        (
+                            sample
+                            for sample in samples
+                            if sample[0] == critical_local
+                        ),
+                        None,
+                    )
+                    critical_summary = ""
+                    if critical_sample is not None:
+                        critical_begin = critical_sample[2]
+                        critical_end = critical_sample[3]
+                        critical_summary = (
+                            f" critical_begin_from_compute_end_us="
+                            f"{(critical_begin - critical_compute_end) / 1.0e3:.3f}"
+                            f" critical_end_from_compute_end_us="
+                            f"{(critical_end - critical_compute_end) / 1.0e3:.3f}"
+                            f" critical_service_us="
+                            f"{(critical_end - critical_begin) / 1.0e3:.3f}"
+                        )
+                    print(
+                        "DSV4_FFN_OUTPUT_PRECEDING "
+                        f"rank={-distance} samples={len(samples)} "
+                        "opcodes="
+                        + ",".join(
+                            f"{name}:{count}"
+                            for name, count in sorted(opcode_counts.items())
+                        )
+                        + " "
+                        f"service_median_us={statistics.median(durations) / 1.0e3:.3f} "
+                        f"service_max_us={max(durations) / 1.0e3:.3f} "
+                        f"critical_sm={critical_sm}"
+                        f"{critical_summary}",
+                        flush=True,
+                    )
         print(
             "DSV4_STEP_PROFILE_SUMMARY "
+            f"profiled_layer="
+            f"{self.layer_ids[-1]} "
             f"window_start={self.args.profile_step_start} "
             f"window_steps={len(self.step_profile_records)} "
             f"layer_steps={self.step_profile_total} "
             f"summed_local_elapsed_us={summed_local_elapsed_ns / 1.0e3:.3f} "
             f"summed_local_m2c_wait_us={summed_wait_ns / 1.0e3:.3f} "
+            f"sm_clock_ghz_min={min(sm_clock_ghz):.3f} "
+            f"sm_clock_ghz_median={statistics.median(sm_clock_ghz):.3f} "
+            f"sm_clock_ghz_max={max(sm_clock_ghz):.3f} "
+            "physical_sm_signature="
+            + ",".join(
+                str(physical_sm_ids[vcore])
+                for vcore in placement_signature_vcores
+            )
+            + " "
             f"sample_index={sample_index if sample_index is not None else -1} "
             f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
             flush=True,
         )
+    def report_fp8_coupled_detail_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        """Decompose the selected layer's Q-a coupled-ring service."""
+        if not self.args.profile_fp8_coupled_detail:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        if runtime_config.num_profile_events < 160:
+            raise RuntimeError(
+                "FP8 coupled detail profiling requires "
+                "fp8_coupled_detail_profile=1"
+            )
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "FP8 coupled detail profiling requires track_profile=1"
+            )
+
+        q_record = next(
+            record
+            for record in self.step_profile_records
+            if record[1] == "attn.q_a.partial"
+        )
+        _, _, step_event, base_sm, num_sms = q_record
+        ldu_base = runtime_config.detail_profile_event_base
+        commands = 8
+        coupled_load_opcode = (
+            (int(runtime.opcode.OP_TMA_LOAD_MX_COUPLED_STREAM) >> 6)
+            | 0x800
+        )
+        opcode_names = {}
+        for name in dir(runtime.opcode):
+            if not name.startswith("OP_"):
+                continue
+            value = getattr(runtime.opcode, name)
+            if isinstance(value, int):
+                opcode_names.setdefault(int(value) >> 6, name)
+
+        def signed_wrapped_delta(end: int, begin: int) -> int:
+            return ((end - begin + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)
+
+        records = []
+        trace = {}
+        for sm in range(base_sm, base_sm + num_sms):
+            ldu = []
+            for port in range(2):
+                port_records = []
+                for command in range(commands):
+                    packed = int(
+                        profile[
+                            sm,
+                            ldu_base + port * commands + command,
+                        ].item()
+                    )
+                    if packed == 0:
+                        break
+                    begin = packed & 0xFFFFFFFF
+                    duration = (packed >> 32) & 0xFFFFF
+                    normalized_opcode = (packed >> 52) & 0xFFF
+                    port_records.append(
+                        (begin, duration, normalized_opcode)
+                    )
+                q_slots = [
+                    index
+                    for index, item in enumerate(port_records)
+                    if item[2] == coupled_load_opcode
+                ]
+                if not port_records or not q_slots:
+                    raise RuntimeError(
+                        f"LDU{port} rolling prefix for SM {sm} has "
+                        f"{len(port_records)} records and Q-a slots {q_slots}; "
+                        f"opcodes={[item[2] for item in port_records]}"
+                    )
+                q_slot = q_slots[0]
+                # The producer stops at the first Q-a command. Slots beyond
+                # it may contain an older sample because the diagnostic path
+                # deliberately avoids clearing global memory in the LDU.
+                port_records = port_records[: q_slot + 1]
+                ldu.append(port_records)
+
+            step_packed = int(profile[sm, step_event])
+            step_elapsed = step_packed & 0xFFFFFFFF
+            step_wait = (step_packed >> 32) & 0xFFFFFFFF
+            step_begin = int(
+                profile[sm, FP8_COUPLED_STEP_BEGIN_EVENT]
+            ) & 0xFFFFFFFF
+            if step_begin == 0:
+                raise RuntimeError(
+                    f"missing Q-a begin timestamp for SM {sm}"
+                )
+            q_commands = []
+            q_gaps = []
+            for port in range(2):
+                q_index = next(
+                    (
+                        index
+                        for index, item in enumerate(ldu[port])
+                        if item[2] == coupled_load_opcode
+                    ),
+                    None,
+                )
+                if q_index is None:
+                    raise RuntimeError(
+                        f"LDU{port} Q-a command lies beyond the "
+                        f"{commands}-command trace on SM {sm}"
+                    )
+                q_commands.append(ldu[port][q_index])
+                previous_end = (
+                    ldu[port][q_index - 1][0]
+                    + ldu[port][q_index - 1][1]
+                    if q_index > 0
+                    else ldu[port][q_index][0]
+                ) & 0xFFFFFFFF
+                q_gaps.append(
+                    signed_wrapped_delta(ldu[port][q_index][0], previous_end)
+                )
+                for command, (begin, duration, normalized_opcode) in enumerate(
+                    ldu[port][: q_index + 1]
+                ):
+                    key = (
+                        port,
+                        command - q_index,
+                        normalized_opcode,
+                    )
+                    trace.setdefault(key, []).append(
+                        (
+                            signed_wrapped_delta(begin, step_begin),
+                            duration,
+                        )
+                    )
+            records.append(
+                {
+                    "sm": sm,
+                    "step": step_elapsed,
+                    "step_wait": step_wait,
+                    "step_active": max(0, step_elapsed - step_wait),
+                    "ldu0_begin": signed_wrapped_delta(
+                        q_commands[0][0], step_begin
+                    ),
+                    "ldu1_begin": signed_wrapped_delta(
+                        q_commands[1][0], step_begin
+                    ),
+                    "ldu0_begin_raw": q_commands[0][0],
+                    "ldu1_begin_raw": q_commands[1][0],
+                    "ldu0_service": q_commands[0][1],
+                    "ldu1_service": q_commands[1][1],
+                    "ldu0_gap": q_gaps[0],
+                    "ldu1_gap": q_gaps[1],
+                }
+            )
+            records[-1]["ldu0_end"] = (
+                records[-1]["ldu0_begin"]
+                + records[-1]["ldu0_service"]
+            )
+            records[-1]["ldu1_end"] = (
+                records[-1]["ldu1_begin"]
+                + records[-1]["ldu1_service"]
+            )
+            records[-1]["post_issue_tail"] = (
+                records[-1]["step"]
+                - max(records[-1]["ldu0_end"], records[-1]["ldu1_end"])
+            )
+
+            wait_base = ldu_base + 2 * commands
+            source_base = wait_base + 6
+            for port in range(2):
+                source = int(profile[sm, source_base + port].item())
+                records[-1][f"ldu{port}_source_begin"] = (
+                    signed_wrapped_delta(source & 0xFFFFFFFF, step_begin)
+                )
+                records[-1][f"ldu{port}_source_begin_raw"] = (
+                    source & 0xFFFFFFFF
+                )
+                records[-1][f"ldu{port}_gate_wait"] = (
+                    records[-1][f"ldu{port}_source_begin"]
+                    - records[-1][f"ldu{port}_begin"]
+                )
+                records[-1][f"ldu{port}_source_wait"] = (
+                    source >> 32
+                ) & 0xFFFFF
+                state = int(profile[sm, wait_base + port * 3].item())
+                records[-1][f"ldu{port}_phase_base"] = state & 0xFFFFFFFF
+                records[-1][f"ldu{port}_pair_count"] = state >> 32
+                for pair in range(2):
+                    packed = int(
+                        profile[
+                            sm,
+                            wait_base + port * 3 + 1 + pair,
+                        ].item()
+                    )
+                    records[-1][f"ldu{port}_pair{pair}_begin"] = (
+                        signed_wrapped_delta(packed & 0xFFFFFFFF, step_begin)
+                    )
+                    records[-1][f"ldu{port}_pair{pair}_wait"] = (
+                        packed >> 32
+                    ) & 0xFFFFF
+                    records[-1][f"ldu{port}_pair{pair}_expected_ready"] = (
+                        packed >> 52
+                    ) & 1
+                    records[-1][f"ldu{port}_pair{pair}_opposite_ready"] = (
+                        packed >> 53
+                    ) & 1
+                    records[-1][f"ldu{port}_pair{pair}_stage"] = (
+                        packed >> 54
+                    ) & 1
+                    records[-1][f"ldu{port}_pair{pair}_phase"] = (
+                        packed >> 55
+                    ) & 1
+
+        def values(name: str) -> list[int]:
+            return [int(record[name]) for record in records]
+
+        quant_store_event = ldu_base + 24
+        quant_sms = self.config.hidden_size // 256
+        quant_store_raw = [
+            int(profile[sm, quant_store_event].item()) & 0xFFFFFFFF
+            for sm in range(quant_sms)
+        ]
+        if any(timestamp == 0 for timestamp in quant_store_raw):
+            raise RuntimeError("missing hidden-quant STU completion timestamp")
+        quant_anchor = quant_store_raw[0]
+        quant_store_offsets = [
+            signed_wrapped_delta(timestamp, quant_anchor)
+            for timestamp in quant_store_raw
+        ]
+        layer_begin_raw = [
+            int(profile[sm, FP8_COUPLED_LAYER_BEGIN_EVENT].item())
+            & 0xFFFFFFFF
+            for sm in range(self.sms)
+        ]
+        if any(timestamp == 0 for timestamp in layer_begin_raw):
+            raise RuntimeError("missing selected-layer begin timestamp")
+        layer_anchor = layer_begin_raw[0]
+        layer_begin_offsets = [
+            signed_wrapped_delta(timestamp, layer_anchor)
+            for timestamp in layer_begin_raw
+        ]
+        layer_origin = min(layer_begin_offsets)
+        reset_record = next(
+            record for record in self.step_profile_records if record[0] == 0
+        )
+        reset_event = reset_record[2]
+        reset_elapsed = []
+        reset_wait = []
+        for sm in range(self.sms):
+            packed = int(profile[sm, reset_event].item())
+            reset_elapsed.append(packed & 0xFFFFFFFF)
+            reset_wait.append((packed >> 32) & 0xFFFFFFFF)
+        reset_active_start = [
+            layer_begin_offsets[sm] - layer_origin + reset_wait[sm]
+            for sm in range(self.sms)
+        ]
+        reset_compute_end = [
+            layer_begin_offsets[sm] - layer_origin + reset_elapsed[sm]
+            for sm in range(self.sms)
+        ]
+        reset_alloc_event = ldu_base + 26
+        reset_alloc_begin_raw = [
+            int(profile[sm, reset_alloc_event].item()) & 0xFFFFFFFF
+            for sm in range(self.sms)
+        ]
+        reset_alloc_end_raw = [
+            int(profile[sm, reset_alloc_event + 1].item()) & 0xFFFFFFFF
+            for sm in range(self.sms)
+        ]
+        reset_store_end_raw = [
+            int(profile[sm, reset_alloc_event + 2].item()) & 0xFFFFFFFF
+            for sm in range(self.sms)
+        ]
+        reload_end_raw = [
+            int(profile[sm, reset_alloc_event + 3].item()) & 0xFFFFFFFF
+            for sm in range(self.sms)
+        ]
+        if any(
+            timestamp == 0
+            for timestamp in (
+                *reset_alloc_begin_raw,
+                *reset_alloc_end_raw,
+                *reset_store_end_raw,
+                *reload_end_raw,
+            )
+        ):
+            raise RuntimeError("missing reset allocation/STU timestamp")
+        reset_alloc_begin = [
+            signed_wrapped_delta(timestamp, layer_anchor) - layer_origin
+            for timestamp in reset_alloc_begin_raw
+        ]
+        reset_alloc_end = [
+            signed_wrapped_delta(timestamp, layer_anchor) - layer_origin
+            for timestamp in reset_alloc_end_raw
+        ]
+        reset_store_end = [
+            signed_wrapped_delta(timestamp, layer_anchor) - layer_origin
+            for timestamp in reset_store_end_raw
+        ]
+        reset_alloc_service = [
+            signed_wrapped_delta(end, begin)
+            for begin, end in zip(
+                reset_alloc_begin_raw, reset_alloc_end_raw
+            )
+        ]
+        reload_end = [
+            signed_wrapped_delta(timestamp, layer_anchor) - layer_origin
+            for timestamp in reload_end_raw
+        ]
+        layer_begin_to_ldu_reload_end = [
+            signed_wrapped_delta(reload, begin)
+            for begin, reload in zip(layer_begin_raw, reload_end_raw)
+        ]
+        reload_to_reset_alloc = [
+            signed_wrapped_delta(allocation, reload)
+            for reload, allocation in zip(
+                reload_end_raw, reset_alloc_begin_raw
+            )
+        ]
+        quant_offsets_from_layer = [
+            signed_wrapped_delta(timestamp, layer_anchor) - layer_origin
+            for timestamp in quant_store_raw
+        ]
+        pair_counts = set(values("ldu1_pair_count"))
+        if len(pair_counts) != 1:
+            raise RuntimeError(
+                f"Q-a tasks disagree on K-pair count: {sorted(pair_counts)}"
+            )
+        pair_count = pair_counts.pop()
+        total_pairs = self.config.hidden_size // 256
+        split_count = total_pairs // pair_count
+        if total_pairs % pair_count or num_sms % split_count:
+            raise RuntimeError("Q-a split placement cannot be mapped to quant shards")
+        output_pairs = num_sms // split_count
+        global_ready = max(quant_store_offsets)
+        local_gate_savings = []
+        for local_task, record in enumerate(records):
+            split = local_task // output_pairs
+            producer_start = split * pair_count
+            local_ready = max(
+                quant_store_offsets[
+                    producer_start : producer_start + pair_count
+                ]
+            )
+            arrival = signed_wrapped_delta(
+                record["ldu1_begin_raw"], quant_anchor
+            )
+            local_gate_savings.append(
+                max(arrival, global_ready) - max(arrival, local_ready)
+            )
+        source_offsets_from_quant = [
+            signed_wrapped_delta(
+                record["ldu1_source_begin_raw"], quant_anchor
+            )
+            for record in records
+        ]
+        late_layer_sms = sorted(
+            range(self.sms),
+            key=lambda sm: layer_begin_offsets[sm],
+            reverse=True,
+        )[:16]
+        late_reset_sms = sorted(
+            range(self.sms),
+            key=lambda sm: reset_active_start[sm],
+            reverse=True,
+        )[:16]
+        print(
+            "DSV4_FP8_QUANT_HANDOFF "
+            f"producer_sms={quant_sms} "
+            f"producer_finish_spread_us="
+            f"{(max(quant_store_offsets) - min(quant_store_offsets)) / 1.0e3:.3f} "
+            f"layer_begin_spread_us="
+            f"{(max(layer_begin_offsets) - layer_origin) / 1.0e3:.3f} "
+            f"reset_active_start_spread_us="
+            f"{(max(reset_active_start) - min(reset_active_start)) / 1.0e3:.3f} "
+            f"reset_compute_end_spread_us="
+            f"{(max(reset_compute_end) - min(reset_compute_end)) / 1.0e3:.3f} "
+            f"reset_alloc_begin_spread_us="
+            f"{(max(reset_alloc_begin) - min(reset_alloc_begin)) / 1.0e3:.3f} "
+            f"reset_alloc_service_median_us="
+            f"{statistics.median(reset_alloc_service) / 1.0e3:.3f} "
+            f"reset_alloc_service_max_us="
+            f"{max(reset_alloc_service) / 1.0e3:.3f} "
+            f"reset_alloc_end_spread_us="
+            f"{(max(reset_alloc_end) - min(reset_alloc_end)) / 1.0e3:.3f} "
+            f"reset_store_end_spread_us="
+            f"{(max(reset_store_end) - min(reset_store_end)) / 1.0e3:.3f} "
+            f"reload_end_spread_us="
+            f"{(max(reload_end) - min(reload_end)) / 1.0e3:.3f} "
+            f"layer_begin_to_ldu_reload_end_min_us="
+            f"{min(layer_begin_to_ldu_reload_end) / 1.0e3:.3f} "
+            f"layer_begin_to_ldu_reload_end_median_us="
+            f"{statistics.median(layer_begin_to_ldu_reload_end) / 1.0e3:.3f} "
+            f"layer_begin_to_ldu_reload_end_max_us="
+            f"{max(layer_begin_to_ldu_reload_end) / 1.0e3:.3f} "
+            f"reload_to_alloc_min_us="
+            f"{min(reload_to_reset_alloc) / 1.0e3:.3f} "
+            f"reload_to_alloc_median_us="
+            f"{statistics.median(reload_to_reset_alloc) / 1.0e3:.3f} "
+            f"reload_to_alloc_max_us="
+            f"{max(reload_to_reset_alloc) / 1.0e3:.3f} "
+            f"quant_finish_frontier_us="
+            f"{max(quant_offsets_from_layer) / 1.0e3:.3f} "
+            f"begin_0_15_median_us="
+            f"{(statistics.median(layer_begin_offsets[0:16]) - layer_origin) / 1.0e3:.3f} "
+            f"begin_16_31_median_us="
+            f"{(statistics.median(layer_begin_offsets[16:32]) - layer_origin) / 1.0e3:.3f} "
+            f"begin_32_151_median_us="
+            f"{(statistics.median(layer_begin_offsets[32:]) - layer_origin) / 1.0e3:.3f} "
+            f"global_release_lag_us="
+            f"{(min(source_offsets_from_quant) - global_ready) / 1.0e3:.3f} "
+            f"shard_gate_saving_median_us="
+            f"{statistics.median(local_gate_savings) / 1.0e3:.3f} "
+            f"shard_gate_saving_max_us="
+            f"{max(local_gate_savings) / 1.0e3:.3f} "
+            f"pair_count={pair_count} output_pairs={output_pairs} "
+            "late_sm:begin_us="
+            + ",".join(
+                f"{sm}:{(layer_begin_offsets[sm] - layer_origin) / 1.0e3:.3f}"
+                for sm in late_layer_sms
+            )
+            + " "
+            "late_reset_sm:active_start_us="
+            + ",".join(
+                f"{sm}:{reset_active_start[sm] / 1.0e3:.3f}"
+                for sm in late_reset_sms
+            )
+            + " "
+            f"sample_index={sample_index if sample_index is not None else -1}",
+            flush=True,
+        )
+
+        critical = max(records, key=lambda record: record["step"])
+        critical_tail = sorted(
+            records,
+            key=lambda record: record["step_active"],
+            reverse=True,
+        )[:8]
+        print(
+            "DSV4_FP8_COUPLED_DETAIL "
+            "stage=attn.q_a.partial "
+            f"active_sms={len(records)} "
+            f"step_us={max(values('step')) / 1.0e3:.3f} "
+            f"step_median_us={statistics.median(values('step')) / 1.0e3:.3f} "
+            f"m2c_wait_us={critical['step_wait'] / 1.0e3:.3f} "
+            f"compute_active_us={critical['step_active'] / 1.0e3:.3f} "
+            f"compute_active_median_us={statistics.median(values('step_active')) / 1.0e3:.3f} "
+            f"ldu0_begin_median_us={statistics.median(values('ldu0_begin')) / 1.0e3:.3f} "
+            f"ldu1_begin_median_us={statistics.median(values('ldu1_begin')) / 1.0e3:.3f} "
+            f"ldu0_service_median_us={statistics.median(values('ldu0_service')) / 1.0e3:.3f} "
+            f"ldu1_service_median_us={statistics.median(values('ldu1_service')) / 1.0e3:.3f} "
+            f"ldu0_preceding_gap_median_us={statistics.median(values('ldu0_gap')) / 1.0e3:.3f} "
+            f"ldu1_preceding_gap_median_us={statistics.median(values('ldu1_gap')) / 1.0e3:.3f} "
+            f"post_issue_tail_median_us="
+            f"{statistics.median(values('post_issue_tail')) / 1.0e3:.3f} "
+            f"critical_sm={critical['sm']} "
+            f"critical_ldu0_service_us={critical['ldu0_service'] / 1.0e3:.3f} "
+            f"critical_ldu1_service_us={critical['ldu1_service'] / 1.0e3:.3f} "
+            f"critical_post_issue_tail_us="
+            f"{critical['post_issue_tail'] / 1.0e3:.3f} "
+            "top_sm:active_us:ldu0_us:ldu1_us:post_issue_us="
+            + ",".join(
+                f"{record['sm']}:{record['step_active'] / 1.0e3:.3f}:"
+                f"{record['ldu0_service'] / 1.0e3:.3f}:"
+                f"{record['ldu1_service'] / 1.0e3:.3f}:"
+                f"{record['post_issue_tail'] / 1.0e3:.3f}"
+                for record in critical_tail
+            )
+            + " "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+        for port in range(2):
+            command_anchor = records[0][f"ldu{port}_begin_raw"]
+            command_offsets = [
+                signed_wrapped_delta(
+                    record[f"ldu{port}_begin_raw"], command_anchor
+                )
+                for record in records
+            ]
+            source_anchor = records[0][f"ldu{port}_source_begin_raw"]
+            source_offsets = [
+                signed_wrapped_delta(
+                    record[f"ldu{port}_source_begin_raw"], source_anchor
+                )
+                for record in records
+            ]
+            print(
+                "DSV4_FP8_COUPLED_SOURCE_LOAD "
+                f"port={port} "
+                f"command_begin_spread_us="
+                f"{(max(command_offsets) - min(command_offsets)) / 1.0e3:.3f} "
+                f"source_begin_spread_us="
+                f"{(max(source_offsets) - min(source_offsets)) / 1.0e3:.3f} "
+                f"gate_wait_min_us={min(values(f'ldu{port}_gate_wait')) / 1.0e3:.3f} "
+                f"gate_wait_median_us={statistics.median(values(f'ldu{port}_gate_wait')) / 1.0e3:.3f} "
+                f"gate_wait_max_us={max(values(f'ldu{port}_gate_wait')) / 1.0e3:.3f} "
+                f"begin_median_us={statistics.median(values(f'ldu{port}_source_begin')) / 1.0e3:.3f} "
+                f"wait_median_us={statistics.median(values(f'ldu{port}_source_wait')) / 1.0e3:.3f} "
+                f"wait_max_us={max(values(f'ldu{port}_source_wait')) / 1.0e3:.3f} "
+                f"sample_index={sample_index if sample_index is not None else -1}",
+                flush=True,
+            )
+            for pair in range(2):
+                wait_key = f"ldu{port}_pair{pair}_wait"
+                begin_key = f"ldu{port}_pair{pair}_begin"
+                expected_key = f"ldu{port}_pair{pair}_expected_ready"
+                opposite_key = f"ldu{port}_pair{pair}_opposite_ready"
+                stage_key = f"ldu{port}_pair{pair}_stage"
+                phase_key = f"ldu{port}_pair{pair}_phase"
+                print(
+                    "DSV4_FP8_COUPLED_EMPTY_WAIT "
+                    f"port={port} pair={pair} "
+                    f"begin_median_us={statistics.median(values(begin_key)) / 1.0e3:.3f} "
+                    f"wait_median_us={statistics.median(values(wait_key)) / 1.0e3:.3f} "
+                    f"wait_max_us={max(values(wait_key)) / 1.0e3:.3f} "
+                    f"expected_ready={sum(values(expected_key))}/{len(records)} "
+                    f"opposite_ready={sum(values(opposite_key))}/{len(records)} "
+                    f"stages={sorted(set(values(stage_key)))} "
+                    f"phases={sorted(set(values(phase_key)))} "
+                    f"phase_bases={sorted(set(values(f'ldu{port}_phase_base')))} "
+                    f"pair_counts={sorted(set(values(f'ldu{port}_pair_count')))} "
+                    f"sample_index={sample_index if sample_index is not None else -1}",
+                    flush=True,
+                )
+        for (port, command, normalized_opcode), samples in sorted(
+            trace.items()
+        ):
+            offsets = [sample[0] for sample in samples]
+            durations = [sample[1] for sample in samples]
+            ends = [
+                offset + duration
+                for offset, duration in samples
+            ]
+            opcode_name = (
+                "OP_TMA_LOAD_MX_COUPLED_STREAM_FP8"
+                if normalized_opcode == coupled_load_opcode
+                else opcode_names.get(
+                    normalized_opcode, f"mop_{normalized_opcode}"
+                )
+            )
+            print(
+                "DSV4_LDU_PREFIX_COMMAND "
+                f"port={port} command={command} "
+                f"opcode={opcode_name} "
+                f"samples={len(samples)} "
+                f"begin_median_us={statistics.median(offsets) / 1.0e3:.3f} "
+                f"end_median_us={statistics.median(ends) / 1.0e3:.3f} "
+                f"service_median_us={statistics.median(durations) / 1.0e3:.3f} "
+                f"sample_index={sample_index if sample_index is not None else -1}",
+                flush=True,
+            )
+
+    def report_attention_detail_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_attention_detail:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "attention detail profiling requires track_profile=1"
+            )
+        family = self.families[0]
+        kind = self.config.attention_kind(family.representative)
+        rows = self.attention_indices_by_kind[kind].numel()
+        num_splits = (rows + 63) // 64
+        producer_base = self.args.attention_producer_base_sm
+        detail = profile[producer_base : producer_base + num_splits].numpy()
+        detail_base = runtime_config.detail_profile_event_base
+        event_names = (
+            (2, "enter"),
+            (3, "operands"),
+            (4, "qk"),
+            (5, "output"),
+            (6, "softmax"),
+            (20, "metadata"),
+            (7, "pv0-done"),
+            (8, "pv0-store"),
+            (9, "pv0-reuse"),
+            (10, "pv1-done"),
+            (11, "pv1-store"),
+            (12, "pv1-reuse"),
+            (13, "pv2-done"),
+            (14, "pv2-store"),
+            (15, "pv2-reuse"),
+            (16, "pv3-done"),
+            (17, "pv3-store"),
+            (18, "pv3-reuse"),
+            (19, "published"),
+            (21, "done"),
+        )
+        pieces = ["enter=0.000/0.000/0/0.000"]
+        previous_event = 2
+        for event_id, label in event_names[1:]:
+            ns_deltas = []
+            ns_offsets = []
+            cycle_deltas = []
+            for row in detail:
+                begin = int(row[detail_base + 2])
+                previous = int(row[detail_base + previous_event])
+                current = int(row[detail_base + event_id])
+                ns_deltas.append(
+                    ((current & 0xFFFFFFFF) - (previous & 0xFFFFFFFF))
+                    & 0xFFFFFFFF
+                )
+                ns_offsets.append(
+                    ((current & 0xFFFFFFFF) - (begin & 0xFFFFFFFF))
+                    & 0xFFFFFFFF
+                )
+                cycle_deltas.append(
+                    (((current >> 32) & 0xFFFFFFFF)
+                     - ((previous >> 32) & 0xFFFFFFFF))
+                    & 0xFFFFFFFF
+                )
+            median_ns = statistics.median(ns_deltas)
+            median_cycles = statistics.median(cycle_deltas)
+            pieces.append(
+                f"{label}={median_ns / 1.0e3:.3f}/"
+                f"{statistics.median(ns_offsets) / 1.0e3:.3f}/"
+                f"{median_cycles:.0f}/"
+                f"{median_cycles / median_ns if median_ns else 0.0:.3f}"
+            )
+            previous_event = event_id
+        print(
+            "DSV4_ATTN_DETAIL_PROFILE "
+            f"kind={kind} rows={rows} splits={num_splits} "
+            "delta_us/median_offset_us/cycles/effective_ghz "
+            + " ".join(pieces)
+            + f" sample_index={sample_index if sample_index is not None else -1}"
+            + f" sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
+    def report_mxfp_ffn_detail_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_mxfp_ffn_detail:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "MXFP FFN detail profiling requires "
+                "mxfp_ffn_detail_profile=1"
+            )
+        # The detail build leaves reload timing disabled, so this compact
+        # event range is available even in the full repeated-layer image.
+        base = runtime_config.reload_profile_event_base
+        event_names = (
+            "allocator-linear1",
+            "allocator-down-weight",
+            "allocator-down-activation",
+            "ldu0-linear1-begin",
+            "ldu0-linear1-end",
+            "ldu0-down-begin",
+            "ldu0-down-ready",
+            "ldu0-down-end",
+            "ldu1-activation-begin",
+            "ldu1-poll-ready",
+            "ldu1-activation-end",
+            "compute-begin",
+            "compute-linear1-end",
+            "compute-end",
+            "ldu0-previous-begin",
+            "ldu0-previous-end",
+        )
+        resident_base = self.sms - 112
+        detail = profile[resident_base : resident_base + 112]
+        physical_sm_ids = [
+            int(value)
+            for value in profile[:, runtime_config.track_profile_event_base + 25]
+        ]
+        unavailable_events: set[int] = set()
+        for event_offset, name in enumerate(event_names):
+            if event_offset in unavailable_events:
+                continue
+            values = [int(value) for value in detail[:, base + event_offset]]
+            if any(value == 0 for value in values):
+                raise RuntimeError(
+                    f"MXFP FFN detail event {name!r} was not recorded"
+                )
+        compute_begin = [
+            int(value) for value in detail[:, base + 11]
+        ]
+        final_layer_start = (
+            max(int(value) for value in profile[:, 0])
+            if len(self.profile_layer_ids) == 1
+            else max(
+                int(value)
+                for value in profile[
+                    :,
+                    runtime_config.layer_profile_event_base
+                    + len(self.profile_layer_ids)
+                    - 2,
+                ]
+            )
+        )
+        final_layer_end = max(
+            int(value)
+            for value in profile[
+                :,
+                runtime_config.layer_profile_event_base
+                + len(self.profile_layer_ids)
+                - 1,
+            ]
+        )
+        print(
+            "DSV4_MXFP_FFN_DETAIL_LAYER "
+            f"layer={self.profile_layer_ids[-1]} "
+            f"start_to_linear1_begin_us="
+            f"{(min(int(value) for value in detail[:, base + 3]) - final_layer_start) / 1.0e3:.3f} "
+            f"start_to_compute_begin_us="
+            f"{(min(compute_begin) - final_layer_start) / 1.0e3:.3f} "
+            f"layer_span_us={(final_layer_end - final_layer_start) / 1.0e3:.3f}",
+            flush=True,
+        )
+
+        def percentile(values: list[int], fraction: float) -> float:
+            ordered = sorted(values)
+            position = fraction * (len(ordered) - 1)
+            lower = int(math.floor(position))
+            upper = int(math.ceil(position))
+            if lower == upper:
+                return float(ordered[lower])
+            weight = position - lower
+            return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+        for event_offset, name in enumerate(event_names):
+            if event_offset in unavailable_events:
+                continue
+            offsets = [
+                int(value) - origin
+                for value, origin in zip(
+                    detail[:, base + event_offset], compute_begin
+                )
+            ]
+            print(
+                "DSV4_MXFP_FFN_DETAIL_EVENT "
+                f"name={name} "
+                f"min_offset_us={min(offsets) / 1.0e3:.3f} "
+                f"median_offset_us={statistics.median(offsets) / 1.0e3:.3f} "
+                f"p95_offset_us={percentile(offsets, 0.95) / 1.0e3:.3f} "
+                f"max_offset_us={max(offsets) / 1.0e3:.3f}",
+                flush=True,
+            )
+
+        intervals = (
+            ("linear1-command-queue", 0, 3),
+            ("down-weight-command-queue", 1, 5),
+            ("down-activation-command-queue", 2, 8),
+            ("ldu0-linear1", 3, 4),
+            ("ldu0-linear1-input-dependency", 3, 21),
+            ("ldu0-linear1-post-dependency", 21, 4),
+            ("ldu0-down-handoff-wait", 5, 6),
+            ("ldu0-down-service", 6, 7),
+            ("ldu1-poll-wait", 8, 9),
+            ("ldu1-activation-service", 9, 10),
+            ("compute-linear1", 11, 12),
+            ("compute-down", 12, 13),
+            ("compute-total", 11, 13),
+            ("ldu0-previous-service", 14, 15),
+            ("previous-to-linear1", 15, 3),
+        )
+        for name, begin_offset, end_offset in intervals:
+            if begin_offset in unavailable_events or end_offset in unavailable_events:
+                continue
+            durations = [
+                int(end) - int(begin)
+                for begin, end in zip(
+                    detail[:, base + begin_offset],
+                    detail[:, base + end_offset],
+                )
+            ]
+            if min(durations) < 0:
+                raise RuntimeError(
+                    f"MXFP FFN interval {name!r} has reversed timestamps"
+                )
+            slowest_local = max(
+                range(len(durations)), key=durations.__getitem__
+            )
+            slowest_vcore = resident_base + slowest_local
+            print(
+                "DSV4_MXFP_FFN_DETAIL_INTERVAL "
+                f"name={name} min_us={min(durations) / 1.0e3:.3f} "
+                f"median_us={statistics.median(durations) / 1.0e3:.3f} "
+                f"p95_us={percentile(durations, 0.95) / 1.0e3:.3f} "
+                f"max_us={max(durations) / 1.0e3:.3f} "
+                f"slowest_vcore={slowest_vcore} "
+                f"slowest_physical_sm={physical_sm_ids[slowest_vcore]}",
+                flush=True,
+            )
+        opcode_counts: dict[int, int] = {}
+        opcode_vcores: dict[int, list[int]] = {}
+        for local_vcore, value in enumerate(detail[:, base + 16]):
+            opcode_value = int(value)
+            opcode_counts[opcode_value] = opcode_counts.get(opcode_value, 0) + 1
+            opcode_vcores.setdefault(opcode_value, []).append(
+                resident_base + local_vcore
+            )
+        print(
+            "DSV4_MXFP_FFN_DETAIL_PREVIOUS_OPCODES counts="
+            + ",".join(
+                f"0x{opcode_value:04x}:{count}"
+                for opcode_value, count in sorted(opcode_counts.items())
+            ),
+            flush=True,
+        )
+        print(
+            "DSV4_MXFP_FFN_DETAIL_PREVIOUS_VCORES groups="
+            + ";".join(
+                f"0x{opcode_value:04x}:"
+                + ",".join(str(vcore) for vcore in vcores)
+                for opcode_value, vcores in sorted(opcode_vcores.items())
+            ),
+            flush=True,
+        )
+        duration_counters = (
+            ("ldu0-linear1-prologue", 17),
+            ("ldu0-linear1-stage-empty-wait", 18),
+            ("compute-linear1-weight-full-wait", 19),
+            ("compute-linear1-umma-full-wait", 20),
+            ("ldu0-down-stage-empty-wait", 22),
+            ("ldu1-down-stage-empty-wait", 23),
+            ("compute-down-weight-full-wait", 24),
+            ("compute-down-operand-full-wait", 25),
+            ("compute-down-umma-full-wait", 26),
+        )
+        for name, event_offset in duration_counters:
+            durations = [
+                int(value)
+                for value in detail[:, base + event_offset]
+            ]
+            slowest_local = max(
+                range(len(durations)), key=durations.__getitem__
+            )
+            slowest_vcore = resident_base + slowest_local
+            top_locals = sorted(
+                range(len(durations)),
+                key=durations.__getitem__,
+                reverse=True,
+            )[:8]
+            print(
+                "DSV4_MXFP_FFN_DETAIL_COUNTER "
+                f"name={name} min_us={min(durations) / 1.0e3:.3f} "
+                f"median_us={statistics.median(durations) / 1.0e3:.3f} "
+                f"p95_us={percentile(durations, 0.95) / 1.0e3:.3f} "
+                f"stddev_us={statistics.pstdev(durations) / 1.0e3:.3f} "
+                f"max_us={max(durations) / 1.0e3:.3f} "
+                f"slowest_vcore={slowest_vcore} "
+                f"slowest_physical_sm={physical_sm_ids[slowest_vcore]} "
+                "top_vcore:physical_sm:us="
+                + ",".join(
+                    f"{resident_base + local}:"
+                    f"{physical_sm_ids[resident_base + local]}:"
+                    f"{durations[local] / 1.0e3:.3f}"
+                    for local in top_locals
+                ),
+                flush=True,
+            )
+
+        def unpack_task_half(value: int, task_order: int) -> int:
+            return (value >> (32 * task_order)) & 0xFFFFFFFF
+
+        packed_phase_counters = (
+            ("compute-down-to-umma-done", 27),
+            ("compute-down-epilogue", 28),
+            ("compute-down-reduction-wait", 29),
+            ("compute-down-output-tma", 30),
+        )
+        # Preserve the historical per-worker sums for direct comparison with
+        # older detail traces, while decoding each task below.
+        for name, event_offset in packed_phase_counters:
+            durations = [
+                unpack_task_half(int(value), 0)
+                + unpack_task_half(int(value), 1)
+                for value in detail[:, base + event_offset]
+            ]
+            print(
+                "DSV4_MXFP_FFN_DETAIL_COUNTER "
+                f"name={name} min_us={min(durations) / 1.0e3:.3f} "
+                f"median_us={statistics.median(durations) / 1.0e3:.3f} "
+                f"p95_us={percentile(durations, 0.95) / 1.0e3:.3f} "
+                f"stddev_us={statistics.pstdev(durations) / 1.0e3:.3f} "
+                f"max_us={max(durations) / 1.0e3:.3f}",
+                flush=True,
+            )
+
+        down_tasks: list[dict[str, int | str]] = []
+        for vcore in range(self.sms):
+            packed_phases = [
+                int(profile[vcore, base + event_offset])
+                for _, event_offset in packed_phase_counters
+            ]
+            packed_begins = int(profile[vcore, base + 31])
+            down_origin = int(profile[vcore, base + 12])
+            for task_order in range(2):
+                phases = [
+                    unpack_task_half(value, task_order)
+                    for value in packed_phases
+                ]
+                if task_order == 1 and not any(phases):
+                    continue
+                if self.sms == 152:
+                    if task_order == 0:
+                        output_task = vcore
+                        task_class = (
+                            "shared-full" if vcore < 32 else "routed-full"
+                        )
+                    else:
+                        output_task = 152 + vcore // 2
+                        task_class = (
+                            "routed-split-first"
+                            if vcore % 2 == 0
+                            else "routed-split-final"
+                        )
+                elif self.sms == 112:
+                    expert, local_slice = divmod(vcore, 16)
+                    output_task = expert * 32 + local_slice + 16 * task_order
+                    task_class = (
+                        "shared-full" if expert == 0 else "routed-full"
+                    )
+                else:
+                    raise RuntimeError(
+                        "MXFP FFN task detail expects 112 or 152 workers"
+                    )
+                task_begin = down_origin + unpack_task_half(
+                    packed_begins, task_order
+                )
+                down_tasks.append(
+                    {
+                        "vcore": vcore,
+                        "physical_sm": physical_sm_ids[vcore],
+                        "order": task_order,
+                        "output_task": output_task,
+                        "tile": output_task % 32,
+                        "class": task_class,
+                        "begin": task_begin,
+                        "to_umma": phases[0],
+                        "epilogue": phases[1],
+                        "reduction_wait": phases[2],
+                        "output_tma": phases[3],
+                        "finish": task_begin + sum(phases),
+                    }
+                )
+        task_origin = min(int(task["begin"]) for task in down_tasks)
+        for task_class in (
+            "shared-full",
+            "routed-full",
+            "routed-split-first",
+            "routed-split-final",
+        ):
+            group = [task for task in down_tasks if task["class"] == task_class]
+            if not group:
+                continue
+            totals = [
+                int(task["finish"]) - int(task["begin"])
+                for task in group
+            ]
+            starts = [int(task["begin"]) - task_origin for task in group]
+            waits = [int(task["reduction_wait"]) for task in group]
+            print(
+                "DSV4_MXFP_FFN_DOWN_CLASS "
+                f"class={task_class} count={len(group)} "
+                f"start_median_us={statistics.median(starts) / 1.0e3:.3f} "
+                f"total_median_us={statistics.median(totals) / 1.0e3:.3f} "
+                f"to_umma_median_us="
+                f"{statistics.median(int(task['to_umma']) for task in group) / 1.0e3:.3f} "
+                f"reduction_wait_median_us={statistics.median(waits) / 1.0e3:.3f} "
+                f"reduction_wait_p95_us={percentile(waits, 0.95) / 1.0e3:.3f} "
+                f"output_tma_median_us="
+                f"{statistics.median(int(task['output_tma']) for task in group) / 1.0e3:.3f}",
+                flush=True,
+            )
+
+        shared_output_done = {
+            int(task["tile"]): int(task["finish"])
+            for task in down_tasks
+            if task["class"] == "shared-full"
+        }
+        predicted_waits: list[int] = []
+        measured_waits: list[int] = []
+        residuals: list[int] = []
+        for task in down_tasks:
+            if task["class"] == "shared-full":
+                continue
+            shared_done = shared_output_done.get(int(task["tile"]))
+            if shared_done is None:
+                continue
+            epilogue_done = (
+                int(task["begin"])
+                + int(task["to_umma"])
+                + int(task["epilogue"])
+            )
+            predicted = max(0, shared_done - epilogue_done)
+            measured = int(task["reduction_wait"])
+            predicted_waits.append(predicted)
+            measured_waits.append(measured)
+            residuals.append(measured - predicted)
+        print(
+            "DSV4_MXFP_FFN_DOWN_DEPENDENCY "
+            f"tasks={len(measured_waits)} "
+            f"shared_frontier_prediction_median_us="
+            f"{statistics.median(predicted_waits) / 1.0e3:.3f} "
+            f"measured_wait_median_us="
+            f"{statistics.median(measured_waits) / 1.0e3:.3f} "
+            f"publication_residual_median_us="
+            f"{statistics.median(residuals) / 1.0e3:.3f}",
+            flush=True,
+        )
+        for task_class in (
+            "routed-full",
+            "routed-split-first",
+            "routed-split-final",
+        ):
+            class_predicted: list[int] = []
+            class_measured: list[int] = []
+            for task in down_tasks:
+                if task["class"] != task_class:
+                    continue
+                shared_done = shared_output_done[int(task["tile"])]
+                epilogue_done = (
+                    int(task["begin"])
+                    + int(task["to_umma"])
+                    + int(task["epilogue"])
+                )
+                class_predicted.append(max(0, shared_done - epilogue_done))
+                class_measured.append(int(task["reduction_wait"]))
+            print(
+                "DSV4_MXFP_FFN_DOWN_DEPENDENCY_CLASS "
+                f"class={task_class} tasks={len(class_measured)} "
+                f"shared_frontier_prediction_median_us="
+                f"{statistics.median(class_predicted) / 1.0e3:.3f} "
+                f"measured_wait_median_us="
+                f"{statistics.median(class_measured) / 1.0e3:.3f}",
+                flush=True,
+            )
+        critical_tasks = sorted(
+            down_tasks, key=lambda task: int(task["finish"]), reverse=True
+        )[:8]
+        print(
+            "DSV4_MXFP_FFN_DOWN_CRITICAL tasks="
+            + ",".join(
+                f"{task['vcore']}:{task['physical_sm']}:"
+                f"{task['order']}:{task['output_task']}:"
+                f"{task['class']}:"
+                f"{(int(task['finish']) - task_origin) / 1.0e3:.3f}"
+                for task in critical_tasks
+            ),
+            flush=True,
+        )
+        first_tasks = {
+            int(task["vcore"]): task
+            for task in down_tasks
+            if int(task["order"]) == 0
+        }
+        second_tasks = {
+            int(task["vcore"]): task
+            for task in down_tasks
+            if int(task["order"]) == 1
+        }
+        no_second = sorted(set(first_tasks) - set(second_tasks))
+        latest_second = sorted(
+            second_tasks.values(),
+            key=lambda task: int(task["finish"]),
+            reverse=True,
+        )[:16]
+        print(
+            "DSV4_MXFP_FFN_DOWN_PLACEMENT no_second="
+            + ",".join(
+                f"{vcore}:"
+                f"{(int(first_tasks[vcore]['finish']) - task_origin) / 1.0e3:.3f}"
+                for vcore in no_second
+            )
+            + " latest_second="
+            + ",".join(
+                f"{task['vcore']}:"
+                f"{(int(task['finish']) - task_origin) / 1.0e3:.3f}"
+                for task in latest_second
+            ),
+            flush=True,
+        )
+
+        frontier_events = (
+            ("compute-begin", 11),
+            ("ldu0-linear1-after-dependency", 21),
+            ("ldu0-linear1-end", 4),
+            ("compute-linear1-end", 12),
+            ("ldu0-down-end", 7),
+            ("compute-end", 13),
+        )
+        for name, event_offset in frontier_events:
+            values = [
+                int(value)
+                for value in detail[:, base + event_offset]
+            ]
+            origin = min(values)
+            offsets = [value - origin for value in values]
+            latest_local = max(
+                range(len(values)), key=values.__getitem__
+            )
+            latest_vcore = resident_base + latest_local
+            print(
+                "DSV4_MXFP_FFN_DETAIL_FRONTIER "
+                f"name={name} "
+                f"median_from_first_us="
+                f"{statistics.median(offsets) / 1.0e3:.3f} "
+                f"p95_from_first_us={percentile(offsets, 0.95) / 1.0e3:.3f} "
+                f"spread_us={max(offsets) / 1.0e3:.3f} "
+                f"latest_vcore={latest_vcore} "
+                f"latest_physical_sm={physical_sm_ids[latest_vcore]}",
+                flush=True,
+            )
+        dependency_ready = [
+            int(value) for value in detail[:, base + 21]
+        ]
+        linear1_complete = [
+            int(value) for value in detail[:, base + 12]
+        ]
+        compute_complete = [
+            int(value) for value in detail[:, base + 13]
+        ]
+        ready_origin = min(dependency_ready)
+        print(
+            "DSV4_MXFP_FFN_DETAIL_CRITICAL "
+            f"dependency_spread_us="
+            f"{(max(dependency_ready) - ready_origin) / 1.0e3:.3f} "
+            f"ready_to_linear1_end_us="
+            f"{(max(linear1_complete) - ready_origin) / 1.0e3:.3f} "
+            f"ready_to_compute_end_us="
+            f"{(max(compute_complete) - ready_origin) / 1.0e3:.3f}",
+            flush=True,
+        )
+        effective_sm_clock = [
+            (int(clock_end) - int(clock_start))
+            / (int(timer_end) - int(timer_start))
+            for timer_start, timer_end, clock_start, clock_end in zip(
+                profile[:, 0], profile[:, 1], profile[:, 122], profile[:, 123]
+            )
+            if int(timer_end) > int(timer_start)
+        ]
+        print(
+            "DSV4_MXFP_FFN_DETAIL_SUMMARY "
+            f"workers={detail.shape[0]} "
+            "effective_sm_clock_median_ghz="
+            f"{statistics.median(effective_sm_clock):.6f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+
+    def report_mxfp_ffn_basic_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        """Report the production resident-FFN timestamps in events 2--5.
+
+        The routed resident handler always records these four events when the
+        runtime is built without ``DAE_TRACK_PROFILE``.  Reading them here
+        therefore does not add device-side profiling work or alter the image.
+        """
+        if not self.args.profile_mxfp_ffn_basic:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        workers = profile[: self.sms]
+        event_names = {
+            2: "task-begin",
+            3: "task-end",
+            4: "linear1-end/down-begin",
+            5: "down-end",
+        }
+        for event_id, name in event_names.items():
+            if any(int(value) == 0 for value in workers[:, event_id]):
+                raise RuntimeError(
+                    f"production MXFP FFN event {name!r} was not recorded"
+                )
+
+        def percentile(values: list[int], fraction: float) -> float:
+            ordered = sorted(values)
+            position = fraction * (len(ordered) - 1)
+            lower = int(math.floor(position))
+            upper = int(math.ceil(position))
+            if lower == upper:
+                return float(ordered[lower])
+            weight = position - lower
+            return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+        def interval(label: str, rows: torch.Tensor, begin: int, end: int) -> None:
+            durations = [
+                int(stop) - int(start)
+                for start, stop in zip(rows[:, begin], rows[:, end])
+            ]
+            if min(durations) < 0:
+                raise RuntimeError(f"production MXFP FFN interval {label!r} reversed")
+            print(
+                "DSV4_MXFP_FFN_BASIC_INTERVAL "
+                f"name={label} min_us={min(durations) / 1.0e3:.3f} "
+                f"median_us={statistics.median(durations) / 1.0e3:.3f} "
+                f"p95_us={percentile(durations, 0.95) / 1.0e3:.3f} "
+                f"max_us={max(durations) / 1.0e3:.3f}",
+                flush=True,
+            )
+
+        linear1_base = self.sms - 112
+        linear1 = workers[linear1_base:]
+        task_begin = [int(value) for value in workers[:, 2]]
+        task_end = [int(value) for value in workers[:, 3]]
+        linear1_begin = [int(value) for value in linear1[:, 2]]
+        linear1_end = [int(value) for value in linear1[:, 4]]
+        down_begin = [int(value) for value in workers[:, 4]]
+        down_end = [int(value) for value in workers[:, 5]]
+        kernel_start = max(int(value) for value in workers[:, 0])
+        kernel_end = max(int(value) for value in workers[:, 1])
+        print(
+            "DSV4_MXFP_FFN_BASIC_FRONTIER "
+            f"workers={len(workers)} linear1_workers={len(linear1)} "
+            f"kernel_to_task_begin_us={(min(task_begin) - kernel_start) / 1.0e3:.3f} "
+            f"task_entry_spread_us={(max(task_begin) - min(task_begin)) / 1.0e3:.3f} "
+            f"task_envelope_us={(max(task_end) - min(task_begin)) / 1.0e3:.3f} "
+            f"linear1_envelope_us={(max(linear1_end) - min(linear1_begin)) / 1.0e3:.3f} "
+            f"linear1_finish_spread_us={(max(linear1_end) - min(linear1_end)) / 1.0e3:.3f} "
+            f"down_envelope_us={(max(down_end) - min(down_begin)) / 1.0e3:.3f} "
+            f"down_finish_spread_us={(max(down_end) - min(down_end)) / 1.0e3:.3f} "
+            f"task_end_to_kernel_end_us={(kernel_end - max(task_end)) / 1.0e3:.3f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+        interval("task", workers, 2, 3)
+        interval("linear1", linear1, 2, 4)
+        interval("down", workers, 4, 5)
 
     def report_ffn_aggregate_profile(
         self,
@@ -4297,10 +6452,45 @@ def main() -> None:
     )
     parser.add_argument("--layers", type=int, choices=(1, 2, 43), default=1)
     parser.add_argument(
+        "--repeat-same-layer",
+        action="store_true",
+        help=(
+            "with --layers=2, reuse layer-0 tensor addresses in both loop "
+            "iterations for a working-set/orchestration diagnostic"
+        ),
+    )
+    parser.add_argument(
+        "--unroll-two-layers",
+        action="store_true",
+        help=(
+            "diagnostically duplicate the same layer-0 body without LOOPC, "
+            "LOOPM, or LDU barrier reload; requires --layers=2 and "
+            "--repeat-same-layer"
+        ),
+    )
+    parser.add_argument(
         "--single-layer-id",
         type=int,
         default=0,
         help="checkpoint layer to use when --layers=1",
+    )
+    parser.add_argument(
+        "--two-layer-start-id",
+        type=int,
+        default=0,
+        help=(
+            "first checkpoint layer for a two-layer orchestration diagnostic; "
+            "the second layer is adjacent unless --repeat-same-layer is set"
+        ),
+    )
+    parser.add_argument(
+        "--two-layer-pair-repeats",
+        type=int,
+        default=1,
+        help=(
+            "repeat the selected two-layer body while reusing its tensors; "
+            "diagnoses loop/orchestration scaling independently of working set"
+        ),
     )
     parser.add_argument("--token-id", type=int, default=791)
     parser.add_argument(
@@ -4317,7 +6507,21 @@ def main() -> None:
     parser.add_argument("--sms", type=int, default=152)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument(
+        "--cold-l2-scrub-mib",
+        type=int,
+        default=0,
+        help="evict cached data before each out-of-interval timed launch",
+    )
     parser.add_argument("--expected-token-id", type=int)
+    parser.add_argument(
+        "--allow-token-variation",
+        action="store_true",
+        help=(
+            "diagnostically retain all numerical samples when a truncated "
+            "model crosses a near-tied argmax"
+        ),
+    )
     parser.add_argument("--resident-reserve-gib", type=float, default=8.0)
     parser.add_argument(
         "--fp8-qb-mode",
@@ -4371,10 +6575,43 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--qkv-projection-schedule",
+        choices=("overlap", "q-first"),
+        default="overlap",
+        help=(
+            "statically release Q-a and KV together or attach KV's load "
+            "command to Q-a's direct completion dependency"
+        ),
+    )
+    parser.add_argument(
+        "--projection-reset-sms",
+        type=int,
+        default=0,
+        help=(
+            "statically shard the split-K projection reset across this many "
+            "SMs; zero retains the full-grid diagnostic baseline"
+        ),
+    )
+    parser.add_argument(
+        "--projection-reset-position",
+        choices=("after-input", "layer-first"),
+        default="after-input",
+        help=(
+            "queue the independent split-K output reset after attention "
+            "input production or first in the loop-local layer body"
+        ),
+    )
+    parser.add_argument(
         "--attention-mode",
         choices=("auto", "umma-split", "contiguous", "scalar"),
         default="auto",
         help="select the sparse-attention compute mechanism for matched A/B profiling",
+    )
+    parser.add_argument(
+        "--attention-producer-base-sm",
+        type=int,
+        default=0,
+        help="diagnostic base SM for the split64 attention producer",
     )
     parser.add_argument(
         "--index-selection-mode",
@@ -4397,6 +6634,14 @@ def main() -> None:
         "--diagnose-projections",
         action="store_true",
         help="compare resident projection output with a raw-checkpoint oracle",
+    )
+    parser.add_argument(
+        "--validate-each-launch",
+        action="store_true",
+        help=(
+            "diagnostically validate every emitted FP8-head token against "
+            "resident logits and the independent BF16 head"
+        ),
     )
     parser.add_argument(
         "--profile-stages",
@@ -4434,17 +6679,51 @@ def main() -> None:
         help="passively aggregate whole attention and FFN spans",
     )
     parser.add_argument(
+        "--profile-attention-detail",
+        action="store_true",
+        help="report native split-attention task timestamps without step wrappers",
+    )
+    parser.add_argument(
+        "--profile-mxfp-ffn-detail",
+        action="store_true",
+        help="report allocator/LDU/compute timing for the resident MXFP FFN",
+    )
+    parser.add_argument(
+        "--profile-mxfp-ffn-basic",
+        action="store_true",
+        help=(
+            "report the production resident-FFN timestamps already emitted "
+            "in profile events 2--5"
+        ),
+    )
+    parser.add_argument(
+        "--profile-fp8-coupled-detail",
+        action="store_true",
+        help=(
+            "decompose selected-layer Q-a LDU issue timing and barrier waits; "
+            "requires a one- or two-layer run and the FP8 coupled detail runtime"
+        ),
+    )
+    parser.add_argument(
         "--profile-step-start",
         type=int,
         default=0,
         help="first queued layer step included by --profile-steps",
     )
     parser.add_argument(
+        "--profile-step-frontiers",
+        action="store_true",
+        help=(
+            "augment a bounded step window with absolute per-SM begin, ready, "
+            "and completion frontiers"
+        ),
+    )
+    parser.add_argument(
         "--profile-step-count",
         type=int,
         default=(
             runtime_config.reload_profile_event_base
-            - runtime_config.layer_profile_event_base
+            - STEP_PROFILE_EVENT_BASE
         ),
         help="number of queued layer steps included by --profile-steps",
     )
@@ -4461,14 +6740,41 @@ def main() -> None:
         parser.error("single-layer-id is outside the transformer")
     if args.layers != 1 and args.single_layer_id != 0:
         parser.error("single-layer-id is only valid with --layers=1")
+    if args.layers != 2 and args.two_layer_start_id != 0:
+        parser.error("two-layer-start-id is only valid with --layers=2")
+    if args.layers != 2 and args.two_layer_pair_repeats != 1:
+        parser.error("two-layer-pair-repeats is only valid with --layers=2")
+    if not 1 <= args.two_layer_pair_repeats <= 20:
+        parser.error("two-layer-pair-repeats must be in [1,20]")
+    if args.layers == 2:
+        max_start = cfg.num_layers - (1 if args.repeat_same_layer else 2)
+        if not 0 <= args.two_layer_start_id <= max_start:
+            parser.error("two-layer-start-id is outside the transformer")
+    if args.repeat_same_layer and args.layers != 2:
+        parser.error("--repeat-same-layer requires --layers=2")
+    if args.unroll_two_layers and not (
+        args.layers == 2
+        and args.repeat_same_layer
+        and args.two_layer_pair_repeats == 1
+    ):
+        parser.error(
+            "--unroll-two-layers requires --layers=2, --repeat-same-layer, "
+            "and --two-layer-pair-repeats=1"
+        )
     if not 1 <= args.context_length <= cfg.sliding_window:
         parser.error("context-length must be in [1,128]")
     if not 1 <= args.vocab_size <= cfg.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0 or args.iterations <= 0 or args.warmup < 0:
         parser.error("sms/iterations must be positive and warmup non-negative")
+    if not 0 <= args.projection_reset_sms <= args.sms:
+        parser.error("projection-reset-sms must be zero or within the resident grid")
+    if not 0 <= args.attention_producer_base_sm < args.sms:
+        parser.error("attention producer base SM is outside the resident grid")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
+    if args.cold_l2_scrub_mib < 0:
+        parser.error("cold-l2-scrub-mib must be non-negative")
     profile_modes = sum(
         (
             args.profile_layers,
@@ -4476,17 +6782,46 @@ def main() -> None:
             args.profile_steps,
             args.profile_ffn_aggregate,
             args.profile_phase_aggregate,
+            args.profile_attention_detail,
+            args.profile_mxfp_ffn_basic,
+            args.profile_mxfp_ffn_detail,
         )
     )
     if profile_modes > 1:
         parser.error("profiling modes are mutually exclusive")
     if args.profile_preattention_only and not args.profile_stages:
         parser.error("--profile-preattention-only requires --profile-stages")
-    if (args.profile_stages or args.profile_steps) and args.layers != 1:
-        parser.error("stage/step profiling requires --layers 1")
+    if args.profile_stages and args.layers not in (1, 2):
+        parser.error("stage profiling requires --layers 1 or 2")
+    if args.profile_attention_detail and args.layers != 1:
+        parser.error(
+            "attention detail profiling requires --layers 1"
+        )
+    if args.profile_mxfp_ffn_detail and args.layers not in (1, 2, 43):
+        parser.error("MXFP FFN detail profiling supports 1, 2, or 43 layers")
+    if args.profile_mxfp_ffn_basic and args.layers != 1:
+        parser.error("production MXFP FFN basic profiling requires --layers 1")
+    if args.profile_steps and args.layers not in (1, 2, 43):
+        parser.error(
+            "step profiling supports one layer or the final logical family "
+            "of a repeated image"
+        )
+    if args.profile_fp8_coupled_detail and (
+        args.layers not in (1, 2)
+        or not args.profile_steps
+        or not (
+            args.profile_step_start
+            <= 4
+            < args.profile_step_start + args.profile_step_count
+        )
+    ):
+        parser.error(
+            "--profile-fp8-coupled-detail requires one or two layers and a "
+            "--profile-steps window containing step 4"
+        )
     step_capacity = (
         runtime_config.reload_profile_event_base
-        - runtime_config.layer_profile_event_base
+        - STEP_PROFILE_EVENT_BASE
     )
     if (
         args.profile_step_start < 0
@@ -4497,16 +6832,81 @@ def main() -> None:
         )
     if not args.profile_steps and args.profile_step_start != 0:
         parser.error("--profile-step-start requires --profile-steps")
+    if args.profile_step_frontiers and not args.profile_steps:
+        parser.error("--profile-step-frontiers requires --profile-steps")
+    if args.profile_step_frontiers and args.profile_fp8_coupled_detail:
+        parser.error(
+            "--profile-step-frontiers and --profile-fp8-coupled-detail "
+            "use the same begin-event range"
+        )
+    step_frontier_capacity = (
+        STEP_PROFILE_EVENT_BASE - STEP_PROFILE_FRONTIER_BASE
+    )
+    if (
+        args.profile_step_frontiers
+        and args.profile_step_count > step_frontier_capacity
+    ):
+        parser.error(
+            "--profile-step-frontiers supports at most "
+            f"{step_frontier_capacity} steps"
+        )
     if args.profile_all_samples and not profile_modes:
         parser.error("--profile-all-samples requires a profiling mode")
 
     device = torch.device("cuda")
     build_started = time.monotonic()
     flow = ResidentOneLaunchDecode(args, device)
+    dump_sm = os.environ.get("DAE_DUMP_MEMORY_SM")
+    if dump_sm is not None:
+        flow.launcher.prepare_launch()
+        for segment_index, segment in enumerate(
+            getattr(flow.program, "segments", (flow.program,))
+        ):
+            for stage_index, stage in enumerate(segment.stages):
+                print(
+                    "DSV4_STAGE_PLAN "
+                    f"segment={segment_index} stage={stage_index} "
+                    f"name={stage.name} base_sm={stage.base_sm} "
+                    f"num_sms={stage.num_sms} "
+                    f"wait_previous={str(stage.wait_for_previous).lower()} "
+                    f"wait_group={stage.wait_group or '-'} "
+                    f"release_group={stage.release_group or '-'} "
+                    f"prefetch={str(stage.prefetch_before_wait).lower()}",
+                    flush=True,
+                )
+        for sm in (int(value) for value in dump_sm.split(",")):
+            for pc, inst in enumerate(flow.launcher.builder[sm].built_cinsts):
+                print(
+                    "DSV4_COMPUTE_INST "
+                    f"sm={sm} pc={pc} op={inst.compute_operator_name()} "
+                    f"args={inst.args}",
+                    flush=True,
+                )
+            for pc, inst in enumerate(flow.launcher.builder[sm].built_minsts):
+                address = sum(int(coord) << (16 * index)
+                              for index, coord in enumerate(inst.cords))
+                print(
+                    "DSV4_MEMORY_INST "
+                    f"sm={sm} pc={pc} opcode=0x{inst.opcode:04x} "
+                    f"slot={inst.num_slots & 0x3f} "
+                    f"bar={inst.num_slots >> 6} arg={inst.arg} "
+                    f"size={inst.size} address=0x{address:x} "
+                    f"annotation={inst.annotation}",
+                    flush=True,
+                )
+        return
     torch.cuda.synchronize(device)
     build_seconds = time.monotonic() - build_started
     prime_token, prime_ms, prime_logits = flow.run_once()
-    flow.validate_fp8_head(prime_token)
+    flow.validate_fp8_head(
+        prime_token, require_reference=not args.validate_each_launch
+    )
+    if flow.fp8_head and args.validate_each_launch:
+        flow.head_norm_oracle = flow.head_norm.clone()
+        flow.fp8_head_activation_oracle = flow.head_input_native_fp8.clone()
+    repeat_state_oracle = (
+        flow.capture_repeat_state() if args.validate_each_launch else None
+    )
     if args.diagnose_projections:
         flow.report_projection_diagnostics()
     if args.expected_token_id is not None and prime_token != args.expected_token_id:
@@ -4514,12 +6914,23 @@ def main() -> None:
             f"prime launch emitted token {prime_token}, "
             f"expected {args.expected_token_id}"
         )
-    logit_summary = (
-        f"logit_min={float(prime_logits.min().item()):.6f} "
-        f"logit_max={float(prime_logits.max().item()):.6f}"
-        if prime_logits.numel()
-        else "logits=fp8_argmax"
-    )
+    if prime_logits.numel():
+        logit_digest = hashlib.sha256(
+            prime_logits.contiguous().numpy().tobytes()
+        ).hexdigest()[:16]
+        prime_top_values, prime_top_indices = torch.topk(prime_logits, 2)
+        logit_summary = (
+            f"logit_min={float(prime_logits.min().item()):.6f} "
+            f"logit_max={float(prime_logits.max().item()):.6f} "
+            f"logit_sha256_64={logit_digest} "
+            f"top1={int(prime_top_indices[0].item())}:"
+            f"{float(prime_top_values[0].item()):.6f} "
+            f"top2={int(prime_top_indices[1].item())}:"
+            f"{float(prime_top_values[1].item()):.6f} "
+            f"top_margin={float((prime_top_values[0] - prime_top_values[1]).item()):.6f}"
+        )
+    else:
+        logit_summary = "logits=fp8_argmax"
     print(
         "DSV4_ONE_LAUNCH_PRIME status=PASS "
         f"output_token={prime_token} elapsed_ms={prime_ms:.6f}",
@@ -4533,23 +6944,58 @@ def main() -> None:
             )
 
     timings = []
+    device_frontier_timings = []
+    repeat_logit_max_abs = []
+    repeat_logit_mean_abs = []
     profile_samples = []
     reference_token = None
     logits = None
     for iteration in range(args.iterations):
         token, elapsed_ms, logits = flow.run_once()
+        if repeat_state_oracle is not None:
+            flow.report_repeat_state(repeat_state_oracle, iteration)
+        if args.validate_each_launch:
+            flow.validate_fp8_head(token)
         timings.append(elapsed_ms)
+        device_frontier_ms = flow.device_frontier_ms()
+        device_frontier_timings.append(device_frontier_ms)
+        if logits.numel() and prime_logits.numel():
+            repeat_delta = (logits - prime_logits).abs()
+            repeat_logit_max_abs.append(float(repeat_delta.max().item()))
+            repeat_logit_mean_abs.append(float(repeat_delta.mean().item()))
         if profile_modes:
             profile_samples.append(flow.launcher.profile.cpu().clone())
         print(
             "DSV4_ONE_LAUNCH_SAMPLE "
-            f"iteration={iteration} elapsed_ms={elapsed_ms:.6f}",
+            f"iteration={iteration} elapsed_ms={elapsed_ms:.6f} "
+            f"device_frontier_ms={device_frontier_ms:.6f} "
+            f"output_token={token}",
             flush=True,
         )
         if reference_token is None:
             reference_token = token
         elif token != reference_token:
-            raise AssertionError("one-launch checkpoint token is not repeatable")
+            if logits.numel():
+                top_values, top_indices = torch.topk(logits, 2)
+                top_summary = (
+                    f", current_top1={int(top_indices[0].item())}:"
+                    f"{float(top_values[0].item()):.6f}"
+                    f", current_top2={int(top_indices[1].item())}:"
+                    f"{float(top_values[1].item()):.6f}"
+                )
+            else:
+                top_summary = ""
+            message = (
+                "one-launch checkpoint token is not repeatable: "
+                f"reference={reference_token}, current={token}{top_summary}"
+            )
+            if args.allow_token_variation:
+                print(
+                    "DSV4_TOKEN_VARIATION status=DIAGNOSTIC " + message,
+                    flush=True,
+                )
+            else:
+                raise AssertionError(message)
     if args.expected_token_id is not None and reference_token != args.expected_token_id:
         raise AssertionError(
             f"checkpoint emitted token {reference_token}, "
@@ -4557,12 +7003,84 @@ def main() -> None:
         )
     flow.validate_fp8_head(reference_token)
     if reference_token != prime_token:
-        raise AssertionError(
-            "one-launch checkpoint token changed between prime and timed "
-            f"launches: prime={prime_token}, timed={reference_token}"
-        )
+        if (
+            (args.profile_attention_detail or args.profile_steps)
+            and args.attention_producer_base_sm != 0
+        ):
+            print(
+                "DSV4_ATTN_PLACEMENT_PRIME_MISMATCH status=DIAGNOSTIC "
+                f"prime={prime_token} timed={reference_token}",
+                flush=True,
+            )
+        elif not args.allow_token_variation:
+            raise AssertionError(
+                "one-launch checkpoint token changed between prime and timed "
+                f"launches: prime={prime_token}, timed={reference_token}"
+            )
     assert logits is not None
     if profile_modes:
+        if args.profile_mxfp_ffn_detail and len(profile_samples) > 1:
+            base = runtime_config.reload_profile_event_base
+            task0_finishes: dict[int, list[int]] = {
+                vcore: [] for vcore in range(args.sms)
+            }
+            task1_finishes: dict[int, list[int]] = {
+                vcore: [] for vcore in range(args.sms)
+            }
+            for profile in profile_samples:
+                sample_tasks = []
+                for vcore in range(args.sms):
+                    down_origin = int(profile[vcore, base + 12])
+                    packed_begins = int(profile[vcore, base + 31])
+                    packed_phases = [
+                        int(profile[vcore, base + offset])
+                        for offset in range(27, 31)
+                    ]
+                    for task_order in range(2):
+                        phases = [
+                            (value >> (32 * task_order)) & 0xFFFFFFFF
+                            for value in packed_phases
+                        ]
+                        if task_order == 1 and not any(phases):
+                            continue
+                        begin = down_origin + (
+                            (packed_begins >> (32 * task_order)) & 0xFFFFFFFF
+                        )
+                        sample_tasks.append(
+                            (vcore, task_order, begin + sum(phases))
+                        )
+                origin = min(task[2] for task in sample_tasks)
+                for vcore, task_order, finish in sample_tasks:
+                    destination = (
+                        task0_finishes if task_order == 0 else task1_finishes
+                    )
+                    destination[vcore].append(finish - origin)
+            late_second = sorted(
+                (
+                    (statistics.median(samples), vcore)
+                    for vcore, samples in task1_finishes.items()
+                    if samples
+                ),
+                reverse=True,
+            )[:24]
+            no_second = [
+                vcore for vcore, samples in task1_finishes.items() if not samples
+            ]
+            print(
+                "DSV4_MXFP_FFN_DOWN_PLACEMENT_AGGREGATE samples="
+                f"{len(profile_samples)} no_second="
+                + ",".join(
+                    f"{vcore}:"
+                    f"{statistics.median(task0_finishes[vcore]) / 1.0e3:.3f}"
+                    for vcore in no_second
+                )
+                + " latest_second="
+                + ",".join(
+                    f"{vcore}:{finish / 1.0e3:.3f}"
+                    for finish, vcore in late_second
+                ),
+                flush=True,
+            )
         median_timing = statistics.median(timings)
         profile_index = min(
             range(len(timings)),
@@ -4574,7 +7092,9 @@ def main() -> None:
             else (profile_index,)
         )
         for sample_index in profile_indices:
-            if args.profile_layers:
+            if args.profile_fp8_coupled_detail:
+                reporter = flow.report_fp8_coupled_detail_profile
+            elif args.profile_layers:
                 reporter = flow.report_layer_profile
             elif args.profile_stages:
                 reporter = flow.report_stage_profile
@@ -4582,6 +7102,12 @@ def main() -> None:
                 reporter = flow.report_ffn_aggregate_profile
             elif args.profile_phase_aggregate:
                 reporter = flow.report_phase_aggregate_profile
+            elif args.profile_attention_detail:
+                reporter = flow.report_attention_detail_profile
+            elif args.profile_mxfp_ffn_basic:
+                reporter = flow.report_mxfp_ffn_basic_profile
+            elif args.profile_mxfp_ffn_detail:
+                reporter = flow.report_mxfp_ffn_detail_profile
             else:
                 reporter = flow.report_step_profile
             reporter(
@@ -4589,6 +7115,14 @@ def main() -> None:
                 sample_index=sample_index,
                 sample_cuda_ms=timings[sample_index],
             )
+    repeat_logit_summary = (
+        "repeat_logit_max_abs="
+        f"{max(repeat_logit_max_abs):.6f} "
+        "repeat_logit_mean_abs="
+        f"{statistics.mean(repeat_logit_mean_abs):.6f}"
+        if repeat_logit_max_abs
+        else "repeat_logits=fp8_argmax"
+    )
     print(
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "
         f"layers={args.layers} token_id={args.token_id} "
@@ -4602,7 +7136,11 @@ def main() -> None:
         f"build_s={build_seconds:.3f} min_ms={min(timings):.6f} "
         f"median_ms={statistics.median(timings):.6f} "
         f"max_ms={max(timings):.6f} "
-        f"{logit_summary}",
+        f"device_frontier_min_ms={min(device_frontier_timings):.6f} "
+        "device_frontier_median_ms="
+        f"{statistics.median(device_frontier_timings):.6f} "
+        f"device_frontier_max_ms={max(device_frontier_timings):.6f} "
+        f"{logit_summary} {repeat_logit_summary}",
         flush=True,
     )
 

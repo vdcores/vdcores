@@ -109,6 +109,11 @@ DAE_OP(OP_ALLOC_WB_TMA_STORE_PAIR_2D, MK_MOP(59, MEM_OP_FLAGS_ALLOCATE | MEM_OP_
 // publish a single compute operand. ``address`` points to two uint64 source
 // addresses, ``arg`` is the first byte count, and ``size`` is the total.
 DAE_OP(OP_ALLOC_TMA_LOAD_PAIR_1D, MK_MOP(60, MEM_OP_FLAGS_ALLOCATE))
+// Restore a disjoint barrier-bank slice on LDU0 while an alternate bank is
+// live. Task-local clears join ordinary useful work; loop-bank clears publish
+// directly to the next iteration's first allocating loads.
+DAE_OP(OP_LDU_ASYNC_RELOAD_BARRIERS, MK_MOP(61, MEM_OP_FLAGS_NONE))
+DAE_OP(OP_LDU_WAIT_BARRIER, MK_MOP(62, MEM_OP_FLAGS_NONE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

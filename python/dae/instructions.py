@@ -589,7 +589,11 @@ class Fp8GemvUmmaCoupledSm100(ComputeInstruction):
             raise ValueError("coupled FP8 phase base must fit uint16")
         super().__init__(
             opcode=opcode.OP_FP8_GEMV_UMMA_COUPLED_SM100,
-            args=[int(k_pairs), int(reduction_bytes), int(phase_base)],
+            args=[
+                int(k_pairs),
+                int(reduction_bytes),
+                int(phase_base),
+            ],
         )
 
 
@@ -930,6 +934,22 @@ class Dsv4AttentionSplitReduceFp8Sm100(ComputeInstruction):
         )
 
 
+class Dsv4AttentionContext1Fp8Sm100(ComputeInstruction):
+    """Directly emit native FP8 attention for one Q/KV row."""
+
+    def __init__(self, head: int, *, normalize_q: bool = False):
+        if not 0 <= head < 64:
+            raise ValueError("context-1 attention head must be in [0,64)")
+        # num_splits == 0 selects the compact single-row path in the ordinary
+        # split-attention handler. The output-group sentinel 2 means that the
+        # one head task publishes all four native O_a tiles. Bit 2 fuses the
+        # BF16 Q RMS/RoPE boundary into the task.
+        super().__init__(
+            opcode=opcode.OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100,
+            args=[0, head, 2 | (int(normalize_q) << 2)],
+        )
+
+
 class Dsv4RouteTop6(ComputeInstruction):
     def __init__(
         self,
@@ -953,12 +973,19 @@ class Dsv4RouteTop6(ComputeInstruction):
 class Dsv4RouteTop6Prepared(ComputeInstruction):
     """Select top-6 from projection-prepared original/biased score pairs."""
 
-    def __init__(self, hash_routing: bool, route_scale: float = 1.5):
+    def __init__(
+        self,
+        hash_routing: bool,
+        route_scale: float = 1.5,
+    ):
         if route_scale <= 0:
             raise ValueError("DeepSeek route_scale must be positive")
         super().__init__(
             opcode=opcode.OP_DSV4_ROUTE_TOP6_PREPARED,
-            args=[int(hash_routing), encode_bfloat16_u16(route_scale)],
+            args=[
+                int(hash_routing),
+                encode_bfloat16_u16(route_scale),
+            ],
         )
 
 
@@ -1913,10 +1940,13 @@ class Copy(ComputeInstruction):
 class Dsv4ZeroFill(ComputeInstruction):
     """Fill one allocator-owned output span with zero words."""
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, *, has_gate: bool = True):
         if size <= 0 or size % 4 or size > 0xFFFF * 4:
             raise ValueError("zero-fill size must be a positive uint16 word count")
-        super().__init__(opcode=opcode.OP_DSV4_ZERO_FILL, args=[size // 4])
+        super().__init__(
+            opcode=opcode.OP_DSV4_ZERO_FILL,
+            args=[size // 4, int(has_gate)],
+        )
 
 
 class Dsv4Fp32ToBf16(ComputeInstruction):
@@ -1966,6 +1996,20 @@ class ProfileStep(ComputeInstruction):
         super().__init__(
             opcode=opcode.OP_PROFILE_EVENT,
             args=[event_id, 2 if begin else 3],
+        )
+
+
+class ProfileLayer(ComputeInstruction):
+    """Record a loop-aware compute frontier for each logical layer."""
+
+    def __init__(self, event_base: int, event_count: int):
+        if event_base < config.layer_profile_event_base or event_count <= 0:
+            raise ValueError("layer profile events must follow kernel slots 0/1")
+        if event_base + event_count > config.reload_profile_event_base:
+            raise ValueError("layer profile events overlap reload profile slots")
+        super().__init__(
+            opcode=opcode.OP_PROFILE_EVENT,
+            args=[event_base, 6, event_count],
         )
 
 
@@ -2485,7 +2529,13 @@ class RepeatM(MemoryInstruction):
 
 
 class RawAddress(MemoryInstruction):
-    def __init__(self, tensor: torch.Tensor, slot_id: int):
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        slot_id: int,
+        *,
+        profile_event: int | None = None,
+    ):
         assert tensor.device.type == "cuda"
         address = tensor.data_ptr()
 
@@ -2494,11 +2544,17 @@ class RawAddress(MemoryInstruction):
         assert min_slot <= slot_id <= max_slot, (
             f"slot_id must be in the range of special slots [{min_slot}, {max_slot}]"
         )
+        if profile_event is not None and not (
+            0 <= profile_event < config.track_profile_event_base - 2
+        ):
+            raise ValueError("raw-address profile event exceeds diagnostic slots")
         super().__init__(
             opcode=opcode.OP_ALLOC_WB_RAW_ADDRESS,
             num_slots=slot_id,
             arg=slot_id,
-            size=0,
+            # RawAddress has no byte transfer. A nonzero size is therefore a
+            # track-only event-base encoding consumed by allocator/STU.
+            size=0 if profile_event is None else profile_event + 1,
             address=address,
         )
 
@@ -2777,6 +2833,9 @@ def indirect_1d_from(
 class LduReloadBarriers(MemoryInstruction):
     """Drain both LDU ports and restore one loop-local barrier range."""
 
+    FIRST_BAR_MASK = (1 << 10) - 1
+    LOOP_REG_SHIFT = 10
+    SKIP_FINAL_LOOP = 1 << 14
     RESET_MXFP_RESIDENT = 1 << 15
 
     def __init__(
@@ -2786,22 +2845,35 @@ class LduReloadBarriers(MemoryInstruction):
         count: int,
         special_slot: int,
         reset_mxfp_resident: bool = False,
+        skip_final_loop_reg: int | None = None,
     ):
         if bar_source.device.type != "cuda" or not bar_source.is_contiguous():
             raise ValueError("barrier reload source must be a contiguous CUDA tensor")
         if first_bar < 0 or count <= 0:
             raise ValueError("barrier reload range must be non-empty")
+        if first_bar > self.FIRST_BAR_MASK:
+            raise ValueError("barrier reload start must fit its low byte")
+        if count > 0xFFFF:
+            raise ValueError("barrier reload count must fit uint16")
         if first_bar + count > config.max_bars - 2:
             raise ValueError("barrier reload range overlaps runtime handshake counters")
         if bar_source.numel() * bar_source.element_size() < 4 * (first_bar + count):
             raise ValueError("barrier reload source does not cover the requested range")
         if not 0 <= special_slot < config.num_special_slots:
             raise ValueError("barrier reload requires one special slot")
+        if skip_final_loop_reg is None:
+            loop_reg = 0
+        else:
+            loop_reg = skip_final_loop_reg
+            if not 0 <= loop_reg < config.num_loop_counters:
+                raise ValueError("terminal reload loop register is invalid")
         super().__init__(
             opcode=opcode.OP_LDU_RELOAD_BARRIERS,
             num_slots=config.num_slots + special_slot,
             arg=(
                 first_bar
+                | (loop_reg << self.LOOP_REG_SHIFT)
+                | (self.SKIP_FINAL_LOOP if skip_final_loop_reg is not None else 0)
                 | (self.RESET_MXFP_RESIDENT if reset_mxfp_resident else 0)
             ),
             size=count,
@@ -2809,24 +2881,100 @@ class LduReloadBarriers(MemoryInstruction):
         )
 
 
+class LduAsyncReloadBarriers(MemoryInstruction):
+    """Restore one disjoint barrier-bank slice and publish its completion."""
+
+    FIRST_BAR_MASK = (1 << 10) - 1
+    SHIFT_TARGET = 1 << 13
+    BANK_READY_COMPLETION = 1 << 14
+    BANK_READY_LEADER = 1 << 15
+
+    def __init__(
+        self,
+        bar_source: torch.Tensor,
+        first_bar: int,
+        count: int,
+        input_bar: int,
+        special_slot: int,
+        *,
+        shift_target: bool = False,
+        bank_ready_completion: bool = False,
+        bank_ready_leader: bool = False,
+    ):
+        if bar_source.device.type != "cuda" or not bar_source.is_contiguous():
+            raise ValueError("async barrier reload source must be contiguous CUDA")
+        if first_bar < 0 or count <= 0:
+            raise ValueError("async barrier reload range must be non-empty")
+        if first_bar > self.FIRST_BAR_MASK:
+            raise ValueError("async barrier reload start must fit its low ten bits")
+        if count >= (1 << 6):
+            raise ValueError("one async barrier reload slice must fit six bits")
+        if not 0 <= input_bar < config.max_bars - 2:
+            raise ValueError("async barrier reload input dependency is invalid")
+        if first_bar + count > config.max_bars - 2:
+            raise ValueError(
+                "async barrier reload range overlaps runtime handshake counters"
+            )
+        if bar_source.numel() * bar_source.element_size() < 4 * (first_bar + count):
+            raise ValueError("async barrier reload source does not cover its range")
+        if not 0 <= special_slot < config.num_special_slots:
+            raise ValueError("async barrier reload requires one special slot")
+        if bank_ready_leader and not bank_ready_completion:
+            raise ValueError("async bank-ready leader requires bank completion")
+        super().__init__(
+            opcode=opcode.OP_LDU_ASYNC_RELOAD_BARRIERS,
+            num_slots=config.num_slots + special_slot,
+            arg=(
+                first_bar
+                | (self.SHIFT_TARGET if shift_target else 0)
+                | (
+                    self.BANK_READY_COMPLETION
+                    if bank_ready_completion
+                    else 0
+                )
+                | (self.BANK_READY_LEADER if bank_ready_leader else 0)
+            ),
+            size=count | (input_bar << 6),
+            address=bar_source.data_ptr() + 4 * first_bar,
+        )
+        # The LDU performs the global counter publication itself after all
+        # slice stores. Sequential composition attaches the join barrier.
+        self.writeback()
+        self.annotation["input_independent_writeback"] = True
+
+
+class LduWaitBarrier(MemoryInstruction):
+    """Wait for one monotonic bank-ready generation on both LDU ports."""
+
+    def __init__(self, generation_reg: int, special_slot: int):
+        if not 0 <= generation_reg < config.num_loop_counters:
+            raise ValueError("LDU bank wait generation register is invalid")
+        if not 0 <= special_slot < config.num_special_slots:
+            raise ValueError("LDU bank wait requires one special slot")
+        super().__init__(
+            opcode=opcode.OP_LDU_WAIT_BARRIER,
+            num_slots=config.num_slots + special_slot,
+            arg=generation_reg,
+            size=0,
+            address=0,
+        )
+
+
 class LduProfileLayer(MemoryInstruction):
-    """Record one completed-layer frontier with an LDU-local counter."""
+    """Record one completed-layer frontier without occupying a shared mailbox."""
 
     def __init__(
         self,
         event_base: int,
         event_count: int,
-        special_slot: int = 0,
     ):
         if event_base < config.layer_profile_event_base or event_count <= 0:
             raise ValueError("layer profile events must follow kernel slots 0/1")
         if event_base + event_count > config.reload_profile_event_base:
             raise ValueError("layer profile events overlap reload profile slots")
-        if not 0 <= special_slot < config.num_special_slots - 1:
-            raise ValueError("layer profiling requires two adjacent special slots")
         super().__init__(
             opcode=opcode.OP_LDU_PROFILE_LAYER,
-            num_slots=config.num_slots + special_slot,
+            num_slots=0,
             arg=event_base,
             size=event_count,
             address=0,
@@ -2965,6 +3113,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
     STAGES_MASK = 0x00F0
     LOCAL_CHAIN = 0x0100
     DYNAMIC_EXPERT = 0x0200
+    DOWN_ONLY = 0x0400
     PHASE_BASE_SHIFT = 9
     MAX_PHASE_BASE = 0x7F
     FP8_STAGES = 2
@@ -2986,6 +3135,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         phase_base: int = 0,
         layer_indexed: bool = False,
         dynamic_expert: bool = False,
+        down_only: bool = False,
     ):
         if plan_address <= 0 or plan_address >= 1 << 64:
             raise ValueError("coupled-stream plan address must fit uint64")
@@ -3004,9 +3154,9 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         if not 0 <= int(area_id) <= 0xFFFF:
             raise ValueError("coupled-stream area id must fit uint16")
         if kind in (self.FP8_GEMV, self.TMA_RING):
-            if dynamic_expert:
+            if dynamic_expert or down_only:
                 raise ValueError(
-                    "dynamic expert selection is reserved for resident FFN streams"
+                    "dynamic expert/down-only flags are reserved for resident FFN streams"
                 )
             if kind == self.TMA_RING:
                 raise ValueError(
@@ -3065,6 +3215,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
                 int(kind)
                 | (int(stages) << self.STAGES_SHIFT)
                 | (self.DYNAMIC_EXPERT if dynamic_expert else 0)
+                | (self.DOWN_ONLY if down_only else 0)
             ),
             size=int(area_slots),
             address=plan_address,
@@ -3075,6 +3226,7 @@ class TmaLoadMxfpCoupledStream(MemoryInstruction):
         self.annotation["coupled_stream_dynamic_expert"] = bool(
             dynamic_expert
         )
+        self.annotation["coupled_stream_down_only"] = bool(down_only)
         self.fixed_port(int(port))
 
     def local_chain_source(self):
@@ -3614,6 +3766,7 @@ __all__ = [
     "Dsv4AttentionSplit32UmmaSm100",
     "Dsv4AttentionSplit64UmmaSm100",
     "Dsv4AttentionSplitReduceFp8Sm100",
+    "Dsv4AttentionContext1Fp8Sm100",
     "Dsv4RouteTop6",
     "Dsv4RouteTop6Prepared",
     "Dsv4ExpertReduce",
@@ -3718,6 +3871,8 @@ __all__ = [
     "IndirectIndexedTmaLoad1D",
     "indirect_1d_from",
     "LduReloadBarriers",
+    "LduAsyncReloadBarriers",
+    "LduWaitBarrier",
     "LduLoad1D",
     "IssueBarrier",
     "CC0",

@@ -3,6 +3,7 @@ import warnings
 
 from .runtime import *
 from .launcher import *
+from .instructions import Dsv4AttentionContext1Fp8Sm100
 from .routing import IndexedLoadTable
 
 class Schedule:
@@ -1953,11 +1954,19 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
     TILE_K = SchedFp8UmmaPrepack.TILE_K
     TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
 
-    def __init__(self, input, output, scale_pack: int = 1):
+    def __init__(
+        self,
+        input,
+        output,
+        scale_pack: int = 1,
+        *,
+        profile_store_event: int | None = None,
+    ):
         super().__init__()
         self.input = input
         self.output = output
         self.scale_pack = int(scale_pack)
+        self.profile_store_event = profile_store_event
 
     def _on_place(self):
         if self.input.dtype != torch.bfloat16 or self.input.ndim != 1:
@@ -1996,14 +2005,19 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
         tile_stop = tile_start + tile_count
         start = tile_start * self.TILE_K
         stop = tile_stop * self.TILE_K
+        store = TmaStore1D(
+            self.output[tile_start:tile_stop].reshape(-1)
+        ).bar(self._bar("output"))
+        if self.profile_store_event is not None:
+            if not 0 <= self.profile_store_event < (1 << 15):
+                raise ValueError("profile store event must fit 15 bits")
+            store.arg = (1 << 15) | self.profile_store_event
         return [
             Dsv4Fp8QuantUmmaBSm100(tile_count, self.scale_pack),
             _shared_load_1d(
                 self.input[start:stop]
             ).fixed_port(1),
-            TmaStore1D(self.output[tile_start:tile_stop].reshape(-1)).bar(
-                self._bar("output")
-            ),
+            store,
         ]
 
     def bar_release_count(self, role: str):
@@ -2013,9 +2027,10 @@ class SchedDsv4Fp8QuantUmmaB(Schedule):
 
 
 class SchedDsv4Mxfp8QuantFfnInput(Schedule):
-    """Quantize BF16 directly into packed native K512 Linear-1 records.
+    """Quantize BF16 into native K512 ``[data|SFB]`` records.
 
-    Every output row is ``[4096-byte N8 E4M3 data | 2048-byte SFB]``.
+    A separately scheduled copy handoff converts the records into the two
+    contiguous planes used by resident Linear-1; that copy overlaps routing.
     Only the 128 active SFB bytes are initialized; native-layout padding is
     deliberately unspecified.
     """
@@ -2500,15 +2515,16 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
 class SchedDsv4ZeroFill(Schedule):
     """Shard an in-queue zero fill over a contiguous tensor."""
 
-    def __init__(self, gate, output):
+    def __init__(self, gate, output, *, profile_store_event=None):
         super().__init__()
         self.gate = gate
         self.output = output
+        self.profile_store_event = profile_store_event
 
     def _on_place(self):
         if not self.output.is_contiguous() or self.output.numel() <= 0:
             raise ValueError("zero-fill output must be nonempty and contiguous")
-        if (
+        if self.gate is not None and (
             self.gate.dtype != torch.uint32
             or self.gate.numel() != 1
             or not self.gate.is_contiguous()
@@ -2537,11 +2553,22 @@ class SchedDsv4ZeroFill(Schedule):
         element_start = word_start * self.elements_per_word
         element_stop = (word_start + word_count) * self.elements_per_word
         output = self.output.reshape(-1)[element_start:element_stop]
-        return [
-            Dsv4ZeroFill(word_count * 4),
-            LduLoad1D(self.gate).bar(self._bar("gate")),
-            TmaStore1D(output).bar(self._bar("output")),
+        instructions = [
+            Dsv4ZeroFill(word_count * 4, has_gate=self.gate is not None),
         ]
+        if self.gate is not None:
+            instructions.append(
+                LduLoad1D(self.gate).bar(self._bar("gate"))
+            )
+        store = TmaStore1D(output).bar(self._bar("output"))
+        if self.profile_store_event is not None:
+            if not 0 <= self.profile_store_event < (1 << 14):
+                raise ValueError("profile store event must fit 14 bits")
+            store.arg = (
+                (1 << 15) | (1 << 14) | self.profile_store_event
+            )
+        instructions.append(store)
+        return instructions
 
     def bar_release_count(self, role: str):
         if role != "output":
@@ -3142,10 +3169,17 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
             )
         if (
             self.metadata.dtype != torch.uint8
-            or tuple(self.metadata.shape) != (self.tasks, self.METADATA_BYTES)
+            or tuple(self.metadata.shape) not in (
+                (self.tasks, self.METADATA_BYTES),
+                (3 * self.tasks, self.METADATA_BYTES),
+            )
             or not self.metadata.is_contiguous()
         ):
-            raise ValueError("down metadata must be contiguous uint8 [tasks,128]")
+            raise ValueError(
+                "down metadata must be contiguous uint8 [tasks,128] or "
+                "[3*tasks,128]"
+            )
+        self.metadata_variants = self.metadata.shape[0] // self.tasks
         if (
             self.weight_tma is None
             or getattr(self.weight_tma, "rank", None) != 5
@@ -3329,8 +3363,8 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
     The physical worker image remains seven experts: shared plus six routed
     ranks.  LDU0 maps each routed rank to its offline-packed expert block from
     the 128-byte route record; compute continues to operate on fixed physical
-    activation records.  The output is an FP32 ``[8,4096]`` accumulation;
-    one following task performs the sole BF16 rounding for the model handoff.
+    activation records. The output is the N-major BF16 ``[8,4096]`` model
+    handoff; routed and split-K tasks reduce directly into that tensor.
     """
 
     ROUTE_RECORD_BYTES = 128
@@ -3347,6 +3381,8 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
         linear1_stream_scales,
         down_stream_weights,
         down_stream_scales,
+        *,
+        profile_output_event=None,
     ):
         super().__init__()
         self.linear1 = linear1
@@ -3356,6 +3392,7 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
         self.linear1_stream_scales = linear1_stream_scales
         self.down_stream_weights = down_stream_weights
         self.down_stream_scales = down_stream_scales
+        self.profile_output_event = profile_output_event
 
     def _validate_streams(self):
         stream_experts = self.CHECKPOINT_EXPERTS + 1
@@ -3419,15 +3456,18 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
 
     def _on_place(self):
         self._validate_streams()
-        self.placed_linear1 = self.linear1.place(self.num_sms)
-        self.placed_down = self.down.place(self.num_sms)
-        if self.placed_linear1.m_tiles != self.num_sms:
-            raise ValueError("routed resident FFN requires one Linear-1 task per worker")
-        if self.num_sms != 7 * self.LINEAR1_SLICES:
-            raise ValueError("routed resident FFN requires 112 physical workers")
-        if not self.placed_down.output_n_major or not self.placed_down.fp32_output:
+        if self.num_sms not in (7 * self.LINEAR1_SLICES, 152):
             raise ValueError(
-                "routed resident FFN output must use FP32 [8,4096] layout"
+                "routed resident FFN requires 112 or 152 physical workers"
+            )
+        self.linear1_worker_base = self.num_sms - 7 * self.LINEAR1_SLICES
+        self.placed_linear1 = self.linear1.place(7 * self.LINEAR1_SLICES)
+        self.placed_down = self.down.place(self.num_sms)
+        if self.placed_linear1.m_tiles != 7 * self.LINEAR1_SLICES:
+            raise ValueError("routed resident FFN requires one Linear-1 task per worker")
+        if self.placed_down.fp32_output or not self.placed_down.output_n_major:
+            raise ValueError(
+                "routed resident FFN output must use BF16 [8,4096] layout"
             )
         if max(map(len, self.placed_down.task_queues)) > 2:
             raise ValueError("routed resident FFN supports two Down tasks per worker")
@@ -3437,13 +3477,38 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
         ):
             raise ValueError("routed resident FFN needs seven physical expert slots")
 
-        self.placed_down.task_queues = []
-        for worker in range(self.num_sms):
-            physical_expert, local_slice = divmod(worker, self.LINEAR1_SLICES)
-            expert_base = physical_expert * self.DOWN_SLICES
-            self.placed_down.task_queues.append(
-                [expert_base + local_slice, expert_base + 16 + local_slice]
-            )
+        self.down_metadata_variants = self.placed_down.metadata_variants
+        self.placed_down.task_queues = [[] for _ in range(self.num_sms)]
+        if self.num_sms == 112:
+            for worker in range(self.num_sms):
+                physical_expert, local_slice = divmod(
+                    worker, self.LINEAR1_SLICES
+                )
+                expert_base = physical_expert * self.DOWN_SLICES
+                self.placed_down.task_queues[worker] = [
+                    expert_base + local_slice,
+                    expert_base + 16 + local_slice,
+                ]
+        else:
+            if self.down_metadata_variants != 3:
+                raise ValueError(
+                    "152-worker Down balancing requires full/half metadata"
+                )
+            # One full K2048 tile per worker forms the first wave. Replace the
+            # remaining 72 full tiles with 144 K1024 halves, assigning at most
+            # one half to each worker. Every SM therefore carries either 1.0
+            # or 1.5 equal-work tiles instead of the old 1-or-2 tile tail.
+            for worker in range(self.num_sms):
+                self.placed_down.task_queues[worker].append(3 * worker)
+            split_record = 0
+            for output_task in range(self.num_sms, self.placed_down.tasks):
+                for split_variant in (1, 2):
+                    self.placed_down.task_queues[split_record].append(
+                        3 * output_task + split_variant
+                    )
+                    split_record += 1
+        if max(map(len, self.placed_down.task_queues)) > 2:
+            raise ValueError("routed resident FFN supports two Down tasks per worker")
 
         launcher = getattr(self.placed_linear1.gate_weight_tma, "launcher", None)
         if launcher is None:
@@ -3455,34 +3520,51 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
             launcher, self.down_stream_weights
         ).mxfp4_load(256)
 
-        plans = torch.zeros((self.num_sms, 12), dtype=torch.int64, device="cpu")
+        plans = torch.zeros((self.num_sms, 13), dtype=torch.int64, device="cpu")
         linear1_scale_base = self.linear1_stream_scales.data_ptr()
         for worker, task_queue in enumerate(self.placed_down.task_queues):
-            physical_expert, local_slice = divmod(worker, self.LINEAR1_SLICES)
+            has_linear1 = worker >= self.linear1_worker_base
+            linear1_worker = worker - self.linear1_worker_base
+            physical_expert = (
+                linear1_worker // self.LINEAR1_SLICES
+                if has_linear1 else 0
+            )
+            local_slice = (
+                linear1_worker % self.LINEAR1_SLICES
+                if has_linear1 else 0
+            )
             route_rank = physical_expert - 1
-            plans[worker, 0] = self.placed_linear1.metadata[worker].data_ptr()
-            plans[worker, 1] = self.placed_down.metadata[task_queue[0]].data_ptr()
-            plans[worker, 2] = self.placed_down.metadata[task_queue[1]].data_ptr()
-            plans[worker, 3] = 2
-            if physical_expert == 0:
-                plans[worker, 4] = self.linear1_stream_scales[
-                    worker, 0
+            if has_linear1:
+                plans[worker, 0] = self.placed_linear1.metadata[
+                    linear1_worker
                 ].data_ptr()
-                linear1_coordinate = worker
-            else:
+            plans[worker, 1] = self.placed_down.metadata[task_queue[0]].data_ptr()
+            if len(task_queue) > 1:
+                plans[worker, 2] = self.placed_down.metadata[
+                    task_queue[1]
+                ].data_ptr()
+            plans[worker, 3] = len(task_queue)
+            if has_linear1 and physical_expert == 0:
+                plans[worker, 4] = self.linear1_stream_scales[
+                    linear1_worker, 0
+                ].data_ptr()
+                linear1_coordinate = linear1_worker
+            elif has_linear1:
                 plans[worker, 4] = linear1_scale_base
                 linear1_coordinate = local_slice
-            plans[worker, 5] = (
-                self.linear1_stream_tma.arg | (linear1_coordinate << 32)
-            )
-            plans[worker, 6] = self.placed_linear1.activation_data.data_ptr()
-            plans[worker, 7] = self.placed_linear1.activation_scale.data_ptr()
+            if has_linear1:
+                plans[worker, 5] = (
+                    self.linear1_stream_tma.arg | (linear1_coordinate << 32)
+                )
+                plans[worker, 6] = self.placed_linear1.activation_data.data_ptr()
+                plans[worker, 7] = self.placed_linear1.activation_scale.data_ptr()
             plans[worker, 8] = self.route_record.data_ptr()
             plans[worker, 9] = (
                 (route_rank & 0xFFFFFFFF) | (local_slice << 32)
             )
             plans[worker, 10] = self.down_stream_scales.data_ptr()
             plans[worker, 11] = self.down_stream_tma.arg
+            plans[worker, 12] = int(has_linear1)
         self.resident_plans = plans.to(self.route_record.device)
         self.task_queues = self.placed_down.task_queues
 
@@ -3490,35 +3572,48 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
         if sm < 0 or sm >= self.num_sms:
             return []
         plan_address = self.resident_plans[sm].data_ptr()
-        dynamic_expert = sm >= self.LINEAR1_SLICES
-        linear1_load = TmaLoadMxfpCoupledStream(
+        has_linear1 = sm >= self.linear1_worker_base
+        linear1_worker = sm - self.linear1_worker_base
+        linear1_dynamic_expert = (
+            has_linear1 and linear1_worker >= self.LINEAR1_SLICES
+        )
+        down_dynamic_expert = self.down_metadata_variants == 3 or (
+            self.task_queues[sm][0] // self.DOWN_SLICES > 0
+        )
+        instructions = [Mxfp4Mxfp8RoutedResidentFfnSm100(plan_address)]
+        if has_linear1:
+            instructions.append(
+                TmaLoadMxfpCoupledStream(
+                    plan_address,
+                    kind=TmaLoadMxfpCoupledStream.LINEAR1,
+                    stages=2,
+                    area_slots=(168 * 1024) // config.slot_size,
+                    area_id=0,
+                    # Ordinary router and prepared-top-k raw operands occupy
+                    # special mailboxes 1, 3, 4, and 5. Use the final mailbox
+                    # so look-ahead cannot overwrite a live raw operand.
+                    mailbox=8,
+                    port=0,
+                    dynamic_expert=linear1_dynamic_expert,
+                ).bar(self._bar("input"))
+            )
+        down_weight = TmaLoadMxfpCoupledStream(
             plan_address,
-            kind=TmaLoadMxfpCoupledStream.LINEAR1,
+            kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
             stages=2,
-            area_slots=(168 * 1024) // config.slot_size,
+            area_slots=(76 * 1024 + config.slot_size - 1)
+                // config.slot_size,
             area_id=0,
-            # Ordinary router and prepared-top-k raw operands occupy special
-            # mailboxes 1, 3, 4, and 5.  Coupled streams bypass allocator slot
-            # ownership, so use the otherwise-unaddressable final mailbox to
-            # prevent look-ahead from overwriting any live raw operand.
-            mailbox=8,
+            mailbox=6,
             port=0,
-            dynamic_expert=dynamic_expert,
-        ).bar(self._bar("input"))
-        instructions = [
-            Mxfp4Mxfp8RoutedResidentFfnSm100(plan_address),
-            linear1_load,
-            TmaLoadMxfpCoupledStream(
-                plan_address,
-                kind=TmaLoadMxfpCoupledStream.DOWN_WEIGHT,
-                stages=2,
-                area_slots=(76 * 1024 + config.slot_size - 1)
-                    // config.slot_size,
-                area_id=0,
-                mailbox=6,
-                port=0,
-                dynamic_expert=dynamic_expert,
-            ),
+            dynamic_expert=down_dynamic_expert,
+            down_only=not has_linear1,
+        )
+        if not has_linear1:
+            down_weight.bar(self._bar("input"))
+        instructions.extend(
+            [
+                down_weight,
             TmaLoadMxfpCoupledStream(
                 plan_address,
                 kind=TmaLoadMxfpCoupledStream.DOWN_ACTIVATION,
@@ -3528,11 +3623,15 @@ class SchedMxfp4Mxfp8RoutedResidentFfn(Schedule):
                 area_id=0,
                 mailbox=7,
                 port=1,
+                down_only=not has_linear1,
             ),
             RawAddress(
-                self.placed_down.final_output, config.num_slots + 5
+                self.placed_down.final_output,
+                config.num_slots + 5,
+                profile_event=self.profile_output_event,
             ).writeback().bar(self._bar("output")).fixed_port(1),
-        ]
+            ]
+        )
         return instructions
 
     def bar_release_count(self, role: str):
@@ -3609,8 +3708,10 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
         resident = self.resident._clone()
         resident._bars.update(self._bars)
         self.placed_resident = resident.place(self.num_sms)
-        if self.num_sms != 112:
-            raise ValueError("layered routed resident FFN requires 112 workers")
+        if self.num_sms not in (112, 152):
+            raise ValueError(
+                "layered routed resident FFN requires 112 or 152 workers"
+            )
         device = self.placed_resident.route_record.device
         representatives = (
             self.placed_resident.linear1_stream_weights,
@@ -3639,8 +3740,11 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
                     raise ValueError(
                         "layered MXFP streams must match representative storage"
                     )
-        expected_linear1_metadata = (self.num_sms, 128)
-        expected_down_metadata = (7 * 32, 128)
+        expected_linear1_metadata = (112, 128)
+        expected_down_metadata = (
+            7 * 32 * self.placed_resident.down_metadata_variants,
+            128,
+        )
         for layer in range(self.layer_count):
             linear1_metadata = self.linear1_metadata_layers[layer]
             down_metadata = self.down_metadata_layers[layer]
@@ -3709,7 +3813,7 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
         self.down_tmas = tuple(down_tmas)
 
         plans = torch.zeros(
-            (self.layer_count, self.num_sms, 12),
+            (self.layer_count, self.num_sms, 13),
             dtype=torch.int64,
             device="cpu",
         )
@@ -3728,38 +3832,49 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
             ):
                 raise ValueError("layered MXFP scale streams must be contiguous CUDA")
             for worker, task_queue in enumerate(task_queues):
-                physical_expert, local_slice = divmod(worker, 16)
-                route_rank = physical_expert - 1
-                plans[layer, worker, 0] = (
-                    self.linear1_metadata_layers[layer][worker].data_ptr()
+                has_linear1 = worker >= self.placed_resident.linear1_worker_base
+                linear1_worker = (
+                    worker - self.placed_resident.linear1_worker_base
                 )
+                physical_expert = (
+                    linear1_worker // 16 if has_linear1 else 0
+                )
+                local_slice = linear1_worker % 16 if has_linear1 else 0
+                route_rank = physical_expert - 1
+                if has_linear1:
+                    plans[layer, worker, 0] = self.linear1_metadata_layers[
+                        layer
+                    ][linear1_worker].data_ptr()
                 plans[layer, worker, 1] = (
                     self.down_metadata_layers[layer][task_queue[0]].data_ptr()
                 )
-                plans[layer, worker, 2] = (
-                    self.down_metadata_layers[layer][task_queue[1]].data_ptr()
-                )
+                if len(task_queue) > 1:
+                    plans[layer, worker, 2] = self.down_metadata_layers[
+                        layer
+                    ][task_queue[1]].data_ptr()
                 plans[layer, worker, 3] = len(task_queue)
-                if physical_expert == 0:
+                if has_linear1 and physical_expert == 0:
                     plans[layer, worker, 4] = linear1_scales[
-                        worker, 0
+                        linear1_worker, 0
                     ].data_ptr()
-                    linear1_coordinate = worker
-                else:
+                    linear1_coordinate = linear1_worker
+                elif has_linear1:
                     plans[layer, worker, 4] = linear1_scales.data_ptr()
                     linear1_coordinate = local_slice
-                plans[layer, worker, 5] = (
-                    self.linear1_tmas[layer].arg
-                    | (linear1_coordinate << 32)
-                )
-                plans[layer, worker, 6] = activation_data.data_ptr()
-                plans[layer, worker, 7] = activation_scale.data_ptr()
+                if has_linear1:
+                    plans[layer, worker, 5] = (
+                        self.linear1_tmas[layer].arg
+                        | (linear1_coordinate << 32)
+                    )
+                    plans[layer, worker, 6] = activation_data.data_ptr()
+                    plans[layer, worker, 7] = activation_scale.data_ptr()
                 plans[layer, worker, 8] = route_record.data_ptr()
                 plans[layer, worker, 9] = (
                     (route_rank & 0xFFFFFFFF) | (local_slice << 32)
                 )
                 plans[layer, worker, 10] = down_scales.data_ptr()
                 plans[layer, worker, 11] = self.down_tmas[layer].arg
+                plans[layer, worker, 12] = int(has_linear1)
         self.layered_plans = plans.to(device)
         self.plan_layer_bytes = (
             self.layered_plans.stride(0)
@@ -3770,12 +3885,14 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
         if sm < 0 or sm >= self.num_sms:
             return []
         base = self.placed_resident.schedule(sm)
-        if len(base) != 5:
+        if len(base) not in (4, 5):
             raise ValueError("routed resident FFN command contract changed")
-        compute, linear1, down_weight, down_activation, output = base
+        compute = base[0]
+        output = base[-1]
+        down_activation = base[-2]
+        down_weight = base[-3]
+        linear1 = base[1] if len(base) == 5 else None
         plan_address = self.layered_plans[0, sm].data_ptr()
-        linear1 = linear1.copy()
-        linear1.set_cords(addr2cords(plan_address))
         down_weight = down_weight.copy()
         down_weight.set_cords(addr2cords(plan_address))
         down_activation = down_activation.copy()
@@ -3784,9 +3901,16 @@ class SchedLayeredMxfp4Mxfp8RoutedResidentFfn(Schedule):
             (counter, stride * self.plan_layer_bytes)
             for counter, stride in self.counter_strides
         )
-        weight_window = RepeatM.offsetWindowByCounters(
-            offsets, linear1, down_weight
-        )
+        if linear1 is not None:
+            linear1 = linear1.copy()
+            linear1.set_cords(addr2cords(plan_address))
+            weight_window = RepeatM.offsetWindowByCounters(
+                offsets, linear1, down_weight
+            )
+        else:
+            weight_window = RepeatM.offsetWindowByCounters(
+                offsets, down_weight
+            )
         return [compute, weight_window, down_activation, output]
 
     def bar_release_count(self, role: str):
@@ -5693,6 +5817,114 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         return self._bar_release_if_present(role, self.num_splits)
 
 
+class SchedDsv4AttentionContext1Fp8Sm100(Schedule):
+    """Compute one-row sink attention and publish native O_a records."""
+
+    HEADS = 64
+    OUTPUT_GROUPS = 2
+    TILES = 4
+    TILE_BYTES = SchedFp8UmmaPrepack.ACTIVATION_TILE_BYTES
+
+    def __init__(
+        self,
+        q,
+        kv,
+        sink,
+        table,
+        output,
+        *,
+        head_start=0,
+        head_count=64,
+        normalize_q=False,
+    ):
+        super().__init__()
+        self.q = q
+        self.kv = kv
+        self.sink = sink
+        self.table = table
+        self.output = output
+        self.head_start = int(head_start)
+        self.head_count = int(head_count)
+        self.normalize_q = bool(normalize_q)
+
+    def _on_place(self):
+        if (
+            self.q.dtype != torch.bfloat16
+            or tuple(self.q.shape) != (self.HEADS, 512)
+            or not self.q.is_contiguous()
+        ):
+            raise ValueError("context-1 Q must be contiguous BF16 [64,512]")
+        if (
+            self.kv.dtype != torch.bfloat16
+            or tuple(self.kv.shape) != (1, 512)
+            or not self.kv.is_contiguous()
+        ):
+            raise ValueError("context-1 KV must be contiguous BF16 [1,512]")
+        if self.table.dtype != torch.float32 or tuple(self.table.shape) != (32, 2):
+            raise ValueError("inverse-RoPE table must be FP32 [32,2]")
+        if (
+            self.sink.dtype != torch.float32
+            or tuple(self.sink.shape) != (64,)
+        ):
+            raise ValueError("context-1 sink must be FP32 [64]")
+        if (
+            self.output.dtype != torch.uint8
+            or tuple(self.output.shape)
+            != (self.HEADS, self.TILES, self.TILE_BYTES)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError("native O_a output must be uint8 [64,4,2048]")
+        if (
+            self.head_start < 0
+            or self.head_count <= 0
+            or self.head_start + self.head_count > self.HEADS
+        ):
+            raise ValueError("context-1 attention head shard exceeds [0,64)")
+        work_count = self.head_count
+        if not 0 < self.num_sms <= work_count:
+            raise ValueError("context-1 attention SMs exceed its head count")
+        self.raw_record = torch.tensor(
+            (
+                self.q.data_ptr(),
+                self.kv.data_ptr(),
+                self.table.data_ptr(),
+            ),
+            dtype=torch.uint64,
+            device=self.q.device,
+        )
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        instructions = []
+        work_count = self.head_count
+        for work in range(sm, work_count, self.num_sms):
+            head = self.head_start + work
+            sink_start = head & ~3
+            instructions.extend(
+                (
+                    Dsv4AttentionContext1Fp8Sm100(
+                        head, normalize_q=self.normalize_q
+                    ),
+                    RawAddress(
+                        self.raw_record, config.num_slots
+                    ).bar(self._bar("input")).fixed_port(0),
+                    LduLoad1D(
+                        self.sink[sink_start : sink_start + 4], bytes=16
+                    ).fixed_port(1),
+                    RawAddress(
+                        self.output, config.num_slots + 1
+                    ).writeback().bar(self._bar("output")),
+                )
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.head_count)
+
+
 class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
     """Merge split-KV partials and directly publish native O_a records."""
 
@@ -5888,7 +6120,6 @@ class SchedDsv4RouteTop6(Schedule):
             raise ValueError("DeepSeek route-id storage must contain eight int32 values")
         if self.output_weights.dtype != torch.float32 or self.output_weights.numel() != 8:
             raise ValueError("DeepSeek route-weight storage must contain eight FP32 values")
-
     def schedule(self, sm):
         if sm != 0:
             return []
@@ -5951,7 +6182,9 @@ class SchedDsv4RouteTop6(Schedule):
     def bar_release_count(self, role: str):
         if role != "output":
             return 0
-        return self._bar_release_if_present(role, 1)
+        return self._bar_release_if_present(
+            role, 1
+        )
 
 
 class SchedDsv4ExpertReduce(Schedule):
@@ -6944,18 +7177,11 @@ class SchedDsv4HcPreRms(Schedule):
             output_fp8=self.fp8_output is not None,
             split_metadata_splits=self.split_metadata_splits,
         )]
-        if self.split_metadata_splits:
-            instructions.extend((
-                metadata,
-                residual,
-                TmaLoad1D(self.norm_weight).fixed_port(1),
-            ))
-        else:
-            instructions.extend((
-                metadata,
-                residual,
-                TmaLoad1D(self.norm_weight).fixed_port(1),
-            ))
+        instructions.extend((
+            metadata,
+            residual,
+            TmaLoad1D(self.norm_weight).fixed_port(1),
+        ))
         if self.fp8_output is not None:
             instructions.extend(
                 (
@@ -7158,6 +7384,83 @@ class SchedDsv4HcPost(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedOverlapAsyncBarrierReload(Schedule):
+    """Join useful work with a disjoint LDU barrier-bank clear.
+
+    ``inner`` occupies the low SM range. Selected otherwise-idle SMs each
+    restore a contiguous slice of an inactive barrier bank. Both paths publish
+    the same ordinary output dependency, so the clear is latency-free whenever
+    it finishes before the useful path.
+    """
+
+    def __init__(
+        self,
+        inner,
+        inner_sms: int,
+        bar_source: torch.Tensor,
+        first_bar: int,
+        count: int,
+        worker_base: int,
+        workers: int,
+        *,
+        special_slot: int = 2,
+    ):
+        super().__init__()
+        self.inner = inner
+        self.inner_sms = int(inner_sms)
+        self.bar_source = bar_source
+        self.first_bar = int(first_bar)
+        self.count = int(count)
+        self.worker_base = int(worker_base)
+        self.workers = int(workers)
+        self.special_slot = int(special_slot)
+
+    def _on_place(self):
+        if (
+            self.inner_sms <= 0
+            or self.worker_base < self.inner_sms
+            or self.workers <= 0
+            or self.worker_base + self.workers > self.num_sms
+            or self.count < self.workers
+        ):
+            raise ValueError("async barrier reload placement is invalid")
+        inner = self.inner._clone()
+        inner._bars.update(self._bars)
+        self.placed_inner = inner.place(self.inner_sms)
+
+    def schedule(self, sm):
+        if sm < 0 or sm >= self.num_sms:
+            return []
+        instructions = (
+            list(self.placed_inner.schedule(sm))
+            if sm < self.inner_sms
+            else []
+        )
+        worker = sm - self.worker_base
+        if 0 <= worker < self.workers:
+            width, remainder = divmod(self.count, self.workers)
+            local_count = width + int(worker < remainder)
+            local_offset = worker * width + min(worker, remainder)
+            instructions.append(
+                LduAsyncReloadBarriers(
+                    self.bar_source,
+                    self.first_bar + local_offset,
+                    local_count,
+                    self._bar("input"),
+                    self.special_slot,
+                )
+            )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        inner_count = self.placed_inner.bar_release_count(role)
+        return self._bar_release_if_present(
+            role, inner_count + self.workers
+        )
 
 
 class SchedDsv4Hadamard(Schedule):

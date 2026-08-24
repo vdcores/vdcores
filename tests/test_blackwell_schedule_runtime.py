@@ -1595,7 +1595,7 @@ def test_dsv4_mxfp8_ffn_input_quant_uses_one_packed_record_per_sm(monkeypatch):
     schedule = SchedDsv4Mxfp8QuantFfnInput(
         torch.empty((4096,), dtype=torch.bfloat16),
         torch.empty((8, 6144), dtype=torch.uint8),
-    ).place(8)
+    ).bar("output", 7).place(8)
 
     first = schedule.schedule(0)
     last = schedule.schedule(7)
@@ -1605,7 +1605,9 @@ def test_dsv4_mxfp8_ffn_input_quant_uses_one_packed_record_per_sm(monkeypatch):
     assert first[1].size == last[1].size == 512 * 2
     assert first[2].size == last[2].size == 6144
     assert first[1].num_slots == last[1].num_slots == 1
-    assert first[2].num_slots == last[2].num_slots == 1
+    assert first[2].num_slots & 0x3F == last[2].num_slots & 0x3F == 1
+    assert first[2].num_slots >> 6 == 7
+    assert schedule.bar_release_count("output") == 8
     assert first[1].cords != last[1].cords
 
 
@@ -2967,6 +2969,152 @@ def test_looped_program_reload_can_include_shared_task_barriers():
                 ),
             ),
         )
+
+
+def test_looped_program_carries_final_completion_directly_into_tail_loads():
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeBarrierSource:
+        device = FakeDevice()
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 1 << 20
+
+        @staticmethod
+        def element_size():
+            return 4
+
+        @staticmethod
+        def data_ptr():
+            return 0x34560000
+
+    class FakeLauncher:
+        num_sms = 2
+        max_insts = 64
+        bars_src = FakeBarrierSource()
+
+        def __init__(self):
+            self.num_bars = 0
+            self.bar_values = {}
+
+        def new_bar(self, count):
+            bar_id = self.num_bars
+            self.num_bars += 1
+            self.bar_values[bar_id] = count
+            return bar_id
+
+        def copy_cptrs(self):
+            return [0] * self.num_sms
+
+        def copy_mptrs(self):
+            return [0] * self.num_sms
+
+    class BasicStage(Schedule):
+        def schedule(self, sm):
+            if sm < 0:
+                return []
+            return [
+                Copy(1, 16),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_LDU_LOAD_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ).port(1),
+                MemoryInstruction(
+                    opcode.OP_ALLOC_WB_STU_STORE_1D,
+                    num_slots=1,
+                    arg=0,
+                    size=16,
+                    address=0,
+                ),
+            ]
+
+    program = LoopedSequentialProgram(
+        FakeLauncher(),
+        (
+            SequentialBlock(
+                "body",
+                (SequentialStage("body", BasicStage(), 2),),
+                repeat=3,
+                reload_mxfp_resident=True,
+                elide_terminal_reload=True,
+            ),
+            SequentialBlock(
+                "tail",
+                (SequentialStage("tail", BasicStage(), 2),),
+                reload_after=False,
+            ),
+        ),
+    )
+
+    memory = [
+        inst
+        for inst in program.instructions[0]
+        if isinstance(inst, MemoryInstruction)
+    ]
+    reload_index = next(
+        index
+        for index, inst in enumerate(memory)
+        if (inst.opcode & ~0x3F)
+        == (opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F)
+    )
+    reload = memory[reload_index]
+    completion = reload.num_slots >> 6
+    assert reload.arg & LduReloadBarriers.SKIP_FINAL_LOOP
+    assert reload.arg & LduReloadBarriers.RESET_MXFP_RESIDENT
+    assert (
+        reload.arg >> LduReloadBarriers.LOOP_REG_SHIFT
+    ) & 0x3 == 0
+    assert reload.size == completion + 1
+
+    loop_index = next(
+        index
+        for index, inst in enumerate(memory)
+        if index > reload_index and isinstance(inst, LoopM)
+    )
+    assert memory[loop_index].size == 3
+    tail_loads = [
+        inst
+        for inst in memory[loop_index + 1 :]
+        if inst.opcode & 0x1 and not inst.opcode & 0x2
+    ]
+    assert {int(bool(inst.opcode & 0x20)) for inst in tail_loads} == {0, 1}
+    assert all(inst.opcode & 0x10 for inst in tail_loads)
+    assert all(inst.num_slots >> 6 == completion for inst in tail_loads)
+    assert all(
+        (inst.opcode & ~0x10) != opcode.OP_ISSUE_BARRIER for inst in memory
+    )
+
+    # The terminal-loop metadata must not narrow the reload range: the full
+    # model restores substantially more than 255 dependency counters.
+    wide_reload = LduReloadBarriers(
+        FakeBarrierSource(),
+        first_bar=256,
+        count=512,
+        special_slot=2,
+        reset_mxfp_resident=True,
+        skip_final_loop_reg=3,
+    )
+    assert wide_reload.arg & LduReloadBarriers.FIRST_BAR_MASK == 256
+    assert (
+        wide_reload.arg >> LduReloadBarriers.LOOP_REG_SHIFT
+    ) & 0x3 == 3
+    assert wide_reload.size == 512
 
 
 def test_sequential_program_resets_resident_state_between_two_ffns():

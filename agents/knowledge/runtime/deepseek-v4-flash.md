@@ -2937,3 +2937,191 @@ output checks. It measured 30.838 us hot and 48.288 us cold by CUDA events,
 with 25.856 us hot and 35.712 us cold device-counter medians. Relative to the
 pre-cleanup unified result, hot latency improved by 0.218 us while cold latency
 was unchanged within the short-run variance.
+
+## Full-image FFN/attention unroll limit (2026-08-23)
+
+The production routed MXFP image now leaves the Linear-1 projection loop, the
+Linear-1/Linear-2 outer K-bundle loops, and the split64 attention QK-tile loop
+rolled. Inner CuTe fragment loops and the ring/UMMA schedule remain unchanged.
+In the exact 27-handler full image this reduces `dae2` text from 675,712 to
+576,256 bytes (-14.72%), and ptxas allocation from 246 to 242 registers, with
+no spills.
+
+The matched 43-layer/context-128 raw device frontier is 16.471360 ms before
+and 16.399104 ms after (-0.44%, within launch variation). The isolated resident
+FFN changes from 61.664 to 61.696 us, and split64 attention changes by only
++0.2% to +0.4%. All checks pass and the full path emits token 7249. This rules
+out handler code size as the dominant source of the approximately 16-ms
+single-token time while retaining the substantially smaller image. Full
+commands and job IDs are in `.agentlog/2026-08-23-dsv4-full-image-unroll.md`.
+
+## Allocator-lane-owned LDU publication (2026-08-23)
+
+The generic allocator now treats its control mailboxes according to their
+actual ownership: allocator lane zero publishes them and one lane in each LDU
+consumes them.  The publication-lifetime barrier therefore has three
+participants instead of all 32 allocator lanes plus both LDUs.  The remaining
+allocator lanes do not access the mailbox; the next allocator iteration's
+full-mask shuffle reconverges the warp before lane-derived state is consumed.
+This is a normal-runtime change, not a specialized executor or IssueBarrier.
+
+Detail traces showed the old 34-participant barrier had already completed on
+both LDUs while allocator lane zero remained unscheduled for about 55 us.  The
+compute handler had already begun the following layer, and the allocator took
+only 0.064--0.224 us to fetch its next instruction once it resumed.  Explicit
+M2C polling sleeps did not alter this delay and regressed repeated-layer time;
+warp-leader polling and the legacy all-consumer M2C contract are invalid for
+the divergent full image.  Those rejected variants and their build switches
+were removed.
+
+Matched profiling-free measurements used the same 29-handler full image, 10
+warmups, and 101 samples.  One layer improved from 0.367488 to 0.353312 ms
+(-3.9%); two repeated layers improved from 0.892864 to 0.679456 ms (-23.9%).
+The 43-layer raw device-frontier minimum improved from 14.815616 to 14.068768
+ms (-5.0%).  Its repeated-launch median also improved from 83.301312 to
+16.817696 ms, although cross-token reset drift remains tracked separately
+from the requested raw single-token estimate.  All cases passed and produced
+the same output tokens as their controls.  Ptxas resources are unchanged at
+242 registers, ten barriers, a 224-byte stack, and zero spills.
+
+Jobs are `20260823T211950Z-1654299` and
+`20260823T212013Z-1657271` (candidate small controls),
+`20260823T212248Z-1680329` and `20260823T212310Z-1685772`
+(baseline small controls), `20260823T212351Z-1692424` (baseline full), and
+`20260823T212721Z-1726488` (candidate full).
+
+## Direct-BF16 routed MXFP Down handoff (2026-08-24)
+
+The routed MXFP4 x MXFP8 Down specialization now reduces directly into the
+BF16 `[8,4096]` model handoff.  Expert zero establishes each destination tile
+with a TMA copy; routed experts and the selected K1024 halves use BF16 TMA
+reduce-add.  The separate FP32 `[8,4096]` accumulator and resident
+`FP32_TO_BF16` stage are gone.  Writing converted values directly into the
+N-major shared fragment was important: retaining a second BF16 register
+fragment measured 184.384 us for one layer, while direct shared stores won.
+This intentionally accepts BF16 cross-expert/split-K accumulation error.
+
+The production image builds at 246 registers, ten barriers, a 256-byte stack,
+zero spills, and 15,104 bytes static shared memory.  A hot one-layer run
+(`20260824T130828Z-1378564`) measured a 172.448-us device-frontier median,
+down from the preceding 177.600-us result.  The repeated-launch 43-layer
+validation (`20260824T124400Z-1035208`) kept token 201 and improved the device
+median from 5.405120 to 5.345760 ms (-59.360 us, -1.10%).  The final hot run
+(`20260824T133139Z-1709174`) measured 5.347968 ms device and 5.460128 ms CUDA
+median, with token 201, a 2.0 top-logit margin, and 0.1875 maximum repeated
+logit delta.
+
+Three adjacent controls were rejected.  Removing the overlapped 16-CTA
+native-record split and gathering activation data with one strided 3-D TMA
+slowed the matched hot median from 172.448 to 173.920 us: placing that gather
+inside LDU delays its first weight transaction, whereas the original split is
+hidden under routing.  Refining four Down tiles to K512 quarters reduced the
+predicted SM work spread but slowed the median to 173.760 us because eight
+extra BF16 reduction transactions cost more than the smaller tail.  Finally,
+dropping the unexecuted general FP32 finalizer from the selected switch slowed
+the hot median to 178.912 us; moving the existing profile opcode into its
+slot recovered only to 176.896 us.  The valid fallback handler therefore
+remains selected to preserve the measured 29-case dispatch layout.
+
+Timing and repeated-state validation must remain separate for one-layer
+comparisons.  `--validate-each-launch` clones all intermediates between
+samples, disturbs cache residency, and moved otherwise comparable medians
+into the 184-us range.  Candidates are timed without inter-sample cloning and
+then validated separately; full-model validation remains the final accuracy
+gate.
+
+## Generation-safe asynchronous barrier-bank reload (2026-08-24)
+
+The repeated HCA/CSA body now owns two shifted dependency-counter banks.  At
+each body tail, 16 selected LDUs partition the just-consumed bank into
+contiguous slices while the alternate bank begins.  A three-phase worker
+counter first gathers every clear command, then proves every worker observed
+the old completion counter at zero before any slice can restore it, and
+finally publishes the stores.  The last worker increments an adjacent
+monotonic ready generation.  This prevents both restoration of the completion
+counter in front of a late worker and zero-valued ABA across bank reuse.
+
+Every LDU port receives one compact wait command at the repeated-body entry.
+The allocator substitutes the current outer-loop counter as its expected
+generation; the command normally observes an already-complete clear and costs
+only decode/publication.  It also invalidates handler-local route IDs.  This
+boundary is required because SMs absent from the first stage can otherwise
+look ahead to later counters, and ping-pong route-record addresses do not
+guarantee that every LDU port consumed the alternate address.  It is a direct
+bank-generation dependency, not an `IssueBarrier`.  B's first pass remains
+free to overlap A's tail because its independent bank begins at generation
+zero.
+
+Two more aggressive controls were rejected.  Joining clear completion only
+to the nominal root dependency allowed independent per-SM paths to consume
+stale counters.  Moving the check into `LOOPM` covered allocator backedges but
+did not invalidate LDU-local routing state.  Both produced unstable top-token
+results in the ten-pair diagnostic.  The selected LDU-entry boundary made all
+21 timed ten-pair launches stable; its cold prime chose the other member of a
+near-tied BF16 top-2 pair, consistent with the intentionally order-dependent
+BF16 split-K reduction.
+
+CUDA built-in atomics were retained for the hot reload counters.  A direct
+microtrack measured 2.880 us for `atomicAdd` versus 3.328 us for
+`cuda::atomic_ref` (-13.5%).  A corrected repeated service test measured
+3.367 versus 3.545 us (-5.0%); complete pair time did not improve reliably,
+so the primitive is not the dominant endpoint cost.
+
+Full job `20260824T201042Z-3720755` used one persistent launch, 43 layers,
+context one, 10 warmups, and 101 timed samples.  All launches emitted token
+201.  CUDA time was 5.342240/5.358112/5.423136 ms min/median/max and the raw
+device frontier was 5.257728/5.269696/5.329376 ms.  The preceding synchronous
+5.313216-ms device and 5.406016-ms CUDA medians therefore improve by 43.520 us
+(0.82%) and 47.904 us (0.89%).  This is statistically tied with the earlier
+coalesced asynchronous sample at 5.267520/5.362368 ms; the generation-safe
+form is selected because it closes the reproduced reuse races.  The kernel
+remains at 246 registers, ten barriers, a 256-byte stack, zero spills, and
+15,104 bytes static shared memory.
+
+An invalid combined-generation entry control was also rejected.  It changed
+the expected value from the bank-local outer generation to
+`2 * outer + inner`.  Because the grouped entry command already selects a
+different ready counter for A and B, B's first pass then waited for generation
+one on B's own zero-valued counter.  That counter can be incremented only by
+B's tail clear, creating a direct self-cycle.  The matched ten-pair baseline
+(`20260824T202303Z-3919480`) measured 2.461536 ms at the device frontier, but
+the combined-generation candidate (`20260824T202706Z-3991184`) never completed
+its prime launch and was stopped after a bounded wait.  The existing grouped,
+bank-local outer generation is already the exact reuse dependency: A0 and B0
+both observe generation zero on separate counters, then A1/B1 independently
+wait for A0/B0 clear completion.  Keep B's first independent load free so it
+can overlap A's tail.  If later profiling supports a B weight fence, its source
+must be A's memory-side last-issue publication, not task completion,
+bank-clear completion, or an `IssueBarrier`.
+
+## Full-image Linear-1 tile-unroll rejection (2026-08-24)
+
+Operator-first profiling isolated a real Linear-1 scheduling opportunity, but
+the full-model promotion gate rejected it.  In the focused routed-FFN image,
+leaving the two-projection loop rolled while changing the two eight-tile
+compute loops from `#pragma unroll 1` to `#pragma unroll 2` reduced the
+instrumented device median from 45.664 to 40.064 us.  Fully cloning both the
+projection and tile loops reached 34.112 us.  The gain came from a shorter
+ring-empty/UMMA wait envelope, not from faster memory transactions.
+
+The same controls behaved differently in the 29-handler production image.
+The fully rolled, mixed, and fully cloned instrumented medians were
+48.224/47.712/47.456 us.  The mixed image retained 246 registers, a 304-byte
+profile stack, and zero spills, proving that the focused gain largely vanished
+through full-image instruction placement/scheduling rather than register
+spilling.  The uninstrumented mixed image (`20260824T211525Z-613663`) improved
+the isolated hot FFN device median from 45.824 to 45.344 us, but regressed its
+cold median from 57.120 to 58.656 us.
+
+Most importantly, the exact 43-layer/context-one promotion
+(`20260824T211646Z-637582`) passed token-201 correctness but measured
+5.325248 ms at the device frontier and 5.407136 ms by CUDA event.  The
+immediately adjacent rebuilt rolled control (`20260824T212223Z-721711`) passed
+all 101 timed launches and measured 5.312896/5.399264 ms, making the mixed
+unroll 12.352/7.872 us slower in the matched run.  The earlier selected clear
+sample remains faster at 5.269696/5.358112 ms; the difference between that run
+and the fresh rolled control is launch/clock variation and is not attributed
+to source.  Both Linear-1 outer loops therefore remain rolled in production.
+Do not promote a focused FFN unroll solely from its isolated result; require
+the full-handler-image operator measurement and the 43-layer gate because
+cloned control bodies perturb scheduling elsewhere in the persistent kernel.
