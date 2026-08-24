@@ -3156,3 +3156,15 @@ adjacent rolled production control at 5.312896/5.399264 ms, the final default
 is 267.712 us (5.04%) faster on-device and 270.304 us (5.01%) faster by CUDA
 event.  The source change is deliberately limited to the Linear-1 function
 boundary and its three fixed unroll directives.
+
+A second clean production rebuild and full-model verification
+(`20260824T222851Z-1855313`) used the 29-op inference image, one persistent
+launch, 43 layers, context one, 10 warmups, and 101 timed samples.  Every
+sample again emitted token 201.  CUDA-event time was
+5.111264/5.122304/5.146080 ms min/median/max, while the raw device frontier was
+5.028096/5.038624/5.050880 ms.  The medians are 0.13% faster than the first
+clean default run and therefore reproduce the milestone within run-to-run
+variation.  The rebuilt kernel retained 246 registers, ten barriers, a
+256-byte stack, zero spills, and 15,104 bytes static shared memory.  No Down
+scheduling, pipeline-depth, profiling, or other exploratory switch was
+enabled in this verification.
