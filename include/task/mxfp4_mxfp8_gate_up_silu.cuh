@@ -144,7 +144,7 @@ template <
     int K, int RingStages, int TileN, bool PublishReady,
     bool UseLduWeightRing, bool ResidentAllTma,
     typename M2CQueue, typename C2MQueue>
-__device__ __forceinline__ void
+__device__ __noinline__ void
 task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
     void *smem_base,
     uint32_t tmem_base_ptr,
@@ -504,10 +504,9 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
   auto c_acc = cta_coord_c(make_coord(_, _), _0{}, _0{});
   auto tiled_t2r = make_tmem_copy(TmemLoad{}, gate_tmem);
 
-  // Keep one compact gate/up body and one compact K-tile body in the full
-  // resident image.  The isolated FFN benefits from cloning either loop, but
-  // the larger instruction footprint regresses the complete 43-layer image.
-  #pragma unroll 1
+  // Keep the expanded gate/up schedule behind a device-call boundary so it
+  // does not inflate the persistent dispatch handler's instruction footprint.
+  #pragma unroll 2
   for (int projection = 0; projection < 2; ++projection) {
     const uint16_t descriptor_index =
         projection == 0 ? gate_tma_index : up_tma_index;
@@ -569,7 +568,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
             tid, tiled_t2r, gate_tmem, c_acc, register_gate_silu);
       }
     } else if (warp >= 2) {
-      #pragma unroll 1
+      #pragma unroll 2
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;
@@ -705,7 +704,7 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
         }
       }
     } else if (warp == 0) {
-      #pragma unroll 1
+      #pragma unroll 2
       for (int tile = 0; tile < kNumKTiles; ++tile) {
         const int operation = projection * kNumKTiles + tile;
         const int stage = operation % RingStages;

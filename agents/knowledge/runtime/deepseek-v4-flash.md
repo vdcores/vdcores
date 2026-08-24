@@ -3125,3 +3125,34 @@ to source.  Both Linear-1 outer loops therefore remain rolled in production.
 Do not promote a focused FFN unroll solely from its isolated result; require
 the full-handler-image operator measurement and the 43-layer gate because
 cloned control bodies perturb scheduling elsewhere in the persistent kernel.
+
+## Device-call-isolated Linear-1 expansion (2026-08-24)
+
+The rejected inline expansion above identified the right local schedule but
+put it in the wrong code-layout scope.  Moving the complete Linear-1 compute
+handler behind a `__noinline__` device-call boundary makes the two-projection
+and two eight-tile loops safe to fully unroll without cloning their bodies into
+the persistent dispatch handler.  A rolled noinline control measured 45.888 us
+versus 45.824 us inline, so the call boundary itself is neutral.  Expanding the
+body behind that boundary reduced the isolated full-image routed FFN to
+39.552 us and its Linear-1 local interval to 24.736 us.  The parent kernel
+remains at 246 registers, ten barriers, a 256-byte stack, zero spills, and
+15,104 bytes static shared memory; the new child function also has zero stack
+and zero spills.
+
+Matched promotion gates confirmed that this is not an isolated-kernel effect.
+Two repeated uses of layer zero improved from 342.112 to 326.720 us device
+time (-4.50%).  A heterogeneous HCA/CSA pair using layers three and four
+improved from 359.776 us (`20260824T214427Z-1103082`) to 339.584 us
+(`20260824T214106Z-1048862`), a 20.192-us or 5.61% gain, with the same output
+token.
+
+The compile-flag candidate (`20260824T214813Z-1166533`) passed all 101
+43-layer/context-one launches with token 201 and measured 5.040288 ms at the
+device frontier and 5.119616 ms by CUDA event.  After hard-wiring the selected
+layout and removing the exploratory build switches, the clean default rebuild
+(`20260824T215257Z-1255189`) reproduced 5.045184/5.128960 ms.  Relative to the
+adjacent rolled production control at 5.312896/5.399264 ms, the final default
+is 267.712 us (5.04%) faster on-device and 270.304 us (5.01%) faster by CUDA
+event.  The source change is deliberately limited to the Linear-1 function
+boundary and its three fixed unroll directives.
