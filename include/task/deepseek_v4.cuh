@@ -1524,11 +1524,19 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     }
   }
   const int output_slots = m2c.template pop<0>();
-  const int output_slot = extract(output_slots);
-  auto *output = static_cast<float *>(
-      get_slot_address(smem_base, output_slot));
-  int square_output_slots;
+  const int output_slot = EmitPreRmsMetadata
+      ? output_slots
+      : extract(output_slots);
+  float *output;
   float *square_output;
+  if constexpr (EmitPreRmsMetadata) {
+    square_output = static_cast<float *>(
+        slot_2_glob_ptr(st_insts, output_slot));
+    output = square_output + 1;
+  } else {
+    output = static_cast<float *>(
+        get_slot_address(smem_base, output_slot));
+  }
   int scale_slots;
   const float *scale;
   int base_slots;
@@ -1536,9 +1544,6 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
   int metadata_tail_slots;
   float *metadata_tail;
   if constexpr (EmitPreRmsMetadata) {
-    square_output_slots = m2c.template pop<0>();
-    square_output = static_cast<float *>(
-        get_slot_address(smem_base, extract(square_output_slots)));
     scale_slots = m2c.template pop<0>();
     scale = static_cast<const float *>(
         get_slot_address(smem_base, extract(scale_slots)));
@@ -1582,11 +1587,16 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     // metadata_tail[27] is alignment padding and intentionally uninitialized.
   }
   __sync_compute_group(128);
-  c2m.template push<31, true, false>(tid, output_slots);
+  if constexpr (!EmitPreRmsMetadata) {
+    c2m.template push<31, true, false>(tid, output_slots);
+  }
   if constexpr (EmitPreRmsMetadata) {
-    c2m.template push<31, true, false>(tid, square_output_slots);
     c2m.push(tid, scale_slots | base_slots);
     c2m.template push<31, true, false>(tid, metadata_tail_slots);
+    // This no-copy STU command is queued after both direct global stores and
+    // the metadata-tail writeback.  Its attached barrier is therefore the
+    // stage's release edge for the complete packed record.
+    c2m.template push<31, true, false>(tid, 1U << output_slot);
   }
 }
 

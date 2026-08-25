@@ -5865,11 +5865,13 @@ class ResidentOneLaunchDecode:
         for name, begin_offset, end_offset in intervals:
             if begin_offset in unavailable_events or end_offset in unavailable_events:
                 continue
+            interval_base = 16 if 21 in (begin_offset, end_offset) else 0
+            interval_detail = detail[interval_base:]
             durations = [
                 int(end) - int(begin)
                 for begin, end in zip(
-                    detail[:, base + begin_offset],
-                    detail[:, base + end_offset],
+                    interval_detail[:, base + begin_offset],
+                    interval_detail[:, base + end_offset],
                 )
             ]
             if min(durations) < 0:
@@ -5879,7 +5881,7 @@ class ResidentOneLaunchDecode:
             slowest_local = max(
                 range(len(durations)), key=durations.__getitem__
             )
-            slowest_vcore = resident_base + slowest_local
+            slowest_vcore = resident_base + interval_base + slowest_local
             print(
                 "DSV4_MXFP_FFN_DETAIL_INTERVAL "
                 f"name={name} min_us={min(durations) / 1.0e3:.3f} "
@@ -5987,6 +5989,18 @@ class ResidentOneLaunchDecode:
             )
 
         down_tasks: list[dict[str, int | str]] = []
+        placed_residents = [
+            schedule
+            for schedule in self.program.placed_schedules
+            if isinstance(
+                schedule, SchedLayeredMxfp4Mxfp8RoutedResidentFfn
+            )
+        ]
+        if not placed_residents:
+            raise RuntimeError("placed MXFP resident schedule was not retained")
+        final_resident = placed_residents[-1].placed_resident
+        task_queues = final_resident.task_queues
+        metadata_variants = final_resident.down_metadata_variants
         for vcore in range(self.sms):
             packed_phases = [
                 int(profile[vcore, base + event_offset])
@@ -6001,28 +6015,31 @@ class ResidentOneLaunchDecode:
                 ]
                 if task_order == 1 and not any(phases):
                     continue
-                if self.sms == 152:
-                    if task_order == 0:
-                        output_task = vcore
-                        task_class = (
-                            "shared-full" if vcore < 32 else "routed-full"
-                        )
-                    else:
-                        output_task = 152 + vcore // 2
-                        task_class = (
-                            "routed-split-first"
-                            if vcore % 2 == 0
-                            else "routed-split-final"
-                        )
-                elif self.sms == 112:
-                    expert, local_slice = divmod(vcore, 16)
-                    output_task = expert * 32 + local_slice + 16 * task_order
-                    task_class = (
-                        "shared-full" if expert == 0 else "routed-full"
-                    )
-                else:
+                if self.sms not in (112, 152):
                     raise RuntimeError(
                         "MXFP FFN task detail expects 112 or 152 workers"
+                    )
+                metadata_record = task_queues[vcore][task_order]
+                output_task, split_variant = divmod(
+                    metadata_record, metadata_variants
+                )
+                if split_variant == 0:
+                    task_class = (
+                        "shared-full"
+                        if output_task < 32
+                        else "routed-full"
+                    )
+                elif split_variant == 1:
+                    task_class = (
+                        "shared-split-first"
+                        if output_task < 32
+                        else "routed-split-first"
+                    )
+                else:
+                    task_class = (
+                        "shared-split-final"
+                        if output_task < 32
+                        else "routed-split-final"
                     )
                 task_begin = down_origin + unpack_task_half(
                     packed_begins, task_order
@@ -6108,6 +6125,30 @@ class ResidentOneLaunchDecode:
             f"{statistics.median(residuals) / 1.0e3:.3f}",
             flush=True,
         )
+        for physical_expert in range(7):
+            expert_tasks = [
+                task
+                for task in down_tasks
+                if int(task["output_task"]) // 32 == physical_expert
+            ]
+            if not expert_tasks:
+                continue
+            finishes = [
+                int(task["finish"]) - task_origin for task in expert_tasks
+            ]
+            starts = [
+                int(task["begin"]) - task_origin for task in expert_tasks
+            ]
+            print(
+                "DSV4_MXFP_FFN_DOWN_EXPERT "
+                f"physical_expert={physical_expert} "
+                f"records={len(expert_tasks)} "
+                f"start_median_us={statistics.median(starts) / 1.0e3:.3f} "
+                f"finish_median_us={statistics.median(finishes) / 1.0e3:.3f} "
+                f"finish_p95_us={percentile(finishes, 0.95) / 1.0e3:.3f} "
+                f"finish_max_us={max(finishes) / 1.0e3:.3f}",
+                flush=True,
+            )
         for task_class in (
             "routed-full",
             "routed-split-first",
@@ -6144,7 +6185,12 @@ class ResidentOneLaunchDecode:
                 f"{task['vcore']}:{task['physical_sm']}:"
                 f"{task['order']}:{task['output_task']}:"
                 f"{task['class']}:"
-                f"{(int(task['finish']) - task_origin) / 1.0e3:.3f}"
+                f"finish={(int(task['finish']) - task_origin) / 1.0e3:.3f}:"
+                f"start={(int(task['begin']) - task_origin) / 1.0e3:.3f}:"
+                f"umma={int(task['to_umma']) / 1.0e3:.3f}:"
+                f"epilogue={int(task['epilogue']) / 1.0e3:.3f}:"
+                f"reduce={int(task['reduction_wait']) / 1.0e3:.3f}:"
+                f"output={int(task['output_tma']) / 1.0e3:.3f}"
                 for task in critical_tasks
             ),
             flush=True,
@@ -6165,6 +6211,11 @@ class ResidentOneLaunchDecode:
             key=lambda task: int(task["finish"]),
             reverse=True,
         )[:16]
+        latest_first = sorted(
+            first_tasks.values(),
+            key=lambda task: int(task["finish"]),
+            reverse=True,
+        )[:16]
         print(
             "DSV4_MXFP_FFN_DOWN_PLACEMENT no_second="
             + ",".join(
@@ -6180,6 +6231,15 @@ class ResidentOneLaunchDecode:
             ),
             flush=True,
         )
+        print(
+            "DSV4_MXFP_FFN_DOWN_FIRST_LATEST tasks="
+            + ",".join(
+                f"{task['vcore']}:{task['physical_sm']}:"
+                f"{(int(task['finish']) - task_origin) / 1.0e3:.3f}"
+                for task in latest_first
+            ),
+            flush=True,
+        )
 
         frontier_events = (
             ("compute-begin", 11),
@@ -6190,16 +6250,17 @@ class ResidentOneLaunchDecode:
             ("compute-end", 13),
         )
         for name, event_offset in frontier_events:
+            frontier_base = 16 if event_offset == 21 else 0
             values = [
                 int(value)
-                for value in detail[:, base + event_offset]
+                for value in detail[frontier_base:, base + event_offset]
             ]
             origin = min(values)
             offsets = [value - origin for value in values]
             latest_local = max(
                 range(len(values)), key=values.__getitem__
             )
-            latest_vcore = resident_base + latest_local
+            latest_vcore = resident_base + frontier_base + latest_local
             print(
                 "DSV4_MXFP_FFN_DETAIL_FRONTIER "
                 f"name={name} "
@@ -6212,7 +6273,7 @@ class ResidentOneLaunchDecode:
                 flush=True,
             )
         dependency_ready = [
-            int(value) for value in detail[:, base + 21]
+            int(value) for value in detail[16:, base + 21]
         ]
         linear1_complete = [
             int(value) for value in detail[:, base + 12]
@@ -7063,6 +7124,14 @@ def main() -> None:
                 ),
                 reverse=True,
             )[:24]
+            late_first = sorted(
+                (
+                    (statistics.median(samples), vcore)
+                    for vcore, samples in task0_finishes.items()
+                    if samples
+                ),
+                reverse=True,
+            )[:24]
             no_second = [
                 vcore for vcore, samples in task1_finishes.items() if not samples
             ]
@@ -7078,6 +7147,11 @@ def main() -> None:
                 + ",".join(
                     f"{vcore}:{finish / 1.0e3:.3f}"
                     for finish, vcore in late_second
+                )
+                + " latest_first="
+                + ",".join(
+                    f"{vcore}:{finish / 1.0e3:.3f}"
+                    for finish, vcore in late_first
                 ),
                 flush=True,
             )

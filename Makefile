@@ -38,11 +38,6 @@ ifneq ($(m2c_poll_sleep_cycles),)
 	export DAE_M2C_POLL_SLEEP_CYCLES := $(m2c_poll_sleep_cycles)
 endif
 
-ifneq ($(c2m_poll_wait),)
-	NVCC_FLAGS += -DDAE_C2M_POLL_WAIT=1
-	export DAE_C2M_POLL_WAIT := 1
-endif
-
 ifneq ($(track_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE
 endif
@@ -56,8 +51,8 @@ ifneq ($(reload_atomic_add),)
 endif
 
 ifneq ($(async_barrier_reload),)
-	NVCC_FLAGS += -DDAE_ASYNC_BARRIER_RELOAD=1
-	export DAE_ASYNC_BARRIER_RELOAD := 1
+	NVCC_FLAGS += -DDAE_ASYNC_BARRIER_RELOAD=$(async_barrier_reload)
+	export DAE_ASYNC_BARRIER_RELOAD := $(async_barrier_reload)
 endif
 
 ifneq ($(async_barrier_reload_workers),)

@@ -33,6 +33,7 @@ from dae.launcher import Launcher
 from dae.schedule import (
     SchedArgmaxSmemPartial,
     SchedArgmaxSmemReduce,
+    SchedDsv4AttentionContext1Fp8Sm100,
     SchedDsv4Bf16Gemv,
     SchedDsv4ContiguousAttention512Block4,
     SchedDsv4Fp8Quant128,
@@ -52,6 +53,7 @@ from dae.schedule import (
     SchedDsv4Rope512_64,
     SchedDsv4RouteTop6,
     SchedDsv4RouterBf16Gemv,
+    SchedDsv4SplitMxfp8FfnInputRecords,
 )
 from dae.sequential import SequentialProgram, SequentialStage
 
@@ -456,6 +458,104 @@ def build_attention(
         validate,
         "OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4",
         f"h64_d512_rows{rows}_sms64",
+    )
+
+
+def build_attention_context1_native(
+    device: torch.device,
+    generator: torch.Generator,
+    *,
+    heads: int,
+    normalize_q: bool,
+) -> Case:
+    q = torch.randn(
+        (64, 512), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    kv = torch.randn(
+        (1, 512), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    sink = torch.linspace(-0.5, 0.5, 64, dtype=torch.float32, device=device)
+    table = _rope_table(device)
+    output = torch.empty(
+        (64, 4, 2048), dtype=torch.uint8, device=device
+    )
+    launcher = _launcher(
+        device,
+        heads,
+        SchedDsv4AttentionContext1Fp8Sm100(
+            q,
+            kv,
+            sink,
+            table,
+            output,
+            head_count=heads,
+            normalize_q=normalize_q,
+        ).place(heads),
+    )
+
+    def validate() -> float:
+        q_values = q[:heads].float()
+        if normalize_q:
+            q_values = q_values * torch.rsqrt(
+                q_values.square().mean(dim=1, keepdim=True)
+                + float.fromhex("0x1.0cp-20")
+            )
+            q_values = apply_partial_rope_512_64(
+                q_values, table
+            ).to(torch.bfloat16).float()
+        score = (q_values * kv.float()).sum(dim=1) / (128.0**0.5)
+        probability = torch.sigmoid(score - sink[:heads])
+        values = kv.float().expand(heads, -1) * probability[:, None]
+        values = apply_partial_rope_512_64(values, table, inverse=True)
+
+        expected_data = _native_fp8_data_reference(values.reshape(-1)).reshape(
+            heads, 4, 1024
+        )
+        torch.testing.assert_close(
+            output[:heads, :, :1024], expected_data, rtol=0, atol=0
+        )
+
+        _, expected_scale = quantize_fp8_block128(values.reshape(-1))
+        expected_scale_bits = expected_scale.view(torch.uint8).reshape(heads, 4)
+        rows = torch.arange(8, device=device) * 16
+        actual_scale_bits = torch.empty_like(expected_scale_bits)
+        for group_start in range(0, 4, 2):
+            for scale_in_pair in range(2):
+                copies = output[
+                    :heads, group_start, 1024 + rows + scale_in_pair
+                ]
+                if not bool((copies == copies[:, :1]).all().item()):
+                    raise AssertionError("context-1 scale replication differs")
+                actual_scale_bits[:, group_start + scale_in_pair] = copies[:, 0]
+        torch.testing.assert_close(
+            actual_scale_bits, expected_scale_bits, rtol=0, atol=0
+        )
+
+        actual_bits = output[:heads, :, :1024].reshape(
+            heads, 4, 8, 8, 16
+        )[:, :, 0].reshape(heads, 512)
+        actual = (
+            actual_bits.view(torch.float8_e4m3fn).float()
+            * actual_scale_bits.view(torch.float8_e8m0fnu)
+            .float()
+            .repeat_interleave(128, dim=1)
+        )
+        expected = (
+            expected_data.reshape(heads, 4, 8, 8, 16)[:, :, 0]
+            .reshape(heads, 512)
+            .view(torch.float8_e4m3fn)
+            .float()
+            * expected_scale.float().reshape(heads, 4)
+            .repeat_interleave(128, dim=1)
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        return _max_abs(actual, values)
+
+    return Case(
+        launcher,
+        validate,
+        "OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100",
+        f"context1_h{heads}_d512_normalize={int(normalize_q)}_sms{heads}",
     )
 
 
@@ -1394,6 +1494,63 @@ def build_mxfp8_ffn_input(
     )
 
 
+def build_mxfp8_ffn_input_split(
+    device: torch.device,
+    generator: torch.Generator,
+) -> Case:
+    """Measure the exact production quantize-then-split handoff."""
+    source = torch.randn(
+        (4096,), generator=generator, dtype=torch.bfloat16, device=device
+    ) * 0.25
+    source[::257] *= 8
+    records = torch.empty((8, 6144), dtype=torch.uint8, device=device)
+    data = torch.empty((8, 4096), dtype=torch.uint8, device=device)
+    scales = torch.empty((8, 2048), dtype=torch.uint8, device=device)
+    launcher = Launcher(16, device=device)
+    launcher.s(
+        SequentialProgram(
+            launcher,
+            (
+                SequentialStage(
+                    "ffn_mxfp8_quant",
+                    SchedDsv4Mxfp8QuantFfnInput(source, records),
+                    8,
+                    base_sm=8,
+                    release_group="quant_records_ready",
+                ),
+                SequentialStage(
+                    "ffn_mxfp8_split",
+                    SchedDsv4SplitMxfp8FfnInputRecords(
+                        records, data, scales
+                    ),
+                    16,
+                    wait_group_roles=(("quant_records_ready", "input"),),
+                ),
+            ),
+        )
+    )
+
+    def validate() -> float:
+        expected_data, expected_scales = _mxfp8_ffn_input_reference(source)
+        torch.testing.assert_close(data, expected_data, rtol=0, atol=0)
+        active_scale_indices = (
+            torch.arange(8, device=device).reshape(-1, 1) * 16
+            + torch.arange(4, device=device).reshape(1, -1)
+        ).reshape(-1)
+        actual_scales = scales.reshape(8, 4, 512)[:, :, active_scale_indices]
+        torch.testing.assert_close(
+            actual_scales, expected_scales, rtol=0, atol=0
+        )
+        return 0.0
+
+    return Case(
+        launcher,
+        validate,
+        ("OP_DSV4_MXFP8_QUANT_FFN_INPUT_SM100", "OP_COPY"),
+        "bf16_k4096_to_resident_data_scale_planes_sms16",
+    )
+
+
 CASES: dict[str, Callable[[torch.device, torch.Generator], Case]] = {
     "preload_rope4": build_preload,
     "hc_pre_rms": lambda d, g: build_hc_pre_rms(d, g, zero_output=False),
@@ -1411,6 +1568,12 @@ CASES: dict[str, Callable[[torch.device, torch.Generator], Case]] = {
     "attention_rows128": lambda d, g: build_attention(d, g, rows=128),
     "attention_rows129": lambda d, g: build_attention(d, g, rows=129),
     "attention_rows160": lambda d, g: build_attention(d, g, rows=160),
+    "attention_context1_native_h8": lambda d, g: (
+        build_attention_context1_native(d, g, heads=8, normalize_q=True)
+    ),
+    "attention_context1_native_h64": lambda d, g: (
+        build_attention_context1_native(d, g, heads=64, normalize_q=True)
+    ),
     "rope_d512_forward": lambda d, g: build_rope(d, g, width=512, inverse=False),
     "rope_d512_inverse": lambda d, g: build_rope(d, g, width=512, inverse=True),
     "rope_d128_forward": lambda d, g: build_rope(d, g, width=128, inverse=False),
@@ -1451,7 +1614,9 @@ CASES: dict[str, Callable[[torch.device, torch.Generator], Case]] = {
     "argmax_reduce": build_argmax_reduce,
     "fp8_native_k2048": lambda d, g: build_fp8_native(d, g, k=2048),
     "fp8_native_k4096": lambda d, g: build_fp8_native(d, g, k=4096),
+    "fp8_native_k8192": lambda d, g: build_fp8_native(d, g, k=8192),
     "mxfp8_ffn_input_k4096": build_mxfp8_ffn_input,
+    "mxfp8_ffn_input_split_k4096": build_mxfp8_ffn_input_split,
 }
 
 

@@ -349,10 +349,7 @@ struct alignas(16) LoopCounters {
 // barrier configurations
 static constexpr int numThreadsM2CBarrier =
     dae2M2CObserverWait ? 1 : numComputeWarps * numThreadsPerWarp + 1;
-#ifndef DAE_C2M_POLL_WAIT
-#define DAE_C2M_POLL_WAIT 0
-#endif
-static constexpr bool dae2C2MPollWait = DAE_C2M_POLL_WAIT != 0;
+static constexpr bool dae2C2MPollWait = true;
 static constexpr int numThreadsC2MBarrier =
     numComputeWarps * numThreadsPerWarp + 1;
 static constexpr int numThreadsLDBarrier = 2;
@@ -372,7 +369,7 @@ static_assert(reloadBarrierPollSleepCycles >= 0);
 static constexpr bool reloadBarrierUseAtomicAdd =
     DAE_RELOAD_ATOMIC_ADD != 0;
 #ifndef DAE_ASYNC_BARRIER_RELOAD
-#define DAE_ASYNC_BARRIER_RELOAD 0
+#define DAE_ASYNC_BARRIER_RELOAD 1
 #endif
 static constexpr bool dae2AsyncBarrierReload =
     DAE_ASYNC_BARRIER_RELOAD != 0;

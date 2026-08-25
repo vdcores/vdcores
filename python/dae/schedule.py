@@ -6291,6 +6291,7 @@ class SchedDsv4ExpertTmaReduceFp32(Schedule):
 
 class SchedDsv4Fp32Bf16Gemv(Schedule):
     TILE_K = 8192
+    DIRECT_RECORD_SLOT = config.num_slots + 3
     FUSED_SPLITS = 16
     FUSED_HALVES_PER_TASK = 1
     FUSED_TILE_HIDDEN = 256
@@ -6549,19 +6550,30 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                     _shared_load_1d(self.weight[row, column:end]),
                     _shared_load_1d(self.input[column:end]),
                 ]
-            store = _shared_store_1d(self.output[row:row + 1])
             is_last_row = local_row + 1 == row_count
-            if is_last_row and not emit_square_sum:
-                store.bar(self._bar("output"))
-            instructions.append(store)
             if emit_square_sum:
-                instructions.append(_shared_store_1d(self.square_sum_output))
+                # Square sum and row-zero output are adjacent in the packed
+                # metadata record.  Compute writes both scalars directly and
+                # returns this raw token through C2M after the stores.  STU's
+                # no-copy writeback then supplies the projection completion
+                # edge without a shared-memory data roundtrip.
+                raw_output = RawAddress(
+                    self.square_sum_output,
+                    self.DIRECT_RECORD_SLOT,
+                ).writeback()
+                if is_last_row:
+                    raw_output.bar(self._bar("output"))
+                instructions.append(raw_output)
                 instructions.append(_shared_load_1d(self.metadata_scale))
                 instructions.append(_shared_load_1d(self.metadata_base))
-                metadata_store = _shared_store_1d(self.metadata_tail_output)
+                instructions.append(
+                    _shared_store_1d(self.metadata_tail_output)
+                )
+            else:
+                store = _shared_store_1d(self.output[row:row + 1])
                 if is_last_row:
-                    metadata_store.bar(self._bar("output"))
-                instructions.append(metadata_store)
+                    store.bar(self._bar("output"))
+                instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):

@@ -3168,3 +3168,473 @@ variation.  The rebuilt kernel retained 246 registers, ten barriers, a
 256-byte stack, zero spills, and 15,104 bytes static shared memory.  No Down
 scheduling, pipeline-depth, profiling, or other exploratory switch was
 enabled in this verification.
+
+## Participant-preserving C2M polling default (2026-08-25)
+
+A narrow production-shaped trace isolated a bimodal FFN output tail in the
+legacy C2M `arrive_and_wait` path.  Across eleven one-layer samples, the
+compute-end-to-STU-publication tail had a 17.792-us median and reached
+22.272 us, while actual STU service remained approximately 0.5 us.  Reusing
+the existing exact-token participant-polling queue collapsed every sample to
+0.384--0.512 us and improved the one-layer device median from 201.728 to
+181.120 us.  The diagnostic timestamp path was removed after attribution.
+
+The same compile-time policy improved one HCA/CSA pair from the recorded
+373.088-us direct-wait control to 306.464 us and ten pairs from 2.759008 to
+2.385536 ms.  The adjacent 43-layer direct-wait rebuild
+(`20260825T035619Z-3124526`) measured 5.838176 ms device and 5.931904 ms CUDA;
+the polling build (`20260825T035245Z-3071696`) measured 5.059360 and
+5.148768 ms.  This is a 778.816-us device reduction.  The fact that the
+previous 5.038624-ms artifact cannot be reproduced by a clean legacy-wait
+build is consistent with flag-sensitive build residue having preserved the
+polling specialization, although that old binary is no longer available for
+direct inspection.  The production source now selects participant polling as
+a constexpr and removes the optional Makefile switch.
+
+The final clean default (`20260825T040112Z-3198082`) retained 246 registers,
+ten barriers, a 256-byte stack, zero spills, and 15,104 bytes shared memory.
+All 101 launches emitted token 201 and measured 5.085408 ms device and
+5.176832 ms CUDA median.  This is still 46.784 us slower than the best
+historical device median, so it is a reproducibility/runtime correction rather
+than a new best-time claim.  Its one-layer control
+(`20260825T040045Z-3192349`) measured 178.752 us device and 258.112 us CUDA.
+
+## Context-one attention scheduling audit (2026-08-25)
+
+The context-one critical path was decomposed before changing its schedule.
+Across layer-three samples, the eight O_a groups each spend approximately
+7.5--8.2 us in their coupled projection and finish within roughly 1 us of one
+another.  The whole-vector O-rank native-FP8 quantization then adds about
+1.7--2.0 us before O_b.  O_b itself is not dependency limited after release:
+its M2C wait is 0.064--0.128 us.  The detailed producer trace is
+`20260825T045621Z-4010550`.
+
+Two bounded scheduling changes were rejected.  First, O_b split-K4 increased
+the directly measured ready-to-completion span from 4.864--5.184 us to
+7.776 us median.  Its one-layer device median was 188.160 us versus the prior
+187.584-us split-K8 control, so production remains split-K8.  Jobs are
+`20260825T045441Z-3981494` and the adjacent split-K8 bracket
+`20260825T045526Z-3992125`.
+
+Second, eight per-group O_a completion barriers allowed each four-SM O-rank
+quant slice to overlap its own producer.  With matched two-event profiling it
+advanced O_b readiness from 50.080 to 48.704 us, HC-post completion from
+59.040 to 57.312 us, and the one-layer device median from 189.024 to
+185.440 us (`20260825T045908Z-4052001` versus
+`20260825T045959Z-4064231`).  It nevertheless failed the next integration
+gate: a heterogeneous HCA/CSA pair regressed from 311.456 to 316.672 us device
+and from 398.272 to 402.560 us CUDA (`20260825T050217Z-4095425` versus
+`20260825T050128Z-4082242`).  Per-layer profiling localized 8.320 us of the
+loss to the first layer and 1.056 us to the second, while allocator, LDU, and
+STU command counts were exactly unchanged.  The candidate expanded the graph
+from 28 to 35 dependency barriers per layer; duplicating that form in the
+unrolled two-body diagnostic also failed to reach prime.  It was removed.
+Do not trade the existing whole O_a join for additional fine-grained barriers
+without first solving this multi-body liveness and placement cost.
+
+The native-FP8 K8192 quant operator's placement was independently swept to
+rule out over-parallelization.  Exact device medians were 3.776, 4.128,
+4.640, and 5.600 us for 32, 16, 8, and 4 SMs respectively (jobs
+`20260825T051207Z-53169`, `20260825T051217Z-54986`,
+`20260825T051227Z-57412`, and `20260825T051236Z-60866`).  The production
+32-SM placement is selected and the diagnostic option was removed.
+
+A restored ten-pair profile (`20260825T051401Z-84624`) completed stably with
+token 1115 at 2.441056 ms device median.  After the cold first pair, its HCA
+positions commonly measured 113--116 us and CSA positions 120--123 us.
+Repeating the identical HCA family in the ordinary one-bank loop did not
+reproduce a stable odd/even split; reload service was 3.0--3.6 us per layer
+(`20260825T051443Z-93500`).  A synthetic two-family tensor-alias control was
+invalid because the family counter-stride contract assumes distinct streams
+and it did not reach prime.  Therefore the observed HCA/CSA difference is not
+yet proof of barrier-bank asymmetry and must not motivate a runtime change
+without a valid matched control.
+
+A temporary track-build timestamp was then placed around the actual
+`LDU_WAIT_BARRIER` bank-entry gate used by asynchronous pair reload.  In a
+ten-pair run, the ten exposed waits were only 0.352--0.608 us each and summed
+to 4.928 us (`20260825T052247Z-212056`).  Thus the asynchronous clear is
+already almost entirely hidden behind the preceding pair; its worker service
+time is not an exposed multi-microsecond critical path.  The timestamp was
+removed after attribution.  An attempted isolated layer-four control did not
+reach prime under the one-layer reset construction, although layer four is
+stable inside the production pair, so no standalone layer-four performance
+claim is made from that invalid diagnostic.
+
+## Repeated-layer frontier and FFN attribution (2026-08-25)
+
+Matched step-profile sweeps compared one HCA/CSA pair with the final pair of a
+ten-pair run across all 36 stages.  The final context-one attention tail
+(O-rank quantization, O-b, and HC-post) retained the same or slightly shorter
+local spans in the repeated run.  The apparent roughly 3-us FFN increase in a
+coarse stage timestamp was inherited from an earlier producer frontier rather
+than generated inside the FFN.  The paired sweeps are
+`20260825T053617Z-423483`/`20260825T053640Z-430132`,
+`20260825T053741Z-443490`/`20260825T053803Z-451962`,
+`20260825T053825Z-456065`/`20260825T053845Z-459977`, and
+`20260825T053912Z-468161`/`20260825T054002Z-479782`.
+
+An MXFP FFN-detail build then timestamped dependency readiness, Linear-1, and
+Down directly.  In a one-pair run (`20260825T054447Z-545799`), readiness to
+Linear-1 completion was 27.424 us and readiness to final compute completion
+was 43.712 us.  At the final pair of a ten-pair run
+(`20260825T054509Z-551181`), the corresponding spans were 27.200 and
+43.296 us.  The complete local CSA layer spans were 125.056 and 125.088 us.
+Therefore neither Linear-1 nor Down slows under repetition; do not attribute
+the full-run tail to recurrent FFN resource interference without a new direct
+counterexample.
+
+## Rejected HC-projection queue and placement changes (2026-08-25)
+
+Fixed LDU port assignments improved the isolated HC projection from 5.824 to
+5.440 us with weight on LDU0 (`20260825T054907Z-613247` and
+`20260825T055015Z-631654`) and to 5.472 us with weight on LDU1
+(`20260825T055329Z-680888`).  Neither integrated.  Prefetching the weight
+before activation readiness made a one-layer run 206.240 us versus the
+198.304-us control, and fixed LDU0 without prefetch measured 207.264 us.  The
+reverse mapping appeared faster in one layer at 195.968 us but regressed a
+heterogeneous pair from 318.912 to 326.816 us
+(`20260825T055435Z-701022` versus `20260825T055457Z-705345`).  All fixed-port
+and prefetch code was removed.  A K16384 construction was also rejected before
+launch because its 65,536-byte weight command exceeds the generic load
+command's 16-bit byte-count field; it provided no kernel performance result.
+
+Finally, placing the projection reset on SMs 16--151 while hidden quantization
+used SMs 0--15 improved a one-layer device median from 203.712 to 196.544 us.
+It failed the production-like pair gate: the unprofiled median regressed from
+318.912 to 324.928 us.  A matched profile did show small local improvements
+(HCA 140.864 to 139.552 us, CSA 122.688 to 122.592 us, and total device
+frontier 328.544 to 324.960 us), proving that the reset/quant join can advance
+but also that the effect is not robust enough to explain the unprofiled
+integration result.  The candidate job is `20260825T060301Z-816856`; its
+diagnostic placement option was removed rather than promoted.
+
+## HC pre-RMS metadata-prefetch rejection (2026-08-25)
+
+The HC pre-RMS packed metadata address can be published before its residual
+input is ready, which lets LDU0 begin the residual transfer while LDU1 waits
+on the projection dependency.  In a tracked one-layer run this reduced the
+HC pre-RMS critical median from 6.080 to 4.800 us and the complete device
+frontier from 199.744 to 193.920 us (`20260825T061934Z-1080490` and
+`20260825T062226Z-1111712`).  It did not generalize to the FFN placement, and
+moving the task off the projection SM only converted the same dependency into
+an exposed wait.
+
+The ten-pair gate rejected the change.  Its matched control measured
+2.445728 ms device and 2.531648 ms CUDA (`20260825T062946Z-1217093`), while
+the metadata-prefetch schedule measured 2.466112/2.551168 ms
+(`20260825T063012Z-1223825`).  A final-layer trace showed that the small local
+HC pre-RMS benefit was offset by longer following projection and reset waits:
+early residual traffic was contending with later LDU/allocator work.  The
+prefetch placement and all diagnostic options were removed.
+
+## Packed HC projection record direct-output path (2026-08-25)
+
+Operator profiling found a persistent row-zero straggler in the 24-SM HC
+projection.  Row zero produces the ordinary projection scalar, residual
+square sum, and packed pre-RMS metadata, while peer rows produce only one
+scalar.  The tracked control measured a 4.640-us critical projection median
+against approximately 2.400 us for peer tasks; 2.112 us of the critical span
+was M2C wait.  The following HC pre-RMS measured 6.080 us
+(`20260825T061934Z-1080490`).
+
+The selected implementation treats the adjacent square sum and row-zero
+projection scalar as one raw output record.  Compute writes those two FP32
+values directly to their final addresses, avoiding two tiny compute-to-shared
+to-STU data roundtrips.  It still follows the VDcores publication contract:
+compute returns the raw writeback token through C2M after its stores, STU
+first drains the queued metadata-tail store, and a no-copy raw STU command
+releases the stage output barrier.  The producer uses special mailbox 27;
+mailbox 24 cannot be reused because the immediately following pre-RMS raw
+input also occupies 24 and special mailboxes bypass allocator occupancy.  A
+dump showed the conflicting commands at pc 0 and pc 5
+(`20260825T071808Z-1957567`).  This solution adds neither a fence nor an
+IssueBarrier.
+
+The initial diagnostic that relied on the unrelated metadata-tail STU
+publication was faster but was not selected: it lacked a compute-store to STU
+release edge, and one full-model repetition showed a 7.1875 maximum logit
+variation.  Adding the correct raw writeback first reused mailbox 24 and hung
+at prime; assigning mailbox 27 fixed the descriptor lifetime.  The ordered
+one-layer run passed 101 samples at 180.960 us device
+(`20260825T071926Z-1974203`).  Its HCA/CSA pair measured 296.736 us versus the
+adjacent 297.408-us control, and ten pairs measured 2.344064 ms versus
+2.371552 ms (`20260825T071949Z-1980707`,
+`20260825T070026Z-1693847`, `20260825T072014Z-1985609`, and
+`20260825T070051Z-1699076`).
+
+Two clean 43-layer/context-one runs emitted token 201 in every timed launch.
+They measured 4.993088/5.090784 and 4.993728/5.084576 ms at the device/CUDA
+medians (`20260825T072041Z-1988767` and
+`20260825T072149Z-2002059`).  Relative to the accepted
+5.085408/5.176832-ms production control (`20260825T040112Z-3198082`), the
+reproduced result saves 91.680 us (1.80%) on-device and 92.256 us (1.78%) by
+CUDA event.  Repeated-logit maximum variation was 1.125 and 1.03125 in the two
+ordered runs.  The kernel remains at 246 registers, ten barriers, a 256-byte
+stack, zero spills, and 15,104 bytes static shared memory.
+
+## Post-milestone one-layer critical-frontier baseline (2026-08-25)
+
+The next optimization cycle began from the selected packed-record path and
+profiled all queued layer steps in the same 29-handler image.  Two bounded
+windows avoid event aliasing; jobs are `20260825T072859Z-2114608` and
+`20260825T072930Z-2124951`.  The large raw elapsed values for projection
+reset, FFN quant/split/route, and the resident FFN are not serialized costs:
+those tasks intentionally begin early and spend most of the interval waiting
+for their producer.  Ready-to-end frontiers are the relevant measure.
+
+The directly exposed attention spans were 6.129 us for Q-b, approximately
+7.44--7.96 us for each parallel O-a group, 1.391 us for O-rank
+quantization, 4.861 us for O-b, and 1.908 us for HC-post.  In the FFN half,
+the spans were 2.880 us for HC projection, 3.986 us for HC pre-RMS,
+3.314 us for MXFP8 quantization, 1.461 us for router GEMV completion,
+0.811 us for activation-layout split, 2.944 us for prepared top-6 routing,
+45.830 us for the resident FFN, and 1.775 us for HC-post.  The resident FFN
+span agrees with its existing isolated full-image measurement, so it is not
+evidence of new attention/FFN interference.  Prepared routing finishes about
+0.94 us after the quant/split branch and is therefore the producer that gates
+resident-FFN readiness in this layer.  Any next orchestration change should
+target that bounded route-to-resident path, or provide new evidence that an
+earlier independent load delays it; do not optimize the intentionally hidden
+wait envelopes themselves.
+
+## Prepared-route publication and placement rejection (2026-08-25)
+
+A temporary raw-output timestamp split the prepared top-6 handoff into its
+compute-to-C2M dequeue, no-copy STU service, and publication wake-up pieces.
+Across eleven control samples, the corresponding means were 0.250, 0.233,
+and 0.244 us, or 0.727 us total (`20260825T074555Z-2368718`).  An adjacent
+control reproduced 0.215/0.227/0.227 us, or 0.669 us total
+(`20260825T074942Z-2421912`).  There is therefore no long C2M queue tail,
+slow STU command, or barrier wake-up to remove; the route branch's remaining
+lag is its top-6 computation rather than its VDcores publication path.
+
+Per-worker timestamps also tested whether route placement on vcore 128 makes
+that worker the resident-FFN straggler.  Vcores 129--131 finished at the same
+frontier, 132--135 only 0.6--0.8 us earlier, and the short-work vcores
+144--151 approximately 3.7 us earlier.  Moving route to vcore 144 shared its
+prior quant/split STU traffic: publication plus wake-up increased from about
+0.73 to 1.30 us and the tracked one-layer device median regressed from
+188.544 to 191.584 us (`20260825T074707Z-2383134`).  Vcore 132 produced
+contradictory 185.280- and 195.680-us samples and then lost to the adjacent
+183.936-us restored control (`20260825T074819Z-2396992`,
+`20260825T074900Z-2407720`, and `20260825T074942Z-2421912`).  Production
+therefore retains vcore 128.  All route-publication and placement diagnostics
+were removed; do not replace the existing C2M/STU release with a direct
+compute atomic or add an IssueBarrier based on this profile.
+
+## Coupled-FP8 issue and dispatch-layout rejections (2026-08-25)
+
+The next operator-first cycle used the unchanged 29-handler full inference
+image.  Its eleven-sample control (`20260825T075756Z-2558450`) measured
+5.993 us for Q-b, 7.484 us averaged across the eight O-a groups, 1.591 us for
+O-rank quantization, and 4.893 us for O-b.  The one-layer device frontier was
+198.144 us in that tracked run.
+
+Moving the large coupled-FP8 handler behind a device-call boundary was a
+direct regression (`20260825T080112Z-2596197`): Q-b, mean O-a, and O-b rose
+to 7.121, 8.087, and 5.536 us, while the layer rose to 206.016 us.  Ptxas also
+moved from 246 registers/304-byte profile stack to 248 registers/432 bytes.
+The handler remains force-inlined.
+
+Temporary LDU and compute-phase counters then established why generic
+load-side changes are unlikely to help.  For Q-a, both coupled LDU services
+finish ahead of the task; source loads have 0--0.032 us wait, the first two
+stage-empty waits are only 0.032--0.096 us, and the post-issue compute tail is
+about 2.8--3.2 us (`20260825T080801Z-2709222` and
+`20260825T081511Z-2816550`).  The latter diagnostic showed the scale-copy/UMMA
+issue interval dominating its instrumented coupled task; ring release, output
+allocation, epilogue, and publication together added only about 0.35 us.
+All temporary timestamps and reporter accommodations were removed.
+
+Partially unrolling the dynamic K-pair loop by two did not reduce the coupled
+operator spans (`20260825T082054Z-2905094` and
+`20260825T082129Z-2913413`).  The adjacent rolled control
+(`20260825T082439Z-2958205`) was also faster at the layer frontier, so the
+loop remains rolled.
+
+Context-one O-a split-K4 provided a useful scheduling counterexample.  It
+filled all sixteen SMs assigned to each group and reduced mean O-a from
+7.441 to 5.448 us.  Its O-a join and O-b completion advanced by 4.535 and
+4.055 us (`20260825T082647Z-2988959`,
+`20260825T082726Z-2998150`, and control
+`20260825T082802Z-3007926`).  Nevertheless it failed the next integration
+gate: an HCA/CSA pair measured 313.120 us versus bracketed split-K2 controls
+at 309.504 and 309.696 us (`20260825T083034Z-3043025`,
+`20260825T083007Z-3036937`, and `20260825T083105Z-3051516`).  Doubling the
+partial-result contributors creates more recurring allocator/STU/reduction
+pressure than its local compute saving, so production remains split-K2.
+
+Two switch-layout experiments were also rejected.  Adding an early coupled
+opcode branch perturbed surrounding handlers and raised the tracked layer to
+196.064 us (`20260825T083621Z-3124162`).  Conversely, removing the two early
+split-attention tests reduced the parent from 246 to 244 registers, but its
+unprofiled one-layer median was effectively tied with the restored control:
+193.312 versus 193.472 us (`20260825T084226Z-3218960` and
+`20260825T084535Z-3265422`), with mixed operator deltas.  The dense normal
+switch and its existing split-attention placement are retained unchanged.
+
+## HC pre-RMS coefficient-split rejection (2026-08-25)
+
+The next operator-first cycle profiled the fused HC pre-RMS task before
+changing its schedule.  The unchanged full-image operator measured 5.376 us
+hot (`20260825T090315Z-3525277`).  A timestamped build measured 5.760 us and
+showed that the three hidden/RMS worker warps completed their BF16 output at
+4.352 us, while warp zero did not finish the Sinkhorn coefficient path until
+5.376 us (`20260825T091114Z-3653086`).  This was direct evidence for a
+roughly one-microsecond local warp-zero tail, not evidence for an LDU or slot
+stall.
+
+Two smaller changes failed the isolated gate.  Rolling the 20-iteration
+Sinkhorn loop increased the instrumented median from 5.760 to 5.856 us
+(`20260825T091437Z-3702544`).  Replacing two warp-zero M2C pops with a shared
+worker token tied the 5.760-us envelope but extended task publication from
+5.888 to 6.144 us (`20260825T092213Z-3796346`).  Divergently publishing the
+hidden output before warp zero completed was also invalid: normal C2M FIFO
+phases require all compute participants to advance together, and both tested
+orderings stalled before prime.  No divergent queue path was retained.
+
+A separate normal compute task then tested whether the coefficient work could
+overlap the following attention/FFN body.  Hidden/RMS alone was correct at
+4.672 us, 1.088 us faster than the instrumented fused task
+(`20260825T100653Z-240861`).  The coefficient task was also numerically exact,
+but its isolated envelope was 13.696 us.  Direct timestamps attributed 2.048
+us to its two M2C operands and 10.496 us to the dependent 4x4 Sinkhorn
+shuffle/divide chain; the 64-byte direct output issue was below the 32-ns
+timestamp resolution (`20260825T102908Z-588670`).  Staging the 224-byte input
+through LDU and redundantly executing the chain in all four compute warps did
+not materially shorten that serial dependency, so neither memory delivery nor
+an STU output copy was the missing optimization.
+
+The first integrated image exposed a separate descriptor-lifetime bug.  Both
+the attention and FFN coefficient commands used raw special mailbox 26 on
+vcore 130.  Because special mailboxes bypass allocator occupancy, the later
+descriptor could overwrite the earlier one before STU drained its token; the
+attention join then never received its release.  The command dump in
+`20260825T102212Z-477347` showed the two uses at memory PCs 2 and 6.  Assigning
+distinct mailboxes removed the deadlock and preserved the established
+layer-zero token 2835.
+
+The repaired one-layer schedule still failed the performance gate.  Its
+device/CUDA medians were 200.896/295.616 us
+(`20260825T102503Z-518641`), versus the matched tracked control's 191.264-us
+device frontier (`20260825T085440Z-3405948`).  The coefficient task occupied
+vcore 130 after hidden readiness, so the following all-152-SM projection reset
+could not complete until that vcore finished the 10.5-us serial chain.  The
+local hidden-output advance therefore became a larger placement delay.  The
+separate opcode, schedules, compile flags, timestamps, and extra dependency
+groups were removed; production keeps the fused warp-zero coefficient path.
+The restored 29-handler image rebuilt at 246 registers, ten barriers, a
+256-byte stack, and zero spills; its isolated fused task passed at a 4.960-us
+hot median (`20260825T103811Z-738661`).
+
+## Prepared-route and premature-LDU-wait rejection (2026-08-25)
+
+The next operator-first cycle decomposed the prepared score-routing task in
+the unchanged 29-handler image.  Its refined isolated result was 3.584 us hot
+and exact (`20260825T105806Z-870201`).  Entry-to-score readiness consumed
+1.536 us; after the scores arrived, candidate loads, six selections,
+normalization/output, and publication occupied 1.280 us.  The raw output
+descriptor was already available when the score operand arrived.
+
+A score-routed layer-3 trace then separated the two M2C operands and the
+surrounding queued steps (`20260825T105638Z-869164`).  The route task entered
+at 14.304 us, received its prepared scores at 70.304 us, received its ungated
+raw output descriptor 0.096 us later, and published at 72.960 us.  The
+128-worker router GEMV ended at 68.832 us, so its 2-KiB output TMA contributed
+a directly measured 1.472-us producer-to-consumer tail.  The complete route
+task spent 56.032 of 59.264 us in M2C waits; these intentionally early queue
+times are not compute costs.
+
+MXFP-FFN detail counters proved that early resident commands overlapped the
+route interval (`20260825T110319Z-873772`).  On route vcore 128, the LDU1
+Down-activation command entered at 5.120 us and did not pass its internal poll
+until 99.872 us.  The already data-barriered LDU0 Linear-1 command entered at
+72.800 us, passed its dependency at 75.328 us, and issued no weight traffic
+before that point.  Therefore the overlap was waiting-warps rather than an
+early weight TMA.  CUTLASS's transaction-barrier wait uses a timed
+`mbarrier.try_wait` with a 10,000,000-tick timeout; it is not a tight software
+poll loop.
+
+Putting every Down-activation command on the existing route/split data
+dependency looked positive only in the timestamp-heavy diagnostic image:
+the layer frontier moved from 192.704 to 186.432 us
+(`20260825T110319Z-873772` and `20260825T110506Z-874559`).  The real
+246-register production image rejected it.  A clean control measured
+176.416/264.992 us device/CUDA (`20260825T111010Z-876887`), while the
+all-worker fence measured 179.840/266.912 us
+(`20260825T111051Z-877171`).  Delaying useful Down setup cost more than the
+diagnostic waiting-warp saving.
+
+A fence restricted to route vcore 128 measured 176.352/264.032 us
+(`20260825T111130Z-877495`), but bracketed production controls were 176.416
+and 179.936 us (`20260825T111010Z-876887` and
+`20260825T111202Z-877758`).  Its 0.064-us apparent device improvement over
+the first control is below run-to-run variation and was also removed.  No
+IssueBarrier was introduced.  Production retains the original ungated LDU1
+Down-activation command and the necessary direct data barrier on dynamic
+Linear-1 weights.
+
+## Generation-safe asynchronous barrier reload default (2026-08-25)
+
+The repeated HCA/CSA gate directly compared the synchronous bank reload with
+the existing generation-safe asynchronous clear.  Both runs used ten repeats
+of the same two-layer body, ten warmups, and 31 measured launches.  The
+synchronous control measured 2.350592 ms device and 2.435456 ms CUDA
+(`20260825T143207Z-982763`); the 16-worker asynchronous path measured
+2.306208/2.393280 ms (`20260825T143442Z-984151`).  The saving is 44.384 us
+device and 42.176 us CUDA over twenty layers, or about 2.22/2.11 us per layer.
+The clear remains an ordinary LDU operation on disjoint workers and joins the
+useful HC-post completion through its normal data dependency.  It introduces
+neither an IssueBarrier nor a thread fence.
+
+The promoted 43-layer run used one persistent kernel launch, ten warmups, and
+101 measured launches.  Every sample emitted token 201.  Device time was
+4.898688--4.965760 ms, with a 4.920960-ms median; CUDA-event time was
+5.010944 ms median (`20260825T143514Z-984349`).  Relative to the prior
+4.993088/5.090784-ms milestone, this saves 72.128 us device and 79.840 us CUDA.
+It is 38.49% below the historical 8-ms boundary and 18.20% below the
+6.0157-ms vLLM reference on device time.  Repeated-layer numerical sensitivity
+was also reproduced in the synchronous control, so it is not evidence of an
+asynchronous-clear race.  The asynchronous path is now the compile-time
+default; an explicit `async_barrier_reload=0` still produces the synchronous
+diagnostic image.
+
+Two alternative clear mechanisms were rejected before promotion.  A
+register-load/store template copy on 16 workers measured 2.308704/2.396576 ms
+over ten pairs (`20260825T144759Z-988484`), slightly behind the intrinsic
+asynchronous clear.  An eight-worker TMA template copy produced overlapping
+A/B ranges: 2.294528/2.389824 and 2.307232/2.393120 ms for the candidates,
+versus 2.352640/2.428800 and 2.302016/2.399008 ms for adjacent controls
+(`20260825T144927Z-989000`, `20260825T145007Z-989274`,
+`20260825T145045Z-989451`, and `20260825T145138Z-989729`).  Copying a pristine
+barrier template therefore adds allocator, compute, and STU/TMA traffic without
+removing an exposed critical path; all template-copy code was removed.
+
+The asynchronous worker width was finally bracketed at the repeated-pair gate.
+Eight workers exposed clear latency at 2.371296 ms device
+(`20260825T152018Z-999660`).  Thirty-two workers measured 2.301408 ms with ten
+warmups and 2.331712 ms with 100 warmups
+(`20260825T152243Z-1000422` and `20260825T152911Z-1002357`).  However the
+unchanged 16-worker image itself ranged from 2.301440 to 2.381184 ms across
+adjacent rebuilds/runs, including 2.371360 and 2.301440 ms with 100 warmups
+(`20260825T152556Z-1001407`, `20260825T152645Z-1001708`, and
+`20260825T153150Z-1003080`).  The apparent 16-versus-32 delta reverses inside
+the measured run-state variation, so production retains 16 workers.  The
+restored production image compiles at 246 registers, ten barriers, a 256-byte
+stack, zero spills, and 15,104 bytes static shared memory.
+
+## Down second-wave placement rejection (2026-08-25)
+
+MXFP FFN-detail profiling tested whether consistently late first-wave workers
+should be exempted from the split-K Down second wave.  The candidate retained
+the exact 152 full plus 144 half-task decomposition and changed only the eight
+workers that received no second task.  It failed the one-layer gate: an
+adjacent control measured 0.187072 ms device with a 43.840-us
+ready-to-compute-end FFN frontier (`20260825T151408Z-997255`), while the
+closing candidate measured 0.202304 ms and 54.912 us
+(`20260825T151449Z-997600`).  A first candidate sample was also slower at
+0.191328 ms (`20260825T151315Z-997000`).  Aggregate first-wave stragglers were
+not stable across runs, and remapping the entire subsequent split record stream
+perturbed reduction/cache placement more than it helped the selected workers.
+The remap was removed; production retains the contiguous split-record mapping.
