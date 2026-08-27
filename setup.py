@@ -26,6 +26,8 @@ cuda_gencode = f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"
 cuda_defines = []
 if os.environ.get("DAE_TRACK_PROFILE"):
     cuda_defines.append("-DDAE_TRACK_PROFILE")
+if os.environ.get("DAE_ATTENTION_DETAIL_PROFILE"):
+    cuda_defines.append("-DDAE_ATTENTION_DETAIL_PROFILE")
 if os.environ.get("DAE_M2C_POLL_SLEEP_CYCLES"):
     cuda_defines.append(
         "-DDAE_M2C_POLL_SLEEP_CYCLES="

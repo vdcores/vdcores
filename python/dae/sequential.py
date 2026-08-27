@@ -50,6 +50,7 @@ class SequentialStage:
     profile_span_begin: tuple[int, int] | None = None
     profile_span_end: tuple[int, int] | None = None
     prefetch_before_wait: bool = False
+    prefetch_before_resident_reset: bool = False
     wait_group_roles: tuple[tuple[str, str], ...] = ()
     release_group_roles: tuple[tuple[str, str], ...] = ()
     reset_mxfp_resident_after: bool = False
@@ -68,6 +69,7 @@ class SequentialBlock:
     reload_mxfp_resident: bool = False
     elide_terminal_reload: bool = False
     async_reload_after: bool = False
+    async_reload_worker_base: int = 32
 
 
 def _flatten(item, sm: int, output: list) -> None:
@@ -198,6 +200,16 @@ def _validate_prefetch_gate(per_sm: list[list], bar_id: int, stage: str) -> None
             and _bar_id(inst) == bar_id
         ]
         if not gated_loads:
+            memory_commands = [
+                inst
+                for inst in instructions
+                if isinstance(inst, MemoryInstruction)
+            ]
+            if memory_commands and all(
+                inst.annotation.get("input_independent_writeback")
+                for inst in memory_commands
+            ):
+                continue
             raise ValueError(
                 f"prefetching stage {stage!r} has no explicitly gated LDU load"
             )
@@ -479,6 +491,14 @@ class SequentialProgram:
                 previous_stage is not None
                 and previous_stage.reset_mxfp_resident_after
             )
+            if stage.prefetch_before_resident_reset and (
+                not reset_mxfp_before_stage
+                or not stage.prefetch_before_wait
+            ):
+                raise ValueError(
+                    f"stage {stage.name!r} can prefetch across a resident "
+                    "reset only with an explicit prefetched input dependency"
+                )
             if reset_mxfp_before_stage and (
                 not stage.wait_for_previous
                 or stage.parallel_with_previous
@@ -555,6 +575,7 @@ class SequentialProgram:
                 for instructions in self.instructions:
                     instructions.append(marker)
 
+            resident_reset_reload = None
             if reset_mxfp_before_stage:
                 if input_bar is None:
                     raise ValueError(
@@ -567,7 +588,7 @@ class SequentialProgram:
                 # not advance to the next stage until both LDUs acknowledge,
                 # so the following loads need no second wait on a barrier that
                 # this command has just reinitialized.
-                reload = LduReloadBarriers(
+                resident_reset_reload = LduReloadBarriers(
                     launcher.bars_src,
                     input_bar,
                     1,
@@ -577,9 +598,8 @@ class SequentialProgram:
                     special_slot=7,
                     reset_mxfp_resident=True,
                 ).bar(input_bar)
-                for instructions in self.instructions:
-                    instructions.append(reload.copy())
-                input_bar = None
+                if not stage.prefetch_before_resident_reset:
+                    input_bar = None
 
             schedule = stage.schedule._clone()
             if input_bar is not None and stage.input_role is not None:
@@ -666,6 +686,55 @@ class SequentialProgram:
                     _validate_prefetch_gate(rendered, input_bar, stage.name)
                 else:
                     _gate_load_ports(rendered, input_bar, stage.name)
+            if resident_reset_reload is not None:
+                found_reset_prefetch = False
+                for sm, instructions in enumerate(rendered):
+                    prefetch_positions = [
+                        index
+                        for index, inst in enumerate(instructions)
+                        if isinstance(inst, MemoryInstruction)
+                        and inst.annotation.get(
+                            "prefetch_before_resident_reset"
+                        )
+                    ]
+                    if prefetch_positions:
+                        found_reset_prefetch = True
+                        prefix_stop = prefetch_positions[-1] + 1
+                        if any(
+                            isinstance(inst, MemoryInstruction)
+                            and not inst.annotation.get(
+                                "prefetch_before_resident_reset"
+                            )
+                            for inst in instructions[:prefix_stop]
+                        ):
+                            raise ValueError(
+                                f"stage {stage.name!r} resident-reset "
+                                "prefetch is not a memory-stream prefix"
+                            )
+                        self.instructions[sm].extend(
+                            inst
+                            for inst in instructions[:prefix_stop]
+                            if isinstance(inst, MemoryInstruction)
+                            and inst.annotation.get(
+                                "prefetch_before_resident_reset"
+                            )
+                        )
+                        rendered[sm] = [
+                            inst
+                            for index, inst in enumerate(instructions)
+                            if index not in prefetch_positions
+                        ]
+                    self.instructions[sm].append(
+                        resident_reset_reload.copy()
+                    )
+                if (
+                    stage.prefetch_before_resident_reset
+                    and not found_reset_prefetch
+                ):
+                    raise ValueError(
+                        f"stage {stage.name!r} declared resident-reset "
+                        "prefetching but emitted no annotated memory operand"
+                    )
             for group, role in stage.wait_group_roles:
                 _validate_explicit_role_bar(
                     rendered,
@@ -933,18 +1002,21 @@ class LoopedSequentialProgram:
             outer_reg = int(bank_count > 1)
             if block.async_reload_after:
                 workers = config.async_barrier_reload_workers
-                worker_base = 32
-                if worker_base + workers > launcher.num_sms:
+                worker_base = block.async_reload_worker_base
+                if (
+                    worker_base < 0
+                    or worker_base + workers > launcher.num_sms
+                ):
                     raise ValueError(
                         f"block {block.name!r} has no disjoint async reload workers"
-                    )
+                )
                 clear_count = (
                     segment.completion_barrier + 1 - segment.barrier_start
                 )
                 if clear_count <= 0:
                     raise ValueError(
                         f"block {block.name!r} has no barrier range to clear"
-                    )
+                )
                 width, remainder = divmod(clear_count, workers)
                 for sm in range(launcher.num_sms):
                     segment.instructions[sm].insert(

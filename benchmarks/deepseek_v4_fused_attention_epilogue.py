@@ -188,7 +188,7 @@ def benchmark_split_attention(
         kv_v_tma = TmaTensor(launcher, kv).wgmma_load(64, 128, Major.MN)
         partial_tma = TmaTensor(
             launcher, partials.reshape(num_splits * 64, 512)
-        ).wgmma("store", 64, 128, Major.K)
+        ).rowmajor_2d("store", 64, 128)
         producer = SchedDsv4AttentionSplit64UmmaSm100(
             q,
             kv,

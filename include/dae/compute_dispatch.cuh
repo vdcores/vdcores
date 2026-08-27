@@ -575,7 +575,8 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_BF16_GEMV_GROUP4_SPLITK_SM100) {
              g_events);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   task_dsv4_bf16_gemv_group4_splitk_sm100(
-      inst.args[0], smem_base, get_slot_address(smem_base, numSlots),
+      inst.args[0],
+      smem_base, get_slot_address(smem_base, numSlots),
       tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase, m2c, c2m);
 #endif
 }
@@ -726,28 +727,61 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_EXPERT_REDUCE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, tmem_base_ptr,
+  DAE_UNUSED(thread_id, pc, count, finish, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  const uint64_t fused_coefficients_address =
+      (uint64_t(inst.args[0]) |
+       (uint64_t(inst.args[1]) << 16) |
+       (uint64_t(inst.args[2] >> 4) << 32)) << 4;
+  const auto *fused_coefficients = reinterpret_cast<const float *>(
+      fused_coefficients_address);
+  if ((inst.args[2] & 8U) == 0) {
+    fused_coefficients = nullptr;
+  }
   switch (inst.args[2] & 3U) {
   case 3:
+#if defined(DAE_TRACK_PROFILE)
+    if (inst.args[2] & 4U) {
+      task_dsv4_fp32_bf16_gemv<true, true, 1, 3, true>(
+          inst.args[0], inst.args[1], smem_base,
+          get_slot_address(smem_base, numSlots), st_insts,
+          fused_coefficients, m2c, c2m,
+          sm_id, g_events);
+      break;
+    }
+#endif
     task_dsv4_fp32_bf16_gemv<true, true, 1, 3>(
         inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+        get_slot_address(smem_base, numSlots), st_insts,
+        fused_coefficients, m2c, c2m);
     break;
   case 2:
+#if defined(DAE_TRACK_PROFILE)
+    if (inst.args[2] & 4U) {
+      task_dsv4_fp32_bf16_gemv<false, true, 1, 3, true>(
+          inst.args[0], inst.args[1], smem_base,
+          get_slot_address(smem_base, numSlots), st_insts,
+          fused_coefficients, m2c, c2m,
+          sm_id, g_events);
+      break;
+    }
+#endif
     task_dsv4_fp32_bf16_gemv<false, true, 1, 3>(
         inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+        get_slot_address(smem_base, numSlots), st_insts,
+        fused_coefficients, m2c, c2m);
     break;
   case 1:
     task_dsv4_fp32_bf16_gemv<true, false>(
         inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+        get_slot_address(smem_base, numSlots), st_insts,
+        nullptr, m2c, c2m);
     break;
   default:
     task_dsv4_fp32_bf16_gemv<false, false>(
         inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
+        get_slot_address(smem_base, numSlots), st_insts,
+        nullptr, m2c, c2m);
     break;
   }
 }
@@ -847,7 +881,7 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_RMS_ROPE) {
   task_dsv4_gated_pool_rms_rope(
       inst.args[0], (config & 1) ? 512 : 128,
       ((config >> 1) & 1) != 0, ((config >> 2) & 1) != 0,
-      config >> 3,
+      (config >> 3) & 7,
       *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
       smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }

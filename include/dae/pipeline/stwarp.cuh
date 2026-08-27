@@ -306,7 +306,8 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 #endif
       // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-#if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
+#if defined(DAE_FP8_COUPLED_DETAIL_PROFILE) || \
+    defined(DAE_ATTENTION_DETAIL_PROFILE)
       constexpr uint16_t kProfileStoreEventFlag = 1U << 15;
       constexpr uint16_t kProfileStoreAllocationFlag = 1U << 14;
       constexpr uint16_t kProfileStoreEventMask = (1U << 14) - 1;
@@ -321,6 +322,14 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
       }
 #endif
       atomicSub(&bars[inst.bar()], 1);
+#if defined(DAE_ATTENTION_DETAIL_PROFILE)
+      if (op(opcode) == op(OP_ALLOC_WB_TMA_STORE_1D) &&
+          (inst.arg & kProfileStoreEventFlag)) {
+        const int event_id = inst.arg & kProfileStoreEventMask;
+        g_events[sm_id * numProfileEvents + event_id + 1] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
 #if defined(DAE_TRACK_PROFILE)
       if (raw_profile_event >= 0) {
         g_events[sm_id * numProfileEvents + raw_profile_event + 2] =

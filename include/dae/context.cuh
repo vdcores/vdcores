@@ -174,7 +174,7 @@ static constexpr int numThreadsLduControlPublishBarrier = 3;
 #if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
 static constexpr int numProfileEvents = 160;
 #elif defined(DAE_ATTENTION_DETAIL_PROFILE)
-static constexpr int numProfileEvents = 160;
+static constexpr int numProfileEvents = 176;
 #else
 static constexpr int numProfileEvents = 128;
 #endif
@@ -211,7 +211,7 @@ static_assert(
     trackProfileEventBase);
 #endif
 #if defined(DAE_ATTENTION_DETAIL_PROFILE)
-static_assert(detailProfileEventBase + 30 <= numProfileEvents);
+static_assert(detailProfileEventBase + 48 <= numProfileEvents);
 #endif
 #if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
 static constexpr int fp8CoupledDetailLduEventBase = detailProfileEventBase;

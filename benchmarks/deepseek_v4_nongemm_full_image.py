@@ -671,7 +671,7 @@ def build_hc_post_pre_boundary(
 ) -> Case:
     """Measure post -> metadata projection -> pre/RMS in one resident launch."""
     packed_input_record = torch.empty(
-        (6, 4096), dtype=torch.bfloat16, device=device
+        (5, 4096), dtype=torch.bfloat16, device=device
     )
     branch = packed_input_record[0]
     residual = packed_input_record[1:5]
@@ -688,9 +688,6 @@ def build_hc_post_pre_boundary(
     coefficients = torch.rand(
         (20,), generator=generator, dtype=torch.float32, device=device
     )
-    coefficient_bits = coefficients.view(torch.bfloat16)
-    for start in range(0, 4096, 128):
-        packed_input_record[5, start : start + 40].copy_(coefficient_bits)
     post = coefficients[:4]
     comb = coefficients[4:].view(4, 4)
     post_output = torch.empty(
@@ -749,6 +746,7 @@ def build_hc_post_pre_boundary(
                     fused_post_input_record=packed_input_record,
                     fused_post_output=post_output,
                     fused_partial_metadata=metadata,
+                    packed_coefficients=coefficients,
                     launcher=launcher,
                 ),
                 8 * 16,
@@ -791,9 +789,10 @@ def build_hc_post_pre_boundary(
             "ij,id->jd", comb.float(), residual.float()
         )
         expected_residual = expected_residual_fp32.to(torch.bfloat16)
-        expected_mixes = projection @ expected_residual_fp32.reshape(-1)
+        rounded_residual_fp32 = expected_residual.float()
+        expected_mixes = projection @ rounded_residual_fp32.reshape(-1)
         coefficient_rstd = torch.rsqrt(
-            expected_residual_fp32.square().mean() + 1.0e-6
+            rounded_residual_fp32.square().mean() + 1.0e-6
         )
         normalized_mixes = expected_mixes * coefficient_rstd
         expected_pre = (

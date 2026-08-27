@@ -59,6 +59,7 @@ from dae.instructions import (
     Nvfp4GemvUmmaStreamSm100,
     Nvfp4UmmaPrepackSm100,
     ProfileEvent,
+    ProfileLayer,
     ProfileStep,
     RawAddress,
     RMS_NORM_F16_SMEM,
@@ -1342,8 +1343,8 @@ def test_dsv4_zero_fill_shards_contiguous_output(monkeypatch):
     first = schedule.schedule(0)
     last = schedule.schedule(7)
 
-    assert first[0].args == [64]
-    assert last[0].args == [64]
+    assert first[0].args == [64, 1]
+    assert last[0].args == [64, 1]
     assert first[1].size == last[1].size == 4
     assert first[1].opcode & 16
     assert first[2].size == last[2].size == 256
@@ -2341,7 +2342,7 @@ def test_sequential_program_elides_only_same_placement_independent_edge():
         )
 
 
-def test_sequential_profile_markers_can_use_reserved_special_slots():
+def test_sequential_profile_markers_use_the_compute_stream():
     class FakeLauncher:
         num_sms = 1
         num_bars = 0
@@ -2384,15 +2385,14 @@ def test_sequential_profile_markers_can_use_reserved_special_slots():
             SequentialStage("profiled", BasicStage(), 1, profile_after=True),
             SequentialStage("tail", BasicStage(), 1),
         ),
-        profile_special_slot=7,
     )
     marker = next(
         inst
         for inst in program.instructions[0]
-        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_PROFILE_LAYER & ~0x3F)
+        if isinstance(inst, ProfileLayer)
     )
 
-    assert marker.num_slots & 0x3F == config.num_slots + 7
+    assert marker.args == [config.layer_profile_event_base, 6, 1]
 
 
 def test_sequential_program_fans_out_and_joins_labeled_stage_groups():
@@ -2469,9 +2469,9 @@ def test_sequential_program_fans_out_and_joins_labeled_stage_groups():
     marker = next(
         inst
         for inst in program.instructions[0]
-        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_PROFILE_LAYER & ~0x3F)
+        if isinstance(inst, ProfileLayer)
     )
-    assert marker.num_slots >> 6 == 1
+    assert marker.args == [config.layer_profile_event_base, 6, 1]
     for sm in range(4):
         memory = [
             inst
@@ -2822,8 +2822,8 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
         inst for inst in program.instructions[0]
         if isinstance(inst, MemoryInstruction)
     ]
-    assert isinstance(compute[2], LoopC)
-    assert compute[2].args == [2, 0, 0]
+    compute_loop = next(inst for inst in compute if isinstance(inst, LoopC))
+    assert compute_loop.args == [2, 0, 0]
     reload = next(
         inst
         for inst in memory
@@ -2840,21 +2840,14 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     # Bank zero spans barriers [0, 2); the shifted bank spans [2, 4).
     assert (reload.num_slots >> 6) + 1 - reload.size == 0
     assert (reload.num_slots >> 6) + 2 + 1 - reload.size == 2
-    profile_layer = next(
-        inst
-        for inst in memory
-        if (inst.opcode & ~0x3F) == (opcode.OP_LDU_PROFILE_LAYER & ~0x3F)
-    )
-    assert profile_layer.opcode & 0x4
-    assert profile_layer.num_slots >> 6 == 1
-    assert profile_layer.arg == 2
-    assert profile_layer.size == 2
+    profile_layer = next(inst for inst in compute if isinstance(inst, ProfileLayer))
+    assert profile_layer.args == [config.layer_profile_event_base, 6, 2]
     loop = next(inst for inst in memory if isinstance(inst, LoopM))
     assert loop.size == 2
     assert loop.cords[0] == 1
     assert loop.cords[1] == 1
     assert loop.cords[2] == 2 << 6
-    assert memory.index(profile_layer) < memory.index(reload) < memory.index(loop)
+    assert memory.index(reload) < memory.index(loop)
     shifted_body = [
         inst
         for inst in memory
@@ -3533,7 +3526,7 @@ def test_ldu_layer_profile_encodes_internal_counter_range():
     assert (instruction.opcode & ~0x3F) == (
         opcode.OP_LDU_PROFILE_LAYER & ~0x3F
     )
-    assert instruction.num_slots & 0x3F == config.num_slots
+    assert instruction.num_slots & 0x3F == 0
     assert instruction.num_slots >> 6 == 7
     assert instruction.arg == config.layer_profile_event_base
     assert instruction.size == 43

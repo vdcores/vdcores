@@ -457,6 +457,17 @@ __device__ __forceinline__ void allocwarp_execute(
         break;
         case op(OP_LDU_ASYNC_RELOAD_BARRIERS): {
           if constexpr (dae2AsyncBarrierReload) {
+            constexpr uint16_t kSkipInitialLoop = 1U << 12;
+            const bool skip_initial_loop =
+                (inst.arg & kSkipInitialLoop) &&
+                __shfl_sync(ALL_THREADS, di.jmp_cnt, 0) == 0 &&
+                __shfl_sync(ALL_THREADS, di.jmp_cnt, 1) == 0;
+            if (skip_initial_loop) {
+              if (lane_id == 0) {
+                atomicSub(&bars[inst.bar()], 1);
+              }
+              break;
+            }
             if (lane_id == 0) {
               const int special_slot = inst.nslot();
               if (special_slot < numSlots ||

@@ -39,7 +39,8 @@ __device__ __forceinline__ void task_dsv4_bf16_gemv_group4_splitk_sm100(
       UMMA::Major::K, UMMA::Major::K>;
   using TiledMma = decltype(make_tiled_mma(Atom{}));
 
-  if (num_k_tiles <= 0 || num_k_tiles % kActivationTilesPerChunk) {
+  if (num_k_tiles <= 0 ||
+      (num_k_tiles != 2 && num_k_tiles % kActivationTilesPerChunk)) {
     asm volatile("trap;");
   }
 
@@ -80,9 +81,10 @@ __device__ __forceinline__ void task_dsv4_bf16_gemv_group4_splitk_sm100(
     const auto *activation = static_cast<const __nv_bfloat16 *>(
         get_slot_address(smem_base, extract(activation_slots)));
 
-#pragma unroll
+    const int tiles_in_chunk = min(
+        kActivationTilesPerChunk, num_k_tiles - chunk_start);
     for (int tile_in_chunk = 0;
-         tile_in_chunk < kActivationTilesPerChunk;
+         tile_in_chunk < tiles_in_chunk;
          ++tile_in_chunk, ++logical_tile) {
       const Data value = Data(
           __bfloat162float(

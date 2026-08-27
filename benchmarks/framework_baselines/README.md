@@ -68,6 +68,32 @@ VDcores jobs were `20260827T144133Z-1232596`,
 1, 128, 256, 512, and 1024 respectively.  Those runs used ten warmups and 21
 samples with token variation allowed and loopback HC fusion enabled.
 
+### VDcores source-snapshot reproduction
+
+Before committing the production source that accompanied the table above, the
+same BF16-head/MXFP image was rebuilt from scratch with
+`DAE_COMPUTE_OPS_FILE=benchmarks/deepseek_v4_resident_full_checkpoint.ops`,
+`num_insts=512`, and `mxfp_direct_tma=1`.  It compiled with 244 registers, ten
+barriers, a 256-byte stack, 15,104 bytes of static shared memory, and no
+spills.  Each context then ran sequentially on one locked GPU with the same
+token, loopback-HC, warmup, sample-count, and token-variation settings as the
+accepted scan.
+
+| Context | Reproduced CUDA | Reproduced device | CUDA delta from accepted |
+|---:|---:|---:|---:|
+| 1 | 4.769984 | 4.682944 | +0.55% |
+| 128 | 5.331936 | 5.250176 | +0.09% |
+| 256 | 5.408320 | 5.325504 | +0.03% |
+| 512 | 5.408128 | 5.321568 | -1.23% |
+| 1024 | 5.459808 | 5.366976 | -0.32% |
+
+Reproduction jobs were `20260827T213311Z-3325072`,
+`20260827T213416Z-3339244`, `20260827T213519Z-3357499`,
+`20260827T213624Z-3375845`, and `20260827T213732Z-3393327`.  These VDcores
+contexts above one retain the benchmark's deterministic seeded prefix cache;
+they reproduce the production performance workload and are not a real-prompt
+prefill correctness claim.
+
 ## Reproduction on the configured cluster
 
 Run these commands from the repository root on the jump host.  The cluster

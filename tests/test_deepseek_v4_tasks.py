@@ -461,9 +461,18 @@ def test_hc_projection_publishes_packed_metadata_before_stage_release(monkeypatc
             self.bar_id = bar_id
             return self
 
+    class FakeRawAddress(FakeTransfer):
+        def __init__(self, tensor, slot_id):
+            super().__init__(tensor)
+            self.slot_id = slot_id
+
+        def writeback(self):
+            return self
+
     globals_ = SchedDsv4Fp32Bf16Gemv.schedule.__globals__
     monkeypatch.setitem(globals_, "_shared_load_1d", FakeTransfer)
     monkeypatch.setitem(globals_, "_shared_store_1d", FakeTransfer)
+    monkeypatch.setitem(globals_, "RawAddress", FakeRawAddress)
 
     packed = torch.empty((56,), dtype=torch.float32)
     square_sum = packed[:1]
@@ -485,19 +494,40 @@ def test_hc_projection_publishes_packed_metadata_before_stage_release(monkeypatc
     assert isinstance(row_zero[0], Dsv4Fp32Bf16Gemv)
     assert row_zero[0].args == [32, 8192, 1]
     assert [item.tensor.data_ptr() for item in row_zero[3:]] == [
-        mixes[:1].data_ptr(),
         square_sum.data_ptr(),
         scale.data_ptr(),
         base.data_ptr(),
         metadata_tail.data_ptr(),
     ]
-    assert row_zero[3].bar_id is None
-    assert row_zero[-1].bar_id == 7
+    assert row_zero[3].bar_id == 7
+    assert row_zero[-1].bar_id is None
 
     ordinary_row = schedule.schedule(1)
     assert ordinary_row[0].args == [32, 8192, 0]
     assert ordinary_row[-1].bar_id == 7
     assert schedule.bar_release_count("output") == 24
+
+
+def test_fused_hc_projection_encodes_raw_coefficient_pointer():
+    address = 0x123456789AB0
+    instruction = Dsv4Fp32Bf16Gemv(
+        256,
+        7,
+        emit_square_sum=True,
+        fuse_hc_post=True,
+        packed_coefficients_address=address,
+    )
+    encoded_pointer = (
+        instruction.args[0]
+        | (instruction.args[1] << 16)
+        | ((instruction.args[2] >> 4) << 32)
+    ) << 4
+    assert encoded_pointer == address
+    assert instruction.args[2] & 15 == (
+        Dsv4Fp32Bf16Gemv.EMIT_SQUARE_SUM
+        | Dsv4Fp32Bf16Gemv.FUSE_HC_POST
+        | Dsv4Fp32Bf16Gemv.DIRECT_COEFFICIENTS
+    )
 
 
 def test_activation_quant_schedules_shard_whole_scale_blocks(monkeypatch):

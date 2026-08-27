@@ -2408,15 +2408,23 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
         ):
             raise ValueError("grouped BF16 activation must be contiguous BF16 [K]")
         self.k_tiles = self.k // self.TILE_K
-        if (
-            self.split_k <= 0
-            or self.k_tiles % self.split_k
-            or (self.k_tiles // self.split_k) % self.ACTIVATION_TILES_PER_CHUNK
-        ):
+        if self.split_k <= 0 or self.k_tiles % self.split_k:
             raise ValueError(
-                "grouped BF16 split-K must preserve four K128 tiles per shard"
+                "grouped BF16 split-K must divide the K128 tile count"
             )
         self.k_tiles_per_split = self.k_tiles // self.split_k
+        if (
+            self.k_tiles_per_split != 2
+            and self.k_tiles_per_split % self.ACTIVATION_TILES_PER_CHUNK
+        ):
+            raise ValueError(
+                "grouped BF16 split-K requires two or a multiple of four "
+                "K128 tiles per shard"
+            )
+        self.activation_tiles_per_chunk = min(
+            self.ACTIVATION_TILES_PER_CHUNK,
+            self.k_tiles_per_split,
+        )
         self.m_groups = self.rows // group_rows
         self.work_items = self.m_groups * self.split_k
         if not 0 < self.num_sms <= self.work_items:
@@ -2463,9 +2471,9 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
                 Dsv4Bf16GemvGroup4SplitKSm100(self.k_tiles_per_split)
             )
             for chunk_start in range(
-                k_start, k_stop, self.ACTIVATION_TILES_PER_CHUNK
+                k_start, k_stop, self.activation_tiles_per_chunk
             ):
-                chunk_stop = chunk_start + self.ACTIVATION_TILES_PER_CHUNK
+                chunk_stop = chunk_start + self.activation_tiles_per_chunk
                 instructions.append(
                     TmaLoad1D(
                         self.activation[
@@ -5015,6 +5023,7 @@ class SchedDsv4RmsRope512_64(Schedule):
         epsilon: float,
         weight=None,
         fixed_table_id=None,
+        profile_store_event=None,
     ):
         super().__init__()
         self.input = input
@@ -5023,6 +5032,7 @@ class SchedDsv4RmsRope512_64(Schedule):
         self.epsilon = epsilon
         self.weight = weight
         self.fixed_table_id = fixed_table_id
+        self.profile_store_event = profile_store_event
 
     def _on_place(self):
         if (
@@ -5050,6 +5060,10 @@ class SchedDsv4RmsRope512_64(Schedule):
             raise ValueError("fused RMS/RoPE epsilon must be positive")
         if self.fixed_table_id is not None and not 0 <= self.fixed_table_id < 4:
             raise ValueError("DeepSeek fixed RoPE table ID must be in [0,4)")
+        if self.profile_store_event is not None and not (
+            0 <= self.profile_store_event < (1 << 15)
+        ):
+            raise ValueError("fused RMS/RoPE profile event must fit 15 bits")
         self.rows = self.input.shape[0]
         if not 0 < self.num_sms <= self.rows:
             raise ValueError("fused RMS/RoPE requires 1..rows SMs")
@@ -5073,9 +5087,10 @@ class SchedDsv4RmsRope512_64(Schedule):
                 instructions.append(TmaLoad1D(self.weight))
             if self.fixed_table_id is None:
                 instructions.append(TmaLoad1D(self.table))
-            instructions.append(
-                TmaStore1D(self.output[row]).bar(self._bar("output"))
-            )
+            store = TmaStore1D(self.output[row]).bar(self._bar("output"))
+            if self.profile_store_event is not None:
+                store.arg = (1 << 15) | self.profile_store_event
+            instructions.append(store)
         return instructions
 
     def bar_release_count(self, role: str):
@@ -5663,6 +5678,7 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         kv_tma,
         kv_v_tma,
         partial_tma,
+        gate_kv_last_split_only=False,
     ):
         super().__init__()
         self.q = q
@@ -5674,6 +5690,7 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         self.kv_tma = kv_tma
         self.kv_v_tma = kv_v_tma
         self.partial_tma = partial_tma
+        self.gate_kv_last_split_only = bool(gate_kv_last_split_only)
         self.ring_plans = []
         self.split_rows = []
 
@@ -5782,19 +5799,26 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         if sm < 0:
             return []
         row, active_tokens = self.split_rows[sm]
+        ring_load = TmaLoadInternalRingStream(
+            self.ring_plans[sm],
+            stages=1,
+            stage_bytes=self.STAGE_BYTES,
+            area_slots=self.AREA_SLOTS,
+            area_id=0,
+            stream_length=1,
+            port_mask=3,
+        )
+        kv_bar = self._bar("kv")
+        if kv_bar is not None and (
+            not self.gate_kv_last_split_only
+            or row + active_tokens == self.rows
+        ):
+            ring_load.bar(kv_bar)
         return [
             Dsv4AttentionSplit64UmmaSm100(
                 active_tokens, ring_port_mask=3
             ),
-            TmaLoadInternalRingStream(
-                self.ring_plans[sm],
-                stages=1,
-                stage_bytes=self.STAGE_BYTES,
-                area_slots=self.AREA_SLOTS,
-                area_id=0,
-                stream_length=1,
-                port_mask=3,
-            ),
+            ring_load,
             self.q_tma.cord(0, 0).bar(self._bar("q")),
             RawAddress(
                 self.metadata[sm], config.num_slots + 8
@@ -6313,7 +6337,10 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         fused_post_input_record=None,
         fused_post_output=None,
         fused_partial_metadata=None,
+        packed_coefficients=None,
         launcher=None,
+        prefetch_operands_before_resident_reset=False,
+        profile_operands=False,
     ):
         super().__init__()
         self.weight = weight
@@ -6326,7 +6353,12 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         self.fused_post_input_record = fused_post_input_record
         self.fused_post_output = fused_post_output
         self.fused_partial_metadata = fused_partial_metadata
+        self.packed_coefficients = packed_coefficients
         self.launcher = launcher
+        self.prefetch_operands_before_resident_reset = bool(
+            prefetch_operands_before_resident_reset
+        )
+        self.profile_operands = bool(profile_operands)
 
     def _on_place(self):
         self.fuse_hc_post = self.fused_post_input_record is not None
@@ -6368,11 +6400,11 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                 )
             if (
                 self.fused_post_input_record.dtype != torch.bfloat16
-                or tuple(self.fused_post_input_record.shape) != (6, 4096)
+                or tuple(self.fused_post_input_record.shape) != (5, 4096)
                 or not self.fused_post_input_record.is_contiguous()
             ):
                 raise ValueError(
-                    "fused mHC post input record must be contiguous BF16 [6,4096]"
+                    "fused mHC post input record must be contiguous BF16 [5,4096]"
                 )
             if (
                 self.fused_post_output.dtype != torch.bfloat16
@@ -6398,13 +6430,22 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                     "fused mHC partial metadata must be contiguous FP32 "
                     "split records plus a packed scale/base tail"
                 )
+            if (
+                self.packed_coefficients is None
+                or self.packed_coefficients.dtype != torch.float32
+                or self.packed_coefficients.numel() != 20
+                or not self.packed_coefficients.is_contiguous()
+            ):
+                raise ValueError(
+                    "fused mHC post coefficients must be contiguous FP32 [20]"
+                )
             if self.launcher is None:
                 raise ValueError("fused mHC projection requires a TMA launcher")
             self.fused_record_tma = TmaTensor(
                 self.launcher, self.fused_post_input_record
             ).rowmajor_2d(
                 "load",
-                6,
+                5,
                 self.FUSED_TILE_HIDDEN,
             )
             self.fused_output_tma = TmaTensor(
@@ -6484,18 +6525,42 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
             return []
         if self.fuse_hc_post:
             output_group, split = divmod(sm, self.FUSED_SPLITS)
+            weight_load = _shared_load_1d(
+                self.weight[output_group, split]
+            ).fixed_port(0)
+            if self.prefetch_operands_before_resident_reset:
+                weight_load.annotation[
+                    "prefetch_before_resident_reset"
+                ] = True
             emit_residual = output_group == 0
+            coefficients_bar = self._bar("coefficients")
+            direct_coefficients = coefficients_bar is None
             task = [
                 Dsv4Fp32Bf16Gemv(
                     self.FUSED_HALVES_PER_TASK * self.FUSED_TILE_HIDDEN,
                     output_group,
                     emit_square_sum=emit_residual,
                     fuse_hc_post=True,
+                    profile_operands=self.profile_operands,
+                    packed_coefficients_address=(
+                        self.packed_coefficients.data_ptr()
+                        if direct_coefficients
+                        else None
+                    ),
                 ),
-                _shared_load_1d(
-                    self.weight[output_group, split]
-                ).fixed_port(0),
+                weight_load,
             ]
+            if not direct_coefficients:
+                coefficients = RawAddress(
+                    self.packed_coefficients, self.DIRECT_RECORD_SLOT
+                ).fixed_port(1)
+                if coefficients_bar is not None:
+                    coefficients.bar(coefficients_bar)
+                if self.prefetch_operands_before_resident_reset:
+                    coefficients.annotation[
+                        "prefetch_before_resident_reset"
+                    ] = True
+                task.append(coefficients)
             tile_start = (
                 split * self.FUSED_HALVES_PER_TASK * self.FUSED_TILE_HIDDEN
             )
@@ -6507,7 +6572,15 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                     tile_start,
                     delta_cols=self.FUSED_TILE_HIDDEN,
                 )
-            task.append(record_load.fixed_port(1))
+            record_load = record_load.fixed_port(1)
+            record_bar = self._bar("record")
+            if record_bar is not None:
+                record_load.bar(record_bar)
+            if self.prefetch_operands_before_resident_reset:
+                record_load.annotation[
+                    "prefetch_before_resident_reset"
+                ] = True
+            task.append(record_load)
             if emit_residual:
                 if self.FUSED_HALVES_PER_TASK == 1:
                     residual_store = self.fused_output_tma.cord(0, tile_start)
@@ -6523,13 +6596,20 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
             metadata_bar = self._bar("metadata")
             if metadata_bar is None:
                 metadata_bar = self._bar("output")
-            partial_store = RawAddress(
+            # Give every producer a disjoint 16-byte destination.  Group zero
+            # writes [square_sum, mix0, mix1, mix2]; the remaining groups
+            # write three mixes and leave their fourth word unspecified.  A
+            # whole-record store here would race with the other seven output
+            # groups and overwrite their partials with uninitialized shared
+            # data.
+            partial_start = (
+                split * self.FUSED_RECORD_STRIDE + output_group * 4
+            )
+            partial_store = _shared_store_1d(
                 self.fused_partial_metadata[
-                    split * self.FUSED_RECORD_STRIDE:
-                    (split + 1) * self.FUSED_RECORD_STRIDE
-                ],
-                config.num_slots,
-            ).writeback().bar(metadata_bar)
+                    partial_start:partial_start + 4
+                ]
+            ).bar(metadata_bar)
             task.append(partial_store)
             return task
 
@@ -7418,6 +7498,8 @@ class SchedOverlapAsyncBarrierReload(Schedule):
         workers: int,
         *,
         special_slot: int = 2,
+        clear_input_role: str = "input",
+        skip_initial_loop: bool = False,
     ):
         super().__init__()
         self.inner = inner
@@ -7428,6 +7510,8 @@ class SchedOverlapAsyncBarrierReload(Schedule):
         self.worker_base = int(worker_base)
         self.workers = int(workers)
         self.special_slot = int(special_slot)
+        self.clear_input_role = str(clear_input_role)
+        self.skip_initial_loop = bool(skip_initial_loop)
 
     def _on_place(self):
         if (
@@ -7438,6 +7522,10 @@ class SchedOverlapAsyncBarrierReload(Schedule):
             or self.count < self.workers
         ):
             raise ValueError("async barrier reload placement is invalid")
+        if self.skip_initial_loop and self._bar("clear") is None:
+            raise ValueError(
+                "an initially skipped reload needs a clear-completion edge"
+            )
         inner = self.inner._clone()
         inner._bars.update(self._bars)
         self.placed_inner = inner.place(self.inner_sms)
@@ -7455,25 +7543,28 @@ class SchedOverlapAsyncBarrierReload(Schedule):
             width, remainder = divmod(self.count, self.workers)
             local_count = width + int(worker < remainder)
             local_offset = worker * width + min(worker, remainder)
-            instructions.append(
-                LduAsyncReloadBarriers(
-                    self.bar_source,
-                    self.first_bar + local_offset,
-                    local_count,
-                    self._bar("input"),
-                    self.special_slot,
-                )
+            clear = LduAsyncReloadBarriers(
+                self.bar_source,
+                self.first_bar + local_offset,
+                local_count,
+                self._bar(self.clear_input_role),
+                self.special_slot,
+                skip_initial_loop=self.skip_initial_loop,
             )
+            if self._bar("clear") is not None:
+                clear.bar(self._bar("clear"))
+            instructions.append(clear)
         return instructions
 
     def bar_release_count(self, role: str):
+        if role == "clear":
+            return self._bar_release_if_present(role, self.workers)
         if role != "output":
-            return 0
+            return self.placed_inner.bar_release_count(role)
         inner_count = self.placed_inner.bar_release_count(role)
         return self._bar_release_if_present(
             role, inner_count + self.workers
         )
-
 
 class SchedDsv4Hadamard(Schedule):
     def __init__(self, input, output):
@@ -7627,6 +7718,7 @@ class SchedDsv4GatedPoolRmsRope(Schedule):
         tail_bias=None,
         hadamard=False,
         fixed_table_id=None,
+        prefetch_static_inputs=False,
     ):
         super().__init__()
         self.values = values
@@ -7640,6 +7732,7 @@ class SchedDsv4GatedPoolRmsRope(Schedule):
         self.tail_bias = tail_bias
         self.hadamard = bool(hadamard)
         self.fixed_table_id = fixed_table_id
+        self.prefetch_static_inputs = bool(prefetch_static_inputs)
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -7692,6 +7785,10 @@ class SchedDsv4GatedPoolRmsRope(Schedule):
                     raise ValueError(
                         f"fused gated-pool {name} must be FP32 [width]"
                     )
+        if self.prefetch_static_inputs and self.tail_values is None:
+            raise ValueError(
+                "static gated-pool prefetch requires a dynamic tail row"
+            )
         if self.tail_bias is not None:
             if self.tail_values is None:
                 raise ValueError("fused gated-pool bias requires a tail row")
@@ -7701,6 +7798,10 @@ class SchedDsv4GatedPoolRmsRope(Schedule):
                 or not self.tail_bias.is_contiguous()
             ):
                 raise ValueError("fused gated-pool bias must be FP32 [width]")
+        elif self.tail_values is not None:
+            raise ValueError(
+                "fused gated-pool dynamic tail requires an FP32 bias row"
+            )
         self.pool_rows = history_rows + int(self.tail_values is not None)
         if self.pool_rows <= 0:
             raise ValueError("fused gated pooling needs at least one row")
@@ -7726,12 +7827,23 @@ class SchedDsv4GatedPoolRmsRope(Schedule):
                 (TmaLoad1D(self.scores[0]), row_bytes),
             )
         if self.tail_values is not None:
-            instructions.extend(
-                (TmaLoad1D(self.tail_values), TmaLoad1D(self.tail_scores))
-            )
-            if self.tail_bias is not None:
-                instructions.append(TmaLoad1D(self.tail_bias))
-        instructions.append(TmaLoad1D(self.weight))
+            tail_values = TmaLoad1D(self.tail_values)
+            tail_scores = TmaLoad1D(self.tail_scores)
+            if self.prefetch_static_inputs:
+                tail_bar = self._bar("tail")
+                for tail_load in (tail_values, tail_scores):
+                    if tail_bar is not None:
+                        tail_load.bar(tail_bar)
+                    tail_load.fixed_port(0)
+            instructions.extend((tail_values, tail_scores))
+            tail_bias = TmaLoad1D(self.tail_bias)
+            if self.prefetch_static_inputs:
+                tail_bias.fixed_port(1)
+            instructions.append(tail_bias)
+        weight = TmaLoad1D(self.weight)
+        if self.prefetch_static_inputs:
+            weight.fixed_port(1)
+        instructions.append(weight)
         if self.fixed_table_id is None:
             instructions.append(TmaLoad1D(self.table))
         instructions.append(
@@ -10153,10 +10265,17 @@ class SchedArgmaxSmemPartial(Schedule):
 
     RECORD_BYTES = 16
 
-    def __init__(self, logits: torch.Tensor, partials: torch.Tensor):
+    def __init__(
+        self,
+        logits: torch.Tensor,
+        partials: torch.Tensor,
+        *,
+        index_base: int = 0,
+    ):
         super().__init__()
         self.logits = logits
         self.partials = partials
+        self.index_base = int(index_base)
 
     def _on_place(self):
         if (self.logits.dtype != torch.bfloat16 or self.logits.ndim != 1 or
@@ -10166,6 +10285,8 @@ class SchedArgmaxSmemPartial(Schedule):
             raise ValueError("shared argmax logits must contain a multiple of 8 values")
         if self.num_sms > self.logits.numel() // 8:
             raise ValueError("shared argmax requires at least eight logits per SM")
+        if not 0 <= self.index_base <= 0xFFFFFFFF - self.logits.numel():
+            raise ValueError("shared argmax absolute index range must fit in uint32")
         if (self.partials.dtype != torch.uint8 or
                 tuple(self.partials.shape) != (self.num_sms, self.RECORD_BYTES) or
                 not self.partials.is_contiguous()):
@@ -10180,7 +10301,7 @@ class SchedArgmaxSmemPartial(Schedule):
             self.logits.numel(), self.num_sms, sm, alignment=8
         )
         return [
-            ArgmaxSmemPartialBf16(row_count, row_start),
+            ArgmaxSmemPartialBf16(row_count, self.index_base + row_start),
             _shared_load_1d(self.logits[row_start:row_start + row_count]),
             _shared_store_1d(self.partials[sm]).bar(self._bar("output")),
         ]

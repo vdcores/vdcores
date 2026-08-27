@@ -45,7 +45,12 @@ from dae.deepseek_v4_quant import (
     quantize_fp8_block128,
 )
 from dae.launcher import Launcher
-from dae.instructions import TmaTensor
+from dae.instructions import (
+    Gemv_M128N8Direct4,
+    TmaLoad1D,
+    TmaStore1D,
+    TmaTensor,
+)
 from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayeredSchedule,
@@ -84,11 +89,13 @@ from dae.schedule import (
     SchedDsv4ContiguousAttention512Block4,
     SchedDsv4TopK512,
     SchedDsv4ZeroFill,
+    SchedCopy,
     SchedDsv4Mxfp8QuantFfnInput,
     SchedDsv4SplitMxfp8FfnInputRecords,
     SchedFp8Block128Gemv,
     SchedFp8Block128GateUpSwiGlu,
     SchedFp8GemvUmmaCoupled,
+    SchedGemvMGroup,
     SchedLayeredDsv4RouterBf16Gemv,
     SchedLayeredMxfp4Mxfp8RoutedResidentFfn,
     SchedMxfp4Mxfp8DownFixedRing,
@@ -103,7 +110,7 @@ from dae.sequential import (
     SequentialProgram,
     SequentialStage,
 )
-from dae.tma_utils import Major
+from dae.tma_utils import Major, pack_weight_tile_major
 
 
 # Task-local detail traces occupy events 2--29 when DAE_TRACK_PROFILE is
@@ -111,6 +118,11 @@ from dae.tma_utils import Major
 # task cannot overwrite its enclosing begin/end pair.
 STEP_PROFILE_EVENT_BASE = 32
 STEP_PROFILE_FRONTIER_BASE = runtime_config.layer_profile_event_base
+LOOPBACK_PROFILE_CSA_COMPLETIONS = 20
+LOOPBACK_PROFILE_FRONTIER_BASE = (
+    runtime_config.layer_profile_event_base
+    + LOOPBACK_PROFILE_CSA_COMPLETIONS
+)
 FP8_COUPLED_STEP_BEGIN_EVENT = runtime_config.reload_profile_event_base - 1
 FP8_COUPLED_LAYER_BEGIN_EVENT = runtime_config.detail_profile_event_base + 25
 FFN_OUTPUT_PROFILE_EVENT_BASE = 55
@@ -152,10 +164,12 @@ class Stage:
     num_sms: int
     input_role: str | None = None
     wait_for_previous: bool = True
+    parallel_with_previous: bool = False
     base_sm: int | None = None
     wait_group: str | None = None
     release_group: str | None = None
     prefetch_before_wait: bool = False
+    prefetch_before_resident_reset: bool = False
     wait_group_roles: tuple[tuple[str, str], ...] = ()
     release_group_roles: tuple[tuple[str, str], ...] = ()
 
@@ -218,6 +232,9 @@ class ResidentOneLaunchDecode:
         self.families = self._families()
         self._hash_rows: dict[int, torch.Tensor] = {}
         self._fused_bf16_weight_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
+        self._fused_hc_projection_cache: dict[
+            tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
+        ] = {}
         self._allocate_state()
         self._allocate_mxfp_ffn_runtime()
         rope_tables = [self.main_rope, self.compress_rope]
@@ -235,7 +252,30 @@ class ResidentOneLaunchDecode:
             family.representative: self._build_family(family)
             for family in self.families
         }
+        cross_layer_hc_pair = (
+            args.layers == 43
+            or (
+                args.layers == 2
+                and args.two_layer_start_id == 3
+                and not args.repeat_same_layer
+            )
+        )
+        if cross_layer_hc_pair and not args.disable_cross_layer_hc_fusion:
+            previous_family, next_family = (
+                self.families
+                if args.layers == 2
+                else self.families[2:4]
+            )
+            self._apply_cross_layer_hc_fusion(
+                previous_family, next_family
+            )
         self.head_stages = self._build_head()
+        if args.loopback_hc_fusion:
+            self._apply_loopback_hc_fusion(
+                self.families[1],
+                self.families[2],
+                self.families[3],
+            )
         self._build_program()
         print(
             "DSV4_COMPUTE_OPS "
@@ -559,27 +599,33 @@ class ResidentOneLaunchDecode:
         *,
         input_role: str | None = None,
         wait_for_previous: bool = True,
+        parallel_with_previous: bool = False,
         base_sm: int | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
         prefetch_before_wait: bool = False,
+        prefetch_before_resident_reset: bool = False,
         wait_group_roles: tuple[tuple[str, str], ...] = (),
         release_group_roles: tuple[tuple[str, str], ...] = (),
     ) -> Stage:
         if isinstance(sms, ShapeAssignment):
             sms = self._remember(sms)
         return Stage(
-            name,
-            schedule,
-            int(sms),
-            input_role,
-            wait_for_previous,
-            base_sm,
-            wait_group,
-            release_group,
-            prefetch_before_wait,
-            wait_group_roles,
-            release_group_roles,
+            name=name,
+            schedule=schedule,
+            num_sms=int(sms),
+            input_role=input_role,
+            wait_for_previous=wait_for_previous,
+            parallel_with_previous=parallel_with_previous,
+            base_sm=base_sm,
+            wait_group=wait_group,
+            release_group=release_group,
+            prefetch_before_wait=prefetch_before_wait,
+            prefetch_before_resident_reset=(
+                prefetch_before_resident_reset
+            ),
+            wait_group_roles=wait_group_roles,
+            release_group_roles=release_group_roles,
         )
 
     @staticmethod
@@ -604,7 +650,13 @@ class ResidentOneLaunchDecode:
         cfg, d = self.config, self.device
         embedding = self._tensor("embed.weight")[self.args.token_id]
         self.initial_residual = embedding.reshape(1, -1).repeat(cfg.hc_mult, 1)
-        self.residual = torch.empty_like(self.initial_residual)
+        self.attention_post_input_record = torch.empty(
+            (1 + cfg.hc_mult, cfg.hidden_size),
+            dtype=torch.bfloat16,
+            device=d,
+        )
+        self.branch = self.attention_post_input_record[0]
+        self.residual = self.attention_post_input_record[1:]
         self.next_residual = torch.empty_like(self.residual)
         self.hidden = torch.empty((cfg.hidden_size,), dtype=torch.bfloat16, device=d)
         self.mhc_packed_output = torch.empty(
@@ -618,8 +670,7 @@ class ResidentOneLaunchDecode:
         direct_projection_views = {}
         if self.direct_splitk_bf16:
             projection_rows = (
-                cfg.hidden_size
-                + cfg.q_lora_rank
+                cfg.q_lora_rank
                 + cfg.head_dim
                 + cfg.num_heads * cfg.head_dim
                 + cfg.index_heads * cfg.index_head_dim
@@ -639,7 +690,6 @@ class ResidentOneLaunchDecode:
                 direct_projection_views[name] = view
                 offset += elements
 
-            direct_view("branch", (cfg.hidden_size,))
             direct_view("q_rank", (cfg.q_lora_rank,))
             direct_view("kv", (cfg.head_dim,))
             direct_view("q", (cfg.num_heads, cfg.head_dim))
@@ -647,16 +697,25 @@ class ResidentOneLaunchDecode:
             direct_view("o_rank", (cfg.o_groups, cfg.o_lora_rank))
             if offset != projection_rows:
                 raise AssertionError("split-K output arena was not carved exactly")
-            self.branch = direct_projection_views["branch"]
         else:
             self.splitk_output_arena = None
-            self.branch = torch.empty_like(self.hidden)
         self.mhc_packed_metadata = torch.empty(
             (56,), dtype=torch.float32, device=d
         )
         self.mhc_residual_square_sum = self.mhc_packed_metadata[:1]
         self.mixes = self.mhc_packed_metadata[1:25]
         self.mhc_metadata_tail = self.mhc_packed_metadata[28:56]
+        fused_records = (
+            SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS
+            * SchedDsv4Fp32Bf16Gemv.FUSED_RECORD_STRIDE
+        )
+        self.mhc_fused_metadata = torch.empty(
+            (fused_records + SchedDsv4Fp32Bf16Gemv.FUSED_TAIL_ITEMS,),
+            dtype=torch.float32,
+            device=d,
+        )
+        self.mhc_fused_residual_square_sum = self.mhc_fused_metadata[:1]
+        self.mhc_fused_metadata_tail = self.mhc_fused_metadata[fused_records:]
         self.post = mhc_output_metadata[:4]
         self.comb = mhc_output_metadata[4:].view(4, 4)
 
@@ -1658,6 +1717,40 @@ class ResidentOneLaunchDecode:
         self._fused_bf16_weight_cache[key] = fused
         return fused
 
+    def _fused_hc_projection_operands(
+        self,
+        family: LayerFamily,
+        branch_name: str = "ffn",
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Offline-pack mHC projection weights and scale/base tails."""
+        key = (family.representative, family.layer_ids, branch_name)
+        cached = self._fused_hc_projection_cache.get(key)
+        if cached is not None:
+            return cached
+        functions = self._family_tensors(family, f"hc_{branch_name}_fn")
+        scales = self._family_tensors(family, f"hc_{branch_name}_scale")
+        bases = self._family_tensors(family, f"hc_{branch_name}_base")
+        packed_weights = tuple(
+            function.view(8, 3, 4, 16, 1, 256)
+            .permute(0, 3, 4, 1, 2, 5)
+            .contiguous()
+            for function in functions
+        )
+        metadata_tails = []
+        for scale, base in zip(scales, bases, strict=True):
+            tail = torch.empty(
+                (SchedDsv4Fp32Bf16Gemv.FUSED_TAIL_ITEMS,),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            tail[:3].copy_(scale)
+            tail[3:27].copy_(base)
+            # The final padding word is not consumed by the reducer.
+            metadata_tails.append(tail)
+        result = (packed_weights, tuple(metadata_tails))
+        self._fused_hc_projection_cache[key] = result
+        return result
+
     def _grouped_bf16_splitk_stage(
         self,
         name: str,
@@ -1771,6 +1864,12 @@ class ResidentOneLaunchDecode:
             epsilon=self.config.rms_epsilon,
             weight=weight,
             fixed_table_id=self.resident_rope_table_ids[table.data_ptr()],
+            profile_store_event=(
+                runtime_config.detail_profile_event_base + 46
+                if self.args.profile_attention_detail
+                and name == "attn.q_head_rms_rope"
+                else None
+            ),
         )
         if weights is not None:
             schedule = self._layered(schedule, family, weights)
@@ -1848,7 +1947,112 @@ class ResidentOneLaunchDecode:
         )
         return [project_stage, pre_stage], post_stage
 
-    def _build_attention(self, family: LayerFamily) -> list[Stage]:
+    def _fused_attention_ffn_hc_stages(
+        self,
+        family: LayerFamily,
+    ) -> tuple[Stage, list[Stage]]:
+        """Fuse attention post into the following FFN mHC projection."""
+        packed_weights, metadata_tails = self._fused_hc_projection_operands(
+            family
+        )
+        norm_weights = self._family_tensors(family, "ffn_norm.weight")
+        attention_input_ready = f"{family.name}.attn.input.ready"
+        attention_post_input_ready = f"{family.name}.attn.post_input.ready"
+        metadata_ready = f"{family.name}.ffn.hc.metadata.ready"
+        residual_ready = f"{family.name}.ffn.hc.residual.ready"
+        ffn_input_ready = f"{family.name}.ffn.input.ready"
+        grouped_preattention = {
+            "q_a", "q_b", "kv"
+        }.issubset(self.splitk_components)
+
+        tail_copy = SchedCopy(
+            (
+                TmaLoad1D(metadata_tails[0]),
+                TmaStore1D(self.mhc_fused_metadata_tail),
+            ),
+            size=self.mhc_fused_metadata_tail.numel()
+            * self.mhc_fused_metadata_tail.element_size(),
+        )
+        tail_copy = self._layered(
+            tail_copy,
+            family,
+            metadata_tails,
+        )
+        tail_stage = self._stage(
+            "ffn.hc_metadata_tail",
+            tail_copy,
+            1,
+            base_sm=self.sms - 1,
+            wait_for_previous=not grouped_preattention,
+            wait_group=(
+                attention_input_ready if grouped_preattention else None
+            ),
+            release_group=metadata_ready,
+        )
+
+        fused_project = SchedDsv4Fp32Bf16Gemv(
+            packed_weights[0],
+            self.next_residual.reshape(-1),
+            self.mixes,
+            fused_post_input_record=self.attention_post_input_record,
+            fused_post_output=self.next_residual,
+            fused_partial_metadata=self.mhc_fused_metadata,
+            packed_coefficients=self.mhc_output_metadata,
+            launcher=self.launcher,
+        )
+        fused_project = self._layered(
+            fused_project,
+            family,
+            packed_weights,
+        )
+        fused_stage = self._stage(
+            "attn.hc_post_ffn.hc_project",
+            fused_project,
+            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+            base_sm=0,
+            wait_for_previous=False,
+            wait_group_roles=(
+                (attention_input_ready, "coefficients"),
+                (attention_post_input_ready, "record"),
+            ),
+            release_group_roles=(
+                (metadata_ready, "metadata"),
+                (residual_ready, "residual"),
+            ),
+        )
+
+        pre = SchedDsv4HcPreRms(
+            self.next_residual,
+            self.mixes,
+            metadata_tails[0][:3],
+            metadata_tails[0][3:27],
+            norm_weights[0],
+            self.norm_hidden,
+            self.post,
+            self.comb,
+            residual_square_sum=self.mhc_fused_residual_square_sum,
+            packed_metadata=self.mhc_fused_metadata,
+            packed_output=self.mhc_packed_output,
+            split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
+        )
+        pre = self._layered(pre, family, norm_weights)
+        pre_stage = self._stage(
+            "ffn.hc_pre_rms4096",
+            pre,
+            1,
+            base_sm=128,
+            wait_for_previous=False,
+            wait_group_roles=(
+                (metadata_ready, "metadata"),
+                (residual_ready, "residual"),
+            ),
+            release_group=ffn_input_ready,
+        )
+        return tail_stage, [fused_stage, pre_stage]
+
+    def _build_attention(
+        self, family: LayerFamily
+    ) -> tuple[list[Stage], Stage]:
         cfg = self.config
         layer_id = family.representative
         kind = cfg.attention_kind(layer_id)
@@ -1871,8 +2075,12 @@ class ResidentOneLaunchDecode:
             cfg.q_lora_rank // (128 * self.args.fp8_umma_scale_pack),
         )
         qkv_input_ready = f"{family.name}.attn.qkv.input.ready"
+        attention_post_input_ready = f"{family.name}.attn.post_input.ready"
         q_a_ready = f"{family.name}.attn.q_a.ready"
         q_norm_ready = f"{family.name}.attn.q_norm.ready"
+        split_attention_q_ready = (
+            f"{family.name}.attn.split_attention.q.ready"
+        )
         kv_ready = f"{family.name}.attn.kv.ready"
         kv_norm_ready = f"{family.name}.attn.kv_norm.ready"
         qkv_prefix_join = f"{family.name}.attn.qkv.prefix.join"
@@ -1880,6 +2088,9 @@ class ResidentOneLaunchDecode:
         compressor_reset_ready = f"{family.name}.attn.compressor.reset.ready"
         compressor_projection_ready = (
             f"{family.name}.attn.compressor.projection.ready"
+        )
+        compressor_output_ready = (
+            f"{family.name}.attn.compressor.output.ready"
         )
         index_compressor_reset_ready = (
             f"{family.name}.index.compressor.reset.ready"
@@ -1902,6 +2113,10 @@ class ResidentOneLaunchDecode:
             and attention_rows == 1
             and self.args.attention_mode in ("auto", "umma-split")
         )
+        use_split_umma_attention = split_o_a and self.args.attention_mode in (
+            "auto",
+            "umma-split",
+        )
         context1_q_ready = f"{family.name}.attn.context1.q.ready"
         use_grouped_preattention = split_q_a and split_kv and split_q_b
         compress_values = self.compress_values
@@ -1921,6 +2136,20 @@ class ResidentOneLaunchDecode:
             + cfg.o_groups * cfg.o_lora_rank * int(split_o_a)
             + cfg.hidden_size * int(split_o_b)
         )
+        projection_reset_sms = self.args.projection_reset_sms
+        if projection_reset_sms == 0:
+            # Compressed layers have independent main- and index-compressor
+            # clears on SM64+ after the same hidden-ready edge.  Restricting
+            # the projection arena clear to SM0--63 lets those clears overlap
+            # instead of queueing behind an all-grid reset.  SWA has no such
+            # parallel branch and retains the full-grid reset.
+            projection_reset_sms = (
+                64
+                if use_grouped_preattention
+                and kind in ("csa", "hca")
+                and plan.should_compress
+                else self.sms
+            )
         projection_reset = None
         if workspace_rows:
             if self.direct_splitk_bf16:
@@ -1950,7 +2179,7 @@ class ResidentOneLaunchDecode:
                     ),
                 ),
                 min(
-                    self.args.projection_reset_sms or self.sms,
+                    projection_reset_sms,
                     workspace_rows // 4,
                 ),
                 wait_group=(
@@ -2218,8 +2447,18 @@ class ResidentOneLaunchDecode:
             _, q_prefix_sms = self.policy.fp8_umma_split_k(
                 cfg.q_lora_rank, cfg.hidden_size
             )
-            compressor_base = q_base + q_prefix_sms
             compressor_sms = 2 * width // 512 * 8
+            compressor_base = q_base + q_prefix_sms
+            _, q_b_sms = self.policy.fp8_umma_split_k(
+                cfg.num_heads * cfg.head_dim, cfg.q_lora_rank
+            )
+            q_b_free_base = q_base + q_b_sms
+            compressor_pool_base = q_b_free_base
+            compressor_projection_base = (
+                32
+                if kind == "csa"
+                else compressor_base
+            )
             stages.append(
                 self._stage(
                     "attn.compressor.projection_reset",
@@ -2240,8 +2479,8 @@ class ResidentOneLaunchDecode:
                     ),
                     self.norm_hidden,
                     fused_output,
-                    split_k=8,
-                    base_sm=compressor_base,
+                    split_k=16,
+                    base_sm=compressor_projection_base,
                     wait_group=compressor_reset_ready,
                     release_group=compressor_projection_ready,
                 )
@@ -2252,13 +2491,18 @@ class ResidentOneLaunchDecode:
             and plan.should_compress
         ):
             fused_index_output = self.index_compress_fused_projection.reshape(-1)
-            index_compress_values = fused_index_output[: 2 * cfg.index_head_dim]
-            index_compress_scores = fused_index_output[2 * cfg.index_head_dim :]
+            index_tail_values = fused_index_output[
+                cfg.index_head_dim : 2 * cfg.index_head_dim
+            ]
+            index_tail_scores = fused_index_output[
+                3 * cfg.index_head_dim : 4 * cfg.index_head_dim
+            ]
             _, kv_prefix_sms = self.policy.fp8_umma_split_k(
                 cfg.head_dim, cfg.hidden_size
             )
             index_compressor_base = kv_base + kv_prefix_sms
             index_compressor_sms = 8
+            index_compressor_pool_base = index_compressor_base
             stages.append(
                 self._stage(
                     "index.compressor.projection_reset",
@@ -2281,7 +2525,7 @@ class ResidentOneLaunchDecode:
                     ),
                     self.norm_hidden,
                     fused_index_output,
-                    split_k=8,
+                    split_k=16,
                     base_sm=index_compressor_base,
                     wait_group=index_compressor_reset_ready,
                     release_group=index_compressor_projection_ready,
@@ -2324,7 +2568,7 @@ class ResidentOneLaunchDecode:
                 compressor_pool_partial_ready = (
                     f"{family.name}.attn.compressor.pool.partial.ready"
                 )
-                history_pool_base = compressor_base + compressor_sms
+                history_pool_base = compressor_pool_base
                 history_pool = SchedDsv4GatedPoolPacked8HistoryState(
                     self.attention_pool_history_packed[kind],
                     history_values.shape[0],
@@ -2381,6 +2625,7 @@ class ResidentOneLaunchDecode:
                         cfg.head_dim // 128,
                         base_sm=history_pool_base,
                         wait_group=compressor_pool_partial_ready,
+                        release_group=compressor_output_ready,
                     )
                 )
             else:
@@ -2397,6 +2642,7 @@ class ResidentOneLaunchDecode:
                     fixed_table_id=self.resident_rope_table_ids[
                         self.compressed_output_rope[kind].data_ptr()
                     ],
+                    prefetch_static_inputs=True,
                 )
                 pool = self._layered(
                     pool, family, ape_rows, norm_weights
@@ -2405,8 +2651,11 @@ class ResidentOneLaunchDecode:
                     self._stage(
                         "attn.compressor.pool_norm_rope",
                         pool,
-                        base_sm=compressor_base,
+                        base_sm=compressor_pool_base,
+                        input_role="tail",
                         wait_group=compressor_projection_ready,
+                        prefetch_before_wait=True,
+                        release_group=compressor_output_ready,
                     )
                 )
         if (
@@ -2434,17 +2683,14 @@ class ResidentOneLaunchDecode:
                 self.compressed_output_rope[kind],
                 self.index_cache[-1:],
                 epsilon=cfg.rms_epsilon,
-                tail_values=index_compress_values[
-                    cfg.index_head_dim : 2 * cfg.index_head_dim
-                ],
-                tail_scores=index_compress_scores[
-                    cfg.index_head_dim : 2 * cfg.index_head_dim
-                ],
+                tail_values=index_tail_values,
+                tail_scores=index_tail_scores,
                 tail_bias=index_ape_rows[0],
                 hadamard=True,
                 fixed_table_id=self.resident_rope_table_ids[
                     self.compressed_output_rope[kind].data_ptr()
                 ],
+                prefetch_static_inputs=True,
             )
             index_pool = self._layered(
                 index_pool,
@@ -2456,8 +2702,10 @@ class ResidentOneLaunchDecode:
                 self._stage(
                     "index.compressor.pool_norm_rope_hadamard",
                     index_pool,
-                    base_sm=index_compressor_base,
+                    base_sm=index_compressor_pool_base,
+                    input_role="tail",
                     wait_group=index_compressor_projection_ready,
+                    prefetch_before_wait=True,
                     release_group=(
                         index_selection_input_join
                         if run_index_selection
@@ -2634,7 +2882,12 @@ class ResidentOneLaunchDecode:
                         context1_q_ready
                         if use_context1_attention
                         and (fuse_q_splitk_epilogue or fuse_context1_q_rms)
-                        else None
+                        else (
+                            split_attention_q_ready
+                            if use_split_umma_attention
+                            and fuse_q_splitk_epilogue
+                            else None
+                        )
                     ),
                     fp32_finalizer=q_fp32_finalizer,
                 )
@@ -2670,11 +2923,16 @@ class ResidentOneLaunchDecode:
                     rope_table,
                     self.q_rope,
                     release_group=(
-                        context1_q_ready if use_context1_attention else None
+                        context1_q_ready
+                        if use_context1_attention
+                        else (
+                            split_attention_q_ready
+                            if use_split_umma_attention
+                            else None
+                        )
                     ),
                 )
             )
-
         if (
             kind in ("csa", "hca")
             and not use_grouped_preattention
@@ -2984,10 +3242,7 @@ class ResidentOneLaunchDecode:
 
         sinks = self._family_tensors(family, "attn.attn_sink")
         attention_rows = self.attention_indices_by_kind[kind].numel()
-        use_split_umma_attention = split_o_a and self.args.attention_mode in (
-            "auto",
-            "umma-split",
-        )
+        o_a_split_k = 4 if self.args.context_length == cfg.sliding_window else 2
         if self.args.attention_mode == "umma-split" and not split_o_a:
             raise ValueError(
                 "UMMA split attention requires native split-K O_a"
@@ -3051,7 +3306,7 @@ class ResidentOneLaunchDecode:
                         self.o_rank[group],
                         row_slice=slice(start, start + cfg.o_lora_rank),
                         base_sm=group * 16,
-                        split_k=2,
+                        split_k=o_a_split_k,
                         num_sms=16,
                         wait_group=group_input_ready,
                         release_group=output_join_group,
@@ -3059,6 +3314,19 @@ class ResidentOneLaunchDecode:
                 )
         elif use_split_umma_attention:
             num_splits = (attention_rows + 63) // 64
+            # Keep split-attention production off the early vcores that carry
+            # q_b and then become the first reducer/O_a partition.  The final
+            # vcores are otherwise idle here and fit the complete producer
+            # split, avoiding a producer -> reducer placement tail.
+            producer_base_sm = (
+                self.args.sms - num_splits
+                if self.args.sms >= 152
+                else 0
+            )
+            if producer_base_sm + num_splits > self.args.sms:
+                raise ValueError(
+                    "split-attention producer placement exceeds resident grid"
+                )
             partials = self.attention_partial_workspace[:num_splits]
             metadata = self.attention_metadata_workspace[:num_splits]
             q_tma = TmaTensor(
@@ -3073,7 +3341,7 @@ class ResidentOneLaunchDecode:
             partial_tma = TmaTensor(
                 self.launcher,
                 partials.reshape(num_splits * cfg.num_heads, cfg.head_dim),
-            ).wgmma("store", cfg.num_heads, 128, Major.K)
+            ).rowmajor_2d("store", cfg.num_heads, 128)
             partial_ready_groups = (
                 f"{family.name}.attn.split64.group0.ready",
                 f"{family.name}.attn.split64.group1.ready",
@@ -3088,15 +3356,30 @@ class ResidentOneLaunchDecode:
                 kv_tma=kv_tma,
                 kv_v_tma=kv_v_tma,
                 partial_tma=partial_tma,
+                gate_kv_last_split_only=(
+                    use_grouped_preattention
+                    and kind in ("csa", "hca")
+                    and plan.should_compress
+                ),
             )
             stages.append(
                 self._stage(
                     f"attn.sparse_{kind}.split64_umma",
                     producer,
                     num_splits,
-                    base_sm=self.args.attention_producer_base_sm,
+                    base_sm=producer_base_sm,
                     input_role="q",
                     prefetch_before_wait=True,
+                    wait_group_roles=(
+                        (
+                            (split_attention_q_ready, "q"),
+                            (compressor_output_ready, "kv"),
+                        )
+                        if use_grouped_preattention
+                        and kind in ("csa", "hca")
+                        and plan.should_compress
+                        else ((split_attention_q_ready, "q"),)
+                    ),
                     release_group_roles=(
                         (partial_ready_groups[0], "output0"),
                         (partial_ready_groups[1], "output1"),
@@ -3143,7 +3426,7 @@ class ResidentOneLaunchDecode:
                         self.o_rank[group],
                         row_slice=slice(start, start + cfg.o_lora_rank),
                         base_sm=group * 16,
-                        split_k=2,
+                        split_k=o_a_split_k,
                         num_sms=16,
                         wait_group=group_input_ready,
                         release_group=output_join_group,
@@ -3278,6 +3561,7 @@ class ResidentOneLaunchDecode:
                     split_k=8,
                     num_sms=128,
                     wait_group=o_rank_ready,
+                    release_group=attention_post_input_ready,
                 )
             )
         else:
@@ -3298,9 +3582,9 @@ class ResidentOneLaunchDecode:
                     self.o_rank_fp8,
                     self.o_rank_scale,
                     self.branch,
+                    release_group=attention_post_input_ready,
                 )
             )
-        stages.append(post)
         if self._active_splitk_workspace is not None:
             if self._active_splitk_offset != self._active_splitk_workspace.numel():
                 raise ValueError(
@@ -3308,7 +3592,7 @@ class ResidentOneLaunchDecode:
                 )
             self._active_splitk_workspace = None
             self._active_splitk_offset = 0
-        return stages
+        return stages, post
 
     @staticmethod
     def _row_pointer(tensor: torch.Tensor, row_start: int) -> int:
@@ -3329,7 +3613,9 @@ class ResidentOneLaunchDecode:
         self._hash_rows[layer_id] = row
         return row
 
-    def _build_mxfp_ffn(self, family: LayerFamily) -> list[Stage]:
+    def _build_mxfp_ffn(
+        self, family: LayerFamily
+    ) -> tuple[Stage, list[Stage]]:
         cfg = self.config
         async_reload = (
             runtime_config.async_barrier_reload_enabled
@@ -3433,19 +3719,26 @@ class ResidentOneLaunchDecode:
             linear1_tmas=tuple(layer.linear1_tma for layer in runtime_layers),
             down_tmas=tuple(layer.down_tma for layer in runtime_layers),
         )
-        stages, post = self._hc_stages(
-            family,
-            "ffn",
-            self.next_residual,
-            self.residual,
-            branch=self.mxfp_ffn_output[0],
+        tail_stage, stages = self._fused_attention_ffn_hc_stages(family)
+        post = self._stage(
+            "ffn.hc_post",
+            SchedDsv4HcPost(
+                self.mxfp_ffn_output[0],
+                self.next_residual,
+                self.post,
+                self.comb,
+                self.residual,
+                launcher=self.launcher,
+                packed_coefficients=self.mhc_output_metadata,
+            ),
+            self.policy.hc_post(
+                self.config.hidden_size, self.config.hc_mult
+            ),
         )
         ffn_input_ready = f"{family.name}.ffn.input.ready"
         quant_records_ready = f"{family.name}.ffn.mx.quant.ready"
         router_scores_ready = f"{family.name}.ffn.router.scores.ready"
         resident_input_ready = f"{family.name}.ffn.mx.input.ready"
-        stages[-1] = replace(stages[-1], release_group=ffn_input_ready)
-
         # CTA placements are disjoint at the independent frontier:
         # router [0,128), route 128, split [136,152), and quant [144,152).
         # Quant precedes split on their shared eight CTAs.
@@ -3558,14 +3851,380 @@ class ResidentOneLaunchDecode:
                 post,
             )
         )
-        return stages
+        return tail_stage, stages
 
-    def _build_ffn(self, family: LayerFamily) -> list[Stage]:
+    def _build_ffn(
+        self, family: LayerFamily
+    ) -> tuple[Stage, list[Stage]]:
         return self._build_mxfp_ffn(family)
 
     def _build_family(self, family: LayerFamily) -> list[Stage]:
-        attention = self._build_attention(family)
-        return attention + self._build_ffn(family)
+        attention, _ = self._build_attention(family)
+        tail_stage, ffn = self._build_ffn(family)
+        tail_insert_after = max(
+            index
+            for index, stage in enumerate(attention)
+            if stage.name in {
+                "attn.hc_pre_rms4096",
+                "attn.projections.reset",
+            }
+        )
+        attention.insert(tail_insert_after + 1, tail_stage)
+        return attention + ffn
+
+    def _apply_cross_layer_hc_fusion(
+        self,
+        previous_family: LayerFamily,
+        next_family: LayerFamily,
+    ) -> None:
+        """Fuse each HCA FFN-post into the following CSA projection."""
+        previous_stages = self.family_stages[previous_family.representative]
+        next_stages = self.family_stages[next_family.representative]
+        if previous_stages[-1].name != "ffn.hc_post":
+            raise ValueError("cross-layer mHC fusion requires an FFN-post tail")
+
+        packed_weights, metadata_tails = self._fused_hc_projection_operands(
+            next_family, "attn"
+        )
+        norm_weights = self._family_tensors(next_family, "attn_norm.weight")
+        previous_ffn_ready = f"{previous_family.name}.ffn.input.ready"
+        previous_resident_input_ready = (
+            f"{previous_family.name}.ffn.mx.input.ready"
+        )
+        metadata_ready = f"{next_family.name}.attn.hc.metadata.ready"
+        residual_ready = f"{next_family.name}.attn.hc.residual.ready"
+        attention_input_ready = f"{next_family.name}.attn.input.ready"
+
+        tail_copy = SchedCopy(
+            (
+                TmaLoad1D(metadata_tails[0]),
+                TmaStore1D(self.mhc_fused_metadata_tail),
+            ),
+            size=self.mhc_fused_metadata_tail.numel()
+            * self.mhc_fused_metadata_tail.element_size(),
+        )
+        tail_copy = self._layered(
+            tail_copy,
+            next_family,
+            metadata_tails,
+        )
+        tail_stage = self._stage(
+            "attn.hc_metadata_tail",
+            tail_copy,
+            1,
+            base_sm=self.sms - 1,
+            wait_for_previous=False,
+            wait_group=previous_ffn_ready,
+            release_group=metadata_ready,
+        )
+        previous_pre_index = next(
+            index
+            for index, stage in enumerate(previous_stages)
+            if stage.name == "ffn.hc_pre_rms4096"
+        )
+        packed_record = self.mxfp_ffn_output[:5]
+        residual_pack = SchedCopy(
+            (
+                TmaLoad1D(self.next_residual),
+                TmaStore1D(packed_record[1:]),
+            ),
+            size=(
+                self.next_residual.numel()
+                * self.next_residual.element_size()
+            ),
+        )
+        residual_pack_stage = self._stage(
+            "ffn.hc_post_input_pack",
+            residual_pack,
+            1,
+            base_sm=133,
+            wait_for_previous=False,
+            wait_group=previous_ffn_ready,
+            release_group=previous_resident_input_ready,
+        )
+        previous_stages[previous_pre_index + 1:previous_pre_index + 1] = [
+            tail_stage,
+            residual_pack_stage,
+        ]
+
+        previous_stages.pop()
+        if previous_stages[-1].name != "ffn.mx.resident":
+            raise ValueError(
+                "cross-layer mHC fusion requires a resident FFN tail"
+            )
+
+        project_index = next(
+            index
+            for index, stage in enumerate(next_stages)
+            if stage.name == "attn.hc_project"
+        )
+        if next_stages[project_index + 1].name != "attn.hc_pre_rms4096":
+            raise ValueError(
+                "cross-layer mHC fusion requires adjacent attention project/pre"
+            )
+        del next_stages[project_index:project_index + 2]
+
+        fused_project = SchedDsv4Fp32Bf16Gemv(
+            packed_weights[0],
+            self.residual.reshape(-1),
+            self.mixes,
+            fused_post_input_record=packed_record,
+            fused_post_output=self.residual,
+            fused_partial_metadata=self.mhc_fused_metadata,
+            packed_coefficients=self.mhc_output_metadata,
+            launcher=self.launcher,
+            prefetch_operands_before_resident_reset=True,
+        )
+        fused_project = self._layered(
+            fused_project,
+            next_family,
+            packed_weights,
+        )
+        fused_stage = self._stage(
+            "ffn.hc_post_next_attn.hc_project",
+            fused_project,
+            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+            base_sm=0,
+            input_role="record",
+            prefetch_before_wait=True,
+            prefetch_before_resident_reset=True,
+            release_group_roles=(
+                (metadata_ready, "metadata"),
+                (residual_ready, "residual"),
+            ),
+        )
+
+        pre = SchedDsv4HcPreRms(
+            self.residual,
+            self.mixes,
+            metadata_tails[0][:3],
+            metadata_tails[0][3:27],
+            norm_weights[0],
+            self.norm_hidden,
+            self.post,
+            self.comb,
+            residual_square_sum=self.mhc_fused_residual_square_sum,
+            packed_metadata=self.mhc_fused_metadata,
+            packed_output=self.mhc_packed_output,
+            split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
+        )
+        pre = self._layered(pre, next_family, norm_weights)
+        pre_stage = self._stage(
+            "attn.hc_pre_rms4096",
+            pre,
+            1,
+            base_sm=128,
+            wait_for_previous=False,
+            wait_group_roles=(
+                (metadata_ready, "metadata"),
+                (residual_ready, "residual"),
+            ),
+            release_group=attention_input_ready,
+        )
+        next_stages[project_index:project_index] = [fused_stage, pre_stage]
+
+    def _apply_loopback_hc_fusion(
+        self,
+        layer2_family: LayerFamily,
+        hca_family: LayerFamily,
+        csa_family: LayerFamily,
+    ) -> None:
+        """Fuse layer-2/CSA post work into the following repeated HCA."""
+        layer2_stages = self.family_stages[layer2_family.representative]
+        hca_stages = self.family_stages[hca_family.representative]
+        csa_stages = self.family_stages[csa_family.representative]
+        if (
+            layer2_stages[-1].name != "ffn.hc_post"
+            or csa_stages[-1].name != "ffn.hc_post"
+        ):
+            raise ValueError(
+                "loop-back mHC fusion requires layer-2 and CSA FFN-post tails"
+            )
+
+        packed_record = self.mxfp_ffn_output[:5]
+
+        def replace_post_with_record_pack(
+            family: LayerFamily,
+            stages: list[Stage],
+        ) -> Stage:
+            post_stage = stages.pop()
+            pre_index = next(
+                index
+                for index, stage in enumerate(stages)
+                if stage.name == "ffn.hc_pre_rms4096"
+            )
+            ffn_input_ready = f"{family.name}.ffn.input.ready"
+            resident_input_ready = f"{family.name}.ffn.mx.input.ready"
+            residual_pack = SchedCopy(
+                (
+                    TmaLoad1D(self.next_residual),
+                    TmaStore1D(packed_record[1:]),
+                ),
+                size=(
+                    self.next_residual.numel()
+                    * self.next_residual.element_size()
+                ),
+            )
+            stages[pre_index + 1:pre_index + 1] = [
+                self._stage(
+                    "ffn.hc_post_input_pack",
+                    residual_pack,
+                    1,
+                    base_sm=133,
+                    wait_for_previous=False,
+                    wait_group=ffn_input_ready,
+                    release_group=resident_input_ready,
+                )
+            ]
+            if stages[-1].name != "ffn.mx.resident":
+                raise ValueError(
+                    "loop-back mHC fusion requires a resident FFN tail"
+                )
+            return post_stage
+
+        replace_post_with_record_pack(layer2_family, layer2_stages)
+        csa_post = replace_post_with_record_pack(csa_family, csa_stages)
+        if not isinstance(csa_post.schedule, SchedOverlapAsyncBarrierReload):
+            raise ValueError(
+                "loop-back mHC fusion requires the CSA asynchronous clear tail"
+            )
+        clear_wrapper = csa_post.schedule
+        csa_resident_done = f"{csa_family.name}.ffn.mx.resident.done"
+        if csa_stages[-1].release_group != csa_resident_done:
+            raise ValueError(
+                "loop-back internal clear requires the CSA resident release"
+            )
+        csa_stages[-1] = replace(csa_stages[-1], release_group=None)
+
+        packed_weights, metadata_tails = self._fused_hc_projection_operands(
+            hca_family, "attn"
+        )
+        norm_weights = self._family_tensors(
+            hca_family, "attn_norm.weight"
+        )
+        metadata_ready = f"{hca_family.name}.attn.hc.metadata.ready"
+        residual_ready = f"{hca_family.name}.attn.hc.residual.ready"
+        attention_input_ready = f"{hca_family.name}.attn.input.ready"
+        resident_input_ready = f"{hca_family.name}.ffn.mx.input.ready"
+
+        project_index = next(
+            index
+            for index, stage in enumerate(hca_stages)
+            if stage.name == "attn.hc_project"
+        )
+        if hca_stages[project_index + 1].name != "attn.hc_pre_rms4096":
+            raise ValueError(
+                "loop-back mHC fusion requires adjacent HCA project/pre stages"
+        )
+        del hca_stages[project_index:project_index + 2]
+
+        tail_copy = SchedCopy(
+            (
+                TmaLoad1D(metadata_tails[0]),
+                TmaStore1D(self.mhc_fused_metadata_tail),
+            ),
+            size=(
+                self.mhc_fused_metadata_tail.numel()
+                * self.mhc_fused_metadata_tail.element_size()
+            ),
+        )
+        tail_copy = self._layered(
+            tail_copy,
+            hca_family,
+            metadata_tails,
+        )
+        tail_stage = self._stage(
+            "attn.hc_metadata_tail",
+            tail_copy,
+            1,
+            base_sm=self.sms - 1,
+            release_group=metadata_ready,
+        )
+
+        fused_project = SchedDsv4Fp32Bf16Gemv(
+            packed_weights[0],
+            self.residual.reshape(-1),
+            self.mixes,
+            fused_post_input_record=packed_record,
+            fused_post_output=self.residual,
+            fused_partial_metadata=self.mhc_fused_metadata,
+            packed_coefficients=self.mhc_output_metadata,
+            launcher=self.launcher,
+            profile_operands=self.args.profile_loopback_boundary,
+        )
+        fused_project = self._layered(
+            fused_project,
+            hca_family,
+            packed_weights,
+        )
+        fused_project = SchedOverlapAsyncBarrierReload(
+            fused_project,
+            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+            clear_wrapper.bar_source,
+            clear_wrapper.first_bar,
+            clear_wrapper.count,
+            132,
+            clear_wrapper.workers,
+            special_slot=clear_wrapper.special_slot,
+            clear_input_role="metadata",
+            skip_initial_loop=True,
+        )
+        fused_stage = self._stage(
+            "ffn.hc_post_next_attn.hc_project",
+            fused_project,
+            132 + clear_wrapper.workers,
+            base_sm=0,
+            wait_for_previous=False,
+            parallel_with_previous=True,
+            release_group_roles=(
+                (metadata_ready, "metadata"),
+                (residual_ready, "residual"),
+                (resident_input_ready, "clear"),
+            ),
+        )
+
+        pre = SchedDsv4HcPreRms(
+            self.residual,
+            self.mixes,
+            metadata_tails[0][:3],
+            metadata_tails[0][3:27],
+            norm_weights[0],
+            self.norm_hidden,
+            self.post,
+            self.comb,
+            residual_square_sum=self.mhc_fused_residual_square_sum,
+            packed_metadata=self.mhc_fused_metadata,
+            packed_output=self.mhc_packed_output,
+            split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
+        )
+        pre = self._layered(pre, hca_family, norm_weights)
+        pre_stage = self._stage(
+            "attn.hc_pre_rms4096",
+            pre,
+            1,
+            base_sm=128,
+            wait_for_previous=False,
+            wait_group_roles=(
+                (metadata_ready, "metadata"),
+                (residual_ready, "residual"),
+            ),
+            release_group=attention_input_ready,
+        )
+        hca_stages[project_index:project_index] = [
+            tail_stage,
+            fused_stage,
+            pre_stage,
+        ]
+
+        self.head_stages.insert(
+            0,
+            self._stage(
+                "head.final_hc_post",
+                clear_wrapper.inner,
+                clear_wrapper.inner_sms,
+                base_sm=0,
+            ),
+        )
 
     def _build_head(self) -> list[Stage]:
         cfg = self.config
@@ -3573,11 +4232,19 @@ class ResidentOneLaunchDecode:
         head_scale = self._tensor("hc_head_scale")
         head_base = self._tensor("hc_head_base")
         self.head_mixes = torch.empty((4,), dtype=torch.float32, device=self.device)
+        self.fp8_head = (
+            not self.args.bf16_head and self.args.vocab_size == cfg.vocab_size
+        )
+        self.bf16_umma_head = (
+            self.args.bf16_head and self.args.vocab_size == cfg.vocab_size
+        )
+        self.compact_head = self.fp8_head or self.bf16_umma_head
         self.head_norm = torch.empty(
-            (cfg.hidden_size,), dtype=torch.bfloat16, device=self.device
+            ((8, cfg.hidden_size) if self.bf16_umma_head else (cfg.hidden_size,)),
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         self.head_norm_oracle = None
-        self.fp8_head = self.args.vocab_size == cfg.vocab_size
         self.fp8_head_activation_oracle = None
         self.logits = torch.empty(
             (self.args.vocab_size,), dtype=torch.bfloat16, device=self.device
@@ -3598,9 +4265,10 @@ class ResidentOneLaunchDecode:
                     head_scale,
                     head_base,
                     self._tensor("norm.weight"),
-                    self.head_norm,
+                    self.head_norm[0] if self.bf16_umma_head else self.head_norm,
                     rms_epsilon=cfg.rms_epsilon,
                 ),
+                1,
             ),
         ]
         head_weight = self._tensor("head.weight")[: self.args.vocab_size]
@@ -3691,6 +4359,142 @@ class ResidentOneLaunchDecode:
             )
             return stages
 
+        if self.bf16_umma_head:
+            # Reuse the retained four-output BF16 LM-head task.  The hardware
+            # UMMA atom is N8.  The preceding small mHC-head/RMS task emits
+            # only row zero; the other seven physical rows remain
+            # uninitialized and are ignored.  The ordinary K-major TMA path
+            # still performs the proven swizzled N8 load.
+            epoch_rows = (
+                128
+                * Gemv_M128N8Direct4.MNK[0]
+                * Gemv_M128N8Direct4.output_groups
+            )
+            num_epochs = math.ceil(self.args.vocab_size / epoch_rows)
+            padded_rows = num_epochs * epoch_rows
+            if padded_rows % (128 * Gemv_M128N8Direct4.output_groups):
+                raise AssertionError("BF16 LM-head epochs must contain M512 groups")
+            print(
+                "DSV4_HEAD_PREPROCESS status=START "
+                f"rows={self.args.vocab_size} padded_rows={padded_rows} "
+                f"k={cfg.hidden_size} format=bf16_tile_major_group4",
+                flush=True,
+            )
+            preprocess_started = time.monotonic()
+            epoch_weights = []
+            for epoch in range(num_epochs):
+                row_start = epoch * epoch_rows
+                row_end = min(row_start + epoch_rows, self.args.vocab_size)
+                source = head_weight[row_start:row_end]
+                if source.shape[0] != epoch_rows:
+                    padded = torch.empty(
+                        (epoch_rows, cfg.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    # Duplicate a real vocabulary row into the padding.
+                    # Equal-value argmax ties select the smaller absolute
+                    # index, so padded rows cannot replace their source row.
+                    padded[:] = head_weight[0]
+                    padded[: source.shape[0]].copy_(source)
+                    source = padded
+                epoch_weights.append(pack_weight_tile_major(source, 128, 128))
+            self.head_weight_bf16_packed = tuple(epoch_weights)
+            activation_tma = TmaTensor(
+                self.launcher, self.head_norm
+            ).wgmma_load(
+                Gemv_M128N8Direct4.MNK[1],
+                Gemv_M128N8Direct4.MNK[2]
+                * Gemv_M128N8Direct4.n_batch,
+                Major.K,
+            )
+            weight_tmas = tuple(
+                TmaTensor(self.launcher, weight).wgmma_load_tiled(128, 128)
+                for weight in self.head_weight_bf16_packed
+            )
+            self.head_logits_bf16 = torch.empty(
+                (num_epochs, 8, epoch_rows),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            argmax_sms = self.sms - 128
+            self.head_argmax_partial = torch.empty(
+                (num_epochs * argmax_sms, 16),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self.output_token = torch.empty(
+                (1,), dtype=torch.int64, device=self.device
+            )
+            input_ready = "head.bf16.input.ready"
+            partial_ready = "head.bf16.partial.ready"
+            logits_ready = tuple(
+                f"head.bf16.logits.epoch{epoch}.ready"
+                for epoch in range(num_epochs)
+            )
+            stages[-1] = replace(stages[-1], release_group=input_ready)
+            for epoch, weight_tma in enumerate(weight_tmas):
+                stages.append(
+                    self._stage(
+                        f"head.logits.bf16_umma.epoch{epoch}",
+                        SchedGemvMGroup(
+                            Gemv_M128N8Direct4,
+                            (epoch_rows, 8, cfg.hidden_size),
+                            (weight_tma, activation_tma),
+                            self.head_logits_bf16[epoch],
+                            group=False,
+                        ),
+                        128,
+                        base_sm=0,
+                        wait_for_previous=False,
+                        wait_group=input_ready,
+                        release_group=logits_ready[epoch],
+                    )
+                )
+            for epoch in range(num_epochs):
+                real_rows = min(
+                    epoch_rows,
+                    self.args.vocab_size - epoch * epoch_rows,
+                )
+                partial_base = epoch * argmax_sms
+                stages.append(
+                    self._stage(
+                        f"head.argmax.bf16_umma.epoch{epoch}",
+                        SchedArgmaxSmemPartial(
+                            self.head_logits_bf16[epoch, 0, :real_rows],
+                            self.head_argmax_partial[
+                                partial_base : partial_base + argmax_sms
+                            ],
+                            index_base=epoch * epoch_rows,
+                        ),
+                        argmax_sms,
+                        base_sm=128,
+                        wait_for_previous=False,
+                        wait_group=logits_ready[epoch],
+                        release_group=partial_ready,
+                    )
+                )
+            stages.append(
+                self._stage(
+                    "head.argmax.bf16_umma",
+                    SchedArgmaxSmemReduce(
+                        self.head_argmax_partial,
+                        self.output_token,
+                    ),
+                    1,
+                    base_sm=128,
+                    wait_for_previous=False,
+                    wait_group=partial_ready,
+                )
+            )
+            print(
+                "DSV4_HEAD_PREPROCESS status=PASS "
+                f"weight_gib={sum(weight.numel() * weight.element_size() for weight in self.head_weight_bf16_packed) / (1 << 30):.3f} "
+                f"elapsed_s={time.monotonic() - preprocess_started:.3f}",
+                flush=True,
+            )
+            return stages
+
         stages.append(
             self._stage(
                 "head.logits",
@@ -3710,6 +4514,7 @@ class ResidentOneLaunchDecode:
             2 if runtime_config.async_barrier_reload_enabled else 1
         )
         self.stage_profile_labels: list[str] = []
+        self.head_profile_labels: list[str] = []
         self.step_profile_records: list[tuple[int, str, int, int, int]] = []
         self.step_profile_begin_events: dict[int, int] = {}
         self.step_profile_total = 0
@@ -3746,6 +4551,8 @@ class ResidentOneLaunchDecode:
         def aggregate_category(name: str) -> str | None:
             exact = {
                 "ffn.hc_project": "hc_project",
+                "attn.hc_post_ffn.hc_project": "hc_project",
+                "ffn.hc_post_next_attn.hc_project": "hc_project",
                 "ffn.hc_pre_rms4096": "hc_pre_rms",
                 "ffn.hidden.quant_mxfp8": "hidden_quant",
                 "ffn.hidden.split_mxfp8": "hidden_quant",
@@ -3787,10 +4594,12 @@ class ResidentOneLaunchDecode:
                 "attn.o_a.g7",
                 "attn.o_b",
                 "attn.hc_post",
+                "attn.hc_post_ffn.hc_project",
                 "ffn.hc_pre",
                 "ffn.route.prepared",
                 "ffn.mx.resident",
                 "ffn.hc_post",
+                "ffn.hc_post_input_pack",
             }:
                 return True
             return False
@@ -3827,6 +4636,7 @@ class ResidentOneLaunchDecode:
                 input_role=stage.input_role,
                 profile_after=profile_after,
                 wait_for_previous=stage.wait_for_previous,
+                parallel_with_previous=stage.parallel_with_previous,
                 wait_group=group_name(stage.wait_group),
                 release_group=group_name(stage.release_group),
                 profile_step_event=profile_step_event,
@@ -3835,6 +4645,9 @@ class ResidentOneLaunchDecode:
                 profile_span_begin=profile_span_begin,
                 profile_span_end=profile_span_end,
                 prefetch_before_wait=stage.prefetch_before_wait,
+                prefetch_before_resident_reset=(
+                    stage.prefetch_before_resident_reset
+                ),
                 wait_group_roles=tuple(
                     (group_name(group), role)
                     for group, role in stage.wait_group_roles
@@ -3854,8 +4667,20 @@ class ResidentOneLaunchDecode:
             stages = self.family_stages[family.representative]
             self.step_profile_total = len(stages)
             profile_step_family = (
-                len(self.families) == 1
-                or self.profile_layer_ids[-1] in family.layer_ids
+                family is self.families[0]
+                if self.args.profile_fp8_coupled_detail
+                else
+                (
+                    self.args.profile_step_family == "hca"
+                    and self.config.attention_kind(family.representative)
+                    == "hca"
+                    and family.representative >= self.config.num_hash_layers
+                )
+                if self.args.profile_step_family != "last"
+                else (
+                    len(self.families) == 1
+                    or self.profile_layer_ids[-1] in family.layer_ids
+                )
             )
             queued_stages = []
             for index, stage in enumerate(stages):
@@ -3885,8 +4710,13 @@ class ResidentOneLaunchDecode:
                     )
                 step_begin_event = None
                 if step_event is not None and self.args.profile_step_frontiers:
+                    frontier_base = (
+                        LOOPBACK_PROFILE_FRONTIER_BASE
+                        if self.args.profile_loopback_boundary
+                        else STEP_PROFILE_FRONTIER_BASE
+                    )
                     step_begin_event = (
-                        STEP_PROFILE_FRONTIER_BASE
+                        frontier_base
                         + index
                         - self.args.profile_step_start
                     )
@@ -3903,6 +4733,9 @@ class ResidentOneLaunchDecode:
                         span_begin = self.phase_aggregate_events["attention"]
                     elif stage.name == "attn.hc_post":
                         span_end = self.phase_aggregate_events["attention"]
+                    elif stage.name == "attn.hc_post_ffn.hc_project":
+                        span_begin = self.phase_aggregate_events["ffn"]
+                        span_end = self.phase_aggregate_events["attention"]
                     elif stage.name == "ffn.hc_project":
                         span_begin = self.phase_aggregate_events["ffn"]
                     elif stage.name == "ffn.hc_post":
@@ -3918,7 +4751,13 @@ class ResidentOneLaunchDecode:
                             or self.args.profile_mxfp_ffn_detail
                         )
                         and index + 1 == len(stages)
-                    ) or stage_profile_after,
+                    )
+                    or stage_profile_after
+                    or (
+                        self.args.profile_loopback_boundary
+                        and family is self.families[3]
+                        and index + 1 == len(stages)
+                    ),
                     profile_step_event=step_event,
                     profile_step_begin_event=(
                         step_begin_event
@@ -3926,7 +4765,7 @@ class ResidentOneLaunchDecode:
                         else (
                             FP8_COUPLED_STEP_BEGIN_EVENT
                             if self.args.profile_fp8_coupled_detail
-                            and stage.name == "attn.q_a.partial"
+                            and stage.name == "attn.q_b"
                             else (
                                 FP8_COUPLED_LAYER_BEGIN_EVENT
                                 if self.args.profile_fp8_coupled_detail
@@ -3954,6 +4793,61 @@ class ResidentOneLaunchDecode:
                     )
             return queued_stages
 
+        def queued_head() -> list[SequentialStage]:
+            queued_stages = []
+            head_step_base = self.step_profile_total
+            for index, stage in enumerate(self.head_stages):
+                profile_after = (
+                    self.args.profile_layers
+                    and index + 1 < len(self.head_stages)
+                )
+                if profile_after:
+                    self.head_profile_labels.append(stage.name)
+                step_index = head_step_base + index
+                step_event = None
+                if (
+                    self.args.profile_steps
+                    and self.args.profile_step_family == "last"
+                    and self.args.profile_step_start
+                    <= step_index
+                    < self.args.profile_step_start + self.args.profile_step_count
+                ):
+                    step_event = (
+                        STEP_PROFILE_EVENT_BASE
+                        + step_index
+                        - self.args.profile_step_start
+                    )
+                step_begin_event = None
+                if step_event is not None and self.args.profile_step_frontiers:
+                    step_begin_event = (
+                        STEP_PROFILE_FRONTIER_BASE
+                        + step_index
+                        - self.args.profile_step_start
+                    )
+                queued_stage = queued(
+                    stage,
+                    profile_after=profile_after,
+                    profile_step_event=step_event,
+                    profile_step_begin_event=step_begin_event,
+                )
+                queued_stages.append(queued_stage)
+                if step_event is not None:
+                    if step_begin_event is not None:
+                        self.step_profile_begin_events[step_index] = (
+                            step_begin_event
+                        )
+                    self.step_profile_records.append(
+                        (
+                            step_index,
+                            stage.name,
+                            step_event,
+                            queued_stage.base_sm,
+                            queued_stage.num_sms,
+                        )
+                    )
+            self.step_profile_total = head_step_base + len(self.head_stages)
+            return queued_stages
+
         self.launcher.i(
             SchedDsv4PreloadRopeTables(self.resident_rope_tables).place(
                 self.sms
@@ -3969,7 +4863,7 @@ class ResidentOneLaunchDecode:
             stages[-1] = replace(
                 stages[-1], reset_mxfp_resident_after=True
             )
-            stages.extend(queued(stage) for stage in self.head_stages)
+            stages.extend(queued_head())
             self.program = SequentialProgram(
                 self.launcher,
                 stages,
@@ -4002,7 +4896,7 @@ class ResidentOneLaunchDecode:
                 group_namespace="unroll1.",
             )
             stages = first_stages + second_stages
-            stages.extend(queued(stage) for stage in self.head_stages)
+            stages.extend(queued_head())
             self.program = SequentialProgram(
                 self.launcher,
                 stages,
@@ -4020,7 +4914,7 @@ class ResidentOneLaunchDecode:
                     for iteration in range(len(self.profile_layer_ids))
                     for label in labels
                 ]
-            head_stages = [queued(stage) for stage in self.head_stages]
+            head_stages = queued_head()
             blocks = [
                 SequentialBlock(
                     family.name,
@@ -4064,7 +4958,7 @@ class ResidentOneLaunchDecode:
                     for pair_index in range(self.args.two_layer_pair_repeats)
                     for label in labels
                 ]
-            head_stages = [queued(stage) for stage in self.head_stages]
+            head_stages = queued_head()
             blocks = [
                 SequentialBlock(
                     f"{first_family.name}.{second_family.name}",
@@ -4080,6 +4974,9 @@ class ResidentOneLaunchDecode:
                     elide_terminal_reload=bool(head_stages),
                     async_reload_after=(
                         runtime_config.async_barrier_reload_enabled
+                    ),
+                    async_reload_worker_base=(
+                        132 if self.args.loopback_hc_fusion else 32
                     ),
                 ),
             ]
@@ -4104,7 +5001,7 @@ class ResidentOneLaunchDecode:
                 hca_stages[-1], reset_mxfp_resident_after=True
             )
             pair_stages = hca_stages + queued_family(csa)
-            head_stages = [queued(stage) for stage in self.head_stages]
+            head_stages = queued_head()
             blocks = [
                 SequentialBlock(
                     swa.name,
@@ -4134,6 +5031,9 @@ class ResidentOneLaunchDecode:
                     elide_terminal_reload=bool(head_stages),
                     async_reload_after=(
                         runtime_config.async_barrier_reload_enabled
+                    ),
+                    async_reload_worker_base=(
+                        132 if self.args.loopback_hc_fusion else 32
                     ),
                 ),
             ]
@@ -4191,10 +5091,11 @@ class ResidentOneLaunchDecode:
         )
         if (
             self.args.profile_layers
-            and self.program.profile_event_count != len(self.profile_layer_ids)
+            and self.program.profile_event_count
+            != len(self.profile_layer_ids) + len(self.head_profile_labels)
         ):
             raise AssertionError(
-                "internal layer counter does not cover every requested layer"
+                "internal layer/head counter does not cover every requested boundary"
             )
         if (
             self.args.profile_stages
@@ -4266,8 +5167,8 @@ class ResidentOneLaunchDecode:
         self.launcher.launch(synchronize=False)
         end.record()
         end.synchronize()
-        if self.fp8_head:
-            return int(self.output_token.item()), start.elapsed_time(end), torch.empty(0)
+        if self.compact_head:
+            return int(self.output_token[0].item()), start.elapsed_time(end), torch.empty(0)
         logits_cpu = self.logits.cpu()
         logits_fp32 = logits_cpu.float()
         if not bool(torch.isfinite(logits_fp32).all().item()):
@@ -4284,25 +5185,50 @@ class ResidentOneLaunchDecode:
             raise RuntimeError("device termination frontier precedes startup")
         return (end - start) / 1.0e6
 
-    def validate_fp8_head(
+    def validate_compact_head(
         self, token: int, *, require_reference: bool = True
     ) -> None:
-        if not self.fp8_head:
+        if not self.compact_head:
             return
+        active_head_norm = (
+            self.head_norm[0] if self.bf16_umma_head else self.head_norm
+        )
         if self.head_norm_oracle is not None and not torch.equal(
-            self.head_norm, self.head_norm_oracle
+            active_head_norm, self.head_norm_oracle
         ):
-            mismatch = self.head_norm != self.head_norm_oracle
+            mismatch = active_head_norm != self.head_norm_oracle
             first = int(mismatch.nonzero()[0].item())
-            delta = (self.head_norm.float() - self.head_norm_oracle.float()).abs()
+            delta = (
+                active_head_norm.float() - self.head_norm_oracle.float()
+            ).abs()
             raise AssertionError(
                 "BF16 head input changed between launches: "
                 f"mismatches={int(mismatch.count_nonzero().item())} "
                 f"max_abs={float(delta.max().item()):.6f} "
                 f"first_index={first} "
-                f"actual={float(self.head_norm[first].item()):.6f} "
+                f"actual={float(active_head_norm[first].item()):.6f} "
                 f"expected={float(self.head_norm_oracle[first].item()):.6f}"
             )
+        if self.bf16_umma_head:
+            reference_logits = torch.mv(
+                self._tensor("head.weight")[: self.config.vocab_size],
+                self.head_norm[0],
+            )
+            reference_token = int(torch.argmax(reference_logits).item())
+            if token != reference_token and require_reference:
+                raise AssertionError(
+                    "BF16 UMMA head selects "
+                    f"token {token}, reference BF16 GEMV selects "
+                    f"{reference_token}"
+                )
+            print(
+                "DSV4_HEAD_REFERENCE "
+                f"status={'PASS' if token == reference_token else 'DIAGNOSTIC'} "
+                f"output_token={token} reference_token={reference_token} "
+                "format=bf16_umma_group4",
+                flush=True,
+            )
+            return
         if self.fp8_head_activation_oracle is not None and not torch.equal(
             self.head_input_native_fp8, self.fp8_head_activation_oracle
         ):
@@ -4538,6 +5464,7 @@ class ResidentOneLaunchDecode:
                 f"routing={'hash' if layer_id < self.config.num_hash_layers else 'score'} "
                 f"stages={len(self.family_stages[family.representative])} "
                 f"elapsed_ms={elapsed / 1.0e6:.6f} "
+                f"frontier_us={(boundary - start_frontier) / 1.0e3:.3f} "
                 f"frontier_spread_us={spread / 1.0e3:.3f} "
                 f"frontier_vcore={frontier_vcore} "
                 f"frontier_physical_sm={physical_sm_ids[frontier_vcore]}",
@@ -4567,7 +5494,42 @@ class ResidentOneLaunchDecode:
                         flush=True,
                     )
                 reload_index += 1
-        head_elapsed = end_frontier - previous
+        head_start = previous
+        head_event_base = (
+            runtime_config.layer_profile_event_base + len(profile_layer_ids)
+        )
+        for index, label in enumerate(self.head_profile_labels):
+            values = [
+                int(value) for value in profile[:, head_event_base + index]
+            ]
+            if any(value == 0 for value in values):
+                raise RuntimeError(
+                    f"head profile boundary {label!r} was not recorded"
+                )
+            boundary = max(values)
+            elapsed = boundary - previous
+            if elapsed < 0:
+                raise RuntimeError("head profile frontiers are not monotonic")
+            print(
+                "DSV4_HEAD_STAGE_TIME "
+                f"stage={label} elapsed_ms={elapsed / 1.0e6:.6f} "
+                f"frontier_spread_us={(max(values) - min(values)) / 1.0e3:.3f}",
+                flush=True,
+            )
+            previous = boundary
+        if self.head_stages:
+            end_values = [int(value) for value in profile[:, 1]]
+            final_head_elapsed = end_frontier - previous
+            if final_head_elapsed < 0:
+                raise RuntimeError("head termination frontier is not monotonic")
+            print(
+                "DSV4_HEAD_STAGE_TIME "
+                f"stage={self.head_stages[-1].name} "
+                f"elapsed_ms={final_head_elapsed / 1.0e6:.6f} "
+                f"frontier_spread_us={(max(end_values) - min(end_values)) / 1.0e3:.3f}",
+                flush=True,
+            )
+        head_elapsed = end_frontier - head_start
         if head_elapsed < 0:
             raise RuntimeError("head profile frontier precedes the final layer")
         grid_envelope = internal_span * profile.shape[0]
@@ -4721,6 +5683,52 @@ class ResidentOneLaunchDecode:
             for vcore in range(profile.shape[0])
         ]
         grid_start = max(int(value) for value in profile[:, 0])
+        if self.args.profile_loopback_boundary:
+            # The last recorded HCA step belongs to layer 41.  Its preceding
+            # loop iteration completed at CSA layer 40, the nineteenth of the
+            # twenty repeated CSA boundaries recorded below.
+            boundary_event = (
+                runtime_config.layer_profile_event_base
+                + LOOPBACK_PROFILE_CSA_COMPLETIONS
+                - 2
+            )
+            boundary_values = [
+                int(value) for value in profile[:, boundary_event]
+            ]
+            if any(value == 0 for value in boundary_values):
+                raise RuntimeError(
+                    "loopback boundary profile did not record CSA layer 40"
+                )
+            boundary = max(boundary_values)
+            print(
+                "DSV4_LOOPBACK_BOUNDARY "
+                "previous_layer=40 next_layer=41 "
+                f"frontier_us={(max(boundary_values) - grid_start) / 1.0e3:.3f} "
+                f"frontier_spread_us={(max(boundary_values) - min(boundary_values)) / 1.0e3:.3f} "
+                f"sample_index={sample_index if sample_index is not None else -1}",
+                flush=True,
+            )
+            operand_frontiers = []
+            operand_spreads = []
+            for event in range(25, 30):
+                values = [int(profile[sm, event]) for sm in range(128)]
+                if any(value == 0 for value in values):
+                    raise RuntimeError(
+                        f"loopback operand event {event} was not recorded"
+                    )
+                operand_frontiers.append((max(values) - boundary) / 1.0e3)
+                operand_spreads.append((max(values) - min(values)) / 1.0e3)
+            print(
+                "DSV4_LOOPBACK_OPERANDS "
+                f"enter_us={operand_frontiers[0]:.3f} "
+                f"weight_us={operand_frontiers[1]:.3f} "
+                f"coefficients_us={operand_frontiers[2]:.3f} "
+                f"record_us={operand_frontiers[3]:.3f} "
+                f"all_inputs_us={operand_frontiers[4]:.3f} "
+                f"record_spread_us={operand_spreads[3]:.3f} "
+                f"sample_index={sample_index if sample_index is not None else -1}",
+                flush=True,
+            )
         placement_signature_vcores = (0, 1, 2, 3, 16, 31, 101, 116)
         for (
             step_index,
@@ -4824,6 +5832,50 @@ class ResidentOneLaunchDecode:
                 f"{frontier_summary}",
                 flush=True,
             )
+            if (
+                self.args.profile_loopback_boundary
+                and name == "ffn.hc_post_next_attn.hc_project"
+                and self.args.profile_step_frontiers
+            ):
+                operand_events = tuple(
+                    [int(profile[sm, event]) for event in range(25, 30)]
+                    for sm in elapsed_by_sm
+                )
+                operand_by_sm = {
+                    sm: values
+                    for sm, values in zip(elapsed_by_sm, operand_events)
+                }
+                latest = sorted(
+                    (
+                        (
+                            timestamp + elapsed_by_sm[sm][0],
+                            sm,
+                            timestamp,
+                            elapsed_by_sm[sm][1],
+                            elapsed_by_sm[sm][0],
+                        )
+                        for sm, timestamp in begin_samples
+                    ),
+                    reverse=True,
+                )[:12]
+                print(
+                    "DSV4_LOOPBACK_PROJECTION_TAIL "
+                    "end_rank="
+                    + ",".join(
+                        f"{sm}:{physical_sm_ids[sm]}:"
+                        f"{(begin - boundary) / 1.0e3:.3f}:"
+                        f"{(operand_by_sm[sm][1] - boundary) / 1.0e3:.3f}:"
+                        f"{(operand_by_sm[sm][3] - boundary) / 1.0e3:.3f}:"
+                        f"{wait_ns / 1.0e3:.3f}:"
+                        f"{(elapsed_ns - wait_ns) / 1.0e3:.3f}:"
+                        f"{(end - boundary) / 1.0e3:.3f}"
+                        for end, sm, begin, wait_ns, elapsed_ns in latest
+                    )
+                    + " fields=vcore:physical_sm:begin_us:weight_us:record_us:"
+                    "m2c_wait_us:active_us:end_us"
+                    f" sample_index={sample_index if sample_index is not None else -1}",
+                    flush=True,
+                )
         resident_step_indices = [
             step_index
             for step_index, name, _, _, _ in self.step_profile_records
@@ -5111,7 +6163,7 @@ class ResidentOneLaunchDecode:
         q_record = next(
             record
             for record in self.step_profile_records
-            if record[1] == "attn.q_a.partial"
+            if record[1] == "attn.q_b"
         )
         _, _, step_event, base_sm, num_sms = q_record
         ldu_base = runtime_config.detail_profile_event_base
@@ -5301,6 +6353,90 @@ class ResidentOneLaunchDecode:
 
         def values(name: str) -> list[int]:
             return [int(record[name]) for record in records]
+
+        # This diagnostic is temporarily armed on the K1024 Q-b stream.  It
+        # intentionally bypasses the older Q-a/hidden-quant handoff report,
+        # whose producer mapping does not describe Q-b.
+        critical = max(records, key=lambda record: record["step"])
+        critical_tail = sorted(
+            records,
+            key=lambda record: record["step_active"],
+            reverse=True,
+        )[:12]
+        print(
+            "DSV4_FP8_COUPLED_DETAIL "
+            "stage=attn.q_b "
+            f"active_sms={len(records)} "
+            f"step_us={max(values('step')) / 1.0e3:.3f} "
+            f"step_median_us={statistics.median(values('step')) / 1.0e3:.3f} "
+            f"m2c_wait_us={critical['step_wait'] / 1.0e3:.3f} "
+            f"compute_active_us={critical['step_active'] / 1.0e3:.3f} "
+            f"compute_active_median_us="
+            f"{statistics.median(values('step_active')) / 1.0e3:.3f} "
+            f"critical_sm={critical['sm']} "
+            f"critical_ldu0_begin_us={critical['ldu0_begin'] / 1.0e3:.3f} "
+            f"critical_ldu1_begin_us={critical['ldu1_begin'] / 1.0e3:.3f} "
+            f"critical_ldu0_service_us={critical['ldu0_service'] / 1.0e3:.3f} "
+            f"critical_ldu1_service_us={critical['ldu1_service'] / 1.0e3:.3f} "
+            f"critical_post_issue_tail_us="
+            f"{critical['post_issue_tail'] / 1.0e3:.3f} "
+            "top_sm:active_us:ldu0_begin_us:ldu0_service_us:"
+            "ldu1_begin_us:ldu1_service_us:post_issue_us="
+            + ",".join(
+                f"{record['sm']}:{record['step_active'] / 1.0e3:.3f}:"
+                f"{record['ldu0_begin'] / 1.0e3:.3f}:"
+                f"{record['ldu0_service'] / 1.0e3:.3f}:"
+                f"{record['ldu1_begin'] / 1.0e3:.3f}:"
+                f"{record['ldu1_service'] / 1.0e3:.3f}:"
+                f"{record['post_issue_tail'] / 1.0e3:.3f}"
+                for record in critical_tail
+            ),
+            flush=True,
+        )
+        for port in range(2):
+            print(
+                "DSV4_FP8_COUPLED_SOURCE_LOAD "
+                f"port={port} "
+                f"command_begin_min_us={min(values(f'ldu{port}_begin')) / 1.0e3:.3f} "
+                f"command_begin_median_us="
+                f"{statistics.median(values(f'ldu{port}_begin')) / 1.0e3:.3f} "
+                f"command_begin_max_us={max(values(f'ldu{port}_begin')) / 1.0e3:.3f} "
+                f"gate_wait_median_us="
+                f"{statistics.median(values(f'ldu{port}_gate_wait')) / 1.0e3:.3f} "
+                f"source_wait_median_us="
+                f"{statistics.median(values(f'ldu{port}_source_wait')) / 1.0e3:.3f} "
+                f"service_median_us="
+                f"{statistics.median(values(f'ldu{port}_service')) / 1.0e3:.3f}",
+                flush=True,
+            )
+        for band_start in range(0, len(records), 32):
+            band = records[band_start : band_start + 32]
+            print(
+                "DSV4_FP8_COUPLED_BAND "
+                f"start_sm={band_start} stop_sm={band_start + len(band)} "
+                f"active_median_us="
+                f"{statistics.median(record['step_active'] for record in band) / 1.0e3:.3f} "
+                f"active_max_us="
+                f"{max(record['step_active'] for record in band) / 1.0e3:.3f} "
+                f"ldu0_service_median_us="
+                f"{statistics.median(record['ldu0_service'] for record in band) / 1.0e3:.3f} "
+                f"ldu1_service_median_us="
+                f"{statistics.median(record['ldu1_service'] for record in band) / 1.0e3:.3f} "
+                f"ldu0_pair0_wait_median_us="
+                f"{statistics.median(record['ldu0_pair0_wait'] for record in band) / 1.0e3:.3f} "
+                f"ldu0_pair1_wait_median_us="
+                f"{statistics.median(record['ldu0_pair1_wait'] for record in band) / 1.0e3:.3f} "
+                f"ldu1_pair0_wait_median_us="
+                f"{statistics.median(record['ldu1_pair0_wait'] for record in band) / 1.0e3:.3f} "
+                f"ldu1_pair1_wait_median_us="
+                f"{statistics.median(record['ldu1_pair1_wait'] for record in band) / 1.0e3:.3f} "
+                f"phase0={sorted(set(record['ldu0_phase_base'] for record in band))} "
+                f"phase1={sorted(set(record['ldu1_phase_base'] for record in band))} "
+                f"post_issue_median_us="
+                f"{statistics.median(record['post_issue_tail'] for record in band) / 1.0e3:.3f}",
+                flush=True,
+            )
+        return
 
         quant_store_event = ldu_base + 24
         quant_sms = self.config.hidden_size // 256
@@ -5526,7 +6662,7 @@ class ResidentOneLaunchDecode:
         )[:8]
         print(
             "DSV4_FP8_COUPLED_DETAIL "
-            "stage=attn.q_a.partial "
+            "stage=attn.q_b "
             f"active_sms={len(records)} "
             f"step_us={max(values('step')) / 1.0e3:.3f} "
             f"step_median_us={statistics.median(values('step')) / 1.0e3:.3f} "
@@ -5656,11 +6792,19 @@ class ResidentOneLaunchDecode:
             raise RuntimeError(
                 "attention detail profiling requires track_profile=1"
             )
-        family = self.families[0]
+        # Attention-detail events are overwritten by each execution of the
+        # same physical producer SMs.  In a two-layer diagnostic the retained
+        # records therefore belong to the final family, which is also the
+        # production HCA -> CSA handoff we need to inspect.
+        family = self.families[-1]
         kind = self.config.attention_kind(family.representative)
         rows = self.attention_indices_by_kind[kind].numel()
         num_splits = (rows + 63) // 64
-        producer_base = self.args.attention_producer_base_sm
+        producer_base = (
+            self.args.sms - num_splits
+            if self.args.sms >= 152
+            else 0
+        )
         detail = profile[producer_base : producer_base + num_splits].numpy()
         detail_base = runtime_config.detail_profile_event_base
         event_names = (
@@ -5671,15 +6815,23 @@ class ResidentOneLaunchDecode:
             (6, "softmax"),
             (20, "metadata"),
             (7, "pv0-done"),
+            (30, "pv0-alloc"),
+            (34, "pv0-tmem"),
             (8, "pv0-store"),
             (9, "pv0-reuse"),
             (10, "pv1-done"),
+            (31, "pv1-alloc"),
+            (35, "pv1-tmem"),
             (11, "pv1-store"),
             (12, "pv1-reuse"),
             (13, "pv2-done"),
+            (32, "pv2-alloc"),
+            (36, "pv2-tmem"),
             (14, "pv2-store"),
             (15, "pv2-reuse"),
             (16, "pv3-done"),
+            (33, "pv3-alloc"),
+            (37, "pv3-tmem"),
             (17, "pv3-store"),
             (18, "pv3-reuse"),
             (19, "published"),
@@ -5726,6 +6878,97 @@ class ResidentOneLaunchDecode:
             + f" sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
             flush=True,
         )
+        q_store_before = [
+            int(value) & 0xFFFFFFFF
+            for value in profile[: self.config.num_heads, detail_base + 46]
+            if int(value) != 0
+        ]
+        q_store_after = [
+            int(value) & 0xFFFFFFFF
+            for value in profile[: self.config.num_heads, detail_base + 47]
+            if int(value) != 0
+        ]
+        if q_store_before and q_store_after:
+            attention_enter = int(detail[0, detail_base + 2]) & 0xFFFFFFFF
+
+            def store_offset(value: int) -> int:
+                delta = (value - attention_enter) & 0xFFFFFFFF
+                return delta - (1 << 32) if delta >= 1 << 31 else delta
+
+            before_offsets = [store_offset(value) for value in q_store_before]
+            after_offsets = [store_offset(value) for value in q_store_after]
+            print(
+                "DSV4_ATTN_Q_STORE_FRONTIER "
+                f"kind={kind} samples={len(before_offsets)} "
+                f"before_atomic_min_us={min(before_offsets) / 1.0e3:.3f} "
+                f"before_atomic_median_us="
+                f"{statistics.median(before_offsets) / 1.0e3:.3f} "
+                f"before_atomic_max_us={max(before_offsets) / 1.0e3:.3f} "
+                f"after_atomic_min_us={min(after_offsets) / 1.0e3:.3f} "
+                f"after_atomic_median_us="
+                f"{statistics.median(after_offsets) / 1.0e3:.3f} "
+                f"after_atomic_max_us={max(after_offsets) / 1.0e3:.3f}",
+                flush=True,
+            )
+        full_row_groups, residual_rows = divmod(rows, 8)
+        base_groups, extra_groups = divmod(full_row_groups, num_splits)
+        split_lengths = [
+            8 * (base_groups + (split < extra_groups))
+            for split in range(num_splits)
+        ]
+        split_lengths[-1] += residual_rows
+        enter_times = [
+            int(row[detail_base + 2]) & 0xFFFFFFFF for row in detail
+        ]
+        enter_anchor = enter_times[0]
+        row_start = 0
+        for split, (row, split_length) in enumerate(
+            zip(detail, split_lengths, strict=True)
+        ):
+            enter = int(row[detail_base + 2]) & 0xFFFFFFFF
+            operands = int(row[detail_base + 3]) & 0xFFFFFFFF
+            ring_token = int(row[detail_base + 0]) & 0xFFFFFFFF
+            q_token = int(row[detail_base + 1]) & 0xFFFFFFFF
+            ring0_ready = int(row[detail_base + 38]) & 0xFFFFFFFF
+            ring1_ready = int(row[detail_base + 39]) & 0xFFFFFFFF
+            published = int(row[detail_base + 19]) & 0xFFFFFFFF
+            done = int(row[detail_base + 21]) & 0xFFFFFFFF
+            enter_offset = (enter - enter_anchor) & 0xFFFFFFFF
+            if enter_offset >= 1 << 31:
+                enter_offset -= 1 << 32
+            print(
+                "DSV4_ATTN_DETAIL_SPLIT "
+                f"kind={kind} split={split} row_start={row_start} "
+                f"rows={split_length} "
+                f"contains_current={int(row_start + split_length == rows)} "
+                f"enter_offset_us={enter_offset / 1.0e3:.3f} "
+                f"ring_token_us={((ring_token - enter) & 0xFFFFFFFF) / 1.0e3:.3f} "
+                f"q_token_us={((q_token - enter) & 0xFFFFFFFF) / 1.0e3:.3f} "
+                f"ring0_ready_us={((ring0_ready - enter) & 0xFFFFFFFF) / 1.0e3:.3f} "
+                f"ring1_ready_us={((ring1_ready - enter) & 0xFFFFFFFF) / 1.0e3:.3f} "
+                f"operand_wait_us={((operands - enter) & 0xFFFFFFFF) / 1.0e3:.3f} "
+                f"active_to_publish_us={((published - operands) & 0xFFFFFFFF) / 1.0e3:.3f} "
+                f"active_to_done_us={((done - operands) & 0xFFFFFFFF) / 1.0e3:.3f}",
+                flush=True,
+            )
+            def ldu_offset(event_id: int) -> float:
+                value = int(row[detail_base + event_id]) & 0xFFFFFFFF
+                if value == 0:
+                    return -1.0
+                return ((value - enter) & 0xFFFFFFFF) / 1.0e3
+
+            print(
+                "DSV4_ATTN_LDU_DETAIL "
+                f"kind={kind} split={split} "
+                f"ring_begin_us={ldu_offset(40):.3f} "
+                f"ring_dependency_us={ldu_offset(41):.3f} "
+                f"ring_issue_us={ldu_offset(42):.3f} "
+                f"q_begin_us={ldu_offset(43):.3f} "
+                f"q_dependency_us={ldu_offset(44):.3f} "
+                f"q_issue_us={ldu_offset(45):.3f}",
+                flush=True,
+            )
+            row_start += split_length
 
     def report_mxfp_ffn_detail_profile(
         self,
@@ -6241,6 +7484,42 @@ class ResidentOneLaunchDecode:
             flush=True,
         )
 
+        tile_finish = {
+            tile: max(
+                int(task["finish"])
+                for task in down_tasks
+                if int(task["tile"]) == tile
+            )
+            for tile in range(32)
+        }
+        block_finish = {
+            block: max(
+                tile_finish[2 * block],
+                tile_finish[2 * block + 1],
+            )
+            for block in range(16)
+        }
+        global_finish = max(block_finish.values())
+        block_leads = [
+            global_finish - block_finish[block]
+            for block in range(16)
+        ]
+        print(
+            "DSV4_MXFP_FFN_DOWN_BLOCK_FRONTIER "
+            f"global_finish_us={(global_finish - task_origin) / 1.0e3:.3f} "
+            f"lead_min_us={min(block_leads) / 1.0e3:.3f} "
+            f"lead_median_us={statistics.median(block_leads) / 1.0e3:.3f} "
+            f"lead_max_us={max(block_leads) / 1.0e3:.3f} "
+            "blocks="
+            + ",".join(
+                f"{block}:"
+                f"{(block_finish[block] - task_origin) / 1.0e3:.3f}:"
+                f"{(global_finish - block_finish[block]) / 1.0e3:.3f}"
+                for block in range(16)
+            ),
+            flush=True,
+        )
+
         frontier_events = (
             ("compute-begin", 11),
             ("ldu0-linear1-after-dependency", 21),
@@ -6545,6 +7824,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--disable-cross-layer-hc-fusion",
+        action="store_true",
+        help="diagnostically restore the standalone HCA-post to CSA-pre boundary",
+    )
+    parser.add_argument(
+        "--loopback-hc-fusion",
+        action="store_true",
+        help="diagnostically fuse layer-2/CSA post into each following HCA",
+    )
+    parser.add_argument(
         "--two-layer-pair-repeats",
         type=int,
         default=1,
@@ -6559,12 +7848,17 @@ def main() -> None:
         type=int,
         default=1,
         help=(
-            "timed decode context in [1,128]; contexts above one use a "
+            "timed decode context in [1,1024]; contexts above one use a "
             "deterministic resident prefix while the current KV/compressed "
             "rows are produced inside the launch"
         ),
     )
     parser.add_argument("--vocab-size", type=int, default=4096)
+    parser.add_argument(
+        "--bf16-head",
+        action="store_true",
+        help="retain the checkpoint BF16 vocabulary head instead of offline FP8",
+    )
     parser.add_argument("--sms", type=int, default=152)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
@@ -6667,12 +7961,6 @@ def main() -> None:
         choices=("auto", "umma-split", "contiguous", "scalar"),
         default="auto",
         help="select the sparse-attention compute mechanism for matched A/B profiling",
-    )
-    parser.add_argument(
-        "--attention-producer-base-sm",
-        type=int,
-        default=0,
-        help="diagnostic base SM for the split64 attention producer",
     )
     parser.add_argument(
         "--index-selection-mode",
@@ -6780,6 +8068,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--profile-loopback-boundary",
+        action="store_true",
+        help=(
+            "with the first HCA step window, also record the immediately "
+            "preceding CSA completion frontier"
+        ),
+    )
+    parser.add_argument(
         "--profile-step-count",
         type=int,
         default=(
@@ -6787,6 +8083,12 @@ def main() -> None:
             - STEP_PROFILE_EVENT_BASE
         ),
         help="number of queued layer steps included by --profile-steps",
+    )
+    parser.add_argument(
+        "--profile-step-family",
+        choices=("last", "hca"),
+        default="last",
+        help="select the production family whose queued steps receive timestamps",
     )
     parser.add_argument(
         "--profile-all-samples",
@@ -6805,6 +8107,13 @@ def main() -> None:
         parser.error("two-layer-start-id is only valid with --layers=2")
     if args.layers != 2 and args.two_layer_pair_repeats != 1:
         parser.error("two-layer-pair-repeats is only valid with --layers=2")
+    if args.loopback_hc_fusion and (
+        args.layers != cfg.num_layers
+        or args.disable_cross_layer_hc_fusion
+    ):
+        parser.error(
+            "--loopback-hc-fusion requires the full model and forward fusion"
+        )
     if not 1 <= args.two_layer_pair_repeats <= 20:
         parser.error("two-layer-pair-repeats must be in [1,20]")
     if args.layers == 2:
@@ -6822,16 +8131,14 @@ def main() -> None:
             "--unroll-two-layers requires --layers=2, --repeat-same-layer, "
             "and --two-layer-pair-repeats=1"
         )
-    if not 1 <= args.context_length <= cfg.sliding_window:
-        parser.error("context-length must be in [1,128]")
+    if not 1 <= args.context_length <= 1024:
+        parser.error("context-length must be in [1,1024]")
     if not 1 <= args.vocab_size <= cfg.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0 or args.iterations <= 0 or args.warmup < 0:
         parser.error("sms/iterations must be positive and warmup non-negative")
     if not 0 <= args.projection_reset_sms <= args.sms:
         parser.error("projection-reset-sms must be zero or within the resident grid")
-    if not 0 <= args.attention_producer_base_sm < args.sms:
-        parser.error("attention producer base SM is outside the resident grid")
     if args.resident_reserve_gib < 0:
         parser.error("resident-reserve-gib must be non-negative")
     if args.cold_l2_scrub_mib < 0:
@@ -6854,9 +8161,9 @@ def main() -> None:
         parser.error("--profile-preattention-only requires --profile-stages")
     if args.profile_stages and args.layers not in (1, 2):
         parser.error("stage profiling requires --layers 1 or 2")
-    if args.profile_attention_detail and args.layers != 1:
+    if args.profile_attention_detail and args.layers not in (1, 2):
         parser.error(
-            "attention detail profiling requires --layers 1"
+            "attention detail profiling requires --layers 1 or 2"
         )
     if args.profile_mxfp_ffn_detail and args.layers not in (1, 2, 43):
         parser.error("MXFP FFN detail profiling supports 1, 2, or 43 layers")
@@ -6895,6 +8202,21 @@ def main() -> None:
         parser.error("--profile-step-start requires --profile-steps")
     if args.profile_step_frontiers and not args.profile_steps:
         parser.error("--profile-step-frontiers requires --profile-steps")
+    if args.profile_loopback_boundary and not (
+        args.profile_steps
+        and args.profile_step_frontiers
+        and args.profile_step_family == "hca"
+        and args.profile_step_start == 0
+        and args.profile_step_count <= (
+            25 - LOOPBACK_PROFILE_FRONTIER_BASE
+        )
+        and args.layers == cfg.num_layers
+        and args.loopback_hc_fusion
+    ):
+        parser.error(
+            "--profile-loopback-boundary requires the full loopback image, "
+            "HCA step frontiers starting at zero, and a non-overlapping window"
+        )
     if args.profile_step_frontiers and args.profile_fp8_coupled_detail:
         parser.error(
             "--profile-step-frontiers and --profile-fp8-coupled-detail "
@@ -6959,11 +8281,14 @@ def main() -> None:
     torch.cuda.synchronize(device)
     build_seconds = time.monotonic() - build_started
     prime_token, prime_ms, prime_logits = flow.run_once()
-    flow.validate_fp8_head(
+    flow.validate_compact_head(
         prime_token, require_reference=not args.validate_each_launch
     )
+    if flow.compact_head and args.validate_each_launch:
+        flow.head_norm_oracle = (
+            flow.head_norm[0] if flow.bf16_umma_head else flow.head_norm
+        ).clone()
     if flow.fp8_head and args.validate_each_launch:
-        flow.head_norm_oracle = flow.head_norm.clone()
         flow.fp8_head_activation_oracle = flow.head_input_native_fp8.clone()
     repeat_state_oracle = (
         flow.capture_repeat_state() if args.validate_each_launch else None
@@ -6991,7 +8316,11 @@ def main() -> None:
             f"top_margin={float((prime_top_values[0] - prime_top_values[1]).item()):.6f}"
         )
     else:
-        logit_summary = "logits=fp8_argmax"
+        logit_summary = (
+            "logits=bf16_umma_argmax"
+            if flow.bf16_umma_head
+            else "logits=fp8_argmax"
+        )
     print(
         "DSV4_ONE_LAUNCH_PRIME status=PASS "
         f"output_token={prime_token} elapsed_ms={prime_ms:.6f}",
@@ -7016,7 +8345,7 @@ def main() -> None:
         if repeat_state_oracle is not None:
             flow.report_repeat_state(repeat_state_oracle, iteration)
         if args.validate_each_launch:
-            flow.validate_fp8_head(token)
+            flow.validate_compact_head(token)
         timings.append(elapsed_ms)
         device_frontier_ms = flow.device_frontier_ms()
         device_frontier_timings.append(device_frontier_ms)
@@ -7062,18 +8391,15 @@ def main() -> None:
             f"checkpoint emitted token {reference_token}, "
             f"expected {args.expected_token_id}"
         )
-    flow.validate_fp8_head(reference_token)
+    # In diagnostic BF16-reduction mode the resident buffers belong to the
+    # final timed launch, not the first token selected as the repeatability
+    # reference.  Validate the token that corresponds to those buffers.
+    compact_validation_token = (
+        token if args.allow_token_variation else reference_token
+    )
+    flow.validate_compact_head(compact_validation_token)
     if reference_token != prime_token:
-        if (
-            (args.profile_attention_detail or args.profile_steps)
-            and args.attention_producer_base_sm != 0
-        ):
-            print(
-                "DSV4_ATTN_PLACEMENT_PRIME_MISMATCH status=DIAGNOSTIC "
-                f"prime={prime_token} timed={reference_token}",
-                flush=True,
-            )
-        elif not args.allow_token_variation:
+        if not args.allow_token_variation:
             raise AssertionError(
                 "one-launch checkpoint token changed between prime and timed "
                 f"launches: prime={prime_token}, timed={reference_token}"
@@ -7195,7 +8521,11 @@ def main() -> None:
         "repeat_logit_mean_abs="
         f"{statistics.mean(repeat_logit_mean_abs):.6f}"
         if repeat_logit_max_abs
-        else "repeat_logits=fp8_argmax"
+        else (
+            "repeat_logits=bf16_umma_argmax"
+            if flow.bf16_umma_head
+            else "repeat_logits=fp8_argmax"
+        )
     )
     print(
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "

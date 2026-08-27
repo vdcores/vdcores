@@ -741,9 +741,13 @@ class Dsv4Bf16GemvGroup4SplitKSm100(ComputeInstruction):
     """Reuse one BF16 activation across four M128 split-K outputs."""
 
     def __init__(self, k_tiles: int):
-        if not 1 <= k_tiles <= 0xFFFF or k_tiles % 4:
+        if (
+            not 1 <= k_tiles <= 0xFFFF
+            or (k_tiles != 2 and k_tiles % 4)
+        ):
             raise ValueError(
-                "grouped BF16 split-K tile count must be a positive multiple of four"
+                "grouped BF16 split-K tile count must be two or a positive "
+                "multiple of four"
             )
         super().__init__(
             opcode=opcode.OP_DSV4_BF16_GEMV_GROUP4_SPLITK_SM100,
@@ -997,6 +1001,10 @@ class Dsv4ExpertReduce(ComputeInstruction):
 class Dsv4Fp32Bf16Gemv(ComputeInstruction):
     EMIT_SQUARE_SUM = 1 << 0
     FUSE_HC_POST = 1 << 1
+    PROFILE_OPERANDS = 1 << 2
+    DIRECT_COEFFICIENTS = 1 << 3
+    _FUSED_POINTER_ALIGNMENT = 16
+    _FUSED_POINTER_SHIFT = 4
 
     def __init__(
         self,
@@ -1004,18 +1012,41 @@ class Dsv4Fp32Bf16Gemv(ComputeInstruction):
         tile_k: int,
         emit_square_sum: bool = False,
         fuse_hc_post: bool = False,
+        profile_operands: bool = False,
+        packed_coefficients_address: int | None = None,
     ):
         if k <= 0 or k > 0xFFFF:
             raise ValueError("DeepSeek FP32 GEMV K must fit in uint16")
-        if fuse_hc_post:
-            if tile_k < 0 or tile_k > 0xFFFF:
-                raise ValueError("fused mHC projection group must fit in uint16")
-        elif tile_k <= 0 or tile_k > 0xFFFF:
+        if tile_k < 0 or tile_k > 0xFFFF or (not fuse_hc_post and tile_k == 0):
             raise ValueError("DeepSeek FP32 GEMV tile K must fit in uint16")
         flags = (
             self.EMIT_SQUARE_SUM * int(bool(emit_square_sum))
             | self.FUSE_HC_POST * int(bool(fuse_hc_post))
+            | self.PROFILE_OPERANDS * int(bool(profile_operands))
         )
+        if fuse_hc_post and packed_coefficients_address is not None:
+            if packed_coefficients_address % self._FUSED_POINTER_ALIGNMENT:
+                raise ValueError(
+                    "fused DeepSeek FP32 GEMV coefficients must be 16-byte aligned"
+                )
+            encoded_pointer = (
+                packed_coefficients_address >> self._FUSED_POINTER_SHIFT
+            )
+            if encoded_pointer >= 1 << 44:
+                raise ValueError(
+                    "fused DeepSeek FP32 GEMV coefficient pointer must fit 48 bits"
+                )
+            # Fused mode does not consume k or tile_k.  Reuse those two fields
+            # and the unused high twelve bits of flags for the aligned raw
+            # pointer, eliminating a pointer-only LDU/M2C transaction.
+            k = encoded_pointer & 0xFFFF
+            tile_k = (encoded_pointer >> 16) & 0xFFFF
+            flags |= self.DIRECT_COEFFICIENTS
+            flags |= (encoded_pointer >> 32) << 4
+        elif packed_coefficients_address is not None:
+            raise ValueError(
+                "packed coefficients are valid only for fused DeepSeek FP32 GEMV"
+            )
         super().__init__(
             opcode=opcode.OP_DSV4_FP32_BF16_GEMV,
             args=[k, tile_k, flags],
@@ -2857,7 +2888,10 @@ class LduReloadBarriers(MemoryInstruction):
             raise ValueError("barrier reload count must fit uint16")
         if first_bar + count > config.max_bars - 2:
             raise ValueError("barrier reload range overlaps runtime handshake counters")
-        if bar_source.numel() * bar_source.element_size() < 4 * (first_bar + count):
+        if (
+            bar_source.numel() * bar_source.element_size()
+            < 4 * (first_bar + max(count, 1))
+        ):
             raise ValueError("barrier reload source does not cover the requested range")
         if not 0 <= special_slot < config.num_special_slots:
             raise ValueError("barrier reload requires one special slot")
@@ -2885,6 +2919,7 @@ class LduAsyncReloadBarriers(MemoryInstruction):
     """Restore one disjoint barrier-bank slice and publish its completion."""
 
     FIRST_BAR_MASK = (1 << 10) - 1
+    SKIP_INITIAL_LOOP = 1 << 12
     SHIFT_TARGET = 1 << 13
     BANK_READY_COMPLETION = 1 << 14
     BANK_READY_LEADER = 1 << 15
@@ -2897,6 +2932,7 @@ class LduAsyncReloadBarriers(MemoryInstruction):
         input_bar: int,
         special_slot: int,
         *,
+        skip_initial_loop: bool = False,
         shift_target: bool = False,
         bank_ready_completion: bool = False,
         bank_ready_leader: bool = False,
@@ -2926,6 +2962,7 @@ class LduAsyncReloadBarriers(MemoryInstruction):
             num_slots=config.num_slots + special_slot,
             arg=(
                 first_bar
+                | (self.SKIP_INITIAL_LOOP if skip_initial_loop else 0)
                 | (self.SHIFT_TARGET if shift_target else 0)
                 | (
                     self.BANK_READY_COMPLETION

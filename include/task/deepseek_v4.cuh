@@ -1322,7 +1322,7 @@ __device__ __forceinline__ void dsv4_hc_post_project_tile(
 
 #pragma unroll
   for (int half = 0; half < HalvesPerTask; ++half) {
-    const auto *half_record = record + half * (6 * kTileHidden);
+    const auto *half_record = record + half * (5 * kTileHidden);
     branch = half_record;
     residual = half_record + kTileHidden;
     const auto *half_weight =
@@ -1344,7 +1344,7 @@ __device__ __forceinline__ void dsv4_hc_post_project_tile(
       const float2 residual3 = __bfloat1622float2(
           *reinterpret_cast<const __nv_bfloat162 *>(
               residual + 3 * kTileHidden + dim));
-      const float2 values[kHc] = {
+      float2 values[kHc] = {
           dsv4_hc_post_value2(
               branch_value, residual0, residual1, residual2, residual3,
               post0, comb00, comb10, comb20, comb30),
@@ -1358,6 +1358,15 @@ __device__ __forceinline__ void dsv4_hc_post_project_tile(
               branch_value, residual0, residual1, residual2, residual3,
               post3, comb03, comb13, comb23, comb33),
       };
+#pragma unroll
+      for (int output_index = 0; output_index < kHc; ++output_index) {
+        // Preserve the original HC-post -> BF16 -> projection boundary while
+        // keeping the handoff register-local.  Projection and RMS statistics
+        // must observe exactly the values that the standalone post task would
+        // have materialized.
+        values[output_index] = __bfloat1622float2(
+            __float22bfloat162_rn(values[output_index]));
+      }
 #pragma unroll
       for (int output_index = 0;
            output_index < OutputsPerTask;
@@ -1397,11 +1406,13 @@ __device__ __forceinline__ void dsv4_hc_post_project_tile(
 }
 
 // FP32-weight/BF16-input GEMV for the small mHC mixing projections.  Its fused
-// mode forms all four unrounded post streams once per hidden dimension, feeds
-// them directly to the projection, and only materializes the BF16 residual on
-// row zero.  One opcode therefore covers both ordinary and post-fused GEMV.
+// mode forms all four post streams once per hidden dimension, applies the
+// model's BF16 handoff rounding in registers, feeds them directly to the
+// projection, and only materializes the residual on row zero.  One opcode
+// therefore covers both ordinary and post-fused GEMV.
 template <bool EmitPreRmsMetadata, bool FuseHcPost,
           int FusedHalvesPerTask = 2, int FusedOutputsPerTask = 2,
+          bool ProfileOperands = false,
           typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     int k,
@@ -1409,8 +1420,11 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     void *smem_base,
     void *task_scratch,
     const MInst *st_insts,
+    const float *fused_coefficients,
     M2CQueue &m2c,
-    C2MQueue &c2m) {
+    C2MQueue &c2m,
+    int profile_sm_id = -1,
+    uint64_t *profile_events = nullptr) {
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -1424,14 +1438,41 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
   if constexpr (FuseHcPost) {
     constexpr int kTileHidden = 256;
     float partials[FusedOutputsPerTask] = {};
+    if constexpr (ProfileOperands) {
+      if (tid == 0) {
+        profile_events[profile_sm_id * numProfileEvents + 25] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+    }
     const int weight_slots = m2c.template pop<0>();
+    if constexpr (ProfileOperands) {
+      if (tid == 0) {
+        profile_events[profile_sm_id * numProfileEvents + 26] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+    }
     const auto *weight = static_cast<const float *>(
         get_slot_address(smem_base, extract(weight_slots)));
+    if (fused_coefficients == nullptr) {
+      const int coefficient_slots = m2c.template pop<0>();
+      fused_coefficients = static_cast<const float *>(
+          slot_2_glob_ptr(st_insts, coefficient_slots));
+    }
+    if constexpr (ProfileOperands) {
+      if (tid == 0) {
+        profile_events[profile_sm_id * numProfileEvents + 27] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+    }
     const int record_slots = m2c.template pop<0>();
+    if constexpr (ProfileOperands) {
+      if (tid == 0) {
+        profile_events[profile_sm_id * numProfileEvents + 28] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+    }
     const auto *record = static_cast<const __nv_bfloat16 *>(
         get_slot_address(smem_base, extract(record_slots)));
-    const auto *coefficients = reinterpret_cast<const float *>(
-        record + 5 * kTileHidden);
     int output_slots;
     __nv_bfloat16 *output = nullptr;
     if constexpr (EmitPreRmsMetadata) {
@@ -1439,10 +1480,17 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
       output = static_cast<__nv_bfloat16 *>(
           get_slot_address(smem_base, extract(output_slots)));
     }
+    if constexpr (ProfileOperands) {
+      if (tid == 0) {
+        profile_events[profile_sm_id * numProfileEvents + 29] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+    }
     dsv4_hc_post_project_tile<
         kTileHidden, FusedHalvesPerTask, FusedOutputsPerTask,
         EmitPreRmsMetadata>(
-        record, coefficients, weight, output, tid, partials, square_partial);
+        record, fused_coefficients, weight, output, tid, partials,
+        square_partial);
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
 #pragma unroll
@@ -1472,9 +1520,9 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
 
     const int partial_output_slot = m2c.template pop<0>();
     auto *partial_output = static_cast<float *>(
-        slot_2_glob_ptr(st_insts, partial_output_slot));
+        get_slot_address(smem_base, extract(partial_output_slot)));
     if (tid == 0) {
-      const int partial_index = 1 + tile_k * FusedOutputsPerTask;
+      const int partial_index = EmitPreRmsMetadata ? 1 : 0;
 #pragma unroll
       for (int output_index = 0;
            output_index < FusedOutputsPerTask;
@@ -1491,8 +1539,7 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
             warp_reduce[kSquareIndex + 2] + warp_reduce[kSquareIndex + 3];
       }
     }
-    c2m.template push<31, true, false>(
-        tid, 1U << partial_output_slot);
+    c2m.template push<31, true, false>(tid, partial_output_slot);
     c2m.push(tid, record_slots | weight_slots);
     if constexpr (EmitPreRmsMetadata) {
       c2m.template push<31, true, false>(tid, output_slots);
@@ -3079,10 +3126,17 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     if (metadata_splits > 0) {
       if (metadata_splits == 16) {
         if (tid < 25) {
+          int metadata_index = 0;
+          if (tid > 0) {
+            const int output_index = tid - 1;
+            const int output_group = output_index / 3;
+            metadata_index = output_group * 4 + output_index % 3 +
+                int(output_group == 0);
+          }
           float total = 0.0f;
 #pragma unroll
           for (int split = 0; split < 16; ++split) {
-            total += metadata[split * 32 + tid];
+            total += metadata[split * 32 + metadata_index];
           }
           shared[32 + tid] = total;
         }

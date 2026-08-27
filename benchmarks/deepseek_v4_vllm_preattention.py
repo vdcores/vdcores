@@ -129,6 +129,16 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--context", type=int, default=128)
     parser.add_argument(
+        "--engine-max-model-len",
+        type=int,
+        default=256,
+        help=(
+            "padded KV allocation length; SM100 FlashMLA requires a "
+            "TMA-aligned batch stride while the logical decode context "
+            "remains --context"
+        ),
+    )
+    parser.add_argument(
         "--target-layers",
         default="3,4",
         help="comma-separated native checkpoint layer IDs to report",
@@ -145,6 +155,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.context < 2:
         parser.error("context must be >=2")
+    if args.engine_max_model_len < args.context + 1:
+        parser.error("engine max model length must cover prefill plus decode")
     if args.warmups < 0 or args.samples <= 0:
         parser.error("warmups must be non-negative and samples positive")
     if not 0.0 < args.gpu_memory_utilization <= 1.0:
@@ -162,7 +174,7 @@ def main() -> None:
         tokenizer=args.model,
         dtype="bfloat16",
         kv_cache_dtype="fp8",
-        max_model_len=args.context + 1,
+        max_model_len=args.engine_max_model_len,
         max_num_seqs=1,
         max_num_batched_tokens=args.context - 1,
         enable_prefix_caching=False,

@@ -1739,13 +1739,16 @@ __device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
 #define DAE_DSV4_ATTN_EVENT(event_id)                                      \
     do {                                                                   \
         if (tid == 0) {                                                    \
+            asm volatile("" ::: "memory");                               \
             const uint64_t dae_attn_timer =                                \
                 cuda::ptx::get_sreg_globaltimer();                         \
             const uint64_t dae_attn_cycles = clock64();                    \
-            g_events[sm_id * numProfileEvents +                           \
-                     detailProfileEventBase + (event_id)] =               \
+            reinterpret_cast<volatile uint64_t *>(g_events)[               \
+                sm_id * numProfileEvents +                                 \
+                detailProfileEventBase + (event_id)] =                    \
                 (uint64_t(uint32_t(dae_attn_cycles)) << 32) |               \
                 uint32_t(dae_attn_timer);                                  \
+            asm volatile("" ::: "memory");                               \
         }                                                                  \
     } while (false)
 #else
@@ -1803,9 +1806,11 @@ __device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
     auto cta_coord_o = pv_cta.partition_C(coord_o);
 
     const int ring_slots = m2c.template pop<0>();
+    DAE_DSV4_ATTN_EVENT(0);
     auto *ring = static_cast<data_t *>(
         get_slot_address(smem_base, extract(ring_slots)));
     const int q_slots = m2c.template pop<0>();
+    DAE_DSV4_ATTN_EVENT(1);
     auto *q = static_cast<data_t *>(
         get_slot_address(smem_base, extract(q_slots)));
 
@@ -1823,6 +1828,7 @@ __device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
                 ring_full[phase_index].wait(phase);
             }
             internal_ring_full_phase_mask ^= 1U << phase_index;
+            DAE_DSV4_ATTN_EVENT(38 + port);
         }
     }
     DAE_DSV4_ATTN_EVENT(3);
@@ -1919,28 +1925,38 @@ __device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
         }
 
         const int output_slots = m2c.template pop<0>();
+        DAE_DSV4_ATTN_EVENT(30 + tile);
         auto *output = static_cast<data_t *>(
             get_slot_address(smem_base, extract(output_slots)));
-        auto sO = make_tensor(make_smem_ptr(output), q_layout);
+        auto sO = make_tensor(
+            make_smem_ptr(output),
+            make_layout(make_shape(Int<M>{}, Int<D_TILE>{}),
+                        make_stride(Int<D_TILE>{}, Int<1>{})));
         if (tid < 2 * M) {
             using OutputLoad = SM100_TMEM_LOAD_16dp32b16x;
             auto tiled_load = make_tmem_copy(OutputLoad{}, tmem_o);
             auto thread_load = tiled_load.get_slice(tid);
             auto thread_tmem = thread_load.partition_S(tmem_o);
-            auto thread_coords = thread_load.partition_D(cta_coord_o);
-            auto values = make_tensor<accum_t>(shape(thread_coords));
+            auto cta_output = pv_cta.partition_C(sO);
+            auto thread_output = thread_load.partition_D(cta_output);
+            auto values = make_tensor<accum_t>(shape(thread_output));
             copy(tiled_load, thread_tmem, values);
             cutlass::arch::fence_view_async_tmem_load();
+            DAE_DSV4_ATTN_EVENT(34 + tile);
+            auto converted = make_tensor<data_t>(shape(thread_output));
+            static_assert(size(values) % 2 == 0,
+                          "TMEM output fragments must form BF16x2 packs");
+            auto converted_pairs =
+                recast<cutlass::Array<data_t, 2>>(converted);
+            cutlass::NumericArrayConverter<data_t, accum_t, 2> convert;
 #pragma unroll
-            for (int index = 0; index < size(values); ++index) {
-                const int row = int(get<0>(thread_coords(index)));
-                const int column = int(get<1>(thread_coords(index)));
-                const auto sw128_coordinate = make_coord(
-                    make_coord(row, column & 15),
-                    0,
-                    make_coord((column >> 4) & 3, column >> 6));
-                sO(sw128_coordinate) = data_t(values(index) * inv_sum);
+            for (int index = 0; index < size(converted_pairs); ++index) {
+                cutlass::Array<accum_t, 2> pair;
+                pair[0] = values(2 * index) * inv_sum;
+                pair[1] = values(2 * index + 1) * inv_sum;
+                converted_pairs(index) = convert(pair);
             }
+            copy(converted, thread_output);
         }
         DAE_DSV4_ATTN_EVENT(8 + 3 * tile);
         // All four warps drain the same output tile.  Wait for every

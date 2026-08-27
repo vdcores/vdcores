@@ -67,6 +67,8 @@ endif
 
 ifneq ($(attention_detail_profile),)
 	NVCC_FLAGS += -DDAE_TRACK_PROFILE -DDAE_ATTENTION_DETAIL_PROFILE
+	export DAE_TRACK_PROFILE := 1
+	export DAE_ATTENTION_DETAIL_PROFILE := 1
 endif
 
 ifneq ($(fp8_coupled_detail_profile),)

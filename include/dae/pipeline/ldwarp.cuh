@@ -995,6 +995,10 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   uint64_t detail_previous_end = 0;
   uint16_t detail_previous_opcode = 0;
 #endif
+#if defined(DAE_ATTENTION_DETAIL_PROFILE)
+  bool attention_detail_ring_seen = false;
+  bool attention_detail_q_complete = false;
+#endif
   m2ld.wait();
   LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
 
@@ -1013,6 +1017,26 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       inst = st_insts[slot];
 #else
     auto inst = st_insts[slot];
+#endif
+#if defined(DAE_ATTENTION_DETAIL_PROFILE)
+    const bool attention_detail_ring_command =
+        port_id == 1 &&
+        op(opcode) == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
+        (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
+            dae_mxfp_resident_ffn::kCoupledTmaRing;
+    const bool attention_detail_q_command =
+        port_id == 1 && attention_detail_ring_seen &&
+        !attention_detail_q_complete &&
+        op(opcode) == op(OP_ALLOC_TMA_LOAD_3D) &&
+        inst.size == 0 && inst.nslot() == 8;
+    if (attention_detail_ring_command) {
+      g_events[sm_id * numProfileEvents + detailProfileEventBase + 40] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+    if (attention_detail_q_command) {
+      g_events[sm_id * numProfileEvents + detailProfileEventBase + 43] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
 #endif
 
     m2ld.advance();
@@ -1093,6 +1117,16 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #endif
       __ldprint("wait for global barrier before load: bar=%d", dependency_bar);
     };
+#if defined(DAE_ATTENTION_DETAIL_PROFILE)
+    if (attention_detail_ring_command) {
+      g_events[sm_id * numProfileEvents + detailProfileEventBase + 41] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+    if (attention_detail_q_command) {
+      g_events[sm_id * numProfileEvents + detailProfileEventBase + 44] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
+#endif
 
     if (op(opcode) == op(OP_ALLOC_RW_TMA_2D) &&
         inst.coords[2] != 0xFFFFU) {
@@ -1294,13 +1328,18 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
               stream_inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask;
           if (stream_kind == dae_mxfp_resident_ffn::kCoupledFp8Gemv) {
 #if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
-            detail_executed_fp8_coupled = true;
+            // The C128 Q-b projection is the unique pre-attention coupled
+            // stream with four K256 pairs.  Keep the rolling prefix armed
+            // across Q-a/KV and stop only at that command.
+            detail_executed_fp8_coupled = stream_inst.size == 4;
 #endif
             ldu_execute_mxfp8_coupled_stream(
                 stream_inst, slot, port_id, smem_base, tmem_mma_barriers,
                 mxfp8_coupled_pair_base
 #if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
-                , sm_id, g_events, !fp8_coupled_detail_complete
+                , sm_id, g_events,
+                !fp8_coupled_detail_complete &&
+                    detail_executed_fp8_coupled
 #endif
                 );
           } else if (
@@ -1308,6 +1347,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
             ldu_execute_internal_ring_stream(
                 stream_inst, slot, port_id, smem_base, tma_descs,
                 tmem_mma_barriers, internal_ring_empty_phase_mask);
+#if defined(DAE_ATTENTION_DETAIL_PROFILE)
+            if (attention_detail_ring_command) {
+              g_events[sm_id * numProfileEvents +
+                       detailProfileEventBase + 42] =
+                  cuda::ptx::get_sreg_globaltimer();
+            }
+            attention_detail_ring_seen = true;
+#endif
           } else if (
               stream_kind == dae_mxfp_resident_ffn::kCoupledLinear1) {
 #if defined(DAE_MXFP_FFN_DETAIL_PROFILE)
@@ -2118,6 +2165,14 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           (duration << 32) | (normalized_opcode << 52);
       ++fp8_coupled_detail_index;
       fp8_coupled_detail_complete = detail_executed_fp8_coupled;
+    }
+#endif
+
+#if defined(DAE_ATTENTION_DETAIL_PROFILE)
+    if (attention_detail_q_command) {
+      g_events[sm_id * numProfileEvents + detailProfileEventBase + 45] =
+          cuda::ptx::get_sreg_globaltimer();
+      attention_detail_q_complete = true;
     }
 #endif
 

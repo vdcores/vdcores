@@ -25,11 +25,11 @@ static __device__ __forceinline__ void * align_to(void *ptr, size_t align) {
   return (void*)aligned;
 }
 
-// Keep the generic megakernel below the top register-allocation bucket. The
-// resident FFN image schedules at 244 registers under this 248-register cap
-// with no spills. Dynamic setmaxnreg would add a warpgroup rendezvous without
+// Keep the generic megakernel at the measured full-resident register ceiling.
+// The production image schedules at 242 registers under this cap with no
+// spills. Dynamic setmaxnreg would add a warpgroup rendezvous without
 // increasing occupancy because this runtime intentionally keeps one CTA/SM.
-static __global__ __maxnreg__(248)
+static __global__ __maxnreg__(244)
 void dae2(
   const CInst* __restrict__ compute_instructions,
   const MInst* __restrict__ memory_instructions,
