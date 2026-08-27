@@ -3638,3 +3638,23 @@ closing candidate measured 0.202304 ms and 54.912 us
 not stable across runs, and remapping the entire subsequent split record stream
 perturbed reduction/cache placement more than it helped the selected workers.
 The remap was removed; production retains the contiguous split-record mapping.
+
+## Reproducible fixed-context framework baselines (2026-08-27)
+
+The production comparison now has a checked-in, one-process-per-context
+framework harness and complete environment bootstraps under
+`benchmarks/framework_baselines/`.  Both references use the full
+`DeepSeek-V4-Flash-NVFP4` checkpoint, batch one, BF16 model/head activations,
+FP8 KV, two generated tokens, three warmups, and 21 samples.  The metric is
+the first-to-second engine-token interval, so prefill, graph capture, tuning,
+and JIT are excluded while the measured attention length is exact.  Context
+one remains unavailable for framework comparison because it has no
+prompt-backed first-to-second-token equivalent.
+
+At contexts 128, 256, 512, and 1024, accepted VDcores launch-inclusive
+medians are 5.326880, 5.406688, 5.475424, and 5.477216 ms.  vLLM 0.27.1
+medians are 6.874858, 7.523229, 6.870377, and 6.906794 ms; SGLang
+0.5.12.post1 medians are 7.289749, 7.319158, 7.324534, and 7.439609 ms.
+The full matrix, raw min/p90/max distributions, job IDs, exact dependency
+versions, setup commands, and the benchmark-only vLLM TMA-compatible KV-pool
+stride repair are recorded in `benchmarks/framework_baselines/README.md`.

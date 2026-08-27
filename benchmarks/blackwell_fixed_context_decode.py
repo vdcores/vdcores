@@ -73,7 +73,14 @@ def run_vllm(args: argparse.Namespace) -> None:
     # scheduler's token budget for the complete strict batch; otherwise vLLM
     # can interleave residual chunked prefill with the nominal decode interval
     # once batch * context exceeds its default 16K-token budget.
-    engine_max_num_batched_tokens = args.batch * (context - 1)
+    engine_max_num_batched_tokens = (
+        args.max_num_batched_tokens
+        if args.max_num_batched_tokens is not None
+        else args.batch * (context - 1)
+    )
+    unchunked_strict_prefill = (
+        engine_max_num_batched_tokens >= args.batch * (context - 1)
+    )
     print(
         "FIXED_CONTEXT_CONFIG "
         f"framework=vllm batch={args.batch} context={context} "
@@ -81,12 +88,14 @@ def run_vllm(args: argparse.Namespace) -> None:
         f"kv_cache_dtype={args.kv_cache_dtype} "
         f"output_tokens={args.output_tokens} "
         f"max_num_batched_tokens={engine_max_num_batched_tokens} "
-        "strict_batch=1 unchunked_strict_prefill=1",
+        f"strict_batch=1 unchunked_strict_prefill={int(unchunked_strict_prefill)}",
         flush=True,
     )
     engine_options = {}
     if args.disable_flashinfer_autotune:
         engine_options["kernel_config"] = {"enable_flashinfer_autotune": False}
+    if args.num_gpu_blocks_override is not None:
+        engine_options["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     engine = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -348,6 +357,15 @@ def main() -> None:
     parser.add_argument("--token-id", type=int, default=DEFAULT_TOKEN_ID)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--kv-cache-dtype", default="auto")
+    parser.add_argument("--num-gpu-blocks-override", type=int)
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        help=(
+            "optional prefill chunk budget; prefill remains outside the measured "
+            "first-to-second-token decode interval"
+        ),
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
         "--sglang-moe-runner-backend",
@@ -387,6 +405,14 @@ def main() -> None:
         or args.warmups < 0
         or args.samples <= 0
         or args.output_tokens < 2
+        or (
+            args.num_gpu_blocks_override is not None
+            and args.num_gpu_blocks_override <= 0
+        )
+        or (
+            args.max_num_batched_tokens is not None
+            and args.max_num_batched_tokens <= 0
+        )
     ):
         parser.error(
             "batch, samples, and output-tokens must be positive (at least two "
