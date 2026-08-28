@@ -185,6 +185,25 @@ static constexpr int detailProfileEventBase = 128;
 static_assert(layerProfileEventBase < reloadProfileEventBase);
 static_assert(reloadProfileEventBase < trackProfileEventBase);
 static_assert(trackProfileEventBase < numProfileEvents);
+#if defined(DAE_TRACK_PROFILE)
+// Opt-in fused-HC global-counter trace. These IDs are below the generic
+// aggregate-counter range and are only written by explicitly tagged memory
+// commands, so the production image (which is built without TRACK_PROFILE)
+// carries no instructions or state for this diagnostic.
+static constexpr int hcGlobalRecordWaitBeginEvent = 50;
+static constexpr int hcGlobalRecordWaitValueEvent = 51;
+static constexpr int hcGlobalRecordWaitEndEvent = 52;
+static constexpr int hcGlobalRecordCommandEndEvent = 53;
+static constexpr int hcGlobalResidentComputeDoneEvent = 54;
+static constexpr int hcGlobalRawProfileEvent = 55;
+static constexpr int hcGlobalRawPreviousValueEvent = 58;
+static constexpr int hcGlobalReloadBeginEvent = 59;
+static constexpr int hcGlobalReloadValueEvent = 60;
+static constexpr int hcGlobalReloadReadyEvent = 61;
+static constexpr int hcGlobalReloadStoreEvent = 62;
+static constexpr int hcGlobalReloadEndEvent = 63;
+static_assert(hcGlobalReloadEndEvent < reloadProfileEventBase);
+#endif
 #if defined(DAE_STU_HISTORY_PROFILE)
 // Track the four store commands immediately ahead of one profiled RawAddress
 // completion. Reload timing is disabled in this diagnostic build, leaving the

@@ -91,7 +91,10 @@ __device__ __forceinline__ void dae_mxfp_gate_silu_registers(
     const int row = int(get<0>(thread_coord(index)));
     const int column = int(get<1>(thread_coord(index)));
     if (row < 128 && column < OutputRows) {
-      const float gate = registers(index);
+      // DeepSeek-V4's checkpoint contract uses bounded SwiGLU.  Clamp while
+      // the accumulator is still FP32 so the native MXFP8 record matches the
+      // offline/PyTorch path without another task or shared-memory pass.
+      const float gate = fminf(registers(index), 10.0f);
       if constexpr (std::is_same_v<GateSilu, __nv_bfloat16>) {
         const float rounded_gate =
             __bfloat162float(__float2bfloat16_rn(gate));
@@ -945,13 +948,15 @@ task_mxfp4_mxfp8_gate_up_silu_fixed_ring_sm100(
       const int row = int(get<0>(thread_coord(index)));
       const int column = int(get<1>(thread_coord(index)));
       if (row < kTileM && column < kOutputRows) {
+        const float bounded_up = fminf(
+            fmaxf(up_registers(index), -10.0f), 10.0f);
         if constexpr (mxfpGateUpFixedBf16Epilogue) {
           swiglu_values[column] = __bfloat162float(__hmul(
               register_gate_silu[column],
-              __float2bfloat16_rn(up_registers(index))));
+              __float2bfloat16_rn(bounded_up)));
         } else {
           swiglu_values[column] =
-              float(register_gate_silu[column]) * up_registers(index);
+              float(register_gate_silu[column]) * bounded_up;
         }
       }
     }

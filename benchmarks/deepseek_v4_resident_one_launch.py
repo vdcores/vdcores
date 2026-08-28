@@ -24,8 +24,12 @@ import torch
 from dae import runtime
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
+    apply_partial_rope_512_64,
     deepseek_v4_rope_table,
+    hc_post_reference,
+    hc_pre_reference,
     pack_gated_pool_history,
+    sparse_attention_512_reference,
 )
 from dae.deepseek_v4_checkpoint import (
     DeepSeekV4Checkpoint,
@@ -47,6 +51,8 @@ from dae.deepseek_v4_quant import (
 from dae.launcher import Launcher
 from dae.instructions import (
     Gemv_M128N8Direct4,
+    LduReloadBarriers,
+    MemoryInstruction,
     TmaLoad1D,
     TmaStore1D,
     TmaTensor,
@@ -126,6 +132,17 @@ LOOPBACK_PROFILE_FRONTIER_BASE = (
 FP8_COUPLED_STEP_BEGIN_EVENT = runtime_config.reload_profile_event_base - 1
 FP8_COUPLED_LAYER_BEGIN_EVENT = runtime_config.detail_profile_event_base + 25
 FFN_OUTPUT_PROFILE_EVENT_BASE = 55
+HC_GLOBAL_RECORD_WAIT_BEGIN_EVENT = 50
+HC_GLOBAL_RECORD_WAIT_VALUE_EVENT = 51
+HC_GLOBAL_RECORD_WAIT_END_EVENT = 52
+HC_GLOBAL_RECORD_COMMAND_END_EVENT = 53
+HC_GLOBAL_RESIDENT_COMPUTE_DONE_EVENT = 54
+HC_GLOBAL_RAW_PREVIOUS_VALUE_EVENT = 58
+HC_GLOBAL_RELOAD_BEGIN_EVENT = 59
+HC_GLOBAL_RELOAD_VALUE_EVENT = 60
+HC_GLOBAL_RELOAD_READY_EVENT = 61
+HC_GLOBAL_RELOAD_STORE_EVENT = 62
+HC_GLOBAL_RELOAD_END_EVENT = 63
 STU_RAW_POP_BEGIN_EVENT = 64
 STU_RAW_SERVICE_IDENTITY_EVENT = 65
 STU_RAW_OUTPUT_TOKEN_EVENT = 66
@@ -179,7 +196,9 @@ class ResidentOneLaunchDecode:
         self.args = args
         self.device = device
         self.config = DeepSeekV4FlashConfig()
-        if args.layers == 1:
+        if args.stop_after_layer is not None:
+            self.layer_ids = tuple(range(args.stop_after_layer + 1))
+        elif args.layers == 1:
             self.layer_ids = (args.single_layer_id,)
         elif args.layers == 2:
             second_layer_id = (
@@ -252,13 +271,22 @@ class ResidentOneLaunchDecode:
             family.representative: self._build_family(family)
             for family in self.families
         }
+        # Keep prefix correctness runs identical to the production body for
+        # every complete HCA->CSA pair.  An odd terminal HCA remains a
+        # standalone tail because its fused post is owned by the next (omitted)
+        # CSA layer.  This changes no production command and adds no diagnostic
+        # copy stage before the selected layer boundary.
         cross_layer_hc_pair = (
             args.layers == 43
-            or (
-                args.layers == 2
-                and args.two_layer_start_id == 3
-                and not args.repeat_same_layer
+            and (
+                args.stop_after_layer is None
+                or args.stop_after_layer >= 4
             )
+        ) or (
+            args.stop_after_layer is None
+            and args.layers == 2
+            and args.two_layer_start_id == 3
+            and not args.repeat_same_layer
         )
         if cross_layer_hc_pair and not args.disable_cross_layer_hc_fusion:
             previous_family, next_family = (
@@ -269,12 +297,52 @@ class ResidentOneLaunchDecode:
             self._apply_cross_layer_hc_fusion(
                 previous_family, next_family
             )
-        self.head_stages = self._build_head()
+            if args.stop_after_cross_layer_hc_write:
+                next_stages = self.family_stages[
+                    next_family.representative
+                ]
+                writer_index = next(
+                    index
+                    for index, stage in enumerate(next_stages)
+                    if stage.name
+                    == "ffn.hc_post_next_attn.hc_project"
+                )
+                del next_stages[writer_index + 1 :]
+        if args.stop_after_stage is not None:
+            stages = self.family_stages[self.families[0].representative]
+            if args.stop_after_stage >= len(stages):
+                raise ValueError(
+                    "stop-after-stage is outside the selected layer body: "
+                    f"stage={args.stop_after_stage} count={len(stages)}"
+                )
+            del stages[args.stop_after_stage + 1 :]
+        if (
+            args.stop_after_layer is None
+            and not args.stop_after_cross_layer_hc_write
+            and not args.omit_head
+        ):
+            self.head_stages = self._build_head()
+        else:
+            # Prefix correctness and the cross-layer writer diagnostic read
+            # their terminal tensors directly from HBM.  Neither needs a
+            # copy task or diagnostic head operator.
+            self.fp8_head = False
+            self.bf16_umma_head = False
+            self.compact_head = False
+            self.head_stages = []
+            self.logits = torch.empty(0, dtype=torch.bfloat16, device=device)
         if args.loopback_hc_fusion:
+            terminal_hca_family = (
+                self.families[4]
+                if args.stop_after_layer is not None
+                and args.stop_after_layer % 2 == 1
+                else None
+            )
             self._apply_loopback_hc_fusion(
                 self.families[1],
                 self.families[2],
                 self.families[3],
+                terminal_hca_family,
             )
         self._build_program()
         print(
@@ -493,6 +561,43 @@ class ResidentOneLaunchDecode:
         return resident
 
     def _families(self) -> tuple[LayerFamily, ...]:
+        if self.args.stop_after_layer is not None:
+            stop = self.args.stop_after_layer
+            families = [
+                LayerFamily(
+                    "prefix.swa_hash",
+                    tuple(range(min(stop + 1, 2))),
+                    ((0, 1),) if stop >= 1 else (),
+                )
+            ]
+            if stop >= 2:
+                families.append(LayerFamily("prefix.csa_hash", (2,)))
+            paired_hca = tuple(range(3, stop, 2))
+            paired_csa = tuple(range(4, stop + 1, 2))
+            if paired_hca:
+                families.extend(
+                    (
+                        LayerFamily(
+                            "prefix.hca_score",
+                            paired_hca,
+                            ((0, 1), (1, 2))
+                            if len(paired_hca) > 1
+                            else (),
+                        ),
+                        LayerFamily(
+                            "prefix.csa_score",
+                            paired_csa,
+                            ((0, 1), (1, 2))
+                            if len(paired_csa) > 1
+                            else (),
+                        ),
+                    )
+                )
+            if stop >= 3 and stop % 2 == 1:
+                families.append(
+                    LayerFamily("prefix.hca_tail_score", (stop,))
+                )
+            return tuple(families)
         if self.args.layers == 1:
             layer_id = self.args.single_layer_id
             kind = self.config.attention_kind(layer_id)
@@ -650,23 +755,26 @@ class ResidentOneLaunchDecode:
         cfg, d = self.config, self.device
         embedding = self._tensor("embed.weight")[self.args.token_id]
         self.initial_residual = embedding.reshape(1, -1).repeat(cfg.hc_mult, 1)
-        self.attention_post_input_record = torch.empty(
-            (1 + cfg.hc_mult, cfg.hidden_size),
-            dtype=torch.bfloat16,
-            device=d,
-        )
-        self.branch = self.attention_post_input_record[0]
-        self.residual = self.attention_post_input_record[1:]
-        self.next_residual = torch.empty_like(self.residual)
         self.hidden = torch.empty((cfg.hidden_size,), dtype=torch.bfloat16, device=d)
-        self.mhc_packed_output = torch.empty(
-            (cfg.hidden_size + 40,), dtype=torch.bfloat16, device=d
+        # Keep the two cross-layer handoff directions in disjoint storage.
+        # The 20 FP32 post/comb coefficients must remain live until the next
+        # layer consumes them, while that next layer is free to produce its
+        # own normalized hidden and coefficients.  Padding this tiny arena is
+        # cheaper and clearer than adding a copy or another runtime edge.
+        mhc_packed_items = cfg.hidden_size + 40
+        mhc_arena_stride = (mhc_packed_items + 63) // 64 * 64
+        self.mhc_packed_output_arenas = torch.empty(
+            (2, mhc_arena_stride), dtype=torch.bfloat16, device=d
         )
-        self.norm_hidden = self.mhc_packed_output[:cfg.hidden_size]
-        mhc_output_metadata = self.mhc_packed_output[cfg.hidden_size:].view(
-            torch.float32
-        )
-        self.mhc_output_metadata = mhc_output_metadata
+        self.mhc_packed_outputs = self.mhc_packed_output_arenas[
+            :, :mhc_packed_items
+        ]
+        self.norm_hiddens = self.mhc_packed_outputs[:, :cfg.hidden_size]
+        self.mhc_output_metadatas = self.mhc_packed_outputs[
+            :, cfg.hidden_size:
+        ].view(torch.float32)
+        self.posts = self.mhc_output_metadatas[:, :4]
+        self.combs = self.mhc_output_metadatas[:, 4:].view(2, 4, 4)
         direct_projection_views = {}
         if self.direct_splitk_bf16:
             projection_rows = (
@@ -676,15 +784,28 @@ class ResidentOneLaunchDecode:
                 + cfg.index_heads * cfg.index_head_dim
                 + cfg.o_groups * cfg.o_lora_rank
             )
-            self.splitk_output_arena = torch.empty(
-                (projection_rows,), dtype=torch.bfloat16, device=d
+            # Keep every BF16 split-K reduction destination in one reset span.
+            # The final H elements are o_b's branch row; the following four
+            # residual rows remain outside the clear while preserving the
+            # contiguous [branch,residual0..3] HC-post input contract.
+            self.splitk_output_storage = torch.empty(
+                (projection_rows + (1 + cfg.hc_mult) * cfg.hidden_size,),
+                dtype=torch.bfloat16,
+                device=d,
             )
+            projection_arena = self.splitk_output_storage[:projection_rows]
+            self.attention_post_input_record = self.splitk_output_storage[
+                projection_rows:
+            ].view(1 + cfg.hc_mult, cfg.hidden_size)
+            self.splitk_output_arena = self.splitk_output_storage[
+                : projection_rows + cfg.hidden_size
+            ]
             offset = 0
 
             def direct_view(name, shape):
                 nonlocal offset
                 elements = math.prod(shape)
-                view = self.splitk_output_arena[offset : offset + elements].view(
+                view = projection_arena[offset : offset + elements].view(
                     shape
                 )
                 direct_projection_views[name] = view
@@ -698,7 +819,16 @@ class ResidentOneLaunchDecode:
             if offset != projection_rows:
                 raise AssertionError("split-K output arena was not carved exactly")
         else:
+            self.splitk_output_storage = None
             self.splitk_output_arena = None
+            self.attention_post_input_record = torch.empty(
+                (1 + cfg.hc_mult, cfg.hidden_size),
+                dtype=torch.bfloat16,
+                device=d,
+            )
+        self.branch = self.attention_post_input_record[0]
+        self.residual = self.attention_post_input_record[1:]
+        self.next_residual = torch.empty_like(self.residual)
         self.mhc_packed_metadata = torch.empty(
             (56,), dtype=torch.float32, device=d
         )
@@ -716,9 +846,6 @@ class ResidentOneLaunchDecode:
         )
         self.mhc_fused_residual_square_sum = self.mhc_fused_metadata[:1]
         self.mhc_fused_metadata_tail = self.mhc_fused_metadata[fused_records:]
-        self.post = mhc_output_metadata[:4]
-        self.comb = mhc_output_metadata[4:].view(4, 4)
-
         self.decode_position = self.args.context_length - 1
         self.main_rope = deepseek_v4_rope_table(
             self.decode_position, config=cfg, device=d
@@ -1022,9 +1149,80 @@ class ResidentOneLaunchDecode:
         middle_flat = self.mxfp_middle_records.view(112, 1536)
         self.mxfp_middle_data = middle_flat[:, :1024]
         self.mxfp_middle_scales = middle_flat[:, 1024:]
-        self.mxfp_ffn_output = torch.empty(
-            (8, cfg.hidden_size), dtype=torch.bfloat16, device=d
+        # Down produces an N=8 UMMA tile although only lane zero is the model
+        # branch.  Give the other seven lanes padded rows so lane zero can
+        # directly share a persistent contiguous [branch, residual0..3]
+        # cross-layer record without letting those unused lanes overwrite it.
+        # The TMA view remains [8, H], with a five-row physical N stride.
+        cross_layer_record_rows = 1 + cfg.hc_mult
+        down_output_lanes = 8
+        self.mxfp_ffn_output_arenas = torch.empty(
+            (
+                2,
+                (down_output_lanes - 1) * cross_layer_record_rows + 1,
+                cfg.hidden_size,
+            ),
+            dtype=torch.bfloat16,
+            device=d,
         )
+        self.mhc_cross_layer_input_records = self.mxfp_ffn_output_arenas[
+            :, :cross_layer_record_rows
+        ]
+        self.mhc_boundary_record_snapshot = None
+        self.mhc_boundary_coefficients_snapshot = None
+        self.mhc_consumed_record_capture = None
+        self.mhc_consumed_weight_capture = None
+        self.mhc_consumed_coefficient_capture = None
+        self.mhc_fused_weight_reference = None
+        if self.args.diagnose_cross_layer_hc_boundary:
+            self.mhc_boundary_record_snapshot = torch.empty(
+                (cross_layer_record_rows, cfg.hidden_size),
+                dtype=torch.bfloat16,
+                device=d,
+            )
+            self.mhc_boundary_coefficients_snapshot = torch.empty(
+                (20,), dtype=torch.float32, device=d
+            )
+        if (
+            self.args.profile_cross_layer_hc_barrier
+            or self.args.stop_after_cross_layer_hc_write
+        ):
+            self.mhc_consumed_record_capture = torch.full(
+                (
+                    SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+                    5,
+                    SchedDsv4Fp32Bf16Gemv.FUSED_TILE_HIDDEN,
+                ),
+                float("nan"),
+                dtype=torch.bfloat16,
+                device=d,
+            )
+            self.mhc_consumed_weight_capture = torch.full(
+                (
+                    SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+                    SchedDsv4Fp32Bf16Gemv.FUSED_OUTPUTS_PER_TASK,
+                    4,
+                    SchedDsv4Fp32Bf16Gemv.FUSED_TILE_HIDDEN,
+                ),
+                float("nan"),
+                dtype=torch.float32,
+                device=d,
+            )
+            self.mhc_consumed_coefficient_capture = torch.full(
+                (SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS, 20),
+                float("nan"),
+                dtype=torch.float32,
+                device=d,
+            )
+        self.mxfp_ffn_outputs = tuple(
+            torch.as_strided(
+                arena,
+                size=(down_output_lanes, cfg.hidden_size),
+                stride=(cross_layer_record_rows * cfg.hidden_size, 1),
+            )
+            for arena in self.mxfp_ffn_output_arenas
+        )
+        self.mxfp_ffn_output = self.mxfp_ffn_outputs[1]
 
     def _allocate_mxfp_ffn_runtime(self) -> None:
         if self.sms < 148:
@@ -1058,9 +1256,10 @@ class ResidentOneLaunchDecode:
                 tuple(self.launcher.new_bar(1) for _ in range(32))
             )
         self.mxfp_internal_barrier_stop = self.launcher.num_bars
-        self.mxfp_output_tma = TmaTensor(
-            self.launcher, self.mxfp_ffn_output
-        ).m128n8_output("reduce")
+        self.mxfp_output_tmas = tuple(
+            TmaTensor(self.launcher, output).m128n8_output("reduce")
+            for output in self.mxfp_ffn_outputs
+        )
         self._mxfp_runtime_layers: dict[
             tuple[int, int], MxfpFfnRuntimeLayer
         ] = {}
@@ -1068,6 +1267,22 @@ class ResidentOneLaunchDecode:
     @staticmethod
     def _f32_bits(value: float) -> int:
         return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+    def _mxfp_output_set(self, layer_id: int) -> int:
+        # HCA feeds the following CSA; every CSA (including layer 2) feeds the
+        # following HCA.  Keep those two persistent handoff directions in
+        # separate arenas so a producer can never overwrite the other edge.
+        return int(self.config.attention_kind(layer_id) != "hca")
+
+    def _mhc_outputs(self, layer_id: int):
+        output_set = self._mxfp_output_set(layer_id)
+        return (
+            self.mhc_packed_outputs[output_set],
+            self.norm_hiddens[output_set],
+            self.mhc_output_metadatas[output_set],
+            self.posts[output_set],
+            self.combs[output_set],
+        )
 
     def _mxfp_runtime_layer(
         self, layer_id: int, barrier_set: int
@@ -1077,6 +1292,9 @@ class ResidentOneLaunchDecode:
         if existing is not None:
             return existing
         image = self.mxfp_ffn_images[layer_id]
+        output_set = self._mxfp_output_set(layer_id)
+        mxfp_output_tma = self.mxfp_output_tmas[output_set]
+        mxfp_ffn_output = self.mxfp_ffn_outputs[output_set]
         ready_bars = self.mxfp_ready_bars[barrier_set]
         zero_ready = self.mxfp_zero_ready_bars[barrier_set]
         linear1_tma = TmaTensor(
@@ -1132,7 +1350,7 @@ class ResidentOneLaunchDecode:
                 ].data_ptr()
                 down_records[record, 3] = (
                     down_tma.arg
-                    | (self.mxfp_output_tma.arg << 16)
+                    | (mxfp_output_tma.arg << 16)
                     | (task << 32)
                 )
                 down_records[record, 4] = (
@@ -1140,7 +1358,7 @@ class ResidentOneLaunchDecode:
                     | (zero_ready[output_tile] << 32)
                 )
                 down_records[record, 5] = self._f32_bits(1.0)
-                down_records[record, 6] = self.mxfp_ffn_output.data_ptr()
+                down_records[record, 6] = mxfp_ffn_output.data_ptr()
                 # Expert zero establishes the BF16 model handoff directly.
                 # Routed experts and the optional second K half reduce-add
                 # after that one-shot frontier.
@@ -1893,6 +2111,13 @@ class ResidentOneLaunchDecode:
         zero_fp32_output: torch.Tensor | None = None,
     ) -> tuple[list[Stage], Stage]:
         branch = self.branch if branch is None else branch
+        (
+            mhc_packed_output,
+            norm_hidden,
+            mhc_output_metadata,
+            post,
+            comb,
+        ) = self._mhc_outputs(family.representative)
         functions = self._family_tensors(family, f"hc_{branch_name}_fn")
         scales = self._family_tensors(family, f"hc_{branch_name}_scale")
         bases = self._family_tensors(family, f"hc_{branch_name}_base")
@@ -1920,12 +2145,12 @@ class ResidentOneLaunchDecode:
             scales[0],
             bases[0],
             norm_weights[0],
-            self.norm_hidden,
-            self.post,
-            self.comb,
+            norm_hidden,
+            post,
+            comb,
             residual_square_sum=self.mhc_residual_square_sum,
             packed_metadata=self.mhc_packed_metadata,
-            packed_output=self.mhc_packed_output,
+            packed_output=mhc_packed_output,
             zero_fp32_output=zero_fp32_output,
         )
         pre = self._layered(pre, family, norm_weights)
@@ -1935,11 +2160,11 @@ class ResidentOneLaunchDecode:
             SchedDsv4HcPost(
                 branch,
                 residual,
-                self.post,
-                self.comb,
+                post,
+                comb,
                 output_residual,
                 launcher=self.launcher,
-                packed_coefficients=self.mhc_output_metadata,
+                packed_coefficients=mhc_output_metadata,
             ),
             self.policy.hc_post(
                 self.config.hidden_size, self.config.hc_mult
@@ -1952,6 +2177,13 @@ class ResidentOneLaunchDecode:
         family: LayerFamily,
     ) -> tuple[Stage, list[Stage]]:
         """Fuse attention post into the following FFN mHC projection."""
+        (
+            mhc_packed_output,
+            norm_hidden,
+            mhc_output_metadata,
+            post,
+            comb,
+        ) = self._mhc_outputs(family.representative)
         packed_weights, metadata_tails = self._fused_hc_projection_operands(
             family
         )
@@ -1997,7 +2229,7 @@ class ResidentOneLaunchDecode:
             fused_post_input_record=self.attention_post_input_record,
             fused_post_output=self.next_residual,
             fused_partial_metadata=self.mhc_fused_metadata,
-            packed_coefficients=self.mhc_output_metadata,
+            packed_coefficients=mhc_output_metadata,
             launcher=self.launcher,
         )
         fused_project = self._layered(
@@ -2027,12 +2259,12 @@ class ResidentOneLaunchDecode:
             metadata_tails[0][:3],
             metadata_tails[0][3:27],
             norm_weights[0],
-            self.norm_hidden,
-            self.post,
-            self.comb,
+            norm_hidden,
+            post,
+            comb,
             residual_square_sum=self.mhc_fused_residual_square_sum,
             packed_metadata=self.mhc_fused_metadata,
-            packed_output=self.mhc_packed_output,
+            packed_output=mhc_packed_output,
             split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
         )
         pre = self._layered(pre, family, norm_weights)
@@ -2055,6 +2287,7 @@ class ResidentOneLaunchDecode:
     ) -> tuple[list[Stage], Stage]:
         cfg = self.config
         layer_id = family.representative
+        _, norm_hidden, _, _, _ = self._mhc_outputs(layer_id)
         kind = cfg.attention_kind(layer_id)
         plan = self.attention_plans[kind]
         rope_table = self.main_rope if kind == "swa" else self.compress_rope
@@ -2216,7 +2449,7 @@ class ResidentOneLaunchDecode:
             stages.append(
                 self._native_fp8_quant_stage(
                     "attn.hidden.quant_native_fp8",
-                    self.norm_hidden,
+                    norm_hidden,
                     self.hidden_native_fp8,
                     wait_group=(
                         attention_input_ready
@@ -2230,7 +2463,7 @@ class ResidentOneLaunchDecode:
             stages.append(
                 self._fp8_quant_stage(
                     "attn.hidden.quant_fp8",
-                    self.norm_hidden,
+                    norm_hidden,
                     self.hidden_fp8,
                     self.hidden_fp8_scale,
                     wait_for_previous=not need_native_hidden,
@@ -2477,7 +2710,7 @@ class ResidentOneLaunchDecode:
                         "attn.compressor.wkv.weight",
                         "attn.compressor.wgate.weight",
                     ),
-                    self.norm_hidden,
+                    norm_hidden,
                     fused_output,
                     split_k=16,
                     base_sm=compressor_projection_base,
@@ -2523,7 +2756,7 @@ class ResidentOneLaunchDecode:
                         "attn.indexer.compressor.wkv.weight",
                         "attn.indexer.compressor.wgate.weight",
                     ),
-                    self.norm_hidden,
+                    norm_hidden,
                     fused_index_output,
                     split_k=16,
                     base_sm=index_compressor_base,
@@ -2725,7 +2958,7 @@ class ResidentOneLaunchDecode:
                     "index.weights",
                     family,
                     "attn.indexer.weights_proj.weight",
-                    self.norm_hidden,
+                    norm_hidden,
                     self.index_head_weights,
                     placement=(0, cfg.index_heads),
                     wait_group=attention_input_ready,
@@ -2945,7 +3178,7 @@ class ResidentOneLaunchDecode:
                         "attn.compressor.wkv",
                         family,
                         "attn.compressor.wkv.weight",
-                        self.norm_hidden,
+                        norm_hidden,
                         compress_values[:width],
                     )
                 )
@@ -2954,7 +3187,7 @@ class ResidentOneLaunchDecode:
                         "attn.compressor.wgate",
                         family,
                         "attn.compressor.wgate.weight",
-                        self.norm_hidden,
+                        norm_hidden,
                         compress_scores[:width],
                         wait_for_previous=False,
                     )
@@ -3142,7 +3375,7 @@ class ResidentOneLaunchDecode:
                         "index.weights",
                         family,
                         "attn.indexer.weights_proj.weight",
-                        self.norm_hidden,
+                        norm_hidden,
                         self.index_head_weights,
                     )
                 )
@@ -3152,7 +3385,7 @@ class ResidentOneLaunchDecode:
                         "index.compressor.wkv",
                         family,
                         "attn.indexer.compressor.wkv.weight",
-                        self.norm_hidden,
+                        norm_hidden,
                         index_compress_values,
                     )
                 )
@@ -3161,7 +3394,7 @@ class ResidentOneLaunchDecode:
                         "index.compressor.wgate",
                         family,
                         "attn.indexer.compressor.wgate.weight",
-                        self.norm_hidden,
+                        norm_hidden,
                         index_compress_scores,
                         wait_for_previous=False,
                     )
@@ -3617,6 +3850,13 @@ class ResidentOneLaunchDecode:
         self, family: LayerFamily
     ) -> tuple[Stage, list[Stage]]:
         cfg = self.config
+        (
+            _,
+            norm_hidden,
+            mhc_output_metadata,
+            post,
+            comb,
+        ) = self._mhc_outputs(family.representative)
         async_reload = (
             runtime_config.async_barrier_reload_enabled
             and family.representative >= cfg.num_hash_layers
@@ -3644,6 +3884,15 @@ class ResidentOneLaunchDecode:
                 else 0
             )
         )
+        output_sets = {
+            self._mxfp_output_set(layer_id)
+            for layer_id in family.layer_ids
+        }
+        if len(output_sets) != 1:
+            raise ValueError("one MXFP family must share one output direction")
+        mxfp_ffn_output = self.mxfp_ffn_outputs[output_sets.pop()]
+        # Keep the legacy diagnostic alias pointed at the final family built.
+        self.mxfp_ffn_output = mxfp_ffn_output
         # The two score-layer families own disjoint internal MXFP banks.  The
         # first bank remains dead after HCA, so defer its restore and clear the
         # two contiguous banks together during the second layer's post work.
@@ -3687,7 +3936,7 @@ class ResidentOneLaunchDecode:
             down_weight,
             down_scale,
             self.mxfp_middle_records,
-            self.mxfp_ffn_output,
+            mxfp_ffn_output,
             representative.down_tma,
             representative.down_metadata,
             output_n_major=True,
@@ -3703,7 +3952,13 @@ class ResidentOneLaunchDecode:
             representative.image.down_scales,
             profile_output_event=(
                 FFN_OUTPUT_PROFILE_EVENT_BASE
-                if self.args.profile_steps
+                if (
+                    self.args.profile_steps
+                    or (
+                        self.args.profile_cross_layer_hc_barrier
+                        and family.representative == self.layer_ids[0]
+                    )
+                )
                 else None
             ),
         )
@@ -3723,13 +3978,13 @@ class ResidentOneLaunchDecode:
         post = self._stage(
             "ffn.hc_post",
             SchedDsv4HcPost(
-                self.mxfp_ffn_output[0],
+                mxfp_ffn_output[0],
                 self.next_residual,
-                self.post,
-                self.comb,
+                post,
+                comb,
                 self.residual,
                 launcher=self.launcher,
-                packed_coefficients=self.mhc_output_metadata,
+                packed_coefficients=mhc_output_metadata,
             ),
             self.policy.hc_post(
                 self.config.hidden_size, self.config.hc_mult
@@ -3776,7 +4031,7 @@ class ResidentOneLaunchDecode:
                 self._stage(
                     "ffn.hidden.quant_mxfp8",
                     SchedDsv4Mxfp8QuantFfnInput(
-                        self.norm_hidden, self.mxfp_input_records
+                        norm_hidden, self.mxfp_input_records
                     ),
                     8,
                     base_sm=self.sms - 8,
@@ -3801,7 +4056,7 @@ class ResidentOneLaunchDecode:
                 "ffn.router.prepared",
                 SchedLayeredDsv4RouterBf16Gemv(
                     router_weights,
-                    self.norm_hidden,
+                    norm_hidden,
                     router_biases,
                     self.router_prepared,
                     counter_strides=family.counter_strides,
@@ -3883,9 +4138,25 @@ class ResidentOneLaunchDecode:
         if previous_stages[-1].name != "ffn.hc_post":
             raise ValueError("cross-layer mHC fusion requires an FFN-post tail")
 
+        _, _, previous_coefficients, _, _ = self._mhc_outputs(
+            previous_family.representative
+        )
+        (
+            next_packed_output,
+            next_norm_hidden,
+            _,
+            next_post,
+            next_comb,
+        ) = self._mhc_outputs(next_family.representative)
+
         packed_weights, metadata_tails = self._fused_hc_projection_operands(
             next_family, "attn"
         )
+        if (
+            self.args.profile_cross_layer_hc_barrier
+            or self.args.stop_after_cross_layer_hc_write
+        ):
+            self.mhc_fused_weight_reference = packed_weights[0]
         norm_weights = self._family_tensors(next_family, "attn_norm.weight")
         previous_ffn_ready = f"{previous_family.name}.ffn.input.ready"
         previous_resident_input_ready = (
@@ -3922,7 +4193,9 @@ class ResidentOneLaunchDecode:
             for index, stage in enumerate(previous_stages)
             if stage.name == "ffn.hc_pre_rms4096"
         )
-        packed_record = self.mxfp_ffn_output[:5]
+        packed_record = self.mhc_cross_layer_input_records[
+            self._mxfp_output_set(previous_family.representative)
+        ]
         residual_pack = SchedCopy(
             (
                 TmaLoad1D(self.next_residual),
@@ -3964,6 +4237,44 @@ class ResidentOneLaunchDecode:
             )
         del next_stages[project_index:project_index + 2]
 
+        boundary_capture_stages = []
+        if self.args.diagnose_cross_layer_hc_boundary:
+            record_snapshot = self.mhc_boundary_record_snapshot
+            coefficients_snapshot = self.mhc_boundary_coefficients_snapshot
+            record_snapshot_load = TmaLoad1D(packed_record)
+            record_snapshot_load.annotation[
+                "prefetch_before_resident_reset"
+            ] = True
+            boundary_capture_stages.extend(
+                (
+                    self._stage(
+                        "debug.hc_boundary.record_snapshot",
+                        SchedCopy(
+                            (
+                                record_snapshot_load,
+                                TmaStore1D(record_snapshot),
+                            )
+                        ),
+                        1,
+                        base_sm=self.sms - 1,
+                        input_role="load",
+                        prefetch_before_wait=True,
+                        prefetch_before_resident_reset=True,
+                    ),
+                    self._stage(
+                        "debug.hc_boundary.coefficients_snapshot",
+                        SchedCopy(
+                            (
+                                TmaLoad1D(previous_coefficients),
+                                TmaStore1D(coefficients_snapshot),
+                            )
+                        ),
+                        1,
+                        base_sm=self.sms - 1,
+                    ),
+                )
+            )
+
         fused_project = SchedDsv4Fp32Bf16Gemv(
             packed_weights[0],
             self.residual.reshape(-1),
@@ -3971,9 +4282,18 @@ class ResidentOneLaunchDecode:
             fused_post_input_record=packed_record,
             fused_post_output=self.residual,
             fused_partial_metadata=self.mhc_fused_metadata,
-            packed_coefficients=self.mhc_output_metadata,
+            packed_coefficients=previous_coefficients,
             launcher=self.launcher,
-            prefetch_operands_before_resident_reset=True,
+            prefetch_operands_before_resident_reset=(
+                not self.args.diagnose_cross_layer_hc_boundary
+            ),
+            profile_operands=(
+                self.args.profile_cross_layer_hc_barrier
+                or self.args.stop_after_cross_layer_hc_write
+            ),
+            captured_record=self.mhc_consumed_record_capture,
+            captured_weight=self.mhc_consumed_weight_capture,
+            captured_coefficients=self.mhc_consumed_coefficient_capture,
         )
         fused_project = self._layered(
             fused_project,
@@ -3986,8 +4306,12 @@ class ResidentOneLaunchDecode:
             SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
             base_sm=0,
             input_role="record",
-            prefetch_before_wait=True,
-            prefetch_before_resident_reset=True,
+            prefetch_before_wait=(
+                not self.args.diagnose_cross_layer_hc_boundary
+            ),
+            prefetch_before_resident_reset=(
+                not self.args.diagnose_cross_layer_hc_boundary
+            ),
             release_group_roles=(
                 (metadata_ready, "metadata"),
                 (residual_ready, "residual"),
@@ -4000,12 +4324,12 @@ class ResidentOneLaunchDecode:
             metadata_tails[0][:3],
             metadata_tails[0][3:27],
             norm_weights[0],
-            self.norm_hidden,
-            self.post,
-            self.comb,
+            next_norm_hidden,
+            next_post,
+            next_comb,
             residual_square_sum=self.mhc_fused_residual_square_sum,
             packed_metadata=self.mhc_fused_metadata,
-            packed_output=self.mhc_packed_output,
+            packed_output=next_packed_output,
             split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
         )
         pre = self._layered(pre, next_family, norm_weights)
@@ -4021,15 +4345,27 @@ class ResidentOneLaunchDecode:
             ),
             release_group=attention_input_ready,
         )
-        next_stages[project_index:project_index] = [fused_stage, pre_stage]
+        next_stages[project_index:project_index] = [
+            *boundary_capture_stages,
+            fused_stage,
+            pre_stage,
+        ]
 
     def _apply_loopback_hc_fusion(
         self,
         layer2_family: LayerFamily,
         hca_family: LayerFamily,
         csa_family: LayerFamily,
+        terminal_hca_family: LayerFamily | None = None,
     ) -> None:
-        """Fuse layer-2/CSA post work into the following repeated HCA."""
+        """Fuse layer-2/CSA post work into each following HCA.
+
+        A production-prefix diagnostic may end on an HCA after the repeated
+        HCA/CSA body.  In that case ``terminal_hca_family`` consumes the final
+        CSA record with the same fused projection and asynchronous barrier
+        reload as production, while retaining its own ordinary FFN HC-post as
+        the observable terminal boundary.
+        """
         layer2_stages = self.family_stages[layer2_family.representative]
         hca_stages = self.family_stages[hca_family.representative]
         csa_stages = self.family_stages[csa_family.representative]
@@ -4041,7 +4377,21 @@ class ResidentOneLaunchDecode:
                 "loop-back mHC fusion requires layer-2 and CSA FFN-post tails"
             )
 
-        packed_record = self.mxfp_ffn_output[:5]
+        _, _, loopback_coefficients, _, _ = self._mhc_outputs(
+            csa_family.representative
+        )
+
+        loopback_output_sets = {
+            self._mxfp_output_set(family.representative)
+            for family in (layer2_family, csa_family)
+        }
+        if len(loopback_output_sets) != 1:
+            raise ValueError(
+                "layer-2 and CSA loopback must share one output direction"
+            )
+        packed_record = self.mhc_cross_layer_input_records[
+            loopback_output_sets.pop()
+        ]
 
         def replace_post_with_record_pack(
             family: LayerFamily,
@@ -4096,135 +4446,163 @@ class ResidentOneLaunchDecode:
             )
         csa_stages[-1] = replace(csa_stages[-1], release_group=None)
 
-        packed_weights, metadata_tails = self._fused_hc_projection_operands(
-            hca_family, "attn"
-        )
-        norm_weights = self._family_tensors(
-            hca_family, "attn_norm.weight"
-        )
-        metadata_ready = f"{hca_family.name}.attn.hc.metadata.ready"
-        residual_ready = f"{hca_family.name}.attn.hc.residual.ready"
-        attention_input_ready = f"{hca_family.name}.attn.input.ready"
-        resident_input_ready = f"{hca_family.name}.ffn.mx.input.ready"
-
-        project_index = next(
-            index
-            for index, stage in enumerate(hca_stages)
-            if stage.name == "attn.hc_project"
-        )
-        if hca_stages[project_index + 1].name != "attn.hc_pre_rms4096":
-            raise ValueError(
-                "loop-back mHC fusion requires adjacent HCA project/pre stages"
-        )
-        del hca_stages[project_index:project_index + 2]
-
-        tail_copy = SchedCopy(
+        def replace_hca_input(
+            family: LayerFamily,
+            stages: list[Stage],
+            *,
+            skip_initial_loop: bool,
+        ) -> None:
             (
-                TmaLoad1D(metadata_tails[0]),
-                TmaStore1D(self.mhc_fused_metadata_tail),
-            ),
-            size=(
-                self.mhc_fused_metadata_tail.numel()
-                * self.mhc_fused_metadata_tail.element_size()
-            ),
-        )
-        tail_copy = self._layered(
-            tail_copy,
-            hca_family,
-            metadata_tails,
-        )
-        tail_stage = self._stage(
-            "attn.hc_metadata_tail",
-            tail_copy,
-            1,
-            base_sm=self.sms - 1,
-            release_group=metadata_ready,
-        )
+                hca_packed_output,
+                hca_norm_hidden,
+                _,
+                hca_post,
+                hca_comb,
+            ) = self._mhc_outputs(family.representative)
+            packed_weights, metadata_tails = (
+                self._fused_hc_projection_operands(family, "attn")
+            )
+            norm_weights = self._family_tensors(
+                family, "attn_norm.weight"
+            )
+            metadata_ready = f"{family.name}.attn.hc.metadata.ready"
+            residual_ready = f"{family.name}.attn.hc.residual.ready"
+            attention_input_ready = f"{family.name}.attn.input.ready"
+            resident_input_ready = f"{family.name}.ffn.mx.input.ready"
 
-        fused_project = SchedDsv4Fp32Bf16Gemv(
-            packed_weights[0],
-            self.residual.reshape(-1),
-            self.mixes,
-            fused_post_input_record=packed_record,
-            fused_post_output=self.residual,
-            fused_partial_metadata=self.mhc_fused_metadata,
-            packed_coefficients=self.mhc_output_metadata,
-            launcher=self.launcher,
-            profile_operands=self.args.profile_loopback_boundary,
-        )
-        fused_project = self._layered(
-            fused_project,
+            project_index = next(
+                index
+                for index, stage in enumerate(stages)
+                if stage.name == "attn.hc_project"
+            )
+            if stages[project_index + 1].name != "attn.hc_pre_rms4096":
+                raise ValueError(
+                    "loop-back mHC fusion requires adjacent HCA project/pre "
+                    "stages"
+                )
+            del stages[project_index:project_index + 2]
+
+            tail_copy = SchedCopy(
+                (
+                    TmaLoad1D(metadata_tails[0]),
+                    TmaStore1D(self.mhc_fused_metadata_tail),
+                ),
+                size=(
+                    self.mhc_fused_metadata_tail.numel()
+                    * self.mhc_fused_metadata_tail.element_size()
+                ),
+            )
+            tail_copy = self._layered(
+                tail_copy,
+                family,
+                metadata_tails,
+            )
+            tail_stage = self._stage(
+                "attn.hc_metadata_tail",
+                tail_copy,
+                1,
+                base_sm=self.sms - 1,
+                release_group=metadata_ready,
+            )
+
+            fused_project = SchedDsv4Fp32Bf16Gemv(
+                packed_weights[0],
+                self.residual.reshape(-1),
+                self.mixes,
+                fused_post_input_record=packed_record,
+                fused_post_output=self.residual,
+                fused_partial_metadata=self.mhc_fused_metadata,
+                packed_coefficients=loopback_coefficients,
+                launcher=self.launcher,
+                profile_operands=self.args.profile_loopback_boundary,
+            )
+            fused_project = self._layered(
+                fused_project,
+                family,
+                packed_weights,
+            )
+            fused_project = SchedOverlapAsyncBarrierReload(
+                fused_project,
+                SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+                clear_wrapper.bar_source,
+                clear_wrapper.first_bar,
+                clear_wrapper.count,
+                132,
+                clear_wrapper.workers,
+                special_slot=clear_wrapper.special_slot,
+                clear_input_role="metadata",
+                skip_initial_loop=skip_initial_loop,
+            )
+            fused_stage = self._stage(
+                "ffn.hc_post_next_attn.hc_project",
+                fused_project,
+                132 + clear_wrapper.workers,
+                base_sm=0,
+                wait_for_previous=False,
+                parallel_with_previous=True,
+                release_group_roles=(
+                    (metadata_ready, "metadata"),
+                    (residual_ready, "residual"),
+                    (resident_input_ready, "clear"),
+                ),
+            )
+
+            pre = SchedDsv4HcPreRms(
+                self.residual,
+                self.mixes,
+                metadata_tails[0][:3],
+                metadata_tails[0][3:27],
+                norm_weights[0],
+                hca_norm_hidden,
+                hca_post,
+                hca_comb,
+                residual_square_sum=self.mhc_fused_residual_square_sum,
+                packed_metadata=self.mhc_fused_metadata,
+                packed_output=hca_packed_output,
+                split_metadata_splits=(
+                    SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS
+                ),
+            )
+            pre = self._layered(pre, family, norm_weights)
+            pre_stage = self._stage(
+                "attn.hc_pre_rms4096",
+                pre,
+                1,
+                base_sm=128,
+                wait_for_previous=False,
+                wait_group_roles=(
+                    (metadata_ready, "metadata"),
+                    (residual_ready, "residual"),
+                ),
+                release_group=attention_input_ready,
+            )
+            stages[project_index:project_index] = [
+                tail_stage,
+                fused_stage,
+                pre_stage,
+            ]
+
+        replace_hca_input(
             hca_family,
-            packed_weights,
-        )
-        fused_project = SchedOverlapAsyncBarrierReload(
-            fused_project,
-            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
-            clear_wrapper.bar_source,
-            clear_wrapper.first_bar,
-            clear_wrapper.count,
-            132,
-            clear_wrapper.workers,
-            special_slot=clear_wrapper.special_slot,
-            clear_input_role="metadata",
+            hca_stages,
             skip_initial_loop=True,
         )
-        fused_stage = self._stage(
-            "ffn.hc_post_next_attn.hc_project",
-            fused_project,
-            132 + clear_wrapper.workers,
-            base_sm=0,
-            wait_for_previous=False,
-            parallel_with_previous=True,
-            release_group_roles=(
-                (metadata_ready, "metadata"),
-                (residual_ready, "residual"),
-                (resident_input_ready, "clear"),
-            ),
-        )
-
-        pre = SchedDsv4HcPreRms(
-            self.residual,
-            self.mixes,
-            metadata_tails[0][:3],
-            metadata_tails[0][3:27],
-            norm_weights[0],
-            self.norm_hidden,
-            self.post,
-            self.comb,
-            residual_square_sum=self.mhc_fused_residual_square_sum,
-            packed_metadata=self.mhc_fused_metadata,
-            packed_output=self.mhc_packed_output,
-            split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
-        )
-        pre = self._layered(pre, hca_family, norm_weights)
-        pre_stage = self._stage(
-            "attn.hc_pre_rms4096",
-            pre,
-            1,
-            base_sm=128,
-            wait_for_previous=False,
-            wait_group_roles=(
-                (metadata_ready, "metadata"),
-                (residual_ready, "residual"),
-            ),
-            release_group=attention_input_ready,
-        )
-        hca_stages[project_index:project_index] = [
-            tail_stage,
-            fused_stage,
-            pre_stage,
-        ]
-
-        self.head_stages.insert(
-            0,
-            self._stage(
-                "head.final_hc_post",
-                clear_wrapper.inner,
-                clear_wrapper.inner_sms,
-                base_sm=0,
-            ),
-        )
+        if terminal_hca_family is not None:
+            replace_hca_input(
+                terminal_hca_family,
+                self.family_stages[terminal_hca_family.representative],
+                skip_initial_loop=False,
+            )
+        else:
+            self.head_stages.insert(
+                0,
+                self._stage(
+                    "head.final_hc_post",
+                    clear_wrapper.inner,
+                    clear_wrapper.inner_sms,
+                    base_sm=0,
+                ),
+            )
 
     def _build_head(self) -> list[Stage]:
         cfg = self.config
@@ -4853,16 +5231,124 @@ class ResidentOneLaunchDecode:
                 self.sms
             )
         )
-        if self.args.layers == 1:
+        if self.args.stop_after_layer is not None:
+            families = {family.name: family for family in self.families}
+            blocks = []
+
+            swa = families["prefix.swa_hash"]
+            blocks.append(
+                SequentialBlock(
+                    swa.name,
+                    queued_family(swa),
+                    repeat=len(swa.layer_ids),
+                    barrier_banks=family_barrier_banks,
+                    reload_barrier_start=mxfp_reload_start,
+                    reload_mxfp_resident=True,
+                )
+            )
+
+            layer2 = families.get("prefix.csa_hash")
+            if layer2 is not None:
+                blocks.append(
+                    SequentialBlock(
+                        layer2.name,
+                        queued_family(layer2),
+                        reload_barrier_start=mxfp_reload_start,
+                        reload_mxfp_resident=True,
+                    )
+                )
+
+            hca = families.get("prefix.hca_score")
+            csa = families.get("prefix.csa_score")
+            if hca is not None:
+                if csa is None or len(hca.layer_ids) != len(csa.layer_ids):
+                    raise AssertionError("prefix HCA/CSA families are not paired")
+                pair_has_consumer = (
+                    "prefix.hca_tail_score" in families
+                    or bool(self.head_stages)
+                )
+                hca_stages = queued_family(hca)
+                hca_stages[-1] = replace(
+                    hca_stages[-1], reset_mxfp_resident_after=True
+                )
+                blocks.append(
+                    SequentialBlock(
+                        "prefix.hca_csa_score",
+                        hca_stages + queued_family(csa),
+                        repeat=len(hca.layer_ids),
+                        barrier_banks=pair_barrier_banks,
+                        reload_barrier_start=(
+                            None
+                            if runtime_config.async_barrier_reload_enabled
+                            else mxfp_reload_start
+                        ),
+                        reload_mxfp_resident=True,
+                        elide_terminal_reload=pair_has_consumer,
+                        async_reload_after=(
+                            runtime_config.async_barrier_reload_enabled
+                        ),
+                        async_reload_worker_base=32,
+                    )
+                )
+
+            hca_tail = families.get("prefix.hca_tail_score")
+            if hca_tail is not None:
+                blocks.append(
+                    SequentialBlock(
+                        hca_tail.name,
+                        queued_family(hca_tail),
+                        reload_barrier_start=mxfp_reload_start,
+                        reload_mxfp_resident=True,
+                    )
+                )
+
+            terminal_stages = queued_head()
+            if terminal_stages:
+                blocks.append(
+                    SequentialBlock(
+                        "prefix.terminal_hc_post",
+                        terminal_stages,
+                        reload_after=False,
+                    )
+                )
+
+            self.program = LoopedSequentialProgram(
+                self.launcher, tuple(blocks), balance_load_ports=True
+            )
+            logical_stages = sum(
+                len(block.stages) * block.repeat for block in blocks
+            )
+            queue_stages = sum(len(block.stages) for block in blocks)
+        elif self.args.stop_after_cross_layer_hc_write:
+            # Execute the real integrated HCA->CSA producer chain, then stop
+            # immediately after the fused projection's writeback tails.  This
+            # leaves its residual and 16-byte-per-SM metadata records as the
+            # final HBM generation for exact readback.
+            first_family, second_family = self.families
+            first_stages = queued_family(first_family, enable_profile=False)
+            first_stages[-1] = replace(
+                first_stages[-1], reset_mxfp_resident_after=True
+            )
+            second_stages = queued_family(second_family, enable_profile=False)
+            stages = first_stages + second_stages
+            self.program = SequentialProgram(
+                self.launcher,
+                stages,
+                balance_load_ports=True,
+            )
+            logical_stages = len(stages)
+            queue_stages = logical_stages
+        elif self.args.layers == 1:
             family = self.families[0]
             stages = queued_family(family)
             # The looped multi-layer image resets the persistent MXFP rings
             # at every block tail.  Preserve the same direct, FFN-completion-
             # dependent reset in the one-layer diagnostic image so repeated
             # launches do not inherit the previous launch's full/empty phase.
-            stages[-1] = replace(
-                stages[-1], reset_mxfp_resident_after=True
-            )
+            if not self.args.omit_head:
+                stages[-1] = replace(
+                    stages[-1], reset_mxfp_resident_after=True
+                )
             stages.extend(queued_head())
             self.program = SequentialProgram(
                 self.launcher,
@@ -5066,7 +5552,8 @@ class ResidentOneLaunchDecode:
                 )
         print(
             "DSV4_ONE_LAUNCH_PROGRAM "
-            f"model_launches=1 layers={self.args.layers} "
+            f"model_launches=1 layers={len(self.layer_ids)} "
+            f"stop_after_layer={self.args.stop_after_layer if self.args.stop_after_layer is not None else -1} "
             f"instruction_storage="
             f"{'smem' if runtime_config.load_instructions else 'hbm'} "
             f"instruction_capacity={runtime_config.max_insts} "
@@ -5148,6 +5635,18 @@ class ResidentOneLaunchDecode:
 
     def run_once(self) -> tuple[int, float, torch.Tensor]:
         self.residual.copy_(self.initial_residual)
+        if self.args.stop_after_cross_layer_hc_write:
+            # Poison only the partial-record region before the diagnostic
+            # launch.  The tail has its own real producer.  This makes any
+            # missing 16-byte writer visible without adding work to the
+            # persistent kernel or relying on allocator-cache contents.
+            self.mhc_fused_metadata[
+                : SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS
+                * SchedDsv4Fp32Bf16Gemv.FUSED_RECORD_STRIDE
+            ].view(torch.int32).fill_(0x7FFFFFFF)
+            self.mhc_consumed_record_capture.fill_(float("nan"))
+            self.mhc_consumed_weight_capture.fill_(float("nan"))
+            self.mhc_consumed_coefficient_capture.fill_(float("nan"))
         if (
             self.args.profile_layers
             or self.args.profile_stages
@@ -5156,6 +5655,7 @@ class ResidentOneLaunchDecode:
             or self.args.profile_attention_detail
             or self.args.profile_mxfp_ffn_basic
             or self.args.profile_mxfp_ffn_detail
+            or self.args.profile_cross_layer_hc_barrier
         ):
             self.launcher.profile.zero_()
         if self._l2_scrub is not None:
@@ -5167,11 +5667,22 @@ class ResidentOneLaunchDecode:
         self.launcher.launch(synchronize=False)
         end.record()
         end.synchronize()
+        if (
+            self.args.stop_after_layer is not None
+            or self.args.stop_after_cross_layer_hc_write
+            or self.args.omit_head
+        ):
+            return -1, start.elapsed_time(end), torch.empty(0)
         if self.compact_head:
             return int(self.output_token[0].item()), start.elapsed_time(end), torch.empty(0)
         logits_cpu = self.logits.cpu()
         logits_fp32 = logits_cpu.float()
         if not bool(torch.isfinite(logits_fp32).all().item()):
+            if (
+                self.args.hidden_reference is not None
+                or self.args.dump_final_hidden is not None
+            ):
+                return -1, start.elapsed_time(end), logits_fp32
             raise AssertionError("one-launch checkpoint logits are not finite")
         token = int(torch.argmax(logits_fp32).item())
         return token, start.elapsed_time(end), logits_fp32
@@ -5273,7 +5784,7 @@ class ResidentOneLaunchDecode:
 
     def capture_repeat_state(self) -> dict[str, torch.Tensor]:
         names = (
-            "mhc_packed_output",
+            "mhc_packed_outputs",
             "hidden",
             "hidden_native_fp8",
             "q_rank",
@@ -5318,16 +5829,33 @@ class ResidentOneLaunchDecode:
                 continue
             mismatch = actual != expected
             count = int(mismatch.count_nonzero().item())
+            first = tuple(
+                int(value)
+                for value in mismatch.nonzero()[0].tolist()
+            )
             if actual.is_floating_point():
                 max_abs = float(
                     (actual.float() - expected.float()).abs().max().item()
                 )
+                actual_nonfinite = int(
+                    (~torch.isfinite(actual)).count_nonzero().item()
+                )
+                expected_nonfinite = int(
+                    (~torch.isfinite(expected)).count_nonzero().item()
+                )
             else:
                 max_abs = -1.0
+                actual_nonfinite = 0
+                expected_nonfinite = 0
             print(
                 "DSV4_REPEAT_STATE "
                 f"iteration={iteration} name={name} exact=false "
-                f"mismatches={count} max_abs={max_abs:.6f}",
+                f"mismatches={count} max_abs={max_abs:.6f} "
+                f"actual_nonfinite={actual_nonfinite} "
+                f"expected_nonfinite={expected_nonfinite} "
+                f"first_index={first} "
+                f"actual_first={actual[first].item()} "
+                f"expected_first={expected[first].item()}",
                 flush=True,
             )
 
@@ -5373,6 +5901,517 @@ class ResidentOneLaunchDecode:
             f"reference_head={reference[:8].float().cpu().tolist()}",
             flush=True,
         )
+
+    @staticmethod
+    def _native_fp8_data_reference(source: torch.Tensor) -> torch.Tensor:
+        """Return the active 1 KiB data half of each scale-pack-2 tile."""
+        quantized, _ = quantize_fp8_block128(source.reshape(-1))
+        tiles = source.numel() // 128
+        logical = quantized.view(torch.uint8).reshape(tiles, 8, 16)
+        expected = torch.empty(
+            (tiles, 8, 8, 16), dtype=torch.uint8, device=source.device
+        )
+        for row in range(8):
+            for source_chunk in range(8):
+                expected[:, row, source_chunk ^ row].copy_(
+                    logical[:, source_chunk]
+                )
+        return expected.reshape(tiles, 1024)
+
+    @staticmethod
+    def _mxfp8_ffn_input_reference(
+        source: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return packed K512 data and the active scale bytes."""
+        records = source.numel() // 512
+        groups = source.float().reshape(records, 16, 32)
+        requested = (
+            groups.abs().amax(dim=-1) / 448.0
+        ).clamp_min(2.0**-127)
+        exponents = torch.ceil(torch.log2(requested)).clamp(-127, 127)
+        scales = torch.exp2(exponents)
+        quantized = (
+            (groups / scales.unsqueeze(-1))
+            .clamp(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .reshape(records, 4, 8, 16)
+        )
+        packed = torch.empty(
+            (records, 4, 8, 8, 16),
+            dtype=torch.uint8,
+            device=source.device,
+        )
+        for row in range(8):
+            for source_chunk in range(8):
+                packed[:, :, row, source_chunk ^ row].copy_(
+                    quantized[:, :, source_chunk]
+                )
+        scale_bytes = (exponents.to(torch.int16) + 127).to(torch.uint8)
+        active_scales = scale_bytes.reshape(records, 4, 4)
+        active_scales = active_scales.unsqueeze(2).expand(
+            records, 4, 8, 4
+        ).contiguous()
+        return (
+            packed.reshape(records, 4096),
+            active_scales.reshape(records, 4, 32),
+        )
+
+    @staticmethod
+    def _rms_reference(
+        source: torch.Tensor,
+        epsilon: float,
+        weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        normalized = source.float() * torch.rsqrt(
+            source.float().square().mean(dim=-1, keepdim=True) + epsilon
+        )
+        if weight is not None:
+            normalized *= weight.float()
+        return normalized.to(torch.bfloat16)
+
+    @staticmethod
+    def _report_numeric_boundary(
+        name: str,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> None:
+        actual_fp32 = actual.float().reshape(-1)
+        expected_fp32 = expected.float().reshape(-1)
+        delta = actual_fp32 - expected_fp32
+        expected_norm = float(torch.linalg.vector_norm(expected_fp32).item())
+        delta_norm = float(torch.linalg.vector_norm(delta).item())
+        cosine = float(
+            torch.nn.functional.cosine_similarity(
+                actual_fp32.reshape(1, -1),
+                expected_fp32.reshape(1, -1),
+            ).item()
+        )
+        print(
+            "DSV4_ATTENTION_CORRECTNESS "
+            f"stage={name} kind=numeric "
+            f"rel_l2={delta_norm / max(expected_norm, 1.0e-30):.9f} "
+            f"cosine={cosine:.9f} "
+            f"mean_abs={float(delta.abs().mean().item()):.9f} "
+            f"max_abs={float(delta.abs().max().item()):.9f} "
+            f"actual_nonfinite={int((~torch.isfinite(actual_fp32)).sum().item())} "
+            f"expected_nonfinite={int((~torch.isfinite(expected_fp32)).sum().item())}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _report_exact_boundary(
+        name: str,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> None:
+        mismatch = actual.reshape(-1) != expected.reshape(-1)
+        count = int(mismatch.sum().item())
+        if count:
+            first_flat = int(mismatch.nonzero()[0].item())
+            first_index = tuple(
+                int(value)
+                for value in torch.unravel_index(
+                    torch.tensor(first_flat, device=actual.device),
+                    actual.shape,
+                )
+            )
+            first_detail = (
+                f" first_index={first_index} "
+                f"actual_first={actual[first_index].item()} "
+                f"expected_first={expected[first_index].item()}"
+            )
+        else:
+            first_detail = ""
+        print(
+            "DSV4_ATTENTION_CORRECTNESS "
+            f"stage={name} kind=exact mismatches={count} "
+            f"elements={actual.numel()} "
+            f"fraction={count / actual.numel():.9f}{first_detail}",
+            flush=True,
+        )
+
+    def report_attention_correctness(self) -> None:
+        """Compare one resident attention path with the checkpoint oracle.
+
+        This is entirely host-side post-launch diagnosis.  It adds no task,
+        instruction, write, or synchronization to the resident kernel.
+        """
+        if len(self.layer_ids) != 1:
+            raise ValueError("attention correctness diagnosis requires one layer")
+        layer_id = self.layer_ids[0]
+        prefix = f"layers.{layer_id}"
+        attn_prefix = f"{prefix}.attn"
+        epsilon = self.config.rms_epsilon
+        disk_checkpoint = DeepSeekV4Checkpoint(
+            self.args.checkpoint, self.config
+        )
+
+        residual = self.initial_residual
+        functions = self._tensor(f"{prefix}.hc_attn_fn")
+        scales = self._tensor(f"{prefix}.hc_attn_scale")
+        bases = self._tensor(f"{prefix}.hc_attn_base")
+        mixes = functions.float() @ residual.reshape(-1).float()
+        hidden, attn_post_coefficients, attn_comb = hc_pre_reference(
+            residual, mixes, scales, bases
+        )
+        normalized = self._rms_reference(
+            hidden,
+            epsilon,
+            self._tensor(f"{prefix}.attn_norm.weight"),
+        )
+        expected_hidden_native = self._native_fp8_data_reference(normalized)
+        self._report_exact_boundary(
+            "attn_hidden_native_fp8_data",
+            self.hidden_native_fp8[:, :1024],
+            expected_hidden_native,
+        )
+
+        def fp8_linear(name: str, source: torch.Tensor) -> torch.Tensor:
+            activation, activation_scale = quantize_fp8_block128(
+                source.reshape(-1)
+            )
+            linear = disk_checkpoint.load_fp8_linear(
+                name, device=self.device
+            )
+            return (
+                dequantize_fp8_block128(linear.weight, linear.scale)
+                @ dequantize_fp8_block128(activation, activation_scale)
+            ).to(torch.bfloat16)
+
+        q_rank = fp8_linear(f"{attn_prefix}.wq_a", normalized)
+        self._report_numeric_boundary("q_a", self.q_rank, q_rank)
+        q_norm_weight = self._tensor(f"{attn_prefix}.q_norm.weight")
+        q_rank_normalized = self._rms_reference(
+            q_rank, epsilon, q_norm_weight
+        )
+        expected_q_rank_native = self._native_fp8_data_reference(
+            q_rank_normalized
+        )
+        self._report_exact_boundary(
+            "q_rank_native_fp8_data_e2e",
+            self.q_rank_native_fp8[:, :1024],
+            expected_q_rank_native,
+        )
+
+        q = fp8_linear(f"{attn_prefix}.wq_b", q_rank_normalized).reshape(
+            self.config.num_heads, self.config.head_dim
+        )
+        self._report_numeric_boundary("q_b_e2e", self.q, q)
+        actual_q_rank_normalized = self._rms_reference(
+            self.q_rank, epsilon, q_norm_weight
+        )
+        q_local = fp8_linear(
+            f"{attn_prefix}.wq_b", actual_q_rank_normalized
+        ).reshape_as(self.q)
+        self._report_numeric_boundary("q_b_local", self.q, q_local)
+
+        kv = fp8_linear(f"{attn_prefix}.wkv", normalized)
+        self._report_numeric_boundary("kv", self.kv, kv)
+        rope_table = (
+            self.main_rope
+            if self.config.attention_kind(layer_id) == "swa"
+            else self.compress_rope
+        )
+        kv_rope = apply_partial_rope_512_64(
+            self._rms_reference(
+                kv,
+                epsilon,
+                self._tensor(f"{attn_prefix}.kv_norm.weight"),
+            ).reshape(1, self.config.head_dim),
+            rope_table,
+        )
+        kind = self.config.attention_kind(layer_id)
+        self._report_numeric_boundary(
+            "kv_rms_rope", self.current_kv_rows[kind], kv_rope
+        )
+
+        q_rope = apply_partial_rope_512_64(
+            self._rms_reference(q, epsilon), rope_table
+        )
+        indices = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        sink = self._tensor(f"{attn_prefix}.attn_sink")
+        attended = sparse_attention_512_reference(
+            q_rope, kv_rope, indices, sink
+        )
+        attention_inverse = apply_partial_rope_512_64(
+            attended, rope_table, inverse=True
+        )
+        expected_o_native = self._native_fp8_data_reference(
+            attention_inverse
+        ).reshape(self.config.num_heads, 4, 1024)
+        actual_o_native = self.o_group_native_fp8.view(
+            self.config.num_heads, 4, 2048
+        )[:, :, :1024]
+        self._report_exact_boundary(
+            "context1_attention_native_fp8_data",
+            actual_o_native,
+            expected_o_native,
+        )
+
+        def context1_local_values(score_denominator: float) -> torch.Tensor:
+            q_values = self.q.float()
+            q_values *= torch.rsqrt(
+                q_values.square().mean(dim=1, keepdim=True)
+                + float.fromhex("0x1.0cp-20")
+            )
+            q_values = apply_partial_rope_512_64(
+                q_values, rope_table
+            ).to(torch.bfloat16).float()
+            current_kv = self.current_kv_rows[kind].float()
+            score = (q_values * current_kv).sum(dim=1) / score_denominator
+            probability = torch.sigmoid(score - sink)
+            values = current_kv.expand(self.config.num_heads, -1)
+            values = values * probability[:, None]
+            return apply_partial_rope_512_64(
+                values, rope_table, inverse=True
+            )
+
+        for name, denominator in (
+            ("context1_local_task_scale", math.sqrt(512.0)),
+            ("context1_local_old_scale", math.sqrt(128.0)),
+        ):
+            local_native = self._native_fp8_data_reference(
+                context1_local_values(denominator)
+            ).reshape(self.config.num_heads, 4, 1024)
+            self._report_exact_boundary(
+                name, actual_o_native, local_native
+            )
+
+        grouped = attention_inverse.reshape(self.config.o_groups, -1)
+        wo_a = disk_checkpoint.load_fp8_linear(
+            f"{attn_prefix}.wo_a", device=self.device
+        )
+        o_rank = torch.empty_like(self.o_rank)
+        for group in range(self.config.o_groups):
+            activation, activation_scale = quantize_fp8_block128(
+                grouped[group]
+            )
+            start = group * self.config.o_lora_rank
+            stop = start + self.config.o_lora_rank
+            o_rank[group].copy_(
+                (
+                    dequantize_fp8_block128(
+                        wo_a.weight[start:stop],
+                        wo_a.scale[start // 128 : stop // 128],
+                    )
+                    @ dequantize_fp8_block128(
+                        activation, activation_scale
+                    )
+                ).to(torch.bfloat16)
+            )
+        self._report_numeric_boundary("o_a_e2e", self.o_rank, o_rank)
+
+        o_b = fp8_linear(f"{attn_prefix}.wo_b", o_rank.reshape(-1))
+        self._report_numeric_boundary("o_b_e2e", self.branch, o_b)
+        o_b_local = fp8_linear(
+            f"{attn_prefix}.wo_b", self.o_rank.reshape(-1)
+        )
+        self._report_numeric_boundary("o_b_local", self.branch, o_b_local)
+
+        attention_post = hc_post_reference(
+            o_b,
+            residual,
+            attn_post_coefficients,
+            attn_comb,
+        )
+        self._report_numeric_boundary(
+            "attention_hc_post_e2e", self.next_residual, attention_post
+        )
+        attention_post_local = hc_post_reference(
+            self.branch,
+            residual,
+            attn_post_coefficients,
+            attn_comb,
+        )
+        self._report_numeric_boundary(
+            "attention_hc_post_local",
+            self.next_residual,
+            attention_post_local,
+        )
+
+        ffn_functions = self._tensor(f"{prefix}.hc_ffn_fn")
+        ffn_scales = self._tensor(f"{prefix}.hc_ffn_scale")
+        ffn_bases = self._tensor(f"{prefix}.hc_ffn_base")
+        ffn_norm_weight = self._tensor(f"{prefix}.ffn_norm.weight")
+
+        def ffn_hc_pre_reference(source: torch.Tensor):
+            ffn_mixes = ffn_functions.float() @ source.reshape(-1).float()
+            ffn_hidden, ffn_post, ffn_comb = hc_pre_reference(
+                source, ffn_mixes, ffn_scales, ffn_bases
+            )
+            return (
+                self._rms_reference(
+                    ffn_hidden, epsilon, ffn_norm_weight
+                ),
+                ffn_post,
+                ffn_comb,
+            )
+
+        (
+            ffn_normalized,
+            ffn_post_reference,
+            ffn_comb_reference,
+        ) = ffn_hc_pre_reference(attention_post)
+        ffn_normalized_local, ffn_post_local, ffn_comb_local = (
+            ffn_hc_pre_reference(self.next_residual)
+        )
+        _, actual_ffn_normalized, _, actual_ffn_post, actual_ffn_comb = (
+            self._mhc_outputs(layer_id)
+        )
+        self._report_numeric_boundary(
+            "ffn_hc_pre_rms_e2e",
+            actual_ffn_normalized,
+            ffn_normalized,
+        )
+        self._report_numeric_boundary(
+            "ffn_hc_pre_rms_local",
+            actual_ffn_normalized,
+            ffn_normalized_local,
+        )
+        self._report_numeric_boundary(
+            "ffn_hc_pre_post_coefficients_local",
+            actual_ffn_post,
+            ffn_post_local,
+        )
+        self._report_numeric_boundary(
+            "ffn_hc_pre_comb_local",
+            actual_ffn_comb,
+            ffn_comb_local,
+        )
+
+        router_weight = self._tensor(f"{prefix}.ffn.gate.weight")
+
+        def prepared_router_reference(source: torch.Tensor) -> torch.Tensor:
+            logits = router_weight.float() @ source.reshape(-1).float()
+            original = torch.nn.functional.softplus(logits).sqrt()
+            if layer_id < self.config.num_hash_layers:
+                selection = original
+            else:
+                selection = original + self._tensor(
+                    f"{prefix}.ffn.gate.bias"
+                ).float()
+            return torch.stack((original, selection), dim=1)
+
+        router_prepared = prepared_router_reference(ffn_normalized)
+        router_prepared_local = prepared_router_reference(
+            actual_ffn_normalized
+        )
+        self._report_numeric_boundary(
+            "router_prepared_e2e",
+            self.router_prepared,
+            router_prepared,
+        )
+        self._report_numeric_boundary(
+            "router_prepared_local",
+            self.router_prepared,
+            router_prepared_local,
+        )
+
+        if layer_id < self.config.num_hash_layers:
+            expected_indices = self.checkpoint.load_tensor_slice(
+                f"{prefix}.ffn.gate.tid2eid",
+                self.args.token_id,
+                device=self.device,
+            ).to(torch.int32)
+        else:
+            expected_indices = torch.topk(
+                router_prepared_local[:, 1],
+                self.config.experts_per_token,
+            ).indices.to(torch.int32)
+        active_experts = self.config.experts_per_token
+        expected_indices = expected_indices[:active_experts]
+        self._report_exact_boundary(
+            "route_top6_indices",
+            self.route_indices[:active_experts],
+            expected_indices,
+        )
+        selected_original = router_prepared_local[
+            expected_indices.to(torch.int64), 0
+        ]
+        expected_route_weights = (
+            selected_original
+            / selected_original.sum()
+            * self.config.route_scale
+        )
+        if layer_id < self.config.num_hash_layers:
+            reference_route_indices = expected_indices
+        else:
+            reference_route_indices = torch.topk(
+                router_prepared[:, 1], active_experts
+            ).indices.to(torch.int32)
+        reference_selected_original = router_prepared[
+            reference_route_indices.to(torch.int64), 0
+        ]
+        reference_route_weights = (
+            reference_selected_original
+            / reference_selected_original.sum()
+            * self.config.route_scale
+        )
+        self._report_numeric_boundary(
+            "route_top6_weights_local",
+            self.route_weights[:active_experts],
+            expected_route_weights,
+        )
+        route_words = self.route_record.view(torch.int32)
+        expected_linear1_bases = (
+            expected_indices + 1
+        ) * 16
+        expected_down_bases = (
+            expected_indices + 1
+        ) * 32
+        self._report_exact_boundary(
+            "route_linear1_task_bases",
+            route_words[16 : 16 + active_experts],
+            expected_linear1_bases,
+        )
+        self._report_exact_boundary(
+            "route_down_task_bases",
+            route_words[24 : 24 + active_experts],
+            expected_down_bases,
+        )
+
+        expected_mxfp_data, expected_mxfp_scales = (
+            self._mxfp8_ffn_input_reference(actual_ffn_normalized)
+        )
+        active_scale_indices = (
+            torch.arange(8, device=self.device).reshape(-1, 1) * 16
+            + torch.arange(4, device=self.device).reshape(1, -1)
+        ).reshape(-1)
+        actual_record_scales = self.mxfp_input_records[:, 4096:].reshape(
+            8, 4, 512
+        )[:, :, active_scale_indices]
+        actual_split_scales = self.mxfp_activation_scales.reshape(
+            8, 4, 512
+        )[:, :, active_scale_indices]
+        self._report_exact_boundary(
+            "mxfp8_input_record_data",
+            self.mxfp_input_records[:, :4096],
+            expected_mxfp_data,
+        )
+        self._report_exact_boundary(
+            "mxfp8_input_record_scales",
+            actual_record_scales,
+            expected_mxfp_scales,
+        )
+        self._report_exact_boundary(
+            "mxfp8_input_split_data",
+            self.mxfp_activation_data,
+            expected_mxfp_data,
+        )
+        self._report_exact_boundary(
+            "mxfp8_input_split_scales",
+            actual_split_scales,
+            expected_mxfp_scales,
+        )
+        self.attention_correctness_reference = {
+            "attention_post": attention_post,
+            "ffn_normalized": ffn_normalized,
+            "ffn_post": ffn_post_reference,
+            "ffn_comb": ffn_comb_reference,
+            "route_indices": reference_route_indices,
+            "route_weights": reference_route_weights,
+        }
 
     def report_layer_profile(
         self,
@@ -5594,6 +6633,135 @@ class ResidentOneLaunchDecode:
             f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
             flush=True,
         )
+
+    def report_cross_layer_hc_barrier_profile(
+        self,
+        profile: torch.Tensor | None = None,
+        *,
+        sample_index: int | None = None,
+        sample_cuda_ms: float | None = None,
+    ) -> None:
+        if not self.args.profile_cross_layer_hc_barrier:
+            return
+        if profile is None:
+            profile = self.launcher.profile.cpu()
+        magic = 0x4454524B50524631
+        if any(int(value) != magic for value in profile[:, 127]):
+            raise RuntimeError(
+                "cross-layer HC barrier profiling requires track_profile=1"
+            )
+
+        producer_events = (
+            HC_GLOBAL_RESIDENT_COMPUTE_DONE_EVENT,
+            FFN_OUTPUT_PROFILE_EVENT_BASE,
+            FFN_OUTPUT_PROFILE_EVENT_BASE + 1,
+            FFN_OUTPUT_PROFILE_EVENT_BASE + 2,
+            HC_GLOBAL_RAW_PREVIOUS_VALUE_EVENT,
+        )
+        record_events = (
+            HC_GLOBAL_RECORD_WAIT_BEGIN_EVENT,
+            HC_GLOBAL_RECORD_WAIT_VALUE_EVENT,
+            HC_GLOBAL_RECORD_WAIT_END_EVENT,
+            HC_GLOBAL_RECORD_COMMAND_END_EVENT,
+            25,
+            26,
+            27,
+            28,
+            29,
+        )
+        reload_events = (
+            HC_GLOBAL_RELOAD_BEGIN_EVENT,
+            HC_GLOBAL_RELOAD_VALUE_EVENT,
+            HC_GLOBAL_RELOAD_READY_EVENT,
+            HC_GLOBAL_RELOAD_STORE_EVENT,
+            HC_GLOBAL_RELOAD_END_EVENT,
+        )
+        if any(
+            int(profile[sm, event]) == 0
+            for sm in range(self.sms)
+            for event in producer_events + reload_events
+        ):
+            raise RuntimeError("HC producer/reload trace is incomplete")
+        if any(
+            int(profile[sm, event]) == 0
+            for sm in range(SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS)
+            for event in record_events
+        ):
+            raise RuntimeError("HC record-consumer trace is incomplete")
+
+        def values(event, count=self.sms):
+            return [int(profile[sm, event]) for sm in range(count)]
+
+        raw_previous_packed = values(HC_GLOBAL_RAW_PREVIOUS_VALUE_EVENT)
+        raw_bars = [packed >> 32 for packed in raw_previous_packed]
+        raw_previous = [packed & 0xFFFFFFFF for packed in raw_previous_packed]
+        expected_previous = list(range(1, self.sms + 1))
+        exact_decrement_generation = sorted(raw_previous) == expected_previous
+        record_values_packed = values(
+            HC_GLOBAL_RECORD_WAIT_VALUE_EVENT,
+            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+        )
+        record_bars = [packed >> 32 for packed in record_values_packed]
+        record_initial = [packed & 0xFFFFFFFF for packed in record_values_packed]
+        reload_values_packed = values(HC_GLOBAL_RELOAD_VALUE_EVENT)
+        reload_bars = [packed >> 32 for packed in reload_values_packed]
+        reload_initial = [packed & 0xFFFFFFFF for packed in reload_values_packed]
+        one_bar = len(set(raw_bars + record_bars + reload_bars)) == 1
+
+        raw_after = values(FFN_OUTPUT_PROFILE_EVENT_BASE + 2)
+        final_raw_sm = raw_previous.index(1) if 1 in raw_previous else -1
+        final_raw_time = raw_after[final_raw_sm] if final_raw_sm >= 0 else 0
+        record_wait_end = values(
+            HC_GLOBAL_RECORD_WAIT_END_EVENT,
+            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+        )
+        record_command_end = values(
+            HC_GLOBAL_RECORD_COMMAND_END_EVENT,
+            SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS,
+        )
+        record_compute_ready = values(
+            28, SchedDsv4Fp32Bf16Gemv.FUSED_TASK_SMS
+        )
+        reload_ready = values(HC_GLOBAL_RELOAD_READY_EVENT)
+        reload_end = values(HC_GLOBAL_RELOAD_END_EVENT)
+        zero_consumed_before_reload = (
+            not any(reload_initial)
+            and min(reload_ready) >= max(record_command_end)
+        )
+        status = (
+            "PASS"
+            if exact_decrement_generation
+            and one_bar
+            and zero_consumed_before_reload
+            else "FAIL"
+        )
+        grid_start = max(int(value) for value in profile[:, 0])
+        relative_us = lambda timestamp: (timestamp - grid_start) / 1.0e3
+        print(
+            "DSV4_HC_GLOBAL_BARRIER_PROFILE "
+            f"status={status} bar={raw_bars[0] if raw_bars else -1} "
+            f"producer_count={len(raw_previous)} "
+            f"previous_min={min(raw_previous)} previous_max={max(raw_previous)} "
+            f"previous_unique={len(set(raw_previous))} "
+            f"record_initial_min={min(record_initial)} "
+            f"record_initial_max={max(record_initial)} "
+            f"record_initial_zero={sum(value == 0 for value in record_initial)} "
+            f"reload_entry_nonzero={sum(value != 0 for value in reload_initial)} "
+            f"compute_done_frontier_us={relative_us(max(values(HC_GLOBAL_RESIDENT_COMPUTE_DONE_EVENT))):.3f} "
+            f"raw_zero_sm={final_raw_sm} "
+            f"raw_zero_recorded_us={relative_us(final_raw_time):.3f} "
+            f"record_zero_frontier_us={relative_us(max(record_wait_end)):.3f} "
+            f"record_issue_frontier_us={relative_us(max(record_command_end)):.3f} "
+            f"record_compute_ready_frontier_us={relative_us(max(record_compute_ready)):.3f} "
+            f"reload_ready_first_us={relative_us(min(reload_ready)):.3f} "
+            f"reload_ready_frontier_us={relative_us(max(reload_ready)):.3f} "
+            f"reload_end_frontier_us={relative_us(max(reload_end)):.3f} "
+            f"sample_index={sample_index if sample_index is not None else -1} "
+            f"sample_cuda_ms={sample_cuda_ms if sample_cuda_ms is not None else -1.0:.6f}",
+            flush=True,
+        )
+        if status != "PASS":
+            raise RuntimeError("VDcores cross-layer global-barrier trace failed")
 
     def report_stage_profile(
         self,
@@ -7792,6 +8960,14 @@ def main() -> None:
     )
     parser.add_argument("--layers", type=int, choices=(1, 2, 43), default=1)
     parser.add_argument(
+        "--stop-after-layer",
+        type=int,
+        help=(
+            "build the production-model prefix through this zero-based layer, "
+            "omit the head, and read the existing post-layer residual from HBM"
+        ),
+    )
+    parser.add_argument(
         "--repeat-same-layer",
         action="store_true",
         help=(
@@ -7827,6 +9003,36 @@ def main() -> None:
         "--disable-cross-layer-hc-fusion",
         action="store_true",
         help="diagnostically restore the standalone HCA-post to CSA-pre boundary",
+    )
+    parser.add_argument(
+        "--diagnose-cross-layer-hc-boundary",
+        action="store_true",
+        help=(
+            "copy the HCA record and coefficients into dedicated HBM at the "
+            "fused boundary, then make the fused consumer read the snapshots"
+        ),
+    )
+    parser.add_argument(
+        "--inspect-cross-layer-hc-barrier",
+        action="store_true",
+        help="print the fused record's VDcores global-counter contract and exit",
+    )
+    parser.add_argument(
+        "--profile-cross-layer-hc-barrier",
+        action="store_true",
+        help=(
+            "trace the live VDcores producer counter, fused record load, and "
+            "first barrier reload in a fused two-layer HCA-to-CSA run"
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-cross-layer-hc-write",
+        action="store_true",
+        help=(
+            "run the integrated HCA-to-CSA chain only through its fused HC "
+            "writer, leaving that writer's residual and partial metadata as "
+            "the final HBM generation for exact readback"
+        ),
     )
     parser.add_argument(
         "--loopback-hc-fusion",
@@ -7869,6 +9075,34 @@ def main() -> None:
         help="evict cached data before each out-of-interval timed launch",
     )
     parser.add_argument("--expected-token-id", type=int)
+    parser.add_argument(
+        "--hidden-reference",
+        help=(
+            "host-side diagnostic file from deepseek_v4_checkpoint_decode.py; "
+            "one-layer runs consume that layer's recorded input and compare "
+            "their post-layer residual, while 43-layer runs compare the final residual"
+        ),
+    )
+    parser.add_argument(
+        "--dump-final-hidden",
+        help="write the final residual and normalized LM-head input after the run",
+    )
+    parser.add_argument(
+        "--omit-head",
+        action="store_true",
+        help=(
+            "diagnostically stop after the requested transformer body without "
+            "adding LM-head stages"
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-stage",
+        type=int,
+        help=(
+            "with one layer and --omit-head, terminate after this zero-based "
+            "existing stage without inserting a capture operator"
+        ),
+    )
     parser.add_argument(
         "--allow-token-variation",
         action="store_true",
@@ -7983,6 +9217,14 @@ def main() -> None:
         "--diagnose-projections",
         action="store_true",
         help="compare resident projection output with a raw-checkpoint oracle",
+    )
+    parser.add_argument(
+        "--diagnose-attention-correctness",
+        action="store_true",
+        help=(
+            "post-launch compare every retained one-layer attention boundary "
+            "with a direct checkpoint/PyTorch oracle"
+        ),
     )
     parser.add_argument(
         "--validate-each-launch",
@@ -8101,10 +9343,77 @@ def main() -> None:
         parser.error("token-id is outside the vocabulary")
     if not 0 <= args.single_layer_id < cfg.num_layers:
         parser.error("single-layer-id is outside the transformer")
+    if args.stop_after_layer is not None:
+        if args.layers != cfg.num_layers:
+            parser.error("--stop-after-layer requires --layers=43")
+        if not 0 <= args.stop_after_layer < cfg.num_layers:
+            parser.error("stop-after-layer is outside the transformer")
+        if args.loopback_hc_fusion and args.stop_after_layer < 4:
+            parser.error(
+                "a loopback-fused prefix requires a terminal layer at or "
+                "after the first HCA/CSA pair"
+            )
+        if args.expected_token_id is not None:
+            parser.error("--expected-token-id requires the LM head")
     if args.layers != 1 and args.single_layer_id != 0:
         parser.error("single-layer-id is only valid with --layers=1")
+    if args.stop_after_stage is not None and not (
+        args.layers == 1
+        and args.omit_head
+        and args.stop_after_stage >= 0
+    ):
+        parser.error(
+            "--stop-after-stage requires --layers=1, --omit-head, and a "
+            "non-negative stage index"
+        )
+    if args.diagnose_attention_correctness and (
+        args.layers != 1
+        or not {"q_a", "q_b", "kv", "o_a"}.issubset(
+            {
+                item.strip()
+                for item in args.fp8_splitk_components.split(",")
+                if item.strip()
+            }
+            if args.fp8_splitk_components.strip() != "all"
+            else {"q_a", "q_b", "kv", "index_q_b", "o_a", "o_b"}
+        )
+    ):
+        parser.error(
+            "--diagnose-attention-correctness requires one layer and the "
+            "native q_a/q_b/kv/o_a path"
+        )
     if args.layers != 2 and args.two_layer_start_id != 0:
         parser.error("two-layer-start-id is only valid with --layers=2")
+    if args.diagnose_cross_layer_hc_boundary and (
+        args.layers != 2 or args.disable_cross_layer_hc_fusion
+    ):
+        parser.error(
+            "--diagnose-cross-layer-hc-boundary requires a fused two-layer run"
+        )
+    if args.stop_after_cross_layer_hc_write and (
+        args.layers != 2
+        or args.two_layer_start_id != 3
+        or args.repeat_same_layer
+        or args.disable_cross_layer_hc_fusion
+        or args.two_layer_pair_repeats != 1
+    ):
+        parser.error(
+            "--stop-after-cross-layer-hc-write requires the fused layer-3 "
+            "HCA to layer-4 CSA two-layer run"
+        )
+    if (
+        args.stop_after_cross_layer_hc_write
+        and args.expected_token_id is not None
+    ):
+        parser.error(
+            "--expected-token-id is unavailable when stopping at the HC writer"
+        )
+    if args.inspect_cross_layer_hc_barrier and (
+        args.layers != 2 or args.disable_cross_layer_hc_fusion
+    ):
+        parser.error(
+            "--inspect-cross-layer-hc-barrier requires a fused two-layer run"
+        )
     if args.layers != 2 and args.two_layer_pair_repeats != 1:
         parser.error("two-layer-pair-repeats is only valid with --layers=2")
     if args.loopback_hc_fusion and (
@@ -8112,7 +9421,8 @@ def main() -> None:
         or args.disable_cross_layer_hc_fusion
     ):
         parser.error(
-            "--loopback-hc-fusion requires the full model and forward fusion"
+            "--loopback-hc-fusion requires the full/prefix model and forward "
+            "fusion"
         )
     if not 1 <= args.two_layer_pair_repeats <= 20:
         parser.error("two-layer-pair-repeats must be in [1,20]")
@@ -8153,10 +9463,13 @@ def main() -> None:
             args.profile_attention_detail,
             args.profile_mxfp_ffn_basic,
             args.profile_mxfp_ffn_detail,
+            args.profile_cross_layer_hc_barrier,
         )
     )
     if profile_modes > 1:
         parser.error("profiling modes are mutually exclusive")
+    if args.stop_after_layer is not None and profile_modes:
+        parser.error("--stop-after-layer is a hidden-state diagnostic, not profiling")
     if args.profile_preattention_only and not args.profile_stages:
         parser.error("--profile-preattention-only requires --profile-stages")
     if args.profile_stages and args.layers not in (1, 2):
@@ -8169,6 +9482,16 @@ def main() -> None:
         parser.error("MXFP FFN detail profiling supports 1, 2, or 43 layers")
     if args.profile_mxfp_ffn_basic and args.layers != 1:
         parser.error("production MXFP FFN basic profiling requires --layers 1")
+    if args.profile_cross_layer_hc_barrier and (
+        args.layers != 2
+        or args.disable_cross_layer_hc_fusion
+        or cfg.attention_kind(args.two_layer_start_id) != "hca"
+        or cfg.attention_kind(args.two_layer_start_id + 1) != "csa"
+    ):
+        parser.error(
+            "cross-layer HC barrier profiling requires a fused adjacent "
+            "HCA-to-CSA two-layer run"
+        )
     if args.profile_steps and args.layers not in (1, 2, 43):
         parser.error(
             "step profiling supports one layer or the final logical family "
@@ -8239,6 +9562,347 @@ def main() -> None:
     device = torch.device("cuda")
     build_started = time.monotonic()
     flow = ResidentOneLaunchDecode(args, device)
+    if args.inspect_cross_layer_hc_barrier:
+        record_commands = []
+        for sm, instructions in enumerate(flow.program.instructions):
+            for pc, inst in enumerate(instructions):
+                if (
+                    isinstance(inst, MemoryInstruction)
+                    and inst.annotation.get("fused_hc_record")
+                ):
+                    record_commands.append((sm, pc, inst))
+        if not record_commands:
+            raise RuntimeError("fused HC record command was not found")
+        for record_bar in sorted(
+            {inst.num_slots >> 6 for _, _, inst in record_commands}
+        ):
+            selected_records = [
+                item
+                for item in record_commands
+                if item[2].num_slots >> 6 == record_bar
+            ]
+            opcode_counts = {}
+            reloads = []
+            async_reloads = []
+            reload_opcode = runtime.opcode.OP_LDU_RELOAD_BARRIERS & ~0x3F
+            async_reload_opcode = (
+                runtime.opcode.OP_LDU_ASYNC_RELOAD_BARRIERS & ~0x3F
+            )
+            for sm, instructions in enumerate(flow.program.instructions):
+                for pc, inst in enumerate(instructions):
+                    if not isinstance(inst, MemoryInstruction):
+                        continue
+                    if inst.opcode & 0x10 and inst.num_slots >> 6 == record_bar:
+                        key = (
+                            inst.opcode & ~0x3F,
+                            bool(inst.opcode & 0x1),
+                            bool(inst.opcode & 0x2),
+                        )
+                        opcode_counts[key] = opcode_counts.get(key, 0) + 1
+                    base_opcode = inst.opcode & ~0x3F
+                    if base_opcode == reload_opcode:
+                        source_first_bar = (
+                            inst.arg & LduReloadBarriers.FIRST_BAR_MASK
+                        )
+                        completion_bar = inst.num_slots >> 6
+                        first_bar = completion_bar + 1 - inst.size
+                        if first_bar <= record_bar < first_bar + inst.size:
+                            reloads.append(
+                                (
+                                    sm,
+                                    pc,
+                                    first_bar,
+                                    inst.size,
+                                    completion_bar,
+                                    source_first_bar,
+                                )
+                            )
+                    elif base_opcode == async_reload_opcode:
+                        first_bar = inst.arg & ((1 << 10) - 1)
+                        count = inst.size & ((1 << 6) - 1)
+                        input_bar = inst.size >> 6
+                        if first_bar <= record_bar < first_bar + count:
+                            async_reloads.append(
+                                (
+                                    sm,
+                                    pc,
+                                    first_bar,
+                                    count,
+                                    input_bar,
+                                    inst.num_slots >> 6,
+                                    bool(inst.opcode & 0x4),
+                                )
+                            )
+            bar_source_value = int(
+                flow.launcher.bars_src.view(torch.uint32)[record_bar].item()
+            )
+            live_bar_value = int(
+                flow.launcher.bars.view(torch.uint32)[record_bar].item()
+            )
+            async_dependency_details = {}
+            for input_bar in sorted({item[4] for item in async_reloads}):
+                producer_opcodes = {}
+                for instructions in flow.program.instructions:
+                    for inst in instructions:
+                        if (
+                            isinstance(inst, MemoryInstruction)
+                            and inst.opcode & 0x10
+                            and inst.opcode & 0x2
+                            and inst.num_slots >> 6 == input_bar
+                        ):
+                            opcode_key = inst.opcode & ~0x3F
+                            producer_opcodes[opcode_key] = (
+                                producer_opcodes.get(opcode_key, 0) + 1
+                            )
+                async_dependency_details[input_bar] = (
+                    flow.launcher.bar_values.get(input_bar),
+                    int(
+                        flow.launcher.bars_src.view(torch.uint32)[
+                            input_bar
+                        ].item()
+                    ),
+                    sorted(producer_opcodes.items()),
+                )
+            raw_opcode = runtime.opcode.OP_ALLOC_WB_RAW_ADDRESS & ~0x3F
+            raw_reuse_counts = {}
+            raw_special_slots = set()
+            for instructions in flow.program.instructions:
+                memory_stream = [
+                    inst
+                    for inst in instructions
+                    if isinstance(inst, MemoryInstruction)
+                ]
+                for memory_pc, inst in enumerate(memory_stream):
+                    if (
+                        inst.opcode & ~0x3F != raw_opcode
+                        or not inst.opcode & 0x2
+                        or not inst.opcode & 0x10
+                        or inst.num_slots >> 6 != record_bar
+                    ):
+                        continue
+                    special_slot = inst.num_slots & 0x3F
+                    raw_special_slots.add(special_slot)
+                    reuse = None
+                    for next_pc in range(memory_pc + 1, len(memory_stream)):
+                        candidate = memory_stream[next_pc]
+                        if candidate.num_slots & 0x3F == special_slot:
+                            reuse = (
+                                next_pc - memory_pc,
+                                candidate.opcode & ~0x3F,
+                                candidate.opcode & 0x3F,
+                                candidate.num_slots >> 6,
+                            )
+                            break
+                    raw_reuse_counts[reuse] = raw_reuse_counts.get(reuse, 0) + 1
+            print(
+                "DSV4_HC_RECORD_BARRIER "
+                f"bar={record_bar} "
+                f"initial={flow.launcher.bar_values[record_bar]} "
+                f"source={bar_source_value} live_before_launch={live_bar_value} "
+                f"record_loads={len(selected_records)} "
+                f"prefetch_loads={sum(bool(inst.annotation.get('prefetch_before_resident_reset')) for _, _, inst in selected_records)} "
+                f"record_sms={selected_records[0][0]}-{selected_records[-1][0]} "
+                f"raw_special_slots={sorted(raw_special_slots)} "
+                f"raw_next_reuse={sorted(raw_reuse_counts.items(), key=lambda item: str(item[0]))} "
+                f"opcode_counts={sorted(opcode_counts.items())} "
+                f"reloads={len(reloads)} reload_sample={reloads[:4]} "
+                f"async_reloads={len(async_reloads)} "
+                f"async_reload_sample={async_reloads[:4]} "
+                f"async_dependencies={async_dependency_details}",
+                flush=True,
+            )
+        return
+    hidden_reference = None
+    if args.hidden_reference is not None:
+        hidden_reference = torch.load(
+            args.hidden_reference, map_location="cpu", weights_only=True
+        )
+        expected_reference_format = (
+            "mxfp4",
+            "mxfp8_e4m3_group32",
+        )
+        actual_reference_format = (
+            hidden_reference.get("ffn_weight_format"),
+            hidden_reference.get("ffn_activation_format"),
+        )
+        if actual_reference_format != expected_reference_format:
+            raise ValueError(
+                "hidden reference does not use the production FFN formats: "
+                f"expected={expected_reference_format} "
+                f"actual={actual_reference_format}; regenerate it with "
+                "deepseek_v4_checkpoint_torch_reference.py"
+            )
+        if args.stop_after_layer is not None:
+            reference_input = hidden_reference["pre_layer"][0]
+        elif args.layers == 1:
+            reference_input = hidden_reference["pre_layer"][
+                args.single_layer_id
+            ]
+        elif args.layers == 2:
+            reference_input = hidden_reference["pre_layer"][
+                flow.layer_ids[0]
+            ]
+        elif args.layers == cfg.num_layers:
+            reference_input = hidden_reference["pre_layer"][0]
+        else:
+            parser.error(
+                "--hidden-reference supports one layer, an adjacent pair, "
+                "a stopped prefix, or all 43 layers"
+            )
+        if reference_input.shape != flow.initial_residual.shape:
+            raise ValueError(
+                "hidden reference input shape does not match the resident image: "
+                f"reference={tuple(reference_input.shape)} "
+                f"resident={tuple(flow.initial_residual.shape)}"
+            )
+        flow.initial_residual.copy_(reference_input.to(device=device))
+    if os.environ.get("DAE_AUDIT_HC_METADATA_HBM") == "1":
+        flow.launcher.prepare_launch()
+        target_start = flow.mhc_fused_metadata.data_ptr()
+        target_bytes = (
+            flow.mhc_fused_metadata.numel()
+            * flow.mhc_fused_metadata.element_size()
+        )
+        target_end = target_start + target_bytes
+        flag_mask = (1 << 6) - 1
+        explicit_store_ops = {
+            getattr(runtime.opcode, name) & ~flag_mask
+            for name in (
+                "OP_ALLOC_WB_TMA_STORE_1D",
+                "OP_ALLOC_WB_STU_STORE_1D",
+            )
+        }
+        raw_store_op = (
+            runtime.opcode.OP_ALLOC_WB_RAW_ADDRESS & ~flag_mask
+        )
+        overlaps = []
+        raw_overlaps = []
+        descriptor_overlaps = []
+        for sm, builder in enumerate(flow.launcher.builder):
+            for pc, inst in enumerate(builder.built_minsts):
+                base_opcode = inst.opcode & ~flag_mask
+                address = sum(
+                    int(coord) << (16 * index)
+                    for index, coord in enumerate(inst.cords)
+                )
+                if base_opcode in explicit_store_ops:
+                    start = address
+                    end = start + int(inst.size)
+                    if max(start, target_start) < min(end, target_end):
+                        overlaps.append(
+                            (
+                                sm,
+                                pc,
+                                base_opcode,
+                                start - target_start,
+                                int(inst.size),
+                            )
+                        )
+                elif base_opcode == raw_store_op:
+                    if target_start <= address < target_end:
+                        raw_overlaps.append(
+                            (sm, pc, address - target_start, int(inst.size))
+                        )
+
+                tensor = getattr(inst, "mat", None)
+                mode = getattr(inst, "mode", None)
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and mode in ("store", "reduce")
+                ):
+                    start = tensor.data_ptr()
+                    end = start + tensor.numel() * tensor.element_size()
+                    if max(start, target_start) < min(end, target_end):
+                        descriptor_overlaps.append(
+                            (
+                                sm,
+                                pc,
+                                base_opcode,
+                                start - target_start,
+                                end - start,
+                                mode,
+                            )
+                        )
+
+        expected_partial_offsets = {
+            (split * SchedDsv4Fp32Bf16Gemv.FUSED_RECORD_STRIDE + group * 4)
+            * 4
+            for split in range(SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS)
+            for group in range(SchedDsv4Fp32Bf16Gemv.FUSED_GROUPS)
+        }
+        partial_offsets = [
+            offset
+            for _, _, _, offset, size in overlaps
+            if size == 16 and offset < 16 * 32 * 4
+        ]
+        tail_offset = 16 * 32 * 4
+        tail_writes = [
+            item
+            for item in overlaps
+            if item[3] == tail_offset
+            and item[4] == SchedDsv4Fp32Bf16Gemv.FUSED_TAIL_ITEMS * 4
+        ]
+        unexpected = [
+            item
+            for item in overlaps
+            if not (
+                item[4] == 16
+                and item[3] in expected_partial_offsets
+            )
+            and item not in tail_writes
+        ]
+        partial_write_counts = {
+            offset: partial_offsets.count(offset)
+            for offset in expected_partial_offsets
+        }
+        zero_writes = [item for item in overlaps if item[3] == 0]
+        hc_writer_stages = [
+            (segment_index, stage_index, stage.name)
+            for segment_index, segment in enumerate(
+                getattr(flow.program, "segments", (flow.program,))
+            )
+            for stage_index, stage in enumerate(segment.stages)
+            if (
+                "attn.hc_post_ffn.hc_project" in stage.name
+                or "ffn.hc_post_next_attn.hc_project" in stage.name
+            )
+        ]
+        generations = len(hc_writer_stages)
+        complete_generations = (
+            generations > 0
+            and all(
+                count == generations
+                for count in partial_write_counts.values()
+            )
+            and len(tail_writes) == generations
+        )
+        passed = (
+            generations == 3
+            and complete_generations
+            and not raw_overlaps
+            and not descriptor_overlaps
+            and not unexpected
+        )
+        print(
+            "DSV4_HC_METADATA_HBM_AUDIT "
+            f"target=0x{target_start:x} bytes={target_bytes} "
+            f"generations={generations} "
+            f"partial_writes={len(partial_offsets)} "
+            f"partial_unique={len(set(partial_offsets))} "
+            f"partial_missing="
+            f"{len(expected_partial_offsets - set(partial_offsets))} "
+            f"partial_count_values={sorted(set(partial_write_counts.values()))} "
+            f"tail_writes={len(tail_writes)} "
+            f"zero_writes={zero_writes} "
+            f"tail_write_records={tail_writes} "
+            f"hc_writer_stages={hc_writer_stages} "
+            f"raw_overlaps={raw_overlaps} "
+            f"descriptor_overlaps={descriptor_overlaps} "
+            f"unexpected={unexpected} status="
+            f"{'PASS' if passed else 'FAIL'}",
+            flush=True,
+        )
+        return
     dump_sm = os.environ.get("DAE_DUMP_MEMORY_SM")
     if dump_sm is not None:
         flow.launcher.prepare_launch()
@@ -8295,6 +9959,12 @@ def main() -> None:
     )
     if args.diagnose_projections:
         flow.report_projection_diagnostics()
+    if args.diagnose_attention_correctness:
+        print(
+            "DSV4_ATTENTION_CORRECTNESS_SCOPE scope=prime",
+            flush=True,
+        )
+        flow.report_attention_correctness()
     if args.expected_token_id is not None and prime_token != args.expected_token_id:
         raise AssertionError(
             f"prime launch emitted token {prime_token}, "
@@ -8315,6 +9985,20 @@ def main() -> None:
             f"{float(prime_top_values[1].item()):.6f} "
             f"top_margin={float((prime_top_values[0] - prime_top_values[1]).item()):.6f}"
         )
+    elif (
+        args.stop_after_layer is not None
+        or args.stop_after_cross_layer_hc_write
+        or args.omit_head
+    ):
+        logit_summary = (
+            "logits=omitted_hc_writer_stop"
+            if args.stop_after_cross_layer_hc_write
+            else (
+                "logits=omitted_prefix_stop"
+                if args.stop_after_layer is not None
+                else "logits=omitted_diagnostic_head"
+            )
+        )
     else:
         logit_summary = (
             "logits=bf16_umma_argmax"
@@ -8326,21 +10010,33 @@ def main() -> None:
         f"output_token={prime_token} elapsed_ms={prime_ms:.6f}",
         flush=True,
     )
-    for _ in range(args.warmup):
+    for _ in range(0 if args.omit_head else args.warmup):
         token, _, _ = flow.run_once()
         if args.expected_token_id is not None and token != args.expected_token_id:
             raise AssertionError(
                 f"warmup emitted token {token}, expected {args.expected_token_id}"
             )
 
-    timings = []
-    device_frontier_timings = []
+    timings = [prime_ms] if args.omit_head else []
+    device_frontier_timings = (
+        [flow.device_frontier_ms()] if args.omit_head else []
+    )
     repeat_logit_max_abs = []
     repeat_logit_mean_abs = []
     profile_samples = []
-    reference_token = None
-    logits = None
-    for iteration in range(args.iterations):
+    reference_token = prime_token if args.omit_head else None
+    token = prime_token
+    logits = prime_logits if args.omit_head else None
+    if args.omit_head:
+        print(
+            "DSV4_ONE_LAUNCH_SAMPLE "
+            "iteration=0 source=prime_single_launch "
+            f"elapsed_ms={prime_ms:.6f} "
+            f"device_frontier_ms={device_frontier_timings[0]:.6f} "
+            f"output_token={prime_token}",
+            flush=True,
+        )
+    for iteration in range(0 if args.omit_head else args.iterations):
         token, elapsed_ms, logits = flow.run_once()
         if repeat_state_oracle is not None:
             flow.report_repeat_state(repeat_state_oracle, iteration)
@@ -8405,6 +10101,155 @@ def main() -> None:
                 f"launches: prime={prime_token}, timed={reference_token}"
             )
     assert logits is not None
+    if args.diagnose_attention_correctness:
+        print(
+            "DSV4_ATTENTION_CORRECTNESS_SCOPE scope=final_timed",
+            flush=True,
+        )
+        flow.report_attention_correctness()
+    if hidden_reference is not None and args.stop_after_stage is None:
+        if args.stop_after_layer is not None:
+            reference_output = hidden_reference["post_layer"][
+                args.stop_after_layer
+            ].float()
+            scope = "prefix"
+            reference_layer = args.stop_after_layer
+        elif args.layers == 1:
+            reference_output = hidden_reference["post_layer"][
+                args.single_layer_id
+            ].float()
+            scope = "layer"
+            reference_layer = args.single_layer_id
+        elif args.layers == 2:
+            reference_output = hidden_reference["post_layer"][
+                flow.layer_ids[-1]
+            ].float()
+            scope = "pair"
+            reference_layer = flow.layer_ids[-1]
+        else:
+            reference_output = hidden_reference["final_residual"].float()
+            scope = "full"
+            reference_layer = -1
+        resident_output = flow.residual.detach().cpu().float()
+        delta = resident_output - reference_output
+        reference_norm = float(torch.linalg.vector_norm(reference_output).item())
+        delta_norm = float(torch.linalg.vector_norm(delta).item())
+        cosine = float(
+            torch.nn.functional.cosine_similarity(
+                resident_output.reshape(1, -1),
+                reference_output.reshape(1, -1),
+            ).item()
+        )
+        print(
+            "DSV4_HIDDEN_COMPARE status=DIAGNOSTIC "
+            f"scope={scope} layer={reference_layer} "
+            f"rel_l2={delta_norm / max(reference_norm, 1.0e-30):.9f} "
+            f"cosine={cosine:.9f} "
+            f"mean_abs={float(delta.abs().mean().item()):.9f} "
+            f"max_abs={float(delta.abs().max().item()):.9f}",
+            flush=True,
+        )
+    if args.dump_final_hidden is not None:
+        _, final_ffn_normalized, _, _, _ = flow._mhc_outputs(
+            flow.layer_ids[-1]
+        )
+        payload = {
+            "residual": flow.residual.detach().cpu(),
+            "next_residual": flow.next_residual.detach().cpu(),
+            "mxfp_ffn_output": flow.mxfp_ffn_output.detach().cpu(),
+            "ffn_normalized": final_ffn_normalized.detach().cpu(),
+            "route_records": flow.route_records.detach().cpu(),
+            "router_prepared": flow.router_prepared.detach().cpu(),
+            "mxfp_input_records": flow.mxfp_input_records.detach().cpu(),
+            "mxfp_activation_data": flow.mxfp_activation_data.detach().cpu(),
+            "mxfp_activation_scales": (
+                flow.mxfp_activation_scales.detach().cpu()
+            ),
+            "mxfp_middle_records": flow.mxfp_middle_records.detach().cpu(),
+            "mhc_cross_layer_input_records": (
+                flow.mhc_cross_layer_input_records.detach().cpu()
+            ),
+            "mhc_output_metadatas": (
+                flow.mhc_output_metadatas.detach().cpu()
+            ),
+            "mhc_fused_metadata": flow.mhc_fused_metadata.detach().cpu(),
+            "mhc_packed_metadata": flow.mhc_packed_metadata.detach().cpu(),
+            "stop_after_layer": torch.tensor(
+                -1
+                if args.stop_after_layer is None
+                else args.stop_after_layer,
+                dtype=torch.int64,
+            ),
+            "stop_after_cross_layer_hc_write": torch.tensor(
+                int(args.stop_after_cross_layer_hc_write),
+                dtype=torch.int64,
+            ),
+        }
+        if args.layers == 1:
+            payload.update(
+                {
+                    "layer_ids": torch.tensor(
+                        flow.layer_ids, dtype=torch.int64
+                    ),
+                    "route_record": flow.route_record.detach().cpu(),
+                }
+            )
+            correctness_reference = getattr(
+                flow, "attention_correctness_reference", None
+            )
+            if correctness_reference is not None:
+                payload.update(
+                    {
+                        f"reference_{name}": tensor.detach().cpu()
+                        for name, tensor in correctness_reference.items()
+                    }
+                )
+        if flow.mhc_boundary_record_snapshot is not None:
+            payload.update(
+                {
+                    "mhc_boundary_record_snapshot": (
+                        flow.mhc_boundary_record_snapshot.detach().cpu()
+                    ),
+                    "mhc_boundary_coefficients_snapshot": (
+                        flow.mhc_boundary_coefficients_snapshot.detach().cpu()
+                    ),
+                }
+            )
+        if flow.mhc_consumed_record_capture is not None:
+            payload["mhc_consumed_record_capture"] = (
+                flow.mhc_consumed_record_capture.detach().cpu()
+            )
+            payload["mhc_consumed_weight_capture"] = (
+                flow.mhc_consumed_weight_capture.detach().cpu()
+            )
+            payload["mhc_consumed_coefficient_capture"] = (
+                flow.mhc_consumed_coefficient_capture.detach().cpu()
+            )
+            payload["mhc_fused_weight_reference"] = (
+                flow.mhc_fused_weight_reference.detach().cpu()
+            )
+        if (
+            args.stop_after_layer is None
+            and not args.stop_after_cross_layer_hc_write
+            and not args.omit_head
+        ):
+            active_head_norm = (
+                flow.head_norm[0] if flow.bf16_umma_head else flow.head_norm
+            )
+            payload.update(
+                {
+                    "head_norm": active_head_norm.detach().cpu(),
+                    "output_token": torch.tensor(
+                        reference_token, dtype=torch.int64
+                    ),
+                }
+            )
+        torch.save(payload, args.dump_final_hidden)
+        print(
+            "DSV4_FINAL_HIDDEN_DUMP status=PASS "
+            f"path={args.dump_final_hidden}",
+            flush=True,
+        )
     if profile_modes:
         if args.profile_mxfp_ffn_detail and len(profile_samples) > 1:
             base = runtime_config.reload_profile_event_base
@@ -8492,7 +10337,9 @@ def main() -> None:
             else (profile_index,)
         )
         for sample_index in profile_indices:
-            if args.profile_fp8_coupled_detail:
+            if args.profile_cross_layer_hc_barrier:
+                reporter = flow.report_cross_layer_hc_barrier_profile
+            elif args.profile_fp8_coupled_detail:
                 reporter = flow.report_fp8_coupled_detail_profile
             elif args.profile_layers:
                 reporter = flow.report_layer_profile
@@ -8522,14 +10369,27 @@ def main() -> None:
         f"{statistics.mean(repeat_logit_mean_abs):.6f}"
         if repeat_logit_max_abs
         else (
-            "repeat_logits=bf16_umma_argmax"
-            if flow.bf16_umma_head
-            else "repeat_logits=fp8_argmax"
+            "repeat_logits=omitted_hc_writer_stop"
+            if args.stop_after_cross_layer_hc_write
+            else (
+                "repeat_logits=omitted_prefix_stop"
+                if args.stop_after_layer is not None
+                else (
+                    "repeat_logits=omitted_diagnostic_head"
+                    if args.omit_head
+                    else (
+                        "repeat_logits=bf16_umma_argmax"
+                        if flow.bf16_umma_head
+                        else "repeat_logits=fp8_argmax"
+                    )
+                )
+            )
         )
     )
     print(
         "DSV4_ONE_LAUNCH_DECODE status=PASS model_launches=1 gpu=1 "
-        f"layers={args.layers} token_id={args.token_id} "
+        f"layers={len(flow.layer_ids)} token_id={args.token_id} "
+        f"stop_after_layer={args.stop_after_layer if args.stop_after_layer is not None else -1} "
         f"context={args.context_length} position={args.context_length - 1} "
         f"attention={args.attention_mode} "
         "ffn=mxfp4_mxfp8_routed_resident "

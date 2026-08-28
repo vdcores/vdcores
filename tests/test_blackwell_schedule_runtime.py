@@ -177,6 +177,37 @@ def test_rowmajor_2d_tma_coordinates_preserve_row_and_column():
     assert cord(32, 384) == [384, 32]
 
 
+def test_m128n8_tma_descriptor_preserves_physical_n_stride(monkeypatch):
+    descriptor_args = []
+
+    def build_tma_desc(*args):
+        descriptor_args.append(args)
+        return torch.empty((128,), dtype=torch.uint8)
+
+    monkeypatch.setattr("dae.runtime.build_tma_desc", build_tma_desc)
+
+    class FakeLauncher:
+        @staticmethod
+        def new_tma(_descriptor):
+            return 7
+
+    hidden = 4096
+    record_rows = 5
+    arena = torch.empty((36, hidden), dtype=torch.bfloat16)
+    output = torch.as_strided(
+        arena,
+        size=(8, hidden),
+        stride=(record_rows * hidden, 1),
+    )
+    TmaTensor(FakeLauncher(), output).m128n8_output("reduce")
+
+    assert len(descriptor_args) == 1
+    assert descriptor_args[0][2] == [
+        record_rows * hidden * output.element_size(),
+        64 * output.element_size(),
+    ]
+
+
 def test_dynamic_repeat_encodes_zero_count_skip_window():
     step = MemoryInstruction(opcode.OP_ALLOC_TMA_LOAD_1D, num_slots=1, arg=0, size=16)
     instructions = RepeatM.on(

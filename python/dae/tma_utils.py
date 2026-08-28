@@ -289,7 +289,13 @@ def build_tma_wgmma_mnmajor(mat: torch.Tensor, tileM : int, tileK : int):
 
 
 def build_tma_wgmma_mnmajor_m128n8(mat: torch.Tensor, tileM: int, tileK: int):
-    """Build a reducible rank-3 descriptor for an SM100 M128xN8 output tile."""
+    """Build a reducible rank-3 descriptor for an SM100 M128xN8 output tile.
+
+    The M dimension must be contiguous, but the eight N rows may have a
+    larger physical stride.  This lets callers keep lane zero adjacent to a
+    separate contiguous handoff record without making the other seven UMMA
+    lanes overwrite that record.
+    """
     assert mat.dim() == 2, "M128N8 output currently requires a 2D [N, M] tensor"
     assert mat.element_size() in (2, 4), (
         "M128N8 output requires a 16-bit or 32-bit element type"
@@ -299,9 +305,12 @@ def build_tma_wgmma_mnmajor_m128n8(mat: torch.Tensor, tileM: int, tileK: int):
     element_size = mat.element_size()
     block_m = 128 // element_size
     assert n == 8 and m % block_m == 0
+    assert mat.stride(1) == 1, "M128N8 output requires contiguous M rows"
+    row_stride = mat.stride(0)
+    assert row_stride >= m, "M128N8 output N rows must not overlap"
 
     global_dims = [block_m, 8, m // block_m]
-    global_strides = [m * element_size, block_m * element_size]
+    global_strides = [row_stride * element_size, block_m * element_size]
     box_dims = [block_m, 8, tileM // block_m]
     rank = len(global_dims)
     return rank, runtime.build_tma_desc(

@@ -3164,16 +3164,21 @@ class SchedMxfp4Mxfp8DownFixedRing(Schedule):
         expected_output_dtype = (
             torch.float32 if self.fp32_output else torch.bfloat16
         )
+        output_layout_valid = (
+            self.final_output.ndim == 2
+            and self.final_output.stride(1) == 1
+            and self.final_output.stride(0) >= self.HIDDEN
+        ) if self.output_n_major else self.final_output.is_contiguous()
         if (
             self.final_output.dtype != expected_output_dtype
             or tuple(self.final_output.shape) != expected_output_shape
-            or not self.final_output.is_contiguous()
+            or not output_layout_valid
         ):
             layout = "[8,4096]" if self.output_n_major else "[32,128,8]"
             raise ValueError(
                 "down final output must be "
                 f"{str(expected_output_dtype).removeprefix('torch.').upper()} "
-                f"contiguous {layout}"
+                f"M-contiguous {layout}"
             )
         if (
             self.metadata.dtype != torch.uint8
@@ -6341,6 +6346,9 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
         launcher=None,
         prefetch_operands_before_resident_reset=False,
         profile_operands=False,
+        captured_record=None,
+        captured_weight=None,
+        captured_coefficients=None,
     ):
         super().__init__()
         self.weight = weight
@@ -6359,6 +6367,9 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
             prefetch_operands_before_resident_reset
         )
         self.profile_operands = bool(profile_operands)
+        self.captured_record = captured_record
+        self.captured_weight = captured_weight
+        self.captured_coefficients = captured_coefficients
 
     def _on_place(self):
         self.fuse_hc_post = self.fused_post_input_record is not None
@@ -6441,6 +6452,73 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                 )
             if self.launcher is None:
                 raise ValueError("fused mHC projection requires a TMA launcher")
+            if self.captured_record is not None and (
+                not self.profile_operands
+                or self.captured_record.dtype != torch.bfloat16
+                or tuple(self.captured_record.shape)
+                != (
+                    self.FUSED_TASK_SMS,
+                    5,
+                    self.FUSED_TILE_HIDDEN,
+                )
+                or not self.captured_record.is_contiguous()
+                or self.captured_record.device != self.weight.device
+            ):
+                raise ValueError(
+                    "fused mHC record capture must be a contiguous BF16 "
+                    "[128,5,256] tensor in operand-profile mode"
+                )
+            if self.captured_weight is not None and (
+                not self.profile_operands
+                or self.captured_weight.dtype != torch.float32
+                or tuple(self.captured_weight.shape)
+                != (
+                    self.FUSED_TASK_SMS,
+                    self.FUSED_OUTPUTS_PER_TASK,
+                    4,
+                    self.FUSED_TILE_HIDDEN,
+                )
+                or not self.captured_weight.is_contiguous()
+                or self.captured_weight.device != self.weight.device
+            ):
+                raise ValueError(
+                    "fused mHC weight capture must be a contiguous FP32 "
+                    "[128,3,4,256] tensor in operand-profile mode"
+                )
+            if self.captured_coefficients is not None and (
+                not self.profile_operands
+                or self.captured_coefficients.dtype != torch.float32
+                or tuple(self.captured_coefficients.shape)
+                != (self.FUSED_TASK_SMS, 20)
+                or not self.captured_coefficients.is_contiguous()
+                or self.captured_coefficients.device != self.weight.device
+            ):
+                raise ValueError(
+                    "fused mHC coefficient capture must be a contiguous "
+                    "FP32 [128,20] tensor in operand-profile mode"
+                )
+            self.profile_operand_descriptor = None
+            if self.profile_operands:
+                # TRACK_PROFILE interprets the normally direct coefficient
+                # pointer as this diagnostic descriptor.  The
+                # ordinary image never requests operand profiling and keeps
+                # the original direct coefficient address/instruction path.
+                self.profile_operand_descriptor = torch.tensor(
+                    (
+                        self.packed_coefficients.data_ptr(),
+                        0
+                        if self.captured_record is None
+                        else self.captured_record.data_ptr(),
+                        0
+                        if self.captured_weight is None
+                        else self.captured_weight.data_ptr(),
+                        0
+                        if self.captured_coefficients is None
+                        else self.captured_coefficients.data_ptr(),
+                    ),
+                    dtype=torch.int64,
+                    device=self.weight.device,
+                )
             self.fused_record_tma = TmaTensor(
                 self.launcher, self.fused_post_input_record
             ).rowmajor_2d(
@@ -6543,7 +6621,11 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                     fuse_hc_post=True,
                     profile_operands=self.profile_operands,
                     packed_coefficients_address=(
-                        self.packed_coefficients.data_ptr()
+                        (
+                            self.profile_operand_descriptor.data_ptr()
+                            if self.profile_operand_descriptor is not None
+                            else self.packed_coefficients.data_ptr()
+                        )
                         if direct_coefficients
                         else None
                     ),
@@ -6573,6 +6655,14 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
                     delta_cols=self.FUSED_TILE_HIDDEN,
                 )
             record_load = record_load.fixed_port(1)
+            record_load.annotation["fused_hc_record"] = True
+            if self.profile_operands:
+                # coords[3] is unused by both the ordinary and paired 2-D TMA
+                # encodings. The TRACK_PROFILE runtime recognizes this marker
+                # and records the VDcores global-counter generation without
+                # changing the production instruction stream.
+                record_load.cords[3] = 0x4843
+                record_load.annotation["profile_hc_global_bar"] = True
             record_bar = self._bar("record")
             if record_bar is not None:
                 record_load.bar(record_bar)
@@ -6596,16 +6686,16 @@ class SchedDsv4Fp32Bf16Gemv(Schedule):
             metadata_bar = self._bar("metadata")
             if metadata_bar is None:
                 metadata_bar = self._bar("output")
-            # Give every producer a disjoint 16-byte destination.  Group zero
-            # writes [square_sum, mix0, mix1, mix2]; the remaining groups
-            # write three mixes and leave their fourth word unspecified.  A
-            # whole-record store here would race with the other seven output
-            # groups and overwrite their partials with uninitialized shared
-            # data.
+            # Give every producer a disjoint 16-byte destination.  Compute
+            # writes these four FP32 words directly to HBM, then returns the
+            # raw-address token through C2M.  STU performs no data copy; it
+            # only publishes the metadata completion edge.  Group zero writes
+            # [square_sum, mix0, mix1, mix2]; the remaining groups write three
+            # mixes and intentionally leave their fourth word untouched.
             partial_start = (
                 split * self.FUSED_RECORD_STRIDE + output_group * 4
             )
-            partial_store = _shared_store_1d(
+            partial_store = RawWritebackAddress(
                 self.fused_partial_metadata[
                     partial_start:partial_start + 4
                 ]

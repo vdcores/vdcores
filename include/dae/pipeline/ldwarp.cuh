@@ -1018,6 +1018,13 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 #else
     auto inst = st_insts[slot];
 #endif
+#if defined(DAE_TRACK_PROFILE)
+    constexpr uint16_t kHcGlobalRecordMarker = 0x4843;
+    const bool profile_hc_global_record =
+        inst.coords[3] == kHcGlobalRecordMarker &&
+        (op(opcode) == op(OP_ALLOC_TMA_LOAD_2D) ||
+         op(opcode) == op(OP_ALLOC_TMA_LOAD_PAIR_2D));
+#endif
 #if defined(DAE_ATTENTION_DETAIL_PROFILE)
     const bool attention_detail_ring_command =
         port_id == 1 &&
@@ -1081,6 +1088,13 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       const uint64_t dependency_start = cuda::ptx::get_sreg_globaltimer();
       if (*bar != 0)
         ++dependency_contended;
+      if (profile_hc_global_record) {
+        const uint32_t initial_value = uint32_t(*bar);
+        g_events[sm_id * numProfileEvents + hcGlobalRecordWaitBeginEvent] =
+            dependency_start;
+        g_events[sm_id * numProfileEvents + hcGlobalRecordWaitValueEvent] =
+            (uint64_t(inst.bar()) << 32) | initial_value;
+      }
 #endif
       // bool first_wait = true;
       // if (blockIdx.x == 0 && first_wait) {
@@ -1094,6 +1108,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         //   first_wait = false;
         // }
       }
+#if defined(DAE_TRACK_PROFILE)
+      if (profile_hc_global_record) {
+        g_events[sm_id * numProfileEvents + hcGlobalRecordWaitEndEvent] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+#endif
       // A barriered raw-address command is itself the producer dependency:
       // compute will dereference HBM directly instead of issuing a TMA after
       // this wait.  Carry the device-scope release/acquire edge through the
@@ -1912,6 +1932,18 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
       }
       case op(OP_LDU_RELOAD_BARRIERS): {
         produces_compute_operand = false;
+#if defined(DAE_TRACK_PROFILE)
+        constexpr uint16_t kProfileHcGlobalBarrier = 1U << 13;
+        const bool profile_hc_global_reload =
+            port_id == 0 && (inst.arg & kProfileHcGlobalBarrier);
+        if (profile_hc_global_reload) {
+          const uint32_t value = uint32_t(load_l2(bars + inst.bar()));
+          g_events[sm_id * numProfileEvents + hcGlobalReloadBeginEvent] =
+              cuda::ptx::get_sreg_globaltimer();
+          g_events[sm_id * numProfileEvents + hcGlobalReloadValueEvent] =
+              (uint64_t(inst.bar()) << 32) | value;
+        }
+#endif
 #if defined(DAE_TRACK_PROFILE) && \
     !defined(DAE_MXFP_FFN_DETAIL_PROFILE) && \
     !defined(DAE_STU_HISTORY_PROFILE)
@@ -1960,6 +1992,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
                  ready_phase_end) {
             __nanosleep(reloadBarrierPollSleepCycles);
           }
+#if defined(DAE_TRACK_PROFILE)
+          if (profile_hc_global_reload) {
+            g_events[sm_id * numProfileEvents + hcGlobalReloadReadyEvent] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
 
           // Resident mbarriers are persistent objects. Their cyclic data
           // rings complete an even number of generations per layer, while
@@ -1985,6 +2023,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
                 load_l2(source + first_bar + offset),
                 cuda::memory_order_relaxed);
           }
+#if defined(DAE_TRACK_PROFILE)
+          if (profile_hc_global_reload) {
+            g_events[sm_id * numProfileEvents + hcGlobalReloadStoreEvent] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
 
           // The second phase orders every block's disjoint counter stores.
           // All blocks observe the completed reload before either LDU port
@@ -2002,6 +2046,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
           while (done_ref.load(cuda::memory_order_acquire) < done_phase_end) {
             __nanosleep(reloadBarrierPollSleepCycles);
           }
+#if defined(DAE_TRACK_PROFILE)
+          if (profile_hc_global_reload) {
+            g_events[sm_id * numProfileEvents + hcGlobalReloadEndEvent] =
+                cuda::ptx::get_sreg_globaltimer();
+          }
+#endif
 
         }
         // Port 1 cannot consume a following loop iteration until port 0 has
@@ -2180,6 +2230,13 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     detail_previous_begin = detail_command_begin;
     detail_previous_end = cuda::ptx::get_sreg_globaltimer();
     detail_previous_opcode = opcode;
+#endif
+
+#if defined(DAE_TRACK_PROFILE)
+    if (profile_hc_global_record) {
+      g_events[sm_id * numProfileEvents + hcGlobalRecordCommandEndEvent] =
+          cuda::ptx::get_sreg_globaltimer();
+    }
 #endif
 
     // m2c data should be prepared in the CFU

@@ -688,6 +688,16 @@ class SequentialProgram:
                     _gate_load_ports(rendered, input_bar, stage.name)
             if resident_reset_reload is not None:
                 found_reset_prefetch = False
+                if any(
+                    isinstance(inst, MemoryInstruction)
+                    and inst.annotation.get("profile_hc_global_bar")
+                    for instructions in rendered
+                    for inst in instructions
+                ):
+                    # Bits 12--13 are unused by the ordinary reload opcode.
+                    # Tag the matching reset so both LDU ports can trace the
+                    # first restore of the same global-counter generation.
+                    resident_reset_reload.arg |= 1 << 13
                 for sm, instructions in enumerate(rendered):
                     prefetch_positions = [
                         index

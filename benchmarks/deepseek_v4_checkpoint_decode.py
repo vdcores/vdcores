@@ -827,10 +827,16 @@ class CheckpointDecode:
             device=str(self.device),
         )
         residual = embedding.reshape(1, -1).repeat(self.config.hc_mult, 1)
+        pre_layer = []
+        post_layer = []
         started = time.monotonic()
         for layer_id in range(self.args.layers):
+            if self.args.hidden_output is not None:
+                pre_layer.append(residual.detach().cpu().clone())
             layer_started = time.monotonic()
             residual = self._layer(layer_id, residual, token_id, position)
+            if self.args.hidden_output is not None:
+                post_layer.append(residual.detach().cpu().clone())
             print(
                 "DSV4_CHECKPOINT_LAYER status=PASS "
                 f"position={position} layer={layer_id} "
@@ -841,6 +847,23 @@ class CheckpointDecode:
             if not self.args.resident:
                 gc.collect()
                 torch.cuda.empty_cache()
+        if self.args.hidden_output is not None:
+            torch.save(
+                {
+                    "context_length": torch.tensor(1, dtype=torch.int64),
+                    "input_token": torch.tensor(token_id, dtype=torch.int64),
+                    "pre_layer": torch.stack(pre_layer),
+                    "post_layer": torch.stack(post_layer),
+                    "final_residual": post_layer[-1],
+                },
+                self.args.hidden_output,
+            )
+            print(
+                "DSV4_CHECKPOINT_HIDDEN status=PASS "
+                f"layers={len(post_layer)} shape={tuple(post_layer[-1].shape)} "
+                f"path={self.args.hidden_output}",
+                flush=True,
+            )
         token, logits = self._head(residual)
         return token, logits, time.monotonic() - started
 
@@ -879,6 +902,10 @@ def main() -> None:
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--decode-tokens", type=int, default=1)
     parser.add_argument("--expected-token-ids")
+    parser.add_argument(
+        "--hidden-output",
+        help="save the existing pre/post-layer residual after each layer",
+    )
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--sms", type=int, default=152)
     parser.add_argument("--trace-stages", action="store_true")
@@ -903,6 +930,8 @@ def main() -> None:
         parser.error("the real-checkpoint breadth gate currently requires start-pos=0")
     if not 1 <= args.decode_tokens <= 4:
         parser.error("decode-tokens must be in [1,4] for the current breadth gate")
+    if args.hidden_output is not None and args.decode_tokens != 1:
+        parser.error("--hidden-output currently requires --decode-tokens=1")
     if not 1 <= args.vocab_size <= config.vocab_size:
         parser.error("vocab-size must be in [1,129280]")
     if args.sms <= 0:

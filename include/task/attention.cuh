@@ -1996,7 +1996,7 @@ task_dsv4_attention_context1_fp8_sm100(
     constexpr int kScaleVector = 32;
     constexpr int kBBytes = kTileN * kTileK;
     constexpr int kBTileBytes = 2048;
-    constexpr float kScoreScale = M_LOG2E / 11.313708498984761f;
+    constexpr float kScoreScale = M_LOG2E / 22.627416997969522f;
     static_assert(ScalePack == 2);
     const bool normalize_q = (output_group & 4) != 0;
 

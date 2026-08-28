@@ -263,6 +263,13 @@ DAE_COMPUTE_OP_HANDLER(OP_MXFP4_MXFP8_ROUTED_RESIDENT_FFN_SM100) {
   }
   mxfp_resident_phase ^= 1U;
   const int output_token = m2c.template pop<0>();
+#if defined(DAE_TRACK_PROFILE)
+  if (thread_id == 0 &&
+      st_insts[output_token].size == hcGlobalRawProfileEvent + 1) {
+    g_events[sm_id * numProfileEvents + hcGlobalResidentComputeDoneEvent] =
+        cuda::ptx::get_sreg_globaltimer();
+  }
+#endif
 #if defined(DAE_STU_HISTORY_PROFILE)
   const uint32_t warp_ptr = __shfl_sync(0xFFFFFFFFU, c2m.ptr, 0);
   const uint32_t warp_ptr_match =
@@ -728,7 +735,7 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_EXPERT_REDUCE) {
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
   DAE_UNUSED(thread_id, pc, count, finish, tmem_base_ptr,
-             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+             tmem_mma_barrier, tmem_mma_phase, g_events);
   const uint64_t fused_coefficients_address =
       (uint64_t(inst.args[0]) |
        (uint64_t(inst.args[1]) << 16) |
@@ -738,49 +745,75 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_BF16_GEMV) {
   if ((inst.args[2] & 8U) == 0) {
     fused_coefficients = nullptr;
   }
+#if defined(DAE_TRACK_PROFILE)
+  __nv_bfloat16 *fused_record_capture = nullptr;
+  float *fused_weight_capture = nullptr;
+  float *fused_coefficient_capture = nullptr;
+  if ((inst.args[2] & 4U) != 0 && fused_coefficients != nullptr) {
+    // Operand-profile schedules encode a two-pointer descriptor in the
+    // otherwise direct coefficient field.  This keeps the production task's
+    // command stream untouched while allowing the diagnostic specialization
+    // to preserve the exact shared-memory record consumed by each CTA.
+    const auto *profile_descriptor =
+        reinterpret_cast<const uint64_t *>(fused_coefficients);
+    fused_coefficients = reinterpret_cast<const float *>(
+        load_l2_u64(profile_descriptor));
+    fused_record_capture = reinterpret_cast<__nv_bfloat16 *>(
+        load_l2_u64(profile_descriptor + 1));
+    if (fused_record_capture != nullptr) {
+      fused_record_capture += sm_id * 5 * 256;
+    }
+    fused_weight_capture = reinterpret_cast<float *>(
+        load_l2_u64(profile_descriptor + 2));
+    if (fused_weight_capture != nullptr) {
+      fused_weight_capture += sm_id * 3 * 4 * 256;
+    }
+    fused_coefficient_capture = reinterpret_cast<float *>(
+        load_l2_u64(profile_descriptor + 3));
+    if (fused_coefficient_capture != nullptr) {
+      fused_coefficient_capture += sm_id * 20;
+    }
+  }
+#endif
   switch (inst.args[2] & 3U) {
   case 3:
 #if defined(DAE_TRACK_PROFILE)
     if (inst.args[2] & 4U) {
       task_dsv4_fp32_bf16_gemv<true, true, 1, 3, true>(
-          inst.args[0], inst.args[1], smem_base,
-          get_slot_address(smem_base, numSlots), st_insts,
+          inst.args[0], inst.args[1], smem_base, scratch_space, st_insts,
           fused_coefficients, m2c, c2m,
-          sm_id, g_events);
+          sm_id, g_events, fused_record_capture,
+          fused_weight_capture, fused_coefficient_capture);
       break;
     }
 #endif
     task_dsv4_fp32_bf16_gemv<true, true, 1, 3>(
-        inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts,
+        inst.args[0], inst.args[1], smem_base, scratch_space, st_insts,
         fused_coefficients, m2c, c2m);
     break;
   case 2:
 #if defined(DAE_TRACK_PROFILE)
     if (inst.args[2] & 4U) {
       task_dsv4_fp32_bf16_gemv<false, true, 1, 3, true>(
-          inst.args[0], inst.args[1], smem_base,
-          get_slot_address(smem_base, numSlots), st_insts,
+          inst.args[0], inst.args[1], smem_base, scratch_space, st_insts,
           fused_coefficients, m2c, c2m,
-          sm_id, g_events);
+          sm_id, g_events, fused_record_capture,
+          fused_weight_capture, fused_coefficient_capture);
       break;
     }
 #endif
     task_dsv4_fp32_bf16_gemv<false, true, 1, 3>(
-        inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts,
+        inst.args[0], inst.args[1], smem_base, scratch_space, st_insts,
         fused_coefficients, m2c, c2m);
     break;
   case 1:
     task_dsv4_fp32_bf16_gemv<true, false>(
-        inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts,
+        inst.args[0], inst.args[1], smem_base, scratch_space, st_insts,
         nullptr, m2c, c2m);
     break;
   default:
     task_dsv4_fp32_bf16_gemv<false, false>(
-        inst.args[0], inst.args[1], smem_base,
-        get_slot_address(smem_base, numSlots), st_insts,
+        inst.args[0], inst.args[1], smem_base, scratch_space, st_insts,
         nullptr, m2c, c2m);
     break;
   }

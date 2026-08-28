@@ -85,6 +85,13 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     // all ops are writeback ops
 
     switch(op(opcode)) {
+      case op(OP_ALLOC_WB_RAW_ADDRESS):
+        // A normal-slot raw writeback is a stable descriptor lease for a
+        // compute-direct HBM store.  There is no STU copy, but the allocator
+        // slot must remain live until this completion token is consumed.
+        // Legacy special-slot raw addresses remain non-allocating mailboxes.
+        do_free = slot < numSlots;
+        break;
       case op(OP_ALLOC_WB_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(
@@ -321,7 +328,11 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
             cuda::ptx::get_sreg_globaltimer();
       }
 #endif
+#if defined(DAE_TRACK_PROFILE)
+      const int previous_bar_value = atomicSub(&bars[inst.bar()], 1);
+#else
       atomicSub(&bars[inst.bar()], 1);
+#endif
 #if defined(DAE_ATTENTION_DETAIL_PROFILE)
       if (op(opcode) == op(OP_ALLOC_WB_TMA_STORE_1D) &&
           (inst.arg & kProfileStoreEventFlag)) {
@@ -334,6 +345,12 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
       if (raw_profile_event >= 0) {
         g_events[sm_id * numProfileEvents + raw_profile_event + 2] =
             cuda::ptx::get_sreg_globaltimer();
+        if (raw_profile_event == hcGlobalRawProfileEvent) {
+          g_events[
+              sm_id * numProfileEvents + hcGlobalRawPreviousValueEvent] =
+              (uint64_t(inst.bar()) << 32) |
+              uint32_t(previous_bar_value);
+        }
       }
 #endif
       // int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);

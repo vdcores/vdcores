@@ -503,7 +503,7 @@ def build_attention_context1_native(
             q_values = apply_partial_rope_512_64(
                 q_values, table
             ).to(torch.bfloat16).float()
-        score = (q_values * kv.float()).sum(dim=1) / (128.0**0.5)
+        score = (q_values * kv.float()).sum(dim=1) / (512.0**0.5)
         probability = torch.sigmoid(score - sink[:heads])
         values = kv.float().expand(heads, -1) * probability[:, None]
         values = apply_partial_rope_512_64(values, table, inverse=True)

@@ -440,8 +440,18 @@ __device__ __forceinline__ void task_dsv4_rms_rope_512_64(
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *normalized = static_cast<float *>(task_scratch);
+  // The allocator-owned output slot remains leased for the whole task. Keep
+  // the FP32 working row immediately after its 1-KiB BF16 output instead of
+  // borrowing the dynamic shared tail, which is concurrently owned by LDU
+  // scale/ring transactions.
+  constexpr int kOutputBytes = kHeadDim * sizeof(__nv_bfloat16);
+  static_assert(
+      kOutputBytes + (kHeadDim + 5) * int(sizeof(float)) <=
+      slotSizeKb * 1024);
+  auto *normalized = reinterpret_cast<float *>(
+      reinterpret_cast<unsigned char *>(output) + kOutputBytes);
   auto *reduction = normalized + kHeadDim;
+  (void)task_scratch;
 
   float sum = 0.0f;
 #pragma unroll
@@ -549,8 +559,16 @@ __device__ __forceinline__ void task_dsv4_fp32_rms_rope_512_64(
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  auto *normalized = static_cast<float *>(task_scratch);
+  // Match the BF16-input path above: the output allocation also owns the
+  // temporary FP32 row, keeping it disjoint from all LDU dynamic-tail rings.
+  constexpr int kOutputBytes = kHeadDim * sizeof(__nv_bfloat16);
+  static_assert(
+      kOutputBytes + (kHeadDim + 5) * int(sizeof(float)) <=
+      slotSizeKb * 1024);
+  auto *normalized = reinterpret_cast<float *>(
+      reinterpret_cast<unsigned char *>(output) + kOutputBytes);
   auto *reduction = normalized + kHeadDim;
+  (void)task_scratch;
 
   float sum = 0.0f;
 #pragma unroll
@@ -1424,7 +1442,13 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     M2CQueue &m2c,
     C2MQueue &c2m,
     int profile_sm_id = -1,
-    uint64_t *profile_events = nullptr) {
+    uint64_t *profile_events = nullptr
+#if defined(DAE_TRACK_PROFILE)
+    , __nv_bfloat16 *fused_record_capture = nullptr
+    , float *fused_weight_capture = nullptr
+    , float *fused_coefficient_capture = nullptr
+#endif
+    ) {
   const int tid = __compute_tid();
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -1473,6 +1497,26 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     }
     const auto *record = static_cast<const __nv_bfloat16 *>(
         get_slot_address(smem_base, extract(record_slots)));
+    if constexpr (ProfileOperands) {
+#if defined(DAE_TRACK_PROFILE)
+      if (fused_record_capture != nullptr) {
+        constexpr int kRecordElements = 5 * kTileHidden;
+        for (int index = tid; index < kRecordElements; index += 128) {
+          fused_record_capture[index] = record[index];
+        }
+      }
+      if (fused_weight_capture != nullptr) {
+        constexpr int kWeightElements =
+            FusedOutputsPerTask * 4 * kTileHidden;
+        for (int index = tid; index < kWeightElements; index += 128) {
+          fused_weight_capture[index] = weight[index];
+        }
+      }
+      if (fused_coefficient_capture != nullptr && tid < 20) {
+        fused_coefficient_capture[tid] = fused_coefficients[tid];
+      }
+#endif
+    }
     int output_slots;
     __nv_bfloat16 *output = nullptr;
     if constexpr (EmitPreRmsMetadata) {
@@ -1486,11 +1530,91 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
             cuda::ptx::get_sreg_globaltimer();
       }
     }
+    if constexpr (ProfileOperands) {
+      // Keep this deliberately narrow: one known-failing task, with raw bits
+      // printed at the final point before arithmetic.  The full operand
+      // capture still checks every task/element; this print makes the input
+      // observation independently visible without a large printf buffer or
+      // a compute-group synchronization that could perturb the race.
+      if (profile_sm_id == 0 && tid == 0) {
+        if constexpr (EmitPreRmsMetadata) {
+          printf(
+              "DSV4_HC_TASK_INPUT sm=0 weight_slots=0x%x "
+              "record_slots=0x%x output_slots=0x%x\n",
+              weight_slots, record_slots, output_slots);
+        } else {
+          printf(
+              "DSV4_HC_TASK_INPUT sm=0 weight_slots=0x%x "
+              "record_slots=0x%x\n",
+              weight_slots, record_slots);
+        }
+#pragma unroll
+        for (int row = 0; row < 5; ++row) {
+          const auto *raw = reinterpret_cast<const uint16_t *>(
+              record + row * kTileHidden);
+          printf(
+              "DSV4_HC_TASK_RECORD sm=0 row=%d d0=0x%04x d1=0x%04x\n",
+              row, unsigned(raw[0]), unsigned(raw[1]));
+        }
+#pragma unroll
+        for (int output_index = 0;
+             output_index < FusedOutputsPerTask;
+             ++output_index) {
+#pragma unroll
+          for (int input_index = 0; input_index < 4; ++input_index) {
+            const auto *input_weight =
+                weight + (output_index * 4 + input_index) * kTileHidden;
+            printf(
+                "DSV4_HC_TASK_WEIGHT sm=0 output=%d input=%d "
+                "d0=0x%08x d1=0x%08x\n",
+                output_index, input_index,
+                unsigned(__float_as_uint(input_weight[0])),
+                unsigned(__float_as_uint(input_weight[1])));
+          }
+        }
+#pragma unroll
+        for (int coefficient = 0; coefficient < 20; ++coefficient) {
+          printf(
+              "DSV4_HC_TASK_COEFFICIENT sm=0 index=%d value=0x%08x\n",
+              coefficient,
+              unsigned(__float_as_uint(fused_coefficients[coefficient])));
+        }
+      }
+    }
     dsv4_hc_post_project_tile<
         kTileHidden, FusedHalvesPerTask, FusedOutputsPerTask,
         EmitPreRmsMetadata>(
         record, fused_coefficients, weight, output, tid, partials,
         square_partial);
+    if constexpr (ProfileOperands) {
+      if (profile_sm_id == 0 && tid == 0) {
+        if constexpr (EmitPreRmsMetadata) {
+          printf(
+              "DSV4_HC_TASK_PRE_REDUCE sm=0 partial0=0x%08x "
+              "partial1=0x%08x partial2=0x%08x square=0x%08x\n",
+              unsigned(__float_as_uint(partials[0])),
+              unsigned(__float_as_uint(partials[1])),
+              unsigned(__float_as_uint(partials[2])),
+              unsigned(__float_as_uint(square_partial)));
+#pragma unroll
+          for (int row = 0; row < 4; ++row) {
+            const auto *raw = reinterpret_cast<const uint16_t *>(
+                output + row * kTileHidden);
+            printf(
+                "DSV4_HC_TASK_RESIDUAL_PRE_STORE sm=0 row=%d "
+                "d0=0x%04x d1=0x%04x\n",
+                row, unsigned(raw[0]), unsigned(raw[1]));
+          }
+        } else {
+          printf(
+              "DSV4_HC_TASK_PRE_REDUCE sm=0 partial0=0x%08x "
+              "partial1=0x%08x partial2=0x%08x\n",
+              unsigned(__float_as_uint(partials[0])),
+              unsigned(__float_as_uint(partials[1])),
+              unsigned(__float_as_uint(partials[2])));
+        }
+      }
+    }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
 #pragma unroll
@@ -1518,9 +1642,80 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
     }
     __sync_compute_group(128);
 
-    const int partial_output_slot = m2c.template pop<0>();
+    if constexpr (ProfileOperands) {
+      if (profile_sm_id >= 102 && profile_sm_id <= 116 && tid == 0) {
+        const uint32_t warp0 = __float_as_uint(warp_reduce[4]);
+        const uint32_t warp1 = __float_as_uint(warp_reduce[5]);
+        const uint32_t warp2 = __float_as_uint(warp_reduce[6]);
+        const uint32_t warp3 = __float_as_uint(warp_reduce[7]);
+        const float final_word1 =
+            warp_reduce[4] + warp_reduce[5]
+            + warp_reduce[6] + warp_reduce[7];
+        printf(
+            "DSV4_HC_TASK_SHARED sm=%d "
+            "warp0=0x%08x warp1=0x%08x warp2=0x%08x warp3=0x%08x "
+            "final_word1=0x%08x\n",
+            profile_sm_id, unsigned(warp0), unsigned(warp1),
+            unsigned(warp2), unsigned(warp3),
+            unsigned(__float_as_uint(final_word1)));
+      }
+    }
+
+    if constexpr (ProfileOperands) {
+      if (profile_sm_id == 0 && tid == 0) {
+        const float reduced0 =
+            warp_reduce[0] + warp_reduce[1] +
+            warp_reduce[2] + warp_reduce[3];
+        const float reduced1 =
+            warp_reduce[4] + warp_reduce[5] +
+            warp_reduce[6] + warp_reduce[7];
+        const float reduced2 =
+            warp_reduce[8] + warp_reduce[9] +
+            warp_reduce[10] + warp_reduce[11];
+        if constexpr (EmitPreRmsMetadata) {
+          const float reduced_square =
+              warp_reduce[12] + warp_reduce[13] +
+              warp_reduce[14] + warp_reduce[15];
+          printf(
+              "DSV4_HC_TASK_POST_REDUCE sm=0 partial0=0x%08x "
+              "partial1=0x%08x partial2=0x%08x square=0x%08x\n",
+              unsigned(__float_as_uint(reduced0)),
+              unsigned(__float_as_uint(reduced1)),
+              unsigned(__float_as_uint(reduced2)),
+              unsigned(__float_as_uint(reduced_square)));
+        } else {
+          printf(
+              "DSV4_HC_TASK_POST_REDUCE sm=0 partial0=0x%08x "
+              "partial1=0x%08x partial2=0x%08x\n",
+              unsigned(__float_as_uint(reduced0)),
+              unsigned(__float_as_uint(reduced1)),
+              unsigned(__float_as_uint(reduced2)));
+        }
+      }
+    }
+
+    const int partial_output_token = m2c.template pop<0>();
+    const int partial_output_slot = extract(partial_output_token);
+    if constexpr (ProfileOperands) {
+      if (profile_sm_id >= 102 && profile_sm_id <= 116 && tid == 0) {
+        const uint32_t warp0 = __float_as_uint(warp_reduce[4]);
+        const uint32_t warp1 = __float_as_uint(warp_reduce[5]);
+        const uint32_t warp2 = __float_as_uint(warp_reduce[6]);
+        const uint32_t warp3 = __float_as_uint(warp_reduce[7]);
+        const float final_word1 =
+            warp_reduce[4] + warp_reduce[5]
+            + warp_reduce[6] + warp_reduce[7];
+        printf(
+            "DSV4_HC_TASK_AFTER_POP sm=%d token=0x%x "
+            "warp0=0x%08x warp1=0x%08x warp2=0x%08x warp3=0x%08x "
+            "final_word1=0x%08x\n",
+            profile_sm_id, partial_output_token,
+            unsigned(warp0), unsigned(warp1), unsigned(warp2),
+            unsigned(warp3), unsigned(__float_as_uint(final_word1)));
+      }
+    }
     auto *partial_output = static_cast<float *>(
-        get_slot_address(smem_base, extract(partial_output_slot)));
+        slot_2_glob_ptr(st_insts, partial_output_slot));
     if (tid == 0) {
       const int partial_index = EmitPreRmsMetadata ? 1 : 0;
 #pragma unroll
@@ -1528,18 +1723,54 @@ __device__ __forceinline__ void task_dsv4_fp32_bf16_gemv(
            output_index < FusedOutputsPerTask;
            ++output_index) {
         const int reduce_index = output_index * 4;
-        partial_output[partial_index + output_index] =
+        const float value =
             warp_reduce[reduce_index] + warp_reduce[reduce_index + 1] +
             warp_reduce[reduce_index + 2] + warp_reduce[reduce_index + 3];
+        atomicExch(
+            reinterpret_cast<unsigned int *>(
+                partial_output + partial_index + output_index),
+            __float_as_uint(value));
       }
       if constexpr (EmitPreRmsMetadata) {
         constexpr int kSquareIndex = FusedOutputsPerTask * 4;
-        partial_output[0] =
+        const float square =
             warp_reduce[kSquareIndex] + warp_reduce[kSquareIndex + 1] +
             warp_reduce[kSquareIndex + 2] + warp_reduce[kSquareIndex + 3];
+        atomicExch(
+            reinterpret_cast<unsigned int *>(partial_output),
+            __float_as_uint(square));
+      }
+      if constexpr (ProfileOperands) {
+        if (profile_sm_id == 0) {
+          printf(
+              "DSV4_HC_TASK_PARTIAL_PRE_PUBLISH sm=0 token=0x%x slot=%d "
+              "word0=0x%08x word1=0x%08x "
+              "word2=0x%08x word3=0x%08x\n",
+              partial_output_token, partial_output_slot,
+              unsigned(__float_as_uint(partial_output[0])),
+              unsigned(__float_as_uint(partial_output[1])),
+              unsigned(__float_as_uint(partial_output[2])),
+              unsigned(__float_as_uint(partial_output[3])));
+        }
+        if (profile_sm_id >= 102 && profile_sm_id <= 116) {
+          const float reduced_word1 =
+              warp_reduce[4] + warp_reduce[5] +
+              warp_reduce[6] + warp_reduce[7];
+          const uint32_t observed_word1 = uint32_t(load_l2(
+              reinterpret_cast<const int *>(partial_output + 1)));
+          printf(
+              "DSV4_HC_TASK_AFFECTED sm=%d token=0x%x slot=%d "
+              "address=0x%llx computed_word1=0x%08x "
+              "observed_word1=0x%08x\n",
+              profile_sm_id, partial_output_token, partial_output_slot,
+              static_cast<unsigned long long>(
+                  reinterpret_cast<uintptr_t>(partial_output)),
+              unsigned(__float_as_uint(reduced_word1)),
+              unsigned(observed_word1));
+        }
       }
     }
-    c2m.template push<31, true, false>(tid, partial_output_slot);
+    c2m.template push<31, true, false>(tid, partial_output_token);
     c2m.push(tid, record_slots | weight_slots);
     if constexpr (EmitPreRmsMetadata) {
       c2m.template push<31, true, false>(tid, output_slots);
@@ -3123,6 +3354,42 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
             st_insts, packed_metadata_slot));
       }
     }
+#if defined(DAE_TRACK_PROFILE)
+    if (metadata_splits == 16 && sm_id == 128 && tid == 0) {
+      int finite_values = 0;
+      int first_nonfinite = -1;
+      uint32_t first_nonfinite_bits = 0;
+#pragma unroll
+      for (int split = 0; split < 16; ++split) {
+#pragma unroll
+        for (int group = 0; group < 8; ++group) {
+#pragma unroll
+          for (int word = 0; word < 4; ++word) {
+            if (group == 0 || word < 3) {
+              const int index = split * 32 + group * 4 + word;
+              const uint32_t bits = __float_as_uint(metadata[index]);
+              if ((bits & 0x7F800000U) != 0x7F800000U) {
+                ++finite_values;
+              } else if (first_nonfinite < 0) {
+                first_nonfinite = index;
+                first_nonfinite_bits = bits;
+              }
+            }
+          }
+        }
+      }
+      printf(
+          "DSV4_HC_PRE_METADATA_INPUT sm=128 "
+          "word0=0x%08x word1=0x%08x word2=0x%08x word3=0x%08x "
+          "defined_finite=%d/400 first_nonfinite=%d "
+          "first_nonfinite_bits=0x%08x\n",
+          unsigned(__float_as_uint(metadata[0])),
+          unsigned(__float_as_uint(metadata[1])),
+          unsigned(__float_as_uint(metadata[2])),
+          unsigned(__float_as_uint(metadata[3])), finite_values,
+          first_nonfinite, unsigned(first_nonfinite_bits));
+    }
+#endif
     if (metadata_splits > 0) {
       if (metadata_splits == 16) {
         if (tid < 25) {

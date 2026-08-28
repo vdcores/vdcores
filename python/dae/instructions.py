@@ -2590,6 +2590,29 @@ class RawAddress(MemoryInstruction):
         )
 
 
+class RawWritebackAddress(MemoryInstruction):
+    """Stable allocator lease for compute-direct global output.
+
+    Unlike ``RawAddress``, this uses one normal slot so ``st_insts`` retains
+    the destination pointer and dependency barrier until STU consumes the
+    writeback token.  The shared slot carries no payload and STU performs no
+    copy; compute writes the destination HBM address directly.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        if tensor.device.type != "cuda":
+            raise ValueError("raw writeback destination must be CUDA storage")
+        super().__init__(
+            opcode=opcode.OP_ALLOC_WB_RAW_ADDRESS,
+            num_slots=1,
+            arg=0,
+            size=0,
+            address=tensor.data_ptr(),
+        )
+        self.writeback()
+        self.annotation["raw_writeback_lease"] = True
+
+
 class RoutedTmaLoad1D(MemoryInstruction):
     """Resolve one routed field in LDU and copy it into shared memory."""
 
@@ -3640,7 +3663,7 @@ class TmaTensor(MemoryInstruction):
         )
 
     def m128n8_output(self, action: str):
-        """Rank-3 reducible TMA view of contiguous BF16/FP32 ``[8, M]``."""
+        """Rank-3 reducible TMA view of row-strided BF16/FP32 ``[8, M]``."""
         if action not in ("store", "reduce"):
             raise ValueError("M128N8 output action must be store or reduce")
         return self._build(
@@ -3897,6 +3920,7 @@ __all__ = [
     "CounterOffsetMemoryInstruction",
     "RepeatM",
     "RawAddress",
+    "RawWritebackAddress",
     "RoutedTmaLoad1D",
     "RoutedTmaLoadBase1D",
     "TmaLoadAddressReg1D",
