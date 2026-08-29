@@ -92,7 +92,12 @@ DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
 // the same area and LDU may be Python-rewritten into an LDU-local chain: both
 // commands remain visible to the normal memory VM, but the first handler
 // dequeues the second without an allocator transaction or dispatcher return.
-// Opcodes 48--55 held superseded FFN experiments; see commit 79022cc if those
+// Select the batch coordinate of a rank-3 TMA reduction with the allocator's
+// canonical logical-layer index.  The descriptor and reduction remain on the
+// normal allocator/STU path.
+DAE_OP(OP_ALLOC_WB_LAYER_TMA_REDUCE_ADD_3D, MK_MOP(48, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
+DAE_OP(OP_ALLOC_WB_LAYER_TMA_STORE_3D, MK_MOP(49, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
+// Opcodes 50--55 held superseded FFN experiments; see commit 79022cc if those
 // allocator-ring and standalone-resident controls are ever needed again.
 DAE_OP(OP_TMA_LOAD_MX_COUPLED_STREAM, MK_MOP(56, MEM_OP_FLAGS_NONE))
 // General 2-D TMA read/modify/write lease. ``arg`` selects the load descriptor,
@@ -221,6 +226,7 @@ DAE_DEFINE_COMP_FAMILY(MXFP4_MXFP8_GATE_UP_SILU_FIXED_RING_SM100, FIELDS=K|STAGE
   DAE_OP(OP_DSV4_MXFP8_QUANT_FFN_INPUT_SM100, 0x7175)
   DAE_OP(OP_DSV4_ROUTE_TOP6_PREPARED, 0x7176)
   DAE_OP(OP_MXFP4_MXFP8_ROUTED_RESIDENT_FFN_SM100, 0x7177)
+  DAE_OP(OP_DSV4_COMPRESSOR_STATE_STORE, 0x7178)
   DAE_OP(OP_FP8_UMMA_PREPACK_SM100, 0x7149)
   DAE_OP(OP_DSV4_CONTIGUOUS_ATTENTION_512_BLOCK4, 0x714b)
   DAE_OP(OP_DSV4_GATED_POOL_PACKED8_SHARD128, 0x714c)

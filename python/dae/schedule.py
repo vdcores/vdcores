@@ -126,7 +126,9 @@ class LayeredSchedule(Schedule):
         for counter, stride in self.counter_strides:
             if not 0 <= counter < 32 or stride <= 0:
                 raise ValueError("layered counter strides require reg [0,31] and positive stride")
-        for representative, alternatives in self.tensor_groups:
+        for group_id, (representative, alternatives) in enumerate(
+            self.tensor_groups
+        ):
             if not isinstance(representative, torch.Tensor):
                 raise ValueError("layered representatives must be tensors")
             if representative.device.type != "cuda" or not representative.is_contiguous():
@@ -233,6 +235,62 @@ class LayeredSchedule(Schedule):
 
     def bar_release_count(self, role: str):
         return self.placed_inner.bar_release_count(role)
+
+
+class LayerStateSchedule(LayeredSchedule):
+    """Select persistent per-layer state in one compact loop body.
+
+    Ordinary state reads use the same LDU-resolved pointer columns as
+    :class:`LayeredSchedule`.  State writeback cannot use an indirect store
+    opcode, so live state is allocated as evenly-strided layer-major storage
+    and its destination address is stepped from the active loop counters.
+    This keeps both directions in the normal allocator/LDU/STU protocol.
+    """
+
+    _STORE_OPS = {
+        opcode.OP_ALLOC_WB_TMA_STORE_1D & ~((1 << 6) - 1),
+        opcode.OP_ALLOC_WB_STU_STORE_1D & ~((1 << 6) - 1),
+    }
+
+    def _on_place(self):
+        super()._on_place()
+        self._group_strides = []
+        for representative, alternatives in self.tensor_groups:
+            if len(alternatives) == 1:
+                self._group_strides.append(0)
+                continue
+            stride = alternatives[1].data_ptr() - alternatives[0].data_ptr()
+            if stride <= 0 or any(
+                tensor.data_ptr()
+                != alternatives[0].data_ptr() + layer * stride
+                for layer, tensor in enumerate(alternatives)
+            ):
+                stride = None
+            self._group_strides.append(stride)
+
+    def _transform_memory(self, inst):
+        base_opcode = inst.opcode & ~((1 << 6) - 1)
+        match = self._match_group(inst)
+        if match is None:
+            return inst
+        group_id, _, _ = match
+        if base_opcode in self._STORE_OPS:
+            stride = self._group_strides[group_id]
+            if stride is None:
+                raise ValueError(
+                    "layer-state writeback matched a tensor group without a "
+                    f"constant byte stride; group={group_id}"
+                )
+            if stride == 0:
+                return inst
+            return RepeatM.offsetByCounters(
+                tuple(
+                    (counter, layer_stride * stride)
+                    for counter, layer_stride in self.counter_strides
+                ),
+                inst,
+            )
+        return super()._transform_memory(inst)
 
 
 def _aligned_row_shard(rows: int, num_sms: int, sm: int, alignment: int = 8):
@@ -2371,6 +2429,8 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
         split_k: int,
         *,
         layer_indexed_weight=False,
+        layer_indexed_output=False,
+        direct_output=False,
     ):
         super().__init__()
         self.weight = weight
@@ -2379,6 +2439,8 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
         self.output_reduce = output_reduce
         self.split_k = int(split_k)
         self.layer_indexed_weight = bool(layer_indexed_weight)
+        self.layer_indexed_output = bool(layer_indexed_output)
+        self.direct_output = bool(direct_output)
 
     def _on_place(self):
         if (
@@ -2412,6 +2474,8 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
             raise ValueError(
                 "grouped BF16 split-K must divide the K128 tile count"
             )
+        if self.direct_output and self.split_k != 1:
+            raise ValueError("direct grouped BF16 output requires split-K one")
         self.k_tiles_per_split = self.k_tiles // self.split_k
         if (
             self.k_tiles_per_split != 2
@@ -2437,15 +2501,25 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
         ):
             raise ValueError("grouped BF16 weight TMA must load the schedule matrix")
         output = getattr(self.output_reduce, "mat", None)
+        expected_output_shape = (
+            (self.weight.shape[0], self.rows // self.TILE_M, self.TILE_M)
+            if self.layer_indexed_output
+            else (self.rows // self.TILE_M, self.TILE_M)
+        )
         if (
-            getattr(self.output_reduce, "mode", None) != "reduce"
+            getattr(self.output_reduce, "mode", None)
+            != ("store" if self.direct_output else "reduce")
             or output is None
             or output.dtype != torch.float32
-            or tuple(output.shape) != (self.rows // self.TILE_M, self.TILE_M)
+            or tuple(output.shape) != expected_output_shape
             or not output.is_contiguous()
         ):
             raise ValueError(
-                "grouped BF16 output must be row-major FP32 reduce [M/128,128]"
+                "grouped BF16 output has the wrong reduction layout: "
+                f"expected={expected_output_shape} "
+                f"actual={None if output is None else tuple(output.shape)} "
+                f"weight={tuple(self.weight.shape)} "
+                f"layer_indexed={self.layer_indexed_output}"
             )
 
     def _work_shard(self, sm):
@@ -2506,9 +2580,23 @@ class SchedDsv4Bf16GemvGroup4SplitK(Schedule):
                             (weight_load, weight_delta),
                         )
                     )
-            store = self.output_reduce.cord(
-                m_start // self.TILE_M, 0
-            )
+            if self.layer_indexed_output:
+                store = self.output_reduce.cord(
+                    0, m_start // self.TILE_M, 0
+                )
+                flags = store.opcode & ((1 << 6) - 1)
+                store.opcode = (
+                    (
+                        opcode.OP_ALLOC_WB_LAYER_TMA_STORE_3D
+                        if self.direct_output
+                        else opcode.OP_ALLOC_WB_LAYER_TMA_REDUCE_ADD_3D
+                    )
+                    | flags
+                )
+            else:
+                store = self.output_reduce.cord(
+                    m_start // self.TILE_M, 0
+                )
             if work + 1 == work_stop:
                 store.bar(self._bar("output"))
             instructions.append(store)
@@ -5846,6 +5934,143 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         return self._bar_release_if_present(role, self.num_splits)
 
 
+class SchedLayeredDsv4AttentionSplit64UmmaSm100(Schedule):
+    """Use one retained-ring attention body with a plan bank per layer.
+
+    Each plan contains that layer's K- and V-TMA descriptors.  The allocator
+    derives the plan-row address from the existing family loop counters before
+    sending the unchanged retained-ring command to LDU.  Q, partials, metadata,
+    allocator ownership, and the compute task remain identical to the ordinary
+    split-64 schedule.
+    """
+
+    def __init__(self, inner, kv_layers, *, counter_strides):
+        super().__init__()
+        self.inner = inner
+        self.kv_layers = tuple(kv_layers)
+        self.counter_strides = tuple(
+            (int(counter), int(stride))
+            for counter, stride in counter_strides
+        )
+
+    def _on_place(self):
+        if len(self.kv_layers) <= 1:
+            raise ValueError("layered split attention requires multiple KV layers")
+        if not self.counter_strides:
+            raise ValueError("layered split attention requires counter strides")
+        if any(
+            counter < 0 or counter >= 32 or stride <= 0
+            for counter, stride in self.counter_strides
+        ):
+            raise ValueError(
+                "layered split-attention counters require reg [0,31] and "
+                "positive strides"
+            )
+        representative = self.kv_layers[0]
+        for kv in self.kv_layers:
+            if (
+                kv.device != representative.device
+                or kv.dtype != torch.bfloat16
+                or kv.shape != representative.shape
+                or kv.ndim != 2
+                or kv.shape[1] != SchedDsv4AttentionSplit64UmmaSm100.DIM
+                or not kv.is_contiguous()
+            ):
+                raise ValueError(
+                    "layered split-attention KV tensors must be matching "
+                    "contiguous BF16 matrices"
+                )
+
+        inner = self.inner._clone()
+        inner._bars.update(self._bars)
+        self.placed_inner = inner.place(self.num_sms)
+        if self.placed_inner.kv.data_ptr() != representative.data_ptr():
+            raise ValueError(
+                "layer zero KV must match the split-attention representative"
+            )
+
+        kv_tmas = [self.placed_inner.kv_tma]
+        kv_v_tmas = [self.placed_inner.kv_v_tma]
+        launcher = self.placed_inner.kv_tma.launcher
+        for kv in self.kv_layers[1:]:
+            kv_tmas.append(
+                TmaTensor(launcher, kv).wgmma_load(64, 512, Major.K)
+            )
+            kv_v_tmas.append(
+                TmaTensor(launcher, kv).wgmma_load(64, 128, Major.MN)
+            )
+        self.kv_tmas = tuple(kv_tmas)
+        self.kv_v_tmas = tuple(kv_v_tmas)
+
+        layer_plans = []
+        for kv_tma, kv_v_tma in zip(self.kv_tmas, self.kv_v_tmas):
+            split_plans = []
+            for row, _ in self.placed_inner.split_rows:
+                v_coordinates = kv_v_tma.cord2tma(row, 0)
+                next_v_coordinates = kv_v_tma.cord2tma(row, 128)
+                split_plans.append(
+                    build_internal_ring_tma_plan(
+                        device=representative.device,
+                        stage_bytes=self.placed_inner.STAGE_BYTES,
+                        lanes={
+                            0: {
+                                "descriptor_index": kv_tma.arg,
+                                "rank": kv_tma.rank,
+                                "transaction_bytes":
+                                    self.placed_inner.KV_LAYOUT_BYTES,
+                                "coordinates": kv_tma.cord2tma(row, 0),
+                            },
+                            1: {
+                                "descriptor_index": kv_v_tma.arg,
+                                "rank": kv_v_tma.rank,
+                                "issue_count": 4,
+                                "transaction_bytes":
+                                    self.placed_inner.KV_LAYOUT_BYTES // 4,
+                                "destination_offset":
+                                    self.placed_inner.KV_LAYOUT_BYTES,
+                                "destination_issue_stride":
+                                    self.placed_inner.KV_LAYOUT_BYTES // 4,
+                                "coordinates": v_coordinates,
+                                "issue_delta": tuple(
+                                    next_value - value
+                                    for value, next_value in zip(
+                                        v_coordinates, next_v_coordinates
+                                    )
+                                ),
+                            },
+                        },
+                    )
+                )
+            layer_plans.append(torch.stack(split_plans))
+        self.layered_plans = torch.stack(layer_plans).contiguous()
+        self.plan_layer_bytes = (
+            self.layered_plans.stride(0)
+            * self.layered_plans.element_size()
+        )
+
+    def schedule(self, sm):
+        instructions = list(self.placed_inner.schedule(sm))
+        if sm < 0:
+            return instructions
+        if len(instructions) != 8 or not isinstance(
+            instructions[1], TmaLoadInternalRingStream
+        ):
+            raise ValueError("split-64 retained-ring command contract changed")
+        ring = instructions[1].copy()
+        ring.set_cords(addr2cords(self.layered_plans[0, sm].data_ptr()))
+        instructions[1] = RepeatM.offsetByCounters(
+            tuple(
+                (counter, stride * self.plan_layer_bytes)
+                for counter, stride in self.counter_strides
+            ),
+            ring,
+        )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        return self.placed_inner.bar_release_count(role)
+
+
 class SchedDsv4AttentionContext1Fp8Sm100(Schedule):
     """Compute one-row sink attention and publish native O_a records."""
 
@@ -5952,6 +6177,78 @@ class SchedDsv4AttentionContext1Fp8Sm100(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, self.head_count)
+
+
+class SchedLayeredDsv4AttentionContext1Fp8Sm100(Schedule):
+    """Select a layer-private context-one KV row in the allocator stream."""
+
+    def __init__(self, inner, kv_layers, *, counter_strides):
+        super().__init__()
+        self.inner = inner
+        self.kv_layers = tuple(kv_layers)
+        self.counter_strides = tuple(
+            (int(counter), int(stride))
+            for counter, stride in counter_strides
+        )
+
+    def _on_place(self):
+        if len(self.kv_layers) <= 1 or not self.counter_strides:
+            raise ValueError("layered context-one attention requires a loop")
+        representative = self.kv_layers[0]
+        if any(
+            kv.device != representative.device
+            or kv.dtype != torch.bfloat16
+            or tuple(kv.shape) != (1, 512)
+            or not kv.is_contiguous()
+            for kv in self.kv_layers
+        ):
+            raise ValueError(
+                "layered context-one KV rows must be matching contiguous BF16"
+            )
+        inner = self.inner._clone()
+        inner._bars.update(self._bars)
+        self.placed_inner = inner.place(self.num_sms)
+        if self.placed_inner.kv.data_ptr() != representative.data_ptr():
+            raise ValueError("context-one representative KV row changed")
+        self.raw_records = torch.tensor(
+            [
+                (
+                    self.placed_inner.q.data_ptr(),
+                    kv.data_ptr(),
+                    self.placed_inner.table.data_ptr(),
+                )
+                for kv in self.kv_layers
+            ],
+            dtype=torch.uint64,
+            device=representative.device,
+        )
+        self.record_bytes = (
+            self.raw_records.stride(0) * self.raw_records.element_size()
+        )
+
+    def schedule(self, sm):
+        instructions = list(self.placed_inner.schedule(sm))
+        if sm < 0:
+            return instructions
+        for index, inst in enumerate(instructions):
+            if (
+                isinstance(inst, RawAddress)
+                and (inst.num_slots & ((1 << 6) - 1)) == config.num_slots
+                and not (inst.opcode & 0x2)
+            ):
+                selected = inst.copy()
+                selected.set_cords(addr2cords(self.raw_records[0].data_ptr()))
+                instructions[index] = RepeatM.offsetByCounters(
+                    tuple(
+                        (counter, stride * self.record_bytes)
+                        for counter, stride in self.counter_strides
+                    ),
+                    selected,
+                )
+        return instructions
+
+    def bar_release_count(self, role: str):
+        return self.placed_inner.bar_release_count(role)
 
 
 class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
@@ -7359,20 +7656,29 @@ class SchedDsv4HcPreRms(Schedule):
             output_fp8=self.fp8_output is not None,
             split_metadata_splits=self.split_metadata_splits,
         )]
-        instructions.extend((
-            metadata,
-            residual,
-            TmaLoad1D(self.norm_weight).fixed_port(1),
-        ))
+        norm_weight = TmaLoad1D(self.norm_weight).fixed_port(1)
+        if self._bar("reuse") is not None:
+            norm_weight.bar(self._bar("reuse"))
+        # Publish the allocator-owned output workspace before starting the
+        # norm-weight transfer.  The task can mix directly into that lease
+        # while the LDU fetches the norm weight, avoiding common scratch and
+        # retaining the original overlap.
+        instructions.extend((metadata, residual))
         if self.fp8_output is not None:
             instructions.extend(
                 (
                     _shared_store_1d(self.fp8_output),
+                    norm_weight,
                     _shared_store_1d(self.fp8_scale).bar(self._bar("output")),
                 )
             )
         else:
-            instructions.append(TmaStore1D(self.output).bar(self._bar("output")))
+            instructions.extend(
+                (
+                    TmaStore1D(self.output).bar(self._bar("output")),
+                    norm_weight,
+                )
+            )
         if self.zero_fp32_output is not None:
             instructions.append(TmaStore1D(self.zero_fp32_output))
         return instructions
@@ -7679,6 +7985,74 @@ class SchedDsv4Hadamard(Schedule):
             Dsv4Hadamard(self.width),
             TmaLoad1D(self.input[sm]),
             TmaStore1D(self.output[sm]).bar(self._bar("output")),
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
+
+
+class SchedDsv4CompressorStateStore(Schedule):
+    """Publish overlap and ordinary compressor rows for a later token."""
+
+    def __init__(
+        self,
+        values,
+        scores,
+        biases,
+        output_values,
+        output_scores,
+    ):
+        super().__init__()
+        self.values = tuple(values)
+        self.scores = tuple(scores)
+        self.biases = tuple(biases)
+        self.output_values = tuple(output_values)
+        self.output_scores = tuple(output_scores)
+
+    def _on_place(self):
+        groups = (
+            self.values,
+            self.scores,
+            self.biases,
+            self.output_values,
+            self.output_scores,
+        )
+        if (
+            self.num_sms not in (1, 2)
+            or any(len(group) != self.num_sms for group in groups)
+        ):
+            raise ValueError(
+                "compressor-state publication requires one or two row tasks"
+            )
+        widths = {tensor.numel() for group in groups for tensor in group}
+        if len(widths) != 1 or next(iter(widths)) not in (128, 512):
+            raise ValueError(
+                "compressor-state rows must share width 128 or 512"
+            )
+        self.width = next(iter(widths))
+        for group in groups:
+            for tensor in group:
+                if (
+                    tensor.dtype != torch.float32
+                    or tensor.device.type != "cuda"
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        "compressor-state rows must be contiguous CUDA FP32"
+                    )
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        return [
+            Dsv4CompressorStateStore(self.width),
+            TmaLoad1D(self.values[sm]),
+            TmaLoad1D(self.scores[sm]),
+            TmaLoad1D(self.biases[sm]),
+            TmaStore1D(self.output_values[sm]),
+            TmaStore1D(self.output_scores[sm]).bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):

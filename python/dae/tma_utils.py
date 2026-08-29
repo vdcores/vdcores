@@ -223,6 +223,34 @@ def cord_func_rowmajor_2d(mat: torch.Tensor, rank: int):
     return cord_func
 
 
+def build_tma_batched_rowmajor_2d(
+    mat: torch.Tensor, tile_rows: int, tile_cols: int
+):
+    """Build a rank-3 descriptor for contiguous ``[batch,row,col]`` data."""
+    assert mat.ndim == 3, "batched row-major 2D TMA requires a rank-3 tensor"
+    batches, rows, cols = mat.shape
+    element_size = mat.element_size()
+    assert 0 < tile_rows <= rows and 0 < tile_cols <= cols
+    return 3, runtime.build_tma_desc(
+        mat,
+        [cols, rows, batches],
+        [cols * element_size, rows * cols * element_size],
+        [tile_cols, tile_rows, 1],
+        [1, 1, 1],
+        0,
+        0,
+    )
+
+
+def cord_func_batched_rowmajor_2d(mat: torch.Tensor, rank: int):
+    assert rank == 3
+
+    def cord_func(batch: int, row: int, col: int):
+        return [col, row, batch]
+
+    return cord_func
+
+
 # pytorch-major cord functions
 def cord_func_2d_mnmajor(mat: torch.Tensor, rank : int):
     def cord_func(*cords):

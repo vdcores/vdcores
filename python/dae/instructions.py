@@ -18,6 +18,7 @@ from .tma_utils import (
     addr2cords,
     build_tma_1d,
     build_tma_rowmajor_2d,
+    build_tma_batched_rowmajor_2d,
     build_tma_mxfp4,
     build_tma_mxfp4_kmajor,
     build_tma_mxfp4_k512,
@@ -32,6 +33,7 @@ from .tma_utils import (
     cord_func_2d_tile_major,
     cord_func_tma_1d,
     cord_func_rowmajor_2d,
+    cord_func_batched_rowmajor_2d,
     cord_func_mxfp4,
     cord_func_mxfp4_kmajor,
     cord_func_mxfp4_k512,
@@ -1208,6 +1210,16 @@ class Dsv4Hadamard(ComputeInstruction):
             raise ValueError("DeepSeek Hadamard width must be 128 or 512")
         super().__init__(
             opcode=opcode.OP_DSV4_HADAMARD,
+            args=[width],
+        )
+
+
+class Dsv4CompressorStateStore(ComputeInstruction):
+    def __init__(self, width: int):
+        if width not in (128, 512):
+            raise ValueError("compressor-state width must be 128 or 512")
+        super().__init__(
+            opcode=opcode.OP_DSV4_COMPRESSOR_STATE_STORE,
             args=[width],
         )
 
@@ -3662,6 +3674,21 @@ class TmaTensor(MemoryInstruction):
             cord_func_rowmajor_2d,
         )
 
+    def batched_rowmajor_2d(
+        self, action: str, tile_rows: int, tile_cols: int
+    ):
+        if action not in ("load", "store", "reduce"):
+            raise ValueError(
+                "batched row-major 2D TMA action must be load, store, or reduce"
+            )
+        return self._build(
+            action,
+            tile_rows,
+            tile_cols,
+            build_tma_batched_rowmajor_2d,
+            cord_func_batched_rowmajor_2d,
+        )
+
     def m128n8_output(self, action: str):
         """Rank-3 reducible TMA view of row-strided BF16/FP32 ``[8, M]``."""
         if action not in ("store", "reduce"):
@@ -3842,6 +3869,7 @@ __all__ = [
     "Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100",
     "Dsv4Hadamard",
     "Dsv4GatedPool",
+    "Dsv4CompressorStateStore",
     "Dsv4GatedPoolRmsRope",
     "Dsv4GatedPoolPacked8Shard128",
     "Dsv4GatedPoolPacked8RmsPartial",

@@ -59,11 +59,14 @@ from dae.instructions import (
 )
 from dae.runtime import config as runtime_config
 from dae.schedule import (
+    LayerStateSchedule,
     LayeredSchedule,
     SchedDsv4AttentionContext1Fp8Sm100,
+    SchedLayeredDsv4AttentionContext1Fp8Sm100,
     SchedArgmaxSmemPartial,
     SchedArgmaxSmemReduce,
     SchedDsv4AttentionSplit64UmmaSm100,
+    SchedLayeredDsv4AttentionSplit64UmmaSm100,
     SchedDsv4AttentionSplitReduceFp8Sm100,
     SchedDsv4Bf16Gemv,
     SchedDsv4Bf16GemvGroup4SplitK,
@@ -74,6 +77,7 @@ from dae.schedule import (
     SchedDsv4Fp32ToBf16,
     SchedDsv4Fp8Quant128,
     SchedDsv4GatedPool,
+    SchedDsv4CompressorStateStore,
     SchedDsv4GatedPoolRmsRope,
     SchedDsv4GatedPoolPacked8Shard128,
     SchedDsv4GatedPoolPacked8HistoryState,
@@ -189,12 +193,22 @@ class Stage:
     prefetch_before_resident_reset: bool = False
     wait_group_roles: tuple[tuple[str, str], ...] = ()
     release_group_roles: tuple[tuple[str, str], ...] = ()
+    join_completion: bool = False
 
 
 class ResidentOneLaunchDecode:
-    def __init__(self, args: argparse.Namespace, device: torch.device):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        device: torch.device,
+        *,
+        weight_source: "ResidentOneLaunchDecode | None" = None,
+        live_state=None,
+    ):
         self.args = args
         self.device = device
+        self.weight_source = weight_source
+        self.live_state = live_state
         self.config = DeepSeekV4FlashConfig()
         if args.stop_after_layer is not None:
             self.layer_ids = tuple(range(args.stop_after_layer + 1))
@@ -250,10 +264,20 @@ class ResidentOneLaunchDecode:
         self.checkpoint = self._load_checkpoint()
         self.families = self._families()
         self._hash_rows: dict[int, torch.Tensor] = {}
-        self._fused_bf16_weight_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
-        self._fused_hc_projection_cache: dict[
-            tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
-        ] = {}
+        if self.weight_source is None:
+            self._fused_bf16_weight_cache: dict[
+                tuple, tuple[torch.Tensor, ...]
+            ] = {}
+            self._fused_hc_projection_cache: dict[
+                tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
+            ] = {}
+        else:
+            self._fused_bf16_weight_cache = (
+                self.weight_source._fused_bf16_weight_cache
+            )
+            self._fused_hc_projection_cache = (
+                self.weight_source._fused_hc_projection_cache
+            )
         self._allocate_state()
         self._allocate_mxfp_ffn_runtime()
         rope_tables = [self.main_rope, self.compress_rope]
@@ -370,6 +394,25 @@ class ResidentOneLaunchDecode:
         )
 
     def _load_checkpoint(self) -> DeepSeekV4ResidentCheckpoint:
+        if self.weight_source is not None:
+            source = self.weight_source
+            if source.device != self.device or source.layer_ids != self.layer_ids:
+                raise ValueError(
+                    "a shared resident weight source must use the same device "
+                    "and transformer layers"
+                )
+            self.mxfp_ffn_root = source.mxfp_ffn_root
+            self.mxfp_ffn_images = source.mxfp_ffn_images
+            if hasattr(source, "_mxfp_ffn_stacked_storage"):
+                self._mxfp_ffn_stacked_storage = (
+                    source._mxfp_ffn_stacked_storage
+                )
+            print(
+                "DSV4_ONE_LAUNCH_RESIDENT status=REUSED "
+                f"layers={len(self.layer_ids)}",
+                flush=True,
+            )
+            return source.checkpoint
         disk = DeepSeekV4Checkpoint(self.args.checkpoint, self.config)
         # A repeated-layer diagnostic references the same checkpoint tensors
         # twice but should materialize only one resident weight image.
@@ -708,10 +751,12 @@ class ResidentOneLaunchDecode:
         base_sm: int | None = None,
         wait_group: str | None = None,
         release_group: str | None = None,
+        direct_output: bool = False,
         prefetch_before_wait: bool = False,
         prefetch_before_resident_reset: bool = False,
         wait_group_roles: tuple[tuple[str, str], ...] = (),
         release_group_roles: tuple[tuple[str, str], ...] = (),
+        join_completion: bool = False,
     ) -> Stage:
         if isinstance(sms, ShapeAssignment):
             sms = self._remember(sms)
@@ -731,6 +776,7 @@ class ResidentOneLaunchDecode:
             ),
             wait_group_roles=wait_group_roles,
             release_group_roles=release_group_roles,
+            join_completion=join_completion,
         )
 
     @staticmethod
@@ -750,6 +796,130 @@ class ResidentOneLaunchDecode:
             self._groups(*tensor_sets),
             counter_strides=family.counter_strides,
         )
+
+    def _activate_live_family_state(
+        self, family: LayerFamily
+    ) -> tuple[tuple[torch.Tensor, tuple[torch.Tensor, ...]], ...]:
+        """Bind one compact family body to its layer-private decode state."""
+        if self.live_state is None:
+            return ()
+        cfg = self.config
+        kind = cfg.attention_kind(family.representative)
+        plan = self.attention_plans[kind]
+        position = self.decode_position
+        caches = tuple(
+            self.live_state.attention_cache(layer_id, plan.compressed_rows)
+            for layer_id in family.layer_ids
+        )
+        self.attention_cache[kind] = caches[0]
+        window_row = position % cfg.sliding_window
+        self.current_kv_rows[kind] = caches[0][window_row : window_row + 1]
+        if plan.should_compress:
+            compressed_row = cfg.sliding_window + plan.compressed_rows - 1
+            self.current_compressed_rows[kind] = caches[0][
+                compressed_row : compressed_row + 1
+            ]
+
+        groups: list[tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = [
+            (caches[0], caches)
+        ]
+        if kind in ("csa", "hca"):
+            input_arena = self.live_compressor_input_arenas[
+                family.representative
+            ]
+            input_rows = tuple(input_arena.unbind(0))
+            groups.append((input_rows[0], input_rows))
+            projection_arena = self.live_compressor_projection_arenas[
+                family.representative
+            ]
+            projection_rows = tuple(projection_arena.unbind(0))
+            groups.append((projection_rows[0], projection_rows))
+            if kind == "csa":
+                index_projection_arena = (
+                    self.live_index_compressor_projection_arenas[
+                        family.representative
+                    ]
+                )
+                index_projection_rows = tuple(
+                    index_projection_arena.unbind(0)
+                )
+                groups.append(
+                    (index_projection_rows[0], index_projection_rows)
+                )
+        if kind == "csa":
+            index_caches = tuple(
+                self.live_state.index_cache(layer_id, plan.compressed_rows)
+                for layer_id in family.layer_ids
+            )
+            self.index_cache = index_caches[0]
+            if plan.should_compress:
+                attention_histories = tuple(
+                    self.live_state.csa_pool_history(layer_id, position)
+                    for layer_id in family.layer_ids
+                )
+                self.attention_pool_history_values[kind] = (
+                    attention_histories[0][0]
+                )
+                self.attention_pool_history_scores[kind] = (
+                    attention_histories[0][1]
+                )
+                index_histories = tuple(
+                    self.live_state.csa_pool_history(
+                        layer_id, position, index=True
+                    )
+                    for layer_id in family.layer_ids
+                )
+                self.index_pool_history_values = index_histories[0][0]
+                self.index_pool_history_scores = index_histories[0][1]
+            attention_storage = tuple(
+                self.live_state.csa_pool_storage(layer_id)
+                for layer_id in family.layer_ids
+            )
+            index_storage = tuple(
+                self.live_state.csa_pool_storage(layer_id, index=True)
+                for layer_id in family.layer_ids
+            )
+            if plan.compressed_rows:
+                groups.append((index_caches[0], index_caches))
+            groups.extend(
+                (
+                    (
+                        attention_storage[0][0],
+                        tuple(item[0] for item in attention_storage),
+                    ),
+                    (
+                        attention_storage[0][1],
+                        tuple(item[1] for item in attention_storage),
+                    ),
+                    (
+                        index_storage[0][0],
+                        tuple(item[0] for item in index_storage),
+                    ),
+                    (
+                        index_storage[0][1],
+                        tuple(item[1] for item in index_storage),
+                    ),
+                )
+            )
+        elif kind == "hca":
+            if plan.should_compress:
+                histories = tuple(
+                    self.live_state.hca_pool_history(layer_id, position)
+                    for layer_id in family.layer_ids
+                )
+                self.attention_pool_history_values[kind] = histories[0][0]
+                self.attention_pool_history_scores[kind] = histories[0][1]
+            storage = tuple(
+                self.live_state.hca_pool_storage(layer_id)
+                for layer_id in family.layer_ids
+            )
+            groups.extend(
+                (
+                    (storage[0][0], tuple(item[0] for item in storage)),
+                    (storage[0][1], tuple(item[1] for item in storage)),
+                )
+            )
+        return tuple(groups)
 
     def _allocate_state(self) -> None:
         cfg, d = self.config, self.device
@@ -1082,6 +1252,40 @@ class ResidentOneLaunchDecode:
         self.index_compress_fused_projection = torch.empty(
             (4, cfg.index_head_dim), dtype=torch.float32, device=d
         )
+        self.live_compressor_projection_arenas = {}
+        self.live_index_compressor_projection_arenas = {}
+        self.live_compressor_input_arenas = {}
+        if self.live_state is not None:
+            for family in self.families:
+                kind = cfg.attention_kind(family.representative)
+                if kind not in ("csa", "hca"):
+                    continue
+                self.live_compressor_input_arenas[
+                    family.representative
+                ] = torch.empty(
+                    (len(family.layer_ids), cfg.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=d,
+                )
+                width = cfg.head_dim * (2 if kind == "csa" else 1)
+                self.live_compressor_projection_arenas[
+                    family.representative
+                ] = torch.zeros(
+                    (len(family.layer_ids), 2 * width),
+                    dtype=torch.float32,
+                    device=d,
+                )
+                if kind == "csa":
+                    self.live_index_compressor_projection_arenas[
+                        family.representative
+                    ] = torch.zeros(
+                        (
+                            len(family.layer_ids),
+                            4 * cfg.index_head_dim,
+                        ),
+                        dtype=torch.float32,
+                        device=d,
+                    )
         csa_plan = self.attention_plans["csa"]
         self.index_cache = seeded(
             (csa_plan.compressed_rows, cfg.index_head_dim),
@@ -1133,6 +1337,24 @@ class ResidentOneLaunchDecode:
             (1,), dtype=torch.uint32, device=d
         )
         self.zero_hash = torch.zeros((8,), dtype=torch.int32, device=d)
+        self.live_hash_rows = None
+        if self.live_state is not None:
+            if self.layer_ids != tuple(range(cfg.num_layers)):
+                raise ValueError("live decode currently requires all 43 layers")
+            if self.live_state.config != cfg:
+                raise ValueError("live decode state uses a different model config")
+            if self.args.context_length > self.live_state.max_seq_len:
+                raise ValueError("live decode context exceeds state capacity")
+            self.live_hash_rows = torch.zeros(
+                (cfg.num_hash_layers, 8), dtype=torch.int32, device=d
+            )
+            for layer_id in range(cfg.num_hash_layers):
+                source = self._tensor(
+                    f"layers.{layer_id}.ffn.gate.tid2eid"
+                )[self.args.token_id]
+                self.live_hash_rows[
+                    layer_id, : cfg.experts_per_token
+                ].copy_(source.to(torch.int32))
 
         self.mxfp_input_records = torch.empty(
             (8, 6144), dtype=torch.uint8, device=d
@@ -1981,18 +2203,35 @@ class ResidentOneLaunchDecode:
         base_sm: int,
         wait_group: str,
         release_group: str | None = None,
+        direct_output: bool = False,
     ) -> Stage:
         weights = self._fused_bf16_weights(family, suffixes)
         rows, k = weights.shape[-2:]
-        if output.numel() != rows:
-            raise ValueError("grouped BF16 projection output must match fused rows")
-        output_matrix = output.reshape(rows // 128, 128)
+        layer_indexed_output = output.ndim == 2
+        if layer_indexed_output:
+            if tuple(output.shape) != (len(family.layer_ids), rows):
+                raise ValueError(
+                    "layered grouped BF16 output must be [layers,fused rows]"
+                )
+            output_matrix = output.reshape(
+                len(family.layer_ids), rows // 128, 128
+            )
+        else:
+            if output.numel() != rows:
+                raise ValueError(
+                    "grouped BF16 projection output must match fused rows"
+                )
+            output_matrix = output.reshape(rows // 128, 128)
         weight_tma = TmaTensor(
             self.launcher, weights
         ).wgmma_load(128, 128, Major.K)
-        output_reduce = TmaTensor(
-            self.launcher, output_matrix
-        ).rowmajor_2d("reduce", 4, 128)
+        output_reduce_tensor = TmaTensor(self.launcher, output_matrix)
+        output_action = "store" if direct_output else "reduce"
+        output_reduce = (
+            output_reduce_tensor.batched_rowmajor_2d(output_action, 4, 128)
+            if layer_indexed_output
+            else output_reduce_tensor.rowmajor_2d(output_action, 4, 128)
+        )
         schedule = SchedDsv4Bf16GemvGroup4SplitK(
             weights,
             weight_tma,
@@ -2000,6 +2239,8 @@ class ResidentOneLaunchDecode:
             output_reduce,
             split_k,
             layer_indexed_weight=weights.ndim == 3,
+            layer_indexed_output=layer_indexed_output,
+            direct_output=direct_output,
         )
         work_items = rows // 512 * split_k
         return self._stage(
@@ -2268,6 +2509,18 @@ class ResidentOneLaunchDecode:
             split_metadata_splits=SchedDsv4Fp32Bf16Gemv.FUSED_SPLITS,
         )
         pre = self._layered(pre, family, norm_weights)
+        compressor_reuse_wait = (
+            (
+                (
+                    f"{family.name}.attn.compressor.projection.ready",
+                    "reuse",
+                ),
+            )
+            if self.live_state is not None
+            and self.config.attention_kind(family.representative)
+            in ("csa", "hca")
+            else ()
+        )
         pre_stage = self._stage(
             "ffn.hc_pre_rms4096",
             pre,
@@ -2277,7 +2530,7 @@ class ResidentOneLaunchDecode:
             wait_group_roles=(
                 (metadata_ready, "metadata"),
                 (residual_ready, "residual"),
-            ),
+            ) + compressor_reuse_wait,
             release_group=ffn_input_ready,
         )
         return tail_stage, [fused_stage, pre_stage]
@@ -2322,6 +2575,9 @@ class ResidentOneLaunchDecode:
         compressor_projection_ready = (
             f"{family.name}.attn.compressor.projection.ready"
         )
+        compressor_input_ready = (
+            f"{family.name}.attn.compressor.input.ready"
+        )
         compressor_output_ready = (
             f"{family.name}.attn.compressor.output.ready"
         )
@@ -2352,6 +2608,19 @@ class ResidentOneLaunchDecode:
         )
         context1_q_ready = f"{family.name}.attn.context1.q.ready"
         use_grouped_preattention = split_q_a and split_kv and split_q_b
+        live_compressor_state = (
+            self.live_state is not None and kind in ("csa", "hca")
+        )
+        if live_compressor_state and kind == "csa":
+            # Both compressor projections read the same normalized hidden.
+            # Their STU completion tails therefore publish one shared
+            # read-lifetime edge before the FFN mHC pre-task may overwrite it.
+            index_compressor_projection_ready = compressor_projection_ready
+        if live_compressor_state and not use_grouped_preattention:
+            raise ValueError(
+                "live decode requires the production grouped pre-attention path"
+            )
+        project_compressor = plan.should_compress or live_compressor_state
         compress_values = self.compress_values
         compress_scores = self.compress_scores
         index_compress_values = self.index_compress_values
@@ -2380,7 +2649,7 @@ class ResidentOneLaunchDecode:
                 64
                 if use_grouped_preattention
                 and kind in ("csa", "hca")
-                and plan.should_compress
+                and project_compressor
                 else self.sms
             )
         projection_reset = None
@@ -2668,13 +2937,46 @@ class ResidentOneLaunchDecode:
                     release_group=qkv_prefix_join,
                 )
             )
+        compressor_source = norm_hidden
+        if live_compressor_state:
+            compressor_input_arena = self.live_compressor_input_arenas[
+                family.representative
+            ]
+            compressor_source = compressor_input_arena[0]
+            stages.append(
+                self._stage(
+                    "attn.compressor.input_snapshot",
+                    SchedCopy(
+                        (
+                            TmaLoad1D(norm_hidden),
+                            TmaStore1D(compressor_source),
+                        )
+                    ),
+                    1,
+                    base_sm=self.sms - 1,
+                    wait_for_previous=False,
+                    wait_group=attention_input_ready,
+                    release_group=compressor_input_ready,
+                )
+            )
         if (
             use_grouped_preattention
             and kind in ("csa", "hca")
-            and plan.should_compress
+            and project_compressor
         ):
             width = cfg.head_dim * (2 if kind == "csa" else 1)
-            fused_output = self.compress_fused_projection[: 2 * width]
+            if live_compressor_state:
+                grouped_fused_output = (
+                    self.live_compressor_projection_arenas[
+                        family.representative
+                    ]
+                )
+                fused_output = grouped_fused_output[0]
+                if len(family.layer_ids) == 1:
+                    grouped_fused_output = fused_output
+            else:
+                fused_output = self.compress_fused_projection[: 2 * width]
+                grouped_fused_output = fused_output
             compress_values = fused_output[:width]
             compress_scores = fused_output[width:]
             _, q_prefix_sms = self.policy.fp8_umma_split_k(
@@ -2692,16 +2994,17 @@ class ResidentOneLaunchDecode:
                 if kind == "csa"
                 else compressor_base
             )
-            stages.append(
-                self._stage(
-                    "attn.compressor.projection_reset",
-                    SchedDsv4ZeroFill(self.zero_fill_gate, fused_output),
-                    compressor_sms,
-                    base_sm=compressor_base,
-                    wait_group=attention_input_ready,
-                    release_group=compressor_reset_ready,
+            if not live_compressor_state:
+                stages.append(
+                    self._stage(
+                        "attn.compressor.projection_reset",
+                        SchedDsv4ZeroFill(self.zero_fill_gate, fused_output),
+                        compressor_sms,
+                        base_sm=compressor_base,
+                        wait_group=attention_input_ready,
+                        release_group=compressor_reset_ready,
+                    )
                 )
-            )
             stages.append(
                 self._grouped_bf16_splitk_stage(
                     "attn.compressor.wkv_wgate_group4",
@@ -2710,20 +3013,37 @@ class ResidentOneLaunchDecode:
                         "attn.compressor.wkv.weight",
                         "attn.compressor.wgate.weight",
                     ),
-                    norm_hidden,
-                    fused_output,
+                    compressor_source,
+                    grouped_fused_output,
                     split_k=16,
                     base_sm=compressor_projection_base,
-                    wait_group=compressor_reset_ready,
+                    wait_group=(
+                        compressor_input_ready
+                        if live_compressor_state
+                        else compressor_reset_ready
+                    ),
                     release_group=compressor_projection_ready,
                 )
             )
         if (
             use_grouped_preattention
             and kind == "csa"
-            and plan.should_compress
+            and project_compressor
         ):
-            fused_index_output = self.index_compress_fused_projection.reshape(-1)
+            if live_compressor_state:
+                grouped_fused_index_output = (
+                    self.live_index_compressor_projection_arenas[
+                        family.representative
+                    ]
+                )
+                fused_index_output = grouped_fused_index_output[0]
+                if len(family.layer_ids) == 1:
+                    grouped_fused_index_output = fused_index_output
+            else:
+                fused_index_output = (
+                    self.index_compress_fused_projection.reshape(-1)
+                )
+                grouped_fused_index_output = fused_index_output
             index_tail_values = fused_index_output[
                 cfg.index_head_dim : 2 * cfg.index_head_dim
             ]
@@ -2736,18 +3056,19 @@ class ResidentOneLaunchDecode:
             index_compressor_base = kv_base + kv_prefix_sms
             index_compressor_sms = 8
             index_compressor_pool_base = index_compressor_base
-            stages.append(
-                self._stage(
-                    "index.compressor.projection_reset",
-                    SchedDsv4ZeroFill(
-                        self.zero_fill_gate, fused_index_output
-                    ),
-                    index_compressor_sms,
-                    base_sm=index_compressor_base,
-                    wait_group=attention_input_ready,
-                    release_group=index_compressor_reset_ready,
+            if not live_compressor_state:
+                stages.append(
+                    self._stage(
+                        "index.compressor.projection_reset",
+                        SchedDsv4ZeroFill(
+                            self.zero_fill_gate, fused_index_output
+                        ),
+                        index_compressor_sms,
+                        base_sm=index_compressor_base,
+                        wait_group=attention_input_ready,
+                        release_group=index_compressor_reset_ready,
+                    )
                 )
-            )
             stages.append(
                 self._grouped_bf16_splitk_stage(
                     "index.compressor.wkv_wgate_group4",
@@ -2756,12 +3077,140 @@ class ResidentOneLaunchDecode:
                         "attn.indexer.compressor.wkv.weight",
                         "attn.indexer.compressor.wgate.weight",
                     ),
-                    norm_hidden,
-                    fused_index_output,
+                    compressor_source,
+                    grouped_fused_index_output,
                     split_k=16,
                     base_sm=index_compressor_base,
-                    wait_group=index_compressor_reset_ready,
+                    wait_group=(
+                        compressor_input_ready
+                        if live_compressor_state
+                        else index_compressor_reset_ready
+                    ),
                     release_group=index_compressor_projection_ready,
+                )
+            )
+        if live_compressor_state:
+            ape_tensors = self._family_tensors(
+                family, "attn.compressor.ape"
+            )
+            position_in_group = self.decode_position % plan.compress_ratio
+            if kind == "csa":
+                value_rows = (
+                    compress_values[: cfg.head_dim],
+                    compress_values[cfg.head_dim : 2 * cfg.head_dim],
+                )
+                score_rows = (
+                    compress_scores[: cfg.head_dim],
+                    compress_scores[cfg.head_dim : 2 * cfg.head_dim],
+                )
+                bias_rows = tuple(
+                    tuple(
+                        ape[
+                            position_in_group,
+                            half * cfg.head_dim : (half + 1) * cfg.head_dim,
+                        ]
+                        for ape in ape_tensors
+                    )
+                    for half in range(2)
+                )
+                destinations = self.live_state.csa_pool_destinations(
+                    family.representative, self.decode_position
+                )
+                state_store = SchedDsv4CompressorStateStore(
+                    value_rows,
+                    score_rows,
+                    (bias_rows[0][0], bias_rows[1][0]),
+                    (destinations[0], destinations[2]),
+                    (destinations[1], destinations[3]),
+                )
+                state_store = self._layered(
+                    state_store, family, bias_rows[0], bias_rows[1]
+                )
+                state_store_sms = 2
+            else:
+                bias_rows = tuple(
+                    ape[position_in_group, : cfg.head_dim]
+                    for ape in ape_tensors
+                )
+                destination_values, destination_scores = (
+                    self.live_state.hca_pool_destination(
+                        family.representative, self.decode_position
+                    )
+                )
+                state_store = SchedDsv4CompressorStateStore(
+                    (compress_values[: cfg.head_dim],),
+                    (compress_scores[: cfg.head_dim],),
+                    (bias_rows[0],),
+                    (destination_values,),
+                    (destination_scores,),
+                )
+                state_store = self._layered(
+                    state_store, family, bias_rows
+                )
+                state_store_sms = 1
+            stages.append(
+                self._stage(
+                    "attn.compressor.state_store",
+                    state_store,
+                    state_store_sms,
+                    base_sm=self.sms - 4,
+                    wait_for_previous=False,
+                    wait_group=compressor_projection_ready,
+                    join_completion=True,
+                )
+            )
+        if live_compressor_state and kind == "csa":
+            index_ape_tensors = self._family_tensors(
+                family, "attn.indexer.compressor.ape"
+            )
+            index_bias_rows = tuple(
+                tuple(
+                    ape[
+                        position_in_group,
+                        half * cfg.index_head_dim :
+                        (half + 1) * cfg.index_head_dim,
+                    ]
+                    for ape in index_ape_tensors
+                )
+                for half in range(2)
+            )
+            index_destinations = self.live_state.csa_pool_destinations(
+                family.representative, self.decode_position, index=True
+            )
+            index_state_store = SchedDsv4CompressorStateStore(
+                (
+                    fused_index_output[: cfg.index_head_dim],
+                    fused_index_output[
+                        cfg.index_head_dim : 2 * cfg.index_head_dim
+                    ],
+                ),
+                (
+                    fused_index_output[
+                        2 * cfg.index_head_dim : 3 * cfg.index_head_dim
+                    ],
+                    fused_index_output[
+                        3 * cfg.index_head_dim : 4 * cfg.index_head_dim
+                    ],
+                ),
+                (index_bias_rows[0][0], index_bias_rows[1][0]),
+                (index_destinations[0], index_destinations[2]),
+                (index_destinations[1], index_destinations[3]),
+            )
+            index_state_store = self._layered(
+                index_state_store,
+                family,
+                index_bias_rows[0],
+                index_bias_rows[1],
+            )
+            stages.append(
+                self._stage(
+                    "index.compressor.state_store",
+                    index_state_store,
+                    2,
+                    base_sm=self.sms - 2,
+                    wait_for_previous=False,
+                    wait_group=index_compressor_projection_ready,
+                    join_completion=True,
                 )
             )
         if (
@@ -2791,10 +3240,13 @@ class ResidentOneLaunchDecode:
                 family, "attn.compressor.norm.weight"
             )
             use_packed_pool = (
-                self.args.gated_pool_mode == "packed"
+                self.live_state is None
+                and (
+                    self.args.gated_pool_mode == "packed"
                 or (
                     self.args.gated_pool_mode == "auto"
                     and plan.compress_ratio == 128
+                )
                 )
             )
             if use_packed_pool:
@@ -3212,10 +3664,13 @@ class ResidentOneLaunchDecode:
                     tail_offset : tail_offset + cfg.head_dim
                 ]
                 use_packed_pool = (
-                    self.args.gated_pool_mode == "packed"
+                    self.live_state is None
+                    and (
+                        self.args.gated_pool_mode == "packed"
                     or (
                         self.args.gated_pool_mode == "auto"
                         and plan.compress_ratio == 128
+                    )
                     )
                 )
                 fuse_scalar_pool_epilogue = (
@@ -3516,6 +3971,20 @@ class ResidentOneLaunchDecode:
                     head_count=8,
                     normalize_q=fuse_context1_q_rms,
                 )
+                if self.live_state is not None and len(family.layer_ids) > 1:
+                    context1 = SchedLayeredDsv4AttentionContext1Fp8Sm100(
+                        context1,
+                        tuple(
+                            self.live_state.attention_cache(
+                                layer_id, plan.compressed_rows
+                            )[
+                                self.decode_position % cfg.sliding_window :
+                                self.decode_position % cfg.sliding_window + 1
+                            ]
+                            for layer_id in family.layer_ids
+                        ),
+                        counter_strides=family.counter_strides,
+                    )
                 context1 = self._layered(context1, family, sinks)
                 stages.append(
                     self._stage(
@@ -3595,6 +4064,17 @@ class ResidentOneLaunchDecode:
                     and plan.should_compress
                 ),
             )
+            if self.live_state is not None and len(family.layer_ids) > 1:
+                producer = SchedLayeredDsv4AttentionSplit64UmmaSm100(
+                    producer,
+                    tuple(
+                        self.live_state.attention_cache(
+                            layer_id, plan.compressed_rows
+                        )
+                        for layer_id in family.layer_ids
+                    ),
+                    counter_strides=family.counter_strides,
+                )
             stages.append(
                 self._stage(
                     f"attn.sparse_{kind}.split64_umma",
@@ -3846,6 +4326,24 @@ class ResidentOneLaunchDecode:
         self._hash_rows[layer_id] = row
         return row
 
+    def set_input_token(self, token_id: int) -> None:
+        """Update the token-dependent inputs of a prepared live image."""
+        if self.live_state is None:
+            raise RuntimeError("set_input_token is only valid for live decode")
+        if not 0 <= int(token_id) < self.config.vocab_size:
+            raise ValueError("input token is outside the vocabulary")
+        embedding = self._tensor("embed.weight")[int(token_id)]
+        self.initial_residual.copy_(
+            embedding.reshape(1, -1).expand(self.config.hc_mult, -1)
+        )
+        for layer_id in range(self.config.num_hash_layers):
+            source = self._tensor(
+                f"layers.{layer_id}.ffn.gate.tid2eid"
+            )[int(token_id)]
+            self.live_hash_rows[
+                layer_id, : self.config.experts_per_token
+            ].copy_(source.to(torch.int32))
+
     def _build_mxfp_ffn(
         self, family: LayerFamily
     ) -> tuple[Stage, list[Stage]]:
@@ -4045,9 +4543,22 @@ class ResidentOneLaunchDecode:
         hash_routing = family.representative < cfg.num_hash_layers
         if hash_routing:
             router_biases = (self.zero_bias,) * len(family.layer_ids)
-            hash_rows = torch.stack(
-                tuple(self._hash_row(layer_id) for layer_id in family.layer_ids)
-            ).contiguous()
+            if self.live_hash_rows is None:
+                hash_rows = torch.stack(
+                    tuple(
+                        self._hash_row(layer_id)
+                        for layer_id in family.layer_ids
+                    )
+                ).contiguous()
+            else:
+                first = family.layer_ids[0]
+                if family.layer_ids != tuple(
+                    range(first, first + len(family.layer_ids))
+                ):
+                    raise ValueError("live hash families must be contiguous")
+                hash_rows = self.live_hash_rows[
+                    first : first + len(family.layer_ids)
+                ]
         else:
             router_biases = self._family_tensors(family, "ffn.gate.bias")
             hash_rows = self.zero_hash
@@ -4114,6 +4625,7 @@ class ResidentOneLaunchDecode:
         return self._build_mxfp_ffn(family)
 
     def _build_family(self, family: LayerFamily) -> list[Stage]:
+        live_state_groups = self._activate_live_family_state(family)
         attention, _ = self._build_attention(family)
         tail_stage, ffn = self._build_ffn(family)
         tail_insert_after = max(
@@ -4124,6 +4636,18 @@ class ResidentOneLaunchDecode:
                 "attn.projections.reset",
             }
         )
+        if live_state_groups and len(family.layer_ids) > 1:
+            attention = [
+                replace(
+                    stage,
+                    schedule=LayerStateSchedule(
+                        stage.schedule,
+                        live_state_groups,
+                        counter_strides=family.counter_strides,
+                    ),
+                )
+                for stage in attention
+            ]
         attention.insert(tail_insert_after + 1, tail_stage)
         return attention + ffn
 
@@ -4759,25 +5283,38 @@ class ResidentOneLaunchDecode:
                 flush=True,
             )
             preprocess_started = time.monotonic()
-            epoch_weights = []
-            for epoch in range(num_epochs):
-                row_start = epoch * epoch_rows
-                row_end = min(row_start + epoch_rows, self.args.vocab_size)
-                source = head_weight[row_start:row_end]
-                if source.shape[0] != epoch_rows:
-                    padded = torch.empty(
-                        (epoch_rows, cfg.hidden_size),
-                        dtype=torch.bfloat16,
-                        device=self.device,
+            if (
+                self.weight_source is not None
+                and hasattr(self.weight_source, "head_weight_bf16_packed")
+                and self.weight_source.args.vocab_size == self.args.vocab_size
+            ):
+                self.head_weight_bf16_packed = (
+                    self.weight_source.head_weight_bf16_packed
+                )
+            else:
+                epoch_weights = []
+                for epoch in range(num_epochs):
+                    row_start = epoch * epoch_rows
+                    row_end = min(
+                        row_start + epoch_rows, self.args.vocab_size
                     )
-                    # Duplicate a real vocabulary row into the padding.
-                    # Equal-value argmax ties select the smaller absolute
-                    # index, so padded rows cannot replace their source row.
-                    padded[:] = head_weight[0]
-                    padded[: source.shape[0]].copy_(source)
-                    source = padded
-                epoch_weights.append(pack_weight_tile_major(source, 128, 128))
-            self.head_weight_bf16_packed = tuple(epoch_weights)
+                    source = head_weight[row_start:row_end]
+                    if source.shape[0] != epoch_rows:
+                        padded = torch.empty(
+                            (epoch_rows, cfg.hidden_size),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                        # Duplicate a real vocabulary row into the padding.
+                        # Equal-value argmax ties select the smaller absolute
+                        # index, so padded rows cannot replace their source row.
+                        padded[:] = head_weight[0]
+                        padded[: source.shape[0]].copy_(source)
+                        source = padded
+                    epoch_weights.append(
+                        pack_weight_tile_major(source, 128, 128)
+                    )
+                self.head_weight_bf16_packed = tuple(epoch_weights)
             activation_tma = TmaTensor(
                 self.launcher, self.head_norm
             ).wgmma_load(
@@ -5034,6 +5571,7 @@ class ResidentOneLaunchDecode:
                     (group_name(group), role)
                     for group, role in stage.release_group_roles
                 ),
+                join_completion=stage.join_completion,
             )
 
         def queued_family(
@@ -8947,7 +9485,7 @@ class ResidentOneLaunchDecode:
         )
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
@@ -9337,6 +9875,11 @@ def main() -> None:
         action="store_true",
         help="report layer frontiers and aggregate counters for every sample",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_argument_parser()
     args = parser.parse_args()
     cfg = DeepSeekV4FlashConfig()
     if not 0 <= args.token_id < cfg.vocab_size:

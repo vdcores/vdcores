@@ -54,6 +54,7 @@ class SequentialStage:
     wait_group_roles: tuple[tuple[str, str], ...] = ()
     release_group_roles: tuple[tuple[str, str], ...] = ()
     reset_mxfp_resident_after: bool = False
+    join_completion: bool = False
 
 
 @dataclass(frozen=True)
@@ -450,6 +451,7 @@ class SequentialProgram:
         previous_stage = None
         previous_name = None
         previous_profile_after = False
+        completion_join_tails: list[tuple[str, MemoryInstruction]] = []
         for stage_index, stage in enumerate(self.stages):
             if stage.num_sms <= 0:
                 raise ValueError(f"stage {stage.name!r} must use at least one SM")
@@ -531,12 +533,27 @@ class SequentialProgram:
                 pass
             elif previous is not None and stage.wait_for_previous:
                 count, tails = _writeback_tail(previous, previous_name)
+                named_tails = [
+                    (previous_name, tail) for tail in tails
+                ]
+                if reset_mxfp_before_stage and completion_join_tails:
+                    named_tails.extend(completion_join_tails)
+                    completion_join_tails = []
+                    unique_named_tails = []
+                    seen_tail_ids = set()
+                    for stage_name, tail in named_tails:
+                        if id(tail) in seen_tail_ids:
+                            continue
+                        seen_tail_ids.add(id(tail))
+                        unique_named_tails.append((stage_name, tail))
+                    named_tails = unique_named_tails
+                    count = len(named_tails)
                 if launcher.num_bars >= config.max_bars - 2:
                     raise ValueError("sequential program exceeds the runtime barrier capacity")
                 input_bar = launcher.new_bar(count)
                 self.barriers.append(input_bar)
-                for tail in tails:
-                    _attach_bar(tail, input_bar, stage=previous_name)
+                for stage_name, tail in named_tails:
+                    _attach_bar(tail, input_bar, stage=stage_name)
             elif previous is not None:
                 if previous_profile_after:
                     raise ValueError(
@@ -782,6 +799,15 @@ class SequentialProgram:
                         "has no barrier release count"
                     )
                 group_release_counts[group] += count
+            if stage.join_completion:
+                if not completion_barrier:
+                    raise ValueError(
+                        f"stage {stage.name!r} joins a disabled completion barrier"
+                    )
+                _, tails = _writeback_tail(rendered, stage.name)
+                completion_join_tails.extend(
+                    (stage.name, tail) for tail in tails
+                )
             previous = rendered
             previous_stage = stage
             previous_name = stage.name
@@ -800,13 +826,26 @@ class SequentialProgram:
             launcher.set_bar(bar_id, count)
 
         if completion_barrier:
-            count, tails = _writeback_tail(previous, previous_name)
+            _, tails = _writeback_tail(previous, previous_name)
+            completion_tails = [
+                (previous_name, tail) for tail in tails
+            ] + completion_join_tails
+            # A final stage may itself request a completion join.  Count and
+            # annotate each physical STU command once in that case.
+            unique_tails = []
+            seen_tail_ids = set()
+            for stage_name, tail in completion_tails:
+                if id(tail) in seen_tail_ids:
+                    continue
+                seen_tail_ids.add(id(tail))
+                unique_tails.append((stage_name, tail))
+            count = len(unique_tails)
             if launcher.num_bars >= config.max_bars - 2:
                 raise ValueError("sequential program exceeds the runtime barrier capacity")
             self.completion_barrier = launcher.new_bar(count)
             self.barriers.append(self.completion_barrier)
-            for tail in tails:
-                _attach_bar(tail, self.completion_barrier, stage=previous_name)
+            for stage_name, tail in unique_tails:
+                _attach_bar(tail, self.completion_barrier, stage=stage_name)
             if previous_profile_after:
                 if self.profile_event_count == 0:
                     raise ValueError("profiled stage requires profile event capacity")

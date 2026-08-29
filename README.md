@@ -55,6 +55,62 @@ Notes:
 - The tuned Llama path launches one token per VDCores megakernel. Persistent multi-token fusion is intentionally deferred to a later milestone.
 - The Python extension is packaged as `dae` and links [`src/torch_runtime.cu`](src/torch_runtime.cu) with [`src/runtime.cu`](src/runtime.cu) via `runtime.o`.
 
+## DeepSeek-V4-Flash Live Decoding Demo
+
+[`app/python/deepseek_v4/sched.py`](app/python/deepseek_v4/sched.py)
+runs an ordinary prompt end to end: the checkpoint's PyTorch reference prefills
+all but the last prompt token, then VDCores consumes that token and greedily
+decodes.  Each output token uses one already prepared, position-specialized
+persistent-kernel launch.  Offline prefill and image preparation are reported
+separately and are not included in decode timing.
+
+The demo expects the released NVIDIA DeepSeek-V4-Flash-NVFP4 checkpoint and the
+offline VDCores MXFP4 FFN image.  Create the two offline artifacts once:
+
+```bash
+DSV4_CHECKPOINT=/path/to/DeepSeek-V4-Flash-NVFP4
+
+python tools/convert_deepseek_v4_ffn_mxfp.py "$DSV4_CHECKPOINT"
+
+python "$DSV4_CHECKPOINT/inference/convert.py" \
+  --hf-ckpt-path "$DSV4_CHECKPOINT" \
+  --save-path "$DSV4_CHECKPOINT/vdcores-pytorch-mp1" \
+  --n-experts 256 \
+  --model-parallel 1 \
+  --expert-dtype fp4
+```
+
+The second artifact is a one-file, MP1 loader image for offline prefill.  The
+demo explicitly dequantizes its released NVFP4 routed experts in PyTorch; no
+prefill conversion or dependency is present in the timed VDCores path.
+
+Install the checkpoint's prefill dependencies, build the compact live image,
+and run a short stream:
+
+```bash
+pip install -r app/python/deepseek_v4/requirements-prefill.txt
+pip install --no-build-isolation \
+  'git+https://github.com/Dao-AILab/fast-hadamard-transform.git@v1.1.0'
+
+DAE_COMPUTE_OPS_FILE=benchmarks/deepseek_v4_live.ops \
+  make -B -j2 num_insts=512 mxfp_direct_tma=1 pyext
+
+python app/python/deepseek_v4/sched.py \
+  --checkpoint "$DSV4_CHECKPOINT" \
+  --mxfp-ffn-root "$DSV4_CHECKPOINT/vdcores-mxfp4-ffn-v1" \
+  --prefill-checkpoint "$DSV4_CHECKPOINT/vdcores-pytorch-mp1" \
+  -N 4 \
+  "Hi"
+```
+
+On one GB300, the four-token example produced `Hello! How can` with a
+5.366 ms median device frontier, 5.859 ms median Python wall time, and
+170.7 token/s.  The imported boundary is explicit: BF16 KV caches and FP32
+incremental compressor state are retained in their VDCores layouts; the demo
+does not insert an implicit hidden-state conversion.  For a fast decode-only
+smoke test, replace the prompt and prefill option with
+`--input-token-id 1234`.
+
 ## Getting Started
 
 The codebase is organized around three layers:

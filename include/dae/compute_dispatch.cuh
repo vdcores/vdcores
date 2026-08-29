@@ -907,6 +907,13 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL) {
       inst.args[0], inst.args[1], inst.args[2] != 0, smem_base, m2c, c2m);
 }
 
+DAE_COMPUTE_OP_HANDLER(OP_DSV4_COMPRESSOR_STATE_STORE) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+             tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  task_dsv4_compressor_state_store(
+      inst.args[0], smem_base, m2c, c2m);
+}
+
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_GATED_POOL_RMS_ROPE) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);

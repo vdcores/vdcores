@@ -623,12 +623,57 @@ def main() -> None:
         atol=2.0e-3,
     )
 
+    layered_direct_output = torch.empty(
+        (2, 4, 128), dtype=torch.float32, device=device
+    )
+    layered_direct_launcher = Launcher(1, device=device)
+    layered_direct_weight_tma = TmaTensor(
+        layered_direct_launcher, layered_weight
+    ).wgmma_load(128, 128, Major.K)
+    layered_direct_output_tma = TmaTensor(
+        layered_direct_launcher, layered_direct_output
+    ).batched_rowmajor_2d("store", 4, 128)
+    layered_direct_schedule = SchedDsv4Bf16GemvGroup4SplitK(
+        layered_weight,
+        layered_direct_weight_tma,
+        grouped_input,
+        layered_direct_output_tma,
+        split_k=1,
+        layer_indexed_weight=True,
+        layer_indexed_output=True,
+        direct_output=True,
+    )
+    layered_direct_program = LoopedSequentialProgram(
+        layered_direct_launcher,
+        (
+            SequentialBlock(
+                "two_layer_direct_grouped_projection",
+                (
+                    SequentialStage(
+                        "direct_grouped_projection",
+                        layered_direct_schedule,
+                        1,
+                    ),
+                ),
+                repeat=2,
+            ),
+        ),
+    )
+    layered_direct_launcher.s(layered_direct_program)
+    layered_direct_launcher.launch()
+    torch.testing.assert_close(
+        layered_direct_output.reshape(2, -1),
+        torch.matmul(layered_weight.float(), grouped_input.float()),
+        rtol=2.0e-3,
+        atol=2.0e-3,
+    )
+
     print(
         f"DSV4_PREATTENTION_FUSION status=PASS launches={repetitions} "
         "q_rows=64 kv_rows=1 q_rank_tiles=8 bf16_group4_splitk=8 "
         "fp32_epilogues=4 fused_pool_widths=128,512 "
         "packed_pool_shards=4 split_history_pool_shards=4 "
-        "hc_pre_rms=1 layered_weights=2",
+        "hc_pre_rms=1 layered_weights=2 layered_direct_output=2",
         flush=True,
     )
 

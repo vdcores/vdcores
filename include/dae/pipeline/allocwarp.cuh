@@ -165,6 +165,10 @@ __device__ __forceinline__ void allocwarp_execute(
     if (decoded_op == op(OP_ALLOC_LAYER_TMA_LOAD_4D) && lane_id == 0) {
       inst.coords[3] += indirect_layer_index;
     }
+    if ((decoded_op == op(OP_ALLOC_WB_LAYER_TMA_REDUCE_ADD_3D) ||
+         decoded_op == op(OP_ALLOC_WB_LAYER_TMA_STORE_3D)) && lane_id == 0) {
+      inst.coords[2] += indirect_layer_index;
+    }
     if (decoded_op == op(OP_TMA_LOAD_MX_COUPLED_STREAM) &&
         (inst.arg & dae_mxfp_resident_ffn::kCoupledKindMask) ==
             dae_mxfp_resident_ffn::kCoupledFp8Gemv &&

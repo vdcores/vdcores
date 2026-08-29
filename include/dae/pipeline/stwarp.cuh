@@ -207,6 +207,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
           cuda::ptx::cp_async_bulk_commit_group();
         }
         break;
+      case op(OP_ALLOC_WB_LAYER_TMA_STORE_3D):
       case op(OP_ALLOC_WB_TMA_STORE_3D):
         {
           const uint16_t *cord = inst.coords;
@@ -262,6 +263,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
           cuda::ptx::cp_async_bulk_commit_group();
         }
         break;
+      case op(OP_ALLOC_WB_LAYER_TMA_REDUCE_ADD_3D):
       case op(OP_ALLOC_WB_TMA_REDUCE_ADD_3D):
         {
           const uint16_t *cord = inst.coords;

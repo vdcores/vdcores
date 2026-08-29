@@ -2091,6 +2091,46 @@ __device__ __forceinline__ void task_dsv4_hadamard(
   c2m.template push<31, true, false>(tid, output_slots);
 }
 
+// Persist one compressor projection row for a later decode token. Values are
+// copied exactly; positional APE is folded into the score row before STU
+// publication so the existing gated-pool task can consume historical rows
+// without another side input.
+template <typename M2CQueue, typename C2MQueue>
+__device__ __forceinline__ void task_dsv4_compressor_state_store(
+    int width,
+    void *smem_base,
+    M2CQueue &m2c,
+    C2MQueue &c2m) {
+  if (width != 128 && width != 512) {
+    asm volatile("trap;");
+  }
+  const int values_slots = m2c.template pop<0>();
+  const int scores_slots = m2c.template pop<0>();
+  const int bias_slots = m2c.template pop<0>();
+  const int output_values_slots = m2c.template pop<0>();
+  const int output_scores_slots = m2c.template pop<0>();
+  const auto *values = static_cast<const float *>(
+      get_slot_address(smem_base, extract(values_slots)));
+  const auto *scores = static_cast<const float *>(
+      get_slot_address(smem_base, extract(scores_slots)));
+  const auto *bias = static_cast<const float *>(
+      get_slot_address(smem_base, extract(bias_slots)));
+  auto *output_values = static_cast<float *>(
+      get_slot_address(smem_base, extract(output_values_slots)));
+  auto *output_scores = static_cast<float *>(
+      get_slot_address(smem_base, extract(output_scores_slots)));
+
+  const int tid = __compute_tid();
+  for (int dim = tid; dim < width; dim += 128) {
+    output_values[dim] = values[dim];
+    output_scores[dim] = scores[dim] + bias[dim];
+  }
+  __sync_compute_group(128);
+  c2m.push(tid, values_slots | scores_slots | bias_slots);
+  c2m.template push<31, true, false>(tid, output_values_slots);
+  c2m.template push<31, true, false>(tid, output_scores_slots);
+}
+
 // Dimension-wise gated pooling for compressed KV state.  The caller supplies
 // the contiguous rows selected by the ratio-4 overlap rule or ratio-128 rule,
 // with positional APE already added to the FP32 scores.
@@ -3448,7 +3488,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
     }
   }
   __sync_compute_group(128);
-  auto *hidden = reinterpret_cast<__nv_bfloat16 *>(shared + 64);
 
   // Warp zero owns the coefficient transform while the other three warps
   // consume the already-published pre coefficients.  One element per lane
@@ -3502,10 +3541,25 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
 
   auto *worker_rms_rcp = shared + 31;
   int residual_slots = 0;
+  const __nv_bfloat16 *residual = nullptr;
   if (warp != 0) {
     residual_slots = m2c.template pop<0>();
-    const auto *residual = static_cast<const __nv_bfloat16 *>(
+    residual = static_cast<const __nv_bfloat16 *>(
         get_slot_address(smem_base, extract(residual_slots)));
+  }
+
+  // The primary output lease is deliberately published before the norm
+  // weight.  It doubles as the transient BF16 hidden workspace, keeping the
+  // vector out of the common task scratch while the LDU is free to fetch the
+  // norm weight in parallel with the hidden mix.
+  const int output_slots = m2c.template pop<0>();
+  const int output_slot = extract(output_slots);
+  auto *global_output = static_cast<uint8_t *>(slot_2_glob_ptr(
+      st_insts, output_slot));
+  auto *hidden = static_cast<__nv_bfloat16 *>(
+      get_slot_address(smem_base, output_slot));
+
+  if (warp != 0) {
     constexpr int kWorkerThreads = 96;
     const int worker = tid - 32;
     float hidden_sum = 0.0f;
@@ -3535,10 +3589,6 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
   norm_weight_slots = m2c.template pop<0>();
   norm_weight = static_cast<const __nv_bfloat16 *>(get_slot_address(
       smem_base, extract(norm_weight_slots)));
-  const int output_slots = m2c.template pop<0>();
-  const int output_slot = extract(output_slots);
-  auto *global_output = static_cast<uint8_t *>(slot_2_glob_ptr(
-      st_insts, output_slot));
   __nv_bfloat16 *output;
   Fp8 *fp8_output;
   if constexpr (OutputFp8) {
@@ -3656,6 +3706,9 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
       }
       block_scale = __shfl_sync(
           group_mask, block_scale, 0, kLanesPerGroup);
+      // Every group has consumed its BF16 source block before any group
+      // compacts into the lower half of the same allocator slot.
+      __sync_compute_group(128);
 #pragma unroll
       for (int element = 0; element < kVectorWidth; ++element) {
         fp8_output[dim + element] = Fp8(fminf(
@@ -3667,6 +3720,7 @@ __device__ __forceinline__ void task_dsv4_hc_pre_rms(
         zero_vectors[0] = make_uint4(0, 0, 0, 0);
         zero_vectors[1] = make_uint4(0, 0, 0, 0);
       }
+      __sync_compute_group(128);
     }
   }
 
