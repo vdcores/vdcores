@@ -382,6 +382,8 @@ layerg.addBarrier("bar_q_proj")
 layerg.addBarrier("bar_qkv_attn")
 layerg.addBarrier("bar_attn_out")
 layerg.addBarrier("bar_silu_out2")
+for shard in range(4):
+    layerg.addBarrier(f"bar_silu_out_shard{shard}")
 layerg.addBarrier("bar_pre_attn_rms")
 layerg.addBarrier("bar_post_attn_rms")
 
@@ -499,7 +501,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ),
     ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
 
-    GemvFactory = layers_like(GemvLayer, dae, Gemv_M64N8)
+    GemvFactory = layers_like(GemvLayer, dae, Gemv_M64N8IssuerOnly)
     Gqa = SchedAttentionDecoding(
         reqs=BATCH,
         seq_len=token_pos + 1,
@@ -520,33 +522,45 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenOutLayer"]),
     ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
 
-    regGate, regUp = 0, 1
+    regGate = 0
     regStoreGate = RegStore(regGate, size=N * TileM * matSiLUOut.element_size())
-    regStoreUp = RegStore(regUp, size=N * TileM * matSiLUOut.element_size())
 
     gate_proj = SchedGemv(
         LinearAtom,
         MNK=(INTERMIDIATE, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], regStoreGate),
     ).bar("load", layerg["bar_post_attn_rms"])
-    up_proj = SchedGemv(
-        LinearAtom,
-        MNK=(INTERMIDIATE, N, HIDDEN),
-        tmas=(layerg["loadUp"], layerg["loadRMSLayer"], regStoreUp),
-    ).bar("load", layerg["bar_post_attn_rms"])
-    silu_fused = SchedRegSiLUFused(
-        num_token=N,
-        store_tma=layerg["storeSiluLayer"],
-        reg_gate=regGate,
-        reg_up=regUp,
-        base_offset=0,
-        stride=TileM,
-    ).bar("output", layerg["bar_silu_out2"])
-    down_proj = SchedGemv(
-        LinearAtom,
-        MNK=(HIDDEN, N, INTERMIDIATE),
-        tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
-    ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
+    mlp_shard = INTERMIDIATE // 4
+    up_proj = [
+        SchedGemvUpSiLU(
+            MNK=((shard * mlp_shard, mlp_shard), N, HIDDEN),
+            tmas=(
+                layerg["loadUp"],
+                layerg["loadRMSLayer"],
+                layerg["storeSiluLayer"],
+            ),
+            gate_reg=regGate,
+        )
+        .bar("load", layerg["bar_post_attn_rms"])
+        .bar("store", layerg[f"bar_silu_out_shard{shard}"])
+        .place(32, base_sm=shard * 32)
+        for shard in range(4)
+    ]
+    down_proj = [
+        SchedGemv(
+            LinearAtom,
+            MNK=(HIDDEN, N, (shard * mlp_shard, mlp_shard)),
+            tmas=(
+                layerg["loadDown"],
+                layerg["loadSiluLayer"],
+                layerg["reduceHiddenLayer"],
+            ),
+        )
+        .bar("load", layerg[f"bar_silu_out_shard{shard}"])
+        .bar("store", layerg["bar_layer"])
+        .place(32, base_sm=shard * 32)
+        for shard in range(4)
+    ]
 
     LogitsProj = []
     for i in range(logits_epoch):
@@ -591,9 +605,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
     Gqa = Gqa.place(BATCH * NUM_KV_HEAD)
     OutProj = OutProj.place(64)
     gate_proj = gate_proj.place(128)
-    up_proj = up_proj.place(128)
-    silu_fused = silu_fused.place(128)
-    down_proj = down_proj.place(128)
     Argmax = Argmax.place(128)
     restore_bars_low = restore_bars_low.place(1, base_sm=128)
     restore_bars_high = restore_bars_high.place(1, base_sm=128)
@@ -610,7 +621,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ("post_attn_rms", [post_attn_rms]),
         ("gate", [gate_proj]),
         ("up", [up_proj]),
-        ("silu", [silu_fused]),
+        ("silu", []),
         ("down", [down_proj]),
         ("final_rms", [pre_attn_rms]),
         ("logits", [LogitsProj]),
@@ -650,7 +661,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
         *([post_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "post_attn_rms") else []),
         *([gate_proj] if stage_enabled(parsed_args.debug_stop_after, "gate") else []),
         *([up_proj] if stage_enabled(parsed_args.debug_stop_after, "up") else []),
-        *([silu_fused] if stage_enabled(parsed_args.debug_stop_after, "silu") else []),
         *([down_proj] if stage_enabled(parsed_args.debug_stop_after, "down") else []),
         *([pre_attn_rms] if stage_enabled(parsed_args.debug_stop_after, "final_rms") else []),
         *(
