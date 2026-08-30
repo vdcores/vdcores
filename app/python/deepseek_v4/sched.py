@@ -281,7 +281,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Prefill a DeepSeek-V4 prompt with the official PyTorch model, "
-            "then greedily decode one prepared VDCores launch per token."
+            "then greedily decode with prepared VDCores token-span launches."
         )
     )
     parser.add_argument(
