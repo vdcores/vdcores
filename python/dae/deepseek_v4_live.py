@@ -256,6 +256,27 @@ class DeepSeekV4LiveDecodeState:
 
         self._prepared_position = position
 
+    def complete_decode_span(
+        self, first_position: int, last_position: int
+    ) -> None:
+        """Advance host bookkeeping after one device-controlled token span."""
+
+        first_position = int(first_position)
+        last_position = int(last_position)
+        if self._prepared_position != first_position:
+            raise RuntimeError(
+                "device span did not begin at the prepared position"
+            )
+        if not first_position <= last_position < self.max_seq_len:
+            raise ValueError("completed device span is outside live-state capacity")
+        if first_position < self.config.sliding_window:
+            raise ValueError(
+                "device spans before the full sliding window need host CSA packing"
+            )
+        if self._pending_short_csa is not None:
+            raise RuntimeError("device span cannot carry pending short-CSA state")
+        self._prepared_position = last_position
+
     @torch.inference_mode()
     def import_pytorch_prefill(self, model, prefix_length: int) -> None:
         """Import the official batch-one PyTorch prefill state.

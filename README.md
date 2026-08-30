@@ -64,10 +64,15 @@ execution live separately in
 [`python/dae/deepseek_v4_inference.py`](python/dae/deepseek_v4_inference.py),
 which contains no tokenizer, reference model, or terminal UI.  A compact bank
 of reusable structural flows covers ordinary tokens, ratio-4 and ratio-128
-compression boundaries, context one, and long-context index selection.  The
-host only selects a flow, updates the token/position records, and performs one
-persistent-kernel launch per output token; it does not rebuild or requeue the
-43-layer instruction stream.  Offline prefill and flow preparation are
+compression boundaries, context one, and long-context index selection.
+Ordinary positions after the 128-row window fills can execute up to three
+autoregressive tokens in one persistent launch.  The memory virtual core keeps
+the absolute position and loop terminal in GPR state, derives RoPE/APE,
+embedding, routing-hash, KV, and token-history addresses from those registers,
+and feeds each argmax result directly into the next iteration.  Structural
+compression boundaries remain single-token launches.  The host selects a
+prepared span and writes only its first token; it does not rebuild or requeue
+the 43-layer instruction stream.  Offline prefill and flow preparation are
 reported separately and are not included in decode timing.
 
 The demo expects the released NVIDIA DeepSeek-V4-Flash-NVFP4 checkpoint and the
@@ -106,17 +111,28 @@ python app/python/deepseek_v4/sched.py \
   --mxfp-ffn-root "$DSV4_CHECKPOINT/vdcores-mxfp4-ffn-v1" \
   --prefill-checkpoint "$DSV4_CHECKPOINT/vdcores-pytorch-mp1" \
   -N 256 \
+  --device-span-tokens 3 \
   --user-prompt "Explain how asynchronous GPU pipelines overlap memory transfers with matrix computation, then provide a concise Python example and discuss synchronization, correctness, scheduling, resource allocation, and performance tradeoffs in practical inference systems. Compare persistent kernels, CUDA graphs, tensor memory accelerators, and conventional launches for autoregressive decoding."
 ```
 
-The example formats to 63 prompt tokens.  On one GB300, offline PyTorch
-prefill of its 62-token prefix took 72.9 s, four reusable flows took 52.0 s
-to load and prepare, and the following 256-token VDCores decode measured a
-5.411 ms median device frontier, 6.406 ms median Python wall time, and
-156.1 token/s.  The fixed production frontier around this context is
-approximately 5.37 ms, so reusable control changes device time by less than
-one percent.  Decode accepts arbitrary prompt lengths within the 65,536-token
-live cache and up to 256 new tokens; EOS, repeated `--stop-token-id`, and
+The example formats to 63 prompt tokens.  Positions before 128 retain the
+single-token path needed for short-CSA host packing; later ordinary runs are
+grouped without crossing a ratio-4, ratio-128, or index-selection boundary.
+Set `--device-span-tokens 1` to retain one launch per token.  Stop conditions
+are observed after each completed device span, so a three-token span may
+speculatively compute up to two tokens beyond a stop token; those tokens are
+discarded from the returned generation.  For this 256-token example, the
+span-three planner prepares six reusable images and emits 161 launches.
+
+On one GB300, a historical `--device-span-tokens 1` run spent 72.9 s on the
+offline PyTorch prefill of its 62-token prefix and 52.0 s preparing four
+reusable flows.  Its following 256-token VDCores decode measured a 5.411 ms
+median device frontier, 6.406 ms median Python wall time, and 156.1 token/s.
+With span three enabled, a real-prefill validation through position 131
+measured 5.486 ms/device-token for the launch covering positions 128--130;
+the median across all 70 decoded tokens was 5.463 ms/device-token.  Decode
+accepts arbitrary prompt lengths within the 65,536-token live cache and up to
+256 new tokens; EOS, repeated `--stop-token-id`, and
 `--max-decode-seconds` can stop it earlier.  Add `--quiet-stream` to suppress
 the cumulative per-token text while retaining the final completion and timing.
 

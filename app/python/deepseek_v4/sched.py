@@ -310,6 +310,15 @@ def main() -> None:
     )
     parser.add_argument("-N", "--max-new-tokens", type=int, default=4)
     parser.add_argument(
+        "--device-span-tokens",
+        type=int,
+        default=3,
+        help=(
+            "maximum tokens per persistent launch; ordinary positions at or "
+            "beyond context 128 are fused until the next structural boundary"
+        ),
+    )
+    parser.add_argument(
         "--max-decode-seconds",
         type=float,
         help="stop before the next token once this decode wall-time budget expires",
@@ -365,6 +374,10 @@ def main() -> None:
     if not 1 <= args.max_new_tokens <= MAX_DECODE_TOKENS:
         parser.error(
             f"max-new-tokens must be in [1,{MAX_DECODE_TOKENS}]"
+        )
+    if not 1 <= args.device_span_tokens <= MAX_DECODE_TOKENS:
+        parser.error(
+            f"device-span-tokens must be in [1,{MAX_DECODE_TOKENS}]"
         )
     if args.max_decode_seconds is not None and args.max_decode_seconds <= 0:
         parser.error("max-decode-seconds must be positive")
@@ -425,11 +438,13 @@ def main() -> None:
         initial_token_id=prompt_tokens[-1],
         mxfp_ffn_root=args.mxfp_ffn_root,
         device=device,
+        device_span_tokens=args.device_span_tokens,
     )
     prepare_started = time.perf_counter()
     print(
         "[prepare] loading one resident VDCores checkpoint and preparing "
-        f"{len(inference.flow_plans)} reusable position plans for "
+        f"{len(inference.flow_plans)} reusable position plans and "
+        f"{len(inference.token_spans)} launches for "
         f"{args.max_new_tokens} decode tokens "
         f"variants={','.join(plan.variant for plan in inference.flow_plans)}",
         flush=True,
@@ -445,6 +460,7 @@ def main() -> None:
             f"plans={plan_index + 1}/{len(preparations)} "
             f"variant={plan.variant} "
             f"positions={plan.first_position}..{plan.last_position} "
+            f"tokens_per_launch={plan.tokens_per_launch} "
             f"canonical_max={plan.max_position} "
             f"elapsed_s={preparation.elapsed_s:.3f} "
             f"free_gib={preparation.free_bytes / (1 << 30):.3f}",
@@ -471,6 +487,7 @@ def main() -> None:
             f"step={step.step} position={step.position} "
             f"variant={step.variant} input_token={step.input_token} "
             f"output_token={step.output_token} "
+            f"launch_tokens={step.launch_tokens} "
             f"cuda_ms={step.cuda_ms:.6f} device_ms={step.device_ms:.6f} "
             f"wall_ms={step.wall_ms:.6f}",
             flush=True,

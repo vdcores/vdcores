@@ -53,6 +53,8 @@ from dae.launcher import Launcher
 from dae.instructions import (
     Gemv_M128N8Direct4,
     LduReloadBarriers,
+    LoopC,
+    LoopM,
     MemoryInstruction,
     TmaLoad1D,
     TmaStore1D,
@@ -91,6 +93,7 @@ from dae.schedule import (
     SchedDsv4IndexScore,
     SchedDsv4IndexedGather512,
     SchedDsv4PreloadRopeTables,
+    SchedDsv4DynamicTokenSetup,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
     SchedDsv4Fp32RmsRope512_64,
@@ -209,6 +212,8 @@ class ResidentOneLaunchDecode:
         live_state=None,
         dynamic_max_position: int | None = None,
         dynamic_variant: str | None = None,
+        multi_token_count: int = 1,
+        token_history: torch.Tensor | None = None,
     ):
         self.args = args
         self.device = device
@@ -222,6 +227,10 @@ class ResidentOneLaunchDecode:
         )
         self.dynamic_variant = dynamic_variant
         self.dynamic_position = self.dynamic_max_position is not None
+        self.multi_token_count = int(multi_token_count)
+        self.token_history = token_history
+        if not 1 <= self.multi_token_count <= 256:
+            raise ValueError("multi-token count must be in [1,256]")
         if self.dynamic_position:
             if self.live_state is None:
                 raise ValueError("dynamic decode requires persistent live state")
@@ -242,6 +251,28 @@ class ResidentOneLaunchDecode:
         elif self.dynamic_variant is not None:
             raise ValueError("a dynamic variant requires dynamic_max_position")
         self.position_counter_reg = 2 if self.dynamic_position else None
+        self.position_terminal_reg = 3 if self.multi_token_count > 1 else None
+        if self.multi_token_count > 1:
+            if not self.dynamic_position:
+                raise ValueError("multi-token launch requires dynamic positioning")
+            first_position = args.context_length - 1
+            if first_position + self.multi_token_count - 1 > (
+                self.dynamic_max_position
+            ):
+                raise ValueError("multi-token template exceeds its dynamic range")
+            variants = {
+                self.reusable_variant_for_position(position)
+                for position in range(
+                    first_position,
+                    first_position + self.multi_token_count,
+                )
+            }
+            if variants != {self.dynamic_variant}:
+                raise ValueError(
+                    "one multi-token image cannot cross a structural boundary: "
+                    f"first={first_position} count={self.multi_token_count} "
+                    f"expected={self.dynamic_variant} actual={sorted(variants)}"
+                )
         self._dynamic_store_rules: list[tuple[torch.Tensor, tuple]] = []
         self._dynamic_position_updates: dict[tuple, tuple] = {}
         self._active_dynamic_position: int | None = None
@@ -342,11 +373,6 @@ class ResidentOneLaunchDecode:
         self.resident_rope_packed = None
         self._dynamic_rope_banks = None
         if self.dynamic_position:
-            self.resident_rope_packed = self._dynamic_arena(
-                ("rope_record", self.dynamic_variant),
-                (len(self.resident_rope_tables), 32, 2),
-                dtype=torch.float32,
-            )
             banks = []
             for compressed in (False, True):
                 cache_key = (
@@ -366,6 +392,41 @@ class ResidentOneLaunchDecode:
                     self._derived_tensor_cache[cache_key] = bank
                 banks.append(bank)
             self._dynamic_rope_banks = tuple(banks)
+            if self.multi_token_count > 1:
+                record_shape = (
+                    self.dynamic_max_position + 1,
+                    len(self.resident_rope_tables),
+                    32,
+                    2,
+                )
+                self.resident_rope_packed = self._dynamic_arena(
+                    ("rope_record_bank", self.dynamic_variant),
+                    record_shape,
+                    dtype=torch.float32,
+                )
+                main_bank, compressed_bank = self._dynamic_rope_banks
+                self.resident_rope_packed[:, 0].copy_(main_bank)
+                self.resident_rope_packed[:, 1].copy_(compressed_bank)
+                for kind in ("csa", "hca"):
+                    table = self.compressed_output_rope.get(kind)
+                    if table is None:
+                        continue
+                    table_id = self.resident_rope_table_ids[
+                        table.data_ptr()
+                    ]
+                    offset = self.attention_plans[kind].compress_ratio - 1
+                    self.resident_rope_packed[:offset, table_id].copy_(
+                        compressed_bank[0].expand(offset, -1, -1)
+                    )
+                    self.resident_rope_packed[offset:, table_id].copy_(
+                        compressed_bank[: record_shape[0] - offset]
+                    )
+            else:
+                self.resident_rope_packed = self._dynamic_arena(
+                    ("rope_record", self.dynamic_variant),
+                    (len(self.resident_rope_tables), 32, 2),
+                    dtype=torch.float32,
+                )
         self.family_stages = {
             family.representative: self._build_family(family)
             for family in self.families
@@ -1201,8 +1262,37 @@ class ResidentOneLaunchDecode:
 
     def _allocate_state(self) -> None:
         cfg, d = self.config, self.device
-        embedding = self._tensor("embed.weight")[self.args.token_id]
+        self.embedding_table = self._tensor("embed.weight")
+        embedding = self.embedding_table[self.args.token_id]
         self.initial_residual = embedding.reshape(1, -1).repeat(cfg.hc_mult, 1)
+        if self.multi_token_count > 1:
+            if self.token_history is None:
+                self.token_history = torch.empty(
+                    (self.live_state.max_seq_len + 1,),
+                    dtype=torch.int64,
+                    device=d,
+                )
+            if (
+                self.token_history.device.type != d.type
+                or (
+                    d.index is not None
+                    and self.token_history.device.index != d.index
+                )
+                or self.token_history.dtype != torch.int64
+                or self.token_history.ndim != 1
+                or not self.token_history.is_contiguous()
+                or self.token_history.numel() < self.live_state.max_seq_len + 1
+            ):
+                raise ValueError(
+                    "multi-token history must be contiguous CUDA int64 and "
+                    "cover the live cache plus one output: "
+                    f"history_device={self.token_history.device} "
+                    f"requested_device={d} dtype={self.token_history.dtype} "
+                    f"ndim={self.token_history.ndim} "
+                    f"contiguous={self.token_history.is_contiguous()} "
+                    f"items={self.token_history.numel()} "
+                    f"required={self.live_state.max_seq_len + 1}"
+                )
         self.hidden = torch.empty((cfg.hidden_size,), dtype=torch.bfloat16, device=d)
         # Keep the two cross-layer handoff directions in disjoint storage.
         # The 20 FP32 post/comb coefficients must remain live until the next
@@ -1661,6 +1751,7 @@ class ResidentOneLaunchDecode:
         )
         self.zero_hash = torch.zeros((8,), dtype=torch.int32, device=d)
         self.live_hash_rows = None
+        self.dynamic_hash_tables = ()
         if self.live_state is not None:
             if self.layer_ids != tuple(range(cfg.num_layers)):
                 raise ValueError("live decode currently requires all 43 layers")
@@ -1678,6 +1769,29 @@ class ResidentOneLaunchDecode:
                 self.live_hash_rows[
                     layer_id, : cfg.experts_per_token
                 ].copy_(source.to(torch.int32))
+            if self.multi_token_count > 1:
+                dynamic_hash_tables = []
+                for layer_id in range(cfg.num_hash_layers):
+                    source = self._tensor(
+                        f"layers.{layer_id}.ffn.gate.tid2eid"
+                    )
+                    cache_key = (
+                        "dynamic_hash_table_i32",
+                        source.data_ptr(),
+                    )
+                    table = self._derived_tensor_cache.get(cache_key)
+                    if table is None:
+                        table = torch.zeros(
+                            (source.shape[0], 8),
+                            dtype=torch.int32,
+                            device=d,
+                        )
+                        table[:, : cfg.experts_per_token].copy_(
+                            source.to(torch.int32)
+                        )
+                        self._derived_tensor_cache[cache_key] = table
+                    dynamic_hash_tables.append(table)
+                self.dynamic_hash_tables = tuple(dynamic_hash_tables)
 
         self.mxfp_input_records = torch.empty(
             (8, 6144), dtype=torch.uint8, device=d
@@ -4917,8 +5031,26 @@ class ResidentOneLaunchDecode:
                 f"position {position} requires {expected}, not "
                 f"{self.dynamic_variant}"
             )
+        if self.multi_token_count > 1:
+            last_position = position + self.multi_token_count - 1
+            if last_position > self.dynamic_max_position:
+                raise ValueError("multi-token span exceeds the reusable image range")
+            if any(
+                self.reusable_variant_for_position(item) != self.dynamic_variant
+                for item in range(position, last_position + 1)
+            ):
+                raise ValueError(
+                    "multi-token span crosses a structural instruction boundary"
+                )
+
         self.live_state.prepare_decode_position(position)
         self.launcher.set_loop_counter(self.position_counter_reg, position)
+        if self.multi_token_count > 1:
+            self.launcher.set_loop_counter(
+                self.position_terminal_reg, last_position + 1
+            )
+            self._active_dynamic_position = position
+            return
 
         main_bank, compressed_bank = self._dynamic_rope_banks
         self.resident_rope_packed[0].copy_(main_bank[position])
@@ -4957,6 +5089,9 @@ class ResidentOneLaunchDecode:
             raise RuntimeError("set_decode_position must precede token input")
         if not 0 <= int(token_id) < self.config.vocab_size:
             raise ValueError("input token is outside the vocabulary")
+        if self.multi_token_count > 1:
+            self.token_history[self._active_dynamic_position] = int(token_id)
+            return
         embedding = self._tensor("embed.weight")[int(token_id)]
         self.initial_residual.copy_(
             embedding.reshape(1, -1).expand(self.config.hc_mult, -1)
@@ -4968,6 +5103,50 @@ class ResidentOneLaunchDecode:
             self.live_hash_rows[
                 layer_id, : self.config.experts_per_token
             ].copy_(source.to(torch.int32))
+
+    def _dynamic_token_setup_stage(self) -> Stage:
+        if self.multi_token_count <= 1:
+            raise RuntimeError("dynamic token setup requires a multi-token image")
+        counter_copies = []
+        for key, update in self._dynamic_position_updates.items():
+            if key[0] != "ape":
+                raise ValueError(
+                    "multi-token spans currently exclude compression boundaries"
+                )
+            arena, bank = update
+            period = bank.shape[1]
+            if period <= 0 or period & (period - 1):
+                raise ValueError("dynamic APE period must be a power of two")
+            if bank.shape[0] != arena.shape[0]:
+                raise ValueError("dynamic APE bank and arena rows differ")
+            counter_copies.extend(
+                (
+                    bank[layer],
+                    arena[layer],
+                    period.bit_length() - 1,
+                )
+                for layer in range(bank.shape[0])
+            )
+        setup = SchedDsv4DynamicTokenSetup(
+            self.token_history,
+            self.embedding_table,
+            self.residual,
+            self.dynamic_hash_tables,
+            self.live_hash_rows,
+            counter_copies,
+            position_counter_reg=self.position_counter_reg,
+        )
+        setup_sms = (
+            self.residual.shape[0]
+            + len(self.dynamic_hash_tables)
+            + len(counter_copies)
+        )
+        return self._stage(
+            "token.dynamic_setup",
+            setup,
+            setup_sms,
+            base_sm=0,
+        )
 
     def _build_mxfp_ffn(
         self, family: LayerFamily
@@ -5767,6 +5946,13 @@ class ResidentOneLaunchDecode:
                 ),
             )
 
+    def _new_output_token(self) -> torch.Tensor:
+        if self.multi_token_count > 1:
+            return self.token_history[1:2]
+        return torch.empty(
+            (1,), dtype=torch.int64, device=self.device
+        )
+
     def _build_head(self) -> list[Stage]:
         cfg = self.config
         head_fn = self._tensor("hc_head_fn")
@@ -5857,9 +6043,7 @@ class ResidentOneLaunchDecode:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            self.output_token = torch.empty(
-                (1,), dtype=torch.int64, device=self.device
-            )
+            self.output_token = self._new_output_token()
             stages.extend(
                 (
                     self._native_fp8_quant_stage(
@@ -5887,7 +6071,13 @@ class ResidentOneLaunchDecode:
                     self._stage(
                         "head.argmax.reduce",
                         SchedArgmaxSmemReduce(
-                            self.head_argmax_partial, self.output_token
+                            self.head_argmax_partial,
+                            self.output_token,
+                            output_counter_reg=(
+                                self.position_counter_reg
+                                if self.multi_token_count > 1
+                                else None
+                            ),
                         ),
                         1,
                     ),
@@ -5978,9 +6168,7 @@ class ResidentOneLaunchDecode:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            self.output_token = torch.empty(
-                (1,), dtype=torch.int64, device=self.device
-            )
+            self.output_token = self._new_output_token()
             input_ready = "head.bf16.input.ready"
             partial_ready = "head.bf16.partial.ready"
             logits_ready = tuple(
@@ -6035,6 +6223,11 @@ class ResidentOneLaunchDecode:
                     SchedArgmaxSmemReduce(
                         self.head_argmax_partial,
                         self.output_token,
+                        output_counter_reg=(
+                            self.position_counter_reg
+                            if self.multi_token_count > 1
+                            else None
+                        ),
                     ),
                     1,
                     base_sm=128,
@@ -6404,10 +6597,17 @@ class ResidentOneLaunchDecode:
             self.step_profile_total = head_step_base + len(self.head_stages)
             return queued_stages
 
+        token_compute_start = self.launcher.copy_cptrs()
+        token_memory_start = self.launcher.copy_mptrs()
         self.launcher.i(
             SchedDsv4PreloadRopeTables(
                 self.resident_rope_tables,
                 packed_tables=self.resident_rope_packed,
+                position_counter_reg=(
+                    self.position_counter_reg
+                    if self.multi_token_count > 1
+                    else None
+                ),
             ).place(self.sms)
         )
         if self.args.stop_after_layer is not None:
@@ -6667,6 +6867,26 @@ class ResidentOneLaunchDecode:
             )
             pair_stages = hca_stages + queued_family(csa)
             head_stages = queued_head()
+            if self.multi_token_count > 1:
+                setup_stage = queued(self._dynamic_token_setup_stage())
+                self.token_setup_program = SequentialProgram(
+                    self.launcher,
+                    (setup_stage,),
+                    balance_load_ports=True,
+                )
+                # Reserve the queue slot before rendering the production
+                # loop. Its barrier is intentionally late-bound afterward so
+                # accepted production barrier IDs remain unchanged.
+                self.token_setup_reload = LduReloadBarriers(
+                    self.launcher.bars_src,
+                    0,
+                    1,
+                    2,
+                )
+                self.launcher.i(
+                    self.token_setup_program,
+                    self.token_setup_reload,
+                )
             blocks = [
                 SequentialBlock(
                     swa.name,
@@ -6714,7 +6934,62 @@ class ResidentOneLaunchDecode:
                 len(block.stages) * block.repeat for block in blocks
             )
             queue_stages = sum(len(block.stages) for block in blocks)
-        self.launcher.s(self.program)
+        if self.multi_token_count > 1:
+            setup_completion = self.launcher.new_bar(None)
+            self.token_setup_program.bind_late_completion(
+                setup_completion
+            )
+            self.token_setup_reload.arg = (
+                self.token_setup_reload.arg
+                & ~LduReloadBarriers.FIRST_BAR_MASK
+            ) | setup_completion
+            self.token_setup_reload.bar(setup_completion)
+            logical_stages += 1
+            queue_stages += 1
+            token_completion = self.launcher.new_bar(1)
+            output_stores = []
+            for instructions in self.program.instructions:
+                for inst in instructions:
+                    if (
+                        isinstance(inst, MemoryInstruction)
+                        and inst.annotation.get("token_output")
+                    ):
+                        if inst.opcode & 16:
+                            raise ValueError(
+                                "multi-token output store already has a barrier"
+                            )
+                        inst.bar(token_completion)
+                        output_stores.append(inst)
+            if len(output_stores) != 1:
+                raise ValueError(
+                    "multi-token image requires exactly one token-output store"
+                )
+            self.program.barriers.append(token_completion)
+            self.launcher.i(self.program)
+            reload_all = LduReloadBarriers(
+                self.launcher.bars_src,
+                0,
+                token_completion + 1,
+                2,
+                reset_mxfp_resident=True,
+            ).bar(token_completion)
+            token_loop = (
+                LoopM.toNext(
+                    token_memory_start,
+                    0,
+                    reg=self.position_counter_reg,
+                    terminal_reg=self.position_terminal_reg,
+                ),
+                LoopC.toNext(
+                    token_compute_start,
+                    0,
+                    reg=self.position_counter_reg,
+                    terminal_reg=self.position_terminal_reg,
+                ),
+            )
+            self.launcher.s(reload_all, *token_loop)
+        else:
+            self.launcher.s(self.program)
         if os.environ.get("DAE_DUMP_COUPLED_PHASES"):
             segments = getattr(self.program, "segments", (self.program,))
             for segment_index, segment in enumerate(segments):
@@ -6813,6 +7088,8 @@ class ResidentOneLaunchDecode:
             )
 
     def run_once(self) -> tuple[int, float, torch.Tensor]:
+        if self.multi_token_count > 1:
+            raise RuntimeError("use run_token_span for a multi-token image")
         self.residual.copy_(self.initial_residual)
         if self.args.stop_after_cross_layer_hc_write:
             # Poison only the partial-record region before the diagnostic
@@ -6865,6 +7142,37 @@ class ResidentOneLaunchDecode:
             raise AssertionError("one-launch checkpoint logits are not finite")
         token = int(torch.argmax(logits_fp32).item())
         return token, start.elapsed_time(end), logits_fp32
+
+    def run_token_span(self) -> tuple[list[int], float]:
+        """Execute one contiguous same-structure autoregressive token span."""
+
+        if self.multi_token_count <= 1:
+            raise RuntimeError("token-span launch requires a multi-token image")
+        if self._active_dynamic_position is None:
+            raise RuntimeError(
+                "set_decode_position must select the span's first position"
+            )
+        if not self.compact_head:
+            raise RuntimeError("multi-token launch requires the compact head")
+        if self._l2_scrub is not None:
+            self._l2_scrub.add_(1)
+        torch.cuda.synchronize(self.device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        self.launcher.launch(synchronize=False)
+        end.record()
+        end.synchronize()
+        first_position = self._active_dynamic_position
+        first_output = first_position + 1
+        output = self.token_history[
+            first_output:first_output + self.multi_token_count
+        ].cpu().tolist()
+        self.live_state.complete_decode_span(
+            first_position,
+            first_position + self.multi_token_count - 1,
+        )
+        return [int(token) for token in output], start.elapsed_time(end)
 
     def device_frontier_ms(self) -> float:
         """Return the last completed kernel's device-only grid envelope."""

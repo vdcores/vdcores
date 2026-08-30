@@ -5084,10 +5084,17 @@ class SchedFp8Block128GemvBf16(Schedule):
 class SchedDsv4PreloadRopeTables(Schedule):
     """Copy one packed RoPE metadata record into fixed per-SM scratch."""
 
-    def __init__(self, tables, *, packed_tables=None):
+    def __init__(
+        self,
+        tables,
+        *,
+        packed_tables=None,
+        position_counter_reg=None,
+    ):
         super().__init__()
         self.tables = tuple(tables)
         self.packed_tables = packed_tables
+        self.position_counter_reg = position_counter_reg
 
     def _on_place(self):
         if not 1 <= len(self.tables) <= 4:
@@ -5108,23 +5115,162 @@ class SchedDsv4PreloadRopeTables(Schedule):
         # in front of the 16-slot attention ring and its contiguous 8-slot Q.
         if self.packed_tables is None:
             self.packed_tables = torch.stack(self.tables).contiguous()
-        elif (
-            self.packed_tables.dtype != torch.float32
-            or tuple(self.packed_tables.shape) != (len(self.tables), 32, 2)
-            or self.packed_tables.device != self.tables[0].device
-            or not self.packed_tables.is_contiguous()
+        else:
+            expected_tail = (len(self.tables), 32, 2)
+            dynamic = self.position_counter_reg is not None
+            valid_shape = (
+                self.packed_tables.ndim == (4 if dynamic else 3)
+                and tuple(self.packed_tables.shape[-3:]) == expected_tail
+            )
+            if (
+                self.packed_tables.dtype != torch.float32
+                or not valid_shape
+                or self.packed_tables.device != self.tables[0].device
+                or not self.packed_tables.is_contiguous()
+            ):
+                prefix = "P," if dynamic else ""
+                raise ValueError(
+                    "prepacked DeepSeek RoPE tables must be contiguous "
+                    f"FP32 [{prefix}N,32,2]"
+                )
+        if self.position_counter_reg is not None and not (
+            0 <= self.position_counter_reg < config.num_loop_counters
         ):
+            raise ValueError("RoPE preload position counter is invalid")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        address = RawAddress(
+            self.packed_tables[0]
+            if self.position_counter_reg is not None
+            else self.packed_tables,
+            config.num_slots,
+        )
+        if self.position_counter_reg is not None:
+            record_bytes = (
+                len(self.tables) * 32 * 2
+                * self.packed_tables.element_size()
+            )
+            address = CounterOffsetMemoryInstruction(
+                self.position_counter_reg,
+                address,
+                record_bytes,
+            )
+        return [Dsv4PreloadRopeTables(len(self.tables)), address]
+
+
+class SchedDsv4DynamicTokenSetup(Schedule):
+    """Load one device-selected embedding/hash row and small position state."""
+
+    def __init__(
+        self,
+        token_history,
+        embedding,
+        residual,
+        hash_tables,
+        hash_rows,
+        counter_copies,
+        *,
+        position_counter_reg,
+    ):
+        super().__init__()
+        self.token_history = token_history
+        self.embedding = embedding
+        self.residual = residual
+        self.hash_tables = tuple(hash_tables)
+        self.hash_rows = hash_rows
+        self.counter_copies = tuple(counter_copies)
+        self.position_counter_reg = int(position_counter_reg)
+
+    def _on_place(self):
+        if (
+            self.embedding.dtype != torch.bfloat16
+            or self.embedding.ndim != 2
+            or not self.embedding.is_contiguous()
+        ):
+            raise ValueError("dynamic token embedding must be contiguous BF16")
+        if (
+            self.residual.dtype != torch.bfloat16
+            or self.residual.ndim != 2
+            or self.residual.shape[1] != self.embedding.shape[1]
+            or not self.residual.is_contiguous()
+        ):
+            raise ValueError("dynamic token residual must match the embedding row")
+        if (
+            self.hash_rows.dtype != torch.int32
+            or tuple(self.hash_rows.shape) != (len(self.hash_tables), 8)
+            or not self.hash_rows.is_contiguous()
+        ):
+            raise ValueError("dynamic token hash output must be int32 [layers,8]")
+        for table in self.hash_tables:
+            if (
+                table.dtype != torch.int32
+                or table.ndim != 2
+                or table.shape[1] != 8
+                or not table.is_contiguous()
+            ):
+                raise ValueError("dynamic token hash tables must be int32 [vocab,8]")
+        expected_tasks = (
+            self.residual.shape[0]
+            + len(self.hash_tables)
+            + len(self.counter_copies)
+        )
+        if self.num_sms != expected_tasks:
             raise ValueError(
-                "prepacked DeepSeek RoPE tables must be contiguous FP32 [N,32,2]"
+                "dynamic token setup requires one SM per independent copy"
             )
 
     def schedule(self, sm):
         if sm < 0:
             return []
+        residual_rows = self.residual.shape[0]
+        if sm < residual_rows:
+            row_bytes = self.embedding.shape[1] * self.embedding.element_size()
+            load = TmaLoad1D(self.embedding, bytes=row_bytes).jump()
+            store = TmaStore1D(self.residual[sm])
+            prefix = CC0Counter(
+                self.token_history,
+                self.position_counter_reg,
+                row_bytes=row_bytes,
+            )
+        elif sm < residual_rows + len(self.hash_tables):
+            layer = sm - residual_rows
+            row_bytes = 8 * self.hash_tables[layer].element_size()
+            load = TmaLoad1D(
+                self.hash_tables[layer], bytes=row_bytes
+            ).jump()
+            store = TmaStore1D(self.hash_rows[layer])
+            prefix = CC0Counter(
+                self.token_history,
+                self.position_counter_reg,
+                row_bytes=row_bytes,
+            )
+        else:
+            copy_index = sm - residual_rows - len(self.hash_tables)
+            source, destination, counter_mask_bits = self.counter_copies[
+                copy_index
+            ]
+            row_bytes = destination.numel() * destination.element_size()
+            load = CounterOffsetMemoryInstruction(
+                self.position_counter_reg,
+                TmaLoad1D(source, bytes=row_bytes),
+                row_bytes,
+                counter_mask_bits=counter_mask_bits,
+            )
+            store = TmaStore1D(destination)
+            prefix = None
         return [
-            Dsv4PreloadRopeTables(len(self.tables)),
-            RawAddress(self.packed_tables, config.num_slots),
+            Copy(1, size=row_bytes),
+            prefix,
+            load,
+            store.bar(self._bar("output")),
         ]
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedDsv4Rope512_64(Schedule):
@@ -10980,10 +11126,17 @@ class SchedArgmaxSmemPartial(Schedule):
 class SchedArgmaxSmemReduce(Schedule):
     """Reduce compact absolute-index records to one int64 token."""
 
-    def __init__(self, partials: torch.Tensor, output: torch.Tensor):
+    def __init__(
+        self,
+        partials: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        output_counter_reg: int | None = None,
+    ):
         super().__init__()
         self.partials = partials
         self.output = output
+        self.output_counter_reg = output_counter_reg
 
     def _on_place(self):
         if self.num_sms != 1:
@@ -11001,10 +11154,20 @@ class SchedArgmaxSmemReduce(Schedule):
     def schedule(self, sm: int):
         if sm < 0:
             return []
+        store = _shared_store_1d(self.output)
+        if self.output_counter_reg is not None:
+            # The outer token loop discovers this one dynamic writeback and
+            # attaches its loop-carried completion dependency after rendering.
+            store.annotation["token_output"] = True
+            store = CounterOffsetMemoryInstruction(
+                self.output_counter_reg,
+                store,
+                self.output.element_size(),
+            )
         return [
             ArgmaxSmemReduceBf16(self.partials.shape[0]),
             _shared_load_1d(self.partials),
-            _shared_store_1d(self.output).bar(self._bar("output")),
+            store.bar(self._bar("output")),
         ]
 
     def bar_release_count(self, role: str):

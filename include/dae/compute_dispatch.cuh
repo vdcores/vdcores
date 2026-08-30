@@ -1653,8 +1653,14 @@ DAE_COMPUTE_OP_HANDLER(OP_PROFILE_EVENT) {
 
 DAE_COMPUTE_OP_HANDLER(OP_LOOPC) {
   DAE_UNUSED(sm_id, thread_id, finish, smem_base, scratch_space, st_insts, m2c, c2m, g_events);
-  const int counter_reg = inst.args[2];
-  if (++count[counter_reg] < inst.args[0]) {
+  constexpr uint16_t kTerminalCounterFlag = 1U << 15;
+  constexpr int kTerminalCounterShift = 2;
+  const uint16_t encoded_reg = inst.args[2];
+  const int counter_reg = encoded_reg & 0x3;
+  const uint32_t terminal = encoded_reg & kTerminalCounterFlag
+      ? count[(encoded_reg >> kTerminalCounterShift) & 0x3]
+      : inst.args[0];
+  if (++count[counter_reg] < terminal) {
     pc = inst.args[1];
     __cprint("LOOPC back to PC %d, reg=%d count=%d", pc, counter_reg, count[counter_reg]);
   } else {

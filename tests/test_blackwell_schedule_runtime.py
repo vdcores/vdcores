@@ -2944,6 +2944,21 @@ def test_looped_program_reloads_dependencies_in_ldu_without_issue_barrier():
     assert all((inst.opcode & ~0x10) != opcode.OP_ISSUE_BARRIER for inst in memory)
 
 
+def test_loop_instructions_can_take_runtime_terminal_register():
+    compute = LoopC(0, 17, reg=2, terminal_reg=3)
+    memory = LoopM(0, 23, reg=2, terminal_reg=3)
+
+    encoded = (
+        LoopC.TERMINAL_COUNTER_FLAG
+        | (3 << LoopC.TERMINAL_COUNTER_SHIFT)
+        | 2
+    )
+    assert compute.args == [0, 17, encoded]
+    assert memory.arg == encoded & ~0x3
+    assert memory.num_slots == 2
+    assert memory.cords[0] == 23
+
+
 def test_looped_program_reload_can_include_shared_task_barriers():
     class FakeDevice:
         type = "cuda"

@@ -2159,17 +2159,47 @@ class ProfileAggregate(ComputeInstruction):
 
 
 class LoopC(ComputeInstruction):
-    def __init__(self, count: int, pc: int, reg: int = 0):
+    TERMINAL_COUNTER_FLAG = 1 << 15
+    TERMINAL_COUNTER_SHIFT = 2
+
+    def __init__(
+        self,
+        count: int,
+        pc: int,
+        reg: int = 0,
+        *,
+        terminal_reg: int | None = None,
+    ):
         assert 0 <= reg < config.num_loop_counters, (
             "reg must select a runtime compute-loop counter"
         )
-        super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc, reg])
+        encoded_reg = reg
+        if terminal_reg is not None:
+            if not 0 <= terminal_reg < config.num_loop_counters:
+                raise ValueError("terminal register is outside the runtime bank")
+            encoded_reg |= (
+                self.TERMINAL_COUNTER_FLAG
+                | terminal_reg << self.TERMINAL_COUNTER_SHIFT
+            )
+        super().__init__(opcode=opcode.OP_LOOPC, args=[count, pc, encoded_reg])
 
     @classmethod
-    def toNext(cls, ptrs, count, reg: int = 0):
+    def toNext(
+        cls,
+        ptrs,
+        count,
+        reg: int = 0,
+        *,
+        terminal_reg: int | None = None,
+    ):
         def smfunc(sm_id: int):
             pc = ptrs[sm_id]
-            return cls(count, pc, reg=reg)
+            return cls(
+                count,
+                pc,
+                reg=reg,
+                terminal_reg=terminal_reg,
+            )
 
         return smfunc
 
@@ -2328,6 +2358,9 @@ class LoopM(MemoryInstruction):
     - cords[2:3]: resource group shift after each loop iteration
     """
 
+    TERMINAL_COUNTER_FLAG = 1 << 15
+    TERMINAL_COUNTER_SHIFT = 2
+
     def __init__(
         self,
         count: int,
@@ -2337,6 +2370,7 @@ class LoopM(MemoryInstruction):
         tma_shift: int = 0,
         advance_indirect_layer: bool = False,
         resource_group=None,
+        terminal_reg: int | None = None,
     ):
         if resource_group is not None:
             tma_shift, bar_shift = resource_group.get_shift()
@@ -2345,10 +2379,18 @@ class LoopM(MemoryInstruction):
         assert tma_shift < 2**16, "tma_shift must be less than 65536"
         assert bar_shift < 2**10, "bar_shift must be less than 1024"
         bar_shift_mask = bar_shift << 6
+        arg = 0
+        if terminal_reg is not None:
+            if not 0 <= terminal_reg < config.num_loop_counters:
+                raise ValueError("terminal register is outside the runtime bank")
+            arg = (
+                self.TERMINAL_COUNTER_FLAG
+                | terminal_reg << self.TERMINAL_COUNTER_SHIFT
+            )
         super().__init__(
             opcode=opcode.OP_LOOP,
             num_slots=reg,
-            arg=0,
+            arg=arg,
             size=count,
             cords=[pc, int(advance_indirect_layer), bar_shift_mask, tma_shift],
         )
@@ -3222,6 +3264,36 @@ class CC0(MemoryInstruction):
             super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
             return
         super().__init__(opcode=opcode.OP_CC0_ROW_BYTES, num_slots=0, arg=0, size=row_bytes, address=addr)
+
+
+class CC0Counter(MemoryInstruction):
+    """Select a token record with a loop counter before one row load."""
+
+    def __init__(
+        self,
+        tokens: torch.Tensor,
+        counter_reg: int,
+        *,
+        row_bytes: int,
+    ):
+        if (
+            tokens.device.type != "cuda"
+            or tokens.dtype != torch.int64
+            or tokens.ndim != 1
+            or not tokens.is_contiguous()
+        ):
+            raise ValueError("counter CC0 tokens must be contiguous CUDA int64")
+        if not 0 <= counter_reg < config.num_loop_counters:
+            raise ValueError("counter CC0 register is outside the runtime bank")
+        if not 1 <= row_bytes <= 0xFFFF:
+            raise ValueError("counter CC0 row size must fit uint16")
+        super().__init__(
+            opcode=opcode.OP_CC0_COUNTER_ROW_BYTES,
+            num_slots=0,
+            arg=counter_reg,
+            size=row_bytes,
+            address=tokens.data_ptr(),
+        )
 
 
 class RegStore(MemoryInstruction):
@@ -4136,6 +4208,7 @@ __all__ = [
     "LduLoad1D",
     "IssueBarrier",
     "CC0",
+    "CC0Counter",
     "RegStore",
     "RegLoad",
     "TmaLoad1D",

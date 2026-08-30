@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from dae.deepseek_v4 import DeepSeekV4FlashConfig
@@ -12,6 +13,19 @@ def _compressor(rows: int, width: int, offset: float):
     )
     values += offset
     return SimpleNamespace(kv_state=values, score_state=values + 10_000)
+
+
+def test_device_span_advances_full_window_host_bookkeeping():
+    config = DeepSeekV4FlashConfig()
+    state = DeepSeekV4LiveDecodeState(132, device="cpu", config=config)
+
+    state.prepare_decode_position(128)
+    state.complete_decode_span(128, 130)
+    state.prepare_decode_position(131)
+
+    assert state._prepared_position == 131
+    with pytest.raises(RuntimeError, match="prepared position"):
+        state.complete_decode_span(130, 131)
 
 
 def test_import_pytorch_prefill_maps_caches_and_incremental_pools():

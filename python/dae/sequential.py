@@ -396,6 +396,8 @@ class SequentialProgram:
         self.barrier_start = launcher.num_bars
         self.completion_barrier = None
         self.initial_barrier = initial_barrier
+        self.final_instructions = None
+        self.final_stage_name = None
         self.stage_stats = []
         # Placement may materialize device-side routing/index tables or padded
         # scalar storage referenced by encoded memory instructions.  Retain
@@ -689,6 +691,8 @@ class SequentialProgram:
                 rendered.append(instructions)
             if balance_load_ports:
                 _balance_load_ports(rendered)
+            self.final_instructions = rendered
+            self.final_stage_name = stage.name
             for sm, instructions in enumerate(rendered):
                 try:
                     coupled_fp8_phases[sm] = _rebase_coupled_fp8_phases(
@@ -879,6 +883,23 @@ class SequentialProgram:
             )
         self.max_compute_instructions = max_compute + 1
         self.max_memory_instructions = max_memory + 1
+
+    def bind_late_completion(self, bar_id: int) -> None:
+        """Bind a completion allocated after this program was rendered."""
+
+        if self.completion_barrier is not None:
+            raise ValueError("sequential completion barrier is already bound")
+        if self.final_instructions is None or self.final_stage_name is None:
+            raise RuntimeError("sequential final instructions are unavailable")
+        count, tails = _writeback_tail(
+            self.final_instructions,
+            self.final_stage_name,
+        )
+        self.launcher.set_bar(bar_id, count)
+        for tail in tails:
+            _attach_bar(tail, bar_id, stage=self.final_stage_name)
+        self.completion_barrier = bar_id
+        self.barriers.append(bar_id)
 
     def __call__(self, sm: int):
         return self.instructions[sm]

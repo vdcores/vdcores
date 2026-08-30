@@ -436,10 +436,19 @@ __device__ __forceinline__ void allocwarp_execute(
         }
         break;
         case op(OP_LOOP): {
+          constexpr uint16_t kTerminalCounterFlag = 1U << 15;
+          constexpr int kTerminalCounterShift = 2;
           prefetch_inst_window(lane_id, smem_minsts, inst.coords[0] + 1);
+          const int terminal = inst.arg & kTerminalCounterFlag
+              ? __shfl_sync(
+                    ALL_THREADS,
+                    di.jmp_cnt,
+                    (inst.arg >> kTerminalCounterShift) & 0x3)
+              : inst.size;
           // F0: jump to a different pc after certain iterations
           if (__memory_tid() == inst.num_slots) {
-            if (++di.jmp_cnt < inst.size) {
+            const int next_count = ++di.jmp_cnt;
+            if (next_count < terminal) {
               next_pc = (unsigned)inst.coords[0];
               // F2: update the shift for group instructions
               shift += *(const uint32_t *)&inst.coords[2];
@@ -632,6 +641,19 @@ __device__ __forceinline__ void allocwarp_execute(
         case op(OP_CC0_ROW_BYTES): {
           // Generalized CC0 path for non-power-of-two embedding row widths.
           int token = load_l2((const int *)(inst.address));
+          di.loop_counter = 1;
+          di.loop_start_pc = pc + 1;
+          if (lane_id == 0) {
+            di.gpr[1] = token * inst.size;
+          }
+          break;
+        }
+        case op(OP_CC0_COUNTER_ROW_BYTES): {
+          const int counter = __shfl_sync(
+              ALL_THREADS, di.jmp_cnt, inst.arg);
+          const auto *token_address = reinterpret_cast<const int *>(
+              inst.address + uint64_t(counter) * sizeof(int64_t));
+          const int token = load_l2(token_address);
           di.loop_counter = 1;
           di.loop_start_pc = pc + 1;
           if (lane_id == 0) {

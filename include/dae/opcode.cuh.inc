@@ -7,6 +7,10 @@ DAE_OP(OP_SHIFT_RESOURCE, MK_MOP(4, MEM_OP_FLAGS_NONE))
 DAE_OP(OP_ISSUE_BARRIER, MK_MOP(5, MEM_OP_FLAGS_NONE))
 DAE_OP(OP_CC0, MK_MOP(6, MEM_OP_FLAGS_NONE))
 DAE_OP(OP_CC0_ROW_BYTES, MK_MOP(7, MEM_OP_FLAGS_NONE))
+// Read the token row selected by a runtime loop counter, then apply the token
+// ID as the byte offset of the following allocation. This is the multi-token
+// embedding/hash equivalent of CC0 without a host-updated token pointer.
+DAE_OP(OP_CC0_COUNTER_ROW_BYTES, MK_MOP(50, MEM_OP_FLAGS_NONE))
 
 DAE_OP(OP_ALLOC_REG_LOAD, MK_MOP(8, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_TMA_LOAD_1D, MK_MOP(9, MEM_OP_FLAGS_ALLOCATE))
@@ -97,7 +101,7 @@ DAE_OP(OP_ALLOC_TMA_LOAD_MX_SCALE_BASE_1D, MK_MOP(47, MEM_OP_FLAGS_ALLOCATE))
 // normal allocator/STU path.
 DAE_OP(OP_ALLOC_WB_LAYER_TMA_REDUCE_ADD_3D, MK_MOP(48, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
 DAE_OP(OP_ALLOC_WB_LAYER_TMA_STORE_3D, MK_MOP(49, MEM_OP_FLAGS_ALLOCATE | MEM_OP_FLAGS_WRITEBACK))
-// Opcodes 50--55 held superseded FFN experiments; see commit 79022cc if those
+// Opcodes 51--55 held superseded FFN experiments; see commit 79022cc if those
 // allocator-ring and standalone-resident controls are ever needed again.
 DAE_OP(OP_TMA_LOAD_MX_COUPLED_STREAM, MK_MOP(56, MEM_OP_FLAGS_NONE))
 // General 2-D TMA read/modify/write lease. ``arg`` selects the load descriptor,
