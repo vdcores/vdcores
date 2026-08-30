@@ -10,6 +10,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from cli import (
     DEFAULT_DECODE_INPUT_TOKEN,
     DEFAULT_MAX_SEQ_LEN,
+    DEFAULT_PREFILL_TOKEN,
     MODEL_NAME,
 )
 
@@ -149,6 +150,7 @@ class QwenScheduleContext:
     model: object
     config: object
     layers: list
+    BATCH: int
     REQ: int
     N: int
     KVBlockSize: int
@@ -227,35 +229,50 @@ def build_runtime_context(parsed_args):
     else:
         auth_kwargs = hf_auth_kwargs()
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
+            parsed_args.model_name,
             cache_dir=parsed_args.hf_cache_dir,
             dtype=torch.bfloat16,
             device_map="auto",
             **auth_kwargs,
         )
         config = AutoConfig.from_pretrained(
-            MODEL_NAME,
+            parsed_args.model_name,
             cache_dir=parsed_args.hf_cache_dir,
             **auth_kwargs,
         )
         layers = list(model.model.layers)
         dtype = model.dtype
 
+    if parsed_args.debug_layer_start < 0 or parsed_args.debug_layer_start >= len(layers):
+        raise ValueError("--debug-layer-start must select an existing layer")
+    layer_end = None
     if parsed_args.debug_num_layers is not None:
         if parsed_args.debug_num_layers <= 0:
             raise ValueError("--debug-num-layers must be positive")
-        layers = layers[: parsed_args.debug_num_layers]
+        layer_end = parsed_args.debug_layer_start + parsed_args.debug_num_layers
+    layers = layers[parsed_args.debug_layer_start:layer_end]
 
+    if not 1 <= parsed_args.batch_size <= 8:
+        raise ValueError("--batch-size must be in [1, 8]")
+    if parsed_args.max_seq_len <= 0:
+        raise ValueError("--max-seq-len must be positive")
+    BATCH = parsed_args.batch_size
     REQ, N = 8, 8
     KVBlockSize = 64
-    rms_sms = REQ
+    rms_sms = BATCH
     num_sms = 128
     full_sms = 132
-    MAX_SEQ_LEN = min(config.max_position_embeddings, DEFAULT_MAX_SEQ_LEN)
+    MAX_SEQ_LEN = min(config.max_position_embeddings, parsed_args.max_seq_len)
+    if not 0 <= parsed_args.prefill_length < MAX_SEQ_LEN:
+        raise ValueError("--prefill-length must be in [0, max-seq-len)")
     dae = Launcher(full_sms, device=gpu)
 
-    prefill_token_id_and_pos = []
-    input_token_id_and_pos = [(DEFAULT_DECODE_INPUT_TOKEN, 0)]
+    prefill_token_id_and_pos = [
+        (DEFAULT_PREFILL_TOKEN, pos) for pos in range(parsed_args.prefill_length)
+    ]
+    input_token_id_and_pos = [
+        (DEFAULT_DECODE_INPUT_TOKEN, parsed_args.prefill_length)
+    ]
     num_generates = 0 if (parsed_args.correctness or parsed_args.dry_build) else parsed_args.num_generates - 1
 
     eps = config.rms_norm_eps
@@ -277,8 +294,10 @@ def build_runtime_context(parsed_args):
     matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 
     attnQs = [torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu) for _ in range(num_layers)]
-    attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-    attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    # Keep request and head adjacent so the existing rank-4/rank-5 attention
+    # TMA descriptors can collapse them without crossing the sequence stride.
+    attnKs = [torch.zeros(MAX_SEQ_LEN, REQ, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    attnVs = [torch.zeros(MAX_SEQ_LEN, REQ, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
     attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
     matInterm = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
     matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
@@ -344,8 +363,14 @@ def build_runtime_context(parsed_args):
     logits_epoch = (vocab_size + logits_slice - 1) // logits_slice
     matLogits = []
     matLogitsW = []
-    matLmHeadW.resize_(logits_slice * logits_epoch, HIDDEN)
-    matLmHeadW[vocab_size:, :].zero_()
+    padded_lm_head = torch.zeros(
+        logits_slice * logits_epoch,
+        HIDDEN,
+        dtype=dtype,
+        device=gpu,
+    )
+    padded_lm_head[:vocab_size].copy_(matLmHeadW)
+    matLmHeadW = padded_lm_head
 
     for i in range(logits_epoch):
         matLogitsW.append(matLmHeadW[i * logits_slice : (i + 1) * logits_slice])
@@ -411,6 +436,7 @@ def build_runtime_context(parsed_args):
         model=model,
         config=config,
         layers=layers,
+        BATCH=BATCH,
         REQ=REQ,
         N=N,
         KVBlockSize=KVBlockSize,
@@ -496,9 +522,14 @@ def seed_prefill_kv_cache(ctx: QwenScheduleContext):
         layer_cache = pkv.layers[layer_idx]
         k_cache = layer_cache.keys[0].permute(1, 0, 2).reshape(prefill_len, ctx.KW)
         v_cache = layer_cache.values[0].permute(1, 0, 2).reshape(prefill_len, ctx.VW)
-        ctx.attnKs[layer_idx][0, :prefill_len].copy_(
-            permute_rope_activation(k_cache, ctx.NUM_KV_HEAD, ctx.HEAD_DIM)
+        k_cache = permute_rope_activation(
+            k_cache, ctx.NUM_KV_HEAD, ctx.HEAD_DIM
         )
-        ctx.attnVs[layer_idx][0, :prefill_len].copy_(v_cache)
+        ctx.attnKs[layer_idx][:prefill_len].copy_(
+            k_cache[:, None, :].expand(-1, ctx.REQ, -1)
+        )
+        ctx.attnVs[layer_idx][:prefill_len].copy_(
+            v_cache[:, None, :].expand(-1, ctx.REQ, -1)
+        )
 
     return output

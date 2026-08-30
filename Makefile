@@ -221,7 +221,7 @@ qwen3-8b-blackwell-pyext: BLACKWELL_COMPUTE_OPS_FILE := benchmarks/blackwell_qwe
 qwen3-1b-blackwell-pyext: BLACKWELL_COMPUTE_OPS_FILE := benchmarks/blackwell_qwen3_1b.ops
 llama8b-blackwell-pyext llama1b-blackwell-pyext: BLACKWELL_NUM_INSTS := 192
 qwen3-8b-blackwell-pyext: BLACKWELL_NUM_INSTS := 256
-qwen3-1b-blackwell-pyext: BLACKWELL_NUM_INSTS := 224
+qwen3-1b-blackwell-pyext: BLACKWELL_NUM_INSTS := 232
 qwen3-8b-blackwell-pyext: BLACKWELL_DYNAMIC_SMEM_KB := 218
 
 llama8b-blackwell-pyext llama1b-blackwell-pyext qwen3-8b-blackwell-pyext qwen3-1b-blackwell-pyext:
