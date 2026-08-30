@@ -790,7 +790,7 @@ def run_correctness_check():
         check_tensor_threshold("silu", silu_ref, matSiLUOut[0, :], 5.0),
         check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, 0], matHidden[0], 5.0),
         check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
-        check_tensor_threshold("logits_low", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
+        check_tensor_threshold("logits_low", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 5.0),
     ]
     if BATCH > 1:
         final_checks.extend([
@@ -816,7 +816,7 @@ def run_correctness_check():
                 "logits_low.batch",
                 captured["final"]["lm_head"][0, 0, :logits_slice],
                 matLogits[0][:BATCH, :logits_slice],
-                10.0,
+                5.0,
             ),
         ])
     if logits_epoch > 1:
@@ -825,7 +825,7 @@ def run_correctness_check():
                 "logits_high",
                 captured["final"]["lm_head"][0, 0, logits_slice:vocab_size],
                 matLogits[1][0, : vocab_size - logits_slice],
-                10.0,
+                5.0,
             )
         )
         if BATCH > 1:
@@ -834,18 +834,24 @@ def run_correctness_check():
                     "logits_high.batch",
                     captured["final"]["lm_head"][0, 0, logits_slice:vocab_size],
                     matLogits[1][:BATCH, : vocab_size - logits_slice],
-                    10.0,
+                    5.0,
                 )
             )
     all_ok = all_ok and all(passed for passed, _ in final_checks)
 
-    ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
-    dae_idx = matTokens[0, 1].item()
-    print(
-        f"[correctness] argmax reference={ref_idx[0, 0].item()} "
-        f"dae={dae_idx} materialized={torch.argmax(torch.cat(matLogits, dim=1)[0, :vocab_size]).item()}"
+    ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)[0, 0].item()
+    dae_indices = matTokens[:BATCH, 1]
+    materialized_indices = torch.argmax(
+        torch.cat(matLogits, dim=1)[:BATCH, :vocab_size], dim=1
     )
-    all_ok = all_ok and ref_idx[0, 0].item() == dae_idx
+    exact_dae = (dae_indices == ref_idx).tolist()
+    exact_materialized = (materialized_indices == ref_idx).tolist()
+    print(
+        f"[correctness] token-exact reference={ref_idx} "
+        f"dae={dae_indices.tolist()} matches={exact_dae} "
+        f"materialized={materialized_indices.tolist()} "
+        f"materialized-matches={exact_materialized}"
+    )
     if not all_ok:
         raise RuntimeError("Correctness check failed")
 
