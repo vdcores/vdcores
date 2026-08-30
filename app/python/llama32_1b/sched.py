@@ -135,12 +135,15 @@ def parse_args():
     arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
     arg_parser.add_argument("--correctness", action="store_true")
     arg_parser.add_argument("--dry-build", action="store_true")
+    arg_parser.add_argument("--batch-size", type=int, default=8)
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     arg_parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
     arg_parser.add_argument("--debug-print-barriers", action="store_true")
     parsed_args, remaining_argv = arg_parser.parse_known_args()
+    if not 1 <= parsed_args.batch_size <= 8:
+        raise ValueError("--batch-size must be in [1, 8]")
     if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
         remaining_argv = [*remaining_argv, "--launch"]
     sys.argv = [sys.argv[0], *remaining_argv]
@@ -151,8 +154,9 @@ parsed_args = parse_args()
 
 gpu = torch.device("cuda")
 REQ, N = 8, 8
+BATCH = parsed_args.batch_size
 KVBlockSize = 64
-rms_sms = REQ
+rms_sms = BATCH
 num_sms = 128
 full_sms = 132
 dae = Launcher(full_sms, device=gpu)
@@ -290,9 +294,8 @@ matLmHeadW = matLmHeadPadded
 
 matLogits = []
 matLogitsW = []
-matArgmaxIdx = torch.zeros(N, 128, dtype=torch.long, device=gpu)
-matArgmaxVal = torch.zeros(N, 128, dtype=dtype, device=gpu)
-matArgmaxOut = torch.zeros(N, dtype=torch.long, device=gpu)
+matArgmaxIdx = torch.zeros(BATCH, 128, dtype=torch.long, device=gpu)
+matArgmaxVal = torch.zeros(BATCH, 128, dtype=dtype, device=gpu)
 
 for i in range(logits_epoch):
     matLogitsW.append(matLmHeadW[i * logits_slice : (i + 1) * logits_slice])
@@ -382,7 +385,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
 
     embed_rms = SchedRMSShared(
-        num_token=N,
+        num_token=BATCH,
         epsilon=eps,
         tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
         hidden_size=HIDDEN,
@@ -399,13 +402,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
     )
 
     pre_attn_rms = SchedRMSShared(
-        num_token=N,
+        num_token=BATCH,
         epsilon=eps,
         hidden_size=HIDDEN,
         tmas=(layerg["loadRMSInputW"].cord(0), loadHidden1D, storeRMSHidden1D),
     ).bar("input", layerg["bar_layer"]).bar("output", layerg.next("bar_pre_attn_rms"))
     post_attn_rms = SchedRMSShared(
-        num_token=N,
+        num_token=BATCH,
         epsilon=eps,
         hidden_size=HIDDEN,
         tmas=(layerg["loadRMSPostAttnW"].cord(0), loadHidden1D, storeRMSHidden1D),
@@ -446,7 +449,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     GemvFactory = layers_like(GemvLayer, dae, Gemv_M64N8)
     Gqa = SchedAttentionDecoding(
-        reqs=N,
+        reqs=BATCH,
         seq_len=token_pos + 1,
         KV_BLOCK_SIZE=KVBlockSize,
         NUM_KV_HEADS=NUM_KV_HEAD,
@@ -501,7 +504,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         LogitsProj.append(sched.place(num_sms))
 
     Argmax = SchedArgmax(
-        num_token=N,
+        num_token=BATCH,
         logits_slice=logits_slice,
         num_slice=logits_epoch,
         AtomPartial=ARGMAX_PARTIAL_bf16_1024_65536_128,
@@ -509,7 +512,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         matLogits=matLogits,
         matOutVal=matArgmaxVal,
         matOutIdx=matArgmaxIdx,
-        matFinalOut=matTokens[:, token_offset + 1],
+        matFinalOut=matTokens[:BATCH, token_offset + 1],
     ).bar("load", systemg["bar_logits"]).bar("val", systemg["bar_argmax_val"]).bar("idx", systemg["bar_argmax_idx"]).bar("final", systemg["bar_token_finish"])
 
     sstart, send = systemg.range_bars()
@@ -521,7 +524,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     )
 
     embed_rms = embed_rms.place(rms_sms)
-    copy_hidden = copy_hidden.place(N, base_sm=64)
+    copy_hidden = copy_hidden.place(BATCH, base_sm=64)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
     QProj = QProj.place(64)
@@ -529,7 +532,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     KProj = KProj.place(16, base_sm=64)
     KRope = []
     VProj = VProj.place(16, base_sm=80)
-    Gqa = Gqa.place(N * NUM_KV_HEAD)
+    Gqa = Gqa.place(BATCH * NUM_KV_HEAD)
     OutProj = OutProj.place(64)
     gate_proj = gate_proj.place(128)
     up_proj = up_proj.place(128)
@@ -610,7 +613,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
 cur_offset, cur_pos = 0, 0
 for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
-    matTokens[0, token_offset] = token
+    matTokens[:BATCH, token_offset] = token
     if token_offset > 0:
         dae.i(IssueBarrier(systemg["bar_token_finish"]))
     schedule_single_token(token_offset, pos)
@@ -633,7 +636,10 @@ if parsed_args.dry_build:
             print(f"  - {gap}")
     print(f"[dry-build] logits_epoch={logits_epoch}, logits_slice={logits_slice}, vocab_size={vocab_size}")
 else:
-    print(f"run vdcores with {cur_offset + 1} tokens...")
+    print(
+        f"run vdcores with {cur_offset + 1} tokens, logical batch={BATCH}, "
+        f"physical GEMV N={N}..."
+    )
     if parsed_args.debug_stop_after != "full" or parsed_args.debug_num_layers is not None:
         print(
             f"[debug] stop_after={parsed_args.debug_stop_after}, "
