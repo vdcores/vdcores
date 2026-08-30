@@ -92,6 +92,16 @@ class ToSeqMajorAttnKVStoreCordAdapter(ToConvertedCordAdapter):
         super().__init__(inner, lambda _, m: (m, 0, position))
 
 
+class ToSeqMajorAttnKVSplitStoreCordAdapter(ToConvertedCordAdapter):
+    """Map split-M KV stores into ``[position,batch,width]`` storage."""
+
+    def __init__(self, inner, num_sms: int, tile_m: int, position: int):
+        super().__init__(
+            inner,
+            lambda sm: ((sm % num_sms) * tile_m, 0, position),
+        )
+
+
 class ToSeqMajorAttnKVLoadCordAdapter(ToConvertedCordAdapter):
     """Present a seq-major KV cache to the request-major attention schedule."""
 

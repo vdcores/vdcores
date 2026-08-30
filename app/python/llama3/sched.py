@@ -6,6 +6,12 @@ from functools import partial
 from dae.launcher import *
 from dae.schedule import *
 from dae.model import *
+from dae.tma_utils import (
+  ToSeqMajorAttnKVLoadCordAdapter,
+  ToSeqMajorAttnKVSplitStoreCordAdapter,
+  ToSeqMajorAttnKVStoreCordAdapter,
+  tma_store_attn_kv_seq_major,
+)
 from dae.util import dae_app
 from dae import runtime as dae_runtime
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -356,8 +362,13 @@ matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 
 # TODO(zhiyuang): use single Q across layer for multitoken
 attnQs = [torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+# Keep request and head adjacent in physical storage so the rank-4 attention
+# descriptors can collapse them without crossing the sequence stride.  The
+# request-major views preserve the rest of the host-side correctness API.
+attnKStorage = [torch.zeros(MAX_SEQ_LEN, REQ, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+attnVStorage = [torch.zeros(MAX_SEQ_LEN, REQ, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+attnKs = [attnK.permute(1, 0, 2) for attnK in attnKStorage]
+attnVs = [attnV.permute(1, 0, 2) for attnV in attnVStorage]
 attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
 matInterm = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
 matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
@@ -557,12 +568,12 @@ layerg.addTma("loadDown", matDowns, lambda t: weight_load_tma(t, LinearTileM, Li
 layerg.addTma("loadUp", matUps, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 layerg.addTma("loadGate", matGates, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
 
-tma_builder_MN = partial(build_tma_wgmma_mn, iK = -3)
-cord_func_MN = partial(cord_func_MN_major, iK=-3)
+tma_builder_MN = partial(build_tma_wgmma_mn, iK = -4)
+cord_func_MN = partial(cord_func_MN_major, iK=-4)
 cord_func_MN_cord2 = partial(cord_func_MN_major_cord2, iK=-3)
 
-tma_builder_K = partial(build_tma_wgmma_k, iN = -3)
-cord_func_K = partial(cord_func_K_major, iN=-3)
+tma_builder_K = partial(build_tma_wgmma_k, iN = -4)
+cord_func_K = partial(cord_func_K_major, iN=-4)
 
 layerg.addTma("loadQW", matqWs, lambda t: weight_load_tma(t, QProjTileM, QProjTileK))
 layerg.addTma("loadKW", matkWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK))
@@ -570,15 +581,15 @@ layerg.addTma("loadVW", matvWs, lambda t: weight_load_tma(t, QKVTileM, QKVTileK)
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, QProjTileM, Major.MN))
 q_clear_targets = attnQs[-1:] + attnQs[:-1]
 layerg.addTma("storeQClear", q_clear_targets, lambda t: t.wgmma_store(N, QKVTileM, Major.MN))
-layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
-layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
+layerg.addTma("storeK", attnKStorage, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
+layerg.addTma("storeV", attnVStorage, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
 
 HEAD_DIM = ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM
 NUM_KV_HEAD = KW // HEAD_DIM
 HEAD_GROUP_SIZE = QW // KW
 matQ_attn_views = [attnQ.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM) for attnQ in attnQs]
-matK_attn_views = [attnK.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKs]
-matV_attn_views = [attnV.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
+matK_attn_views = [attnK.view(MAX_SEQ_LEN, N, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKStorage]
+matV_attn_views = [attnV.view(MAX_SEQ_LEN, N, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVStorage]
 matO_attn_view = attnO.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
 layerg.addTma('loadQ', matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 8, tma_gqa_load_q, cord_gqa_load_q))
@@ -840,10 +851,10 @@ def schedule_single_token(
       ).bar("load", layerg['bar_pre_attn_rms']).bar("store", layerg['bar_q_proj'])
     QRope = []
     k_store = maybe_counter_adapter(
-      ToAttnVStoreCordAdapter(layerg['storeK'], token_pos),
-      [0, 1, 0],
+      ToSeqMajorAttnKVStoreCordAdapter(layerg['storeK'], token_pos),
+      [0, 0, 1],
       control_flow,
-      [0, base_counter_delta, 0] if control_flow else None,
+      [0, 0, base_counter_delta] if control_flow else None,
     )
     if qkv_head_barriers:
       KProj = [
@@ -908,18 +919,20 @@ def schedule_single_token(
         ),
         regLoadK,
         maybe_counter_adapter(
-          ToAttnKVStoreCordAdapter(layerg['storeK'], 64//4, QKVTileM, token_pos),
-          [0, 1, 0],
+          ToSeqMajorAttnKVSplitStoreCordAdapter(
+            layerg['storeK'], 64//4, QKVTileM, token_pos
+          ),
+          [0, 0, 1],
           control_flow,
-          [0, base_counter_delta, 0] if control_flow else None,
+          [0, 0, base_counter_delta] if control_flow else None,
         ),
       ),
     ).bar("store", layerg['bar_qkv_attn'])
   v_store = maybe_counter_adapter(
-    ToAttnVStoreCordAdapter(layerg['storeV'], token_pos),
-    [0, 1, 0],
+    ToSeqMajorAttnKVStoreCordAdapter(layerg['storeV'], token_pos),
+    [0, 0, 1],
     control_flow,
-    [0, base_counter_delta, 0] if control_flow else None,
+    [0, 0, base_counter_delta] if control_flow else None,
   )
   if qkv_head_barriers:
     VProj = [
@@ -949,7 +962,11 @@ def schedule_single_token(
     KV_BLOCK_SIZE = KVBlockSize,
     NUM_KV_HEADS = NUM_KV_HEAD,
     matO = matO_attn_view,
-    tmas = (layerg['loadQ'], layerg['loadK'], layerg['loadV']),
+    tmas = (
+      layerg['loadQ'],
+      ToSeqMajorAttnKVLoadCordAdapter(layerg['loadK']),
+      ToSeqMajorAttnKVLoadCordAdapter(layerg['loadV']),
+    ),
     seq_len_counter_reg=TOKEN_LOOP_REG if control_flow else None,
     num_kv_block_counter_reg=KV_BLOCK_COUNT_REG if control_flow else None,
     outer_seq_len_counter_reg=TOKEN_BASE_REG if control_flow else None,
