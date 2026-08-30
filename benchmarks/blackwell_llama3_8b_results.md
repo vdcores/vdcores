@@ -49,4 +49,3 @@ python app/python/llama3/sched.py \
   position 140, traversing two KV128 blocks. Every B=8 request row passed;
   final hidden/RMS errors were at most 2.487%/2.494%, and all eight tokens
   exactly matched reference token 264.
-
