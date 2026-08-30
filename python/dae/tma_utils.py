@@ -84,6 +84,37 @@ class ToAttnVStoreCordAdapter(ToConvertedCordAdapter):
     def __init__(self, inner, position: int):
         super().__init__(inner, lambda _, m: (m, position, 0))
 
+
+class ToSeqMajorAttnKVStoreCordAdapter(ToConvertedCordAdapter):
+    """Map an ``[N,M]`` projection tile into ``[position,batch,width]``."""
+
+    def __init__(self, inner, position: int):
+        super().__init__(inner, lambda _, m: (m, 0, position))
+
+
+class ToSeqMajorAttnKVLoadCordAdapter(ToConvertedCordAdapter):
+    """Present a seq-major KV cache to the request-major attention schedule."""
+
+    def __init__(self, inner):
+        super().__init__(
+            inner,
+            lambda req, seq, head, dim: (seq, req, head, dim),
+        )
+
+
+class ToSeqMajorCurrentKStoreCordAdapter(ToConvertedCordAdapter):
+    """Select one current-K head in ``[position,request,width]`` storage."""
+
+    def __init__(self, inner, position: int, num_kv_heads: int, head_dim: int):
+        super().__init__(
+            inner,
+            lambda sm: (
+                position,
+                sm // num_kv_heads,
+                (sm % num_kv_heads) * head_dim,
+            ),
+        )
+
 class ToAttnCurrentKStore1DAdapter(ToConvertedCordAdapter):
     def __init__(self, inner, position: int, max_seq_len: int, num_kv_heads: int, head_dim: int, dtype_size: int = 2):
         row_elems = num_kv_heads * head_dim
@@ -128,6 +159,27 @@ def tma_store_attn_kv(mat: torch.Tensor, TileM: int, TileK: int):
         box_strides,
         128,
         0
+    )
+
+
+def tma_store_attn_kv_seq_major(
+    mat: torch.Tensor, tile_m: int, tile_n: int
+):
+    """Store an ``[N,M]`` projection tile into ``[seq,batch,width]`` cache."""
+    assert mat.ndim == 3, "seq-major KV cache must be [seq,batch,width]"
+    seq_len, batch, width = mat.shape
+    element_size = mat.element_size()
+    assert element_size == 2, "Only support float16/bfloat16 KV caches"
+    assert tile_m == 64, "KV projection stores require a 64-element M tile"
+    assert 0 < tile_n <= batch
+    return 3, runtime.build_tma_desc(
+        mat,
+        [width, batch, seq_len],
+        [width * element_size, batch * width * element_size],
+        [tile_m, tile_n, 1],
+        [1, 1, 1],
+        128,
+        0,
     )
 
 # for building table

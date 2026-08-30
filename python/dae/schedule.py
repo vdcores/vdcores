@@ -9686,9 +9686,15 @@ class SchedAttentionDecoding(Schedule):
             ),
         ]
         if self.use_qwen_fused_qk:
+            if isinstance(self.k_store, (list, tuple)):
+                current_k_store = self.k_store[req].cord(
+                    (self.token_pos * self.num_heads + head) * head_dim
+                )
+            else:
+                current_k_store = self.k_store.cord(sm)
             insts += [
                 self.side_input.cord(self.token_pos * 3 * head_dim).group(),
-                self.k_store[req].cord((self.token_pos * self.num_heads + head) * head_dim).group(),
+                current_k_store.group(),
             ]
         insts += [
             tQ.cord(req, head).bar(q_bar).group(),
