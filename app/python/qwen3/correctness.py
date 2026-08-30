@@ -6,9 +6,9 @@ from runtime_context import QwenScheduleContext, apply_rms_affine_rope_heads
 
 
 def run_correctness_check(ctx: QwenScheduleContext):
-    silu_threshold = 10.0
-    final_hidden_threshold = 15.0
-    final_rms_threshold = 12.0
+    silu_threshold = 5.0
+    final_hidden_threshold = 5.0
+    final_rms_threshold = 5.0
 
     print("[correctness] running 1-prefill + 1-decode reference capture...")
     decode_index = len(ctx.prefill_token_id_and_pos)
@@ -88,7 +88,7 @@ def run_correctness_check(ctx: QwenScheduleContext):
                 f"logits_{i}",
                 captured["final"]["lm_head"][0, decode_index, start:end],
                 ctx.matLogits[i][0, :end - start],
-                10.0,
+                5.0,
             )
         )
 

@@ -9,6 +9,7 @@ from dae.tma_utils import (
     ToSeqMajorAttnKVLoadCordAdapter,
     ToSeqMajorAttnKVStoreCordAdapter,
     ToSeqMajorCurrentKStoreCordAdapter,
+    pack_weight_tile_major,
     tma_store_attn_kv_seq_major,
 )
 from dae.util import dae_app
@@ -80,6 +81,18 @@ if MLP_PREFIX not in (2048, 4096) or MLP_TAIL <= 0 or MLP_TAIL % 64:
         f"64-aligned tail, got intermediate_size={INTERMIDIATE}"
     )
 
+LinearAtom = Gemv_M64N8IssuerOnly
+TileM, _, TileK = LinearAtom.MNK
+print(f"[weights] packing Qwen projections as M{TileM}K{TileK} tiles")
+matqWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matqWs]
+matkWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matkWs]
+matvWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matvWs]
+matOutWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matOutWs]
+matUps = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matUps]
+matGates = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matGates]
+matDowns = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matDowns]
+dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+
 # A fold consumes at least four K256 activation tiles.  Keep register-backed
 # gate/up tails at fold one because RegStore state is local to each SM.
 Q_PROJ_SMS = min(128, (QW // 64) * (HIDDEN // 1024))
@@ -139,31 +152,29 @@ layerg.addBarrier("bar_silu_out2")
 layerg.addBarrier("bar_pre_attn_rms")
 layerg.addBarrier("bar_post_attn_rms")
 
-TileM, _, TileK = Gemv_M64N8.MNK
-layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadRMSLayer", [matRMSHidden] * num_layers, lambda t: t.wgmma_load(N, TileK * LinearAtom.n_batch, Major.K))
 layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * LinearAtom.n_batch, Major.K))
 layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
-layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * Gemv_M64N8.n_batch, Major.K))
+layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * LinearAtom.n_batch, Major.K))
 layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadQwenSideInput", matQwenSideInputs, lambda t: t.tensor1d("load", 3 * HEAD_DIM))
-layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load_tiled(TileM, TileK))
 
 tma_builder_MN = partial(build_tma_wgmma_mn, iK=-4)
 cord_func_MN = partial(cord_func_MN_major, iK=-4)
 tma_builder_K = partial(build_tma_wgmma_k, iN=-4)
 cord_func_K = partial(cord_func_K_major, iN=-4)
 
-TileM, _, TileK = Gemv_M64N8_ROPE_128.MNK
-layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
-layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
 layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
@@ -224,13 +235,13 @@ def schedule_single_token(token_offset: int, token_pos: int):
     ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
 
     QProj = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(QW, N, HIDDEN),
         tmas=(layerg["loadQW"], layerg["loadRMSLayer"], layerg["storeQ"]),
     ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_q_proj"])
 
     KProj = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(KW, N, HIDDEN),
         tmas=(
             layerg["loadKW"],
@@ -239,7 +250,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         ),
     ).bar("store", layerg["bar_qkv_attn"])
     VProj = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(VW, N, HIDDEN),
         tmas=(
             layerg["loadVW"],
@@ -269,18 +280,18 @@ def schedule_single_token(token_offset: int, token_pos: int):
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
     OutProj = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(HIDDEN, N, HIDDEN),
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
 
     gate_proj_low = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(MLP_PREFIX, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
     ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
     up_proj_low = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(MLP_PREFIX, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
     ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
@@ -297,12 +308,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
     regStoreUp = RegStore(reg_up, matInterm[:, 0:TileM])
 
     gate_proj_fused = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=((MLP_PREFIX, MLP_TAIL), N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], regStoreGate),
     )
     up_proj_fused = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=((MLP_PREFIX, MLP_TAIL), N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], regStoreUp),
     )
@@ -316,12 +327,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
     ).bar("output", layerg["bar_silu_out2"])
 
     down_proj_low = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(HIDDEN, N, MLP_PREFIX),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out1"])
     down_proj_high = SchedGemv(
-        Gemv_M64N8,
+        LinearAtom,
         MNK=(HIDDEN, N, (MLP_PREFIX, MLP_TAIL)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
