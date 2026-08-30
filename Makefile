@@ -29,6 +29,18 @@ LDFLAGS = -lcuda -lcublas
 NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
 NVCC_FLAGS += -lineinfo
 
+# The DeepSeek resident VM carries fixed-ring, barrier-reload, and coupled
+# stream state that Llama never executes.  Keep the general runtime as the
+# default, while allowing the 152-SM Llama image to reuse the proven lean VM
+# and compile it against the current task headers.  The prepended include path
+# takes precedence over the general runtime directory for this translation
+# unit; task headers still resolve from include/.
+ifneq ($(llama_blackwell_runtime),)
+	COMPUTE_DISPATCH := include/dae/llama_blackwell/compute_dispatch.cuh
+	NVCC_FLAGS := -Iinclude/dae/llama_blackwell $(NVCC_FLAGS)
+	export DAE_LLAMA_BLACKWELL_RUNTIME := 1
+endif
+
 ifneq ($(m2c_legacy),)
 	NVCC_FLAGS += -DDAE_M2C_OBSERVER_WAIT=0
 endif
@@ -163,6 +175,7 @@ SOURCES = main.cu
 
 # Header files (for dependency tracking)
 HEADERS = $(wildcard include/dae/*.cuh) $(wildcard include/task/*.cuh) $(wildcard include/dae/pipeline/*.cuh)
+HEADERS += $(wildcard include/dae/llama_blackwell/*.cuh) $(wildcard include/dae/llama_blackwell/pipeline/*.cuh)
 
 # for make <target> run
 BIN ?= $(firstword $(filter-out run,$(MAKECMDGOALS)))
@@ -199,6 +212,13 @@ run: $(BIN)
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
 	$(PYTHON) -m pip install -e . --no-build-isolation
 
+# Rebuild when switching runtime profiles: command-line Make variables are not
+# part of runtime.o's normal timestamp dependency graph.
+llama8b-blackwell-pyext:
+	$(MAKE) clean
+	$(MAKE) PYTHON=$(PYTHON) aux_slots=1 llama_blackwell_runtime=1 \
+		DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops pyext
+
 FORCE:
 
-.PHONY: all clean run FORCE
+.PHONY: all clean run FORCE llama8b-blackwell-pyext

@@ -2655,3 +2655,49 @@ parity seed required by the next replay.  Prefer non-UMMA overlap that fits an
 already-live shared slot and the existing join; keep global sidecars separate
 unless they remove more latency than their dispatch, memory scattering, and
 cross-SM synchronization add.
+
+## DSV4-derived lean Llama runtime and grouped drain
+
+The DeepSeek V4 runtime is not a zero-cost container for a selective Llama
+compute manifest.  In `vdcores-dsv4-flash-llama8b-blackwell`, selecting only
+the 13 Llama operators still compiled the DeepSeek fixed-ring,
+barrier-reload, and coupled-stream VM state into the resident kernel.  The
+unchanged image used 158 registers, nine barriers, a 112-byte stack, and
+7,456 bytes of static shared memory; its S128 median was 3.109568 ms over
+501 samples.
+
+`include/dae/llama_blackwell/` therefore snapshots only the qualified lean
+VM dispatcher and memory-pipeline headers from `vdcores-blackwell-tasks`
+commit `992c390443c31e3aff6c15f37105227f09e78388`.  It intentionally does not
+snapshot task headers: `include/task/` continues to supply this tree's current
+BF16 UMMA attention, projection, elementwise, and argmax implementations.  The
+default build remains the general DeepSeek runtime.  Use the clean profile
+target for Llama:
+
+```bash
+make PYTHON=/path/to/python llama8b-blackwell-pyext
+```
+
+The lean image uses 96 registers, nine barriers, a 96-byte stack, 7,088 bytes
+of static shared memory, and zero spills.  At S128 its 2,001-sample median is
+2.484224 ms (402.540 token/s), 20.11% below the unchanged copy.  After the
+inherited DSV4 worktree changes were removed, exact single-step tensor/token
+validation passed in job `20260830T172215Z-400687`, and four resident steps
+crossing KV128 matched `[24748, 24748, 24748, 24748]` in
+`20260830T172244Z-403585`.
+
+The grouped LM-head epilogue must retain disjoint TMEM drains.  Once each
+group's final full barrier completes, warps 1--3 fence and drain their own
+group; warp 0 waits the last group and drains all four groups before the
+cross-warp argmax join.  Making every compute thread drain all four groups
+raises the CTA from 224 to 512 `drain_group` calls.  Restoring the disjoint
+form reduced the expanded-runtime S128 median from 3.109568 to 3.069248 ms
+(40.320 us, 1.30%) while preserving exact token 24748.
+
+Do not transplant schedule-readiness changes solely because they helped the
+older Blackwell task tree.  Down-high1 was a clear regression here, while
+up-prefix, down-low, and Q-clear were neutral in 501-sample screening.  A
+2,001-sample control/candidate/control bracket measured the combined promising
+candidate at 3.073408 ms versus a 3.072752-ms control mean.  Those schedule
+experiments were removed; runtime state and schedule phase must be treated as
+part of an optimization's context.

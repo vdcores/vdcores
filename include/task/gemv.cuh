@@ -888,12 +888,20 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
                             tmem_mma_barrier + empty_barrier_base
                             + output_group);
                     }
+                    if (tile_idx + 1 == n_k_tiles) {
+                        asm volatile(
+                            "tcgen05.fence::after_thread_sync;" ::: "memory");
+                        drain_group(output_group, nullptr);
+                    }
                 } else {
                     if (tile_idx + 1 == n_k_tiles) {
                         cute::wait_barrier(
                             *(tmem_mma_barrier + full_barrier_base
                               + output_group),
                             uint32_t(tile_idx & 1));
+                        asm volatile(
+                            "tcgen05.fence::after_thread_sync;" ::: "memory");
+                        drain_group(output_group, nullptr);
                     }
                 }
             }
@@ -910,13 +918,12 @@ __device__ __forceinline__ void task_gemv_sm100_direct_grouped(
             cute::wait_barrier(
                 *(tmem_mma_barrier + full_barrier_base + OutputGroups - 1),
                 uint32_t((n_k_tiles - 1) & 1));
-        }
-        __sync_compute_group(128);
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        #pragma unroll
-        for (int output_group = 0; output_group < OutputGroups;
-             ++output_group) {
-            drain_group(output_group, nullptr);
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            #pragma unroll
+            for (int output_group = 0; output_group < OutputGroups;
+                 ++output_group) {
+                drain_group(output_group, nullptr);
+            }
         }
     } else {
         for (int tile_idx = 0; tile_idx < n_k_tiles; ++tile_idx) {

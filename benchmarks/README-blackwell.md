@@ -923,9 +923,9 @@ A/B diagnostics.
 Reproduce the retained path with:
 
 ```bash
-# Rebuild the current exact spill-free 12-operator image.
-DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops \
-  make -B pyext
+# In this DSV4-derived tree, rebuild the spill-free Llama-only image with the
+# lean Blackwell VM profile and the current task headers.
+make PYTHON=/path/to/python llama8b-blackwell-pyext
 
 # Internal resident-megakernel span. Supply a prompt with the requested token
 # count; the Llama tokenizer adds its BOS token.
