@@ -11,7 +11,6 @@ from dae.tma_utils import (
     ToSeqMajorAttnKVLoadCordAdapter,
     ToSeqMajorAttnKVStoreCordAdapter,
     ToSeqMajorCurrentKStoreCordAdapter,
-    pack_weight_tile_major,
     tma_store_attn_kv_seq_major,
     wrap_static,
 )
@@ -78,17 +77,8 @@ matArgmaxIdx = ctx.matArgmaxIdx
 matArgmaxVal = ctx.matArgmaxVal
 
 
-LinearAtom = Gemv_M64N8IssuerOnly
+LinearAtom = Gemv_M64N8
 TileM, _, TileK = LinearAtom.MNK
-print(f"[weights] packing Qwen3-1.7B projections as M{TileM}K{TileK} tiles")
-matqWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matqWs]
-matkWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matkWs]
-matvWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matvWs]
-matOutWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matOutWs]
-matUps = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matUps]
-matGates = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matGates]
-matDowns = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matDowns]
-dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
 
 
 DEBUG_STAGE_ORDER = (
@@ -228,19 +218,19 @@ layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadQwenSideInput", matQwenSideInputs, lambda t: t.tensor1d("load", 3 * HEAD_DIM))
-layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
-layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load_tiled(TileM, TileK))
-layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load_tiled(TileM, TileK))
-layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadOutWs", matOutWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 
 tma_builder_MN = partial(build_tma_wgmma_mn, iK=-4)
 cord_func_MN = partial(cord_func_MN_major, iK=-4)
 tma_builder_K = partial(build_tma_wgmma_k, iN=-4)
 cord_func_K = partial(cord_func_K_major, iN=-4)
 
-layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
-layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
-layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
+layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
+layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
 layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
