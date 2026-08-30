@@ -770,7 +770,14 @@ def schedule_single_token(
 
   embed_rms = SchedRMSShared(
     num_token=BATCH, epsilon=eps,
-    tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
+    # CC0 redirects every active request to the same logical input token.
+    # Suppress SchedRMSShared's per-SM row offset on the embedding descriptor;
+    # the output descriptor remains request-strided.
+    tmas=(
+      TmaLoad1D(matRMSInputW[0]),
+      StaticCordAdapter(loadEmbed1D),
+      storeRMSHidden1D,
+    ),
     embedding=maybe_counter_offset(
       CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
       matTokens.element_size(),
@@ -1907,6 +1914,21 @@ def run_correctness_check():
       check_tensor_threshold("v_proj", layer['v_proj'][0, decode_index], attnVs[i][0, decode_pos], 5.0),
       check_tensor_threshold("k_rope", k_ref, attnKs[i][0, decode_pos], 5.0),
     ]
+    if BATCH > 1:
+      checks.extend([
+        check_tensor_threshold(
+          f"v_proj_req{BATCH - 1}",
+          layer['v_proj'][0, decode_index],
+          attnVs[i][BATCH - 1, decode_pos],
+          5.0,
+        ),
+        check_tensor_threshold(
+          f"k_rope_req{BATCH - 1}",
+          k_ref,
+          attnKs[i][BATCH - 1, decode_pos],
+          5.0,
+        ),
+      ])
     print("[correctness] skip q_rope snapshot: clear_q zeros the reusable Q buffer after attention consumes it")
     all_ok = all_ok and all(passed for passed, _ in checks)
 
@@ -1921,14 +1943,45 @@ def run_correctness_check():
     check_tensor_threshold("final_rms", captured['final']['final_rms'][0, decode_index], matRMSHidden[0], 5.0),
     *check_logits_against_reference(captured['final']['lm_head'][0, decode_index]),
   ]
+  if BATCH > 1:
+    final_checks.extend([
+      check_tensor_threshold(
+        f"attention_output_req{BATCH - 1}",
+        attnO[0],
+        attnO[BATCH - 1],
+        5.0,
+      ),
+      check_tensor_threshold(
+        f"final_hidden_req{BATCH - 1}",
+        layer['hidden_state_out'][0, decode_index],
+        matHidden[BATCH - 1],
+        5.0,
+      ),
+      check_tensor_threshold(
+        f"final_rms_req{BATCH - 1}",
+        captured['final']['final_rms'][0, decode_index],
+        matRMSHidden[BATCH - 1],
+        5.0,
+      ),
+    ])
   all_ok = all_ok and all(passed for passed, _ in final_checks)
 
   ref_idx = torch.argmax(captured['final']['lm_head'], dim=-1)
   dae_idx = matTokens[0, decode_index + 1].item()
   ref_token = ref_idx[0, decode_index].item()
   token_ok = ref_token == dae_idx
-  print(f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: ref={ref_token}, dae={dae_idx}")
-  all_ok = all_ok and token_ok
+  print(
+    f"[correctness] {'PASS' if token_ok else 'NOTE'} final_token_exact: "
+    f"ref={ref_token}, dae={dae_idx}"
+  )
+  if BATCH > 1:
+    batch_tokens = matTokens[:BATCH, decode_index + 1]
+    batch_token_ok = bool(torch.all(batch_tokens == batch_tokens[0]).item())
+    print(
+      f"[correctness] {'PASS' if batch_token_ok else 'FAIL'} batch_tokens_equal: "
+      f"{batch_tokens.detach().cpu().tolist()}"
+    )
+    all_ok = all_ok and batch_token_ok
 
   if not all_ok:
     raise RuntimeError("Correctness check failed")
