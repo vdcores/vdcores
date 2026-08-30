@@ -13,6 +13,7 @@ def run_correctness_check(ctx: QwenScheduleContext):
     print("[correctness] running 1-prefill + 1-decode reference capture...")
     decode_index = len(ctx.prefill_token_id_and_pos)
     decode_pos = ctx.input_token_id_and_pos[0][1]
+    mlp_prefix = min(4096, ctx.INTERMIDIATE)
     inputs = input_batch1(
         *(token for token, _ in ctx.prefill_token_id_and_pos),
         *(token for token, _ in ctx.input_token_id_and_pos),
@@ -60,8 +61,8 @@ def run_correctness_check(ctx: QwenScheduleContext):
     layer = captured[ctx.num_layers - 1]
     silu_ref = F.silu(layer["gate_proj"][0, decode_index]) * layer["up_proj"][0, decode_index]
     final_checks = [
-        check_tensor_threshold("gate_proj_low", layer["gate_proj"][0, decode_index, :4096], ctx.matGateOut[0, :4096], 5.0),
-        check_tensor_threshold("up_proj_low", layer["up_proj"][0, decode_index, :4096], ctx.matInterm[0, :4096], 5.0),
+        check_tensor_threshold("gate_proj_low", layer["gate_proj"][0, decode_index, :mlp_prefix], ctx.matGateOut[0, :mlp_prefix], 5.0),
+        check_tensor_threshold("up_proj_low", layer["up_proj"][0, decode_index, :mlp_prefix], ctx.matInterm[0, :mlp_prefix], 5.0),
         check_tensor_threshold("silu", silu_ref, ctx.matSiLUOut[0], silu_threshold),
         check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, decode_index], ctx.matHidden[0], final_hidden_threshold),
         check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, decode_index], ctx.matRMSHidden[0], final_rms_threshold),

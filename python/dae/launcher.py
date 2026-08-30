@@ -92,8 +92,16 @@ class SMInstructionBuilder:
         mtensor : torch.Tensor, mptrs: list[int]):
         # TODO(zhiyuang): now we only keep this check for not submitting "too many"
         #                 insts, but not 100% safe it won't overwrite
-        assert len(self.cinsts) <= ctensor.shape[0]
-        assert len(self.minsts) <= mtensor.shape[0]
+        if len(self.cinsts) > ctensor.shape[0]:
+            raise ValueError(
+                f"SM {self.sm_id} requires {len(self.cinsts)} compute instructions, "
+                f"but the runtime capacity is {ctensor.shape[0]}"
+            )
+        if len(self.minsts) > mtensor.shape[0]:
+            raise ValueError(
+                f"SM {self.sm_id} requires {len(self.minsts)} memory instructions, "
+                f"but the runtime capacity is {mtensor.shape[0]}"
+            )
         for i, inst in enumerate(self.cinsts):
             inst.tensor(ctensor[cptrs[self.sm_id],...])
             cptrs[self.sm_id] = (cptrs[self.sm_id] + 1) % ctensor.shape[0]
@@ -335,6 +343,19 @@ class Launcher:
 
     def build_instructions(self):
         if self.need_instruction_build:
+            max_cinsts, max_cinst_sm = max(
+                (len(builder.cinsts), builder.sm_id) for builder in self.builder
+            )
+            max_minsts, max_minst_sm = max(
+                (len(builder.minsts), builder.sm_id) for builder in self.builder
+            )
+            if max_cinsts > self.cinsts.shape[1] or max_minsts > self.minsts.shape[1]:
+                raise ValueError(
+                    "Runtime instruction capacity is too small: "
+                    f"compute={max_cinsts} on SM {max_cinst_sm}, "
+                    f"memory={max_minsts} on SM {max_minst_sm}, "
+                    f"capacity={self.max_insts}"
+                )
             for i in range(self.num_sms):
                 self.builder[i].rewrite_coupled_stream_local_chains()
                 self.builder[i].build(

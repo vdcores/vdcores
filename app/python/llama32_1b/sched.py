@@ -133,7 +133,7 @@ parsed_args = parse_args()
 
 gpu = torch.device("cuda")
 REQ, N = 8, 8
-KVBlockSize = 16
+KVBlockSize = 64
 rms_sms = REQ
 num_sms = 128
 full_sms = 132
@@ -154,17 +154,19 @@ if parsed_args.dry_build:
     dtype = torch.bfloat16
     model = None
 else:
+    hf_token = os.environ.get("HF_TOKEN")
+    auth_kwargs = {"token": hf_token} if hf_token else {}
     model = AutoModelForCausalLM.from_pretrained(
         parsed_args.model_name,
         cache_dir=parsed_args.hf_cache_dir,
         dtype=torch.bfloat16,
         device_map="auto",
-        token=os.environ["HF_TOKEN"],
+        **auth_kwargs,
     )
     config = AutoConfig.from_pretrained(
         parsed_args.model_name,
         cache_dir=parsed_args.hf_cache_dir,
-        token=os.environ["HF_TOKEN"],
+        **auth_kwargs,
     )
     dtype = model.dtype
 
@@ -258,9 +260,11 @@ logits_fold = 8
 logits_slice = 8192 * logits_fold
 vocab_size = matLmHeadW.shape[0]
 logits_epoch = math.ceil(vocab_size / logits_slice)
-matLmHeadW.resize_(logits_slice * logits_epoch, HIDDEN)
-if logits_slice * logits_epoch > vocab_size:
-    matLmHeadW[vocab_size:,].zero_()
+matLmHeadPadded = torch.zeros(
+    logits_slice * logits_epoch, HIDDEN, dtype=dtype, device=gpu
+)
+matLmHeadPadded[:vocab_size].copy_(matLmHeadW)
+matLmHeadW = matLmHeadPadded
 
 matLogits = []
 matLogitsW = []

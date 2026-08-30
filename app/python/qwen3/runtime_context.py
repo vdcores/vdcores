@@ -139,26 +139,34 @@ class QwenScheduleContext:
 
 def build_runtime_context(parsed_args):
     gpu = torch.device("cuda")
+    hf_token = os.environ.get("HF_TOKEN")
+    auth_kwargs = {"token": hf_token} if hf_token else {}
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        parsed_args.model_name,
         cache_dir=parsed_args.hf_cache_dir,
         dtype=torch.bfloat16,
         device_map="auto",
-        token=os.environ["HF_TOKEN"],
+        **auth_kwargs,
     )
     config = AutoConfig.from_pretrained(
-        MODEL_NAME,
+        parsed_args.model_name,
         cache_dir=parsed_args.hf_cache_dir,
-        token=os.environ["HF_TOKEN"],
+        **auth_kwargs,
     )
     layers = model.model.layers
+    if parsed_args.debug_num_layers is not None:
+        if parsed_args.debug_num_layers <= 0:
+            raise ValueError("--debug-num-layers must be positive")
+        layers = layers[: parsed_args.debug_num_layers]
 
     REQ, N = 8, 8
     KVBlockSize = 64
     rms_sms = REQ
     num_sms = 128
     full_sms = 132
-    MAX_SEQ_LEN = min(config.max_position_embeddings, DEFAULT_MAX_SEQ_LEN)
+    if parsed_args.max_seq_len <= 0:
+        raise ValueError("--max-seq-len must be positive")
+    MAX_SEQ_LEN = min(config.max_position_embeddings, parsed_args.max_seq_len)
     dae = Launcher(full_sms, device=gpu)
 
     prefill_token_id_and_pos = [(DEFAULT_PREFILL_TOKEN, 0)]
@@ -184,7 +192,7 @@ def build_runtime_context(parsed_args):
     matHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
     matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 
-    attnQs = [torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    attnQs = [torch.zeros(REQ, QW, dtype=dtype, device=gpu) for _ in range(num_layers)]
     attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
     attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
     attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
@@ -224,9 +232,10 @@ def build_runtime_context(parsed_args):
     logits_epoch = (vocab_size + logits_slice - 1) // logits_slice
     matLogits = []
     matLogitsW = []
-    matLmHeadW = model.lm_head.weight.detach()
-    matLmHeadW.resize_(logits_slice * logits_epoch, HIDDEN)
-    matLmHeadW[vocab_size:, :].zero_()
+    matLmHeadW = torch.zeros(
+        logits_slice * logits_epoch, HIDDEN, dtype=dtype, device=gpu
+    )
+    matLmHeadW[:vocab_size].copy_(model.lm_head.weight.detach())
 
     for i in range(logits_epoch):
         matLogitsW.append(matLmHeadW[i * logits_slice:(i + 1) * logits_slice])
@@ -236,7 +245,10 @@ def build_runtime_context(parsed_args):
     matArgmaxVal = torch.zeros(N, full_sms, dtype=dtype, device=gpu)
 
     dae.set_persistent(matTokens)
-    dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+    dae.set_streaming(
+        matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns,
+        matLogitsW,
+    )
 
     return QwenScheduleContext(
         parsed_args=parsed_args,

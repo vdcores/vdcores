@@ -30,15 +30,16 @@ NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -
 NVCC_FLAGS += -lineinfo
 
 # The DeepSeek resident VM carries fixed-ring, barrier-reload, and coupled
-# stream state that Llama never executes.  Keep the general runtime as the
-# default, while allowing the 152-SM Llama image to reuse the proven lean VM
-# and compile it against the current task headers.  The prepended include path
-# takes precedence over the general runtime directory for this translation
-# unit; task headers still resolve from include/.
-ifneq ($(llama_blackwell_runtime),)
+# stream state that the dense Llama/Qwen schedules never execute.  Keep the
+# general runtime as the default, while allowing dense Blackwell images to
+# reuse the proven lean VM and compile it against the current task headers.
+# The prepended include path takes precedence over the general runtime
+# directory for this translation unit; task headers still resolve from
+# include/.  `llama_blackwell_runtime` remains as a compatibility alias.
+ifneq ($(strip $(blackwell_runtime)$(llama_blackwell_runtime)),)
 	COMPUTE_DISPATCH := include/dae/llama_blackwell/compute_dispatch.cuh
 	NVCC_FLAGS := -Iinclude/dae/llama_blackwell $(NVCC_FLAGS)
-	export DAE_LLAMA_BLACKWELL_RUNTIME := 1
+	export DAE_BLACKWELL_RUNTIME := 1
 endif
 
 ifneq ($(m2c_legacy),)
@@ -212,13 +213,22 @@ run: $(BIN)
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
 	$(PYTHON) -m pip install -e . --no-build-isolation
 
-# Rebuild when switching runtime profiles: command-line Make variables are not
-# part of runtime.o's normal timestamp dependency graph.
-llama8b-blackwell-pyext:
+# Rebuild when switching runtime profiles or model manifests: command-line
+# Make variables are not part of runtime.o's normal timestamp dependency graph.
+llama8b-blackwell-pyext: BLACKWELL_COMPUTE_OPS_FILE := benchmarks/blackwell_llama8b_fused_argmax.ops
+llama1b-blackwell-pyext: BLACKWELL_COMPUTE_OPS_FILE := benchmarks/blackwell_llama1b.ops
+qwen3-8b-blackwell-pyext: BLACKWELL_COMPUTE_OPS_FILE := benchmarks/blackwell_qwen3_8b.ops
+qwen3-1b-blackwell-pyext: BLACKWELL_COMPUTE_OPS_FILE := benchmarks/blackwell_qwen3_1b.ops
+llama8b-blackwell-pyext llama1b-blackwell-pyext: BLACKWELL_NUM_INSTS := 192
+qwen3-8b-blackwell-pyext qwen3-1b-blackwell-pyext: BLACKWELL_NUM_INSTS := 224
+
+llama8b-blackwell-pyext llama1b-blackwell-pyext qwen3-8b-blackwell-pyext qwen3-1b-blackwell-pyext:
 	$(MAKE) clean
-	$(MAKE) PYTHON=$(PYTHON) aux_slots=1 llama_blackwell_runtime=1 \
-		DAE_COMPUTE_OPS_FILE=benchmarks/blackwell_llama8b_fused_argmax.ops pyext
+	$(MAKE) PYTHON=$(PYTHON) aux_slots=1 num_insts=$(BLACKWELL_NUM_INSTS) \
+		blackwell_runtime=1 debug=$(debug) \
+		DAE_COMPUTE_OPS_FILE=$(BLACKWELL_COMPUTE_OPS_FILE) pyext
 
 FORCE:
 
-.PHONY: all clean run FORCE llama8b-blackwell-pyext
+.PHONY: all clean run FORCE llama8b-blackwell-pyext llama1b-blackwell-pyext \
+	qwen3-8b-blackwell-pyext qwen3-1b-blackwell-pyext

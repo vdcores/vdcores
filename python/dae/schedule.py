@@ -11063,6 +11063,7 @@ class SchedArgmax(Schedule):
     def schedule(self, sm):
         if sm < 0:
             return []
+        special_slot = config.num_slots
         # decide which slice
         sm_per_slice = self.num_sms // self.num_slice
         slice_idx = sm // sm_per_slice
@@ -11071,14 +11072,14 @@ class SchedArgmax(Schedule):
         insts = [
             self.AtomPartial(self.num_token),
             # FIXME(zhiyuang): the index 0 for batched mode?
-            RawAddress(self.matLogits[slice_idx][0,slice_ofst], 24).bar(self._bar("load")),
-            RawAddress(self.matOutVal[0,sm], 25).bar(self._bar("val")).writeback(),
-            RawAddress(self.matOutIdx[0,sm], 26).bar(self._bar("idx")).writeback(),
+            RawAddress(self.matLogits[slice_idx][0,slice_ofst], special_slot).bar(self._bar("load")),
+            RawAddress(self.matOutVal[0,sm], special_slot + 1).bar(self._bar("val")).writeback(),
+            RawAddress(self.matOutIdx[0,sm], special_slot + 2).bar(self._bar("idx")).writeback(),
         ]
         if sm >= self.num_token:
             return insts
 
-        final_out = RawAddress(self.matFinalOut[sm], 29).bar(self._bar("final")).writeback()
+        final_out = RawAddress(self.matFinalOut[sm], special_slot + 5).bar(self._bar("final")).writeback()
         final_counter_offsets = self.final_counter_offsets
         if final_counter_offsets is None and self.final_counter_reg is not None:
             final_counter_offsets = [(self.final_counter_reg, self.final_counter_stride)]
@@ -11088,8 +11089,8 @@ class SchedArgmax(Schedule):
         insts += [
             self.AtomReduce(1),
 
-            RawAddress(self.matOutVal[sm], 27).bar(self._bar("val")),
-            RawAddress(self.matOutIdx[sm], 28).bar(self._bar("idx")),
+            RawAddress(self.matOutVal[sm], special_slot + 3).bar(self._bar("val")),
+            RawAddress(self.matOutIdx[sm], special_slot + 4).bar(self._bar("idx")),
             final_out,
         ]
         return insts
@@ -11125,8 +11126,9 @@ class SchedArgmaxReduceGlobal(Schedule):
     def schedule(self, sm: int):
         if sm < 0:
             return []
+        special_slot = config.num_slots
         final_out = (
-            RawAddress(self.mat_final_out[sm], 29)
+            RawAddress(self.mat_final_out[sm], special_slot + 5)
             .bar(self._bar("final"))
             .writeback()
         )
@@ -11135,7 +11137,7 @@ class SchedArgmaxReduceGlobal(Schedule):
                 self.final_counter_offsets, final_out)
         return [
             self.AtomReduce(1),
-            RawAddress(self.mat_out_partial[sm], 27)
+            RawAddress(self.mat_out_partial[sm], special_slot + 3)
             .bar(self._bar("partial")),
             final_out,
         ]

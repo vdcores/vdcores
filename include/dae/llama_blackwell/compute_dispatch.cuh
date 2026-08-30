@@ -488,10 +488,38 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTN_SPLIT_POST_REDUCE) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
+  DAE_UNUSED(sm_id, thread_id, pc, finish, g_events);
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  const int num_active_q = inst.args[1] & 0x7F;
+  int num_kv_blocks = inst.args[0] & 0xFF;
+  const int outer_seq_stride = (inst.args[0] >> 8) & 0xFF;
+  int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  const bool need_norm = inst.args[2] & 0x1;
+  const bool need_rope = inst.args[2] & 0x2;
+  if (inst.args[2] & 0x8) {
+    const int counter_reg = (inst.args[2] >> 4) & 0xF;
+    num_kv_blocks += count[counter_reg];
+  }
+  if (outer_seq_stride > 0) {
+    const int counter_reg = (inst.args[2] >> 12) & 0xF;
+    last_kv_active_token_len += count[counter_reg] * outer_seq_stride;
+    last_kv_active_token_len =
+        (last_kv_active_token_len - 1) % 64 + 1;
+  }
+  if (inst.args[2] & 0x4) {
+    const int counter_reg = (inst.args[2] >> 8) & 0xF;
+    last_kv_active_token_len += count[counter_reg];
+  }
+  task_attention_fwd_sm100_decode<64, 64>(
+    num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+    need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier,
+    tmem_mma_phase, smem_base, (float *)scratch_space, st_insts,
+    m2c, c2m);
+#else
   using kernel_qk = cute::SM90_64x64x16_F32BF16BF16_SS<cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using kernel_pv = cute::SM90_64x64x16_F32BF16BF16_RS<cute::GMMA::Major::K, cute::GMMA::Major::MN>;
   handle_attention_common<64, false, kernel_qk, kernel_pv>(inst, count, smem_base, scratch_space, st_insts, m2c, c2m);
+#endif
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_MMA) {
@@ -567,6 +595,19 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {
     smem_base,
     inst.args[0],
     *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    (float *)scratch_space,
+    m2c,
+    c2m
+  );
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_SMEM) {
+  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
+  task_rms_norm_f16_from_smem_runtime(
+    smem_base,
+    inst.args[0],
+    inst.args[1],
+    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 2),
     (float *)scratch_space,
     m2c,
     c2m

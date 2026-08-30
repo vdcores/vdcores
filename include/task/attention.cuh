@@ -2686,7 +2686,8 @@ __device__ __forceinline__ void task_attention_fwd_sm100_decode(
     constexpr int O_N = HEAD_DIM;
     constexpr uint32_t P_OFFSET = 0;
     constexpr uint32_t O_OFFSET = 128;
-    static_assert(HEAD_DIM == 128, "The SM100 decode path is specialized for Llama head_dim=128");
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128,
+                  "The SM100 decode path supports head_dim=64 or 128");
     static_assert(KV == 64 || KV == 128, "The SM100 decode path supports 64- or 128-token KV tiles");
 
     using QKAtom = SM100_MMA_F16BF16_SS<

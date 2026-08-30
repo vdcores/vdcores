@@ -1830,13 +1830,32 @@ class ATTENTION_SM100_BF16_HDIM128_SWAP_SPLIT_DIRECT(
 class ATTENTION_M64N64K16_F16_F32_64_64_hdim64(ComputeInstruction):
     HEAD_DIM = 64
 
-    def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = True, need_rope: bool = True, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None):
+    def __init__(self, num_kv_block: int, num_active_q: int,
+                 last_kv_active_token_len: int, need_norm: bool = True,
+                 need_rope: bool = True,
+                 seq_len_counter_reg: int | None = None,
+                 num_kv_block_counter_reg: int | None = None,
+                 kv_block_size: int = 64,
+                 outer_seq_len_counter_reg: int | None = None,
+                 outer_seq_len_counter_stride: int = 0):
+        assert kv_block_size == 64, "head_dim=64 attention requires KV64"
+        if outer_seq_len_counter_reg is None:
+            assert outer_seq_len_counter_stride == 0
+        else:
+            assert 0 < outer_seq_len_counter_stride < 256
+        assert 0 < num_kv_block < 256
+        encoded_num_kv_block = num_kv_block | (outer_seq_len_counter_stride << 8)
         super().__init__(
             opcode=opcode.OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64,
             args=[
-                num_kv_block, 
-                _encode_attention_qkv_workload_flag(num_active_q, last_kv_active_token_len), 
-                _encode_attention_runtime_flags(need_norm, need_rope, seq_len_counter_reg, num_kv_block_counter_reg)
+                encoded_num_kv_block,
+                _encode_attention_qkv_workload_flag(
+                    num_active_q, last_kv_active_token_len, kv_block_size
+                ),
+                _encode_attention_runtime_flags(
+                    need_norm, need_rope, seq_len_counter_reg,
+                    num_kv_block_counter_reg, outer_seq_len_counter_reg,
+                ),
             ],
         )
 
@@ -1942,7 +1961,7 @@ def select_attention_decode_instruction(head_dim: int, direct_output: bool = Fal
             return ATTENTION_SM100_BF16_HDIM128_DIRECT
         return ATTENTION_M64N64K16_F16_F32_64_64_hdim
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim64.HEAD_DIM:
-        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA
+        return ATTENTION_M64N64K16_F16_F32_64_64_hdim64
     raise NotImplementedError(
         f"Missing attention decode kernel support for head_dim={head_dim}. "
         "Add a dedicated opcode/instruction path before launching this model."

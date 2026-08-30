@@ -9,7 +9,7 @@ from dae.tma_utils import (
     ToAttnVStoreCordAdapter,
 )
 from dae.util import dae_app
-from cli import parse_args
+from cli import DEBUG_STAGE_ORDER, parse_args
 from correctness import run_correctness_check
 from runtime_context import build_runtime_context, seed_prefill_kv_cache
 from utils import build_tma_wgmma_k, build_tma_wgmma_mn, cord_func_K_major, cord_func_MN_major
@@ -68,6 +68,50 @@ matLogits = ctx.matLogits
 matLogitsW = ctx.matLogitsW
 matArgmaxIdx = ctx.matArgmaxIdx
 matArgmaxVal = ctx.matArgmaxVal
+
+MLP_PREFIX = min(4096, INTERMIDIATE)
+MLP_TAIL = INTERMIDIATE - MLP_PREFIX
+if MLP_PREFIX not in (2048, 4096) or MLP_TAIL <= 0 or MLP_TAIL % 64:
+    raise ValueError(
+        "Qwen Blackwell schedule requires a 2048/4096 prefix and a positive "
+        f"64-aligned tail, got intermediate_size={INTERMIDIATE}"
+    )
+
+# A fold consumes at least four K256 activation tiles.  Keep register-backed
+# gate/up tails at fold one because RegStore state is local to each SM.
+Q_PROJ_SMS = min(128, (QW // 64) * (HIDDEN // 1024))
+KV_PROJ_SMS = min(64, (KW // 64) * (HIDDEN // 1024))
+OUT_PROJ_SMS = min(128, (HIDDEN // 64) * (HIDDEN // 1024))
+MLP_TAIL_SMS = MLP_TAIL // 64
+DOWN_LOW_SMS = min(128, (HIDDEN // 64) * (MLP_PREFIX // 1024))
+DOWN_TAIL_SMS = min(128, (HIDDEN // 64) * (MLP_TAIL // 1024))
+
+
+def stage_enabled(stage_name: str) -> bool:
+    return DEBUG_STAGE_ORDER.index(stage_name) <= DEBUG_STAGE_ORDER.index(
+        ctx.parsed_args.debug_stop_after
+    )
+
+
+def bind_debug_barrier_counts(*schedules):
+    """Bind active schedule counts and zero barriers beyond a debug frontier."""
+    counts = dae.collect_barrier_release_counts(*schedules)
+    for group in dae.resource_groups.values():
+        for name, bar_info in group.bars.items():
+            if not bar_info["late_bind"] or bar_info["count"] is not None:
+                continue
+            matched = {
+                counts[bar_id]
+                for bar_id in group.bar_instances.get(name, [])
+                if bar_id in counts
+            }
+            if len(matched) > 1:
+                raise ValueError(
+                    f"Barrier {group.name}.{name} has inconsistent counts: "
+                    f"{sorted(matched)}"
+                )
+            group.bindBarrier(name, matched.pop() if matched else 0)
+    dae._late_barriers_bound = True
 
 defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
@@ -213,20 +257,20 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     gate_proj_low = SchedGemv(
         Gemv_M64N8,
-        MNK=(4096, N, HIDDEN),
+        MNK=(MLP_PREFIX, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
     ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
     up_proj_low = SchedGemv(
         Gemv_M64N8,
-        MNK=(4096, N, HIDDEN),
+        MNK=(MLP_PREFIX, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
     ).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
 
     silu1 = SchedSmemSiLUInterleaved(
         num_token=N,
-        gate_glob=matGateOut[:, :4096],
-        up_glob=matInterm[:, :4096],
-        out_glob=matSiLUOut[:, :4096],
+        gate_glob=matGateOut[:, :MLP_PREFIX],
+        up_glob=matInterm[:, :MLP_PREFIX],
+        out_glob=matSiLUOut[:, :MLP_PREFIX],
     ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
 
     reg_gate, reg_up = 0, 1
@@ -235,12 +279,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     gate_proj_fused = SchedGemv(
         Gemv_M64N8,
-        MNK=((4096, 8192), N, HIDDEN),
+        MNK=((MLP_PREFIX, MLP_TAIL), N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], regStoreGate),
     )
     up_proj_fused = SchedGemv(
         Gemv_M64N8,
-        MNK=((4096, 8192), N, HIDDEN),
+        MNK=((MLP_PREFIX, MLP_TAIL), N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], regStoreUp),
     )
     silu_fused = SchedRegSiLUFused(
@@ -248,18 +292,18 @@ def schedule_single_token(token_offset: int, token_pos: int):
         store_tma=layerg["storeSiluLayer"],
         reg_gate=reg_gate,
         reg_up=reg_up,
-        base_offset=4096,
+        base_offset=MLP_PREFIX,
         stride=TileM,
     ).bar("output", layerg["bar_silu_out2"])
 
     down_proj_low = SchedGemv(
         Gemv_M64N8,
-        MNK=(HIDDEN, N, 4096),
+        MNK=(HIDDEN, N, MLP_PREFIX),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out1"])
     down_proj_high = SchedGemv(
         Gemv_M64N8,
-        MNK=(HIDDEN, N, (4096, 8192)),
+        MNK=(HIDDEN, N, (MLP_PREFIX, MLP_TAIL)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
 
@@ -299,46 +343,52 @@ def schedule_single_token(token_offset: int, token_pos: int):
     copy_hidden = copy_hidden.place(N, base_sm=64)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
-    QProj = QProj.place(128)
-    KProj = KProj.place(64, base_sm=64)
-    VProj = VProj.place(64)
+    QProj = QProj.place(Q_PROJ_SMS)
+    if Q_PROJ_SMS == 128:
+        KProj = KProj.place(KV_PROJ_SMS, base_sm=64)
+        VProj = VProj.place(KV_PROJ_SMS)
+    else:
+        KProj = KProj.place(KV_PROJ_SMS, base_sm=64)
+        VProj = VProj.place(KV_PROJ_SMS, base_sm=64 + KV_PROJ_SMS)
     Gqa = Gqa.place(N * NUM_KV_HEAD)
-    OutProj = OutProj.place(num_sms)
+    OutProj = OutProj.place(OUT_PROJ_SMS)
     gate_proj_low = gate_proj_low.place(64)
     up_proj_low = up_proj_low.place(64, base_sm=64)
     silu1 = silu1.place(4, base_sm=128)
-    gate_proj_fused = gate_proj_fused.place(128)
-    up_proj_fused = up_proj_fused.place(128)
-    silu_fused = silu_fused.place(128)
-    down_proj_low = down_proj_low.place(128)
-    down_proj_high = down_proj_high.place(128)
+    gate_proj_fused = gate_proj_fused.place(MLP_TAIL_SMS)
+    up_proj_fused = up_proj_fused.place(MLP_TAIL_SMS)
+    silu_fused = silu_fused.place(MLP_TAIL_SMS)
+    down_proj_low = down_proj_low.place(DOWN_LOW_SMS)
+    down_proj_high = down_proj_high.place(DOWN_TAIL_SMS)
     argmax = argmax.place(full_sms)
     restore_bars_low = restore_bars_low.place(1, base_sm=128)
     restore_bars_high = restore_bars_high.place(1, base_sm=128)
 
-    dae.bind_late_barrier_counts(
+    active_schedules = [
         embed_rms,
         copy_hidden,
         restore_bars_high,
-        QProj,
-        KProj,
-        VProj,
-        Gqa,
-        OutProj,
-        post_attn_rms,
-        gate_proj_low,
-        up_proj_low,
-        silu1,
-        gate_proj_fused,
-        up_proj_fused,
-        silu_fused,
-        down_proj_low,
-        down_proj_high,
-        pre_attn_rms,
-        logits_proj,
-        argmax,
-        restore_bars_low,
-    )
+        *([QProj, KProj, VProj] if stage_enabled("qkv") else []),
+        *([Gqa] if stage_enabled("attention") else []),
+        *([OutProj] if stage_enabled("out") else []),
+        *([post_attn_rms] if stage_enabled("post_attn_rms") else []),
+        *([gate_proj_low, up_proj_low] if stage_enabled("mlp_prefix") else []),
+        *([silu1] if stage_enabled("silu_prefix") else []),
+        *(
+            [gate_proj_fused, up_proj_fused, silu_fused]
+            if stage_enabled("mlp_tail")
+            else []
+        ),
+        *([down_proj_low, down_proj_high] if stage_enabled("down") else []),
+        *([pre_attn_rms] if stage_enabled("final_rms") else []),
+        *([logits_proj] if stage_enabled("logits") else []),
+        *([argmax] if stage_enabled("argmax") else []),
+        *([restore_bars_low] if stage_enabled("restore") else []),
+    ]
+    if ctx.parsed_args.debug_stop_after == "full":
+        dae.bind_late_barrier_counts(*active_schedules)
+    else:
+        bind_debug_barrier_counts(*active_schedules)
 
     dae.i(
         embed_rms,
@@ -347,26 +397,30 @@ def schedule_single_token(token_offset: int, token_pos: int):
     )
 
     dae.i(
-        QProj,
-        KProj,
-        VProj,
-        Gqa,
-        OutProj,
-        post_attn_rms,
-        gate_proj_low,
-        up_proj_low,
-        silu1,
-        gate_proj_fused,
-        up_proj_fused,
-        silu_fused,
-        down_proj_low,
-        down_proj_high,
-        pre_attn_rms,
-        LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
-        LoopC.toNext(dae.copy_cptrs(), num_layers),
-        logits_proj,
-        argmax,
-        restore_bars_low,
+        *([QProj, KProj, VProj] if stage_enabled("qkv") else []),
+        *([Gqa] if stage_enabled("attention") else []),
+        *([OutProj] if stage_enabled("out") else []),
+        *([post_attn_rms] if stage_enabled("post_attn_rms") else []),
+        *([gate_proj_low, up_proj_low] if stage_enabled("mlp_prefix") else []),
+        *([silu1] if stage_enabled("silu_prefix") else []),
+        *(
+            [gate_proj_fused, up_proj_fused, silu_fused]
+            if stage_enabled("mlp_tail")
+            else []
+        ),
+        *([down_proj_low, down_proj_high] if stage_enabled("down") else []),
+        *([pre_attn_rms] if stage_enabled("final_rms") else []),
+        *(
+            [
+                LoopM.toNext(dae.copy_mptrs(), num_layers, resource_group=layerg),
+                LoopC.toNext(dae.copy_cptrs(), num_layers),
+            ]
+            if stage_enabled("final_rms")
+            else []
+        ),
+        *([logits_proj] if stage_enabled("logits") else []),
+        *([argmax] if stage_enabled("argmax") else []),
+        *([restore_bars_low] if stage_enabled("restore") else []),
     )
 
 
@@ -388,7 +442,26 @@ for _ in range(num_generates):
     schedule_single_token(cur_offset, cur_pos)
 
 print(f"run vdcores with {cur_offset + 1} tokens...")
+if ctx.parsed_args.debug_stop_after != "full" or ctx.parsed_args.debug_num_layers:
+    print(
+        "[debug] "
+        f"stop_after={ctx.parsed_args.debug_stop_after}, layers={num_layers}"
+    )
 dae.s()
 dae_app(dae)
+if ctx.parsed_args.debug_stop_after != "full":
+    for name, tensor in (
+        ("q", attnQs[0]),
+        ("k", attnKs[0]),
+        ("v", attnVs[0]),
+        ("attn_o", attnO),
+        ("hidden", matHidden),
+        ("silu", matSiLUOut),
+    ):
+        values = tensor.float()
+        print(
+            f"[debug] {name}: finite={bool(torch.isfinite(values).all())} "
+            f"abs_sum={values.abs().sum().item():.6f}"
+        )
 if ctx.parsed_args.correctness:
     run_correctness_check(ctx)
