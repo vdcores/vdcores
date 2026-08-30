@@ -134,6 +134,7 @@ def parse_args():
     arg_parser.add_argument("-N", "--num-generates", type=int, default=16)
     arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
     arg_parser.add_argument("--correctness", action="store_true")
+    arg_parser.add_argument("--kv-layout-smoke", action="store_true")
     arg_parser.add_argument("--dry-build", action="store_true")
     arg_parser.add_argument("--batch-size", type=int, default=8)
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
@@ -144,7 +145,11 @@ def parse_args():
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     if not 1 <= parsed_args.batch_size <= 8:
         raise ValueError("--batch-size must be in [1, 8]")
-    if parsed_args.correctness and not any(arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv):
+    if parsed_args.kv_layout_smoke and (parsed_args.correctness or parsed_args.dry_build):
+        raise ValueError("--kv-layout-smoke cannot be combined with --correctness or --dry-build")
+    if (parsed_args.correctness or parsed_args.kv_layout_smoke) and not any(
+        arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv
+    ):
         remaining_argv = [*remaining_argv, "--launch"]
     sys.argv = [sys.argv[0], *remaining_argv]
     return parsed_args
@@ -156,6 +161,7 @@ gpu = torch.device("cuda")
 REQ, N = 8, 8
 BATCH = parsed_args.batch_size
 KVBlockSize = 64
+KV_LAYOUT_SMOKE_POS = 2 * KVBlockSize
 rms_sms = BATCH
 num_sms = 128
 full_sms = 132
@@ -166,8 +172,14 @@ dae = Launcher(full_sms, device=gpu)
 # Token 791 has only a 0.03125 BF16 top-1 margin in this checkpoint, so valid
 # reduction-order noise can flip it.  Use a single-token case with a stable
 # 0.9375 reference margin for the end-to-end token check.
-input_token_id_and_pos = [(29871, 0)]
-num_generates = 0 if (parsed_args.correctness or parsed_args.dry_build) else parsed_args.num_generates - 1
+input_token_id_and_pos = [
+    (29871, KV_LAYOUT_SMOKE_POS if parsed_args.kv_layout_smoke else 0)
+]
+num_generates = (
+    0
+    if (parsed_args.correctness or parsed_args.kv_layout_smoke or parsed_args.dry_build)
+    else parsed_args.num_generates - 1
+)
 
 if parsed_args.dry_build:
     config = SimpleNamespace(
@@ -277,10 +289,46 @@ matHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 
 attnQs = [torch.zeros(REQ, QW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+attnKs = [torch.zeros(MAX_SEQ_LEN, REQ, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+attnVs = [torch.zeros(MAX_SEQ_LEN, REQ, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
 attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
 matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
+
+# Exercise RepeatM across two complete KV blocks and a one-token tail.  Each
+# physical request receives the same nonzero history, so request-wise equality
+# and a PyTorch attention oracle can expose either a bad request stride or a
+# missing prefix block without requiring a synthetic model/runtime operation.
+if parsed_args.kv_layout_smoke:
+    if MAX_SEQ_LEN <= KV_LAYOUT_SMOKE_POS:
+        raise ValueError(
+            f"--kv-layout-smoke requires --max-seq-len > {KV_LAYOUT_SMOKE_POS}"
+        )
+    smoke_generator = torch.Generator(device=gpu).manual_seed(0x1A32)
+    for attnK, attnV in zip(attnKs, attnVs):
+        k_seed = (
+            torch.rand(
+                KV_LAYOUT_SMOKE_POS,
+                1,
+                KW,
+                dtype=dtype,
+                device=gpu,
+                generator=smoke_generator,
+            )
+            - 0.5
+        )
+        v_seed = (
+            torch.rand(
+                KV_LAYOUT_SMOKE_POS,
+                1,
+                VW,
+                dtype=dtype,
+                device=gpu,
+                generator=smoke_generator,
+            )
+            - 0.5
+        )
+        attnK[:KV_LAYOUT_SMOKE_POS].copy_(k_seed.expand(-1, REQ, -1))
+        attnV[:KV_LAYOUT_SMOKE_POS].copy_(v_seed.expand(-1, REQ, -1))
 
 logits_fold = 8
 logits_slice = 8192 * logits_fold
@@ -351,23 +399,23 @@ layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load_tiled(LinearTileM, Li
 layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load_tiled(QKVTileM, QKVTileK))
 layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load_tiled(QKVTileM, QKVTileK))
 
-tma_builder_MN = partial(build_tma_wgmma_mn, iK=-3)
-cord_func_MN = partial(cord_func_MN_major, iK=-3)
-tma_builder_K = partial(build_tma_wgmma_k, iN=-3)
-cord_func_K = partial(cord_func_K_major, iN=-3)
+tma_builder_MN = partial(build_tma_wgmma_mn, iK=-4)
+cord_func_MN = partial(cord_func_MN_major, iK=-4)
+tma_builder_K = partial(build_tma_wgmma_k, iN=-4)
+cord_func_K = partial(cord_func_K_major, iN=-4)
 
 layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load_tiled(QKVTileM, QKVTileK))
 layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load_tiled(QKVTileM, QKVTileK))
 layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load_tiled(QKVTileM, QKVTileK))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
-layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
+layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
+layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
 
 NUM_KV_HEAD = config.num_key_value_heads
 HEAD_GROUP_SIZE = config.num_attention_heads // config.num_key_value_heads
 matQ_attn_views = [attnQ.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM) for attnQ in attnQs]
-matK_attn_views = [attnK.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKs]
-matV_attn_views = [attnV.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
+matK_attn_views = [attnK.view(MAX_SEQ_LEN, N, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKs]
+matV_attn_views = [attnV.view(MAX_SEQ_LEN, N, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
 matO_attn_view = attnO.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
 layerg.addTma("loadQ", matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 64, tma_gqa_load_q, cord_gqa_load_q))
@@ -387,7 +435,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
     embed_rms = SchedRMSShared(
         num_token=BATCH,
         epsilon=eps,
-        tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
+        tmas=(
+            TmaLoad1D(matRMSInputW[0]),
+            StaticCordAdapter(loadEmbed1D),
+            storeRMSHidden1D,
+        ),
         hidden_size=HIDDEN,
         embedding=CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
     ).bar("output", layerg["bar_pre_attn_rms"])
@@ -429,7 +481,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(
             layerg["loadKW"],
             layerg["loadRMSLayer"],
-            ToAttnVStoreCordAdapter(layerg["storeK"], token_pos),
+            ToSeqMajorAttnKVStoreCordAdapter(layerg["storeK"], token_pos),
         ),
         rope_table=RawAddress(matRopeFused, dae_runtime.config.num_slots),
         hist_seq_len=token_pos,
@@ -443,7 +495,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(
             layerg["loadVW"],
             layerg["loadRMSLayer"],
-            ToAttnVStoreCordAdapter(layerg["storeV"], token_pos),
+            ToSeqMajorAttnKVStoreCordAdapter(layerg["storeV"], token_pos),
         ),
     ).bar("load", layerg["bar_pre_attn_rms"]).bar("store", layerg["bar_qkv_attn"])
 
@@ -454,7 +506,11 @@ def schedule_single_token(token_offset: int, token_pos: int):
         KV_BLOCK_SIZE=KVBlockSize,
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
-        tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
+        tmas=(
+            layerg["loadQ"],
+            ToSeqMajorAttnKVLoadCordAdapter(layerg["loadK"]),
+            ToSeqMajorAttnKVLoadCordAdapter(layerg["loadV"]),
+        ),
         num_active_q=4,
     ).bar("o", layerg["bar_attn_out"]).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"])
 
@@ -663,6 +719,23 @@ def run_correctness_check():
     decode_pos = input_token_id_and_pos[0][1]
     rope_row = matRope[decode_pos, 0]
 
+    def check_batch_tensor_threshold(name, expected, actual, threshold_pct):
+        expected_f = expected.float()
+        actual_f = actual.float()
+        reduce_dims = tuple(range(1, actual_f.ndim))
+        denom = expected_f.abs().mean().item() or 1.0
+        diffs = (actual_f - expected_f.unsqueeze(0)).abs().mean(dim=reduce_dims)
+        diffs = diffs / denom * 100.0
+        worst_diff, worst_req = torch.max(diffs, dim=0)
+        passed = worst_diff.item() <= threshold_pct
+        status = "PASS" if passed else "FAIL"
+        print(
+            f"[correctness] {status} {name}: worst req={worst_req.item()} "
+            f"{worst_diff.item():.3f}% <= {threshold_pct:.3f}% "
+            f"all={[round(value, 3) for value in diffs.tolist()]}"
+        )
+        return passed, worst_diff.item()
+
     for i in range(min(2, num_layers)):
         layer = captured[i]
         q_ref = apply_interleaved_rope_activation(
@@ -684,13 +757,31 @@ def run_correctness_check():
         checks = [
             check_tensor_threshold(
                 f"layer{i}.v_proj", layer["v_proj"][0, 0],
-                attnVs[i][0, decode_pos], 5.0
+                attnVs[i][decode_pos, 0], 5.0
             ),
             check_tensor_threshold(f"layer{i}.q_rope", q_ref, attnQs[i][0], 5.0),
             check_tensor_threshold(
-                f"layer{i}.k_rope", k_ref, attnKs[i][0, decode_pos], 5.0
+                f"layer{i}.k_rope", k_ref, attnKs[i][decode_pos, 0], 5.0
             ),
         ]
+        if BATCH > 1:
+            checks.extend([
+                check_batch_tensor_threshold(
+                    f"layer{i}.batch.v_proj",
+                    layer["v_proj"][0, 0],
+                    attnVs[i][decode_pos, :BATCH],
+                    5.0,
+                ),
+                check_batch_tensor_threshold(
+                    f"layer{i}.batch.q_rope", q_ref, attnQs[i][:BATCH], 5.0
+                ),
+                check_batch_tensor_threshold(
+                    f"layer{i}.batch.k_rope",
+                    k_ref,
+                    attnKs[i][decode_pos, :BATCH],
+                    5.0,
+                ),
+            ])
         all_ok = all_ok and all(passed for passed, _ in checks)
 
     layer = captured[num_layers - 1]
@@ -701,6 +792,33 @@ def run_correctness_check():
         check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
         check_tensor_threshold("logits_low", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 10.0),
     ]
+    if BATCH > 1:
+        final_checks.extend([
+            check_batch_tensor_threshold(
+                "final_attention_output.batch", attnO[0], attnO[:BATCH], 5.0
+            ),
+            check_batch_tensor_threshold(
+                "silu.batch", silu_ref, matSiLUOut[:BATCH], 5.0
+            ),
+            check_batch_tensor_threshold(
+                "final_hidden.batch",
+                layer["hidden_state_out"][0, 0],
+                matHidden[:BATCH],
+                5.0,
+            ),
+            check_batch_tensor_threshold(
+                "final_rms.batch",
+                captured["final"]["final_rms"][0, 0],
+                matRMSHidden[:BATCH],
+                5.0,
+            ),
+            check_batch_tensor_threshold(
+                "logits_low.batch",
+                captured["final"]["lm_head"][0, 0, :logits_slice],
+                matLogits[0][:BATCH, :logits_slice],
+                10.0,
+            ),
+        ])
     if logits_epoch > 1:
         final_checks.append(
             check_tensor_threshold(
@@ -710,6 +828,15 @@ def run_correctness_check():
                 10.0,
             )
         )
+        if BATCH > 1:
+            final_checks.append(
+                check_batch_tensor_threshold(
+                    "logits_high.batch",
+                    captured["final"]["lm_head"][0, 0, logits_slice:vocab_size],
+                    matLogits[1][:BATCH, : vocab_size - logits_slice],
+                    10.0,
+                )
+            )
     all_ok = all_ok and all(passed for passed, _ in final_checks)
 
     ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
@@ -723,5 +850,91 @@ def run_correctness_check():
         raise RuntimeError("Correctness check failed")
 
 
+def run_kv_layout_smoke():
+    """Validate seq-major request strides and RepeatM loads over three blocks."""
+    smoke_pos = input_token_id_and_pos[0][1]
+    seq_len = smoke_pos + 1
+    all_ok = True
+
+    def check_request_rows(name, rows, threshold_pct=5.0):
+        rows_f = rows.float()
+        reduce_dims = tuple(range(1, rows_f.ndim))
+        reference = rows_f[0]
+        denom = reference.abs().mean().item() or 1.0
+        diffs = (rows_f - reference.unsqueeze(0)).abs().mean(dim=reduce_dims)
+        diffs = diffs / denom * 100.0
+        live = rows_f.abs().amax(dim=reduce_dims)
+        finite = torch.isfinite(rows_f).flatten(1).all(dim=1)
+        worst_diff, worst_req = torch.max(diffs, dim=0)
+        passed = bool(
+            finite.all().item()
+            and (live > 1.0e-6).all().item()
+            and worst_diff.item() <= threshold_pct
+        )
+        print(
+            f"[kv-layout-smoke] {'PASS' if passed else 'FAIL'} {name}: "
+            f"worst req={worst_req.item()} {worst_diff.item():.3f}% "
+            f"all={[round(value, 3) for value in diffs.tolist()]} "
+            f"min-live={live.min().item():.6g}"
+        )
+        return passed
+
+    current_k = torch.stack(
+        [attnK[smoke_pos, :BATCH] for attnK in attnKs], dim=1
+    )
+    current_v = torch.stack(
+        [attnV[smoke_pos, :BATCH] for attnV in attnVs], dim=1
+    )
+    all_ok &= check_request_rows("current-k.all-layers", current_k)
+    all_ok &= check_request_rows("current-v.all-layers", current_v)
+    all_ok &= check_request_rows("final-attention-output", attnO[:BATCH])
+
+    q = matQ_attn_views[-1][:BATCH].float()
+    k = (
+        matK_attn_views[-1][:seq_len, :BATCH]
+        .permute(1, 2, 0, 3)
+        .float()
+    )
+    v = (
+        matV_attn_views[-1][:seq_len, :BATCH]
+        .permute(1, 2, 0, 3)
+        .float()
+    )
+    # This is the score scale used by the existing Llama Blackwell decode
+    # primitive.  The smoke test targets its TMA traversal rather than changing
+    # instruction semantics.
+    scores = torch.einsum("bhgd,bhsd->bhgs", q, k) / math.sqrt(128.0)
+    probabilities = torch.softmax(scores, dim=-1)
+    expected_o = torch.einsum("bhgs,bhsd->bhgd", probabilities, v)
+    actual_o = matO_attn_view[:BATCH].float()
+    reduce_dims = tuple(range(1, actual_o.ndim))
+    oracle_denom = expected_o.abs().mean(dim=reduce_dims).clamp_min(1.0e-8)
+    oracle_diffs = (
+        (actual_o - expected_o).abs().mean(dim=reduce_dims)
+        / oracle_denom
+        * 100.0
+    )
+    oracle_worst, oracle_req = torch.max(oracle_diffs, dim=0)
+    oracle_ok = bool(
+        torch.isfinite(actual_o).all().item() and oracle_worst.item() <= 5.0
+    )
+    all_ok &= oracle_ok
+    print(
+        f"[kv-layout-smoke] {'PASS' if oracle_ok else 'FAIL'} "
+        f"three-block attention oracle: seq={seq_len}, blocks="
+        f"{math.ceil(seq_len / KVBlockSize)}, worst req={oracle_req.item()} "
+        f"{oracle_worst.item():.3f}% all="
+        f"{[round(value, 3) for value in oracle_diffs.tolist()]}"
+    )
+    print(
+        f"[kv-layout-smoke] output tokens="
+        f"{matTokens[:BATCH, 1].tolist()}"
+    )
+    if not all_ok:
+        raise RuntimeError("KV layout smoke check failed")
+
+
 if parsed_args.correctness:
     run_correctness_check()
+elif parsed_args.kv_layout_smoke:
+    run_kv_layout_smoke()
