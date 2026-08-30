@@ -30,6 +30,12 @@ def parse_args():
     arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
     arg_parser.add_argument("--model", "--model-name", dest="model_name", default=MODEL_NAME)
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
+    arg_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Logical request batch (1-8); GEMV tiles remain physically N=8",
+    )
     arg_parser.add_argument("--correctness", action="store_true")
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument(

@@ -25,6 +25,15 @@ def run_correctness_check(ctx: QwenScheduleContext):
     rope_row = ctx.matRope[decode_pos]
     all_ok = True
 
+    def check_batch_rows(name: str, rows: torch.Tensor):
+        """Broadcast inputs must keep every live row numerically coherent."""
+        if ctx.REQ == 1:
+            return True, 0.0
+        expected = rows[0:1].expand_as(rows)
+        return check_tensor_threshold(
+            f"{name}_batch_rows", expected, rows, 5.0
+        )
+
     for i in range(min(2, ctx.num_layers)):
         layer = captured[i]
         dae_q_rope = apply_rms_affine_rope_heads(
@@ -35,7 +44,7 @@ def run_correctness_check(ctx: QwenScheduleContext):
         ).reshape(-1)
         print(f"[correctness] Layer {i}:")
         checks = [
-            check_tensor_threshold("v_proj", layer["v_proj"][0, decode_index], ctx.attnVs[i][0, decode_pos], 5.0),
+            check_tensor_threshold("v_proj", layer["v_proj"][0, decode_index], ctx.attnVs[i][decode_pos, 0], 5.0),
             check_tensor_threshold(
                 "q_proj_interleaved",
                 layer["q_proj_interleaved"][0, decode_index],
@@ -51,9 +60,12 @@ def run_correctness_check(ctx: QwenScheduleContext):
             check_tensor_threshold(
                 "k_rope_interleaved",
                 layer["k_rope_interleaved"][0, decode_index],
-                ctx.attnKs[i][0, decode_pos],
+                ctx.attnKs[i][decode_pos, 0],
                 5.0,
             ),
+            check_batch_rows("v_proj", ctx.attnVs[i][decode_pos, :ctx.REQ]),
+            check_batch_rows("q_proj", ctx.attnQs[i][:ctx.REQ]),
+            check_batch_rows("k_rope", ctx.attnKs[i][decode_pos, :ctx.REQ]),
         ]
         all_ok = all_ok and all(passed for passed, _ in checks)
 
@@ -80,13 +92,28 @@ def run_correctness_check(ctx: QwenScheduleContext):
             )
         )
 
+    final_checks.extend([
+        check_batch_rows("gate_proj_low", ctx.matGateOut[:ctx.REQ, :mlp_prefix]),
+        check_batch_rows("up_proj_low", ctx.matInterm[:ctx.REQ, :mlp_prefix]),
+        check_batch_rows("silu", ctx.matSiLUOut[:ctx.REQ]),
+        check_batch_rows("final_hidden", ctx.matHidden[:ctx.REQ]),
+        check_batch_rows("final_rms", ctx.matRMSHidden[:ctx.REQ]),
+    ])
+    for i in range(ctx.logits_epoch):
+        final_checks.append(
+            check_batch_rows(f"logits_{i}", ctx.matLogits[i][:ctx.REQ])
+        )
+
     all_ok = all_ok and all(passed for passed, _ in final_checks)
 
     ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)
-    dae_idx = ctx.matTokens[0, decode_index + 1].item()
     ref_token = ref_idx[0, decode_index].item()
-    token_ok = ref_token == dae_idx
-    print(f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: ref={ref_token}, dae={dae_idx}")
+    dae_tokens = ctx.matTokens[:ctx.REQ, decode_index + 1]
+    token_ok = bool(torch.all(dae_tokens == ref_token))
+    print(
+        f"[correctness] {'PASS' if token_ok else 'FAIL'} final_token: "
+        f"ref={ref_token}, dae={dae_tokens.tolist()}"
+    )
     all_ok = all_ok and token_ok
 
     if not all_ok:

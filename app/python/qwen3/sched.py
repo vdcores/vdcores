@@ -6,7 +6,10 @@ from dae.model import *
 from dae.schedule import *
 from dae.tma_utils import (
     StaticCordAdapter,
-    ToAttnVStoreCordAdapter,
+    ToSeqMajorAttnKVLoadCordAdapter,
+    ToSeqMajorAttnKVStoreCordAdapter,
+    ToSeqMajorCurrentKStoreCordAdapter,
+    tma_store_attn_kv_seq_major,
 )
 from dae.util import dae_app
 from cli import DEBUG_STAGE_ORDER, parse_args
@@ -117,7 +120,7 @@ defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
 systemg = dae.add_group("system", 1)
 
-defaultg.addBarrier("bar_embedding", N)
+defaultg.addBarrier("bar_embedding", REQ)
 systemg.addBarrier("bar_logits")
 systemg.addBarrier("bar_argmax_idx")
 systemg.addBarrier("bar_argmax_val")
@@ -152,23 +155,22 @@ layerg.addTma("loadDown", matDowns, lambda t: t.wgmma_load(TileM, TileK, Major.K
 layerg.addTma("loadUp", matUps, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadGate", matGates, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 
-tma_builder_MN = partial(build_tma_wgmma_mn, iK=-3)
-cord_func_MN = partial(cord_func_MN_major, iK=-3)
-tma_builder_K = partial(build_tma_wgmma_k, iN=-3)
-cord_func_K = partial(cord_func_K_major, iN=-3)
+tma_builder_MN = partial(build_tma_wgmma_mn, iK=-4)
+cord_func_MN = partial(cord_func_MN_major, iK=-4)
+tma_builder_K = partial(build_tma_wgmma_k, iN=-4)
+cord_func_K = partial(cord_func_K_major, iN=-4)
 
 TileM, _, TileK = Gemv_M64N8_ROPE_128.MNK
 layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load(TileM, TileK, Major.K))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
-layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
-layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv, cord_id))
-for req in range(REQ):
-    layerg.addTma(f"storeKCurrentReq{req}", [attnK[req] for attnK in attnKs], lambda t: t.tensor1d("store", HEAD_DIM))
+layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
+layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
+layerg.addTma("storeKCurrent", attnKs, lambda t: t.batched_rowmajor_2d("store", 1, HEAD_DIM))
 matQ_attn_views = [attnQ.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM) for attnQ in attnQs]
-matK_attn_views = [attnK.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKs]
-matV_attn_views = [attnV.view(N, MAX_SEQ_LEN, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
+matK_attn_views = [attnK.view(MAX_SEQ_LEN, N, NUM_KV_HEAD, HEAD_DIM) for attnK in attnKs]
+matV_attn_views = [attnV.view(MAX_SEQ_LEN, N, NUM_KV_HEAD, HEAD_DIM) for attnV in attnVs]
 matO_attn_view = attnO.view(N, NUM_KV_HEAD, HEAD_GROUP_SIZE, HEAD_DIM)
 
 layerg.addTma("loadQ", matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 64, tma_gqa_load_q, cord_gqa_load_q))
@@ -179,33 +181,44 @@ dae.build_groups()
 
 
 def schedule_single_token(token_offset: int, token_pos: int):
-    loadEmbed1D = TmaLoad1D(matEmbed, bytes=HIDDEN * 2)
-    storeHidden1D = TmaStore1D(matHidden, bytes=HIDDEN * 2)
     loadHidden1D = TmaLoad1D(matHidden, bytes=HIDDEN * 2)
     storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
 
-    embed_rms = SchedRMSShared(
-        num_token=N,
-        epsilon=eps,
-        tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
-        embedding=CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
-    ).bar("output", layerg["bar_pre_attn_rms"])
-    copy_hidden = SchedCopy(
-        size=HIDDEN * matHidden.element_size(),
-        tmas=(
-            StaticCordAdapter(loadEmbed1D),
-            StaticCordAdapter(storeHidden1D),
-        ),
-        before_copy=CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
-    )
+    # Each logical request owns its token selector and destination row. GEMV
+    # remains physically N=8, but embedding setup must not alias every request
+    # onto row zero when sweeping smaller or larger logical batches.
+    embed_rms = ListSchedule([
+        SchedRMSShared(
+            num_token=1,
+            epsilon=eps,
+            tmas=(
+                TmaLoad1D(matRMSInputW[0]),
+                StaticCordAdapter(TmaLoad1D(matEmbed, bytes=HIDDEN * 2)),
+                TmaStore1D(matRMSHidden[req], bytes=HIDDEN * 2),
+            ),
+            embedding=CC0(matTokens[req], token_offset, hidden_size=HIDDEN),
+        ).bar("output", layerg["bar_pre_attn_rms"]).place(1, base_sm=req)
+        for req in range(REQ)
+    ])
+    copy_hidden = ListSchedule([
+        SchedCopy(
+            size=HIDDEN * matHidden.element_size(),
+            tmas=(
+                StaticCordAdapter(TmaLoad1D(matEmbed, bytes=HIDDEN * 2)),
+                TmaStore1D(matHidden[req], bytes=HIDDEN * 2),
+            ),
+            before_copy=CC0(matTokens[req], token_offset, hidden_size=HIDDEN),
+        ).place(1, base_sm=64 + req)
+        for req in range(REQ)
+    ])
 
     pre_attn_rms = SchedRMSShared(
-        num_token=N,
+        num_token=REQ,
         epsilon=eps,
         tmas=(layerg["loadRMSInputW"].cord(0), loadHidden1D, storeRMSHidden1D),
     ).bar("input", layerg["bar_layer"]).bar("output", layerg.next("bar_pre_attn_rms"))
     post_attn_rms = SchedRMSShared(
-        num_token=N,
+        num_token=REQ,
         epsilon=eps,
         tmas=(layerg["loadRMSPostAttnW"].cord(0), loadHidden1D, storeRMSHidden1D),
     ).bar("input", layerg["bar_out_mlp"]).bar("output", layerg["bar_post_attn_rms"])
@@ -222,7 +235,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(
             layerg["loadKW"],
             layerg["loadRMSLayer"],
-            ToAttnVStoreCordAdapter(layerg["storeK"], token_pos),
+            ToSeqMajorAttnKVStoreCordAdapter(layerg["storeK"], token_pos),
         ),
     ).bar("store", layerg["bar_qkv_attn"])
     VProj = SchedGemv(
@@ -231,18 +244,24 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(
             layerg["loadVW"],
             layerg["loadRMSLayer"],
-            ToAttnVStoreCordAdapter(layerg["storeV"], token_pos),
+            ToSeqMajorAttnKVStoreCordAdapter(layerg["storeV"], token_pos),
         ),
     ).bar("store", layerg["bar_qkv_attn"])
-    current_k_store = [layerg[f"storeKCurrentReq{req}"] for req in range(REQ)]
+    current_k_store = ToSeqMajorCurrentKStoreCordAdapter(
+        layerg["storeKCurrent"], token_pos, NUM_KV_HEAD, HEAD_DIM
+    )
 
     Gqa = SchedAttentionDecoding(
-        reqs=N,
+        reqs=REQ,
         seq_len=token_pos + 1,
         KV_BLOCK_SIZE=KVBlockSize,
         NUM_KV_HEADS=NUM_KV_HEAD,
         matO=matO_attn_view,
-        tmas=(layerg["loadQ"], layerg["loadK"], layerg["loadV"]),
+        tmas=(
+            layerg["loadQ"],
+            ToSeqMajorAttnKVLoadCordAdapter(layerg["loadK"]),
+            ToSeqMajorAttnKVLoadCordAdapter(layerg["loadV"]),
+        ),
         side_input=layerg["loadQwenSideInput"],
         k_store=current_k_store,
         token_pos=token_pos,
@@ -320,7 +339,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         logits_proj.append(sched.place(full_sms))
 
     argmax = SchedArgmax(
-        num_token=N,
+        num_token=REQ,
         logits_slice=logits_slice,
         num_slice=logits_epoch,
         AtomPartial=ARGMAX_PARTIAL_bf16_1152_50688_132,
@@ -328,7 +347,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         matLogits=matLogits,
         matOutVal=matArgmaxVal,
         matOutIdx=matArgmaxIdx,
-        matFinalOut=matTokens[:, token_offset + 1],
+        matFinalOut=matTokens[:REQ, token_offset + 1],
     ).bar("load", systemg["bar_logits"]).bar("val", systemg["bar_argmax_val"]).bar("idx", systemg["bar_argmax_idx"]).bar("final", systemg["bar_token_finish"])
 
     sstart, send = systemg.range_bars()
@@ -339,8 +358,6 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(StaticCordAdapter(TmaLoad1D(dae.bars_src[sstart:send])), StaticCordAdapter(TmaStore1D(dae.bars[sstart:send]))),
     )
 
-    embed_rms = embed_rms.place(rms_sms)
-    copy_hidden = copy_hidden.place(N, base_sm=64)
     pre_attn_rms = pre_attn_rms.place(rms_sms)
     post_attn_rms = post_attn_rms.place(rms_sms)
     QProj = QProj.place(Q_PROJ_SMS)
@@ -350,7 +367,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
     else:
         KProj = KProj.place(KV_PROJ_SMS, base_sm=64)
         VProj = VProj.place(KV_PROJ_SMS, base_sm=64 + KV_PROJ_SMS)
-    Gqa = Gqa.place(N * NUM_KV_HEAD)
+    Gqa = Gqa.place(REQ * NUM_KV_HEAD)
     OutProj = OutProj.place(OUT_PROJ_SMS)
     gate_proj_low = gate_proj_low.place(64)
     up_proj_low = up_proj_low.place(64, base_sm=64)
@@ -429,7 +446,7 @@ seed_prefill_kv_cache(ctx)
 cur_offset = len(prefill_token_id_and_pos) - 1
 cur_pos = prefill_token_id_and_pos[-1][1] if prefill_token_id_and_pos else -1
 for token_offset, (token, pos) in enumerate(input_token_id_and_pos, start=len(prefill_token_id_and_pos)):
-    matTokens[0, token_offset] = token
+    matTokens[:REQ, token_offset] = token
     if token_offset > len(prefill_token_id_and_pos):
         dae.i(IssueBarrier(systemg["bar_token_finish"]))
     schedule_single_token(token_offset, pos)
@@ -451,12 +468,12 @@ dae.s()
 dae_app(dae)
 if ctx.parsed_args.debug_stop_after != "full":
     for name, tensor in (
-        ("q", attnQs[0]),
-        ("k", attnKs[0]),
-        ("v", attnVs[0]),
-        ("attn_o", attnO),
-        ("hidden", matHidden),
-        ("silu", matSiLUOut),
+        ("q", attnQs[0][:REQ]),
+        ("k", attnKs[0][:cur_pos + 1, :REQ].transpose(0, 1)),
+        ("v", attnVs[0][:cur_pos + 1, :REQ].transpose(0, 1)),
+        ("attn_o", attnO[:REQ]),
+        ("hidden", matHidden[:REQ]),
+        ("silu", matSiLUOut[:REQ]),
     ):
         values = tensor.float()
         print(

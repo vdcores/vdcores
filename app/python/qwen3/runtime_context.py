@@ -159,7 +159,9 @@ def build_runtime_context(parsed_args):
             raise ValueError("--debug-num-layers must be positive")
         layers = layers[: parsed_args.debug_num_layers]
 
-    REQ, N = 8, 8
+    if not 1 <= parsed_args.batch_size <= 8:
+        raise ValueError("--batch-size must be in [1, 8]")
+    REQ, N = parsed_args.batch_size, 8
     KVBlockSize = 64
     rms_sms = REQ
     num_sms = 128
@@ -192,10 +194,16 @@ def build_runtime_context(parsed_args):
     matHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
     matRMSHidden = torch.rand(N, HIDDEN, dtype=dtype, device=gpu) - 0.5
 
-    attnQs = [torch.zeros(REQ, QW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-    attnKs = [torch.zeros(REQ, MAX_SEQ_LEN, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-    attnVs = [torch.zeros(REQ, MAX_SEQ_LEN, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
-    attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
+    # GEMV remains the qualified physical N=8 tile. Attention and reductions
+    # consume only the logical REQ rows; keeping the backing tensors padded to
+    # N prevents projection stores from overrunning a smaller logical batch.
+    attnQs = [torch.zeros(N, QW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    # Keep sequence outermost so the existing attention TMA can address
+    # request and head independently.  A request-major [N,seq,width] cache
+    # cannot collapse N+head around the intervening sequence dimension.
+    attnKs = [torch.zeros(MAX_SEQ_LEN, N, KW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    attnVs = [torch.zeros(MAX_SEQ_LEN, N, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
+    attnO = torch.zeros(N, HIDDEN, dtype=dtype, device=gpu)
     matInterm = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
     matGateOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
     matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
@@ -241,8 +249,8 @@ def build_runtime_context(parsed_args):
         matLogitsW.append(matLmHeadW[i * logits_slice:(i + 1) * logits_slice])
         matLogits.append(torch.zeros(N, logits_slice, dtype=dtype, device=gpu))
 
-    matArgmaxIdx = torch.zeros(N, full_sms, dtype=torch.long, device=gpu)
-    matArgmaxVal = torch.zeros(N, full_sms, dtype=dtype, device=gpu)
+    matArgmaxIdx = torch.zeros(REQ, full_sms, dtype=torch.long, device=gpu)
+    matArgmaxVal = torch.zeros(REQ, full_sms, dtype=dtype, device=gpu)
 
     dae.set_persistent(matTokens)
     dae.set_streaming(
@@ -338,9 +346,14 @@ def seed_prefill_kv_cache(ctx: QwenScheduleContext):
         layer_cache = pkv.layers[layer_idx]
         k_cache = layer_cache.keys[0].permute(1, 0, 2).reshape(prefill_len, ctx.KW)
         v_cache = layer_cache.values[0].permute(1, 0, 2).reshape(prefill_len, ctx.VW)
-        ctx.attnKs[layer_idx][0, :prefill_len].copy_(
-            permute_rope_activation(k_cache, ctx.NUM_KV_HEAD, ctx.HEAD_DIM)
+        k_cache = permute_rope_activation(
+            k_cache, ctx.NUM_KV_HEAD, ctx.HEAD_DIM
         )
-        ctx.attnVs[layer_idx][0, :prefill_len].copy_(v_cache)
+        ctx.attnKs[layer_idx][:prefill_len, :ctx.REQ].copy_(
+            k_cache.unsqueeze(1).expand(-1, ctx.REQ, -1)
+        )
+        ctx.attnVs[layer_idx][:prefill_len, :ctx.REQ].copy_(
+            v_cache.unsqueeze(1).expand(-1, ctx.REQ, -1)
+        )
 
     return output
