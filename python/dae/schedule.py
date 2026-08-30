@@ -10454,6 +10454,7 @@ class SchedGemvRope(Schedule):
                  hist_seq_len: int,
                  rope_counter_offsets=None,
                  Atom=Gemv_M64N8_ROPE_128,
+                 rope_dim: int = 128,
                  ):
         super().__init__()
         self.Atom = Atom
@@ -10479,6 +10480,7 @@ class SchedGemvRope(Schedule):
         self.rope_table = rope_table
         self.hist_seq_len = hist_seq_len
         self.rope_counter_offsets = rope_counter_offsets or []
+        self.rope_dim = rope_dim
 
         self.fold = None
         self.prefetch = True
@@ -10494,7 +10496,10 @@ class SchedGemvRope(Schedule):
     def validate(self):
         TileM, TileN, TileK = self.Atom.MNK
         M, N, K = self.MNK
-        assert 128 % TileM == 0, "TileM must divide 128 for rope fusion"
+        assert self.rope_dim > 0 and self.rope_dim % 2 == 0
+        assert self.rope_dim % TileM == 0 or TileM % self.rope_dim == 0, (
+            "RoPE heads and GEMV output tiles must have aligned boundaries"
+        )
 
         # verify fold
         assert self.num_sms % (M // TileM) == 0, f"SMS must be multiple of M tiles, got SMS={self.num_sms}, M={M}, TileM={TileM}"
@@ -10518,13 +10523,19 @@ class SchedGemvRope(Schedule):
 
         n_repeat = self.k_per_fold // (TileK * n_batch)
 
-        rope_table = self.rope_table.copy().delta(self.hist_seq_len * 128 * 2)
+        rope_table = self.rope_table.copy().delta(
+            self.hist_seq_len * self.rope_dim * 2
+        )
         for counter_reg, delta in self.rope_counter_offsets:
             rope_table = CounterOffsetMemoryInstruction(
                 counter_reg, rope_table, delta)
 
         insts = [
-            self.Atom(self.k_per_fold // TileK, self.hist_seq_len, m % 128),
+            self.Atom(
+                self.k_per_fold // TileK,
+                self.hist_seq_len,
+                m % self.rope_dim,
+            ),
             rope_table,
             RepeatM.onSync(0, self._bar("load"), n_repeat,
                 (loadB.cord(0, k).group(), loadB.cord2tma(0, TileK * n_batch)),
