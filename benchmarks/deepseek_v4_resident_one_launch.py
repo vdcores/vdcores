@@ -25,6 +25,7 @@ from dae import runtime
 from dae.deepseek_v4 import (
     DeepSeekV4FlashConfig,
     apply_partial_rope_512_64,
+    deepseek_v4_rope_bank,
     deepseek_v4_rope_table,
     hc_post_reference,
     hc_pre_reference,
@@ -57,6 +58,7 @@ from dae.instructions import (
     TmaStore1D,
     TmaTensor,
 )
+from dae.routing import IndexedLoadTable
 from dae.runtime import config as runtime_config
 from dae.schedule import (
     LayerStateSchedule,
@@ -87,6 +89,7 @@ from dae.schedule import (
     SchedDsv4HcPost,
     SchedDsv4HcPreRms,
     SchedDsv4IndexScore,
+    SchedDsv4IndexedGather512,
     SchedDsv4PreloadRopeTables,
     SchedDsv4Rope128_64,
     SchedDsv4Rope512_64,
@@ -204,12 +207,44 @@ class ResidentOneLaunchDecode:
         *,
         weight_source: "ResidentOneLaunchDecode | None" = None,
         live_state=None,
+        dynamic_max_position: int | None = None,
+        dynamic_variant: str | None = None,
     ):
         self.args = args
         self.device = device
         self.weight_source = weight_source
         self.live_state = live_state
         self.config = DeepSeekV4FlashConfig()
+        self.dynamic_max_position = (
+            None
+            if dynamic_max_position is None
+            else int(dynamic_max_position)
+        )
+        self.dynamic_variant = dynamic_variant
+        self.dynamic_position = self.dynamic_max_position is not None
+        if self.dynamic_position:
+            if self.live_state is None:
+                raise ValueError("dynamic decode requires persistent live state")
+            if self.dynamic_variant not in {
+                "context1",
+                "normal",
+                "csa_first",
+                "csa_short",
+                "csa",
+                "hca",
+                "indexed_normal",
+                "indexed_csa",
+                "indexed_hca",
+            }:
+                raise ValueError("unknown reusable decode structural variant")
+            if not args.context_length - 1 <= self.dynamic_max_position:
+                raise ValueError("dynamic maximum precedes its template position")
+        elif self.dynamic_variant is not None:
+            raise ValueError("a dynamic variant requires dynamic_max_position")
+        self.position_counter_reg = 2 if self.dynamic_position else None
+        self._dynamic_store_rules: list[tuple[torch.Tensor, tuple]] = []
+        self._dynamic_position_updates: dict[tuple, tuple] = {}
+        self._active_dynamic_position: int | None = None
         if args.stop_after_layer is not None:
             self.layer_ids = tuple(range(args.stop_after_layer + 1))
         elif args.layers == 1:
@@ -261,6 +296,10 @@ class ResidentOneLaunchDecode:
         self.policy = DeepSeekV4ShapePolicy(self.sms)
         self.assignments: dict[tuple, ShapeAssignment] = {}
         self.launcher = Launcher(self.sms, device=self.device)
+        if self.weight_source is not None:
+            self.launcher.tma_descriptor_cache = (
+                self.weight_source.launcher.tma_descriptor_cache
+            )
         self.checkpoint = self._load_checkpoint()
         self.families = self._families()
         self._hash_rows: dict[int, torch.Tensor] = {}
@@ -271,6 +310,8 @@ class ResidentOneLaunchDecode:
             self._fused_hc_projection_cache: dict[
                 tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
             ] = {}
+            self._derived_tensor_cache: dict[tuple, object] = {}
+            self._live_workspace_cache: dict[tuple, object] = {}
         else:
             self._fused_bf16_weight_cache = (
                 self.weight_source._fused_bf16_weight_cache
@@ -278,7 +319,14 @@ class ResidentOneLaunchDecode:
             self._fused_hc_projection_cache = (
                 self.weight_source._fused_hc_projection_cache
             )
+            self._derived_tensor_cache = (
+                self.weight_source._derived_tensor_cache
+            )
+            self._live_workspace_cache = (
+                self.weight_source._live_workspace_cache
+            )
         self._allocate_state()
+        self._reuse_live_workspace()
         self._allocate_mxfp_ffn_runtime()
         rope_tables = [self.main_rope, self.compress_rope]
         rope_tables.extend(
@@ -291,6 +339,33 @@ class ResidentOneLaunchDecode:
             table.data_ptr(): table_id
             for table_id, table in enumerate(self.resident_rope_tables)
         }
+        self.resident_rope_packed = None
+        self._dynamic_rope_banks = None
+        if self.dynamic_position:
+            self.resident_rope_packed = self._dynamic_arena(
+                ("rope_record", self.dynamic_variant),
+                (len(self.resident_rope_tables), 32, 2),
+                dtype=torch.float32,
+            )
+            banks = []
+            for compressed in (False, True):
+                cache_key = (
+                    "dynamic_rope_bank",
+                    self.dynamic_max_position,
+                    compressed,
+                )
+                bank = self._derived_tensor_cache.get(cache_key)
+                if bank is None:
+                    bank = deepseek_v4_rope_bank(
+                        self.dynamic_max_position + 1,
+                        compressed=compressed,
+                        config=self.config,
+                        device="cpu",
+                    )
+                    bank = bank.to(self.device)
+                    self._derived_tensor_cache[cache_key] = bank
+                banks.append(bank)
+            self._dynamic_rope_banks = tuple(banks)
         self.family_stages = {
             family.representative: self._build_family(family)
             for family in self.families
@@ -603,6 +678,81 @@ class ResidentOneLaunchDecode:
         )
         return resident
 
+    def _reuse_live_workspace(self) -> None:
+        """Alias serial token scratch while retaining persistent decode state.
+
+        A prepared live-decode image is executed only after the preceding
+        token has completed.  Its large projection and reduction arenas can
+        therefore use the same storage as every other reusable flow.  Cache
+        rows, compressor histories/destinations, attention indices, and RoPE
+        tables remain private views because their addresses or values encode
+        the absolute decode position.
+        """
+
+        if self.live_state is None:
+            return
+        position_owned = {
+            "_derived_tensor_cache",
+            "_fused_bf16_weight_cache",
+            "_fused_hc_projection_cache",
+            "_hash_rows",
+            "_live_workspace_cache",
+            "attention_cache",
+            "attention_indices_by_kind",
+            "attention_plans",
+            "attention_pool_history_packed",
+            "attention_pool_history_scores",
+            "attention_pool_history_values",
+            "compress_rope",
+            "compressed_output_rope",
+            "current_compressed_rows",
+            "current_kv_rows",
+            "decode_position",
+            "index_cache",
+            "index_pool_history_scores",
+            "index_pool_history_values",
+            "main_rope",
+            "mxfp_ffn_images",
+        }
+
+        def reuse(value, path):
+            if isinstance(value, torch.Tensor):
+                if value.device != self.device:
+                    return value
+                key = (
+                    path,
+                    value.dtype,
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    value.storage_offset(),
+                )
+                existing = self._live_workspace_cache.get(key)
+                if existing is None:
+                    self._live_workspace_cache[key] = value
+                    return value
+                return existing
+            if isinstance(value, dict):
+                return type(value)(
+                    (key, reuse(child, (*path, key)))
+                    for key, child in value.items()
+                )
+            if isinstance(value, list):
+                return [
+                    reuse(child, (*path, index))
+                    for index, child in enumerate(value)
+                ]
+            if isinstance(value, tuple):
+                return tuple(
+                    reuse(child, (*path, index))
+                    for index, child in enumerate(value)
+                )
+            return value
+
+        for name, value in tuple(vars(self).items()):
+            if name in position_owned:
+                continue
+            setattr(self, name, reuse(value, (name,)))
+
     def _families(self) -> tuple[LayerFamily, ...]:
         if self.args.stop_after_layer is not None:
             stop = self.args.stop_after_layer
@@ -726,6 +876,47 @@ class ResidentOneLaunchDecode:
             for layer_id in family.layer_ids
         )
 
+    def _dynamic_arena(self, key, shape, *, dtype):
+        cache_key = ("dynamic_live_arena", key, tuple(shape), dtype)
+        arena = self._derived_tensor_cache.get(cache_key)
+        if arena is None:
+            arena = torch.empty(shape, dtype=dtype, device=self.device)
+            self._derived_tensor_cache[cache_key] = arena
+        return arena
+
+    def _family_ape_rows(
+        self,
+        family: LayerFamily,
+        suffix: str,
+        position_in_group: int,
+    ) -> tuple[torch.Tensor, ...]:
+        sources = self._family_tensors(family, suffix)
+        if not self.dynamic_position:
+            return tuple(source[position_in_group] for source in sources)
+        bank_key = (
+            "dynamic_ape_bank",
+            suffix,
+            tuple(source.data_ptr() for source in sources),
+        )
+        bank = self._derived_tensor_cache.get(bank_key)
+        if bank is None:
+            bank = torch.stack(sources).contiguous()
+            self._derived_tensor_cache[bank_key] = bank
+        arena = self._dynamic_arena(
+            ("ape_row", suffix, tuple(family.layer_ids)),
+            (len(sources), bank.shape[-1]),
+            dtype=bank.dtype,
+        )
+        self._dynamic_position_updates[("ape", suffix, family.representative)] = (
+            arena,
+            bank,
+        )
+        return tuple(arena.unbind(0))
+
+    def _register_dynamic_store(self, tensor: torch.Tensor, *offsets) -> None:
+        if self.dynamic_position:
+            self._dynamic_store_rules.append((tensor, tuple(offsets)))
+
     def _remember(self, assignment: ShapeAssignment) -> int:
         key = (
             assignment.task,
@@ -812,13 +1003,42 @@ class ResidentOneLaunchDecode:
             for layer_id in family.layer_ids
         )
         self.attention_cache[kind] = caches[0]
-        window_row = position % cfg.sliding_window
+        window_row = 0 if self.dynamic_position else position % cfg.sliding_window
         self.current_kv_rows[kind] = caches[0][window_row : window_row + 1]
+        if self.dynamic_position:
+            row_bytes = cfg.head_dim * caches[0].element_size()
+            self._register_dynamic_store(
+                self.current_kv_rows[kind],
+                (self.position_counter_reg, row_bytes, 0, 7),
+            )
         if plan.should_compress:
-            compressed_row = cfg.sliding_window + plan.compressed_rows - 1
+            if self.dynamic_position and kind == "csa" and (
+                self.dynamic_variant in ("csa_first", "csa_short")
+            ):
+                compressed_row = 1
+                compressed_offsets = (
+                    (self.position_counter_reg, row_bytes),
+                    (self.position_counter_reg, row_bytes, 2, 0),
+                )
+            elif self.dynamic_position:
+                compressed_row = cfg.sliding_window
+                compressed_offsets = ((
+                    self.position_counter_reg,
+                    row_bytes,
+                    2 if kind == "csa" else 7,
+                    0,
+                ),)
+            else:
+                compressed_row = cfg.sliding_window + plan.compressed_rows - 1
+                compressed_offsets = ()
             self.current_compressed_rows[kind] = caches[0][
                 compressed_row : compressed_row + 1
             ]
+            if self.dynamic_position:
+                self._register_dynamic_store(
+                    self.current_compressed_rows[kind],
+                    *compressed_offsets,
+                )
 
         groups: list[tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = [
             (caches[0], caches)
@@ -852,25 +1072,83 @@ class ResidentOneLaunchDecode:
                 for layer_id in family.layer_ids
             )
             self.index_cache = index_caches[0]
+            self.current_index_compressed = (
+                self.index_cache[:1]
+                if self.dynamic_position
+                else self.index_cache[-1:]
+            )
+            if self.dynamic_position and plan.should_compress:
+                self._register_dynamic_store(
+                    self.current_index_compressed,
+                    (
+                        self.position_counter_reg,
+                        cfg.index_head_dim
+                        * self.current_index_compressed.element_size(),
+                        2,
+                        0,
+                    ),
+                )
             if plan.should_compress:
-                attention_histories = tuple(
-                    self.live_state.csa_pool_history(layer_id, position)
-                    for layer_id in family.layer_ids
-                )
-                self.attention_pool_history_values[kind] = (
-                    attention_histories[0][0]
-                )
-                self.attention_pool_history_scores[kind] = (
-                    attention_histories[0][1]
-                )
-                index_histories = tuple(
-                    self.live_state.csa_pool_history(
-                        layer_id, position, index=True
+                if self.dynamic_position:
+                    history_rows = (
+                        3 if self.dynamic_variant == "csa_first" else 7
                     )
-                    for layer_id in family.layer_ids
-                )
-                self.index_pool_history_values = index_histories[0][0]
-                self.index_pool_history_scores = index_histories[0][1]
+                    offsets = [
+                        self.live_state.layer_offsets[layer_id][1]
+                        for layer_id in family.layer_ids
+                    ]
+                    if offsets != list(range(offsets[0], offsets[0] + len(offsets))):
+                        raise ValueError("CSA live-state layers must be contiguous")
+                    state_slice = slice(offsets[0], offsets[-1] + 1)
+                    dynamic_histories = []
+                    for label, storage in (
+                        ("attention_values", self.live_state.csa_pool_values),
+                        ("attention_scores", self.live_state.csa_pool_scores),
+                        ("index_values", self.live_state.index_pool_values),
+                        ("index_scores", self.live_state.index_pool_scores),
+                    ):
+                        width = storage.shape[-1]
+                        arena = self._dynamic_arena(
+                            ("csa_history", label, tuple(family.layer_ids), history_rows),
+                            (len(family.layer_ids), history_rows, width),
+                            dtype=storage.dtype,
+                        )
+                        self._dynamic_position_updates[
+                            ("csa_history", label, family.representative)
+                        ] = (
+                            arena,
+                            storage[state_slice],
+                            history_rows,
+                            4 if self.dynamic_variant == "csa_first" else 0,
+                        )
+                        rows = tuple(arena.unbind(0))
+                        groups.append((rows[0], rows))
+                        dynamic_histories.append(rows[0])
+                    (
+                        self.attention_pool_history_values[kind],
+                        self.attention_pool_history_scores[kind],
+                        self.index_pool_history_values,
+                        self.index_pool_history_scores,
+                    ) = dynamic_histories
+                else:
+                    attention_histories = tuple(
+                        self.live_state.csa_pool_history(layer_id, position)
+                        for layer_id in family.layer_ids
+                    )
+                    self.attention_pool_history_values[kind] = (
+                        attention_histories[0][0]
+                    )
+                    self.attention_pool_history_scores[kind] = (
+                        attention_histories[0][1]
+                    )
+                    index_histories = tuple(
+                        self.live_state.csa_pool_history(
+                            layer_id, position, index=True
+                        )
+                        for layer_id in family.layer_ids
+                    )
+                    self.index_pool_history_values = index_histories[0][0]
+                    self.index_pool_history_scores = index_histories[0][1]
             attention_storage = tuple(
                 self.live_state.csa_pool_storage(layer_id)
                 for layer_id in family.layer_ids
@@ -1039,6 +1317,19 @@ class ResidentOneLaunchDecode:
             kind: build_layer_decode_plan(layer_id, self.decode_position, cfg)
             for kind, layer_id in representatives.items()
         }
+        if self.dynamic_position and self.dynamic_variant != "context1":
+            for kind, layer_id in representatives.items():
+                maximum = build_layer_decode_plan(
+                    layer_id, self.dynamic_max_position, cfg
+                )
+                template = self.attention_plans[kind]
+                self.attention_plans[kind] = replace(
+                    template,
+                    compressed_rows=maximum.compressed_rows,
+                    compressed_selected=maximum.compressed_selected,
+                    requires_index_selection=maximum.requires_index_selection,
+                    attention_candidates=maximum.attention_candidates,
+                )
         self.attention_cache = {}
         self.attention_indices_by_kind = {}
         self.current_kv_rows = {}
@@ -1051,7 +1342,15 @@ class ResidentOneLaunchDecode:
                 dtype=torch.bfloat16,
                 seed=202608110 + kind_index,
             )
-            valid_window = min(cfg.sliding_window, self.args.context_length)
+            valid_window = min(
+                cfg.sliding_window,
+                (
+                    self.dynamic_max_position + 1
+                    if self.dynamic_position
+                    and self.dynamic_variant != "context1"
+                    else self.args.context_length
+                ),
+            )
             indices = torch.empty(
                 (plan.attention_candidates,), dtype=torch.int32, device=d
             )
@@ -1069,10 +1368,18 @@ class ResidentOneLaunchDecode:
                 )
             self.attention_cache[kind] = cache
             self.attention_indices_by_kind[kind] = indices
-            window_row = self.decode_position % cfg.sliding_window
+            window_row = (
+                0
+                if self.dynamic_position
+                else self.decode_position % cfg.sliding_window
+            )
             self.current_kv_rows[kind] = cache[window_row : window_row + 1]
             if plan.should_compress:
-                compressed_row = cfg.sliding_window + plan.compressed_rows - 1
+                compressed_row = (
+                    cfg.sliding_window
+                    if self.dynamic_position
+                    else cfg.sliding_window + plan.compressed_rows - 1
+                )
                 self.current_compressed_rows[kind] = cache[
                     compressed_row : compressed_row + 1
                 ]
@@ -1186,7 +1493,11 @@ class ResidentOneLaunchDecode:
                 continue
             pool_rows = (
                 plan.compress_ratio
-                if plan.compress_ratio != 4 or plan.compressed_rows == 1
+                if (
+                    plan.compress_ratio != 4
+                    or plan.compressed_rows == 1
+                    or self.dynamic_variant == "csa_first"
+                )
                 else 2 * plan.compress_ratio
             )
             history_values = seeded(
@@ -1295,10 +1606,22 @@ class ResidentOneLaunchDecode:
         self.index_scores = torch.empty(
             (csa_plan.compressed_rows,), dtype=torch.float32, device=d
         )
+        self.attention_gather_workspace = (
+            torch.empty(
+                (csa_plan.attention_candidates, cfg.head_dim),
+                dtype=torch.bfloat16,
+                device=d,
+            )
+            if csa_plan.requires_index_selection
+            else None
+        )
         if csa_plan.should_compress:
             index_pool_rows = (
                 csa_plan.compress_ratio
-                if csa_plan.compressed_rows == 1
+                if (
+                    csa_plan.compressed_rows == 1
+                    or self.dynamic_variant == "csa_first"
+                )
                 else 2 * csa_plan.compress_ratio
             )
             self.index_pool_history_values = seeded(
@@ -1864,6 +2187,7 @@ class ResidentOneLaunchDecode:
             activation,
             output.reshape(-1),
             weight_layers=weights,
+            derived_tensor_cache=self._derived_tensor_cache,
         )
         assignment = self.policy.fp8_umma_gemv(
             output.numel(), activation.shape[0] * 128
@@ -1964,6 +2288,7 @@ class ResidentOneLaunchDecode:
                 activation,
                 output_vector,
                 weight_layers=weights,
+                derived_tensor_cache=self._derived_tensor_cache,
             )
             return [
                 self._stage(
@@ -2005,6 +2330,7 @@ class ResidentOneLaunchDecode:
             output_reduce,
             split_k=split_k,
             weight_layers=weights,
+            derived_tensor_cache=self._derived_tensor_cache,
         )
         gemv = self._stage(
             f"{name}.partial",
@@ -2071,6 +2397,7 @@ class ResidentOneLaunchDecode:
             split_k=1 if balanced_k else split_k,
             balanced_k=balanced_k,
             weight_layers=weights,
+            derived_tensor_cache=self._derived_tensor_cache,
         )
         rows = weights[0].shape[0] * 128
         k_pairs = activation.shape[0] // 2
@@ -2590,6 +2917,9 @@ class ResidentOneLaunchDecode:
         index_selection_input_join = (
             f"{family.name}.index.selection.input.join"
         )
+        index_q_ready = f"{family.name}.index.q.ready"
+        index_selection_ready = f"{family.name}.index.selection.ready"
+        attention_gather_ready = f"{family.name}.attn.gather.ready"
         split_q_a = "q_a" in self.splitk_components
         split_q_b = "q_b" in self.splitk_components
         split_kv = "kv" in self.splitk_components
@@ -2994,7 +3324,22 @@ class ResidentOneLaunchDecode:
                 if kind == "csa"
                 else compressor_base
             )
-            if not live_compressor_state:
+            if live_compressor_state:
+                reset = SchedDsv4ZeroFill(
+                    self.zero_fill_gate, fused_output
+                )
+                stages.append(
+                    self._stage(
+                        "attn.compressor.projection_reset",
+                        reset,
+                        compressor_sms,
+                        base_sm=compressor_base,
+                        wait_for_previous=False,
+                        wait_group=attention_input_ready,
+                        release_group=compressor_input_ready,
+                    )
+                )
+            else:
                 stages.append(
                     self._stage(
                         "attn.compressor.projection_reset",
@@ -3056,7 +3401,22 @@ class ResidentOneLaunchDecode:
             index_compressor_base = kv_base + kv_prefix_sms
             index_compressor_sms = 8
             index_compressor_pool_base = index_compressor_base
-            if not live_compressor_state:
+            if live_compressor_state:
+                reset = SchedDsv4ZeroFill(
+                    self.zero_fill_gate, fused_index_output
+                )
+                stages.append(
+                    self._stage(
+                        "index.compressor.projection_reset",
+                        reset,
+                        index_compressor_sms,
+                        base_sm=index_compressor_base,
+                        wait_for_previous=False,
+                        wait_group=attention_input_ready,
+                        release_group=compressor_input_ready,
+                    )
+                )
+            else:
                 stages.append(
                     self._stage(
                         "index.compressor.projection_reset",
@@ -3090,10 +3450,10 @@ class ResidentOneLaunchDecode:
                 )
             )
         if live_compressor_state:
-            ape_tensors = self._family_tensors(
-                family, "attn.compressor.ape"
-            )
             position_in_group = self.decode_position % plan.compress_ratio
+            ape_tensors = self._family_ape_rows(
+                family, "attn.compressor.ape", position_in_group
+            )
             if kind == "csa":
                 value_rows = (
                     compress_values[: cfg.head_dim],
@@ -3106,16 +3466,57 @@ class ResidentOneLaunchDecode:
                 bias_rows = tuple(
                     tuple(
                         ape[
-                            position_in_group,
-                            half * cfg.head_dim : (half + 1) * cfg.head_dim,
+                            half * cfg.head_dim : (half + 1) * cfg.head_dim
                         ]
                         for ape in ape_tensors
                     )
                     for half in range(2)
                 )
-                destinations = self.live_state.csa_pool_destinations(
-                    family.representative, self.decode_position
-                )
+                if self.dynamic_position:
+                    storage_values, storage_scores = (
+                        self.live_state.csa_pool_storage(
+                            family.representative
+                        )
+                    )
+                    flat_values = storage_values.reshape(-1, cfg.head_dim)
+                    flat_scores = storage_scores.reshape(-1, cfg.head_dim)
+                    ordinary_base = 4
+                    destinations = (
+                        flat_values[8],
+                        flat_scores[8],
+                        flat_values[ordinary_base],
+                        flat_scores[ordinary_base],
+                    )
+                    row_bytes = cfg.head_dim * 4
+                    overlap_offsets = (
+                        (self.position_counter_reg, row_bytes, 0, 2),
+                        (self.position_counter_reg, -8 * row_bytes, 2, 1),
+                    )
+                    ordinary_offsets = (
+                        (self.position_counter_reg, row_bytes, 0, 2),
+                    )
+                    ordinary_offsets += ((
+                        self.position_counter_reg,
+                        8 * row_bytes,
+                        2,
+                        1,
+                    ),)
+                    self._register_dynamic_store(
+                        destinations[0], *overlap_offsets
+                    )
+                    self._register_dynamic_store(
+                        destinations[1], *overlap_offsets
+                    )
+                    self._register_dynamic_store(
+                        destinations[2], *ordinary_offsets
+                    )
+                    self._register_dynamic_store(
+                        destinations[3], *ordinary_offsets
+                    )
+                else:
+                    destinations = self.live_state.csa_pool_destinations(
+                        family.representative, self.decode_position
+                    )
                 state_store = SchedDsv4CompressorStateStore(
                     value_rows,
                     score_rows,
@@ -3129,14 +3530,36 @@ class ResidentOneLaunchDecode:
                 state_store_sms = 2
             else:
                 bias_rows = tuple(
-                    ape[position_in_group, : cfg.head_dim]
+                    ape[: cfg.head_dim]
                     for ape in ape_tensors
                 )
-                destination_values, destination_scores = (
-                    self.live_state.hca_pool_destination(
-                        family.representative, self.decode_position
+                if self.dynamic_position:
+                    storage_values, storage_scores = (
+                        self.live_state.hca_pool_storage(
+                            family.representative
+                        )
                     )
-                )
+                    destination_values = storage_values[0]
+                    destination_scores = storage_scores[0]
+                    row_bytes = cfg.head_dim * 4
+                    offsets = ((
+                        self.position_counter_reg,
+                        row_bytes,
+                        0,
+                        7,
+                    ),)
+                    self._register_dynamic_store(
+                        destination_values, *offsets
+                    )
+                    self._register_dynamic_store(
+                        destination_scores, *offsets
+                    )
+                else:
+                    destination_values, destination_scores = (
+                        self.live_state.hca_pool_destination(
+                            family.representative, self.decode_position
+                        )
+                    )
                 state_store = SchedDsv4CompressorStateStore(
                     (compress_values[: cfg.head_dim],),
                     (compress_scores[: cfg.head_dim],),
@@ -3160,13 +3583,14 @@ class ResidentOneLaunchDecode:
                 )
             )
         if live_compressor_state and kind == "csa":
-            index_ape_tensors = self._family_tensors(
-                family, "attn.indexer.compressor.ape"
+            index_ape_tensors = self._family_ape_rows(
+                family,
+                "attn.indexer.compressor.ape",
+                position_in_group,
             )
             index_bias_rows = tuple(
                 tuple(
                     ape[
-                        position_in_group,
                         half * cfg.index_head_dim :
                         (half + 1) * cfg.index_head_dim,
                     ]
@@ -3174,9 +3598,55 @@ class ResidentOneLaunchDecode:
                 )
                 for half in range(2)
             )
-            index_destinations = self.live_state.csa_pool_destinations(
-                family.representative, self.decode_position, index=True
-            )
+            if self.dynamic_position:
+                storage_values, storage_scores = (
+                    self.live_state.csa_pool_storage(
+                        family.representative, index=True
+                    )
+                )
+                flat_values = storage_values.reshape(
+                    -1, cfg.index_head_dim
+                )
+                flat_scores = storage_scores.reshape(
+                    -1, cfg.index_head_dim
+                )
+                ordinary_base = 4
+                index_destinations = (
+                    flat_values[8],
+                    flat_scores[8],
+                    flat_values[ordinary_base],
+                    flat_scores[ordinary_base],
+                )
+                row_bytes = cfg.index_head_dim * 4
+                overlap_offsets = (
+                    (self.position_counter_reg, row_bytes, 0, 2),
+                    (self.position_counter_reg, -8 * row_bytes, 2, 1),
+                )
+                ordinary_offsets = (
+                    (self.position_counter_reg, row_bytes, 0, 2),
+                )
+                ordinary_offsets += ((
+                    self.position_counter_reg,
+                    8 * row_bytes,
+                    2,
+                    1,
+                ),)
+                self._register_dynamic_store(
+                    index_destinations[0], *overlap_offsets
+                )
+                self._register_dynamic_store(
+                    index_destinations[1], *overlap_offsets
+                )
+                self._register_dynamic_store(
+                    index_destinations[2], *ordinary_offsets
+                )
+                self._register_dynamic_store(
+                    index_destinations[3], *ordinary_offsets
+                )
+            else:
+                index_destinations = self.live_state.csa_pool_destinations(
+                    family.representative, self.decode_position, index=True
+                )
             index_state_store = SchedDsv4CompressorStateStore(
                 (
                     fused_index_output[: cfg.index_head_dim],
@@ -3218,15 +3688,14 @@ class ResidentOneLaunchDecode:
             and kind in ("csa", "hca")
             and plan.should_compress
         ):
-            ape_tensors = self._family_tensors(
-                family, "attn.compressor.ape"
+            ape_tensors = self._family_ape_rows(
+                family,
+                "attn.compressor.ape",
+                self.decode_position % plan.compress_ratio,
             )
             tail_offset = cfg.head_dim if plan.compress_ratio == 4 else 0
             ape_rows = tuple(
-                ape[
-                    self.decode_position % plan.compress_ratio,
-                    tail_offset : tail_offset + cfg.head_dim,
-                ]
+                ape[tail_offset : tail_offset + cfg.head_dim]
                 for ape in ape_tensors
             )
             history_values = self.attention_pool_history_values[kind]
@@ -3348,14 +3817,13 @@ class ResidentOneLaunchDecode:
             and kind == "csa"
             and plan.should_compress
         ):
-            index_ape_tensors = self._family_tensors(
-                family, "attn.indexer.compressor.ape"
+            index_ape_tensors = self._family_ape_rows(
+                family,
+                "attn.indexer.compressor.ape",
+                self.decode_position % plan.compress_ratio,
             )
             index_ape_rows = tuple(
-                ape[
-                    self.decode_position % plan.compress_ratio,
-                    cfg.index_head_dim : 2 * cfg.index_head_dim,
-                ]
+                ape[cfg.index_head_dim : 2 * cfg.index_head_dim]
                 for ape in index_ape_tensors
             )
             index_norm_weights = self._family_tensors(
@@ -3366,7 +3834,7 @@ class ResidentOneLaunchDecode:
                 self.index_pool_history_scores,
                 index_norm_weights[0],
                 self.compressed_output_rope[kind],
-                self.index_cache[-1:],
+                self.current_index_compressed,
                 epsilon=cfg.rms_epsilon,
                 tail_values=index_tail_values,
                 tail_scores=index_tail_scores,
@@ -3449,7 +3917,11 @@ class ResidentOneLaunchDecode:
                         base_sm=0,
                         num_sms=cfg.index_heads,
                         wait_group=qkv_prefix_join,
-                        release_group=index_selection_input_join,
+                        release_group=(
+                            index_selection_input_join
+                            if fuse_index_q_splitk_epilogue
+                            else index_q_ready
+                        ),
                         fp32_finalizer=index_q_fp32_finalizer,
                     )
                 )
@@ -3463,6 +3935,7 @@ class ResidentOneLaunchDecode:
                         self.index_q,
                         placement=(0, cfg.index_heads),
                         wait_group=qkv_prefix_join,
+                        release_group=index_q_ready,
                     )
                 )
             else:
@@ -3476,6 +3949,7 @@ class ResidentOneLaunchDecode:
                         self.index_q,
                         placement=(0, cfg.index_heads),
                         wait_group=qkv_prefix_join,
+                        release_group=index_q_ready,
                     )
                 )
             if not fuse_index_q_splitk_epilogue:
@@ -3491,6 +3965,7 @@ class ResidentOneLaunchDecode:
                             ],
                         ),
                         cfg.index_heads,
+                        wait_group=index_q_ready,
                     )
                 )
                 stages.append(
@@ -3512,6 +3987,7 @@ class ResidentOneLaunchDecode:
                             self.index_cache,
                             self.index_head_weights,
                             self.index_scores,
+                            position_counter_reg=self.position_counter_reg,
                         ),
                         min(plan.compressed_rows, self.sms),
                         wait_group=index_selection_input_join,
@@ -3527,6 +4003,7 @@ class ResidentOneLaunchDecode:
                             ],
                             index_offset=cfg.sliding_window,
                         ),
+                        release_group=index_selection_ready,
                     )
                 )
         fuse_q_splitk_epilogue = (
@@ -3645,15 +4122,14 @@ class ResidentOneLaunchDecode:
                     )
                 )
             if plan.should_compress:
-                ape_tensors = self._family_tensors(
-                    family, "attn.compressor.ape"
+                ape_tensors = self._family_ape_rows(
+                    family,
+                    "attn.compressor.ape",
+                    self.decode_position % plan.compress_ratio,
                 )
                 tail_offset = cfg.head_dim if plan.compress_ratio == 4 else 0
                 ape_rows = tuple(
-                    ape[
-                        self.decode_position % plan.compress_ratio,
-                        tail_offset : tail_offset + cfg.head_dim,
-                    ]
+                    ape[tail_offset : tail_offset + cfg.head_dim]
                     for ape in ape_tensors
                 )
                 history_values = self.attention_pool_history_values[kind]
@@ -3855,14 +4331,13 @@ class ResidentOneLaunchDecode:
                     )
                 )
             if plan.should_compress and not use_grouped_preattention:
-                index_ape_tensors = self._family_tensors(
-                    family, "attn.indexer.compressor.ape"
+                index_ape_tensors = self._family_ape_rows(
+                    family,
+                    "attn.indexer.compressor.ape",
+                    self.decode_position % plan.compress_ratio,
                 )
                 index_ape_rows = tuple(
-                    ape[
-                        self.decode_position % plan.compress_ratio,
-                        cfg.index_head_dim : 2 * cfg.index_head_dim,
-                    ]
+                    ape[cfg.index_head_dim : 2 * cfg.index_head_dim]
                     for ape in index_ape_tensors
                 )
                 index_tail_values = index_compress_values[
@@ -3880,7 +4355,7 @@ class ResidentOneLaunchDecode:
                     self.index_pool_history_scores,
                     index_norm_weights[0],
                     self.compressed_output_rope[kind],
-                    self.index_cache[-1:],
+                    self.current_index_compressed,
                     epsilon=cfg.rms_epsilon,
                     tail_values=index_tail_values,
                     tail_scores=index_tail_scores,
@@ -3911,6 +4386,7 @@ class ResidentOneLaunchDecode:
                             self.index_cache,
                             self.index_head_weights,
                             self.index_scores,
+                            position_counter_reg=self.position_counter_reg,
                         ),
                         min(plan.compressed_rows, self.sms),
                     )
@@ -3925,8 +4401,66 @@ class ResidentOneLaunchDecode:
                             ],
                             index_offset=cfg.sliding_window,
                         ),
+                        release_group=index_selection_ready,
                     )
                 )
+
+        attention_kv = self.attention_cache[kind]
+        gathered_attention = (
+            use_split_umma_attention and plan.requires_index_selection
+        )
+        if gathered_attention:
+            if kind != "csa" or self.attention_gather_workspace is None:
+                raise ValueError("indexed UMMA gather requires CSA workspace")
+            indices = self.attention_indices_by_kind[kind]
+            if self.live_state is not None:
+                source_layers = tuple(
+                    self.live_state.attention_cache(
+                        active_layer_id, plan.compressed_rows
+                    )
+                    for active_layer_id in family.layer_ids
+                )
+            else:
+                source_layers = (self.attention_cache[kind],)
+            indexed_tables = tuple(
+                IndexedLoadTable(source, indices) for source in source_layers
+            )
+            gather = SchedDsv4IndexedGather512(
+                source_layers[0],
+                indices,
+                self.attention_gather_workspace,
+                indexed_table=indexed_tables[0],
+            )
+            if len(source_layers) > 1:
+                gather = LayeredSchedule(
+                    gather,
+                    ((
+                        indexed_tables[0].state,
+                        tuple(table.state for table in indexed_tables),
+                    ),),
+                    counter_strides=family.counter_strides,
+                )
+            gather_dependencies = ()
+            if use_grouped_preattention and plan.should_compress:
+                gather_dependencies = (
+                    (compressor_output_ready, "kv"),
+                    (index_selection_ready, "indices"),
+                )
+            stages.append(
+                self._stage(
+                    "attn.indexed_gather",
+                    gather,
+                    min(128, indices.numel()),
+                    wait_group=(
+                        None
+                        if gather_dependencies
+                        else index_selection_ready
+                    ),
+                    wait_group_roles=gather_dependencies,
+                    release_group=attention_gather_ready,
+                )
+            )
+            attention_kv = self.attention_gather_workspace
 
         sinks = self._family_tensors(family, "attn.attn_sink")
         attention_rows = self.attention_indices_by_kind[kind].numel()
@@ -3935,7 +4469,7 @@ class ResidentOneLaunchDecode:
             raise ValueError(
                 "UMMA split attention requires native split-K O_a"
             )
-        if use_split_umma_attention and (
+        if use_split_umma_attention and not gathered_attention and (
             plan.compressed_selected != plan.compressed_rows
         ):
             raise ValueError(
@@ -4035,10 +4569,10 @@ class ResidentOneLaunchDecode:
                 self.launcher, self.q_rope
             ).wgmma_load(64, 512, Major.K).encode_64k()
             kv_tma = TmaTensor(
-                self.launcher, self.attention_cache[kind]
+                self.launcher, attention_kv
             ).wgmma_load(64, 512, Major.K)
             kv_v_tma = TmaTensor(
-                self.launcher, self.attention_cache[kind]
+                self.launcher, attention_kv
             ).wgmma_load(64, 128, Major.MN)
             partial_tma = TmaTensor(
                 self.launcher,
@@ -4050,7 +4584,7 @@ class ResidentOneLaunchDecode:
             )
             producer = SchedDsv4AttentionSplit64UmmaSm100(
                 self.q_rope,
-                self.attention_cache[kind],
+                attention_kv,
                 attention_rows,
                 partials,
                 metadata,
@@ -4059,12 +4593,25 @@ class ResidentOneLaunchDecode:
                 kv_v_tma=kv_v_tma,
                 partial_tma=partial_tma,
                 gate_kv_last_split_only=(
-                    use_grouped_preattention
+                    not gathered_attention
+                    and use_grouped_preattention
                     and kind in ("csa", "hca")
                     and plan.should_compress
                 ),
+                position_counter_reg=(
+                    None if gathered_attention else self.position_counter_reg
+                ),
+                attention_kind=(
+                    None
+                    if gathered_attention or not self.dynamic_position
+                    else kind
+                ),
             )
-            if self.live_state is not None and len(family.layer_ids) > 1:
+            if (
+                not gathered_attention
+                and self.live_state is not None
+                and len(family.layer_ids) > 1
+            ):
                 producer = SchedLayeredDsv4AttentionSplit64UmmaSm100(
                     producer,
                     tuple(
@@ -4085,6 +4632,11 @@ class ResidentOneLaunchDecode:
                     prefetch_before_wait=True,
                     wait_group_roles=(
                         (
+                            (split_attention_q_ready, "q"),
+                            (attention_gather_ready, "kv"),
+                        )
+                        if gathered_attention
+                        else (
                             (split_attention_q_ready, "q"),
                             (compressor_output_ready, "kv"),
                         )
@@ -4114,6 +4666,14 @@ class ResidentOneLaunchDecode:
                     native_heads,
                     head_start=group * 8,
                     head_count=8,
+                    position_counter_reg=(
+                        None if gathered_attention else self.position_counter_reg
+                    ),
+                    attention_kind=(
+                        None
+                        if gathered_attention or not self.dynamic_position
+                        else kind
+                    ),
                 )
                 reducer = self._layered(reducer, family, sinks)
                 stages.append(
@@ -4326,10 +4886,75 @@ class ResidentOneLaunchDecode:
         self._hash_rows[layer_id] = row
         return row
 
+    @staticmethod
+    def reusable_variant_for_position(position: int) -> str:
+        position = int(position)
+        if position == 0:
+            return "context1"
+        if position == 3:
+            return "csa_first"
+        if (position + 1) % 128 == 0:
+            variant = "hca"
+        elif (position + 1) % 4 == 0:
+            variant = "csa_short" if position < 127 else "csa"
+        else:
+            variant = "normal"
+        return f"indexed_{variant}" if position >= 2051 else variant
+
+    def set_decode_position(self, position: int) -> None:
+        """Retarget one reusable live image without rebuilding its schedule."""
+
+        if not self.dynamic_position:
+            if int(position) != self.decode_position:
+                raise RuntimeError("fixed-position image cannot be retargeted")
+            return
+        position = int(position)
+        if not 0 <= position <= self.dynamic_max_position:
+            raise ValueError("decode position exceeds the reusable image range")
+        expected = self.reusable_variant_for_position(position)
+        if expected != self.dynamic_variant:
+            raise ValueError(
+                f"position {position} requires {expected}, not "
+                f"{self.dynamic_variant}"
+            )
+        self.live_state.prepare_decode_position(position)
+        self.launcher.set_loop_counter(self.position_counter_reg, position)
+
+        main_bank, compressed_bank = self._dynamic_rope_banks
+        self.resident_rope_packed[0].copy_(main_bank[position])
+        self.resident_rope_packed[1].copy_(compressed_bank[position])
+        for kind in ("csa", "hca"):
+            table = self.compressed_output_rope.get(kind)
+            if table is None:
+                continue
+            table_id = self.resident_rope_table_ids[table.data_ptr()]
+            output_position = (
+                position - self.attention_plans[kind].compress_ratio + 1
+            )
+            self.resident_rope_packed[table_id].copy_(
+                compressed_bank[output_position]
+            )
+
+        for key, update in self._dynamic_position_updates.items():
+            if key[0] == "ape":
+                arena, bank = update
+                arena.copy_(bank[:, position % bank.shape[1]])
+            elif key[0] == "csa_history":
+                arena, storage, rows, row_start = update
+                bank = (position // 4) & 1
+                arena.copy_(
+                    storage[:, bank, row_start : row_start + rows]
+                )
+            else:
+                raise RuntimeError(f"unknown dynamic-position update {key[0]}")
+        self._active_dynamic_position = position
+
     def set_input_token(self, token_id: int) -> None:
         """Update the token-dependent inputs of a prepared live image."""
         if self.live_state is None:
             raise RuntimeError("set_input_token is only valid for live decode")
+        if self.dynamic_position and self._active_dynamic_position is None:
+            raise RuntimeError("set_decode_position must precede token input")
         if not 0 <= int(token_id) < self.config.vocab_size:
             raise ValueError("input token is outside the vocabulary")
         embedding = self._tensor("embed.weight")[int(token_id)]
@@ -4408,12 +5033,23 @@ class ResidentOneLaunchDecode:
         # The fixed compute task validates seven physical slots.  Its retained
         # LDU plans below still point at the complete 257-stream offline image,
         # so routed slots are selected dynamically from the packed top-k record.
-        linear1_physical = representative.image.linear1_weights[:112]
-        linear1_scale_physical = representative.image.linear1_scales[:112]
-        gate_weight = linear1_physical[:, :8].contiguous()
-        up_weight = linear1_physical[:, 8:].contiguous()
-        gate_scale = linear1_scale_physical[:, :8].contiguous()
-        up_scale = linear1_scale_physical[:, 8:].contiguous()
+        physical_key = (
+            "mxfp_ffn_physical_gate_up_v1",
+            representative.image.linear1_weights.data_ptr(),
+            representative.image.linear1_scales.data_ptr(),
+        )
+        physical_gate_up = self._derived_tensor_cache.get(physical_key)
+        if physical_gate_up is None:
+            linear1_physical = representative.image.linear1_weights[:112]
+            linear1_scale_physical = representative.image.linear1_scales[:112]
+            physical_gate_up = (
+                linear1_physical[:, :8].contiguous(),
+                linear1_physical[:, 8:].contiguous(),
+                linear1_scale_physical[:, :8].contiguous(),
+                linear1_scale_physical[:, 8:].contiguous(),
+            )
+            self._derived_tensor_cache[physical_key] = physical_gate_up
+        gate_weight, up_weight, gate_scale, up_scale = physical_gate_up
         down_weight = representative.image.down_weights[: 7 * 32]
         down_scale = representative.image.down_scales[: 7 * 32]
         linear1 = SchedMxfp4Mxfp8GateUpSiluFixedRing(
@@ -4636,7 +5272,9 @@ class ResidentOneLaunchDecode:
                 "attn.projections.reset",
             }
         )
-        if live_state_groups and len(family.layer_ids) > 1:
+        if live_state_groups and (
+            len(family.layer_ids) > 1 or self.dynamic_position
+        ):
             attention = [
                 replace(
                     stage,
@@ -4644,6 +5282,7 @@ class ResidentOneLaunchDecode:
                         stage.schedule,
                         live_state_groups,
                         counter_strides=family.counter_strides,
+                        store_offset_rules=self._dynamic_store_rules,
                     ),
                 )
                 for stage in attention
@@ -5234,6 +5873,7 @@ class ResidentOneLaunchDecode:
                             self.head_weight_native_fp8,
                             self.head_input_native_fp8,
                             self.logits,
+                            derived_tensor_cache=self._derived_tensor_cache,
                         ),
                         head_assignment,
                     ),
@@ -5765,9 +6405,10 @@ class ResidentOneLaunchDecode:
             return queued_stages
 
         self.launcher.i(
-            SchedDsv4PreloadRopeTables(self.resident_rope_tables).place(
-                self.sms
-            )
+            SchedDsv4PreloadRopeTables(
+                self.resident_rope_tables,
+                packed_tables=self.resident_rope_packed,
+            ).place(self.sms)
         )
         if self.args.stop_after_layer is not None:
             families = {family.name: family for family in self.families}

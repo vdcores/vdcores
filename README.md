@@ -57,12 +57,18 @@ Notes:
 
 ## DeepSeek-V4-Flash Live Decoding Demo
 
-[`app/python/deepseek_v4/sched.py`](app/python/deepseek_v4/sched.py)
-runs an ordinary prompt end to end: the checkpoint's PyTorch reference prefills
-all but the last prompt token, then VDCores consumes that token and greedily
-decodes.  Each output token uses one already prepared, position-specialized
-persistent-kernel launch.  Offline prefill and image preparation are reported
-separately and are not included in decode timing.
+[`app/python/deepseek_v4/sched.py`](app/python/deepseek_v4/sched.py) is the
+user-facing demo: it formats the prompt, runs offline reference prefill,
+streams text, and reports measurements.  Production flow planning and token
+execution live separately in
+[`python/dae/deepseek_v4_inference.py`](python/dae/deepseek_v4_inference.py),
+which contains no tokenizer, reference model, or terminal UI.  A compact bank
+of reusable structural flows covers ordinary tokens, ratio-4 and ratio-128
+compression boundaries, context one, and long-context index selection.  The
+host only selects a flow, updates the token/position records, and performs one
+persistent-kernel launch per output token; it does not rebuild or requeue the
+43-layer instruction stream.  Offline prefill and flow preparation are
+reported separately and are not included in decode timing.
 
 The demo expects the released NVIDIA DeepSeek-V4-Flash-NVFP4 checkpoint and the
 offline VDCores MXFP4 FFN image.  Create the two offline artifacts once:
@@ -85,7 +91,7 @@ demo explicitly dequantizes its released NVFP4 routed experts in PyTorch; no
 prefill conversion or dependency is present in the timed VDCores path.
 
 Install the checkpoint's prefill dependencies, build the compact live image,
-and run a short stream:
+and run a stream:
 
 ```bash
 pip install -r app/python/deepseek_v4/requirements-prefill.txt
@@ -99,17 +105,27 @@ python app/python/deepseek_v4/sched.py \
   --checkpoint "$DSV4_CHECKPOINT" \
   --mxfp-ffn-root "$DSV4_CHECKPOINT/vdcores-mxfp4-ffn-v1" \
   --prefill-checkpoint "$DSV4_CHECKPOINT/vdcores-pytorch-mp1" \
-  -N 4 \
-  "Hi"
+  -N 256 \
+  --user-prompt "Explain how asynchronous GPU pipelines overlap memory transfers with matrix computation, then provide a concise Python example and discuss synchronization, correctness, scheduling, resource allocation, and performance tradeoffs in practical inference systems. Compare persistent kernels, CUDA graphs, tensor memory accelerators, and conventional launches for autoregressive decoding."
 ```
 
-On one GB300, the four-token example produced `Hello! How can` with a
-5.366 ms median device frontier, 5.859 ms median Python wall time, and
-170.7 token/s.  The imported boundary is explicit: BF16 KV caches and FP32
-incremental compressor state are retained in their VDCores layouts; the demo
-does not insert an implicit hidden-state conversion.  For a fast decode-only
-smoke test, replace the prompt and prefill option with
-`--input-token-id 1234`.
+The example formats to 63 prompt tokens.  On one GB300, offline PyTorch
+prefill of its 62-token prefix took 72.9 s, four reusable flows took 52.0 s
+to load and prepare, and the following 256-token VDCores decode measured a
+5.411 ms median device frontier, 6.406 ms median Python wall time, and
+156.1 token/s.  The fixed production frontier around this context is
+approximately 5.37 ms, so reusable control changes device time by less than
+one percent.  Decode accepts arbitrary prompt lengths within the 65,536-token
+live cache and up to 256 new tokens; EOS, repeated `--stop-token-id`, and
+`--max-decode-seconds` can stop it earlier.  Add `--quiet-stream` to suppress
+the cumulative per-token text while retaining the final completion and timing.
+
+The imported boundary is explicit: BF16 KV caches and FP32 incremental
+compressor state are retained in their VDCores layouts; the demo does not
+insert an implicit hidden-state conversion.  For a fast schedule/performance
+smoke test without real prefill, replace the prompt and prefill option with
+`--input-token-id 1234 --decode-start-position 62 --ignore-eos`.  That mode
+uses zero-initialized history and is not a text-correctness test.
 
 ## Getting Started
 

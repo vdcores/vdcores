@@ -18,7 +18,11 @@ static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
 static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
 static constexpr uint16_t repeatSkipCountMask = 0x1F00U;
 static constexpr int repeatSkipCountShift = 8;
-static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
+static constexpr uint16_t repeatCounterRegMask = 0x0003U;
+static constexpr uint16_t repeatCounterShiftMask = 0x001CU;
+static constexpr int repeatCounterShiftShift = 2;
+static constexpr uint16_t repeatCounterMaskBitsMask = 0x00E0U;
+static constexpr int repeatCounterMaskBitsShift = 5;
 
 static __device__ __forceinline__ void allocwarp_wait_ldu_publication(
     const int lane_id,
@@ -124,11 +128,23 @@ __device__ __forceinline__ void allocwarp_execute(
     auto &curld = m2ld[di.port];
 
     // ID.A: modification to the instruction
+    const int decoded_op = op(inst.opcode);
+    const bool layer_repeat_offset =
+        decoded_op == op(OP_ALLOC_LAYER_TMA_LOAD_1D) ||
+        decoded_op == op(OP_ALLOC_LAYER_LDU_LOAD_1D);
     // A1. shift the address field
     // load the address anyway regardless of allocate or not
     // TODO(zhiyuang): sometimes shuffle (esp, on 64bit) is slow?
     if (lane_id == 0 && di.id_repeat()) {
-      inst.address += addr_accum;
+      if (layer_repeat_offset) {
+        // Keep the common short-context path in LDU. Its existing 16-bit arg
+        // can carry a 16-byte-granular offset without another instruction.
+        if ((addr_accum >> 4) <= 0xFFFFU) {
+          inst.arg = static_cast<uint16_t>(addr_accum >> 4);
+        }
+      } else {
+        inst.address += addr_accum;
+      }
       __mprint("[Loop][loop_counter=%d] Updated address addr + 0x? -> 0x%lx",
                 di.loop_counter, inst.address);
     }
@@ -136,7 +152,6 @@ __device__ __forceinline__ void allocwarp_execute(
     // All layer-indexed dynamic loads in one repeated body share this linear
     // allocator index. The loop control advances it once per logical body,
     // replacing per-load address-arithmetic instruction sequences.
-    const int decoded_op = op(inst.opcode);
 #if defined(DAE_FP8_COUPLED_DETAIL_PROFILE)
     constexpr uint16_t kProfileStoreEventFlag = 1U << 15;
     constexpr uint16_t kProfileStoreAllocationFlag = 1U << 14;
@@ -161,6 +176,22 @@ __device__ __forceinline__ void allocwarp_execute(
       if (lane_id == 0) {
         inst.address += uint64_t(indirect_layer_index) * entry_bytes;
       }
+    }
+    if (lane_id == 0 && layer_repeat_offset && di.id_repeat() &&
+        (addr_accum >> 4) > 0xFFFFU) {
+      // Long-context byte offsets do not fit the compact LDU encoding.
+      // Resolve the already layer-selected pointer here and turn this into
+      // the equivalent direct load. This moves the one pointer read from LDU
+      // to the allocator; it adds neither a command nor a global transaction.
+      inst.address = load_l2_u64(
+          reinterpret_cast<const uint64_t *>(inst.address)) + addr_accum;
+      constexpr uint16_t kMemoryFlags = (1U << flagBits) - 1U;
+      const uint16_t direct_opcode =
+          decoded_op == op(OP_ALLOC_LAYER_TMA_LOAD_1D)
+          ? OP_ALLOC_TMA_LOAD_1D
+          : OP_ALLOC_LDU_LOAD_1D;
+      inst.opcode = (direct_opcode & ~kMemoryFlags) |
+                    (inst.opcode & kMemoryFlags);
     }
     if (decoded_op == op(OP_ALLOC_LAYER_TMA_LOAD_4D) && lane_id == 0) {
       inst.coords[3] += indirect_layer_index;
@@ -368,7 +399,18 @@ __device__ __forceinline__ void allocwarp_execute(
           const bool count_counter_mode = inst.arg & repeatCountCounterModeFlag;
           const bool accumulate_mode = inst.arg & repeatAccumulateModeFlag;
           const int counter_reg = inst.arg & repeatCounterRegMask;
-          const int counter_value = __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
+          const int raw_counter_value =
+              __shfl_sync(ALL_THREADS, di.jmp_cnt, counter_reg);
+          const int counter_shift =
+              (inst.arg & repeatCounterShiftMask) >> repeatCounterShiftShift;
+          const int counter_mask_bits =
+              (inst.arg & repeatCounterMaskBitsMask) >>
+              repeatCounterMaskBitsShift;
+          const int counter_mask = counter_mask_bits == 0
+              ? -1
+              : (1 << counter_mask_bits) - 1;
+          const int counter_value =
+              (raw_counter_value >> counter_shift) & counter_mask;
           const int repeat_count = inst.size + (count_counter_mode ? counter_value : 0);
           const int skip_count = (inst.arg & repeatSkipCountMask) >> repeatSkipCountShift;
           // Accumulator repeats extend the active seed; they do not start a new

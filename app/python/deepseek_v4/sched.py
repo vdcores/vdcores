@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline-PyTorch prefill followed by live VDCores DeepSeek-V4 decode."""
+"""User-facing demo for offline prefill and live VDCores DeepSeek-V4 decode."""
 
 from __future__ import annotations
 
@@ -18,43 +18,17 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmarks.deepseek_v4_resident_one_launch import (
-    ResidentOneLaunchDecode,
-    build_argument_parser,
-)
 from dae.deepseek_v4 import DeepSeekV4FlashConfig
+from dae.deepseek_v4_inference import (
+    DeepSeekV4ProductionInference,
+    MAX_DECODE_TOKENS,
+    MAX_LIVE_SEQUENCE,
+)
 from dae.deepseek_v4_live import DeepSeekV4LiveDecodeState
 from dae.deepseek_v4_quant import dequantize_nvfp4
 
 
 DEFAULT_PROMPT = "Write a hello world program in Python."
-
-
-def _production_args(
-    checkpoint: str,
-    mxfp_ffn_root: str | None,
-    *,
-    context_length: int,
-    token_id: int,
-) -> argparse.Namespace:
-    argv = [
-        "--checkpoint",
-        checkpoint,
-        "--layers",
-        "43",
-        "--context-length",
-        str(context_length),
-        "--token-id",
-        str(token_id),
-        "--vocab-size",
-        str(DeepSeekV4FlashConfig().vocab_size),
-        "--bf16-head",
-        "--loopback-hc-fusion",
-        "--allow-token-variation",
-    ]
-    if mxfp_ffn_root is not None:
-        argv.extend(("--mxfp-ffn-root", mxfp_ffn_root))
-    return build_argument_parser().parse_args(argv)
 
 
 def _load_source_module(name: str, path: Path):
@@ -310,7 +284,18 @@ def main() -> None:
             "then greedily decode one prepared VDCores launch per token."
         )
     )
-    parser.add_argument("prompt", nargs="?", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        help="legacy positional alias for --user-prompt",
+    )
+    parser.add_argument(
+        "--user-prompt",
+        help=(
+            "user message to format and prefill; defaults to a small "
+            "hello-world request"
+        ),
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--mxfp-ffn-root")
     parser.add_argument(
@@ -325,6 +310,33 @@ def main() -> None:
     )
     parser.add_argument("-N", "--max-new-tokens", type=int, default=4)
     parser.add_argument(
+        "--max-decode-seconds",
+        type=float,
+        help="stop before the next token once this decode wall-time budget expires",
+    )
+    parser.add_argument(
+        "--stop-token-id",
+        type=int,
+        action="append",
+        default=[],
+        help="additional generated token that ends decoding; may be repeated",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="do not stop on the tokenizer's EOS token",
+    )
+    parser.add_argument(
+        "--verbose-prepare",
+        action="store_true",
+        help="print the internal schedule report for every reusable flow",
+    )
+    parser.add_argument(
+        "--quiet-stream",
+        action="store_true",
+        help="suppress cumulative per-token text while retaining final output",
+    )
+    parser.add_argument(
         "--input-token-id",
         type=int,
         help=(
@@ -332,20 +344,44 @@ def main() -> None:
             "for a fast context-one smoke run"
         ),
     )
+    parser.add_argument(
+        "--decode-start-position",
+        type=int,
+        help=(
+            "decode-only starting position; requires --input-token-id and "
+            "uses the already allocated live-cache layout"
+        ),
+    )
     args = parser.parse_args()
 
-    if not 1 <= args.max_new_tokens <= 64:
-        parser.error("max-new-tokens must be in [1,64]")
+    if args.user_prompt is not None and args.prompt is not None:
+        parser.error("use either --user-prompt or the positional prompt, not both")
+    if args.user_prompt is not None:
+        user_prompt = args.user_prompt
+    elif args.prompt is not None:
+        user_prompt = args.prompt
+    else:
+        user_prompt = DEFAULT_PROMPT
+    if not 1 <= args.max_new_tokens <= MAX_DECODE_TOKENS:
+        parser.error(
+            f"max-new-tokens must be in [1,{MAX_DECODE_TOKENS}]"
+        )
+    if args.max_decode_seconds is not None and args.max_decode_seconds <= 0:
+        parser.error("max-decode-seconds must be positive")
+    if args.decode_start_position is not None and args.input_token_id is None:
+        parser.error("decode-start-position requires input-token-id")
+    if args.decode_start_position is not None and args.decode_start_position < 0:
+        parser.error("decode-start-position must be non-negative")
     cfg = DeepSeekV4FlashConfig()
     checkpoint = Path(args.checkpoint).resolve()
     device = torch.device("cuda")
 
     if args.input_token_id is None:
         tokenizer, prompt_tokens = _tokenize_prompt(
-            checkpoint, args.prompt, args.thinking_mode
+            checkpoint, user_prompt, args.thinking_mode
         )
         print(
-            f"[prompt] tokens={len(prompt_tokens)} text={args.prompt!r}",
+            f"[prompt] tokens={len(prompt_tokens)} text={user_prompt!r}",
             flush=True,
         )
     else:
@@ -355,7 +391,20 @@ def main() -> None:
         prompt_tokens = [args.input_token_id]
         print(f"[prompt] token_id={args.input_token_id}", flush=True)
 
-    max_seq_len = len(prompt_tokens) + args.max_new_tokens
+    first_position = (
+        args.decode_start_position
+        if args.decode_start_position is not None
+        else len(prompt_tokens) - 1
+    )
+    # The final launch consumes position first+N-1, so first+N is the requested
+    # live-cache extent and still permits position 65,535 at the model limit.
+    requested_seq_len = first_position + args.max_new_tokens
+    if requested_seq_len > MAX_LIVE_SEQUENCE:
+        parser.error(
+            f"prompt plus decode budget exceeds the "
+            f"{MAX_LIVE_SEQUENCE:,}-token live cache"
+        )
+    max_seq_len = requested_seq_len
     state = DeepSeekV4LiveDecodeState(
         max_seq_len, device=device, config=cfg
     )
@@ -368,87 +417,77 @@ def main() -> None:
             checkpoint, converted, prompt_tokens, state, device
         )
 
-    flows: list[ResidentOneLaunchDecode] = []
-    weight_source = None
+    inference = DeepSeekV4ProductionInference(
+        checkpoint,
+        live_state=state,
+        first_position=first_position,
+        max_new_tokens=args.max_new_tokens,
+        initial_token_id=prompt_tokens[-1],
+        mxfp_ffn_root=args.mxfp_ffn_root,
+        device=device,
+    )
     prepare_started = time.perf_counter()
     print(
         "[prepare] loading one resident VDCores checkpoint and preparing "
-        f"{args.max_new_tokens} position-specialized images",
+        f"{len(inference.flow_plans)} reusable position plans for "
+        f"{args.max_new_tokens} decode tokens "
+        f"variants={','.join(plan.variant for plan in inference.flow_plans)}",
         flush=True,
     )
-    # Schedule construction may bind TMA descriptors to persistent state but
-    # must never publish into it.  Keep a small setup-only guard so preparing
-    # future positions cannot silently alter the first decode token.
-    state_before_prepare = tuple(
-        tensor.clone() for tensor in state.persistent_tensors()
+    preparations = inference.prepare(
+        verbose=args.verbose_prepare,
+        verify_state_unchanged=True,
     )
-    for step in range(args.max_new_tokens):
-        flow_args = _production_args(
-            str(checkpoint),
-            args.mxfp_ffn_root,
-            context_length=len(prompt_tokens) + step,
-            token_id=prompt_tokens[-1],
+    for plan_index, preparation in enumerate(preparations):
+        plan = preparation.plan
+        print(
+            "[prepare] "
+            f"plans={plan_index + 1}/{len(preparations)} "
+            f"variant={plan.variant} "
+            f"positions={plan.first_position}..{plan.last_position} "
+            f"canonical_max={plan.max_position} "
+            f"elapsed_s={preparation.elapsed_s:.3f} "
+            f"free_gib={preparation.free_bytes / (1 << 30):.3f}",
+            flush=True,
         )
-        flow = ResidentOneLaunchDecode(
-            flow_args,
-            device,
-            weight_source=weight_source,
-            live_state=state,
-        )
-        if weight_source is None:
-            weight_source = flow
-        flows.append(flow)
-    torch.cuda.synchronize(device)
-    if any(
-        not torch.equal(
-            before.view(torch.uint8), after.view(torch.uint8)
-        )
-        for before, after in zip(
-            state_before_prepare, state.persistent_tensors(), strict=True
-        )
-    ):
-        raise RuntimeError(
-            "preparing future VDCores images modified live decode state"
-        )
-    del state_before_prepare
     print(
         f"[prepare] complete elapsed_s={time.perf_counter() - prepare_started:.3f}",
         flush=True,
     )
 
-    token = prompt_tokens[-1]
     generated: list[int] = []
-    cuda_ms: list[float] = []
-    device_ms: list[float] = []
-    wall_ms: list[float] = []
-    eos_token_id = None if tokenizer is None else tokenizer.eos_token_id
-    for step, flow in enumerate(flows):
-        wall_started = time.perf_counter_ns()
-        flow.set_input_token(token)
-        output, elapsed_ms, _ = flow.run_once()
-        elapsed_wall_ms = (time.perf_counter_ns() - wall_started) / 1.0e6
-        frontier_ms = flow.device_frontier_ms()
-        generated.append(output)
-        cuda_ms.append(elapsed_ms)
-        device_ms.append(frontier_ms)
-        wall_ms.append(elapsed_wall_ms)
+    stop_token_ids = set(args.stop_token_id)
+    if (
+        tokenizer is not None
+        and tokenizer.eos_token_id is not None
+        and not args.ignore_eos
+    ):
+        stop_token_ids.add(tokenizer.eos_token_id)
+
+    def report_step(step) -> None:
+        generated.append(step.output_token)
         print(
             "[decode] "
-            f"step={step} position={len(prompt_tokens) - 1 + step} "
-            f"input_token={token} output_token={output} "
-            f"cuda_ms={elapsed_ms:.6f} device_ms={frontier_ms:.6f} "
-            f"wall_ms={elapsed_wall_ms:.6f}",
+            f"step={step.step} position={step.position} "
+            f"variant={step.variant} input_token={step.input_token} "
+            f"output_token={step.output_token} "
+            f"cuda_ms={step.cuda_ms:.6f} device_ms={step.device_ms:.6f} "
+            f"wall_ms={step.wall_ms:.6f}",
             flush=True,
         )
-        if tokenizer is not None:
+        if tokenizer is not None and not args.quiet_stream:
             print(
                 f"[stream] {tokenizer.decode(generated, skip_special_tokens=True)!r}",
                 flush=True,
             )
-        token = output
-        if eos_token_id is not None and output == eos_token_id:
-            break
 
+    result = inference.generate(
+        stop_token_ids=stop_token_ids,
+        max_decode_seconds=args.max_decode_seconds,
+        on_step=report_step,
+    )
+
+    print(f"[stop] reason={result.stop_reason}", flush=True)
     print(f"[output] token_ids={generated}", flush=True)
     if tokenizer is not None:
         completion = tokenizer.decode(generated, skip_special_tokens=True)
@@ -457,6 +496,9 @@ def main() -> None:
         )
         print(f"[output] completion={completion!r}", flush=True)
         print(f"[output] full_text={full_text!r}", flush=True)
+    cuda_ms = [step.cuda_ms for step in result.steps]
+    device_ms = [step.device_ms for step in result.steps]
+    wall_ms = [step.wall_ms for step in result.steps]
     median_wall = statistics.median(wall_ms)
     print(
         "[perf] "

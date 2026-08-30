@@ -1,4 +1,4 @@
-"""Persistent state shared by prepared DeepSeek-V4 decode-token images."""
+"""Persistent state shared by reusable DeepSeek-V4 decode flows."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ class DeepSeekV4LiveDecodeState:
     Storage is family-major and has a constant byte stride between layers so a
     compact VDCores layer loop can address both reads and writebacks from its
     existing loop counters.  Scratch tensors remain owned by each prepared
-    token image; only state that survives a token launch lives here.
+    structural flow; only state that survives a token launch lives here.
     """
 
     def __init__(
@@ -59,6 +59,24 @@ class DeepSeekV4LiveDecodeState:
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+
+        # Before the sliding window fills, exhaustive CSA attention is packed
+        # as [valid window, compressed rows].  Those regions overlap the
+        # not-yet-written tail of the 128-row window, so retain the at-most-31
+        # completed compressed rows separately until position 127.  This is a
+        # small, explicit state buffer rather than an in-place overlapping
+        # cache move.
+        self.short_csa_compressed = torch.zeros(
+            (
+                len(self.layers_by_kind["csa"]),
+                self.config.sliding_window // 4,
+                self.config.head_dim,
+            ),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._prepared_position: int | None = None
+        self._pending_short_csa: tuple[int, int] | None = None
 
         csa_layers = self.layers_by_kind["csa"]
         csa_capacity = self.max_seq_len // 4
@@ -177,6 +195,7 @@ class DeepSeekV4LiveDecodeState:
 
         return (
             *self.attention_cache_storage.values(),
+            self.short_csa_compressed,
             self.index_cache_storage,
             self.csa_pool_values,
             self.csa_pool_scores,
@@ -185,6 +204,57 @@ class DeepSeekV4LiveDecodeState:
             self.hca_pool_values,
             self.hca_pool_scores,
         )
+
+    @torch.inference_mode()
+    def prepare_decode_position(self, position: int) -> None:
+        """Pack short-context CSA rows before one sequential decode token."""
+
+        position = int(position)
+        if not 0 <= position < self.max_seq_len:
+            raise ValueError("decode position is outside live-state capacity")
+        if self._prepared_position is not None:
+            if position == self._prepared_position:
+                return
+            if position != self._prepared_position + 1:
+                raise ValueError(
+                    "reusable live decode positions must advance sequentially"
+                )
+        elif 0 < position < 4:
+            # The PyTorch importer mirrors the checkpoint's compact first
+            # group in rows 0..3.  Reusable VDCores state uses the ordinary
+            # half (rows 4..7) from token zero onward so the same address
+            # transform applies before and after the first compression.
+            for storage in (
+                self.csa_pool_values,
+                self.csa_pool_scores,
+                self.index_pool_values,
+                self.index_pool_scores,
+            ):
+                storage[:, 0, 4 : 4 + position].copy_(
+                    storage[:, 0, :position]
+                )
+
+        if self._pending_short_csa is not None:
+            packed_row, compressed_row = self._pending_short_csa
+            self.short_csa_compressed[:, compressed_row].copy_(
+                self.attention_cache_storage["csa"][:, packed_row]
+            )
+            self._pending_short_csa = None
+
+        window = self.config.sliding_window
+        if position < window:
+            completed = position // 4
+            if completed:
+                self.attention_cache_storage["csa"][
+                    :, position + 1 : position + 1 + completed
+                ].copy_(self.short_csa_compressed[:, :completed])
+            if (position + 1) % 4 == 0 and position + 1 < window:
+                self._pending_short_csa = (
+                    position + 1 + completed,
+                    completed,
+                )
+
+        self._prepared_position = position
 
     @torch.inference_mode()
     def import_pytorch_prefill(self, model, prefix_length: int) -> None:
@@ -229,6 +299,12 @@ class DeepSeekV4LiveDecodeState:
                 destination[
                     window : window + compressed_rows
                 ].copy_(source[window : window + compressed_rows])
+                if kind == "csa" and prefix_length < window:
+                    self.short_csa_compressed[
+                        self.layer_offsets[layer_id][1], :compressed_rows
+                    ].copy_(
+                        source[window : window + compressed_rows]
+                    )
 
             if kind == "csa":
                 index_source = layer.attn.indexer.kv_cache[0]

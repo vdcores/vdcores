@@ -257,6 +257,10 @@ class Launcher:
         self.mptrs = [0 for _ in range(num_sms)]
 
         self.tmas = []
+        # Descriptor construction is pure in the tensor address/layout and
+        # tile geometry.  Live decode images may share this cache when their
+        # weights and serial workspaces are shared as well.
+        self.tma_descriptor_cache = {}
         # Schedules may own setup-only packed tensors whose addresses are
         # embedded in memory plans. Keep the instruction sources alive for
         # the lifetime of the launcher instead of retaining only encoded

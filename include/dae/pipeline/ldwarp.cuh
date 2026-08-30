@@ -1535,8 +1535,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break; }
       case op(OP_ALLOC_INDIRECT_TMA_LOAD_1D):
       case op(OP_ALLOC_LAYER_TMA_LOAD_1D): {
-        const uint64_t resolved = load_l2_u64(
+        uint64_t resolved = load_l2_u64(
             reinterpret_cast<const uint64_t *>(inst.address));
+        if (op(inst.opcode) == op(OP_ALLOC_LAYER_TMA_LOAD_1D)) {
+          resolved += uint64_t(inst.arg) << 4;
+        }
         if (resolved == 0) {
           asm volatile("trap;");
         }
@@ -1581,8 +1584,11 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         break; }
       case op(OP_ALLOC_INDIRECT_LDU_LOAD_1D):
       case op(OP_ALLOC_LAYER_LDU_LOAD_1D): {
-        const uint64_t resolved = load_l2_u64(
+        uint64_t resolved = load_l2_u64(
             reinterpret_cast<const uint64_t *>(inst.address));
+        if (op(inst.opcode) == op(OP_ALLOC_LAYER_LDU_LOAD_1D)) {
+          resolved += uint64_t(inst.arg) << 4;
+        }
         if (resolved == 0) {
           asm volatile("trap;");
         }

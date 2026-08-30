@@ -671,11 +671,29 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT32_UMMA_SM100) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100) {
-  DAE_UNUSED(thread_id, pc, count, finish, scratch_space, st_insts,
+  DAE_UNUSED(thread_id, pc, finish, scratch_space, st_insts,
              tma_descs, global_bars);
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  int active_tokens = inst.args[0];
+  int ring_port_mask = inst.args[1];
+  if (ring_port_mask & 0x8000U) {
+    const int split_capacity = (active_tokens & 0x3FU) + 1;
+    const int row_start = active_tokens >> 6;
+    const int attention_kind = (ring_port_mask >> 2) & 0x3;
+    const int counter_reg = (ring_port_mask >> 4) & 0x3;
+    const int position = count[counter_reg];
+    const int window_rows = min(128, position + 1);
+    int total_rows = window_rows;
+    if (attention_kind == 1) {
+      total_rows += min(512, (position + 1) / 4);
+    } else if (attention_kind == 2) {
+      total_rows += (position + 1) / 128;
+    }
+    active_tokens = max(0, min(split_capacity, total_rows - row_start));
+    ring_port_mask &= 0x3;
+  }
   task_dsv4_attention_split64_umma_sm100(
-      sm_id, inst.args[0], inst.args[1],
+      sm_id, active_tokens, ring_port_mask,
       tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
       internal_ring_full_phase_mask, smem_base, st_insts,
       m2c, c2m, g_events);
@@ -691,8 +709,25 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100) {
         inst.args[1], inst.args[2], smem_base,
         get_slot_address(smem_base, numSlots), st_insts, m2c, c2m);
   } else {
+    int num_splits = inst.args[0];
+    int output_group = inst.args[2];
+    if (num_splits & 0x8000U) {
+      const int max_splits = num_splits & 0x7FFFU;
+      const int attention_kind = (output_group >> 2) & 0x3;
+      const int counter_reg = (output_group >> 4) & 0x3;
+      const int position = count[counter_reg];
+      const int window_rows = min(128, position + 1);
+      int total_rows = window_rows;
+      if (attention_kind == 1) {
+        total_rows += min(512, (position + 1) / 4);
+      } else if (attention_kind == 2) {
+        total_rows += (position + 1) / 128;
+      }
+      num_splits = min(max_splits, (total_rows + 63) / 64);
+      output_group &= 0x3;
+    }
     task_dsv4_attention_split_reduce_fp8_sm100<2>(
-        sm_id, inst.args[0], inst.args[1], inst.args[2],
+        sm_id, num_splits, inst.args[1], output_group,
         get_slot_address(smem_base, numSlots), st_insts, m2c, c2m, g_events);
   }
 #endif
@@ -965,10 +1000,15 @@ DAE_COMPUTE_OP_HANDLER(OP_DSV4_FP32_RMS_ROPE_SHARD128) {
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_INDEX_SCORE) {
-  DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, tmem_base_ptr,
+  DAE_UNUSED(sm_id, thread_id, pc, finish, st_insts, tmem_base_ptr,
              tmem_mma_barrier, tmem_mma_phase, scratch_space, g_events);
+  const int counter_selector = inst.args[2];
+  const int active_rows = counter_selector == 0
+      ? inst.args[1] + inst.args[0]
+      : (count[counter_selector - 1] + 1) / 4;
   task_dsv4_index_score(
-      inst.args[0], smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
+      inst.args[0], inst.args[1], active_rows,
+      smem_base, get_slot_address(smem_base, numSlots), m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_DSV4_TOPK_512) {

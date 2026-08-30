@@ -61,17 +61,14 @@ class DeepSeekV4FlashConfig:
         ]
 
 
-def deepseek_v4_rope_table(
-    position: int,
+def _deepseek_v4_rope_inverse(
     *,
-    compressed: bool = False,
-    config: DeepSeekV4FlashConfig | None = None,
-    device: torch.device | str | None = None,
+    compressed: bool,
+    config: DeepSeekV4FlashConfig,
+    device: torch.device | str | None,
 ) -> torch.Tensor:
-    """Build the checkpoint's interleaved 64-wide main/compressor RoPE row."""
-    if position < 0:
-        raise ValueError("RoPE position must be non-negative")
-    config = config or DeepSeekV4FlashConfig()
+    """Return the checkpoint's exact FP32 inverse-frequency vector."""
+
     dim = config.rope_dim
     base = config.compress_rope_theta if compressed else config.rope_theta
     exponents = torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
@@ -98,8 +95,47 @@ def deepseek_v4_rope_table(
         ramp = ((ramp - low) / max(high - low, 0.001)).clamp(0.0, 1.0)
         extrapolation = 1.0 - ramp
         inverse = interpolation * (1.0 - extrapolation) + inverse * extrapolation
+    return inverse
+
+
+def deepseek_v4_rope_table(
+    position: int,
+    *,
+    compressed: bool = False,
+    config: DeepSeekV4FlashConfig | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Build the checkpoint's interleaved 64-wide main/compressor RoPE row."""
+    if position < 0:
+        raise ValueError("RoPE position must be non-negative")
+    config = config or DeepSeekV4FlashConfig()
+    inverse = _deepseek_v4_rope_inverse(
+        compressed=compressed, config=config, device=device
+    )
     angles = inverse * float(position)
     return torch.stack((angles.cos(), angles.sin()), dim=1)
+
+
+def deepseek_v4_rope_bank(
+    num_positions: int,
+    *,
+    compressed: bool = False,
+    config: DeepSeekV4FlashConfig | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Build exact checkpoint RoPE rows for positions ``[0,num_positions)``."""
+
+    if num_positions <= 0:
+        raise ValueError("RoPE bank must contain at least one position")
+    config = config or DeepSeekV4FlashConfig()
+    inverse = _deepseek_v4_rope_inverse(
+        compressed=compressed, config=config, device=device
+    )
+    positions = torch.arange(
+        num_positions, dtype=torch.float32, device=device
+    )[:, None]
+    angles = positions * inverse[None, :]
+    return torch.stack((angles.cos(), angles.sin()), dim=-1)
 
 
 def _apply_partial_rope_64(
@@ -371,6 +407,7 @@ def hc_head_reference(
 
 __all__ = [
     "DeepSeekV4FlashConfig",
+    "deepseek_v4_rope_bank",
     "deepseek_v4_rope_table",
     "apply_partial_rope_128_64",
     "apply_partial_rope_512_64",

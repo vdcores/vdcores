@@ -913,27 +913,84 @@ class Dsv4AttentionSplit32UmmaSm100(ComputeInstruction):
 class Dsv4AttentionSplit64UmmaSm100(ComputeInstruction):
     """Produce one B64 BF16 partial from a retained internal KV ring."""
 
-    def __init__(self, active_tokens: int, *, ring_port_mask: int = 1):
+    _KINDS = {"swa": 0, "csa": 1, "hca": 2}
+
+    def __init__(
+        self,
+        active_tokens: int,
+        *,
+        ring_port_mask: int = 1,
+        row_start: int = 0,
+        position_counter_reg: int | None = None,
+        attention_kind: str | None = None,
+    ):
         if not 1 <= active_tokens <= 64:
             raise ValueError("B64 attention split must contain 1..64 tokens")
         if ring_port_mask not in (1, 2, 3):
             raise ValueError("attention ring must select LDU0 and/or LDU1")
+        dynamic = position_counter_reg is not None
+        if dynamic != (attention_kind is not None):
+            raise ValueError(
+                "dynamic split attention requires both a counter and kind"
+            )
+        if dynamic:
+            if not 0 <= position_counter_reg < config.num_loop_counters:
+                raise ValueError("split-attention counter is outside the runtime bank")
+            if attention_kind not in self._KINDS:
+                raise ValueError("unknown dynamic split-attention kind")
+            if not 0 <= row_start <= 0x3FF:
+                raise ValueError("dynamic split-attention row start exceeds 10 bits")
+            encoded_tokens = (active_tokens - 1) | (row_start << 6)
+            encoded_control = (
+                ring_port_mask
+                | (self._KINDS[attention_kind] << 2)
+                | (position_counter_reg << 4)
+                | 0x8000
+            )
+        else:
+            encoded_tokens = active_tokens
+            encoded_control = ring_port_mask
         super().__init__(
             opcode=opcode.OP_DSV4_ATTENTION_SPLIT64_UMMA_SM100,
-            args=[active_tokens, ring_port_mask],
+            args=[encoded_tokens, encoded_control],
         )
 
 
 class Dsv4AttentionSplitReduceFp8Sm100(ComputeInstruction):
     """Merge attention partials and emit inverse-RoPE native FP8."""
 
-    def __init__(self, num_splits: int, head: int, output_group: int = 0):
+    _KINDS = {"swa": 0, "csa": 1, "hca": 2}
+
+    def __init__(
+        self,
+        num_splits: int,
+        head: int,
+        output_group: int = 0,
+        *,
+        position_counter_reg: int | None = None,
+        attention_kind: str | None = None,
+    ):
         if not 1 <= num_splits <= 24:
             raise ValueError("attention reducer split count must be in [1,24]")
         if not 0 <= head < 64:
             raise ValueError("attention reducer head must be in [0,64)")
         if output_group not in (0, 1):
             raise ValueError("attention reducer output group must be 0 or 1")
+        dynamic = position_counter_reg is not None
+        if dynamic != (attention_kind is not None):
+            raise ValueError(
+                "dynamic attention reduction requires both a counter and kind"
+            )
+        if dynamic:
+            if not 0 <= position_counter_reg < config.num_loop_counters:
+                raise ValueError("attention-reducer counter is outside the runtime bank")
+            if attention_kind not in self._KINDS:
+                raise ValueError("unknown dynamic attention-reducer kind")
+            num_splits |= 0x8000
+            output_group |= (
+                self._KINDS[attention_kind] << 2
+                | position_counter_reg << 4
+            )
         super().__init__(
             opcode=opcode.OP_DSV4_ATTENTION_SPLIT_REDUCE_FP8_SM100,
             args=[num_splits, head, output_group],
@@ -1349,10 +1406,29 @@ class Dsv4Fp32RmsRopeShard128(ComputeInstruction):
 
 
 class Dsv4IndexScore(ComputeInstruction):
-    def __init__(self, rows: int):
+    def __init__(
+        self,
+        rows: int,
+        *,
+        row_start: int = 0,
+        position_counter_reg: int | None = None,
+    ):
         if rows <= 0 or rows > 0xFFFF:
             raise ValueError("DeepSeek index-score rows must fit in uint16")
-        super().__init__(opcode=opcode.OP_DSV4_INDEX_SCORE, args=[rows])
+        if row_start < 0 or row_start > 0xFFFF:
+            raise ValueError("DeepSeek index-score row start must fit in uint16")
+        if position_counter_reg is not None and not (
+            0 <= position_counter_reg < config.num_loop_counters
+        ):
+            raise ValueError("DeepSeek index-score counter is outside the runtime bank")
+        super().__init__(
+            opcode=opcode.OP_DSV4_INDEX_SCORE,
+            args=[
+                rows,
+                row_start,
+                0 if position_counter_reg is None else position_counter_reg + 1,
+            ],
+        )
 
 
 class Dsv4TopK512(ComputeInstruction):
@@ -2115,7 +2191,9 @@ class MemoryInstruction(Instruction):
         self.set_cords(cords)
         self.annotation = {}
         if address is not None:
-            addr_bytes = address.to_bytes(8, byteorder="little")
+            addr_bytes = (address & ((1 << 64) - 1)).to_bytes(
+                8, byteorder="little"
+            )
             for i in range(4):
                 self.cords[i] = int.from_bytes(addr_bytes[i * 2 : i * 2 + 2], byteorder="little")
 
@@ -2298,8 +2376,21 @@ class ResetIndirectLayer(MemoryInstruction):
 
 
 class CounterOffsetMemoryInstruction:
-    def __init__(self, counter_reg: int, inst: MemoryInstruction, delta):
-        offsets = [(counter_reg, delta)]
+    def __init__(
+        self,
+        counter_reg: int,
+        inst: MemoryInstruction,
+        delta,
+        *,
+        counter_shift: int = 0,
+        counter_mask_bits: int = 0,
+    ):
+        offsets = [(
+            counter_reg,
+            delta,
+            counter_shift,
+            counter_mask_bits,
+        )]
         if isinstance(inst, CounterOffsetMemoryInstruction):
             self.inst = inst.inst
             self.offsets = inst.offsets + offsets
@@ -2331,7 +2422,14 @@ class CounterOffsetMemoryInstruction:
         return self
 
     def copy(self):
-        new_inst = CounterOffsetMemoryInstruction(self.offsets[0][0], self.inst.copy(), self.offsets[0][1])
+        counter_reg, delta, counter_shift, counter_mask_bits = self.offsets[0]
+        new_inst = CounterOffsetMemoryInstruction(
+            counter_reg,
+            self.inst.copy(),
+            delta,
+            counter_shift=counter_shift,
+            counter_mask_bits=counter_mask_bits,
+        )
         new_inst.offsets = self.offsets.copy()
         return new_inst
 
@@ -2348,7 +2446,11 @@ class RepeatM(MemoryInstruction):
     ACCUMULATE_MODE_FLAG = 0x2000
     SKIP_COUNT_SHIFT = 8
     SKIP_COUNT_MASK = 0x1F
-    COUNTER_REG_MASK = 0x00FF
+    COUNTER_REG_MASK = 0x0003
+    COUNTER_SHIFT_SHIFT = 2
+    COUNTER_SHIFT_MASK = 0x001C
+    COUNTER_MASK_BITS_SHIFT = 5
+    COUNTER_MASK_BITS_MASK = 0x00E0
 
     def __init__(
         self,
@@ -2360,6 +2462,8 @@ class RepeatM(MemoryInstruction):
         counter_reg: int | None = None,
         count_counter_reg: int | None = None,
         accumulate: bool = False,
+        counter_shift: int = 0,
+        counter_mask_bits: int = 0,
     ):
         if reg_end is None:
             reg_end = reg + 1
@@ -2368,6 +2472,10 @@ class RepeatM(MemoryInstruction):
         assert reg_end > reg, "reg_end must be greater than reg"
         arg = 0
         encoded_counter_reg = None
+        if not 0 <= counter_shift <= 7:
+            raise ValueError("REPEAT counter shift must be in [0,7]")
+        if not 0 <= counter_mask_bits <= 7:
+            raise ValueError("REPEAT counter mask width must be in [0,7]")
         if counter_reg is not None:
             assert 0 <= counter_reg <= self.COUNTER_REG_MASK, "counter_reg must fit in the REPEAT counter field"
             encoded_counter_reg = counter_reg
@@ -2382,6 +2490,10 @@ class RepeatM(MemoryInstruction):
             arg |= self.ACCUMULATE_MODE_FLAG
         if encoded_counter_reg is not None:
             arg |= encoded_counter_reg
+            arg |= counter_shift << self.COUNTER_SHIFT_SHIFT
+            arg |= counter_mask_bits << self.COUNTER_MASK_BITS_SHIFT
+        elif counter_shift or counter_mask_bits:
+            raise ValueError("REPEAT counter transform requires a counter")
         super().__init__(
             opcode=opcode.OP_REPEAT,
             num_slots=(reg_end << 8) | reg,
@@ -2392,7 +2504,13 @@ class RepeatM(MemoryInstruction):
         )
 
     @classmethod
-    def byCounter(cls, counter_reg: int, *steps):
+    def byCounter(
+        cls,
+        counter_reg: int,
+        *steps,
+        counter_shift: int = 0,
+        counter_mask_bits: int = 0,
+    ):
         insts = []
         if len(steps) == 0:
             return insts
@@ -2411,28 +2529,60 @@ class RepeatM(MemoryInstruction):
             else:
                 regcords.append([i, i + 1, cords])
 
-        insts.append(cls(1, reg=0, reg_end=32, delta_cords=[0], counter_reg=counter_reg))
+        insts.append(cls(
+            1,
+            reg=0,
+            reg_end=32,
+            delta_cords=[0],
+            counter_reg=counter_reg,
+            counter_shift=counter_shift,
+            counter_mask_bits=counter_mask_bits,
+        ))
         for reg_start, reg_end, delta_cords in regcords:
-            insts += [cls(1, reg=reg_start, reg_end=reg_end, delta_cords=delta_cords, counter_reg=counter_reg)]
+            insts += [cls(
+                1,
+                reg=reg_start,
+                reg_end=reg_end,
+                delta_cords=delta_cords,
+                counter_reg=counter_reg,
+                counter_shift=counter_shift,
+                counter_mask_bits=counter_mask_bits,
+            )]
         for inst, _ in steps:
             insts.append(inst)
         insts[-1].jump()
         return insts
 
     @classmethod
-    def offsetByCounter(cls, counter_reg: int, inst, delta):
-        return cls.byCounter(counter_reg, (inst, delta))
+    def offsetByCounter(
+        cls,
+        counter_reg: int,
+        inst,
+        delta,
+        *,
+        counter_shift: int = 0,
+        counter_mask_bits: int = 0,
+    ):
+        return cls.byCounter(
+            counter_reg,
+            (inst, delta),
+            counter_shift=counter_shift,
+            counter_mask_bits=counter_mask_bits,
+        )
 
     @classmethod
     def offsetByCounters(cls, counter_offsets, inst):
-        offsets = [(counter_reg, delta) for counter_reg, delta in counter_offsets]
+        offsets = [
+            (*offset, 0, 0) if len(offset) == 2 else tuple(offset)
+            for offset in counter_offsets
+        ]
         if len(offsets) == 0:
             return inst
         target_reg = len(offsets)
         assert target_reg < 32, "offsetByCounters can combine at most 31 counter offsets"
 
         insts = [cls(1, reg=0, reg_end=32, delta_cords=[0])]
-        for counter_reg, delta in offsets:
+        for counter_reg, delta, counter_shift, counter_mask_bits in offsets:
             if isinstance(delta, list):
                 delta_cords = delta
                 delta_addr = None
@@ -2449,6 +2599,8 @@ class RepeatM(MemoryInstruction):
                 delta_cords=delta_cords,
                 counter_reg=counter_reg,
                 accumulate=True,
+                counter_shift=counter_shift,
+                counter_mask_bits=counter_mask_bits,
             ))
         insts.append(inst)
         insts[-1].jump()
@@ -3634,7 +3786,26 @@ class TmaTensor(MemoryInstruction):
         self.mode = action
         self.size = self.mat.element_size() * tileM * tileN
         self.num_slots = bytes2slots(self.size)
-        rank, desc = tma_func(self.mat, tileM, tileN)
+        cache = getattr(self.launcher, "tma_descriptor_cache", None)
+        cache_key = (
+            tma_func,
+            self.mat.device.type,
+            self.mat.device.index,
+            self.mat.data_ptr(),
+            self.mat.dtype,
+            tuple(self.mat.shape),
+            tuple(self.mat.stride()),
+            self.mat.storage_offset(),
+            int(tileM),
+            int(tileN),
+        )
+        cached = None if cache is None else cache.get(cache_key)
+        if cached is None:
+            rank, desc = tma_func(self.mat, tileM, tileN)
+            if cache is not None:
+                cache[cache_key] = (rank, desc)
+        else:
+            rank, desc = cached
         self.rank = rank
         self.opcode = self._rank2opcode(rank, action)
         self.cord_func = cord_func_builder(self.mat, rank)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cuda/atomic>
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
@@ -1833,6 +1834,44 @@ __device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
     }
     DAE_DSV4_ATTN_EVENT(3);
 
+    // A reusable position image is sized for its largest decode context.
+    // Splits beyond the current candidate count still consume their ordinary
+    // LDU/STU messages, but publish the exact softmax identity partial.  This
+    // preserves the queue and reducer contracts without issuing useless UMMA.
+    if (active_tokens == 0) {
+        c2m.push(tid, q_slots);
+        const int metadata_slots = m2c.template pop<0>();
+        const ComputeRawAddressSlots raw_slots{st_insts};
+        auto *metadata = raw_slots.template get<float>(metadata_slots);
+        if (tid < M) {
+            cuda::atomic_ref<float, cuda::thread_scope_device>(
+                metadata[tid * 2]
+            ).store(-FLT_MAX, cuda::memory_order_release);
+            cuda::atomic_ref<float, cuda::thread_scope_device>(
+                metadata[tid * 2 + 1]
+            ).store(0.0f, cuda::memory_order_release);
+        }
+#pragma unroll
+        for (int tile = 0; tile < D_TILES; ++tile) {
+            if (tile + 1 == D_TILES) {
+                if (tid == 0) {
+                    ring_empty[0].arrive();
+                }
+                c2m.push(tid, ring_slots);
+            }
+            const int output_slots = m2c.template pop<0>();
+            auto *output = static_cast<data_t *>(
+                get_slot_address(smem_base, extract(output_slots)));
+            for (int item = tid; item < M * D_TILE; item += 128) {
+                output[item] = data_t(0.0f);
+            }
+            __sync_compute_group(128);
+            cutlass::arch::fence_view_async_shared();
+            c2m.template push<31, true, false>(tid, output_slots);
+        }
+        return;
+    }
+
     tiled_qk.accumulate_ = UMMA::ScaleOut::Zero;
     if (tid < numThreadsPerWarp) {
         // QK remains one four-tile loop so the full inference image does not
@@ -1880,8 +1919,12 @@ __device__ __forceinline__ void task_dsv4_attention_split64_umma_sm100(
     DAE_DSV4_ATTN_EVENT(6);
     const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
     if ((tid & 16) == 0) {
-        metadata[logical_row * 2] = row_max;
-        metadata[logical_row * 2 + 1] = row_sum;
+        cuda::atomic_ref<float, cuda::thread_scope_device>(
+            metadata[logical_row * 2]
+        ).store(row_max, cuda::memory_order_release);
+        cuda::atomic_ref<float, cuda::thread_scope_device>(
+            metadata[logical_row * 2 + 1]
+        ).store(row_sum, cuda::memory_order_release);
     }
     // Metadata rows are disjoint raw global stores.  Do not stop PV issue on
     // them: the first PV materialization joins all four compute warps before
@@ -2265,7 +2308,9 @@ task_dsv4_attention_split_reduce_fp8_sm100(
     // The barriered record is the reducer's sole input message.  Its four
     // pointers name [partials, metadata, sink, inverse-RoPE table]; LDU owns
     // the producer dependency and publishes this message only after every
-    // producer STU has completed its partial and metadata stores.
+    // producer STU has completed its partial stores. Max/sum metadata bypasses
+    // STU, so its producer uses device-release stores and the loads below use
+    // device-acquire semantics instead of borrowing STU's release sequence.
     const int record_slot = m2c.template pop<0>();
     DAE_DSV4_REDUCE_EVENT(23);
     const ComputeRawAddressSlots raw_slots{st_insts};
@@ -2282,9 +2327,22 @@ task_dsv4_attention_split_reduce_fp8_sm100(
 
     if (warp == 0) {
         const float sink_log2 = sink[head] * M_LOG2E;
+        float local_max = -FLT_MAX;
+        float local_mass = 0.0f;
+        if (lane < num_splits) {
+            local_max = cuda::atomic_ref<
+                float, cuda::thread_scope_device
+            >(*const_cast<float *>(
+                metadata + (lane * kHeads + head) * 2
+            )).load(cuda::memory_order_acquire);
+            local_mass = cuda::atomic_ref<
+                float, cuda::thread_scope_device
+            >(*const_cast<float *>(
+                metadata + (lane * kHeads + head) * 2 + 1
+            )).load(cuda::memory_order_acquire);
+        }
         if (num_splits == 2) {
-            const float split_max = lane < 2
-                ? metadata[(lane * kHeads + head) * 2] : -FLT_MAX;
+            const float split_max = lane < 2 ? local_max : -FLT_MAX;
             const float max_candidate = lane == 0
                 ? fmaxf(split_max, sink_log2) : split_max;
             const float global_max = fmaxf(
@@ -2292,8 +2350,6 @@ task_dsv4_attention_split_reduce_fp8_sm100(
                 __shfl_xor_sync(0xFFFFFFFFU, max_candidate, 1));
             float split_contribution = 0.0f;
             if (lane < 2) {
-                const float local_mass =
-                    metadata[(lane * kHeads + head) * 2 + 1];
                 split_contribution =
                     exp2f(split_max - global_max) * local_mass;
             }
@@ -2311,8 +2367,7 @@ task_dsv4_attention_split_reduce_fp8_sm100(
         } else {
             float global_max = lane == 0 ? sink_log2 : -FLT_MAX;
             if (lane < num_splits) {
-                global_max = fmaxf(
-                    global_max, metadata[(lane * kHeads + head) * 2]);
+                global_max = fmaxf(global_max, local_max);
             }
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
@@ -2324,10 +2379,6 @@ task_dsv4_attention_split_reduce_fp8_sm100(
 
             float split_contribution = 0.0f;
             if (lane < num_splits) {
-                const float local_max =
-                    metadata[(lane * kHeads + head) * 2];
-                const float local_mass =
-                    metadata[(lane * kHeads + head) * 2 + 1];
                 split_contribution =
                     exp2f(local_max - global_max) * local_mass;
             }

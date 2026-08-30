@@ -252,6 +252,26 @@ class LayerStateSchedule(LayeredSchedule):
         opcode.OP_ALLOC_WB_STU_STORE_1D & ~((1 << 6) - 1),
     }
 
+    def __init__(
+        self,
+        schedule,
+        tensor_groups,
+        *,
+        counter_strides=(),
+        route_indices=None,
+        store_offset_rules=(),
+    ):
+        super().__init__(
+            schedule,
+            tensor_groups,
+            counter_strides=counter_strides,
+            route_indices=route_indices,
+        )
+        self.store_offset_rules = tuple(
+            (tensor, tuple(tuple(offset) for offset in offsets))
+            for tensor, offsets in store_offset_rules
+        )
+
     def _on_place(self):
         super()._on_place()
         self._group_strides = []
@@ -267,6 +287,31 @@ class LayerStateSchedule(LayeredSchedule):
             ):
                 stride = None
             self._group_strides.append(stride)
+        for tensor, offsets in self.store_offset_rules:
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.device.type != "cuda"
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    "layer-state store-offset rules require contiguous CUDA tensors"
+                )
+            for offset in offsets:
+                if len(offset) not in (2, 4):
+                    raise ValueError(
+                        "store counter offsets must be (reg,delta) or "
+                        "(reg,delta,shift,mask_bits)"
+                    )
+
+    def _store_position_offsets(self, inst):
+        address = cords2addr(inst.cords)
+        matches = []
+        for tensor, offsets in self.store_offset_rules:
+            start = tensor.data_ptr()
+            nbytes = tensor.numel() * tensor.element_size()
+            if start <= address and address + inst.size <= start + nbytes:
+                matches.extend(offsets)
+        return tuple(matches)
 
     def _transform_memory(self, inst):
         base_opcode = inst.opcode & ~((1 << 6) - 1)
@@ -281,15 +326,18 @@ class LayerStateSchedule(LayeredSchedule):
                     "layer-state writeback matched a tensor group without a "
                     f"constant byte stride; group={group_id}"
                 )
-            if stride == 0:
+            position_offsets = self._store_position_offsets(inst)
+            if stride == 0 and not position_offsets:
                 return inst
             return RepeatM.offsetByCounters(
                 tuple(
                     (counter, layer_stride * stride)
                     for counter, layer_stride in self.counter_strides
-                ),
+                ) + position_offsets,
                 inst,
             )
+        if self.layer_count == 1:
+            return inst
         return super()._transform_memory(inst)
 
 
@@ -4361,6 +4409,7 @@ class SchedFp8GemvUmmaCoupled(Schedule):
         split_k: int = 1,
         balanced_k: bool = False,
         weight_layers=None,
+        derived_tensor_cache=None,
     ):
         super().__init__()
         self.weight_tiles = weight_tiles
@@ -4373,6 +4422,7 @@ class SchedFp8GemvUmmaCoupled(Schedule):
         self.output = output
         self.split_k = int(split_k)
         self.balanced_k = bool(balanced_k)
+        self.derived_tensor_cache = derived_tensor_cache
 
     def _on_place(self):
         if not self.weight_layers:
@@ -4559,10 +4609,30 @@ class SchedFp8GemvUmmaCoupled(Schedule):
                 raise ValueError("internal coupled FP8 weight layout mismatch")
             return stream
 
-        self.weight_stream_layers = tuple(
-            compact_weight(weight_batches)
-            for weight_batches in self.weight_batches_by_layer
+        cache_key = (
+            "fp8_coupled_weight_stream_v1",
+            tuple(
+                (
+                    weight.data_ptr(),
+                    tuple(weight.shape),
+                    tuple(weight.stride()),
+                    weight.storage_offset(),
+                )
+                for weight in self.weight_layers
+            ),
         )
+        self.weight_stream_layers = (
+            None
+            if self.derived_tensor_cache is None
+            else self.derived_tensor_cache.get(cache_key)
+        )
+        if self.weight_stream_layers is None:
+            self.weight_stream_layers = tuple(
+                compact_weight(weight_batches)
+                for weight_batches in self.weight_batches_by_layer
+            )
+            if self.derived_tensor_cache is not None:
+                self.derived_tensor_cache[cache_key] = self.weight_stream_layers
         self.weight_stream = self.weight_stream_layers[0]
         if self.balanced_k:
             self._build_balanced_tasks()
@@ -5014,9 +5084,10 @@ class SchedFp8Block128GemvBf16(Schedule):
 class SchedDsv4PreloadRopeTables(Schedule):
     """Copy one packed RoPE metadata record into fixed per-SM scratch."""
 
-    def __init__(self, tables):
+    def __init__(self, tables, *, packed_tables=None):
         super().__init__()
         self.tables = tuple(tables)
+        self.packed_tables = packed_tables
 
     def _on_place(self):
         if not 1 <= len(self.tables) <= 4:
@@ -5035,7 +5106,17 @@ class SchedDsv4PreloadRopeTables(Schedule):
         # This setup-time pack is the persistent HBM layout consumed by every
         # SM.  A raw metadata record avoids fragmenting the allocator directly
         # in front of the 16-slot attention ring and its contiguous 8-slot Q.
-        self.packed_tables = torch.stack(self.tables).contiguous()
+        if self.packed_tables is None:
+            self.packed_tables = torch.stack(self.tables).contiguous()
+        elif (
+            self.packed_tables.dtype != torch.float32
+            or tuple(self.packed_tables.shape) != (len(self.tables), 32, 2)
+            or self.packed_tables.device != self.tables[0].device
+            or not self.packed_tables.is_contiguous()
+        ):
+            raise ValueError(
+                "prepacked DeepSeek RoPE tables must be contiguous FP32 [N,32,2]"
+            )
 
     def schedule(self, sm):
         if sm < 0:
@@ -5772,6 +5853,8 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         kv_v_tma,
         partial_tma,
         gate_kv_last_split_only=False,
+        position_counter_reg=None,
+        attention_kind=None,
     ):
         super().__init__()
         self.q = q
@@ -5784,6 +5867,8 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         self.kv_v_tma = kv_v_tma
         self.partial_tma = partial_tma
         self.gate_kv_last_split_only = bool(gate_kv_last_split_only)
+        self.position_counter_reg = position_counter_reg
+        self.attention_kind = attention_kind
         self.ring_plans = []
         self.split_rows = []
 
@@ -5832,17 +5917,29 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         ):
             raise ValueError("B64 partial descriptor must store one D128 tile")
 
-        # Keep every non-final TMA origin aligned to the MN-major descriptor's
-        # eight-row block while distributing work evenly across split CTAs.
-        # This avoids a 64+1 tail and reduces producer stragglers without
-        # changing the number of partials consumed by the reducer.
-        full_row_groups, residual_rows = divmod(self.rows, 8)
-        base_groups, extra_groups = divmod(full_row_groups, self.num_splits)
-        split_lengths = [
-            8 * (base_groups + (split < extra_groups))
-            for split in range(self.num_splits)
-        ]
-        split_lengths[-1] += residual_rows
+        if self.position_counter_reg is not None:
+            # A reusable image must not repartition earlier rows according to
+            # the largest position represented by the image.  Constant B64
+            # boundaries give every token the same softmax partials regardless
+            # of the requested decode budget; the compute task masks only the
+            # final active split from the runtime position counter.
+            split_lengths = [
+                min(self.KV_TILE, self.rows - row)
+                for row in range(0, self.rows, self.KV_TILE)
+            ]
+        else:
+            # Keep every non-final TMA origin aligned to the MN-major
+            # descriptor's eight-row block while distributing work evenly
+            # across position-specialized CTAs.  This avoids a 64+1 tail.
+            full_row_groups, residual_rows = divmod(self.rows, 8)
+            base_groups, extra_groups = divmod(
+                full_row_groups, self.num_splits
+            )
+            split_lengths = [
+                8 * (base_groups + (split < extra_groups))
+                for split in range(self.num_splits)
+            ]
+            split_lengths[-1] += residual_rows
         row_start = 0
         self.split_rows = []
         for split_length in split_lengths:
@@ -5904,12 +6001,17 @@ class SchedDsv4AttentionSplit64UmmaSm100(Schedule):
         kv_bar = self._bar("kv")
         if kv_bar is not None and (
             not self.gate_kv_last_split_only
+            or self.position_counter_reg is not None
             or row + active_tokens == self.rows
         ):
             ring_load.bar(kv_bar)
         return [
             Dsv4AttentionSplit64UmmaSm100(
-                active_tokens, ring_port_mask=3
+                active_tokens,
+                ring_port_mask=3,
+                row_start=row,
+                position_counter_reg=self.position_counter_reg,
+                attention_kind=self.attention_kind,
             ),
             ring_load,
             self.q_tma.cord(0, 0).bar(self._bar("q")),
@@ -6269,6 +6371,8 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
         *,
         head_start=0,
         head_count=64,
+        position_counter_reg=None,
+        attention_kind=None,
     ):
         super().__init__()
         self.partials = partials
@@ -6278,6 +6382,8 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
         self.output = output
         self.head_start = int(head_start)
         self.head_count = int(head_count)
+        self.position_counter_reg = position_counter_reg
+        self.attention_kind = attention_kind
 
     def _on_place(self):
         if (
@@ -6342,7 +6448,11 @@ class SchedDsv4AttentionSplitReduceFp8Sm100(Schedule):
             instructions.extend(
                 (
                     Dsv4AttentionSplitReduceFp8Sm100(
-                        self.num_splits, head, output_group
+                        self.num_splits,
+                        head,
+                        output_group,
+                        position_counter_reg=self.position_counter_reg,
+                        attention_kind=self.attention_kind,
                     ),
                     RawAddress(
                         self.raw_record, config.num_slots
@@ -8792,12 +8902,21 @@ class SchedDsv4Fp32RmsRopeShard128(Schedule):
 class SchedDsv4IndexScore(Schedule):
     TILE_ROWS = 240
 
-    def __init__(self, q, kv, head_weights, output):
+    def __init__(
+        self,
+        q,
+        kv,
+        head_weights,
+        output,
+        *,
+        position_counter_reg=None,
+    ):
         super().__init__()
         self.q = q
         self.kv = kv
         self.head_weights = head_weights
         self.output = output
+        self.position_counter_reg = position_counter_reg
 
     def _on_place(self):
         if self.q.dtype != torch.bfloat16 or tuple(self.q.shape) != (64, 128):
@@ -8824,7 +8943,11 @@ class SchedDsv4IndexScore(Schedule):
         for tile_start in range(row_start, row_end, self.TILE_ROWS):
             tile_end = min(tile_start + self.TILE_ROWS, row_end)
             instructions += [
-                Dsv4IndexScore(tile_end - tile_start),
+                Dsv4IndexScore(
+                    tile_end - tile_start,
+                    row_start=tile_start,
+                    position_counter_reg=self.position_counter_reg,
+                ),
                 TmaLoad1D(self.q),
                 TmaLoad1D(self.kv[tile_start:tile_end]),
                 TmaLoad1D(self.head_weights),
@@ -8883,6 +9006,84 @@ class SchedDsv4TopK512(Schedule):
         if role != "output":
             return 0
         return self._bar_release_if_present(role, 1)
+
+
+class SchedDsv4IndexedGather512(Schedule):
+    """Gather runtime-selected BF16 KV rows through the ordinary LDU/STU path.
+
+    Each vcore copies a strided subset of rows.  The first two indexed loads
+    expose distinct dependency roles so a compression token can join the
+    top-k publication with the independently produced main-compressor row
+    without a synthetic compute-side barrier.
+    """
+
+    ROW_BYTES = 512 * 2
+
+    def __init__(self, source, indices, output, *, indexed_table=None):
+        super().__init__()
+        self.source = source
+        self.indices = indices
+        self.output = output
+        self.indexed_table = indexed_table
+
+    def _on_place(self):
+        if (
+            self.source.dtype != torch.bfloat16
+            or self.source.ndim != 2
+            or self.source.shape[1] != 512
+            or not self.source.is_contiguous()
+        ):
+            raise ValueError(
+                "DeepSeek indexed gather source must be contiguous BF16 [rows,512]"
+            )
+        if (
+            self.indices.dtype != torch.int32
+            or self.indices.ndim != 1
+            or not self.indices.is_contiguous()
+        ):
+            raise ValueError("DeepSeek indexed gather indices must be int32 [rows]")
+        if (
+            self.output.dtype != torch.bfloat16
+            or tuple(self.output.shape) != (self.indices.numel(), 512)
+            or not self.output.is_contiguous()
+        ):
+            raise ValueError(
+                "DeepSeek indexed gather output must be contiguous BF16 [rows,512]"
+            )
+        if not 0 < self.num_sms <= self.indices.numel():
+            raise ValueError("DeepSeek indexed gather SM count exceeds its rows")
+        if self.indexed_table is None:
+            self.indexed_table = IndexedLoadTable(self.source, self.indices)
+        elif (
+            self.indexed_table.rows.data_ptr() != self.source.data_ptr()
+            or self.indexed_table.indices.data_ptr() != self.indices.data_ptr()
+            or self.indexed_table.state.shape[0] != self.indices.numel()
+        ):
+            raise ValueError("DeepSeek indexed gather table does not match its tensors")
+
+    def schedule(self, sm):
+        if sm < 0:
+            return []
+        rows = tuple(range(sm, self.indices.numel(), self.num_sms))
+        instructions = []
+        for local_row, row in enumerate(rows):
+            load = IndexedTmaLoad1D(
+                self.indexed_table.state[row], self.ROW_BYTES
+            ).fixed_port(0)
+            if local_row == 0:
+                load.bar(self._bar("kv"))
+            elif local_row == 1:
+                load.bar(self._bar("indices"))
+            store = TmaStore1D(self.output[row])
+            if local_row + 1 == len(rows):
+                store.bar(self._bar("output"))
+            instructions.extend((Copy(1, size=self.ROW_BYTES), load, store))
+        return instructions
+
+    def bar_release_count(self, role: str):
+        if role != "output":
+            return 0
+        return self._bar_release_if_present(role, self.num_sms)
 
 
 class SchedDsv4HcHead(Schedule):

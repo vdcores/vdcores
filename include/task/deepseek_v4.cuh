@@ -2741,6 +2741,8 @@ __device__ __forceinline__ void task_dsv4_fp32_rms_rope_shard128(
 template <typename M2CQueue, typename C2MQueue>
 __device__ __forceinline__ void task_dsv4_index_score(
     int rows,
+    int row_start,
+    int active_rows,
     void *smem_base,
     void *task_scratch,
     M2CQueue &m2c,
@@ -2770,6 +2772,13 @@ __device__ __forceinline__ void task_dsv4_index_score(
   const int warp = tid >> 5;
   auto *warp_reduce = static_cast<float *>(task_scratch);
   for (int row = 0; row < rows; ++row) {
+    if (row_start + row >= active_rows) {
+      if (tid == 0) {
+        output[row] = -FLT_MAX;
+      }
+      __sync_compute_group(128);
+      continue;
+    }
     float warp_score = 0.0f;
     for (int head = warp; head < kHeads; head += 4) {
       float partial = 0.0f;

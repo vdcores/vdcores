@@ -13,11 +13,14 @@ from dae.instructions import (
     ARGMAX_REDUCE_GLOBAL_bf16_256,
     ComputeInstruction,
     Copy,
+    Dsv4AttentionSplit64UmmaSm100,
+    Dsv4AttentionSplitReduceFp8Sm100,
     Dsv4ContiguousAttention512UmmaSm100,
     Dsv4ContiguousAttention512UmmaTail32Sm100,
     Dsv4HcPreRms,
     Dsv4HcHeadRms,
     Dsv4HcPost,
+    Dsv4IndexScore,
     Dsv4Fp8QuantUmmaBSm100,
     Dsv4Mxfp8QuantFfnInputSm100,
     Dsv4Fp32SwiGluNvfp4QuantUmmaBSm100,
@@ -221,6 +224,57 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert repeat.arg & RepeatM.COUNT_COUNTER_MODE_FLAG
     assert repeat.arg & RepeatM.COUNTER_REG_MASK == 3
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
+
+
+def test_dynamic_repeat_encodes_counter_transform():
+    step = MemoryInstruction(
+        opcode.OP_ALLOC_TMA_LOAD_1D,
+        num_slots=1,
+        arg=0,
+        size=16,
+    )
+    repeat = RepeatM.offsetByCounter(
+        2,
+        step,
+        128,
+        counter_shift=2,
+        counter_mask_bits=1,
+    )[0]
+
+    assert repeat.arg & RepeatM.COUNTER_REG_MASK == 2
+    assert (
+        repeat.arg & RepeatM.COUNTER_SHIFT_MASK
+    ) >> RepeatM.COUNTER_SHIFT_SHIFT == 2
+    assert (
+        repeat.arg & RepeatM.COUNTER_MASK_BITS_MASK
+    ) >> RepeatM.COUNTER_MASK_BITS_SHIFT == 1
+
+
+def test_dynamic_deepseek_attention_and_index_score_encode_position_counter():
+    attention = Dsv4AttentionSplit64UmmaSm100(
+        48,
+        ring_port_mask=3,
+        row_start=192,
+        position_counter_reg=2,
+        attention_kind="csa",
+    )
+    reducer = Dsv4AttentionSplitReduceFp8Sm100(
+        6,
+        17,
+        1,
+        position_counter_reg=2,
+        attention_kind="hca",
+    )
+    score = Dsv4IndexScore(
+        240,
+        row_start=480,
+        position_counter_reg=2,
+    )
+
+    assert attention.args[0] == 47 | (192 << 6)
+    assert attention.args[1] == 3 | (1 << 2) | (2 << 4) | 0x8000
+    assert reducer.args == [6 | 0x8000, 17, 1 | (2 << 2) | (2 << 4)]
+    assert score.args == [240, 480, 3]
 
 
 def test_counter_offset_window_preserves_retained_stream_adjacency():
@@ -1733,7 +1787,8 @@ def test_dsv4_hc_pre_rms_is_one_cleanroom_fused_task(monkeypatch):
     ).bar("output", 9).place(1).schedule(0)
     assert isinstance(fp8[0], Dsv4HcPreRms)
     assert fp8[0].args == [Dsv4HcPreRms.OUTPUT_FP8, 0]
-    assert [inst.size for inst in fp8[-2:]] == [4096, 32]
+    assert fp8[3].size == 4096
+    assert fp8[-1].size == 32
     assert fp8[-1].num_slots >> 6 == 9
 
     with pytest.raises(ValueError, match="either BF16 or FP8, not both"):
