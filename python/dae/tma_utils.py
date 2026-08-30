@@ -106,10 +106,17 @@ class ToSeqMajorAttnKVLoadCordAdapter(ToConvertedCordAdapter):
     """Present a seq-major KV cache to the request-major attention schedule."""
 
     def __init__(self, inner):
+        self._to_seq_major = (
+            lambda req, seq, head, dim: (seq, req, head, dim)
+        )
         super().__init__(
             inner,
-            lambda req, seq, head, dim: (seq, req, head, dim),
+            self._to_seq_major,
         )
+
+    def cord2tma(self, *cords):
+        """Convert RepeatM coordinate deltas as well as initial coordinates."""
+        return self.inner.cord2tma(*self._to_seq_major(*cords))
 
 
 class ToSeqMajorCurrentKStoreCordAdapter(ToConvertedCordAdapter):
