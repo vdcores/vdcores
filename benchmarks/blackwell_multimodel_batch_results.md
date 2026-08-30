@@ -1,7 +1,7 @@
 # Blackwell LLM batch 1-8 evaluation
 
 Measured on 2026-08-30 on one GPU and one MPI rank on worker
-`10.0.16.34`. The worker exposes NVIDIA GB300/B300-class Blackwell GPUs and
+`10.0.16.34`. The worker exposes NVIDIA GB200 Blackwell GPUs and
 the checkpoint-backed conda environment from `setup.sh`.
 
 The requested 1B aliases use the checkpoints available on the cluster:

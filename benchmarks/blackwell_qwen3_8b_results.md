@@ -1,7 +1,7 @@
 # Qwen3-8B Blackwell decode results
 
 Measured on 2026-08-30 with checkpoint
-`/mnt/checkpoints/Qwen/Qwen3-8B` on worker `10.0.16.34` (one GB300/B300
+`/mnt/checkpoints/Qwen/Qwen3-8B` on worker `10.0.16.34` (one NVIDIA GB200
 GPU, one MPI rank). The tested implementation is commit `e2494e7` on
 `port/qwen3-8b-blackwell`.
 
