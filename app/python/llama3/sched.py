@@ -23,6 +23,7 @@ CONTROL_FLOW_TOKENS_PER_LAUNCH = 1
 
 arg_parser = argparse.ArgumentParser(add_help=False)
 arg_parser.add_argument("-N", "--num-generates", type=int, default=None)
+arg_parser.add_argument("--batch-size", type=int, default=8)
 arg_parser.add_argument("--max-decode-steps", type=int, default=DEFAULT_MAX_DECODE_STEPS)
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
@@ -177,10 +178,13 @@ gpu = torch.device("cuda")
 
 
 REQ, N = 8, 8
+BATCH = parsed_args.batch_size
+if not 1 <= BATCH <= N:
+  raise ValueError(f"--batch-size must be in [1, {N}], got {BATCH}")
 MAX_SEQ_LEN = 512
 KVBlockSize = 128
 
-rms_sms = REQ
+rms_sms = BATCH
 num_sms = 128
 blackwell_sms = 152
 blackwell_aux_sms = blackwell_sms - num_sms
@@ -299,7 +303,7 @@ defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
 systemg = dae.add_group("system", 1)
 
-defaultg.addBarrier('bar_embedding', N)
+defaultg.addBarrier('bar_embedding', BATCH)
 
 systemg.addBarrier('bar_argmax_partial')
 systemg.addBarrier('bar_token_finish') # argmax plus restore-barrier copy after placement
@@ -311,7 +315,7 @@ if not qkv_head_barriers:
   layerg.addBarrier('bar_qkv_attn')
 if phased_attn_out:
   for group_id, heads in enumerate(attn_out_head_groups):
-    layerg.addBarrier(f'bar_attn_out_group{group_id}', N * len(heads))
+    layerg.addBarrier(f'bar_attn_out_group{group_id}', BATCH * len(heads))
 else:
   layerg.addBarrier('bar_attn_out')
   layerg.addBarrier('bar_q_clear')
@@ -754,7 +758,7 @@ def schedule_single_token(
   storeRMSHidden1D = TmaStore1D(matRMSHidden, bytes=HIDDEN * 2)
 
   embed_rms = SchedRMSShared(
-    num_token=N, epsilon=eps,
+    num_token=BATCH, epsilon=eps,
     tmas=(TmaLoad1D(matRMSInputW[0]), loadEmbed1D, storeRMSHidden1D),
     embedding=maybe_counter_offset(
       CC0(matTokens[0], token_offset, hidden_size=HIDDEN),
@@ -779,11 +783,11 @@ def schedule_single_token(
   )
 
   pre_attn_rms = SchedRMSShared(
-    num_token=N, epsilon=eps,
+    num_token=BATCH, epsilon=eps,
     tmas=(layerg['loadRMSInputW'].cord(0), loadHidden1D, storeRMSHidden1D)
   ).bar("input", layerg['bar_layer']).bar("output", layerg.next('bar_pre_attn_rms'))
   post_attn_rms = SchedRMSShared(
-    num_token=N, epsilon=eps,
+    num_token=BATCH, epsilon=eps,
     tmas=(layerg['loadRMSPostAttnW'].cord(0), loadHidden1D, storeRMSHidden1D)
   ).bar("input", layerg['bar_out_mlp']).bar("output", layerg['bar_post_attn_rms'])
 
@@ -941,7 +945,7 @@ def schedule_single_token(
     ).bar("store", layerg['bar_qkv_attn'])
 
   Gqa = SchedAttentionDecoding(
-    reqs = N, seq_len = token_pos + 1,
+    reqs = BATCH, seq_len = token_pos + 1,
     KV_BLOCK_SIZE = KVBlockSize,
     NUM_KV_HEADS = NUM_KV_HEAD,
     matO = matO_attn_view,
@@ -1058,7 +1062,7 @@ def schedule_single_token(
 
   mlp_split = 6144
   silu1 = SchedSmemSiLUInterleaved(
-    num_token=N,
+    num_token=BATCH,
     gate_glob=matGateOut[:, :mlp_split],
     up_glob=matInterm[:, :mlp_split],
     out_glob=matSiLUOut[:, :mlp_split],
@@ -1129,7 +1133,7 @@ def schedule_single_token(
       silu1 = []
       for shard_id in range(3):
         shard = SchedSmemSiLUInterleaved(
-          num_token=N,
+          num_token=BATCH,
           gate_glob=matGateOut[:, :mlp_split],
           up_glob=matInterm[:, :mlp_split],
           out_glob=matSiLUOut[:, :mlp_split],
@@ -1141,7 +1145,7 @@ def schedule_single_token(
         silu1.append(shard)
     else:
       silu1 = SchedSmemSiLUInterleaved(
-        num_token=N,
+        num_token=BATCH,
         gate_glob=matGateOut[:, :mlp_split],
         up_glob=matInterm[:, :mlp_split],
         out_glob=matSiLUOut[:, :mlp_split],
@@ -1203,12 +1207,13 @@ def schedule_single_token(
     LogitsProj.append(sched)
 
   # The LM-head epilogue keeps logits in TMEM/registers and emits only one
-  # compact maximum per task/token.  Eight reducer SMs consume the 256 records.
+  # compact maximum per task/token. One reducer SM per active request consumes
+  # the corresponding 256 records.
   Argmax = SchedArgmaxReduceGlobal(
-    num_token=N,
+    num_token=BATCH,
     AtomReduce=ARGMAX_REDUCE_GLOBAL_bf16_256,
-    mat_out_partial=matArgmaxPartial,
-    mat_final_out=matTokens[:, token_offset+1],
+    mat_out_partial=matArgmaxPartial[:BATCH],
+    mat_final_out=matTokens[:BATCH, token_offset+1],
     final_counter_offsets=_control_flow_offsets(
       matTokens.stride(1) * matTokens.element_size(),
       base_counter_delta * matTokens.stride(1) * matTokens.element_size() if control_flow else None,
@@ -1226,7 +1231,7 @@ def schedule_single_token(
   )
 
   embed_rms = embed_rms.place(rms_sms)
-  copy_hidden = copy_hidden.place(N, base_sm=64)
+  copy_hidden = copy_hidden.place(BATCH, base_sm=64)
   pre_attn_rms = pre_attn_rms.place(rms_sms)
   post_attn_rms = post_attn_rms.place(rms_sms)
   QProj = QProj if qkv_head_barriers else QProj.place(128)
@@ -1234,7 +1239,7 @@ def schedule_single_token(
   KProj = KProj if qkv_head_barriers else KProj.place(64, base_sm=64)
   KRope = [] if fused_qk_rope else KRope.place(64, base_sm=64)
   VProj = VProj if qkv_head_barriers else VProj.place(64)
-  Gqa = Gqa.place(N * NUM_KV_HEAD)
+  Gqa = Gqa.place(BATCH * NUM_KV_HEAD)
   if out_proj_placement_specs is not None:
     OutProj = [
       part.place(part_sms, base_sm=base_sm)
@@ -1264,12 +1269,12 @@ def schedule_single_token(
       # This avoids making early down-projection owners wait on an unrelated
       # late shard while preserving all 24 token-shard tasks and barriers.
       silu1 = [
-        silu1[0].place(N, base_sm=num_sms),
-        silu1[1].place(N, base_sm=num_sms),
-        silu1[2].place(N, base_sm=num_sms + 16),
+        silu1[0].place(BATCH, base_sm=num_sms),
+        silu1[1].place(BATCH, base_sm=num_sms),
+        silu1[2].place(BATCH, base_sm=num_sms + 16),
       ]
     else:
-      silu1 = silu1.place(N * 3, base_sm=num_sms)
+      silu1 = silu1.place(BATCH * 3, base_sm=num_sms)
     down_low_parts = [
       part.place(part_sms, base_sm=base_sm)
       for part, (part_sms, base_sm) in zip(
@@ -1292,7 +1297,7 @@ def schedule_single_token(
       up_proj_aux1,
       up_proj_aux2,
     ]
-    silu1 = silu1.place(N * 3, base_sm=num_sms)
+    silu1 = silu1.place(BATCH * 3, base_sm=num_sms)
     down_low_schedules = [down_proj_low0, down_proj_low1]
   gate_proj_tail = gate_proj_tail.place(128)
   up_silu_tail = up_silu_tail.place(128)
@@ -1327,7 +1332,7 @@ def schedule_single_token(
     make_down_proj_high((3968, 128)).place(8, base_sm=128),
   ]
   down_high1_profile_sms = (*range(96), *range(128, 136))
-  Argmax = Argmax.place(N)
+  Argmax = Argmax.place(BATCH)
   restore_bars_low = restore_bars_low.place(1, base_sm=128)
   restore_bars_high = restore_bars_high.place(1, base_sm=128)
   # Layer L clears L-1 only after L's input-RMS frontier.  Issue the unchanged
@@ -1408,7 +1413,7 @@ def schedule_single_token(
     stage_profile_marker("v_proj", v_projection_profile_sms),
 
     Gqa,
-    stage_profile_marker("attention", range(N * NUM_KV_HEAD)),
+    stage_profile_marker("attention", range(BATCH * NUM_KV_HEAD)),
     clear_q,
     stage_profile_marker("clear_q", range(88, full_sms)),
     stage_profile_schedule_parts("out_proj_part", OutProj),
@@ -1454,7 +1459,7 @@ def schedule_single_token(
 
     # argmax and cleanup
     Argmax,
-    stage_profile_marker("argmax", range(N)),
+    stage_profile_marker("argmax", range(BATCH)),
 
     restore_bars_low,
     stage_profile_marker("restore", range(128, 129)),
@@ -1515,6 +1520,7 @@ else:
 
 print(
   f"run VDCores with {cur_offset+1} tokens... "
+  f"batch={BATCH}, "
   f"fine_mlp_barriers={int(fine_mlp_barriers)}, "
   f"packed_silu_shards={int(packed_silu_shards)}, "
   f"interleave_down_high={int(interleave_down_high)}, "
@@ -1603,9 +1609,11 @@ if will_execute and parsed_args.control_flow:
     "[perf] "
     f"kernel_time_ms={kernel_time_ns / 1e6:.3f}, "
     f"end_to_end_ms={wall_time_ns / 1e6:.3f}, "
+    f"batch={BATCH}, "
     f"decode_tokens={total_decode_tokens}, "
     f"TBT_ms={tbt_ns / 1e6:.3f}, "
-    f"tokens_per_s={1e9 / tbt_ns:.2f}"
+    f"sequences_per_s={1e9 / tbt_ns:.2f}, "
+    f"tokens_per_s={BATCH * 1e9 / tbt_ns:.2f}"
   )
 elif will_execute:
   dae_app(dae)
@@ -1615,9 +1623,11 @@ elif will_execute:
   perf_summary = (
     "[perf] "
     f"kernel_time_ms={kernel_time_ns / 1e6:.3f}, "
+    f"batch={BATCH}, "
     f"decode_tokens={total_decode_tokens}, "
     f"TBT_ms={tbt_ns / 1e6:.3f}, "
-    f"tokens_per_s={1e9 / tbt_ns:.2f}"
+    f"sequences_per_s={1e9 / tbt_ns:.2f}, "
+    f"tokens_per_s={BATCH * 1e9 / tbt_ns:.2f}"
   )
 else:
   dae_app(dae)
