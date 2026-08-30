@@ -2,7 +2,7 @@
 
 Measured on worker `10.0.16.34` on 2026-08-30 with checkpoint
 `/mnt/checkpoints/Qwen/Qwen3-1.7B`. The tested implementation is commit
-`f7b7fb8` on `port/qwen3-1b-blackwell`.
+`8971e9e` on `port/qwen3-1b-blackwell`.
 
 The schedule retains the qualified physical GEMV width `N=8` and exposes
 `--batch-size=1..8` as the logical request count. Request-dependent embedding,
@@ -13,23 +13,19 @@ so every request/head pair remains addressable by the existing TMA builders.
 ## Decode-step latency
 
 Each row measures one position-0 decode step after three unmeasured warmups and
-over 20 measured launches (`DAE_BENCH_WARMUP=3`, `-b 20`). Model loading and
+20 measured launches (`DAE_BENCH_WARMUP=3`, `-b 20`). Model loading and
 schedule construction are outside the timed region. Latency is the median
 device execution interval reported by the DAE profiler. Aggregate throughput
 is logical batch divided by median latency.
 
 | Logical batch | Median latency (ns) | Median latency (ms) | Aggregate req/s |
 | ---: | ---: | ---: | ---: |
-| 1 | 1,397,280 | 1.397280 | 715.68 |
-| 2 | 1,414,608 | 1.414608 | 1,413.82 |
-| 3 | 1,391,072 | 1.391072 | 2,156.61 |
-| 4 | 1,392,064 | 1.392064 | 2,873.43 |
-| 5 | 1,387,152 | 1.387152 | 3,604.51 |
-| 6 | 1,346,304 | 1.346304 | 4,456.65 |
-| 7 | 1,364,016 | 1.364016 | 5,131.90 |
-| 8 | 1,428,736 | 1.428736 | 5,599.35 |
+| 1 | 1,153,392 | 1.153392 | 867.01 |
+| 2 | 1,153,040 | 1.153040 | 1,734.55 |
+| 4 | 1,154,176 | 1.154176 | 3,465.68 |
+| 8 | 1,165,600 | 1.165600 | 6,863.42 |
 
-Cluster job: `20260830T190526Z-1030814`.
+Cluster job: `20260830T233517Z-2649692`.
 
 The sweep used the worktree-local extension through absolute `PYTHONPATH` and
 ran this model command for each batch value:
@@ -41,6 +37,28 @@ python app/python/qwen3_1p7b/sched.py \
 ```
 
 ## Optimization A/B
+
+The accepted schedule forwards all 6,144 gate and up rows through the existing
+per-SM `RegStore`/`RegLoad` path. It removes the 4,096-row materialized prefix,
+its two global-store descriptors, and its input barrier. Two register SwiGLU
+groups preserve independent 4,096/2,048-row readiness so low-K down projection
+can overlap the high tail without changing the existing M64N8 operator or
+runtime publication behavior.
+
+The matched control was captured before the edit with the same 10-op SM100
+image and 3-warmup/20-sample method (`20260830T225259Z-2388240`).
+
+| Batch | Control (ms) | Register-fused (ms) | Latency change | Requested ceiling (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.343376 | 1.153392 | -14.14% | 0.766308 |
+| 2 | 1.347968 | 1.153040 | -14.46% | 0.824114 |
+| 4 | 1.382512 | 1.154176 | -16.52% | 0.885683 |
+| 8 | 1.362992 | 1.165600 | -14.48% | 0.799076 |
+
+This is a material improvement at every accepted batch, but it does not meet
+the requested framework-relative latency ceilings. A grouped M128 direct-output
+experiment was rejected after its launch failed to make progress; none of its
+operator selections or schedule changes are present in the accepted image.
 
 The original under-filled projection placement measured 112.214384 ms at B1
 and 120.310352 ms at B8 (jobs `20260830T184934Z-932685` and
@@ -56,20 +74,23 @@ Q/K/V/out/down fold counts; it does not retain packed-weight streaming.
 
 ## Correctness and cache traversal
 
-Job `20260830T190446Z-1026378` ran all three full 28-layer checks against the
+Job `20260830T233441Z-2646448` ran all three full 28-layer checks against the
 dense checkpoint reference. Every reported tensor passed the 5% mean-relative
 error gate.
 
 | Case | Worst reported tensor error | Attention row error | Exact token (informational) |
 | --- | ---: | ---: | ---: |
-| B1, position 0 | 3.000% | 1.847% | 25 |
-| B8, position 0 | 2.428% | 1.895% | 25 |
-| B8, position 65 (65-token prefill) | 4.059% | 0.410% | 52 |
+| B1, position 0 | 3.469% | 1.907% | 25 |
+| B8, position 0 | 2.538% | 1.988% | 25 |
+| B8, position 65 (65-token prefill) | 4.137% | 0.398% | 52 |
 
 The position-65 case traverses two 64-token KV blocks. It checks current K/V
 and attention output for request 0 and request 7, proving the seq-major cache
 store/load coordinates and repeat strides beyond the first block. Exact token
 agreement is recorded as a diagnostic; the tensor-error gate is authoritative.
+Gate and up projections are intentionally not materialized by the optimized
+schedule; their first public tensor is the fused SwiGLU output, which is checked
+along with final hidden, RMS, logits, and both edge-request attention rows.
 
 ## Build
 
