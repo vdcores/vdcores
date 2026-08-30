@@ -61,4 +61,5 @@ Qwen3 small-model lane. The other checkpoints are
 | Qwen3-8B, B8 | `20260830T211104Z-1787432` |
 
 Raw min/median/p90/max result lines and environment evidence are retained in
-`.agentlog/2026-08-30-vllm-multimodel-batch.md`.
+`.agentlog/2026-08-30-framework-baselines/vllm-accepted-results.md`
+(SHA-256 `a8014b6a88c8d6733a36683df887dbf6f629118a651fb3f77f7c61532d40d001`).

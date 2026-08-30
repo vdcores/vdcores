@@ -66,4 +66,5 @@ with CUDA 13.0, `sglang-kernel=0.4.2.post2`,
 `flashinfer=0.6.11.post1`, and `flash-mla=1.0.0+15f13e5`. Exact launcher,
 configuration, min/median/P90/max result lines, discarded smoke records, and
 the FlashMLA transfer checksum are preserved under
-`.agentlog/sglang-multimodel-20260830/accepted-results.log`.
+`.agentlog/2026-08-30-framework-baselines/sglang-accepted-results.log`
+(SHA-256 `9f18560a6b0a9b426cd2b87d001b0bad62b48b846f761a979a319a2833d306d5`).
