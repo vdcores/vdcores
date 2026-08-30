@@ -571,7 +571,7 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim64_MMA) {
 
 DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_4096_INTER) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
-  task_silu_smem_1D<6144>(inst.args[0], smem_base, m2c, c2m);
+  task_silu_smem_1D<4096>(inst.args[0], smem_base, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_2048_INTER) {
