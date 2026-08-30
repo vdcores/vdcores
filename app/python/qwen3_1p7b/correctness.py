@@ -7,7 +7,6 @@ from runtime_context import QwenScheduleContext, apply_rms_affine_rope_heads
 
 def run_correctness_check(ctx: QwenScheduleContext):
     tensor_threshold = 5.0
-    mlp_prefix = min(4096, ctx.INTERMIDIATE)
 
     print("[correctness] running prefill + single-decode reference capture...")
     token_index = len(ctx.prefill_token_id_and_pos)
@@ -106,8 +105,10 @@ def run_correctness_check(ctx: QwenScheduleContext):
             ctx.attnO[ctx.BATCH - 1],
             tensor_threshold,
         ),
-        check_tensor_threshold("gate_proj_prefix", layer["gate_proj"][0, token_index, :mlp_prefix], ctx.matGateOut[0, :mlp_prefix], tensor_threshold),
-        check_tensor_threshold("up_proj_prefix", layer["up_proj"][0, token_index, :mlp_prefix], ctx.matInterm[0, :mlp_prefix], tensor_threshold),
+        # Gate and up are forwarded through per-SM register slots in the
+        # optimized schedule rather than materialized in global memory.  The
+        # fused SwiGLU output is their first public tensor and validates both
+        # projections plus the register handoff.
         check_tensor_threshold("silu", silu_ref, ctx.matSiLUOut[0], tensor_threshold),
         check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, token_index], ctx.matHidden[0], tensor_threshold),
         check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, token_index], ctx.matRMSHidden[0], tensor_threshold),

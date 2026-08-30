@@ -104,7 +104,7 @@ MLP_LOW = 4096
 MLP_HIGH = INTERMIDIATE - MLP_LOW
 if MLP_HIGH <= 0 or MLP_HIGH % 64:
     raise ValueError(f"Expected intermediate size larger than {MLP_LOW}, got {INTERMIDIATE}")
-MLP_HIGH_SMS = MLP_HIGH // 64
+MLP_SMS = INTERMIDIATE // TileM
 
 PREFETCH_OFF = env_prefetch_overrides()
 LONG_CONTEXT = bool(prefill_token_id_and_pos)
@@ -122,9 +122,6 @@ VPROJ_SMS = env_int(
 OUTPROJ_SMS = env_int(
     "QWEN1P7B_OUTPROJ_SMS", min(128, (HIDDEN // TileM) * (HIDDEN // 1024))
 )
-GATE_LOW_SMS = env_int("QWEN1P7B_GATE_LOW_SMS", 64)
-UP_LOW_SMS = env_int("QWEN1P7B_UP_LOW_SMS", 64)
-SILU_SMS = env_int("QWEN1P7B_SILU_SMS", 4)
 DOWN_LOW_SMS = env_int(
     "QWEN1P7B_DOWN_LOW_SMS", min(128, (HIDDEN // TileM) * (MLP_LOW // 1024))
 )
@@ -202,7 +199,6 @@ layerg.addBarrier("bar_qkv_attn")
 layerg.addBarrier("bar_attn_out")
 layerg.addBarrier("bar_rms_layer", 0)
 layerg.addBarrier("bar_rms_mlp", 0)
-layerg.addBarrier("bar_silu_in")
 layerg.addBarrier("bar_silu_out1")
 layerg.addBarrier("bar_silu_out2")
 layerg.addBarrier("bar_pre_attn_rms")
@@ -213,8 +209,6 @@ layerg.addTma("reduceHiddenLayer", [matHidden] * num_layers, lambda t: t.wgmma("
 layerg.addTma("loadSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_load(N, TileK * LinearAtom.n_batch, Major.K))
 layerg.addTma("storeSiluLayer", [matSiLUOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("loadAttnOLayer", [attnO] * num_layers, lambda t: t.wgmma_load(N, TileK * LinearAtom.n_batch, Major.K))
-layerg.addTma("storeInterm", [matInterm] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
-layerg.addTma("storeGateOut", [matGateOut] * num_layers, lambda t: t.wgmma_store(N, TileM, Major.MN))
 layerg.addTma("loadRMSInputW", matRMSInputW[1:], lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadRMSPostAttnW", matRMSPostAttnW, lambda t: t.tensor1d("load", HIDDEN))
 layerg.addTma("loadQwenSideInput", matQwenSideInputs, lambda t: t.tensor1d("load", 3 * HEAD_DIM))
@@ -349,37 +343,27 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(layerg["loadOutWs"], layerg["loadAttnOLayer"], layerg["reduceHiddenLayer"]),
     )).bar("load", layerg["bar_attn_out"]).bar("store", layerg["bar_out_mlp"])
 
-    gate_proj_low = maybe_no_prefetch("gate_low", SchedGemv(
-        LinearAtom,
-        MNK=(MLP_LOW, N, HIDDEN),
-        tmas=(layerg["loadGate"], layerg["loadRMSLayer"], layerg["storeGateOut"]),
-    )).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
     reg_gate, reg_up = 0, 1
     reg_store_gate = RegStore(reg_gate, matGateOut[:, 0:TileM])
     reg_store_up = RegStore(reg_up, matInterm[:, 0:TileM])
-    gate_proj_high = maybe_no_prefetch("gate_high", SchedGemv(
+    gate_proj = maybe_no_prefetch("gate", SchedGemv(
         LinearAtom,
-        MNK=((MLP_LOW, MLP_HIGH), N, HIDDEN),
+        MNK=(INTERMIDIATE, N, HIDDEN),
         tmas=(layerg["loadGate"], layerg["loadRMSLayer"], reg_store_gate),
-    ))
-    up_proj_low = maybe_no_prefetch("up_low", SchedGemv(
+    )).bar("load", layerg["bar_post_attn_rms"])
+    up_proj = maybe_no_prefetch("up", SchedGemv(
         LinearAtom,
-        MNK=(MLP_LOW, N, HIDDEN),
-        tmas=(layerg["loadUp"], layerg["loadRMSLayer"], layerg["storeInterm"]),
-    )).bar("load", layerg["bar_post_attn_rms"]).bar("store", layerg["bar_silu_in"])
-    up_proj_high = maybe_no_prefetch("up_high", SchedGemv(
-        LinearAtom,
-        MNK=((MLP_LOW, MLP_HIGH), N, HIDDEN),
+        MNK=(INTERMIDIATE, N, HIDDEN),
         tmas=(layerg["loadUp"], layerg["loadRMSLayer"], reg_store_up),
-    ))
-
-    silu1 = SchedSmemSiLUInterleaved(
+    )).bar("load", layerg["bar_post_attn_rms"])
+    silu_low = SchedRegSiLUFused(
         num_token=N,
-        gate_glob=matGateOut[:, :MLP_LOW],
-        up_glob=matInterm[:, :MLP_LOW],
-        out_glob=matSiLUOut[:, :MLP_LOW],
-    ).bar("input", layerg["bar_silu_in"]).bar("output", layerg["bar_silu_out1"])
-
+        store_tma=layerg["storeSiluLayer"],
+        reg_gate=reg_gate,
+        reg_up=reg_up,
+        base_offset=0,
+        stride=TileM,
+    ).bar("output", layerg["bar_silu_out1"])
     silu_high = SchedRegSiLUFused(
         num_token=N,
         store_tma=layerg["storeSiluLayer"],
@@ -388,13 +372,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
         base_offset=MLP_LOW,
         stride=TileM,
     ).bar("output", layerg["bar_silu_out2"])
-
-    down_proj_low = maybe_no_prefetch("down_low", SchedGemv(
+    down_proj_low = maybe_no_prefetch("down", SchedGemv(
         LinearAtom,
         MNK=(HIDDEN, N, MLP_LOW),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     )).bar("load", layerg["bar_silu_out1"]).bar("store", layerg["bar_layer"])
-    down_proj_high = maybe_no_prefetch("down_high", SchedGemv(
+    down_proj_high = maybe_no_prefetch("down", SchedGemv(
         LinearAtom,
         MNK=(HIDDEN, N, (MLP_LOW, MLP_HIGH)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
@@ -445,12 +428,10 @@ def schedule_single_token(token_offset: int, token_pos: int):
     VProj = VProj.place(VPROJ_SMS, base_sm=96)
     Gqa = Gqa.place(BATCH * NUM_KV_HEAD)
     OutProj = OutProj.place(OUTPROJ_SMS)
-    gate_proj_low = gate_proj_low.place(GATE_LOW_SMS)
-    gate_proj_high = gate_proj_high.place(MLP_HIGH_SMS)
-    up_proj_low = up_proj_low.place(UP_LOW_SMS, base_sm=64)
-    up_proj_high = up_proj_high.place(MLP_HIGH_SMS)
-    silu1 = silu1.place(SILU_SMS, base_sm=128)
-    silu_high = silu_high.place(MLP_HIGH_SMS)
+    gate_proj = gate_proj.place(MLP_SMS)
+    up_proj = up_proj.place(MLP_SMS)
+    silu_low = silu_low.place(MLP_LOW // TileM)
+    silu_high = silu_high.place(MLP_HIGH // TileM, base_sm=MLP_LOW // TileM)
     down_proj_low = down_proj_low.place(DOWN_LOW_SMS)
     down_proj_high = down_proj_high.place(DOWN_HIGH_SMS)
     argmax = argmax.place(full_sms)
@@ -469,11 +450,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
             Gqa,
             OutProj,
             post_attn_rms,
-            gate_proj_low,
-            gate_proj_high,
-            up_proj_low,
-            up_proj_high,
-            silu1,
+            gate_proj,
+            up_proj,
+            silu_low,
             silu_high,
             down_proj_low,
             down_proj_high,
@@ -496,11 +475,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
             Gqa,
             OutProj,
             post_attn_rms,
-            gate_proj_low,
-            gate_proj_high,
-            up_proj_low,
-            up_proj_high,
-            silu1,
+            gate_proj,
+            up_proj,
+            silu_low,
             silu_high,
             down_proj_low,
             down_proj_high,
@@ -520,11 +497,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
         Gqa,
         OutProj,
         post_attn_rms,
-        gate_proj_low,
-        gate_proj_high,
-        up_proj_low,
-        up_proj_high,
-        silu1,
+        gate_proj,
+        up_proj,
+        silu_low,
         silu_high,
         down_proj_low,
         down_proj_high,
