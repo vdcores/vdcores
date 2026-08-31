@@ -10,6 +10,8 @@ from dae.tma_utils import (
     ToSeqMajorAttnKVLoadCordAdapter,
     ToSeqMajorAttnKVStoreCordAdapter,
     ToSeqMajorCurrentKStoreCordAdapter,
+    build_tma_wgmma_mnmajor_m128n8,
+    cord_func_m128n8_output,
     pack_weight_tile_major,
     tma_store_attn_kv_seq_major,
 )
@@ -90,7 +92,12 @@ if MLP_PREFIX not in (2048, 4096) or MLP_TAIL <= 0 or MLP_TAIL % 64:
 
 LinearAtom = Gemv_M64N8IssuerOnly
 TileM, _, TileK = LinearAtom.MNK
-print(f"[weights] packing Qwen projections as M{TileM}K{TileK} tiles")
+LogitsAtom = Gemv_M128N8
+LogitsTileM, _, LogitsTileK = LogitsAtom.MNK
+print(
+    f"[weights] packing Qwen projections as M{TileM}K{TileK} and "
+    f"LM head as M{LogitsTileM}K{LogitsTileK} tiles"
+)
 matqWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matqWs]
 matkWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matkWs]
 matvWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matvWs]
@@ -98,7 +105,20 @@ matOutWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight
 matUps = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matUps]
 matGates = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matGates]
 matDowns = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matDowns]
-dae.set_streaming(matqWs, matkWs, matvWs, matOutWs, matUps, matGates, matDowns)
+matLogitsW = [
+    pack_weight_tile_major(weight.contiguous(), LogitsTileM, LogitsTileK)
+    for weight in matLogitsW
+]
+dae.set_streaming(
+    matqWs,
+    matkWs,
+    matvWs,
+    matOutWs,
+    matUps,
+    matGates,
+    matDowns,
+    matLogitsW,
+)
 
 # A fold consumes at least four K256 activation tiles.  Keep register-backed
 # gate/up tails at fold one because RegStore state is local to each SM.
@@ -284,6 +304,31 @@ layerg.addTma("loadQ", matQ_attn_views, lambda t: t._build("load", HEAD_DIM, 64,
 layerg.addTma("loadK", matK_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_K, cord_func_K))
 layerg.addTma("loadV", matV_attn_views, lambda t: t._build("load", HEAD_DIM, KVBlockSize, tma_builder_MN, cord_func_MN))
 
+systemg.addTma(
+    "loadLogitsB",
+    [matRMSHidden],
+    lambda t: t.wgmma_load(
+        N, LogitsTileK * LogitsAtom.n_batch, Major.K
+    ),
+)
+for logits_idx in range(logits_epoch):
+    systemg.addTma(
+        f"loadLogitsW{logits_idx}",
+        [matLogitsW[logits_idx]],
+        lambda t: t.wgmma_load_tiled(LogitsTileM, LogitsTileK),
+    )
+    systemg.addTma(
+        f"storeLogits{logits_idx}",
+        [matLogits[logits_idx]],
+        lambda t: t._build(
+            "store",
+            LogitsTileM,
+            N,
+            build_tma_wgmma_mnmajor_m128n8,
+            cord_func_m128n8_output,
+        ),
+    )
+
 dae.build_groups()
 
 
@@ -453,11 +498,19 @@ def schedule_single_token(token_offset: int, token_pos: int):
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
 
-    qwen_gemvs = layers_like(GemvLayer, dae, Gemv_M64N8)
     logits_proj = []
     for i in range(logits_epoch):
-        proj = qwen_gemvs(f"logits_proj_{i}", (matLogitsW[i], matRMSHidden, matLogits[i]), reduce=False)
-        sched = proj.schedule_(group=False).split_M(6)
+        sched = SchedGemv(
+            LogitsAtom,
+            MNK=(logits_slice, N, HIDDEN),
+            tmas=(
+                systemg[f"loadLogitsW{i}"],
+                systemg["loadLogitsB"],
+                systemg[f"storeLogits{i}"],
+            ),
+            fold=1,
+            group=False,
+        ).split_M(3)
         if i == 0:
             sched.bar("load", layerg.over("bar_pre_attn_rms"))
             sched[0].no_prefetch()
