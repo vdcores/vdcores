@@ -120,3 +120,30 @@ interleaved SiLU handler smoke passed in `20260830T182540Z-782716`.
 - Fused attention keeps the existing Q/K RMS normalization and RoPE path;
   dense projections use the existing Llama Blackwell issuer-only M64N8
   operator.
+
+## Context-matched C128 milestone sweep
+
+The 2026-08-31 correction seeds 127 checkpoint-backed prefix KV rows and
+decodes at position 127. Three warmups and 20 measured resident launches were
+used; framework baselines were not rerun.
+
+| Logical batch | Median latency (ns) | Median latency (ms) |
+| ---: | ---: | ---: |
+| 1 | 2,835,808 | 2.835808 |
+| 2 | 2,827,728 | 2.827728 |
+| 4 | 2,846,864 | 2.846864 |
+| 8 | 2,839,152 | 2.839152 |
+
+Performance job: `20260831T053131Z-1172356`. C128 B8 correctness job
+`20260831T053106Z-1168105` passed every tensor gate, with a worst reported
+mean-relative error of 4.183%; all eight outputs exactly matched reference
+token 198.
+
+The command shape was:
+
+```bash
+DAE_BENCH_WARMUP=3 python app/python/qwen3/sched.py \
+  --model-name /mnt/checkpoints/Qwen/Qwen3-8B \
+  --batch-size BATCH --prefill-length 127 --max-seq-len 512 \
+  -N 1 --bench 20
+```

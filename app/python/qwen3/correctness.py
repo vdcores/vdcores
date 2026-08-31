@@ -13,7 +13,10 @@ def run_correctness_check(
     final_hidden_threshold = 5.0
     final_rms_threshold = 5.0
 
-    print("[correctness] running 1-prefill + 1-decode reference capture...")
+    print(
+        "[correctness] running "
+        f"{len(ctx.prefill_token_id_and_pos)}-prefill + 1-decode reference capture..."
+    )
     decode_index = len(ctx.prefill_token_id_and_pos)
     decode_pos = ctx.input_token_id_and_pos[0][1]
     mlp_prefix = min(4096, ctx.INTERMIDIATE)

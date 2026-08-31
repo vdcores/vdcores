@@ -34,6 +34,12 @@ arg_parser.add_argument("--max-decode-steps", type=int, default=DEFAULT_MAX_DECO
 arg_parser.add_argument("--hf-cache-dir", default="/tmp/huggingface_cache")
 arg_parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
 arg_parser.add_argument("--correctness", action="store_true")
+arg_parser.add_argument(
+  "--prefill-length",
+  type=int,
+  default=None,
+  help="Use this many repeated token-791 KV-prefix rows before one decode token",
+)
 arg_parser.add_argument("--prompt", default=None)
 arg_parser.add_argument("--message", action="append", default=None)
 arg_parser.add_argument("--control-flow", dest="control_flow", action="store_true", default=True)
@@ -50,6 +56,10 @@ if positional_prompt is not None:
   parsed_args.prompt = positional_prompt
 if parsed_args.prompt is not None and parsed_args.message:
   raise ValueError("Use prompt text or --message, not both")
+if parsed_args.prefill_length is not None and (
+  parsed_args.prompt is not None or parsed_args.message
+):
+  raise ValueError("Use --prefill-length or a text/message prompt, not both")
 
 def dae_execution_requested(argv):
   return any(
@@ -132,6 +142,16 @@ def normalize_token_ids(tokens, *, add_special_tokens=False):
   return [int(token_id) for token_id in tokens]
 
 def prompt_token_ids():
+  if parsed_args.prefill_length is not None:
+    if not 0 <= parsed_args.prefill_length < MAX_SEQ_LEN:
+      raise ValueError("--prefill-length must be in [0, MAX_SEQ_LEN)")
+    tokens = [791] * (parsed_args.prefill_length + 1)
+    print(
+      f"[prompt] built {parsed_args.prefill_length} repeated prefill tokens "
+      "plus one decode input token"
+    )
+    return tokens
+
   if parsed_args.message:
     messages = [{"role": "user", "content": message} for message in parsed_args.message]
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:

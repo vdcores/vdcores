@@ -102,3 +102,34 @@ along with final hidden, RMS, logits, and both edge-request attention rows.
 - Runtime dynamic shared memory: 219 KiB. The image launched successfully with
   both static and dynamic allocations active.
 - No new opcode, allocator behavior, or publication mechanism was added.
+
+## Context-matched C128 milestone sweep
+
+The 2026-08-31 correction seeds 127 checkpoint-backed prefix KV rows and
+decodes at position 127. Three warmups and 20 measured resident launches were
+used; framework baselines were not rerun.
+
+| Logical batch | Median latency (ns) | Median latency (ms) |
+| ---: | ---: | ---: |
+| 1 | 1,364,928 | 1.364928 |
+| 2 | 1,365,984 | 1.365984 |
+| 4 | 1,361,584 | 1.361584 |
+| 8 | 1,387,152 | 1.387152 |
+
+Performance job: `20260831T053638Z-1226097`. C128 B1 correctness job
+`20260831T053614Z-1222284` passed every tensor gate with a worst reported
+mean-relative error of 4.188%, and its output exactly matched reference token
+198. Repeated C128 B8 checks (`20260831T053410Z-1203310` and
+`20260831T053526Z-1214397`) also matched token 198, but were numerically
+marginal: their worst observations were 5.228% on one logits shard and 5.239%
+on fused SwiGLU. The B8 latency is therefore retained as performance evidence,
+not a strict below-5% qualification.
+
+The command shape was:
+
+```bash
+DAE_BENCH_WARMUP=3 python app/python/qwen3_1p7b/sched.py \
+  --model-name /mnt/checkpoints/Qwen/Qwen3-1.7B \
+  --batch-size BATCH --prefill-length 127 --max-seq-len 512 \
+  -N 1 --bench 20
+```

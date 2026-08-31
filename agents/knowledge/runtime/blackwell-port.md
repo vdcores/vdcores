@@ -2710,12 +2710,19 @@ phased-down/down-owner chain with the existing lean Llama-3.1-8B port.  The
 canonical result and commit-source table is
 `benchmarks/blackwell_bf16_multimodel_optimization_milestone.md`.
 
-Keep the measurement boundary attached to these results.  vLLM and SGLang
-rows are BF16 C128 framework intervals.  The accepted logical-batch VDCores
-sweeps are internal C1 intervals for both Llama lanes and Qwen3-1.7B, and C2
-for Qwen3-8B.  `--max-seq-len 128` reserves cache capacity; it does not make a
-one-prefill Qwen run C128.  Do not calculate a cross-framework speedup from
-those unmatched rows.
+Keep the measurement boundary attached to these results.  The corrected
+milestone table now uses C128 for all three runtimes: VDCores seeds 127 prefix
+KV rows and executes the current row at position 127, while vLLM and SGLang
+reuse their existing BF16 C128 framework intervals.  VDCores reports the
+internal device interval; the framework rows include their serving/IPC
+observation boundary.  No framework was rerun for the correction.  Merely
+setting `--max-seq-len 128` still only reserves cache capacity; an explicit
+127-row prefill is required.
+
+The C128 B8 tensor gate passed for both Llama lanes and Qwen3-8B. Qwen3-1.7B
+passed the complete C128 gate at B1 and returned the exact reference token at
+B8, but two B8 launches were marginal at 5.228% and 5.239% worst
+mean-relative error. Preserve that qualification with its B8 timing.
 
 The milestone integration adds no FP8 model path and no allocator/writeback
 publication exception.  The uncommitted Qwen3-8B Group4-prefix experiment was

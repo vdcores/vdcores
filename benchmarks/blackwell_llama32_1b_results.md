@@ -107,3 +107,30 @@ static shared memory, and reports zero spills.
 The existing Llama-8B fused GEMV/argmax head was evaluated at the 1B model's
 `K=2048`, but repeated runs produced nondeterministic corrupt partial maxima.
 It is therefore not used here; the stable materialized-logits head is retained.
+
+## Context-matched C128 milestone sweep
+
+The 2026-08-31 correction seeds 127 checkpoint-backed prefix KV rows and
+decodes at position 127. Three warmups and 20 measured resident launches were
+used; framework baselines were not rerun.
+
+| Logical batch | Median latency (ns) | Median latency (ms) |
+| ---: | ---: | ---: |
+| 1 | 694,256 | 0.694256 |
+| 2 | 699,200 | 0.699200 |
+| 4 | 702,048 | 0.702048 |
+| 8 | 706,112 | 0.706112 |
+
+Performance job: `20260831T052831Z-1139853`. C128 B8 correctness job
+`20260831T052811Z-1135232` passed every tensor gate, with a worst reported
+mean-relative error of 3.104%; generated and materialized outputs exactly
+matched reference token 315 on every row.
+
+The command shape was:
+
+```bash
+DAE_BENCH_WARMUP=3 python app/python/llama32_1b/sched.py \
+  --model-name /mnt/checkpoints/unsloth/Llama-3.2-1B-Instruct \
+  --batch-size BATCH --prefill-length 127 --max-seq-len 512 \
+  -N 1 --bench 20
+```

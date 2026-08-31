@@ -26,6 +26,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 DEFAULT_MODEL_NAME = "unsloth/Llama-3.2-1B-Instruct"
 DEFAULT_MAX_SEQ_LEN = 512
 DEFAULT_VOCAB_SIZE = 128256
+DEFAULT_DECODE_TOKEN = 29871
 
 
 def build_rope_table(max_seq_len, batch, head_dim, rope_theta, positions, device, dtype):
@@ -57,8 +58,8 @@ def permute_rope_weight(weight, head_dim, hidden, num_heads):
 
 def permute_rope_activation(activation, head_dim, num_heads):
     return (
-        activation.view(num_heads, 2, head_dim // 2)
-        .transpose(1, 2)
+        activation.view(*activation.shape[:-1], num_heads, 2, head_dim // 2)
+        .transpose(-2, -1)
         .reshape_as(activation)
         .contiguous()
     )
@@ -138,6 +139,12 @@ def parse_args():
     arg_parser.add_argument("--dry-build", action="store_true")
     arg_parser.add_argument("--batch-size", type=int, default=8)
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
+    arg_parser.add_argument(
+        "--prefill-length",
+        type=int,
+        default=0,
+        help="Number of checkpoint-backed KV-prefix tokens before decode",
+    )
     arg_parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument("--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full")
@@ -145,8 +152,12 @@ def parse_args():
     parsed_args, remaining_argv = arg_parser.parse_known_args()
     if not 1 <= parsed_args.batch_size <= 8:
         raise ValueError("--batch-size must be in [1, 8]")
+    if not 0 <= parsed_args.prefill_length < parsed_args.max_seq_len:
+        raise ValueError("--prefill-length must be in [0, max-seq-len)")
     if parsed_args.kv_layout_smoke and (parsed_args.correctness or parsed_args.dry_build):
         raise ValueError("--kv-layout-smoke cannot be combined with --correctness or --dry-build")
+    if parsed_args.kv_layout_smoke and parsed_args.prefill_length:
+        raise ValueError("--kv-layout-smoke cannot be combined with --prefill-length")
     if (parsed_args.correctness or parsed_args.kv_layout_smoke) and not any(
         arg in ("-l", "--launch", "-b", "--bench") for arg in remaining_argv
     ):
@@ -172,9 +183,15 @@ dae = Launcher(full_sms, device=gpu)
 # Token 791 has only a 0.03125 BF16 top-1 margin in this checkpoint, so valid
 # reduction-order noise can flip it.  Use a single-token case with a stable
 # 0.9375 reference margin for the end-to-end token check.
-input_token_id_and_pos = [
-    (29871, KV_LAYOUT_SMOKE_POS if parsed_args.kv_layout_smoke else 0)
+prefill_token_id_and_pos = [
+    (DEFAULT_DECODE_TOKEN, pos) for pos in range(parsed_args.prefill_length)
 ]
+input_token_id_and_pos = [(
+    DEFAULT_DECODE_TOKEN,
+    KV_LAYOUT_SMOKE_POS
+    if parsed_args.kv_layout_smoke
+    else parsed_args.prefill_length,
+)]
 num_generates = (
     0
     if (parsed_args.correctness or parsed_args.kv_layout_smoke or parsed_args.dry_build)
@@ -293,6 +310,48 @@ attnKs = [torch.zeros(MAX_SEQ_LEN, REQ, KW, dtype=dtype, device=gpu) for _ in ra
 attnVs = [torch.zeros(MAX_SEQ_LEN, REQ, VW, dtype=dtype, device=gpu) for _ in range(num_layers)]
 attnO = torch.zeros(REQ, HIDDEN, dtype=dtype, device=gpu)
 matSiLUOut = torch.zeros(N, INTERMIDIATE, dtype=dtype, device=gpu)
+
+
+def seed_prefill_kv_cache():
+    for layer_k, layer_v in zip(attnKs, attnVs):
+        layer_k.zero_()
+        layer_v.zero_()
+
+    if parsed_args.dry_build or not prefill_token_id_and_pos:
+        return None
+
+    prefill_tokens = [token for token, _ in prefill_token_id_and_pos]
+    prefill_positions = [pos for _, pos in prefill_token_id_and_pos]
+    inputs = input_batch1(*prefill_tokens, positions=prefill_positions)
+    with torch.no_grad():
+        output = model(**inputs, use_cache=True)
+
+    cache = output.past_key_values
+    prefill_len = len(prefill_tokens)
+    for layer_idx in range(num_layers):
+        layer_cache = cache.layers[layer_idx]
+        k_cache = (
+            layer_cache.keys[0]
+            .permute(1, 0, 2)
+            .reshape(prefill_len, KW)
+        )
+        v_cache = (
+            layer_cache.values[0]
+            .permute(1, 0, 2)
+            .reshape(prefill_len, VW)
+        )
+        k_cache = permute_rope_activation(
+            k_cache, HEAD_DIM, KW // HEAD_DIM
+        )
+        attnKs[layer_idx][:prefill_len].copy_(
+            k_cache.unsqueeze(1).expand(-1, REQ, -1)
+        )
+        attnVs[layer_idx][:prefill_len].copy_(
+            v_cache.unsqueeze(1).expand(-1, REQ, -1)
+        )
+
+    print(f"[prefill] seeded {prefill_len} checkpoint KV rows")
+    return output
 
 # Exercise RepeatM across two complete KV blocks and a one-token tail.  Each
 # physical request receives the same nonzero history, so request-wise equality
@@ -677,6 +736,9 @@ def schedule_single_token(token_offset: int, token_pos: int):
     )
 
 
+if not parsed_args.kv_layout_smoke:
+    seed_prefill_kv_cache()
+
 cur_offset, cur_pos = 0, 0
 for token_offset, (token, pos) in enumerate(input_token_id_and_pos):
     matTokens[:BATCH, token_offset] = token
@@ -719,10 +781,13 @@ def run_correctness_check():
     if parsed_args.dry_build:
         raise RuntimeError("Correctness check is unavailable in --dry-build mode")
 
+    dae_indices = matTokens[:BATCH, 1].clone()
+    decode_index = len(prefill_token_id_and_pos)
     inputs = input_batch1(
+        *(e[0] for e in prefill_token_id_and_pos),
         *(e[0] for e in input_token_id_and_pos),
-        mat=matTokens[0],
-        positions=[e[1] for e in input_token_id_and_pos],
+        positions=[e[1] for e in prefill_token_id_and_pos]
+        + [e[1] for e in input_token_id_and_pos],
     )
     captured, _ = reference_pass(model, inputs)
     all_ok = True
@@ -750,7 +815,7 @@ def run_correctness_check():
         layer = captured[i]
         q_ref = apply_interleaved_rope_activation(
             permute_rope_activation(
-                layer["q_proj"][0, 0], HEAD_DIM, QW // HEAD_DIM
+                layer["q_proj"][0, decode_index], HEAD_DIM, QW // HEAD_DIM
             ),
             HEAD_DIM,
             QW // HEAD_DIM,
@@ -758,7 +823,7 @@ def run_correctness_check():
         )
         k_ref = apply_interleaved_rope_activation(
             permute_rope_activation(
-                layer["k_proj"][0, 0], HEAD_DIM, KW // HEAD_DIM
+                layer["k_proj"][0, decode_index], HEAD_DIM, KW // HEAD_DIM
             ),
             HEAD_DIM,
             KW // HEAD_DIM,
@@ -766,7 +831,7 @@ def run_correctness_check():
         )
         checks = [
             check_tensor_threshold(
-                f"layer{i}.v_proj", layer["v_proj"][0, 0],
+                f"layer{i}.v_proj", layer["v_proj"][0, decode_index],
                 attnVs[i][decode_pos, 0], 5.0
             ),
             check_tensor_threshold(f"layer{i}.q_rope", q_ref, attnQs[i][0], 5.0),
@@ -778,7 +843,7 @@ def run_correctness_check():
             checks.extend([
                 check_batch_tensor_threshold(
                     f"layer{i}.batch.v_proj",
-                    layer["v_proj"][0, 0],
+                    layer["v_proj"][0, decode_index],
                     attnVs[i][decode_pos, :BATCH],
                     5.0,
                 ),
@@ -795,12 +860,30 @@ def run_correctness_check():
         all_ok = all_ok and all(passed for passed, _ in checks)
 
     layer = captured[num_layers - 1]
-    silu_ref = F.silu(layer["gate_proj"][0, 0]) * layer["up_proj"][0, 0]
+    silu_ref = (
+        F.silu(layer["gate_proj"][0, decode_index])
+        * layer["up_proj"][0, decode_index]
+    )
     final_checks = [
         check_tensor_threshold("silu", silu_ref, matSiLUOut[0, :], 5.0),
-        check_tensor_threshold("final_hidden", layer["hidden_state_out"][0, 0], matHidden[0], 5.0),
-        check_tensor_threshold("final_rms", captured["final"]["final_rms"][0, 0], matRMSHidden[0], 5.0),
-        check_tensor_threshold("logits_low", captured["final"]["lm_head"][0, 0, :logits_slice], matLogits[0][0, :logits_slice], 5.0),
+        check_tensor_threshold(
+            "final_hidden",
+            layer["hidden_state_out"][0, decode_index],
+            matHidden[0],
+            5.0,
+        ),
+        check_tensor_threshold(
+            "final_rms",
+            captured["final"]["final_rms"][0, decode_index],
+            matRMSHidden[0],
+            5.0,
+        ),
+        check_tensor_threshold(
+            "logits_low",
+            captured["final"]["lm_head"][0, decode_index, :logits_slice],
+            matLogits[0][0, :logits_slice],
+            5.0,
+        ),
     ]
     if BATCH > 1:
         final_checks.extend([
@@ -812,19 +895,19 @@ def run_correctness_check():
             ),
             check_batch_tensor_threshold(
                 "final_hidden.batch",
-                layer["hidden_state_out"][0, 0],
+                layer["hidden_state_out"][0, decode_index],
                 matHidden[:BATCH],
                 5.0,
             ),
             check_batch_tensor_threshold(
                 "final_rms.batch",
-                captured["final"]["final_rms"][0, 0],
+                captured["final"]["final_rms"][0, decode_index],
                 matRMSHidden[:BATCH],
                 5.0,
             ),
             check_batch_tensor_threshold(
                 "logits_low.batch",
-                captured["final"]["lm_head"][0, 0, :logits_slice],
+                captured["final"]["lm_head"][0, decode_index, :logits_slice],
                 matLogits[0][:BATCH, :logits_slice],
                 5.0,
             ),
@@ -833,7 +916,7 @@ def run_correctness_check():
         final_checks.append(
             check_tensor_threshold(
                 "logits_high",
-                captured["final"]["lm_head"][0, 0, logits_slice:vocab_size],
+                captured["final"]["lm_head"][0, decode_index, logits_slice:vocab_size],
                 matLogits[1][0, : vocab_size - logits_slice],
                 5.0,
             )
@@ -842,15 +925,16 @@ def run_correctness_check():
             final_checks.append(
                 check_batch_tensor_threshold(
                     "logits_high.batch",
-                    captured["final"]["lm_head"][0, 0, logits_slice:vocab_size],
+                    captured["final"]["lm_head"][0, decode_index, logits_slice:vocab_size],
                     matLogits[1][:BATCH, : vocab_size - logits_slice],
                     5.0,
                 )
             )
     all_ok = all_ok and all(passed for passed, _ in final_checks)
 
-    ref_idx = torch.argmax(captured["final"]["lm_head"], dim=-1)[0, 0].item()
-    dae_indices = matTokens[:BATCH, 1]
+    ref_idx = torch.argmax(
+        captured["final"]["lm_head"], dim=-1
+    )[0, decode_index].item()
     materialized_indices = torch.argmax(
         torch.cat(matLogits, dim=1)[:BATCH, :vocab_size], dim=1
     )

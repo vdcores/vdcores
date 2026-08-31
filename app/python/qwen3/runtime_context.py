@@ -169,9 +169,14 @@ def build_runtime_context(parsed_args):
     if parsed_args.max_seq_len <= 0:
         raise ValueError("--max-seq-len must be positive")
     MAX_SEQ_LEN = min(config.max_position_embeddings, parsed_args.max_seq_len)
+    if not 0 <= parsed_args.prefill_length < MAX_SEQ_LEN:
+        raise ValueError("--prefill-length must be in [0, max-seq-len)")
     dae = Launcher(full_sms, device=gpu)
 
-    prefill_token_id_and_pos = [(DEFAULT_PREFILL_TOKEN, 0)]
+    prefill_token_id_and_pos = [
+        (DEFAULT_PREFILL_TOKEN, pos)
+        for pos in range(parsed_args.prefill_length)
+    ]
     input_token_id_and_pos = [(DEFAULT_DECODE_INPUT_TOKEN, len(prefill_token_id_and_pos))]
     num_generates = 0 if parsed_args.correctness else parsed_args.num_generates - 1
 

@@ -49,3 +49,31 @@ python app/python/llama3/sched.py \
   position 140, traversing two KV128 blocks. Every B=8 request row passed;
   final hidden/RMS errors were at most 2.487%/2.494%, and all eight tokens
   exactly matched reference token 264.
+
+## Context-matched C128 milestone sweep
+
+The 2026-08-31 milestone correction used 127 repeated prefill tokens and one
+current decode token, so every resident interval below attends C128. It used
+three warmups and 20 measured launches; framework baselines were not rerun.
+
+| Logical batch | Median latency (ns) | Median latency (ms) |
+| ---: | ---: | ---: |
+| 1 | 2,488,144 | 2.488144 |
+| 2 | 2,494,496 | 2.494496 |
+| 4 | 2,498,176 | 2.498176 |
+| 8 | 2,495,088 | 2.495088 |
+
+Performance job: `20260831T052449Z-1098144`. C128 B8 correctness job
+`20260831T052416Z-1092493` passed every tensor gate, with a worst reported
+mean-relative error of 3.573%. All eight VDCores rows agreed; the fused
+argmax/reference-token difference remains an informational, non-gating
+diagnostic.
+
+The command shape was:
+
+```bash
+DAE_BENCH_WARMUP=3 python app/python/llama3/sched.py \
+  --model /mnt/checkpoints/unsloth/Meta-Llama-3.1-8B-Instruct \
+  --batch-size BATCH --prefill-length 127 \
+  --no-control-flow -N 1 --bench 20
+```

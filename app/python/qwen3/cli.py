@@ -31,6 +31,12 @@ def parse_args():
     arg_parser.add_argument("--model", "--model-name", dest="model_name", default=MODEL_NAME)
     arg_parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     arg_parser.add_argument(
+        "--prefill-length",
+        type=int,
+        default=1,
+        help="Number of checkpoint-backed KV-prefix tokens before decode",
+    )
+    arg_parser.add_argument(
         "--batch-size",
         type=int,
         default=8,

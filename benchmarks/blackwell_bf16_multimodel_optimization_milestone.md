@@ -28,41 +28,38 @@ the freeze point.
 
 ## Median decode latency
 
-Lower is better.  This table reuses existing measurements; no closure run was
-performed.  The framework columns are BF16 decode at exactly C128.  The
-VDCores column reports its actual measured context and internal device timing:
-the logical-batch sweeps are C1 for the Llama and small-Qwen lanes and C2 for
-Qwen3-8B.  These timing boundaries and contexts are not directly comparable,
-so the table deliberately makes no VDCores/framework speedup claim.
+Lower is better.  Every row is now context-matched at C128: 127 cached prefix
+tokens plus one current decode token.  VDCores uses three unmeasured warmups
+and 20 measured resident launches and reports the median internal device
+interval.  The vLLM and SGLang columns reuse the previously accepted BF16 C128
+framework results unchanged; neither framework was rerun for this correction.
+Framework timing includes its serving/IPC observation boundary, so the table
+is context- and dtype-matched but not a pure kernel-to-kernel comparison.
 
-| Model | Batch | VDCores context | VDCores existing (ms) | vLLM BF16 C128 (ms) | SGLang BF16 C128 (ms) |
-|:--|--:|:--:|--:|--:|--:|
-| Llama-3.1-8B | 1 | C1 | 2.501280 | 2.801810 | 3.187549 |
-| Llama-3.1-8B | 2 | C1 | 2.504928 | 2.736208 | 3.366307 |
-| Llama-3.1-8B | 4 | C1 | 2.507152 | 2.830291 | 3.389763 |
-| Llama-3.1-8B | 8 | C1 | 2.492736 | 2.843123 | 3.373474 |
-| Llama-3.2-1B | 1 | C1 | 0.678144 | 0.318281 | 1.730291 |
-| Llama-3.2-1B | 2 | C1 | 0.679616 | 0.332170 | 1.770964 |
-| Llama-3.2-1B | 4 | C1 | 0.681808 | 0.351210 | 1.683249 |
-| Llama-3.2-1B | 8 | C1 | 0.684832 | 0.369546 | 1.754931 |
-| Qwen3-8B | 1 | C2 | 2.842656 | 3.108603 | 3.473574 |
-| Qwen3-8B | 2 | C2, prior port | 3.001520 [^qwen-prior] | 3.125051 | 3.656299 |
-| Qwen3-8B | 4 | C2, prior port | 2.958224 [^qwen-prior] | 3.174845 | 3.656171 |
-| Qwen3-8B | 8 | C2 | 2.830880 | 3.093018 | 3.666604 |
-| Qwen3-1.7B | 1 | C1 | 1.153392 | 0.957885 | 1.486380 |
-| Qwen3-1.7B | 2 | C1 | 1.153040 | 1.030142 | 1.609935 |
-| Qwen3-1.7B | 4 | C1 | 1.154176 | 1.107104 | 1.690033 |
-| Qwen3-1.7B | 8 | C1 | 1.165600 | 0.998845 | 1.762260 |
+| Model | Batch | VDCores BF16 C128 (ms) | vLLM BF16 C128 (ms) | SGLang BF16 C128 (ms) |
+|:--|--:|--:|--:|--:|
+| Llama-3.1-8B | 1 | 2.488144 | 2.801810 | 3.187549 |
+| Llama-3.1-8B | 2 | 2.494496 | 2.736208 | 3.366307 |
+| Llama-3.1-8B | 4 | 2.498176 | 2.830291 | 3.389763 |
+| Llama-3.1-8B | 8 | 2.495088 | 2.843123 | 3.373474 |
+| Llama-3.2-1B | 1 | 0.694256 | 0.318281 | 1.730291 |
+| Llama-3.2-1B | 2 | 0.699200 | 0.332170 | 1.770964 |
+| Llama-3.2-1B | 4 | 0.702048 | 0.351210 | 1.683249 |
+| Llama-3.2-1B | 8 | 0.706112 | 0.369546 | 1.754931 |
+| Qwen3-8B | 1 | 2.835808 | 3.108603 | 3.473574 |
+| Qwen3-8B | 2 | 2.827728 | 3.125051 | 3.656299 |
+| Qwen3-8B | 4 | 2.846864 | 3.174845 | 3.656171 |
+| Qwen3-8B | 8 | 2.839152 | 3.093018 | 3.666604 |
+| Qwen3-1.7B | 1 | 1.364928 | 0.957885 | 1.486380 |
+| Qwen3-1.7B | 2 | 1.365984 | 1.030142 | 1.609935 |
+| Qwen3-1.7B | 4 | 1.361584 | 1.107104 | 1.690033 |
+| Qwen3-1.7B | 8 | 1.387152 [^qwen17-c128] | 0.998845 | 1.762260 |
 
-[^qwen-prior]: The final Qwen3-8B head `584c3bf` has accepted B1 and B8
-    timings only.  B2 and B4 are the existing one-prefill measurements from
-    the earlier accepted port at `e2494e7`; they are retained for table
-    completeness and are not presented as final-head measurements.
-
-The original lean Llama-3.1-8B refinement also recorded a 2.484224-ms S128
-internal median before logical batch controls were introduced.  Because that
-run does not carry a logical B1/B2/B4/B8 label, it is not substituted into the
-batch table.
+[^qwen17-c128]: The C128 B8 run returned the exact reference token on every
+    checked launch, but its repeated tensor checks were numerically marginal:
+    the worst observations were 5.228% for one logits shard and 5.239% for
+    fused SwiGLU.  The B8 value is retained as performance evidence, not as a
+    strict below-5% correctness qualification.
 
 ## Improvement against each VDCores lane's retained control
 
@@ -76,14 +73,14 @@ batch table.
 ## Correctness gates
 
 Mean-relative tensor error below 5% is the acceptance criterion.  The retained
-jobs passed that gate:
+jobs produced the following C128 evidence:
 
 | Model | Accepted evidence |
 |:--|:--|
-| Llama-3.1-8B | B8 all-row checks below 3.304%; position-140 cache traversal below 2.494% |
-| Llama-3.2-1B | B1/B8 worst 2.346%/2.913%; position-128 three-block cache check below 2.892% |
-| Qwen3-8B | Final-head B1/B8 worst 2.397%/2.806%, token 422 on every live row |
-| Qwen3-1.7B | B1/B8/position-65 suite worst 4.137% |
+| Llama-3.1-8B | C128 B8 all-row checks passed; worst reported tensor error 3.573% |
+| Llama-3.2-1B | C128 B8 passed; worst reported tensor error 3.104%, exact token 315 on every row |
+| Qwen3-8B | C128 B8 passed; worst reported tensor error 4.183%, exact token 198 on every row |
+| Qwen3-1.7B | C128 B1 passed with worst 4.188% and exact token 198; C128 B8 exact-token checks passed but repeated tensor maxima reached 5.239% |
 
 Exact commands, job identifiers, distributions, and build profiles are in:
 
