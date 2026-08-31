@@ -43,6 +43,15 @@ def parse_args():
         default=True,
         help="Write fused attention output directly (disable for matched A/B)",
     )
+    arg_parser.add_argument(
+        "--fused-down-phases",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Accumulate prefix/tail down-projection K phases in one ordinary "
+            "UMMA task per owner"
+        ),
+    )
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument(
         "--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full"

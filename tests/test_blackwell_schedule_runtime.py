@@ -35,6 +35,7 @@ from dae.instructions import (
     Gemv_M128N8Direct4,
     Gemv_M128N8_ROPE_128,
     Gemv_M64N8_ROPE_128,
+    Gemv_M64N8IssuerOnly,
     Gemv_M64N8UpSiLU,
     LoopC,
     LoopM,
@@ -96,6 +97,7 @@ from dae.schedule import (
     SchedFp8GemvUmmaStream,
     SchedFp8GemvUmmaSplitK,
     SchedFp8GemvUmmaCoupled,
+    SchedGemvPhasedKSegments,
     SchedMxfp4Mxfp8GemvUmmaK512,
     SchedMxfp4Mxfp8GateUpSiluFixedRing,
     SchedMxfp4Mxfp8DownFixedRing,
@@ -224,6 +226,97 @@ def test_dynamic_repeat_encodes_zero_count_skip_window():
     assert repeat.arg & RepeatM.COUNT_COUNTER_MODE_FLAG
     assert repeat.arg & RepeatM.COUNTER_REG_MASK == 3
     assert (repeat.arg >> RepeatM.SKIP_COUNT_SHIFT) & RepeatM.SKIP_COUNT_MASK == 1
+
+
+def test_phased_k_segments_preserve_fold_balance_and_single_store():
+    class FakeTma:
+        def __init__(self, kind, op, mode):
+            self.kind = kind
+            self.op = op
+            self.mode = mode
+
+        def cord(self, *coords):
+            inst = MemoryInstruction(
+                self.op, num_slots=1, arg=0, size=16, cords=list(coords)
+            )
+            inst.annotation["kind"] = self.kind
+            inst.annotation["coords"] = tuple(coords)
+            return inst
+
+        @staticmethod
+        def cord2tma(*delta):
+            return list(delta)
+
+    weight = FakeTma("weight", opcode.OP_ALLOC_TMA_LOAD_1D, "load")
+    activation = FakeTma("activation", opcode.OP_ALLOC_LDU_LOAD_1D, "load")
+    output = FakeTma("output", opcode.OP_ALLOC_WB_TMA_REDUCE_ADD_2D, "reduce")
+    schedule = SchedGemvPhasedKSegments(
+        Gemv_M64N8IssuerOnly,
+        MNK=(4096, 8, 12288),
+        fold=2,
+        fold_segments=(
+            ((0, 2048, 11), (4096, 4096, 12)),
+            ((2048, 2048, 11), (8192, 4096, 12)),
+        ),
+        tmas=(weight, activation, output),
+    ).bar("store", 13).place(128)
+
+    fold0 = schedule.schedule(0)
+    fold1 = schedule.schedule(64)
+    assert fold0[0].args == fold1[0].args == [24, 0]
+    assert fold0[-1].annotation["coords"] == (0, 0)
+    assert fold1[-1].annotation["coords"] == (0, 0)
+    assert fold0[-1].num_slots >> 6 == 13
+    assert fold1[-1].num_slots >> 6 == 13
+    assert schedule.bar_release_count("store") == 128
+
+    def barriered_activation_starts(instructions):
+        return [
+            (inst.annotation["coords"][1], inst.num_slots >> 6)
+            for inst in instructions[1]
+            if (
+                isinstance(inst, MemoryInstruction)
+                and not isinstance(inst, RepeatM)
+                and inst.annotation.get("kind") == "activation"
+                and inst.opcode & 16
+            )
+        ]
+
+    assert barriered_activation_starts(fold0) == [(0, 11), (4096, 12)]
+    assert barriered_activation_starts(fold1) == [(2048, 11), (8192, 12)]
+
+
+def test_phased_k_segments_reject_gaps_or_overlap():
+    class FakeTma:
+        mode = "load"
+
+        @staticmethod
+        def cord(*coords):
+            return MemoryInstruction(
+                opcode.OP_ALLOC_TMA_LOAD_1D,
+                num_slots=1,
+                arg=0,
+                size=16,
+                cords=list(coords),
+            )
+
+        @staticmethod
+        def cord2tma(*delta):
+            return list(delta)
+
+    output = FakeTma()
+    output.mode = "reduce"
+    with pytest.raises(ValueError, match="partition"):
+        SchedGemvPhasedKSegments(
+            Gemv_M64N8IssuerOnly,
+            MNK=(4096, 8, 12288),
+            fold=2,
+            fold_segments=(
+                ((0, 2048, 11), (4096, 4096, 12)),
+                ((2048, 2048, 11), (7168, 4096, 12)),
+            ),
+            tmas=(FakeTma(), FakeTma(), output),
+        ).place(128)
 
 
 def test_dynamic_repeat_encodes_counter_transform():

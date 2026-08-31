@@ -499,6 +499,30 @@ def schedule_single_token(token_offset: int, token_pos: int):
         MNK=(HIDDEN, N, (MLP_PREFIX, MLP_TAIL)),
         tmas=(layerg["loadDown"], layerg["loadSiluLayer"], layerg["reduceHiddenLayer"]),
     ).bar("load", layerg["bar_silu_out2"]).bar("store", layerg["bar_layer"])
+    down_proj_fused = SchedGemvPhasedKSegments(
+        LinearAtom,
+        MNK=(HIDDEN, N, INTERMIDIATE),
+        fold=2,
+        fold_segments=(
+            (
+                (0, MLP_PREFIX // 2, layerg["bar_silu_out1"]),
+                (MLP_PREFIX, MLP_TAIL // 2, layerg["bar_silu_out2"]),
+            ),
+            (
+                (MLP_PREFIX // 2, MLP_PREFIX // 2, layerg["bar_silu_out1"]),
+                (
+                    MLP_PREFIX + MLP_TAIL // 2,
+                    MLP_TAIL // 2,
+                    layerg["bar_silu_out2"],
+                ),
+            ),
+        ),
+        tmas=(
+            layerg["loadDown"],
+            layerg["loadSiluLayer"],
+            layerg["reduceHiddenLayer"],
+        ),
+    ).bar("store", layerg["bar_layer"])
 
     logits_proj = []
     for i in range(logits_epoch):
@@ -561,6 +585,12 @@ def schedule_single_token(token_offset: int, token_pos: int):
     silu_fused = silu_fused.place(MLP_TAIL_SMS)
     down_proj_low = down_proj_low.place(DOWN_LOW_SMS)
     down_proj_high = down_proj_high.place(DOWN_TAIL_SMS)
+    down_proj_fused = down_proj_fused.place(DOWN_LOW_SMS)
+    down_schedules = (
+        [down_proj_fused]
+        if ctx.parsed_args.fused_down_phases
+        else [down_proj_low, down_proj_high]
+    )
     argmax = argmax.place(full_sms)
     restore_bars_low = restore_bars_low.place(1, base_sm=128)
     restore_bars_high = restore_bars_high.place(1, base_sm=128)
@@ -580,7 +610,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             if stage_enabled("mlp_tail")
             else []
         ),
-        *([down_proj_low, down_proj_high] if stage_enabled("down") else []),
+        *(down_schedules if stage_enabled("down") else []),
         *([pre_attn_rms] if stage_enabled("final_rms") else []),
         *([logits_proj] if stage_enabled("logits") else []),
         *([argmax] if stage_enabled("argmax") else []),
@@ -609,7 +639,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
             if stage_enabled("mlp_tail")
             else []
         ),
-        *([down_proj_low, down_proj_high] if stage_enabled("down") else []),
+        *(down_schedules if stage_enabled("down") else []),
         *([pre_attn_rms] if stage_enabled("final_rms") else []),
         *(
             [

@@ -38,6 +38,31 @@ weight layout improved the matched batch-1 median from 3,100,128 ns to
 `20260830T184128Z-883093`, respectively. No new opcode, allocator behavior,
 or publication mechanism was introduced.
 
+### Retained phased down projection
+
+The down projection now keeps each owner's prefix and tail products in one
+ordinary BF16 UMMA accumulator and performs one final reduction store. The two
+folds retain exactly 128 owners and six K1024 repeats per owner: each fold
+observes two prefix repeats after `bar_silu_out1` and four tail repeats after
+`bar_silu_out2`. This removes one compute dispatch and one intermediate
+reduction store per owner per layer without changing the M2C/C2M or allocator
+publication protocol. `--no-fused-down-phases` selects the prior two-task
+schedule for matched controls.
+
+On the same SM100 image with `--max-seq-len 128`, three warmups, and 301
+measured iterations, the full-token control/candidate/control medians were:
+
+| Batch | Control 1 | Phased down | Control 2 | Control mean | Saving |
+| ---: | --- | --- | --- | ---: | ---: |
+| 1 | 2.961600 ms (`20260831T022821Z-3727764`) | 2.951136 ms (`20260831T022854Z-3730697`) | 3.001984 ms (`20260831T022925Z-3733341`) | 2.981792 ms | 30.656 us (1.03%) |
+| 8 | 2.959776 ms (`20260831T022957Z-3736089`) | 2.956000 ms (`20260831T023029Z-3738846`) | 2.964896 ms (`20260831T023102Z-3742529`) | 2.962336 ms | 6.336 us (0.21%) |
+
+A one-layer final-RMS 301-iteration bracket measured 78.240/77.664/78.016 us
+(`20260831T022614Z-3713222`, `20260831T022641Z-3715507`, and
+`20260831T022708Z-3719011`), a 0.464-us improvement over the control-endpoint
+mean. The composed full-token gain is therefore consistent with a small
+per-layer queue/dispatch reduction rather than a new compute primitive.
+
 ## Correctness
 
 Full 36-layer reference checks use a 5% mean-relative-error gate for every
@@ -49,6 +74,8 @@ state, logits slice, and cross-request consistency check.
 | 1 | `20260830T184526Z-907712` | 2.659% | `[422]` |
 | 8 | `20260830T184556Z-910073` | 2.888% | `[422, 422, 422, 422, 422, 422, 422, 422]` |
 | 8 repeat | `20260830T184704Z-918688` | 2.668% | `[422, 422, 422, 422, 422, 422, 422, 422]` |
+| 1 phased down | `20260831T023141Z-3745358` | 2.513% | `[422]` |
+| 8 phased down | `20260831T023212Z-3749900` | 2.222% | `[422, 422, 422, 422, 422, 422, 422, 422]` |
 
 The repeated batch-8 run confirms the same accepted token on every live row
 and keeps every tensor metric below 5%. Token agreement is recorded as an

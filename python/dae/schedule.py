@@ -10069,6 +10069,125 @@ class SchedGemvPhasedActivation(SchedGemv):
         ]
 
 
+class SchedGemvPhasedKSegments(SchedGemv):
+    """Accumulate discontiguous, barriered K segments in one GEMV task.
+
+    ``fold_segments`` supplies one segment list per K fold.  Every segment is
+    ``(base_k, size_k, producer_bar)`` and all segments together must partition
+    the GEMV K range exactly.  This preserves ordinary GEMV M2C/C2M behavior
+    while allowing one accumulator and one output store to span independently
+    produced activation ranges.
+    """
+
+    def __init__(self, Atom, MNK, tmas, fold_segments,
+                 fold: int | None = None, prefetch=True, group=True):
+        super().__init__(
+            Atom, MNK, tmas, fold=fold, prefetch=prefetch, group=group
+        )
+        self.fold_segments = tuple(
+            tuple(tuple(segment) for segment in segments)
+            for segments in fold_segments
+        )
+
+    def validate(self):
+        super().validate()
+        if self._bar("load") is not None:
+            raise ValueError(
+                "phased K-segment GEMV takes producer barriers explicitly"
+            )
+        if len(self.fold_segments) != self.fold:
+            raise ValueError(
+                "phased K-segment GEMV requires one segment list per fold"
+            )
+
+        TileK = self.Atom.MNK[2]
+        repeat_k = TileK * self.Atom.n_batch
+        base_k = self.MNK_base[2]
+        end_k = base_k + self.MNK[2]
+        covered = []
+        for fold_id, segments in enumerate(self.fold_segments):
+            if not segments:
+                raise ValueError(
+                    f"phased K-segment GEMV fold {fold_id} has no segments"
+                )
+            fold_k = 0
+            for segment in segments:
+                if len(segment) != 3:
+                    raise ValueError(
+                        "phased K segment must be (base_k, size_k, barrier)"
+                    )
+                segment_k, segment_size, bar_id = segment
+                if bar_id is None:
+                    raise ValueError("phased K segment requires a producer barrier")
+                if segment_size <= 0 or segment_size % repeat_k:
+                    raise ValueError(
+                        "phased K segment size must be a positive activation-repeat multiple"
+                    )
+                if (
+                    segment_k < base_k
+                    or segment_k + segment_size > end_k
+                    or (segment_k - base_k) % repeat_k
+                ):
+                    raise ValueError(
+                        "phased K segment must be repeat-aligned and inside the GEMV K range"
+                    )
+                fold_k += segment_size
+                covered.append((segment_k, segment_k + segment_size))
+            if fold_k != self.k_per_fold:
+                raise ValueError(
+                    "phased K segments must carry exactly one fold's K work"
+                )
+
+        cursor = base_k
+        for segment_k, segment_end in sorted(covered):
+            if segment_k != cursor:
+                raise ValueError(
+                    "phased K segments must partition the GEMV K range exactly"
+                )
+            cursor = segment_end
+        if cursor != end_k:
+            raise ValueError(
+                "phased K segments must partition the GEMV K range exactly"
+            )
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+
+        TileM, _, TileK = self.Atom.MNK
+        baseM, _, _ = self.MNK_base
+        n_batch = self.Atom.n_batch
+        loadA, loadB, storeC = self.tmas
+
+        m = baseM + (sm % self.sm_per_fold) * TileM
+        fold_id = sm // self.sm_per_fold
+        repeat_k = TileK * n_batch
+        phased_loads = []
+        for segment_k, segment_size, bar_id in self.fold_segments[fold_id]:
+            load_steps = [
+                (loadB.cord(0, segment_k).group(),
+                 loadB.cord2tma(0, repeat_k)),
+                *[
+                    (loadA.cord(m, segment_k + TileK * i).group(),
+                     loadA.cord2tma(0, repeat_k))
+                    for i in range(n_batch)
+                ],
+            ]
+            phased_loads.extend(
+                RepeatM.onSync(
+                    0, bar_id, segment_size // repeat_k, *load_steps,
+                    asyncPort=self.prefetch,
+                )
+            )
+
+        store_group = self.group and self._bar("store") is not None
+        return [
+            self.Atom(self.k_per_fold // TileK),
+            phased_loads,
+            storeC.cord(0, m).bar(self._bar("store")).group(store_group),
+        ]
+
+
 class SchedGemvUpSiLU(SchedGemv):
     """Up projection whose final UMMA group overlaps gate SiLU work."""
 
