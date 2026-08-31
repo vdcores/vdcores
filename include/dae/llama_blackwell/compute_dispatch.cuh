@@ -340,6 +340,8 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_DIRECT) {
   int num_kv_blocks = inst.args[0] & 0xFF;
   const int outer_seq_stride = (inst.args[0] >> 8) & 0xFF;
   int last_kv_active_token_len = (inst.args[1] >> 8) & 0xFF;
+  const bool need_norm = inst.args[2] & 0x1;
+  const bool need_rope = inst.args[2] & 0x2;
   if (inst.args[2] & 0x8) {
     const int counter_reg = (inst.args[2] >> 4) & 0xF;
     num_kv_blocks += count[counter_reg];
@@ -356,15 +358,29 @@ DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_DIRECT) {
     last_kv_active_token_len += count[counter_reg];
   }
   if (use_kv128) {
-    task_attention_fwd_sm100_decode<128, 128, false, 16, true, true>(
-      num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
-      false, false, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
-      smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+    if (need_norm || need_rope) {
+      task_attention_fwd_sm100_decode<128, 128, false, 16, true, false>(
+        num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+        need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+    } else {
+      task_attention_fwd_sm100_decode<128, 128, false, 16, true, true>(
+        num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+        need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+    }
   } else {
-    task_attention_fwd_sm100_decode<128, 64, false, 16, true, true>(
-      num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
-      false, false, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
-      smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+    if (need_norm || need_rope) {
+      task_attention_fwd_sm100_decode<128, 64, false, 16, true, false>(
+        num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+        need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+    } else {
+      task_attention_fwd_sm100_decode<128, 64, false, 16, true, true>(
+        num_kv_blocks, 0, num_active_q, last_kv_active_token_len,
+        need_norm, need_rope, tmem_base_ptr, tmem_mma_barrier, tmem_mma_phase,
+        smem_base, (float *)scratch_space, st_insts, m2c, c2m);
+    }
   }
 #endif
 }

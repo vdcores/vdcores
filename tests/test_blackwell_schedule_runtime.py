@@ -3640,8 +3640,8 @@ def test_direct_attention_preserves_dynamic_decode_fields():
         num_kv_block=1,
         num_active_q=4,
         last_kv_active_token_len=1,
-        need_norm=False,
-        need_rope=False,
+        need_norm=True,
+        need_rope=True,
         seq_len_counter_reg=1,
         num_kv_block_counter_reg=3,
         kv_block_size=128,
@@ -3651,7 +3651,37 @@ def test_direct_attention_preserves_dynamic_decode_fields():
 
     assert instruction.args[0] == 0x0101
     assert instruction.args[1] == 0x0184
-    assert instruction.args[2] == 0x213C
+    assert instruction.args[2] == 0x213F
+
+
+@pytest.mark.parametrize(
+    "dispatch_path",
+    (
+        "include/dae/compute_dispatch.cuh",
+        "include/dae/llama_blackwell/compute_dispatch.cuh",
+    ),
+)
+def test_fused_direct_attention_selects_tmem_probability_path(dispatch_path):
+    source = (Path(__file__).parents[1] / dispatch_path).read_text()
+    start = source.index(
+        "DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_DIRECT)"
+    )
+    end = source.index(
+        "DAE_COMPUTE_OP_HANDLER(OP_ATTENTION_SM100_BF16_HDIM128_SPLIT_DIRECT)",
+        start,
+    )
+    handler = "".join(source[start:end].split())
+
+    assert "if(need_norm||need_rope)" in handler
+    for kv_block_size in (64, 128):
+        assert (
+            f"task_attention_fwd_sm100_decode<128,{kv_block_size},"
+            "false,16,true,false>"
+        ) in handler
+        assert (
+            f"task_attention_fwd_sm100_decode<128,{kv_block_size},"
+            "false,16,true,true>"
+        ) in handler
 
 
 def test_swapped_attention_preserves_runtime_fields_and_requires_kv128():
@@ -3725,6 +3755,112 @@ def test_decode_schedule_selects_swapped_attention_without_changing_defaults():
             num_active_q=4,
             swapped_qk_pv=True,
         )
+
+
+def test_decode_schedule_allows_qwen_fused_qk_direct_output():
+    output = torch.empty((1, 1, 4, 128), dtype=torch.bfloat16)
+    fused_args = dict(
+        reqs=1,
+        seq_len=1,
+        KV_BLOCK_SIZE=64,
+        NUM_KV_HEADS=1,
+        matO=output,
+        tmas=(None, None, None),
+        side_input=object(),
+        k_store=object(),
+        token_pos=0,
+        num_active_q=4,
+    )
+
+    direct = SchedAttentionDecoding(**fused_args, direct_output=True)
+    materialized = SchedAttentionDecoding(**fused_args, direct_output=False)
+
+    assert direct.direct_output
+    assert direct.AttentionInst is ATTENTION_SM100_BF16_HDIM128_DIRECT
+    assert not materialized.direct_output
+    assert materialized.AttentionInst is ATTENTION_M64N64K16_F16_F32_64_64_hdim
+
+    with pytest.raises(ValueError, match="head_dim=128"):
+        SchedAttentionDecoding(
+            **{**fused_args, "matO": torch.empty((1, 1, 4, 64), dtype=torch.bfloat16)},
+            direct_output=True,
+        )
+
+
+def test_qwen_direct_attention_keeps_side_k_qkv_and_raw_output_order(monkeypatch):
+    class TaggedTma:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def cord(self, *cords):
+            instruction = MemoryInstruction(
+                opcode.OP_ALLOC_TMA_LOAD_1D,
+                num_slots=1,
+                arg=0,
+                size=16,
+                address=0x1000,
+            )
+            instruction.annotation["tag"] = self.tag
+            return instruction
+
+        def cord2tma(self, *cords):
+            return [0]
+
+    monkeypatch.setattr(
+        "dae.schedule.RawAddress",
+        lambda tensor, slot_id: MemoryInstruction(
+            opcode=opcode.OP_ALLOC_WB_RAW_ADDRESS,
+            num_slots=slot_id,
+            arg=slot_id,
+            size=0,
+            address=tensor.data_ptr(),
+        ),
+    )
+    output = torch.empty((1, 1, 4, 128), dtype=torch.bfloat16)
+    schedule = SchedAttentionDecoding(
+        reqs=1,
+        seq_len=1,
+        KV_BLOCK_SIZE=64,
+        NUM_KV_HEADS=1,
+        matO=output,
+        tmas=(TaggedTma("q"), TaggedTma("k"), TaggedTma("v")),
+        side_input=TaggedTma("side"),
+        k_store=TaggedTma("current_k_store"),
+        token_pos=0,
+        num_active_q=4,
+        direct_output=True,
+    ).bar("q", 3).bar("k", 4).bar("o", 5).place(1)
+
+    instructions = schedule.schedule(0)
+    compute = instructions[0]
+    memory = []
+    for item in instructions[1:]:
+        memory.extend(item if isinstance(item, list) else [item])
+    output_store = memory[-1]
+
+    assert compute.opcode == opcode.OP_ATTENTION_SM100_BF16_HDIM128_DIRECT
+    assert compute.args[2] & 0x3 == 0x3
+    assert [inst.annotation.get("tag") for inst in memory[:-1]] == [
+        "side",
+        "current_k_store",
+        "q",
+        "k",
+        "v",
+    ]
+    assert all(inst.opcode & 0x4 for inst in memory[:-1])
+    assert memory[2].opcode & 0x10
+    assert memory[3].opcode & 0x10
+    assert memory[3].opcode & 0x20
+    assert memory[4].opcode & 0x20
+    assert output_store.opcode & ~0x3F == opcode.OP_ALLOC_WB_RAW_ADDRESS & ~0x3F
+    assert output_store.opcode & 0x2
+    assert output_store.opcode & 0x4
+    assert output_store.opcode & 0x10
+    assert output_store.arg == config.num_slots
+    assert output_store.num_slots & 0x3F == config.num_slots
+    assert output_store.num_slots >> 6 == 5
+    assert cords2addr(output_store.cords) == output[0, 0].data_ptr()
+    assert schedule.bar_release_count("o") == 1
 
 
 def test_decode_schedule_maps_head_major_workers_to_per_head_barriers():

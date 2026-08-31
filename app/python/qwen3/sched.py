@@ -98,6 +98,7 @@ print(
     f"[weights] packing Qwen projections as M{TileM}K{TileK} and "
     f"LM head as M{LogitsTileM}K{LogitsTileK} tiles"
 )
+print(f"[attention] direct_output={ctx.parsed_args.direct_attention_output}")
 matqWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matqWs]
 matkWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matkWs]
 matvWs = [pack_weight_tile_major(weight.contiguous(), TileM, TileK) for weight in matvWs]
@@ -418,6 +419,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         k_store=current_k_store,
         token_pos=token_pos,
         num_active_q=HEAD_GROUP_SIZE,
+        direct_output=ctx.parsed_args.direct_attention_output,
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
     clear_q = SchedClearQ(

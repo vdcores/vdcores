@@ -1754,10 +1754,6 @@ class ATTENTION_SM100_BF16_HDIM128_DIRECT(ComputeInstruction):
     HEAD_DIM = 128
 
     def __init__(self, num_kv_block: int, num_active_q: int, last_kv_active_token_len: int, need_norm: bool = False, need_rope: bool = False, seq_len_counter_reg: int | None = None, num_kv_block_counter_reg: int | None = None, kv_block_size: int = 64, outer_seq_len_counter_reg: int | None = None, outer_seq_len_counter_stride: int = 0):
-        assert not need_norm and not need_rope, (
-            "direct SM100 attention expects Q/K normalization and RoPE to be "
-            "scheduled separately"
-        )
         if outer_seq_len_counter_reg is None:
             assert outer_seq_len_counter_stride == 0
         else:

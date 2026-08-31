@@ -9589,7 +9589,8 @@ class SchedAttentionDecoding(Schedule):
                  q_head_bars=None,
                  kv_head_bars=None,
                  o_head_bars=None,
-                 head_major: bool = False):
+                 head_major: bool = False,
+                 direct_output: bool | None = None):
         super().__init__()
         self.reqs = reqs
         self.seq_len = seq_len
@@ -9620,7 +9621,15 @@ class SchedAttentionDecoding(Schedule):
         self.required_sms = reqs * NUM_KV_HEADS
         self.block_size = KV_BLOCK_SIZE
         self.use_qwen_fused_qk = side_input is not None
-        self.direct_output = matO.shape[-1] == 128 and not self.use_qwen_fused_qk
+        supports_direct_output = matO.shape[-1] == 128
+        if direct_output is None:
+            # Preserve the established default for existing callers.  Fused
+            # Qwen schedules opt in explicitly after selecting the DIRECT op.
+            self.direct_output = supports_direct_output and not self.use_qwen_fused_qk
+        else:
+            self.direct_output = bool(direct_output)
+            if self.direct_output and not supports_direct_output:
+                raise ValueError("direct attention output requires head_dim=128")
         if swapped_qk_pv:
             if not self.direct_output or self.block_size != 128:
                 raise ValueError(

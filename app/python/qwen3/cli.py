@@ -37,6 +37,12 @@ def parse_args():
         help="Logical request batch (1-8); GEMV tiles remain physically N=8",
     )
     arg_parser.add_argument("--correctness", action="store_true")
+    arg_parser.add_argument(
+        "--direct-attention-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write fused attention output directly (disable for matched A/B)",
+    )
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument(
         "--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full"
