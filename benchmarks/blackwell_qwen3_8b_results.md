@@ -1,9 +1,10 @@
 # Qwen3-8B Blackwell decode results
 
-Measured on 2026-08-30 with checkpoint
+Measured on 2026-08-30 through 2026-08-31 with checkpoint
 `/mnt/checkpoints/Qwen/Qwen3-8B` on worker `10.0.16.34` (one NVIDIA GB200
-GPU, one MPI rank). The tested implementation is commit `e2494e7` on
-`port/qwen3-8b-blackwell`.
+GPU, one MPI rank). The initial batch sweep used commit `e2494e7` on
+`port/qwen3-8b-blackwell`; the retained BF16 optimization chain ends at
+`584c3bf` on `opt/qwen3-8b-blackwell-bf16`.
 
 ## Method
 

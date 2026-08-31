@@ -1,5 +1,9 @@
 # Blackwell VDCores, vLLM, and SGLang multimodel baselines
 
+> The optimized BF16 milestone and its updated VDCores rows are recorded in
+> [Blackwell BF16 multimodel optimization milestone](blackwell_bf16_multimodel_optimization_milestone.md).
+> This file preserves the original 2026-08-30 framework-baseline aggregation.
+
 Measured on one NVIDIA GB200 on worker `10.0.16.34` on 2026-08-30. Per the
 accepted reporting scope, this comparison retains only batch sizes 1, 2, 4,
 and 8.

@@ -1,5 +1,9 @@
 # Blackwell LLM batch 1-8 evaluation
 
+> Later accepted BF16 schedule optimizations and the consolidated framework
+> table are recorded in
+> [Blackwell BF16 multimodel optimization milestone](blackwell_bf16_multimodel_optimization_milestone.md).
+
 Measured on 2026-08-30 on one GPU and one MPI rank on worker
 `10.0.16.34`. The worker exposes NVIDIA GB200 Blackwell GPUs and
 the checkpoint-backed conda environment from `setup.sh`.

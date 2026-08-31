@@ -2701,3 +2701,23 @@ up-prefix, down-low, and Q-clear were neutral in 501-sample screening.  A
 candidate at 3.073408 ms versus a 3.072752-ms control mean.  Those schedule
 experiments were removed; runtime state and schedule phase must be treated as
 part of an optimization's context.
+
+## Closed BF16 multimodel milestone
+
+The 2026-08-31 closure integrates the qualified Llama-3.2-1B handoff schedule,
+Qwen3-1.7B register-forwarded MLP, and Qwen3-8B Q-clear/M128-head/direct-attention/
+phased-down/down-owner chain with the existing lean Llama-3.1-8B port.  The
+canonical result and commit-source table is
+`benchmarks/blackwell_bf16_multimodel_optimization_milestone.md`.
+
+Keep the measurement boundary attached to these results.  vLLM and SGLang
+rows are BF16 C128 framework intervals.  The accepted logical-batch VDCores
+sweeps are internal C1 intervals for both Llama lanes and Qwen3-1.7B, and C2
+for Qwen3-8B.  `--max-seq-len 128` reserves cache capacity; it does not make a
+one-prefill Qwen run C128.  Do not calculate a cross-framework speedup from
+those unmatched rows.
+
+The milestone integration adds no FP8 model path and no allocator/writeback
+publication exception.  The uncommitted Qwen3-8B Group4-prefix experiment was
+excluded at closure because full correctness and matched end-to-end timing had
+not both qualified.

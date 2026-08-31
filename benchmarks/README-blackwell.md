@@ -2476,6 +2476,11 @@ KV128 exactly matched `[24748, 24748, 24748, 24748]` in
 
 ## Implementation references
 
+The closed four-model BF16 port/optimization state, including the retained
+B1/B2/B4/B8 table and explicit VDCores-versus-framework context boundaries,
+is recorded in
+[the Blackwell BF16 multimodel optimization milestone](blackwell_bf16_multimodel_optimization_milestone.md).
+
 The retained implementation follows the SM100 programming model and UMMA/TMEM
 layouts described by the [CUDA Blackwell tuning guide](https://docs.nvidia.com/cuda/archive/13.0.1/blackwell-tuning-guide/index.html),
 the [CUDA PTX ISA tcgen05/TMEM synchronization model](https://docs.nvidia.com/cuda/parallel-thread-execution/contents.html),
