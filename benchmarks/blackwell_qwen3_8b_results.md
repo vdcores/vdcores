@@ -63,6 +63,29 @@ A one-layer final-RMS 301-iteration bracket measured 78.240/77.664/78.016 us
 mean. The composed full-token gain is therefore consistent with a small
 per-layer queue/dispatch reduction rather than a new compute primitive.
 
+### Retained critical-path down-owner offload
+
+On the composed BF16 image at `7d48fe9`, the phased down projection has 128
+logical owners on the 132-SM GB300.  Physical SMs 0--3 also carry the earliest
+live attention requests, while SMs 128--131 only carry the short prefix-SiLU
+task before the down frontier.  The retained placement maps logical down
+owners 0--3 onto physical SMs 128--131.  It preserves all 128 contributors,
+the same K segments, reduction stores, barriers, and compute operators; only
+physical ownership changes.  `--no-down-tail-offload` selects the matched
+placement control.
+
+With `--max-seq-len 128`, three warmups, and 301 measured iterations:
+
+| Batch | Control | Down-owner offload | Saving |
+| ---: | ---: | ---: | ---: |
+| 1 | 2.936256 ms (`20260831T025341Z-3883376`) | 2.842656 ms (`20260831T025418Z-3888616`) | 93.600 us (3.19%) |
+| 8 | 2.936160 ms (`20260831T025525Z-3896378`) | 2.830880 ms (`20260831T025454Z-3892296`) | 105.280 us (3.59%) |
+
+Full 36-layer BF16 reference checks passed at batch 1 and batch 8 in jobs
+`20260831T025559Z-3899631` and `20260831T025635Z-3902811`.  The worst reported
+mean-relative errors were 2.397% and 2.806%, respectively, and both runs
+returned token 422 on every live request row.
+
 ## Correctness
 
 Full 36-layer reference checks use a 5% mean-relative-error gate for every

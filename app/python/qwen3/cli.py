@@ -52,6 +52,15 @@ def parse_args():
             "UMMA task per owner"
         ),
     )
+    arg_parser.add_argument(
+        "--down-tail-offload",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Move four attention-burdened phased-down owners onto otherwise "
+            "idle SM128-131"
+        ),
+    )
     arg_parser.add_argument("--debug-num-layers", type=int, default=None)
     arg_parser.add_argument(
         "--debug-stop-after", choices=DEBUG_STAGE_ORDER, default="full"

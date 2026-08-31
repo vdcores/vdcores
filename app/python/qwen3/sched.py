@@ -228,6 +228,41 @@ class SchedSnapshotQ(Schedule):
         ]
 
 
+class SchedLogicalSmOffload(Schedule):
+    """Run selected logical tasks on otherwise-unused physical SMs."""
+
+    def __init__(self, inner, source_sms, target_sms):
+        super().__init__()
+        if len(source_sms) != len(target_sms):
+            raise ValueError("logical-SM offload requires one target per source")
+        self.inner = inner
+        self.source_sms = tuple(source_sms)
+        self.target_to_source = dict(zip(target_sms, source_sms))
+        if len(set(self.source_sms)) != len(self.source_sms):
+            raise ValueError("logical-SM offload sources must be unique")
+        if len(self.target_to_source) != len(target_sms):
+            raise ValueError("logical-SM offload targets must be unique")
+
+    def _on_place(self):
+        if self.inner.num_sms is None:
+            raise ValueError("logical-SM offload requires a placed inner schedule")
+        if any(sm < 0 or sm >= self.inner.num_sms for sm in self.source_sms):
+            raise ValueError("logical-SM offload source is outside the inner placement")
+        if any(sm < self.inner.num_sms or sm >= self.num_sms for sm in self.target_to_source):
+            raise ValueError("logical-SM offload target must be an unused outer SM")
+
+    def schedule(self, sm: int):
+        if sm in self.source_sms:
+            return []
+        logical_sm = self.target_to_source.get(sm, sm)
+        if logical_sm < 0 or logical_sm >= self.inner.num_sms:
+            return []
+        return self.inner.schedule(logical_sm)
+
+    def collect_barrier_release_counts(self):
+        return self.inner.collect_barrier_release_counts()
+
+
 defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
 systemg = dae.add_group("system", 1)
@@ -586,6 +621,19 @@ def schedule_single_token(token_offset: int, token_pos: int):
     down_proj_low = down_proj_low.place(DOWN_LOW_SMS)
     down_proj_high = down_proj_high.place(DOWN_TAIL_SMS)
     down_proj_fused = down_proj_fused.place(DOWN_LOW_SMS)
+    if ctx.parsed_args.down_tail_offload:
+        if DOWN_LOW_SMS != 128 or full_sms < 132:
+            raise ValueError(
+                "down-tail offload requires the 128-on-at-least-132 placement"
+            )
+        down_proj_fused = SchedLogicalSmOffload(
+            down_proj_fused,
+            # SM0-3 carry the earliest live attention requests before they
+            # reach down projection; SM128-131 only carry the short prefix
+            # SiLU task at this frontier.
+            range(0, 4),
+            range(128, 132),
+        ).place(full_sms)
     down_schedules = (
         [down_proj_fused]
         if ctx.parsed_args.fused_down_phases
