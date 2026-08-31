@@ -3,7 +3,13 @@ from .instruction_utils import decode_opcode, dedcode_opcode
 from .instructions import *
 from .runtime import config, opcode
 from .tma_utils import *
-from .core import CoreConfig, CoreKind, KernelVariant, parse_kernel_variant
+from .core import (
+    CORE_FLAG_CTA_COMPUTE_OPERATOR,
+    CoreConfig,
+    CoreKind,
+    KernelVariant,
+    parse_kernel_variant,
+)
 
 import copy
 import os
@@ -647,11 +653,48 @@ class Launcher:
                         f"pool core {sm_id} cannot execute an ordinary CommInst stream"
                     )
             elif pool_insts:
-                raise ValueError(
-                    f"block {sm_id} contains PoolInst but is not configured as a pool core"
-                )
+                if not (
+                    core.kind == CoreKind.COMPUTE_MEMORY
+                    and core.flags & CORE_FLAG_CTA_COMPUTE_OPERATOR
+                ):
+                    raise ValueError(
+                        f"block {sm_id} contains PoolInst but is not configured "
+                        "as a pool core or cooperative CTA compute operator"
+                    )
 
             if core.kind == CoreKind.COMPUTE_MEMORY:
+                if core.flags & CORE_FLAG_CTA_COMPUTE_OPERATOR:
+                    compute_names = [
+                        inst.compute_operator_name()
+                        for inst in builder.built_cinsts
+                    ]
+                    role_names = {
+                        "OP_POOL_SLICE_METADATA_ROUTE",
+                        "OP_POOL_SLICE_REMOTE_SEND",
+                        "OP_POOL_SLICE_SELF_DISPATCH",
+                        "OP_POOL_SLICE_EXECUTOR",
+                        "OP_POOL_SLICE_DISPATCH_BYPASS",
+                    }
+                    if not compute_names or compute_names[0] not in role_names:
+                        raise ValueError(
+                            f"CTA-wide compute block {sm_id} must begin with "
+                            "one explicit pool worker role operator"
+                        )
+                    unexpected = [
+                        name
+                        for name in compute_names[1:]
+                        if name != "OP_TERMINATEC"
+                    ]
+                    if unexpected:
+                        raise ValueError(
+                            f"CTA-wide compute block {sm_id} must contain one "
+                            "fused pool worker role operator"
+                        )
+                    if not pool_insts or len(pool_headers) != 1:
+                        raise ValueError(
+                            f"CTA-wide pool worker {sm_id} requires one PoolInst "
+                            "sidecar header"
+                        )
                 required_comm_warps = 1 if comm_insts else 0
                 if core.communication_warps < required_comm_warps:
                     raise ValueError(
@@ -695,8 +738,27 @@ class Launcher:
         self, core_configs: list[CoreConfig]
     ) -> KernelVariant:
         variant = self.kernel_variant
+        cooperative_pool_assembly = (
+            any(core.kind == CoreKind.POOL for core in core_configs)
+            and any(
+                core.kind == CoreKind.COMPUTE_MEMORY
+                and core.flags & CORE_FLAG_CTA_COMPUTE_OPERATOR
+                for core in core_configs
+            )
+            and all(
+                core.kind == CoreKind.POOL
+                or (
+                    core.kind == CoreKind.COMPUTE_MEMORY
+                    and core.flags & CORE_FLAG_CTA_COMPUTE_OPERATOR
+                    and core.communication_warps == 0
+                )
+                for core in core_configs
+            )
+        )
         if variant == KernelVariant.AUTO:
-            if all(
+            if cooperative_pool_assembly:
+                variant = KernelVariant.POOL_CTA_COMPUTE
+            elif all(
                 core.kind == CoreKind.COMPUTE_MEMORY
                 and core.load_warps == 2
                 and core.communication_warps == 0
@@ -738,6 +800,8 @@ class Launcher:
             )
         elif variant == KernelVariant.POOL:
             valid = all(core.kind == CoreKind.POOL for core in core_configs)
+        elif variant == KernelVariant.POOL_CTA_COMPUTE:
+            valid = cooperative_pool_assembly
         elif variant == KernelVariant.RUNTIME:
             valid = not any(core.communication_warps for core in core_configs)
         else:
@@ -776,6 +840,18 @@ class Launcher:
         core_configs = self._resolve_core_configs()
         kernel_variant = self._select_kernel_variant(core_configs)
         pool_inst_opcode = self._resolve_pool_inst_opcode()
+        cooperative_pool_assembly = all(
+            core.kind == CoreKind.POOL
+            or (
+                core.kind == CoreKind.COMPUTE_MEMORY
+                and core.flags & CORE_FLAG_CTA_COMPUTE_OPERATOR
+            )
+            for core in core_configs
+        )
+        # Cooperative pool operators use only their compile-time shared state.
+        # Reserving the generic VM's 202-KiB dynamic arena would needlessly
+        # repartition almost the complete SM SRAM away from L1 on every worker.
+        launch_smem_size = 0 if cooperative_pool_assembly else self.smem_size
         core_config_tensor = self._pack_core_configs(
             core_configs, kernel_variant
         )
@@ -856,6 +932,7 @@ class Launcher:
         )
         self._launch_packet = {
             "kernel_variant": kernel_variant,
+            "smem_size": launch_smem_size,
             "pool_inst_opcode": pool_inst_opcode,
             "core_config_tensor": core_config_tensor,
             "cinsts": cinsts,
@@ -884,6 +961,7 @@ class Launcher:
     def launch(self):
         packet = self._prepare_launch_packet()
         kernel_variant = packet["kernel_variant"]
+        smem_size = packet["smem_size"]
         pool_inst_opcode = packet["pool_inst_opcode"]
         core_config_tensor = packet["core_config_tensor"]
         cinsts = packet["cinsts"]
@@ -931,7 +1009,7 @@ class Launcher:
             )
 
         ret = runtime.launch_dae(
-            self.num_sms, self.smem_size,
+            self.num_sms, smem_size,
             cinsts, minsts, comminsts, poolinsts, tma,
             self.bars, profile,
             stream, self.signal_array, core_config_tensor, int(kernel_variant),

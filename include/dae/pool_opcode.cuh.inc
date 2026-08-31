@@ -23,6 +23,10 @@ DAE_POOL_OP(
     POOL_SLICE_SOURCE_GATHER_EXCHANGE,
     8,
     PoolSliceSourceGatherExchangeExecuteWarp)
+DAE_POOL_OP(
+    POOL_SLICE_SOURCE_GATHER_SCHEDULER,
+    9,
+    PoolSliceSourceGatherSchedulerExecuteWarp)
 #endif
 #endif
 #ifdef DAE_ENABLE_NCCL_GIN

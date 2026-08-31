@@ -385,6 +385,13 @@ their registered execute-warp type.
   compile-time NCCL GIN assembly; all remotely accessed objects must be views
   of its registered HBM window. The raw build changes dispatch WQE formation,
   not the PoolInst dependency semantics.
+- `POOL_SLICE_SOURCE_GATHER_SCHEDULER` is the scheduler-only source-gather
+  header used by the cooperative CTA-compute assembly. Its fields match the
+  source-gather exchange header. Exactly one `POOL` block performs
+  initialization and ring scheduling: warp zero advances dispatch, warp one
+  concurrently waits return generations and releases combine, and the same
+  CTA joins every scatter and executor completion. Payload, route, executor,
+  and return work is delegated to ordinary compute/memory blocks.
 
 Generic dependency semantics are in `memory-pool-protocol.md`. The batched gathered
 read ABI, warp roles, and ordering rules are in `pool-slice-dynamic-read.md`
@@ -404,6 +411,39 @@ runtime roles through compile-time core assembly rather than device calls.
 - `OP_LOOPC`
 - `OP_DUMMY`
 - `OP_COPY`
+
+The source-gather CTA-compute assembly uses five specialized ordinary `CInst`
+roles for `CORE_FLAG_CTA_COMPUTE_OPERATOR` blocks:
+
+- `OP_POOL_SLICE_METADATA_ROUTE` publishes one metadata envelope and expands
+  one source route;
+- `OP_POOL_SLICE_REMOTE_SEND` owns one static target/group SEND;
+- `OP_POOL_SLICE_SELF_DISPATCH` owns one local direct-scatter group;
+- `OP_POOL_SLICE_EXECUTOR` has no static placement job and enters the common
+  ring;
+- `OP_POOL_SLICE_DISPATCH_BYPASS` skips dispatch but still performs its gather
+  stripe.
+
+The opcode, rather than `pool_rank`, selects the role. Every role instruction
+packs `args[0]=task ordinal`, `args[1]=ring dispatch slot`, and
+`args[2]=source-gather rank`; unused fields are zero. The PoolInst sidecar
+header supplies `PoolSliceConfig`, dependency-barrier bases, and the common
+gather count. Dispatch and source-gather return are fused into this one
+operator. All eight physical warps enter the handler, but their normal
+ownership is preserved:
+
+- compute warps `[0, 4)` perform only shared-memory BF16/FP32 return reduction;
+- memory warps `[4, 8)` perform program/configuration reads, polling, route and
+  metadata work, all global activation transfers, and completion/profile
+  stores;
+- memory-warp bulk engines stage source-gather rows into the dynamic shared
+  envelope and store the shared result back to the source row;
+- the handler sets `finish` directly. It does not use the generic VM counter,
+  allocator, load/store queue, or communication-warp state.
+
+The launcher accepts these opcodes only in `DAE_KERNEL_POOL_CTA_COMPUTE`, with
+one scheduler PoolInst header and a CTA-wide worker core configuration. It
+rejects multiple non-termination compute ops in one worker program.
 
 ## Control ops
 
@@ -634,6 +674,9 @@ Many opcodes are declared in [include/dae/opcode.cuh.inc](/home1/11362/depctg/vd
 - `OP_TERMINATEC`
 - `OP_COPY`
 - `OP_SILU_MUL_SHARED_BF16_K_4096_INTER`
+
+The 2026-08-04 GB300 pool CTA-compute build is a separate minimal profile and
+selects the five explicit pool role ops above plus `OP_TERMINATEC`.
 
 Also, some Python wrappers reference opcode names that are declared but do not have a checked-in handler in the current source snapshot, including:
 

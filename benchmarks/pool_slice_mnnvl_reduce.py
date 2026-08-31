@@ -72,6 +72,14 @@ def parse_args() -> argparse.Namespace:
             "launch, then require exact output on every iteration"
         ),
     )
+    parser.add_argument(
+        "--vdcores-workers",
+        action="store_true",
+        help=(
+            "keep rank zero as PoolInst scheduler and execute every other "
+            "pool worker through a cooperative normal compute opcode"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -199,7 +207,10 @@ def main() -> None:
         )
         pool.prepare(pool.token_pool, output)
         program = build_pool_slice_copy_program(
-            pool, in_place_identity=True, source_preloaded=True
+            pool,
+            in_place_identity=True,
+            source_preloaded=True,
+            vdcores_workers=args.vdcores_workers,
         )
         torch.cuda.synchronize(device)
     comm.Barrier()
@@ -367,6 +378,7 @@ def main() -> None:
             "group_limit": pool.group_limit,
             "reduction_backend": args.reduction_backend,
             "static_routes": args.static_routes,
+            "vdcores_workers": args.vdcores_workers,
             "dispatch_ms": statistics.median(gather_samples),
             "combine_or_tail_ms": statistics.median(return_samples),
             "end_to_end_ms": statistics.median(total_samples),

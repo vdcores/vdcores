@@ -18,6 +18,15 @@ static constexpr uint8_t daeDefaultCoreWarps =
 static constexpr int daeWideRegisterLimit = 255;
 static constexpr int daeNineWarpRegisterLimit = 168;
 
+// A cooperative compute instruction may temporarily own the complete physical
+// CTA.  The block is still assembled as a normal compute+memory VDCores core
+// and decodes an ordinary CInst; its allocator/store/load warps join the
+// operator instead of interpreting an independent memory stream.  This is
+// required by block-synchronous operators whose established implementation
+// uses CTA-wide barriers.
+static constexpr uint8_t daeCoreFlagCtaComputeOperator = 1U << 0;
+static constexpr uint8_t daeCoreKnownFlags = daeCoreFlagCtaComputeOperator;
+
 #if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
     defined(DAE_ENABLE_LOCAL_POOL)
 #ifdef DAE_ENABLE_NVSHMEM
@@ -112,6 +121,9 @@ enum DaeKernelVariant : uint32_t {
   // Maximum envelope for blocks that combine compute/memory with a CommInst
   // warp. Kept separate so the common eight-warp kernels are not register-capped.
   DAE_KERNEL_RUNTIME_COMMUNICATION = 5,
+  // One PoolInst scheduler plus cooperative compute-op workers. The ordinary
+  // CInst decoder remains, but allocator/store/load VM paths are not compiled.
+  DAE_KERNEL_POOL_CTA_COMPUTE = 6,
 };
 
 static __device__ __host__ __forceinline__ constexpr DaeCoreConfig

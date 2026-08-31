@@ -177,39 +177,40 @@ poisoned outputs. Times are medians of rank-maximum device-event samples.
 
 | GPUs | Group limit | Dispatch (ms) | Return tail (ms) | VDCores total (ms) | NCCL-EP (ms) | VDCores advantage |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 2 | 0.063632 | 0.019376 | 0.081264 | 0.126944 | 35.98% |
-| 4 | 8 | 0.059552 | 0.023136 | 0.082688 | 0.110144 | 24.93% |
-| 8 | 4 | 0.070976 | 0.026240 | 0.097136 | 0.154400 | 37.09% |
-| 12 | 4 | 0.071328 | 0.027616 | 0.098576 | unsupported | — |
-| 16 | 2 | 0.075456 | 0.028704 | 0.103840 | 0.159136 | 34.75% |
+| 2 | 2 | 0.061440 | 0.019840 | 0.080416 | 0.124432 | 35.37% |
+| 4 | 8 | 0.064320 | 0.024304 | 0.087744 | 0.118224 | 25.78% |
+| 8 | 4 | 0.072016 | 0.026288 | 0.097952 | 0.161296 | 39.27% |
+| 12 | 4 | 0.070656 | 0.027376 | 0.097952 | unsupported | — |
+| 16 | 2 | 0.075856 | 0.029296 | 0.105072 | 0.165728 | 36.60% |
 
 All VDCores points passed changing-input/poisoned-output validation. Two GPUs
 was bit-exact; the direct-scatter points were BF16-close with maximum absolute
 error `0.00390625`, explained by a valid change in BF16 accumulation order.
-Latency stays within 1.278x from two to sixteen GPUs, and within 1.256x from
-four to sixteen. The requested greater-than-20% advantage is achieved at
-every NCCL-supported scale; the smallest margin is 24.93% at four GPUs. Two
-additional four-GPU long-run validations measured 0.083808 and 0.085728 ms,
-also clearing the threshold. Peer-direct opcodes and CUDA assemblies remain
-absent from the accepted runtime.
+The independent full rerun on 2026-08-02 measured a 1.307x latency spread
+from two to sixteen GPUs and a 1.197x spread from four to sixteen. The
+greater-than-20% advantage is achieved at every NCCL-supported scale; the
+smallest rerun margin is 25.78% at four GPUs. The previous accepted scan and
+two additional four-GPU validations remain in
+`.agentlog/2026-08-02-random-global-top8.md`. Peer-direct opcodes and CUDA
+assemblies remain absent from the accepted runtime.
 
 NCCL-EP provenance is nccl4py 0.3.1, NCCL-EP 0.1.0, NCCL 2.30.7, source
 revision `5067397c2676d5aed50042fc39e5c8ee96eb0027`, expert-major BF16, QP8,
 and library-auto SM/channels. GIN and IB were disabled and MNNVL was enabled.
 NCCL-EP does not support 12 ranks.
 
-### Corrected full baseline scan
+### Latest independent full baseline rerun
 
 Communication totals in milliseconds:
 
 | Implementation | Payload/contract note | 2 GPUs | 4 GPUs | 8 GPUs | 12 GPUs | 16 GPUs |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| VDCores source-gather | BF16 global top-8 | 0.081264 | 0.082688 | 0.097136 | 0.098576 | 0.103840 |
-| NCCL-EP | BF16 global top-8 | 0.126944 | 0.110144 | 0.154400 | unsupported rank count | 0.159136 |
-| DeepEP V1 | BF16 global top-8 | 0.1442 | 0.1485 | unsupported without IBGDA RC QPs | unsupported | unsupported |
-| UCCL | BF16 global top-8 | 0.256880 | 0.214112 | cross-host path requires RDMA proxy | unsupported | unsupported |
-| Triton-distributed | online FP8; not BF16 byte-matched | 0.309664 | 0.341456 | 0.325376 | 0.347488 | 0.348208 |
-| Dense NCCL ring control | BF16 top-k 1; two dense all-reduces | 0.560 | 0.829 | 2.740 | 6.033 | 10.698 |
+| VDCores source-gather | BF16 global top-8 | 0.080416 | 0.087744 | 0.097952 | 0.097952 | 0.105072 |
+| NCCL-EP | BF16 global top-8 | 0.124432 | 0.118224 | 0.161296 | unsupported rank count | 0.165728 |
+| DeepEP V1 | BF16 global top-8 | 0.1716 | 0.1419 | unsupported without IBGDA RC QPs | unsupported | unsupported |
+| UCCL | BF16 global top-8 | 0.236656 | 0.216624 | cross-host path requires RDMA proxy | unsupported | unsupported |
+| Triton-distributed | online FP8; not BF16 byte-matched | 0.325264 | 0.350208 | 0.333216 | 0.348208 | 0.344288 |
+| Dense NCCL ring control | BF16 top-k 1; two dense all-reduces | 0.304 | 0.353 | 0.549 | 1.009 | 1.643 |
 | DeepEP V2 | requires NCCL GIN | unsupported | unsupported | unsupported | unsupported | unsupported |
 
 DeepEP V1 and UCCL are not extended across hosts by silently enabling a NIC;
@@ -219,9 +220,134 @@ controls but not byte-matched. DeepEP V2's capability check fails when GIN is
 correctly disabled. The dense ring is a traffic-heavy surrogate, not sparse
 expert parallelism.
 
+The clean NCCL-EP four-GPU repeat is reported above; an earlier sample during
+unrelated worker CPU compilation was 0.127520 ms. DeepEP V1's two-GPU quiet
+repeat was 0.1716 ms after an initial 0.1666 ms sample. Triton's clean
+two-GPU repeat was 0.325264 ms after a 0.422240 ms outlier. Full phase
+breakdowns, route digests, transport evidence, and cluster health are in
+`.agentlog/2026-08-02-full-baseline-rerun.md`.
+
 The shape is DeepSeek-V3 activation width/top-k, not a full DeepSeek-V3 MoE
 layer: experts are identity operations and the benchmark uses
 `8 * world_size` routed experts rather than the model's full expert count.
+
+## Historical single-op VDCores CTA workers (2026-08-03)
+
+The source-gather pool first used an experimental hybrid assembly selected by
+`--vdcores-workers`. One `POOL_SLICE_SOURCE_GATHER_SCHEDULER` PoolInst block
+retains initialization and scheduling. The other 128 blocks are normal
+four-compute/four-memory `COMPUTE_MEMORY` VDCores and execute
+the now-removed `OP_POOL_SLICE_SOURCE_GATHER_WORKER` as a cooperative ordinary
+`CInst`; the launch therefore used 129 blocks instead of the fixed control's
+128. The 2026-08-04 explicit-role implementation below supersedes this
+predecessor; these results remain a historical comparison.
+
+The implementation preserves decoupled access inside every worker. Compute
+warps perform only shared-row BF16/FP32 arithmetic. Memory warps load the
+program/configuration, publish and receive metadata, expand routes, poll
+readiness, execute remote SEND/self-scatter and low-PE Copy work, decode
+source-gather addresses, bulk-stage the eight input rows, and bulk-store the
+shared result. At four or more GPUs, direct scatter still removes Copy jobs;
+the ring then carries the STOP join tickets while normal worker CTAs execute
+the static send/self/route roles. The rejected synchronous access-warp return
+experiment raised the four-GPU return tail to 0.123040 ms, so the accepted
+path retains four asynchronous memory-warp bulk engines.
+
+The matched 10-warmup/30-iteration results use the same global-top-8 contract
+as the corrected scan. The 4/8/12-GPU pairs ran on fully idle one-/two-/three-
+host allocations `.23`, `.23+.31`, and `.23+.31+.24`; three cooperative
+reservations kept them from being mixed with an unrelated long-running job on
+`.25`. Times are milliseconds, and delta is worker total relative to the
+fixed-PoolInst control.
+
+| GPUs | Mode | Dispatch | Return tail | Total | Worker delta |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 2 | fixed PoolInst | 0.058752 | 0.019808 | 0.077648 | — |
+| 2 | ordinary VDCores worker | 0.055952 | 0.018944 | 0.075056 | -3.34% |
+| 4 | fixed PoolInst | 0.053952 | 0.023168 | 0.076944 | — |
+| 4 | ordinary VDCores worker | 0.053024 | 0.025568 | 0.078624 | +2.18% |
+| 8 | fixed PoolInst | 0.056096 | 0.026176 | 0.081952 | — |
+| 8 | ordinary VDCores worker | 0.053152 | 0.028336 | 0.081360 | -0.72% |
+| 12 | fixed PoolInst | 0.061344 | 0.027296 | 0.088368 | — |
+| 12 | ordinary VDCores worker | 0.057184 | 0.029616 | 0.086672 | -1.92% |
+
+Two GPUs is bit-exact; 4/8/12 GPUs are BF16-close with maximum absolute error
+`0.00390625`. The ordinary-worker path is within 2.2% of the fixed path at
+every measured scale and is faster at three of four scales. A 16-GPU worker
+point was not accepted: one `.25` GPU remained occupied for more than four
+hours by an unrelated `gemv_test`, and the cooperative allocator correctly
+refused to oversubscribe it. The independent fixed-PoolInst 16-GPU baseline
+above remains valid but is not presented as a paired worker result.
+
+The reported device exposes 152 SMs, 65,536 registers/SM, 233,472 bytes of
+shared memory/SM, and 64 warp slots/SM. The selected mixed kernel uses 138
+registers/thread, 8,912 bytes static shared memory, 129,024 bytes dynamic
+shared memory, one barrier, a 128-byte stack frame, and zero spills. Both
+registers and shared memory limit it to one 256-thread CTA/SM. The 129-block
+grid therefore covers 129/152 = 84.9% of SMs, with eight active warps on each
+occupied SM (12.5% local warp occupancy, 10.6% aggregate device warp-slot
+occupancy). The worker population is 512 compute warps and 512 memory warps,
+plus the scheduler CTA's eight warps.
+
+Focused source/launcher validation passes all 31 tests in
+`tests/test_pool_slice.py` and `tests/test_core_config.py`. The full build and
+benchmark record is in `.agentlog/2026-08-03-vdcores-worker-operator.md`.
+
+## Explicit role operators and one two-phase scheduler (2026-08-04)
+
+The current hybrid keeps exactly one non-ordinary CTA: block zero is the sole
+PoolInst scheduler for both dispatch and combine. Its warp zero advances
+dispatch, warp one publishes source-gather combine readiness, and the same CTA
+joins executor and scatter completion. There is no worker-side coordinator.
+All other 128 CTAs are ordinary four-compute/four-memory VDCores workers.
+
+Each worker now executes one fused role CInst:
+
+- `OP_POOL_SLICE_METADATA_ROUTE`;
+- `OP_POOL_SLICE_REMOTE_SEND`;
+- `OP_POOL_SLICE_SELF_DISPATCH`;
+- `OP_POOL_SLICE_EXECUTOR`;
+- `OP_POOL_SLICE_DISPATCH_BYPASS`.
+
+The opcode chooses the role. Its arguments carry the task ordinal, dispatch
+slot, and gather rank, so `pool_rank` is no longer a device-side role switch.
+The common source-gather return is fused into that operator. This removes the
+prototype's extra role-to-return CInst decode, second sidecar/configuration
+load, and terminal CTA barrier while keeping all global access on memory
+warps. Dispatch-bypass CTAs go directly to their gather stripe.
+
+Matched 10-warmup/30-sample BF16 global-top-8 results are below. Two and four
+GPUs used one host; the accepted eight-GPU pair used the same three-host
+allocation after an external `.25` process changed allocator availability;
+twelve GPUs used `.23+.31+.24`. Delta is explicit-role total versus the fixed
+PoolInst control on the identical allocation.
+
+| GPUs | Mode | Dispatch | Return tail | Total | Explicit-role delta |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 2 | fixed PoolInst | 0.055520 | 0.017760 | 0.073264 | — |
+| 2 | explicit-role VDCores | 0.058016 | 0.019184 | 0.076720 | +4.72% |
+| 4 | fixed PoolInst | 0.052672 | 0.023312 | 0.075968 | — |
+| 4 | explicit-role VDCores | 0.053696 | 0.025248 | 0.078976 | +3.96% |
+| 8 | fixed PoolInst | 0.060512 | 0.026576 | 0.086656 | — |
+| 8 | explicit-role VDCores | 0.057520 | 0.028000 | 0.085472 | -1.37% |
+| 12 | fixed PoolInst | 0.061248 | 0.027456 | 0.088272 | — |
+| 12 | explicit-role VDCores | 0.057840 | 0.029712 | 0.087488 | -0.89% |
+
+Two GPUs remains bit-exact. Four, eight, and twelve GPUs are BF16-close with
+maximum absolute error `0.00390625`; all route digests match. The cost is
+bounded to 3.46 us at two GPUs and 3.01 us at four, while the explicit-role
+path is faster at eight and twelve GPUs.
+
+The selected SM100a mixed entry uses 137 registers/thread, one barrier, 9,104
+bytes static shared memory, 129,024 bytes dynamic shared memory, a 128-byte
+stack frame, and zero spills. Register and shared-memory limits still permit
+one CTA/SM. The 129-block grid covers 84.9% of the 152 SMs; each occupied SM
+has eight of 64 warp slots active. The worker population remains 512 compute
+warps and 512 memory warps, plus the sole scheduler CTA's eight warps.
+
+Focused validation passes all 33 tests in `tests/test_pool_slice.py` and
+`tests/test_core_config.py`. The implementation/build/benchmark record is in
+`.agentlog/2026-08-04-explicit-pool-role-operators.md`.
 
 Relevant NVIDIA documentation:
 

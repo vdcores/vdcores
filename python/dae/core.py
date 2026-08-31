@@ -9,6 +9,8 @@ import struct
 
 CORE_CONFIG_BYTES = 8
 _CORE_CONFIG_STRUCT = struct.Struct("<8B")
+CORE_FLAG_CTA_COMPUTE_OPERATOR = 1 << 0
+CORE_KNOWN_FLAGS = CORE_FLAG_CTA_COMPUTE_OPERATOR
 
 
 class CoreKind(IntEnum):
@@ -24,6 +26,7 @@ class KernelVariant(IntEnum):
     RUNTIME = 3
     POOL = 4
     RUNTIME_COMMUNICATION = 5
+    POOL_CTA_COMPUTE = 6
 
 
 _KERNEL_VARIANT_NAMES = {
@@ -37,6 +40,7 @@ _KERNEL_VARIANT_NAMES = {
     "pool": KernelVariant.POOL,
     "runtime_communication": KernelVariant.RUNTIME_COMMUNICATION,
     "runtime_comm": KernelVariant.RUNTIME_COMMUNICATION,
+    "pool_cta_compute": KernelVariant.POOL_CTA_COMPUTE,
 }
 
 
@@ -73,7 +77,11 @@ class CoreConfig:
 
     @classmethod
     def compute_memory(
-        cls, *, load_warps: int = 2, communication_warps: int = 0
+        cls,
+        *,
+        load_warps: int = 2,
+        communication_warps: int = 0,
+        cta_compute_operator: bool = False,
     ) -> "CoreConfig":
         if load_warps not in (1, 2):
             raise ValueError("compute+memory cores support one or two load warps")
@@ -87,6 +95,11 @@ class CoreConfig:
             load_warps=load_warps,
             communication_warps=communication_warps,
             pool_warps=0,
+            flags=(
+                CORE_FLAG_CTA_COMPUTE_OPERATOR
+                if cta_compute_operator
+                else 0
+            ),
         )
 
     @classmethod
@@ -115,6 +128,8 @@ class CoreConfig:
         )
         if any(not 0 <= int(value) < 256 for value in fields):
             raise ValueError("core configuration fields must fit in uint8")
+        if self.flags & ~CORE_KNOWN_FLAGS:
+            raise ValueError(f"unknown core configuration flags 0x{self.flags:x}")
         if self.kind == CoreKind.COMPUTE_MEMORY:
             if self.compute_warps != 4:
                 raise ValueError("compute operators require one four-warp warpgroup")
@@ -126,6 +141,13 @@ class CoreConfig:
                 )
             if self.pool_warps != 0:
                 raise ValueError("compute+memory cores cannot contain pool warps")
+            if (
+                self.flags & CORE_FLAG_CTA_COMPUTE_OPERATOR
+                and self.communication_warps != 0
+            ):
+                raise ValueError(
+                    "CTA-wide compute operators cannot contain a communication warp"
+                )
         elif self.kind == CoreKind.POOL:
             if (
                 self.compute_warps != 0
@@ -140,6 +162,8 @@ class CoreConfig:
                     "a runtime PoolInst core must use the complete physical "
                     f"envelope ({runtime_core_warps} warps); zero selects it"
                 )
+            if self.flags:
+                raise ValueError("PoolInst cores cannot carry compute flags")
         elif self.kind == CoreKind.INACTIVE:
             if (
                 self.compute_warps
@@ -148,6 +172,8 @@ class CoreConfig:
                 or self.pool_warps
             ):
                 raise ValueError("inactive cores cannot contain active warps")
+            if self.flags:
+                raise ValueError("inactive cores cannot carry compute flags")
         else:
             raise ValueError(f"unknown core kind {self.kind!r}")
 
@@ -167,6 +193,8 @@ class CoreConfig:
 
 __all__ = [
     "CORE_CONFIG_BYTES",
+    "CORE_FLAG_CTA_COMPUTE_OPERATOR",
+    "CORE_KNOWN_FLAGS",
     "CoreConfig",
     "CoreKind",
     "KernelVariant",

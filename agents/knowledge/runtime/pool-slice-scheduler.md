@@ -110,6 +110,22 @@ vectors per loop iteration. The forwarding ReduceAdd executor remains the
 portable command implementation and the NVSHMEM/IBGDA build retains its
 original transport path.
 
+In the cooperative ordinary-VDCores source-gather assembly, "rank zero" is
+exactly one PoolInst scheduler CTA, not a second combine coordinator. Warp zero
+owns dispatch scheduling while warp one concurrently waits the per-source
+return generations and publishes `ScatterStart`. After both paths close, all
+eight warps in that same CTA join the ordinary workers' `ScatterGeneration`
+and logical executors' `DispatchGeneration` arrays and record final
+completion. Workers publish only their own generations.
+
+Worker placement is host-compiled into distinct CInst opcodes for metadata /
+route, remote SEND, self-dispatch, executor-only, and dispatch-bypass roles.
+The instruction arguments carry task, executor slot, and gather rank, so the
+device never infers a role from `pool_rank` and the HBM ring still contains
+only overflow work plus the ordered STOP suffix. The 4+ GPU direct-scatter
+shape reserves enough explicit remote-SEND slots that its steady-state ring
+normally contains only STOP tickets.
+
 ## Model 2: Stateful DynamicRead Workers
 
 Each worker CTA owns one or more active DynamicReads and directly scans the

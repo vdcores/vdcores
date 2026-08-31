@@ -28,6 +28,34 @@
 #define DAE_POOL_MULTIMEM_VECTOR_ILP 4
 #endif
 
+// The decoupled ordinary-VDCores worker stages one top-k=8 input row per
+// route plus one output row.  DeepSeek-V3 width 7168 is 14,336 BF16 bytes.
+// Keep this compile-time bound explicit so the runtime can reserve exactly
+// the same dynamic-shared-memory envelope as the device implementation.
+#ifndef DAE_POOL_CTA_COMPUTE_MAX_ROW_BYTES
+#define DAE_POOL_CTA_COMPUTE_MAX_ROW_BYTES 14336
+#endif
+
+static constexpr uint32_t daePoolCtaComputeMaxRowBytes =
+    DAE_POOL_CTA_COMPUTE_MAX_ROW_BYTES;
+static constexpr uint32_t daePoolCtaComputeRouteCapacity = 8;
+static constexpr uint32_t daePoolCtaComputeTileVectors =
+    daePoolCtaComputeMaxRowBytes / sizeof(uint4);
+static constexpr uint32_t daePoolCtaComputeStageBuffers = 1;
+static constexpr size_t daePoolCtaComputeStageBytes =
+    daePoolCtaComputeStageBuffers *
+    static_cast<size_t>(daePoolCtaComputeRouteCapacity + 1) *
+    daePoolCtaComputeTileVectors * sizeof(uint4);
+static_assert(daePoolCtaComputeMaxRowBytes % sizeof(uint4) == 0);
+
+enum PoolSliceVdcoresWorkerRole : uint32_t {
+  POOL_SLICE_VDCORES_ROLE_NONE = 0,
+  POOL_SLICE_VDCORES_ROLE_METADATA_ROUTE = 1,
+  POOL_SLICE_VDCORES_ROLE_REMOTE_SEND = 2,
+  POOL_SLICE_VDCORES_ROLE_SELF_DISPATCH = 3,
+  POOL_SLICE_VDCORES_ROLE_EXECUTOR = 4,
+};
+
 static_assert(
     DAE_POOL_MULTIMEM_VECTOR_ILP >= 1 &&
         DAE_POOL_MULTIMEM_VECTOR_ILP <= 4,
@@ -382,6 +410,43 @@ static __device__ __forceinline__ void pool_slice_copy_block(
     dst[index] = src[index];
 }
 
+// Same vectorized copy with an explicit logical worker range. Ordinary
+// compute+memory VDCores CTAs use this to keep global traffic on the physical
+// memory warps while retaining coalesced 128-thread metadata copies.
+static __device__ __forceinline__ void pool_slice_copy_workers(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    uint32_t worker,
+    uint32_t workers) {
+  auto* dst = reinterpret_cast<uint4*>(destination);
+  const auto* src = reinterpret_cast<const uint4*>(source);
+  const uint64_t vectors = bytes / sizeof(uint4);
+  constexpr uint64_t copy_ilp = 8;
+  uint64_t index = worker;
+  for (; index + (copy_ilp - 1) * workers < vectors;
+       index += copy_ilp * workers) {
+    const uint4 value0 = src[index];
+    const uint4 value1 = src[index + workers];
+    const uint4 value2 = src[index + 2 * workers];
+    const uint4 value3 = src[index + 3 * workers];
+    const uint4 value4 = src[index + 4 * workers];
+    const uint4 value5 = src[index + 5 * workers];
+    const uint4 value6 = src[index + 6 * workers];
+    const uint4 value7 = src[index + 7 * workers];
+    dst[index] = value0;
+    dst[index + workers] = value1;
+    dst[index + 2 * workers] = value2;
+    dst[index + 3 * workers] = value3;
+    dst[index + 4 * workers] = value4;
+    dst[index + 5 * workers] = value5;
+    dst[index + 6 * workers] = value6;
+    dst[index + 7 * workers] = value7;
+  }
+  for (; index < vectors; index += workers)
+    dst[index] = src[index];
+}
+
 static __device__ __forceinline__ void pool_slice_put_nbi_warp(
     void* destination,
     const void* source,
@@ -525,6 +590,25 @@ static __device__ __forceinline__ uint32_t pool_slice_stream_group_count(
   groups = groups < max_groups ? groups : max_groups;
   groups = groups < active_rows ? groups : active_rows;
   return static_cast<uint32_t>(groups);
+}
+
+// The explicit CInst role layout reserves the self-dispatch suffix first,
+// then gives the remaining logical worker slots to the flat remote-SEND
+// stripe. SEND tasks beyond this capacity retain the existing executor-ring
+// overflow path. The same arithmetic is mirrored by the Python builder.
+static __device__ __forceinline__ uint32_t
+pool_slice_vdcores_direct_send_capacity(const PoolSliceConfig& config) {
+  const uint32_t logical_workers = config.pool_count - 1;
+  if (logical_workers <= config.num_pes)
+    return 0;
+  const uint32_t static_capacity = logical_workers - config.num_pes;
+  const uint32_t self_capacity = config.group_limit < static_capacity
+      ? config.group_limit
+      : static_capacity;
+  const uint32_t remote_capacity = static_capacity - self_capacity;
+  const uint32_t remote_limit =
+      (config.num_pes - 1) * config.group_limit;
+  return remote_limit < remote_capacity ? remote_limit : remote_capacity;
 }
 
 static __device__ __forceinline__ uint32_t
@@ -1268,9 +1352,276 @@ static __device__ __noinline__ void pool_slice_stream_scatter_rows_local(
   }
 }
 
+// Decoupled-access form used by an ordinary compute+memory VDCores worker.
+// The four physical memory-side warps split the compact-row interval.  Each
+// lane-zero memory issuer bulk-loads one authoritative source row into its
+// private shared plane, then bulk-stores that plane to every routed expert
+// slot. Compute warps participate only in the final CTA join.
+static __device__ __noinline__ void
+pool_slice_stream_scatter_rows_local_dae(
+    uint32_t target_pe,
+    uint32_t row_begin,
+    uint32_t row_end,
+    const PoolSliceConfig& config,
+    int* bars,
+    uint32_t write_barrier,
+    uint32_t* shared_status,
+    uint32_t thread_id) {
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_warps = daeDefaultMemoryWarps;
+#pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ cuda::barrier<cuda::thread_scope_block>
+      shared_load_barriers[memory_warps];
+  __shared__ PoolSlicePublishBatch shared_batch;
+  __shared__ uint64_t
+      shared_destinations[memory_warps][poolSliceMaxLocalReaders];
+  extern __shared__ uint4 dae_pool_cta_compute_stage[];
+
+  const bool memory_thread = thread_id >= memory_begin;
+  const uint32_t memory_thread_id = thread_id - memory_begin;
+  const uint32_t lane = memory_thread_id & 31U;
+  const uint32_t memory_warp = memory_thread_id >> 5;
+  if (thread_id == memory_begin) {
+    shared_batch = *pool_slice_stream_batch(
+        reinterpret_cast<const PoolSlicePublishBatch*>(
+            config.send_batches_address),
+        target_pe,
+        config.route_capacity);
+  }
+  if (memory_thread && lane == 0)
+    init(&shared_load_barriers[memory_warp], 1);
+  __syncthreads();
+
+  if (memory_thread) {
+    const auto* send_rows = reinterpret_cast<const uint32_t*>(
+        config.send_rows_address);
+    const auto* send_token_rows = reinterpret_cast<const uint32_t*>(
+        config.send_token_rows_address) +
+        static_cast<uint64_t>(target_pe) * config.token_capacity;
+    const auto* token_pool = reinterpret_cast<const uint8_t*>(
+        config.token_pool_address);
+    auto* expert_input = reinterpret_cast<uint8_t*>(
+        config.expert_input_address);
+    auto* target_expert_input = target_pe == config.my_pe
+        ? expert_input
+        : reinterpret_cast<uint8_t*>(
+              pool_slice_peer_ptr(expert_input, target_pe));
+    const uint32_t group_rows = row_end - row_begin;
+    const uint32_t warp_row_begin = row_begin + static_cast<uint32_t>(
+        static_cast<uint64_t>(group_rows) * memory_warp / memory_warps);
+    const uint32_t warp_row_end = row_begin + static_cast<uint32_t>(
+        static_cast<uint64_t>(group_rows) * (memory_warp + 1) /
+        memory_warps);
+
+    uint32_t reader_route_begin = shared_batch.route_begin;
+    if (lane < config.local_readers) {
+      for (uint32_t reader = 0; reader < lane; ++reader)
+        reader_route_begin += shared_batch.reader_counts[reader];
+    }
+    const uint32_t reader_count = lane < config.local_readers
+        ? shared_batch.reader_counts[lane]
+        : 0;
+    uint32_t relative = lane < config.local_readers
+        ? pool_slice_stream_route_lower_bound(
+              send_rows,
+              reader_route_begin,
+              reader_count,
+              warp_row_begin)
+        : 0;
+    const uint32_t relative_end = lane < config.local_readers
+        ? pool_slice_stream_route_lower_bound(
+              send_rows,
+              reader_route_begin,
+              reader_count,
+              warp_row_end)
+        : 0;
+    uint32_t waited_chunk = UINT32_MAX;
+    uint4* stage = dae_pool_cta_compute_stage +
+        memory_warp * (daePoolCtaComputeMaxRowBytes / sizeof(uint4));
+
+    for (uint32_t compact_row = warp_row_begin;
+         compact_row < warp_row_end;
+         ++compact_row) {
+      uint32_t source_row = 0;
+      if (lane == 0)
+        source_row = send_token_rows[compact_row];
+      source_row = __shfl_sync(0xffffffffU, source_row, 0);
+      if (source_row >= config.token_capacity) {
+        if (lane == 0)
+          atomicCAS(
+              shared_status,
+              static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+              static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+        continue;
+      }
+      const uint32_t chunk = source_row / config.write_chunk_rows;
+      if (chunk != waited_chunk) {
+        uint32_t write_ready = 0;
+        while (write_ready == 0) {
+          if (lane == 0)
+            write_ready = pool_slice_barrier_ready(
+                bars + write_barrier + chunk);
+          write_ready = __shfl_sync(0xffffffffU, write_ready, 0);
+          if (write_ready == 0)
+            __nanosleep(barrierPollSleepCycles);
+        }
+        waited_chunk = chunk;
+      }
+
+      const uint32_t route_compact =
+          lane < config.local_readers && relative < relative_end
+          ? send_rows[reader_route_begin + relative] & 0xffffU
+          : UINT32_MAX;
+      const uint32_t active_readers = __ballot_sync(
+          0xffffffffU,
+          lane < config.local_readers && route_compact == compact_row);
+      if (lane < config.local_readers && route_compact == compact_row) {
+        shared_destinations[memory_warp][lane] = reinterpret_cast<uint64_t>(
+            target_expert_input +
+            (static_cast<uint64_t>(lane) * config.expert_capacity_rows +
+             static_cast<uint64_t>(config.my_pe) * config.token_capacity +
+             relative) *
+                config.row_bytes);
+        ++relative;
+      }
+      __syncwarp();
+
+      if (lane == 0) {
+        const auto* source = reinterpret_cast<const uint4*>(
+            token_pool + static_cast<uint64_t>(source_row) *
+                config.row_bytes);
+        cuda::device::memcpy_async_tx(
+            stage,
+            source,
+            cuda::aligned_size_t<16>(config.row_bytes),
+            shared_load_barriers[memory_warp]);
+        cuda::device::barrier_expect_tx(
+            shared_load_barriers[memory_warp],
+            cuda::aligned_size_t<16>(config.row_bytes));
+        shared_load_barriers[memory_warp].arrive_and_wait();
+        for (uint32_t reader = 0;
+             reader < config.local_readers;
+             ++reader) {
+          if ((active_readers & (1U << reader)) == 0)
+            continue;
+          cuda::ptx::cp_async_bulk(
+              cuda::ptx::space_global,
+              cuda::ptx::space_shared,
+              reinterpret_cast<void*>(
+                  shared_destinations[memory_warp][reader]),
+              stage,
+              config.row_bytes);
+        }
+        cuda::ptx::cp_async_bulk_commit_group();
+        cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+}
+
+// Low-PE delivery has one compact destination row rather than a direct expert
+// fanout. It uses the same four memory-warp row stripes and bulk engines.
+static __device__ __noinline__ void pool_slice_stream_put_rows_local_dae(
+    uint32_t target_pe,
+    uint32_t row_begin,
+    uint32_t row_end,
+    const PoolSliceConfig& config,
+    int* bars,
+    uint32_t write_barrier,
+    uint32_t* shared_status,
+    uint32_t thread_id) {
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_warps = daeDefaultMemoryWarps;
+#pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ cuda::barrier<cuda::thread_scope_block>
+      shared_load_barriers[memory_warps];
+  extern __shared__ uint4 dae_pool_cta_compute_stage[];
+
+  const bool memory_thread = thread_id >= memory_begin;
+  const uint32_t memory_thread_id = thread_id - memory_begin;
+  const uint32_t lane = memory_thread_id & 31U;
+  const uint32_t memory_warp = memory_thread_id >> 5;
+  if (memory_thread && lane == 0)
+    init(&shared_load_barriers[memory_warp], 1);
+  __syncthreads();
+
+  if (memory_thread) {
+    const auto* target_rows = reinterpret_cast<const uint32_t*>(
+        config.send_token_rows_address) +
+        static_cast<uint64_t>(target_pe) * config.token_capacity;
+    const auto* token_pool = reinterpret_cast<const uint8_t*>(
+        config.token_pool_address);
+    auto* delivery_pool = reinterpret_cast<uint8_t*>(
+        config.delivery_pool_address);
+    auto* target_delivery = target_pe == config.my_pe
+        ? delivery_pool
+        : reinterpret_cast<uint8_t*>(
+              pool_slice_peer_ptr(delivery_pool, target_pe));
+    const uint32_t group_rows = row_end - row_begin;
+    const uint32_t warp_row_begin = row_begin + static_cast<uint32_t>(
+        static_cast<uint64_t>(group_rows) * memory_warp / memory_warps);
+    const uint32_t warp_row_end = row_begin + static_cast<uint32_t>(
+        static_cast<uint64_t>(group_rows) * (memory_warp + 1) /
+        memory_warps);
+    uint32_t waited_chunk = UINT32_MAX;
+    uint4* stage = dae_pool_cta_compute_stage +
+        memory_warp * (daePoolCtaComputeMaxRowBytes / sizeof(uint4));
+
+    for (uint32_t compact_row = warp_row_begin;
+         compact_row < warp_row_end;
+         ++compact_row) {
+      if (lane != 0)
+        continue;
+      const uint32_t source_row = target_rows[compact_row];
+      if (source_row >= config.token_capacity) {
+        atomicCAS(
+            shared_status,
+            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+        continue;
+      }
+      const uint32_t chunk = source_row / config.write_chunk_rows;
+      if (chunk != waited_chunk) {
+        while (!pool_slice_barrier_ready(
+            bars + write_barrier + chunk))
+          __nanosleep(barrierPollSleepCycles);
+        waited_chunk = chunk;
+      }
+      const auto* source = reinterpret_cast<const uint4*>(
+          token_pool + static_cast<uint64_t>(source_row) * config.row_bytes);
+      cuda::device::memcpy_async_tx(
+          stage,
+          source,
+          cuda::aligned_size_t<16>(config.row_bytes),
+          shared_load_barriers[memory_warp]);
+      cuda::device::barrier_expect_tx(
+          shared_load_barriers[memory_warp],
+          cuda::aligned_size_t<16>(config.row_bytes));
+      shared_load_barriers[memory_warp].arrive_and_wait();
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_global,
+          cuda::ptx::space_shared,
+          target_delivery +
+              (static_cast<uint64_t>(config.my_pe) * config.token_capacity +
+               compact_row) *
+                  config.row_bytes,
+          stage,
+          config.row_bytes);
+      cuda::ptx::cp_async_bulk_commit_group();
+      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    }
+  }
+  __syncthreads();
+}
+
 // Pack self-source rows into the same compact delivery layout used by remote
 // sources. Independent CTAs do this while metadata and remote NVLink writes
 // proceed, then publish the ordinary data-ready generation.
+template <bool VdcoresWorker = false>
 static __device__ __noinline__ void pool_slice_stream_pack_local_group(
     uint32_t group,
     const PoolSliceConfig& config,
@@ -1280,16 +1631,23 @@ static __device__ __noinline__ void pool_slice_stream_pack_local_group(
     uint64_t sequence,
     uint32_t* shared_status,
     uint32_t thread_id) {
+  __shared__ uint32_t shared_token_count;
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
   const auto* send_token_counts = reinterpret_cast<const uint32_t*>(
       config.send_token_counts_address);
-  const uint32_t token_count = send_token_counts[config.my_pe];
+  if (thread_id == access_leader)
+    shared_token_count = send_token_counts[config.my_pe];
+  __syncthreads();
+  const uint32_t token_count = shared_token_count;
   const uint32_t group_count = pool_slice_stream_group_count(
       token_count,
       config.row_bytes,
       config.group_limit,
       config.num_pes);
   if (group >= group_count) {
-    if (thread_id == 0)
+    if (thread_id == access_leader)
       atomicCAS(
           shared_status,
           static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1307,25 +1665,47 @@ static __device__ __noinline__ void pool_slice_stream_pack_local_group(
       &row_end);
 #if DAE_POOL_LOCAL_DIRECT_SCATTER
   if (config.num_pes >= 4) {
-    pool_slice_stream_scatter_rows_local(
-        config.my_pe,
-        row_begin,
-        row_end,
-        config,
-        bars,
-        write_barrier,
-        shared_status,
-        thread_id);
+    if constexpr (VdcoresWorker)
+      pool_slice_stream_scatter_rows_local_dae(
+          config.my_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
+    else
+      pool_slice_stream_scatter_rows_local(
+          config.my_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
   } else {
-    pool_slice_stream_put_rows_public(
-        config.my_pe,
-        row_begin,
-        row_end,
-        config,
-        bars,
-        write_barrier,
-        shared_status,
-        thread_id);
+    if constexpr (VdcoresWorker)
+      pool_slice_stream_put_rows_local_dae(
+          config.my_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
+    else
+      pool_slice_stream_put_rows_public(
+          config.my_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
   }
 #else
   pool_slice_stream_put_rows_public(
@@ -1339,7 +1719,7 @@ static __device__ __noinline__ void pool_slice_stream_pack_local_group(
       thread_id);
 #endif
   __syncthreads();
-  if (thread_id == 0) {
+  if (thread_id == access_leader) {
     pool_slice_signal_release_local(
         pool_slice_stream_data_ready(
             control, config.my_pe, group, 0),
@@ -1355,7 +1735,7 @@ static __device__ __noinline__ void pool_slice_stream_pack_local_group(
 // posts one same-QP generation after all warp WQEs, while a warp-mapped build
 // couples each active warp's final run to its own generation. Neither path
 // performs a transport-wide completion sweep.
-template <bool HostDataPlane>
+template <bool HostDataPlane, bool VdcoresWorker = false>
 static __device__ __noinline__ void pool_slice_stream_send_group(
     uint32_t target_pe,
     uint32_t group,
@@ -1368,9 +1748,23 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     uint64_t sequence,
     uint32_t* shared_status,
     uint32_t* shared_first_payload,
-  uint32_t thread_id) {
-  const uint32_t lane = thread_id & 31U;
-  const uint32_t warp = thread_id >> 5;
+    uint32_t thread_id) {
+  __shared__ uint32_t shared_token_count;
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_threads =
+      daeDefaultMemoryWarps * numThreadsPerWarp;
+  const bool access_thread_active =
+      !VdcoresWorker || thread_id >= memory_begin;
+  const uint32_t access_thread =
+      VdcoresWorker ? thread_id - memory_begin : thread_id;
+  const uint32_t access_threads =
+      VdcoresWorker ? memory_threads : blockDim.x;
+  const uint32_t access_lane = access_thread & 31U;
+  const uint32_t access_warp = access_thread >> 5;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
+  [[maybe_unused]] const uint32_t lane = thread_id & 31U;
+  [[maybe_unused]] const uint32_t warp = thread_id >> 5;
   const auto* send_token_rows =
       reinterpret_cast<const uint32_t*>(config.send_token_rows_address);
   const auto* send_token_counts =
@@ -1378,7 +1772,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
   // Send-task decoding emits remote targets only. Keeping that invariant
   // explicit removes the local/raw transport matrix from the hot helper.
   if (target_pe >= config.num_pes || target_pe == config.my_pe) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       atomicCAS(
           shared_status,
           static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1386,7 +1780,10 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     }
     return;
   }
-  const uint32_t token_count = send_token_counts[target_pe];
+  if (thread_id == access_leader)
+    shared_token_count = send_token_counts[target_pe];
+  __syncthreads();
+  const uint32_t token_count = shared_token_count;
   const uint32_t group_count = pool_slice_stream_group_count(
       token_count,
       config.row_bytes,
@@ -1394,7 +1791,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
       config.num_pes);
   if (group_count == 0 || group >= group_count ||
       token_count > config.token_capacity) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       atomicCAS(
           shared_status,
           static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1413,7 +1810,7 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
       &row_begin,
       &row_end);
   if constexpr (HostDataPlane) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       const auto* generations = reinterpret_cast<const uint64_t*>(
           host_config->producer_generations_address);
       while (dae_atomic_load_acquire_gpu(
@@ -1422,7 +1819,8 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
     }
     __syncthreads();
   }
-  if (thread_id == 0 && atomicCAS(shared_first_payload, 0U, 1U) == 0U &&
+  if (thread_id == access_leader &&
+      atomicCAS(shared_first_payload, 0U, 1U) == 0U &&
       g_events != nullptr) {
     g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
              poolSliceProfileFirstPayload] =
@@ -1433,30 +1831,32 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
   const uint32_t* target_rows = send_token_rows +
       static_cast<uint64_t>(target_pe) * config.token_capacity;
   if constexpr (HostDataPlane) {
-    for (uint32_t packed_row = row_begin + thread_id;
-         packed_row < row_end;
-         packed_row += blockDim.x) {
-      const uint32_t source_row = target_rows[packed_row];
-      if (source_row >= config.token_capacity) {
-        atomicCAS(
-            shared_status,
-            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
-            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
-        continue;
+    if (access_thread_active) {
+      for (uint32_t packed_row = row_begin + access_thread;
+           packed_row < row_end;
+           packed_row += access_threads) {
+        const uint32_t source_row = target_rows[packed_row];
+        if (source_row >= config.token_capacity) {
+          atomicCAS(
+              shared_status,
+              static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+              static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+          continue;
+        }
+        const uint32_t chunk = source_row / config.write_chunk_rows;
+        while (!pool_slice_barrier_ready(bars + write_barrier + chunk))
+          __nanosleep(barrierPollSleepCycles);
       }
-      const uint32_t chunk = source_row / config.write_chunk_rows;
-      while (!pool_slice_barrier_ready(bars + write_barrier + chunk))
-        __nanosleep(barrierPollSleepCycles);
     }
     __syncthreads();
-    if (warp == 0) {
+    if (access_thread_active && access_warp == 0) {
       const auto* peers = reinterpret_cast<const PoolSliceHostPeer*>(
           host_config->peers_address);
       auto* generations = reinterpret_cast<uint64_t*>(
           host_config->producer_generations_address);
       const PoolSliceHostPeer peer = peers[target_pe];
       const uint64_t generation = pool_host_reserve_generation_warp(
-          generations + target_pe, lane);
+          generations + target_pe, access_lane);
       uint64_t* local_ready = pool_slice_stream_data_ready(
           control, config.my_pe, group, 0);
       const uint64_t ready_offset =
@@ -1481,10 +1881,10 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
                     sequence,
                     pool_slice_stream_data_segments(row_begin, row_end))
               : sequence,
-          lane);
+          access_lane);
     }
     __syncthreads();
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       atomicAdd(
           reinterpret_cast<unsigned long long*>(
               control + poolSliceControlStreamSendDone),
@@ -1558,25 +1958,47 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
 #endif
 #if defined(DAE_ENABLE_LOCAL_POOL) && DAE_POOL_LOCAL_DIRECT_SCATTER
   if (config.num_pes >= 4) {
-    pool_slice_stream_scatter_rows_local(
-        target_pe,
-        row_begin,
-        row_end,
-        config,
-        bars,
-        write_barrier,
-        shared_status,
-        thread_id);
+    if constexpr (VdcoresWorker)
+      pool_slice_stream_scatter_rows_local_dae(
+          target_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
+    else
+      pool_slice_stream_scatter_rows_local(
+          target_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
   } else {
-    pool_slice_stream_put_rows_public(
-        target_pe,
-        row_begin,
-        row_end,
-        config,
-        bars,
-        write_barrier,
-        shared_status,
-        thread_id);
+    if constexpr (VdcoresWorker)
+      pool_slice_stream_put_rows_local_dae(
+          target_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
+    else
+      pool_slice_stream_put_rows_public(
+          target_pe,
+          row_begin,
+          row_end,
+          config,
+          bars,
+          write_barrier,
+          shared_status,
+          thread_id);
   }
 #else
   pool_slice_stream_put_rows_public(
@@ -1607,9 +2029,17 @@ static __device__ __noinline__ void pool_slice_stream_send_group(
 #endif
 
   __syncthreads();
-  if (thread_id == 0) {
 #ifdef DAE_POOL_DATA_PATH_NVLINK
-    pool_slice_fence_release_system();
+  if constexpr (VdcoresWorker) {
+    if (access_thread_active && access_lane == 0)
+      pool_slice_fence_release_system();
+    __syncthreads();
+  }
+#endif
+  if (thread_id == access_leader) {
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+    if constexpr (!VdcoresWorker)
+      pool_slice_fence_release_system();
     pool_slice_signal_release_remote(
         pool_slice_stream_data_ready(
             control, config.my_pe, group, 0),
@@ -1664,13 +2094,109 @@ static __device__ __forceinline__ void pool_slice_reduce_add_shard_range(
 
 struct PoolSliceDynamicReadWorker;
 
+#ifdef DAE_ENABLE_LOCAL_POOL
+// Low-PE staged delivery still needs a destination Copy job. Keep that pure
+// memory operator on the four physical access warps: each warp owns one
+// full-row shared plane and one bulk-transaction barrier. This avoids turning
+// the compute warps into a second set of global copy lanes merely to recover
+// bandwidth from the staged path.
+static __device__ __noinline__ void
+pool_slice_stream_gather_rows_local_dae(
+    uint32_t source_pe,
+    uint32_t compact_begin,
+    uint32_t compact_end,
+    uint32_t local_reader,
+    const PoolSliceConfig& config,
+    const uint32_t* source_routes,
+    uint32_t packed_route_begin,
+    uint32_t relative_begin,
+    uint32_t relative_end,
+    const PoolSliceReceiveBatch& route,
+    const uint8_t* delivery_pool,
+    uint8_t* expert_input,
+    uint32_t* shared_status,
+    uint32_t thread_id) {
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_warps = daeDefaultMemoryWarps;
+#pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ cuda::barrier<cuda::thread_scope_block>
+      shared_load_barriers[memory_warps];
+  extern __shared__ uint4 dae_pool_cta_compute_stage[];
+
+  const bool memory_thread = thread_id >= memory_begin;
+  const uint32_t memory_thread_id = thread_id - memory_begin;
+  const uint32_t lane = memory_thread_id & 31U;
+  const uint32_t memory_warp = memory_thread_id >> 5;
+  if (memory_thread && lane == 0)
+    init(&shared_load_barriers[memory_warp], 1);
+  __syncthreads();
+
+  if (memory_thread && lane == 0) {
+    const uint32_t relative_count = relative_end - relative_begin;
+    const uint32_t warp_begin = relative_begin + static_cast<uint32_t>(
+        static_cast<uint64_t>(relative_count) * memory_warp / memory_warps);
+    const uint32_t warp_end = relative_begin + static_cast<uint32_t>(
+        static_cast<uint64_t>(relative_count) * (memory_warp + 1) /
+        memory_warps);
+    uint4* stage = dae_pool_cta_compute_stage +
+        memory_warp * (daePoolCtaComputeMaxRowBytes / sizeof(uint4));
+    for (uint32_t relative = warp_begin;
+         relative < warp_end;
+         ++relative) {
+      const uint32_t route_word =
+          source_routes[packed_route_begin + relative];
+      const uint32_t compact_row = route_word & 0xffffU;
+      if (compact_row < compact_begin || compact_row >= compact_end ||
+          compact_row >= config.token_capacity) {
+        atomicCAS(
+            shared_status,
+            static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
+            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+        continue;
+      }
+      const auto* source = reinterpret_cast<const uint4*>(
+          delivery_pool +
+          (static_cast<uint64_t>(source_pe) * config.token_capacity +
+           compact_row) *
+              config.row_bytes);
+      cuda::device::memcpy_async_tx(
+          stage,
+          source,
+          cuda::aligned_size_t<16>(config.row_bytes),
+          shared_load_barriers[memory_warp]);
+      cuda::device::barrier_expect_tx(
+          shared_load_barriers[memory_warp],
+          cuda::aligned_size_t<16>(config.row_bytes));
+      shared_load_barriers[memory_warp].arrive_and_wait();
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_global,
+          cuda::ptx::space_shared,
+          expert_input +
+              (static_cast<uint64_t>(local_reader) *
+                   config.expert_capacity_rows +
+               route.base_row + relative) *
+                  config.row_bytes,
+          stage,
+          config.row_bytes);
+      cuda::ptx::cp_async_bulk_commit_group();
+      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    }
+  }
+  __syncthreads();
+}
+#endif
+
 // A destination DATA instruction compiled as DynamicRead<Copy> is executed by
 // the whole PoolInst CTA:
 // one warp owns each
 // local reader, and its lanes move that reader's matching activation rows.
 // Queue-zero metadata reserves the complete (reader, source) span once.  A
 // queue carries the exact compact interval, so the consumer never derives G.
-template <bool HostDataPlane, uint32_t TotalWarps>
+template <
+    bool HostDataPlane,
+    uint32_t TotalWarps,
+    bool VdcoresWorker = false>
 static __device__ __noinline__ void pool_slice_stream_gather_rows(
     uint32_t source_pe,
     uint32_t compact_begin,
@@ -1689,12 +2215,26 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
     uint32_t* shared_status,
     uint32_t thread_id) {
   __shared__ PoolSliceReceiveBatch shared_route;
+  __shared__ PoolSlicePublishBatch shared_batch;
   __shared__ uint32_t shared_relative_begin;
   __shared__ uint32_t shared_relative_end;
   __shared__ uint32_t shared_route_valid;
 
-  const uint32_t lane = thread_id & 31U;
-  const uint32_t warp = thread_id >> 5;
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_threads =
+      daeDefaultMemoryWarps * numThreadsPerWarp;
+  const bool access_thread_active =
+      !VdcoresWorker || thread_id >= memory_begin;
+  const uint32_t access_thread =
+      VdcoresWorker ? thread_id - memory_begin : thread_id;
+  const uint32_t access_threads =
+      VdcoresWorker ? memory_threads : blockDim.x;
+  const uint32_t access_lane = access_thread & 31U;
+  const uint32_t access_warp = access_thread >> 5;
+  const uint32_t access_warps =
+      VdcoresWorker ? daeDefaultMemoryWarps : TotalWarps;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
   const uint32_t ready_slot = ready_slot_and_reader & 0xffffU;
   const uint32_t local_reader = ready_slot_and_reader >> 16;
   auto* control = reinterpret_cast<uint64_t*>(config.control_address);
@@ -1703,7 +2243,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
       compact_end > config.token_capacity ||
       ready_slot >= poolSliceMaxDataGroups ||
       local_reader >= config.local_readers) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       atomicCAS(
           shared_status,
           static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1712,11 +2252,12 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
     return;
   }
 
-  const PoolSlicePublishBatch batch = *pool_slice_stream_batch(
-      receive_batches, source_pe, config.route_capacity);
-  const uint32_t* source_routes = pool_slice_stream_route_words(
-      receive_batches, source_pe, config, batch);
-  if (thread_id == 0) {
+  if (thread_id == access_leader) {
+    shared_batch = *pool_slice_stream_batch(
+        receive_batches, source_pe, config.route_capacity);
+    const PoolSlicePublishBatch& batch = shared_batch;
+    const uint32_t* source_routes = pool_slice_stream_route_words(
+        receive_batches, source_pe, config, batch);
     shared_route = receive_routes[
         static_cast<uint64_t>(local_reader) * config.num_pes + source_pe];
     const PoolSliceReceiveBatch& route = shared_route;
@@ -1745,8 +2286,11 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
     }
   }
   __syncthreads();
+  const PoolSlicePublishBatch batch = shared_batch;
+  const uint32_t* source_routes = pool_slice_stream_route_words(
+      receive_batches, source_pe, config, batch);
   if (shared_route_valid == 0) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       atomicCAS(
           shared_status,
           static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1760,11 +2304,37 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
       route.source_begin - batch.route_begin;
   const uint32_t relative_begin = shared_relative_begin;
   const uint32_t relative_end = shared_relative_end;
+#ifdef DAE_ENABLE_LOCAL_POOL
+  if constexpr (VdcoresWorker) {
+    if (config.num_pes < 4) {
+      pool_slice_stream_gather_rows_local_dae(
+          source_pe,
+          compact_begin,
+          compact_end,
+          local_reader,
+          config,
+          source_routes,
+          packed_route_begin,
+          relative_begin,
+          relative_end,
+          route,
+          delivery_pool,
+          expert_input,
+          shared_status,
+          thread_id);
+      if (thread_id == access_leader && relative_begin < relative_end) {
+        dae_atomic_add_release_gpu(
+            control + poolSliceControlReaderDataDone + local_reader, 1);
+      }
+      return;
+    }
+  }
+#endif
 #if defined(DAE_ENABLE_LOCAL_POOL) && DAE_POOL_LOCAL_DIRECT_SCATTER
   if (config.num_pes >= 4) {
     if (route.base_row !=
         static_cast<uint64_t>(source_pe) * config.token_capacity) {
-      if (thread_id == 0) {
+      if (thread_id == access_leader) {
         atomicCAS(
             shared_status,
             static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1778,10 +2348,10 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
       source_pe != config.my_pe &&
           relative_end - relative_begin == compact_end - compact_begin;
   bool dense_thread_valid = true;
-  if (dense_remote) {
-    for (uint32_t relative = relative_begin + thread_id;
+  if (dense_remote && access_thread_active) {
+    for (uint32_t relative = relative_begin + access_thread;
          relative < relative_end;
-         relative += blockDim.x) {
+         relative += access_threads) {
       const uint32_t route_word =
           source_routes[packed_route_begin + relative];
       const uint32_t compact_row = route_word & 0xffffU;
@@ -1800,7 +2370,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
       const uint32_t segment_count = pool_slice_stream_data_segments(
           compact_begin, compact_end);
       for (uint32_t segment = 0; segment < segment_count; ++segment) {
-        if (segment != 0 && thread_id == 0) {
+        if (segment != 0 && thread_id == access_leader) {
           const uint64_t expected = pool_slice_stream_data_progress(
               sequence, segment + 1);
           while (pool_slice_signal_fetch(
@@ -1817,44 +2387,51 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
             ? segment_begin + poolSliceRawSglWidth
             : compact_end;
         const uint32_t relative_offset = segment_begin - compact_begin;
-        pool_slice_copy_block(
+        if (access_thread_active) {
+          pool_slice_copy_workers(
+              expert_input +
+                  (static_cast<uint64_t>(local_reader) *
+                       config.expert_capacity_rows +
+                   route.base_row + relative_begin + relative_offset) *
+                      config.row_bytes,
+              delivery_pool +
+                  (static_cast<uint64_t>(source_pe) * config.token_capacity +
+                   segment_begin) *
+                      config.row_bytes,
+              static_cast<uint64_t>(segment_end - segment_begin) *
+                  config.row_bytes,
+              access_thread,
+              access_threads);
+        }
+      }
+    } else {
+      if (access_thread_active) {
+        pool_slice_copy_workers(
             expert_input +
                 (static_cast<uint64_t>(local_reader) *
                      config.expert_capacity_rows +
-                 route.base_row + relative_begin + relative_offset) *
+                 route.base_row + relative_begin) *
                     config.row_bytes,
             delivery_pool +
                 (static_cast<uint64_t>(source_pe) * config.token_capacity +
-                 segment_begin) *
+                 compact_begin) *
                     config.row_bytes,
-            static_cast<uint64_t>(segment_end - segment_begin) *
+            static_cast<uint64_t>(relative_end - relative_begin) *
                 config.row_bytes,
-            thread_id);
+            access_thread,
+            access_threads);
       }
-    } else {
-      pool_slice_copy_block(
-          expert_input +
-              (static_cast<uint64_t>(local_reader) *
-                   config.expert_capacity_rows +
-               route.base_row + relative_begin) *
-                  config.row_bytes,
-          delivery_pool +
-              (static_cast<uint64_t>(source_pe) * config.token_capacity +
-               compact_begin) *
-                  config.row_bytes,
-          static_cast<uint64_t>(relative_end - relative_begin) *
-              config.row_bytes,
-          thread_id);
     }
   } else {
     // Sparse and self-source gathers stripe rows across the compiled warps;
     // each warp keeps a full coalesced row copy and its precise writer wait.
-    for (uint32_t relative = relative_begin + warp;
+    if (access_thread_active) {
+    for (uint32_t relative = relative_begin + access_warp;
          relative < relative_end;
-         relative += TotalWarps) {
+         relative += access_warps) {
       uint32_t route_word = 0;
       uint32_t compact_row = 0;
-      if (lane == 0) {
+      if (access_lane == 0) {
         route_word = source_routes[packed_route_begin + relative];
         compact_row = route_word & 0xffffU;
       }
@@ -1862,7 +2439,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
       compact_row = __shfl_sync(0xffffffffU, compact_row, 0);
       if (compact_row < compact_begin || compact_row >= compact_end ||
           compact_row >= config.token_capacity) {
-        if (lane == 0) {
+        if (access_lane == 0) {
           atomicCAS(
               shared_status,
               static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1884,21 +2461,21 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
                 source_pe,
                 ready_slot,
                 pool_slice_stream_data_progress(sequence, segment + 1),
-                lane);
+                access_lane);
           }
         }
       }
       if (source_pe == config.my_pe) {
 #ifndef DAE_ENABLE_LOCAL_POOL
         uint32_t token_row = 0;
-        if (lane == 0) {
+        if (access_lane == 0) {
           token_row = send_token_rows[
               static_cast<uint64_t>(config.my_pe) * config.token_capacity +
               compact_row];
         }
         token_row = __shfl_sync(0xffffffffU, token_row, 0);
         if (token_row >= config.token_capacity) {
-          if (lane == 0) {
+          if (access_lane == 0) {
             atomicCAS(
                 shared_status,
                 static_cast<uint32_t>(POOL_SLICE_STATUS_OK),
@@ -1909,7 +2486,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
         const uint32_t chunk = token_row / config.write_chunk_rows;
         uint32_t write_ready = 0;
         while (write_ready == 0) {
-          if (lane == 0)
+          if (access_lane == 0)
             write_ready = pool_slice_barrier_ready(
                 bars + write_barrier + chunk);
           write_ready =
@@ -1929,7 +2506,8 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
                   config.row_bytes,
           source_address,
           config.row_bytes,
-          lane);
+          access_lane);
+    }
     }
   }
   }
@@ -1937,7 +2515,7 @@ static __device__ __noinline__ void pool_slice_stream_gather_rows(
   // The final release-add for a reader is its precise expert-input data fence.
   // Metadata computes the expected number of nonempty shards independently,
   // so no queue-wide END or unrelated reader participates in this dependency.
-  if (thread_id == 0 && relative_begin < relative_end) {
+  if (thread_id == access_leader && relative_begin < relative_end) {
     dae_atomic_add_release_gpu(
         control + poolSliceControlReaderDataDone + local_reader, 1);
   }
@@ -2414,6 +2992,272 @@ pool_slice_source_gather_top8_predecoded(
     }
   }
   __syncwarp();
+}
+
+// Source-gather return for an ordinary compute+memory VDCores CTA.  Physical
+// warps retain their normal ownership even though this is one cooperative
+// CInst: warps [4, 8) perform every global load/store and warps [0, 4)
+// consume only CTA-shared rows and produce a CTA-shared result.  At the tuned
+// 128-worker shape, each CTA owns one source token, so staging all eight
+// routed expert rows costs one global read per byte and only three CTA joins.
+template <uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP>
+static __device__ __noinline__ void
+pool_slice_source_gather_dae_finish(
+    const PoolSliceConfig& config,
+    uint64_t* g_events,
+    uint32_t thread_id,
+    uint64_t sequence,
+    uint32_t gather_rank,
+    uint32_t gather_count) {
+  (void)VectorIlp;
+  constexpr uint32_t compute_threads =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_begin = compute_threads;
+  constexpr uint32_t memory_threads =
+      daeDefaultMemoryWarps * numThreadsPerWarp;
+  static_assert(compute_threads == memory_threads);
+
+  __shared__ uint64_t shared_rows[daePoolCtaComputeRouteCapacity];
+  __shared__ float shared_weights[daePoolCtaComputeRouteCapacity];
+  __shared__ uint32_t shared_route_begin;
+  __shared__ uint32_t shared_route_count;
+  __shared__ uint32_t shared_valid;
+  __shared__ uint32_t shared_uniform_eighth;
+  __shared__ uint32_t shared_status;
+#pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ cuda::barrier<cuda::thread_scope_block>
+      shared_load_barriers[daeDefaultMemoryWarps];
+  extern __shared__ uint4 dae_pool_cta_compute_stage[];
+
+  const bool memory_thread = thread_id >= memory_begin;
+  const uint32_t memory_thread_id = thread_id - memory_begin;
+  const uint32_t memory_lane = memory_thread_id & 31U;
+  const uint32_t memory_warp = memory_thread_id >> 5;
+  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
+
+  if (thread_id == memory_begin)
+    shared_status = POOL_SLICE_STATUS_OK;
+  if (memory_thread && memory_lane == 0)
+    init(&shared_load_barriers[memory_warp], 1);
+  __syncthreads();
+
+  if (thread_id == memory_begin)
+    while (dae_atomic_load_acquire_gpu(
+               control + poolSliceControlScatterStart) < sequence)
+      __nanosleep(barrierPollSleepCycles);
+  __syncthreads();
+
+  const uint32_t row_bytes = config.row_bytes;
+  const uint32_t vectors = row_bytes / sizeof(uint4);
+  if (thread_id == memory_begin &&
+      (row_bytes == 0 || row_bytes > daePoolCtaComputeMaxRowBytes ||
+       row_bytes % sizeof(uint4) != 0)) {
+    shared_status = POOL_SLICE_STATUS_ROUTE_RANGE;
+  }
+  __syncthreads();
+
+  const auto* route_storage = reinterpret_cast<const uint8_t*>(
+      config.return_inbox_address);
+  const auto* source_offsets = reinterpret_cast<const uint32_t*>(
+      route_storage);
+  const uint64_t descriptor_offset =
+      (static_cast<uint64_t>(config.token_capacity + 1) * sizeof(uint32_t) +
+       15ULL) &
+      ~15ULL;
+  const auto* descriptors = reinterpret_cast<const uint64_t*>(
+      route_storage + descriptor_offset);
+  auto* destination_base = reinterpret_cast<uint8_t*>(
+      config.returned_address);
+
+  for (uint32_t source_row = gather_rank;
+       source_row < config.token_capacity;
+       source_row += gather_count) {
+    if (thread_id == memory_begin) {
+      const uint32_t route_begin = source_offsets[source_row];
+      const uint32_t route_end = source_offsets[source_row + 1];
+      shared_route_begin = route_begin;
+      shared_route_count = route_end - route_begin;
+      shared_valid = shared_status == POOL_SLICE_STATUS_OK &&
+              route_begin <= route_end &&
+              route_end <= config.active_rows &&
+              route_end - route_begin <= daePoolCtaComputeRouteCapacity
+          ? 1U
+          : 0U;
+      shared_uniform_eighth = 1U;
+      if (shared_valid == 0)
+        shared_status = POOL_SLICE_STATUS_ROUTE_RANGE;
+      if (g_events != nullptr) {
+        g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+                 poolSliceProfileReturnReduceStart] =
+            cuda::ptx::get_sreg_globaltimer();
+      }
+    }
+    if (memory_thread && memory_warp == 0 &&
+        memory_lane < daePoolCtaComputeRouteCapacity) {
+      shared_rows[memory_lane] = 0;
+      shared_weights[memory_lane] = 0.0f;
+    }
+    __syncthreads();
+
+    if (memory_thread && memory_warp == 0 &&
+        memory_lane < shared_route_count && shared_valid != 0) {
+      const uint64_t descriptor =
+          descriptors[shared_route_begin + memory_lane];
+      const uint32_t descriptor_low = static_cast<uint32_t>(descriptor);
+      const uint32_t descriptor_high =
+          static_cast<uint32_t>(descriptor >> 32);
+      const uint32_t global_reader = descriptor_high & 0xffffU;
+      const uint32_t target_pe = global_reader / config.local_readers;
+      const uint32_t reader = global_reader % config.local_readers;
+      const uint32_t base_row = config.my_pe * config.token_capacity;
+      const uint32_t expert_row = base_row + descriptor_low;
+      const bool valid =
+          global_reader < config.num_pes * config.local_readers &&
+          descriptor_low < config.token_capacity &&
+          expert_row >= base_row &&
+          expert_row < config.expert_capacity_rows;
+      if (!valid) {
+        atomicExch(&shared_valid, 0U);
+        atomicExch(
+            &shared_status,
+            static_cast<uint32_t>(POOL_SLICE_STATUS_ROUTE_RANGE));
+      } else {
+        const auto* local_expert_output =
+            reinterpret_cast<const uint8_t*>(config.expert_output_address);
+        const auto* peer_expert_output = target_pe == config.my_pe
+            ? local_expert_output
+            : reinterpret_cast<const uint8_t*>(
+                  pool_slice_peer_ptr(local_expert_output, target_pe));
+        shared_rows[memory_lane] = reinterpret_cast<uint64_t>(
+            peer_expert_output +
+            (static_cast<uint64_t>(reader) * config.expert_capacity_rows +
+             expert_row) * row_bytes);
+        union {
+          uint16_t bits;
+          __nv_bfloat16 value;
+        } packed_weight;
+        packed_weight.bits =
+            static_cast<uint16_t>(descriptor_high >> 16);
+        if (packed_weight.bits != 0x3e00U)
+          atomicExch(&shared_uniform_eighth, 0U);
+        shared_weights[memory_lane] =
+            __bfloat162float(packed_weight.value);
+      }
+    }
+    __syncthreads();
+
+    const uint32_t output_base =
+        daePoolCtaComputeRouteCapacity * daePoolCtaComputeTileVectors;
+    auto* destination = reinterpret_cast<uint4*>(
+        destination_base + static_cast<uint64_t>(source_row) * row_bytes);
+    for (uint32_t vector_base = 0;
+         vector_base < vectors;
+         vector_base += daePoolCtaComputeTileVectors) {
+      const uint32_t tile_vectors =
+          vectors - vector_base < daePoolCtaComputeTileVectors
+          ? vectors - vector_base
+          : daePoolCtaComputeTileVectors;
+      const uint32_t tile_bytes = tile_vectors * sizeof(uint4);
+      if (memory_thread && memory_lane == 0 && shared_valid != 0) {
+#pragma unroll
+        for (uint32_t route = memory_warp;
+             route < daePoolCtaComputeRouteCapacity;
+             route += daeDefaultMemoryWarps) {
+          if (route >= shared_route_count)
+            continue;
+          cuda::device::memcpy_async_tx(
+              dae_pool_cta_compute_stage +
+                  route * daePoolCtaComputeTileVectors,
+              reinterpret_cast<const uint4*>(shared_rows[route]) +
+                  vector_base,
+              cuda::aligned_size_t<16>(tile_bytes),
+              shared_load_barriers[memory_warp]);
+          cuda::device::barrier_expect_tx(
+              shared_load_barriers[memory_warp],
+              cuda::aligned_size_t<16>(tile_bytes));
+        }
+        shared_load_barriers[memory_warp].arrive_and_wait();
+      }
+      __syncthreads();
+
+      if (thread_id < compute_threads && shared_valid != 0) {
+        for (uint32_t vector = thread_id;
+             vector < tile_vectors;
+             vector += compute_threads) {
+          float2 sums[4] = {
+              make_float2(0.0f, 0.0f),
+              make_float2(0.0f, 0.0f),
+              make_float2(0.0f, 0.0f),
+              make_float2(0.0f, 0.0f)};
+#pragma unroll
+          for (uint32_t route = 0;
+               route < daePoolCtaComputeRouteCapacity;
+               ++route) {
+            if (route >= shared_route_count)
+              continue;
+            const uint4 packed = dae_pool_cta_compute_stage[
+                route * daePoolCtaComputeTileVectors + vector];
+            const uint32_t* words =
+                reinterpret_cast<const uint32_t*>(&packed);
+#pragma unroll
+            for (uint32_t item = 0; item < 4; ++item) {
+              const __nv_bfloat162 value =
+                  *reinterpret_cast<const __nv_bfloat162*>(words + item);
+              const float2 converted = __bfloat1622float2(value);
+              if (shared_uniform_eighth != 0) {
+                sums[item].x += converted.x;
+                sums[item].y += converted.y;
+              } else {
+                sums[item].x += converted.x * shared_weights[route];
+                sums[item].y += converted.y * shared_weights[route];
+              }
+            }
+          }
+          uint4 reduced;
+          uint32_t* words = reinterpret_cast<uint32_t*>(&reduced);
+#pragma unroll
+          for (uint32_t item = 0; item < 4; ++item) {
+            const float scale =
+                shared_uniform_eighth != 0 ? 0.125f : 1.0f;
+            const __nv_bfloat162 packed = __floats2bfloat162_rn(
+                sums[item].x * scale, sums[item].y * scale);
+            words[item] = *reinterpret_cast<const uint32_t*>(&packed);
+          }
+          dae_pool_cta_compute_stage[output_base + vector] = reduced;
+        }
+      }
+      __syncthreads();
+
+      if (thread_id == memory_begin && shared_valid != 0) {
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_global,
+            cuda::ptx::space_shared,
+            destination + vector_base,
+            dae_pool_cta_compute_stage + output_base,
+            tile_bytes);
+        cuda::ptx::cp_async_bulk_commit_group();
+        cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+      }
+      __syncthreads();
+    }
+  }
+
+  if (thread_id == memory_begin) {
+    if (gather_rank < config.token_capacity && g_events != nullptr) {
+      const uint64_t now = cuda::ptx::get_sreg_globaltimer();
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileReturnReduceDone] = now;
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileReturnCtaDone] = now;
+    }
+    if (shared_status != POOL_SLICE_STATUS_OK)
+      pool_slice_set_status(
+          config, static_cast<PoolSliceStatus>(shared_status));
+    dae_atomic_store_release_gpu(
+        control + poolSliceControlScatterGeneration + gather_rank,
+        sequence);
+  }
+  __syncthreads();
 }
 
 // Finalize one source token from destination-owned weighted partials. Every
@@ -3420,7 +4264,7 @@ pool_slice_dynamic_read_reduce_add_finish(
       }
       if (lane == 0 && g_events != nullptr) {
         const uint64_t now = cuda::ptx::get_sreg_globaltimer();
-        const uint32_t rank_zero_block = blockIdx.x - gather_rank;
+        const uint32_t rank_zero_block = blockIdx.x - config.pool_rank;
         g_events[static_cast<uint64_t>(rank_zero_block) * numProfileEvents +
                  poolSliceProfilePayloadDone] = now;
         g_events[static_cast<uint64_t>(rank_zero_block) * numProfileEvents +
@@ -3614,13 +4458,14 @@ pool_slice_dynamic_read_reduce_add_finish(
         control[3] = config.num_pes;
         if (g_events != nullptr) {
           const uint64_t now = cuda::ptx::get_sreg_globaltimer();
-          g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+          const uint32_t scheduler_block = blockIdx.x - config.pool_rank;
+          g_events[static_cast<uint64_t>(scheduler_block) * numProfileEvents +
                    poolSliceProfileReturnPayloadDone] = now;
-          g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+          g_events[static_cast<uint64_t>(scheduler_block) * numProfileEvents +
                    poolSliceProfileReturnSignalsClosed] = now;
-          g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+          g_events[static_cast<uint64_t>(scheduler_block) * numProfileEvents +
                    poolSliceProfileScatterDone] = now;
-          g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+          g_events[static_cast<uint64_t>(scheduler_block) * numProfileEvents +
                    poolSliceProfileDone] = now;
         }
       }
@@ -3859,7 +4704,8 @@ struct PoolSliceDynamicReadWorker {
       bool MultimemReduction = false,
       bool PeerDirectReduction = false,
       bool SourceGatherReduction = false,
-      uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP>
+      uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP,
+      bool VdcoresWorker = false>
   static __device__ __forceinline__ void execute(
       const PoolInst& instruction,
       const PoolSliceQueueEntry& message,
@@ -3873,7 +4719,8 @@ struct PoolSliceDynamicReadWorker {
       uint32_t thread_id) {
     switch (instruction.opcode) {
       case POOL_SLICE_DYNAMIC_READ_COPY:
-        pool_slice_stream_gather_rows<HostDataPlane, TotalWarps>(
+        pool_slice_stream_gather_rows<
+            HostDataPlane, TotalWarps, VdcoresWorker>(
             source_pe,
             message.row_begin,
             message.row_end,
@@ -3948,7 +4795,7 @@ struct PoolSliceDynamicReadWorker {
   }
 };
 
-template <bool BlockCooperative = false>
+template <bool BlockCooperative = false, bool VdcoresWorker = false>
 static __device__ __forceinline__ void
 pool_slice_stream_publish_metadata_target(
     const PoolSliceConfig& config,
@@ -3956,6 +4803,145 @@ pool_slice_stream_publish_metadata_target(
     uint64_t signal_delta,
     uint32_t index,
     uint32_t thread_id) {
+  if constexpr (VdcoresWorker) {
+    static_assert(
+        BlockCooperative,
+        "a VDCores metadata publisher is a CTA-cooperative memory operator");
+    constexpr uint32_t memory_begin =
+        daeComputeWarps * numThreadsPerWarp;
+    constexpr uint32_t memory_threads =
+        daeDefaultMemoryWarps * numThreadsPerWarp;
+    __shared__ PoolSlicePublishBatch shared_source_batch;
+    __shared__ uint32_t shared_target_pe;
+    __shared__ uint32_t shared_envelope_bytes;
+    __shared__ uint32_t shared_route_count;
+    __shared__ uint64_t shared_packet_bytes;
+
+    const bool memory_thread = thread_id >= memory_begin;
+    const uint32_t memory_thread_id = thread_id - memory_begin;
+    const uint32_t memory_warp = memory_thread_id >> 5;
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+    (void)memory_warp;
+#endif
+    auto* send_batches = reinterpret_cast<PoolSlicePublishBatch*>(
+        config.send_batches_address);
+    auto* receive_batches = reinterpret_cast<PoolSlicePublishBatch*>(
+        config.receive_batches_address);
+
+    if (thread_id == memory_begin) {
+      shared_target_pe = index + config.my_pe >= config.num_pes
+          ? index + config.my_pe - config.num_pes
+          : index + config.my_pe;
+      const PoolSliceMetadataEnvelope* source = pool_slice_stream_envelope(
+          send_batches, shared_target_pe, config.route_capacity);
+      shared_source_batch = source->batch;
+      shared_envelope_bytes = pool_slice_stream_envelope_bytes(
+          shared_source_batch.active_rows,
+          config.row_bytes,
+          config.group_limit,
+          config.num_pes);
+      shared_route_count =
+          shared_source_batch.route_end - shared_source_batch.route_begin;
+      const uint64_t route_packet_bytes =
+          (shared_envelope_bytes +
+           static_cast<uint64_t>(shared_route_count) * sizeof(uint32_t) + 15) &
+          ~15ULL;
+      shared_packet_bytes =
+          (route_packet_bytes +
+           static_cast<uint64_t>(shared_source_batch.active_rows) *
+               sizeof(uint32_t) +
+           15) &
+          ~15ULL;
+    }
+    __syncthreads();
+
+    const uint32_t target_pe = shared_target_pe;
+    PoolSliceMetadataEnvelope* destination = pool_slice_stream_envelope(
+        receive_batches, config.my_pe, config.route_capacity);
+    PoolSliceMetadataEnvelope* source = pool_slice_stream_envelope(
+        send_batches, target_pe, config.route_capacity);
+    if (memory_thread) {
+      const auto* send_rows = reinterpret_cast<const uint32_t*>(
+          config.send_rows_address);
+      const auto* send_token_rows = reinterpret_cast<const uint32_t*>(
+          config.send_token_rows_address);
+      uint32_t* packed_routes = pool_slice_stream_route_words(
+          send_batches, target_pe, config, shared_source_batch);
+      for (uint32_t route = memory_thread_id;
+           route < shared_route_count;
+           route += memory_threads) {
+        packed_routes[route] =
+            send_rows[shared_source_batch.route_begin + route];
+      }
+      uint32_t* reduction_rows = pool_slice_stream_reduction_source_rows(
+          send_batches, target_pe, config, shared_source_batch);
+      const uint32_t* target_rows = send_token_rows +
+          static_cast<uint64_t>(target_pe) * config.token_capacity;
+      for (uint32_t row = memory_thread_id;
+           row < shared_source_batch.active_rows;
+           row += memory_threads)
+        reduction_rows[row] = target_rows[row];
+    }
+    __syncthreads();
+
+    auto* control = reinterpret_cast<uint64_t*>(config.control_address);
+    uint64_t* ready = control +
+        poolSliceControlStreamMetadataTransportReady + config.my_pe;
+    if (target_pe == config.my_pe) {
+      if (memory_thread) {
+        pool_slice_copy_workers(
+            destination,
+            source,
+            shared_packet_bytes,
+            memory_thread_id,
+            memory_threads);
+      }
+      __syncthreads();
+      if (thread_id == memory_begin)
+        pool_slice_signal_release_local(ready, sequence);
+    } else {
+#ifdef DAE_POOL_DATA_PATH_NVLINK
+      if (memory_thread) {
+        pool_slice_copy_workers(
+            pool_slice_peer_ptr(destination, target_pe),
+            source,
+            shared_packet_bytes,
+            memory_thread_id,
+            memory_threads);
+      }
+      __syncthreads();
+      if (memory_thread)
+        pool_slice_fence_release_system();
+      __syncthreads();
+      if (thread_id == memory_begin)
+        pool_slice_signal_add_remote(ready, signal_delta, target_pe);
+#elif defined(DAE_ENABLE_NVSHMEM)
+      if (memory_thread && memory_warp == 0) {
+        nvshmemx_putmem_signal_nbi_warp(
+            destination,
+            source,
+            static_cast<size_t>(shared_packet_bytes),
+            ready,
+            signal_delta,
+            NVSHMEM_SIGNAL_ADD,
+            target_pe);
+      }
+#else
+      if (memory_thread && memory_warp == 0) {
+        pool_gin_put_add_signal_warp(
+            destination,
+            source,
+            static_cast<size_t>(shared_packet_bytes),
+            ready,
+            signal_delta,
+            target_pe);
+      }
+#endif
+    }
+    __syncthreads();
+    return;
+  }
+
   const uint32_t lane = thread_id & 31U;
   const uint32_t worker = BlockCooperative ? thread_id : lane;
   const uint32_t workers = BlockCooperative ? blockDim.x : 32;
@@ -4086,7 +5072,10 @@ pool_slice_stream_publish_metadata_target(
     __syncwarp();
 }
 
-template <bool HostDataPlane, uint32_t TotalWarps>
+template <
+    bool HostDataPlane,
+    uint32_t TotalWarps,
+    bool VdcoresWorker = false>
 static __device__ __noinline__ void pool_slice_stream_publish_metadata(
     const PoolSliceConfig& config,
     uint64_t sequence,
@@ -4112,7 +5101,7 @@ static __device__ __noinline__ void pool_slice_stream_publish_metadata(
           ? pool_slice_remote_first_pe(
                 config.pool_rank - 1, config.my_pe, config.num_pes)
           : config.pool_rank;
-      pool_slice_stream_publish_metadata_target<true>(
+      pool_slice_stream_publish_metadata_target<true, VdcoresWorker>(
           config,
           sequence,
           signal_delta,
@@ -4508,7 +5497,8 @@ static __device__ __forceinline__ bool pool_slice_dynamic_read_data_valid(
 template <
     bool WeightedReturn,
     bool SchedulerOwned = false,
-    bool SourceGatherReduction = false>
+    bool SourceGatherReduction = false,
+    bool VdcoresWorker = false>
 static __device__ __noinline__ void
 pool_slice_stream_execute_reserve_routes(
     const PoolSliceQueueEntry& message,
@@ -4524,14 +5514,31 @@ pool_slice_stream_execute_reserve_routes(
     uint32_t thread_id) {
   __shared__ PoolSlicePublishBatch shared_batch;
   __shared__ uint32_t shared_valid;
+  __shared__ uint32_t shared_reuse_static_routes;
 
-  const bool reuse_static_routes =
-      dae_atomic_load_relaxed_gpu(
-          control + poolSliceControlStaticRoutesEnabled) != 0 &&
-      dae_atomic_load_acquire_gpu(
-          control + poolSliceControlStaticRoutesInitialized) != 0;
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_threads =
+      daeDefaultMemoryWarps * numThreadsPerWarp;
+  const bool access_thread_active =
+      !VdcoresWorker || thread_id >= memory_begin;
+  const uint32_t access_thread =
+      VdcoresWorker ? thread_id - memory_begin : thread_id;
+  const uint32_t access_threads =
+      VdcoresWorker ? memory_threads : blockDim.x;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
 
-  if (thread_id == 0) {
+  if (thread_id == access_leader) {
+    shared_reuse_static_routes =
+        dae_atomic_load_relaxed_gpu(
+            control + poolSliceControlStaticRoutesEnabled) != 0 &&
+        dae_atomic_load_acquire_gpu(
+            control + poolSliceControlStaticRoutesInitialized) != 0;
+  }
+  __syncthreads();
+  const bool reuse_static_routes = shared_reuse_static_routes != 0;
+
+  if (thread_id == access_leader) {
     const uint64_t head = atomicAdd(
         reinterpret_cast<unsigned long long*>(
             pool_slice_stream_queue_head(control, source_pe, queue)),
@@ -4643,7 +5650,7 @@ pool_slice_stream_execute_reserve_routes(
       // consumes the destination weighted reverse map or a fine dependency
       // mask, so materialize only the one completion plan the scheduler posts
       // for this source.
-      if (thread_id == 0) {
+      if (thread_id == access_leader) {
         PoolSliceDynamicReadPlan plan{
             sequence,
             source_pe,
@@ -4663,14 +5670,14 @@ pool_slice_stream_execute_reserve_routes(
       // as forwarding, but not its destination-to-source payload stores.
       const uint32_t* source_routes = pool_slice_stream_route_words(
           receive_batches, source_pe, config, batch);
-      if (shared_valid != 0) {
+      if (shared_valid != 0 && access_thread_active) {
         for (uint32_t reader = 0; reader < config.local_readers; ++reader) {
           const PoolSliceReceiveBatch route = receive_routes[
               static_cast<uint64_t>(reader) * config.num_pes + source_pe];
           const uint32_t packed_begin = route.source_begin - batch.route_begin;
-          for (uint32_t relative = thread_id;
+          for (uint32_t relative = access_thread;
                relative < route.row_count;
-               relative += blockDim.x) {
+               relative += access_threads) {
             const uint32_t route_word = source_routes[packed_begin + relative];
             const uint32_t compact_row = route_word & 0xffffU;
             if (compact_row >= batch.active_rows) {
@@ -4693,14 +5700,14 @@ pool_slice_stream_execute_reserve_routes(
     } else {
       const uint32_t* source_routes = pool_slice_stream_route_words(
           receive_batches, source_pe, config, batch);
-      if (shared_valid != 0) {
+      if (shared_valid != 0 && access_thread_active) {
         for (uint32_t reader = 0; reader < config.local_readers; ++reader) {
           const PoolSliceReceiveBatch route = receive_routes[
               static_cast<uint64_t>(reader) * config.num_pes + source_pe];
           const uint32_t packed_begin = route.source_begin - batch.route_begin;
-          for (uint32_t relative = thread_id;
+          for (uint32_t relative = access_thread;
                relative < route.row_count;
-               relative += blockDim.x) {
+               relative += access_threads) {
             const uint32_t route_word = source_routes[packed_begin + relative];
             const uint32_t compact_row = route_word & 0xffffU;
             if (compact_row >= batch.active_rows) {
@@ -4733,7 +5740,7 @@ pool_slice_stream_execute_reserve_routes(
     }
   }
 
-  if (thread_id == 0) {
+  if (thread_id == access_leader) {
     // RouteReady covers receive_routes, the weighted reverse map, and every
     // source-owned ReduceAdd plan. DATA needs only the first object; combine
     // acquires the same publication without a later plan-build phase.
@@ -5733,12 +6740,18 @@ struct PoolSliceExecutorShared {
 // same vectorized SIMT sender used by the direct predecessor-style stripe.
 // SEND is uncommon in the persistent loop (only group-count overflow), so the
 // noinline boundary keeps its state out of the DynamicRead hot loop.
-template <bool HostDataPlane, uint32_t TotalWarps>
+template <
+    bool HostDataPlane,
+    uint32_t TotalWarps,
+    bool VdcoresWorker = false>
 static __device__ __noinline__ void pool_slice_executor_send_task(
     PoolSliceExecutorShared* shared,
     uint32_t task,
     uint32_t thread_id) {
-  if (thread_id == 0) {
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
+  if (thread_id == access_leader) {
     const PoolSliceConfig& config = *shared->config;
     const auto* send_token_counts = reinterpret_cast<const uint32_t*>(
         config.send_token_counts_address);
@@ -5754,7 +6767,7 @@ static __device__ __noinline__ void pool_slice_executor_send_task(
   __syncthreads();
   if (shared->batch_offset == 0)
     return;
-  pool_slice_stream_send_group<HostDataPlane>(
+  pool_slice_stream_send_group<HostDataPlane, VdcoresWorker>(
       shared->source_pe,
       shared->queue,
       *shared->config,
@@ -5781,12 +6794,20 @@ template <
     bool MultimemReduction = false,
     bool PeerDirectReduction = false,
     bool SourceGatherReduction = false,
-    uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP>
+    uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP,
+    bool VdcoresWorker = false>
 static __device__ __noinline__ void pool_slice_executor_loop(
     PoolSliceExecutorShared* shared,
     uint32_t thread_id) {
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  const bool access_thread_active =
+      !VdcoresWorker || thread_id >= memory_begin;
+  const uint32_t access_thread =
+      VdcoresWorker ? thread_id - memory_begin : thread_id;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
   while (true) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       auto* control = reinterpret_cast<uint64_t*>(
           shared->config->control_address);
       if (shared->phase_start != 0) {
@@ -5821,7 +6842,7 @@ static __device__ __noinline__ void pool_slice_executor_loop(
     }
     __syncthreads();
     if (shared->task.opcode == POOL_SLICE_EXECUTOR_STOP) {
-      if (thread_id == 0) {
+      if (thread_id == access_leader) {
         auto* control = reinterpret_cast<uint64_t*>(
             shared->config->control_address);
         if (shared->ticket != UINT64_MAX)
@@ -5839,15 +6860,17 @@ static __device__ __noinline__ void pool_slice_executor_loop(
       __syncthreads();
       break;
     }
-    if (thread_id < sizeof(PoolSliceExecutorSlot) / sizeof(uint4)) {
+    if (access_thread_active &&
+        access_thread < sizeof(PoolSliceExecutorSlot) / sizeof(uint4)) {
       auto* control = reinterpret_cast<uint64_t*>(
           shared->config->control_address);
-      reinterpret_cast<uint4*>(&shared->task)[thread_id] =
+      reinterpret_cast<uint4*>(&shared->task)[access_thread] =
           reinterpret_cast<const uint4*>(
-              pool_slice_executor_slot(control, shared->ticket))[thread_id];
+              pool_slice_executor_slot(control, shared->ticket))[access_thread];
     }
     __syncthreads();
-    if (shared->task.queue_index != UINT32_MAX && thread_id < 2) {
+    if (shared->task.queue_index != UINT32_MAX &&
+        access_thread_active && access_thread < 2) {
       const PoolSliceConfig& config = *shared->config;
       const uint32_t source_pe =
           shared->task.queue_index / poolSliceMaxStreamQueues;
@@ -5856,22 +6879,23 @@ static __device__ __noinline__ void pool_slice_executor_loop(
       const auto* receive_batches =
           reinterpret_cast<const PoolSlicePublishBatch*>(
               config.receive_batches_address);
-      reinterpret_cast<uint4*>(&shared->message)[thread_id] =
+      reinterpret_cast<uint4*>(&shared->message)[access_thread] =
           reinterpret_cast<const uint4*>(pool_slice_stream_queue_entry(
               receive_batches,
               source_pe,
               queue,
               shared->task.message_index,
-              config.route_capacity))[thread_id];
+              config.route_capacity))[access_thread];
     }
     __syncthreads();
 
     const uint32_t opcode = shared->task.opcode;
     if (opcode == POOL_SLICE_EXECUTOR_SEND) {
-      pool_slice_executor_send_task<HostDataPlane, TotalWarps>(
+      pool_slice_executor_send_task<
+          HostDataPlane, TotalWarps, VdcoresWorker>(
           shared, shared->task.argument, thread_id);
     } else if (opcode == POOL_SLICE_EXECUTOR_DYNAMIC_READ) {
-      if (thread_id == 0) {
+      if (thread_id == access_leader) {
         shared->source_pe = shared->task.queue_index == UINT32_MAX
             ? 0
             : shared->task.queue_index / poolSliceMaxStreamQueues;
@@ -5897,7 +6921,8 @@ static __device__ __noinline__ void pool_slice_executor_loop(
                 MultimemReduction,
                 PeerDirectReduction,
                 SourceGatherReduction,
-                VectorIlp>(
+                VectorIlp,
+                VdcoresWorker>(
                 shared->instruction,
                 shared->message,
                 0,
@@ -5912,7 +6937,7 @@ static __device__ __noinline__ void pool_slice_executor_loop(
                      POOL_SLICE_DYNAMIC_READ_COPY &&
                  shared->batch_count != 0) {
         while (shared->batch_offset < shared->batch_count) {
-          if (thread_id == 0) {
+          if (thread_id == access_leader) {
             while (!pool_slice_scheduler_queue_message_ready<
                        HostDataPlane, TotalWarps>(
                        shared->source_pe,
@@ -5926,23 +6951,24 @@ static __device__ __noinline__ void pool_slice_executor_loop(
                        shared->sequence))
               __nanosleep(barrierPollSleepCycles);
           }
-          if (shared->batch_offset != 0 && thread_id < 2) {
+          if (shared->batch_offset != 0 && access_thread_active &&
+              access_thread < 2) {
             const auto* receive_batches =
                 reinterpret_cast<const PoolSlicePublishBatch*>(
                     shared->config->receive_batches_address);
-            reinterpret_cast<uint4*>(&shared->message)[thread_id] =
+            reinterpret_cast<uint4*>(&shared->message)[access_thread] =
                 reinterpret_cast<const uint4*>(
                     pool_slice_stream_queue_entry(
                         receive_batches,
                         shared->source_pe,
                         shared->queue,
                         shared->task.message_index + shared->batch_offset,
-                        shared->config->route_capacity))[thread_id];
+                        shared->config->route_capacity))[access_thread];
           }
           __syncthreads();
           if (shared->instruction.opcode ==
                   POOL_SLICE_DYNAMIC_READ_COPY &&
-              thread_id == 0 &&
+              thread_id == access_leader &&
               atomicCAS(shared->first_gather, 0U, 1U) == 0U &&
               shared->events != nullptr) {
             shared->events[
@@ -5959,7 +6985,8 @@ static __device__ __noinline__ void pool_slice_executor_loop(
                   MultimemReduction,
                   PeerDirectReduction,
                   SourceGatherReduction,
-                  VectorIlp>(
+                  VectorIlp,
+                  VdcoresWorker>(
                   shared->instruction,
                   shared->message,
                   shared->source_pe,
@@ -5971,19 +6998,20 @@ static __device__ __noinline__ void pool_slice_executor_loop(
                   shared->status,
                   thread_id);
           __syncthreads();
-          if (thread_id == 0)
+          if (thread_id == access_leader)
             ++shared->batch_offset;
           __syncthreads();
         }
-      } else if (thread_id == 0) {
+      } else if (thread_id == access_leader) {
         pool_slice_stream_queue_error(*shared->config, shared->status);
       }
-    } else if (opcode != POOL_SLICE_EXECUTOR_STOP && thread_id == 0) {
+    } else if (opcode != POOL_SLICE_EXECUTOR_STOP &&
+               thread_id == access_leader) {
       pool_slice_stream_queue_error(*shared->config, shared->status);
     }
     __syncthreads();
 
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       auto* control = reinterpret_cast<uint64_t*>(
           shared->config->control_address);
       if (shared->task.queue_index != UINT32_MAX) {
@@ -6246,6 +7274,78 @@ pool_slice_stream_rearm_static_metadata(
   __syncthreads();
 }
 
+// Warp one of the sole scheduler CTA owns source-gather combine readiness.
+// It runs concurrently with warp zero's dispatch scheduler, replacing the
+// former worker-CTA coordinator without adding a second scheduling block.
+static __device__ __forceinline__ void
+pool_slice_source_gather_scheduler_start(
+    const PoolSliceConfig& config,
+    uint64_t* g_events,
+    uint64_t sequence,
+    uint32_t lane) {
+  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
+  pool_slice_wait_generation_warp(
+      control + poolSliceControlReturnGeneration,
+      config.num_pes,
+      sequence,
+      lane);
+  if (lane == 0) {
+    if (g_events != nullptr) {
+      const uint64_t now = cuda::ptx::get_sreg_globaltimer();
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfilePayloadDone] = now;
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileGatherReady] = now;
+    }
+    dae_atomic_store_release_gpu(
+        control + poolSliceControlScatterStart, sequence);
+  }
+  __syncwarp();
+}
+
+// After dispatch scheduling and combine release have both completed, the same
+// scheduler CTA joins every return worker and every ring executor. Worker
+// CTAs publish only their own generation and never coordinate one another.
+static __device__ __forceinline__ void
+pool_slice_source_gather_scheduler_finish(
+    const PoolSliceConfig& config,
+    uint64_t* g_events,
+    uint64_t sequence,
+  uint32_t gather_count,
+  uint32_t thread_id) {
+  auto* control = reinterpret_cast<uint64_t*>(config.control_address);
+  // Weighted source-gather keeps every logical non-scheduler CTA in the
+  // executor set, even when its explicit static role is empty this round.
+  const uint32_t executor_count = config.pool_count - 1;
+  const uint32_t completion_count = gather_count + executor_count + 1;
+  for (uint32_t index = thread_id;
+       index < completion_count;
+       index += blockDim.x) {
+    const uint64_t* generation = index < gather_count
+        ? control + poolSliceControlScatterGeneration + index
+        : control + poolSliceControlDispatchGeneration +
+              index - gather_count;
+    while (dae_atomic_load_acquire_gpu(generation) < sequence)
+      __nanosleep(barrierPollSleepCycles);
+  }
+  __syncthreads();
+  if (thread_id == 0) {
+    control[3] = config.num_pes;
+    if (g_events != nullptr) {
+      const uint64_t now = cuda::ptx::get_sreg_globaltimer();
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileReturnPayloadDone] = now;
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileReturnSignalsClosed] = now;
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileScatterDone] = now;
+      g_events[static_cast<uint64_t>(blockIdx.x) * numProfileEvents +
+               poolSliceProfileDone] = now;
+    }
+  }
+  __syncthreads();
+}
+
 // Direct-source, dynamically grouped dispatch. Metadata and activation data
 // have independent readiness generations. Payload CTAs alternate source-group
 // transmission with ready destination queue heads, so a destination copy can
@@ -6259,7 +7359,9 @@ template <
     bool MultimemReduction = false,
     bool PeerDirectReduction = false,
     bool SourceGatherReduction = false,
-    uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP>
+    uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP,
+    bool VdcoresWorker = false,
+    bool SourceGatherSchedulerOnly = false>
 static __device__ __noinline__ void pool_slice_exchange_streaming(
     const PoolSliceConfig& config,
     const PoolSliceHostConfig* host_config,
@@ -6274,7 +7376,10 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     uint64_t sequence,
     uint64_t return_value,
     uint32_t source_gather_pool_rank = UINT32_MAX,
-    uint32_t source_gather_pool_count = 0) {
+    uint32_t source_gather_pool_count = 0,
+    uint32_t vdcores_role = POOL_SLICE_VDCORES_ROLE_NONE,
+    uint32_t vdcores_role_task = UINT32_MAX,
+    uint32_t vdcores_dispatch_slot = UINT32_MAX) {
   static_assert(
       !(MultimemReduction && PeerDirectReduction) &&
           !(MultimemReduction && SourceGatherReduction) &&
@@ -6298,6 +7403,9 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   __shared__ uint32_t shared_direct_send_task;
   __shared__ uint32_t shared_direct_local_group;
   __shared__ uint32_t shared_direct_route_source;
+  __shared__ uint32_t shared_reuse_static_routes;
+  __shared__ uint32_t shared_dispatch_worker_count;
+  __shared__ uint64_t shared_metadata_signal_delta;
   // The DynamicRead program is immutable for an invocation. Prefetch it once
   // while the pool is initializing so queue execution never brings a 16-byte
   // descriptor through the DATA-message critical path. The largest program is
@@ -6307,6 +7415,19 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
 
   const uint32_t lane = thread_id & 31U;
   const uint32_t warp = thread_id >> 5;
+  constexpr uint32_t memory_begin =
+      daeComputeWarps * numThreadsPerWarp;
+  constexpr uint32_t memory_threads =
+      daeDefaultMemoryWarps * numThreadsPerWarp;
+  const bool access_thread_active =
+      !VdcoresWorker || thread_id >= memory_begin;
+  const uint32_t access_thread =
+      VdcoresWorker ? thread_id - memory_begin : thread_id;
+  const uint32_t access_threads =
+      VdcoresWorker ? memory_threads : blockDim.x;
+  const uint32_t access_lane = access_thread & 31U;
+  const uint32_t access_warp = access_thread >> 5;
+  const uint32_t access_leader = VdcoresWorker ? memory_begin : 0U;
   auto* control = reinterpret_cast<uint64_t*>(config.control_address);
   auto* send_batches = reinterpret_cast<PoolSlicePublishBatch*>(
       config.send_batches_address);
@@ -6320,11 +7441,15 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       config.send_offsets_address);
   const auto* send_token_counts = reinterpret_cast<const uint32_t*>(
       config.send_token_counts_address);
-  const bool reuse_static_routes =
-      dae_atomic_load_relaxed_gpu(
-          control + poolSliceControlStaticRoutesEnabled) != 0 &&
-      dae_atomic_load_acquire_gpu(
-          control + poolSliceControlStaticRoutesInitialized) != 0;
+  if (thread_id == access_leader) {
+    shared_reuse_static_routes =
+        dae_atomic_load_relaxed_gpu(
+            control + poolSliceControlStaticRoutesEnabled) != 0 &&
+        dae_atomic_load_acquire_gpu(
+            control + poolSliceControlStaticRoutesInitialized) != 0;
+  }
+  __syncthreads();
+  const bool reuse_static_routes = shared_reuse_static_routes != 0;
 
   if constexpr (SourceGatherReduction) {
     // Physical CTAs above the 64-CTA dispatcher never enter the PoolInst
@@ -6333,10 +7458,12 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     // shards, allowing return bandwidth to scale across the otherwise idle
     // GB300 SMs without widening dispatch CTAs.
     if (source_gather_pool_count > config.pool_count &&
-        source_gather_pool_rank >= config.pool_count) {
+        config.pool_rank >= config.pool_count) {
       if (thread_id == 0)
         shared_status = POOL_SLICE_STATUS_OK;
       __syncthreads();
+      if constexpr (VdcoresWorker)
+        return;
       pool_slice_dynamic_read_reduce_add_finish<
           TotalWarps,
           MultimemReduction,
@@ -6398,19 +7525,21 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     shared_scheduler.direct_send_count = 0;
     shared_scheduler.bounded_reduction_wave = 0;
   }
-  for (uint32_t instruction = thread_id;
-       instruction < config.local_readers + config.pool_count;
-       instruction += blockDim.x) {
-    shared_dynamic_read_instructions[instruction] =
-        dynamic_read_instructions[instruction];
+  if (access_thread_active) {
+    for (uint32_t instruction = access_thread;
+         instruction < config.local_readers + config.pool_count;
+         instruction += access_threads) {
+      shared_dynamic_read_instructions[instruction] =
+          dynamic_read_instructions[instruction];
+    }
   }
-  if (g_events != nullptr) {
+  if (g_events != nullptr && access_thread_active) {
     constexpr uint32_t last_profile_event = poolSliceProfileAllReadersReady;
     uint64_t* block_events =
         g_events + static_cast<uint64_t>(blockIdx.x) * numProfileEvents;
-    for (uint32_t event = poolSliceProfileStart + thread_id;
+    for (uint32_t event = poolSliceProfileStart + access_thread;
          event <= last_profile_event;
-         event += blockDim.x)
+         event += access_threads)
       block_events[event] = 0;
   }
   __syncthreads();
@@ -6600,8 +7729,15 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
           control + poolSliceControlStart, sequence);
     }
   } else {
-    pool_slice_wait_value_warp(
-        control + poolSliceControlStart, sequence, lane);
+    if constexpr (VdcoresWorker) {
+      if (access_thread_active && access_warp == 0) {
+        pool_slice_wait_value_warp(
+            control + poolSliceControlStart, sequence, access_lane);
+      }
+    } else {
+      pool_slice_wait_value_warp(
+          control + poolSliceControlStart, sequence, lane);
+    }
   }
   __syncthreads();
 
@@ -6678,24 +7814,33 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   // Metadata is one source-owned envelope per destination. It is always an
   // independent fused message, so routing can be accepted while the selected
   // host, public-NVSHMEM, or raw-SGL data plane remains in flight.
-  const uint64_t metadata_signal_delta = dae_atomic_load_relaxed_gpu(
-      control + poolSliceControlStreamMetadataSignalDelta);
-  const uint32_t dispatch_worker_count =
-      pool_slice_stream_dispatch_worker_count(config, control);
+  if (thread_id == access_leader) {
+    shared_metadata_signal_delta = dae_atomic_load_relaxed_gpu(
+        control + poolSliceControlStreamMetadataSignalDelta);
+    shared_dispatch_worker_count =
+        pool_slice_stream_dispatch_worker_count(config, control);
+  }
+  __syncthreads();
+  const uint64_t metadata_signal_delta = shared_metadata_signal_delta;
+  const uint32_t dispatch_worker_count = shared_dispatch_worker_count;
   // Weighted combine has one independently executable shard per PoolInst
   // rank. Keep every assembled CTA available to the dynamic ring so moving
   // ReduceAdd behind the scheduler never reduces the prior reduction width.
   const uint32_t executor_count = WeightedReturn
       ? config.pool_count - 1
       : dispatch_worker_count;
-  if (thread_id == 0) {
+  if (thread_id == access_leader) {
     const uint32_t send_count = static_cast<uint32_t>(
         dae_atomic_load_relaxed_gpu(
             control + poolSliceControlStreamSendTotal));
+    uint32_t direct_send_capacity = dispatch_worker_count;
+    if constexpr (VdcoresWorker || SourceGatherSchedulerOnly)
+      direct_send_capacity =
+          pool_slice_vdcores_direct_send_capacity(config);
     const uint32_t direct_send_count =
-        send_count < dispatch_worker_count
+        send_count < direct_send_capacity
         ? send_count
-        : dispatch_worker_count;
+        : direct_send_capacity;
     shared_scheduler.worker_count = executor_count;
     shared_scheduler.send_count = send_count;
     shared_scheduler.direct_send_count = direct_send_count;
@@ -6707,8 +7852,30 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
       shared_executor.bounded_reduction_wave = bounded_reduction_wave;
     }
 #endif
-    if (config.pool_rank != 0 &&
-        config.pool_rank <= dispatch_worker_count) {
+    if constexpr (VdcoresWorker) {
+      if (vdcores_dispatch_slot < dispatch_worker_count)
+        shared_executor.phase_start = 1;
+#ifdef DAE_ENABLE_LOCAL_POOL
+      if (vdcores_role == POOL_SLICE_VDCORES_ROLE_METADATA_ROUTE &&
+          vdcores_role_task < config.num_pes) {
+        shared_direct_route_source = vdcores_role_task;
+      } else if (
+          vdcores_role == POOL_SLICE_VDCORES_ROLE_REMOTE_SEND &&
+          vdcores_role_task < direct_send_count) {
+        shared_direct_send_task = vdcores_role_task;
+      } else if (
+          vdcores_role == POOL_SLICE_VDCORES_ROLE_SELF_DISPATCH) {
+        const uint32_t local_group_count = pool_slice_stream_group_count(
+            send_token_counts[config.my_pe],
+            config.row_bytes,
+            config.group_limit,
+            config.num_pes);
+        if (vdcores_role_task < local_group_count)
+          shared_direct_local_group = vdcores_role_task;
+      }
+#endif
+    } else if (config.pool_rank != 0 &&
+               config.pool_rank <= dispatch_worker_count) {
       const uint32_t worker_index = config.pool_rank - 1;
 #ifdef DAE_ENABLE_LOCAL_POOL
       const bool split_workers =
@@ -6766,11 +7933,30 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     }
   }
   if (!reuse_static_routes) {
-    pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>(
-        config,
-        sequence,
-        metadata_signal_delta,
-        thread_id);
+    if constexpr (VdcoresWorker) {
+      if (vdcores_role == POOL_SLICE_VDCORES_ROLE_METADATA_ROUTE &&
+          vdcores_role_task < config.num_pes) {
+        // Preserve the established remote-first/self-last permutation while
+        // making the publisher identity explicit in the CInst.
+        const uint32_t target = pool_slice_remote_first_pe(
+            vdcores_role_task,
+            config.my_pe,
+            config.num_pes);
+        pool_slice_stream_publish_metadata_target<true, true>(
+            config,
+            sequence,
+            metadata_signal_delta,
+            target,
+            thread_id);
+      }
+    } else if constexpr (!SourceGatherSchedulerOnly) {
+      pool_slice_stream_publish_metadata<
+          HostDataPlane, TotalWarps, VdcoresWorker>(
+          config,
+          sequence,
+          metadata_signal_delta,
+          thread_id);
+    }
   }
   __syncthreads();
   if constexpr (HostDataPlane) {
@@ -6786,13 +7972,14 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   // target-major CTA stripe as the predecessor; only overflow enters the HBM
   // ring. Metadata and data retain independent remote readiness generations.
   if (shared_direct_send_task != UINT32_MAX) {
-    pool_slice_executor_send_task<HostDataPlane, TotalWarps>(
+    pool_slice_executor_send_task<
+        HostDataPlane, TotalWarps, VdcoresWorker>(
         &shared_executor, shared_direct_send_task, thread_id);
   }
   __syncthreads();
 #ifdef DAE_ENABLE_LOCAL_POOL
   if (shared_direct_local_group != UINT32_MAX) {
-    pool_slice_stream_pack_local_group(
+    pool_slice_stream_pack_local_group<VdcoresWorker>(
         shared_direct_local_group,
         config,
         bars,
@@ -6811,25 +7998,25 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   // stage direct removes a ring handoff from every DynamicRead dependency.
   if (shared_direct_route_source != UINT32_MAX) {
     const uint32_t source_pe = shared_direct_route_source;
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       while (dae_atomic_load_acquire_gpu(
                  control + poolSliceControlStreamMetadataReady + source_pe) <
              sequence)
         __nanosleep(barrierPollSleepCycles);
     }
     __syncthreads();
-    if (thread_id < 2) {
-      reinterpret_cast<uint4*>(&shared_queue_message)[thread_id] =
+    if (access_thread_active && access_thread < 2) {
+      reinterpret_cast<uint4*>(&shared_queue_message)[access_thread] =
           reinterpret_cast<const uint4*>(pool_slice_stream_queue_entry(
               receive_batches,
               source_pe,
               0,
               0,
-              config.route_capacity))[thread_id];
+              config.route_capacity))[access_thread];
     }
     __syncthreads();
     pool_slice_stream_execute_reserve_routes<
-        WeightedReturn, true, SourceGatherReduction>(
+        WeightedReturn, true, SourceGatherReduction, VdcoresWorker>(
         shared_queue_message,
         source_pe,
         0,
@@ -6842,7 +8029,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
         &shared_status,
         thread_id);
     __syncthreads();
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       dae_atomic_or_release_gpu(
           pool_slice_stream_queue_claim(control, source_pe, 0),
           1ULL << 32);
@@ -6861,6 +8048,15 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
         SourceGatherReduction>(
             &shared_scheduler,
             lane);
+  }
+  if constexpr (SourceGatherSchedulerOnly) {
+    if (config.pool_count > 1 && config.pool_rank == 0 && warp == 1) {
+      pool_slice_source_gather_scheduler_start(
+          config,
+          g_events,
+          sequence,
+          lane);
+    }
   }
   if (config.pool_count == 1 && config.pool_rank == 0 && warp == 0) {
     bool metadata_ready = lane >= config.num_pes;
@@ -7029,9 +8225,12 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
   __syncthreads();
 
   const bool ring_executor = config.pool_count > 1 &&
-      ((config.pool_rank != 0 &&
-        config.pool_rank <= executor_count) ||
-       (WeightedReturn && !SourceGatherReduction && config.pool_rank == 0));
+      (VdcoresWorker
+           ? vdcores_dispatch_slot < executor_count
+           : ((config.pool_rank != 0 &&
+               config.pool_rank <= executor_count) ||
+              (WeightedReturn && !SourceGatherReduction &&
+               config.pool_rank == 0)));
 #ifdef DAE_ENABLE_LOCAL_POOL
   if constexpr (WeightedReturn) {
     // Low-rank staged delivery has static publisher, route, and SEND roles
@@ -7041,7 +8240,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     // available. Word 3 is invocation-local scratch and is overwritten with
     // the final PE count at completion.
     if (config.num_pes < 8 && ring_executor && config.pool_rank != 0) {
-      if (thread_id == 0) {
+      if (thread_id == access_leader) {
         atomicAdd(
             reinterpret_cast<unsigned long long*>(control + 3),
             1ULL);
@@ -7058,7 +8257,8 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
         MultimemReduction,
         PeerDirectReduction,
         SourceGatherReduction,
-        VectorIlp>(
+        VectorIlp,
+        VdcoresWorker>(
         &shared_executor,
         thread_id);
   }
@@ -7087,7 +8287,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
               send_token_counts,
               &target_pe,
               &group)) {
-          pool_slice_stream_send_group<HostDataPlane>(
+          pool_slice_stream_send_group<HostDataPlane, VdcoresWorker>(
               target_pe,
               group,
               config,
@@ -7196,7 +8396,8 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
                     MultimemReduction,
                     PeerDirectReduction,
                     SourceGatherReduction,
-                    VectorIlp>(
+                    VectorIlp,
+                    VdcoresWorker>(
                 shared_dynamic_read_instructions[shared_queue_reader],
                 shared_queue_message,
                 source_pe,
@@ -7212,7 +8413,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
             shared_queue_message.opcode ==
             POOL_SLICE_QUEUE_RESERVE_ROUTES) {
           pool_slice_stream_execute_reserve_routes<
-              WeightedReturn, false, SourceGatherReduction>(
+              WeightedReturn, false, SourceGatherReduction, VdcoresWorker>(
               shared_queue_message,
               source_pe,
               queue,
@@ -7273,7 +8474,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     }
   }
   if (config.pool_count > 1 && !ring_executor) {
-    if (thread_id == 0) {
+    if (thread_id == access_leader) {
       const uint64_t expected_retired =
           pool_slice_stream_queue_retired_mask(config.num_pes);
       while (true) {
@@ -7311,7 +8512,7 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
     __syncwarp();
   }
 
-  if (thread_id == 0) {
+  if (thread_id == access_leader) {
     if (shared_status != POOL_SLICE_STATUS_OK)
       pool_slice_set_status(
           config, static_cast<PoolSliceStatus>(shared_status));
@@ -7394,9 +8595,36 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
           g_events, poolSliceProfileGatherReady, lane);
   }
 
-  pool_slice_wait_value_warp(
-      control + poolSliceControlDispatchReady, sequence, lane);
+  if constexpr (VdcoresWorker) {
+    if (access_thread_active && access_warp == 0) {
+      pool_slice_wait_value_warp(
+          control + poolSliceControlDispatchReady, sequence, access_lane);
+    }
+    __syncthreads();
+  } else {
+    pool_slice_wait_value_warp(
+        control + poolSliceControlDispatchReady, sequence, lane);
+  }
   if constexpr (WeightedReturn) {
+    if constexpr (SourceGatherReduction) {
+      // The mixed assembly keeps PoolInst rank zero scheduler-only. Its normal
+      // worker CTAs are densely renumbered for source gather and publish the
+      // final timing boundary into the scheduler's profile record.
+      if constexpr (SourceGatherSchedulerOnly) {
+        if (thread_id == 0 &&
+            dae_atomic_load_relaxed_gpu(
+                control + poolSliceControlStaticRoutesEnabled) != 0) {
+          dae_atomic_store_release_gpu(
+              control + poolSliceControlStaticRoutesInitialized, 1);
+        }
+        return;
+      }
+      // The ordinary compute/memory worker returns through a DAE split after
+      // this common dispatch state machine unwinds.  Its memory-side warps
+      // stage global rows; compute warps never enter the legacy global gather.
+      if constexpr (VdcoresWorker)
+        return;
+    }
     // A one-CTA correctness assembly has no independent ring consumer. The
     // production assembly enqueued all ReduceAdd programs on the common ring
     // before its STOP suffix, so only the fallback executes one directly.
@@ -7409,7 +8637,8 @@ static __device__ __noinline__ void pool_slice_exchange_streaming(
               MultimemReduction,
               PeerDirectReduction,
               SourceGatherReduction,
-              VectorIlp>(
+              VectorIlp,
+              VdcoresWorker>(
               shared_dynamic_read_instructions[config.local_readers],
               shared_queue_message,
               0,
@@ -7465,13 +8694,19 @@ template <
     bool MultimemReduction = false,
     bool PeerDirectReduction = false,
     bool SourceGatherReduction = false,
-    uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP>
+    uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP,
+    bool VdcoresWorker = false,
+    bool SourceGatherSchedulerOnly = false>
 static __device__ __noinline__ void pool_slice_exchange(
     const PoolInst* instructions,
     int* bars,
     uint64_t* signal_array,
     uint64_t* g_events,
-    uint32_t thread_id) {
+    uint32_t thread_id,
+    uint32_t vdcores_role = POOL_SLICE_VDCORES_ROLE_NONE,
+    uint32_t vdcores_role_task = UINT32_MAX,
+    uint32_t vdcores_dispatch_slot = UINT32_MAX,
+    uint32_t vdcores_gather_rank = UINT32_MAX) {
   static_assert(TotalWarps >= 3, "PoolInst requires coordinator plus workers");
   static_assert(
       !(MultimemReduction && PeerDirectReduction) &&
@@ -7482,13 +8717,24 @@ static __device__ __noinline__ void pool_slice_exchange(
   __shared__ PoolSliceConfig shared_config;
   __shared__ uint32_t shared_physical_pool_rank;
   __shared__ uint32_t shared_physical_pool_count;
+  __shared__ uint64_t shared_sequence;
+  constexpr uint32_t program_leader = VdcoresWorker
+      ? daeComputeWarps * numThreadsPerWarp
+      : 0U;
 
-  if (thread_id == 0) {
+  if (thread_id == program_leader) {
     shared_program_header = instructions[0];
     shared_config = *reinterpret_cast<const PoolSliceConfig*>(
         shared_program_header.address);
-    shared_physical_pool_rank = shared_config.pool_rank;
-    shared_physical_pool_count = shared_config.pool_count;
+    if constexpr (SourceGatherReduction && VdcoresWorker) {
+      // Rank zero is the scheduler-only PoolInst CTA. Map normal worker ranks
+      // [1, P) densely onto source-gather ranks [0, P-1).
+      shared_physical_pool_rank = shared_config.pool_rank - 1;
+      shared_physical_pool_count = shared_config.pool_count - 1;
+    } else {
+      shared_physical_pool_rank = shared_config.pool_rank;
+      shared_physical_pool_count = shared_config.pool_count;
+    }
     if constexpr (SourceGatherReduction) {
       // Four-PE dispatch is fastest at 40 logical executors. Larger random
       // global top-k domains need the proven 64-executor envelope to retire
@@ -7498,11 +8744,12 @@ static __device__ __noinline__ void pool_slice_exchange(
       if (shared_config.pool_count > logical_limit)
         shared_config.pool_count = logical_limit;
     }
+    shared_sequence = pool_slice_sequence(shared_config);
   }
   __syncthreads();
 
   const PoolSliceConfig& config = shared_config;
-  const uint64_t sequence = pool_slice_sequence(config);
+  const uint64_t sequence = shared_sequence;
   const uint64_t return_value = sequence;
   pool_slice_exchange_streaming<
       WeightedReturn,
@@ -7511,7 +8758,9 @@ static __device__ __noinline__ void pool_slice_exchange(
       MultimemReduction,
       PeerDirectReduction,
       SourceGatherReduction,
-      VectorIlp>(
+      VectorIlp,
+      VdcoresWorker,
+      SourceGatherSchedulerOnly>(
       config,
       nullptr,
       instructions + 1,
@@ -7525,7 +8774,62 @@ static __device__ __noinline__ void pool_slice_exchange(
       sequence,
       return_value,
       shared_physical_pool_rank,
-      shared_physical_pool_count);
+      shared_physical_pool_count,
+      vdcores_role,
+      vdcores_role_task,
+      vdcores_dispatch_slot);
+  if constexpr (
+      WeightedReturn && SourceGatherReduction && SourceGatherSchedulerOnly) {
+    pool_slice_source_gather_scheduler_finish(
+        config,
+        g_events,
+        sequence,
+        shared_physical_pool_count - 1,
+        thread_id);
+  } else if constexpr (
+      WeightedReturn && SourceGatherReduction && VdcoresWorker) {
+    // The opcode already identifies the dispatch role; its third argument
+    // explicitly identifies this CTA's gather stripe. Keep the common return
+    // in the same normal VDCores operator so there is no second decode,
+    // sidecar load, or CTA-wide handoff on the critical path.
+    pool_slice_source_gather_dae_finish<VectorIlp>(
+        shared_config,
+        g_events,
+        thread_id,
+        sequence,
+        vdcores_gather_rank,
+        shared_physical_pool_count);
+  }
+}
+
+// A dispatch-bypass role skips the common dispatch state machine but still
+// owns an explicit gather stripe. Its first physical memory warp alone loads
+// the sidecar configuration; compute warps enter only shared-row reduction.
+template <uint32_t VectorIlp = DAE_POOL_MULTIMEM_VECTOR_ILP>
+static __device__ __noinline__ void pool_slice_source_gather_dae_return(
+    const PoolInst* instructions,
+    uint64_t* g_events,
+    uint32_t thread_id,
+    uint32_t gather_rank) {
+  constexpr uint32_t memory_leader =
+      daeComputeWarps * numThreadsPerWarp;
+  __shared__ PoolInst shared_program_header;
+  __shared__ PoolSliceConfig shared_config;
+  __shared__ uint64_t shared_sequence;
+  if (thread_id == memory_leader) {
+    shared_program_header = instructions[0];
+    shared_config = *reinterpret_cast<const PoolSliceConfig*>(
+        shared_program_header.address);
+    shared_sequence = pool_slice_sequence(shared_config);
+  }
+  __syncthreads();
+  pool_slice_source_gather_dae_finish<VectorIlp>(
+      shared_config,
+      g_events,
+      thread_id,
+      shared_sequence,
+      gather_rank,
+      shared_config.pool_count - 1);
 }
 
 // Host-routed EP is a distinct compile-time PoolInst. It reuses the complete

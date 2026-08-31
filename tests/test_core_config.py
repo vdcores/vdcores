@@ -8,6 +8,8 @@ from dae.instructions import (
     PoolInstruction,
     PoolSliceDynamicReadCopy,
     PoolSliceExchange,
+    PoolSliceMetadataRoute,
+    PoolSliceSourceGatherSchedulerExchange,
 )
 from dae.launcher import Launcher, SMInstructionBuilder
 
@@ -18,6 +20,11 @@ def test_core_config_abi_and_variants():
 
     compact = CoreConfig.compute_memory(load_warps=1)
     assert compact.pack() == bytes([CoreKind.COMPUTE_MEMORY, 4, 1, 0, 0, 0, 0, 0])
+
+    cooperative = CoreConfig.compute_memory(cta_compute_operator=True)
+    assert cooperative.pack() == bytes(
+        [CoreKind.COMPUTE_MEMORY, 4, 2, 0, 0, 1, 0, 0]
+    )
 
     pool = CoreConfig.pool()
     assert pool.pack(runtime_core_warps=8) == bytes(
@@ -30,6 +37,10 @@ def test_core_config_abi_and_variants():
     assert parse_kernel_variant("default") == KernelVariant.COMPUTE_MEMORY
     assert parse_kernel_variant("one_load") == KernelVariant.COMPUTE_MEMORY_ONE_LOAD
     assert parse_kernel_variant("pool") == KernelVariant.POOL
+    assert (
+        parse_kernel_variant("pool_cta_compute")
+        == KernelVariant.POOL_CTA_COMPUTE
+    )
     with pytest.raises(ValueError, match="unknown VDCores kernel variant"):
         parse_kernel_variant("not-a-core")
 
@@ -41,6 +52,11 @@ def test_core_config_rejects_unsupported_role_shapes():
         CoreConfig(CoreKind.COMPUTE_MEMORY, 3, 2, 0).pack()
     with pytest.raises(ValueError, match="complete physical envelope"):
         CoreConfig.pool(pool_warps=7).pack(runtime_core_warps=8)
+    with pytest.raises(ValueError, match="cannot contain a communication warp"):
+        CoreConfig.compute_memory(
+            communication_warps=1,
+            cta_compute_operator=True,
+        ).pack(runtime_core_warps=9)
 
 
 def test_launcher_infers_mixed_pool_inst_runtime_without_comm_warp():
@@ -62,6 +78,65 @@ def test_launcher_infers_mixed_pool_inst_runtime_without_comm_warp():
     assert cores[0] == CoreConfig.compute_memory()
     assert cores[1] == CoreConfig.pool()
     assert launcher._select_kernel_variant(cores) == KernelVariant.RUNTIME
+
+
+def test_launcher_accepts_scheduler_pool_with_cooperative_worker_sidecar():
+    launcher = object.__new__(Launcher)
+    launcher.num_sms = 2
+    launcher.kernel_variant = KernelVariant.AUTO
+    launcher.core_configs = [
+        CoreConfig.pool(),
+        CoreConfig.compute_memory(cta_compute_operator=True),
+    ]
+    launcher.builder = [SMInstructionBuilder(0), SMInstructionBuilder(1)]
+    for builder in launcher.builder:
+        builder.built_poolinsts.append(
+            PoolSliceSourceGatherSchedulerExchange(
+                1,
+                write_barrier=0,
+                dispatch_barrier_base=1,
+                compute_barrier_base=2,
+            )
+        )
+    launcher.builder[1].built_cinsts.append(
+        PoolSliceMetadataRoute(0, dispatch_slot=0, gather_rank=0)
+    )
+
+    cores = launcher._resolve_core_configs()
+    assert cores == launcher.core_configs
+    assert (
+        launcher._select_kernel_variant(cores)
+        == KernelVariant.POOL_CTA_COMPUTE
+    )
+
+
+def test_launcher_rejects_multiple_cooperative_worker_role_operators():
+    launcher = object.__new__(Launcher)
+    launcher.num_sms = 2
+    launcher.kernel_variant = KernelVariant.AUTO
+    launcher.core_configs = [
+        CoreConfig.pool(),
+        CoreConfig.compute_memory(cta_compute_operator=True),
+    ]
+    launcher.builder = [SMInstructionBuilder(0), SMInstructionBuilder(1)]
+    for builder in launcher.builder:
+        builder.built_poolinsts.append(
+            PoolSliceSourceGatherSchedulerExchange(
+                1,
+                write_barrier=0,
+                dispatch_barrier_base=1,
+                compute_barrier_base=2,
+            )
+        )
+    launcher.builder[1].built_cinsts.extend(
+        [
+            PoolSliceMetadataRoute(0, dispatch_slot=0, gather_rank=0),
+            PoolSliceMetadataRoute(0, dispatch_slot=0, gather_rank=0),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="one fused pool worker role"):
+        launcher._resolve_core_configs()
 
 
 def test_launcher_selects_pool_inst_execute_warp_from_registry(monkeypatch):

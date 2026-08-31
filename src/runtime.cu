@@ -233,9 +233,50 @@ static cudaError_t launch_fixed_pool_inst(
   return cudaGetLastError();
 }
 
+template <typename PoolInstExecuteWarp>
+static cudaError_t launch_pool_cta_compute_inst(
+    int num_sms,
+    CInst* compute_instructions,
+    MInst* memory_instructions,
+    CommInst* communication_instructions,
+    PoolInst* pool_instructions,
+    CUtensorMap* tma_descs,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* profile,
+    const DaeCoreConfig* core_configs,
+    cudaStream_t stream) {
+  constexpr int compiled_warps =
+      daeDefaultCoreWarps > PoolInstExecuteWarp::num_warps
+      ? daeDefaultCoreWarps
+      : PoolInstExecuteWarp::num_warps;
+  cudaError_t status = cudaFuncSetAttribute(
+      dae2_pool_cta_compute<PoolInstExecuteWarp>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      daePoolCtaComputeStageBytes);
+  if (status != cudaSuccess)
+    return status;
+  dae2_pool_cta_compute<PoolInstExecuteWarp>
+      <<<num_sms,
+         compiled_warps * numThreadsPerWarp,
+         daePoolCtaComputeStageBytes,
+         stream>>>(
+          compute_instructions,
+          memory_instructions,
+          communication_instructions,
+          pool_instructions,
+          tma_descs,
+          bars,
+          signal_array,
+          profile,
+          core_configs);
+  return cudaGetLastError();
+}
+
 static cudaError_t launch_selected_pool_inst(
     uint16_t pool_inst_opcode,
     bool pool_only,
+    bool pool_cta_compute,
     int num_sms,
     size_t smem_size,
     CInst* compute_instructions,
@@ -256,11 +297,16 @@ static cudaError_t launch_selected_pool_inst(
                   num_sms, compute_instructions, memory_instructions, \
                   communication_instructions, pool_instructions, tma_descs, \
                   bars, signal_array, profile, core_configs, stream) \
-            : launch_runtime_pool_inst<execute_warp_type>( \
+            : (pool_cta_compute \
+                ? launch_pool_cta_compute_inst<execute_warp_type>( \
+                    num_sms, compute_instructions, memory_instructions, \
+                    communication_instructions, pool_instructions, tma_descs, \
+                    bars, signal_array, profile, core_configs, stream) \
+                : launch_runtime_pool_inst<execute_warp_type>( \
                   num_sms, smem_size, compute_instructions, \
                   memory_instructions, communication_instructions, \
                   pool_instructions, tma_descs, bars, signal_array, profile, \
-                  core_configs, stream);
+                  core_configs, stream));
     #include "dae/pool_opcode.cuh.inc"
     #undef DAE_POOL_OP
     default:
@@ -390,6 +436,7 @@ cudaError_t launch_dae(
         const cudaError_t launch_status = launch_selected_pool_inst(
             pool_inst_opcode,
             false,
+            false,
             numSMs,
             smem_size,
             compute_instructions,
@@ -417,8 +464,39 @@ cudaError_t launch_dae(
       const cudaError_t launch_status = launch_selected_pool_inst(
           pool_inst_opcode,
           true,
+          false,
           numSMs,
           smem_size,
+          compute_instructions,
+          memory_instructions,
+          communication_instructions,
+          pool_instructions,
+          tma_descs,
+          bars,
+          signal_array,
+          profile,
+          core_configs,
+          cuda_stream);
+      if (launch_status != cudaSuccess)
+        return launch_status;
+      break;
+      }
+#else
+      return cudaErrorNotSupported;
+#endif
+
+    case DAE_KERNEL_POOL_CTA_COMPUTE:
+#if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN) || \
+    defined(DAE_ENABLE_LOCAL_POOL)
+      {
+      if (pool_inst_opcode == 0 || core_configs == nullptr)
+        return cudaErrorInvalidValue;
+      const cudaError_t launch_status = launch_selected_pool_inst(
+          pool_inst_opcode,
+          false,
+          true,
+          numSMs,
+          0,
           compute_instructions,
           memory_instructions,
           communication_instructions,

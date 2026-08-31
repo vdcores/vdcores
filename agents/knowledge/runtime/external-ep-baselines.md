@@ -34,18 +34,21 @@ to the BF16 sparse-EP rows.
 
 | Implementation | 2 GPUs | 4 GPUs | 8 GPUs | 12 GPUs | 16 GPUs |
 |---|---:|---:|---:|---:|---:|
-| VDCores BF16 source-gather | 0.100480 | 0.113088 | 0.115408 | 0.119296 | 0.127168 |
-| NCCL-EP BF16 | 0.126944 | 0.110144 | 0.154400 | unsupported | 0.159136 |
-| DeepEP V1 BF16 | 0.1442 | 0.1485 | unsupported | unsupported | unsupported |
-| UCCL BF16 | 0.256880 | 0.214112 | unsupported | unsupported | unsupported |
-| Triton-distributed online FP8 | 0.309664 | 0.341456 | 0.325376 | 0.347488 | 0.348208 |
-| Dense NCCL ring, BF16 top-k 1 | 0.560 | 0.829 | 2.740 | 6.033 | 10.698 |
+| VDCores BF16 source-gather | 0.080416 | 0.087744 | 0.097952 | 0.097952 | 0.105072 |
+| NCCL-EP BF16 | 0.124432 | 0.118224 | 0.161296 | unsupported | 0.165728 |
+| DeepEP V1 BF16 | 0.1716 | 0.1419 | unsupported | unsupported | unsupported |
+| UCCL BF16 | 0.236656 | 0.216624 | unsupported | unsupported | unsupported |
+| Triton-distributed online FP8 | 0.325264 | 0.350208 | 0.333216 | 0.348208 | 0.344288 |
+| Dense NCCL ring, BF16 top-k 1 | 0.304 | 0.353 | 0.549 | 1.009 | 1.643 |
 
 DeepEP V1's cross-host low-latency kernel requires IBGDA RC QPs, UCCL's
 cross-host branch launches RDMA proxies, and DeepEP V2 requires NCCL GIN.
 Those paths are reported unsupported rather than enabled inside the pure
-NVL72 all-NVLink scan. Full provenance and route digests are in
-`.agentlog/2026-08-02-random-global-top8.md`.
+NVL72 all-NVLink scan. The table is the independent rerun at commit
+`809b2351581595222fe35565b145e81f4e14c5ab`; full phase breakdowns,
+provenance, route digests, and transport checks are in
+`.agentlog/2026-08-02-full-baseline-rerun.md`. The preceding accepted scan is
+retained in `.agentlog/2026-08-02-random-global-top8.md`.
 
 ## Historical cross-library Vista GH200 matrix
 

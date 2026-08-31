@@ -56,6 +56,74 @@ class TerminateC(ComputeInstruction):
         super().__init__(opcode=opcode.OP_TERMINATEC, args=[])
 
 
+class _PoolSliceWorkerRole(ComputeInstruction):
+    """One fused CTA role with explicit placement and gather identities."""
+
+    def __init__(
+        self,
+        role_opcode: int,
+        task: int,
+        dispatch_slot: int,
+        gather_rank: int,
+    ):
+        super().__init__(
+            opcode=role_opcode,
+            args=[task, dispatch_slot, gather_rank],
+        )
+
+
+class PoolSliceMetadataRoute(_PoolSliceWorkerRole):
+    def __init__(
+        self, source: int, dispatch_slot: int, gather_rank: int = 0
+    ):
+        super().__init__(
+            opcode.OP_POOL_SLICE_METADATA_ROUTE,
+            source,
+            dispatch_slot,
+            gather_rank,
+        )
+
+
+class PoolSliceRemoteSend(_PoolSliceWorkerRole):
+    def __init__(
+        self, task: int, dispatch_slot: int, gather_rank: int = 0
+    ):
+        super().__init__(
+            opcode.OP_POOL_SLICE_REMOTE_SEND,
+            task,
+            dispatch_slot,
+            gather_rank,
+        )
+
+
+class PoolSliceSelfDispatch(_PoolSliceWorkerRole):
+    def __init__(
+        self, group: int, dispatch_slot: int, gather_rank: int = 0
+    ):
+        super().__init__(
+            opcode.OP_POOL_SLICE_SELF_DISPATCH,
+            group,
+            dispatch_slot,
+            gather_rank,
+        )
+
+
+class PoolSliceExecutor(ComputeInstruction):
+    def __init__(self, dispatch_slot: int, gather_rank: int = 0):
+        super().__init__(
+            opcode=opcode.OP_POOL_SLICE_EXECUTOR,
+            args=[0, dispatch_slot, gather_rank],
+        )
+
+
+class PoolSliceDispatchBypass(ComputeInstruction):
+    def __init__(self, gather_rank: int = 0):
+        super().__init__(
+            opcode=opcode.OP_POOL_SLICE_DISPATCH_BYPASS,
+            args=[0, 0, gather_rank],
+        )
+
+
 class Gemv_M64N8(ComputeInstruction):
     MNK = (64, 8, 256)
     n_batch = 4
@@ -1150,6 +1218,16 @@ class PoolSliceSourceGatherExchange(PoolSliceExchange):
     wire_opcode = getattr(pool_opcode, "POOL_SLICE_SOURCE_GATHER_EXCHANGE", 8)
 
 
+class PoolSliceSourceGatherSchedulerExchange(PoolSliceExchange):
+    """Select the scheduler-only PoolInst for cooperative VDCores workers."""
+
+    wire_opcode = getattr(
+        pool_opcode,
+        "POOL_SLICE_SOURCE_GATHER_SCHEDULER",
+        9,
+    )
+
+
 class PoolSliceGinWeightedExchange(PoolSliceExchange):
     """Run weighted PoolInst with the compile-time NCCL GIN transport."""
 
@@ -1369,6 +1447,11 @@ __all__ = [
     "Instruction",
     "ComputeInstruction",
     "TerminateC",
+    "PoolSliceMetadataRoute",
+    "PoolSliceRemoteSend",
+    "PoolSliceSelfDispatch",
+    "PoolSliceExecutor",
+    "PoolSliceDispatchBypass",
     "Gemv_M64N8",
     "Gemv_M128N8",
     "Gemv_M64N8K64",
@@ -1429,6 +1512,7 @@ __all__ = [
     "PoolSliceHostWeightedExchange",
     "PoolSliceMultimemExchange",
     "PoolSliceSourceGatherExchange",
+    "PoolSliceSourceGatherSchedulerExchange",
     "PoolSliceGinWeightedExchange",
     "PoolSliceDynamicReadCopy",
     "PoolSliceDynamicReadReduceAdd",

@@ -458,7 +458,10 @@ def test_raw_sgl_progress_reuses_one_group_signal_and_one_reader_task():
 
     assert "pool_slice_stream_data_progress(" in source
     assert "pool_slice_stream_data_segments(" in source
-    assert "pool_slice_stream_gather_rows<HostDataPlane, TotalWarps>" in source
+    assert (
+        "pool_slice_stream_gather_rows<\n"
+        "            HostDataPlane, TotalWarps, VdcoresWorker>" in source
+    )
     assert "message.ready_slot |" in source
     assert "static_cast<uint32_t>(instruction.size) << 16" in source
     assert "ready_slot_and_reader & 0xffffU" in source
@@ -748,10 +751,8 @@ def test_dynamic_reads_are_prebuilt_poolinsts_with_shared_workers():
     assert "config.local_readers + source_pe +" in source
     assert "(base + lane) * config.num_pes" in source
     assert "ReduceAdd tickets precede all STOP tickets" in scheduler
-    assert (
-        "WeightedReturn && !SourceGatherReduction && config.pool_rank == 0"
-        in source
-    )
+    assert "WeightedReturn && !SourceGatherReduction" in source
+    assert "config.pool_rank == 0" in source
     assert "config.pool_rank <= executor_count" in source
     assert "if (config.pool_count == 1)" in source
     assert "pool_slice_executor_loop<" in source
@@ -805,7 +806,9 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "nvshmemx_putmem_signal_nbi_warp(" in metadata_publisher
     assert "nvshmemx_putmem_nbi_warp(" not in metadata_publisher
     assert "nvshmem_putmem_signal_nbi(" not in metadata_publisher
-    assert metadata_publisher.count("nvshmemx_putmem_signal_nbi_warp(") == 1
+    # The generic PoolInst publisher and the ordinary-VDCores memory-warp
+    # specialization each retain one public-transport fallback.
+    assert metadata_publisher.count("nvshmemx_putmem_signal_nbi_warp(") == 2
     assert "NVSHMEM_SIGNAL_ADD" in metadata_publisher
     assert "signal_delta" in metadata_publisher
     assert "payload_coupled" not in metadata_publisher
@@ -826,10 +829,12 @@ def test_streaming_pool_gather_decouples_metadata_and_dynamic_data_groups():
     assert "index = warp" in metadata_publisher
     assert "index += TotalWarps" in metadata_publisher
     metadata_call = source.index(
-        "pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>("
+        "pool_slice_stream_publish_metadata<\n"
+        "          HostDataPlane, TotalWarps, VdcoresWorker>("
     )
     assert source.count(
-        "pool_slice_stream_publish_metadata<HostDataPlane, TotalWarps>("
+        "pool_slice_stream_publish_metadata<\n"
+        "          HostDataPlane, TotalWarps, VdcoresWorker>("
     ) == 1
     assert "config.pool_count >= config.num_pes" in (
         metadata_publisher
@@ -982,6 +987,7 @@ def test_pool_inst_has_its_own_compile_time_warp_type():
     assert "struct PoolSliceExchangeExecuteWarp" in pool_inst
     assert "struct PoolSliceWeightedExchangeExecuteWarp" in pool_inst
     assert "struct PoolSliceHostWeightedExchangeExecuteWarp" in pool_inst
+    assert "struct PoolSliceSourceGatherSchedulerExecuteWarp" in pool_inst
     assert "pool_slice_exchange<false, num_warps>(" in pool_inst
     assert "pool_slice_exchange<true, num_warps>(" in pool_inst
     assert "pool_slice_host_weighted_exchange<num_warps>(" in pool_inst
@@ -992,7 +998,56 @@ def test_pool_inst_has_its_own_compile_time_warp_type():
     assert "PoolSliceExchangeExecuteWarp" in registry
     assert "PoolSliceWeightedExchangeExecuteWarp" in registry
     assert "PoolSliceHostWeightedExchangeExecuteWarp" in registry
+    assert "PoolSliceSourceGatherSchedulerExecuteWarp" in registry
+    assert "POOL_SLICE_SOURCE_GATHER_SCHEDULER" in registry
     context = (ROOT / "include" / "dae" / "context.cuh").read_text()
     assert "struct alignas(16) PoolInst" in context
     assert "struct alignas(16) CommInst" in context
     assert "numPoolInsts = 1 + 8 + 132" in context
+
+
+def test_cta_compute_source_gather_preserves_decoupled_access_warps():
+    source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
+    dae2 = (ROOT / "include" / "dae" / "dae2.cuh").read_text()
+    finish = source.split("pool_slice_source_gather_dae_finish(", 1)[1].split(
+        "// Finalize one source token", 1
+    )[0]
+
+    assert "const bool memory_thread = thread_id >= memory_begin;" in finish
+    assert "if (memory_thread && memory_lane == 0 && shared_valid != 0)" in finish
+    assert "if (thread_id < compute_threads && shared_valid != 0)" in finish
+    compute = finish.split(
+        "if (thread_id < compute_threads && shared_valid != 0)", 1
+    )[1].split("__syncthreads();", 1)[0]
+    assert "dae_pool_cta_compute_stage[" in compute
+    assert "descriptors[" not in compute
+    assert "source_offsets[" not in compute
+    assert "memcpy_async_tx" not in compute
+    assert "cp_async_bulk" not in compute
+    assert "destination[" not in compute
+    assert "if (thread_id == memory_begin && shared_valid != 0)" in finish
+    assert "coordinator_rank" not in finish
+    assert "completion_count" not in finish
+
+    kernel = dae2.split("void dae2_pool_cta_compute(", 1)[1]
+    assert "if (thread_id == memory_leader)\n    shared_core = core_configs[sm_id]" in kernel
+    assert "cta_compute_instruction =" in kernel
+    assert "cta_compute_instructions" not in kernel
+    assert "instruction < 2" not in kernel
+    assert "      nullptr,\n      finish," in kernel
+
+
+def test_source_gather_has_one_dispatch_and_combine_scheduler_cta():
+    source = (ROOT / "include" / "dae" / "pool_slice.cuh").read_text()
+    scheduler = source.split(
+        "pool_slice_source_gather_scheduler_start(", 1
+    )[1].split("// After dispatch scheduling", 1)[0]
+    finish = source.split(
+        "pool_slice_source_gather_scheduler_finish(", 1
+    )[1].split("// Direct-source", 1)[0]
+
+    assert "poolSliceControlReturnGeneration" in scheduler
+    assert "poolSliceControlScatterStart" in scheduler
+    assert "poolSliceControlScatterGeneration" in finish
+    assert "poolSliceControlDispatchGeneration" in finish
+    assert "config.pool_rank == 0 && warp == 1" in source

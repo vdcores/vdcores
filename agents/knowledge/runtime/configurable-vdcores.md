@@ -14,6 +14,9 @@ or reassign resident warps but cannot reclaim their launch resources.
   a selected PoolInst, or inactive;
 - fixed pool: only the selected PoolInst executor is instantiated; its
   compile-time execute-warp type owns the CTA width and register budget;
+- pool CTA-compute: one selected PoolInst scheduler block shares an eight-warp
+  grid with ordinary `COMPUTE_MEMORY` blocks whose first `CInst` is a
+  CTA-cooperative operator;
 - runtime communication: a `9`-warp specialization containing the default
   compute+memory VM plus one ordinary `CommInst` warp.
 
@@ -52,13 +55,49 @@ single GPU-scope claim cursor makes them one logical per-PE instruction queue.
 The fixed queue and worker cardinalities match, so weighted combine needs one
 claim per CTA and no terminal empty-queue probe.
 
+## Cooperative Pool CTA-Compute Assembly
+
+`DAE_KERNEL_POOL_CTA_COMPUTE` is the specialized heterogeneous assembly used
+by the GB300 source-gather worker path. Block zero is the sole
+`POOL_SLICE_SOURCE_GATHER_SCHEDULER` PoolInst CTA for both phases: scheduler
+warp zero owns dispatch queue advancement, scheduler warp one publishes
+combine readiness, and that same CTA performs the final dispatch/scatter
+join. The remaining blocks are normal `COMPUTE_MEMORY` cores marked with
+`CORE_FLAG_CTA_COMPUTE_OPERATOR`.
+
+Each worker contains one fused ordinary `CInst`, selected from
+`OP_POOL_SLICE_METADATA_ROUTE`, `OP_POOL_SLICE_REMOTE_SEND`,
+`OP_POOL_SLICE_SELF_DISPATCH`, `OP_POOL_SLICE_EXECUTOR`, or
+`OP_POOL_SLICE_DISPATCH_BYPASS`. The opcode is the role; no `pool_rank`
+comparison assigns it on device. Its three 16-bit arguments carry the static
+task ordinal, ring-executor slot, and source-gather stripe. The common return
+is fused into the role operator, avoiding a second decode, sidecar load, and
+CTA handoff. A dispatch-bypass CTA enters only its gather stripe.
+
+The flag changes participation, not the physical core shape: all eight warps
+enter the cooperative handler so CTA barriers are legal, while the established
+four-compute/four-memory ownership remains enforced inside the operator.
+Compute warps use registers and shared row tiles only. Memory warps own program
+and configuration loads, metadata, route expansion, readiness polling, remote
+SEND/self-scatter, ring tickets, source-gather global reads, and the returned
+global store. The launcher rejects any other first compute opcode or a worker
+without its PoolInst sidecar header, and rejects a second non-termination
+compute operator in the CTA-wide program.
+
+For BF16 width 7168 and top-k 8, the assembly opts into 129,024 bytes of
+dynamic shared memory per CTA: eight 14,336-byte input rows plus one output
+row. The accepted grid has one scheduler plus 128 workers (`129` blocks).
+Legacy fixed-PoolInst launches retain their original kernel and do not use
+this variant.
+
 ## Per-Block Configuration
 
 `DaeCoreConfig` is an eight-byte host/device ABI with three logical kinds:
 
 - `COMPUTE_MEMORY`: four compute warps plus allocator/store and one or two load
   warps; an ordinary communication warp is valid only in the separately
-  compiled communication envelope;
+  compiled communication envelope. `CORE_FLAG_CTA_COMPUTE_OPERATOR` selects
+  the cooperative eight-warp pool-worker specialization described above;
 - `POOL`: the entire envelope runs the compile-time selected PoolInst;
 - `INACTIVE`: no virtual core executes.
 

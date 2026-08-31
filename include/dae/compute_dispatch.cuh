@@ -9,6 +9,10 @@
 #include "task/silu.cuh"
 #include "task/wgmma.cuh"
 
+#ifdef DAE_ENABLE_LOCAL_POOL
+#include "pool_slice.cuh"
+#endif
+
 #include <type_traits>
 
 #define DAE_COMPUTE_OP_PARAMS \
@@ -21,6 +25,9 @@
   void *smem_base, \
   uint64_t *scratch_space, \
   MInst *st_insts, \
+  const PoolInst *pool_instructions, \
+  int *bars, \
+  uint64_t *signal_array, \
   M2CQueue &m2c, \
   C2MQueue &c2m, \
   uint64_t *g_events
@@ -383,6 +390,106 @@ DAE_COMPUTE_OP_HANDLER(OP_TERMINATEC) {
   __cprint("TERMINATE from comptue: c2m.ptr=%d", c2m.ptr);
 }
 
+// One CInst explicitly marks the complete CTA-uniform worker role. Every
+// non-bypass role enters the same scheduler/worker protocol with its task,
+// executor slot, and gather slice already encoded, then performs the common
+// source-gather return before the operator completes.
+static __device__ __forceinline__ void dae_pool_slice_dispatch_role(
+    const CInst& inst,
+    const PoolInst* pool_instructions,
+    int* bars,
+    uint64_t* signal_array,
+    uint64_t* g_events,
+    uint32_t thread_id,
+    uint32_t role) {
+#ifdef DAE_ENABLE_LOCAL_POOL
+  pool_slice_exchange<true, daePoolSliceWarps, false, false, true, 4, true>(
+      pool_instructions,
+      bars,
+      signal_array,
+      g_events,
+      thread_id,
+      role,
+      inst.args[0],
+      inst.args[1],
+      inst.args[2]);
+#else
+  DAE_UNUSED(inst, pool_instructions, bars, signal_array, g_events, role);
+  if (thread_id == 0)
+    asm volatile("trap;");
+#endif
+}
+
+static __device__ __forceinline__ void dae_pool_slice_complete_role(
+    int sm_id,
+    uint32_t thread_id,
+    uint64_t* g_events,
+    bool& finish) {
+  finish = true;
+  if (thread_id == daeComputeWarps * numThreadsPerWarp &&
+      g_events != nullptr) {
+    const int event_base = sm_id * numProfileEvents;
+    g_events[event_base + 1] = cuda::ptx::get_sreg_globaltimer();
+  }
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_SLICE_METADATA_ROUTE) {
+  DAE_UNUSED(
+      pc, count, smem_base, scratch_space, st_insts, m2c, c2m);
+  dae_pool_slice_dispatch_role(
+      inst, pool_instructions, bars, signal_array, g_events, thread_id, 1U);
+  dae_pool_slice_complete_role(sm_id, thread_id, g_events, finish);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_SLICE_REMOTE_SEND) {
+  DAE_UNUSED(
+      pc, count, smem_base, scratch_space, st_insts, m2c, c2m);
+  dae_pool_slice_dispatch_role(
+      inst, pool_instructions, bars, signal_array, g_events, thread_id, 2U);
+  dae_pool_slice_complete_role(sm_id, thread_id, g_events, finish);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_SLICE_SELF_DISPATCH) {
+  DAE_UNUSED(
+      pc, count, smem_base, scratch_space, st_insts, m2c, c2m);
+  dae_pool_slice_dispatch_role(
+      inst, pool_instructions, bars, signal_array, g_events, thread_id, 3U);
+  dae_pool_slice_complete_role(sm_id, thread_id, g_events, finish);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_SLICE_EXECUTOR) {
+  DAE_UNUSED(
+      pc, count, smem_base, scratch_space, st_insts, m2c, c2m);
+  dae_pool_slice_dispatch_role(
+      inst, pool_instructions, bars, signal_array, g_events, thread_id, 4U);
+  dae_pool_slice_complete_role(sm_id, thread_id, g_events, finish);
+}
+
+DAE_COMPUTE_OP_HANDLER(OP_POOL_SLICE_DISPATCH_BYPASS) {
+  DAE_UNUSED(
+      pc,
+      count,
+      smem_base,
+      scratch_space,
+      st_insts,
+      bars,
+      signal_array,
+      m2c,
+      c2m);
+#ifdef DAE_ENABLE_LOCAL_POOL
+  pool_slice_source_gather_dae_return<4>(
+      pool_instructions,
+      g_events,
+      thread_id,
+      inst.args[2]);
+#else
+  DAE_UNUSED(inst, pool_instructions);
+  if (thread_id == 0)
+    asm volatile("trap;");
+#endif
+  dae_pool_slice_complete_role(sm_id, thread_id, g_events, finish);
+}
+
 #if __has_include("dae/dynamic_compute_handlers.inc")
   #include "dae/dynamic_compute_handlers.inc"
 #endif
@@ -400,6 +507,9 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   void *smem_base,
   uint64_t *scratch_space,
   MInst *st_insts,
+  const PoolInst *pool_instructions,
+  int *bars,
+  uint64_t *signal_array,
   M2CQueue &m2c,
   C2MQueue &c2m,
   uint64_t *g_events
@@ -407,7 +517,7 @@ static __device__ __forceinline__ void dispatch_compute_instruction(
   switch (inst.opcode) {
     #define DAE_COMPUTE_OP(name) \
       case name: \
-        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, scratch_space, st_insts, m2c, c2m, g_events); \
+        DAE_COMPUTE_HANDLER_NAME(name)(sm_id, thread_id, pc, count, finish, inst, smem_base, scratch_space, st_insts, pool_instructions, bars, signal_array, m2c, c2m, g_events); \
         break;
       #include "dae/selected_compute_ops.inc"
     #undef DAE_COMPUTE_OP

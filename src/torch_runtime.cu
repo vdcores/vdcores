@@ -252,7 +252,7 @@ int py_launch_dae(
   }
   TORCH_CHECK(
       kernel_variant >= DAE_KERNEL_AUTO &&
-          kernel_variant <= DAE_KERNEL_RUNTIME_COMMUNICATION,
+          kernel_variant <= DAE_KERNEL_POOL_CTA_COMPUTE,
       "kernel_variant is outside the DaeKernelVariant range");
   TORCH_CHECK(
       pool_inst_opcode >= 0 && pool_inst_opcode <= UINT16_MAX,
@@ -561,6 +561,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("kernel_pool") = static_cast<int>(DAE_KERNEL_POOL);
   config.attr("kernel_runtime_communication") =
       static_cast<int>(DAE_KERNEL_RUNTIME_COMMUNICATION);
+  config.attr("kernel_pool_cta_compute") =
+      static_cast<int>(DAE_KERNEL_POOL_CTA_COMPUTE);
 #ifdef DAE_ENABLE_NVSHMEM
   config.attr("pool_enabled") = true;
   config.attr("nvshmem_enabled") = true;

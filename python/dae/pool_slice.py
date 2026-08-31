@@ -1146,18 +1146,25 @@ def build_pool_slice_copy_program(
     in_place_identity: bool = False,
     source_preloaded: bool = False,
     host_data_plane: bool = False,
+    vdcores_workers: bool = False,
 ) -> PoolSliceProgram:
     """Build writer, PoolInst, and reader VDCores operations."""
 
     from .instructions import (
         Copy,
         IssueBarrier,
+        PoolSliceDispatchBypass,
         PoolSliceDynamicReadCopy,
         PoolSliceDynamicReadReduceAdd,
         PoolSliceExchange,
+        PoolSliceExecutor,
         PoolSliceGinWeightedExchange,
         PoolSliceHostWeightedExchange,
+        PoolSliceMetadataRoute,
         PoolSliceMultimemExchange,
+        PoolSliceRemoteSend,
+        PoolSliceSelfDispatch,
+        PoolSliceSourceGatherSchedulerExchange,
         PoolSliceSourceGatherExchange,
         PoolSliceWeightedExchange,
         TerminateC,
@@ -1166,12 +1173,38 @@ def build_pool_slice_copy_program(
         TmaStore1D,
     )
     from .launcher import Launcher
+    from .core import CoreConfig
 
     if buffers.reduction_backend == "peer_direct":
         raise ValueError(
             "peer_direct return is invalid for general top-k routing; use a "
             "reduction-safe return backend"
         )
+    if vdcores_workers:
+        local_pool_runtime = (
+            bool(getattr(_runtime_config, "pool_enabled", False))
+            and not bool(getattr(_runtime_config, "nvshmem_enabled", False))
+            and not bool(getattr(_runtime_config, "nccl_gin_enabled", False))
+        )
+        if not local_pool_runtime:
+            raise ValueError(
+                "vdcores_workers requires the local CUDA-Fabric pool runtime"
+            )
+        if not buffers.weighted_return or (
+            buffers.reduction_backend != "source_gather"
+        ):
+            raise ValueError(
+                "vdcores_workers currently supports weighted source_gather only"
+            )
+        if buffers.pool_count < 2:
+            raise ValueError(
+                "vdcores_workers requires one scheduler and at least one worker"
+            )
+        if buffers.pool_count < buffers.num_pes + 1:
+            raise ValueError(
+                "vdcores_workers requires one scheduler plus one metadata/route "
+                "worker per PE"
+            )
 
     if buffers._source is None or buffers._returned is None:
         raise RuntimeError("call buffers.prepare(source, returned) before building")
@@ -1264,7 +1297,11 @@ def build_pool_slice_copy_program(
             if buffers.reduction_backend == "multimem":
                 pool_instruction = PoolSliceMultimemExchange
             elif buffers.reduction_backend == "source_gather":
-                pool_instruction = PoolSliceSourceGatherExchange
+                pool_instruction = (
+                    PoolSliceSourceGatherSchedulerExchange
+                    if vdcores_workers
+                    else PoolSliceSourceGatherExchange
+                )
             else:
                 pool_instruction = PoolSliceWeightedExchange
         else:
@@ -1277,6 +1314,58 @@ def build_pool_slice_copy_program(
                 compute_barrier_base=compute_barrier_base,
             )
         )
+        if vdcores_workers:
+            if pool_rank == 0:
+                launcher.set_core(pool_base + pool_rank, CoreConfig.pool())
+            else:
+                launcher.set_core(
+                    pool_base + pool_rank,
+                    CoreConfig.compute_memory(cta_compute_operator=True),
+                )
+                worker_index = pool_rank - 1
+                logical_pool_count = min(
+                    buffers.pool_count,
+                    40 if buffers.num_pes <= 4 else 64,
+                )
+                logical_workers = logical_pool_count - 1
+                static_workers = logical_workers - buffers.num_pes
+                self_capacity = min(buffers.group_limit, static_workers)
+                remote_capacity = min(
+                    (buffers.num_pes - 1) * buffers.group_limit,
+                    static_workers - self_capacity,
+                )
+                remote_begin = buffers.num_pes
+                self_begin = remote_begin + remote_capacity
+                executor_begin = self_begin + self_capacity
+
+                if worker_index < buffers.num_pes:
+                    role = PoolSliceMetadataRoute(
+                        worker_index,
+                        dispatch_slot=worker_index,
+                        gather_rank=worker_index,
+                    )
+                elif worker_index < self_begin:
+                    role = PoolSliceRemoteSend(
+                        worker_index - remote_begin,
+                        dispatch_slot=worker_index,
+                        gather_rank=worker_index,
+                    )
+                elif worker_index < executor_begin:
+                    role = PoolSliceSelfDispatch(
+                        worker_index - self_begin,
+                        dispatch_slot=worker_index,
+                        gather_rank=worker_index,
+                    )
+                elif worker_index < logical_workers:
+                    role = PoolSliceExecutor(
+                        dispatch_slot=worker_index,
+                        gather_rank=worker_index,
+                    )
+                else:
+                    role = PoolSliceDispatchBypass(
+                        gather_rank=worker_index,
+                    )
+                pool_builder.add_compute(role)
         for local_reader in range(buffers.local_readers):
             pool_builder.add_pool(
                 PoolSliceDynamicReadCopy(
@@ -1352,6 +1441,9 @@ def build_pool_slice_copy_program(
         1 if source_preloaded else token_chunks + 1,
         1 if in_place_identity else reader_chunks + 1,
     )
+    if vdcores_workers:
+        # Explicit role, source-gather return, and the ordinary terminator.
+        max_compute = max(max_compute, 3)
     if max_memory > launcher.max_insts or max_compute > launcher.max_insts:
         raise ValueError("pool capacity requires too many VDCores instructions")
     return PoolSliceProgram(
