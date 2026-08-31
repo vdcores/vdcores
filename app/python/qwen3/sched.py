@@ -6,6 +6,7 @@ from dae.model import *
 from dae.schedule import *
 from dae.tma_utils import (
     StaticCordAdapter,
+    ToSplitMCordAdapter,
     ToSeqMajorAttnKVLoadCordAdapter,
     ToSeqMajorAttnKVStoreCordAdapter,
     ToSeqMajorCurrentKStoreCordAdapter,
@@ -72,6 +73,12 @@ matLogits = ctx.matLogits
 matLogitsW = ctx.matLogitsW
 matArgmaxIdx = ctx.matArgmaxIdx
 matArgmaxVal = ctx.matArgmaxVal
+matZero = torch.zeros(HIDDEN, dtype=matHidden.dtype, device=matHidden.device)
+matQSnapshots = (
+    [torch.zeros_like(attnQ) for attnQ in attnQs]
+    if ctx.parsed_args.correctness
+    else None
+)
 
 MLP_PREFIX = min(4096, INTERMIDIATE)
 MLP_TAIL = INTERMIDIATE - MLP_PREFIX
@@ -129,6 +136,77 @@ def bind_debug_barrier_counts(*schedules):
             group.bindBarrier(name, matched.pop() if matched else 0)
     dae._late_barriers_bound = True
 
+
+class SchedClearQ(Schedule):
+    """Clear the preceding layer's fold-reduced Q buffer after consumption."""
+
+    def __init__(
+        self,
+        load_zero,
+        store_q,
+        tile_bytes: int,
+        tile_m: int,
+        num_clear_sms: int,
+        wait_bar,
+    ):
+        super().__init__()
+        self.load_zero = load_zero
+        self.store_q = store_q
+        self.tile_bytes = tile_bytes
+        self.tile_m = tile_m
+        self.num_clear_sms = num_clear_sms
+        self.wait_bar = wait_bar
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        count = (
+            HIDDEN // self.tile_m + self.num_clear_sms - 1 - sm
+        ) // self.num_clear_sms
+        if count <= 0:
+            return []
+        store = self.store_q.cord(sm)
+        finish = None
+        if self._bar("store") is not None:
+            store = store.bar(self._bar("store")).group()
+            finish = IssueBarrier(self._bar("store")).group()
+        return [
+            IssueBarrier(self.wait_bar).group(),
+            Copy(count, size=self.tile_bytes),
+            RepeatM.on(
+                count,
+                (self.load_zero.cord(0), 0),
+                (store, [self.num_clear_sms * self.tile_m, 0]),
+            ),
+            finish,
+        ]
+
+    def bar_release_count(self, role: str):
+        if role != "store":
+            return 0
+        return self._bar_release_if_present(role, HIDDEN // self.tile_m)
+
+
+class SchedSnapshotQ(Schedule):
+    """Correctness-only ordinary-TMA snapshot before a Q buffer is cleared."""
+
+    def __init__(self, load_q, store_q, tile_bytes: int, wait_bar):
+        super().__init__()
+        self.load_q = load_q
+        self.store_q = store_q
+        self.tile_bytes = tile_bytes
+        self.wait_bar = wait_bar
+
+    def schedule(self, sm: int):
+        if sm < 0:
+            return []
+        return [
+            Copy(1, size=self.tile_bytes),
+            self.load_q.cord(sm).bar(self.wait_bar).group(),
+            self.store_q.cord(sm),
+        ]
+
+
 defaultg = dae.get_group()
 layerg = dae.add_group("layer", num_layers)
 systemg = dae.add_group("system", 1)
@@ -144,6 +222,7 @@ layerg.addBarrier("bar_out_mlp")
 layerg.addBarrier("bar_q_proj")
 layerg.addBarrier("bar_qkv_attn")
 layerg.addBarrier("bar_attn_out")
+layerg.addBarrier("bar_q_clear")
 layerg.addBarrier("bar_rms_layer", 0)
 layerg.addBarrier("bar_rms_mlp", 0)
 layerg.addBarrier("bar_silu_in")
@@ -176,6 +255,23 @@ layerg.addTma("loadQW", matqWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
 layerg.addTma("loadKW", matkWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
 layerg.addTma("loadVW", matvWs, lambda t: t.wgmma_load_tiled(TileM, TileK))
 layerg.addTma("storeQ", attnQs, lambda t: t.wgmma("reduce", N, TileM, Major.MN))
+if matQSnapshots is not None:
+    layerg.addTma(
+        "loadQSnapshot",
+        attnQs,
+        lambda t: t.wgmma_load(N, TileM, Major.MN),
+    )
+    layerg.addTma(
+        "storeQSnapshot",
+        matQSnapshots,
+        lambda t: t.wgmma_store(N, TileM, Major.MN),
+    )
+q_clear_targets = attnQs[-1:] + attnQs[:-1]
+layerg.addTma(
+    "storeQClear",
+    q_clear_targets,
+    lambda t: t.wgmma_store(N, TileM, Major.MN),
+)
 layerg.addTma("storeK", attnKs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
 layerg.addTma("storeV", attnVs, lambda t: t._build("reduce", 64, N, tma_store_attn_kv_seq_major, cord_id))
 layerg.addTma("storeKCurrent", attnKs, lambda t: t.batched_rowmajor_2d("store", 1, HEAD_DIM))
@@ -279,6 +375,26 @@ def schedule_single_token(token_offset: int, token_pos: int):
         num_active_q=HEAD_GROUP_SIZE,
     ).bar("q", layerg["bar_q_proj"]).bar("k", layerg["bar_qkv_attn"]).bar("o", layerg["bar_attn_out"])
 
+    clear_q = SchedClearQ(
+        TmaLoad1D(
+            matZero[:N * TileM],
+            bytes=N * TileM * matZero.element_size(),
+        ),
+        ToSplitMCordAdapter(layerg["storeQClear"], 64, TileM),
+        N * TileM * matZero.element_size(),
+        TileM,
+        64,
+        layerg["bar_pre_attn_rms"],
+    ).bar("store", layerg["bar_q_clear"])
+    snapshot_q = []
+    if matQSnapshots is not None:
+        snapshot_q = [SchedSnapshotQ(
+            ToSplitMCordAdapter(layerg["loadQSnapshot"], 64, TileM),
+            ToSplitMCordAdapter(layerg["storeQSnapshot"], 64, TileM),
+            N * TileM * matZero.element_size(),
+            layerg["bar_q_proj"],
+        )]
+
     OutProj = SchedGemv(
         LinearAtom,
         MNK=(HIDDEN, N, HIDDEN),
@@ -379,6 +495,8 @@ def schedule_single_token(token_offset: int, token_pos: int):
         KProj = KProj.place(KV_PROJ_SMS, base_sm=64)
         VProj = VProj.place(KV_PROJ_SMS, base_sm=64 + KV_PROJ_SMS)
     Gqa = Gqa.place(REQ * NUM_KV_HEAD)
+    snapshot_q = [schedule.place(64) for schedule in snapshot_q]
+    clear_q = clear_q.place(64, base_sm=64)
     OutProj = OutProj.place(OUT_PROJ_SMS)
     gate_proj_low = gate_proj_low.place(64)
     up_proj_low = up_proj_low.place(64, base_sm=64)
@@ -397,7 +515,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
         copy_hidden,
         restore_bars_high,
         *([QProj, KProj, VProj] if stage_enabled("qkv") else []),
-        *([Gqa] if stage_enabled("attention") else []),
+        *([Gqa, *snapshot_q, clear_q] if stage_enabled("attention") else []),
         *([OutProj] if stage_enabled("out") else []),
         *([post_attn_rms] if stage_enabled("post_attn_rms") else []),
         *([gate_proj_low, up_proj_low] if stage_enabled("mlp_prefix") else []),
@@ -426,7 +544,7 @@ def schedule_single_token(token_offset: int, token_pos: int):
 
     dae.i(
         *([QProj, KProj, VProj] if stage_enabled("qkv") else []),
-        *([Gqa] if stage_enabled("attention") else []),
+        *([Gqa, *snapshot_q, clear_q] if stage_enabled("attention") else []),
         *([OutProj] if stage_enabled("out") else []),
         *([post_attn_rms] if stage_enabled("post_attn_rms") else []),
         *([gate_proj_low, up_proj_low] if stage_enabled("mlp_prefix") else []),
@@ -492,4 +610,4 @@ if ctx.parsed_args.debug_stop_after != "full":
             f"abs_sum={values.abs().sum().item():.6f}"
         )
 if ctx.parsed_args.correctness:
-    run_correctness_check(ctx)
+    run_correctness_check(ctx, matQSnapshots)

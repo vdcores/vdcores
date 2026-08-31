@@ -5,7 +5,10 @@ from reference import check_tensor_threshold, input_batch1, reference_pass
 from runtime_context import QwenScheduleContext, apply_rms_affine_rope_heads
 
 
-def run_correctness_check(ctx: QwenScheduleContext):
+def run_correctness_check(
+    ctx: QwenScheduleContext,
+    attn_q_snapshots: list[torch.Tensor] | None = None,
+):
     silu_threshold = 5.0
     final_hidden_threshold = 5.0
     final_rms_threshold = 5.0
@@ -22,6 +25,8 @@ def run_correctness_check(ctx: QwenScheduleContext):
     )
 
     captured, _ = reference_pass(ctx.model, inputs, rope_theta=ctx.rope_theta)
+    if attn_q_snapshots is None:
+        raise ValueError("Qwen correctness requires pre-clear Q snapshots")
     rope_row = ctx.matRope[decode_pos]
     all_ok = True
 
@@ -37,7 +42,7 @@ def run_correctness_check(ctx: QwenScheduleContext):
     for i in range(min(2, ctx.num_layers)):
         layer = captured[i]
         dae_q_rope = apply_rms_affine_rope_heads(
-            ctx.attnQs[i][0].view(ctx.NUM_Q_HEAD, ctx.HEAD_DIM),
+            attn_q_snapshots[i][0].view(ctx.NUM_Q_HEAD, ctx.HEAD_DIM),
             ctx.matQNormWs[i],
             rope_row,
             ctx.eps,
@@ -48,7 +53,7 @@ def run_correctness_check(ctx: QwenScheduleContext):
             check_tensor_threshold(
                 "q_proj_interleaved",
                 layer["q_proj_interleaved"][0, decode_index],
-                ctx.attnQs[i][0],
+                attn_q_snapshots[i][0],
                 5.0,
             ),
             check_tensor_threshold(
@@ -64,7 +69,7 @@ def run_correctness_check(ctx: QwenScheduleContext):
                 5.0,
             ),
             check_batch_rows("v_proj", ctx.attnVs[i][decode_pos, :ctx.REQ]),
-            check_batch_rows("q_proj", ctx.attnQs[i][:ctx.REQ]),
+            check_batch_rows("q_proj", attn_q_snapshots[i][:ctx.REQ]),
             check_batch_rows("k_rope", ctx.attnKs[i][decode_pos, :ctx.REQ]),
         ]
         all_ok = all_ok and all(passed for passed, _ in checks)
