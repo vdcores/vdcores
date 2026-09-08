@@ -851,12 +851,14 @@ class NvshmemPut(MemoryInstruction):
 
 
 class NvshmemWait(MemoryInstruction):
-    def __init__(self, signal_id: int):
+    def __init__(self, signal_id: int, wait_count: int = 1):
+        assert 0 < wait_count <= 0xFFFF, "wait_count must fit in uint16"
+
         super().__init__(
             opcode=opcode.OP_NVSHMEM_WAIT,
             num_slots=0,
             arg=_encode_nvshmem_arg(signal_id),
-            size=0,
+            size=wait_count,
             address=0,
         )
 

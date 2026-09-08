@@ -16,6 +16,10 @@ static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
 static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
+static constexpr uint16_t nvshmemSignalIdShift = 8U;
+static constexpr uint16_t nvshmemSignalIdMask = 0x00FFU;
+static constexpr uint16_t nvshmemTargetPeMask = 0x00FFU;
+
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,
@@ -218,10 +222,6 @@ __device__ __forceinline__ void allocwarp_execute(
           break;
         }
 
-        static constexpr uint16_t nvshmemSignalIdShift = 8U;
-        static constexpr uint16_t nvshmemSignalIdMask = 0x00FFU;
-        static constexpr uint16_t nvshmemTargetPeMask = 0x00FFU;
-
         case op(OP_NVSHMEM_PUT): {
           if (lane_id == 0) {
             void *symm_addr =
@@ -265,13 +265,14 @@ __device__ __forceinline__ void allocwarp_execute(
                 (static_cast<uint32_t>(inst.arg) >> nvshmemSignalIdShift) &
                 nvshmemSignalIdMask;
 
-            uint64_t *signal_addr =
-                signal_array + signal_id;
+            uint64_t *signal_addr = signal_array + signal_id;
+
+            uint64_t wait_count = static_cast<uint64_t>(inst.size);
 
             nvshmem_signal_wait_until(
                 signal_addr,
                 NVSHMEM_CMP_GE,
-                1);
+                wait_count);
           }
 
           __syncwarp();
