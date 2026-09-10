@@ -244,6 +244,7 @@ class Launcher:
 
         self._cache_window_override = None
         self._cache_window_requests = []
+        self._inflight_launch = None
 
         runtime.set_smem_size(self.smem_size)
 
@@ -465,7 +466,12 @@ class Launcher:
             mi += len(b.minsts)
         return ci / self.num_sms, mi / self.num_sms
 
-    def launch(self):
+    def launch(self, synchronize: bool = True):
+        if self._inflight_launch is not None:
+            raise RuntimeError(
+                "A VDCores launch is still in flight; call synchronize() before launching again"
+            )
+
         self.build_instructions()
 
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
@@ -488,7 +494,8 @@ class Launcher:
         cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
         minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
 
-        stream = torch.cuda.current_stream().cuda_stream
+        torch_stream = torch.cuda.current_stream()
+        stream = torch_stream.cuda_stream
         # TODO(zhiyuang): check this?
 
         # init the bars based on dict
@@ -527,9 +534,34 @@ class Launcher:
             self.num_sms, self.smem_size,
             cinsts, minsts, tma,
             self.bars, profile,
-            stream
+            stream, synchronize
         )
         assert ret == 0
+
+        if not synchronize:
+            self._inflight_launch = (
+                torch_stream,
+                cinsts,
+                minsts,
+                tma,
+                profile,
+            )
+            return torch_stream
+
+        return None
+
+    def launch_async(self):
+        return self.launch(synchronize=False)
+
+    def synchronize(self):
+        if self._inflight_launch is None:
+            return
+
+        torch_stream = self._inflight_launch[0]
+        try:
+            torch_stream.synchronize()
+        finally:
+            self._inflight_launch = None
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)
