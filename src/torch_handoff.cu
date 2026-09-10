@@ -107,6 +107,13 @@ static int32_t* gpu_accessible_counter_ptr(torch::Tensor counter) {
   return nullptr;
 }
 
+__global__ void atomic_add_kernel(int32_t* counter, int32_t delta) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system> atomic_counter(*counter);
+    atomic_counter.fetch_add(delta, cuda::memory_order_acq_rel);
+  }
+}
+
 static int64_t cpu_atomic_load(torch::Tensor counter) {
   std::atomic_ref<int32_t> atomic_counter(*check_cpu_counter(counter));
   TORCH_CHECK(atomic_counter.is_lock_free(), "counter atomic is not lock-free on this CPU");
@@ -159,6 +166,18 @@ static int64_t cpu_atomic_wait(torch::Tensor counter, int64_t target, int64_t ti
   return 0;
 }
 
+static void gpu_atomic_add(torch::Tensor counter, int64_t delta, int64_t stream_id) {
+  TORCH_CHECK(delta >= std::numeric_limits<int32_t>::min() &&
+                  delta <= std::numeric_limits<int32_t>::max(),
+              "delta is outside the int32 range");
+  auto* device_ptr = gpu_accessible_counter_ptr(counter);
+  auto stream = reinterpret_cast<cudaStream_t>(stream_id);
+  atomic_add_kernel<<<1, 1, 0, stream>>>(device_ptr, static_cast<int32_t>(delta));
+  const auto err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "handoff atomic kernel launch failed: ", cudaGetErrorString(err));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("handoff_capabilities", &handoff_capabilities,
         "Report CUDA capabilities relevant to CPU/GPU atomic handoff");
@@ -173,4 +192,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cpu_atomic_wait", &cpu_atomic_wait,
         py::arg("counter"), py::arg("target"), py::arg("timeout_ms") = 5000,
         "Wait until a CPU int32 tensor reaches a target value");
+  m.def("gpu_atomic_add", &gpu_atomic_add,
+        py::arg("counter"), py::arg("delta") = 1, py::arg("stream") = 0,
+        "Asynchronously add to a CPU counter from the GPU at system scope");
 }
