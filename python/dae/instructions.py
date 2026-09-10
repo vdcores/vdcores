@@ -812,6 +812,7 @@ class RawAddress(MemoryInstruction):
             size=0,
             address=address,
         )
+        self._tensor_ref = tensor
 
 
 class IssueBarrier(MemoryInstruction):
@@ -829,8 +830,10 @@ class CC0(MemoryInstruction):
         if (row_bytes & (row_bytes - 1)) == 0:
             shift = row_bytes.bit_length() - 1
             super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
+            self._tensor_ref = tokens
             return
         super().__init__(opcode=opcode.OP_CC0_ROW_BYTES, num_slots=0, arg=0, size=row_bytes, address=addr)
+        self._tensor_ref = tokens
 
 
 class RegStore(MemoryInstruction):
@@ -877,6 +880,7 @@ class TmaLoad1D(MemoryInstruction):
             size=bytes,
             address=address,
         )
+        self._tensor_ref = src
 
     def cord(self, addr):
         new_inst = copy.copy(self)
@@ -898,6 +902,7 @@ class TmaStore1D(MemoryInstruction):
             size=bytes,
             address=address,
         )
+        self._tensor_ref = dst
 
     def cord(self, addr):
         new_inst = copy.copy(self)
