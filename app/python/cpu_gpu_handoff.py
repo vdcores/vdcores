@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
+import time
 
 import torch
 
@@ -29,6 +31,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def percentile(values: list[int], fraction: float) -> int:
+    ordered = sorted(values)
+    return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def run_once(counter: torch.Tensor, stream: int, timeout_ms: int) -> int:
+    runtime.cpu_atomic_store(counter, 0)
+    start_ns = time.perf_counter_ns()
+    runtime.gpu_atomic_add(counter, 1, stream)
+    observed = runtime.cpu_atomic_wait(counter, 1, timeout_ms)
+    elapsed_ns = time.perf_counter_ns() - start_ns
+    if observed != 1:
+        raise RuntimeError(f"expected GPU signal value 1, observed {observed}")
+    return elapsed_ns
+
+
 def main() -> None:
     args = parse_args()
     if args.iterations <= 0:
@@ -48,10 +66,27 @@ def main() -> None:
         )
 
     counter = torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=args.pinned)
-    runtime.cpu_atomic_store(counter, 0)
+    stream = torch.cuda.current_stream().cuda_stream
+    torch.cuda.synchronize()
+
+    for _ in range(args.warmup):
+        run_once(counter, stream, args.timeout_ms)
+    torch.cuda.synchronize()
+
+    latencies_ns = [
+        run_once(counter, stream, args.timeout_ms) for _ in range(args.iterations)
+    ]
+    torch.cuda.synchronize()
     result = {
         "device": capabilities["device_name"],
         "allocation": "pinned" if args.pinned else "system",
+        "iterations": args.iterations,
+        "gpu_to_cpu": {
+            "min_ns": min(latencies_ns),
+            "median_ns": int(statistics.median(latencies_ns)),
+            "p95_ns": percentile(latencies_ns, 0.95),
+            "max_ns": max(latencies_ns),
+        },
         "capabilities": capabilities,
     }
     if args.json:
@@ -61,6 +96,12 @@ def main() -> None:
     print(f"Device: {result['device']}")
     print(f"CPU allocation: {result['allocation']}")
     print(f"CUDA handoff capabilities: {capabilities}")
+    values = result["gpu_to_cpu"]
+    print(
+        "GPU-to-CPU notification latency (ns): "
+        f"min={values['min_ns']} median={values['median_ns']} "
+        f"p95={values['p95_ns']} max={values['max_ns']}"
+    )
 
 
 if __name__ == "__main__":
