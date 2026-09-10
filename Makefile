@@ -80,6 +80,9 @@ run: $(BIN)
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
 	pip install -e . --no-build-isolation
 
+handoff:
+	$(PYTHON) setup_handoff.py build_ext --inplace --build-temp build/handoff
+
 FORCE:
 
-.PHONY: all clean run FORCE
+.PHONY: all clean run handoff FORCE
