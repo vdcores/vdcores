@@ -139,7 +139,8 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
-    int64_t stream
+    int64_t stream,
+    bool synchronize
 ) {
   set_persistent_cache();
 
@@ -156,7 +157,7 @@ int py_launch_dae(
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, prof, stream, synchronize
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -391,6 +392,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_smem_size", &py_set_smem_size,
             "Set dynamic shared memory size for DAE2 kernel");
   m.def("launch_dae", &py_launch_dae,
+            py::arg("num_sms"),
+            py::arg("smem_size"),
+            py::arg("compute_insts_bytes"),
+            py::arg("memory_insts_bytes"),
+            py::arg("tma_descs_bytes"),
+            py::arg("bars_int32"),
+            py::arg("profile_u64"),
+            py::arg("stream"),
+            py::arg("synchronize") = true,
             "Launch DAE2 kernel with given parameters");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");

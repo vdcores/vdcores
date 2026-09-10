@@ -23,7 +23,8 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  bool synchronize
 ) {
   // wait for all pre-launch meta-data copying
   cudaDeviceSynchronize();
@@ -35,11 +36,16 @@ cudaError_t launch_dae(
     bars,
     profile
   );
-  // TODO(zhiyuang): check launch error here?
+  cudaError_t launch_error = cudaGetLastError();
+  if (launch_error != cudaSuccess) {
+    return launch_error;
+  }
 
-  cudaDeviceSynchronize();
+  if (synchronize) {
+    return cudaDeviceSynchronize();
+  }
 
-  return cudaGetLastError();
+  return cudaSuccess;
 }
 
 CUtensorMap create_tma_descriptor(
