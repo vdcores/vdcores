@@ -1,9 +1,13 @@
 #include <torch/extension.h>
 
+#include <cuda/atomic>
+#include <cuda_runtime.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <thread>
 
 namespace py = pybind11;
@@ -21,6 +25,86 @@ static int32_t* check_cpu_counter(torch::Tensor counter) {
       address % std::atomic_ref<int32_t>::required_alignment == 0,
       "counter is not aligned for std::atomic_ref<int32_t>");
   return ptr;
+}
+
+static int current_device() {
+  int device = 0;
+  const auto err = cudaGetDevice(&device);
+  TORCH_CHECK(err == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(err));
+  return device;
+}
+
+static int device_attribute(cudaDeviceAttr attribute) {
+  int value = 0;
+  const auto err = cudaDeviceGetAttribute(&value, attribute, current_device());
+  TORCH_CHECK(err == cudaSuccess, "cudaDeviceGetAttribute failed: ", cudaGetErrorString(err));
+  return value;
+}
+
+static py::dict handoff_capabilities() {
+  cudaDeviceProp prop{};
+  const auto err = cudaGetDeviceProperties(&prop, current_device());
+  TORCH_CHECK(err == cudaSuccess, "cudaGetDeviceProperties failed: ", cudaGetErrorString(err));
+
+  py::dict result;
+  result["device_name"] = std::string(prop.name);
+  result["pageable_memory_access"] =
+      device_attribute(cudaDevAttrPageableMemoryAccess) != 0;
+  result["uses_host_page_tables"] =
+      device_attribute(cudaDevAttrPageableMemoryAccessUsesHostPageTables) != 0;
+  result["host_native_atomics"] =
+      device_attribute(cudaDevAttrHostNativeAtomicSupported) != 0;
+  result["concurrent_managed_access"] =
+      device_attribute(cudaDevAttrConcurrentManagedAccess) != 0;
+  return result;
+}
+
+static int32_t* gpu_accessible_counter_ptr(torch::Tensor counter) {
+  auto* host_ptr = check_cpu_counter(counter);
+
+  cudaPointerAttributes attributes{};
+  auto err = cudaPointerGetAttributes(&attributes, host_ptr);
+  if (err == cudaErrorInvalidValue) {
+    cudaGetLastError();
+    attributes.type = cudaMemoryTypeUnregistered;
+  } else {
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaPointerGetAttributes failed: ", cudaGetErrorString(err));
+  }
+
+  if (attributes.type == cudaMemoryTypeUnregistered) {
+    TORCH_CHECK(
+        device_attribute(cudaDevAttrPageableMemoryAccess) != 0,
+        "this GPU cannot directly access an ordinary CPU tensor; use a GH200/GB200 "
+        "or a Linux HMM configuration with pageable memory access");
+    return host_ptr;
+  }
+
+  if (attributes.type == cudaMemoryTypeHost) {
+    TORCH_CHECK(
+        device_attribute(cudaDevAttrHostNativeAtomicSupported) != 0,
+        "mapped host memory does not support native CPU/GPU read-modify-write atomics "
+        "on this system");
+    if (attributes.devicePointer != nullptr) {
+      return static_cast<int32_t*>(attributes.devicePointer);
+    }
+
+    void* device_ptr = nullptr;
+    err = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
+    return static_cast<int32_t*>(device_ptr);
+  }
+
+  if (attributes.type == cudaMemoryTypeManaged) {
+    TORCH_CHECK(
+        device_attribute(cudaDevAttrConcurrentManagedAccess) != 0,
+        "managed counter does not support concurrent CPU/GPU access on this system");
+    return host_ptr;
+  }
+
+  TORCH_CHECK(false, "counter must use system, mapped host, or managed memory");
+  return nullptr;
 }
 
 static int64_t cpu_atomic_load(torch::Tensor counter) {
@@ -76,6 +160,8 @@ static int64_t cpu_atomic_wait(torch::Tensor counter, int64_t target, int64_t ti
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("handoff_capabilities", &handoff_capabilities,
+        "Report CUDA capabilities relevant to CPU/GPU atomic handoff");
   m.def("cpu_atomic_load", &cpu_atomic_load, py::arg("counter"),
         "Load a one-element CPU int32 tensor with acquire ordering");
   m.def("cpu_atomic_store", &cpu_atomic_store,
