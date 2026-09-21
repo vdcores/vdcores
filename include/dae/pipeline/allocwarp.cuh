@@ -249,7 +249,7 @@ __device__ __forceinline__ void allocwarp_execute(
                 nbytes,
                 signal_addr,        // matching remote signal slot
                 1,
-                NVSHMEM_SIGNAL_SET,
+                NVSHMEM_SIGNAL_ADD,
                 target_pe);
 
             nvshmem_quiet();
