@@ -1,0 +1,40 @@
+{
+  "date": "2026-09-21",
+  "instance": "anant_testing",
+  "commit_tested": "a64a1093c6485051629497c257f0d4c0bd38e56f",
+  "environment": {
+    "os": "Linux 6.8.0-1046-nvidia-64k aarch64 GNU/Linux",
+    "gpu": "NVIDIA GH200 480GB",
+    "gpu_memory_mib": 97871,
+    "driver": "580.105.08",
+    "cuda_toolkit": "12.8.93",
+    "python": "3.10.12",
+    "torch": "2.7.0",
+    "torch_cuda": "12.8"
+  },
+  "capabilities": {
+    "concurrent_managed_access": true,
+    "host_native_atomics": true,
+    "pageable_memory_access": true,
+    "uses_host_page_tables": true
+  },
+  "configuration": {
+    "warmup_iterations": 500,
+    "measured_iterations": 10000,
+    "timeout_ms": 5000
+  },
+  "system_trials": [
+    {"trial": 1, "gpu_to_cpu": {"min_ns": 380900, "median_ns": 536325, "p95_ns": 629605, "max_ns": 1637295}, "round_trip": {"min_ns": 385220, "median_ns": 539589, "p95_ns": 632358, "max_ns": 1640143}},
+    {"trial": 2, "gpu_to_cpu": {"min_ns": 379716, "median_ns": 535909, "p95_ns": 624070, "max_ns": 1380013}, "round_trip": {"min_ns": 383108, "median_ns": 539525, "p95_ns": 627365, "max_ns": 1382925}},
+    {"trial": 3, "gpu_to_cpu": {"min_ns": 377348, "median_ns": 535941, "p95_ns": 576998, "max_ns": 1375821}, "round_trip": {"min_ns": 381188, "median_ns": 539364, "p95_ns": 579814, "max_ns": 1378893}},
+    {"trial": 4, "gpu_to_cpu": {"min_ns": 381763, "median_ns": 534853, "p95_ns": 556389, "max_ns": 1325133}, "round_trip": {"min_ns": 385507, "median_ns": 538405, "p95_ns": 560293, "max_ns": 1328077}},
+    {"trial": 5, "gpu_to_cpu": {"min_ns": 385380, "median_ns": 911848, "p95_ns": 1062057, "max_ns": 22400493}, "round_trip": {"min_ns": 389124, "median_ns": 1049322, "p95_ns": 1199915, "max_ns": 22404461}, "note": "transient outlier"},
+    {"trial": 6, "gpu_to_cpu": {"min_ns": 383939, "median_ns": 536709, "p95_ns": 592550, "max_ns": 1356908}, "round_trip": {"min_ns": 387684, "median_ns": 540101, "p95_ns": 595238, "max_ns": 1359628}}
+  ],
+  "pinned_trials": [
+    {"trial": 1, "gpu_to_cpu": {"min_ns": 387715, "median_ns": 539653, "p95_ns": 626917, "max_ns": 1318540}, "round_trip": {"min_ns": 391523, "median_ns": 542757, "p95_ns": 629797, "max_ns": 1321196}},
+    {"trial": 2, "gpu_to_cpu": {"min_ns": 387779, "median_ns": 534053, "p95_ns": 558629, "max_ns": 1326253}, "round_trip": {"min_ns": 390563, "median_ns": 537445, "p95_ns": 562182, "max_ns": 1329197}},
+    {"trial": 3, "gpu_to_cpu": {"min_ns": 385635, "median_ns": 538149, "p95_ns": 582502, "max_ns": 1307596}, "round_trip": {"min_ns": 388387, "median_ns": 541445, "p95_ns": 585318, "max_ns": 1310764}},
+    {"trial": 4, "gpu_to_cpu": {"min_ns": 380867, "median_ns": 536165, "p95_ns": 573222, "max_ns": 1322732}, "round_trip": {"min_ns": 384611, "median_ns": 539685, "p95_ns": 577062, "max_ns": 1325804}}
+  ]
+}

@@ -3,13 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+from pathlib import Path
 import statistics
+import sys
 import time
 
 import torch
 
-from dae import handoff_runtime as runtime
+
+def load_runtime():
+    try:
+        from dae import handoff_runtime
+
+        return handoff_runtime
+    except ImportError:
+        # ``make handoff`` builds only this small extension.  Loading it directly
+        # keeps the benchmark independent from the full VDCores extension.
+        extension_dir = Path(__file__).resolve().parents[2] / "python" / "dae"
+        sys.path.insert(0, str(extension_dir))
+        return importlib.import_module("handoff_runtime")
+
+
+runtime = load_runtime()
 
 
 def parse_args() -> argparse.Namespace:
