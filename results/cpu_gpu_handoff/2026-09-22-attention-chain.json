@@ -1,0 +1,104 @@
+{
+  "date": "2026-09-22",
+  "instance": "anant_testing",
+  "commit_tested": "986d27b80bf358eab9458a278cf7b848eaa43b5d",
+  "cutlass_commit": "098de2a652cf8f00fd70b2df54051c7eccbb855a",
+  "environment": {
+    "os": "Linux 6.8.0-1046-nvidia-64k aarch64 GNU/Linux",
+    "gpu": "NVIDIA GH200 480GB",
+    "gpu_memory_mib": 97871,
+    "driver": "580.105.08",
+    "cuda_toolkit": "12.8.93",
+    "python": "3.10.12",
+    "torch": "2.7.0",
+    "torch_cuda": "12.8"
+  },
+  "capabilities": {
+    "concurrent_managed_access": true,
+    "host_native_atomics": true,
+    "pageable_memory_access": true,
+    "uses_host_page_tables": true
+  },
+  "configuration": {
+    "attention": "split-KV attention, 32768 tokens, 2 splits, 16 SMs",
+    "cpu_consumer": "1024-element int64 dot product",
+    "gpu_consumer": "1024-element float64 dot product",
+    "timeout_ms": 20000,
+    "selected_compute_ops": [
+      "OP_ATTENTION_M64N64K16_F16_F32_64_64_hdim_split",
+      "OP_ATTN_SPLIT_POST_REDUCE",
+      "OP_TERMINATEC"
+    ]
+  },
+  "repeat_trials": [
+    {
+      "iterations": 100,
+      "warmup": 10,
+      "blocking": {
+        "attention_to_cpu_ns": {"min_ns": 2425431, "median_ns": 2664872, "p95_ns": 2819482, "max_ns": 3055260},
+        "cpu_task_ns": {"min_ns": 10208, "median_ns": 11888, "p95_ns": 12608, "max_ns": 29248},
+        "gpu_task_ns": {"min_ns": 618630, "median_ns": 695798, "p95_ns": 842279, "max_ns": 884392},
+        "end_to_end_ns": {"min_ns": 3122717, "median_ns": 3372814, "p95_ns": 3590529, "max_ns": 3797763}
+      },
+      "handoff": {
+        "attention_to_cpu_ns": {"min_ns": 2754009, "median_ns": 2818233, "p95_ns": 2992251, "max_ns": 3169853},
+        "cpu_task_ns": {"min_ns": 11904, "median_ns": 13056, "p95_ns": 14400, "max_ns": 33536},
+        "cpu_ack_ns": {"min_ns": 640, "median_ns": 864, "p95_ns": 1184, "max_ns": 1504},
+        "cpu_to_gpu_completion_ns": {"min_ns": 3872, "median_ns": 4288, "p95_ns": 5344, "max_ns": 21280},
+        "end_to_end_ns": {"min_ns": 2771449, "median_ns": 2837626, "p95_ns": 3009468, "max_ns": 3188413}
+      }
+    },
+    {
+      "iterations": 100,
+      "warmup": 10,
+      "blocking": {
+        "attention_to_cpu_ns": {"min_ns": 2536823, "median_ns": 2682152, "p95_ns": 2845402, "max_ns": 2917019},
+        "cpu_task_ns": {"min_ns": 10016, "median_ns": 11872, "p95_ns": 12992, "max_ns": 21408},
+        "gpu_task_ns": {"min_ns": 670566, "median_ns": 689990, "p95_ns": 829320, "max_ns": 866408},
+        "end_to_end_ns": {"min_ns": 3244990, "median_ns": 3389023, "p95_ns": 3557824, "max_ns": 3683873}
+      },
+      "handoff": {
+        "attention_to_cpu_ns": {"min_ns": 2620600, "median_ns": 2814442, "p95_ns": 2993115, "max_ns": 3143101},
+        "cpu_task_ns": {"min_ns": 11840, "median_ns": 12784, "p95_ns": 13984, "max_ns": 14752},
+        "cpu_ack_ns": {"min_ns": 544, "median_ns": 800, "p95_ns": 1024, "max_ns": 1056},
+        "cpu_to_gpu_completion_ns": {"min_ns": 3584, "median_ns": 3936, "p95_ns": 4992, "max_ns": 23776},
+        "end_to_end_ns": {"min_ns": 2637880, "median_ns": 2833210, "p95_ns": 3011323, "max_ns": 3160381}
+      }
+    },
+    {
+      "iterations": 100,
+      "warmup": 10,
+      "blocking": {
+        "attention_to_cpu_ns": {"min_ns": 2489047, "median_ns": 2676744, "p95_ns": 2849530, "max_ns": 2939515},
+        "cpu_task_ns": {"min_ns": 9920, "median_ns": 11632, "p95_ns": 12416, "max_ns": 31073},
+        "gpu_task_ns": {"min_ns": 674822, "median_ns": 691590, "p95_ns": 833991, "max_ns": 861320},
+        "end_to_end_ns": {"min_ns": 3191390, "median_ns": 3392143, "p95_ns": 3566401, "max_ns": 3666978}
+      },
+      "handoff": {
+        "attention_to_cpu_ns": {"min_ns": 2756697, "median_ns": 2819993, "p95_ns": 2998043, "max_ns": 3129308},
+        "cpu_task_ns": {"min_ns": 11904, "median_ns": 12768, "p95_ns": 13888, "max_ns": 14785},
+        "cpu_ack_ns": {"min_ns": 640, "median_ns": 864, "p95_ns": 1248, "max_ns": 1344},
+        "cpu_to_gpu_completion_ns": {"min_ns": 4256, "median_ns": 4528, "p95_ns": 5376, "max_ns": 5504},
+        "end_to_end_ns": {"min_ns": 2776249, "median_ns": 2838905, "p95_ns": 3017403, "max_ns": 3149373}
+      }
+    }
+  ],
+  "final_trial": {
+    "iterations": 1000,
+    "warmup": 50,
+    "blocking": {
+      "attention_to_cpu_ns": {"min_ns": 2413334, "median_ns": 2677208, "p95_ns": 2842938, "max_ns": 3762403},
+      "cpu_task_ns": {"min_ns": 10112, "median_ns": 11904, "p95_ns": 12929, "max_ns": 31264},
+      "gpu_task_ns": {"min_ns": 673350, "median_ns": 694726, "p95_ns": 841991, "max_ns": 1109674},
+      "end_to_end_ns": {"min_ns": 3109852, "median_ns": 3388559, "p95_ns": 3578752, "max_ns": 4469769}
+    },
+    "handoff": {
+      "attention_to_cpu_ns": {"min_ns": 2597368, "median_ns": 2828266, "p95_ns": 3015675, "max_ns": 3773218},
+      "cpu_task_ns": {"min_ns": 11904, "median_ns": 13057, "p95_ns": 14592, "max_ns": 33569},
+      "cpu_ack_ns": {"min_ns": 544, "median_ns": 832, "p95_ns": 1152, "max_ns": 1472},
+      "cpu_to_gpu_completion_ns": {"min_ns": 3680, "median_ns": 4192, "p95_ns": 5152, "max_ns": 24736},
+      "end_to_end_ns": {"min_ns": 2616472, "median_ns": 2847290, "p95_ns": 3034011, "max_ns": 3791362}
+    },
+    "split_kv_normalized_mean_error": 0.002002375346003815
+  }
+}

@@ -91,3 +91,23 @@ Questions to settle with the project lead before step 3:
 - What operation granularity should the first prototype target?
 - Which shared-memory mechanism is the intended GH200 baseline?
 - Which end-to-end workload will be used after the microbenchmark?
+
+## Fixed Heterogeneous Chain Result
+
+The first fixed GPU-to-CPU-to-GPU chain was completed on a GH200 on
+2026-09-22. `tests/script/check_attention_handoff.py` connects VDCores split-KV
+attention to a CPU dot product and then to a prequeued GPU dot-product consumer
+through a CPU-resident coherent counter. The GPU consumer waits for the CPU
+acknowledgement inside CUDA and signals only after its output is ready.
+
+Against a matched blocking synchronize-and-relaunch baseline, the 1,000-run
+median fell from 3.389 ms to 2.847 ms, a 0.541 ms or 15.97% reduction. The
+prequeued GPU consumer completed 4.192 us after CPU acknowledgement, while the
+blocking post-CPU launch and synchronization stage took 694.726 us. Making the
+attention result visible to the CPU added about 151 us, so the net gain came
+from avoiding the later host launch boundary.
+
+See `results/cpu_gpu_handoff/2026-09-22-attention-chain.md` for the method,
+interpretation, environment, and limitations, and the adjacent JSON file for
+raw aggregate measurements. This is still fixed placement; workload crossover
+measurements should come before adding a dynamic placement policy.
