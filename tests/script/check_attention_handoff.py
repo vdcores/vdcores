@@ -47,7 +47,15 @@ def summarize(values: list[int]) -> dict[str, int]:
     }
 
 
-def run_blocking_once(dae, cpu_input, gpu_input, gpu_output) -> dict[str, int]:
+def run_blocking_once(
+    dae,
+    counter,
+    cpu_input,
+    gpu_input,
+    gpu_output,
+    timeout_ms: int,
+) -> dict[str, int]:
+    handoff_runtime.cpu_atomic_store(counter, 0)
     start_ns = time.perf_counter_ns()
     dae.launch()
     attention_done_ns = time.perf_counter_ns()
@@ -55,12 +63,26 @@ def run_blocking_once(dae, cpu_input, gpu_input, gpu_output) -> dict[str, int]:
     cpu_result = int(torch.dot(cpu_input, cpu_input).item())
     cpu_done_ns = time.perf_counter_ns()
 
-    torch.dot(gpu_input, gpu_input, out=gpu_output)
+    # Conventional boundary: after blocking for VDCores and completing CPU
+    # work, launch the same GPU consumer with an already-satisfied dependency.
+    handoff_runtime.cpu_atomic_store(counter, 2)
+    stream = torch.cuda.current_stream()
+    handoff_runtime.gpu_atomic_wait_dot_add(
+        counter,
+        2,
+        gpu_input,
+        gpu_output,
+        2,
+        timeout_ms,
+        stream.cuda_stream,
+    )
     torch.cuda.synchronize()
     end_ns = time.perf_counter_ns()
 
     if cpu_result != EXPECTED_DOT or int(gpu_output.item()) != EXPECTED_DOT:
         raise AssertionError("blocking baseline produced an incorrect dependent result")
+    if handoff_runtime.cpu_atomic_load(counter) != 4:
+        raise AssertionError("blocking baseline counter did not finish at 4")
 
     return {
         "attention_to_cpu_ns": attention_done_ns - start_ns,
@@ -84,15 +106,17 @@ def run_handoff_once(
     try:
         # 0 -> 1: VDCores attention has completed on this stream.
         handoff_runtime.gpu_atomic_add(counter, 1, stream.cuda_stream)
-        # Wait for the CPU's 1 -> 2 acknowledgement, then advance 2 -> 3.
-        handoff_runtime.gpu_atomic_wait_add(
-            counter, 2, 1, timeout_ms, stream.cuda_stream
+        # After the CPU's 1 -> 2 acknowledgement, a real GPU consumer computes
+        # the dot product and advances 2 -> 4 only after its output is ready.
+        handoff_runtime.gpu_atomic_wait_dot_add(
+            counter,
+            2,
+            gpu_input,
+            gpu_output,
+            2,
+            timeout_ms,
+            stream.cuda_stream,
         )
-        # A real GPU consumer follows the acknowledgement on the same stream.
-        with torch.cuda.stream(stream):
-            torch.dot(gpu_input, gpu_input, out=gpu_output)
-        # 3 -> 4 signals that the GPU consumer itself has completed.
-        handoff_runtime.gpu_atomic_add(counter, 1, stream.cuda_stream)
 
         observed = handoff_runtime.cpu_atomic_wait(counter, 1, timeout_ms)
         attention_observed_ns = time.perf_counter_ns()
@@ -161,7 +185,9 @@ def main() -> None:
     torch.cuda.synchronize()
 
     for _ in range(args.warmup):
-        run_blocking_once(dae, cpu_input, gpu_input, gpu_output)
+        run_blocking_once(
+            dae, counter, cpu_input, gpu_input, gpu_output, args.timeout_ms
+        )
         run_handoff_once(
             dae, counter, cpu_input, gpu_input, gpu_output, args.timeout_ms
         )
@@ -176,11 +202,15 @@ def main() -> None:
                 )
             )
             blocking_measurements.append(
-                run_blocking_once(dae, cpu_input, gpu_input, gpu_output)
+                run_blocking_once(
+                    dae, counter, cpu_input, gpu_input, gpu_output, args.timeout_ms
+                )
             )
         else:
             blocking_measurements.append(
-                run_blocking_once(dae, cpu_input, gpu_input, gpu_output)
+                run_blocking_once(
+                    dae, counter, cpu_input, gpu_input, gpu_output, args.timeout_ms
+                )
             )
             handoff_measurements.append(
                 run_handoff_once(

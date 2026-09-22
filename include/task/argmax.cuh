@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cfloat>
+
 #include "virtualcore.cuh"
 #include "type.cuh"
 

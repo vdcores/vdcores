@@ -134,6 +134,57 @@ __global__ void atomic_wait_add_kernel(
   atomic_counter.fetch_add(delta, cuda::memory_order_acq_rel);
 }
 
+__global__ void atomic_wait_dot_add_kernel(
+    int32_t* counter,
+    int32_t target,
+    int32_t delta,
+    const double* input,
+    double* output,
+    int64_t numel,
+    uint64_t timeout_cycles) {
+  __shared__ int ready;
+  __shared__ double partial[256];
+
+  if (threadIdx.x == 0) {
+    ready = 0;
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system> atomic_counter(*counter);
+    const uint64_t start = clock64();
+    while (atomic_counter.load(cuda::memory_order_acquire) < target) {
+      if (clock64() - start >= timeout_cycles) {
+        break;
+      }
+      __nanosleep(64);
+    }
+    if (atomic_counter.load(cuda::memory_order_acquire) >= target) {
+      ready = 1;
+    }
+  }
+  __syncthreads();
+  if (!ready) {
+    return;
+  }
+
+  double sum = 0.0;
+  for (int64_t index = threadIdx.x; index < numel; index += blockDim.x) {
+    sum += input[index] * input[index];
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (threadIdx.x < offset) {
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    *output = partial[0];
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system> atomic_counter(*counter);
+    atomic_counter.fetch_add(delta, cuda::memory_order_acq_rel);
+  }
+}
+
 static int64_t cpu_atomic_load(torch::Tensor counter) {
   std::atomic_ref<int32_t> atomic_counter(*check_cpu_counter(counter));
   TORCH_CHECK(atomic_counter.is_lock_free(), "counter atomic is not lock-free on this CPU");
@@ -227,6 +278,53 @@ static void gpu_atomic_wait_add(
               "handoff wait kernel launch failed: ", cudaGetErrorString(err));
 }
 
+static void gpu_atomic_wait_dot_add(
+    torch::Tensor counter,
+    int64_t target,
+    torch::Tensor input,
+    torch::Tensor output,
+    int64_t delta,
+    int64_t timeout_ms,
+    int64_t stream_id) {
+  TORCH_CHECK(target >= std::numeric_limits<int32_t>::min() &&
+                  target <= std::numeric_limits<int32_t>::max(),
+              "target is outside the int32 range");
+  TORCH_CHECK(delta >= std::numeric_limits<int32_t>::min() &&
+                  delta <= std::numeric_limits<int32_t>::max(),
+              "delta is outside the int32 range");
+  TORCH_CHECK(timeout_ms > 0, "timeout_ms must be positive");
+  TORCH_CHECK(input.defined() && input.is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(output.defined() && output.is_cuda(), "output must be a CUDA tensor");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat64,
+              "input must have dtype torch.float64");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat64,
+              "output must have dtype torch.float64");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(output.is_contiguous() && output.numel() == 1,
+              "output must be a contiguous scalar tensor");
+  TORCH_CHECK(input.numel() > 0, "input must not be empty");
+  TORCH_CHECK(input.get_device() == current_device() &&
+                  output.get_device() == current_device(),
+              "input and output must be on the current CUDA device");
+
+  auto* counter_ptr = gpu_accessible_counter_ptr(counter);
+  const uint64_t timeout_cycles =
+      static_cast<uint64_t>(device_attribute(cudaDevAttrClockRate)) *
+      static_cast<uint64_t>(timeout_ms);
+  auto stream = reinterpret_cast<cudaStream_t>(stream_id);
+  atomic_wait_dot_add_kernel<<<1, 256, 0, stream>>>(
+      counter_ptr,
+      static_cast<int32_t>(target),
+      static_cast<int32_t>(delta),
+      input.data_ptr<double>(),
+      output.data_ptr<double>(),
+      input.numel(),
+      timeout_cycles);
+  const auto err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "handoff GPU consumer launch failed: ", cudaGetErrorString(err));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("handoff_capabilities", &handoff_capabilities,
         "Report CUDA capabilities relevant to CPU/GPU atomic handoff");
@@ -248,4 +346,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("counter"), py::arg("target"), py::arg("delta") = 1,
         py::arg("timeout_ms") = 5000, py::arg("stream") = 0,
         "Wait on a CPU counter from the GPU, then atomically add to it");
+  m.def("gpu_atomic_wait_dot_add", &gpu_atomic_wait_dot_add,
+        py::arg("counter"), py::arg("target"), py::arg("input"),
+        py::arg("output"), py::arg("delta") = 2,
+        py::arg("timeout_ms") = 5000, py::arg("stream") = 0,
+        "Wait on a CPU counter, compute a CUDA dot product, then signal completion");
 }
