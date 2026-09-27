@@ -111,3 +111,22 @@ See `results/cpu_gpu_handoff/2026-09-22-attention-chain.md` for the method,
 interpretation, environment, and limitations, and the adjacent JSON file for
 raw aggregate measurements. This is still fixed placement; workload crossover
 measurements should come before adding a dynamic placement policy.
+
+## Measured Placement Follow-On
+
+`tests/script/check_attention_placement.py` is the next experiment. It keeps
+the split-KV attention producer and a final prequeued GPU successor fixed, but
+runs the middle float64 dot product on either CPU or GPU across configurable
+work sizes. This isolates the placement crossover while preserving a real
+GPU-producer to flexible-stage to GPU-successor dependency graph.
+
+`python/dae/placement.py` consumes the benchmark JSON as a measured crossover
+policy. It interpolates latency within the measured work-size range, adds
+caller-supplied CPU/GPU queue delay, supports a deadline, and uses a switch
+margin to avoid changing placement for small predicted gains. It deliberately
+clamps outside the measured range instead of inventing an extrapolation.
+
+The experiment and policy are implemented but still require a new sequential
+GH200/GB200 sweep before the crossover or any selected device can be reported.
+They do not yet create CPU virtual-core workers or dynamically schedule a full
+VDCores instruction graph.
