@@ -41,3 +41,23 @@ that is a visible limitation, not evidence about unmeasured sizes.
 This policy is a first placement layer. It does not add a CPU worker pool,
 encode CPU operations in the VDCores instruction stream, or infer contention
 automatically.
+
+## Plan Or Run One Adaptive Chain
+
+After a real calibration file exists, inspect the decision without CUDA:
+
+```bash
+python tests/script/run_adaptive_attention_handoff.py \
+  --policy results/cpu_gpu_handoff/YYYY-MM-DD-placement.json \
+  --work-items 4096 \
+  --plan-only
+```
+
+Remove `--plan-only` on the coherent machine to execute the selected path. Use
+`--cpu-queue-us`, `--gpu-queue-us`, or `--deadline-us` to supply scheduling
+context. Work sizes outside the measured range fail by default; explicitly pass
+`--allow-outside-range` to clamp to the nearest measurement.
+
+The adaptive runner builds a three-node dependency plan with
+`python/dae/heterogeneous.py`: GPU attention, a flexible CPU/GPU dot product,
+and a fixed GPU successor. Plan-only mode never imports the CUDA extension.

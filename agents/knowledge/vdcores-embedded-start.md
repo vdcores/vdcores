@@ -130,3 +130,23 @@ The experiment and policy are implemented but still require a new sequential
 GH200/GB200 sweep before the crossover or any selected device can be reported.
 They do not yet create CPU virtual-core workers or dynamically schedule a full
 VDCores instruction graph.
+
+## Offline Heterogeneous Scheduler
+
+`python/dae/heterogeneous.py` now provides the first backend-independent DAG
+scheduler. It validates dependencies and cycles, exposes ready operations,
+tracks pending/ready/running/complete transitions, preserves fixed CPU/GPU
+placements, and asks the measured crossover policy to place flexible work with
+queue-delay and deadline inputs. CUDA execution remains outside the scheduler;
+backends consume dispatch records and report completion.
+
+`tests/script/run_adaptive_attention_handoff.py` connects that scheduler to the
+attention experiment. Its plan-only mode loads a calibration JSON and chooses
+the middle CPU/GPU dot placement without importing CUDA. Execution mode uses
+the same decision to run one of the two already-correctness-checked paths on a
+coherent machine. Unmeasured work sizes fail closed unless endpoint clamping is
+explicitly enabled.
+
+These pieces are verified offline with synthetic values in tests only. No
+synthetic crossover or placement result belongs under `results/` or should be
+reported as a hardware finding.
