@@ -34,7 +34,8 @@ cudaError_t launch_dae(
   int64_t stream,
   const DaeCoreConfig* core_configs = nullptr,
   DaeKernelVariant kernel_variant = DAE_KERNEL_AUTO,
-  uint16_t pool_inst_opcode = 0
+  uint16_t pool_inst_opcode = 0,
+  const void* const* metadata_ptrs = nullptr
 );
 
 CUtensorMap create_tma_descriptor(

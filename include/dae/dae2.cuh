@@ -51,7 +51,8 @@ void dae2(
     int* __restrict__ bars,
     uint64_t* __restrict__ signal_array,
     uint64_t* __restrict__ g_events,
-    const DaeCoreConfig* __restrict__ core_configs) {
+    const DaeCoreConfig* __restrict__ core_configs,
+    const void* const* __restrict__ metadata_ptrs) {
   static_assert(FixedLoadWarps >= 0 && FixedLoadWarps <= daeMaxLoadWarps);
   static_assert(FixedCommunicationWarps >= 0 &&
                 FixedCommunicationWarps <= 1);
@@ -317,7 +318,8 @@ void dae2(
       } else if (lane_id == 0) {
         const int port_id = memory_warp_id - daeMemoryControlWarps;
         ldwarp_execute_singlethread(
-            m2ld[port_id], m2c, st_insts, smem_base, tma_descs, bars);
+            m2ld[port_id], m2c, st_insts, smem_base, tma_descs, bars,
+            metadata_ptrs);
       }
     }
 #ifdef DAE_ENABLE_NVSHMEM

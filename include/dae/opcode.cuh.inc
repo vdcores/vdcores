@@ -33,6 +33,7 @@ DAE_OP(OP_ALLOC_WB_TMA_REDUCE_ADD_3D, MK_MOP(22, MEM_OP_FLAGS_ALLOCATE | MEM_OP_
 //   2. always write to slot regardless of writeback flag
 
 DAE_OP(OP_ALLOC_WB_RAW_ADDRESS, MK_MOP(23, MEM_OP_FLAGS_ALLOCATE))
+DAE_OP(OP_ALLOC_TMA_LOAD_METADATA, MK_MOP(26, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

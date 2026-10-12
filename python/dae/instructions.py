@@ -1321,6 +1321,61 @@ class TmaTensor(MemoryInstruction):
         return self.wgmma("store", tileN, tileM, major)
 
 
+# address and coords overlap, so the metadata index cannot be stored in
+# address next to the static coordinates. The coord slots hold the static
+# coordinates (unused slots are 0xFFFF). The index is split across size and arg.
+_METADATA_DESC_INDEX_MASK = 0x3FF
+_METADATA_COORD_UNUSED = 0xFFFF
+_METADATA_INDEX_LIMIT = 1 << 10
+
+
+def _pack_metadata_cords(coords: list[int]) -> list[int]:
+    if not 0 <= len(coords) <= 4:
+        raise ValueError("coords must contain 0 to 4 static coordinates")
+    for coord in coords:
+        if not 0 <= coord < _METADATA_COORD_UNUSED:
+            raise ValueError("static coordinate must be in 0..65534")
+    return list(coords) + [_METADATA_COORD_UNUSED] * (4 - len(coords))
+
+
+def _pack_metadata_size(nbytes: int, meta_idx: int) -> int:
+    if not 0 <= meta_idx < _METADATA_INDEX_LIMIT:
+        raise ValueError("meta_idx must be in 0..1023")
+    aligned = (int(nbytes) + 15) & ~15
+    if aligned > (0xFFF << 4):
+        raise ValueError("transfer size does not fit in the instruction")
+    return (aligned >> 4) | ((meta_idx & 0xF) << 12)
+
+
+def _pack_metadata_arg(desc_index: int, meta_idx: int) -> int:
+    if not 0 <= desc_index <= _METADATA_DESC_INDEX_MASK:
+        raise ValueError("TMA descriptor index must fit in 10 bits")
+    return desc_index | (((meta_idx >> 4) & 0x3F) << 10)
+
+
+class MetadataTmaLoadND(MemoryInstruction):
+    def __init__(self, desc, meta_idx, coords):
+        coords = list(coords)
+        super().__init__(
+            opcode=opcode.OP_ALLOC_TMA_LOAD_METADATA,
+            num_slots=desc.num_slots,
+            arg=_pack_metadata_arg(desc.arg, meta_idx),
+            size=_pack_metadata_size(desc.size, meta_idx),
+            cords=_pack_metadata_cords(coords),
+        )
+        self.desc = desc
+        self.meta_idx = meta_idx
+        self.rank = len(coords) + 1
+
+    def cord(self, *coords):
+        coords = list(coords)
+        inst = copy.copy(self)
+        inst.rank = len(coords) + 1
+        inst.set_cords(_pack_metadata_cords(coords))
+        inst.arg = _pack_metadata_arg(self.desc.arg & _METADATA_DESC_INDEX_MASK, self.meta_idx)
+        inst.size = _pack_metadata_size(self.desc.size, self.meta_idx)
+        return inst
+
 __all__ = [
     "decode_opcode",
     "dedcode_opcode",

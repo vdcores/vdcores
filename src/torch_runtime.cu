@@ -174,6 +174,7 @@ int py_launch_dae(
     torch::Tensor communication_insts_bytes,
     torch::Tensor pool_insts_bytes,
     torch::Tensor tma_descs_bytes,       // uint8 buffer
+    torch::Tensor metadata_ptrs_bytes,
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
     int64_t stream,
@@ -195,6 +196,7 @@ int py_launch_dae(
   auto poolinst = check_tensor_ptr<PoolInst>(
       pool_insts_bytes, "pool_insts_bytes");
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
+  auto metadata_ptrs = check_tensor_ptr<const void*>(metadata_ptrs_bytes, "metadata_ptrs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
   uint64_t* signal_array = nullptr;
@@ -223,7 +225,8 @@ int py_launch_dae(
       bars, signal_array, prof, stream,
       core_configs,
       static_cast<DaeKernelVariant>(kernel_variant),
-      static_cast<uint16_t>(pool_inst_opcode)
+      static_cast<uint16_t>(pool_inst_opcode),
+      metadata_ptrs
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -534,6 +537,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("communication_insts_bytes"),
       py::arg("pool_insts_bytes"),
       py::arg("tma_descs_bytes"),
+      py::arg("metadata_ptrs_bytes"),
       py::arg("bars_int32"),
       py::arg("profile_u64"),
       py::arg("stream"),

@@ -254,6 +254,7 @@ class Launcher:
         signal_array: torch.Tensor | None = None,
         benchmark_barrier=None,
         kernel_variant: KernelVariant | str | int = KernelVariant.AUTO,
+        metadata: torch.Tensor | None = None,
     ):
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
@@ -289,6 +290,7 @@ class Launcher:
         self.core_configs: list[CoreConfig | None] = [None] * num_sms
 
         self.tmas = []
+        self.metadata = metadata
 
         self.need_instruction_build = True
 
@@ -853,6 +855,18 @@ class Launcher:
             tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
         else:
             tma = torch.stack(self.tmas).to(self.device)
+
+        if self.metadata is None:
+            metadata_ptrs = torch.zeros(
+                (1, 8), dtype=torch.uint8, device=self.device
+            )
+        else:
+            metadata_ptrs = torch.tensor(
+                [self.metadata.data_ptr()],
+                dtype=torch.uint64,
+                device=self.device,
+            ).view(torch.uint8).reshape(1, 8)
+
         profile = self.profile.view(torch.uint8).view(
             self.num_sms * config.num_profile_events, 8
         )
@@ -866,6 +880,7 @@ class Launcher:
             "poolinsts": poolinsts,
             "tma": tma,
             "profile": profile,
+            "metadata_ptrs": metadata_ptrs,
         }
         return self._launch_packet
 
@@ -893,6 +908,7 @@ class Launcher:
         comminsts = packet["comminsts"]
         poolinsts = packet["poolinsts"]
         tma = packet["tma"]
+        metadata_ptrs = packet["metadata_ptrs"]
         profile = packet["profile"]
 
         unbound_bar_ids = [
@@ -935,7 +951,7 @@ class Launcher:
         ret = runtime.launch_dae(
             self.num_sms, self.smem_size,
             cinsts, minsts, comminsts, poolinsts, tma,
-            self.bars, profile,
+            metadata_ptrs, self.bars, profile,
             stream, self.signal_array, core_config_tensor, int(kernel_variant),
             pool_inst_opcode,
         )

@@ -28,7 +28,8 @@ cudaError_t launch_dae_runtime_communication(
     uint64_t* signal_array,
     uint64_t* profile,
     const DaeCoreConfig* core_configs,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* const* metadata_ptrs) {
   dae2<NoPoolInstExecuteWarp, 2, 1, true, true>
       <<<num_sms,
          daeRuntimeCommunicationCoreWarps * numThreadsPerWarp,
@@ -42,7 +43,8 @@ cudaError_t launch_dae_runtime_communication(
           bars,
           signal_array,
           profile,
-          core_configs);
+          core_configs,
+          metadata_ptrs);
   return cudaGetLastError();
 }
 }
@@ -181,7 +183,8 @@ static cudaError_t launch_runtime_pool_inst(
     uint64_t* signal_array,
     uint64_t* profile,
     const DaeCoreConfig* core_configs,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* const* metadata_ptrs) {
   dae2<PoolInstExecuteWarp, 2, 0, true, true>
       <<<num_sms,
          (daeDefaultCoreWarps > PoolInstExecuteWarp::num_warps
@@ -197,7 +200,8 @@ static cudaError_t launch_runtime_pool_inst(
           bars,
           signal_array,
           profile,
-          core_configs);
+          core_configs,
+          metadata_ptrs);
   return cudaGetLastError();
 }
 
@@ -213,7 +217,8 @@ static cudaError_t launch_fixed_pool_inst(
     uint64_t* signal_array,
     uint64_t* profile,
     const DaeCoreConfig* core_configs,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* const* metadata_ptrs) {
   dae2<PoolInstExecuteWarp, 0, 0, false, false>
       <<<num_sms,
          PoolInstExecuteWarp::num_warps * numThreadsPerWarp,
@@ -227,7 +232,8 @@ static cudaError_t launch_fixed_pool_inst(
           bars,
           signal_array,
           profile,
-          core_configs);
+          core_configs,
+          metadata_ptrs);
   return cudaGetLastError();
 }
 
@@ -245,7 +251,8 @@ static cudaError_t launch_selected_pool_inst(
     uint64_t* signal_array,
     uint64_t* profile,
     const DaeCoreConfig* core_configs,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* const* metadata_ptrs) {
   switch (pool_inst_opcode) {
     #define DAE_POOL_OP(name, value, execute_warp_type) \
       case name: \
@@ -253,12 +260,13 @@ static cudaError_t launch_selected_pool_inst(
             ? launch_fixed_pool_inst<execute_warp_type>( \
                   num_sms, compute_instructions, memory_instructions, \
                   communication_instructions, pool_instructions, tma_descs, \
-                  bars, signal_array, profile, core_configs, stream) \
+                  bars, signal_array, profile, core_configs, stream, \
+                  metadata_ptrs) \
             : launch_runtime_pool_inst<execute_warp_type>( \
                   num_sms, smem_size, compute_instructions, \
                   memory_instructions, communication_instructions, \
                   pool_instructions, tma_descs, bars, signal_array, profile, \
-                  core_configs, stream);
+                  core_configs, stream, metadata_ptrs);
     #include "dae/pool_opcode.cuh.inc"
     #undef DAE_POOL_OP
     default:
@@ -281,7 +289,8 @@ cudaError_t launch_dae(
   int64_t stream,
   const DaeCoreConfig* core_configs,
   DaeKernelVariant kernel_variant,
-  uint16_t pool_inst_opcode
+  uint16_t pool_inst_opcode,
+  const void* const* metadata_ptrs
 ) {
   // wait for all pre-launch meta-data copying
   cudaDeviceSynchronize();
@@ -309,7 +318,8 @@ cudaError_t launch_dae(
               bars,
               signal_array,
               profile,
-              core_configs);
+              core_configs,
+              metadata_ptrs);
       break;
 
     case DAE_KERNEL_COMPUTE_MEMORY_ONE_LOAD:
@@ -328,7 +338,8 @@ cudaError_t launch_dae(
               bars,
               signal_array,
               profile,
-              core_configs);
+              core_configs,
+              metadata_ptrs);
       break;
 
     case DAE_KERNEL_RUNTIME:
@@ -346,7 +357,8 @@ cudaError_t launch_dae(
                 bars,
                 signal_array,
                 profile,
-                core_configs);
+                core_configs,
+                metadata_ptrs);
       } else {
 #if defined(DAE_ENABLE_NVSHMEM) || defined(DAE_ENABLE_NCCL_GIN)
         const cudaError_t launch_status = launch_selected_pool_inst(
@@ -363,7 +375,8 @@ cudaError_t launch_dae(
             signal_array,
             profile,
             core_configs,
-            cuda_stream);
+            cuda_stream,
+            metadata_ptrs);
         if (launch_status != cudaSuccess)
           return launch_status;
 #else
@@ -389,7 +402,8 @@ cudaError_t launch_dae(
           signal_array,
           profile,
           core_configs,
-          cuda_stream);
+          cuda_stream,
+          metadata_ptrs);
       if (launch_status != cudaSuccess)
         return launch_status;
       break;
@@ -415,7 +429,8 @@ cudaError_t launch_dae(
           signal_array,
           profile,
           core_configs,
-          cuda_stream);
+          cuda_stream,
+          metadata_ptrs);
       if (launch_status != cudaSuccess)
         return launch_status;
       break;
