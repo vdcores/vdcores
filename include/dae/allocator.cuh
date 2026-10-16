@@ -6,34 +6,35 @@ template <unsigned numSlots>
 struct SharedMemoryAllocator {
   static_assert(numSlots <= 32, "MAX_SLOTS must be less than or equal to 32");
 
+  // Every allocator lane mirrors this register bitmap. Compute/store returns
+  // accumulate separately in the shared slot_avail mailbox.
+  uint32_t available = 0;
+
   __device__ __forceinline__ int allocate(int lane_id, int *slot_avail, uint16_t req, int &alloc) {
     // special handling for special allocations
     if (req >= numSlots) {
-      // TODO (zijian): rawaddress uses this path but alloc is not set
       alloc = req;
       return req;
     }
 
-    // find available slots, should have no flag set (ALLOCATE/WRITEBACK)
-    // All threads participate in ballot, then mask to only consider first numSlots
-    // see dae2.cuh, the slots are inited to 1 for non-allocating lanes, so no need to mask here
-    uint32_t availbility = *(volatile uint32_t *)slot_avail;
+    // Search cached free spans first. Only the allocator removes mailbox bits;
+    // exchanging with zero preserves concurrent atomic OR returns.
     uint32_t mask = ((1U << req) - 1) << lane_id;
-    // TODO(zhiyuang): check this mod. can we NOT mask availability here?
-    uint32_t candidate = __ballot_sync(ALL_THREADS, (availbility & mask) == mask);
-    // ActiveMask ensures bits >= numSlots are 0, so no out-of-bounds allocation
+    uint32_t candidate = __ballot_sync(ALL_THREADS, (available & mask) == mask);
+    if (!candidate) {
+      uint32_t released = 0;
+      if (lane_id == 0) released = atomicExch(slot_avail, 0);
+      available |= __shfl_sync(ALL_THREADS, released, 0);
+      candidate = __ballot_sync(ALL_THREADS, (available & mask) == mask);
+    }
+    // Only normal-slot bits enter the free bitmap.
     int slot = __ffs(candidate) - 1;
     if (candidate) {
-      if (lane_id == slot) {
-        atomicAnd(slot_avail, ~mask); // mark these slots as occupied.
-      }
       alloc = __shfl_sync(ALL_THREADS, mask, slot);
+      available &= ~alloc;
     }
-
-
-    // set the stall flag inside the allocator
-    __mprint("[Alloc] request %d slots: avail=0x%08x mask=0x%x slot=%d, alloc=0x%x avail_after=0x%08x",
-            (int)req, availbility, mask, slot, alloc, *(volatile uint32_t *)slot_avail);
+    __mprint("[Alloc] request %d slots: cached=0x%08x mask=0x%x slot=%d alloc=0x%x returned=0x%08x",
+            (int)req, available, mask, slot, alloc, *(volatile uint32_t *)slot_avail);
     return slot;
   }
 };

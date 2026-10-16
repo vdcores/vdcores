@@ -67,10 +67,10 @@ void dae2(
   __shared__ MInst st_insts[numSlots + numSpecialSlots]; // we can have some special slots that don't go through the allocator, for special purposes like reduction output, argmax output, etc. these are indexed from numSlots and above.
 
   // allocator
-  // TODO(zhiyuang): align this to lane 31 to avoid bank conflict?
+  // Seed the release mailbox; the allocator drains it into a private bitmap.
   __shared__ int slot_avail;
   if (thread_id == 0)
-    slot_avail = (1U << numSlots) - 1; // all slots are available at the beginning. each bit represents a slot. 1 means available, 0 means occupied.
+    slot_avail = (1U << numSlots) - 1;
 
   // Init the queues
   #pragma nv_diag_suppress static_var_with_dynamic_init
@@ -147,14 +147,14 @@ void dae2(
     // TODO(zhiyuang): reduce the register usage in memory warps
     // cuda::ptx::set_max_nreg();
 
-    // TODO(zhiyuang): change this to threadIdx.x predicates. will be faster than lane_id based?
-    if (warp_id == 0) {
+    // Memory warps: store, allocator, load port 0, load port 1.
+    if (warp_id == 1) {
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
         st_insts, smem_base, tma_descs, bars
       );
-    } else if (warp_id == 1) {
+    } else if (warp_id == 0) {
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
@@ -163,9 +163,9 @@ void dae2(
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
       if (lane_id == 0) {
-        int port_id = warp_id - 2;
+        auto load_queue = warp_id == 2 ? m2ld[0] : m2ld[1];
         ldwarp_execute_singlethread(
-          m2ld[port_id], m2c,
+          load_queue, m2c,
           st_insts,
           smem_base, tma_descs, bars
         );

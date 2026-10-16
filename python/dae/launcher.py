@@ -234,6 +234,8 @@ class Launcher:
         self.num_bars = 0
         self.bar_values = {}
         self._late_barriers_bound = False
+        self._bar_source_values = None
+        self._bar_source_cpu = None
 
         self.bars = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
         self.bars_src = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
@@ -491,12 +493,19 @@ class Launcher:
         stream = torch.cuda.current_stream().cuda_stream
         # TODO(zhiyuang): check this?
 
-        # init the bars based on dict
-        bar_int_view = self.bars.view(torch.uint32)
-        bar_src_int_view = self.bars_src.view(torch.uint32)
-        for bar_id, value in self.bar_values.items():
-            bar_int_view[bar_id] = value
-            bar_src_int_view[bar_id] = value
+        # Materialize counts on the CPU only when they change. Refresh both
+        # GPU banks on every launch, preserving the original reset behavior
+        # without one CUDA assignment per counter.
+        bar_values = tuple(self.bar_values.items())
+        if bar_values != self._bar_source_values:
+            bar_source = self.bars_src.cpu()
+            bar_source_int = bar_source.view(torch.uint32)
+            for bar_id, value in bar_values:
+                bar_source_int[bar_id] = value
+            self._bar_source_cpu = bar_source
+            self._bar_source_values = bar_values
+        self.bars_src.copy_(self._bar_source_cpu)
+        self.bars.copy_(self.bars_src)
 
         # print("bars before launch:", self.bar_values)
 

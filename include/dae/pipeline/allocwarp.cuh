@@ -52,7 +52,6 @@ __device__ __forceinline__ void allocwarp_execute(
     // end of async zone
 
     di.inst_decode(inst);
-    auto &curld = m2ld[di.port];
 
     // ID.A: modification to the instruction
     // A1. shift the address field
@@ -73,6 +72,15 @@ __device__ __forceinline__ void allocwarp_execute(
         shift, inst.bar(), inst.arg, inst.nslot());
       // __smprint(0, lane_id, "[Group] Updated: shift %x: bar=%d arg=%d nslot=%d bar=%d",
       //   shift, inst.bar(), inst.arg, inst.nslot(), inst.opcode & MEM_OP_FLAGS_BARRIER);
+    }
+
+    // Warm the resolved tensor map before waiting for a free slot.
+    if (lane_id == 0) {
+      const auto kind = op(inst.opcode);
+      if ((kind >= op(OP_ALLOC_TMA_LOAD_TENSOR_1D) && kind <= op(OP_ALLOC_TMA_LOAD_5D_FIX0)) ||
+          (kind >= op(OP_ALLOC_WB_TMA_STORE_2D) && kind <= op(OP_ALLOC_WB_TMA_REDUCE_ADD_3D))) {
+        asm volatile("prefetch.tensormap [%0];" : : "l"(tma_descs + inst.arg) : "memory");
+      }
     }
 
     // TODO(zhiyuang): let the allocator decide whether to stall
@@ -109,13 +117,12 @@ __device__ __forceinline__ void allocwarp_execute(
         LdCmd ld;
         ld.init(di.slot_alloc, m2c.ptr, inst.opcode);
 
-        curld.put(ld.raw);
-        // TODO(zhiyuang): change the return value of allocate
-
-        // TODO(zhiyuang): double push could be optimize? maybe put the barrier to the last
         m2c.advance();
-        curld.commit();
-        curld.advance();
+        // Constant indices keep each port's queue state in registers.
+        if (di.port)
+          m2ld[1].push(ld.raw);
+        else
+          m2ld[0].push(ld.raw);
       }
 
       // have to keep this branch
