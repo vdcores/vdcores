@@ -163,9 +163,9 @@ void dae2(
       }
     } else if (warp_id >= 2) { // LD Warps 0-1
       if (lane_id == 0) {
-        int port_id = warp_id - 2;
+        auto load_queue = warp_id == 2 ? m2ld[0] : m2ld[1];
         ldwarp_execute_singlethread(
-          m2ld[port_id], m2c,
+          load_queue, m2c,
           st_insts,
           smem_base, tma_descs, bars
         );

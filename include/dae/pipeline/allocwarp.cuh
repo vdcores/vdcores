@@ -52,7 +52,6 @@ __device__ __forceinline__ void allocwarp_execute(
     // end of async zone
 
     di.inst_decode(inst);
-    auto &curld = m2ld[di.port];
 
     // ID.A: modification to the instruction
     // A1. shift the address field
@@ -109,13 +108,12 @@ __device__ __forceinline__ void allocwarp_execute(
         LdCmd ld;
         ld.init(di.slot_alloc, m2c.ptr, inst.opcode);
 
-        curld.put(ld.raw);
-        // TODO(zhiyuang): change the return value of allocate
-
-        // TODO(zhiyuang): double push could be optimize? maybe put the barrier to the last
         m2c.advance();
-        curld.commit();
-        curld.advance();
+        // Constant indices keep each port's queue state in registers.
+        if (di.port)
+          m2ld[1].push(ld.raw);
+        else
+          m2ld[0].push(ld.raw);
       }
 
       // have to keep this branch
