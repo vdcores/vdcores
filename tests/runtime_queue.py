@@ -36,6 +36,33 @@ def check_copy(sms, copies, port, retained, tile_bytes=8192):
         assert launcher.bars.view(torch.uint32)[completion].item() == 0
 
 
+def check_barrier_updates():
+    launcher = Launcher(1)
+    marker = launcher.new_bar(3)
+    launcher.s()
+    for value in (3, 3, 5):
+        launcher.set_bar(marker, value)
+        launcher.launch()
+        assert launcher.bars.view(torch.uint32)[marker].item() == value
+        assert launcher.bars_src.view(torch.uint32)[marker].item() == value
+        launcher.bars.view(torch.uint32)[marker] = 0
+        launcher.bars_src.view(torch.uint32)[marker] = 0
+    # Public count updates and new barriers must invalidate the reset image.
+    launcher.bar_values[marker] = 7
+    added = launcher.new_bar(11)
+    launcher.launch()
+    counts = launcher.bars.view(torch.uint32).cpu()
+    assert counts[marker].item() == 7 and counts[added].item() == 11
+    launcher.new_bar(None)
+    try:
+        launcher.launch()
+    except ValueError as error:
+        assert "unbound barrier" in str(error)
+    else:
+        raise AssertionError("Unbound barrier must be rejected before launch")
+    print("PASS: repeated barrier reset, count updates and unbound validation", flush=True)
+
+
 def check_dependency_chain(sms):
     """A store must publish its dependency before waiting for the next token."""
     tile_bytes = 8192
@@ -78,3 +105,4 @@ if __name__ == "__main__":
                 check_copy(sms, 33, port, False, tile_bytes=slots * 8192)
         print(f"PASS: {sms} SMs, contiguous allocations of 2, 3, 4, 5 and 7 slots", flush=True)
         check_dependency_chain(sms)
+    check_barrier_updates()
