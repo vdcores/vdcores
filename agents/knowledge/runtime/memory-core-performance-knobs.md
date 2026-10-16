@@ -150,6 +150,39 @@ These notes summarize the memory-core runtime path that matters for end-to-end d
   - avoiding a broader switch is not automatically a win; on this kernel, the extra source-level fast-path branches were at least as expensive as the compiler’s existing lowering
   - a rewrite is only worth keeping here if it produces a clearly repeatable multi-run improvement, not just a tiny change within benchmark noise
 
+## Allocator Pre-read Experiment (2026-10-16)
+
+Compared early release-mailbox reads outside `allocate()` against
+`hopper-runtime-minimal` `c2636ed`. Lane zero pre-reads with
+`ld.relaxed.cta.shared.u32`; later, a no-result atomic AND clears only the
+observed bits before merging them into the private free bitmap. This requires
+one allocator, consuming each snapshot once, clearing before publishing reused
+slots, and refreshing on allocation retries. Concurrent returns outside the
+observed mask remain pending. See the [PTX memory model](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model).
+
+H100 80GB / 132 SMs, batch eight, single token, fixed 14-op clean builds.
+Each variant has sequential control/candidate/control runs through `na run`,
+501 measured launches plus five warmups per fresh process. Controls below
+average the two run medians; 1B is timing-only.
+
+| Pre-read variant | 8B control -> trial (ms) | 1B control -> trial (ms) |
+|---|---:|---:|
+| Before decode | 5.318976 -> 5.336864 | 0.995312 -> 1.006176 |
+| Before decode, direct AND | 5.319200 -> 5.329408 | 0.996352 -> 0.998304 |
+| Previous iteration, direct AND | 5.318496 -> 5.329056 | 1.001248 -> 1.001568 |
+| Previous iteration, single search | 5.318784 -> 5.334464 | 1.001184 -> 1.001408 |
+
+All variants passed exact queue/GEMV and fresh 8B reference checks, but none
+met the additional >0.05 ms 8B gain gate; the runtime changes were reverted.
+Existing intermittent repeated-launch 8B token deviations also occur in controls.
+SASS confirmed early loads and `ATOMS.AND RZ`. CUDA 13.0 ptxas initially added
+redundant warp aggregation around the single-lane AND; a lane-varying integer
+address with an inline lane-zero predicate removed it. Inactive lanes never
+access memory. All builds retained 174 registers, a 32-byte stack and no spills.
+Moving the read earlier and removing atomic-result dependence alone did not
+improve end-to-end latency. Patches, binaries, SASS, raw samples and restoration
+checks: `.agentlog/2026-10-16-allocator-preread/`.
+
 ## Benchmark Convention
 
 - For a single-token Llama3 end-to-end decode baseline, use:
