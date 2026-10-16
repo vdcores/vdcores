@@ -147,14 +147,14 @@ void dae2(
     // TODO(zhiyuang): reduce the register usage in memory warps
     // cuda::ptx::set_max_nreg();
 
-    // TODO(zhiyuang): change this to threadIdx.x predicates. will be faster than lane_id based?
-    if (warp_id == 0) {
+    // Memory warps: store, allocator, load port 0, load port 1.
+    if (warp_id == 1) {
       allocwarp_execute(
         lane_id,
         m2c, m2ld, minsts, &slot_avail,
         st_insts, smem_base, tma_descs, bars
       );
-    } else if (warp_id == 1) {
+    } else if (warp_id == 0) {
       if (lane_id == 0) {
         stwarp_execute_singlethread(
           c2m, st_insts,
