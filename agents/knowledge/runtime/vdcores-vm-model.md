@@ -37,8 +37,8 @@ Each SM/block owns:
   - the allocated-memory instruction table
   - entry `st_insts[slot]` is the metadata for that live slot
 - `slot_avail`
-  - a shared `uint32` bitmap
-  - bit `1` means the corresponding normal slot is free
+  - a shared `uint32` release mailbox, initially containing every normal slot
+  - the allocator drains it into a private free bitmap; zero need not mean full
 - Dynamic shared memory, aligned to `1 KiB`
   - normal slot `s` starts at `smem_base + s * 8 KiB`
 - `scratch_space[32]`
@@ -82,16 +82,16 @@ Practical convention:
 
 The memory side is split into four warp roles:
 
-- alloc warp:
+- alloc warp (physical warp 5):
   - interprets `MInst`
   - allocates slots
   - writes `st_insts`
   - routes work to load ports
-- store warp:
+- store warp (physical warp 4, lane 0):
   - consumes writeback requests from compute
   - performs TMA/global stores
   - frees slots after completion
-- two load warps:
+- two load warps (physical warps 6 and 7, lane 0):
   - one per async load port
   - execute TMA/global-load side effects
   - publish ready tokens to compute
@@ -148,6 +148,8 @@ The live protocol centers on three queues.
   - packed `LdCmd { slot, bar, opcode }`
 - Meaning:
   - issue the load-side behavior for `st_insts[slot]` on port `0` or `1`
+- Constant port indices keep producer queue pointers/cursors in registers;
+  dynamically indexing the local queue array caused stack traffic on Hopper.
 
 ### `c2m`
 
@@ -189,13 +191,17 @@ Compiled-mode note:
 The active allocator is [SharedMemoryAllocator](/home1/11362/depctg/vdcores/include/dae/allocator.cuh):
 
 - storage:
-  - `slot_avail` in shared memory
+  - a private free bitmap mirrored across allocator lanes
+  - `slot_avail` in shared memory accumulates atomic OR returns
 - policy:
   - contiguous allocation only
   - first lead lane whose `req`-bit mask fits wins
 - effect:
-  - winning lead lane clears those bits with `atomicAnd`
+  - if no cached span fits, lane zero drains `slot_avail` with `atomicExch(0)`
+    and broadcasts the returned bits; reservations clear only the private bitmap
   - the alloc warp stores the full `MInst` into `st_insts[lead_slot]`
+  - descriptor-backed ops prefetch their resolved tensor map after `GROUP`
+    rewriting and before allocation can stall
 
 Normal-slot lifetime:
 
@@ -371,6 +377,8 @@ There are two barrier classes in play.
 
 Used internally by `m2c`, `c2m`, and `m2ld`.
 
+- Every consumer arrives, then acquire-polls its exact arrival token with
+  `mbarrier.try_wait`; participant counts and phase advancement are preserved.
 - `m2c` and `c2m` barriers include the full 128-thread compute group plus one memory-side producer/consumer thread
 - each `m2ld` barrier includes:
   - alloc warp lane `0`

@@ -74,6 +74,15 @@ __device__ __forceinline__ void allocwarp_execute(
       //   shift, inst.bar(), inst.arg, inst.nslot(), inst.opcode & MEM_OP_FLAGS_BARRIER);
     }
 
+    // Warm the resolved tensor map before waiting for a free slot.
+    if (lane_id == 0) {
+      const auto kind = op(inst.opcode);
+      if ((kind >= op(OP_ALLOC_TMA_LOAD_TENSOR_1D) && kind <= op(OP_ALLOC_TMA_LOAD_5D_FIX0)) ||
+          (kind >= op(OP_ALLOC_WB_TMA_STORE_2D) && kind <= op(OP_ALLOC_WB_TMA_REDUCE_ADD_3D))) {
+        asm volatile("prefetch.tensormap [%0];" : : "l"(tma_descs + inst.arg) : "memory");
+      }
+    }
+
     // TODO(zhiyuang): let the allocator decide whether to stall
     // ID.C: resource allocation
     // we also commit in the alloc

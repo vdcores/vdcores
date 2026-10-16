@@ -10,6 +10,9 @@ Start here for the VDCores runtime and VM model.
 
 Then pull in narrower notes as needed:
 
+- [hopper-runtime-minimal.md](hopper-runtime-minimal.md): accepted runtime changes,
+  per-commit Llama 8B/1B comparisons and final validation against main
+
 - [memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
 - [gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
 
