@@ -22,12 +22,16 @@ struct SizeBoundedBarrierQueue {
   }
 
   __device__ __forceinline__ void wait() {
-    barriers[ptr].arrive_and_wait();
+    // Keep every participant arrival and acquire the completed phase.
+    const auto token = barriers[ptr].arrive();
+    while (!cuda::ptx::mbarrier_try_wait(
+        cuda::ptx::sem_acquire, cuda::ptx::scope_cta, native_bar(ptr), token)) {
+    }
   }
 
   template<int PH = 0>
   __device__ __forceinline__ T pop() {
-    barriers[ptr].arrive_and_wait();
+    wait();
     T val = data[ptr];
     ptr = (ptr + 1) % QSIZE;
     return val;
