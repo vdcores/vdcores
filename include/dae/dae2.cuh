@@ -67,10 +67,10 @@ void dae2(
   __shared__ MInst st_insts[numSlots + numSpecialSlots]; // we can have some special slots that don't go through the allocator, for special purposes like reduction output, argmax output, etc. these are indexed from numSlots and above.
 
   // allocator
-  // TODO(zhiyuang): align this to lane 31 to avoid bank conflict?
+  // Seed the release mailbox; the allocator drains it into a private bitmap.
   __shared__ int slot_avail;
   if (thread_id == 0)
-    slot_avail = (1U << numSlots) - 1; // all slots are available at the beginning. each bit represents a slot. 1 means available, 0 means occupied.
+    slot_avail = (1U << numSlots) - 1;
 
   // Init the queues
   #pragma nv_diag_suppress static_var_with_dynamic_init
