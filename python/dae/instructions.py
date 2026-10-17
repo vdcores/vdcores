@@ -13,6 +13,7 @@ from .instruction_utils import (
 )
 from .op_families import ComputeOpFamilyRef, family_ref
 from .runtime import config, opcode
+from .paged import PagedCacheConfig
 from .tma_utils import (
     Major,
     addr2cords,
@@ -881,7 +882,7 @@ class TmaLoad1D(MemoryInstruction):
     def cord(self, addr):
         new_inst = copy.copy(self)
         new_inst.delta(addr)
-        return new_inst
+        return new_inst 
 
 
 class TmaStore1D(MemoryInstruction):
@@ -903,7 +904,33 @@ class TmaStore1D(MemoryInstruction):
         new_inst = copy.copy(self)
         new_inst.delta(addr)
         return new_inst
+    
+# Loads one token from global memory into shared memory
+class PagedLoad1D(MemoryInstruction):
+    def __init__(self, token_id: int, session_id: int, cache: PagedCacheConfig):
+        slots = bytes2slots(cache.bytes_per_token())
+        super().__init__(
+            opcode=opcode.OP_PAGED_LOAD_1D,
+            num_slots=slots,
+            arg=session_id,
+            size=token_id,
+            address=cache.descriptor.data_ptr(),
+        )
+        self.annotation["paged_cache"] = cache
 
+class PagedStore1D(MemoryInstruction):
+    def __init__(self, token_id: int, session_id: int, token: torch, cache: PagedCacheConfig):
+        assert token.numel() * token.element_size() == cache.bytes_per_token() 
+        slots = bytes2slots(cache.bytes_per_token())
+        
+        # Where to put token address for copy?? 
+        super().__init__(
+            opcode=opcode.OP_PAGED_STORE_1D,
+            num_slots=slots,
+            arg=session_id,
+            size=token_id,
+            address=cache.descriptor.data_ptr()
+        )
 
 class TmaTensor(MemoryInstruction):
     def __init__(self, launcher, mat: torch.Tensor):
@@ -1028,6 +1055,7 @@ __all__ = [
     "Copy",
     "LoopC",
     "MemoryInstruction",
+    "PagedLoad1D",
     "TerminateM",
     "LoopM",
     "CounterOffsetMemoryInstruction",
