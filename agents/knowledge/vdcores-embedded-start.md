@@ -150,3 +150,69 @@ explicitly enabled.
 These pieces are verified offline with synthetic values in tests only. No
 synthetic crossover or placement result belongs under `results/` or should be
 reported as a hardware finding.
+
+## Native fixed feedback loop (2026-10-18)
+
+`src/embedded_loop.cpp` adds a standalone C++17 worker pool, with ctypes ownership
+in `python/dae/embedded.py`. Its typed fixed graph repeats native preprocessing,
+an external mean-square reduction, and native control; the previous action is
+part of the next synthetic sensor input. Per-lane slots and lane/frame completion
+tokens serialize feedback and permit independent loops to overlap. Native stage
+queues and a mutex/condition-variable completion protocol drive CPU stages.
+This is an intentionally fixed-graph prototype, not general MInst/CInst lowering.
+
+`python/dae/embedded_backends.py` provides real CPU-reference execution and a
+Torch CUDA adapter with pinned H2D/D2H transfers, per-lane streams, and completion
+events. Python owns external submission/query, but does not traverse the graph.
+After a recorded D2H event completes, its result releases native control. The
+blocking-service comparison uses the same operations and buffers and waits on
+each event instead of servicing several outstanding lanes.
+
+The CUDA path targets discrete A10/A100 as well as newer CUDA devices and does
+not import the Hopper extension or use host/GPU atomics. Native workers stop
+before owners can release memory; stream work drains on completion or failure.
+Cancellation is terminal. A CUDA run timeout bounds service progress, not a
+potentially hung driver call or GPU operation.
+
+Build with `python tools/build_embedded.py`; no CUDA toolkit is needed for the
+native library. Use `tests/script/run_embedded_loop.py` and
+`tools/run_embedded_sweep.py` following
+`agents/workflows/embedded-loop-experiments.md`. The focused suite passes 38
+tests locally and skips two CUDA integration cases. Native ASan/UBSan and TSan
+stress runs also passed. Local Apple M4 Pro CPU-only results preserve 3,300
+correct feedback frames under `results/embedded_loop/`; no GPU result is implied.
+
+At the initial local milestone, GPU validation and placement integration were
+pending. The following A100 milestone completes those two fixed-loop gates.
+
+## A100 execution and placement follow-on (2026-10-18)
+
+The supplied Lambda instance is A100-SXM4-80GB (108 SMs), AMD EPYC 7J13 host,
+Torch 2.7.0/CUDA 12.8, driver 580.105.08. All 48 focused tests pass there,
+including real event/blocking execution and a real-calibration adaptive test.
+Two of these cases also validate captured CUDA Graph replay with changing
+feedback inputs and both completion-service modes.
+Native ASan/UBSan stress also passes remotely; TSan passes on the local Mac.
+
+Native ABI version 3 adds persistent-worker feature dispatch and a consistent
+snapshot of queued/running preprocessing, feature, and controller counts.
+`AdaptiveBackend` combines these counts with measured cost and pending GPU
+requests, then releases either a native feature task or a CUDA event request.
+Calibration is isolated from the earlier coherent attention benchmark and
+validates hardware/workload/source identity. `--backend compare` executes both
+fixed devices and adaptive in alternating method order. General policy log-size
+interpolation is preserved, with an optional linear model for byte-scaled work.
+
+Recorded data includes an initial 12-configuration shared-loop/polling sweep,
+exploratory and refined placement trials, order-alternated held-out comparisons,
+and longer tail validation. Source/library hashes distinguish intermediate
+implementations. Preserve regressions: the first interpolation model selected
+GPU too early, and current adaptive dispatch still adds overhead and can lose
+to fixed GPU placement near the crossover. Generated plots and a complete
+summary table are under `results/embedded_loop/figures/`.
+
+The former GPU-validation and placement-integration gates are now complete for
+this fixed event-transport workload. Still open: native GPU submission/selection
+without Python, arbitrary graph lowering, coherent/Hopper VM integration, and
+a real embedded sensor/model/controller workload. CUDA-stream sharing of fixed
+loops is not yet sharing arbitrary GPU VCore instruction graphs.

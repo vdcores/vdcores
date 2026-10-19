@@ -17,6 +17,89 @@ Decoupling brings three key benefits:
 Learn more about VDCores in our [paper](https://arxiv.org/abs/2605.03190) and
 [blog post](https://mlsys.wuklab.io/posts/vdcores/).
 
+## VDCores-Embedded Branch Roadmap
+
+This section tracks the experimental work on the `anant/cpu-gpu-handoff` branch as of October 18, 2026. The goal is to extend VDCores from GPU-only virtual cores into a dependency-driven CPU–GPU runtime: work becomes eligible when its inputs are ready, and CPU/GPU-capable operations can be placed late using measured cost and current resource availability.
+
+Checklist convention: checked items are complete within the scope stated. Unchecked items still need work. Coherent-attention experiments specifically require compatible GH200 hardware; the separate CUDA-event loop has now been tested on A100.
+
+### Completed
+
+- [x] Build a coherent CPU/GPU counter backed by a CPU-resident PyTorch tensor.
+- [x] Use `std::atomic_ref` on the CPU and system-scope CUDA atomics on the GPU through a PyBind bridge.
+- [x] Validate CPU-to-GPU, GPU-to-CPU, and round-trip signaling on GH200 hardware.
+- [x] Integrate the signal into a real VDCores chain: split-attention completion → CPU dot product → CPU acknowledgement → GPU dot product → final completion.
+- [x] Compare the integrated chain with a host-blocking baseline and save reproducible [results](results/cpu_gpu_handoff/2026-09-22-attention-chain.md). The handoff path reduced median latency from 3.389 ms to 2.847 ms in the recorded 1,000-iteration run, while preserving the benchmark's correctness checks.
+- [x] Add unit coverage for placement, dependency scheduling, adaptive planning, and the embedded loop. All 48 focused tests pass on A100; local CPU-only runs pass 43 and skip the five real-CUDA cases.
+
+### Implemented, but not finished
+
+- [x] Add a measured CPU/GPU [placement policy](python/dae/placement.py) that considers work size, estimated execution time, queue delay, deadlines, and a switch margin.
+- [x] Add a backend-independent [reference scheduler](python/dae/heterogeneous.py) for dependency validation, ready/running/complete states, and fixed or flexible placement.
+- [x] Add a same-operation CPU-versus-GPU [crossover benchmark](tests/script/check_attention_placement.py).
+- [x] Add a calibration-driven [adaptive attention runner](tests/script/run_adaptive_attention_handoff.py) with an offline planning mode.
+- [ ] **Hardware run pending:** measure the crossover curve on GH200/GB200-class coherent hardware and commit the raw JSON plus a readable summary.
+- [ ] **Hardware run pending:** execute the adaptive chain at small, near-crossover, and large work sizes; verify correctness and compare its choice with both static CPU and static GPU placement.
+- [ ] **Hardware run pending:** repeat the placement experiment under controlled CPU and GPU queue pressure and report median and tail latency.
+
+The general scheduler is a Python reference/control model. The new native loop below advances a fixed graph directly, while arbitrary graph lowering remains unfinished.
+
+### Embedded feedback loop: first executable prototype
+
+- [x] Add persistent C++ CPU workers for a repeating sensor/preprocess → external feature reduction → controller → next-frame feedback graph.
+- [x] Bound buffer use to one slot per independent loop and validate frame-tagged completion tokens before releasing dependent CPU work.
+- [x] Add real CPU-reference execution and an independent numerical oracle for every frame's feature and feedback action.
+- [x] Add cancellation, failure propagation, ownership checks, and standalone sanitizer stress tests.
+- [x] Add and hardware-test an ordinary Torch CUDA adapter using pinned transfers, streams, and completion events, plus a matched blocking-service baseline, on A100-SXM4-80GB without building the Hopper extension.
+- [x] Record [local CPU validation](results/embedded_loop/2026-10-18-local-validation.md): 3,300 correct feedback frames across one-loop and four-loop experiments, with raw per-frame records.
+- [x] Execute both CUDA adapter modes on A100 and collect size, shared-loop, polling, and longer tail-latency experiments.
+- [x] Execute CPU feature work on the persistent native worker pool and expose live queued/running counts for preprocessing, feature, and control work.
+- [x] Calibrate native CPU versus GPU event-transport cost on the same host, integrate the measured policy into the running loop, and test held-out sizes against both fixed-device baselines.
+- [x] Add linear cost interpolation for bandwidth-bound work after held-out tests exposed early GPU selection from the original log-size interpolation.
+- [x] Produce a reproducible [figure gallery](results/embedded_loop/figures/README.md) with raw samples, trial spread, stage breakdowns, and clearly separated historical GH200 results.
+- [x] Capture and hardware-test the fixed GPU stage with CUDA Graph replay to reduce repeated Python/driver submission work, retaining event-based buffer ownership.
+- [ ] Reduce adaptive-selection overhead and improve queue estimates near the crossover; current adaptive execution can regress against the best fixed placement.
+- [ ] Replace the synthetic reduction with a real embedded workload and integrate a compatible VDCores GPU launcher.
+
+Build and run the portable validation:
+
+```bash
+python tools/build_embedded.py
+python tests/script/run_embedded_loop.py --backend cpu --lanes 4 \
+  --output results/embedded_loop/local-check.json
+```
+
+See the [reviewed implementation plan](agents/workflows/embedded-loop-plan.md) and [experiment workflow](agents/workflows/embedded-loop-experiments.md) for CUDA runs and measurements. This fixed-graph prototype uses synthetic sensor data; it does not yet lower arbitrary operations into the original VDCores GPU VM or implement coherent GH200 handoffs inside the new loop.
+
+### Still to build
+
+- [ ] Define the native CPU micro-operation descriptor, capabilities, dependencies, buffers, and completion-token format.
+- [x] Add persistent native CPU workers for the fixed embedded-loop prototype.
+- [ ] Connect those workers to general VDCores operation descriptors and the original attention handoff graph.
+- [ ] Lower a heterogeneous graph into compact runtime metadata so Python is not in the steady-state execution path.
+- [ ] Generalize the shared-memory protocol beyond one counter, including buffer ownership, release/acquire ordering, error propagation, and timeouts.
+- [x] Define fixed-loop input-slot ownership, event completion publication, generation checks, error propagation, and terminal cancellation.
+- [x] Feed live native CPU-stage counts and outstanding GPU requests into placement for the fixed loop, with measured service-cost estimates.
+- [ ] Extend that telemetry and placement to arbitrary VDCores operation graphs.
+- [ ] Calibrate the CUDA Graph transport before combining graph replay with adaptive placement.
+- [x] Run independent fixed feedback loops on one A100 through CUDA streams and measure per-loop latency and aggregate throughput.
+- [ ] Run two or more independent graphs through a shared GPU VCore pool and evaluate contention, fairness, median latency, and tail latency.
+- [ ] Integrate a representative embedded/robotics pipeline and measure sensor-to-action latency on the selected target platform.
+- [ ] Add full integration tests, operator documentation, and a merge-ready design note for the upstream runtime.
+- [x] Add fixed-loop integration/failure tests, CPU CI, and a documented [native completion/ownership contract](agents/knowledge/runtime/embedded-loop-native.md).
+
+### Plan to finish
+
+1. **Calibrate placement.** Run the existing crossover benchmark in at least three independent trials per work size, preserve environment metadata and raw measurements, and identify stable CPU/GPU crossover regions rather than relying on a single threshold.
+2. **Validate adaptive execution.** Run static-CPU, static-GPU, and adaptive variants across the calibrated range and under controlled queue pressure. Completion means the outputs pass correctness checks and the report explains where adaptive placement helps, ties, or regresses.
+3. **Implement CPU Virtual Cores.** Agree on the native micro-operation and shared-buffer contract, add a persistent CPU worker pool, and execute the existing attention → CPU → GPU chain without Python or application-side synchronization in the steady-state path.
+4. **Replace centralized execution control.** Lower graph dependencies and placement metadata into the runtime, while keeping the Python scheduler as a reference oracle for tests.
+5. **Add multi-workload GPU sharing.** Run concurrent graphs through one GPU pool, collect queue telemetry, and compare static scheduling with dependency-ready and adaptive placement using median and p95 end-to-end latency.
+6. **Demonstrate the embedded use case.** Port one real sensor-to-action workload to the chosen coherent platform, document the baseline, and publish reproducible latency and resource-use results.
+7. **Harden and upstream.** Add failure-path tests, CI coverage, user documentation, and a design review before proposing a merge.
+
+Coherent signaling and one real heterogeneous chain have been measured, and the native fixed feedback loop now passes CPU and A100 validation, including measured adaptive placement. The next implementation priorities are removing Python submission/selection overhead, general graph lowering, and replacing the synthetic workload with a real embedded pipeline. Coherent placement calibration and integration with the original Hopper GPU VM require compatible hardware later.
+
 ## Llama 3.1-8B-Instruct Decoding Demo
 
 The repository includes a decoding demo for `meta-llama/Llama-3.1-8B` in [`app/python/llama3/sched.py`](app/python/llama3/sched.py).

@@ -2,6 +2,10 @@
 
 Start here for the VDCores runtime and VM model.
 
+For the separate native CPU/event-based feedback-loop prototype, see
+[embedded-loop-native.md](embedded-loop-native.md). It is not an extension of the
+Hopper instruction encoding yet.
+
 ## Recommended Load Order
 
 1. [vdcores-vm-model.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-vm-model.md)
