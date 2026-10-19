@@ -29,3 +29,6 @@ There is no automatic Torch fallback for a task marked `gpu_executor="vdcores"`.
 
 This graph layer is not MInst/CInst lowering, the coherent counter protocol,
 arbitrary GPU VCore-pool sharing, or proof of VDCores performance benefits.
+The user explicitly wants A100 work kept as reference/data collection, not a
+port or replacement of the original runtime. No existing core CUDA/kernel,
+launcher, instruction, or build-target file was changed for these experiments.

@@ -32,6 +32,10 @@ Checklist convention: checked items are complete within the scope stated. Unchec
 - [x] Compare the integrated chain with a host-blocking baseline and save reproducible [results](results/cpu_gpu_handoff/2026-09-22-attention-chain.md). The handoff path reduced median latency from 3.389 ms to 2.847 ms in the recorded 1,000-iteration run, while preserving the benchmark's correctness checks.
 - [x] Add unit coverage for placement, dependency scheduling, adaptive planning, and the embedded loop. All 48 focused tests pass on A100; local CPU-only runs pass 43 and skip the five real-CUDA cases.
 
+The expanded reference-graph/camera suite now passes 69 focused tests on A100;
+local runs pass 60 and skip nine real-CUDA cases. These tests do not establish
+that the original Hopper VM runs on A100.
+
 ### Implemented, but not finished
 
 - [x] Add a measured CPU/GPU [placement policy](python/dae/placement.py) that considers work size, estimated execution time, queue delay, deadlines, and a switch margin.
@@ -71,12 +75,40 @@ python tests/script/run_embedded_loop.py --backend cpu --lanes 4 \
 
 See the [reviewed implementation plan](agents/workflows/embedded-loop-plan.md) and [experiment workflow](agents/workflows/embedded-loop-experiments.md) for CUDA runs and measurements. This fixed-graph prototype uses synthetic sensor data; it does not yet lower arbitrary operations into the original VDCores GPU VM or implement coherent GH200 handoffs inside the new loop.
 
+### A100 reference studies — not a VDCores port
+
+The A100 is a reference/data-collection platform. **The original VDCores CUDA
+runtime, kernels, instruction encoding, launcher, and Hopper build target remain
+unchanged.** The added host-side experiments must not become a replacement
+runtime or be described as measured VDCores GPU-VM benefits. Python stays in the
+reference execution path intentionally; removing it is not the current priority.
+
+- [x] Add executable reference task graphs with declared inputs, dependencies,
+  CPU/GPU capabilities, branching/joining, and bounded feedback contexts.
+- [x] Add a separate original-Launcher adapter contract and fake-Launcher tests;
+  actual workload binding and Hopper hardware validation are still pending.
+- [x] Add a camera-to-control reference workload using classical lane/obstacle
+  processing, previous-command feedback, and an independent NumPy oracle.
+- [x] Support user-provided RGB NPZ recordings. Current experiments use generated
+  scenes, not validated real-world recordings, learned inference, or a robot.
+- [x] Add matched CPU-only, serial GPU, ready-task GPU, and adaptive comparisons,
+  with separate calibration/evaluation frames, trial ordering, CPU/GPU background
+  load, periodic-arrival backlog, per-loop tails, throughput, and CPU-use reporting.
+- [ ] Use the reference measurements to propose specific changes to actual
+  VDCores; validate any performance claim on the real runtime later.
+- [ ] Choose a representative application and evaluate recorded inputs/accuracy.
+- [ ] Add optimized GPU-resident/fused and camera-stage CUDA Graph baselines
+  before claiming an advantage over an optimized GPU implementation.
+
+See the [reviewed reference plan](agents/workflows/embedded-graph-plan.md) and
+[camera experiment workflow](agents/workflows/camera-control-experiments.md).
+
 ### Still to build
 
 - [ ] Define the native CPU micro-operation descriptor, capabilities, dependencies, buffers, and completion-token format.
 - [x] Add persistent native CPU workers for the fixed embedded-loop prototype.
 - [ ] Connect those workers to general VDCores operation descriptors and the original attention handoff graph.
-- [ ] Lower a heterogeneous graph into compact runtime metadata so Python is not in the steady-state execution path.
+- [ ] Optional later optimization: lower a heterogeneous graph into compact runtime metadata without Python in the steady-state path. Python removal is deferred, not required for the current reference studies.
 - [ ] Generalize the shared-memory protocol beyond one counter, including buffer ownership, release/acquire ordering, error propagation, and timeouts.
 - [x] Define fixed-loop input-slot ownership, event completion publication, generation checks, error propagation, and terminal cancellation.
 - [x] Feed live native CPU-stage counts and outstanding GPU requests into placement for the fixed loop, with measured service-cost estimates.
@@ -90,15 +122,14 @@ See the [reviewed implementation plan](agents/workflows/embedded-loop-plan.md) a
 
 ### Plan to finish
 
-1. **Calibrate placement.** Run the existing crossover benchmark in at least three independent trials per work size, preserve environment metadata and raw measurements, and identify stable CPU/GPU crossover regions rather than relying on a single threshold.
-2. **Validate adaptive execution.** Run static-CPU, static-GPU, and adaptive variants across the calibrated range and under controlled queue pressure. Completion means the outputs pass correctness checks and the report explains where adaptive placement helps, ties, or regresses.
-3. **Implement CPU Virtual Cores.** Agree on the native micro-operation and shared-buffer contract, add a persistent CPU worker pool, and execute the existing attention → CPU → GPU chain without Python or application-side synchronization in the steady-state path.
-4. **Replace centralized execution control.** Lower graph dependencies and placement metadata into the runtime, while keeping the Python scheduler as a reference oracle for tests.
-5. **Add multi-workload GPU sharing.** Run concurrent graphs through one GPU pool, collect queue telemetry, and compare static scheduling with dependency-ready and adaptive placement using median and p95 end-to-end latency.
-6. **Demonstrate the embedded use case.** Port one real sensor-to-action workload to the chosen coherent platform, document the baseline, and publish reproducible latency and resource-use results.
-7. **Harden and upstream.** Add failure-path tests, CI coverage, user documentation, and a design review before proposing a merge.
+1. **Collect reference evidence, without porting the VM.** Use the A100 for matched graph/workload comparisons, keep Python, preserve raw trials, and report regressions as well as improvements. Separate scheduling gains from device-choice gains.
+2. **Choose a meaningful application.** Obtain recorded sensor inputs and define accuracy/control criteria with the project lead. Generated camera scenes validate execution mechanics, not application quality.
+3. **Translate findings into a VDCores design.** Specify operation/buffer contracts, dependency-ready CPU work, placement telemetry, and which GPU operations remain on actual VDCores. Do not rewrite the Hopper runtime to make the reference experiment run on A100.
+4. **Reconnect on compatible hardware.** Bind real VDCores operations to the host graph, beginning with the existing attention handoff. Calibrate coherent placement and validate static/adaptive execution under controlled pressure on GH200/Hopper.
+5. **Evaluate actual VCore sharing.** Run multiple independent graphs through the original GPU VCore pool, assess fairness and tails, and compare against strong application baselines.
+6. **Harden and review.** Complete application-level failure tests, documentation, and upstream design review. Consider native submission only if evidence makes it worthwhile.
 
-Coherent signaling and one real heterogeneous chain have been measured, and the native fixed feedback loop now passes CPU and A100 validation, including measured adaptive placement. The next implementation priorities are removing Python submission/selection overhead, general graph lowering, and replacing the synthetic workload with a real embedded pipeline. Coherent placement calibration and integration with the original Hopper GPU VM require compatible hardware later.
+Coherent signaling and one real heterogeneous chain were measured earlier on GH200. The separate native fixed loop and Python task-graph references now pass CPU/A100 validation. Current priority is using reference measurements to inform future VDCores changes, not porting the GPU VM to A100 or removing Python. Actual VM integration and coherent placement calibration require compatible hardware later.
 
 ## Llama 3.1-8B-Instruct Decoding Demo
 

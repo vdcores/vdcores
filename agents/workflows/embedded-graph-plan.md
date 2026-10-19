@@ -55,3 +55,14 @@ are preserved in four separate commits before this follow-on.
   safety claim follows from generated scenes and finite Linux runs.
 - Review outcome: proceed with these bounded Python-led changes; retain original
   VDCores reconnection and recorded real-world evaluation as explicit gates.
+
+## User scope clarification
+
+Use A100 only as reference/data collection to inform future VDCores changes.
+Do not port or rewrite the original Hopper runtime for A100. The original CUDA
+runtime, kernels, instruction format, launcher, and build target are unchanged;
+the general graph and camera workload are additive reference experiments. Stop
+expanding the reference executor after the current study. A prepared-Launcher
+adapter contract is not completed VDCores workload integration. Finish the
+already-running bounded measurement matrix and document what it suggests and
+what it cannot establish; defer core architecture changes until reviewed.
