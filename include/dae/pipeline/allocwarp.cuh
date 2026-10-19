@@ -16,10 +16,6 @@ static constexpr uint16_t repeatCountCounterModeFlag = 0x4000U;
 static constexpr uint16_t repeatAccumulateModeFlag = 0x2000U;
 static constexpr uint16_t repeatCounterRegMask = 0x00FFU;
 
-static constexpr uint16_t nvshmemSignalIdShift = 8U;
-static constexpr uint16_t nvshmemSignalIdMask = 0x00FFU;
-static constexpr uint16_t nvshmemTargetPeMask = 0x00FFU;
-
 template<typename M2C_Type, typename M2LD_Type>
 __device__ __forceinline__ void allocwarp_execute(
     const int lane_id,

@@ -819,9 +819,10 @@ class IssueBarrier(MemoryInstruction):
         super().__init__(opcode=opcode.OP_ISSUE_BARRIER, num_slots=0, arg=0, size=0, address=0)
         self.bar(bar)
 
-NVSHMEM_SIGNAL_ID_SHIFT = 8
-NVSHMEM_SIGNAL_ID_MASK = 0xFF
-NVSHMEM_TARGET_PE_MASK = 0xFF
+# Shared with the C++ side (include/dae/context.cuh) via runtime.config.
+NVSHMEM_SIGNAL_ID_SHIFT = config.nvshmem_signal_id_shift
+NVSHMEM_SIGNAL_ID_MASK = config.nvshmem_signal_id_mask
+NVSHMEM_TARGET_PE_MASK = config.nvshmem_target_pe_mask
 
 
 def _encode_nvshmem_arg(signal_id: int, target_pe: int = 0) -> int:
