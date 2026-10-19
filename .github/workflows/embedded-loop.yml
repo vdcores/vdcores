@@ -1,0 +1,18 @@
+name: Embedded loop CPU validation
+on:
+  push:
+    paths: ['src/embedded_loop.cpp', 'python/dae/*.py', 'tools/*embedded*.py', 'tests/**', '.github/workflows/embedded-loop.yml']
+  pull_request:
+    paths: ['src/embedded_loop.cpp', 'python/dae/*.py', 'tools/*embedded*.py', 'tests/**', '.github/workflows/embedded-loop.yml']
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pytest
+      - run: python -m pytest -q tests/test_placement.py tests/test_heterogeneous.py tests/test_adaptive_plan.py tests/test_embedded_loop.py
+      - run: c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer tests/native/embedded_loop_stress.cpp -o /tmp/embedded-stress
+      - run: /tmp/embedded-stress

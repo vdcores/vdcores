@@ -43,8 +43,9 @@ class PlacementDecision:
 class MeasuredCrossoverPolicy:
     """Choose CPU or GPU from measured latency samples.
 
-    Latencies are interpolated between measured work sizes in log2(work-items)
-    space. Requests outside the measured range use the nearest endpoint instead
+    Latencies are interpolated in log2(work-items) space by default. Linear
+    work-size interpolation can be selected for bandwidth-bound operations.
+    Requests outside the measured range use the nearest endpoint instead
     of extrapolating an unsupported trend. Queue-delay estimates are added after
     interpolation, so a busy device can lose even when its isolated kernel is
     faster.
@@ -56,6 +57,7 @@ class MeasuredCrossoverPolicy:
         *,
         preferred_device: Device = "cpu",
         switch_margin: float = 0.0,
+        interpolation: Literal["log2", "linear"] = "log2",
     ) -> None:
         ordered = sorted(samples, key=lambda sample: sample.work_items)
         if not ordered:
@@ -66,11 +68,14 @@ class MeasuredCrossoverPolicy:
             raise ValueError("preferred_device must be 'cpu' or 'gpu'")
         if not 0.0 <= switch_margin < 1.0:
             raise ValueError("switch_margin must be in [0, 1)")
+        if interpolation not in ("log2", "linear"):
+            raise ValueError("interpolation must be 'log2' or 'linear'")
 
         self._samples = tuple(ordered)
         self._sizes = tuple(sample.work_items for sample in ordered)
         self.preferred_device = preferred_device
         self.switch_margin = switch_margin
+        self.interpolation = interpolation
 
     @classmethod
     def from_benchmark(
@@ -80,6 +85,7 @@ class MeasuredCrossoverPolicy:
         metric: str = "end_to_end_ns",
         preferred_device: Device = "cpu",
         switch_margin: float = 0.0,
+        interpolation: Literal["log2", "linear"] = "log2",
     ) -> "MeasuredCrossoverPolicy":
         """Build a policy from ``check_attention_placement.py`` JSON output."""
 
@@ -114,6 +120,7 @@ class MeasuredCrossoverPolicy:
             samples,
             preferred_device=preferred_device,
             switch_margin=switch_margin,
+            interpolation=interpolation,
         )
 
     @property
@@ -141,10 +148,13 @@ class MeasuredCrossoverPolicy:
 
         lower = self._samples[position - 1]
         upper = self._samples[position]
-        log_lower = math.log2(lower.work_items)
-        fraction = (math.log2(work_items) - log_lower) / (
-            math.log2(upper.work_items) - log_lower
-        )
+        if self.interpolation == "linear":
+            fraction = (work_items - lower.work_items) / (upper.work_items - lower.work_items)
+        else:
+            log_lower = math.log2(lower.work_items)
+            fraction = (math.log2(work_items) - log_lower) / (
+                math.log2(upper.work_items) - log_lower
+            )
 
         def interpolate(low: int, high: int) -> int:
             return round(low + fraction * (high - low))

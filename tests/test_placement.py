@@ -37,6 +37,16 @@ class MeasuredCrossoverPolicyTest(unittest.TestCase):
         self.assertEqual(decision.gpu_estimate_ns, 150)
         self.assertEqual(decision.device, "gpu")
 
+    def test_linear_cost_model_preserves_bandwidth_scaling(self) -> None:
+        policy = MeasuredCrossoverPolicy(
+            [PlacementSample(100, 100, 200), PlacementSample(400, 400, 100)],
+            interpolation="linear")
+        decision = policy.choose(200)
+        self.assertEqual(decision.cpu_estimate_ns, 200)
+        self.assertEqual(decision.gpu_estimate_ns, 167)
+        with self.assertRaisesRegex(ValueError, "interpolation"):
+            MeasuredCrossoverPolicy([PlacementSample(1, 1, 1)], interpolation="unknown")
+
     def test_queue_delay_can_flip_the_choice(self) -> None:
         decision = self.policy.choose(200, gpu_queue_ns=200)
         self.assertEqual(decision.device, "cpu")
