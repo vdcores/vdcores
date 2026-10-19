@@ -47,6 +47,7 @@ wheelhouse/
 *.png
 *.dot
 !docs/**/*.png
+!results/embedded_loop/figures/*.png
 
 # Triton transpiler
 demo/mirage_search_checkpoint.json
