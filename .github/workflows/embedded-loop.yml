@@ -1,9 +1,9 @@
 name: Embedded loop CPU validation
 on:
   push:
-    paths: ['src/embedded_loop.cpp', 'python/dae/*.py', 'tools/*embedded*.py', 'tests/**', '.github/workflows/embedded-loop.yml']
+    paths: ['src/embedded_loop.cpp', 'python/dae/*.py', 'tools/*embedded*.py', 'tools/*camera*.py', 'tests/**', '.github/workflows/embedded-loop.yml']
   pull_request:
-    paths: ['src/embedded_loop.cpp', 'python/dae/*.py', 'tools/*embedded*.py', 'tests/**', '.github/workflows/embedded-loop.yml']
+    paths: ['src/embedded_loop.cpp', 'python/dae/*.py', 'tools/*embedded*.py', 'tools/*camera*.py', 'tests/**', '.github/workflows/embedded-loop.yml']
 jobs:
   cpu:
     runs-on: ubuntu-latest
@@ -12,7 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install pytest
-      - run: python -m pytest -q tests/test_placement.py tests/test_heterogeneous.py tests/test_adaptive_plan.py tests/test_embedded_loop.py
+      - run: pip install pytest numpy
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pytest -q tests/test_placement.py tests/test_heterogeneous.py tests/test_adaptive_plan.py tests/test_embedded_loop.py tests/test_graph_execution.py tests/test_camera_control.py
+        env:
+          OMP_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
       - run: c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer tests/native/embedded_loop_stress.cpp -o /tmp/embedded-stress
       - run: /tmp/embedded-stress
