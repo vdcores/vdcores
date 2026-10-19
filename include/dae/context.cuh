@@ -44,6 +44,12 @@ static constexpr int allocwarpInstructionPrefetchDistance = 2;
 static constexpr int allocwarpInstructionSeedCount = 2;
 static constexpr int allocwarpInstructionTargetSpan = 2;
 
+// NVSHMEM PUT/WAIT arg encoding: (signal_id << nvshmemSignalIdShift) | target_pe.
+// Exposed to Python via runtime.config so both sides share one definition.
+static constexpr uint16_t nvshmemSignalIdShift = 8U;
+static constexpr uint16_t nvshmemSignalIdMask = 0x00FFU;
+static constexpr uint16_t nvshmemTargetPeMask = 0x00FFU;
+
 constexpr int flagBits = 6;
 constexpr int slotBits = 6;
 static_assert(numSlots <= (1 << slotBits), "numSlots exceeds slotBits capacity");

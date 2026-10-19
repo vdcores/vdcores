@@ -394,6 +394,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   config.attr("max_tmas") = numTmas;
   config.attr("max_bars") = numBars;
   config.attr("num_special_slots") = numSpecialSlots;
+  config.attr("nvshmem_signal_id_shift") = nvshmemSignalIdShift;
+  config.attr("nvshmem_signal_id_mask") = nvshmemSignalIdMask;
+  config.attr("nvshmem_target_pe_mask") = nvshmemTargetPeMask;
 #ifdef DAE_ENABLE_NVSHMEM
   config.attr("nvshmem_enabled") = true;
   m.def(
