@@ -6,6 +6,9 @@ For the separate native CPU/event-based feedback-loop prototype, see
 [embedded-loop-native.md](embedded-loop-native.md). It is not an extension of the
 Hopper instruction encoding yet.
 
+For the Python-led general task-graph layer and distinct Torch/original-Launcher
+adapters, see [python-task-graphs.md](python-task-graphs.md).
+
 ## Recommended Load Order
 
 1. [vdcores-vm-model.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/vdcores-vm-model.md)

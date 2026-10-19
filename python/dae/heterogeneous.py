@@ -151,13 +151,18 @@ class HeterogeneousScheduler:
         *,
         cpu_queue_ns: int = 0,
         gpu_queue_ns: int = 0,
+        device: Device | None = None,
     ) -> DispatchRecord:
         self._require_sealed()
         if self.state(name) != OperationState.READY:
             raise RuntimeError(f"operation {name!r} is not ready")
         operation = self._operations[name]
 
-        if len(operation.devices) == 1:
+        if device is not None:
+            if device not in operation.devices:
+                raise ValueError(f"illegal device {device!r} for {name!r}")
+            record = DispatchRecord(name, device, "explicit executor placement")
+        elif len(operation.devices) == 1:
             device = operation.devices[0]
             record = DispatchRecord(
                 operation=name,
