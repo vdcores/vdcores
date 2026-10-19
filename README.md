@@ -94,6 +94,10 @@ reference execution path intentionally; removing it is not the current priority.
 - [x] Add matched CPU-only, serial GPU, ready-task GPU, and adaptive comparisons,
   with separate calibration/evaluation frames, trial ordering, CPU/GPU background
   load, periodic-arrival backlog, per-loop tails, throughput, and CPU-use reporting.
+- [x] Complete a nine-configuration A100 reference study: 108 evaluation runs,
+  117,600 checked frames, exact input fixtures, and a [seven-figure gallery](results/camera_control/figures/README.md).
+  The [report](results/camera_control/README.md) documents benefits, regressions,
+  overload, and what these results can/cannot imply for actual VDCores.
 - [ ] Use the reference measurements to propose specific changes to actual
   VDCores; validate any performance claim on the real runtime later.
 - [ ] Choose a representative application and evaluate recorded inputs/accuracy.

@@ -90,3 +90,12 @@ represent explicit competing work, not guaranteed fixed utilization percentages.
   replay as separate controls before claiming an optimized-runtime advantage.
 - Pending gates: real recorded-scene accuracy, a learned model if the application
   needs one, physical sensor/actuator integration, and actual VDCores execution.
+
+## Plot and archive
+
+`python tools/plot_camera_control.py` renders seven PNG/editable-SVG figures and
+complete trial summaries. It also reconstructs and hash-checks the exact seed-7
+RGB arrays before archiving them in `results/camera_control/fixtures/` as NPZ.
+The default plot input is the completed `a100-taskgraph-v1` nine-case matrix.
+Deadline-miss figures pool all measured frames; do not take the median miss count
+across trials, which could hide a trial containing all rare misses.
