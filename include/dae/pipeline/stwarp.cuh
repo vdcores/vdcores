@@ -23,6 +23,32 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     // all ops are writeback ops
 
     switch(op(opcode)) {
+      case op(OP_PAGED_STORE_1D):
+      {
+        const auto& config = *reinterpret_cast<const PagedLoadConfig*>(inst.address); 
+        const auto token_id = (uint32_t) inst.size; const auto session_id = (uint32_t) inst.arg; 
+        const auto pages_per_session = config.kv_seq_len / config.tokens_per_page; 
+
+        // Compute address in global memory
+        const auto page_index = token_id / config.tokens_per_page; 
+        const auto page_offset = token_id % config.tokens_per_page;
+        const auto page_id = config.context_table[(session_id * pages_per_session) + page_index]; 
+
+        const auto per_token_size = config.layers * config.num_kv_heads * 2 * config.head_dim * 2; 
+        const auto token_start_addr = config.page_table[page_id] + (page_offset * per_token_size); 
+
+        // Issue TMA store of token KV cache from allocated SMEM slots into GMEM
+        cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_global,
+          cuda::ptx::space_shared,
+          (void*)(token_start_addr),
+          (const void *)(get_slot_address(smem_base, slot)),
+          per_token_size
+        ); 
+        cuda::ptx::cp_async_bulk_commit_group(); 
+
+        break;
+      }
       case op(OP_ALLOC_WB_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(

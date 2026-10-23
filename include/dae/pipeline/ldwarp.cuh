@@ -48,56 +48,31 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
     switch(op(opcode)) {
       case op(OP_PAGED_LOAD_1D): {
         // Inst.size = token_id, Inst.arg = session_id
-        // All exits reach the common barrier arrival; Dummy frees the slots.
-        if (inst.address == 0) {
-          printf("[PAGED] missing descriptor\n");
-          break;
-        }
-        const auto& cache = *reinterpret_cast<const PagedLoadConfig*>(inst.address);
-        if (!cache.page_table || !cache.context_table) {
-          printf("[PAGED] missing tables\n");
-          break;
-        }
+        const auto& config = *reinterpret_cast<const PagedLoadConfig*>(inst.address); 
+        const auto token_id = (uint32_t) inst.size; const auto session_id = (uint32_t) inst.arg; 
+        const auto pages_per_session = config.kv_seq_len / config.tokens_per_page; 
 
-        // Is there a way to make it clearer that we are refering to token_id and not size? Maybe copying to another variable? 
-        const uint32_t page_index = inst.size / cache.tokens_per_page;
-        const uint32_t page_offset = inst.size % cache.tokens_per_page;
+        // Compute address in global memory
+        const auto page_index = token_id / config.tokens_per_page; 
+        const auto page_offset = token_id % config.tokens_per_page;
+        const auto page_id = config.context_table[(session_id * pages_per_session) + page_index]; 
 
-        const uint32_t pages_per_session = cache.kv_seq_len / cache.tokens_per_page;
+        const auto per_token_size = config.layers * config.num_kv_heads * 2 * config.head_dim * 2; 
+        const auto token_start_addr = config.page_table[page_id] + (page_offset * per_token_size); 
+
+        // What does the 16 byte alignment imply? 
+        cuda::device::memcpy_async_tx(
+          (char *)(get_slot_address(smem_base, slot)), // Why char* and not void*? 
+          (char *)(token_start_addr),
+          cuda::aligned_size_t<16>(per_token_size), // TODO: Replace this with appropriate thing, inst.size neq size!
+          m2c.barriers[bar]
+        ); 
+
+        cuda::device::barrier_expect_tx(
+          m2c.barriers[bar],
+          cuda::aligned_size_t<16>(per_token_size)
+        );
         
-        // Can we make it clearer that arg is the session_id
-        const int64_t page_id = cache.context_table[
-            uint64_t(inst.arg) * pages_per_session + page_index];
-        if (page_id < 0) {
-          printf("[PAGED] session=%u token=%u unmapped\n",
-                 unsigned(inst.arg), unsigned(inst.size));
-          break;
-        }
-
-        // Positive physical page IDs and session IDs must be valid.
-        const uint64_t page_addr = cache.page_table[page_id];
-        if (!page_addr) {
-          printf("[PAGED] null page address\n");
-          break;
-        }
-
-        // Assumes bf16 dtype
-        const uint64_t head_stride_bytes = uint64_t(cache.head_dim) * 2 * 2;
-        const uint64_t layer_stride_bytes = cache.num_kv_heads * head_stride_bytes;
-        const uint64_t token_stride_bytes = cache.layers * layer_stride_bytes;
-
-        const uint64_t token_addr = page_addr + page_offset * token_stride_bytes;
-        
-        for (uint32_t layer = 0; layer < cache.layers; ++layer) {
-          for (uint32_t head = 0; head < cache.num_kv_heads; ++head) {
-            const uint64_t key_addr = token_addr + layer * layer_stride_bytes
-                + head * head_stride_bytes;
-            printf("[PAGED] session=%u token=%u layer=%u head=%u K=0x%llx V=0x%llx\n",
-                   unsigned(inst.arg), unsigned(inst.size), layer, head,
-                   static_cast<unsigned long long>(key_addr),
-                   static_cast<unsigned long long>(key_addr + uint64_t(cache.head_dim) * 2));
-          }
-        }
         break;
       }
       case op(OP_ALLOC_TMA_LOAD_1D): {

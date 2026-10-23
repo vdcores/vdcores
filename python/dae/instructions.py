@@ -919,11 +919,11 @@ class PagedLoad1D(MemoryInstruction):
         self.annotation["paged_cache"] = cache
 
 class PagedStore1D(MemoryInstruction):
-    def __init__(self, token_id: int, session_id: int, token: torch, cache: PagedCacheConfig):
-        assert token.numel() * token.element_size() == cache.bytes_per_token() 
+    def __init__(self, token_id: int, session_id: int, cache: PagedCacheConfig):        
+        # allocwarp.cuh refers to this to reserve slots
         slots = bytes2slots(cache.bytes_per_token())
         
-        # Where to put token address for copy?? 
+        # We will read from slots, copy to GMEM
         super().__init__(
             opcode=opcode.OP_PAGED_STORE_1D,
             num_slots=slots,
@@ -1056,6 +1056,7 @@ __all__ = [
     "LoopC",
     "MemoryInstruction",
     "PagedLoad1D",
+    "PagedStore1D",
     "TerminateM",
     "LoopM",
     "CounterOffsetMemoryInstruction",
