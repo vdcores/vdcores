@@ -309,6 +309,10 @@ class RMS_NORM_F16_K_5120_SMEM(ComputeInstruction):
     def __init__(self, num_token: int, epsilon: float):
         super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_5120_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
 
+class RMS_NORM_F16_K_8192_SMEM(ComputeInstruction):
+    def __init__(self, num_token: int, epsilon: float):
+        super().__init__(opcode=opcode.OP_RMS_NORM_F16_K_8192_SMEM, args=[num_token, encode_bfloat16_u16(epsilon)])
+
 
 def select_attention_decode_instruction(head_dim: int):
     if head_dim == ATTENTION_M64N64K16_F16_F32_64_64_hdim.HEAD_DIM:
@@ -337,6 +341,8 @@ def select_rms_smem_instruction(hidden_size: int):
         return RMS_NORM_F16_K_2048_SMEM
     if hidden_size == 5120:
         return RMS_NORM_F16_K_5120_SMEM
+    if hidden_size == 8192:
+        return RMS_NORM_F16_K_8192_SMEM
     if hidden_size == 128:
         return RMS_NORM_F16_K_128_SMEM
     raise NotImplementedError(f"Missing shared-memory RMS kernel support for hidden_size={hidden_size}. Add a dedicated opcode/instruction path before launching this model.")
