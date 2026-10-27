@@ -213,10 +213,25 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
-    def __init__(self, num_sms : int = 1, device = 'cuda'):
+    def __init__(self, num_sms : int = 1, device = 'cuda', *, num_gpus: int = 1):
+        if isinstance(num_gpus, bool) or not isinstance(num_gpus, int) or num_gpus < 1:
+            raise ValueError("num_gpus must be a positive integer")
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("Launcher requires a CUDA device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if num_gpus > torch.cuda.device_count():
+            raise ValueError("num_gpus exceeds the visible GPU count")
+        if num_gpus > 1:
+            if device.index >= num_gpus:
+                raise ValueError("Launch device must be among the first num_gpus visible GPUs")
+            torch.cuda.init()
+            runtime.enable_peer_access(num_gpus)
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
         self.device = device
+        self.num_gpus = num_gpus
 
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
@@ -245,7 +260,16 @@ class Launcher:
         self._cache_window_override = None
         self._cache_window_requests = []
 
-        runtime.set_smem_size(self.smem_size)
+        with torch.cuda.device(self.device):
+            runtime.set_smem_size(self.smem_size)
+
+    def _validate_tensor(self, tensor):
+        if tensor.device == self.device:
+            return
+        if self.num_gpus == 1:
+            raise ValueError("Peer tensors require an explicit num_gpus >= 2")
+        if tensor.device.type != "cuda" or tensor.device.index >= self.num_gpus:
+            raise ValueError("Tensor device must be among the first num_gpus visible GPUs")
 
     # resource management functions
     def add_group(self, name, size):
@@ -292,6 +316,10 @@ class Launcher:
 
     def build_instructions(self):
         if self.need_instruction_build:
+            for builder in self.builder:
+                for inst in [*builder.built_minsts, *builder.minsts]:
+                    for tensor in inst.tensors:
+                        self._validate_tensor(tensor)
             for i in range(self.num_sms):
                 self.builder[i].build(
                     self.cinsts[i,...],
@@ -466,6 +494,11 @@ class Launcher:
         return ci / self.num_sms, mi / self.num_sms
 
     def launch(self):
+        with torch.cuda.device(self.device):
+            self._launch()
+
+    def _launch(self):
+        runtime.set_smem_size(self.smem_size)
         self.build_instructions()
 
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
@@ -488,8 +521,7 @@ class Launcher:
         cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
         minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
 
-        stream = torch.cuda.current_stream().cuda_stream
-        # TODO(zhiyuang): check this?
+        stream = torch.cuda.current_stream(self.device).cuda_stream
 
         # init the bars based on dict
         bar_int_view = self.bars.view(torch.uint32)
@@ -514,22 +546,16 @@ class Launcher:
             minsts=minsts,
         )
         if cache_window is not None:
+            self._validate_tensor(cache_window["tensor"])
             runtime.set_cache_policy(
-                cache_window["tensor"],
-                stream,
-                cache_window["hit_ratio"],
-                cache_window["hit_policy"],
-                cache_window["miss_policy"],
+                cache_window["tensor"], stream, cache_window["hit_ratio"],
+                cache_window["hit_policy"], cache_window["miss_policy"],
                 cache_window["num_bytes"] if cache_window["num_bytes"] is not None else -1,
             )
-
-        ret = runtime.launch_dae(
-            self.num_sms, self.smem_size,
-            cinsts, minsts, tma,
-            self.bars, profile,
-            stream
+        runtime.launch_dae(
+            self.num_sms, self.smem_size, cinsts, minsts, tma,
+            self.bars, profile, stream,
         )
-        assert ret == 0
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)

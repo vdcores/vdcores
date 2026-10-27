@@ -14,7 +14,8 @@ cudaError_t launch_dae(
   CUtensorMap* tma_descs,
   int * bars,
   uint64_t * profile,
-  int64_t stream
+  int64_t stream,
+  bool synchronize = true
 );
 
 CUtensorMap create_tma_descriptor(
