@@ -185,8 +185,8 @@ __device__ __forceinline__ void allocwarp_execute(
         break;
         case op(OP_ISSUE_BARRIER): {
           if (lane_id == 0) {
-            volatile int *bar = bars + inst.bar();
-            while (*bar != 0) {
+            cuda::atomic_ref<int, cuda::thread_scope_system> counter(bars[inst.bar()]);
+            while (counter.load(cuda::memory_order_acquire) != 0) {
               __nanosleep(barrierPollSleepCycles);
             }
             __mprint("Issue barrier %d passed", inst.bar());

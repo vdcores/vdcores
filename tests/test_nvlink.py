@@ -5,8 +5,9 @@ import unittest
 
 import torch
 
+from dae import runtime
 from dae.launcher import Launcher
-from dae.instructions import Copy, RepeatM, TerminateC, TerminateM, TmaLoad1D, TmaStore1D
+from dae.instructions import Copy, IssueBarrier, RepeatM, TerminateC, TerminateM, TmaLoad1D, TmaStore1D
 
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two allocated CUDA GPUs")
@@ -48,6 +49,7 @@ class PeerLaunchTests(unittest.TestCase):
                     current = torch.cuda.current_device()
                     stream = torch.cuda.Stream(device=execution_device)
                     for _ in range(2):
+                        dae.reset_barriers()
                         target.zero_()
                         torch.cuda.synchronize(target.device)
                         with torch.cuda.stream(stream):
@@ -72,6 +74,48 @@ class PeerLaunchTests(unittest.TestCase):
         dae = self.make_copy(source, target, "cuda:1", num_gpus=1)
         dae.launch()
         self.assertTrue(torch.equal(source, target))
+
+    def test_shared_gpu0_barriers(self):
+        producer = Launcher(1, device="cuda:0", num_gpus=2)
+        consumer = Launcher(1, device="cuda:1", num_gpus=2)
+        self.assertIs(producer.bars, consumer.bars)
+        self.assertIs(producer.bars_src, consumer.bars_src)
+        self.assertEqual(producer.bars.device, torch.device("cuda:0"))
+        ready = producer.new_bar(1)
+        done = consumer.new_bar(1)
+        self.assertNotEqual(ready, done)
+
+        source = torch.randint(256, (8192,), dtype=torch.uint8, device="cuda:0")
+        staging = torch.empty_like(source, device="cuda:1")
+        result = torch.empty_like(source)
+        producer.s(Copy(1, 8192), TmaLoad1D(source),
+                   TmaStore1D(staging).bar(ready), IssueBarrier(done))
+        consumer.s(Copy(1, 8192), TmaLoad1D(staging).bar(ready),
+                   TmaStore1D(result).bar(done))
+
+        def upload(dae):
+            dae.build_instructions()
+            return (dae.cinsts.to(dae.device).view(-1, 8),
+                    dae.minsts.to(dae.device).view(-1, 16),
+                    torch.empty((4, 128), dtype=torch.uint8, device=dae.device),
+                    dae.profile.view(torch.uint8).view(-1, 8))
+
+        programs = [(dae, upload(dae)) for dae in (consumer, producer)]
+        for _ in range(2):
+            producer.reset_barriers()
+            result.zero_()
+            # Start the consumer first: it must wait on the shared GPU-0 counter.
+            for dae, (cinsts, minsts, tma, profile) in programs:
+                runtime.launch_dae(1, dae.smem_size, cinsts, minsts, tma,
+                                   dae.bars, profile,
+                                   torch.cuda.current_stream(dae.device).cuda_stream, False)
+            torch.cuda.synchronize(0)
+            torch.cuda.synchronize(1)
+            self.assertTrue(torch.equal(result, source))
+            self.assertEqual(int(producer.bars.view(torch.int32)[ready]), 0)
+            self.assertEqual(int(producer.bars.view(torch.int32)[done]), 0)
+            self.assertEqual(int(producer.bars_src.view(torch.int32)[ready]), 1)
+            self.assertEqual(int(producer.bars_src.view(torch.int32)[done]), 1)
 
 
 if __name__ == "__main__":

@@ -181,8 +181,10 @@ int py_launch_dae(
 
   const auto device = compute_insts_bytes.device();
   TORCH_CHECK(memory_insts_bytes.device() == device && tma_descs_bytes.device() == device &&
-              bars_int32.device() == device && profile_u64.device() == device,
-              "All launch buffers must reside on the same CUDA device");
+              profile_u64.device() == device,
+              "Instruction, TMA, and profile buffers must reside on the launch device");
+  TORCH_CHECK(bars_int32.get_device() == 0 || bars_int32.device() == device,
+              "Barriers must reside on GPU 0 or the launch device");
   c10::cuda::CUDAGuard guard(device);
   TORCH_CHECK(num_sms > 0 && num_sms <= current_device_prop().multiProcessorCount,
               "num_sms out of range for launch device");

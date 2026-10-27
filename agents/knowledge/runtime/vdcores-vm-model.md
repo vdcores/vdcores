@@ -380,6 +380,10 @@ Used internally by `m2c`, `c2m`, and `m2ld`.
 
 The `bars` array is the externally visible dependency table.
 
+Multi-GPU launchers share this array and its ID namespace on GPU 0. Initialize
+it once before launching the participating GPUs, then call `reset_barriers()`
+once between completed runs. Waits and decrements use system-scope atomics.
+
 - read side:
   - `OP_ISSUE_BARRIER` spins until `bars[bar] == 0`
   - load ops with `MEM_OP_FLAGS_BARRIER` also wait for `bars[bar] == 0` before issuing
