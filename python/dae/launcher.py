@@ -320,8 +320,7 @@ class Launcher:
         if unbound:
             raise ValueError(f"Cannot launch with unbound barrier counts: {unbound}")
         values = torch.zeros(config.max_bars, dtype=torch.int32, device="cpu")
-        for bar, value in self.bar_values.items():
-            values[bar] = value
+        values[:self.num_bars] = values.new_tensor(list(self.bar_values.values()))
         with torch.cuda.device(self.bars.device):
             self.bars.view(torch.int32).view(-1).copy_(values)
             self.bars_src.view(torch.int32).view(-1).copy_(values)

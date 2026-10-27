@@ -28,5 +28,7 @@
 - The native `runtime.launch_dae(..., synchronize=False)` can enqueue independent
   kernels on multiple GPUs; callers must keep buffers alive until completion.
   Upload and timing helpers stay inside `benchmark/nvlink.py`.
+- The NVLink roundtrip benchmark measures peer-memory throughput without flagged
+  schedule barriers; it does not measure contention on the shared counters.
 - Rebuild with `make pyext`, then run
   `na run -n=2 python -m unittest discover -s tests -p test_nvlink.py`.
