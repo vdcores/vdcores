@@ -1,4 +1,4 @@
-"""Sustained pairwise NVLink payload bandwidth, including simultaneous duplex."""
+"""NVLink load/store roundtrips: raw CUDA versus VDCores."""
 
 from pathlib import Path
 import statistics
@@ -30,16 +30,17 @@ def _topology(torch):
     return {"physical_devices": devices, "link": link}
 
 
-def _schedule(torch, source, target, sms, tile):
+def _schedule(torch, peer, device, sms):
     from dae import runtime
-    from dae.instructions import Copy, RepeatM, TerminateC, TerminateM, TmaLoad1D, TmaStore1D
+    from dae.instructions import Dummy, RepeatM, TerminateC, TerminateM, TmaLoad1D
     from dae.launcher import Launcher
 
-    tiles = source.numel() // tile
+    tile = 8192
+    tiles = peer.numel() // tile
     quotient, remainder = divmod(tiles, sms)
     if quotient + bool(remainder) >= 2**16:
         raise ValueError("payload exceeds the 16-bit repeat count; use a smaller size")
-    dae = Launcher(sms, device=target.device, num_gpus=2)
+    dae = Launcher(sms, device=f"cuda:{device}", num_gpus=2)
 
     def work(sm):
         count = quotient + (sm < remainder)
@@ -47,10 +48,9 @@ def _schedule(torch, source, target, sms, tile):
             return [TerminateC(), TerminateM()]
         offset = (sm * quotient + min(sm, remainder)) * tile
         return [
-            Copy(count, tile),
+            Dummy(count, writeback=True),
             *RepeatM.on(count,
-                        [TmaLoad1D(source[offset:offset + tile]), tile],
-                        [TmaStore1D(target[offset:offset + tile]), tile]),
+                        [TmaLoad1D(peer[offset:offset + tile]).writeback(), tile]),
             TerminateC(), TerminateM(),
         ]
 
@@ -131,65 +131,57 @@ def run(args):
     if sms > min(prop.multi_processor_count for prop in properties):
         raise ValueError("--num-sms exceeds the allocated GPU's SM count")
     topology = _topology(torch)
-    missing = {"OP_COPY", "OP_TERMINATEC"} - set(runtime.supported_compute_ops)
+    missing = {"OP_DUMMY", "OP_TERMINATEC"} - set(runtime.supported_compute_ops)
     if missing:
-        raise ValueError(f"missing compute ops {sorted(missing)}; rebuild with make pyext DAE_COMPUTE_OPS=OP_COPY,OP_TERMINATEC")
+        raise ValueError(f"missing compute ops {sorted(missing)}; rebuild with make pyext DAE_COMPUTE_OPS=OP_DUMMY,OP_TERMINATEC")
     runtime.enable_peer_access(2)
     # Compile outside all timed regions. C++ baseline has no Torch tensor math.
     raw = load(name="vdcores_benchmark_nvlink", sources=[str(Path(__file__).resolve().parents[1] / "cuda/nvlink.cu")],
                extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
     print(f"NVLink {topology['link']}: {properties[0].name} <-> {properties[1].name}; {sms} VDCores SMs", flush=True)
-    print("Payload GB/s (decimal); duplex sums both directions. Graph batch=8; correctness checked outside timing.")
-    print(f"{'MiB/dir':>8} {'direction':>12} {'implementation':>20} {'tile KiB':>8} {'median GB/s':>12} {'peak GB/s':>10}")
+    print("Roundtrip GB/s counts peer reads + writes. Graph batch=8; correctness checked outside timing.")
+    print(f"{'MiB/buf':>8} {'roundtrip':>12} {'implementation':>15} {'median GB/s':>12} {'peak GB/s':>10}")
     results = []
     for mib in args.sizes_mib:
         size = mib * 1024**2
-        source = [torch.randint(0, 256, (size,), device=i, dtype=torch.uint8) for i in range(2)]
-        target = [torch.empty_like(source[i]) for i in range(2)]
+        buffers = [torch.randint(0, 256, (size,), device=i, dtype=torch.uint8) for i in range(2)]
+        reference = [buffer.clone() for buffer in buffers]
         for device in range(2):
             torch.cuda.synchronize(device)
-        for direction, destinations in (("0->1", [1]), ("1->0", [0]), ("duplex", [0, 1])):
-            variants = [("cuda_kernel", None), ("cuda_memcpy_async", None)] + [("vdcores", tile) for tile in (8192, 16384, 32768)]
-            for implementation, tile in variants:
+        for direction, executors in (("0->1->0", [1]), ("1->0->1", [0]), ("concurrent", [0, 1])):
+            for implementation in ("cuda_kernel", "vdcores"):
                 transfers = []
-                for dst in destinations:
-                    src = 1 - dst
-                    target[dst].fill_(0xA5)
+                for device in executors:
+                    peer = buffers[1 - device]
                     if implementation == "vdcores":
-                        operation = _schedule(torch, source[src], target[dst], sms, tile)
-                    elif implementation == "cuda_kernel":
-                        operation = lambda dst=dst, src=src: raw.copy_kernel(
-                            target[dst].data_ptr(), source[src].data_ptr(), size,
-                            properties[dst].multi_processor_count * 4, torch.cuda.current_stream(dst).cuda_stream)
+                        operation = _schedule(torch, peer, device, sms)
                     else:
-                        operation = lambda dst=dst, src=src: raw.copy_engine(
-                            target[dst].data_ptr(), source[src].data_ptr(),
-                            size, torch.cuda.current_stream(dst).cuda_stream)
-                    transfers.append((dst, operation))
+                        operation = lambda device=device, peer=peer: raw.roundtrip_kernel(
+                            peer.data_ptr(), peer.data_ptr(), size,
+                            properties[device].multi_processor_count * 4, torch.cuda.current_stream(device).cuda_stream)
+                    transfers.append((device, operation))
                 for device in range(2):
                     torch.cuda.synchronize(device)
                 samples = _measure(torch, transfers, args.warmup, args.bench)
-                for dst in destinations:
-                    # Compare on the source GPU; this checking copy is untimed.
-                    if not torch.equal(target[dst].to(source[1 - dst].device), source[1 - dst]):
-                        raise RuntimeError(f"incorrect {implementation} transfer ({direction}, {mib} MiB)")
-                payload = size * len(destinations)  # Count only bytes crossing NVLink.
+                for device in executors:
+                    if not torch.equal(buffers[1 - device], reference[1 - device]):
+                        raise RuntimeError(f"incorrect {implementation} roundtrip ({direction}, {mib} MiB)")
+                payload = 2 * size * len(executors)  # Each roundtrip reads and writes the peer buffer.
                 median_ms, best_ms = statistics.median(samples), min(samples)
-                row = {"size_bytes_per_direction": size, "direction": direction,
-                       "implementation": implementation, "tile_bytes": tile,
+                row = {"size_bytes": size, "bytes_transferred": payload, "direction": direction,
+                       "implementation": implementation,
                        "median_ms": median_ms, "min_ms": best_ms,
                        "median_gbps": payload / median_ms / 1e6,
                        "peak_gbps": payload / best_ms / 1e6, "samples_ms": samples}
                 results.append(row)
-                tile_label = str(tile // 1024) if tile else "-"
-                print(f"{mib:8} {direction:>12} {implementation:>20} {tile_label:>8} {row['median_gbps']:12.2f} {row['peak_gbps']:10.2f}", flush=True)
-        del source, target, transfers
+                print(f"{mib:8} {direction:>12} {implementation:>15} {row['median_gbps']:12.2f} {row['peak_gbps']:10.2f}", flush=True)
+        del buffers, reference, transfers
     peaks = []
-    for direction in ("0->1", "1->0", "duplex"):
-        for implementation in ("cuda_kernel", "cuda_memcpy_async", "vdcores"):
+    for direction in ("0->1->0", "1->0->1", "concurrent"):
+        for implementation in ("cuda_kernel", "vdcores"):
             best = max((row for row in results if row["direction"] == direction and row["implementation"] == implementation), key=lambda row: row["peak_gbps"])
             peaks.append(best)
-            print(f"Peak measured {direction} {implementation}: {best['peak_gbps']:.2f} GB/s ({best['size_bytes_per_direction'] // 1024**2} MiB/direction, tile={best['tile_bytes']})")
+            print(f"Peak measured {direction} {implementation}: {best['peak_gbps']:.2f} GB/s ({best['size_bytes'] // 1024**2} MiB/buffer)")
     return {"devices": [{"name": prop.name, "uuid": str(prop.uuid)} for prop in properties],
             "topology": topology, "num_gpus": 2, "num_sms": sms, "iterations": args.bench,
             "warmup": args.warmup, "graph_batch": 8, "bandwidth_unit": "GB/s (10^9 bytes/s)",

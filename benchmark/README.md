@@ -5,7 +5,7 @@ Torch.
 
 ```bash
 # Compile the runtime, including the two operators used by the NVLink suite.
-make pyext DAE_COMPUTE_OPS=OP_COPY,OP_TERMINATEC
+make pyext DAE_COMPUTE_OPS=OP_DUMMY,OP_TERMINATEC
 pip install ninja  # needed for the small raw-CUDA baseline extension
 python -m benchmark --list
 na run -n=2 python -m benchmark nvlink --num-gpus 2 -b 20 \
@@ -25,33 +25,33 @@ both directions, and an NVLink connection verified with `nvidia-smi topo -m`.
 CUDA UUIDs map visible ordinals to physical GPUs. The suite fails with a clear
 error on an allocation connected only by PCIe.
 
-- Compares VDCores 1D TMA load/copy/store with a vectorized raw CUDA SM copy and
-  CUDA's copy engine (`cudaMemcpyAsync` with enabled peer UVA pointers). Each SM
-  copy pulls from a peer source into a local destination. Duplex uses independent
-  buffers and launches one transfer on each GPU simultaneously.
-- Sweeps 16, 64, and 256 MiB **per direction**, and 8/16/32 KiB VDCores tiles.
+- Compares VDCores with a raw CUDA kernel doing the same in-place roundtrip:
+  load a peer buffer, then store it back. VDCores uses 8 KiB TMA tiles and
+  `Dummy(count, writeback=True)` to pass each loaded slot directly to the store
+  warp. The shared-memory contents stay in that slot throughout the roundtrip.
+  The raw kernel performs coalesced vector loads/stores through peer pointers.
+- Runs `0->1->0` (executed on GPU 1), `1->0->1` (executed on GPU 0), and
+  `concurrent` (both GPUs execute roundtrips on separate peer buffers).
+- Sweeps 16, 64, and 256 MiB **per buffer**.
   Override payloads with `--sizes-mib 64 256 512`, SM count with `--num-sms 64`,
   or warmups with `--warmup 5`. All VDCores SMs are used by default.
 - Compilation, allocation, schedule upload, warmup, and exact byte-for-byte
   validation happen outside timing. Baseline compilation uses Torch's extension
-  cache. Each timed graph contains eight copies to remove Python dispatch gaps.
+  cache. Each timed graph contains eight roundtrips to remove Python dispatch gaps.
   Both start and end events use the same GPU clock; a control stream waits for
-  completion on both GPUs in duplex mode. VDCores timings include the complete
-  kernel, including store completion.
-- Reports median and maximum measured payload GB/s in decimal units, counting
-  each byte crossing NVLink once. Duplex sums both directions. The final peak
-  for each implementation/direction is the fastest measured size/tile/sample;
+  completion on both GPUs in concurrent mode. VDCores timings include the
+  complete kernel, including store completion.
+- Reports median and maximum measured roundtrip GB/s in decimal units, counting
+  both the peer read and write: `2 * buffer_bytes / time` for one executor, or
+  `4 * buffer_bytes / time` for concurrent executors. The final peak
+  for each implementation/case is the fastest measured size/sample;
   it is an observed throughput, not a hardware specification. Small payloads may
   benefit from caches; use payloads larger than L2 for sustained bandwidth.
 - JSON includes device UUIDs, topology, parameters, all timing samples, results,
   and measured peaks. Run benchmarks sequentially for credible measurements.
 
-The baseline uses `cudaMemcpyAsync` because `cudaMemcpyPeerAsync` rejects stream
-capture on the tested CUDA toolkit. Runtime device configuration also stays
-outside capture; warmup establishes those settings before graph recording.
-
 If a local `.vdcore.build` file selects other operators, the suite reports a
-rebuild instruction. To preserve model operators, include `OP_COPY` and
+rebuild instruction. To preserve model operators, include `OP_DUMMY` and
 `OP_TERMINATEC` in the full selection rather than replacing it with the minimal
 example above.
 

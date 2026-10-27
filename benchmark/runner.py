@@ -24,7 +24,7 @@ def main(argv=None):
     parser.add_argument("--num-gpus", type=positive_int, default=1, help="explicit number of visible GPUs to use (default: 1)")
     parser.add_argument("-b", "--bench", type=positive_int, nargs="?", const=20, default=20, metavar="ITERATIONS")
     parser.add_argument("--warmup", type=positive_int, default=3)
-    parser.add_argument("--sizes-mib", type=positive_int, nargs="+", default=[16, 64, 256], help="payload sizes per direction")
+    parser.add_argument("--sizes-mib", type=positive_int, nargs="+", default=[16, 64, 256], help="buffer sizes in MiB")
     parser.add_argument("--num-sms", type=positive_int, help="VDCores SM count (default: all available SMs)")
     parser.add_argument("--json", type=Path, metavar="PATH", help="write structured measurements")
     args = parser.parse_args(argv)

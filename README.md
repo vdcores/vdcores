@@ -78,11 +78,11 @@ dependency barriers remain local to each GPU. Use one launcher per executing
 GPU. The default `num_gpus=1` rejects peer tensors.
 
 The modular [`benchmark/`](benchmark/) runner compares VDCores with raw systems.
-Its first suite measures NVLink bandwidth in both directions and simultaneously
-in duplex, against a CUDA kernel and `cudaMemcpyAsync` with peer pointers:
+Its first suite compares NVLink load/store roundtrips in VDCores and a raw CUDA
+kernel. Both read peer memory and write it back; bandwidth counts both transfers:
 
 ```bash
-make pyext DAE_COMPUTE_OPS=OP_COPY,OP_TERMINATEC
+make pyext DAE_COMPUTE_OPS=OP_DUMMY,OP_TERMINATEC
 pip install ninja
 python -m benchmark --list
 na run -n=2 python -m benchmark nvlink --num-gpus 2 -b 20
