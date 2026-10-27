@@ -63,6 +63,35 @@ If you are new to the repository (as a model programmer want to play with schedu
 2. Read a small application example in [`app/python/`](app/python/) or jump directly to full LLM inference example [`app/python/llama3/sched.py`](app/python/llama3/sched.py).
 3. Follow how Python schedules map to task primitives and runtime instructions through `launcher.py`, `schedule.py`, and the task headers.
 
+## NVLink peer access and benchmarks
+
+Opt into peer access with an explicit GPU count:
+
+```python
+dae = Launcher(132, device="cuda:0", num_gpus=2)
+```
+
+The first two CUDA-visible devices are mapped through Torch's allocator. Allocate
+tensors normally on either GPU and use existing `TmaLoad1D` / `TmaStore1D`
+instructions with peer tensors. Finish remote producers before launching;
+dependency barriers remain local to each GPU. Use one launcher per executing
+GPU. The default `num_gpus=1` rejects peer tensors.
+
+The modular [`benchmark/`](benchmark/) runner compares VDCores with raw systems.
+Its first suite measures NVLink bandwidth in both directions and simultaneously
+in duplex, against a CUDA kernel and `cudaMemcpyAsync` with peer pointers:
+
+```bash
+make pyext DAE_COMPUTE_OPS=OP_COPY,OP_TERMINATEC
+pip install ninja
+python -m benchmark --list
+na run -n=2 python -m benchmark nvlink --num-gpus 2 -b 20
+```
+
+Add other operators to `DAE_COMPUTE_OPS` when sharing a build with model apps.
+See [`benchmark/README.md`](benchmark/README.md) for measurement details and suite
+extension instructions.
+
 ## Contact and Reference
 
 Contacts:
