@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <cuda/barrier>
+#include <cuda/atomic>
 #include <cuda/ptx>
 
 // features

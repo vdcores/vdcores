@@ -23,6 +23,8 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     // all ops are writeback ops
 
     switch(op(opcode)) {
+      // A relayed load writes the same slot back to its original address.
+      case op(OP_ALLOC_TMA_LOAD_1D):
       case op(OP_ALLOC_WB_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(
@@ -155,7 +157,8 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     if (opcode & MEM_OP_FLAGS_BARRIER) {
       // cuda::std::atomic_ref<int> bar {bars[inst.bar()]};
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-      atomicSub(&bars[inst.bar()], 1);
+      cuda::atomic_ref<int, cuda::thread_scope_system> counter(bars[inst.bar()]);
+      counter.fetch_sub(1, cuda::memory_order_release);
       // int current_cnt = bar.fetch_sub(1, cuda::std::memory_order_release);
       // __stprint("Arrive for barrier %d, remaining count=%d", inst.bar(), current_cnt - 1);
       // if (inst.bar() == 0)
@@ -173,5 +176,6 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     slot_mask = c2m.pop();
   }
 
+  cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
   __stprint("End of ST warp execution");
 }

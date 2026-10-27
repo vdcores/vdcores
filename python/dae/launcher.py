@@ -13,6 +13,17 @@ import numpy as np
 import torch
 
 
+class _BarrierState:
+    def __init__(self, device):
+        self.tensor = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=device)
+        self.source = torch.zeros_like(self.tensor)
+        self.values = {}
+        self.initialized = False
+
+
+_gpu0_barriers = None
+
+
 def extract_compute_operator_names(launcher) -> list[str]:
     operator_names = []
     seen = set()
@@ -213,10 +224,25 @@ class ResourceGroup:
         self.built = True
 
 class Launcher:
-    def __init__(self, num_sms : int = 1, device = 'cuda'):
+    def __init__(self, num_sms : int = 1, device = 'cuda', *, num_gpus: int = 1):
+        if isinstance(num_gpus, bool) or not isinstance(num_gpus, int) or num_gpus < 1:
+            raise ValueError("num_gpus must be a positive integer")
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("Launcher requires a CUDA device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if num_gpus > torch.cuda.device_count():
+            raise ValueError("num_gpus exceeds the visible GPU count")
+        if num_gpus > 1:
+            if device.index >= num_gpus:
+                raise ValueError("Launch device must be among the first num_gpus visible GPUs")
+            torch.cuda.init()
+            runtime.enable_peer_access(num_gpus)
         self.smem_size = 202 * 1024 # 202 KB
         self.num_sms = num_sms
         self.device = device
+        self.num_gpus = num_gpus
 
         self.max_insts = config.max_insts
         self.builder = [SMInstructionBuilder(sm_id=i) for i in range(num_sms)]
@@ -231,12 +257,17 @@ class Launcher:
 
         self.need_instruction_build = True
 
-        self.num_bars = 0
-        self.bar_values = {}
         self._late_barriers_bound = False
-
-        self.bars = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
-        self.bars_src = torch.zeros(config.max_bars, 4, dtype=torch.uint8, device=self.device)
+        global _gpu0_barriers
+        if num_gpus > 1:
+            if _gpu0_barriers is None:
+                _gpu0_barriers = _BarrierState("cuda:0")
+            self._barriers = _gpu0_barriers
+        else:
+            self._barriers = _BarrierState(self.device)
+        self.bars = self._barriers.tensor
+        self.bars_src = self._barriers.source
+        self.bar_values = self._barriers.values
 
         self.resource_groups = {
             'default': ResourceGroup('default')
@@ -245,7 +276,16 @@ class Launcher:
         self._cache_window_override = None
         self._cache_window_requests = []
 
-        runtime.set_smem_size(self.smem_size)
+        with torch.cuda.device(self.device):
+            runtime.set_smem_size(self.smem_size)
+
+    def _validate_tensor(self, tensor):
+        if tensor.device == self.device:
+            return
+        if self.num_gpus == 1:
+            raise ValueError("Peer tensors require an explicit num_gpus >= 2")
+        if tensor.device.type != "cuda" or tensor.device.index >= self.num_gpus:
+            raise ValueError("Tensor device must be among the first num_gpus visible GPUs")
 
     # resource management functions
     def add_group(self, name, size):
@@ -259,15 +299,32 @@ class Launcher:
         for group in self.resource_groups.values():
             group.build(self)
 
+    @property
+    def num_bars(self):
+        return len(self.bar_values)
+
     def new_bar(self, value: int | None):
         bar_id = self.num_bars
         self.bar_values[bar_id] = value
-        self.num_bars += 1
+        self._barriers.initialized = False
         return bar_id
     def set_bar(self, bar_id: int, value: int):
         assert bar_id in self.bar_values, f"bar_id {bar_id} does not exist"
         assert isinstance(value, int), "bar value must be an int"
         self.bar_values[bar_id] = value
+        self._barriers.initialized = False
+
+    def reset_barriers(self):
+        """Reset the shared table once before launching the GPUs for a new run."""
+        unbound = [bar for bar, value in self.bar_values.items() if value is None]
+        if unbound:
+            raise ValueError(f"Cannot launch with unbound barrier counts: {unbound}")
+        values = torch.zeros(config.max_bars, dtype=torch.int32, device="cpu")
+        values[:self.num_bars] = values.new_tensor(list(self.bar_values.values()))
+        with torch.cuda.device(self.bars.device):
+            self.bars.view(torch.int32).view(-1).copy_(values)
+            self.bars_src.view(torch.int32).view(-1).copy_(values)
+        self._barriers.initialized = True
     def new_tma(self, desc: torch.Tensor) -> int:
         self.tmas.append(desc)
         return len(self.tmas) - 1
@@ -292,6 +349,10 @@ class Launcher:
 
     def build_instructions(self):
         if self.need_instruction_build:
+            for builder in self.builder:
+                for inst in [*builder.built_minsts, *builder.minsts]:
+                    for tensor in inst.tensors:
+                        self._validate_tensor(tensor)
             for i in range(self.num_sms):
                 self.builder[i].build(
                     self.cinsts[i,...],
@@ -466,6 +527,11 @@ class Launcher:
         return ci / self.num_sms, mi / self.num_sms
 
     def launch(self):
+        with torch.cuda.device(self.device):
+            self._launch()
+
+    def _launch(self):
+        runtime.set_smem_size(self.smem_size)
         self.build_instructions()
 
         supported_compute_ops = getattr(runtime, "supported_compute_ops", None)
@@ -480,25 +546,14 @@ class Launcher:
                     f"{missing_compute_ops}. Rebuild with DAE_COMPUTE_OPS={rebuild_list} or a superset."
                 )
 
-        unbound_bar_ids = [bar_id for bar_id, value in self.bar_values.items() if value is None]
-        if unbound_bar_ids:
-            raise ValueError(f"Cannot launch with unbound barrier counts: {unbound_bar_ids}")
+        if self.num_gpus == 1 or not self._barriers.initialized:
+            self.reset_barriers()
 
         # Load the model using the runtime
         cinsts = self.cinsts.to(self.device).view(self.num_sms * self.max_insts, 8)
         minsts = self.minsts.to(self.device).view(self.num_sms * self.max_insts, 16)
 
-        stream = torch.cuda.current_stream().cuda_stream
-        # TODO(zhiyuang): check this?
-
-        # init the bars based on dict
-        bar_int_view = self.bars.view(torch.uint32)
-        bar_src_int_view = self.bars_src.view(torch.uint32)
-        for bar_id, value in self.bar_values.items():
-            bar_int_view[bar_id] = value
-            bar_src_int_view[bar_id] = value
-
-        # print("bars before launch:", self.bar_values)
+        stream = torch.cuda.current_stream(self.device).cuda_stream
 
         if len(self.tmas) == 0:
             tma = torch.empty((4, 128), dtype=torch.uint8, device=self.device)
@@ -514,22 +569,16 @@ class Launcher:
             minsts=minsts,
         )
         if cache_window is not None:
+            self._validate_tensor(cache_window["tensor"])
             runtime.set_cache_policy(
-                cache_window["tensor"],
-                stream,
-                cache_window["hit_ratio"],
-                cache_window["hit_policy"],
-                cache_window["miss_policy"],
+                cache_window["tensor"], stream, cache_window["hit_ratio"],
+                cache_window["hit_policy"], cache_window["miss_policy"],
                 cache_window["num_bytes"] if cache_window["num_bytes"] is not None else -1,
             )
-
-        ret = runtime.launch_dae(
-            self.num_sms, self.smem_size,
-            cinsts, minsts, tma,
-            self.bars, profile,
-            stream
+        runtime.launch_dae(
+            self.num_sms, self.smem_size, cinsts, minsts, tma,
+            self.bars, profile, stream,
         )
-        assert ret == 0
 
     def compute_operator_names(self) -> list[str]:
         return extract_compute_operator_names(self)
@@ -539,6 +588,8 @@ class Launcher:
         execution_times = []
         duration_ns = np.zeros(self.num_sms, dtype=np.float64)
         for i in range(iterations):
+            if self.num_gpus > 1:
+                self.reset_barriers()
             self.launch()
 
             # fetch profile data

@@ -2,6 +2,9 @@
 #include "dae/context.cuh"
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 #include <cuda.h>            // Driver API
 #include <cuda_runtime.h>
@@ -15,8 +18,36 @@
 
 namespace py = pybind11;
 
+// Use Torch's allocator hook so expandable segments and cudaMallocAsync pools
+// receive peer mappings too. Plain cudaDeviceEnablePeerAccess is insufficient.
+void py_enable_peer_access(int64_t num_gpus) {
+  int count = 0;
+  C10_CUDA_CHECK(cudaGetDeviceCount(&count));
+  TORCH_CHECK(num_gpus >= 2 && num_gpus <= count,
+              "num_gpus must be between 2 and the visible GPU count (", count, ")");
+  // Check the complete group before changing any peer mappings.
+  for (int src = 0; src < num_gpus; ++src) {
+    for (int dst = 0; dst < num_gpus; ++dst) {
+      if (src == dst) continue;
+      int capable = 0;
+      C10_CUDA_CHECK(cudaDeviceCanAccessPeer(&capable, src, dst));
+      TORCH_CHECK(capable, "CUDA peer access unavailable from GPU ", src, " to GPU ", dst);
+    }
+  }
+  for (int src = 0; src < num_gpus; ++src) {
+    c10::cuda::CUDAGuard guard(src);
+    for (int dst = 0; dst < num_gpus; ++dst) {
+      if (src != dst)
+        c10::cuda::CUDACachingAllocator::enablePeerAccess(src, dst);
+    }
+  }
+}
+
 // function 1: set smem size
+static void set_persistent_cache();
+
 size_t py_set_smem_size(size_t requested_size) {
+  set_persistent_cache();
   return set_smem_size(requested_size);
 }
 
@@ -139,24 +170,34 @@ int py_launch_dae(
     torch::Tensor tma_descs_bytes,       // uint8 buffer
     torch::Tensor bars_int32,            // int32
     torch::Tensor profile_u64,           // uint64
-    int64_t stream
+    int64_t stream,
+    bool synchronize
 ) {
-  set_persistent_cache();
-
-  // fixed for H100 for now
-  TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
-
-  // Make sure we run on the right device/stream
   auto cinst = check_tensor_ptr<CInst>(compute_insts_bytes, "compute_insts_bytes");
   auto minst = check_tensor_ptr<MInst>(memory_insts_bytes, "memory_insts_bytes");
   auto tma = check_tensor_ptr<CUtensorMap>(tma_descs_bytes, "tma_descs_bytes");
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
 
+  const auto device = compute_insts_bytes.device();
+  TORCH_CHECK(memory_insts_bytes.device() == device && tma_descs_bytes.device() == device &&
+              profile_u64.device() == device,
+              "Instruction, TMA, and profile buffers must reside on the launch device");
+  TORCH_CHECK(bars_int32.get_device() == 0 || bars_int32.device() == device,
+              "Barriers must reside on GPU 0 or the launch device");
+  c10::cuda::CUDAGuard guard(device);
+  TORCH_CHECK(num_sms > 0 && num_sms <= current_device_prop().multiProcessorCount,
+              "num_sms out of range for launch device");
+  TORCH_CHECK(compute_insts_bytes.size(0) >= num_sms * numInsts &&
+              memory_insts_bytes.size(0) >= num_sms * numInsts &&
+              bars_int32.size(0) >= numBars &&
+              profile_u64.size(0) >= num_sms * numProfileEvents,
+              "Launch buffers are too small");
+
   cudaError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
-      bars, prof, stream
+      bars, prof, stream, synchronize
   );
 
   TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
@@ -390,7 +431,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("set_smem_size", &py_set_smem_size,
             "Set dynamic shared memory size for DAE2 kernel");
+  m.def("enable_peer_access", &py_enable_peer_access, py::arg("num_gpus"),
+            "Enable allocator-aware peer access among the first num_gpus visible GPUs");
   m.def("launch_dae", &py_launch_dae,
+            py::arg("num_sms"), py::arg("smem_size"),
+            py::arg("compute_insts_bytes"), py::arg("memory_insts_bytes"),
+            py::arg("tma_descs_bytes"), py::arg("bars_int32"),
+            py::arg("profile_u64"), py::arg("stream"),
+            py::arg("synchronize") = true,
             "Launch DAE2 kernel with given parameters");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");

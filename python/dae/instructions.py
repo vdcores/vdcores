@@ -384,8 +384,9 @@ class ARGMAX_REDUCE_bf16_1024_128(ComputeInstruction):
 
 
 class Dummy(ComputeInstruction):
-    def __init__(self, iters: int):
-        super().__init__(opcode=opcode.OP_DUMMY, args=[iters])
+    def __init__(self, iters: int, *, writeback: bool = False):
+        """Relay loaded slots to writeback, or simply free them by default."""
+        super().__init__(opcode=opcode.OP_DUMMY, args=[iters, 0, int(writeback)])
 
 
 class Copy(ComputeInstruction):
@@ -417,6 +418,7 @@ class MemoryInstruction(Instruction):
         size: int,
         cords: list[int] = [],
         address: int | None = None,
+        tensors: tuple[torch.Tensor, ...] = (),
     ):
         self.opcode = opcode
         self.num_slots = num_slots
@@ -424,6 +426,8 @@ class MemoryInstruction(Instruction):
         self.size = size
         self.set_cords(cords)
         self.annotation = {}
+        # Keep storage alive while instructions carry raw UVA addresses.
+        self.tensors = tensors
         if address is not None:
             addr_bytes = address.to_bytes(8, byteorder="little")
             for i in range(4):
@@ -485,6 +489,7 @@ class MemoryInstruction(Instruction):
             arg=self.arg,
             size=self.size,
             cords=self.cords.copy(),
+            tensors=self.tensors,
         )
         other.annotation = self.annotation.copy()
         return other
@@ -811,6 +816,7 @@ class RawAddress(MemoryInstruction):
             arg=slot_id,
             size=0,
             address=address,
+            tensors=(tensor,),
         )
 
 
@@ -828,9 +834,9 @@ class CC0(MemoryInstruction):
             raise ValueError(f"CC0 requires a positive embedding row size in bytes, got {row_bytes}")
         if (row_bytes & (row_bytes - 1)) == 0:
             shift = row_bytes.bit_length() - 1
-            super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr)
+            super().__init__(opcode=opcode.OP_CC0, num_slots=0, arg=shift, size=0, address=addr, tensors=(tokens,))
             return
-        super().__init__(opcode=opcode.OP_CC0_ROW_BYTES, num_slots=0, arg=0, size=row_bytes, address=addr)
+        super().__init__(opcode=opcode.OP_CC0_ROW_BYTES, num_slots=0, arg=0, size=row_bytes, address=addr, tensors=(tokens,))
 
 
 class RegStore(MemoryInstruction):
@@ -876,6 +882,7 @@ class TmaLoad1D(MemoryInstruction):
             arg=0,
             size=bytes,
             address=address,
+            tensors=(src,),
         )
 
     def cord(self, addr):
@@ -897,6 +904,7 @@ class TmaStore1D(MemoryInstruction):
             arg=0,
             size=bytes,
             address=address,
+            tensors=(dst,),
         )
 
     def cord(self, addr):
@@ -907,7 +915,7 @@ class TmaStore1D(MemoryInstruction):
 
 class TmaTensor(MemoryInstruction):
     def __init__(self, launcher, mat: torch.Tensor):
-        super().__init__(opcode=0, num_slots=0, arg=0, size=0, cords=[])
+        super().__init__(opcode=0, num_slots=0, arg=0, size=0, cords=[], tensors=(mat,))
         self.launcher = launcher
         self.mat = mat
         self.cord_func = None

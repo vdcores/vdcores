@@ -43,7 +43,10 @@ DAE_COMPUTE_OP_HANDLER(OP_DUMMY) {
     auto slot_id = m2c.pop();
     __nanosleep(inst.args[1]);
     __cprint("[Dummy][i=%d] after pop slot_id=%d", i, slot_id);
-    c2m.template push<0>(thread_id, slot_id);
+    if (inst.args[2])
+      c2m.template push<0, true>(thread_id, slot_id);
+    else
+      c2m.template push<0>(thread_id, slot_id);
   }
 }
 
