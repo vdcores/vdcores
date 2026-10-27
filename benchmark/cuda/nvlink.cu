@@ -19,8 +19,6 @@ __global__ void peer_roundtrip(uint4* dst, const uint4* src, size_t count) {
 
 static void roundtrip_kernel(uintptr_t dst, uintptr_t src, size_t bytes,
                              int blocks, uintptr_t stream) {
-  if (bytes % sizeof(uint4) != 0 || blocks < 1)
-    throw std::runtime_error("roundtrip requires 16-byte size alignment and positive blocks");
   peer_roundtrip<<<blocks, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<uint4*>(dst), reinterpret_cast<const uint4*>(src),
       bytes / sizeof(uint4));

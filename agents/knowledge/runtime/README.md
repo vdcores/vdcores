@@ -10,9 +10,6 @@ Start here for the VDCores runtime and VM model.
 
 Then pull in narrower notes as needed:
 
-- [peer-memory.md](peer-memory.md): explicit multi-GPU opt-in, peer allocation,
-  device/stream selection, and synchronization boundaries
-
 - [memory-core-performance-knobs.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/memory-core-performance-knobs.md)
 - [gemm-scheduler.md](/home1/11362/depctg/vdcores/agents/knowledge/runtime/gemm-scheduler.md)
 
