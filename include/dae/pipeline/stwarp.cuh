@@ -23,6 +23,8 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     // all ops are writeback ops
 
     switch(op(opcode)) {
+      // A relayed load writes the same slot back to its original address.
+      case op(OP_ALLOC_TMA_LOAD_1D):
       case op(OP_ALLOC_WB_TMA_STORE_1D):
       {
         cuda::ptx::cp_async_bulk(
@@ -173,5 +175,6 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     slot_mask = c2m.pop();
   }
 
+  cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
   __stprint("End of ST warp execution");
 }

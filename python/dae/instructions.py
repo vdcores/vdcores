@@ -384,8 +384,9 @@ class ARGMAX_REDUCE_bf16_1024_128(ComputeInstruction):
 
 
 class Dummy(ComputeInstruction):
-    def __init__(self, iters: int):
-        super().__init__(opcode=opcode.OP_DUMMY, args=[iters])
+    def __init__(self, iters: int, *, writeback: bool = False):
+        """Relay loaded slots to writeback, or simply free them by default."""
+        super().__init__(opcode=opcode.OP_DUMMY, args=[iters, 0, int(writeback)])
 
 
 class Copy(ComputeInstruction):

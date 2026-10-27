@@ -181,6 +181,9 @@ The memory-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/dep
     - allocate normal shared-memory slots
     - async copy global bytes into the slot span
     - publish a ready token to `m2c`
+  - roundtrip:
+    - `.writeback()` plus `Dummy(count, writeback=True)` sends the loaded slot
+      to the store warp, which writes it back to the same global address
 
 - `OP_ALLOC_TMA_LOAD_TENSOR_1D`
   - fields:
@@ -255,6 +258,8 @@ Barrier behavior for load ops:
 
 Barrier behavior for writeback ops:
 
+- The store warp drains outstanding TMA stores before exiting.
+
 - if `BARRIER` is set, the store warp waits for the async store to complete and then decrements `bars[bar]`
 
 ### Pseudo-register and raw-address ops
@@ -324,10 +329,11 @@ The compute-op registry declared in [include/dae/opcode.cuh.inc](/home1/11362/de
   - args:
     - `args[0]` = number of input tokens to consume
     - `args[1]` = optional nanosleep delay
+    - `args[2]` = relay the slot to writeback when nonzero (default zero frees it)
   - effect:
     - pop one `m2c` token per iteration
     - optionally sleep
-    - return the same token through `c2m`
+    - return the same token through `c2m`, without copying the slot contents
 
 - `OP_COPY`
   - args:
