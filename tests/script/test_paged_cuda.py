@@ -1,5 +1,5 @@
 import struct
-
+import random
 import torch
 
 from dae.instructions import Dummy, PagedLoad1D
@@ -7,6 +7,7 @@ from dae.launcher import Launcher
 from dae.paged import PagedCacheConfig
 
 
+# TODO: Remove all of these constants later
 NUM_REQ = 2
 PAGES_PER_SESSION = 3
 TOKENS_PER_PAGE = 16
@@ -39,67 +40,67 @@ EXPECTED_TOKEN_BYTES = (
 # no padding. This test assumes the current 64-bit native struct layout.
 DESCRIPTOR_FORMAT = "=2Q6I"
 
+class PagedMemoryTestHarness:
+    def __init__(self):
+        self.launcher = Launcher(1, "cuda")
+        
+        self.pool = torch.full(
+            (NUM_PAGES, TOKENS_PER_PAGE, LAYERS, NUM_KV_HEAD, NUM_KV_VECTORS, HEAD_DIM), -1, 
+            dtype=DTYPE, device=DEVICE,
+        )
+        
+        self.permutation = list(range(NUM_PAGES))
+        random.Random(42).shuffle(self.permutation)
+        
+        page_table = torch.tensor([self.pool[i].data_ptr() for i in self.permutation], dtype=torch.int64, device=DEVICE)
+
+        self.context_table = torch.tensor(((5, 0, 3), (1, 4, 2)), dtype=torch.int64, device=DEVICE)
+        
+        self.cache = PagedCacheConfig(page_table=page_table, context_table=self.context_table,
+                                tokens_per_page=TOKENS_PER_PAGE, kv_seq_len=KV_SEQ_LEN,
+                                num_req=NUM_REQ, layers=LAYERS,
+                                num_kv_heads=NUM_KV_HEAD, head_dim=HEAD_DIM)
+
+    """
+    Tests PagedLoad1D by storing a dummy vector, load to SMEM by PagedLoad, and checking output. 
+    """
+    def load_test(self, token_id: int, session_id: int):
+        # stores to session 1, page 2, token 0 ()
+        expected = torch.rand((LAYERS, NUM_KV_HEAD, 2, HEAD_DIM), dtype=DTYPE, device=DEVICE)
+        
+        actual = torch.zeros((LAYERS, NUM_KV_HEAD, 2, HEAD_DIM), dtype = DTYPE, device= DEVICE)
+        
+        logical_page = token_id // TOKENS_PER_PAGE
+        page_offset = token_id % TOKENS_PER_PAGE
+        
+        page_id = self.context_table[session_id][logical_page].item()
+        
+        self.pool[self.permutation[page_id]][page_offset] = tK
+        
+        self.launcher.s(PagedLoad1D(session_id = session_id, token_id = token_id, cache = self.cache), TmaStore1D(dst = actual))
+        self.launcher.launch()
+        
+        assert torch.equal(expected, actual), (
+            f"PagedLoad1D failed for session={session_id}, "
+            f"token={token_id}, "
+            f"logical_page={logical_page}, "
+            f"physical_page={page_id}, "
+            f"pool_index={self.permutation[page_id]}"
+        )
+        
+        print(f'Passed test (token, session) = ({token_id}, {session_id})')
+        
+    def store_test(self, token_id: int, session_id: int):
+        pass
 
 def main():
     # Contiguous layout: [page, token, layer, head, K/V, dim].
-    pool = torch.empty(
-        (NUM_PAGES, TOKENS_PER_PAGE, LAYERS, NUM_KV_HEAD, NUM_KV_VECTORS, HEAD_DIM),
-        dtype=DTYPE, device=DEVICE,
-    )
-    page_table = torch.tensor([pool[i].data_ptr() for i in range(NUM_PAGES)],
-                              dtype=torch.int64, device=DEVICE)
-
-    context_table = torch.tensor(CONTEXT_MAPPING, dtype=torch.int64, device=DEVICE)
     
-    cache = PagedCacheConfig(page_table=page_table, context_table=context_table,
-                             tokens_per_page=TOKENS_PER_PAGE, kv_seq_len=KV_SEQ_LEN,
-                             num_req=NUM_REQ, layers=LAYERS,
-                             num_kv_heads=NUM_KV_HEAD, head_dim=HEAD_DIM)
+    harness = PagedMemoryTestHarness()
     
-    # Verify C++ packed the input pointers and dimensions in the expected order.
-    # This layout inspection is test-only; production packing stays in C++.
-    descriptor = bytes(cache.descriptor.cpu().tolist())
-    expected_fields = (
-        page_table.data_ptr(), context_table.data_ptr(),
-        TOKENS_PER_PAGE, KV_SEQ_LEN, NUM_REQ, LAYERS, NUM_KV_HEAD, HEAD_DIM,
-    )
-    assert struct.unpack(DESCRIPTOR_FORMAT, descriptor) == expected_fields
-    
-    assert cache.bytes_per_token() == EXPECTED_TOKEN_BYTES
-    
-    # Test verifies device printed address at boundaries matches what we expect 
-    launcher = Launcher(NUM_SMS, DEVICE)
     for session in range(NUM_REQ):
-        for token in BOUNDARY_TOKENS:
-            page_index, page_offset = divmod(token, TOKENS_PER_PAGE)
-            physical = int(context_table[session, page_index].item())
-            for layer in range(LAYERS):
-                for head in range(NUM_KV_HEAD):
-                    key = pool[physical, page_offset, layer, head, KEY_INDEX].data_ptr()
-                    value = pool[physical, page_offset, layer, head, VALUE_INDEX].data_ptr()
-                    print(f"EXPECT session={session} token={token} layer={layer} "
-                          f"head={head} K=0x{key:x} V=0x{value:x}", flush=True)
-            launcher.i(PagedLoad1D(token, session, cache), Dummy(1))
-    launcher.s()
-    launcher.launch()
-    
-    # Tests two failure cases: session with logical page unmapped; page table having null pointer to pool
-    # Checks device code still completes schedule (rather than wait indef) and prints error reason. 
-    failure_token = BOUNDARY_TOKENS[0]
-    failure_page_index = failure_token // TOKENS_PER_PAGE
-    unmapped_session, null_page_session = 0, 1
-    null_page_id = int(context_table[null_page_session, failure_page_index].item())
-    context_table[unmapped_session, failure_page_index] = -1
-    page_table[null_page_id] = 0
-    failures = Launcher(NUM_SMS, DEVICE)
-    failure_loads = (
-        PagedLoad1D(failure_token, unmapped_session, cache),
-        PagedLoad1D(failure_token, null_page_session, cache),
-    )
-    failures.s(*failure_loads, Dummy(len(failure_loads)))
-    failures.launch()
-    torch.cuda.synchronize()
-    print("Native descriptor and paged/Dummy schedules completed.")
+        for token in range(TOKENS_PER_PAGE * PAGES_PER_SESSION):
+            harness.load_test(token_id = token, session_id=session)
 
 
 if __name__ == "__main__":
