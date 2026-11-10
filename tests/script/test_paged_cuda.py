@@ -119,7 +119,7 @@ class PagedMemoryTestHarness:
         page_id = self.permutation[self.context_table[session_id][token_id // TOKENS_PER_PAGE].item()]
         page_offset = token_id % TOKENS_PER_PAGE
         
-        actual = self.page_pool[page_id][page_offset]
+        actual = self.pool[page_id][page_offset]
         
         assert torch.equal(expected, actual), (
             f"PagedStore1D failed for session={session_id}, "
@@ -129,6 +129,42 @@ class PagedMemoryTestHarness:
         )
         
         print(f'Passed PagedStore1D test (token, session) = ({token_id}, {session_id})')
+    
+    """
+    Verifies that PagedStore1D only changes the intended portion of the pool. 
+    """
+    def store_test_pool(self, token_id: int, session_id: int): 
+        launcher = Launcher(1, "cuda")
+        
+        expected_pool = self.pool.clone()
+        
+        tK = torch.rand((LAYERS, NUM_KV_HEAD, 2, HEAD_DIM), dtype= DTYPE, device =DEVICE)
+
+        page_id = self.permutation[self.context_table[session_id][token_id // TOKENS_PER_PAGE].item()]
+        page_offset = token_id % TOKENS_PER_PAGE
+        
+        expected_pool[page_id][page_offset] = tK 
+
+        launcher.s(
+            TmaLoad1D(src = tK), 
+            Copy(1, EXPECTED_TOKEN_BYTES), 
+            PagedStore1D(token_id = token_id, session_id = session_id, cache = self.cache)
+        )
+        
+        launcher.launch() 
+        
+        torch.cuda.synchronize() 
+        
+        assert torch.equal(expected_pool, self.pool), (
+            f"PagedStore1D failed (pool-wide) for session={session_id}, "
+            f"token={token_id}, "
+            f"physical_page={page_id}, "
+            f"pool_index={self.permutation[page_id]}"
+        )
+        
+        print(f'PagedStore1D passed (pool-wide) for (token, session) = ({token_id}, {session_id})')
+        
+        
 
 def main():
     harness = PagedMemoryTestHarness()
@@ -136,6 +172,14 @@ def main():
     for session in range(NUM_REQ):
         for token in range(TOKENS_PER_PAGE * PAGES_PER_SESSION):
             harness.load_test(token_id = token, session_id=session)
+    
+    for session in range(NUM_REQ):
+        for token in range(TOKENS_PER_PAGE * PAGES_PER_SESSION):
+            harness.store_test(token_id = token, session_id = session)
+
+    for session in range(NUM_REQ):
+        for token in range(TOKENS_PER_PAGE * PAGES_PER_SESSION):
+            harness.store_test_pool(token_id = token, session_id = session)
 
 
 if __name__ == "__main__":
