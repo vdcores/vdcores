@@ -25,6 +25,8 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
     switch(op(opcode)) {
       case op(OP_PAGED_STORE_1D):
       {
+        // This could be stored in a VDCores reserved register and shared across all loads, might 
+        // let us have a clearner interface from the Python end. 
         const auto& config = *reinterpret_cast<const PagedLoadConfig*>(inst.address); 
         const auto token_id = (uint32_t) inst.size; const auto session_id = (uint32_t) inst.arg; 
         const auto pages_per_session = config.kv_seq_len / config.tokens_per_page; 
@@ -45,6 +47,7 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
           (const void *)(get_slot_address(smem_base, slot)),
           per_token_size
         ); 
+
         cuda::ptx::cp_async_bulk_commit_group(); 
 
         break;

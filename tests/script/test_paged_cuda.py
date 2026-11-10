@@ -2,7 +2,7 @@ import struct
 import random
 import torch
 
-from dae.instructions import Dummy, PagedLoad1D
+from dae.instructions import Dummy, Copy, TmaStore1D, TmaLoad1D, PagedLoad1D, PagedStore1D
 from dae.launcher import Launcher
 from dae.paged import PagedCacheConfig
 
@@ -40,10 +40,13 @@ EXPECTED_TOKEN_BYTES = (
 # no padding. This test assumes the current 64-bit native struct layout.
 DESCRIPTOR_FORMAT = "=2Q6I"
 
+# Contiguous layout: [page, token, layer, head, K/V, dim].
 class PagedMemoryTestHarness:
-    def __init__(self):
-        self.launcher = Launcher(1, "cuda")
-        
+    """
+    Initializes memory pool, page table, context table, and cache to test loads and stores. 
+    Currently uses the constants defined above, but likely to instead use parameters in the future. 
+    """
+    def __init__(self):        
         self.pool = torch.full(
             (NUM_PAGES, TOKENS_PER_PAGE, LAYERS, NUM_KV_HEAD, NUM_KV_VECTORS, HEAD_DIM), -1, 
             dtype=DTYPE, device=DEVICE,
@@ -65,7 +68,8 @@ class PagedMemoryTestHarness:
     Tests PagedLoad1D by storing a dummy vector, load to SMEM by PagedLoad, and checking output. 
     """
     def load_test(self, token_id: int, session_id: int):
-        # stores to session 1, page 2, token 0 ()
+        launcher = Launcher(1, "cuda")
+        
         expected = torch.rand((LAYERS, NUM_KV_HEAD, 2, HEAD_DIM), dtype=DTYPE, device=DEVICE)
         
         actual = torch.zeros((LAYERS, NUM_KV_HEAD, 2, HEAD_DIM), dtype = DTYPE, device= DEVICE)
@@ -75,10 +79,12 @@ class PagedMemoryTestHarness:
         
         page_id = self.context_table[session_id][logical_page].item()
         
-        self.pool[self.permutation[page_id]][page_offset] = tK
+        self.pool[self.permutation[page_id]][page_offset] = expected
         
-        self.launcher.s(PagedLoad1D(session_id = session_id, token_id = token_id, cache = self.cache), TmaStore1D(dst = actual))
-        self.launcher.launch()
+        launcher.s(PagedLoad1D(session_id = session_id, token_id = token_id, cache = self.cache), Copy(1, EXPECTED_TOKEN_BYTES), TmaStore1D(dst = actual))
+        launcher.launch()
+        
+        torch.cuda.synchronize()
         
         assert torch.equal(expected, actual), (
             f"PagedLoad1D failed for session={session_id}, "
@@ -88,14 +94,43 @@ class PagedMemoryTestHarness:
             f"pool_index={self.permutation[page_id]}"
         )
         
-        print(f'Passed test (token, session) = ({token_id}, {session_id})')
+        print(f'Passed PagedLoad1D test (token, session) = ({token_id}, {session_id})')
         
+    """
+    Test for PagedStore1D. First issues a load using TmaLoad1D (assumed to be reliable), issues a copy into working space slots, 
+    then issues a PagedStore into global memory given the token_id and session_id. Check confirms that the store is as expected. 
+    All loads and stores operate on single-token KV cache. 
+    """
     def store_test(self, token_id: int, session_id: int):
-        pass
+        launcher = Launcher(1, "cuda")
+        
+        expected = torch.rand((LAYERS, NUM_KV_HEAD, 2, HEAD_DIM), dtype= DTYPE, device =DEVICE)
+        
+        launcher.s(
+            TmaLoad1D(src = expected), 
+            Copy(1, EXPECTED_TOKEN_BYTES), 
+            PagedStore1D(token_id = token_id, session_id = session_id, cache = self.cache)
+        )
+        
+        launcher.launch()
+        
+        torch.cuda.synchronize() 
+        
+        page_id = self.permutation[self.context_table[session_id][token_id // TOKENS_PER_PAGE].item()]
+        page_offset = token_id % TOKENS_PER_PAGE
+        
+        actual = self.page_pool[page_id][page_offset]
+        
+        assert torch.equal(expected, actual), (
+            f"PagedStore1D failed for session={session_id}, "
+            f"token={token_id}, "
+            f"physical_page={page_id}, "
+            f"pool_index={self.permutation[page_id]}"
+        )
+        
+        print(f'Passed PagedStore1D test (token, session) = ({token_id}, {session_id})')
 
 def main():
-    # Contiguous layout: [page, token, layer, head, K/V, dim].
-    
     harness = PagedMemoryTestHarness()
     
     for session in range(NUM_REQ):

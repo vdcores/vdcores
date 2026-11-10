@@ -60,12 +60,12 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         const auto per_token_size = config.layers * config.num_kv_heads * 2 * config.head_dim * 2; 
         const auto token_start_addr = config.page_table[page_id] + (page_offset * per_token_size); 
 
-        // What does the 16 byte alignment imply? 
+        
         cuda::device::memcpy_async_tx(
-          (char *)(get_slot_address(smem_base, slot)), // Why char* and not void*? 
-          (char *)(token_start_addr),
-          cuda::aligned_size_t<16>(per_token_size), // TODO: Replace this with appropriate thing, inst.size neq size!
-          m2c.barriers[bar]
+          (char *)(get_slot_address(smem_base, slot)), // Slots we are loading into  
+          (char *)(token_start_addr), // Global memory pointer to read from
+          cuda::aligned_size_t<16>(per_token_size), 
+          m2c.barriers[bar] // Tells the load to update this barrier for compute to wait on
         ); 
 
         cuda::device::barrier_expect_tx(
