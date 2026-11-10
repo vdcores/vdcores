@@ -48,6 +48,18 @@ constexpr int flagBits = 6;
 constexpr int slotBits = 6;
 static_assert(numSlots <= (1 << slotBits), "numSlots exceeds slotBits capacity");
 
+// Shared GMEM metadata for contiguous BF16 [page, token, layer, head, K/V, dim].
+struct PagedLoadConfig {
+  const uint64_t* page_table = nullptr;
+  const int64_t* context_table = nullptr;
+  uint32_t tokens_per_page = 0;
+  uint32_t kv_seq_len = 0;
+  uint32_t num_req = 0;
+  uint32_t layers = 0;
+  uint32_t num_kv_heads = 0;
+  uint32_t head_dim = 0;
+};
+
 // definition of instruction formats
 struct alignas(8) CInst {
   uint16_t opcode;
@@ -86,7 +98,8 @@ enum InstOpcode : uint16_t {
 
 // TODO(zhiyuang): load128
 struct alignas(16) MInst {
-  uint16_t opcode; // 12 bits opcode + 4 bits flags
+  // 
+  uint16_t opcode; // 10 bits opcode + 6 bits flags
   uint16_t size;
   union {
     struct {

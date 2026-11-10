@@ -9,7 +9,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <optional>
+#include <limits>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -130,6 +133,58 @@ static void set_persistent_cache() {
   // printf("persistentCacheSize: %zu bytes\n", set_aside);
 }
 
+torch::Tensor py_build_paged_config(
+    const torch::Tensor& page_table, const torch::Tensor& context_table,
+    int64_t tokens_per_page, int64_t kv_seq_len, int64_t num_req,
+    int64_t layers, int64_t num_kv_heads, int64_t head_dim) {
+  
+  auto check_table = [](const torch::Tensor& table, const char* name, int rank) {
+    TORCH_CHECK(table.defined() && table.is_cuda() && table.scalar_type() == torch::kInt64
+                && table.dim() == rank && table.is_contiguous() && table.numel() > 0,
+                name, " must be a nonempty contiguous CUDA int64 tensor of rank ", rank);
+  };
+  check_table(page_table, "page_table", 1);
+  check_table(context_table, "context_table", 2);
+
+  // I'm not sure what this syntax is doing. Is the RHS a set of each of these values? 
+  for (int64_t value : {tokens_per_page, kv_seq_len, num_req, layers, num_kv_heads, head_dim}) {
+    TORCH_CHECK(value > 0 && uint64_t(value) <= std::numeric_limits<uint32_t>::max(),
+                "Paged dimensions must be positive and fit uint32");
+  }
+
+  // Explain why we need this assertion as a requirement. 
+  TORCH_CHECK(kv_seq_len % tokens_per_page == 0,
+              "kv_seq_len must be divisible by tokens_per_page");
+  TORCH_CHECK(context_table.size(0) == num_req && context_table.size(1) == kv_seq_len / tokens_per_page,
+              "context_table shape must match num_req and maximum number of pages (kv_seq_len / tokens_per_page)");
+  
+  // Multiply by 4 because 2 bf16 exist (key and value)
+  uint64_t page_bytes = uint64_t(head_dim) * 4;
+  for (int64_t count : {num_kv_heads, layers, tokens_per_page}) {
+    TORCH_CHECK(page_bytes <= std::numeric_limits<uint64_t>::max() / count,
+                "Paged configuration byte strides overflow uint64");
+    page_bytes *= count;
+  }
+  PagedLoadConfig config{};
+
+  config.page_table = reinterpret_cast<const uint64_t*>(page_table.data_ptr<int64_t>());
+  config.context_table = context_table.data_ptr<int64_t>();
+  config.tokens_per_page = tokens_per_page;
+  config.kv_seq_len = kv_seq_len;
+  config.num_req = num_req;
+  config.layers = layers;
+  config.num_kv_heads = num_kv_heads;
+  config.head_dim = head_dim;
+
+  static_assert(std::is_trivially_copyable_v<PagedLoadConfig>);
+  auto bytes = torch::empty({static_cast<int64_t>(sizeof(config))},
+                           torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  
+  std::memcpy(bytes.data_ptr<uint8_t>(), &config, sizeof(config));
+  
+  return bytes.to(page_table.device());
+}
+
 // function 2: launch_dae
 int py_launch_dae(
     int64_t num_sms,
@@ -141,8 +196,6 @@ int py_launch_dae(
     torch::Tensor profile_u64,           // uint64
     int64_t stream
 ) {
-  set_persistent_cache();
-
   // fixed for H100 for now
   TORCH_CHECK(num_sms >= 0 && num_sms <= 132, "num_sms out of range");
 
@@ -392,6 +445,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Set dynamic shared memory size for DAE2 kernel");
   m.def("launch_dae", &py_launch_dae,
             "Launch DAE2 kernel with given parameters");
+  m.def("build_paged_config", &py_build_paged_config,
+            py::arg("page_table"), py::arg("context_table"),
+            py::arg("tokens_per_page"), py::arg("kv_seq_len"), py::arg("num_req"),
+            py::arg("layers"),
+            py::arg("num_kv_heads"), py::arg("head_dim"),
+            "Build a shared GMEM paged-cache descriptor in the native layout");
   m.def("build_tma_desc", &py_build_tma_desc,
             "Build CUtensorMap descriptor for given tensor and layout");
   m.def("reset_cache_policy", &py_reset_cache_policy,

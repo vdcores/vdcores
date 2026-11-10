@@ -46,6 +46,35 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
 
     // TODO(zhiyuang): change location?
     switch(op(opcode)) {
+      case op(OP_PAGED_LOAD_1D): {
+        // Inst.size = token_id, Inst.arg = session_id
+        const auto& config = *reinterpret_cast<const PagedLoadConfig*>(inst.address); 
+        const auto token_id = (uint32_t) inst.size; const auto session_id = (uint32_t) inst.arg; 
+        const auto pages_per_session = config.kv_seq_len / config.tokens_per_page; 
+
+        // Compute address in global memory
+        const auto page_index = token_id / config.tokens_per_page; 
+        const auto page_offset = token_id % config.tokens_per_page;
+        const auto page_id = config.context_table[(session_id * pages_per_session) + page_index]; 
+
+        const auto per_token_size = config.layers * config.num_kv_heads * 2 * config.head_dim * 2; 
+        const auto token_start_addr = config.page_table[page_id] + (page_offset * per_token_size); 
+
+        
+        cuda::device::memcpy_async_tx(
+          (char *)(get_slot_address(smem_base, slot)), // Slots we are loading into  
+          (char *)(token_start_addr), // Global memory pointer to read from
+          cuda::aligned_size_t<16>(per_token_size), 
+          m2c.barriers[bar] // Tells the load to update this barrier for compute to wait on
+        ); 
+
+        cuda::device::barrier_expect_tx(
+          m2c.barriers[bar],
+          cuda::aligned_size_t<16>(per_token_size)
+        );
+        
+        break;
+      }
       case op(OP_ALLOC_TMA_LOAD_1D): {
         __ldprint("TMA 1D Load: size=%d", inst.size);
         // We need to get a slot ID first, as we will use its barrier
