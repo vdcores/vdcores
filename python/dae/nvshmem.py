@@ -193,6 +193,8 @@ def init(
             )
         return current
 
+    user_set_transport = "NVSHMEM_REMOTE_TRANSPORT" in os.environ
+    user_set_ibgda = "NVSHMEM_IB_ENABLE_IBGDA" in os.environ
     _configure_environment(requested_size)
     _load_allocator()
     dae_runtime = _load_runtime()
@@ -209,6 +211,12 @@ def init(
     local_comm = world.Split_type(mpi.COMM_TYPE_SHARED, key=rank)
     local_rank = local_comm.Get_rank()
     local_size = local_comm.Get_size()
+    # One node. IBGDA cannot allocate a GPU UAR here, and the IBRC fallback
+    # then segfaults inside nvshmem init. P2P covers every rank.
+    if local_size == world_size and not user_set_transport:
+        os.environ["NVSHMEM_REMOTE_TRANSPORT"] = "none"
+        if not user_set_ibgda:
+            os.environ["NVSHMEM_IB_ENABLE_IBGDA"] = "0"
 
     owns_nvshmem = False
     module_initialized = False
