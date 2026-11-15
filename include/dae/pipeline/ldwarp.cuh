@@ -281,6 +281,120 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
         );
         break;
       }
+      case op(OP_ALLOC_TMA_LOAD_METADATA_LAST): {
+        const uint16_t *cord = inst.coords;
+        // my_cord = [...static coords, metadata_array[meta_idx]]
+        const uint32_t desc_index = (uint32_t)inst.arg & 0x3ffu;
+        const uint32_t meta_idx =
+            (((uint32_t)inst.size >> 12) & 0xfu) |
+            ((((uint32_t)inst.arg >> 10) & 0x3fu) << 4);
+        const uint32_t nbytes = ((uint32_t)inst.size & 0x0fffu) << 4;
+        int nstatic = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          if (cord[i] == 0xffffu) break;
+          ++nstatic;
+        }
+        const uint32_t rank = (uint32_t)nstatic + 1u;
+
+        if (metadata_ptrs == nullptr || metadata_ptrs[0] == nullptr) {
+          __trap();
+        }
+        const uint32_t index = *reinterpret_cast<const volatile uint32_t*>(
+            ((const uint32_t *)metadata_ptrs[0]) + meta_idx);
+        const CUtensorMap *desc = tma_descs + desc_index;
+
+        switch (rank) {
+          case 1:
+            asm volatile(
+              "cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes"
+              "[%0], [%1, {%2}], [%3];\n"
+              :
+              : "r"((uint32_t)__cvta_generic_to_shared(
+                    get_slot_address(smem_base, slot))),
+                "l"((void *)desc),
+                "r"((int)index),
+                "r"((uint32_t)__cvta_generic_to_shared(
+                    m2c.native_bar(bar)))
+              : "memory");
+            break;
+
+          case 2:
+            asm volatile(
+              "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+              "[%0], [%1, {%2, %3}], [%4];\n"
+              :
+              : "r"((uint32_t)__cvta_generic_to_shared(
+                    get_slot_address(smem_base, slot))),
+                "l"((void *)desc),
+                "r"((int)cord[0]),
+                "r"((int)index),
+                "r"((uint32_t)__cvta_generic_to_shared(
+                    m2c.native_bar(bar)))
+              : "memory");
+            break;
+
+          case 3:
+            asm volatile(
+              "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+              "[%0], [%1, {%2, %3, %4}], [%5];\n"
+              :
+              : "r"((uint32_t)__cvta_generic_to_shared(
+                    get_slot_address(smem_base, slot))),
+                "l"((void *)desc),
+                "r"((int)cord[0]),
+                "r"((int)cord[1]),
+                "r"((int)index),
+                "r"((uint32_t)__cvta_generic_to_shared(
+                    m2c.native_bar(bar)))
+              : "memory");
+            break;
+
+          case 4:
+            asm volatile(
+              "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes"
+              "[%0], [%1, {%2, %3, %4, %5}], [%6];\n"
+              :
+              : "r"((uint32_t)__cvta_generic_to_shared(
+                    get_slot_address(smem_base, slot))),
+                "l"((void *)desc),
+                "r"((int)cord[0]),
+                "r"((int)cord[1]),
+                "r"((int)cord[2]),
+                "r"((int)index),
+                "r"((uint32_t)__cvta_generic_to_shared(
+                    m2c.native_bar(bar)))
+              : "memory");
+            break;
+
+          case 5:
+            asm volatile(
+              "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes"
+              "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];\n"
+              :
+              : "r"((uint32_t)__cvta_generic_to_shared(
+                    get_slot_address(smem_base, slot))),
+                "l"((void *)desc),
+                "r"((int)cord[0]),
+                "r"((int)cord[1]),
+                "r"((int)cord[2]),
+                "r"((int)cord[3]),
+                "r"((int)index),
+                "r"((uint32_t)__cvta_generic_to_shared(
+                    m2c.native_bar(bar)))
+              : "memory");
+            break;
+
+          default:
+            __trap();
+        }
+
+        cuda::device::barrier_expect_tx(
+            m2c.barriers[bar],
+            cuda::aligned_size_t<16>(nbytes)
+        );
+        break;
+      }
       case op(OP_ALLOC_WB_REG_STORE): {
         // TODO(zhiyuang): recalculate the mask or read from smem?
         int slotMask = mkSlotMask(slot, inst.nslot());

@@ -34,6 +34,10 @@ DAE_OP(OP_ALLOC_WB_TMA_REDUCE_ADD_3D, MK_MOP(22, MEM_OP_FLAGS_ALLOCATE | MEM_OP_
 
 DAE_OP(OP_ALLOC_WB_RAW_ADDRESS, MK_MOP(23, MEM_OP_FLAGS_ALLOCATE))
 DAE_OP(OP_ALLOC_TMA_LOAD_METADATA, MK_MOP(26, MEM_OP_FLAGS_ALLOCATE))
+// Same packing as OP_ALLOC_TMA_LOAD_METADATA. The metadata value is the
+// last coordinate instead of the first, so a K-major tile can select an
+// outer expert dimension. Opcode 26 stays leading for the existing tests.
+DAE_OP(OP_ALLOC_TMA_LOAD_METADATA_LAST, MK_MOP(27, MEM_OP_FLAGS_ALLOCATE))
 // following ops must have a slot to be loaded, but not the full slot
 
 

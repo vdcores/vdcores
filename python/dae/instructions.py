@@ -1354,10 +1354,19 @@ def _pack_metadata_arg(desc_index: int, meta_idx: int) -> int:
 
 
 class MetadataTmaLoadND(MemoryInstruction):
-    def __init__(self, desc, meta_idx, coords):
+    def __init__(self, desc, meta_idx, coords, metadata_last=False):
         coords = list(coords)
+        # The default opcode inserts the metadata value in front of the static
+        # coordinates. metadata_last uses the same packed fields and appends
+        # that value, which is the coordinate a K-major GEMM tile needs when
+        # the expert index is the outer dimension of the weight tensor.
+        load_opcode = (
+            opcode.OP_ALLOC_TMA_LOAD_METADATA_LAST
+            if metadata_last else
+            opcode.OP_ALLOC_TMA_LOAD_METADATA
+        )
         super().__init__(
-            opcode=opcode.OP_ALLOC_TMA_LOAD_METADATA,
+            opcode=load_opcode,
             num_slots=desc.num_slots,
             arg=_pack_metadata_arg(desc.arg, meta_idx),
             size=_pack_metadata_size(desc.size, meta_idx),
@@ -1365,6 +1374,7 @@ class MetadataTmaLoadND(MemoryInstruction):
         )
         self.desc = desc
         self.meta_idx = meta_idx
+        self.metadata_last = bool(metadata_last)
         self.rank = len(coords) + 1
 
     def cord(self, *coords):
